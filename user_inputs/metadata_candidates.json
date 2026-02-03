@@ -1,0 +1,29 @@
+{
+  "program_titles": [
+  ],
+  "asset_types": [
+    "Valve",
+    "Thruster",
+    "Connector",
+    "Pump",
+    "Actuator",
+    "Sensor",
+    "Controller",
+    "Regulator",
+    "Manifold",
+    "Motor",
+    "Gearbox",
+    "Battery",
+    "Harness",
+    "Filter",
+    "Nozzle",
+    "Turbine",
+    "Compressor",
+    "Panel",
+    "Bracket",
+    "Structure"
+  ],
+  "document_types": [
+    "EIDP"
+  ]
+}

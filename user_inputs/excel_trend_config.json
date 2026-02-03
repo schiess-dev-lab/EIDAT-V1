@@ -1,0 +1,12 @@
+{
+  "description": "Configure which columns from Excel data files to extract and trend across serial numbers.",
+  "data_group": "Excel Data",
+  "columns": [
+    { "name": "thrust", "units": "lbf", "range_min": null, "range_max": null },
+    { "name": "isp", "units": "s", "range_min": null, "range_max": null },
+    { "name": "pc", "units": "psia", "range_min": null, "range_max": null }
+  ],
+  "statistics": ["mean", "min", "max", "std", "median", "count"],
+  "sheet_name": null,
+  "header_row": 0
+}

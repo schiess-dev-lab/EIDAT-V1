@@ -12,7 +12,6 @@
 # User data/output folders
 /Data Packages/
 /Product_Data_File/
-/user_inputs/
 /cache/
 
 # Keep debug outputs for debugging, but ignore large image files
