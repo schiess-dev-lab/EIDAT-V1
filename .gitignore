@@ -1,0 +1,38 @@
+# App runtime (kept local per machine)
+/EIDAT_App_Files/.venv/
+/EIDAT_App_Files/Lib/
+/EIDAT_App_Files/.tmp_ocrify/
+/EIDAT_App_Files/debug_method/debug_file/
+/EIDAT_App_Files/debug_method/DebugFileLocation/
+/EIDAT_App_Files/debug_method/results/
+/EIDAT_App_Files/debug_method/word_gap_debug/
+
+# User data/output folders
+/Data Packages/
+/Product_Data_File/
+/user_inputs/
+/cache/
+
+# Keep debug outputs for debugging, but ignore large image files
+/debug/**/*.png
+/debug/**/*.jpg
+/debug/**/*.jpeg
+/global_run_mirror/
+
+
+# Generated/ephemeral files
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+debug_output*.txt
+nul
+
+# Local tool configs
+/.claude/
+
+# Backups not needed for runtime
+EIDAT_App_Files/Application/*.bak
+EIDAT_App_Files/Application/*.backup
+EIDAT_App_Files/ui_next/qt_main.py.backup-*
