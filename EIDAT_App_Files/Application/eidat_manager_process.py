@@ -44,6 +44,22 @@ def _load_scanner_core() -> Any:
     return mod
 
 
+EXCEL_EXTENSIONS = {".xlsx", ".xls", ".xlsm"}
+EXCEL_ARTIFACT_SUFFIX = "__excel"
+
+
+def _load_excel_extractor() -> Any:
+    """Load the Excel extraction helper module from scripts/."""
+    project_root = Path(__file__).resolve().parent.parent
+    mod_path = project_root / "scripts" / "excel_extraction.py"
+    spec = importlib.util.spec_from_file_location("excel_extraction", mod_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Unable to load Excel extractor from {mod_path}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)  # type: ignore[attr-defined]
+    return mod
+
+
 def _run_legacy_extraction(pdf_path: Path, dpi: int | None, output_dir: Path) -> dict[str, Any]:
     """
     Legacy extraction pipeline (ExtractionPipeline).
@@ -403,6 +419,50 @@ def _run_clean_extraction(pdf_path: Path, dpi: int | None, output_dir: Path) -> 
     return _run_debug_method_extraction(pdf_path, dpi=dpi, output_dir=output_dir)
 
 
+def _default_excel_config_path() -> Path:
+    repo_root = Path(__file__).resolve().parents[2]
+    return repo_root / "user_inputs" / "excel_trend_config.json"
+
+
+def _excel_artifacts_dir(paths: SupportPaths, excel_path: Path) -> Path:
+    return paths.support_dir / "debug" / "ocr" / f"{excel_path.stem}{EXCEL_ARTIFACT_SUFFIX}"
+
+
+def _derive_excel_metadata(excel_mod: Any, excel_path: Path) -> dict:
+    try:
+        program, vehicle, serial = excel_mod.derive_file_identity(excel_path)
+    except Exception:
+        program, vehicle, serial = "", "", ""
+    if program and vehicle:
+        program_title = f"{program} {vehicle}".strip()
+    else:
+        program_title = (program or vehicle or "Unknown").strip()
+    serial_number = (serial or "Unknown").strip() or "Unknown"
+    return {
+        "program_title": program_title,
+        "asset_type": "Unknown",
+        "serial_number": serial_number,
+        "part_number": "Unknown",
+        "revision": "Unknown",
+        "test_date": "Unknown",
+        "report_date": "Unknown",
+        "document_type": "Excel",
+    }
+
+
+def _run_excel_extraction(excel_mod: Any, excel_path: Path, output_dir: Path, config_path: Path) -> dict[str, Any]:
+    if not config_path.exists():
+        raise RuntimeError(f"Excel trend config not found: {config_path}")
+    config = excel_mod.load_config(config_path)
+    rows = excel_mod.extract_from_excel(excel_path, config)
+    excel_mod.write_outputs(rows, output_dir)
+    return {
+        "dir": str(output_dir),
+        "rows_count": len(rows),
+        "config": str(config_path),
+    }
+
+
 def _set_env_for_support(paths: SupportPaths) -> dict[str, str | None]:
     support_root = paths.support_dir
     merged_root = support_root / "debug" / "ocr"
@@ -446,7 +506,21 @@ def process_candidates(
     force: bool = False,
 ) -> list[ProcessResult]:
     now_ns = time.time_ns()
-    core = _load_scanner_core()
+    core = None
+    excel_mod = None
+    excel_config_path = _default_excel_config_path()
+
+    def _get_core() -> Any:
+        nonlocal core
+        if core is None:
+            core = _load_scanner_core()
+        return core
+
+    def _get_excel_mod() -> Any:
+        nonlocal excel_mod
+        if excel_mod is None:
+            excel_mod = _load_excel_extractor()
+        return excel_mod
 
     with connect_db(paths.db_path) as conn:
         ensure_schema(conn)
@@ -482,67 +556,86 @@ def process_candidates(
                         raise FileNotFoundError(f"Missing file: {abs_path}")
                     content_sha1 = _sha1_file(abs_path)
 
-                    # Use default debug-method pipeline (fused tables)
-                    res = _run_clean_extraction(abs_path, dpi=dpi, output_dir=paths.support_dir)
+                    ext = abs_path.suffix.lower()
+                    is_excel = ext in EXCEL_EXTENSIONS
 
                     artifacts_dir = None
-                    combined_text = ""
-                    try:
-                        artifacts_dir = str(res.get("dir") or res.get("target_dir") or "")
-                        artifacts_dir = artifacts_dir or None
-                    except Exception:
-                        artifacts_dir = None
-                    try:
-                        combined_path = res.get("combined")
-                        if combined_path:
-                            combined_text = Path(combined_path).read_text(encoding="utf-8", errors="ignore")
-                    except Exception:
-                        combined_text = ""
                     metadata_path = None
-                    raw_meta = extract_metadata_from_text(combined_text, pdf_path=abs_path) if combined_text else None
-                    if raw_meta is None:
-                        raw_meta = load_metadata_for_pdf(abs_path)
-                    if raw_meta is None and artifacts_dir:
-                        raw_meta = load_metadata_from_artifacts(Path(artifacts_dir), abs_path)
-                    if raw_meta is None:
-                        raw_meta = derive_minimal_metadata(core, abs_path)
-                    clean_meta = sanitize_metadata(raw_meta)
-                    if artifacts_dir:
-                        metadata_path = write_metadata(Path(artifacts_dir), abs_path, clean_meta)
-
                     pointer_token = None
                     eidat_uuid = None
-                    if force or not has_pointer_token(abs_path):
-                        eidat_uuid = uuid.uuid4().hex
-                        support_rel = None
-                        artifacts_rel = None
-                        metadata_rel = None
+
+                    if is_excel:
+                        excel_mod = _get_excel_mod()
+                        artifacts_root = _excel_artifacts_dir(paths, abs_path)
+                        res = _run_excel_extraction(
+                            excel_mod,
+                            abs_path,
+                            artifacts_root,
+                            excel_config_path,
+                        )
+                        artifacts_dir = str(artifacts_root)
+                        raw_meta = _derive_excel_metadata(excel_mod, abs_path)
+                        clean_meta = sanitize_metadata(raw_meta)
+                        metadata_path = write_metadata(Path(artifacts_dir), abs_path, clean_meta)
+                    else:
+                        core = _get_core()
+                        # Use default debug-method pipeline (fused tables)
+                        res = _run_clean_extraction(abs_path, dpi=dpi, output_dir=paths.support_dir)
+
+                        combined_text = ""
                         try:
-                            support_rel = str(paths.support_dir.resolve().relative_to(paths.global_repo.resolve()))
+                            artifacts_dir = str(res.get("dir") or res.get("target_dir") or "")
+                            artifacts_dir = artifacts_dir or None
                         except Exception:
-                            support_rel = str(paths.support_dir)
+                            artifacts_dir = None
+                        try:
+                            combined_path = res.get("combined")
+                            if combined_path:
+                                combined_text = Path(combined_path).read_text(encoding="utf-8", errors="ignore")
+                        except Exception:
+                            combined_text = ""
+                        raw_meta = extract_metadata_from_text(combined_text, pdf_path=abs_path) if combined_text else None
+                        if raw_meta is None:
+                            raw_meta = load_metadata_for_pdf(abs_path)
+                        if raw_meta is None and artifacts_dir:
+                            raw_meta = load_metadata_from_artifacts(Path(artifacts_dir), abs_path)
+                        if raw_meta is None:
+                            raw_meta = derive_minimal_metadata(core, abs_path)
+                        clean_meta = sanitize_metadata(raw_meta)
                         if artifacts_dir:
+                            metadata_path = write_metadata(Path(artifacts_dir), abs_path, clean_meta)
+
+                        if force or not has_pointer_token(abs_path):
+                            eidat_uuid = uuid.uuid4().hex
+                            support_rel = None
+                            artifacts_rel = None
+                            metadata_rel = None
                             try:
-                                artifacts_rel = str(Path(artifacts_dir).resolve().relative_to(paths.global_repo.resolve()))
+                                support_rel = str(paths.support_dir.resolve().relative_to(paths.global_repo.resolve()))
                             except Exception:
-                                artifacts_rel = artifacts_dir
-                        if metadata_path:
-                            try:
-                                metadata_rel = str(metadata_path.resolve().relative_to(paths.global_repo.resolve()))
-                            except Exception:
-                                metadata_rel = str(metadata_path)
-                        payload = {
-                            "eidat_uuid": eidat_uuid,
-                            "support_rel": support_rel,
-                            "artifacts_rel": artifacts_rel,
-                            "metadata_rel": metadata_rel,
-                            "processed_epoch_ns": now_ns,
-                        }
-                        pointer_token = build_pointer_token(payload)
-                        embedded = embed_pointer_token(abs_path, pointer_token, overwrite=force)
-                        if not embedded and not force:
-                            pointer_token = None
-                            eidat_uuid = None
+                                support_rel = str(paths.support_dir)
+                            if artifacts_dir:
+                                try:
+                                    artifacts_rel = str(Path(artifacts_dir).resolve().relative_to(paths.global_repo.resolve()))
+                                except Exception:
+                                    artifacts_rel = artifacts_dir
+                            if metadata_path:
+                                try:
+                                    metadata_rel = str(metadata_path.resolve().relative_to(paths.global_repo.resolve()))
+                                except Exception:
+                                    metadata_rel = str(metadata_path)
+                            payload = {
+                                "eidat_uuid": eidat_uuid,
+                                "support_rel": support_rel,
+                                "artifacts_rel": artifacts_rel,
+                                "metadata_rel": metadata_rel,
+                                "processed_epoch_ns": now_ns,
+                            }
+                            pointer_token = build_pointer_token(payload)
+                            embedded = embed_pointer_token(abs_path, pointer_token, overwrite=force)
+                            if not embedded and not force:
+                                pointer_token = None
+                                eidat_uuid = None
                     conn.execute(
                         """
                         UPDATE files
@@ -556,8 +649,8 @@ def process_candidates(
                         """,
                         (now_ns, int(row["mtime_ns"] or 0), content_sha1, eidat_uuid, pointer_token, rel_path),
                     )
-                    # Run certification analysis on extracted terms
-                    if artifacts_dir:
+                    if not is_excel and artifacts_dir:
+                        # Run certification analysis on extracted terms (PDF-only)
                         try:
                             from extraction.certification_analyzer import analyze_artifacts_folder
                             analyze_artifacts_folder(Path(artifacts_dir))

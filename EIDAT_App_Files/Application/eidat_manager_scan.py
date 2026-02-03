@@ -16,7 +16,7 @@ except Exception:  # pragma: no cover
 
 
 # Supported file extensions for scanning
-SUPPORTED_EXTENSIONS = {".pdf", ".xlsx", ".xls"}
+SUPPORTED_EXTENSIONS = {".pdf", ".xlsx", ".xls", ".xlsm"}
 
 
 @dataclass(frozen=True)
@@ -58,7 +58,7 @@ def _iter_data_files(global_repo: Path, *, exclude_dir: Path) -> list[Path]:
             if ext not in SUPPORTED_EXTENSIONS:
                 continue
             # Skip Excel temp files (start with ~$)
-            if ext in {".xlsx", ".xls"} and p.name.startswith("~$"):
+            if ext in {".xlsx", ".xls", ".xlsm"} and p.name.startswith("~$"):
                 continue
         except Exception:
             continue

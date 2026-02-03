@@ -21,6 +21,8 @@ DEFAULT_TERMS_XLSX = ROOT / "user_inputs" / "terms.schema.simple.xlsx"
 DEFAULT_PLOT_TERMS_XLSX = ROOT / "user_inputs" / "plot_terms.xlsx"
 DEFAULT_PROPOSED_PLOTS_JSON = ROOT / "user_inputs" / "proposed_plots.json"
 DEFAULT_EXCEL_TREND_CONFIG = ROOT / "user_inputs" / "excel_trend_config.json"
+EXCEL_EXTENSIONS = {".xlsx", ".xls", ".xlsm"}
+EXCEL_ARTIFACT_SUFFIX = "__excel"
 # Default repository root where PDFs may live (user-organized, nested or flat)
 DEFAULT_REPO_ROOT = ROOT / "Data Packages"
 DEFAULT_PDF_DIR = DEFAULT_REPO_ROOT
@@ -2039,9 +2041,18 @@ def read_files_with_index_metadata(global_repo: Path) -> list[dict]:
 def get_file_artifacts_path(global_repo: Path, rel_path: str) -> Path | None:
     """Return full path to artifacts folder for a file."""
     repo = Path(global_repo).expanduser()
-    pdf_stem = Path(rel_path).stem
-    artifacts_dir = eidat_debug_ocr_root(repo) / pdf_stem
-    return artifacts_dir if artifacts_dir.exists() else None
+    path_obj = Path(rel_path)
+    stem = path_obj.stem
+    ext = path_obj.suffix.lower()
+    root = eidat_debug_ocr_root(repo)
+    candidates: list[Path] = []
+    if ext in EXCEL_EXTENSIONS:
+        candidates.append(root / f"{stem}{EXCEL_ARTIFACT_SUFFIX}")
+    candidates.append(root / stem)
+    for cand in candidates:
+        if cand.exists():
+            return cand
+    return None
 
 
 def _normalize_text(s: str) -> str:

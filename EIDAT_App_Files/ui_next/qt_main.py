@@ -5012,7 +5012,7 @@ class MainWindow(QtWidgets.QMainWindow):
         def _on_success(payload: dict):
             candidates = int(payload.get("candidates_count") or 0)
             pdf_count = int(payload.get("pdf_count") or 0)
-            self._append_log(f"[EIDAT MANAGER] Scanned {pdf_count} PDFs; {candidates} candidate(s) need processing.")
+            self._append_log(f"[EIDAT MANAGER] Scanned {pdf_count} file(s); {candidates} candidate(s) need processing.")
             if candidates > 0:
                 if not auto:
                     QtWidgets.QMessageBox.information(
