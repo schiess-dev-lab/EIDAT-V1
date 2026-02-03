@@ -117,6 +117,18 @@ def _parse_int_env(key: str, default: int) -> int:
         return default
 
 
+def _parse_bool_env(key: str, default: bool) -> bool:
+    raw = os.environ.get(key, "")
+    if not str(raw).strip():
+        return default
+    val = str(raw).strip().lower()
+    if val in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if val in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    return default
+
+
 def _load_debug_master_config(project_root: Path) -> Dict[str, Any]:
     cfg_path = project_root / "debug_method" / "debug_master_config.json"
     if not cfg_path.exists():
@@ -249,6 +261,11 @@ def _run_debug_method_extraction(pdf_path: Path, dpi: int | None, output_dir: Pa
     if tg_border_thickness <= 0:
         tg_border_thickness = max(4, tg_line_thickness + 2)
 
+    # Table-grid overlays are debug-only and have been unstable (false positive borders / crashes).
+    # Default to disabling all overlay line projection unless explicitly enabled.
+    tg_draw_overlay_lines = _parse_bool_env("EIDAT_TABLE_GRID_DRAW_LINES", False)
+    tg_apply_borders_to_page = _parse_bool_env("EIDAT_TABLE_GRID_APPLY_BORDERS_TO_PAGE", False)
+
     table_variants_lang = table_variants_cfg.get("lang") or None
     if table_variants_lang is None:
         table_variants_lang = ocr_engine.get_tesseract_lang()
@@ -300,13 +317,13 @@ def _run_debug_method_extraction(pdf_path: Path, dpi: int | None, output_dir: Pa
                 line_pad_factor=tg_line_pad,
                 min_token_h_px=tg_min_token_h,
                 min_token_h_ratio=tg_min_token_h_ratio,
-                draw_tables=True,
-                draw_hlines=tg_draw_hlines,
-                draw_seps_in_tables=tg_draw_seps_in_tables,
-                draw_separators=tg_draw_separators,
+                draw_tables=bool(tg_draw_overlay_lines),
+                draw_hlines=bool(tg_draw_overlay_lines and tg_draw_hlines),
+                draw_seps_in_tables=bool(tg_draw_overlay_lines and tg_draw_seps_in_tables),
+                draw_separators=bool(tg_draw_overlay_lines and tg_draw_separators),
             )
             tables_grid = summary.get("tables") or []
-            if tables_grid:
+            if tg_apply_borders_to_page and tables_grid:
                 _draw_table_borders(
                     page_path,
                     tables_grid,
@@ -446,7 +463,7 @@ def _derive_excel_metadata(excel_mod: Any, excel_path: Path) -> dict:
         "revision": "Unknown",
         "test_date": "Unknown",
         "report_date": "Unknown",
-        "document_type": "Excel",
+        "document_type": "Excel file data",
     }
 
 
@@ -575,7 +592,7 @@ def process_candidates(
                         )
                         artifacts_dir = str(artifacts_root)
                         raw_meta = _derive_excel_metadata(excel_mod, abs_path)
-                        clean_meta = sanitize_metadata(raw_meta)
+                        clean_meta = sanitize_metadata(raw_meta, default_document_type="Excel file data")
                         metadata_path = write_metadata(Path(artifacts_dir), abs_path, clean_meta)
                     else:
                         core = _get_core()
@@ -601,7 +618,7 @@ def process_candidates(
                             raw_meta = load_metadata_from_artifacts(Path(artifacts_dir), abs_path)
                         if raw_meta is None:
                             raw_meta = derive_minimal_metadata(core, abs_path)
-                        clean_meta = sanitize_metadata(raw_meta)
+                        clean_meta = sanitize_metadata(raw_meta, default_document_type="EIDP")
                         if artifacts_dir:
                             metadata_path = write_metadata(Path(artifacts_dir), abs_path, clean_meta)
 

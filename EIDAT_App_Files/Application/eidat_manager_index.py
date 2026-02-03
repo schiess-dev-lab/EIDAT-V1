@@ -134,7 +134,8 @@ def build_index(paths: SupportPaths, *, similarity: float = 0.86) -> IndexSummar
             raw = json.loads(meta_path.read_text(encoding="utf-8"))
         except Exception:
             continue
-        meta = sanitize_metadata(raw)
+        default_doc_type = "Excel file data" if str(meta_path.parent.name).endswith("__excel") else "EIDP"
+        meta = sanitize_metadata(raw, default_document_type=default_doc_type)
         title = str(meta.get("program_title") or "")
         title_norm = normalize_title(title)
         artifacts_rel = None

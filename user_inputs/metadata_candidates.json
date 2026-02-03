@@ -24,6 +24,7 @@
     "Structure"
   ],
   "document_types": [
-    "EIDP"
+    "EIDP",
+    "Excel file data"
   ]
 }

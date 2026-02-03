@@ -42,7 +42,7 @@ DEFAULT_CANDIDATES = {
         "Bracket",
         "Structure",
     ],
-    "document_types": ["EIDP"],
+    "document_types": ["EIDP", "Excel file data"],
 }
 
 LABEL_ALIASES = {
@@ -69,9 +69,9 @@ PART_NUMBER_FIELD_PATTERNS = [
 ]
 
 
-def sanitize_metadata(raw: Any) -> dict:
+def sanitize_metadata(raw: Any, *, default_document_type: str = "EIDP") -> dict:
     if not isinstance(raw, dict):
-        return {"document_type": "EIDP"}
+        return {"document_type": default_document_type}
     cleaned = {}
     for k, v in raw.items():
         key = str(k)
@@ -81,7 +81,7 @@ def sanitize_metadata(raw: Any) -> dict:
             continue
         cleaned[key] = v
     if not cleaned.get("document_type"):
-        cleaned["document_type"] = "EIDP"
+        cleaned["document_type"] = default_document_type
     return cleaned
 
 
