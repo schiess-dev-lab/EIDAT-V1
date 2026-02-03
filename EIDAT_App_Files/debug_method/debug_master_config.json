@@ -1,0 +1,34 @@
+{
+  "pdf": "",
+  "render": {
+    "input_dir": "debug_method/DebugFileLocation",
+    "dpi": 450,
+    "out_root": "debug_method/debug_file",
+    "clean": true
+  },
+  "table_grid": {
+    "enabled": true,
+    "out_root": "debug_method/word_gap_debug",
+    "merge_kx": 0,
+    "min_gap": 50.0,
+    "min_gap_ratio": 0.0,
+    "gap_threshold": 0.0,
+    "left_offset": 24.0,
+    "line_thickness": 3,
+    "line_pad": 0.25,
+    "min_token_h": 0.0,
+    "min_token_h_ratio": 0.85,
+    "draw_separators": false,
+    "draw_hlines": true,
+    "draw_seps_in_tables": false,
+    "border_thickness": 0
+  },
+  "table_variants": {
+    "out_root": "debug_method/results",
+    "ocr_dpi": 450,
+    "detection_dpi": 900,
+    "lang": null,
+    "clean": true,
+    "fuse": true
+  }
+}

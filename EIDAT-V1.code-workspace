@@ -1,9 +1,11 @@
 {
 	"folders": [
 		{
+			"name": "EIDAT-V1",
 			"path": "."
 		},
 		{
+			"name": "user_inputs",
 			"path": "../../../../../Documents/DevProjects/PDF_Scanner/EIDAT_PROTO_V2/user_inputs"
 		}
 	],

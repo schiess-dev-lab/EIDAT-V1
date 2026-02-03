@@ -1,0 +1,390 @@
+{
+  "notes": [
+    "Normalization support lexicon for OCR post-processing.",
+    "This file is intentionally permissive and domain-oriented (mechanical/aerospace).",
+    "Add aliases for common OCR variants (e.g., psig vs psi(g), degC vs °C)."
+  ],
+  "special_symbols": {
+    "degree": [
+      "Aø",
+      "A§",
+      "Es",
+      "°",
+      "º",
+      "˚",
+      "Â°",
+      "Âº",
+      "Â˚"
+    ],
+    "micro": [
+      "Aæ",
+      "I¬",
+      "µ",
+      "μ",
+      "Âµ",
+      "Âμ"
+    ],
+    "plus_minus": [
+      "Añ",
+      "±",
+      "Â±"
+    ],
+    "times": [
+      "×",
+      "Â×"
+    ],
+    "dot": [
+      "Aú",
+      "·",
+      "•",
+      "⋅",
+      "Â·"
+    ]
+  },
+  "unit_aliases": {
+    "psig": [
+      "psig",
+      "psi g",
+      "psi(g)",
+      "psi-g",
+      "ps i g",
+      "p sig"
+    ],
+    "psia": [
+      "psia",
+      "psi a",
+      "psi(a)",
+      "psi-a",
+      "ps i a"
+    ],
+    "psi": [
+      "psi"
+    ],
+    "kpa": [
+      "kpa",
+      "k pa"
+    ],
+    "mpa": [
+      "mpa",
+      "m pa"
+    ],
+    "pa": [
+      "pa"
+    ],
+    "bar": [
+      "bar"
+    ],
+    "mbar": [
+      "mbar",
+      "m bar"
+    ],
+    "torr": [
+      "torr"
+    ],
+    "inhg": [
+      "inhg",
+      "in hg",
+      "in-hg"
+    ],
+    "mmhg": [
+      "mmhg",
+      "mm hg",
+      "mm-hg"
+    ],
+    "atm": [
+      "atm"
+    ],
+    "n": [
+      "n",
+      "newton",
+      "newtons"
+    ],
+    "kn": [
+      "kn",
+      "k n"
+    ],
+    "mn": [
+      "mn"
+    ],
+    "lbf": [
+      "lbf",
+      "lb f",
+      "l b f",
+      "ibf"
+    ],
+    "lbm": [
+      "lbm",
+      "lb m",
+      "l bm"
+    ],
+    "lb": [
+      "lb",
+      "lbs",
+      "pound",
+      "pounds"
+    ],
+    "kg": [
+      "kg",
+      "kilogram",
+      "kilograms"
+    ],
+    "g": [
+      "g",
+      "gram",
+      "grams"
+    ],
+    "mg": [
+      "mg",
+      "milligram",
+      "milligrams"
+    ],
+    "ug": [
+      "ug",
+      "Aæg",
+      "I¬g",
+      "µg",
+      "μg",
+      "Âµg",
+      "Âμg"
+    ],
+    "nm": [
+      "n·m",
+      "n•m",
+      "n⋅m",
+      "n-m",
+      "nm",
+      "newton·meter",
+      "newton-meter",
+      "nAúm"
+    ],
+    "inlbf": [
+      "in·lbf",
+      "in•lbf",
+      "in⋅lbf",
+      "in-lbf",
+      "inlbf",
+      "in lb f",
+      "in-lb",
+      "inAúlbf"
+    ],
+    "ftlbf": [
+      "ft·lbf",
+      "ft•lbf",
+      "ft⋅lbf",
+      "ft-lbf",
+      "ftlbf",
+      "ft lb f",
+      "ft-lb",
+      "ftAúlbf"
+    ],
+    "mm": [
+      "mm",
+      "millimeter",
+      "millimeters"
+    ],
+    "cm": [
+      "cm",
+      "centimeter",
+      "centimeters"
+    ],
+    "m": [
+      "m",
+      "meter",
+      "meters"
+    ],
+    "in": [
+      "in",
+      "inch",
+      "inches"
+    ],
+    "ft": [
+      "ft",
+      "foot",
+      "feet"
+    ],
+    "mil": [
+      "mil",
+      "thou"
+    ],
+    "s": [
+      "s",
+      "sec",
+      "secs",
+      "second",
+      "seconds"
+    ],
+    "ms": [
+      "ms",
+      "msec",
+      "msecs"
+    ],
+    "us": [
+      "us",
+      "usec",
+      "usecs",
+      "µs",
+      "μs",
+      "µsec",
+      "μsec",
+      "microsec",
+      "microsecs",
+      "microsecond",
+      "microseconds"
+    ],
+    "min": [
+      "min",
+      "mins",
+      "minute",
+      "minutes"
+    ],
+    "h": [
+      "h",
+      "hr",
+      "hrs",
+      "hour",
+      "hours"
+    ],
+    "rpm": [
+      "rpm"
+    ],
+    "hz": [
+      "hz"
+    ],
+    "c": [
+      "c",
+      "°c",
+      "° c",
+      "Aøc",
+      "degc",
+      "deg c"
+    ],
+    "f": [
+      "f",
+      "°f",
+      "° f",
+      "Aøf",
+      "degf",
+      "deg f"
+    ],
+    "k": [
+      "k",
+      "kelvin"
+    ],
+    "r": [
+      "r",
+      "°r",
+      "° r",
+      "Aør",
+      "degr",
+      "rankine"
+    ],
+    "percent": [
+      "%",
+      "percent"
+    ],
+    "ppm": [
+      "ppm"
+    ],
+    "ppb": [
+      "ppb"
+    ],
+    "v": [
+      "v",
+      "volt",
+      "volts"
+    ],
+    "mv": [
+      "mv"
+    ],
+    "a": [
+      "a",
+      "amp",
+      "amps",
+      "ampere",
+      "amperes"
+    ],
+    "ma": [
+      "ma"
+    ],
+    "ohm": [
+      "ohm",
+      "Ω",
+      "Ω",
+      "omega",
+      "Q",
+      "q",
+      "Ic"
+    ],
+    "w": [
+      "w",
+      "watt",
+      "watts"
+    ],
+    "kw": [
+      "kw"
+    ],
+    "ml": [
+      "ml",
+      "mL"
+    ],
+    "l": [
+      "l",
+      "L",
+      "liter",
+      "liters"
+    ],
+    "cc": [
+      "cc"
+    ],
+    "gpm": [
+      "gpm"
+    ],
+    "lpm": [
+      "lpm",
+      "l/min",
+      "L/min"
+    ]
+  },
+  "unit_tokens_prefer": [
+    "psig",
+    "psia",
+    "psi",
+    "kpa",
+    "mpa",
+    "bar",
+    "mbar",
+    "pa",
+    "inhg",
+    "mmhg",
+    "torr",
+    "atm",
+    "lbf",
+    "lbm",
+    "lb",
+    "n",
+    "kn",
+    "nm",
+    "inlbf",
+    "ftlbf",
+    "mm",
+    "cm",
+    "m",
+    "in",
+    "ft",
+    "s",
+    "ms",
+    "us",
+    "min",
+    "h",
+    "rpm",
+    "hz",
+    "%",
+    "ppm",
+    "ppb",
+    "°c",
+    "°f",
+    "degc",
+    "degf",
+    "k"
+  ]
+}

@@ -1,0 +1,36 @@
+Run Summary (auto-generated)
+
+Inputs:
+- C:\Users\zachs\Documents\DevProjects\PDF_Scanner\EIDAT_PROTO_V2\EIDAT_App_Files\debug_method\debug_file\FakeProgram_SV1_SN1111\page_4.png
+
+Output root: C:\Users\zachs\Documents\DevProjects\PDF_Scanner\EIDAT_PROTO_V2\EIDAT_App_Files\debug_method\results\FakeProgram_SV1_SN1111
+Per-input outputs: <output root>/<input_stem>/
+
+Base OCR DPI: 450
+Detection DPI (table geometry): 900
+Fuse enabled: True
+
+Variants:
+- table_region_ocr psm=11 scale=0.66 rl0
+- table_region_ocr psm=11 scale=0.66 rl1(default)
+- table_region_ocr psm=11 scale=0.66 rl1(light)
+- table_region_ocr psm=6 scale=0.66 rl1(default)
+- table_region_ocr psm=6 scale=0.66 rl1(light)
+- table_region_ocr psm=11 scale=1.0 rl0
+- table_region_ocr psm=11 scale=1.0 rl1(default)
+- table_region_ocr psm=11 scale=1.0 rl1(light)
+- table_region_ocr psm=6 scale=1.0 rl1(default)
+- table_region_ocr psm=6 scale=1.0 rl1(light)
+
+Line-strip debug images (per input):
+- Only nolines images are saved.
+- Pattern: line_strip_debug/*_rl1*_table*_nolines.png
+
+Borderless tables:
+Borderless table detection is disabled (tables are assumed to be bordered).
+
+Fuse (--fuse) logic:
+- Per table cell, collect the candidate text from every variant.
+- If any non-empty candidates exist, pick the most frequent non-empty value.
+- If all candidates are empty, keep empty.
+- No confidence weighting, normalization, or row/col context.
