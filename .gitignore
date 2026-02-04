@@ -14,7 +14,8 @@
 /user_inputs/
 /cache/
 /obs/
-/tools/
+/tools/tesseract/
+/tools/user_inputs/
 
 # Keep debug outputs for debugging, but ignore large image files
 /debug/**/*.png
