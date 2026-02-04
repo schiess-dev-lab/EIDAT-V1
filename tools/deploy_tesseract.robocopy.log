@@ -1,0 +1,2 @@
+[INFO] robocopy "C:\Program Files\Tesseract-OCR" "C:\Users\zachs\OneDrive\Documents\DevProjects\PDF Scanner\EIDAT-V1\tools\tesseract" /E /R:1 /W:1
+
