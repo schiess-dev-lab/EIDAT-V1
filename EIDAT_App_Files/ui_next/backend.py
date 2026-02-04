@@ -199,9 +199,7 @@ def save_scanner_env(env_map: Dict[str, str], path: Path = SCANNER_ENV) -> None:
         "REPO_ROOT",
         "OCR_MODE",
         "OCR_DPI",
-        "EASYOCR_LANGS",
         "FORCE_OCR",
-        "USE_EASYOCR_XY",
         "XY_LOG",
         "OCR_ROW_EPS",
         "VENV_DIR",
@@ -1658,7 +1656,7 @@ def check_environment() -> subprocess.Popen:
     code = (
         "import sys;\n"
         "print('[INFO] Checking environment for EIDAT...');\n"
-        "mods=['fitz','pandas','openpyxl','matplotlib','easyocr'];\n"
+        "mods=['fitz','pandas','openpyxl','matplotlib'];\n"
         "ok=True;\n"
         "from importlib import import_module;\n"
         "for m in mods:\n"

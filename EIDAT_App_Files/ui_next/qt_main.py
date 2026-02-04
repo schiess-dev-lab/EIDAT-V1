@@ -1500,9 +1500,6 @@ class MainWindow(QtWidgets.QMainWindow):
             if not (env.get("OCR_DPI") or "").strip():
                 env["OCR_DPI"] = "500"
                 changed = True
-            if not (env.get("EASYOCR_LANGS") or "").strip():
-                env["EASYOCR_LANGS"] = "en"
-                changed = True
             if changed:
                 be.save_scanner_env(env)
         except Exception:
@@ -6322,8 +6319,6 @@ class MainWindow(QtWidgets.QMainWindow):
             env["FUZZY_PRESET"] = self._fuzzy_display_to_value.get(fuzzy_disp, "medium") if hasattr(self, "_fuzzy_display_to_value") else "medium"
             # QUIET is inverse of logging toggle
             env["QUIET"] = "0" if self.chk_logging.isChecked() else "1"
-            # OCR language is fixed to English
-            env["EASYOCR_LANGS"] = "en"
             be.save_scanner_env(env)
             self.status_bar.showMessage("Settings saved", 2000)
         except Exception:

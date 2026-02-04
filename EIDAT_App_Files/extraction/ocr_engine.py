@@ -25,6 +25,35 @@ except ImportError:
     HAVE_CV2 = False
 
 
+def _resolve_tesseract_cmd() -> Tuple[str, Optional[Path]]:
+    """Resolve the Tesseract CLI path and optional tessdata dir."""
+    for key in ("TESSERACT_CMD", "TESSERACT_BIN", "TESSERACT_PATH"):
+        try:
+            val = (os.getenv(key) or "").strip()
+        except Exception:
+            val = ""
+        if val:
+            cmd_path = Path(val)
+            if cmd_path.is_dir():
+                exe_name = "tesseract.exe" if os.name == "nt" else "tesseract"
+                cmd_path = cmd_path / exe_name
+            tessdata = cmd_path.parent / "tessdata"
+            return str(cmd_path), tessdata if tessdata.exists() else None
+
+    # Repo-local fallback: tools/tesseract/tesseract(.exe)
+    try:
+        repo_root = Path(__file__).resolve().parents[2]
+        exe_name = "tesseract.exe" if os.name == "nt" else "tesseract"
+        repo_cmd = repo_root / "tools" / "tesseract" / exe_name
+        if repo_cmd.exists():
+            tessdata = repo_cmd.parent / "tessdata"
+            return str(repo_cmd), tessdata if tessdata.exists() else None
+    except Exception:
+        pass
+
+    return "tesseract", None
+
+
 def render_pdf_page(pdf_path: Path, page_num: int, dpi: int = 900) -> Tuple[Optional[np.ndarray], int, int]:
     """
     Render a PDF page to grayscale image.
@@ -377,9 +406,15 @@ def run_tesseract_tsv(
         Tuple of (tsv_output, error_message)
     """
     try:
+        tesseract_cmd, tessdata_dir = _resolve_tesseract_cmd()
+        env = None
+        if tessdata_dir:
+            env = os.environ.copy()
+            env.setdefault("TESSDATA_PREFIX", str(tessdata_dir))
+
         # Build tesseract command
         cmd = [
-            "tesseract",
+            tesseract_cmd,
             str(img_path),
             "stdout",
             "-l", lang,
@@ -396,7 +431,8 @@ def run_tesseract_tsv(
             text=True,
             timeout=300,
             encoding='utf-8',
-            errors='replace'
+            errors='replace',
+            env=env
         )
 
         if result.returncode != 0:
