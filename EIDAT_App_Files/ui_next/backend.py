@@ -2978,6 +2978,7 @@ def _extract_from_tables_by_header(
     header_anchor: str = "",
 ) -> tuple[str | None, str, dict]:
     term_k = _normalize_key(term)
+    term_n = _normalize_text(term)
     term_label_n = _normalize_text(term_label)
     anchor_n = _normalize_text(header_anchor)
     if not term_k and not term_label_n:
@@ -3001,47 +3002,183 @@ def _extract_from_tables_by_header(
                 return idx
         return None
 
+    def _find_col_in_headers(headers_norm: list[list[str]], wanted: str) -> int | None:
+        for hnorm in headers_norm:
+            idx = _find_col(hnorm, wanted)
+            if idx is not None:
+                return idx
+        return None
+
+    def _find_col_keywords_in_headers(headers_norm: list[list[str]], keywords: list[str]) -> int | None:
+        for hnorm in headers_norm:
+            idx = _find_col_keywords(hnorm, keywords)
+            if idx is not None:
+                return idx
+        return None
+
+    def _looks_like_header_row(row: list[str]) -> bool:
+        if not row:
+            return False
+        cells = [str(c or "").strip() for c in row if str(c or "").strip()]
+        if not cells:
+            return False
+        # If any known header keywords are present, treat as header continuation.
+        header_keywords = [
+            "tag",
+            "term",
+            "parameter",
+            "id",
+            "field",
+            "label",
+            "description",
+            "desc",
+            "name",
+            "kpi",
+            "metric",
+            "min",
+            "minimum",
+            "max",
+            "maximum",
+            "range",
+            "measured",
+            "value",
+            "actual",
+            "result",
+            "units",
+            "unit",
+            "uom",
+            "requirement",
+            "criteria",
+            "spec",
+            "acceptance",
+            "limit",
+            "target",
+            "threshold",
+            "status",
+            "pass",
+            "fail",
+            "voltage",
+        ]
+        for c in cells:
+            cn = _normalize_text(c)
+            if not cn:
+                continue
+            if cn in header_keywords:
+                return True
+            for kw in header_keywords:
+                if kw in cn:
+                    return True
+        # Otherwise, treat as header if it is short and mostly non-numeric.
+        numeric = sum(1 for c in cells if re.search(r"[-+]?\d", c))
+        max_len = max(len(c) for c in cells) if cells else 0
+        return numeric == 0 and max_len <= 24
+
     for b in blocks or []:
         rows = b.get("rows") or []
         if not isinstance(rows, list) or len(rows) < 2:
             continue
         header = rows[0] if isinstance(rows[0], list) else []
+        header2 = rows[1] if len(rows) > 1 and isinstance(rows[1], list) else []
         header_norm = [_normalize_text(c) for c in header]
+        header2_norm = [_normalize_text(c) for c in header2] if _looks_like_header_row(header2) else []
 
-        term_col = _find_col_keywords(header_norm, ["tag", "term", "parameter", "id", "field", "label", "test"])
+        merged_norm: list[str] = []
+        if header2_norm:
+            max_len = max(len(header), len(header2))
+            for i in range(max_len):
+                h0 = header[i] if i < len(header) else ""
+                h1 = header2[i] if i < len(header2) else ""
+                merged_norm.append(_normalize_text(f"{h0} {h1}".strip()))
+
+        header_norms: list[list[str]] = [header_norm]
+        if merged_norm:
+            header_norms.append(merged_norm)
+        if header2_norm:
+            header_norms.append(header2_norm)
+
+        term_col = _find_col_keywords_in_headers(
+            header_norms, ["tag", "term", "parameter", "id", "field", "label", "test"]
+        )
         if term_col is None:
             term_col = 0
+        desc_col = _find_col_keywords_in_headers(
+            header_norms, ["description", "desc", "name", "kpi", "metric", "test descr", "test description"]
+        )
 
-        value_col = _find_col(header_norm, anchor_n) if anchor_n else None
+        value_col = _find_col_in_headers(header_norms, anchor_n) if anchor_n else None
         if value_col is None and anchor_n:
-            value_col = _find_col_keywords(header_norm, [anchor_n])
+            value_col = _find_col_keywords_in_headers(header_norms, [anchor_n])
         if value_col is None and not anchor_n:
-            value_col = _find_col_keywords(header_norm, ["measured", "measured value", "value", "actual"])
+            # Auto column selection: prefer measured/value only (ignore result/voltage/etc).
+            value_col = _find_col_keywords_in_headers(header_norms, ["measured", "measured value", "value", "actual"])
 
-        units_col = _find_col_keywords(header_norm, ["units", "unit", "uom"])
-        req_col = _find_col_keywords(header_norm, ["target", "requirement", "criteria", "spec", "acceptance", "limit"])
-        min_col = _find_col_keywords(header_norm, ["min", "minimum", "range min", "range (min)"])
-        max_col = _find_col_keywords(header_norm, ["max", "maximum", "range max", "range (max)"])
+        units_col = _find_col_keywords_in_headers(header_norms, ["units", "unit", "uom"])
+        req_col = _find_col_keywords_in_headers(header_norms, ["target", "requirement", "criteria", "spec", "acceptance", "limit"])
+        min_col = _find_col_keywords_in_headers(header_norms, ["min", "minimum", "range min", "range (min)"])
+        max_col = _find_col_keywords_in_headers(header_norms, ["max", "maximum", "range max", "range (max)"])
 
-        for r in rows[1:]:
+        data_start = 2 if header2_norm else 1
+        for r in rows[data_start:]:
             if not isinstance(r, list) or not r:
                 continue
             tag = str(r[term_col] if term_col < len(r) else "").strip()
             tag_k = _normalize_key(tag)
             tag_n = _normalize_text(tag)
+            desc = str(r[desc_col] if isinstance(desc_col, int) and desc_col < len(r) else "").strip()
+            desc_k = _normalize_key(desc)
+            desc_n = _normalize_text(desc)
             matched = False
+            matched_col: int | None = None
             if term_k and tag_k and (term_k == tag_k or term_k in tag_k or tag_k in term_k):
                 matched = True
+                matched_col = term_col
             elif term_label_n and tag_n and term_label_n in tag_n:
                 matched = True
+                matched_col = term_col
+            elif term_label_n and desc_n and term_label_n in desc_n:
+                matched = True
+                matched_col = desc_col if isinstance(desc_col, int) else term_col
+            elif term_n and desc_n and term_n in desc_n:
+                matched = True
+                matched_col = desc_col if isinstance(desc_col, int) else term_col
+            elif term_k and desc_k and (term_k == desc_k or term_k in desc_k or desc_k in term_k):
+                matched = True
+                matched_col = desc_col if isinstance(desc_col, int) else term_col
+            else:
+                # Match against any column if the term appears elsewhere in the row.
+                for ci, cell in enumerate(r):
+                    cell_s = str(cell or "").strip()
+                    if not cell_s:
+                        continue
+                    cell_k = _normalize_key(cell_s)
+                    cell_n = _normalize_text(cell_s)
+                    if term_k and cell_k and (term_k == cell_k or term_k in cell_k or cell_k in term_k):
+                        matched = True
+                        matched_col = ci
+                        break
+                    if term_label_n and cell_n and term_label_n in cell_n:
+                        matched = True
+                        matched_col = ci
+                        break
+                    if term_n and cell_n and term_n in cell_n:
+                        matched = True
+                        matched_col = ci
+                        break
             if not matched:
                 continue
 
             val = None
             if value_col is not None and value_col < len(r):
                 val = str(r[value_col]).strip()
-            if not val:
-                # fallback to last non-empty cell
+            if not val and not anchor_n:
+                # Header not specified: fallback to first non-empty cell to the right of the match.
+                if matched_col is not None:
+                    for c in r[matched_col + 1 :]:
+                        if str(c).strip():
+                            val = str(c).strip()
+                            break
+            if not val and not anchor_n:
+                # Final fallback to last non-empty cell in the row.
                 for c in reversed(r[1:]):
                     if str(c).strip():
                         val = str(c).strip()
@@ -3574,7 +3711,8 @@ def update_eidp_trending_project_workbook(
                                 pass
 
             # 2) ASCII table extraction from combined.txt (key/value and general tables)
-            if val in (None, ""):
+            # Skip if a specific Header is provided (header overrides value selection).
+            if val in (None, "") and not header_anchor:
                 blocks = tables_cache.get(sn_header) or []
                 tval, tsnip = _extract_from_tables(
                     blocks,
@@ -3589,7 +3727,8 @@ def update_eidp_trending_project_workbook(
                     snippet = tsnip
 
             # 2b) Paired acceptance/measured tables (common in synthetic debug PDFs)
-            if val in (None, ""):
+            # Skip if a specific Header is provided (header overrides value selection).
+            if val in (None, "") and not header_anchor:
                 blocks = tables_cache.get(sn_header) or []
                 tval, tsnip = _extract_from_paired_acceptance_tables(blocks, term=term, term_label=term_label)
                 if tval:
@@ -3605,35 +3744,38 @@ def update_eidp_trending_project_workbook(
                     golden = _maybe_load_golden_lines(repo, meta) if isinstance(meta, Mapping) else None
                     if golden:
                         gblocks = _parse_ascii_tables(golden)
-                        tval, tsnip = _extract_from_tables(
-                            gblocks,
-                            term=term,
-                            term_label=term_label,
-                            header_anchor=header_anchor,
-                            group_after=group_after,
-                        )
-                        if tval:
-                            val = _clean_cell_text(tval)
-                            used_method = "golden_table"
-                            snippet = tsnip
-                        else:
-                            tval2, tsnip2 = _extract_from_paired_acceptance_tables(gblocks, term=term, term_label=term_label)
-                            if tval2:
-                                val = _clean_cell_text(tval2)
-                                used_method = "golden_paired_tables"
-                                snippet = tsnip2
-                            fallback, snip = _extract_value_from_lines(
-                                golden,
+                        if not header_anchor:
+                            tval, tsnip = _extract_from_tables(
+                                gblocks,
                                 term=term,
+                                term_label=term_label,
                                 header_anchor=header_anchor,
                                 group_after=group_after,
-                                window_lines=window_lines,
-                                want_type=want_type,
                             )
-                            if fallback not in (None, ""):
-                                val = fallback
-                                used_method = "golden_lines"
-                                snippet = snip
+                            if tval:
+                                val = _clean_cell_text(tval)
+                                used_method = "golden_table"
+                                snippet = tsnip
+                            else:
+                                tval2, tsnip2 = _extract_from_paired_acceptance_tables(
+                                    gblocks, term=term, term_label=term_label
+                                )
+                                if tval2:
+                                    val = _clean_cell_text(tval2)
+                                    used_method = "golden_paired_tables"
+                                    snippet = tsnip2
+                        fallback, snip = _extract_value_from_lines(
+                            golden,
+                            term=term,
+                            header_anchor=header_anchor,
+                            group_after=group_after,
+                            window_lines=window_lines,
+                            want_type=want_type,
+                        )
+                        if fallback not in (None, ""):
+                            val = fallback
+                            used_method = "golden_lines"
+                            snippet = snip
                     if val in (None, ""):
                         missing_source += 1
                         err = "missing_source"
@@ -4069,7 +4211,7 @@ def update_eidp_raw_trending_project_workbook(
             used_method = "table_header" if header_anchor else "table_header_auto"
             snippet = tsnip
 
-        if val in (None, ""):
+        if val in (None, "") and not header_anchor:
             tval2, tsnip2 = _extract_from_tables(
                 tables,
                 term=term,
@@ -4101,6 +4243,8 @@ def update_eidp_raw_trending_project_workbook(
     for row in range(2, ws.max_row + 1):
         term, header_anchor, group_after, data_group, term_label, units, mn, mx, want_type = _resolve_row_fields(row)
         if not term:
+            continue
+        if _normalize_text(data_group) == "metadata":
             continue
 
         if use_row_layout:
@@ -4616,6 +4760,9 @@ def _write_eidp_trending_workbook(path: Path, *, serials: list[str], docs: list[
                 row.append(str(doc.get(doc_field) or ""))
             ws.append(row)
 
+        # Blank separator row between metadata and user data inputs.
+        ws.append(["" for _ in headers])
+
     ws.freeze_panes = "A2"
 
     # Create metadata sheet with full document info for each serial (for reference)
@@ -4668,7 +4815,12 @@ def _write_eidp_trending_workbook(path: Path, *, serials: list[str], docs: list[
         pass
 
 
-def _write_eidp_raw_trending_workbook(path: Path, *, serials: list[str]) -> None:
+def _write_eidp_raw_trending_workbook(
+    path: Path,
+    *,
+    serials: list[str],
+    docs: list[dict] | None = None,
+) -> None:
     """
     Create a blank EIDP raw file trending workbook.
 
@@ -4702,6 +4854,39 @@ def _write_eidp_raw_trending_workbook(path: Path, *, serials: list[str]) -> None
         dv.add(f"{col_letter}2:{col_letter}{int(max_rows)}")
     except Exception:
         pass
+
+    # Add metadata rows at the top of the sheet (like EIDP Trending).
+    if docs:
+        docs_by_serial: dict[str, dict] = {}
+        for d in docs:
+            sn = str(d.get("serial_number") or "").strip()
+            if sn and sn not in docs_by_serial:
+                docs_by_serial[sn] = d
+
+        metadata_fields = [
+            ("Program", "program_title", "Program"),
+            ("Asset Type", "asset_type", "Asset Type"),
+            ("Vendor", "vendor", "Vendor"),
+            ("Acceptance Test Plan", "acceptance_test_plan_number", "Acceptance Test Plan"),
+            ("Part Number", "part_number", "Part Number"),
+            ("Revision", "revision", "Revision Letter"),
+            ("Test Date", "test_date", "Test Date"),
+            ("Report Date", "report_date", "Report Date"),
+            ("Document Type", "document_type", "Document Type"),
+            ("Document Acronym", "document_type_acronym", "Document Acronym"),
+            ("Similarity Group", "similarity_group", "Similarity Group"),
+        ]
+
+        for term_name, doc_field, term_label in metadata_fields:
+            row = [term_name, "", "", "string", "Metadata", term_label, "", "", ""]
+            for sn in serials:
+                sn_clean = str(sn).strip()
+                doc = docs_by_serial.get(sn_clean, {})
+                row.append(str(doc.get(doc_field) or ""))
+            ws.append(row)
+
+        # Blank separator row between metadata and user data inputs.
+        ws.append(["" for _ in headers])
 
     ws.freeze_panes = "A2"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -5073,7 +5258,9 @@ def create_eidat_project(
         auto_populate = False
         _ensure_file_written(
             workbook_path,
-            create_fn=lambda: _write_eidp_raw_trending_workbook(workbook_path, serials=serials),
+            create_fn=lambda: _write_eidp_raw_trending_workbook(
+                workbook_path, serials=serials, docs=chosen_docs
+            ),
         )
 
     else:
