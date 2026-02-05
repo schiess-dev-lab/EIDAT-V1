@@ -264,6 +264,8 @@ def _write_run_summary(
     variants: List[Dict],
     fuse: bool,
     borderless_enabled: bool = False,
+    cluster_gap_ratio: Optional[float] = None,
+    cluster_gap_px: Optional[float] = None,
 ) -> None:
     lines: List[str] = []
     lines.append("Run Summary (auto-generated)")
@@ -277,6 +279,10 @@ def _write_run_summary(
     lines.append("")
     lines.append(f"Base OCR DPI: {int(ocr_dpi_base)}")
     lines.append(f"Detection DPI (table geometry): {int(detection_dpi)}")
+    if cluster_gap_ratio is not None:
+        lines.append(f"Table cluster gap ratio: {float(cluster_gap_ratio)}")
+    if cluster_gap_px is not None:
+        lines.append(f"Table cluster gap px: {float(cluster_gap_px)}")
     lines.append(f"Fuse enabled: {bool(fuse)}")
     lines.append("")
     lines.append("Variants:")
@@ -396,7 +402,18 @@ def _run_for_input(
         raise RuntimeError("Failed to prepare detection image")
 
     # Detect tables once (fixed geometry)
-    table_result = table_detection.detect_tables(detection_img, verbose=False)
+    cluster_gap_ratio = _parse_float_env("EIDAT_TABLE_CLUSTER_GAP_RATIO", 0.02)
+    cluster_gap_px = _parse_float_env("EIDAT_TABLE_CLUSTER_GAP_PX", 0.0)
+    if cluster_gap_px <= 0:
+        cluster_gap_px_val = None
+    else:
+        cluster_gap_px_val = float(cluster_gap_px)
+    table_result = table_detection.detect_tables(
+        detection_img,
+        verbose=False,
+        cluster_gap_ratio=cluster_gap_ratio,
+        cluster_gap_px=cluster_gap_px_val,
+    )
     tables = table_result.get("tables") or []
 
     # Borderless table detection is disabled by default (bordered tables expected).
@@ -997,6 +1014,9 @@ def main() -> int:
 
     summary_path = debug_dir / "run_table_variants_summary.txt"
     try:
+        cluster_gap_ratio = _parse_float_env("EIDAT_TABLE_CLUSTER_GAP_RATIO", 0.02)
+        cluster_gap_px = _parse_float_env("EIDAT_TABLE_CLUSTER_GAP_PX", 0.0)
+        cluster_gap_px_val = float(cluster_gap_px) if cluster_gap_px > 0 else None
         _write_run_summary(
             summary_path,
             input_paths=input_paths,
@@ -1006,6 +1026,8 @@ def main() -> int:
             variants=variants,
             fuse=bool(fuse_enabled),
             borderless_enabled=bool(args.enable_borderless),
+            cluster_gap_ratio=cluster_gap_ratio,
+            cluster_gap_px=cluster_gap_px_val,
         )
     except Exception:
         pass

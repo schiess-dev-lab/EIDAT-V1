@@ -1,0 +1,4 @@
+# global_run_mirror target
+# Generated: 2026-02-04 15:13:24
+REPO_ROOT=C:\Users\zachs\Desktop\System Files
+EIDAT_SUPPORT=C:\Users\zachs\Desktop\System Files\EIDAT Support

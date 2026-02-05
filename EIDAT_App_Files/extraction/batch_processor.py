@@ -1312,16 +1312,16 @@ class ExtractionPipeline:
                             remove_borders=False,
                             tesseract_config=tesseract_config,
                         )
-                    _record_candidate("cell_interior_ocr", table_idx, cell, text)
-                    if text.strip():
-                        if force_cell_interior_override or not str(cell.get("text", "")).strip():
-                            cell["text"] = text
-                            cell["ocr_method"] = "cell_interior_ocr"
-                            cell["ocr_psm"] = 6
-                            if tesseract_config is not None:
-                                cell["ocr_numeric_whitelist"] = True
-                            cell["token_count"] = len(text.split())
-                            interior_filled += 1
+                        _record_candidate("cell_interior_ocr", table_idx, cell, text)
+                        if text.strip():
+                            if force_cell_interior_override or not str(cell.get("text", "")).strip():
+                                cell["text"] = text
+                                cell["ocr_method"] = "cell_interior_ocr"
+                                cell["ocr_psm"] = 6
+                                if tesseract_config is not None:
+                                    cell["ocr_numeric_whitelist"] = True
+                                cell["token_count"] = len(text.split())
+                                interior_filled += 1
 
                 ocr_pass_stats["cell_interior"]["attempted"] += interior_attempts
                 ocr_pass_stats["cell_interior"]["filled"] += interior_filled
@@ -1601,9 +1601,19 @@ class ExtractionPipeline:
         flow_data = page_analyzer.extract_flow_text(flow_tokens, tables, det_img_w, det_img_h)
 
         # Step 6b: Detect charts (axis/label regions)
-        charts = chart_detection.detect_charts(
-            img_gray_hires, flow_tokens, tables, det_img_w, det_img_h, flow_data
+        enable_charts = str(os.environ.get("EIDAT_ENABLE_CHART_EXTRACTION", "1")).strip().lower() not in (
+            "0",
+            "false",
+            "f",
+            "no",
+            "n",
+            "off",
         )
+        charts = []
+        if enable_charts:
+            charts = chart_detection.detect_charts(
+                img_gray_hires, flow_tokens, tables, det_img_w, det_img_h, flow_data
+            )
 
         # Step 7: Build result
         result = {

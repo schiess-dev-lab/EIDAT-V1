@@ -6,6 +6,7 @@ Creates compatible debug output matching existing format.
 
 import json
 import math
+import os
 import re
 from pathlib import Path
 from typing import List, Dict, Any, Optional
@@ -492,7 +493,79 @@ def export_combined_text(pdf_path: Path, pages_data: List[Dict],
         return {'y0': float(y0), 'y1': float(y1), 'h': h}
 
     def _line_text(line: List[Dict]) -> str:
-        return page_analyzer.extract_line_text(line).strip()
+        """
+        Render a token line as text, inserting " | " when there's a single clear horizontal gap.
+
+        This helps represent two-column "term value" lines that aren't boxed as tables, e.g.:
+          Test Plan         TPL-1000  ->  Test Plan | TPL-1000
+        """
+        enable = str(os.environ.get("EIDAT_KV_GAP_SPLIT", "1") or "1").strip().lower() not in {
+            "0",
+            "false",
+            "f",
+            "no",
+            "n",
+            "off",
+        }
+        toks = [t for t in (line or []) if str(t.get("text", "")).strip()]
+        if not toks:
+            return ""
+        if not enable:
+            return page_analyzer.extract_line_text(toks).strip()
+
+        # Sort tokens left-to-right; fall back to original order if x is missing.
+        def _x0(tok: Dict) -> float:
+            try:
+                return float(tok.get("x0", tok.get("left", 0.0)) or 0.0)
+            except Exception:
+                return 0.0
+
+        def _x1(tok: Dict) -> float:
+            try:
+                return float(tok.get("x1", tok.get("right", 0.0)) or 0.0)
+            except Exception:
+                return 0.0
+
+        try:
+            toks_sorted = sorted(toks, key=_x0)
+        except Exception:
+            toks_sorted = toks
+
+        b = _line_bounds(toks_sorted)
+        h = float(b.get("h", 0.0) or 0.0)
+        try:
+            min_px = float(os.environ.get("EIDAT_KV_GAP_MIN_PX", "0") or 0.0)
+        except Exception:
+            min_px = 0.0
+        try:
+            h_mult = float(os.environ.get("EIDAT_KV_GAP_H_MULT", "2.5") or 2.5)
+        except Exception:
+            h_mult = 2.5
+        gap_thr = max(min_px, max(40.0, h * h_mult))
+
+        # Identify large gaps between adjacent tokens.
+        breaks = []
+        for i in range(len(toks_sorted) - 1):
+            g = _x0(toks_sorted[i + 1]) - _x1(toks_sorted[i])
+            if g >= gap_thr:
+                breaks.append(i)
+                if len(breaks) > 1:
+                    break
+
+        # Only apply when there's a single clear split; otherwise keep normal spacing.
+        if len(breaks) != 1:
+            return page_analyzer.extract_line_text(toks_sorted).strip()
+
+        i = breaks[0]
+        left = page_analyzer.extract_line_text(toks_sorted[: i + 1]).strip()
+        right = page_analyzer.extract_line_text(toks_sorted[i + 1 :]).strip()
+        if not left or not right:
+            return page_analyzer.extract_line_text(toks_sorted).strip()
+        if "|" in left or "|" in right:
+            return page_analyzer.extract_line_text(toks_sorted).strip()
+        if not re.search(r"[A-Za-z]", left) or not re.search(r"[A-Za-z0-9]", right):
+            return page_analyzer.extract_line_text(toks_sorted).strip()
+        return f"{left} | {right}"
 
     def _paragraph_lines(paragraph: List[List[Dict]]) -> List[str]:
         parts = [_line_text(line) for line in paragraph]
@@ -554,6 +627,7 @@ def export_combined_text(pdf_path: Path, pages_data: List[Dict],
         flow = page_data.get('flow') or {}
         charts = page_data.get('charts', []) or []
         chart_bboxes = [c.get("bbox_px") for c in charts if c.get("bbox_px")]
+        confirmed_footers: List[List[Dict]] = []
 
         def _line_bbox(line: List[Dict]) -> Dict[str, float]:
             if not line:

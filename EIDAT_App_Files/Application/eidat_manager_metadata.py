@@ -16,10 +16,14 @@ ALLOWED_KEYS = {
     "test_date",
     "report_date",
     "document_type",
+    "document_type_acronym",
+    "vendor",
+    "acceptance_test_plan_number",
 }
 
 DEFAULT_CANDIDATES = {
     "program_titles": [],
+    "vendors": [],
     "asset_types": [
         "Valve",
         "Thruster",
@@ -42,6 +46,7 @@ DEFAULT_CANDIDATES = {
         "Bracket",
         "Structure",
     ],
+    # Back-compat: this can be a list[str] or list[{"name","acronym","aliases"}]
     "document_types": ["EIDP", "Excel file data"],
 }
 
@@ -52,6 +57,8 @@ LABEL_ALIASES = {
     "revision": ["revision", "rev"],
     "test_date": ["test date", "date of test"],
     "report_date": ["report date", "date of report"],
+    "vendor": ["vendor", "supplier", "manufacturer", "mfr", "oem"],
+    "acceptance_test_plan_number": ["acceptance test plan", "test plan", "acceptance plan", "atp", "plan number"],
 }
 
 # Field name patterns that typically contain part numbers
@@ -82,7 +89,105 @@ def sanitize_metadata(raw: Any, *, default_document_type: str = "EIDP") -> dict:
         cleaned[key] = v
     if not cleaned.get("document_type"):
         cleaned["document_type"] = default_document_type
+    if not cleaned.get("document_type_acronym") and cleaned.get("document_type") and cleaned.get("document_type") != "Unknown":
+        cleaned["document_type_acronym"] = cleaned.get("document_type")
     return cleaned
+
+
+def _first_nonempty(lines: list[str], max_lines: int = 120) -> str:
+    out: list[str] = []
+    for ln in lines[: int(max_lines)]:
+        s = str(ln or "").strip()
+        if s:
+            out.append(s)
+    return "\n".join(out)
+
+
+def _match_from_candidates(value: str, candidates: list[str]) -> Optional[str]:
+    if not value:
+        return None
+    return _match_from_list(value, candidates)
+
+
+def _iter_doc_type_entries(raw: Any) -> list[dict]:
+    """
+    Normalize document type candidates.
+
+    Accepts either:
+      - list[str] (treated as {"name": s, "acronym": s, "aliases":[s]})
+      - list[dict] with keys name/acronym/aliases
+    """
+    out: list[dict] = []
+    if not isinstance(raw, list):
+        return out
+    for item in raw:
+        if isinstance(item, str) and item.strip():
+            s = item.strip()
+            out.append({"name": s, "acronym": s, "aliases": [s]})
+            continue
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        acronym = str(item.get("acronym") or "").strip()
+        aliases = item.get("aliases")
+        alias_list: list[str] = []
+        if isinstance(aliases, list):
+            alias_list = [str(a).strip() for a in aliases if str(a).strip()]
+        if not alias_list and name:
+            alias_list = [name]
+        if not name and alias_list:
+            name = alias_list[0]
+        if not acronym and name:
+            acronym = name
+        if name:
+            out.append({"name": name, "acronym": acronym, "aliases": alias_list})
+    return out
+
+
+def _pick_document_type(text: str, entries: list[dict]) -> tuple[Optional[str], Optional[str]]:
+    """
+    Return (document_type, acronym) based on first match in text.
+
+    document_type is standardized to acronym when present.
+    """
+    if not text or not entries:
+        return None, None
+    for e in entries:
+        aliases = e.get("aliases") or []
+        for a in aliases:
+            if not a:
+                continue
+            if re.search(rf"\b{re.escape(str(a))}\b", text, flags=re.IGNORECASE):
+                acr = str(e.get("acronym") or "").strip() or None
+                name = str(e.get("name") or "").strip() or None
+                return (acr or name), acr
+    return None, None
+
+
+def _extract_plan_number(text: str) -> Optional[str]:
+    """
+    Extract an acceptance test plan identifier from free text.
+
+    Examples:
+      - ATP-1234
+      - Acceptance Test Plan: ATP 1234
+      - Test Plan TP-001
+    """
+    if not text:
+        return None
+    patterns = [
+        r"\b(?:ACCEPTANCE\s+TEST\s+PLAN|TEST\s+PLAN|ACCEPTANCE\s+PLAN)\s*(?:NO\.|NUMBER|#|:)?\s*([A-Z]{1,6}[-_\s]?\d{1,8}[A-Z0-9\-_\/]{0,16})\b",
+        r"\b(?:ATP|TP)\s*[-_#:]?\s*(\d{1,8}[A-Z0-9\-_\/]{0,16})\b",
+        r"\b(ATP[-_ ]?\d{1,8}[A-Z0-9\-_\/]{0,16})\b",
+        r"\b(TP[-_ ]?\d{1,8}[A-Z0-9\-_\/]{0,16})\b",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, flags=re.IGNORECASE)
+        if m:
+            val = (m.group(1) or "").strip()
+            if val:
+                return re.sub(r"\s+", "", val.upper())
+    return None
 
 
 def load_metadata_for_pdf(pdf_path: Path) -> Optional[dict]:
@@ -131,6 +236,9 @@ def derive_minimal_metadata(core: Any, pdf_path: Path) -> dict:
         "test_date": "Unknown",
         "report_date": "Unknown",
         "document_type": "EIDP",
+        "document_type_acronym": "EIDP",
+        "vendor": "Unknown",
+        "acceptance_test_plan_number": "Unknown",
     }
     return meta
 
@@ -329,7 +437,8 @@ def extract_metadata_from_text(text: str, *, asset_types: Optional[list[str]] = 
     candidates = _load_candidates()
     asset_list = asset_types or candidates.get("asset_types") or []
     program_titles = candidates.get("program_titles") or []
-    doc_types = candidates.get("document_types") or []
+    vendors = candidates.get("vendors") or []
+    doc_type_entries = _iter_doc_type_entries(candidates.get("document_types") or [])
     meta: dict[str, Optional[str]] = {
         "program_title": None,
         "asset_type": None,
@@ -339,7 +448,18 @@ def extract_metadata_from_text(text: str, *, asset_types: Optional[list[str]] = 
         "test_date": None,
         "report_date": None,
         "document_type": None,
+        "document_type_acronym": None,
+        "vendor": None,
+        "acceptance_test_plan_number": None,
     }
+
+    first_page_text = _first_nonempty(lines, max_lines=220)
+    title_blob = _first_nonempty(lines, max_lines=60)
+    if pdf_path is not None:
+        try:
+            title_blob = f"{title_blob}\n{pdf_path.stem}"
+        except Exception:
+            pass
 
     header_line = ""
     for line in lines[:80]:
@@ -374,6 +494,23 @@ def extract_metadata_from_text(text: str, *, asset_types: Optional[list[str]] = 
             if val:
                 meta[key] = val.strip()
                 break
+
+    # Vendor: match known vendor candidates if not found by label.
+    if not meta.get("vendor") and vendors:
+        for v in vendors:
+            sv = str(v or "").strip()
+            if not sv:
+                continue
+            if re.search(rf"\b{re.escape(sv)}\b", title_blob, flags=re.IGNORECASE):
+                meta["vendor"] = sv
+                break
+            if re.search(rf"\b{re.escape(sv)}\b", first_page_text, flags=re.IGNORECASE):
+                meta["vendor"] = sv
+                break
+
+    # Acceptance test plan number: try labels and free-text patterns.
+    if not meta.get("acceptance_test_plan_number"):
+        meta["acceptance_test_plan_number"] = _extract_plan_number(title_blob) or _extract_plan_number(first_page_text)
 
     # If asset_type was found via label (e.g. "Control Valve (End Item)"),
     # try to extract the actual asset type from it
@@ -411,8 +548,8 @@ def extract_metadata_from_text(text: str, *, asset_types: Optional[list[str]] = 
             first_page_lines.append(line)
             if len(first_page_lines) >= 200:
                 break
-        first_page_text = "\n".join(first_page_lines)
-        freq_asset = _find_asset_type_by_frequency(first_page_text, asset_list)
+        first_page_text_freq = "\n".join(first_page_lines)
+        freq_asset = _find_asset_type_by_frequency(first_page_text_freq, asset_list)
         if freq_asset:
             meta["asset_type"] = freq_asset
 
@@ -442,17 +579,27 @@ def extract_metadata_from_text(text: str, *, asset_types: Optional[list[str]] = 
         match = _match_from_list(meta.get("asset_type") or "", asset_list)
         meta["asset_type"] = match or "Unknown"
 
-    if doc_types:
-        doc_match = None
-        for dt in doc_types:
-            if re.search(rf"\b{re.escape(str(dt))}\b", "\n".join(lines[:120]), flags=re.IGNORECASE):
-                doc_match = str(dt)
-                break
-        meta["document_type"] = doc_match or ("EIDP" if "EIDP" in doc_types else "Unknown")
+    # Document type: match on early-page/title text, standardize to acronym when available.
+    doc_match, acr = _pick_document_type(title_blob + "\n" + _first_nonempty(lines, max_lines=120), doc_type_entries)
+    if doc_match:
+        meta["document_type"] = doc_match
+        meta["document_type_acronym"] = acr or doc_match
     else:
         meta["document_type"] = "Unknown"
+        meta["document_type_acronym"] = None
 
-    for key in ["program_title", "asset_type", "serial_number", "part_number", "revision", "test_date", "report_date", "document_type"]:
+    for key in [
+        "program_title",
+        "asset_type",
+        "serial_number",
+        "part_number",
+        "revision",
+        "test_date",
+        "report_date",
+        "document_type",
+        "vendor",
+        "acceptance_test_plan_number",
+    ]:
         if not meta.get(key):
             meta[key] = "Unknown"
 

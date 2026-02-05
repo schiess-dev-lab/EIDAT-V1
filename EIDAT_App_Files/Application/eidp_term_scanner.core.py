@@ -10069,12 +10069,66 @@ def pre_ocr_and_merge_pdf(pdf_path: Path, *, serial_component: Optional[str] = N
             return f"{m.group(1)}. {m.group(2).strip()}"
         return s
 
+    # Heuristic: convert "Term<big gap>Value" lines into "Term | Value".
+    # This helps downstream term/field extraction when the PDF isn't boxed as a table,
+    # but the layout clearly shows two columns on the same line.
+    _kv_gap_enabled = str(os.environ.get("EIDAT_KV_GAP_SPLIT", "1") or "1").strip().lower() not in {
+        "0",
+        "false",
+        "f",
+        "no",
+        "n",
+        "off",
+    }
+    try:
+        _kv_gap_min_spaces = int(os.environ.get("EIDAT_KV_GAP_MIN_SPACES", "8") or 8)
+    except Exception:
+        _kv_gap_min_spaces = 8
+    if _kv_gap_min_spaces < 2:
+        _kv_gap_min_spaces = 2
+    _kv_gap_re = re.compile(rf"[ \t]{{{_kv_gap_min_spaces},}}")
+
+    def _maybe_gap_split_kv_line(text: str) -> str:
+        if not _kv_gap_enabled:
+            return text
+        s = str(text or "")
+        if not s.strip():
+            return text
+        if "|" in s:
+            return text
+        if "\n" in s or "\r" in s:
+            return text
+        # Normalize NBSP which often appears in OCR pipelines.
+        s2 = s.replace("\u00A0", " ")
+        if not _kv_gap_re.search(s2):
+            return text
+        parts = [p.strip() for p in _kv_gap_re.split(s2.strip())]
+        if len(parts) != 2:
+            return text
+        left, right = parts[0], parts[1]
+        if not left or not right:
+            return text
+        # Require letter(s) in the key, and at least some alnum in the value.
+        if not re.search(r"[A-Za-z]", left):
+            return text
+        if not re.search(r"[A-Za-z0-9]", right):
+            return text
+        # Avoid turning obvious page/footer artifacts into kv pairs.
+        low_left = left.strip().lower()
+        if re.fullmatch(r"(?:p\.?\s*\d+|page\s+\d+(?:\s*/\s*\d+)?)", low_left):
+            return text
+        if len(left) > 120 or len(right) > 200:
+            return text
+        return f"{left} | {right}"
+
     def _render_text_item(item: Dict[str, object]) -> List[str]:
         out: List[str] = []
         kind = str(item.get("kind") or "string").strip().lower()
         txt = str(item.get("text") or "")
         if kind == "string":
             txt = _normalize_section_heading_text(txt)
+        if kind in {"string", "line"}:
+            txt = _maybe_gap_split_kv_line(txt)
         if not txt.strip():
             return out
         try:

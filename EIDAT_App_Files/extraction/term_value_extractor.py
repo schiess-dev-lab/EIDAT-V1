@@ -13,6 +13,7 @@ Outputs to JSON and SQLite formats.
 import re
 import json
 import sqlite3
+from difflib import SequenceMatcher
 from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Tuple, Optional, Any
@@ -94,6 +95,7 @@ class ExtractionResult:
     acceptance_tests: List[AcceptanceTest] = field(default_factory=list)
     test_data: Dict[str, List[Dict]] = field(default_factory=dict)
     calibration: List[Dict] = field(default_factory=list)
+    kv_pairs: List[Dict[str, Any]] = field(default_factory=list)
     source_file: str = ""
     extracted_at: str = ""
 
@@ -205,6 +207,70 @@ class MeasuredValueParser:
 # Combined.txt Parser
 # =============================================================================
 
+_APP_ROOT = Path(__file__).resolve().parents[1]  # EIDAT_App_Files/
+_REPO_ROOT = _APP_ROOT.parent  # repo root (holds user_inputs/)
+DEFAULT_ACCEPTANCE_HEURISTICS_PATH = _REPO_ROOT / "user_inputs" / "acceptance_heuristics.json"
+
+
+def _norm_text(value: str) -> str:
+    v = str(value or "").strip().lower()
+    v = re.sub(r"[\u00A0\t\r\n]+", " ", v)
+    v = re.sub(r"[^a-z0-9]+", " ", v)
+    v = re.sub(r"\s+", " ", v).strip()
+    return v
+
+
+def _best_fuzzy_match(raw: str, candidates: List[str]) -> Tuple[Optional[str], float]:
+    s = _norm_text(raw)
+    if not s:
+        return None, 0.0
+    best = None
+    best_score = 0.0
+    for c in candidates:
+        cn = _norm_text(c)
+        if not cn:
+            continue
+        if s == cn:
+            return c, 1.0
+        score = SequenceMatcher(None, s, cn).ratio()
+        if score > best_score:
+            best_score = score
+            best = c
+    return best, float(best_score)
+
+
+def _load_acceptance_heuristics(path: Path = DEFAULT_ACCEPTANCE_HEURISTICS_PATH) -> Dict[str, Any]:
+    """
+    Best-effort load of acceptance heuristics config.
+
+    Schema (v1):
+      - fuzzy_min_ratio: float (default 0.82)
+      - require_term_match: bool (default False)
+      - terms: list[str]
+      - headers: dict[str, list[str]] (roles: term/value/min/max/units/requirement/description/status)
+    """
+    try:
+        if not path.exists():
+            return {}
+        data = json.loads(path.read_text(encoding="utf-8", errors="ignore"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _default_header_synonyms() -> Dict[str, List[str]]:
+    return {
+        "term": ["term", "tag", "parameter", "id", "field", "label", "test"],
+        "description": ["description", "desc", "name"],
+        "value": ["measured", "actual", "value", "reading"],
+        "min": ["min", "minimum", "lower", "low", "range min", "range_min", "range (min)"],
+        "max": ["max", "maximum", "upper", "high", "range max", "range_max", "range (max)"],
+        "units": ["units", "unit", "uom"],
+        "requirement": ["requirement", "criteria", "spec", "acceptance", "limit"],
+        "status": ["status", "result", "pass?", "pass fail", "pass/fail", "outcome"],
+    }
+
+
 class CombinedTxtParser:
     """Parse combined.txt OCR output format."""
 
@@ -214,11 +280,31 @@ class CombinedTxtParser:
     SECTION_MARKER = re.compile(r'^\[([^\]]+)\]$')
     TABLE_ROW = re.compile(r'^\|(.+)\|$')
     TABLE_SEPARATOR = re.compile(r'^\+[-+]+\+$')
+    _KV_PIPE = re.compile(r"\s+\|\s+")
+    _KV_GAP = re.compile(r"[ \t]{8,}")  # matches "clear gap" between term/value fragments
 
-    def __init__(self, content: str):
+    def __init__(self, content: str, *, heuristics: Optional[Dict[str, Any]] = None):
         self.content = content
         self.lines = content.split('\n')
         self.current_page = 0
+
+        cfg = heuristics if isinstance(heuristics, dict) else _load_acceptance_heuristics()
+        try:
+            self._fuzzy_min_ratio = float(cfg.get("fuzzy_min_ratio", 0.82) or 0.82)
+        except Exception:
+            self._fuzzy_min_ratio = 0.82
+        self._require_term_match = bool(cfg.get("require_term_match", False))
+        self._terms: List[str] = [str(t).strip() for t in (cfg.get("terms") or []) if str(t).strip()]
+
+        headers_cfg = cfg.get("headers") if isinstance(cfg.get("headers"), dict) else {}
+        base = _default_header_synonyms()
+        for role, synonyms in (headers_cfg or {}).items():
+            if not isinstance(role, str):
+                continue
+            if not isinstance(synonyms, list):
+                continue
+            base[str(role).strip().lower()] = [str(s).strip() for s in synonyms if str(s).strip()]
+        self._header_synonyms = base
 
     def parse(self) -> ExtractionResult:
         """Parse the entire combined.txt file."""
@@ -232,6 +318,9 @@ class CombinedTxtParser:
         # Extract document metadata from first tables
         result.document = self._extract_metadata(tables)
 
+        # Extract generic key/value pairs from non-table lines
+        result.kv_pairs = self._extract_kv_pairs()
+
         # Extract acceptance tests
         result.acceptance_tests = self._extract_acceptance_tests(tables)
 
@@ -242,6 +331,103 @@ class CombinedTxtParser:
         result.calibration = self._extract_calibration(tables)
 
         return result
+
+    def _extract_kv_pairs(self) -> List[Dict[str, Any]]:
+        """
+        Extract simple "term | value" pairs that appear outside ASCII tables.
+
+        Supports two encodings:
+          - explicit delimiter: "Test Plan | TPL-1000"
+          - implicit delimiter: "Test Plan        TPL-1000" (clear whitespace gap)
+
+        This intentionally avoids [Header]/[Footer] sections to reduce noise.
+        """
+        pairs: List[Dict[str, Any]] = []
+        current_page = 0
+        current_section: Optional[str] = None
+
+        def _split_kv(line: str) -> Optional[Tuple[str, str]]:
+            if not line or not line.strip():
+                return None
+            s = str(line).replace("\u00A0", " ").strip()
+            if "|" in s:
+                parts = [p.strip() for p in s.split(" | ")]
+                if len(parts) == 2 and parts[0] and parts[1]:
+                    return parts[0], parts[1]
+                return None
+            if not self._KV_GAP.search(s):
+                return None
+            parts = [p.strip() for p in self._KV_GAP.split(s) if p.strip()]
+            if len(parts) != 2:
+                return None
+            return parts[0], parts[1]
+
+        for raw in self.lines:
+            line = str(raw or "").rstrip("\r")
+            s = line.strip()
+            if not s:
+                continue
+
+            page_match = self.PAGE_MARKER.match(s)
+            if page_match:
+                current_page = int(page_match.group(1))
+                current_section = None
+                continue
+
+            sec = self.SECTION_MARKER.match(s)
+            if sec:
+                current_section = sec.group(1).strip()
+                continue
+
+            # Skip table blocks and obvious formatting artifacts
+            if self.TABLE_START.match(s):
+                continue
+            if self.TABLE_SEPARATOR.match(s):
+                continue
+            if self.TABLE_ROW.match(s):
+                continue
+            if s.startswith(("+", "|")) and (s.endswith("+") or "|" in s):
+                continue
+
+            # Skip noisy sections by default (allow Table/Chart Title; it often contains kv lines)
+            if current_section and current_section.lower() in {"header", "footer", "table"}:
+                continue
+
+            kv = _split_kv(s)
+            if not kv:
+                continue
+            term, value = kv
+
+            if len(term) > 120 or len(value) > 200:
+                continue
+            if not re.search(r"[A-Za-z]", term):
+                continue
+            if not re.search(r"[A-Za-z0-9]", value):
+                continue
+            low_term = term.strip().lower()
+            if re.fullmatch(r"(?:p\.?\s*\d+|page\s+\d+(?:\s*/\s*\d+)?)", low_term):
+                continue
+
+            pairs.append(
+                {
+                    "term": term,
+                    "value": value,
+                    "page": int(current_page or 0),
+                    "section": current_section or "",
+                    "source_line": s,
+                }
+            )
+
+        # De-dup identical (term,value,page) pairs while preserving order
+        seen: set[tuple[str, str, int]] = set()
+        out: List[Dict[str, Any]] = []
+        for p in pairs:
+            k = (str(p.get("term") or ""), str(p.get("value") or ""), int(p.get("page") or 0))
+            if k in seen:
+                continue
+            seen.add(k)
+            out.append(p)
+        return out
 
     def _extract_all_tables(self) -> List[Dict]:
         """Extract all tables with their context."""
@@ -348,43 +534,85 @@ class CombinedTxtParser:
         # Look for Acceptance Criteria tables
         for table in tables:
             title = (table.get('title') or '').lower()
-            headers = [h.lower() for h in table['headers']]
+            headers = [str(h or "").strip() for h in table['headers']]
+            header_norm = [_norm_text(h) for h in headers]
 
-            # Check if this looks like an acceptance criteria table
-            has_tag = any(h in ['tag', 'term', 'id', 'parameter'] for h in headers)
-            has_requirement = any(h in ['requirement', 'criteria', 'spec', 'acceptance'] for h in headers)
-            has_measured = any(h in ['measured', 'actual', 'value', 'result'] for h in headers)
+            # Assign roles to columns using fuzzy header matching
+            roles: Dict[str, int] = {}
+            for idx, h in enumerate(header_norm):
+                if not h:
+                    continue
+                best_role = None
+                best_score = 0.0
+                for role, syns in self._header_synonyms.items():
+                    _, score = _best_fuzzy_match(h, syns)
+                    if score > best_score:
+                        best_score = score
+                        best_role = role
+                if best_role and best_score >= self._fuzzy_min_ratio and best_role not in roles:
+                    roles[best_role] = idx
 
-            if not (has_tag and (has_requirement or has_measured)):
+            # Check if this looks like an acceptance criteria table (avoid Field/Value metadata tables)
+            has_tag = "term" in roles
+            has_measured = ("value" in roles) or ("min" in roles) or ("max" in roles)
+            has_requirement = "requirement" in roles
+            has_acceptance_signals = any(k in roles for k in ["requirement", "min", "max", "units", "status"])
+            title_hint = any(t in title for t in ["accept", "criteria", "require", "spec"])
+
+            # Common metadata table: Field/Value (2 cols) on early pages.
+            is_simple_field_value = (
+                len(headers) <= 2
+                and ("term" in roles and "value" in roles)
+                and ("field" in header_norm[int(roles.get("term", 0))] if "term" in roles else False)
+                and ("value" in header_norm[int(roles.get("value", 0))] if "value" in roles else False)
+            )
+            if is_simple_field_value and not title_hint:
+                continue
+
+            if not (has_tag and (has_requirement or has_measured) and (has_acceptance_signals or title_hint)):
                 continue
 
             # Find column indices
-            tag_idx = next((i for i, h in enumerate(headers)
-                           if h in ['tag', 'term', 'id', 'parameter']), 0)
-            desc_idx = next((i for i, h in enumerate(headers)
-                            if h in ['description', 'desc', 'name']), 1)
-            req_idx = next((i for i, h in enumerate(headers)
-                           if h in ['requirement', 'criteria', 'spec', 'acceptance']), 2)
-            meas_idx = next((i for i, h in enumerate(headers)
-                            if h in ['measured', 'actual', 'value']), 3)
-            units_idx = next((i for i, h in enumerate(headers)
-                             if h in ['units', 'unit']), None)
-            result_idx = next((i for i, h in enumerate(headers)
-                              if headers[i] == 'result' or h in ['pass?', 'status']), None)
+            tag_idx = int(roles.get("term", 0))
+            desc_idx = int(roles.get("description", 1))
+            req_idx = roles.get("requirement", None)
+            meas_idx = roles.get("value", None)
+            min_idx = roles.get("min", None)
+            max_idx = roles.get("max", None)
+            units_idx = roles.get("units", None)
+            result_idx = roles.get("status", None)
 
             for row in table['rows']:
                 if len(row) <= tag_idx:
                     continue
 
-                term = row[tag_idx].strip()
-                if not term:
+                raw_term = row[tag_idx].strip()
+                if not raw_term:
                     continue
 
+                term = raw_term
+                if self._terms:
+                    best, score = _best_fuzzy_match(raw_term, self._terms)
+                    if best and score >= self._fuzzy_min_ratio:
+                        term = str(best).strip()
+                    elif self._require_term_match:
+                        continue
+
                 desc = row[desc_idx].strip() if desc_idx < len(row) else ''
-                req_raw = row[req_idx].strip() if req_idx < len(row) else ''
-                meas_raw = row[meas_idx].strip() if meas_idx < len(row) else ''
-                units = row[units_idx].strip() if units_idx and units_idx < len(row) else None
-                result = row[result_idx].strip() if result_idx and result_idx < len(row) else None
+                req_raw = row[req_idx].strip() if isinstance(req_idx, int) and req_idx < len(row) else ""
+                meas_raw = row[meas_idx].strip() if isinstance(meas_idx, int) and meas_idx < len(row) else ""
+                units = row[units_idx].strip() if isinstance(units_idx, int) and units_idx < len(row) else None
+                result = row[result_idx].strip() if isinstance(result_idx, int) and result_idx < len(row) else None
+
+                req_min = row[min_idx].strip() if isinstance(min_idx, int) and min_idx < len(row) else ""
+                req_max = row[max_idx].strip() if isinstance(max_idx, int) and max_idx < len(row) else ""
+                if not req_raw and (req_min or req_max):
+                    if req_min and req_max:
+                        req_raw = f"{req_min} - {req_max}"
+                    elif req_min:
+                        req_raw = f">= {req_min}"
+                    else:
+                        req_raw = f"<= {req_max}"
 
                 requirement = RequirementParser.parse(req_raw)
                 measured = MeasuredValueParser.parse(meas_raw)
@@ -493,6 +721,7 @@ def extraction_to_dict(result: ExtractionResult) -> Dict:
         ],
         'test_data': result.test_data,
         'calibration': result.calibration,
+        'kv_pairs': result.kv_pairs,
         'source_file': result.source_file,
         'extracted_at': result.extracted_at
     }
@@ -580,6 +809,19 @@ CREATE INDEX IF NOT EXISTS idx_acceptance_term ON acceptance_tests(term);
 CREATE INDEX IF NOT EXISTS idx_acceptance_doc ON acceptance_tests(document_id);
 CREATE INDEX IF NOT EXISTS idx_documents_serial ON documents(serial);
 CREATE INDEX IF NOT EXISTS idx_documents_program ON documents(program);
+
+-- Simple term/value pairs found outside ASCII tables
+CREATE TABLE IF NOT EXISTS kv_pairs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    document_id INTEGER REFERENCES documents(id) ON DELETE CASCADE,
+    term TEXT NOT NULL,
+    value TEXT NOT NULL,
+    page INTEGER,
+    section TEXT,
+    source_line TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_kv_pairs_term ON kv_pairs(term);
+CREATE INDEX IF NOT EXISTS idx_kv_pairs_doc ON kv_pairs(document_id);
 """
 
 
@@ -645,6 +887,7 @@ class SQLiteExporter:
 
         # Clear existing acceptance tests for this document
         cursor.execute("DELETE FROM acceptance_tests WHERE document_id = ?", (doc_id,))
+        cursor.execute("DELETE FROM kv_pairs WHERE document_id = ?", (doc_id,))
 
         # Insert acceptance tests
         for test in result.acceptance_tests:
@@ -664,6 +907,30 @@ class SQLiteExporter:
                 1 if test.computed_pass else (0 if test.computed_pass is False else None),
                 test.page, test.table_index
             ))
+
+        # Insert kv pairs
+        for kv in result.kv_pairs or []:
+            try:
+                term = str(kv.get("term") or "").strip()
+                value = str(kv.get("value") or "").strip()
+                if not term or not value:
+                    continue
+                cursor.execute(
+                    """
+                    INSERT INTO kv_pairs (document_id, term, value, page, section, source_line)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        doc_id,
+                        term,
+                        value,
+                        int(kv.get("page") or 0),
+                        str(kv.get("section") or ""),
+                        str(kv.get("source_line") or ""),
+                    ),
+                )
+            except Exception:
+                continue
 
         # Clear and insert test data
         cursor.execute("DELETE FROM test_data WHERE document_id = ?", (doc_id,))

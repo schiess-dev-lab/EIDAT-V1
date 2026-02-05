@@ -16,7 +16,13 @@ except ImportError:
     HAVE_CV2 = False
 
 
-def detect_tables(img_gray: np.ndarray, verbose: bool = False) -> Dict:
+def detect_tables(
+    img_gray: np.ndarray,
+    verbose: bool = False,
+    *,
+    cluster_gap_ratio: float = 0.02,
+    cluster_gap_px: Optional[float] = None,
+) -> Dict:
     """
     Main table detection function.
 
@@ -58,7 +64,13 @@ def detect_tables(img_gray: np.ndarray, verbose: bool = False) -> Dict:
                     if (c['bbox_px'][2] - c['bbox_px'][0]) * (c['bbox_px'][3] - c['bbox_px'][1]) <= max_cell_area]
 
     # Step 5: Cluster cells into tables
-    tables = _cluster_into_tables(actual_cells, w, h)
+    tables = _cluster_into_tables(
+        actual_cells,
+        w,
+        h,
+        gap_ratio=float(cluster_gap_ratio),
+        gap_px=cluster_gap_px,
+    )
 
     # Step 5.5: Merge overlapping cells within each row band (dedupe artifacts)
     drop_ids = set()
@@ -328,13 +340,25 @@ def _filter_containers(cells: List[Dict]) -> List[Dict]:
     return actual
 
 
-def _cluster_into_tables(cells: List[Dict], img_w: int, img_h: int,
-                          gap_ratio: float = 0.02) -> List[Dict]:
+def _cluster_into_tables(
+    cells: List[Dict],
+    img_w: int,
+    img_h: int,
+    gap_ratio: float = 0.02,
+    gap_px: Optional[float] = None,
+) -> List[Dict]:
     """Cluster cells into tables based on direct adjacency."""
     if not cells:
         return []
 
     gap = max(img_w, img_h) * gap_ratio
+    if gap_px is not None:
+        try:
+            gap_px_val = float(gap_px)
+        except (TypeError, ValueError):
+            gap_px_val = None
+        if gap_px_val is not None and gap_px_val > 0:
+            gap = min(gap, gap_px_val)
     n = len(cells)
     adj = [set() for _ in range(n)]
 

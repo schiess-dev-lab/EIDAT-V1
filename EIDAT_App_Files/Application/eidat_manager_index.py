@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -33,6 +34,9 @@ CREATE TABLE IF NOT EXISTS documents (
   test_date TEXT,
   report_date TEXT,
   document_type TEXT,
+  document_type_acronym TEXT,
+  vendor TEXT,
+  acceptance_test_plan_number TEXT,
   title_norm TEXT,
   similarity_group TEXT,
   indexed_epoch_ns INTEGER NOT NULL,
@@ -46,6 +50,57 @@ CREATE TABLE IF NOT EXISTS groups (
   member_count INTEGER NOT NULL
 );
 """
+
+
+def _load_program_title_candidates() -> list[str]:
+    """Load program title candidates from user_inputs/metadata_candidates.json."""
+    try:
+        root = Path(__file__).resolve().parents[2]
+        cand_path = root / "user_inputs" / "metadata_candidates.json"
+        if cand_path.exists():
+            data = json.loads(cand_path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                titles = data.get("program_titles") or []
+                return [str(t).strip() for t in titles if str(t).strip()]
+    except Exception:
+        pass
+    return []
+
+
+def _infer_program_title_from_filename(meta_path: Path, candidates: list[str]) -> str | None:
+    """Infer program title from metadata filename (e.g., SN2222_starlink_metadata.json)."""
+    if not candidates:
+        return None
+    try:
+        stem = meta_path.stem
+        stem = re.sub(r"(_metadata|\\.metadata)$", "", stem, flags=re.IGNORECASE)
+        low = stem.lower()
+        best = ""
+        for cand in candidates:
+            c = str(cand or "").strip()
+            if not c:
+                continue
+            cl = c.lower()
+            if re.search(rf"\\b{re.escape(cl)}\\b", low) or cl in low:
+                if len(c) > len(best):
+                    best = c
+        return best or None
+    except Exception:
+        return None
+
+
+def _infer_serial_from_filename(meta_path: Path) -> str | None:
+    """Infer serial number like SN2222 from metadata filename."""
+    try:
+        stem = meta_path.stem
+        # Filenames often use separators (e.g., SN2222_starlink_metadata),
+        # so avoid strict word-boundary matching.
+        m = re.search(r"SN\d+", stem, flags=re.IGNORECASE)
+        if m:
+            return m.group(0).upper()
+    except Exception:
+        pass
+    return None
 
 
 def _connect(db_path: Path) -> sqlite3.Connection:
@@ -128,15 +183,38 @@ def build_index(paths: SupportPaths, *, similarity: float = 0.86) -> IndexSummar
     index_db = support_dir / "eidat_index.sqlite3"
 
     metadata_files = _load_metadata_files(support_dir)
+    program_title_candidates = _load_program_title_candidates()
     docs: list[dict] = []
     for meta_path in metadata_files:
         try:
             raw = json.loads(meta_path.read_text(encoding="utf-8"))
         except Exception:
             continue
-        default_doc_type = "Excel file data" if str(meta_path.parent.name).endswith("__excel") else "EIDP"
+        is_excel_artifacts = str(meta_path.parent.name).endswith("__excel")
+        default_doc_type = "Data file" if is_excel_artifacts else "EIDP"
         meta = sanitize_metadata(raw, default_document_type=default_doc_type)
+        # Normalize legacy Excel doc type values to the new default.
+        try:
+            if is_excel_artifacts and str(meta.get("document_type") or "").strip().lower() in {"excel file data", "excel"}:
+                meta["document_type"] = "Data file"
+                meta["document_type_acronym"] = "DATA"
+        except Exception:
+            pass
         title = str(meta.get("program_title") or "")
+        # If program title is unknown, infer it from the filename using candidates.
+        if not title or title.strip().lower() == "unknown":
+            inferred_title = _infer_program_title_from_filename(meta_path, program_title_candidates)
+            if inferred_title:
+                meta["program_title"] = inferred_title
+                title = inferred_title
+
+        # If serial number is unknown, infer it from the filename (e.g., SN2222).
+        serial_val = str(meta.get("serial_number") or "")
+        if not serial_val or serial_val.strip().lower() == "unknown":
+            inferred_serial = _infer_serial_from_filename(meta_path)
+            if inferred_serial:
+                meta["serial_number"] = inferred_serial
+
         title_norm = normalize_title(title)
         artifacts_rel = None
         try:
@@ -161,6 +239,9 @@ def build_index(paths: SupportPaths, *, similarity: float = 0.86) -> IndexSummar
                 "test_date": meta.get("test_date"),
                 "report_date": meta.get("report_date"),
                 "document_type": meta.get("document_type"),
+                "document_type_acronym": meta.get("document_type_acronym"),
+                "vendor": meta.get("vendor"),
+                "acceptance_test_plan_number": meta.get("acceptance_test_plan_number"),
                 "title_norm": title_norm,
                 "similarity_group": "",
                 "certification_status": cert_info.get("certification_status"),
@@ -178,6 +259,9 @@ def build_index(paths: SupportPaths, *, similarity: float = 0.86) -> IndexSummar
             ("part_number", "TEXT"),
             ("certification_status", "TEXT"),
             ("certification_pass_rate", "TEXT"),
+            ("document_type_acronym", "TEXT"),
+            ("vendor", "TEXT"),
+            ("acceptance_test_plan_number", "TEXT"),
         ]
         for col_name, col_type in migration_columns:
             try:
@@ -192,9 +276,10 @@ def build_index(paths: SupportPaths, *, similarity: float = 0.86) -> IndexSummar
                 INSERT INTO documents(
                   metadata_rel, artifacts_rel, program_title, asset_type,
                   serial_number, part_number, revision, test_date, report_date, document_type,
+                  document_type_acronym, vendor, acceptance_test_plan_number,
                   title_norm, similarity_group, indexed_epoch_ns,
                   certification_status, certification_pass_rate
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     d["metadata_rel"],
@@ -207,6 +292,9 @@ def build_index(paths: SupportPaths, *, similarity: float = 0.86) -> IndexSummar
                     d["test_date"],
                     d["report_date"],
                     d["document_type"],
+                    d.get("document_type_acronym"),
+                    d.get("vendor"),
+                    d.get("acceptance_test_plan_number"),
                     d["title_norm"],
                     d["similarity_group"],
                     now_ns,

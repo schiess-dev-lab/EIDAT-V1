@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 import math
 import os
 import sqlite3
@@ -21,6 +22,7 @@ DEFAULT_TERMS_XLSX = ROOT / "user_inputs" / "terms.schema.simple.xlsx"
 DEFAULT_PLOT_TERMS_XLSX = ROOT / "user_inputs" / "plot_terms.xlsx"
 DEFAULT_PROPOSED_PLOTS_JSON = ROOT / "user_inputs" / "proposed_plots.json"
 DEFAULT_EXCEL_TREND_CONFIG = ROOT / "user_inputs" / "excel_trend_config.json"
+DEFAULT_ACCEPTANCE_HEURISTICS = ROOT / "user_inputs" / "acceptance_heuristics.json"
 EXCEL_EXTENSIONS = {".xlsx", ".xls", ".xlsm"}
 EXCEL_ARTIFACT_SUFFIX = "__excel"
 # Default repository root where PDFs may live (user-organized, nested or flat)
@@ -323,6 +325,149 @@ def eidat_manager_index(global_repo: Path, *, similarity: float = 0.86) -> Dict[
     return _run_eidat_manager(global_repo, "index", args)
 
 
+def _load_eidat_metadata_module():
+    try:
+        from Application import eidat_manager_metadata as emd  # type: ignore
+        return emd
+    except Exception:
+        mod_path = APP_ROOT / "Application" / "eidat_manager_metadata.py"
+        spec = importlib.util.spec_from_file_location("eidat_manager_metadata", mod_path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"Unable to load metadata module: {mod_path}")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)  # type: ignore[attr-defined]
+        return mod
+
+
+def _merge_metadata(primary: Optional[Mapping[str, object]], fallback: Optional[Mapping[str, object]]) -> dict:
+    out: dict = {}
+    if isinstance(fallback, Mapping):
+        out.update({k: v for k, v in fallback.items()})
+    if isinstance(primary, Mapping):
+        for k, v in primary.items():
+            if v is None:
+                continue
+            if isinstance(v, str) and not v.strip():
+                continue
+            out[k] = v
+    return out
+
+
+def refresh_metadata_only(global_repo: Path, rel_paths: list[str]) -> Dict[str, object]:
+    """Refresh metadata JSONs from existing artifacts without re-OCR."""
+    repo = Path(global_repo).expanduser()
+    if not repo.exists():
+        raise RuntimeError(f"Global repo does not exist: {repo}")
+
+    emd = _load_eidat_metadata_module()
+    results: list[dict] = []
+    updated = 0
+    failed = 0
+    skipped = 0
+
+    clean_rel_paths = [str(p).strip() for p in (rel_paths or []) if str(p).strip()]
+    for rel_path in clean_rel_paths:
+        try:
+            abs_path = (repo / rel_path).expanduser()
+            if not abs_path.exists():
+                raise FileNotFoundError(f"Missing file: {abs_path}")
+            artifacts_dir = get_file_artifacts_path(repo, rel_path)
+            if not artifacts_dir or not artifacts_dir.exists():
+                raise FileNotFoundError(f"Artifacts folder not found for: {rel_path}")
+
+            combined_path = artifacts_dir / "combined.txt"
+            combined_text = ""
+            if combined_path.exists():
+                try:
+                    combined_text = combined_path.read_text(encoding="utf-8", errors="ignore")
+                except Exception:
+                    combined_text = ""
+
+            extracted_meta = None
+            if combined_text.strip():
+                try:
+                    extracted_meta = emd.extract_metadata_from_text(combined_text, pdf_path=abs_path)
+                except Exception:
+                    extracted_meta = None
+
+            existing_meta = None
+            try:
+                existing_meta = emd.load_metadata_from_artifacts(artifacts_dir, abs_path)
+            except Exception:
+                existing_meta = None
+            if not existing_meta:
+                try:
+                    existing_meta = emd.load_metadata_for_pdf(abs_path)
+                except Exception:
+                    existing_meta = None
+            if not existing_meta:
+                try:
+                    existing_meta = _load_metadata_from_artifacts_dir(artifacts_dir)
+                except Exception:
+                    existing_meta = None
+
+            if extracted_meta:
+                raw_meta = _merge_metadata(extracted_meta, existing_meta)
+            else:
+                raw_meta = existing_meta
+
+            if not raw_meta:
+                try:
+                    raw_meta = emd.derive_minimal_metadata(None, abs_path)
+                except Exception:
+                    raw_meta = {"document_type": "EIDP"}
+
+            default_doc_type = "Data file" if abs_path.suffix.lower() in EXCEL_EXTENSIONS else "EIDP"
+            clean_meta = emd.sanitize_metadata(raw_meta, default_document_type=default_doc_type)
+            metadata_path = emd.write_metadata(Path(artifacts_dir), abs_path, clean_meta)
+
+            # Remove stale metadata files in this artifacts folder (keep the new one if present)
+            if metadata_path:
+                keep = Path(metadata_path)
+                for pat in ("*_metadata.json", "*.metadata.json"):
+                    for p in artifacts_dir.glob(pat):
+                        try:
+                            if p.resolve() == keep.resolve():
+                                continue
+                            p.unlink()
+                        except Exception:
+                            continue
+
+            results.append(
+                {
+                    "rel_path": rel_path,
+                    "ok": True,
+                    "metadata_path": str(metadata_path) if metadata_path else None,
+                }
+            )
+            updated += 1
+        except Exception as exc:
+            results.append(
+                {
+                    "rel_path": rel_path,
+                    "ok": False,
+                    "error": str(exc),
+                }
+            )
+            failed += 1
+
+    index_result = None
+    index_error = None
+    try:
+        index_result = eidat_manager_index(repo)
+    except Exception as exc:
+        index_error = str(exc)
+
+    return {
+        "updated": updated,
+        "failed": failed,
+        "skipped": skipped,
+        "results": results,
+        "index": index_result,
+        "index_error": index_error,
+    }
+
+
 def _prefer_existing(*paths: Path) -> Path:
     """Return the first existing path, or the first element if none exist."""
     for p in paths:
@@ -399,6 +544,8 @@ def _base_env() -> Dict[str, str]:
     # Ensure vendored site-packages are importable as fallback
     env["PYTHONPATH"] = str(APP_ROOT / "Lib" / "site-packages") + os.pathsep + env.get("PYTHONPATH", "")
     env.setdefault("QUIET", "1")
+    # GUI: charts are experimental and slow; keep disabled unless explicitly enabled.
+    env.setdefault("EIDAT_ENABLE_CHART_EXTRACTION", "0")
     # Force cache to always be in project root, not executable location
     # This ensures cache is consistent whether running as script or frozen exe
     if "CACHE_ROOT" not in env and "OCR_CACHE_ROOT" not in env:
@@ -1838,6 +1985,7 @@ EIDAT_PROJECTS_DIRNAME = "projects"
 EIDAT_PROJECTS_REGISTRY = "projects.json"
 EIDAT_PROJECT_META = "project.json"
 EIDAT_PROJECT_TYPE_TRENDING = "EIDP Trending"
+EIDAT_PROJECT_IMPLEMENTATION_DB = "implementation_trending.sqlite3"
 GLOBAL_RUN_MIRROR_DIRNAME = "global_run_mirror"
 LOCAL_PROJECTS_MIRROR_DIRNAME = "projects"
 PROJECT_UPDATE_DEBUG_JSON = "update_debug.json"
@@ -1849,6 +1997,295 @@ def eidat_support_dir(global_repo: Path) -> Path:
 
 def eidat_projects_root(global_repo: Path) -> Path:
     return eidat_support_dir(global_repo) / EIDAT_PROJECTS_DIRNAME
+
+
+def ensure_trending_project_sqlite(project_dir: Path, workbook_path: Path) -> Path:
+    """
+    Ensure a project-local SQLite cache exists for the EIDP Trending workbook.
+
+    The DB is stored inside the project folder and rebuilt if the workbook is newer.
+    """
+    proj_dir = Path(project_dir).expanduser()
+    wb_path = Path(workbook_path).expanduser()
+    if not wb_path.exists():
+        raise FileNotFoundError(f"Workbook not found: {wb_path}")
+
+    db_path = proj_dir / EIDAT_PROJECT_IMPLEMENTATION_DB
+    rebuild = True
+
+    if db_path.exists():
+        try:
+            db_mtime = db_path.stat().st_mtime
+            wb_mtime = wb_path.stat().st_mtime
+            rebuild = wb_mtime > db_mtime
+        except Exception:
+            rebuild = True
+
+        if not rebuild:
+            try:
+                with sqlite3.connect(str(db_path)) as conn:
+                    conn.row_factory = sqlite3.Row
+                    tables = {
+                        r["name"]
+                        for r in conn.execute(
+                            "SELECT name FROM sqlite_master WHERE type='table'"
+                        ).fetchall()
+                    }
+                required = {"serials", "terms", "term_values", "meta"}
+                if not required.issubset(tables):
+                    rebuild = True
+            except Exception:
+                rebuild = True
+
+    if rebuild:
+        _build_trending_project_sqlite(db_path, wb_path)
+
+    return db_path
+
+
+def load_trending_project_terms(db_path: Path) -> list[dict]:
+    """Return available terms from the project SQLite cache."""
+    path = Path(db_path).expanduser()
+    if not path.exists():
+        return []
+    rows: list[dict] = []
+    with sqlite3.connect(str(path)) as conn:
+        conn.row_factory = sqlite3.Row
+        for r in conn.execute(
+            """
+            SELECT term_key, term, term_label, units, min_val, max_val, data_group, row_index
+            FROM terms
+            ORDER BY row_index ASC
+            """
+        ).fetchall():
+            rows.append(dict(r))
+    return rows
+
+
+def load_trending_project_serials(db_path: Path) -> list[str]:
+    path = Path(db_path).expanduser()
+    if not path.exists():
+        return []
+    with sqlite3.connect(str(path)) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT serial FROM serials ORDER BY position ASC"
+        ).fetchall()
+    return [str(r["serial"] or "").strip() for r in rows if str(r["serial"] or "").strip()]
+
+
+def load_trending_project_series(db_path: Path, term_key: str) -> list[dict]:
+    """Return list of dicts with serial + value for a single term_key."""
+    path = Path(db_path).expanduser()
+    if not path.exists():
+        return []
+    with sqlite3.connect(str(path)) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT v.serial, v.value_text, v.value_num
+            FROM term_values v
+            WHERE v.term_key = ?
+            ORDER BY v.position ASC
+            """,
+            (str(term_key),),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _build_trending_project_sqlite(db_path: Path, workbook_path: Path) -> None:
+    """Build a SQLite cache from the EIDP Trending workbook."""
+    try:
+        from openpyxl import load_workbook  # type: ignore
+    except Exception as exc:
+        raise RuntimeError(
+            "openpyxl is required to read the EIDP Trending workbook. "
+            "Install it with `py -m pip install openpyxl` within the project environment."
+        ) from exc
+
+    wb_path = Path(workbook_path).expanduser()
+    if not wb_path.exists():
+        raise FileNotFoundError(f"Workbook not found: {wb_path}")
+
+    def _to_float(value: object | None) -> float | None:
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        text = str(value).strip()
+        if not text:
+            return None
+        text = text.replace(",", "")
+        try:
+            return float(text)
+        except Exception:
+            pass
+        m = re.search(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", text)
+        if not m:
+            return None
+        try:
+            return float(m.group(0))
+        except Exception:
+            return None
+
+    wb = load_workbook(str(wb_path), read_only=True, data_only=True)
+    if "master" not in wb.sheetnames:
+        raise RuntimeError("Workbook missing required 'master' sheet.")
+    ws = wb["master"]
+
+    rows = ws.iter_rows(values_only=True)
+    try:
+        header = next(rows)
+    except StopIteration:
+        raise RuntimeError("Workbook master sheet is empty.")
+
+    header = list(header)
+    serial_cols: list[tuple[int, str]] = []
+    for idx in range(9, len(header)):
+        val = header[idx]
+        sn = str(val).strip() if val is not None else ""
+        if sn:
+            serial_cols.append((idx, sn))
+    serials = [sn for _, sn in serial_cols]
+
+    db_path = Path(db_path).expanduser()
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    if db_path.exists():
+        try:
+            db_path.unlink()
+        except Exception:
+            pass
+
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute(
+            """
+            CREATE TABLE meta (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE serials (
+                position INTEGER NOT NULL,
+                serial TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE terms (
+                term_key TEXT PRIMARY KEY,
+                term TEXT,
+                header TEXT,
+                groupafter TEXT,
+                valuetype TEXT,
+                data_group TEXT,
+                term_label TEXT,
+                units TEXT,
+                min_val REAL,
+                max_val REAL,
+                row_index INTEGER
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE term_values (
+                term_key TEXT NOT NULL,
+                serial TEXT NOT NULL,
+                position INTEGER NOT NULL,
+                value_text TEXT,
+                value_num REAL
+            )
+            """
+        )
+        conn.execute("CREATE INDEX idx_values_term ON term_values(term_key)")
+        conn.execute("CREATE INDEX idx_values_serial ON term_values(serial)")
+
+        conn.execute("INSERT INTO meta (key, value) VALUES (?, ?)", ("workbook_path", str(wb_path)))
+        try:
+            wb_mtime = str(wb_path.stat().st_mtime)
+        except Exception:
+            wb_mtime = ""
+        conn.execute("INSERT INTO meta (key, value) VALUES (?, ?)", ("workbook_mtime", wb_mtime))
+
+        serial_rows = [(idx, sn) for idx, sn in enumerate(serials)]
+        conn.executemany("INSERT INTO serials (position, serial) VALUES (?, ?)", serial_rows)
+
+        row_index = 1  # header row is 1 in Excel
+        term_rows: list[tuple] = []
+        value_rows: list[tuple] = []
+
+        for row in rows:
+            row_index += 1
+            if not row:
+                continue
+            row = list(row)
+            term = str(row[0] or "").strip()
+            if not term:
+                continue
+            header_val = str(row[1] or "").strip()
+            group_after = str(row[2] or "").strip()
+            value_type = str(row[3] or "").strip()
+            data_group = str(row[4] or "").strip()
+            term_label = str(row[5] or "").strip()
+            units = str(row[6] or "").strip()
+            min_val = _to_float(row[7] if len(row) > 7 else None)
+            max_val = _to_float(row[8] if len(row) > 8 else None)
+
+            term_key = f"{term}__row_{row_index}"
+            term_rows.append(
+                (
+                    term_key,
+                    term,
+                    header_val,
+                    group_after,
+                    value_type,
+                    data_group,
+                    term_label,
+                    units,
+                    min_val,
+                    max_val,
+                    row_index,
+                )
+            )
+
+            for pos, (col_idx, sn) in enumerate(serial_cols):
+                if col_idx >= len(row):
+                    cell_val = None
+                else:
+                    cell_val = row[col_idx]
+                val_text = "" if cell_val is None else str(cell_val)
+                val_num = _to_float(cell_val)
+                value_rows.append((term_key, sn, pos, val_text, val_num))
+
+        if term_rows:
+            conn.executemany(
+                """
+                INSERT INTO terms (
+                    term_key, term, header, groupafter, valuetype,
+                    data_group, term_label, units, min_val, max_val, row_index
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                term_rows,
+            )
+        if value_rows:
+            conn.executemany(
+                """
+                INSERT INTO term_values (
+                    term_key, serial, position, value_text, value_num
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                value_rows,
+            )
+        conn.commit()
+
+    try:
+        wb.close()
+    except Exception:
+        pass
 
 
 def eidat_debug_ocr_root(global_repo: Path) -> Path:
@@ -1931,19 +2368,37 @@ def read_eidat_index_documents(global_repo: Path) -> list[dict]:
         raise FileNotFoundError(f"EIDAT index DB not found: {db_path}")
     with sqlite3.connect(str(db_path)) as conn:
         conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            """
-            SELECT
-              id, program_title, asset_type, serial_number, part_number,
-              revision, test_date, report_date, document_type,
-              metadata_rel, artifacts_rel, similarity_group
-            FROM documents
-            ORDER BY program_title, asset_type, serial_number, metadata_rel
-            """
-        ).fetchall()
+        try:
+            rows = conn.execute(
+                """
+                SELECT
+                  id, program_title, asset_type, serial_number, part_number,
+                  revision, test_date, report_date, document_type,
+                  document_type_acronym, vendor, acceptance_test_plan_number,
+                  metadata_rel, artifacts_rel, similarity_group
+                FROM documents
+                ORDER BY program_title, asset_type, serial_number, metadata_rel
+                """
+            ).fetchall()
+        except sqlite3.OperationalError:
+            # Back-compat with older index schema (no vendor/doc_type_acronym/ATP cols).
+            rows = conn.execute(
+                """
+                SELECT
+                  id, program_title, asset_type, serial_number, part_number,
+                  revision, test_date, report_date, document_type,
+                  metadata_rel, artifacts_rel, similarity_group
+                FROM documents
+                ORDER BY program_title, asset_type, serial_number, metadata_rel
+                """
+            ).fetchall()
     docs: list[dict] = []
     for r in rows:
-        docs.append({k: r[k] for k in r.keys()})
+        d = {k: r[k] for k in r.keys()}
+        d.setdefault("document_type_acronym", None)
+        d.setdefault("vendor", None)
+        d.setdefault("acceptance_test_plan_number", None)
+        docs.append(d)
     return docs
 
 
@@ -3044,10 +3499,52 @@ def list_eidat_projects(global_repo: Path) -> list[dict]:
         return []
     if not isinstance(data, list):
         return []
+
+    repo = Path(global_repo).expanduser()
+    projects_root = eidat_projects_root(repo)
+
     out: list[dict] = []
+    removed = 0
     for p in data:
-        if isinstance(p, dict):
-            out.append(p)
+        if not isinstance(p, dict):
+            continue
+
+        # Prune entries when users manually delete folders/files from disk but leave registry stale.
+        try:
+            raw_dir = str(p.get("project_dir") or "").strip()
+        except Exception:
+            raw_dir = ""
+        if raw_dir:
+            proj_path = Path(raw_dir).expanduser()
+            if not proj_path.is_absolute():
+                proj_path = repo / proj_path
+            try:
+                proj_res = proj_path.resolve()
+            except Exception:
+                proj_res = proj_path.absolute()
+            try:
+                root_res = projects_root.resolve()
+            except Exception:
+                root_res = projects_root.absolute()
+            try:
+                # Only accept projects that live under EIDAT Support/projects and still exist on disk.
+                proj_res.relative_to(root_res)
+                if not proj_res.exists():
+                    removed += 1
+                    continue
+            except Exception:
+                removed += 1
+                continue
+
+        out.append(p)
+
+    if removed:
+        # Best-effort self-heal so GUI reflects disk state immediately.
+        try:
+            _write_projects_registry(repo, out)
+        except Exception:
+            pass
+
     return out
 
 
@@ -3113,6 +3610,25 @@ def _mirror_project_to_local(project_dir: Path, *, project_name: str) -> Path:
     dest_root = local_projects_mirror_root()
     dest_root.mkdir(parents=True, exist_ok=True)
     dest = dest_root / _safe_project_slug(project_name)
+
+    # Safety: if the "local mirror" resolves into the same folder as the source
+    # (e.g., when global_run_mirror is a junction into the Global Repo), do not delete/copy.
+    try:
+        src_res = src.resolve()
+    except Exception:
+        src_res = src.absolute()
+    try:
+        dest_res = dest.resolve()
+    except Exception:
+        dest_res = dest.absolute()
+
+    try:
+        if src_res == dest_res or src_res in dest_res.parents or dest_res in src_res.parents:
+            return dest
+    except Exception:
+        # If we can't safely compare, proceed without deleting anything.
+        pass
+
     if dest.exists():
         shutil.rmtree(dest, ignore_errors=True)
     dest.mkdir(parents=True, exist_ok=True)
@@ -3136,6 +3652,33 @@ def _safe_project_slug(name: str) -> str:
     return cleaned or "New Project"
 
 
+def _ensure_file_written(path: Path, *, create_fn) -> None:
+    """
+    Ensure a file exists by attempting to create it (best-effort) and verifying via stat/open.
+
+    `create_fn` should write the file to `path`.
+    """
+    try:
+        if path.exists():
+            # Verify it's actually readable (guards against edge cases where exists() lies).
+            with path.open("rb"):
+                return
+    except Exception:
+        pass
+
+    try:
+        create_fn()
+    except Exception:
+        # We'll verify below and raise a clear error if still missing.
+        pass
+
+    try:
+        with path.open("rb"):
+            return
+    except Exception as exc:
+        raise RuntimeError(f"Failed to create file: {path} ({exc})") from exc
+
+
 def _write_eidp_trending_workbook(path: Path, *, serials: list[str], docs: list[dict] | None = None) -> None:
     """
     Create a blank EIDP trending workbook with header row and serial columns.
@@ -3149,6 +3692,7 @@ def _write_eidp_trending_workbook(path: Path, *, serials: list[str], docs: list[
     try:
         from openpyxl import Workbook  # type: ignore
         from openpyxl.worksheet.datavalidation import DataValidation  # type: ignore
+        from openpyxl.utils import get_column_letter  # type: ignore
     except Exception as exc:
         raise RuntimeError(
             "openpyxl is required to create the EIDP Trending workbook. "
@@ -3168,12 +3712,13 @@ def _write_eidp_trending_workbook(path: Path, *, serials: list[str], docs: list[
         max_rows = 500  # Reasonable limit for manual entry
         dv = DataValidation(type="list", formula1='"auto,string,number"', allow_blank=True, showDropDown=True)
         ws.add_data_validation(dv)
-        dv.add(f"{ws.cell(2, value_type_col).coordinate}:{ws.cell(max_rows, value_type_col).coordinate}")
+        col_letter = get_column_letter(int(value_type_col))
+        dv.add(f"{col_letter}2:{col_letter}{int(max_rows)}")
     except Exception:
         pass
 
-    # Add metadata rows to master sheet (Part Number, Revision, Test Date, Report Date)
-    # These appear as the first rows before any term data
+    # Add metadata rows to master sheet.
+    # These appear as the first rows before any term data (both manual + auto-populate flows).
     if docs:
         # Build serial -> best doc mapping
         docs_by_serial: dict[str, dict] = {}
@@ -3185,10 +3730,17 @@ def _write_eidp_trending_workbook(path: Path, *, serials: list[str], docs: list[
         # Metadata fields to add as rows in master sheet
         # Format: (term_name, doc_field, term_label)
         metadata_fields = [
+            ("Program", "program_title", "Program"),
+            ("Asset Type", "asset_type", "Asset Type"),
+            ("Vendor", "vendor", "Vendor"),
+            ("Acceptance Test Plan", "acceptance_test_plan_number", "Acceptance Test Plan"),
             ("Part Number", "part_number", "Part Number"),
             ("Revision", "revision", "Revision Letter"),
             ("Test Date", "test_date", "Test Date"),
             ("Report Date", "report_date", "Report Date"),
+            ("Document Type", "document_type", "Document Type"),
+            ("Document Acronym", "document_type_acronym", "Document Acronym"),
+            ("Similarity Group", "similarity_group", "Similarity Group"),
         ]
 
         for term_name, doc_field, term_label in metadata_fields:
@@ -3205,6 +3757,21 @@ def _write_eidp_trending_workbook(path: Path, *, serials: list[str], docs: list[
     # Create metadata sheet with full document info for each serial (for reference)
     ws_meta = wb.create_sheet("metadata")
     meta_headers = ["Serial Number", "Program", "Asset Type", "Part Number", "Revision", "Test Date", "Report Date", "Document Type", "Similarity Group"]
+    # Keep metadata sheet ordered similarly to master-sheet metadata rows.
+    meta_headers = [
+        "Serial Number",
+        "Program",
+        "Asset Type",
+        "Vendor",
+        "Acceptance Test Plan",
+        "Part Number",
+        "Revision",
+        "Test Date",
+        "Report Date",
+        "Document Type",
+        "Document Acronym",
+        "Similarity Group",
+    ]
     ws_meta.append(meta_headers)
 
     if docs:
@@ -3216,11 +3783,14 @@ def _write_eidp_trending_workbook(path: Path, *, serials: list[str], docs: list[
                 sn_clean,
                 str(doc.get("program_title") or ""),
                 str(doc.get("asset_type") or ""),
+                str(doc.get("vendor") or ""),
+                str(doc.get("acceptance_test_plan_number") or ""),
                 str(doc.get("part_number") or ""),
                 str(doc.get("revision") or ""),
                 str(doc.get("test_date") or ""),
                 str(doc.get("report_date") or ""),
                 str(doc.get("document_type") or ""),
+                str(doc.get("document_type_acronym") or ""),
                 str(doc.get("similarity_group") or ""),
             ])
 
@@ -3239,7 +3809,7 @@ def _extract_acceptance_data_for_serial(
     artifacts_rel: str,
 ) -> dict[str, dict]:
     """
-    Extract acceptance test data from combined.txt using term_value_extractor.
+    Extract acceptance test data from extracted_terms.db (preferred) or combined.txt (fallback).
 
     Returns dict of term -> {value, units, requirement_type, min, max, result, computed_pass}
     """
@@ -3252,13 +3822,101 @@ def _extract_acceptance_data_for_serial(
     if not art_dir or not art_dir.exists():
         return {}
 
+    # Preferred: extracted_terms.db produced by term_value_extractor during processing
+    db_path = art_dir / "extracted_terms.db"
+    if db_path.exists():
+        try:
+            term_data: dict[str, dict] = {}
+            with sqlite3.connect(str(db_path)) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    """
+                    SELECT term, description,
+                           requirement_type, requirement_min, requirement_max, requirement_raw,
+                           measured_value, measured_raw, units, result, computed_pass
+                    FROM acceptance_tests
+                    ORDER BY term
+                    """
+                ).fetchall()
+            for r in rows:
+                term = str(r["term"] or "").strip()
+                if not term:
+                    continue
+                term_data[term] = {
+                    "value": r["measured_value"],
+                    "raw": r["measured_raw"],
+                    "units": r["units"],
+                    "requirement_type": r["requirement_type"],
+                    "requirement_min": r["requirement_min"],
+                    "requirement_max": r["requirement_max"],
+                    "requirement_raw": r["requirement_raw"],
+                    "result": r["result"],
+                    "computed_pass": (None if r["computed_pass"] is None else bool(int(r["computed_pass"]))),
+                    "description": r["description"],
+                }
+            return term_data
+        except Exception:
+            # Fall back to parsing combined.txt
+            pass
+
+    # If extracted_terms.db is missing but combined.txt exists (older artifacts),
+    # try to generate the DB so Trending + certification share a single source.
     combined_path = art_dir / "combined.txt"
     if not combined_path.exists():
         return {}
 
+    if not db_path.exists():
+        try:
+            from extraction.term_value_extractor import extract_from_combined_txt
+
+            extract_from_combined_txt(combined_path, output_db=db_path, auto_project=False)
+        except Exception:
+            pass
+
+    if db_path.exists():
+        try:
+            term_data = {}
+            with sqlite3.connect(str(db_path)) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    """
+                    SELECT term, description,
+                           requirement_type, requirement_min, requirement_max, requirement_raw,
+                           measured_value, measured_raw, units, result, computed_pass
+                    FROM acceptance_tests
+                    ORDER BY term
+                    """
+                ).fetchall()
+            for r in rows:
+                term = str(r["term"] or "").strip()
+                if not term:
+                    continue
+                term_data[term] = {
+                    "value": r["measured_value"],
+                    "raw": r["measured_raw"],
+                    "units": r["units"],
+                    "requirement_type": r["requirement_type"],
+                    "requirement_min": r["requirement_min"],
+                    "requirement_max": r["requirement_max"],
+                    "requirement_raw": r["requirement_raw"],
+                    "result": r["result"],
+                    "computed_pass": (None if r["computed_pass"] is None else bool(int(r["computed_pass"]))),
+                    "description": r["description"],
+                }
+            return term_data
+        except Exception:
+            pass
+
+    # Last resort: parse combined.txt directly (no DB write access / parsing errors)
     try:
         content = combined_path.read_text(encoding="utf-8", errors="ignore")
-        parser = CombinedTxtParser(content)
+        heuristics = None
+        try:
+            if DEFAULT_ACCEPTANCE_HEURISTICS.exists():
+                heuristics = json.loads(DEFAULT_ACCEPTANCE_HEURISTICS.read_text(encoding="utf-8", errors="ignore"))
+        except Exception:
+            heuristics = None
+        parser = CombinedTxtParser(content, heuristics=heuristics)
         result = parser.parse()
 
         term_data = {}
@@ -3429,9 +4087,18 @@ def create_eidat_project(
     if project_type != EIDAT_PROJECT_TYPE_TRENDING:
         raise RuntimeError(f"Unsupported project type: {project_type}")
 
-    # Create workbook with header row, serial columns, and metadata sheet
-    # Metadata sheet is always populated regardless of auto_populate setting
-    _write_eidp_trending_workbook(workbook_path, serials=serials, docs=chosen_docs)
+    # Create workbook with header row, serial columns, and metadata sheet.
+    # Metadata sheet is always populated regardless of auto_populate setting.
+    _ensure_file_written(
+        workbook_path,
+        create_fn=lambda: _write_eidp_trending_workbook(workbook_path, serials=serials, docs=chosen_docs),
+    )
+
+    # Best-effort: build a project-local SQLite cache for Implementation/Trending.
+    try:
+        ensure_trending_project_sqlite(project_dir, workbook_path)
+    except Exception:
+        pass
 
     # Auto-populate: extract terms and values from combined.txt
     auto_populate_result = None
@@ -3465,7 +4132,11 @@ def create_eidat_project(
         "auto_populate": auto_populate_result,
         "population_mode": "auto" if auto_populate else "blank",
     }
-    (project_dir / EIDAT_PROJECT_META).write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    meta_path = project_dir / EIDAT_PROJECT_META
+    _ensure_file_written(
+        meta_path,
+        create_fn=lambda: meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8"),
+    )
     try:
         _mirror_project_to_local(project_dir, project_name=safe_name)
     except Exception:

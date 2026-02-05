@@ -48,6 +48,36 @@ EXCEL_EXTENSIONS = {".xlsx", ".xls", ".xlsm"}
 EXCEL_ARTIFACT_SUFFIX = "__excel"
 
 
+def _export_extracted_terms_db(artifacts_dir: Path, combined_txt_path: Path) -> None:
+    """
+    Create/refresh `extracted_terms.db` in an artifacts folder from `combined.txt`.
+
+    This enables downstream certification analysis (which expects extracted_terms.db).
+    """
+    try:
+        from extraction.term_value_extractor import extract_from_combined_txt
+    except Exception:
+        return
+
+    try:
+        if not combined_txt_path.exists():
+            return
+        db_path = artifacts_dir / "extracted_terms.db"
+        try:
+            db_path.unlink(missing_ok=True)  # type: ignore[call-arg]
+        except TypeError:
+            if db_path.exists():
+                db_path.unlink()
+        except Exception:
+            # If we can't delete, try exporting anyway (schema is CREATE IF NOT EXISTS).
+            pass
+
+        extract_from_combined_txt(combined_txt_path, output_db=db_path, auto_project=False)
+    except Exception:
+        # Best-effort; extraction should still succeed without this DB.
+        return
+
+
 def _load_excel_extractor() -> Any:
     """Load the Excel extraction helper module from scripts/."""
     project_root = Path(__file__).resolve().parent.parent
@@ -187,7 +217,7 @@ def _run_debug_method_extraction(pdf_path: Path, dpi: int | None, output_dir: Pa
         sys.path.insert(0, str(project_root))
 
     try:
-        from extraction import ocr_engine, token_projector, page_analyzer, chart_detection, debug_exporter
+        from extraction import ocr_engine, token_projector, page_analyzer, debug_exporter
     except ImportError as e:
         raise RuntimeError(f"Unable to import extraction modules: {e}") from e
 
@@ -371,8 +401,11 @@ def _run_debug_method_extraction(pdf_path: Path, dpi: int | None, output_dir: Pa
         flow_data = page_analyzer.extract_flow_text(flow_tokens, fused_tables, det_w, det_h)
 
         charts: List[Dict] = []
-        if det_img is not None:
+        enable_charts = _parse_bool_env("EIDAT_ENABLE_CHART_EXTRACTION", True)
+        if enable_charts and det_img is not None:
             try:
+                from extraction import chart_detection
+
                 charts = chart_detection.detect_charts(
                     det_img, flow_tokens, fused_tables, det_w, det_h, flow_data
                 )
@@ -463,7 +496,10 @@ def _derive_excel_metadata(excel_mod: Any, excel_path: Path) -> dict:
         "revision": "Unknown",
         "test_date": "Unknown",
         "report_date": "Unknown",
-        "document_type": "Excel file data",
+        "document_type": "Data file",
+        "document_type_acronym": "DATA",
+        "vendor": "Unknown",
+        "acceptance_test_plan_number": "Unknown",
     }
 
 
@@ -592,7 +628,7 @@ def process_candidates(
                         )
                         artifacts_dir = str(artifacts_root)
                         raw_meta = _derive_excel_metadata(excel_mod, abs_path)
-                        clean_meta = sanitize_metadata(raw_meta, default_document_type="Excel file data")
+                        clean_meta = sanitize_metadata(raw_meta, default_document_type="Data file")
                         metadata_path = write_metadata(Path(artifacts_dir), abs_path, clean_meta)
                     else:
                         core = _get_core()
@@ -600,6 +636,7 @@ def process_candidates(
                         res = _run_clean_extraction(abs_path, dpi=dpi, output_dir=paths.support_dir)
 
                         combined_text = ""
+                        combined_txt_path: Path | None = None
                         try:
                             artifacts_dir = str(res.get("dir") or res.get("target_dir") or "")
                             artifacts_dir = artifacts_dir or None
@@ -608,9 +645,14 @@ def process_candidates(
                         try:
                             combined_path = res.get("combined")
                             if combined_path:
+                                combined_txt_path = Path(combined_path)
                                 combined_text = Path(combined_path).read_text(encoding="utf-8", errors="ignore")
                         except Exception:
                             combined_text = ""
+                            combined_txt_path = None
+
+                        if artifacts_dir and combined_txt_path is not None:
+                            _export_extracted_terms_db(Path(artifacts_dir), combined_txt_path)
                         raw_meta = extract_metadata_from_text(combined_text, pdf_path=abs_path) if combined_text else None
                         if raw_meta is None:
                             raw_meta = load_metadata_for_pdf(abs_path)

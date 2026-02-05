@@ -4,6 +4,8 @@ import re
 import shutil
 import sys
 import threading
+import math
+import statistics
 from pathlib import Path
 from typing import Callable
 
@@ -1481,6 +1483,403 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
     def showEvent(self, event: QtGui.QShowEvent) -> None:  # type: ignore[override]
         super().showEvent(event)
         _fit_widget_to_screen(self)
+
+
+class ImplementationTrendDialog(QtWidgets.QDialog):
+    def __init__(self, project_dir: Path, workbook_path: Path, parent=None):
+        super().__init__(parent)
+        self._project_dir = Path(project_dir).expanduser()
+        self._workbook_path = Path(workbook_path).expanduser()
+        self._db_path: Path | None = None
+        self._serials: list[str] = []
+        self._terms: list[dict] = []
+        self._plot_ready = False
+
+        self.setWindowTitle("Implementation - Trend / Analyze Data")
+        self.resize(1080, 720)
+        self.setStyleSheet(
+            """
+            QDialog {
+                background: #f8fafc;
+                color: #0f172a;
+            }
+            QLabel {
+                color: #0f172a;
+            }
+            QListWidget {
+                background: #ffffff;
+                border: 1px solid #e2e8f0;
+                border-radius: 8px;
+                padding: 6px;
+            }
+            QListWidget::item {
+                color: #0f172a;
+                padding: 4px 6px;
+            }
+            QListWidget::item:selected {
+                background: #dbeafe;
+                color: #1e3a8a;
+            }
+            QTableWidget {
+                background: #ffffff;
+                border: 1px solid #e2e8f0;
+                border-radius: 8px;
+                gridline-color: #e2e8f0;
+            }
+            QTableWidget::item {
+                color: #0f172a;
+            }
+            QHeaderView::section {
+                background: #f1f5f9;
+                color: #0f172a;
+                padding: 6px 8px;
+                border: 1px solid #e2e8f0;
+                font-weight: 600;
+            }
+            """
+        )
+
+        root = QtWidgets.QHBoxLayout(self)
+        root.setContentsMargins(16, 16, 16, 16)
+        root.setSpacing(16)
+
+        splitter = QtWidgets.QSplitter()
+        splitter.setOrientation(QtCore.Qt.Orientation.Horizontal)
+        root.addWidget(splitter)
+
+        # Left: term selection
+        left = QtWidgets.QFrame()
+        left.setStyleSheet(
+            "QFrame { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 10px; }"
+        )
+        left_layout = QtWidgets.QVBoxLayout(left)
+        left_layout.setContentsMargins(12, 12, 12, 12)
+        left_layout.setSpacing(10)
+
+        lbl = QtWidgets.QLabel("Select Terms")
+        lbl.setStyleSheet("font-size: 14px; font-weight: 700;")
+        left_layout.addWidget(lbl)
+
+        self.ed_filter_terms = QtWidgets.QLineEdit()
+        self.ed_filter_terms.setPlaceholderText("Filter terms (e.g., OPEN_T)")
+        self.ed_filter_terms.textChanged.connect(self._apply_term_filter)
+        left_layout.addWidget(self.ed_filter_terms)
+
+        self.list_terms = QtWidgets.QListWidget()
+        self.list_terms.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.list_terms.itemSelectionChanged.connect(self._on_term_selection_changed)
+        left_layout.addWidget(self.list_terms, 1)
+
+        select_row = QtWidgets.QHBoxLayout()
+        self.btn_select_all = QtWidgets.QPushButton("Select All")
+        self.btn_clear_all = QtWidgets.QPushButton("Clear")
+        for b in (self.btn_select_all, self.btn_clear_all):
+            b.setStyleSheet(
+                """
+                QPushButton {
+                    padding: 6px 10px;
+                    border-radius: 6px;
+                    background: #ffffff;
+                    color: #1f2937;
+                    border: 1px solid #cbd5e1;
+                    font-size: 12px;
+                    font-weight: 600;
+                }
+                QPushButton:hover { background: #f8fafc; }
+                """
+            )
+        self.btn_select_all.clicked.connect(self._select_all_terms)
+        self.btn_clear_all.clicked.connect(self._clear_all_terms)
+        select_row.addWidget(self.btn_select_all)
+        select_row.addWidget(self.btn_clear_all)
+        left_layout.addLayout(select_row)
+
+        self.btn_plot = QtWidgets.QPushButton("Plot Selected Terms")
+        self.btn_plot.setEnabled(False)
+        self.btn_plot.setStyleSheet(
+            """
+            QPushButton {
+                padding: 10px 14px;
+                border-radius: 8px;
+                background: #0f766e;
+                color: #ffffff;
+                border: 1px solid #0f766e;
+                font-size: 13px;
+                font-weight: 700;
+            }
+            QPushButton:hover { background: #0d9488; }
+            QPushButton:disabled { background: #94a3b8; border-color: #94a3b8; }
+            """
+        )
+        self.btn_plot.clicked.connect(self._plot_selected_terms)
+        left_layout.addWidget(self.btn_plot)
+
+        splitter.addWidget(left)
+
+        # Right: plot + stats
+        right = QtWidgets.QFrame()
+        right.setStyleSheet(
+            "QFrame { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 10px; }"
+        )
+        right_layout = QtWidgets.QVBoxLayout(right)
+        right_layout.setContentsMargins(12, 12, 12, 12)
+        right_layout.setSpacing(10)
+
+        header_row = QtWidgets.QHBoxLayout()
+        title = QtWidgets.QLabel("Trend Plot")
+        title.setStyleSheet("font-size: 14px; font-weight: 700;")
+        self.lbl_source = QtWidgets.QLabel("")
+        self.lbl_source.setStyleSheet("color: #64748b; font-size: 11px;")
+        header_row.addWidget(title)
+        header_row.addStretch(1)
+        header_row.addWidget(self.lbl_source)
+        right_layout.addLayout(header_row)
+
+        self.plot_container = QtWidgets.QFrame()
+        plot_layout = QtWidgets.QVBoxLayout(self.plot_container)
+        plot_layout.setContentsMargins(0, 0, 0, 0)
+
+        self._canvas = None
+        self._figure = None
+        self._axes = None
+        self._init_plot_area(plot_layout)
+        right_layout.addWidget(self.plot_container, 2)
+
+        stats_label = QtWidgets.QLabel("Analysis Summary")
+        stats_label.setStyleSheet("font-size: 13px; font-weight: 700;")
+        right_layout.addWidget(stats_label)
+
+        cols = [
+            "Term",
+            "Count",
+            "Mean",
+            "Std",
+            "Min",
+            "Max",
+            "Min Limit",
+            "Max Limit",
+            "Exceed Low",
+            "Exceed High",
+            "Exceed SNs",
+        ]
+        self.tbl_stats = QtWidgets.QTableWidget(0, len(cols))
+        self.tbl_stats.setHorizontalHeaderLabels(cols)
+        self.tbl_stats.verticalHeader().setVisible(False)
+        self.tbl_stats.setAlternatingRowColors(True)
+        self.tbl_stats.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
+        self.tbl_stats.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.tbl_stats.horizontalHeader().setStretchLastSection(True)
+        right_layout.addWidget(self.tbl_stats, 1)
+
+        splitter.addWidget(right)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 3)
+
+        self._load_terms()
+
+    def _init_plot_area(self, layout: QtWidgets.QVBoxLayout) -> None:
+        try:
+            from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+            from matplotlib.figure import Figure
+
+            self._figure = Figure(figsize=(8, 4), dpi=100)
+            self._axes = self._figure.add_subplot(111)
+            self._axes.set_facecolor("#ffffff")
+            self._figure.patch.set_facecolor("#ffffff")
+            self._canvas = FigureCanvas(self._figure)
+            layout.addWidget(self._canvas)
+            self._plot_ready = True
+        except Exception as exc:
+            self._plot_ready = False
+            label = QtWidgets.QLabel(
+                "Plotting unavailable. Install matplotlib to enable charts.\n"
+                f"Details: {exc}"
+            )
+            label.setWordWrap(True)
+            label.setStyleSheet("color: #b91c1c; font-size: 12px;")
+            layout.addWidget(label)
+
+    def _load_terms(self) -> None:
+        try:
+            self._db_path = be.ensure_trending_project_sqlite(self._project_dir, self._workbook_path)
+            self._serials = be.load_trending_project_serials(self._db_path)
+            self._terms = be.load_trending_project_terms(self._db_path)
+            self.lbl_source.setText(str(self._db_path))
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Implementation", str(exc))
+            return
+
+        self.list_terms.clear()
+        for t in self._terms:
+            term = str(t.get("term") or "").strip()
+            label = str(t.get("term_label") or "").strip()
+            units = str(t.get("units") or "").strip()
+            display = label if label else term
+            if units:
+                display = f"{display} ({units})"
+            if not display:
+                display = term
+            item = QtWidgets.QListWidgetItem(display)
+            item.setData(QtCore.Qt.ItemDataRole.UserRole, t)
+            self.list_terms.addItem(item)
+
+        if self.list_terms.count() == 0:
+            self.list_terms.addItem("No terms available in this project workbook.")
+            self.list_terms.setEnabled(False)
+        else:
+            self.list_terms.setEnabled(True)
+
+    def _apply_term_filter(self) -> None:
+        needle = (self.ed_filter_terms.text() or "").strip().lower()
+        for i in range(self.list_terms.count()):
+            item = self.list_terms.item(i)
+            text = item.text().lower()
+            item.setHidden(bool(needle) and needle not in text)
+
+    def _on_term_selection_changed(self) -> None:
+        selected = self.list_terms.selectedItems()
+        self.btn_plot.setEnabled(bool(selected) and self._plot_ready)
+
+    def _select_all_terms(self) -> None:
+        if not self.list_terms.isEnabled():
+            return
+        self.list_terms.selectAll()
+
+    def _clear_all_terms(self) -> None:
+        self.list_terms.clearSelection()
+
+    def _plot_selected_terms(self) -> None:
+        if not self._plot_ready or not self._db_path:
+            return
+        items = self.list_terms.selectedItems()
+        if not items:
+            return
+
+        if not self._serials:
+            QtWidgets.QMessageBox.information(self, "Implementation", "No serials found in the project workbook.")
+            return
+
+        term_payloads = []
+        for item in items:
+            payload = item.data(QtCore.Qt.ItemDataRole.UserRole) or {}
+            term_key = str(payload.get("term_key") or "").strip()
+            if term_key:
+                term_payloads.append(payload)
+
+        if not term_payloads:
+            return
+
+        self._axes.clear()
+        self._axes.set_title("Trend Plot")
+        self._axes.set_xlabel("Serial Number")
+        self._axes.set_ylabel("Value")
+
+        x = list(range(len(self._serials)))
+
+        stats_rows: list[dict] = []
+        for payload in term_payloads:
+            term_key = str(payload.get("term_key") or "").strip()
+            term_name = str(payload.get("term_label") or payload.get("term") or "").strip() or "Term"
+            min_limit = payload.get("min_val")
+            max_limit = payload.get("max_val")
+            units = str(payload.get("units") or "").strip()
+            if units:
+                term_name = f"{term_name} ({units})"
+
+            series = be.load_trending_project_series(self._db_path, term_key)
+            values_num: list[float | None] = []
+            serials: list[str] = []
+            for row in series:
+                serials.append(str(row.get("serial") or ""))
+                values_num.append(row.get("value_num"))
+
+            y = [v if v is not None else float("nan") for v in values_num]
+            line = self._axes.plot(x, y, marker="o", linewidth=1.6, label=term_name)[0]
+            color = line.get_color()
+
+            if min_limit is not None:
+                self._axes.axhline(float(min_limit), color=color, linestyle="--", alpha=0.4)
+            if max_limit is not None:
+                self._axes.axhline(float(max_limit), color=color, linestyle="--", alpha=0.4)
+
+            numeric_values = [v for v in values_num if isinstance(v, (int, float)) and not math.isnan(float(v))]
+            if numeric_values:
+                mean_val = statistics.mean(numeric_values)
+                std_val = statistics.pstdev(numeric_values) if len(numeric_values) > 1 else 0.0
+                min_val = min(numeric_values)
+                max_val = max(numeric_values)
+            else:
+                mean_val = None
+                std_val = None
+                min_val = None
+                max_val = None
+
+            exceed_low = []
+            exceed_high = []
+            for sn, val in zip(self._serials, values_num):
+                if val is None:
+                    continue
+                if min_limit is not None and val < float(min_limit):
+                    exceed_low.append(sn)
+                if max_limit is not None and val > float(max_limit):
+                    exceed_high.append(sn)
+
+            stats_rows.append(
+                {
+                    "term": term_name,
+                    "count": len(numeric_values),
+                    "mean": mean_val,
+                    "std": std_val,
+                    "min": min_val,
+                    "max": max_val,
+                    "min_limit": min_limit,
+                    "max_limit": max_limit,
+                    "exceed_low": len(exceed_low),
+                    "exceed_high": len(exceed_high),
+                    "exceed_sns": ", ".join(sorted(set(exceed_low + exceed_high))),
+                }
+            )
+
+        self._axes.set_xticks(x)
+        self._axes.set_xticklabels(self._serials, rotation=45, ha="right", fontsize=8)
+        self._axes.grid(True, alpha=0.25)
+        if len(term_payloads) > 1:
+            self._axes.legend(fontsize=8, loc="best")
+        self._figure.tight_layout()
+        self._canvas.draw()
+
+        self._populate_stats(stats_rows)
+
+    def _populate_stats(self, rows: list[dict]) -> None:
+        self.tbl_stats.setRowCount(0)
+        for r, row in enumerate(rows):
+            self.tbl_stats.insertRow(r)
+            values = [
+                row.get("term", ""),
+                row.get("count", ""),
+                self._fmt_num(row.get("mean")),
+                self._fmt_num(row.get("std")),
+                self._fmt_num(row.get("min")),
+                self._fmt_num(row.get("max")),
+                self._fmt_num(row.get("min_limit")),
+                self._fmt_num(row.get("max_limit")),
+                row.get("exceed_low", ""),
+                row.get("exceed_high", ""),
+                row.get("exceed_sns", ""),
+            ]
+            for c, v in enumerate(values):
+                item = QtWidgets.QTableWidgetItem(str(v))
+                self.tbl_stats.setItem(r, c, item)
+        self.tbl_stats.resizeColumnsToContents()
+
+    @staticmethod
+    def _fmt_num(value: object | None) -> str:
+        if value is None:
+            return ""
+        try:
+            return f"{float(value):.4g}"
+        except Exception:
+            return str(value)
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -3102,11 +3501,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_files_open_metadata = QtWidgets.QPushButton("Open Metadata")
         self.btn_files_open_artifacts = QtWidgets.QPushButton("Open Artifacts")
         self.btn_files_show_explorer = QtWidgets.QPushButton("Show in Explorer")
+        self.btn_files_update_metadata = QtWidgets.QPushButton("Update Metadata")
         self.btn_files_certify_all = QtWidgets.QPushButton("Certify All")
 
         for b in (self.btn_files_open_pdf, self.btn_files_open_metadata,
                   self.btn_files_open_artifacts, self.btn_files_show_explorer,
-                  self.btn_files_certify_all):
+                  self.btn_files_update_metadata, self.btn_files_certify_all):
             b.setStyleSheet("""
                 QPushButton {
                     padding: 8px 14px;
@@ -3124,12 +3524,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_files_open_metadata.clicked.connect(self._act_files_open_metadata)
         self.btn_files_open_artifacts.clicked.connect(self._act_files_open_artifacts)
         self.btn_files_show_explorer.clicked.connect(self._act_files_show_explorer)
+        self.btn_files_update_metadata.clicked.connect(self._act_files_update_metadata)
         self.btn_files_certify_all.clicked.connect(self._act_files_certify_all)
 
         actions.addWidget(self.btn_files_open_pdf)
         actions.addWidget(self.btn_files_open_metadata)
         actions.addWidget(self.btn_files_open_artifacts)
         actions.addWidget(self.btn_files_show_explorer)
+        actions.addWidget(self.btn_files_update_metadata)
         actions.addWidget(self.btn_files_certify_all)
         r.addLayout(actions)
 
@@ -3206,6 +3608,39 @@ class MainWindow(QtWidgets.QMainWindow):
 
         l.addWidget(self.btn_project_new)
         l.addWidget(self.btn_project_refresh)
+
+        impl_divider = QtWidgets.QFrame()
+        impl_divider.setFrameShape(QtWidgets.QFrame.Shape.HLine)
+        impl_divider.setStyleSheet("background-color: #e5e7eb; margin: 8px 0;")
+        l.addWidget(impl_divider)
+
+        impl_lbl = QtWidgets.QLabel("Implementation")
+        impl_lbl.setStyleSheet("font-size: 13px; font-weight: 700; color: #0f172a;")
+        impl_desc = QtWidgets.QLabel("Trend / analyze data for a selected EIDP Trending project.")
+        impl_desc.setStyleSheet("font-size: 11px; color: #475569;")
+        impl_desc.setWordWrap(True)
+        l.addWidget(impl_lbl)
+        l.addWidget(impl_desc)
+
+        self.btn_project_implementation = QtWidgets.QPushButton("Trend / Analyze Data")
+        self.btn_project_implementation.setEnabled(False)
+        self.btn_project_implementation.setStyleSheet(
+            """
+            QPushButton {
+                padding: 10px 14px;
+                border-radius: 8px;
+                background: #0f766e;
+                color: #ffffff;
+                border: 1px solid #0f766e;
+                font-size: 13px;
+                font-weight: 700;
+            }
+            QPushButton:hover { background: #0d9488; }
+            QPushButton:disabled { background: #94a3b8; border-color: #94a3b8; }
+            """
+        )
+        self.btn_project_implementation.clicked.connect(self._act_open_project_implementation)
+        l.addWidget(self.btn_project_implementation)
         l.addStretch(1)
 
         self.lbl_projects_hint = QtWidgets.QLabel("Tip: run 'Index' first to populate metadata.")
@@ -3269,6 +3704,7 @@ class MainWindow(QtWidgets.QMainWindow):
             }
             """
         )
+        self.tbl_projects.itemSelectionChanged.connect(self._update_project_actions)
         self.tbl_projects.doubleClicked.connect(self._act_open_project_workbook)
         r.addWidget(self.tbl_projects, 1)
 
@@ -3321,6 +3757,7 @@ class MainWindow(QtWidgets.QMainWindow):
         tbl.setRowCount(0)
         if not repo_raw:
             self.lbl_projects_status.setText("Select a Global Repo in Setup")
+            self._update_project_actions()
             return
 
         repo = Path(repo_raw).expanduser()
@@ -3355,6 +3792,7 @@ class MainWindow(QtWidgets.QMainWindow):
         tbl.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Stretch)
         tbl.horizontalHeader().setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.Stretch)
         self.lbl_projects_status.setText(f"{len(projects)} project(s)")
+        self._update_project_actions()
 
     def _act_new_project(self) -> None:
         try:
@@ -3379,6 +3817,29 @@ class MainWindow(QtWidgets.QMainWindow):
             return None
         return tbl.item(row, col)
 
+    def _selected_project_record(self) -> dict | None:
+        item_name = self._selected_project_item(0)
+        item_type = self._selected_project_item(1)
+        item_folder = self._selected_project_item(2)
+        item_workbook = self._selected_project_item(3)
+        if not item_name or not item_type or not item_folder or not item_workbook:
+            return None
+        return {
+            "name": (item_name.text() or "").strip(),
+            "type": (item_type.text() or "").strip(),
+            "folder": str(item_folder.data(QtCore.Qt.ItemDataRole.UserRole) or item_folder.text() or "").strip(),
+            "workbook": str(item_workbook.data(QtCore.Qt.ItemDataRole.UserRole) or item_workbook.text() or "").strip(),
+        }
+
+    def _update_project_actions(self) -> None:
+        record = self._selected_project_record()
+        is_trending = False
+        if record:
+            ptype = str(record.get("type") or "").strip()
+            is_trending = ptype == getattr(be, "EIDAT_PROJECT_TYPE_TRENDING", "EIDP Trending")
+        if hasattr(self, "btn_project_implementation"):
+            self.btn_project_implementation.setEnabled(bool(record) and is_trending)
+
     def _act_open_project_folder(self) -> None:
         item = self._selected_project_item(2)
         if not item:
@@ -3398,6 +3859,28 @@ class MainWindow(QtWidgets.QMainWindow):
             be.open_path(path)
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "Open Workbook", str(exc))
+
+    def _act_open_project_implementation(self) -> None:
+        try:
+            record = self._selected_project_record()
+            if not record:
+                raise RuntimeError("Select a project in the list first.")
+            ptype = str(record.get("type") or "").strip()
+            if ptype != getattr(be, "EIDAT_PROJECT_TYPE_TRENDING", "EIDP Trending"):
+                raise RuntimeError("Implementation is available only for EIDP Trending projects.")
+
+            project_dir = Path(str(record.get("folder") or "")).expanduser()
+            workbook = Path(str(record.get("workbook") or "")).expanduser()
+            if not project_dir.exists():
+                raise RuntimeError(f"Project folder not found: {project_dir}")
+            if not workbook.exists():
+                raise RuntimeError(f"Project workbook not found: {workbook}")
+
+            dlg = ImplementationTrendDialog(project_dir, workbook, self)
+            self._prepare_dialog(dlg)
+            dlg.exec()
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Implementation", str(exc))
 
     def _act_update_project(self) -> None:
         try:
@@ -3694,6 +4177,22 @@ class MainWindow(QtWidgets.QMainWindow):
             return None
         return item.data(QtCore.Qt.ItemDataRole.UserRole)
 
+    def _selected_files_info(self) -> list[dict]:
+        """Return file info dicts for selected rows (fallback to current row)."""
+        model = self.tbl_files.selectionModel()
+        rows = {idx.row() for idx in model.selectedRows()} if model else set()
+        if not rows and self.tbl_files.currentRow() >= 0:
+            rows = {self.tbl_files.currentRow()}
+        infos: list[dict] = []
+        for row in sorted(rows):
+            item = self.tbl_files.item(row, 0)
+            if not item:
+                continue
+            info = item.data(QtCore.Qt.ItemDataRole.UserRole)
+            if isinstance(info, dict):
+                infos.append(info)
+        return infos
+
     def _act_files_open_pdf(self) -> None:
         """Open the source PDF file."""
         info = self._selected_file_info()
@@ -3763,6 +4262,50 @@ class MainWindow(QtWidgets.QMainWindow):
             be.open_path(full_path.parent)
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "Show in Explorer", str(exc))
+
+    def _act_files_update_metadata(self) -> None:
+        """Refresh metadata JSON for selected files without re-OCR."""
+        infos = self._selected_files_info()
+        if not infos:
+            QtWidgets.QMessageBox.information(self, "Update Metadata", "Select one or more files first.")
+            return
+        repo_raw = (self.ed_global_repo.text() or "").strip()
+        if not repo_raw:
+            QtWidgets.QMessageBox.warning(self, "Update Metadata", "No global repository selected.")
+            return
+        rel_paths = [str(i.get("rel_path") or "").strip() for i in infos if str(i.get("rel_path") or "").strip()]
+        if not rel_paths:
+            QtWidgets.QMessageBox.warning(self, "Update Metadata", "Selected rows are missing file paths.")
+            return
+        repo = Path(repo_raw).expanduser()
+
+        def _on_success(payload: dict):
+            ok = int(payload.get("updated") or 0)
+            failed = int(payload.get("failed") or 0)
+            results = payload.get("results") or []
+            index_error = payload.get("index_error")
+            for r in results:
+                if not r.get("ok") and r.get("error"):
+                    self._append_log(f"[METADATA] FAILED: {r.get('rel_path')}: {r.get('error')}")
+            if index_error:
+                self._append_log(f"[METADATA] Index rebuild failed: {index_error}")
+            if failed > 0:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Update Metadata",
+                    f"Updated {ok} file(s), but {failed} failed.\n\nSee Debug Console for details.",
+                )
+            else:
+                self._show_toast(f"Updated metadata for {ok} file(s).")
+            self._refresh_files_tab()
+            return f"Metadata update complete - ok={ok}, failed={failed}"
+
+        self._start_manager_action(
+            heading="Update Metadata",
+            status_text="Updating metadata",
+            task=lambda: be.refresh_metadata_only(repo, rel_paths),
+            on_success=_on_success,
+        )
 
     def _act_files_recertify(self) -> None:
         """Re-run certification analysis on selected file."""
@@ -3874,6 +4417,7 @@ class MainWindow(QtWidgets.QMainWindow):
         act_open_artifacts = menu.addAction("Open Artifacts Folder")
         menu.addSeparator()
         act_show_explorer = menu.addAction("Show in Explorer")
+        act_update_metadata = menu.addAction("Update Metadata Only")
         menu.addSeparator()
         act_recertify = menu.addAction("Re-analyze Certification")
 
@@ -3881,6 +4425,7 @@ class MainWindow(QtWidgets.QMainWindow):
         act_open_metadata.triggered.connect(self._act_files_open_metadata)
         act_open_artifacts.triggered.connect(self._act_files_open_artifacts)
         act_show_explorer.triggered.connect(self._act_files_show_explorer)
+        act_update_metadata.triggered.connect(self._act_files_update_metadata)
         act_recertify.triggered.connect(self._act_files_recertify)
 
         menu.exec(self.tbl_files.mapToGlobal(pos))

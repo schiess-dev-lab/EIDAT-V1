@@ -1,5 +1,9 @@
 {
   "program_titles": [
+    "Starlink"
+  ],
+  "vendors": [
+    "MOOG"
   ],
   "asset_types": [
     "Valve",
@@ -24,7 +28,15 @@
     "Structure"
   ],
   "document_types": [
-    "EIDP",
-    "Excel file data"
+    {
+      "name": "End Item Data Package",
+      "acronym": "EIDP",
+      "aliases": ["EIDP", "End Item Data Package", "End-Item Data Package", "Valve End Item Data Package (EIDP)"]
+    },
+    {
+      "name": "Data file",
+      "acronym": "DATA",
+      "aliases": ["Data file", "Data File", "Excel", "Spreadsheet", "Excel file data"]
+    }
   ]
 }
