@@ -1164,7 +1164,7 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
 
         title = QtWidgets.QLabel("New Project")
         title.setStyleSheet("font-size: 18px; font-weight: 700; color: #0f172a;")
-        subtitle = QtWidgets.QLabel("Projects live inside the selected Global Repo and start as a trending workbook.")
+        subtitle = QtWidgets.QLabel("Projects live inside the selected Global Repo and start as a project workbook.")
         subtitle.setStyleSheet("font-size: 12px; color: #475569;")
         v.addWidget(title)
         v.addWidget(subtitle)
@@ -1210,7 +1210,11 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
         self.ed_name.textChanged.connect(lambda _: self._update_nav())
 
         self.cb_type = QtWidgets.QComboBox()
-        self.cb_type.addItems([getattr(be, "EIDAT_PROJECT_TYPE_TRENDING", "EIDP Trending")])
+        self.cb_type.addItems([
+            getattr(be, "EIDAT_PROJECT_TYPE_TRENDING", "EIDP Trending"),
+            getattr(be, "EIDAT_PROJECT_TYPE_RAW_TRENDING", "EIDP Raw File Trending"),
+        ])
+        self.cb_type.currentIndexChanged.connect(self._on_project_type_changed)
 
         loc_row = QtWidgets.QHBoxLayout()
         self.ed_location = QtWidgets.QLineEdit(str(getattr(be, "eidat_projects_root")(self._global_repo)))
@@ -1248,6 +1252,19 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
 
         form.addRow("", self.rb_auto_populate)
         form.addRow("", self.rb_blank)
+        self._on_project_type_changed()
+
+    def _on_project_type_changed(self) -> None:
+        ptype = str(self.cb_type.currentText() or "").strip()
+        is_raw = ptype == getattr(be, "EIDAT_PROJECT_TYPE_RAW_TRENDING", "EIDP Raw File Trending")
+        if is_raw:
+            self.rb_auto_populate.setChecked(False)
+            self.rb_blank.setChecked(True)
+            self.rb_auto_populate.setEnabled(False)
+            self.rb_blank.setEnabled(False)
+        else:
+            self.rb_auto_populate.setEnabled(True)
+            self.rb_blank.setEnabled(True)
 
     def _build_page_select(self) -> None:
         v = QtWidgets.QVBoxLayout(self._page_select)
@@ -1467,6 +1484,8 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
                 raise RuntimeError("Select at least one EIDP.")
             # Two clear options: auto-populate or blank
             auto_populate = self.rb_auto_populate.isChecked()
+            if project_type == getattr(be, "EIDAT_PROJECT_TYPE_RAW_TRENDING", "EIDP Raw File Trending"):
+                auto_populate = False
             meta = getattr(be, "create_eidat_project")(
                 self._global_repo,
                 project_parent_dir=location,
@@ -3565,7 +3584,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         lbl = QtWidgets.QLabel("Project Builder")
         lbl.setStyleSheet("font-size: 14px; font-weight: 700; color: #0f172a;")
-        desc = QtWidgets.QLabel("Create projects from indexed EIDPs.\n(Current: EIDP Trending workbook)")
+        desc = QtWidgets.QLabel("Create projects from indexed EIDPs.\n(Trending or Raw File Trending workbooks)")
         desc.setStyleSheet("font-size: 11px; color: #0f172a;")
         desc.setWordWrap(True)
         l.addWidget(lbl)
@@ -3888,12 +3907,18 @@ class MainWindow(QtWidgets.QMainWindow):
             if not repo_raw:
                 raise RuntimeError("Select a Global Repo first (Setup tab).")
             repo = Path(repo_raw).expanduser()
-            item = self._selected_project_item(3)
-            if not item:
+            record = self._selected_project_record()
+            if not record:
                 raise RuntimeError("Select a project in the list first.")
-            wb_path = Path(str(item.data(QtCore.Qt.ItemDataRole.UserRole) or item.text() or "")).expanduser()
+            wb_path = Path(str(record.get("workbook") or "")).expanduser()
+            ptype = str(record.get("type") or "").strip()
             overwrite = bool(getattr(self, "cb_project_overwrite", None) and self.cb_project_overwrite.isChecked())
-            payload = be.update_eidp_trending_project_workbook(repo, wb_path, overwrite=overwrite)
+            if ptype == getattr(be, "EIDAT_PROJECT_TYPE_TRENDING", "EIDP Trending"):
+                payload = be.update_eidp_trending_project_workbook(repo, wb_path, overwrite=overwrite)
+            elif ptype == getattr(be, "EIDAT_PROJECT_TYPE_RAW_TRENDING", "EIDP Raw File Trending"):
+                payload = be.update_eidp_raw_trending_project_workbook(repo, wb_path, overwrite=overwrite)
+            else:
+                raise RuntimeError(f"Unsupported project type: {ptype}")
             updated = int(payload.get("updated_cells") or 0)
             missing_src = int(payload.get("missing_source") or 0)
             missing_val = int(payload.get("missing_value") or 0)

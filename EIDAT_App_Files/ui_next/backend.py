@@ -1997,6 +1997,7 @@ EIDAT_PROJECTS_DIRNAME = "projects"
 EIDAT_PROJECTS_REGISTRY = "projects.json"
 EIDAT_PROJECT_META = "project.json"
 EIDAT_PROJECT_TYPE_TRENDING = "EIDP Trending"
+EIDAT_PROJECT_TYPE_RAW_TRENDING = "EIDP Raw File Trending"
 EIDAT_PROJECT_IMPLEMENTATION_DB = "implementation_trending.sqlite3"
 GLOBAL_RUN_MIRROR_DIRNAME = "global_run_mirror"
 LOCAL_PROJECTS_MIRROR_DIRNAME = "projects"
@@ -3841,6 +3842,513 @@ def update_eidp_trending_project_workbook(
     }
 
 
+def update_eidp_raw_trending_project_workbook(
+    global_repo: Path,
+    workbook_path: Path,
+    *,
+    overwrite: bool = False,
+    window_lines: int = 600,
+) -> dict:
+    """Update a raw trending workbook by extracting from combined.txt only."""
+    try:
+        from openpyxl import load_workbook  # type: ignore
+    except Exception as exc:
+        raise RuntimeError(
+            "openpyxl is required to update project workbooks. "
+            "Install it with `py -m pip install openpyxl` within the project environment."
+        ) from exc
+
+    repo = Path(global_repo).expanduser()
+    support_dir = eidat_support_dir(repo)
+    wb_path = Path(workbook_path).expanduser()
+    if not wb_path.exists():
+        raise FileNotFoundError(f"Project workbook not found: {wb_path}")
+
+    docs = read_eidat_index_documents(repo)
+    docs_by_serial: dict[str, list[dict]] = {}
+    for d in docs:
+        serial = str(d.get("serial_number") or "").strip()
+        if serial:
+            docs_by_serial.setdefault(serial, []).append(d)
+    known_serials = set(docs_by_serial.keys())
+
+    try:
+        wb = load_workbook(str(wb_path))
+    except PermissionError as exc:
+        raise RuntimeError(f"Workbook is not writable (close it in Excel first): {wb_path}") from exc
+
+    ws = wb["master"] if "master" in wb.sheetnames else wb.active
+
+    header_row = 1
+    headers: dict[str, int] = {}
+    for col in range(1, ws.max_column + 1):
+        val = ws.cell(header_row, col).value
+        if val is None or str(val).strip() == "":
+            continue
+        key = _normalize_text(str(val))
+        headers[key] = col
+        compact = key.replace(" ", "")
+        if compact and compact not in headers:
+            headers[compact] = col
+
+    def _col(keys: list[str]) -> int | None:
+        for k in keys:
+            if k in headers:
+                return headers[k]
+        return None
+
+    col_term = _col(["term"])
+    col_term_header = _col(["termheader", "term header"])
+    col_header = _col(["header"])
+    col_group_after = _col(["groupafter", "group after"])
+    col_value_type = _col(["valuetype", "value type", "value_type"])
+    col_data_group = _col(["datagroup", "data group"])
+    col_term_label = _col(["termlabel", "term label"])
+    col_units = _col(["units", "unit", "uom"])
+    col_min = _col(["min", "minimum", "range (min)", "range min", "range_min"])
+    col_max = _col(["max", "maximum", "range (max)", "range max", "range_max"])
+    col_serial = _col(["serialnumber", "serial number", "serial", "sn"])
+    col_value = _col(["value", "measured", "measured value", "actual", "result"])
+
+    if col_term is None and col_term_header is None and col_term_label is None:
+        raise RuntimeError("Raw trending workbook is missing required column: Term (or Term Header / Term Label)")
+
+    # Cache combined.txt lines/tables per serial
+    combined_cache: dict[str, list[str]] = {}
+    tables_cache: dict[str, list[dict]] = {}
+    artifacts_used: dict[str, str] = {}
+
+    def _split_term_header(raw: str) -> tuple[str, str]:
+        s = str(raw or "").strip()
+        if not s:
+            return "", ""
+        for delim in ("|", "::", "->", "=>"):
+            if delim in s:
+                left, right = s.split(delim, 1)
+                return left.strip(), right.strip()
+        return s, ""
+
+    def _ensure_serial_loaded(sn_raw: str) -> tuple[str, list[str], list[dict]] | None:
+        sn_key = _match_serial_key(sn_raw, known_serials) if known_serials else sn_raw
+        if not sn_key:
+            return None
+        if sn_key in combined_cache and sn_key in tables_cache:
+            return sn_key, combined_cache[sn_key], tables_cache[sn_key]
+        doc = _best_doc_for_serial(support_dir, docs_by_serial.get(sn_key, []))
+        if not doc:
+            return None
+        artifacts_rel = str(doc.get("artifacts_rel") or "").strip()
+        art_dir = _resolve_support_path(support_dir, artifacts_rel)
+        if not art_dir or not art_dir.exists():
+            return None
+        combined = art_dir / "combined.txt"
+        if not combined.exists():
+            return None
+        try:
+            lines = combined.read_text(encoding="utf-8", errors="ignore").splitlines()
+            combined_cache[sn_key] = lines
+            tables_cache[sn_key] = _parse_ascii_tables(lines)
+            artifacts_used[sn_key] = str(art_dir)
+        except Exception:
+            return None
+        return sn_key, combined_cache[sn_key], tables_cache[sn_key]
+
+    # Detect layout:
+    # - Row layout: has "Serial Number" + "Value" columns.
+    # - Matrix layout: serial numbers are column headers (like EIDP Trending).
+    if col_serial is not None and col_value is None:
+        raise RuntimeError("Raw trending workbook has 'Serial Number' but is missing the 'Value' column.")
+    if col_value is not None and col_serial is None:
+        raise RuntimeError("Raw trending workbook has 'Value' but is missing the 'Serial Number' column.")
+    use_row_layout = col_serial is not None and col_value is not None
+    sn_cols: dict[str, int] = {}
+    if not use_row_layout:
+        fixed_cols = max(
+            col_term or 0,
+            col_term_header or 0,
+            col_header or 0,
+            col_group_after or 0,
+            col_value_type or 0,
+            col_data_group or 0,
+            col_term_label or 0,
+            col_units or 0,
+            col_min or 0,
+            col_max or 0,
+        )
+        for col in range(1, ws.max_column + 1):
+            if col <= fixed_cols:
+                continue
+            name = str(ws.cell(header_row, col).value or "").strip()
+            if not name:
+                continue
+            sn_cols[name] = col
+        if not sn_cols:
+            raise RuntimeError("Raw trending workbook has no serial columns or Serial Number/Value columns.")
+
+    # Mirror updated workbook + project.json and write debug json into repo-local mirror.
+    project_name = ""
+    project_dir = wb_path.parent
+    try:
+        pj = project_dir / EIDAT_PROJECT_META
+        if pj.exists():
+            project_name = str(json.loads(pj.read_text(encoding="utf-8")).get("name") or "").strip()
+    except Exception:
+        project_name = ""
+
+    mirror_dir: Path | None = None
+    if project_name:
+        mirror_dir = local_projects_mirror_root() / _safe_project_slug(project_name)
+    else:
+        mirror_dir = local_projects_mirror_root() / "_last"
+    try:
+        mirror_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        mirror_dir = None
+
+    debug_events: list[dict] = []
+    debug_failures: list[dict] = []
+    updated_cells = 0
+    skipped_existing = 0
+    missing_source = 0
+    missing_value = 0
+
+    def _resolve_row_fields(row_idx: int) -> tuple[str, str, str, str, str, str, float | None, float | None, str]:
+        term = str(ws.cell(row_idx, col_term).value or "").strip() if col_term else ""
+        term_header_raw = str(ws.cell(row_idx, col_term_header).value or "").strip() if col_term_header else ""
+        header_anchor = str(ws.cell(row_idx, col_header).value or "").strip() if col_header else ""
+        group_after = str(ws.cell(row_idx, col_group_after).value or "").strip() if col_group_after else ""
+        data_group = str(ws.cell(row_idx, col_data_group).value or "").strip() if col_data_group else ""
+        term_label = str(ws.cell(row_idx, col_term_label).value or "").strip() if col_term_label else ""
+        units = str(ws.cell(row_idx, col_units).value or "").strip() if col_units else ""
+        mn = _parse_float_loose(ws.cell(row_idx, col_min).value) if col_min else None
+        mx = _parse_float_loose(ws.cell(row_idx, col_max).value) if col_max else None
+        explicit_type = str(ws.cell(row_idx, col_value_type).value or "").strip() if col_value_type else ""
+
+        if term_header_raw:
+            t_part, h_part = _split_term_header(term_header_raw)
+            if not term:
+                term = t_part
+            if not header_anchor and h_part:
+                header_anchor = h_part
+            if not header_anchor and not col_header and term and term_header_raw and term_header_raw != term:
+                header_anchor = term_header_raw
+
+        if not term and term_label:
+            term = term_label
+
+        # Use Data Group as anchor if Header is generic like "Value"
+        if _normalize_text(header_anchor) in ("value", "val", "result"):
+            header_anchor = data_group or header_anchor
+
+        want_type = _infer_value_type(term, explicit=explicit_type, units=units, mn=mn, mx=mx)
+        return term, header_anchor, group_after, data_group, term_label, units, mn, mx, want_type
+
+    def _extract_value_for_serial(
+        *,
+        term: str,
+        term_label: str,
+        header_anchor: str,
+        group_after: str,
+        want_type: str,
+        lines: list[str],
+        tables: list[dict],
+    ) -> tuple[object | None, str, str, dict]:
+        used_method = ""
+        snippet = ""
+        val: object | None = None
+        extra: dict = {}
+
+        tval, tsnip, extra = _extract_from_tables_by_header(
+            tables,
+            term=term,
+            term_label=term_label,
+            header_anchor=header_anchor,
+        )
+        if tval not in (None, ""):
+            val = _clean_cell_text(str(tval))
+            used_method = "table_header" if header_anchor else "table_header_auto"
+            snippet = tsnip
+
+        if val in (None, ""):
+            tval2, tsnip2 = _extract_from_tables(
+                tables,
+                term=term,
+                term_label=term_label,
+                header_anchor=header_anchor,
+                group_after=group_after,
+            )
+            if tval2:
+                val = _clean_cell_text(str(tval2))
+                used_method = "table"
+                snippet = tsnip2
+
+        if val in (None, ""):
+            fallback, snip = _extract_value_from_lines(
+                lines,
+                term=term,
+                header_anchor=header_anchor,
+                group_after=group_after,
+                window_lines=window_lines,
+                want_type=want_type,
+            )
+            if fallback not in (None, ""):
+                val = fallback
+                used_method = "lines"
+                snippet = snip
+
+        return val, used_method, snippet, extra
+
+    for row in range(2, ws.max_row + 1):
+        term, header_anchor, group_after, data_group, term_label, units, mn, mx, want_type = _resolve_row_fields(row)
+        if not term:
+            continue
+
+        if use_row_layout:
+            sn_raw = str(ws.cell(row, col_serial).value or "").strip() if col_serial else ""
+            if not sn_raw:
+                missing_source += 1
+                debug_failures.append({"row": int(row), "term": term, "error": "missing_serial"})
+                continue
+            loaded = _ensure_serial_loaded(sn_raw)
+            if not loaded:
+                missing_source += 1
+                debug_failures.append({"row": int(row), "term": term, "serial": sn_raw, "error": "missing_source"})
+                continue
+
+            sn_key, lines, tables = loaded
+            val_cell = ws.cell(row, col_value)
+            if val_cell.value not in (None, "") and not overwrite:
+                skipped_existing += 1
+                continue
+
+            val, used_method, snippet, extra = _extract_value_for_serial(
+                term=term,
+                term_label=term_label,
+                header_anchor=header_anchor,
+                group_after=group_after,
+                want_type=want_type,
+                lines=lines,
+                tables=tables,
+            )
+            if val in (None, ""):
+                missing_value += 1
+                debug_failures.append({"row": int(row), "term": term, "serial": sn_raw, "error": "missing_value"})
+                continue
+
+            val_cell.value = val
+            updated_cells += 1
+
+            # Fill units/min/max from table if missing
+            if col_units and not units and extra.get("units"):
+                try:
+                    ws.cell(row, col_units).value = extra.get("units")
+                    units = str(extra.get("units") or "").strip()
+                except Exception:
+                    pass
+            if (col_min or col_max) and (mn is None or mx is None):
+                req_raw = extra.get("requirement_raw") or ""
+                min_raw = extra.get("min_raw") or ""
+                max_raw = extra.get("max_raw") or ""
+                if col_min and min_raw:
+                    try:
+                        mn = _parse_float_loose(min_raw)
+                        if mn is not None and ws.cell(row, col_min).value in (None, ""):
+                            ws.cell(row, col_min).value = mn
+                    except Exception:
+                        pass
+                if col_max and max_raw:
+                    try:
+                        mx = _parse_float_loose(max_raw)
+                        if mx is not None and ws.cell(row, col_max).value in (None, ""):
+                            ws.cell(row, col_max).value = mx
+                    except Exception:
+                        pass
+                if (mn is None or mx is None) and req_raw:
+                    rmin, rmax = _parse_requirement_range(req_raw)
+                    if col_min and mn is None and rmin is not None:
+                        mn = rmin
+                        try:
+                            if ws.cell(row, col_min).value in (None, ""):
+                                ws.cell(row, col_min).value = mn
+                        except Exception:
+                            pass
+                    if col_max and mx is None and rmax is not None:
+                        mx = rmax
+                        try:
+                            if ws.cell(row, col_max).value in (None, ""):
+                                ws.cell(row, col_max).value = mx
+                        except Exception:
+                            pass
+
+            try:
+                debug_events.append(
+                    {
+                        "row": int(row),
+                        "serial": sn_key,
+                        "term": term,
+                        "term_label": term_label,
+                        "header_anchor": header_anchor,
+                        "group_after": group_after,
+                        "value_type": want_type,
+                        "value": val,
+                        "method": used_method,
+                        "snippet": snippet,
+                        "artifacts_dir": artifacts_used.get(sn_key, ""),
+                    }
+                )
+            except Exception:
+                pass
+            continue
+
+        # Matrix layout: iterate serial columns
+        for sn_header, col in sn_cols.items():
+            cell = ws.cell(row, col)
+            if cell.value not in (None, "") and not overwrite:
+                skipped_existing += 1
+                continue
+            loaded = _ensure_serial_loaded(sn_header)
+            if not loaded:
+                missing_source += 1
+                debug_failures.append({"row": int(row), "term": term, "serial": sn_header, "error": "missing_source"})
+                continue
+            sn_key, lines, tables = loaded
+            val, used_method, snippet, extra = _extract_value_for_serial(
+                term=term,
+                term_label=term_label,
+                header_anchor=header_anchor,
+                group_after=group_after,
+                want_type=want_type,
+                lines=lines,
+                tables=tables,
+            )
+            if val in (None, ""):
+                missing_value += 1
+                debug_failures.append({"row": int(row), "term": term, "serial": sn_header, "error": "missing_value"})
+                continue
+            cell.value = val
+            updated_cells += 1
+
+            # Fill units/min/max from table if missing (row-level)
+            if col_units and not units and extra.get("units"):
+                try:
+                    ws.cell(row, col_units).value = extra.get("units")
+                    units = str(extra.get("units") or "").strip()
+                except Exception:
+                    pass
+            if (col_min or col_max) and (mn is None or mx is None):
+                req_raw = extra.get("requirement_raw") or ""
+                min_raw = extra.get("min_raw") or ""
+                max_raw = extra.get("max_raw") or ""
+                if col_min and min_raw:
+                    try:
+                        mn = _parse_float_loose(min_raw)
+                        if mn is not None and ws.cell(row, col_min).value in (None, ""):
+                            ws.cell(row, col_min).value = mn
+                    except Exception:
+                        pass
+                if col_max and max_raw:
+                    try:
+                        mx = _parse_float_loose(max_raw)
+                        if mx is not None and ws.cell(row, col_max).value in (None, ""):
+                            ws.cell(row, col_max).value = mx
+                    except Exception:
+                        pass
+                if (mn is None or mx is None) and req_raw:
+                    rmin, rmax = _parse_requirement_range(req_raw)
+                    if col_min and mn is None and rmin is not None:
+                        mn = rmin
+                        try:
+                            if ws.cell(row, col_min).value in (None, ""):
+                                ws.cell(row, col_min).value = mn
+                        except Exception:
+                            pass
+                    if col_max and mx is None and rmax is not None:
+                        mx = rmax
+                        try:
+                            if ws.cell(row, col_max).value in (None, ""):
+                                ws.cell(row, col_max).value = mx
+                        except Exception:
+                            pass
+
+            try:
+                debug_events.append(
+                    {
+                        "row": int(row),
+                        "serial": sn_key,
+                        "term": term,
+                        "term_label": term_label,
+                        "header_anchor": header_anchor,
+                        "group_after": group_after,
+                        "value_type": want_type,
+                        "value": val,
+                        "method": used_method,
+                        "snippet": snippet,
+                        "artifacts_dir": artifacts_used.get(sn_key, ""),
+                    }
+                )
+            except Exception:
+                pass
+
+    try:
+        wb.save(str(wb_path))
+    except PermissionError as exc:
+        raise RuntimeError(f"Workbook is not writable (close it in Excel first): {wb_path}") from exc
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
+
+    debug_json_path = ""
+    if mirror_dir:
+        try:
+            if project_name:
+                _mirror_project_to_local(project_dir, project_name=project_name)
+            else:
+                mirror_dir.mkdir(parents=True, exist_ok=True)
+                try:
+                    shutil.copy2(wb_path, mirror_dir / wb_path.name)
+                except Exception:
+                    pass
+            debug_json_path = str((mirror_dir / PROJECT_UPDATE_DEBUG_JSON).resolve())
+            payload = {
+                "workbook": str(wb_path),
+                "global_repo": str(repo),
+                "project_name": project_name,
+                "project_dir": str(project_dir),
+                "overwrite": bool(overwrite),
+                "window_lines": int(window_lines),
+                "updated_cells": int(updated_cells),
+                "skipped_existing": int(skipped_existing),
+                "missing_source": int(missing_source),
+                "missing_value": int(missing_value),
+                "serials_in_workbook": int(len(sn_cols) if not use_row_layout else (ws.max_row - 1)),
+                "serials_with_source": int(len(combined_cache)),
+                "events_sample": debug_events[-500:],
+                "failures": debug_failures[-2000:],
+            }
+            payload_json = json.dumps(payload, indent=2)
+            (mirror_dir / PROJECT_UPDATE_DEBUG_JSON).write_text(payload_json, encoding="utf-8")
+            if project_dir and project_dir.exists():
+                try:
+                    (project_dir / PROJECT_UPDATE_DEBUG_JSON).write_text(payload_json, encoding="utf-8")
+                except Exception:
+                    pass
+        except Exception:
+            debug_json_path = ""
+
+    return {
+        "workbook": str(wb_path),
+        "updated_cells": int(updated_cells),
+        "skipped_existing": int(skipped_existing),
+        "missing_source": int(missing_source),
+        "missing_value": int(missing_value),
+        "serials_in_workbook": int(len(sn_cols) if not use_row_layout else (ws.max_row - 1)),
+        "serials_with_source": int(len(combined_cache)),
+        "debug_json": debug_json_path,
+    }
+
+
 def _registry_path(global_repo: Path) -> Path:
     return eidat_projects_root(global_repo) / EIDAT_PROJECTS_REGISTRY
 
@@ -4152,6 +4660,50 @@ def _write_eidp_trending_workbook(path: Path, *, serials: list[str], docs: list[
 
     ws_meta.freeze_panes = "A2"
 
+    path.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(str(path))
+    try:
+        wb.close()
+    except Exception:
+        pass
+
+
+def _write_eidp_raw_trending_workbook(path: Path, *, serials: list[str]) -> None:
+    """
+    Create a blank EIDP raw file trending workbook.
+
+    This workbook is intentionally minimal and is filled by combined.txt extraction.
+    """
+    try:
+        from openpyxl import Workbook  # type: ignore
+        from openpyxl.worksheet.datavalidation import DataValidation  # type: ignore
+        from openpyxl.utils import get_column_letter  # type: ignore
+    except Exception as exc:
+        raise RuntimeError(
+            "openpyxl is required to create the EIDP Raw File Trending workbook. "
+            "Install it with `py -m pip install openpyxl` within the project environment."
+        ) from exc
+
+    headers = ["Term", "Header", "GroupAfter", "ValueType", "Data Group", "Term Label", "Units", "Min", "Max"]
+    headers.extend([str(s) for s in serials if str(s).strip()])
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "master"
+    ws.append(headers)
+
+    # Value Type dropdown to prevent invalid inputs (blank = auto).
+    try:
+        value_type_col = headers.index("Value Type") + 1  # 1-based
+        max_rows = 1000
+        dv = DataValidation(type="list", formula1='"auto,string,number"', allow_blank=True, showDropDown=True)
+        ws.add_data_validation(dv)
+        col_letter = get_column_letter(int(value_type_col))
+        dv.add(f"{col_letter}2:{col_letter}{int(max_rows)}")
+    except Exception:
+        pass
+
+    ws.freeze_panes = "A2"
     path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(str(path))
     try:
@@ -4483,39 +5035,49 @@ def create_eidat_project(
     project_dir.mkdir(parents=True, exist_ok=False)
     workbook_path = project_dir / f"{safe_name}.xlsx"
 
-    if project_type != EIDAT_PROJECT_TYPE_TRENDING:
-        raise RuntimeError(f"Unsupported project type: {project_type}")
-
-    # Create workbook with header row, serial columns, and metadata sheet.
-    # Metadata sheet is always populated regardless of auto_populate setting.
-    _ensure_file_written(
-        workbook_path,
-        create_fn=lambda: _write_eidp_trending_workbook(workbook_path, serials=serials, docs=chosen_docs),
-    )
-
-    # Best-effort: build a project-local SQLite cache for Implementation/Trending.
-    try:
-        ensure_trending_project_sqlite(project_dir, workbook_path)
-    except Exception:
-        pass
-
-    # Auto-populate: extract terms and values from combined.txt
     auto_populate_result = None
     terms_count = 0
-    if auto_populate:
+
+    if project_type == EIDAT_PROJECT_TYPE_TRENDING:
+        # Create workbook with header row, serial columns, and metadata sheet.
+        # Metadata sheet is always populated regardless of auto_populate setting.
+        _ensure_file_written(
+            workbook_path,
+            create_fn=lambda: _write_eidp_trending_workbook(workbook_path, serials=serials, docs=chosen_docs),
+        )
+
+        # Best-effort: build a project-local SQLite cache for Implementation/Trending.
         try:
-            support_dir = eidat_support_dir(repo)
-            docs_by_serial: dict[str, list[dict]] = {}
-            for d in docs:
-                serial = str(d.get("serial_number") or "").strip()
-                if serial:
-                    docs_by_serial.setdefault(serial, []).append(d)
-            auto_populate_result = _populate_workbook_with_acceptance_data(
-                workbook_path, support_dir, docs_by_serial, discover_terms=True
-            )
-            terms_count = auto_populate_result.get("new_terms_added", 0)
-        except Exception as exc:
-            auto_populate_result = {"error": str(exc)}
+            ensure_trending_project_sqlite(project_dir, workbook_path)
+        except Exception:
+            pass
+
+        # Auto-populate: extract terms and values from combined.txt
+        if auto_populate:
+            try:
+                support_dir = eidat_support_dir(repo)
+                docs_by_serial: dict[str, list[dict]] = {}
+                for d in docs:
+                    serial = str(d.get("serial_number") or "").strip()
+                    if serial:
+                        docs_by_serial.setdefault(serial, []).append(d)
+                auto_populate_result = _populate_workbook_with_acceptance_data(
+                    workbook_path, support_dir, docs_by_serial, discover_terms=True
+                )
+                terms_count = auto_populate_result.get("new_terms_added", 0)
+            except Exception as exc:
+                auto_populate_result = {"error": str(exc)}
+
+    elif project_type == EIDAT_PROJECT_TYPE_RAW_TRENDING:
+        # Raw trending: always start blank (combined.txt-only extraction)
+        auto_populate = False
+        _ensure_file_written(
+            workbook_path,
+            create_fn=lambda: _write_eidp_raw_trending_workbook(workbook_path, serials=serials),
+        )
+
+    else:
+        raise RuntimeError(f"Unsupported project type: {project_type}")
 
     meta = {
         "name": safe_name,
