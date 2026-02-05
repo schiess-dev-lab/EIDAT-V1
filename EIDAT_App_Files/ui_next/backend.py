@@ -2931,6 +2931,121 @@ def _extract_from_tables(
     return None, ""
 
 
+def _parse_requirement_range(raw: str) -> tuple[float | None, float | None]:
+    s = str(raw or "").strip()
+    if not s:
+        return None, None
+    s = s.replace("\u2264", "<=").replace("\u2265", ">=")
+    # Range like "40 - 46" or "40.0 - 46.0"
+    m = re.search(r"([-+]?\d+(?:\.\d+)?)\s*[-–—]\s*([-+]?\d+(?:\.\d+)?)", s)
+    if m:
+        return _parse_float_loose(m.group(1)), _parse_float_loose(m.group(2))
+    # Greater than or equal
+    m = re.search(r"(>=|>|min)\s*([-+]?\d+(?:\.\d+)?)", s, flags=re.IGNORECASE)
+    if m:
+        return _parse_float_loose(m.group(2)), None
+    # Less than or equal
+    m = re.search(r"(<=|<|max)\s*([-+]?\d+(?:\.\d+)?)", s, flags=re.IGNORECASE)
+    if m:
+        return None, _parse_float_loose(m.group(2))
+    # Fallback: two numbers -> treat as min/max
+    nums = re.findall(r"[-+]?\d+(?:\.\d+)?", s)
+    if len(nums) >= 2:
+        return _parse_float_loose(nums[0]), _parse_float_loose(nums[1])
+    if len(nums) == 1:
+        val = _parse_float_loose(nums[0])
+        return val, None
+    return None, None
+
+
+def _extract_from_tables_by_header(
+    blocks: list[dict],
+    *,
+    term: str,
+    term_label: str = "",
+    header_anchor: str = "",
+) -> tuple[str | None, str, dict]:
+    term_k = _normalize_key(term)
+    term_label_n = _normalize_text(term_label)
+    anchor_n = _normalize_text(header_anchor)
+    if not term_k and not term_label_n:
+        return None, "", {}
+
+    def _find_col(header_norm: list[str], wanted: str) -> int | None:
+        w = _normalize_text(wanted)
+        if not w:
+            return None
+        for idx, h in enumerate(header_norm):
+            if not h:
+                continue
+            if w == h or w in h or h in w:
+                return idx
+        return None
+
+    def _find_col_keywords(header_norm: list[str], keywords: list[str]) -> int | None:
+        for kw in keywords:
+            idx = _find_col(header_norm, kw)
+            if idx is not None:
+                return idx
+        return None
+
+    for b in blocks or []:
+        rows = b.get("rows") or []
+        if not isinstance(rows, list) or len(rows) < 2:
+            continue
+        header = rows[0] if isinstance(rows[0], list) else []
+        header_norm = [_normalize_text(c) for c in header]
+
+        term_col = _find_col_keywords(header_norm, ["tag", "term", "parameter", "id", "field", "label", "test"])
+        if term_col is None:
+            term_col = 0
+
+        value_col = _find_col(header_norm, anchor_n) if anchor_n else None
+        if value_col is None and anchor_n:
+            value_col = _find_col_keywords(header_norm, [anchor_n])
+        if value_col is None and not anchor_n:
+            value_col = _find_col_keywords(header_norm, ["measured", "measured value", "value", "actual"])
+
+        units_col = _find_col_keywords(header_norm, ["units", "unit", "uom"])
+        req_col = _find_col_keywords(header_norm, ["target", "requirement", "criteria", "spec", "acceptance", "limit"])
+        min_col = _find_col_keywords(header_norm, ["min", "minimum", "range min", "range (min)"])
+        max_col = _find_col_keywords(header_norm, ["max", "maximum", "range max", "range (max)"])
+
+        for r in rows[1:]:
+            if not isinstance(r, list) or not r:
+                continue
+            tag = str(r[term_col] if term_col < len(r) else "").strip()
+            tag_k = _normalize_key(tag)
+            tag_n = _normalize_text(tag)
+            matched = False
+            if term_k and tag_k and (term_k == tag_k or term_k in tag_k or tag_k in term_k):
+                matched = True
+            elif term_label_n and tag_n and term_label_n in tag_n:
+                matched = True
+            if not matched:
+                continue
+
+            val = None
+            if value_col is not None and value_col < len(r):
+                val = str(r[value_col]).strip()
+            if not val:
+                # fallback to last non-empty cell
+                for c in reversed(r[1:]):
+                    if str(c).strip():
+                        val = str(c).strip()
+                        break
+            extra = {
+                "units": str(r[units_col]).strip() if units_col is not None and units_col < len(r) else "",
+                "requirement_raw": str(r[req_col]).strip() if req_col is not None and req_col < len(r) else "",
+                "min_raw": str(r[min_col]).strip() if min_col is not None and min_col < len(r) else "",
+                "max_raw": str(r[max_col]).strip() if max_col is not None and max_col < len(r) else "",
+            }
+            heading = str(b.get("heading") or "").strip()
+            snippet = f"{heading}: {tag} -> {val}".strip()
+            return val, snippet, extra
+
+    return None, "", {}
+
 def _row_has_headers(row: list[str], headers: list[str]) -> bool:
     if not row:
         return False
@@ -3259,6 +3374,8 @@ def update_eidp_trending_project_workbook(
             if cell.value not in (None, "") and not overwrite:
                 allow_replace = False
                 try:
+                    if header_anchor and _parse_float_loose(cell.value) is None:
+                        allow_replace = True
                     lookup = acceptance_lookup.get(sn_header, {})
                     term_key = lookup.get(term_k)
                     if term_key:
@@ -3330,6 +3447,114 @@ def update_eidp_trending_project_workbook(
                         else:
                             val = _clean_cell_text(str(raw))
                     used_method = f"metadata:{meta_path}" if raw == _meta_get(meta, meta_path) else "metadata:fallback"
+
+            # 1b) Manual header-driven extraction (bypass acceptance heuristics)
+            if header_anchor:
+                tval, tsnip, extra = _extract_from_tables_by_header(
+                    tables_cache.get(sn_header) or [],
+                    term=term,
+                    term_label=term_label,
+                    header_anchor=header_anchor,
+                )
+                if val in (None, "") and tval not in (None, ""):
+                    val = _clean_cell_text(str(tval))
+                    used_method = "table_header"
+                    snippet = tsnip
+                # Fill units/min/max from table if missing
+                if not units and extra.get("units"):
+                    try:
+                        ws.cell(row, col_units).value = extra.get("units")
+                        units = str(extra.get("units") or "").strip()
+                    except Exception:
+                        pass
+                if mn is None or mx is None:
+                    req_raw = extra.get("requirement_raw") or ""
+                    min_raw = extra.get("min_raw") or ""
+                    max_raw = extra.get("max_raw") or ""
+                    if min_raw:
+                        try:
+                            mn = _parse_float_loose(min_raw)
+                            if mn is not None and ws.cell(row, col_min).value in (None, ""):
+                                ws.cell(row, col_min).value = mn
+                        except Exception:
+                            pass
+                    if max_raw:
+                        try:
+                            mx = _parse_float_loose(max_raw)
+                            if mx is not None and ws.cell(row, col_max).value in (None, ""):
+                                ws.cell(row, col_max).value = mx
+                        except Exception:
+                            pass
+                    if (mn is None or mx is None) and req_raw:
+                        rmin, rmax = _parse_requirement_range(req_raw)
+                        if mn is None and rmin is not None:
+                            mn = rmin
+                            try:
+                                if ws.cell(row, col_min).value in (None, ""):
+                                    ws.cell(row, col_min).value = mn
+                            except Exception:
+                                pass
+                        if mx is None and rmax is not None:
+                            mx = rmax
+                            try:
+                                if ws.cell(row, col_max).value in (None, ""):
+                                    ws.cell(row, col_max).value = mx
+                            except Exception:
+                                pass
+
+            # 1c) Auto header-driven extraction (no explicit Header set)
+            if not header_anchor and val in (None, ""):
+                tval, tsnip, extra = _extract_from_tables_by_header(
+                    tables_cache.get(sn_header) or [],
+                    term=term,
+                    term_label=term_label,
+                    header_anchor="",
+                )
+                if tval not in (None, ""):
+                    val = _clean_cell_text(str(tval))
+                    used_method = "table_header_auto"
+                    snippet = tsnip
+                # Fill units/min/max from table if missing
+                if not units and extra.get("units"):
+                    try:
+                        ws.cell(row, col_units).value = extra.get("units")
+                        units = str(extra.get("units") or "").strip()
+                    except Exception:
+                        pass
+                if mn is None or mx is None:
+                    req_raw = extra.get("requirement_raw") or ""
+                    min_raw = extra.get("min_raw") or ""
+                    max_raw = extra.get("max_raw") or ""
+                    if min_raw:
+                        try:
+                            mn = _parse_float_loose(min_raw)
+                            if mn is not None and ws.cell(row, col_min).value in (None, ""):
+                                ws.cell(row, col_min).value = mn
+                        except Exception:
+                            pass
+                    if max_raw:
+                        try:
+                            mx = _parse_float_loose(max_raw)
+                            if mx is not None and ws.cell(row, col_max).value in (None, ""):
+                                ws.cell(row, col_max).value = mx
+                        except Exception:
+                            pass
+                    if (mn is None or mx is None) and req_raw:
+                        rmin, rmax = _parse_requirement_range(req_raw)
+                        if mn is None and rmin is not None:
+                            mn = rmin
+                            try:
+                                if ws.cell(row, col_min).value in (None, ""):
+                                    ws.cell(row, col_min).value = mn
+                            except Exception:
+                                pass
+                        if mx is None and rmax is not None:
+                            mx = rmax
+                            try:
+                                if ws.cell(row, col_max).value in (None, ""):
+                                    ws.cell(row, col_max).value = mx
+                            except Exception:
+                                pass
 
             # 2) ASCII table extraction from combined.txt (key/value and general tables)
             if val in (None, ""):
