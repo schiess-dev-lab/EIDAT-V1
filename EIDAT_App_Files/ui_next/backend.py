@@ -191,15 +191,26 @@ def parse_scanner_env(path: Path = SCANNER_ENV) -> Dict[str, str]:
     return env
 
 
+def _env_truthy(val: object) -> bool:
+    if val is None:
+        return False
+    s = str(val).strip().lower()
+    if not s:
+        return False
+    return s in {"1", "true", "yes", "on", "enable", "enabled"}
+
+
 def save_scanner_env(env_map: Dict[str, str], path: Path = SCANNER_ENV) -> None:
     lines = [
         "# Scanner configuration (KEY=VALUE)",
         "# Edited via new GUI",
+        "# EIDAT_TRENDING_COMBINED_ONLY=1 forces trending extraction to use combined.txt only",
     ]
     order = [
         "QUIET",
         "force_background_processes",
         "REPO_ROOT",
+        "EIDAT_TRENDING_COMBINED_ONLY",
         "OCR_MODE",
         "OCR_DPI",
         "FORCE_OCR",
@@ -3174,6 +3185,10 @@ def update_eidp_trending_project_workbook(
     if not wb_path.exists():
         raise FileNotFoundError(f"Project workbook not found: {wb_path}")
 
+    # scanner.env: EIDAT_TRENDING_COMBINED_ONLY=1 (or EIDAT_COMBINED_ONLY=1) skips acceptance data entirely.
+    env = parse_scanner_env(SCANNER_ENV)
+    combined_only = _env_truthy(env.get("EIDAT_TRENDING_COMBINED_ONLY") or env.get("EIDAT_COMBINED_ONLY"))
+
     docs = read_eidat_index_documents(repo)
     docs_by_serial: dict[str, list[dict]] = {}
     for d in docs:
@@ -3257,15 +3272,16 @@ def update_eidp_trending_project_workbook(
         except Exception:
             continue
         try:
-            term_data = _extract_acceptance_data_for_serial(support_dir, artifacts_rel)
-            if isinstance(term_data, dict) and term_data:
-                acceptance_cache[sn_header] = term_data
-                lookup = {}
-                for k in term_data.keys():
-                    kn = _normalize_key(str(k))
-                    if kn:
-                        lookup[kn] = str(k)
-                acceptance_lookup[sn_header] = lookup
+            if not combined_only:
+                term_data = _extract_acceptance_data_for_serial(support_dir, artifacts_rel)
+                if isinstance(term_data, dict) and term_data:
+                    acceptance_cache[sn_header] = term_data
+                    lookup = {}
+                    for k in term_data.keys():
+                        kn = _normalize_key(str(k))
+                        if kn:
+                            lookup[kn] = str(k)
+                    acceptance_lookup[sn_header] = lookup
         except Exception:
             pass
 
@@ -3790,6 +3806,7 @@ def update_eidp_trending_project_workbook(
                 "project_name": project_name,
                 "project_dir": str(project_dir),
                 "overwrite": bool(overwrite),
+                "combined_only": bool(combined_only),
                 "window_lines": int(window_lines),
                 "updated_cells": int(updated_cells),
                 "skipped_existing": int(skipped_existing),
