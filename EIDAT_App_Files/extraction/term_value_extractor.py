@@ -261,12 +261,12 @@ def _load_acceptance_heuristics(path: Path = DEFAULT_ACCEPTANCE_HEURISTICS_PATH)
 def _default_header_synonyms() -> Dict[str, List[str]]:
     return {
         "term": ["term", "tag", "parameter", "id", "field", "label", "test"],
-        "description": ["description", "desc", "name"],
-        "value": ["measured", "actual", "value", "reading"],
+        "description": ["description", "desc", "name", "kpi", "metric"],
+        "value": ["measured", "measured value", "measured_value", "actual", "value", "reading"],
         "min": ["min", "minimum", "lower", "low", "range min", "range_min", "range (min)"],
         "max": ["max", "maximum", "upper", "high", "range max", "range_max", "range (max)"],
         "units": ["units", "unit", "uom"],
-        "requirement": ["requirement", "criteria", "spec", "acceptance", "limit"],
+        "requirement": ["requirement", "criteria", "spec", "acceptance", "limit", "target", "threshold"],
         "status": ["status", "result", "pass?", "pass fail", "pass/fail", "outcome"],
     }
 
@@ -303,7 +303,19 @@ class CombinedTxtParser:
                 continue
             if not isinstance(synonyms, list):
                 continue
-            base[str(role).strip().lower()] = [str(s).strip() for s in synonyms if str(s).strip()]
+            key = str(role).strip().lower()
+            custom = [str(s).strip() for s in synonyms if str(s).strip()]
+            if not custom:
+                continue
+            if key in base:
+                # Merge custom synonyms with defaults (do not drop defaults).
+                merged = list(base[key])
+                for s in custom:
+                    if s not in merged:
+                        merged.append(s)
+                base[key] = merged
+            else:
+                base[key] = custom
         self._header_synonyms = base
 
     def parse(self) -> ExtractionResult:

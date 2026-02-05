@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "fuzzy_min_ratio": 0.78,
+  "require_term_match": false,
+  "terms": [
+    "Leak Rate",
+    "Seat Leakage",
+    "Stem Leakage",
+    "Opening Pressure",
+    "Closing Pressure"
+  ],
+  "headers": {
+    "term": ["term", "tag", "parameter", "id", "field", "label", "test"],
+    "description": ["description", "desc", "name"],
+    "value": ["measured", "actual", "value", "reading"],
+    "min": ["min", "minimum", "lower", "low", "range (min)", "range_min"],
+    "max": ["max", "maximum", "upper", "high", "range (max)", "range_max"],
+    "units": ["units", "unit", "uom"],
+    "requirement": ["requirement", "criteria", "spec", "acceptance", "limit"],
+    "status": ["status", "result", "pass?", "pass/fail", "passfail", "outcome"]
+  }
+}

@@ -198,6 +198,7 @@ def save_scanner_env(env_map: Dict[str, str], path: Path = SCANNER_ENV) -> None:
     ]
     order = [
         "QUIET",
+        "force_background_processes",
         "REPO_ROOT",
         "OCR_MODE",
         "OCR_DPI",
@@ -3118,6 +3119,8 @@ def update_eidp_trending_project_workbook(
     tables_cache: dict[str, list[dict]] = {}
     meta_cache: dict[str, dict] = {}
     artifacts_used: dict[str, str] = {}
+    acceptance_cache: dict[str, dict[str, dict]] = {}
+    acceptance_lookup: dict[str, dict[str, str]] = {}
     for sn_header in sn_cols.keys():
         sn = _match_serial_key(sn_header, known_serials)
         doc = _best_doc_for_serial(support_dir, docs_by_serial.get(sn, []))
@@ -3138,6 +3141,18 @@ def update_eidp_trending_project_workbook(
             tables_cache[sn_header] = _parse_ascii_tables(lines)
         except Exception:
             continue
+        try:
+            term_data = _extract_acceptance_data_for_serial(support_dir, artifacts_rel)
+            if isinstance(term_data, dict) and term_data:
+                acceptance_cache[sn_header] = term_data
+                lookup = {}
+                for k in term_data.keys():
+                    kn = _normalize_key(str(k))
+                    if kn:
+                        lookup[kn] = str(k)
+                acceptance_lookup[sn_header] = lookup
+        except Exception:
+            pass
 
     prov_sheet = "_provenance"
     if prov_sheet in wb.sheetnames:
@@ -3173,6 +3188,44 @@ def update_eidp_trending_project_workbook(
     debug_events: list[dict] = []
     debug_failures: list[dict] = []
 
+    def _debug_term_hits(tables: list[dict], lines: list[str], term: str, term_label: str) -> dict:
+        term_k = _normalize_key(term)
+        term_label_n = _normalize_text(term_label)
+        table_hits: list[dict] = []
+        for b in tables or []:
+            rows = b.get("rows") or []
+            if not isinstance(rows, list) or not rows:
+                continue
+            header = rows[0] if isinstance(rows[0], list) else []
+            for r in rows[1:] if len(rows) > 1 else rows:
+                if not isinstance(r, list):
+                    continue
+                row_text = " | ".join(str(c or "") for c in r)
+                row_k = _normalize_key(row_text)
+                row_n = _normalize_text(row_text)
+                if (term_k and term_k in row_k) or (term_label_n and term_label_n in row_n):
+                    table_hits.append(
+                        {
+                            "heading": str(b.get("heading") or ""),
+                            "header": header,
+                            "row": r,
+                        }
+                    )
+                if len(table_hits) >= 5:
+                    break
+            if len(table_hits) >= 5:
+                break
+
+        line_hits: list[str] = []
+        term_n = _normalize_text(term)
+        if term_n:
+            for ln in lines or []:
+                if term_n in _normalize_text(ln):
+                    line_hits.append(str(ln).strip()[:300])
+                if len(line_hits) >= 5:
+                    break
+        return {"table_hits": table_hits, "line_hits": line_hits}
+
     updated_cells = 0
     skipped_existing = 0
     missing_source = 0
@@ -3204,8 +3257,21 @@ def update_eidp_trending_project_workbook(
         for sn_header, col in sn_cols.items():
             cell = ws.cell(row, col)
             if cell.value not in (None, "") and not overwrite:
-                skipped_existing += 1
-                continue
+                allow_replace = False
+                try:
+                    lookup = acceptance_lookup.get(sn_header, {})
+                    term_key = lookup.get(term_k)
+                    if term_key:
+                        data = acceptance_cache.get(sn_header, {}).get(term_key, {})
+                        if data.get("value") is not None:
+                            existing_num = _parse_float_loose(cell.value)
+                            if existing_num is None:
+                                allow_replace = True
+                except Exception:
+                    allow_replace = False
+                if not allow_replace:
+                    skipped_existing += 1
+                    continue
 
             meta = meta_cache.get(sn_header) or {}
             used_method = ""
@@ -3213,8 +3279,42 @@ def update_eidp_trending_project_workbook(
             val: object | None = None
             err: str | None = None
 
+            # 0) Acceptance-test DB/TXT extraction (preferred for measured/min/max/units).
+            if sn_header in acceptance_cache:
+                lookup = acceptance_lookup.get(sn_header, {})
+                term_key = lookup.get(term_k)
+                if term_key:
+                    data = acceptance_cache[sn_header].get(term_key, {})
+                    # Fill min/max/units if missing in workbook row.
+                    if not units and data.get("units"):
+                        try:
+                            ws.cell(row, col_units).value = data.get("units")
+                            units = str(data.get("units") or "").strip()
+                        except Exception:
+                            pass
+                    if mn is None and data.get("requirement_min") is not None:
+                        try:
+                            ws.cell(row, col_min).value = data.get("requirement_min")
+                            mn = _parse_float_loose(data.get("requirement_min"))
+                        except Exception:
+                            pass
+                    if mx is None and data.get("requirement_max") is not None:
+                        try:
+                            ws.cell(row, col_max).value = data.get("requirement_max")
+                            mx = _parse_float_loose(data.get("requirement_max"))
+                        except Exception:
+                            pass
+                    if data.get("value") is not None:
+                        val = data.get("value")
+                        used_method = "acceptance_terms"
+                        snippet = str(data.get("requirement_raw") or "")
+                    elif data.get("raw"):
+                        val = data.get("raw")
+                        used_method = "acceptance_terms_raw"
+                        snippet = str(data.get("requirement_raw") or "")
+
             # 1) Metadata-first for known document-profile fields.
-            if term_k in _META_TERM_MAP and isinstance(meta, Mapping):
+            if val in (None, "") and term_k in _META_TERM_MAP and isinstance(meta, Mapping):
                 meta_path, meta_kind = _META_TERM_MAP[term_k]
                 raw = _meta_get(meta, meta_path)
                 # Fallbacks for incomplete metadata files.
@@ -3332,6 +3432,12 @@ def update_eidp_trending_project_workbook(
                 missing_value += 1
                 err = "missing_value"
                 try:
+                    debug_hits = _debug_term_hits(
+                        tables_cache.get(sn_header, []),
+                        combined_cache.get(sn_header, []),
+                        term,
+                        term_label,
+                    )
                     debug_failures.append(
                         {
                             "row": int(row),
@@ -3345,6 +3451,7 @@ def update_eidp_trending_project_workbook(
                             "error": err,
                             "method": used_method,
                             "snippet": snippet,
+                            "debug_hits": debug_hits,
                             "artifacts_dir": artifacts_used.get(sn_header, ""),
                         }
                     )
@@ -3359,6 +3466,12 @@ def update_eidp_trending_project_workbook(
                     missing_value += 1
                     err = "not_numeric"
                     try:
+                        debug_hits = _debug_term_hits(
+                            tables_cache.get(sn_header, []),
+                            combined_cache.get(sn_header, []),
+                            term,
+                            term_label,
+                        )
                         debug_failures.append(
                             {
                                 "row": int(row),
@@ -3373,6 +3486,7 @@ def update_eidp_trending_project_workbook(
                                 "method": used_method,
                                 "value_raw": str(val),
                                 "snippet": snippet,
+                                "debug_hits": debug_hits,
                                 "artifacts_dir": artifacts_used.get(sn_header, ""),
                             }
                         )
@@ -3818,6 +3932,66 @@ def _extract_acceptance_data_for_serial(
     except ImportError:
         return {}
 
+    def _merge_term_data(base: dict[str, dict], incoming: dict[str, dict]) -> dict[str, dict]:
+        if not incoming:
+            return base
+        if not base:
+            return dict(incoming)
+        for term, data in incoming.items():
+            if term not in base:
+                base[term] = data
+                continue
+            target = base[term]
+            # Fill missing fields from incoming
+            for key in (
+                "value",
+                "raw",
+                "units",
+                "requirement_type",
+                "requirement_min",
+                "requirement_max",
+                "requirement_raw",
+                "result",
+                "computed_pass",
+                "description",
+            ):
+                if target.get(key) in (None, "", []):
+                    if data.get(key) not in (None, "", []):
+                        target[key] = data.get(key)
+        return base
+
+    def _parse_combined_txt(path: Path) -> dict[str, dict]:
+        try:
+            content = path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            return {}
+        heuristics = None
+        try:
+            if DEFAULT_ACCEPTANCE_HEURISTICS.exists():
+                heuristics = json.loads(DEFAULT_ACCEPTANCE_HEURISTICS.read_text(encoding="utf-8", errors="ignore"))
+        except Exception:
+            heuristics = None
+        try:
+            parser = CombinedTxtParser(content, heuristics=heuristics)
+            result = parser.parse()
+        except Exception:
+            return {}
+        term_data: dict[str, dict] = {}
+        for test in result.acceptance_tests:
+            term_data[test.term] = {
+                "value": test.measured.value,
+                "raw": test.measured.raw,
+                "units": test.units,
+                "requirement_type": test.requirement.type,
+                "requirement_min": test.requirement.min_value,
+                "requirement_max": test.requirement.max_value,
+                "requirement_raw": test.requirement.raw,
+                "result": test.result,
+                "computed_pass": test.computed_pass,
+                "description": test.description,
+            }
+        return term_data
+
     art_dir = _resolve_support_path(support_dir, artifacts_rel)
     if not art_dir or not art_dir.exists():
         return {}
@@ -3854,6 +4028,10 @@ def _extract_acceptance_data_for_serial(
                     "computed_pass": (None if r["computed_pass"] is None else bool(int(r["computed_pass"]))),
                     "description": r["description"],
                 }
+            # Always attempt to enrich with combined.txt (for user-defined or missed terms)
+            combined_path = art_dir / "combined.txt"
+            if combined_path.exists():
+                term_data = _merge_term_data(term_data, _parse_combined_txt(combined_path))
             return term_data
         except Exception:
             # Fall back to parsing combined.txt
@@ -3903,37 +4081,16 @@ def _extract_acceptance_data_for_serial(
                     "computed_pass": (None if r["computed_pass"] is None else bool(int(r["computed_pass"]))),
                     "description": r["description"],
                 }
+            combined_path = art_dir / "combined.txt"
+            if combined_path.exists():
+                term_data = _merge_term_data(term_data, _parse_combined_txt(combined_path))
             return term_data
         except Exception:
             pass
 
     # Last resort: parse combined.txt directly (no DB write access / parsing errors)
     try:
-        content = combined_path.read_text(encoding="utf-8", errors="ignore")
-        heuristics = None
-        try:
-            if DEFAULT_ACCEPTANCE_HEURISTICS.exists():
-                heuristics = json.loads(DEFAULT_ACCEPTANCE_HEURISTICS.read_text(encoding="utf-8", errors="ignore"))
-        except Exception:
-            heuristics = None
-        parser = CombinedTxtParser(content, heuristics=heuristics)
-        result = parser.parse()
-
-        term_data = {}
-        for test in result.acceptance_tests:
-            term_data[test.term] = {
-                "value": test.measured.value,
-                "raw": test.measured.raw,
-                "units": test.units,
-                "requirement_type": test.requirement.type,
-                "requirement_min": test.requirement.min_value,
-                "requirement_max": test.requirement.max_value,
-                "requirement_raw": test.requirement.raw,
-                "result": test.result,
-                "computed_pass": test.computed_pass,
-                "description": test.description,
-            }
-        return term_data
+        return _parse_combined_txt(combined_path)
     except Exception:
         return {}
 

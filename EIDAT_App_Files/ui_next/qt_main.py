@@ -2332,13 +2332,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self._sync_timer.start()
         except Exception:
             pass
-        # Periodic EIDAT Manager scan (popup only when new files are detected)
+        # Periodic EIDAT Manager scan/process (quiet; uses scanner.env flag)
         try:
             self._manager_scan_timer = QtCore.QTimer(self)
             self._manager_scan_timer.setInterval(10 * 60 * 1000)  # 10 minutes
-            self._manager_scan_timer.timeout.connect(lambda: self._act_manager_scan_all(auto=True))
+            self._manager_scan_timer.timeout.connect(self._auto_manager_tick)
             self._manager_scan_timer.start()
-            QtCore.QTimer.singleShot(800, lambda: self._act_manager_scan_all(auto=True))
+            QtCore.QTimer.singleShot(800, self._auto_manager_tick)
         except Exception:
             pass
 
@@ -5540,7 +5540,20 @@ class MainWindow(QtWidgets.QMainWindow):
             self._repo_scan_dialog.finish(f"{heading} failed: {message}", success=False)
             self._manager_popup_active = False
 
-    def _act_manager_scan_all(self, *, auto: bool = False) -> None:
+    def _background_processing_enabled(self) -> bool:
+        try:
+            env = be.parse_scanner_env()
+            raw = str(env.get("force_background_processes") or "").strip().lower()
+            return raw in ("1", "true", "yes", "on")
+        except Exception:
+            return False
+
+    def _auto_manager_tick(self) -> None:
+        if not self._background_processing_enabled():
+            return
+        self._act_manager_scan_all(auto=True, auto_process=True)
+
+    def _act_manager_scan_all(self, *, auto: bool = False, auto_process: bool = False) -> None:
         try:
             repo_raw = (self.ed_global_repo.text() or "").strip()
             if not repo_raw:
@@ -5562,6 +5575,8 @@ class MainWindow(QtWidgets.QMainWindow):
                         "EIDAT Manager",
                         f"Detected {candidates} new/changed PDF(s).\n\nUse 'Process New Files' to generate EIDAT Support artifacts.",
                     )
+                if auto_process:
+                    self._act_manager_process_new(auto=True)
                 return f"Scan complete - {candidates} candidate(s) ready"
             if not auto:
                 self._show_toast("No new PDFs detected.")
@@ -5576,14 +5591,15 @@ class MainWindow(QtWidgets.QMainWindow):
             show_popup=not auto,
         )
 
-    def _act_manager_process_new(self) -> None:
+    def _act_manager_process_new(self, *, auto: bool = False) -> None:
         try:
             repo_raw = (self.ed_global_repo.text() or "").strip()
             if not repo_raw:
                 raise RuntimeError("Select a Global Repo first.")
             repo = Path(repo_raw).expanduser()
         except Exception as exc:
-            QtWidgets.QMessageBox.warning(self, "EIDAT Manager", str(exc))
+            if not auto:
+                QtWidgets.QMessageBox.warning(self, "EIDAT Manager", str(exc))
             return
 
         def _on_success(payload: dict):
@@ -5598,14 +5614,15 @@ class MainWindow(QtWidgets.QMainWindow):
             for r in results:
                 if not r.get("ok") and r.get("error"):
                     self._append_log(f"[EIDAT MANAGER] FAILED: {r.get('rel_path')}: {r.get('error')}")
-            if failed > 0:
-                QtWidgets.QMessageBox.warning(
-                    self,
-                    "EIDAT Manager",
-                    f"Processed {ok} file(s), but {failed} failed.\n\nSee Debug Console for details.",
-                )
-            else:
-                self._show_toast(f"Processed {ok} file(s).")
+            if not auto:
+                if failed > 0:
+                    QtWidgets.QMessageBox.warning(
+                        self,
+                        "EIDAT Manager",
+                        f"Processed {ok} file(s), but {failed} failed.\n\nSee Debug Console for details.",
+                    )
+                else:
+                    self._show_toast(f"Processed {ok} file(s).")
             return f"Processing complete - ok={ok}, failed={failed}"
 
         self._start_manager_action(
@@ -5613,6 +5630,8 @@ class MainWindow(QtWidgets.QMainWindow):
             status_text="Processing new files",
             task=lambda: be.eidat_manager_process(repo),
             on_success=_on_success,
+            auto=auto,
+            show_popup=not auto,
         )
 
     def _act_manager_force_all(self) -> None:
