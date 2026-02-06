@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import re
+import json
+import time
 import shutil
 import sys
 import threading
@@ -1148,6 +1150,16 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
                 selection-color: #1f2937;
             }
             QTableWidget::item { color: #1f2937; }
+            QListWidget {
+                background: #ffffff;
+                color: #1f2937;
+                border: 1px solid #d1d5db;
+                border-radius: 6px;
+            }
+            QListWidget::item:selected {
+                background: #dbeafe;
+                color: #1f2937;
+            }
             QHeaderView::section {
                 background: #f3f4f6;
                 color: #1f2937;
@@ -1266,6 +1278,13 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
             self.rb_auto_populate.setEnabled(True)
             self.rb_blank.setEnabled(True)
 
+        cont = getattr(self, "_continued_container", None)
+        if cont is not None:
+            cont.setEnabled(not is_raw)
+            if is_raw:
+                for cb in (self.cb_cont_program, self.cb_cont_part, self.cb_cont_vendor, self.cb_cont_asset):
+                    cb.setChecked(False)
+
     def _build_page_select(self) -> None:
         v = QtWidgets.QVBoxLayout(self._page_select)
         v.setContentsMargins(0, 0, 0, 0)
@@ -1323,6 +1342,60 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
         bottom.addWidget(self.btn_sel_none)
         v.addLayout(bottom)
 
+        cont_label = QtWidgets.QLabel("Allow Continued EIDP Population By:")
+        cont_label.setStyleSheet("font-weight: 600; color: #374151; margin-top: 8px;")
+        v.addWidget(cont_label)
+
+        cont_hint = QtWidgets.QLabel(
+            "Any future EIDP that matches these metadata values is auto-added to the project on refresh/update."
+        )
+        cont_hint.setStyleSheet("color: #64748b; font-size: 11px;")
+        cont_hint.setWordWrap(True)
+        v.addWidget(cont_hint)
+
+        self.cb_cont_program = QtWidgets.QCheckBox("Program")
+        self.cb_cont_part = QtWidgets.QCheckBox("Part Number")
+        self.cb_cont_vendor = QtWidgets.QCheckBox("Vendor Name")
+        self.cb_cont_asset = QtWidgets.QCheckBox("Asset Type")
+
+        self.list_cont_program = QtWidgets.QListWidget()
+        self.list_cont_part = QtWidgets.QListWidget()
+        self.list_cont_vendor = QtWidgets.QListWidget()
+        self.list_cont_asset = QtWidgets.QListWidget()
+
+        for lst in (self.list_cont_program, self.list_cont_part, self.list_cont_vendor, self.list_cont_asset):
+            lst.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+            lst.setMinimumHeight(70)
+            lst.setMaximumHeight(120)
+
+        self.cb_cont_program.toggled.connect(self.list_cont_program.setEnabled)
+        self.cb_cont_part.toggled.connect(self.list_cont_part.setEnabled)
+        self.cb_cont_vendor.toggled.connect(self.list_cont_vendor.setEnabled)
+        self.cb_cont_asset.toggled.connect(self.list_cont_asset.setEnabled)
+
+        for lst in (self.list_cont_program, self.list_cont_part, self.list_cont_vendor, self.list_cont_asset):
+            lst.setEnabled(False)
+
+        grid = QtWidgets.QGridLayout()
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(10)
+
+        def _add_cont_row(row: int, col: int, cb: QtWidgets.QCheckBox, lst: QtWidgets.QListWidget) -> None:
+            box = QtWidgets.QVBoxLayout()
+            box.setSpacing(6)
+            box.addWidget(cb)
+            box.addWidget(lst)
+            grid.addLayout(box, row, col)
+
+        _add_cont_row(0, 0, self.cb_cont_program, self.list_cont_program)
+        _add_cont_row(0, 1, self.cb_cont_vendor, self.list_cont_vendor)
+        _add_cont_row(1, 0, self.cb_cont_part, self.list_cont_part)
+        _add_cont_row(1, 1, self.cb_cont_asset, self.list_cont_asset)
+
+        self._continued_container = QtWidgets.QWidget()
+        self._continued_container.setLayout(grid)
+        v.addWidget(self._continued_container)
+
     def _browse_location(self) -> None:
         try:
             start = str(self._global_repo)
@@ -1344,6 +1417,8 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
 
         programs = sorted({str(d.get("program_title") or "").strip() for d in docs if str(d.get("program_title") or "").strip()})
         assets = sorted({str(d.get("asset_type") or "").strip() for d in docs if str(d.get("asset_type") or "").strip()})
+        vendors = sorted({str(d.get("vendor") or "").strip() for d in docs if str(d.get("vendor") or "").strip()})
+        parts = sorted({str(d.get("part_number") or "").strip() for d in docs if str(d.get("part_number") or "").strip()})
 
         self.cb_program.clear()
         self.cb_asset.clear()
@@ -1351,6 +1426,21 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
 
         self.cb_program.addItems(programs or ["(none)"])
         self.cb_asset.addItems(assets or ["(none)"])
+
+        def _populate_list(widget: QtWidgets.QListWidget, items: list[str]) -> None:
+            widget.blockSignals(True)
+            widget.clear()
+            widget.addItems(items or ["(none)"])
+            widget.blockSignals(False)
+
+        if hasattr(self, "list_cont_program"):
+            _populate_list(self.list_cont_program, programs)
+        if hasattr(self, "list_cont_part"):
+            _populate_list(self.list_cont_part, parts)
+        if hasattr(self, "list_cont_vendor"):
+            _populate_list(self.list_cont_vendor, vendors)
+        if hasattr(self, "list_cont_asset"):
+            _populate_list(self.list_cont_asset, assets)
 
         groups = []
         try:
@@ -1437,6 +1527,30 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
                     selected.append(item.text().strip())
         return selected
 
+    def _selected_continued_population(self) -> tuple[dict, list[str]]:
+        rules: dict[str, list[str]] = {}
+        missing: list[str] = []
+
+        def _collect(cb: QtWidgets.QCheckBox, lst: QtWidgets.QListWidget, key: str, label: str) -> None:
+            if not cb.isChecked():
+                return
+            values = [
+                i.text().strip()
+                for i in lst.selectedItems()
+                if i.text().strip() and i.text().strip() != "(none)"
+            ]
+            if values:
+                rules[key] = values
+            else:
+                missing.append(label)
+
+        _collect(self.cb_cont_program, self.list_cont_program, "program_title", "Program")
+        _collect(self.cb_cont_part, self.list_cont_part, "part_number", "Part Number")
+        _collect(self.cb_cont_vendor, self.list_cont_vendor, "vendor", "Vendor Name")
+        _collect(self.cb_cont_asset, self.list_cont_asset, "asset_type", "Asset Type")
+
+        return rules, missing
+
     def _update_counts(self) -> None:
         selected = self._selected_metadata_rel()
         self.lbl_count.setText(f"{len(selected)} selected")
@@ -1482,6 +1596,11 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
             selected = self._selected_metadata_rel()
             if not selected:
                 raise RuntimeError("Select at least one EIDP.")
+            continued_rules, missing = self._selected_continued_population()
+            if missing:
+                raise RuntimeError(
+                    "Select at least one value for: " + ", ".join(missing)
+                )
             # Two clear options: auto-populate or blank
             auto_populate = self.rb_auto_populate.isChecked()
             if project_type == getattr(be, "EIDAT_PROJECT_TYPE_RAW_TRENDING", "EIDP Raw File Trending"):
@@ -1492,6 +1611,7 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
                 project_name=project_name,
                 project_type=project_type,
                 selected_metadata_rel=selected,
+                continued_population=continued_rules,
                 auto_populate=auto_populate,
             )
             self.project_meta = meta if isinstance(meta, dict) else {}
@@ -1513,6 +1633,11 @@ class ImplementationTrendDialog(QtWidgets.QDialog):
         self._serials: list[str] = []
         self._terms: list[dict] = []
         self._plot_ready = False
+        self._auto_plots: list[dict] = []
+        self._last_plot_payloads: list[dict] = []
+        self._auto_plot_path = self._project_dir / "auto_plots.json"
+        self._auto_plot_refreshing = False
+        self._last_plot_source_label = ""
 
         self.setWindowTitle("Implementation - Trend / Analyze Data")
         self.resize(1080, 720)
@@ -1633,6 +1758,62 @@ class ImplementationTrendDialog(QtWidgets.QDialog):
         self.btn_plot.clicked.connect(self._plot_selected_terms)
         left_layout.addWidget(self.btn_plot)
 
+        auto_label = QtWidgets.QLabel("Auto-Plots")
+        auto_label.setStyleSheet("font-size: 13px; font-weight: 700; margin-top: 6px;")
+        left_layout.addWidget(auto_label)
+
+        auto_hint = QtWidgets.QLabel("Select an auto-plot to open it in the plot pane.")
+        auto_hint.setStyleSheet("color: #64748b; font-size: 11px;")
+        auto_hint.setWordWrap(True)
+        left_layout.addWidget(auto_hint)
+
+        self.list_auto_plots = QtWidgets.QListWidget()
+        self.list_auto_plots.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.list_auto_plots.itemSelectionChanged.connect(self._update_auto_plot_actions)
+        self.list_auto_plots.itemDoubleClicked.connect(lambda *_: self._open_selected_auto_plot())
+        left_layout.addWidget(self.list_auto_plots, 1)
+
+        auto_btn_row = QtWidgets.QHBoxLayout()
+        self.btn_open_auto_panel = QtWidgets.QPushButton("Open Selected Auto-Plots")
+        self.btn_open_auto_panel.setEnabled(False)
+        self.btn_open_auto_panel.setStyleSheet(
+            """
+            QPushButton {
+                padding: 6px 10px;
+                border-radius: 6px;
+                background: #ffffff;
+                color: #0f172a;
+                border: 1px solid #cbd5e1;
+                font-size: 12px;
+                font-weight: 600;
+            }
+            QPushButton:hover { background: #f8fafc; }
+            QPushButton:disabled { color: #94a3b8; border-color: #cbd5e1; }
+            """
+        )
+        self.btn_open_auto_panel.clicked.connect(self._open_auto_plot_panel)
+        self.btn_save_all_auto = QtWidgets.QPushButton("Save All Auto-Plots")
+        self.btn_save_all_auto.setEnabled(False)
+        self.btn_save_all_auto.setStyleSheet(
+            """
+            QPushButton {
+                padding: 6px 10px;
+                border-radius: 6px;
+                background: #ffffff;
+                color: #1f2937;
+                border: 1px solid #cbd5e1;
+                font-size: 12px;
+                font-weight: 600;
+            }
+            QPushButton:hover { background: #f8fafc; }
+            QPushButton:disabled { color: #94a3b8; border-color: #cbd5e1; }
+            """
+        )
+        self.btn_save_all_auto.clicked.connect(self._save_all_auto_plots_pdf)
+        auto_btn_row.addWidget(self.btn_open_auto_panel)
+        auto_btn_row.addWidget(self.btn_save_all_auto)
+        left_layout.addLayout(auto_btn_row)
+
         splitter.addWidget(left)
 
         # Right: plot + stats
@@ -1647,10 +1828,49 @@ class ImplementationTrendDialog(QtWidgets.QDialog):
         header_row = QtWidgets.QHBoxLayout()
         title = QtWidgets.QLabel("Trend Plot")
         title.setStyleSheet("font-size: 14px; font-weight: 700;")
+        self.btn_add_auto_plot = QtWidgets.QPushButton("Add to Auto-Plots")
+        self.btn_add_auto_plot.setEnabled(False)
+        self.btn_add_auto_plot.setStyleSheet(
+            """
+            QPushButton {
+                padding: 6px 10px;
+                border-radius: 6px;
+                background: #ffffff;
+                color: #0f766e;
+                border: 1px solid #0f766e;
+                font-size: 12px;
+                font-weight: 700;
+            }
+            QPushButton:hover { background: #ecfdf3; }
+            QPushButton:disabled { color: #94a3b8; border-color: #cbd5e1; }
+            """
+        )
+        self.btn_add_auto_plot.clicked.connect(self._add_current_plot_to_autoplots)
+
+        self.btn_save_plot_pdf = QtWidgets.QPushButton("Save Plot PDF")
+        self.btn_save_plot_pdf.setEnabled(False)
+        self.btn_save_plot_pdf.setStyleSheet(
+            """
+            QPushButton {
+                padding: 6px 10px;
+                border-radius: 6px;
+                background: #ffffff;
+                color: #1d4ed8;
+                border: 1px solid #1d4ed8;
+                font-size: 12px;
+                font-weight: 700;
+            }
+            QPushButton:hover { background: #eff6ff; }
+            QPushButton:disabled { color: #94a3b8; border-color: #cbd5e1; }
+            """
+        )
+        self.btn_save_plot_pdf.clicked.connect(self._save_current_plot_pdf)
         self.lbl_source = QtWidgets.QLabel("")
         self.lbl_source.setStyleSheet("color: #64748b; font-size: 11px;")
         header_row.addWidget(title)
         header_row.addStretch(1)
+        header_row.addWidget(self.btn_add_auto_plot)
+        header_row.addWidget(self.btn_save_plot_pdf)
         header_row.addWidget(self.lbl_source)
         right_layout.addLayout(header_row)
 
@@ -1695,6 +1915,7 @@ class ImplementationTrendDialog(QtWidgets.QDialog):
         splitter.setStretchFactor(1, 3)
 
         self._load_terms()
+        self._load_auto_plots()
 
     def _init_plot_area(self, layout: QtWidgets.QVBoxLayout) -> None:
         try:
@@ -1759,6 +1980,16 @@ class ImplementationTrendDialog(QtWidgets.QDialog):
         selected = self.list_terms.selectedItems()
         self.btn_plot.setEnabled(bool(selected) and self._plot_ready)
 
+    def _update_auto_plot_actions(self) -> None:
+        if not hasattr(self, "list_auto_plots"):
+            return
+        if not self.list_auto_plots.isEnabled():
+            self.btn_open_auto_panel.setEnabled(False)
+            return
+        selected = self.list_auto_plots.selectedItems()
+        has_plots = bool(selected) and self._plot_ready and bool(self._db_path)
+        self.btn_open_auto_panel.setEnabled(has_plots)
+
     def _select_all_terms(self) -> None:
         if not self.list_terms.isEnabled():
             return
@@ -1767,31 +1998,16 @@ class ImplementationTrendDialog(QtWidgets.QDialog):
     def _clear_all_terms(self) -> None:
         self.list_terms.clearSelection()
 
-    def _plot_selected_terms(self) -> None:
+    def _plot_terms_payloads(self, term_payloads: list[dict], *, source_label: str = "") -> None:
         if not self._plot_ready or not self._db_path:
             return
-        items = self.list_terms.selectedItems()
-        if not items:
-            return
-
-        if not self._serials:
-            QtWidgets.QMessageBox.information(self, "Implementation", "No serials found in the project workbook.")
-            return
-
-        term_payloads = []
-        for item in items:
-            payload = item.data(QtCore.Qt.ItemDataRole.UserRole) or {}
-            term_key = str(payload.get("term_key") or "").strip()
-            if term_key:
-                term_payloads.append(payload)
-
         if not term_payloads:
             return
 
         self._axes.clear()
-        self._axes.set_title("Trend Plot")
+        self._axes.set_title(self._compose_title(term_payloads, source_label=source_label))
         self._axes.set_xlabel("Serial Number")
-        self._axes.set_ylabel("Value")
+        self._axes.set_ylabel(self._units_label(term_payloads))
 
         x = list(range(len(self._serials)))
 
@@ -1807,9 +2023,7 @@ class ImplementationTrendDialog(QtWidgets.QDialog):
 
             series = be.load_trending_project_series(self._db_path, term_key)
             values_num: list[float | None] = []
-            serials: list[str] = []
             for row in series:
-                serials.append(str(row.get("serial") or ""))
                 values_num.append(row.get("value_num"))
 
             y = [v if v is not None else float("nan") for v in values_num]
@@ -1862,12 +2076,42 @@ class ImplementationTrendDialog(QtWidgets.QDialog):
         self._axes.set_xticks(x)
         self._axes.set_xticklabels(self._serials, rotation=45, ha="right", fontsize=8)
         self._axes.grid(True, alpha=0.25)
-        if len(term_payloads) > 1:
-            self._axes.legend(fontsize=8, loc="best")
+        self._axes.legend(fontsize=8, loc="best")
         self._figure.tight_layout()
         self._canvas.draw()
 
         self._populate_stats(stats_rows)
+        self._last_plot_payloads = list(term_payloads)
+        self._last_plot_source_label = source_label
+        if source_label:
+            self.lbl_source.setText(f"{self._db_path} • {source_label}")
+        else:
+            self.lbl_source.setText(str(self._db_path))
+        self.btn_add_auto_plot.setEnabled(bool(self._last_plot_payloads))
+        self.btn_save_plot_pdf.setEnabled(bool(self._last_plot_payloads))
+
+    def _plot_selected_terms(self) -> None:
+        if not self._plot_ready or not self._db_path:
+            return
+        items = self.list_terms.selectedItems()
+        if not items:
+            return
+
+        if not self._serials:
+            QtWidgets.QMessageBox.information(self, "Implementation", "No serials found in the project workbook.")
+            return
+
+        term_payloads = []
+        for item in items:
+            payload = item.data(QtCore.Qt.ItemDataRole.UserRole) or {}
+            term_key = str(payload.get("term_key") or "").strip()
+            if term_key:
+                term_payloads.append(payload)
+
+        if not term_payloads:
+            return
+
+        self._plot_terms_payloads(term_payloads, source_label="Selected terms")
 
     def _populate_stats(self, rows: list[dict]) -> None:
         self.tbl_stats.setRowCount(0)
@@ -1899,6 +2143,317 @@ class ImplementationTrendDialog(QtWidgets.QDialog):
             return f"{float(value):.4g}"
         except Exception:
             return str(value)
+
+    def _default_plot_name(self, term_payloads: list[dict]) -> str:
+        labels: list[str] = []
+        for payload in term_payloads:
+            label = str(payload.get("term_label") or payload.get("term") or "").strip()
+            if label:
+                labels.append(label)
+        if not labels:
+            return "Auto Plot"
+        if len(labels) <= 3:
+            return ", ".join(labels)
+        return f"{', '.join(labels[:2])} (+{len(labels) - 2})"
+
+    def _units_label(self, term_payloads: list[dict]) -> str:
+        units = sorted({str(p.get("units") or "").strip() for p in term_payloads if str(p.get("units") or "").strip()})
+        if not units:
+            return "Value"
+        if len(units) == 1:
+            return f"Value ({units[0]})"
+        return "Value (mixed units)"
+
+    def _compose_title(self, term_payloads: list[dict], *, source_label: str = "") -> str:
+        if source_label:
+            return f"Trend Plot — {source_label}"
+        labels: list[str] = []
+        for payload in term_payloads:
+            label = str(payload.get("term_label") or payload.get("term") or "").strip()
+            if label:
+                labels.append(label)
+        if not labels:
+            return "Trend Plot"
+        if len(labels) == 1:
+            return f"Trend Plot — {labels[0]}"
+        return f"Trend Plot — {self._default_plot_name(term_payloads)}"
+
+    def _load_auto_plots(self) -> None:
+        self._auto_plots = []
+        try:
+            if self._auto_plot_path.exists():
+                payload = json.loads(self._auto_plot_path.read_text(encoding="utf-8"))
+                if isinstance(payload, dict):
+                    plots = payload.get("plots")
+                else:
+                    plots = payload
+                if isinstance(plots, list):
+                    self._auto_plots = [p for p in plots if isinstance(p, dict)]
+        except Exception:
+            self._auto_plots = []
+        self._refresh_auto_plot_list()
+
+    def _save_auto_plots(self) -> None:
+        try:
+            data = {"plots": self._auto_plots}
+            self._auto_plot_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    def _refresh_auto_plot_list(self) -> None:
+        if not hasattr(self, "list_auto_plots"):
+            return
+        self._auto_plot_refreshing = True
+        self.list_auto_plots.clear()
+        if not self._auto_plots:
+            self.list_auto_plots.addItem("No auto-plots yet.")
+            self.list_auto_plots.setEnabled(False)
+        else:
+            self.list_auto_plots.setEnabled(True)
+            for plot in self._auto_plots:
+                name = str(plot.get("name") or "Auto Plot").strip()
+                terms = plot.get("terms") or []
+                count = len(terms) if isinstance(terms, list) else 0
+                label = f"{name} ({count})"
+                item = QtWidgets.QListWidgetItem(label)
+                item.setData(QtCore.Qt.ItemDataRole.UserRole, plot)
+                self.list_auto_plots.addItem(item)
+        self._auto_plot_refreshing = False
+        self.btn_save_all_auto.setEnabled(bool(self._auto_plots) and self._plot_ready and bool(self._db_path))
+        self._update_auto_plot_actions()
+
+    def _payloads_from_term_keys(self, keys: list[str]) -> list[dict]:
+        by_key: dict[str, dict] = {}
+        for t in self._terms:
+            key = str(t.get("term_key") or "").strip()
+            if key:
+                by_key[key] = t
+        payloads: list[dict] = []
+        for key in keys:
+            k = str(key or "").strip()
+            if not k:
+                continue
+            payload = by_key.get(k)
+            if payload:
+                payloads.append(payload)
+        return payloads
+
+    def _open_selected_auto_plot(self) -> None:
+        if self._auto_plot_refreshing:
+            return
+        if not self.list_auto_plots.isEnabled():
+            return
+        items = self.list_auto_plots.selectedItems()
+        if not items:
+            return
+        plot = items[0].data(QtCore.Qt.ItemDataRole.UserRole) or {}
+        term_keys = plot.get("terms") or []
+        if not isinstance(term_keys, list) or not term_keys:
+            return
+        payloads = self._payloads_from_term_keys(term_keys)
+        missing = len(term_keys) - len(payloads)
+        if not payloads:
+            QtWidgets.QMessageBox.information(self, "Auto-Plots", "No matching terms found for this auto-plot.")
+            return
+        if missing > 0:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Auto-Plots",
+                f"{missing} term(s) no longer exist in the workbook and were skipped.",
+            )
+        name = str(plot.get("name") or "").strip()
+        label = f"Auto-plot: {name}" if name else "Auto-plot"
+        self._plot_terms_payloads(payloads, source_label=label)
+
+    def _add_current_plot_to_autoplots(self) -> None:
+        if not self._last_plot_payloads:
+            return
+        default_name = self._default_plot_name(self._last_plot_payloads)
+        name, ok = QtWidgets.QInputDialog.getText(
+            self,
+            "Add to Auto-Plots",
+            "Name this auto-plot:",
+            QtWidgets.QLineEdit.EchoMode.Normal,
+            default_name,
+        )
+        if not ok:
+            return
+        name = (name or "").strip() or default_name
+        term_keys = [str(p.get("term_key") or "").strip() for p in self._last_plot_payloads if str(p.get("term_key") or "").strip()]
+        if not term_keys:
+            return
+        plot = {
+            "id": f"auto_{int(time.time()*1000)}",
+            "name": name,
+            "terms": term_keys,
+        }
+        self._auto_plots.append(plot)
+        self._save_auto_plots()
+        self._refresh_auto_plot_list()
+
+    def _open_auto_plot_panel(self) -> None:
+        if not self._plot_ready or not self._db_path:
+            QtWidgets.QMessageBox.information(self, "Auto-Plots", "Plotting is unavailable.")
+            return
+        if not self.list_auto_plots.isEnabled():
+            QtWidgets.QMessageBox.information(self, "Auto-Plots", "No auto-plots available.")
+            return
+        items = self.list_auto_plots.selectedItems()
+        if not items:
+            QtWidgets.QMessageBox.information(self, "Auto-Plots", "Select one or more auto-plots first.")
+            return
+
+        plots_payloads: list[tuple[str, list[dict]]] = []
+        for item in items:
+            plot = item.data(QtCore.Qt.ItemDataRole.UserRole) or {}
+            name = str(plot.get("name") or "Auto Plot").strip()
+            term_keys = plot.get("terms") or []
+            if not isinstance(term_keys, list) or not term_keys:
+                continue
+            payloads = self._payloads_from_term_keys(term_keys)
+            if not payloads:
+                continue
+            plots_payloads.append((name, payloads))
+
+        if not plots_payloads:
+            QtWidgets.QMessageBox.information(self, "Auto-Plots", "No matching terms found for the selected auto-plots.")
+            return
+
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Auto-Plots")
+        dlg.resize(980, 720)
+        dlg.setStyleSheet(
+            """
+            QDialog { background: #ffffff; color: #1f2937; }
+            QLabel { color: #1f2937; }
+            QTabWidget::pane { border: 1px solid #e2e8f0; }
+            QTabBar::tab {
+                background: #f8fafc;
+                border: 1px solid #e2e8f0;
+                color: #0f172a;
+                padding: 6px 10px;
+                margin-right: 4px;
+            }
+            QTabBar::tab:selected {
+                background: #ffffff;
+                color: #0f172a;
+                border-bottom-color: #ffffff;
+            }
+            """
+        )
+        layout = QtWidgets.QVBoxLayout(dlg)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
+        tabs = QtWidgets.QTabWidget()
+        layout.addWidget(tabs, 1)
+
+        try:
+            from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(dlg, "Auto-Plots", f"Plotting unavailable: {exc}")
+            return
+
+        for name, payloads in plots_payloads:
+            tab = QtWidgets.QWidget()
+            tab_layout = QtWidgets.QVBoxLayout(tab)
+            tab_layout.setContentsMargins(8, 8, 8, 8)
+            fig = self._render_plot_to_figure(payloads, title_text=f"Trend Plot — {name}")
+            canvas = FigureCanvas(fig)
+            tab_layout.addWidget(canvas, 1)
+            tabs.addTab(tab, name or "Auto Plot")
+
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_row.addStretch(1)
+        btn_close = QtWidgets.QPushButton("Close")
+        btn_close.clicked.connect(dlg.accept)
+        btn_row.addWidget(btn_close)
+        layout.addLayout(btn_row)
+
+        dlg.exec()
+
+    def _render_plot_to_figure(self, term_payloads: list[dict], *, title_text: str = ""):
+        from matplotlib.figure import Figure
+
+        fig = Figure(figsize=(8, 4), dpi=150)
+        ax = fig.add_subplot(111)
+        ax.set_title(title_text or self._compose_title(term_payloads))
+        ax.set_xlabel("Serial Number")
+        ax.set_ylabel(self._units_label(term_payloads))
+
+        x = list(range(len(self._serials)))
+        for payload in term_payloads:
+            term_key = str(payload.get("term_key") or "").strip()
+            term_name = str(payload.get("term_label") or payload.get("term") or "").strip() or "Term"
+            min_limit = payload.get("min_val")
+            max_limit = payload.get("max_val")
+            units = str(payload.get("units") or "").strip()
+            if units:
+                term_name = f"{term_name} ({units})"
+
+            series = be.load_trending_project_series(self._db_path, term_key)
+            values_num: list[float | None] = [row.get("value_num") for row in series]
+            y = [v if v is not None else float("nan") for v in values_num]
+            line = ax.plot(x, y, marker="o", linewidth=1.6, label=term_name)[0]
+            color = line.get_color()
+            if min_limit is not None:
+                ax.axhline(float(min_limit), color=color, linestyle="--", alpha=0.4)
+            if max_limit is not None:
+                ax.axhline(float(max_limit), color=color, linestyle="--", alpha=0.4)
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(self._serials, rotation=45, ha="right", fontsize=8)
+        ax.grid(True, alpha=0.25)
+        ax.legend(fontsize=8, loc="best")
+        fig.tight_layout()
+        return fig
+
+    def _save_current_plot_pdf(self) -> None:
+        if not self._plot_ready or not self._last_plot_payloads:
+            return
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Save Plot PDF",
+            str(self._project_dir / "trend_plot.pdf"),
+            "PDF Files (*.pdf)",
+        )
+        if not path:
+            return
+        try:
+            title_text = self._compose_title(self._last_plot_payloads, source_label=self._last_plot_source_label)
+            fig = self._render_plot_to_figure(self._last_plot_payloads, title_text=title_text)
+            fig.savefig(path, format="pdf")
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Save Plot PDF", str(exc))
+
+    def _save_all_auto_plots_pdf(self) -> None:
+        if not self._plot_ready or not self._auto_plots:
+            return
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Save All Auto-Plots",
+            str(self._project_dir / "auto_plots.pdf"),
+            "PDF Files (*.pdf)",
+        )
+        if not path:
+            return
+        try:
+            from matplotlib.backends.backend_pdf import PdfPages
+
+            with PdfPages(path) as pdf:
+                for plot in self._auto_plots:
+                    keys = plot.get("terms") or []
+                    if not isinstance(keys, list) or not keys:
+                        continue
+                    payloads = self._payloads_from_term_keys(keys)
+                    if not payloads:
+                        continue
+                    name = str(plot.get("name") or "").strip()
+                    title_text = f"Trend Plot — {name}" if name else self._compose_title(payloads)
+                    fig = self._render_plot_to_figure(payloads, title_text=title_text)
+                    pdf.savefig(fig)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Save All Auto-Plots", str(exc))
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -3855,7 +4410,10 @@ class MainWindow(QtWidgets.QMainWindow):
         is_trending = False
         if record:
             ptype = str(record.get("type") or "").strip()
-            is_trending = ptype == getattr(be, "EIDAT_PROJECT_TYPE_TRENDING", "EIDP Trending")
+            is_trending = ptype in (
+                getattr(be, "EIDAT_PROJECT_TYPE_TRENDING", "EIDP Trending"),
+                getattr(be, "EIDAT_PROJECT_TYPE_RAW_TRENDING", "EIDP Raw File Trending"),
+            )
         if hasattr(self, "btn_project_implementation"):
             self.btn_project_implementation.setEnabled(bool(record) and is_trending)
 
@@ -3885,8 +4443,11 @@ class MainWindow(QtWidgets.QMainWindow):
             if not record:
                 raise RuntimeError("Select a project in the list first.")
             ptype = str(record.get("type") or "").strip()
-            if ptype != getattr(be, "EIDAT_PROJECT_TYPE_TRENDING", "EIDP Trending"):
-                raise RuntimeError("Implementation is available only for EIDP Trending projects.")
+            if ptype not in (
+                getattr(be, "EIDAT_PROJECT_TYPE_TRENDING", "EIDP Trending"),
+                getattr(be, "EIDAT_PROJECT_TYPE_RAW_TRENDING", "EIDP Raw File Trending"),
+            ):
+                raise RuntimeError("Implementation is available only for EIDP Trending or Raw File Trending projects.")
 
             project_dir = Path(str(record.get("folder") or "")).expanduser()
             workbook = Path(str(record.get("workbook") or "")).expanduser()

@@ -223,6 +223,258 @@ def _cells_to_rows(cells: List[Dict]) -> List[List[str]]:
     return rows
 
 
+def _merge_positions(values: List[float], tol_px: float) -> List[float]:
+    """
+    Merge near-identical 1D positions into representative values.
+
+    This is used to treat slightly jittery border detections as the same gridline.
+    """
+    if not values:
+        return []
+    tol = max(0.0, float(tol_px))
+    vals = sorted(float(v) for v in values)
+    if tol <= 0:
+        # Fast path: exact uniqueness (float-safe-ish via rounding).
+        out: List[float] = []
+        last = None
+        for v in vals:
+            key = int(round(v))
+            if last is None or key != last:
+                out.append(float(key))
+                last = key
+        return out
+
+    clusters: List[List[float]] = []
+    cur = [vals[0]]
+    for v in vals[1:]:
+        if abs(v - cur[-1]) <= tol:
+            cur.append(v)
+        else:
+            clusters.append(cur)
+            cur = [v]
+    clusters.append(cur)
+    return [sum(c) / float(len(c)) for c in clusters]
+
+
+def _group_cells_into_rows(cells: List[Dict]) -> List[List[Dict]]:
+    """
+    Group detected bordered cells into rows (top-to-bottom), then sort each row left-to-right.
+
+    We avoid relying on perfect y0 alignment; instead we cluster by y-center with a tolerance
+    derived from the median cell height.
+    """
+    usable: List[Dict] = []
+    heights: List[float] = []
+    for c in cells:
+        bbox = c.get("bbox_px") or []
+        if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+            continue
+        x0, y0, x1, y1 = bbox
+        try:
+            h = float(y1) - float(y0)
+        except Exception:
+            continue
+        if h <= 0:
+            continue
+        usable.append(c)
+        heights.append(h)
+    if not usable:
+        return []
+
+    heights.sort()
+    median_h = float(heights[len(heights) // 2]) if heights else 0.0
+    # A fairly generous tolerance: cell borders can be jittery; we want stable row grouping.
+    row_tol = max(8.0, median_h * 0.60)
+
+    def _cy(cell: Dict) -> float:
+        x0, y0, x1, y1 = cell["bbox_px"]
+        return (float(y0) + float(y1)) / 2.0
+
+    sorted_cells = sorted(usable, key=lambda c: (_cy(c), float(c["bbox_px"][0])))
+    rows: List[List[Dict]] = []
+    cur: List[Dict] = []
+    cur_cy: Optional[float] = None
+
+    for cell in sorted_cells:
+        cy = _cy(cell)
+        if cur and cur_cy is not None and abs(cy - cur_cy) > row_tol:
+            rows.append(sorted(cur, key=lambda c: float(c["bbox_px"][0])))
+            cur = [cell]
+            cur_cy = cy
+            continue
+        cur.append(cell)
+        if cur_cy is None:
+            cur_cy = cy
+        else:
+            cur_cy = (cur_cy * (len(cur) - 1) + cy) / float(len(cur))
+
+    if cur:
+        rows.append(sorted(cur, key=lambda c: float(c["bbox_px"][0])))
+    return rows
+
+
+def _row_vline_signature(
+    row_cells: List[Dict],
+    *,
+    table_left: float,
+    table_right: float,
+    tol_px: float,
+) -> Optional[List[float]]:
+    """
+    Build a "vertical gridline signature" for a row.
+
+    The signature is the sorted list of internal x-boundaries (excluding the outer table borders),
+    with near-identical boundaries merged within tol_px.
+    """
+    if len(row_cells) < 2:
+        return None
+    xs: List[float] = []
+    for c in row_cells:
+        bbox = c.get("bbox_px") or []
+        if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+            continue
+        x0, y0, x1, y1 = bbox
+        try:
+            xs.append(float(x0))
+            xs.append(float(x1))
+        except Exception:
+            continue
+    if not xs:
+        return None
+    merged = _merge_positions(xs, tol_px=float(tol_px))
+    tol = max(0.0, float(tol_px))
+    internal = [x for x in merged if (x - float(table_left)) > tol and (float(table_right) - x) > tol]
+    internal.sort()
+    return internal
+
+
+def _signatures_match(a: Optional[List[float]], b: Optional[List[float]], tol_px: float) -> bool:
+    if a is None or b is None:
+        return a == b
+    if len(a) != len(b):
+        return False
+    tol = max(0.0, float(tol_px))
+    for x, y in zip(a, b):
+        if abs(float(x) - float(y)) > tol:
+            return False
+    return True
+
+
+def _split_table_on_vline_mismatch(table: Dict, tol_px: float) -> List[Dict]:
+    """
+    Split a detected bordered table into multiple tables when internal vertical gridlines
+    are not aligned from row to row.
+
+    Additional rule requested:
+    - If a row has <=1 cell, split that row into its own table *only if* there is at least one
+      multi-cell row above it AND at least one multi-cell row below it.
+    """
+    try:
+        tol = float(tol_px)
+    except Exception:
+        tol = 0.0
+    tol = max(0.0, tol)
+
+    if bool(table.get("borderless", False)):
+        return [table]
+    cells = table.get("cells") or []
+    if not isinstance(cells, list) or len(cells) < 2:
+        return [table]
+
+    rows = _group_cells_into_rows(cells)
+    if len(rows) < 2:
+        return [table]
+
+    # Global table bounds based on cells (more reliable than any precomputed bbox).
+    xs0: List[float] = []
+    xs1: List[float] = []
+    for c in cells:
+        bbox = c.get("bbox_px") or []
+        if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+            continue
+        xs0.append(float(bbox[0]))
+        xs1.append(float(bbox[2]))
+    if not xs0 or not xs1:
+        return [table]
+    table_left = min(xs0)
+    table_right = max(xs1)
+    if table_right <= table_left:
+        return [table]
+
+    is_multi = [len(r) >= 2 for r in rows]
+    prefix_has_multi = []
+    seen = False
+    for flag in is_multi:
+        prefix_has_multi.append(seen)
+        seen = seen or bool(flag)
+    suffix_has_multi = [False] * len(rows)
+    seen = False
+    for i in range(len(rows) - 1, -1, -1):
+        suffix_has_multi[i] = seen
+        seen = seen or bool(is_multi[i])
+
+    segments: List[List[List[Dict]]] = []
+    cur: List[List[Dict]] = []
+    cur_sig: Optional[List[float]] = None
+
+    for i, row in enumerate(rows):
+        # Special separator rule for single-cell (or empty) rows.
+        if len(row) <= 1 and prefix_has_multi[i] and suffix_has_multi[i]:
+            if cur:
+                segments.append(cur)
+                cur = []
+                cur_sig = None
+            segments.append([row])
+            continue
+
+        sig = _row_vline_signature(row, table_left=table_left, table_right=table_right, tol_px=tol) if len(row) >= 2 else None
+        if not cur:
+            cur = [row]
+            cur_sig = sig
+            continue
+
+        # If we can't compute a signature for a row, keep it with the current segment.
+        if sig is None:
+            cur.append(row)
+            continue
+
+        if cur_sig is None:
+            cur.append(row)
+            cur_sig = sig
+            continue
+
+        if not _signatures_match(cur_sig, sig, tol_px=tol):
+            segments.append(cur)
+            cur = [row]
+            cur_sig = sig
+            continue
+
+        cur.append(row)
+
+    if cur:
+        segments.append(cur)
+
+    if len(segments) <= 1:
+        return [table]
+
+    out: List[Dict] = []
+    for seg_rows in segments:
+        seg_cells = [c for r in seg_rows for c in r]
+        if not seg_cells:
+            continue
+        x0 = min(float(c["bbox_px"][0]) for c in seg_cells)
+        y0 = min(float(c["bbox_px"][1]) for c in seg_cells)
+        x1 = max(float(c["bbox_px"][2]) for c in seg_cells)
+        y1 = max(float(c["bbox_px"][3]) for c in seg_cells)
+        tb = dict(table)
+        tb["cells"] = seg_cells
+        tb["bbox_px"] = [x0, y0, x1, y1]
+        tb["num_cells"] = len(seg_cells)
+        out.append(tb)
+
+    return out or [table]
+
+
 def _build_variants(ocr_dpi: int, detection_dpi: int) -> List[Dict]:
     variants: List[Dict] = []
 
@@ -467,6 +719,21 @@ def _run_for_input(
                     )
                 except Exception:
                     pass
+
+    # Split tables when internal vertical gridlines are not aligned (per-row column structure differs).
+    # This helps avoid "one big table" detections that actually contain multiple stacked tables with
+    # different column widths/counts, or a single-cell separator row between tables.
+    vline_tol_px = _parse_float_env("EIDAT_TABLE_SPLIT_VLINE_MISALIGN_PX", 6.0)
+    if vline_tol_px < 0:
+        vline_tol_px = 0.0
+    if tables and vline_tol_px >= 0:
+        split_tables: List[Dict] = []
+        for t in tables:
+            try:
+                split_tables.extend(_split_table_on_vline_mismatch(t, tol_px=float(vline_tol_px)))
+            except Exception:
+                split_tables.append(t)
+        tables = split_tables
 
     base_tables: List[Dict] = []
     for t in tables:

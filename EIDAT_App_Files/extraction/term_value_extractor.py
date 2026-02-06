@@ -564,6 +564,34 @@ class CombinedTxtParser:
                 if best_role and best_score >= self._fuzzy_min_ratio and best_role not in roles:
                     roles[best_role] = idx
 
+            def _col_numeric_ratio(col_idx: int) -> float:
+                """Return fraction of non-empty cells in column that parse as numbers."""
+                total = 0
+                numeric = 0
+                for r in table.get("rows") or []:
+                    if not isinstance(r, list) or col_idx >= len(r):
+                        continue
+                    s = str(r[col_idx] or "").strip()
+                    if not s:
+                        continue
+                    total += 1
+                    try:
+                        if MeasuredValueParser.parse(s).value is not None:
+                            numeric += 1
+                    except Exception:
+                        pass
+                return (numeric / total) if total else 0.0
+
+            # Heuristic: many acceptance tables label the measured column as "Result"
+            # (numeric), which otherwise gets classified as status. If it's numeric-heavy,
+            # treat it as the measured value.
+            if "value" not in roles and "status" in roles:
+                status_idx = int(roles["status"])
+                htxt = header_norm[status_idx] if status_idx < len(header_norm) else ""
+                if ("result" in (htxt or "")) and _col_numeric_ratio(status_idx) >= 0.6:
+                    roles["value"] = status_idx
+                    roles.pop("status", None)
+
             # Check if this looks like an acceptance criteria table (avoid Field/Value metadata tables)
             has_tag = "term" in roles
             has_measured = ("value" in roles) or ("min" in roles) or ("max" in roles)

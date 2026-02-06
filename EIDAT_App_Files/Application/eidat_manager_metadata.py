@@ -103,6 +103,22 @@ def _first_nonempty(lines: list[str], max_lines: int = 120) -> str:
     return "\n".join(out)
 
 
+def _strip_doc_type_lines(lines: list[str]) -> list[str]:
+    """Remove lines that are likely just document-type headers (to avoid asset-type false positives)."""
+    out: list[str] = []
+    for ln in lines:
+        s = str(ln or "").strip()
+        if not s:
+            continue
+        s_l = s.lower()
+        if "end item data package" in s_l or "end-item data package" in s_l:
+            continue
+        if "data package" in s_l and "eidp" in s_l:
+            continue
+        out.append(s)
+    return out
+
+
 def _match_from_candidates(value: str, candidates: list[str]) -> Optional[str]:
     if not value:
         return None
@@ -434,6 +450,7 @@ def _find_asset_type_by_frequency(first_page_text: str, asset_types: list[str]) 
 
 def extract_metadata_from_text(text: str, *, asset_types: Optional[list[str]] = None, pdf_path: Optional[Path] = None) -> dict:
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    asset_lines = _strip_doc_type_lines(lines)
     candidates = _load_candidates()
     asset_list = asset_types or candidates.get("asset_types") or []
     program_titles = candidates.get("program_titles") or []
@@ -523,12 +540,12 @@ def extract_metadata_from_text(text: str, *, asset_types: Optional[list[str]] = 
             meta["asset_type"] = None
 
     if not meta.get("asset_type"):
-        field_asset = _find_asset_type_from_fields(lines, asset_list)
+        field_asset = _find_asset_type_from_fields(asset_lines, asset_list)
         if field_asset:
             meta["asset_type"] = field_asset
 
     if not meta.get("asset_type"):
-        asset = _find_asset_type("\n".join(lines[:200]), asset_list)
+        asset = _find_asset_type("\n".join(asset_lines[:200]), asset_list)
         if asset:
             meta["asset_type"] = asset
 
@@ -542,7 +559,7 @@ def extract_metadata_from_text(text: str, *, asset_types: Optional[list[str]] = 
     if not meta.get("asset_type"):
         # Extract first page text (up to first "=== Page 2 ===" marker or first 200 lines)
         first_page_lines = []
-        for line in lines:
+        for line in asset_lines:
             if "=== Page 2 ===" in line or "=== Page 3 ===" in line:
                 break
             first_page_lines.append(line)

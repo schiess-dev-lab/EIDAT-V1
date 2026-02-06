@@ -2530,6 +2530,30 @@ def _normalize_key(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", _normalize_text(s))
 
 
+def _split_term_instance(term: str) -> tuple[str, int | None]:
+    """
+    Split a term like "Torque (2)" into ("Torque", 2).
+
+    Returns (term, None) if no numeric instance suffix is found.
+    """
+    raw = str(term or "").strip()
+    if not raw:
+        return "", None
+    m = re.search(r"\s*\((\d+)\)\s*$", raw)
+    if not m:
+        return raw, None
+    base = raw[: m.start()].strip()
+    if not base:
+        return raw, None
+    try:
+        idx = int(m.group(1))
+    except Exception:
+        return raw, None
+    if idx <= 0:
+        return raw, None
+    return base, idx
+
+
 def _clean_cell_text(s: str) -> str:
     s = str(s or "")
     s = s.replace("\u00a0", " ")
@@ -2617,6 +2641,97 @@ def _match_serial_key(sn_header: str, known_serials: set[str]) -> str:
         if s.lower() in raw_l and len(s) > len(best):
             best = s
     return best or raw
+
+
+_CONTINUED_POPULATION_FIELDS: dict[str, tuple[str, ...]] = {
+    "program_title": ("program", "programs", "program_title", "programtitle"),
+    "part_number": ("part", "part_number", "partnumber", "part_numbers", "partnumbers", "pn"),
+    "vendor": ("vendor", "vendors", "vendor_name", "vendorname"),
+    "asset_type": ("asset", "asset_type", "assettype", "asset_types", "assettypes"),
+}
+
+
+def _normalize_meta_value(value: object) -> str:
+    return str(value or "").strip().lower()
+
+
+def _sanitize_continued_population(payload: Mapping[str, object] | None) -> dict[str, list[str]]:
+    if not isinstance(payload, Mapping):
+        return {}
+    out: dict[str, list[str]] = {}
+    for field, aliases in _CONTINUED_POPULATION_FIELDS.items():
+        raw_values: list[object] = []
+        for key in aliases:
+            if key not in payload:
+                continue
+            val = payload.get(key)
+            if isinstance(val, (list, tuple, set)):
+                raw_values.extend(list(val))
+            elif isinstance(val, str):
+                raw_values.append(val)
+        cleaned = sorted({str(v).strip() for v in raw_values if str(v).strip()})
+        if cleaned:
+            out[field] = cleaned
+    return out
+
+
+def _extract_continued_population_rules(meta: Mapping[str, object]) -> dict[str, set[str]]:
+    raw = meta.get("continued_population")
+    if not isinstance(raw, Mapping):
+        return {}
+    rules: dict[str, set[str]] = {}
+    for field, aliases in _CONTINUED_POPULATION_FIELDS.items():
+        raw_values: list[object] = []
+        for key in aliases:
+            if key not in raw:
+                continue
+            val = raw.get(key)
+            if isinstance(val, (list, tuple, set)):
+                raw_values.extend(list(val))
+            elif isinstance(val, str):
+                raw_values.append(val)
+        cleaned = {_normalize_meta_value(v) for v in raw_values if _normalize_meta_value(v)}
+        if cleaned:
+            rules[field] = cleaned
+    return rules
+
+
+def _docs_matching_population_rules(docs: list[dict], rules: Mapping[str, set[str]]) -> list[dict]:
+    if not rules:
+        return []
+    matched: list[dict] = []
+    for d in docs:
+        for field, allowed in rules.items():
+            if not allowed:
+                continue
+            val = _normalize_meta_value(d.get(field))
+            if val and val in allowed:
+                matched.append(d)
+                break
+    return matched
+
+
+def _format_continued_population_description(rules: Mapping[str, Iterable[str]]) -> str:
+    if not rules:
+        return ""
+    labels = {
+        "program_title": "Program",
+        "part_number": "Part Number",
+        "vendor": "Vendor",
+        "asset_type": "Asset Type",
+    }
+    parts: list[str] = []
+    for key in ("program_title", "part_number", "vendor", "asset_type"):
+        raw_vals = rules.get(key) if isinstance(rules, Mapping) else None
+        if not raw_vals:
+            continue
+        vals = sorted({str(v).strip() for v in raw_vals if str(v).strip()})
+        if not vals:
+            continue
+        parts.append(f"{labels.get(key, key)}: {', '.join(vals)}")
+    if not parts:
+        return ""
+    return "Continuous plotting enabled by " + "; ".join(parts)
 
 
 def _load_metadata_from_artifacts_dir(art_dir: Path) -> dict:
@@ -2976,6 +3091,8 @@ def _extract_from_tables_by_header(
     term: str,
     term_label: str = "",
     header_anchor: str = "",
+    fuzzy_header: bool = False,
+    fuzzy_min_ratio: float = 0.72,
 ) -> tuple[str | None, str, dict]:
     term_k = _normalize_key(term)
     term_n = _normalize_text(term)
@@ -2983,6 +3100,51 @@ def _extract_from_tables_by_header(
     anchor_n = _normalize_text(header_anchor)
     if not term_k and not term_label_n:
         return None, "", {}
+
+    _RANGE_LIKE_RE = re.compile(
+        r"[-+]?\d+(?:\.\d+)?\s*(?:[-\u2013\u2014]|to)\s*[-+]?\d+(?:\.\d+)?",
+        flags=re.IGNORECASE,
+    )
+
+    def _is_range_like(cell: str) -> bool:
+        s = str(cell or "").strip()
+        if not s:
+            return False
+        # Avoid treating negative scalar values (e.g. "-40") as ranges.
+        if re.fullmatch(r"[-+]?\d+(?:\.\d+)?", s):
+            return False
+        return bool(_RANGE_LIKE_RE.search(s))
+
+    def _tokens(s: str) -> list[str]:
+        return re.findall(r"[a-z0-9]+", _normalize_text(s))
+
+    def _abbr_score(anchor: str, header: str) -> float:
+        """Score abbreviation-style matches: 'propellant valve resistance' ~= 'prop valve res'."""
+        a = _tokens(anchor)
+        h = _tokens(header)
+        if not a or not h:
+            return 0.0
+        ai = 0
+        matched = 0
+        for ht in h:
+            found = False
+            for j in range(ai, len(a)):
+                at = a[j]
+                if at.startswith(ht) or ht.startswith(at):
+                    matched += 1
+                    ai = j + 1
+                    found = True
+                    break
+            if not found:
+                continue
+        return matched / float(len(h)) if h else 0.0
+
+    def _fuzzy_header_score(anchor: str, header: str) -> float:
+        akey = _normalize_key(anchor)
+        hkey = _normalize_key(header)
+        seq = SequenceMatcher(None, akey, hkey).ratio() if (akey and hkey) else 0.0
+        abbr = _abbr_score(anchor, header)
+        return max(seq, abbr)
 
     def _find_col(header_norm: list[str], wanted: str) -> int | None:
         w = _normalize_text(wanted)
@@ -3007,6 +3169,21 @@ def _extract_from_tables_by_header(
             idx = _find_col(hnorm, wanted)
             if idx is not None:
                 return idx
+        return None
+
+    def _find_col_in_headers_fuzzy(headers_norm: list[list[str]], wanted: str, min_ratio: float) -> int | None:
+        best_idx: int | None = None
+        best_score = 0.0
+        for hnorm in headers_norm:
+            for idx, h in enumerate(hnorm):
+                if not h:
+                    continue
+                score = _fuzzy_header_score(wanted, h)
+                if score > best_score:
+                    best_score = score
+                    best_idx = idx
+        if best_idx is not None and best_score >= float(min_ratio or 0.0):
+            return best_idx
         return None
 
     def _find_col_keywords_in_headers(headers_norm: list[list[str]], keywords: list[str]) -> int | None:
@@ -3108,6 +3285,8 @@ def _extract_from_tables_by_header(
         value_col = _find_col_in_headers(header_norms, anchor_n) if anchor_n else None
         if value_col is None and anchor_n:
             value_col = _find_col_keywords_in_headers(header_norms, [anchor_n])
+        if value_col is None and anchor_n and fuzzy_header:
+            value_col = _find_col_in_headers_fuzzy(header_norms, anchor_n, fuzzy_min_ratio)
         if value_col is None and not anchor_n:
             # Auto column selection: prefer measured/value only (ignore result/voltage/etc).
             value_col = _find_col_keywords_in_headers(header_norms, ["measured", "measured value", "value", "actual"])
@@ -3171,12 +3350,26 @@ def _extract_from_tables_by_header(
             if value_col is not None and value_col < len(r):
                 val = str(r[value_col]).strip()
             if not val and not anchor_n:
-                # Header not specified: fallback to first non-empty cell to the right of the match.
+                # Header not specified: prefer a scalar numeric cell (avoid Spec/Requirement ranges like "20-30").
                 if matched_col is not None:
-                    for c in r[matched_col + 1 :]:
-                        if str(c).strip():
-                            val = str(c).strip()
-                            break
+                    numeric_scalar: list[str] = []
+                    skip_cols = {c for c in (units_col, req_col, min_col, max_col) if isinstance(c, int)}
+                    for ci in range(matched_col + 1, len(r)):
+                        if ci in skip_cols:
+                            continue
+                        cs = str(r[ci] or "").strip()
+                        if not cs:
+                            continue
+                        if _parse_float_loose(cs) is not None and not _is_range_like(cs):
+                            numeric_scalar.append(cs)
+                    if numeric_scalar:
+                        val = numeric_scalar[-1]
+                    else:
+                        for c in r[matched_col + 1 :]:
+                            cs = str(c or "").strip()
+                            if cs:
+                                val = cs
+                                break
             if not val and not anchor_n:
                 # Final fallback to last non-empty cell in the row.
                 for c in reversed(r[1:]):
@@ -3326,6 +3519,11 @@ def update_eidp_trending_project_workbook(
     # scanner.env: EIDAT_TRENDING_COMBINED_ONLY=1 (or EIDAT_COMBINED_ONLY=1) skips acceptance data entirely.
     env = parse_scanner_env(SCANNER_ENV)
     combined_only = _env_truthy(env.get("EIDAT_TRENDING_COMBINED_ONLY") or env.get("EIDAT_COMBINED_ONLY"))
+    fuzzy_header_stick = _env_truthy(env.get("EIDAT_FUZZY_HEADER_STICK"))
+    try:
+        fuzzy_header_min_ratio = float(env.get("EIDAT_FUZZY_HEADER_MIN_RATIO", "0.72") or 0.72)
+    except Exception:
+        fuzzy_header_min_ratio = 0.72
 
     docs = read_eidat_index_documents(repo)
     docs_by_serial: dict[str, list[dict]] = {}
@@ -3382,12 +3580,151 @@ def update_eidp_trending_project_workbook(
     if not sn_cols:
         raise RuntimeError("No SN columns found in project workbook header row.")
 
+    added_serials: list[str] = []
+    project_meta: dict = {}
+    project_meta_changed = False
+    try:
+        pj = wb_path.parent / EIDAT_PROJECT_META
+        if pj.exists():
+            project_meta = json.loads(pj.read_text(encoding="utf-8"))
+    except Exception:
+        project_meta = {}
+
+    def _append_serial_columns(serials: list[str]) -> None:
+        if not serials:
+            return
+        meta_rows: dict[str, int] = {}
+        for row in range(2, ws.max_row + 1):
+            term = str(ws.cell(row, col_term).value or "").strip()
+            if not term:
+                continue
+            if col_data_group:
+                dg = str(ws.cell(row, col_data_group).value or "").strip()
+                if dg and _normalize_text(dg) != _normalize_text("Metadata"):
+                    continue
+            key = _normalize_text(term)
+            if key and key not in meta_rows:
+                meta_rows[key] = row
+
+        meta_field_map = {
+            _normalize_text("Program"): "program_title",
+            _normalize_text("Asset Type"): "asset_type",
+            _normalize_text("Vendor"): "vendor",
+            _normalize_text("Acceptance Test Plan"): "acceptance_test_plan_number",
+            _normalize_text("Part Number"): "part_number",
+            _normalize_text("Revision"): "revision",
+            _normalize_text("Test Date"): "test_date",
+            _normalize_text("Report Date"): "report_date",
+            _normalize_text("Document Type"): "document_type",
+            _normalize_text("Document Acronym"): "document_type_acronym",
+            _normalize_text("Similarity Group"): "similarity_group",
+        }
+
+        for sn in serials:
+            col = ws.max_column + 1
+            ws.cell(header_row, col).value = sn
+            doc = _best_doc_for_serial(support_dir, docs_by_serial.get(sn, []))
+            for term_key, doc_field in meta_field_map.items():
+                row = meta_rows.get(term_key)
+                if not row:
+                    continue
+                val = doc.get(doc_field) if doc else ""
+                ws.cell(row, col).value = str(val or "")
+
+    def _append_metadata_sheet_rows(serials: list[str]) -> None:
+        if "metadata" not in wb.sheetnames:
+            return
+        ws_meta = wb["metadata"]
+        header_map: dict[str, int] = {}
+        for col in range(1, ws_meta.max_column + 1):
+            val = str(ws_meta.cell(1, col).value or "").strip()
+            if not val:
+                continue
+            header_map[_normalize_text(val)] = col
+        if not header_map:
+            return
+
+        col_sn = header_map.get("serialnumber") or header_map.get("serial")
+        existing_serials: set[str] = set()
+        if col_sn:
+            for row in range(2, ws_meta.max_row + 1):
+                sn_val = str(ws_meta.cell(row, col_sn).value or "").strip()
+                if sn_val:
+                    existing_serials.add(sn_val)
+
+        fields = {
+            "serialnumber": "serial_number",
+            "program": "program_title",
+            "assettype": "asset_type",
+            "vendor": "vendor",
+            "acceptancetestplan": "acceptance_test_plan_number",
+            "partnumber": "part_number",
+            "revision": "revision",
+            "testdate": "test_date",
+            "reportdate": "report_date",
+            "documenttype": "document_type",
+            "documentacronym": "document_type_acronym",
+            "similaritygroup": "similarity_group",
+        }
+
+        for sn in serials:
+            if col_sn and sn in existing_serials:
+                continue
+            row = ws_meta.max_row + 1
+            doc = _best_doc_for_serial(support_dir, docs_by_serial.get(sn, []))
+            for key, doc_field in fields.items():
+                col = header_map.get(key)
+                if not col:
+                    continue
+                if key in ("serialnumber", "serial"):
+                    val = sn
+                else:
+                    val = doc.get(doc_field) if doc else ""
+                ws_meta.cell(row, col).value = str(val or "")
+
+    continued_rules = _extract_continued_population_rules(project_meta)
+    if continued_rules:
+        desc = _format_continued_population_description(continued_rules)
+        if desc and project_meta.get("description") != desc:
+            project_meta["description"] = desc
+            project_meta_changed = True
+        existing_serials: set[str] = set()
+        for sn_header in sn_cols.keys():
+            raw = str(sn_header).strip()
+            if raw:
+                existing_serials.add(raw)
+            mapped = _match_serial_key(raw, known_serials) if raw else ""
+            if mapped:
+                existing_serials.add(mapped)
+        matched_docs = _docs_matching_population_rules(docs, continued_rules)
+        candidate_serials = sorted(
+            {
+                str(d.get("serial_number") or "").strip()
+                for d in matched_docs
+                if str(d.get("serial_number") or "").strip()
+            }
+        )
+        new_serials = [sn for sn in candidate_serials if sn not in existing_serials]
+        if new_serials:
+            _append_serial_columns(new_serials)
+            _append_metadata_sheet_rows(new_serials)
+            added_serials = list(new_serials)
+            project_meta_changed = True
+            sn_cols = {}
+            for col in range(1, ws.max_column + 1):
+                if col <= fixed_cols:
+                    continue
+                name = str(ws.cell(header_row, col).value or "").strip()
+                if not name:
+                    continue
+                sn_cols[name] = col
+
     # Cache combined.txt lines per SN
     combined_cache: dict[str, list[str]] = {}
     tables_cache: dict[str, list[dict]] = {}
     meta_cache: dict[str, dict] = {}
     artifacts_used: dict[str, str] = {}
-    acceptance_cache: dict[str, dict[str, dict]] = {}
+    acceptance_cache: dict[str, dict[str, list[dict]]] = {}
     acceptance_lookup: dict[str, dict[str, str]] = {}
     for sn_header in sn_cols.keys():
         sn = _match_serial_key(sn_header, known_serials)
@@ -3495,6 +3832,15 @@ def update_eidp_trending_project_workbook(
                     break
         return {"table_hits": table_hits, "line_hits": line_hits}
 
+    def _select_acceptance_entry(data_list: list[dict], instance: int | None) -> dict:
+        if not data_list:
+            return {}
+        if instance is None or instance <= 0:
+            return data_list[0]
+        if instance <= len(data_list):
+            return data_list[instance - 1]
+        return {}
+
     updated_cells = 0
     skipped_existing = 0
     missing_source = 0
@@ -3503,8 +3849,12 @@ def update_eidp_trending_project_workbook(
     # Optional explicit type column
     col_value_type = headers.get("valuetype") or headers.get("value type") or headers.get("value_type")
 
+    term_instance_counts: dict[str, int] = {}
     for row in range(2, ws.max_row + 1):
-        term = str(ws.cell(row, col_term).value or "").strip()
+        raw_term = str(ws.cell(row, col_term).value or "").strip()
+        if not raw_term:
+            continue
+        term, explicit_instance = _split_term_instance(raw_term)
         if not term:
             continue
         header_anchor = str(ws.cell(row, col_header).value or "").strip()
@@ -3522,6 +3872,8 @@ def update_eidp_trending_project_workbook(
 
         want_type = _infer_value_type(term, explicit=explicit_type, units=units, mn=mn, mx=mx)
         term_k = _normalize_key(term)
+        term_instance_counts[term_k] = term_instance_counts.get(term_k, 0) + 1
+        term_instance = explicit_instance or term_instance_counts[term_k]
 
         for sn_header, col in sn_cols.items():
             cell = ws.cell(row, col)
@@ -3532,8 +3884,18 @@ def update_eidp_trending_project_workbook(
                         allow_replace = True
                     lookup = acceptance_lookup.get(sn_header, {})
                     term_key = lookup.get(term_k)
+                    if not term_key and term_k and lookup:
+                        best_len = 0
+                        for lk, orig in lookup.items():
+                            if not lk:
+                                continue
+                            if lk == term_k or lk in term_k or term_k in lk:
+                                if len(lk) > best_len:
+                                    best_len = len(lk)
+                                    term_key = orig
                     if term_key:
-                        data = acceptance_cache.get(sn_header, {}).get(term_key, {})
+                        data_list = acceptance_cache.get(sn_header, {}).get(term_key, [])
+                        data = _select_acceptance_entry(data_list, term_instance)
                         if data.get("value") is not None:
                             existing_num = _parse_float_loose(cell.value)
                             if existing_num is None:
@@ -3554,8 +3916,18 @@ def update_eidp_trending_project_workbook(
             if sn_header in acceptance_cache:
                 lookup = acceptance_lookup.get(sn_header, {})
                 term_key = lookup.get(term_k)
+                if not term_key and term_k and lookup:
+                    best_len = 0
+                    for lk, orig in lookup.items():
+                        if not lk:
+                            continue
+                        if lk == term_k or lk in term_k or term_k in lk:
+                            if len(lk) > best_len:
+                                best_len = len(lk)
+                                term_key = orig
                 if term_key:
-                    data = acceptance_cache[sn_header].get(term_key, {})
+                    data_list = acceptance_cache[sn_header].get(term_key, [])
+                    data = _select_acceptance_entry(data_list, term_instance)
                     # Fill min/max/units if missing in workbook row.
                     if not units and data.get("units"):
                         try:
@@ -3609,6 +3981,8 @@ def update_eidp_trending_project_workbook(
                     term=term,
                     term_label=term_label,
                     header_anchor=header_anchor,
+                    fuzzy_header=fuzzy_header_stick,
+                    fuzzy_min_ratio=fuzzy_header_min_ratio,
                 )
                 if val in (None, "") and tval not in (None, ""):
                     val = _clean_cell_text(str(tval))
@@ -3663,6 +4037,8 @@ def update_eidp_trending_project_workbook(
                     term=term,
                     term_label=term_label,
                     header_anchor="",
+                    fuzzy_header=False,
+                    fuzzy_min_ratio=fuzzy_header_min_ratio,
                 )
                 if tval not in (None, ""):
                     val = _clean_cell_text(str(tval))
@@ -3930,6 +4306,15 @@ def update_eidp_trending_project_workbook(
         except Exception:
             pass
 
+    if project_meta and project_meta_changed:
+        try:
+            serials_now = sorted({str(sn).strip() for sn in sn_cols.keys() if str(sn).strip()})
+            project_meta["serials"] = serials_now
+            project_meta["serials_count"] = len(serials_now)
+            (project_dir / EIDAT_PROJECT_META).write_text(json.dumps(project_meta, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
     # Mirror updated workbook + project.json and write debug json into repo-local mirror.
     debug_json_path = ""
     if mirror_dir:
@@ -3957,6 +4342,8 @@ def update_eidp_trending_project_workbook(
                 "missing_value": int(missing_value),
                 "serials_in_workbook": int(len(sn_cols)),
                 "serials_with_source": int(len(combined_cache)),
+                "serials_added": int(len(added_serials)),
+                "added_serials": added_serials,
                 "events_sample": debug_events[-500:],
                 "failures": debug_failures[-2000:],
             }
@@ -3980,6 +4367,8 @@ def update_eidp_trending_project_workbook(
         "missing_value": int(missing_value),
         "serials_in_workbook": int(len(sn_cols)),
         "serials_with_source": int(len(combined_cache)),
+        "serials_added": int(len(added_serials)),
+        "added_serials": added_serials,
         "debug_json": debug_json_path,
     }
 
@@ -4005,6 +4394,13 @@ def update_eidp_raw_trending_project_workbook(
     wb_path = Path(workbook_path).expanduser()
     if not wb_path.exists():
         raise FileNotFoundError(f"Project workbook not found: {wb_path}")
+
+    env = parse_scanner_env(SCANNER_ENV)
+    fuzzy_header_stick = _env_truthy(env.get("EIDAT_FUZZY_HEADER_STICK"))
+    try:
+        fuzzy_header_min_ratio = float(env.get("EIDAT_FUZZY_HEADER_MIN_RATIO", "0.72") or 0.72)
+    except Exception:
+        fuzzy_header_min_ratio = 0.72
 
     docs = read_eidat_index_documents(repo)
     docs_by_serial: dict[str, list[dict]] = {}
@@ -4205,6 +4601,8 @@ def update_eidp_raw_trending_project_workbook(
             term=term,
             term_label=term_label,
             header_anchor=header_anchor,
+            fuzzy_header=fuzzy_header_stick,
+            fuzzy_min_ratio=fuzzy_header_min_ratio,
         )
         if tval not in (None, ""):
             val = _clean_cell_text(str(tval))
@@ -4900,46 +5298,51 @@ def _write_eidp_raw_trending_workbook(
 def _extract_acceptance_data_for_serial(
     support_dir: Path,
     artifacts_rel: str,
-) -> dict[str, dict]:
+) -> dict[str, list[dict]]:
     """
     Extract acceptance test data from extracted_terms.db (preferred) or combined.txt (fallback).
 
-    Returns dict of term -> {value, units, requirement_type, min, max, result, computed_pass}
+    Returns dict of term -> list[{value, units, requirement_type, min, max, result, computed_pass}]
     """
     try:
         from extraction.term_value_extractor import CombinedTxtParser
     except ImportError:
         return {}
 
-    def _merge_term_data(base: dict[str, dict], incoming: dict[str, dict]) -> dict[str, dict]:
+    def _merge_term_data(base: dict[str, list[dict]], incoming: dict[str, list[dict]]) -> dict[str, list[dict]]:
         if not incoming:
             return base
         if not base:
             return dict(incoming)
-        for term, data in incoming.items():
+        for term, data_list in incoming.items():
             if term not in base:
-                base[term] = data
+                base[term] = list(data_list)
                 continue
-            target = base[term]
-            # Fill missing fields from incoming
-            for key in (
-                "value",
-                "raw",
-                "units",
-                "requirement_type",
-                "requirement_min",
-                "requirement_max",
-                "requirement_raw",
-                "result",
-                "computed_pass",
-                "description",
-            ):
-                if target.get(key) in (None, "", []):
-                    if data.get(key) not in (None, "", []):
-                        target[key] = data.get(key)
+            target_list = base[term]
+            for idx, data in enumerate(data_list):
+                if idx >= len(target_list):
+                    target_list.append(dict(data))
+                    continue
+                target = target_list[idx]
+                # Fill missing fields from incoming (by instance index).
+                for key in (
+                    "value",
+                    "raw",
+                    "units",
+                    "requirement_type",
+                    "requirement_min",
+                    "requirement_max",
+                    "requirement_raw",
+                    "result",
+                    "computed_pass",
+                    "description",
+                ):
+                    if target.get(key) in (None, "", []):
+                        if data.get(key) not in (None, "", []):
+                            target[key] = data.get(key)
         return base
 
-    def _parse_combined_txt(path: Path) -> dict[str, dict]:
+    def _parse_combined_txt(path: Path) -> dict[str, list[dict]]:
         try:
             content = path.read_text(encoding="utf-8", errors="ignore")
         except Exception:
@@ -4955,9 +5358,9 @@ def _extract_acceptance_data_for_serial(
             result = parser.parse()
         except Exception:
             return {}
-        term_data: dict[str, dict] = {}
+        term_data: dict[str, list[dict]] = {}
         for test in result.acceptance_tests:
-            term_data[test.term] = {
+            term_data.setdefault(test.term, []).append({
                 "value": test.measured.value,
                 "raw": test.measured.raw,
                 "units": test.units,
@@ -4968,7 +5371,7 @@ def _extract_acceptance_data_for_serial(
                 "result": test.result,
                 "computed_pass": test.computed_pass,
                 "description": test.description,
-            }
+            })
         return term_data
 
     art_dir = _resolve_support_path(support_dir, artifacts_rel)
@@ -4979,7 +5382,7 @@ def _extract_acceptance_data_for_serial(
     db_path = art_dir / "extracted_terms.db"
     if db_path.exists():
         try:
-            term_data: dict[str, dict] = {}
+            term_data: dict[str, list[dict]] = {}
             with sqlite3.connect(str(db_path)) as conn:
                 conn.row_factory = sqlite3.Row
                 rows = conn.execute(
@@ -4988,14 +5391,14 @@ def _extract_acceptance_data_for_serial(
                            requirement_type, requirement_min, requirement_max, requirement_raw,
                            measured_value, measured_raw, units, result, computed_pass
                     FROM acceptance_tests
-                    ORDER BY term
+                    ORDER BY term, page, table_index, id
                     """
                 ).fetchall()
             for r in rows:
                 term = str(r["term"] or "").strip()
                 if not term:
                     continue
-                term_data[term] = {
+                term_data.setdefault(term, []).append({
                     "value": r["measured_value"],
                     "raw": r["measured_raw"],
                     "units": r["units"],
@@ -5006,7 +5409,7 @@ def _extract_acceptance_data_for_serial(
                     "result": r["result"],
                     "computed_pass": (None if r["computed_pass"] is None else bool(int(r["computed_pass"]))),
                     "description": r["description"],
-                }
+                })
             # Always attempt to enrich with combined.txt (for user-defined or missed terms)
             combined_path = art_dir / "combined.txt"
             if combined_path.exists():
@@ -5032,7 +5435,7 @@ def _extract_acceptance_data_for_serial(
 
     if db_path.exists():
         try:
-            term_data = {}
+            term_data: dict[str, list[dict]] = {}
             with sqlite3.connect(str(db_path)) as conn:
                 conn.row_factory = sqlite3.Row
                 rows = conn.execute(
@@ -5041,14 +5444,14 @@ def _extract_acceptance_data_for_serial(
                            requirement_type, requirement_min, requirement_max, requirement_raw,
                            measured_value, measured_raw, units, result, computed_pass
                     FROM acceptance_tests
-                    ORDER BY term
+                    ORDER BY term, page, table_index, id
                     """
                 ).fetchall()
             for r in rows:
                 term = str(r["term"] or "").strip()
                 if not term:
                     continue
-                term_data[term] = {
+                term_data.setdefault(term, []).append({
                     "value": r["measured_value"],
                     "raw": r["measured_raw"],
                     "units": r["units"],
@@ -5059,7 +5462,7 @@ def _extract_acceptance_data_for_serial(
                     "result": r["result"],
                     "computed_pass": (None if r["computed_pass"] is None else bool(int(r["computed_pass"]))),
                     "description": r["description"],
-                }
+                })
             combined_path = art_dir / "combined.txt"
             if combined_path.exists():
                 term_data = _merge_term_data(term_data, _parse_combined_txt(combined_path))
@@ -5114,16 +5517,17 @@ def _populate_workbook_with_acceptance_data(
         if name:
             sn_cols[name] = col
 
-    # Build existing terms map (row by term name)
-    existing_terms: dict[str, int] = {}
+    # Build existing terms map (row list by term name)
+    existing_terms: dict[str, list[int]] = {}
     for row in range(2, ws.max_row + 1):
         term = str(ws.cell(row, col_term).value or "").strip()
         if term:
-            existing_terms[term] = row
+            base_term, _ = _split_term_instance(term)
+            existing_terms.setdefault(base_term, []).append(row)
 
     # Collect all acceptance data and discovered terms
-    all_term_data: dict[str, dict[str, dict]] = {}  # serial -> term -> data
-    discovered_terms: dict[str, dict] = {}  # term -> first occurrence data
+    all_term_data: dict[str, dict[str, list[dict]]] = {}  # serial -> term -> data list
+    discovered_terms: dict[str, list[dict]] = {}  # term -> data list (max length)
 
     known_serials = set(docs_by_serial.keys())
 
@@ -5136,16 +5540,19 @@ def _populate_workbook_with_acceptance_data(
         term_data = _extract_acceptance_data_for_serial(support_dir, artifacts_rel)
         if term_data:
             all_term_data[sn_header] = term_data
-            for term, data in term_data.items():
-                if term not in discovered_terms:
-                    discovered_terms[term] = data
+            for term, data_list in term_data.items():
+                if term not in discovered_terms or len(data_list) > len(discovered_terms.get(term, [])):
+                    discovered_terms[term] = list(data_list)
 
     # Add discovered terms if enabled
     new_terms_added = 0
     if discover_terms:
         next_row = ws.max_row + 1
-        for term, data in discovered_terms.items():
-            if term not in existing_terms:
+        for term, data_list in discovered_terms.items():
+            existing_rows = existing_terms.get(term, [])
+            needed = max(0, len(data_list) - len(existing_rows))
+            for idx in range(needed):
+                data = data_list[len(existing_rows) + idx] if (len(existing_rows) + idx) < len(data_list) else {}
                 # Add new term row
                 ws.cell(next_row, col_term).value = term
                 if data.get("units"):
@@ -5154,7 +5561,7 @@ def _populate_workbook_with_acceptance_data(
                     ws.cell(next_row, col_min).value = data["requirement_min"]
                 if data.get("requirement_max") is not None:
                     ws.cell(next_row, col_max).value = data["requirement_max"]
-                existing_terms[term] = next_row
+                existing_terms.setdefault(term, []).append(next_row)
                 next_row += 1
                 new_terms_added += 1
 
@@ -5164,11 +5571,16 @@ def _populate_workbook_with_acceptance_data(
         col = sn_cols.get(sn_header)
         if not col:
             continue
-        for term, data in term_data.items():
-            row = existing_terms.get(term)
-            if row and data.get("value") is not None:
-                ws.cell(row, col).value = data["value"]
-                values_populated += 1
+        for term, data_list in term_data.items():
+            rows = existing_terms.get(term, [])
+            if not rows:
+                continue
+            for idx, data in enumerate(data_list):
+                if idx >= len(rows):
+                    break
+                if data.get("value") is not None:
+                    ws.cell(rows[idx], col).value = data["value"]
+                    values_populated += 1
 
     wb.save(str(workbook_path))
     try:
@@ -5190,6 +5602,7 @@ def create_eidat_project(
     project_name: str,
     project_type: str,
     selected_metadata_rel: list[str],
+    continued_population: Mapping[str, object] | None = None,
     auto_populate: bool = False,
 ) -> dict:
     """
@@ -5212,6 +5625,7 @@ def create_eidat_project(
     docs = read_eidat_index_documents(repo)
     selected = {str(s).strip() for s in (selected_metadata_rel or []) if str(s).strip()}
     chosen_docs = [d for d in docs if str(d.get("metadata_rel") or "").strip() in selected]
+    continued_population_clean = _sanitize_continued_population(continued_population)
 
     serials = sorted({str(d.get("serial_number") or "").strip() for d in chosen_docs if str(d.get("serial_number") or "").strip()})
     if not serials:
@@ -5277,9 +5691,13 @@ def create_eidat_project(
         "terms_count": terms_count,
         "selected_metadata_rel": sorted(selected),
         "serials": serials,
+        "continued_population": continued_population_clean,
         "auto_populate": auto_populate_result,
         "population_mode": "auto" if auto_populate else "blank",
     }
+    description = _format_continued_population_description(continued_population_clean)
+    if description:
+        meta["description"] = description
     meta_path = project_dir / EIDAT_PROJECT_META
     _ensure_file_written(
         meta_path,
