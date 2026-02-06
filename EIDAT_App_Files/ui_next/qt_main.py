@@ -2463,18 +2463,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.resize(1280, 860)
 
         be.ensure_scaffold()
-        # Initialize core OCR settings and language defaults for this session
+        # Initialize core OCR settings only if scanner.env doesn't already exist
         try:
-            env = be.parse_scanner_env()
-            changed = False
-            if not (env.get("OCR_ROW_EPS") or "").strip():
-                env["OCR_ROW_EPS"] = "15"
-                changed = True
-            if not (env.get("OCR_DPI") or "").strip():
-                env["OCR_DPI"] = "500"
-                changed = True
-            if changed:
-                be.save_scanner_env(env)
+            if not be.SCANNER_ENV.exists():
+                env = be.parse_scanner_env()
+                if not (env.get("OCR_ROW_EPS") or "").strip():
+                    env["OCR_ROW_EPS"] = "15"
+                if not (env.get("OCR_DPI") or "").strip():
+                    env["OCR_DPI"] = "500"
+                if env:
+                    be.save_scanner_env(env)
         except Exception:
             pass
         self._refresh_plot_series_after_worker = False

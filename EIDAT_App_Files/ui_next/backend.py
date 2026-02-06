@@ -201,11 +201,6 @@ def _env_truthy(val: object) -> bool:
 
 
 def save_scanner_env(env_map: Dict[str, str], path: Path = SCANNER_ENV) -> None:
-    lines = [
-        "# Scanner configuration (KEY=VALUE)",
-        "# Edited via new GUI",
-        "# EIDAT_TRENDING_COMBINED_ONLY=1 forces trending extraction to use combined.txt only",
-    ]
     order = [
         "QUIET",
         "force_background_processes",
@@ -218,19 +213,76 @@ def save_scanner_env(env_map: Dict[str, str], path: Path = SCANNER_ENV) -> None:
         "OCR_ROW_EPS",
         "VENV_DIR",
     ]
+
+    # Normalize input (preserve original key case for new lines)
+    env_norm: dict[str, tuple[str, str]] = {}
+    for k, v in (env_map or {}).items():
+        k_raw = str(k or "").strip()
+        v_raw = str(v or "").strip()
+        if not k_raw or not v_raw:
+            continue
+        env_norm[k_raw.upper()] = (k_raw, v_raw)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    existing_lines: list[str] = []
+    try:
+        if path.exists():
+            existing_lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except Exception:
+        existing_lines = []
+
+    if existing_lines:
+        seen: set[str] = set()
+        new_lines: list[str] = []
+        for line in existing_lines:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or stripped.startswith(";") or "=" not in line:
+                new_lines.append(line)
+                continue
+            k_raw, _ = line.split("=", 1)
+            k_key = k_raw.strip()
+            if not k_key:
+                new_lines.append(line)
+                continue
+            k_norm = k_key.upper()
+            if k_norm in env_norm:
+                new_lines.append(f"{k_key}={env_norm[k_norm][1]}")
+                seen.add(k_norm)
+            else:
+                new_lines.append(line)
+
+        # Append any missing keys in preferred order, then remaining keys.
+        for k in order:
+            k_norm = k.upper()
+            if k_norm in env_norm and k_norm not in seen:
+                new_lines.append(f"{k}={env_norm[k_norm][1]}")
+                seen.add(k_norm)
+        for k_norm, (k_raw, v_raw) in sorted(env_norm.items(), key=lambda kv: kv[0]):
+            if k_norm in seen:
+                continue
+            new_lines.append(f"{k_raw}={v_raw}")
+            seen.add(k_norm)
+
+        path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+        return
+
+    # No existing file: create a clean template with defaults ordering.
+    lines = [
+        "# Scanner configuration (KEY=VALUE)",
+        "# Edited via new GUI",
+        "# EIDAT_TRENDING_COMBINED_ONLY=1 forces trending extraction to use combined.txt only",
+    ]
     written = set()
     for k in order:
-        v = env_map.get(k)
-        if v:
-            lines.append(f"{k}={v}")
-            written.add(k)
-    for k in sorted(env_map.keys()):
-        if k in written:
+        k_norm = k.upper()
+        if k_norm in env_norm:
+            lines.append(f"{k}={env_norm[k_norm][1]}")
+            written.add(k_norm)
+    for k_norm, (k_raw, v_raw) in sorted(env_norm.items(), key=lambda kv: kv[0]):
+        if k_norm in written:
             continue
-        v = env_map[k]
-        if v:
-            lines.append(f"{k}={v}")
-    path.parent.mkdir(parents=True, exist_ok=True)
+        lines.append(f"{k_raw}={v_raw}")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
