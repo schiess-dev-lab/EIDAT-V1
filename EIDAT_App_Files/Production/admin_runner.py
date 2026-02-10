@@ -202,3 +202,77 @@ def run_pipeline(
 
 def now_ns() -> int:
     return int(time.time_ns())
+
+
+def run_scan_force_candidates(
+    *,
+    node_root: str | Path,
+    runtime_root: str | Path,
+    py: str | None = None,
+    similarity: float = 0.86,
+    node_env_enabled: bool = False,
+) -> PipelineResult:
+    """
+    Scan for new/changed files, then force-process ONLY those scan candidates (needs_processing=1).
+
+    This overwrites embedded pointer tokens (force) but does not touch already-processed unchanged files.
+    """
+    node = _as_abs(node_root)
+    runtime = _as_abs(runtime_root)
+    python_exe = py or sys.executable
+
+    outputs: dict[str, object] = {}
+    try:
+        if not node.exists():
+            raise RuntimeError(f"Node root does not exist: {node}")
+        if not node.is_dir():
+            raise RuntimeError(f"Node root is not a directory: {node}")
+        if not (runtime / "EIDAT_App_Files").exists():
+            raise RuntimeError(f"Runtime root does not contain EIDAT_App_Files: {runtime}")
+
+        outputs["init"] = _run_manager(python_exe, runtime, node, "init", node_env_enabled=node_env_enabled)
+        scan = _run_manager(python_exe, runtime, node, "scan", node_env_enabled=node_env_enabled)
+        outputs["scan"] = scan
+
+        candidates = int((scan or {}).get("candidates_count", 0) or 0)
+        if candidates <= 0:
+            outputs["process"] = {"skipped": True, "reason": "no_candidates"}
+            outputs["index"] = _run_manager(
+                python_exe,
+                runtime,
+                node,
+                "index",
+                extra=["--similarity", str(float(similarity))],
+                node_env_enabled=node_env_enabled,
+            )
+            return PipelineResult(ok=True, node_root=node, outputs=outputs)
+
+        cfg = _load_node_config(runtime, node, node_env_enabled=node_env_enabled)
+        eff_limit = _env_int(cfg.get("EIDAT_PROCESS_LIMIT"), 0)
+        eff_dpi = _env_int(cfg.get("EIDAT_PROCESS_DPI"), 0)
+
+        extra: list[str] = ["--force", "--only-candidates"]
+        if eff_limit and eff_limit > 0:
+            extra += ["--limit", str(int(eff_limit))]
+        if eff_dpi and eff_dpi > 0:
+            extra += ["--dpi", str(int(eff_dpi))]
+
+        outputs["process"] = _run_manager(
+            python_exe,
+            runtime,
+            node,
+            "process",
+            extra=extra,
+            node_env_enabled=node_env_enabled,
+        )
+        outputs["index"] = _run_manager(
+            python_exe,
+            runtime,
+            node,
+            "index",
+            extra=["--similarity", str(float(similarity))],
+            node_env_enabled=node_env_enabled,
+        )
+        return PipelineResult(ok=True, node_root=node, outputs=outputs)
+    except Exception as exc:
+        return PipelineResult(ok=False, node_root=node, outputs=outputs, error=str(exc))

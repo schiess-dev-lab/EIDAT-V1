@@ -4039,7 +4039,11 @@ def update_eidp_trending_project_workbook(
             val: object | None = None
             err: str | None = None
 
-            # 0) Acceptance-test DB/TXT extraction (preferred for measured/min/max/units).
+            # 0) Acceptance-test DB/TXT extraction (preferred for min/max/units).
+            #
+            # IMPORTANT: If the workbook row specifies an explicit `Header`, prefer header-driven extraction
+            # from the table blocks (combined.txt) so we don't accidentally fill the cell with a different
+            # measured value for the same term (acceptance DB is term-instance based and not header aware).
             if sn_header in acceptance_cache:
                 lookup = acceptance_lookup.get(sn_header, {})
                 term_key = lookup.get(term_k)
@@ -4074,14 +4078,16 @@ def update_eidp_trending_project_workbook(
                             mx = _parse_float_loose(data.get("requirement_max"))
                         except Exception:
                             pass
-                    if data.get("value") is not None:
-                        val = data.get("value")
-                        used_method = "acceptance_terms"
-                        snippet = str(data.get("requirement_raw") or "")
-                    elif data.get("raw"):
-                        val = data.get("raw")
-                        used_method = "acceptance_terms_raw"
-                        snippet = str(data.get("requirement_raw") or "")
+                    # Only use acceptance-term values when no explicit Header is requested.
+                    if not header_anchor and val in (None, ""):
+                        if data.get("value") is not None:
+                            val = data.get("value")
+                            used_method = "acceptance_terms"
+                            snippet = str(data.get("requirement_raw") or "")
+                        elif data.get("raw"):
+                            val = data.get("raw")
+                            used_method = "acceptance_terms_raw"
+                            snippet = str(data.get("requirement_raw") or "")
 
             # 1) Metadata-first for known document-profile fields.
             if val in (None, "") and term_k in _META_TERM_MAP and isinstance(meta, Mapping):

@@ -557,6 +557,7 @@ def process_candidates(
     limit: int | None = None,
     dpi: int | None = None,
     force: bool = False,
+    only_candidates: bool = False,
 ) -> list[ProcessResult]:
     now_ns = time.time_ns()
     core = None
@@ -577,7 +578,16 @@ def process_candidates(
 
     with connect_db(paths.db_path) as conn:
         ensure_schema(conn)
-        if force:
+        if bool(only_candidates):
+            rows = conn.execute(
+                """
+                SELECT rel_path, mtime_ns
+                FROM files
+                WHERE needs_processing = 1
+                ORDER BY last_seen_epoch_ns DESC
+                """
+            ).fetchall()
+        elif force:
             rows = conn.execute(
                 """
                 SELECT rel_path, mtime_ns

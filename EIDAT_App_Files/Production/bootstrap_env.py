@@ -16,8 +16,11 @@ PROFILE_REQUIRED_IMPORTS: dict[str, list[str]] = {
     # Node end-user GUI (Files + Projects only).
     "ui": [
         "PySide6",
+        "fitz",  # pymupdf
+        "pandas",
         "openpyxl",
         "xlsxwriter",  # XlsxWriter package
+        "matplotlib",
     ],
     # Full environment (admin/extraction tooling).
     "full": [

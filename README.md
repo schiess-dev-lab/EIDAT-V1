@@ -105,6 +105,8 @@ Users run this from the node root:
 
 - `EIDAT\EIDAT.bat`
 
+On launch, the node UI auto-runs a scan so PDFs appear in the Files tab immediately (even before processing).
+
 Venv location overrides (optional):
 
 - Set `EIDAT_VENV_DIR=C:\path\to\.venv` to pin a specific venv folder, or
@@ -133,6 +135,10 @@ Admin processing settings live in the node’s `.env` (open from the dashboard):
 - `EIDAT_PROCESS_FORCE=1` to reprocess already-processed PDFs
 - `EIDAT_PROCESS_LIMIT=100` to cap PDFs per run
 - `EIDAT_PROCESS_DPI=900` to override DPI for that run (0/blank = use normal config)
+
+Per-node shortcut:
+
+- **Scan+Force Candidates** runs a scan and then force-processes only the newly detected candidates (overwrites pointer tokens without reprocessing unchanged files).
 
 ## Projects: multi-writer registry
 Projects are registered in:
@@ -169,6 +175,9 @@ If your company requires an internal index, set env vars before running the `.ba
 - `PIP_INDEX_URL`
 - `PIP_EXTRA_INDEX_URL`
 - `PIP_TRUSTED_HOST`
+
+If you use **EIDP Trending** (Trend / Analyze Data), the node UI environment must be able to install `pandas` + `matplotlib`.
+If the UI shows “Plotting unavailable. Install matplotlib…”, re-run `EIDAT\\EIDAT.bat` after fixing pip access, or delete the node UI venv and launch again to force a clean bootstrap.
 
 ### OCR DPI settings
 OCR DPI knobs are configured via `user_inputs/scanner.env` (for both GUI and pipelines).

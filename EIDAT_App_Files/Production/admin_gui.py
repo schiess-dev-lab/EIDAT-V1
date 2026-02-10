@@ -43,20 +43,30 @@ class _Worker(QtCore.QThread):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._tasks: list[tuple[str, str, str, bool]] = []  # (node_id, node_root, runtime_root, node_env_enabled)
+        self._tasks: list[tuple[str, str, str, bool, str]] = []  # (node_id, node_root, runtime_root, node_env_enabled, action)
 
-    def set_tasks(self, tasks: list[tuple[str, str, str, bool]]) -> None:
+    def set_tasks(self, tasks: list[tuple[str, str, str, bool, str]]) -> None:
         self._tasks = list(tasks)
 
     def run(self) -> None:  # type: ignore[override]
-        for node_id, node_root, runtime_root, node_env_enabled in self._tasks:
+        from .admin_runner import run_scan_force_candidates
+
+        for node_id, node_root, runtime_root, node_env_enabled, action in self._tasks:
             self.log.emit(f"[RUN] {node_root}")
             started = now_ns()
-            res = run_pipeline(
-                node_root=node_root,
-                runtime_root=runtime_root,
-                node_env_enabled=node_env_enabled,
-            )
+            if action == "scan_force_candidates":
+                self.log.emit("[ACTION] scan -> force candidates only")
+                res = run_scan_force_candidates(
+                    node_root=node_root,
+                    runtime_root=runtime_root,
+                    node_env_enabled=node_env_enabled,
+                )
+            else:
+                res = run_pipeline(
+                    node_root=node_root,
+                    runtime_root=runtime_root,
+                    node_env_enabled=node_env_enabled,
+                )
             finished = now_ns()
             if res.ok:
                 scan = res.outputs.get("scan") or {}
@@ -117,12 +127,12 @@ class AdminWindow(QtWidgets.QMainWindow):
         actions.addWidget(self.btn_process_enabled)
         layout.addLayout(actions)
 
-        self.tbl = QtWidgets.QTableWidget(0, 7)
-        self.tbl.setHorizontalHeaderLabels(["Enabled", "Node Root", "Notes", "Last Run", "Status", "Env", "Actions"])
+        self.tbl = QtWidgets.QTableWidget(0, 6)
+        self.tbl.setHorizontalHeaderLabels(["Enabled", "Node Root", "Status", "Last Run", "Env", "Actions"])
         self.tbl.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Stretch)
-        self.tbl.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.tbl.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.tbl.horizontalHeader().setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
         self.tbl.horizontalHeader().setSectionResizeMode(5, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
-        self.tbl.horizontalHeader().setSectionResizeMode(6, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
         self.tbl.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
         self.tbl.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.DoubleClicked | QtWidgets.QAbstractItemView.EditTrigger.SelectedClicked)
         layout.addWidget(self.tbl, 2)
@@ -261,16 +271,22 @@ class AdminWindow(QtWidgets.QMainWindow):
                 it_root.setFlags(it_root.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
                 self.tbl.setItem(r, 1, it_root)
 
-                it_notes = QtWidgets.QTableWidgetItem(n.notes or "")
-                self.tbl.setItem(r, 2, it_notes)
+                statusw = QtWidgets.QWidget()
+                sl = QtWidgets.QHBoxLayout(statusw)
+                sl.setContentsMargins(0, 0, 0, 0)
+                sl.setSpacing(6)
+                lbl = QtWidgets.QLabel((n.last_run_status or "idle").strip() or "idle")
+                lbl.setStyleSheet("color:#0f172a;")
+                btn_scan_force = QtWidgets.QPushButton("Scan+Force Candidates")
+                btn_scan_force.setMaximumWidth(170)
+                btn_scan_force.clicked.connect(lambda _=False, nid=n.node_id: self._act_scan_force_candidates(nid))
+                sl.addWidget(lbl)
+                sl.addWidget(btn_scan_force)
+                self.tbl.setCellWidget(r, 2, statusw)
 
                 it_last = QtWidgets.QTableWidgetItem(_fmt_ts(n.last_run_finished_epoch_ns))
                 it_last.setFlags(it_last.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
                 self.tbl.setItem(r, 3, it_last)
-
-                it_status = QtWidgets.QTableWidgetItem(n.last_run_status or "")
-                it_status.setFlags(it_status.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
-                self.tbl.setItem(r, 4, it_status)
 
                 envw = QtWidgets.QWidget()
                 el = QtWidgets.QHBoxLayout(envw)
@@ -296,7 +312,7 @@ class AdminWindow(QtWidgets.QMainWindow):
                 el.addWidget(lbl_env)
                 el.addWidget(b_env)
                 el.addWidget(b_reset)
-                self.tbl.setCellWidget(r, 5, envw)
+                self.tbl.setCellWidget(r, 4, envw)
 
                 btns = QtWidgets.QWidget()
                 bl = QtWidgets.QHBoxLayout(btns)
@@ -312,7 +328,7 @@ class AdminWindow(QtWidgets.QMainWindow):
                 bl.addWidget(b_open)
                 bl.addWidget(b_deploy)
                 bl.addWidget(b_proc)
-                self.tbl.setCellWidget(r, 6, btns)
+                self.tbl.setCellWidget(r, 5, btns)
         finally:
             self.tbl.blockSignals(False)
 
@@ -326,9 +342,6 @@ class AdminWindow(QtWidgets.QMainWindow):
             if col == 0:
                 enabled = item.checkState() == QtCore.Qt.CheckState.Checked
                 admin_db.set_node_enabled(self._conn, node_id=node_id, enabled=enabled)
-            elif col == 2:
-                notes = (item.text() or "").strip() or None
-                admin_db.set_node_notes(self._conn, node_id=node_id, notes=notes)
         except Exception as exc:
             self._append_log(f"[WARN] Update failed: {exc}")
 
@@ -386,7 +399,7 @@ class AdminWindow(QtWidgets.QMainWindow):
         if self.worker.isRunning():
             QtWidgets.QMessageBox.information(self, "Busy", "Processing is already running.")
             return
-        self.worker.set_tasks([(n.node_id, n.node_root, n.runtime_root, bool(n.node_env_enabled))])
+        self.worker.set_tasks([(n.node_id, n.node_root, n.runtime_root, bool(n.node_env_enabled), "pipeline")])
         self.btn_process_enabled.setEnabled(False)
         self.worker.start()
 
@@ -399,7 +412,19 @@ class AdminWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.information(self, "No nodes", "No enabled nodes to process.")
             return
         tasks = [(n.node_id, n.node_root, n.runtime_root, bool(n.node_env_enabled)) for n in nodes]
-        self.worker.set_tasks(tasks)
+        self.worker.set_tasks([(nid, root, rr, env_on, "pipeline") for (nid, root, rr, env_on) in tasks])
+        self.btn_process_enabled.setEnabled(False)
+        self.worker.start()
+
+    def _act_scan_force_candidates(self, node_id: str) -> None:
+        nodes = {n.node_id: n for n in admin_db.list_nodes(self._conn)}
+        n = nodes.get(node_id)
+        if not n:
+            return
+        if self.worker.isRunning():
+            QtWidgets.QMessageBox.information(self, "Busy", "Processing is already running.")
+            return
+        self.worker.set_tasks([(n.node_id, n.node_root, n.runtime_root, bool(n.node_env_enabled), "scan_force_candidates")])
         self.btn_process_enabled.setEnabled(False)
         self.worker.start()
 

@@ -1,4 +1,13 @@
+# Node end-user UI requirements (Files + Projects, including EIDP Trending plots).
 PySide6>=6.6
+
+# Excel trending / export
+pandas
 openpyxl
 XlsxWriter
 
+# Plotting
+matplotlib
+
+# PDF rendering + token embedding (PyMuPDF provides `fitz`)
+pymupdf

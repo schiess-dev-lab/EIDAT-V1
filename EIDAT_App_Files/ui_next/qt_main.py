@@ -3979,7 +3979,7 @@ class MainWindow(QtWidgets.QMainWindow):
             }
             QPushButton:hover { background: #f9fafb; }
         """)
-        self.btn_files_refresh.clicked.connect(self._refresh_files_tab)
+        self.btn_files_refresh.clicked.connect(self._act_files_refresh)
         l.addWidget(self.btn_files_refresh)
 
         # Status label
@@ -4554,6 +4554,19 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
 
     # ============ Files Tab Methods ============
+    def _act_files_refresh(self) -> None:
+        """Refresh Files tab and rescan repo so new files appear immediately."""
+        try:
+            # Fast path: refresh from DB first.
+            self._refresh_files_tab()
+        except Exception:
+            pass
+        # Then scan the repo to pick up new/changed PDFs (no processing).
+        try:
+            self._act_manager_scan_all(auto=True, auto_process=False)
+        except Exception:
+            pass
+
     def _refresh_files_tab(self) -> None:
         """Refresh the entire Files tab from database."""
         repo_raw = (self.ed_global_repo.text() or "").strip() if hasattr(self, "ed_global_repo") else ""
@@ -6056,6 +6069,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.ed_repo.setText(str(be.get_repo_root()))
         except Exception:
             pass
+        # Node mode: auto-scan on launch so Files tab populates immediately (even if nothing is processed yet).
+        try:
+            if str(os.environ.get("EIDAT_UI_PROFILE") or "").strip().lower() == "node":
+                self._act_manager_scan_all(auto=True, auto_process=False)
+        except Exception:
+            pass
 
     def _act_global_repo_changed(self) -> None:
         try:
@@ -6152,6 +6171,10 @@ class MainWindow(QtWidgets.QMainWindow):
             candidates = int(payload.get("candidates_count") or 0)
             pdf_count = int(payload.get("pdf_count") or 0)
             self._append_log(f"[EIDAT MANAGER] Scanned {pdf_count} file(s); {candidates} candidate(s) need processing.")
+            try:
+                self._refresh_files_tab()
+            except Exception:
+                pass
             if candidates > 0:
                 if not auto:
                     QtWidgets.QMessageBox.information(
