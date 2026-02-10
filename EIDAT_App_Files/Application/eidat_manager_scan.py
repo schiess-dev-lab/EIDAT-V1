@@ -10,6 +10,14 @@ except Exception:  # pragma: no cover
     from .eidat_manager_db import SupportPaths, connect_db, ensure_schema, get_meta_int, set_meta  # type: ignore
 
 try:
+    from eidat_manager_embed import extract_pointer_token
+except Exception:  # pragma: no cover
+    try:
+        from .eidat_manager_embed import extract_pointer_token  # type: ignore
+    except Exception:  # pragma: no cover
+        extract_pointer_token = None  # type: ignore[assignment]
+
+try:
     import fitz  # PyMuPDF
 except Exception:  # pragma: no cover
     fitz = None
@@ -17,6 +25,7 @@ except Exception:  # pragma: no cover
 
 # Supported file extensions for scanning
 SUPPORTED_EXTENSIONS = {".pdf", ".xlsx", ".xls", ".xlsm"}
+EXCEL_ARTIFACT_SUFFIX = "__excel"
 
 
 @dataclass(frozen=True)
@@ -114,6 +123,105 @@ def _has_eidat_metadata(file_path: Path) -> bool:
     return False
 
 
+def _pointer_artifacts_exist(global_repo: Path, file_path: Path) -> bool:
+    """
+    Best-effort: if a PDF has an EIDAT pointer token, only treat it as "already processed"
+    when the referenced artifacts exist under *this* node's support folder.
+
+    This prevents a common production-node scenario:
+      - a previously-processed PDF (with embedded pointer token) is copied into a new node
+      - the new node does NOT yet have its EIDAT Support artifacts
+      - scan must still schedule processing to regenerate artifacts/index
+    """
+    if extract_pointer_token is None:
+        return False
+    try:
+        payload = extract_pointer_token(file_path)
+    except Exception:
+        payload = None
+    if not isinstance(payload, dict) or not payload:
+        return False
+
+    def _resolve(rel_or_abs: object) -> Path | None:
+        try:
+            raw = str(rel_or_abs or "").strip()
+        except Exception:
+            return None
+        if not raw:
+            return None
+        p = Path(raw)
+        if p.is_absolute():
+            return p
+        return Path(global_repo).expanduser() / p
+
+    artifacts_path = _resolve(payload.get("artifacts_rel"))
+    metadata_path = _resolve(payload.get("metadata_rel"))
+    support_path = _resolve(payload.get("support_rel"))
+
+    # If token indicates a support folder, require that it exists in this node.
+    if support_path is not None and not support_path.exists():
+        return False
+
+    # If token indicates a metadata file, require that it exists.
+    if metadata_path is not None and metadata_path.exists():
+        return True
+
+    # If token indicates an artifacts folder, require that it exists and has at least one expected artifact.
+    if artifacts_path is None or not artifacts_path.exists():
+        return False
+    if artifacts_path.is_file():
+        return True
+
+    try:
+        if (artifacts_path / "combined.txt").exists():
+            return True
+        # Common metadata filename pattern used by this repo.
+        for p in artifacts_path.glob("*_metadata.json"):
+            if p.is_file():
+                return True
+        for p in artifacts_path.glob("*.metadata.json"):
+            if p.is_file():
+                return True
+    except Exception:
+        pass
+
+    # If folder exists but we can't confirm artifacts, be conservative and re-process.
+    return False
+
+
+def _expected_artifacts_dir(support_dir: Path, file_path: Path) -> Path:
+    """
+    Where this codebase writes artifacts for a given input file.
+
+    PDFs:  EIDAT Support/debug/ocr/<stem>/
+    Excel: EIDAT Support/debug/ocr/<stem>__excel/
+    """
+    stem = str(file_path.stem or "").strip() or "unknown"
+    ext = str(file_path.suffix or "").lower()
+    name = stem + (EXCEL_ARTIFACT_SUFFIX if ext in {".xlsx", ".xls", ".xlsm"} else "")
+    return Path(support_dir) / "debug" / "ocr" / name
+
+
+def _expected_artifacts_exist(support_dir: Path, file_path: Path) -> bool:
+    artifacts_dir = _expected_artifacts_dir(support_dir, file_path)
+    if not artifacts_dir.exists():
+        return False
+    if artifacts_dir.is_file():
+        return True
+    try:
+        if (artifacts_dir / "combined.txt").exists():
+            return True
+        for p in artifacts_dir.glob("*_metadata.json"):
+            if p.is_file():
+                return True
+        for p in artifacts_dir.glob("*.metadata.json"):
+            if p.is_file():
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def scan_global_repo(paths: SupportPaths) -> ScanSummary:
     global_repo = paths.global_repo
     now_ns = time.time_ns()
@@ -156,6 +264,8 @@ def scan_global_repo(paths: SupportPaths) -> ScanSummary:
             needs_processing = 0
             reason = ""
             metadata_present = False
+            metadata_ok = False
+            artifacts_ok = _expected_artifacts_exist(paths.support_dir, pdf)
             if row is None:
                 moved = conn.execute(
                     """
@@ -167,14 +277,36 @@ def scan_global_repo(paths: SupportPaths) -> ScanSummary:
                     """,
                     (file_fingerprint,),
                 ).fetchone()
+                # Treat as "moved" only when the prior path no longer exists on disk.
+                # If the prior path still exists, this is a duplicate copy and should be tracked separately.
+                if moved is not None:
+                    try:
+                        old_rel = str(moved["rel_path"] or "").strip()
+                    except Exception:
+                        old_rel = ""
+                    if old_rel:
+                        try:
+                            old_abs = (paths.global_repo / Path(old_rel)).expanduser()
+                            if old_abs.exists():
+                                moved = None
+                        except Exception:
+                            pass
                 if moved is not None:
                     needs_processing = 1 if not moved["last_processed_epoch_ns"] else 0
                     reason = "moved_unprocessed" if needs_processing else "moved"
                     if needs_processing:
                         metadata_present = _has_eidat_metadata(pdf)
                         if metadata_present:
-                            needs_processing = 0
-                            reason = "metadata_present"
+                            metadata_ok = _pointer_artifacts_exist(global_repo, pdf)
+                            if metadata_ok:
+                                needs_processing = 0
+                                reason = "metadata_present"
+                            else:
+                                needs_processing = 1
+                                reason = "metadata_missing_artifacts"
+                    if not artifacts_ok:
+                        needs_processing = 1
+                        reason = reason or "missing_artifacts"
                     conn.execute(
                         """
                         UPDATE files
@@ -187,15 +319,23 @@ def scan_global_repo(paths: SupportPaths) -> ScanSummary:
                             needs_processing = CASE WHEN ? = 1 THEN 1 ELSE needs_processing END
                         WHERE id = ?
                         """,
-                        (rel_path, size_bytes, mtime_ns, file_fingerprint, now_ns, 1 if metadata_present else 0, now_ns, needs_processing, int(moved["id"])),
+                        (rel_path, size_bytes, mtime_ns, file_fingerprint, now_ns, 1 if metadata_ok else 0, now_ns, needs_processing, int(moved["id"])),
                     )
                 else:
                     needs_processing = 1
                     reason = "new"
                     metadata_present = _has_eidat_metadata(pdf)
                     if metadata_present:
-                        needs_processing = 0
-                        reason = "metadata_present"
+                        metadata_ok = _pointer_artifacts_exist(global_repo, pdf)
+                        if metadata_ok:
+                            needs_processing = 0
+                            reason = "metadata_present"
+                        else:
+                            needs_processing = 1
+                            reason = "metadata_missing_artifacts"
+                    if not artifacts_ok:
+                        needs_processing = 1
+                        reason = reason or "missing_artifacts"
                     conn.execute(
                         """
                         INSERT INTO files(
@@ -211,7 +351,7 @@ def scan_global_repo(paths: SupportPaths) -> ScanSummary:
                             mtime_ns,
                             now_ns,
                             now_ns,
-                            now_ns if metadata_present else None,
+                            now_ns if metadata_ok else None,
                             1 if needs_processing else 0,
                         ),
                     )
@@ -242,8 +382,26 @@ def scan_global_repo(paths: SupportPaths) -> ScanSummary:
                 if needs_processing:
                     metadata_present = _has_eidat_metadata(pdf)
                     if metadata_present:
-                        needs_processing = 0
-                        reason = "metadata_present"
+                        metadata_ok = _pointer_artifacts_exist(global_repo, pdf)
+                        if metadata_ok:
+                            needs_processing = 0
+                            reason = "metadata_present"
+                        else:
+                            needs_processing = 1
+                            reason = "metadata_missing_artifacts"
+                else:
+                    # Even if the DB says "processed", a pointer token without artifacts in this node
+                    # must trigger processing (common when seeding a new node with already-processed PDFs).
+                    metadata_present = _has_eidat_metadata(pdf)
+                    if metadata_present:
+                        metadata_ok = _pointer_artifacts_exist(global_repo, pdf)
+                        if not metadata_ok:
+                            needs_processing = 1
+                            reason = "metadata_missing_artifacts"
+                    # If the expected artifacts folder is missing, schedule regeneration regardless of fitz availability.
+                    if last_processed_epoch_ns and not artifacts_ok:
+                        needs_processing = 1
+                        reason = reason or "missing_artifacts"
 
                 conn.execute(
                     """
@@ -261,7 +419,7 @@ def scan_global_repo(paths: SupportPaths) -> ScanSummary:
                         mtime_ns,
                         file_fingerprint,
                         now_ns,
-                        1 if metadata_present else 0,
+                        1 if metadata_ok else 0,
                         now_ns,
                         needs_processing,
                         rel_path,

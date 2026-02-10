@@ -16,27 +16,44 @@ from typing import Dict, Iterable, Mapping, Optional
 
 APP_ROOT = Path(__file__).resolve().parents[1]
 ROOT = APP_ROOT.parent  # repository root that holds user data folders
-MASTER_DB_ROOT = ROOT / "Master_Database"
+
+
+def _get_data_root() -> Path:
+    raw = (os.environ.get("EIDAT_DATA_ROOT") or "").strip()
+    if not raw:
+        return ROOT
+    try:
+        p = Path(raw).expanduser()
+        if not p.is_absolute():
+            p = ROOT / p
+        return p.resolve()
+    except Exception:
+        return Path(raw).expanduser().absolute()
+
+
+DATA_ROOT = _get_data_root()
+
+MASTER_DB_ROOT = DATA_ROOT / "Master_Database"
 LEGACY_MASTER_ROOT = ROOT  # previous root-based location for master/registry
-DEFAULT_TERMS_XLSX = ROOT / "user_inputs" / "terms.schema.simple.xlsx"
-DEFAULT_PLOT_TERMS_XLSX = ROOT / "user_inputs" / "plot_terms.xlsx"
-DEFAULT_PROPOSED_PLOTS_JSON = ROOT / "user_inputs" / "proposed_plots.json"
-DEFAULT_EXCEL_TREND_CONFIG = ROOT / "user_inputs" / "excel_trend_config.json"
-DEFAULT_ACCEPTANCE_HEURISTICS = ROOT / "user_inputs" / "acceptance_heuristics.json"
+DEFAULT_TERMS_XLSX = DATA_ROOT / "user_inputs" / "terms.schema.simple.xlsx"
+DEFAULT_PLOT_TERMS_XLSX = DATA_ROOT / "user_inputs" / "plot_terms.xlsx"
+DEFAULT_PROPOSED_PLOTS_JSON = DATA_ROOT / "user_inputs" / "proposed_plots.json"
+DEFAULT_EXCEL_TREND_CONFIG = DATA_ROOT / "user_inputs" / "excel_trend_config.json"
+DEFAULT_ACCEPTANCE_HEURISTICS = DATA_ROOT / "user_inputs" / "acceptance_heuristics.json"
 EXCEL_EXTENSIONS = {".xlsx", ".xls", ".xlsm"}
 EXCEL_ARTIFACT_SUFFIX = "__excel"
 # Default repository root where PDFs may live (user-organized, nested or flat)
 DEFAULT_REPO_ROOT = ROOT / "Data Packages"
 DEFAULT_PDF_DIR = DEFAULT_REPO_ROOT
-SCANNER_ENV = ROOT / "user_inputs" / "scanner.env"
-OCR_FORCE_ENV = ROOT / "user_inputs" / "ocr_force.env"
+SCANNER_ENV = DATA_ROOT / "user_inputs" / "scanner.env"
+OCR_FORCE_ENV = DATA_ROOT / "user_inputs" / "ocr_force.env"
 DOTENV_FILES = [
-    ROOT / ".env",
-    ROOT / "user_inputs" / ".env",
+    DATA_ROOT / ".env",
+    DATA_ROOT / "user_inputs" / ".env",
 ]
 EIDAT_MANAGER_ENTRY = APP_ROOT / "Application" / "eidat_manager.py"
-RUNS_DIR = ROOT / "run_data_simple"
-PLOTS_DIR = ROOT / "plots"
+RUNS_DIR = DATA_ROOT / "run_data_simple"
+PLOTS_DIR = DATA_ROOT / "plots"
 TERMS_TEMPLATE_SHEET = "Template"
 TERMS_SCHEMA_COLUMNS = [
     "Data Group",
@@ -61,7 +78,7 @@ REG_CSV = MASTER_DB_ROOT / "run_registry.csv"
 LEGACY_REG_XLSX = LEGACY_MASTER_ROOT / "run_registry.xlsx"
 LEGACY_REG_CSV = LEGACY_MASTER_ROOT / "run_registry.csv"
 MASTER_BASE_COLUMNS = {"Term Label", "Data Group", "Units", "Min", "Max"}
-REPO_NAME_FILE = ROOT / "user_inputs" / "repo_root_name.txt"
+REPO_NAME_FILE = DATA_ROOT / "user_inputs" / "repo_root_name.txt"
 
 
 def _read_repo_root_name() -> str:
@@ -91,6 +108,10 @@ def ensure_repo_root_name_file() -> str:
 
 
 def _validate_repo_root_name() -> None:
+    # In production-node mode, EIDAT_DATA_ROOT points to a node-local writable data folder.
+    # The runtime folder (ROOT) will intentionally differ, so skip this guard.
+    if DATA_ROOT != ROOT:
+        return
     expected = ensure_repo_root_name_file()
     if expected and expected.lower() != ROOT.name.lower():
         raise RuntimeError(
@@ -99,7 +120,7 @@ def _validate_repo_root_name() -> None:
         )
 
 
-def _path_is_within_root(path: Path, root: Path = ROOT) -> bool:
+def _path_is_within_root(path: Path, root: Path) -> bool:
     try:
         path_res = path.resolve()
     except Exception:
@@ -119,8 +140,8 @@ def is_path_within_repo(path: Path) -> bool:
     try:
         p = Path(path).expanduser()
         if not p.is_absolute():
-            p = ROOT / p
-        return _path_is_within_root(p, ROOT)
+            p = DATA_ROOT / p
+        return _path_is_within_root(p, DATA_ROOT)
     except Exception:
         return False
 
@@ -129,9 +150,9 @@ def resolve_repo_path(path: Path, label: str = "Path") -> Path:
     _validate_repo_root_name()
     p = Path(path).expanduser()
     if not p.is_absolute():
-        p = ROOT / p
-    if not _path_is_within_root(p, ROOT):
-        raise RuntimeError(f"{label} must be inside repo root: {ROOT}")
+        p = DATA_ROOT / p
+    if not _path_is_within_root(p, DATA_ROOT):
+        raise RuntimeError(f"{label} must be inside data root: {DATA_ROOT}")
     return p
 
 
@@ -289,6 +310,7 @@ def save_scanner_env(env_map: Dict[str, str], path: Path = SCANNER_ENV) -> None:
 def get_repo_root() -> Path:
     """Return repository root from scanner.env or DEFAULT_REPO_ROOT."""
     ensure_repo_root_name_file()
+    node_root = (os.environ.get("EIDAT_NODE_ROOT") or "").strip()
     env = parse_scanner_env(SCANNER_ENV)
     val = env.get("REPO_ROOT", "").strip()
     try:
@@ -299,6 +321,11 @@ def get_repo_root() -> Path:
             return p
     except Exception:
         pass
+    if node_root:
+        try:
+            return Path(node_root).expanduser().resolve()
+        except Exception:
+            return Path(node_root).expanduser().absolute()
     return DEFAULT_REPO_ROOT
 
 
@@ -309,8 +336,11 @@ def set_repo_root(p: Path) -> None:
         target = ROOT / target
     env = parse_scanner_env(SCANNER_ENV)
     try:
-        rel = target.resolve().relative_to(ROOT.resolve())
-        env["REPO_ROOT"] = str(rel)
+        if DATA_ROOT != ROOT:
+            env["REPO_ROOT"] = str(target.resolve())
+        else:
+            rel = target.resolve().relative_to(ROOT.resolve())
+            env["REPO_ROOT"] = str(rel)
     except Exception:
         env["REPO_ROOT"] = str(target)
     save_scanner_env(env)
@@ -591,13 +621,19 @@ def resolve_project_python() -> str:
 
 def _base_env() -> Dict[str, str]:
     env = os.environ.copy()
-    # Merge scanner.env values for direct Python invocations
+    # Merge env files for direct Python invocations.
+    #
+    # Precedence (last wins):
+    #   1) Legacy user_inputs/ocr_force.env (deprecated; fallback only)
+    #   2) user_inputs/scanner.env (canonical)
+    #   3) project/node .env overrides
+    #
+    # This lets us "move" OCR DPI settings into scanner.env without ocr_force.env continuing
+    # to override them when both exist.
+    env.update(parse_scanner_env(OCR_FORCE_ENV))
     env.update(parse_scanner_env(SCANNER_ENV))
-    # Merge optional .env overrides (project-level, after scanner.env)
     for path in DOTENV_FILES:
         env.update(parse_scanner_env(path))
-    # Merge OCR force overrides (if present)
-    env.update(parse_scanner_env(OCR_FORCE_ENV))
     # Remove deprecated force flags (no longer used)
     for key in (
         "EIDAT_FORCE_NUMERIC_RESCUE",
@@ -613,7 +649,7 @@ def _base_env() -> Dict[str, str]:
     # Force cache to always be in project root, not executable location
     # This ensures cache is consistent whether running as script or frozen exe
     if "CACHE_ROOT" not in env and "OCR_CACHE_ROOT" not in env:
-        env["CACHE_ROOT"] = str(ROOT)
+        env["CACHE_ROOT"] = str(DATA_ROOT)
     return env
 
 
@@ -1847,8 +1883,8 @@ def open_plots_summary() -> None:
 
 
 def ensure_scaffold() -> None:
-    (ROOT / "user_inputs").mkdir(parents=True, exist_ok=True)
-    DEFAULT_PDF_DIR.mkdir(parents=True, exist_ok=True)
+    (DATA_ROOT / "user_inputs").mkdir(parents=True, exist_ok=True)
+    # Do not auto-create Data Packages on startup; only create when user selects/uses it.
     # DISABLED: run_data_simple and Master_Database are no longer used
     # RUNS_DIR.mkdir(parents=True, exist_ok=True)
     # MASTER_DB_ROOT.mkdir(parents=True, exist_ok=True)
@@ -2046,7 +2082,8 @@ def write_proposed_plots(plots: list[dict]) -> None:
 # --- EIDAT Global Repo Projects (v2) ---
 
 EIDAT_PROJECTS_DIRNAME = "projects"
-EIDAT_PROJECTS_REGISTRY = "projects.json"
+EIDAT_PROJECTS_REGISTRY_JSON = "projects.json"
+EIDAT_PROJECTS_REGISTRY_DB = "projects_registry.sqlite3"
 EIDAT_PROJECT_META = "project.json"
 EIDAT_PROJECT_TYPE_TRENDING = "EIDP Trending"
 EIDAT_PROJECT_TYPE_RAW_TRENDING = "EIDP Raw File Trending"
@@ -2358,8 +2395,8 @@ def eidat_debug_ocr_root(global_repo: Path) -> Path:
 
 
 def global_run_mirror_root() -> Path:
-    """Repo-local root for mirroring Global Repo outputs."""
-    return ROOT / GLOBAL_RUN_MIRROR_DIRNAME
+    """Writable root for mirroring Global Repo outputs (node-local when EIDAT_DATA_ROOT is set)."""
+    return DATA_ROOT / GLOBAL_RUN_MIRROR_DIRNAME
 
 
 def local_projects_mirror_root() -> Path:
@@ -3245,6 +3282,23 @@ def _extract_from_tables_by_header(
                 return idx
         return None
 
+    def _find_col_keywords_in_headers_tokens(headers_norm: list[list[str]], keywords: list[str]) -> int | None:
+        """Token-based header match to avoid substring false positives (e.g. 'id' in 'psid')."""
+        for hnorm in headers_norm:
+            for idx, h in enumerate(hnorm):
+                if not h:
+                    continue
+                ht = set(_tokens(h))
+                if not ht:
+                    continue
+                for kw in keywords:
+                    kt = _tokens(kw)
+                    if not kt:
+                        continue
+                    if all(t in ht for t in kt):
+                        return idx
+        return None
+
     def _looks_like_header_row(row: list[str]) -> bool:
         if not row:
             return False
@@ -3288,19 +3342,32 @@ def _extract_from_tables_by_header(
             "fail",
             "voltage",
         ]
+        keyword_hits = 0
         for c in cells:
             cn = _normalize_text(c)
             if not cn:
                 continue
             if cn in header_keywords:
-                return True
+                keyword_hits += 1
+                continue
             for kw in header_keywords:
                 if kw in cn:
-                    return True
+                    keyword_hits += 1
+                    break
+
         # Otherwise, treat as header if it is short and mostly non-numeric.
+        #
+        # Important: do NOT treat a data row as a header continuation just because it contains
+        # status text like "PASS"/"FAIL". Many tables have a "Pass?" column where every data row
+        # includes PASS, which would otherwise cause us to incorrectly skip the first data row.
         numeric = sum(1 for c in cells if re.search(r"[-+]?\d", c))
+        if numeric > 0:
+            # If the row contains numbers, only treat it as a header continuation when it's strongly
+            # header-like (multiple keyword hits and very few numeric cells).
+            return keyword_hits >= 2 and numeric <= 1
+
         max_len = max(len(c) for c in cells) if cells else 0
-        return numeric == 0 and max_len <= 24
+        return (keyword_hits >= 1) or (numeric == 0 and max_len <= 24)
 
     for b in blocks or []:
         rows = b.get("rows") or []
@@ -3325,12 +3392,12 @@ def _extract_from_tables_by_header(
         if header2_norm:
             header_norms.append(header2_norm)
 
-        term_col = _find_col_keywords_in_headers(
+        term_col = _find_col_keywords_in_headers_tokens(
             header_norms, ["tag", "term", "parameter", "id", "field", "label", "test"]
         )
         if term_col is None:
             term_col = 0
-        desc_col = _find_col_keywords_in_headers(
+        desc_col = _find_col_keywords_in_headers_tokens(
             header_norms, ["description", "desc", "name", "kpi", "metric", "test descr", "test description"]
         )
 
@@ -3347,6 +3414,12 @@ def _extract_from_tables_by_header(
         req_col = _find_col_keywords_in_headers(header_norms, ["target", "requirement", "criteria", "spec", "acceptance", "limit"])
         min_col = _find_col_keywords_in_headers(header_norms, ["min", "minimum", "range min", "range (min)"])
         max_col = _find_col_keywords_in_headers(header_norms, ["max", "maximum", "range max", "range (max)"])
+
+        # If a header is explicitly requested, only consider tables that actually contain that header.
+        # Otherwise we can match the term in an unrelated table and return None prematurely, which
+        # prevents later blocks (the correct table) from being searched.
+        if anchor_n and value_col is None:
+            continue
 
         data_start = 2 if header2_norm else 1
         for r in rows[data_start:]:
@@ -3401,6 +3474,8 @@ def _extract_from_tables_by_header(
             val = None
             if value_col is not None and value_col < len(r):
                 val = str(r[value_col]).strip()
+            if anchor_n and not val:
+                continue
             if not val and not anchor_n:
                 # Header not specified: prefer a scalar numeric cell (avoid Spec/Requirement ranges like "20-30").
                 if matched_col is not None:
@@ -4943,35 +5018,141 @@ def update_eidp_raw_trending_project_workbook(
     }
 
 
-def _registry_path(global_repo: Path) -> Path:
-    return eidat_projects_root(global_repo) / EIDAT_PROJECTS_REGISTRY
+def _registry_json_path(global_repo: Path) -> Path:
+    return eidat_projects_root(global_repo) / EIDAT_PROJECTS_REGISTRY_JSON
+
+
+def _registry_db_path(global_repo: Path) -> Path:
+    return eidat_projects_root(global_repo) / EIDAT_PROJECTS_REGISTRY_DB
+
+
+def _connect_projects_registry(db_path: Path) -> sqlite3.Connection:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path), timeout=5.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA journal_mode=WAL;")
+    except Exception:
+        pass
+    try:
+        conn.execute("PRAGMA foreign_keys=ON;")
+    except Exception:
+        pass
+    try:
+        conn.execute("PRAGMA busy_timeout=2500;")
+    except Exception:
+        pass
+    return conn
+
+
+def _ensure_projects_registry_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS projects (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          name TEXT NOT NULL,
+          type TEXT NOT NULL,
+          project_dir TEXT NOT NULL,
+          workbook TEXT NOT NULL,
+          created_by TEXT,
+          created_epoch_ns INTEGER NOT NULL,
+          updated_epoch_ns INTEGER NOT NULL,
+          UNIQUE(name, type)
+        );
+        CREATE INDEX IF NOT EXISTS idx_projects_updated ON projects(updated_epoch_ns);
+        """
+    )
+
+
+def _ensure_projects_writable(global_repo: Path) -> None:
+    repo = Path(global_repo).expanduser()
+    root = eidat_projects_root(repo)
+    root.mkdir(parents=True, exist_ok=True)
+    probe = root / f".__eidat_write_probe_{os.getpid()}"
+    try:
+        probe.write_text("ok\n", encoding="utf-8")
+        try:
+            probe.unlink(missing_ok=True)  # type: ignore[call-arg]
+        except TypeError:
+            if probe.exists():
+                probe.unlink()
+    except PermissionError as exc:
+        raise RuntimeError(
+            f"Projects folder is not writable; contact admin to grant Modify rights to: {root}"
+        ) from exc
+    except Exception:
+        # Non-fatal for listing; create/delete will also validate.
+        return
+
+
+def _migrate_projects_json_to_sqlite(repo: Path, *, db_path: Path) -> None:
+    json_path = _registry_json_path(repo)
+    if not json_path.exists() or db_path.exists():
+        return
+    try:
+        raw = json.loads(json_path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    if not isinstance(raw, list):
+        return
+    conn = _connect_projects_registry(db_path)
+    try:
+        _ensure_projects_registry_schema(conn)
+        now_ns = __import__("time").time_ns()
+        for p in raw:
+            if not isinstance(p, dict):
+                continue
+            name = str(p.get("name") or "").strip()
+            ptype = str(p.get("type") or "").strip()
+            pdir = str(p.get("project_dir") or "").strip()
+            wb = str(p.get("workbook") or "").strip()
+            if not (name and ptype and pdir and wb):
+                continue
+            try:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO projects(name, type, project_dir, workbook, created_by, created_epoch_ns, updated_epoch_ns)
+                    VALUES(?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (name, ptype, pdir, wb, None, now_ns, now_ns),
+                )
+            except Exception:
+                pass
+        conn.commit()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def list_eidat_projects(global_repo: Path) -> list[dict]:
-    path = _registry_path(global_repo)
-    if not path.exists():
-        return []
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return []
-    if not isinstance(data, list):
-        return []
-
     repo = Path(global_repo).expanduser()
-    projects_root = eidat_projects_root(repo)
+    _ensure_projects_writable(repo)
+    db_path = _registry_db_path(repo)
+    _migrate_projects_json_to_sqlite(repo, db_path=db_path)
 
-    out: list[dict] = []
-    removed = 0
-    for p in data:
-        if not isinstance(p, dict):
-            continue
-
-        # Prune entries when users manually delete folders/files from disk but leave registry stale.
+    conn = _connect_projects_registry(db_path)
+    try:
+        _ensure_projects_registry_schema(conn)
+        rows = conn.execute(
+            """
+            SELECT name, type, project_dir, workbook
+            FROM projects
+            ORDER BY updated_epoch_ns DESC, id DESC
+            """
+        ).fetchall()
+    finally:
         try:
-            raw_dir = str(p.get("project_dir") or "").strip()
+            conn.close()
         except Exception:
-            raw_dir = ""
+            pass
+
+    projects_root = eidat_projects_root(repo)
+    out: list[dict] = []
+    for r in rows:
+        p = dict(r)
+        raw_dir = str(p.get("project_dir") or "").strip()
         if raw_dir:
             proj_path = Path(raw_dir).expanduser()
             if not proj_path.is_absolute():
@@ -4985,36 +5166,20 @@ def list_eidat_projects(global_repo: Path) -> list[dict]:
             except Exception:
                 root_res = projects_root.absolute()
             try:
-                # Only accept projects that live under EIDAT Support/projects and still exist on disk.
                 proj_res.relative_to(root_res)
                 if not proj_res.exists():
-                    removed += 1
                     continue
             except Exception:
-                removed += 1
                 continue
-
         out.append(p)
 
-    if removed:
-        # Best-effort self-heal so GUI reflects disk state immediately.
-        try:
-            _write_projects_registry(repo, out)
-        except Exception:
-            pass
-
     return out
-
-
-def _write_projects_registry(global_repo: Path, projects: list[dict]) -> None:
-    root = eidat_projects_root(global_repo)
-    root.mkdir(parents=True, exist_ok=True)
-    _registry_path(global_repo).write_text(json.dumps(projects, indent=2), encoding="utf-8")
 
 
 def delete_eidat_project(global_repo: Path, project_dir: Path) -> dict:
     """Delete a project folder and remove it from the projects registry."""
     repo = Path(global_repo).expanduser()
+    _ensure_projects_writable(repo)
     proj_dir = resolve_path_within_global_repo(repo, Path(project_dir), "Project folder")
     if not proj_dir.exists():
         raise FileNotFoundError(f"Project folder not found: {proj_dir}")
@@ -5027,28 +5192,33 @@ def delete_eidat_project(global_repo: Path, project_dir: Path) -> dict:
     except Exception:
         proj_name = ""
 
-    # Remove registry entry (match by relative project_dir when possible).
-    projects = list_eidat_projects(repo)
     try:
         proj_rel = str(proj_dir.resolve().relative_to(repo.resolve()))
     except Exception:
         proj_rel = str(proj_dir)
 
-    kept: list[dict] = []
-    removed = 0
-    for p in projects:
-        try:
-            p_dir = str(p.get("project_dir") or "").strip()
-        except Exception:
-            p_dir = ""
-        if p_dir and (p_dir == proj_rel or Path(p_dir).name == proj_dir.name):
-            removed += 1
-            continue
-        kept.append(p)
-
     # Delete folder (after registry filtering so a partially-deleted folder isn't still listed).
     shutil.rmtree(proj_dir)
-    _write_projects_registry(repo, kept)
+
+    removed = 0
+    db_path = _registry_db_path(repo)
+    conn = _connect_projects_registry(db_path)
+    try:
+        _ensure_projects_registry_schema(conn)
+        try:
+            cur = conn.execute(
+                "DELETE FROM projects WHERE project_dir = ? OR name = ?",
+                (proj_rel, proj_dir.name),
+            )
+            removed = int(cur.rowcount or 0)
+        except Exception:
+            removed = 0
+        conn.commit()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
     # Best-effort delete local mirror folder too.
     try:
@@ -5667,6 +5837,7 @@ def create_eidat_project(
                            for each EIDP. Only terms found in extractions are added.
     """
     repo = Path(global_repo).expanduser()
+    _ensure_projects_writable(repo)
     safe_name = _safe_project_slug(project_name)
     parent = resolve_path_within_global_repo(repo, project_parent_dir, "Project location")
     project_dir = resolve_path_within_global_repo(repo, parent / safe_name, "Project folder")
@@ -5760,21 +5931,36 @@ def create_eidat_project(
     except Exception:
         pass
 
-    # Registry entry (stored under EIDAT Support to keep project list centralized)
-    projects = list_eidat_projects(repo)
+    # Registry entry (stored under EIDAT Support/projects as SQLite for multi-writer safety)
+    _ensure_projects_writable(repo)
     try:
         rel = str(project_dir.resolve().relative_to(repo.resolve()))
     except Exception:
         rel = str(project_dir)
-    projects.append(
-        {
-            "name": safe_name,
-            "type": project_type,
-            "project_dir": rel,
-            "workbook": str((Path(rel) / workbook_path.name)) if rel else str(workbook_path),
-        }
-    )
-    _write_projects_registry(repo, projects)
+    wb_rel = str((Path(rel) / workbook_path.name)) if rel else str(workbook_path)
+    db_path = _registry_db_path(repo)
+    conn = _connect_projects_registry(db_path)
+    try:
+        _ensure_projects_registry_schema(conn)
+        now_ns = __import__("time").time_ns()
+        created_by = (os.environ.get("USERNAME") or os.environ.get("USER") or "").strip() or None
+        conn.execute(
+            """
+            INSERT INTO projects(name, type, project_dir, workbook, created_by, created_epoch_ns, updated_epoch_ns)
+            VALUES(?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(name, type) DO UPDATE SET
+              project_dir=excluded.project_dir,
+              workbook=excluded.workbook,
+              updated_epoch_ns=excluded.updated_epoch_ns
+            """,
+            (safe_name, project_type, rel, wb_rel, created_by, now_ns, now_ns),
+        )
+        conn.commit()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
     return meta
 
 

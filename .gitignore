@@ -22,6 +22,15 @@
 /debug/**/*.jpg
 /debug/**/*.jpeg
 /global_run_mirror/
+/node_mirror/
+
+# Admin dashboard registry (when stored in runtime root)
+admin_registry.sqlite3
+admin_registry.sqlite3-wal
+admin_registry.sqlite3-shm
+
+# Node deposit folder (should not live in the Central Runtime repo)
+/EIDAT/
 
 # Generated/ephemeral files
 __pycache__/

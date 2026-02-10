@@ -1,4 +1,4 @@
 # global_run_mirror target
-# Generated: 2026-02-04 15:13:24
-REPO_ROOT=C:\Users\zachs\Desktop\System Files
-EIDAT_SUPPORT=C:\Users\zachs\Desktop\System Files\EIDAT Support
+# Generated: 2026-02-08 08:30:13
+REPO_ROOT=C:\EIDAT PROD TEST\PROGRAM A\EIDAT
+EIDAT_SUPPORT=C:\EIDAT PROD TEST\PROGRAM A\EIDAT\EIDAT Support

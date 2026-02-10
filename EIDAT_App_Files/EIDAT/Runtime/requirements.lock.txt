@@ -1,0 +1,9 @@
+# Node-local virtualenv requirements for end-user UI + projects.
+PySide6>=6.6
+pymupdf
+pandas
+openpyxl
+XlsxWriter
+matplotlib
+opencv-python-headless
+
