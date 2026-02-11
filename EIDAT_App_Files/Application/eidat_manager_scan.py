@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,6 +27,16 @@ except Exception:  # pragma: no cover
 # Supported file extensions for scanning
 SUPPORTED_EXTENSIONS = {".pdf", ".xlsx", ".xls", ".xlsm"}
 EXCEL_ARTIFACT_SUFFIX = "__excel"
+
+# Ignore generated artifacts and support folders anywhere in the repo tree.
+# These are not "source" PDFs/Excels and should not be tracked as inputs.
+_IGNORED_REPO_DIRNAMES_CASEFOLD = {
+    "eidat",
+    "eidat support",
+    # Common typo/legacy naming without the "I"
+    "edat",
+    "edat support",
+}
 
 
 @dataclass(frozen=True)
@@ -56,31 +67,50 @@ def _iter_data_files(global_repo: Path, *, exclude_dir: Path) -> list[Path]:
     except Exception:
         exclude_dir_res = exclude_dir.expanduser().absolute()
 
-    for p in global_repo.rglob("*"):
-        try:
-            if not p.is_file():
+    # Use os.walk so we can prune ignored/support directories efficiently.
+    for dirpath, dirnames, filenames in os.walk(str(global_repo), topdown=True):
+        base = Path(dirpath)
+
+        # Prune directories we never want to scan.
+        kept: list[str] = []
+        for d in dirnames:
+            try:
+                if str(d).casefold() in _IGNORED_REPO_DIRNAMES_CASEFOLD:
+                    continue
+            except Exception:
+                pass
+            cand = base / d
+            try:
+                cr = cand.resolve()
+            except Exception:
+                cr = cand.expanduser().absolute()
+            try:
+                cr.relative_to(exclude_dir_res)
                 continue
-        except Exception:
-            continue
-        try:
-            ext = p.suffix.lower()
-            if ext not in SUPPORTED_EXTENSIONS:
+            except Exception:
+                pass
+            kept.append(d)
+        dirnames[:] = kept
+
+        for name in filenames:
+            p = base / name
+            try:
+                ext = p.suffix.lower()
+                if ext not in SUPPORTED_EXTENSIONS:
+                    continue
+                # Skip Excel temp files (start with ~$)
+                if ext in {".xlsx", ".xls", ".xlsm"} and p.name.startswith("~$"):
+                    continue
+            except Exception:
                 continue
-            # Skip Excel temp files (start with ~$)
-            if ext in {".xlsx", ".xls", ".xlsm"} and p.name.startswith("~$"):
+
+            try:
+                if not p.is_file():
+                    continue
+            except Exception:
                 continue
-        except Exception:
-            continue
-        try:
-            pr = p.resolve()
-        except Exception:
-            pr = p.expanduser().absolute()
-        try:
-            pr.relative_to(exclude_dir_res)
-            continue
-        except Exception:
-            pass
-        files.append(p)
+
+            files.append(p)
     return files
 
 

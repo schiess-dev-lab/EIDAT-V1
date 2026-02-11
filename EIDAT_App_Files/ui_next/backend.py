@@ -2543,13 +2543,26 @@ def read_files_with_index_metadata(global_repo: Path) -> list[dict]:
     support_db = eidat_support_dir(repo) / "eidat_support.sqlite3"
     index_db = eidat_support_dir(repo) / "eidat_index.sqlite3"
 
+    def _ignore_rel_path(rel_path: str) -> bool:
+        # Hide generated PDFs/Excels from the Files tab. These are outputs, not
+        # original documents.
+        try:
+            parts = [p.casefold() for p in Path(str(rel_path or "")).parts]
+        except Exception:
+            parts = []
+        ignored = {"eidat", "eidat support", "edat", "edat support"}
+        return any(p in ignored for p in parts)
+
     # Read all files
     files_by_path: dict[str, dict] = {}
     if support_db.exists():
         with sqlite3.connect(str(support_db)) as conn:
             conn.row_factory = sqlite3.Row
             for r in conn.execute("SELECT * FROM files").fetchall():
-                files_by_path[r["rel_path"]] = dict(r)
+                rel = str(r["rel_path"] or "")
+                if _ignore_rel_path(rel):
+                    continue
+                files_by_path[rel] = dict(r)
 
     # Read all indexed documents
     docs_by_artifacts: dict[str, dict] = {}
@@ -3051,6 +3064,9 @@ _META_TERM_MAP: dict[str, tuple[str, str]] = {
     "assettype": ("asset_type", "string"),
     "serial": ("serial_number", "serial"),
     "serialnumber": ("serial_number", "serial"),
+    "vendor": ("vendor", "string"),
+    "acceptancetestplan": ("acceptance_test_plan_number", "string"),
+    "acceptancetestplannumber": ("acceptance_test_plan_number", "string"),
     "part": ("part_number", "string"),
     "partnumber": ("part_number", "string"),
     "model": ("part_number", "string"),
@@ -3059,9 +3075,291 @@ _META_TERM_MAP: dict[str, tuple[str, str]] = {
     "revision": ("revision", "string"),
     "testdate": ("test_date", "string"),
     "reportdate": ("report_date", "string"),
+    "documenttype": ("document_type", "string"),
+    "documentacronym": ("document_type_acronym", "string"),
+    "similaritygroup": ("similarity_group", "string"),
     "operator": ("operator", "string"),
     "facility": ("facility", "string"),
 }
+
+
+EIDAT_VALIDATION_SHEET = "_eidat_validation"
+
+
+def _collect_unique_nonempty(items: Iterable[object]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for it in items:
+        s = str(it or "").strip()
+        if not s:
+            continue
+        k = s.casefold()
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(s)
+    return sorted(out, key=lambda v: v.casefold())
+
+
+def _load_metadata_candidates() -> dict:
+    """
+    Load user-provided metadata candidate lists.
+
+    Primary location is under DATA_ROOT so production nodes can override it.
+    Falls back to ROOT for dev/workspace convenience.
+    """
+    for base in (DATA_ROOT, ROOT):
+        try:
+            cand_path = Path(base) / "user_inputs" / "metadata_candidates.json"
+            if not cand_path.exists():
+                continue
+            data = json.loads(cand_path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            continue
+    return {}
+
+
+def _build_validation_lists(docs: Iterable[Mapping[str, object]], *, extra_meta: Iterable[Mapping[str, object]] | None = None) -> dict[str, list[str]]:
+    """
+    Build dropdown lists for metadata-driven fields.
+
+    These lists are used for Excel DataValidation in project workbooks.
+    """
+    docs_list = list(docs or [])
+    meta_list = list(extra_meta or [])
+    cand = _load_metadata_candidates()
+
+    cand_program_titles = cand.get("program_titles") if isinstance(cand, dict) else []
+    cand_asset_types = cand.get("asset_types") if isinstance(cand, dict) else []
+    cand_vendors = cand.get("vendors") if isinstance(cand, dict) else []
+
+    cand_doc_types_raw = cand.get("document_types") if isinstance(cand, dict) else []
+    cand_doc_type_names: list[object] = []
+    cand_doc_type_acronyms: list[object] = []
+    if isinstance(cand_doc_types_raw, list):
+        for entry in cand_doc_types_raw:
+            if isinstance(entry, str):
+                # Treat as a document type name.
+                cand_doc_type_names.append(entry)
+                continue
+            if isinstance(entry, Mapping):
+                cand_doc_type_names.append(entry.get("name"))
+                cand_doc_type_acronyms.append(entry.get("acronym"))
+                # Keep aliases as a fallback so older metadata remains selectable.
+                aliases = entry.get("aliases")
+                if isinstance(aliases, list):
+                    cand_doc_type_names.extend(aliases)
+                continue
+
+    return {
+        "program_title": _collect_unique_nonempty(
+            [d.get("program_title") for d in docs_list]
+            + [m.get("program_title") for m in meta_list]
+            + (cand_program_titles if isinstance(cand_program_titles, list) else [])
+        ),
+        "asset_type": _collect_unique_nonempty(
+            [d.get("asset_type") for d in docs_list]
+            + [m.get("asset_type") for m in meta_list]
+            + (cand_asset_types if isinstance(cand_asset_types, list) else [])
+        ),
+        "vendor": _collect_unique_nonempty(
+            [d.get("vendor") for d in docs_list]
+            + [m.get("vendor") for m in meta_list]
+            + (cand_vendors if isinstance(cand_vendors, list) else [])
+        ),
+        "document_type": _collect_unique_nonempty(
+            [d.get("document_type") for d in docs_list]
+            + [m.get("document_type") for m in meta_list]
+            + cand_doc_type_names
+        ),
+        "document_type_acronym": _collect_unique_nonempty(
+            [d.get("document_type_acronym") for d in docs_list]
+            + [m.get("document_type_acronym") for m in meta_list]
+            + cand_doc_type_acronyms
+        ),
+        "similarity_group": _collect_unique_nonempty(
+            [d.get("similarity_group") for d in docs_list]
+            + [m.get("similarity_group") for m in meta_list]
+        ),
+    }
+
+
+def _ensure_validation_sheet(wb, *, sheet_name: str = EIDAT_VALIDATION_SHEET):
+    try:
+        if sheet_name in wb.sheetnames:
+            wb.remove(wb[sheet_name])
+    except Exception:
+        pass
+    ws = wb.create_sheet(sheet_name)
+    try:
+        ws.sheet_state = "hidden"
+    except Exception:
+        pass
+    return ws
+
+
+def _write_validation_sheet(ws, lists: dict[str, list[str]]) -> dict[str, str]:
+    """
+    Write lists into a hidden sheet and return dict[field -> Excel range formula].
+    """
+    try:
+        from openpyxl.utils import get_column_letter  # type: ignore
+    except Exception:
+        return {}
+
+    # Column order is stable so formulas are stable.
+    cols: list[tuple[str, str]] = [
+        ("Program", "program_title"),
+        ("Asset Type", "asset_type"),
+        ("Vendor", "vendor"),
+        ("Document Type", "document_type"),
+        ("Document Acronym", "document_type_acronym"),
+        ("Similarity Group", "similarity_group"),
+    ]
+    ws.append([label for label, _ in cols])
+    max_len = 0
+    for _, key in cols:
+        max_len = max(max_len, len(lists.get(key, []) or []))
+    for i in range(max_len):
+        row: list[str] = []
+        for _, key in cols:
+            vals = lists.get(key, []) or []
+            row.append(vals[i] if i < len(vals) else "")
+        ws.append(row)
+
+    ranges: dict[str, str] = {}
+    for idx, (_, key) in enumerate(cols, start=1):
+        vals = lists.get(key, []) or []
+        if not vals:
+            continue
+        # Values start at row 2
+        col_letter = get_column_letter(idx)  # type: ignore[name-defined]
+        last_row = 1 + len(vals)
+        ranges[key] = f"='{ws.title}'!${col_letter}$2:${col_letter}${int(last_row)}"
+    return ranges
+
+
+def _remove_eidat_data_validations(ws, *, sheet_name: str) -> None:
+    try:
+        dvs = getattr(ws, "data_validations", None)
+        if not dvs:
+            return
+        dv_list = list(getattr(dvs, "dataValidation", []) or [])
+        kept = []
+        for dv in dv_list:
+            try:
+                if str(getattr(dv, "errorTitle", "") or "") == "EIDAT" and sheet_name in str(getattr(dv, "formula1", "") or ""):
+                    continue
+            except Exception:
+                pass
+            kept.append(dv)
+        dvs.dataValidation = kept
+    except Exception:
+        return
+
+
+def _apply_list_validation(ws, *, formula_range: str, sqref: str, title: str) -> None:
+    try:
+        from openpyxl.worksheet.datavalidation import DataValidation  # type: ignore
+    except Exception:
+        return
+    dv = DataValidation(type="list", formula1=str(formula_range), allow_blank=True, showDropDown=True)
+    dv.errorTitle = "EIDAT"
+    dv.error = f"Select a value from the '{title}' list."
+    ws.add_data_validation(dv)
+    dv.add(str(sqref))
+
+
+def _ensure_project_metadata_validations(
+    wb,
+    *,
+    ws_master,
+    ws_metadata,
+    docs: Iterable[Mapping[str, object]],
+    extra_meta: Iterable[Mapping[str, object]] | None = None,
+    master_meta_rows: Mapping[str, int] | None = None,
+    master_sn_col_range: tuple[int, int] | None = None,
+) -> None:
+    """
+    Ensure workbook has restricted dropdowns for metadata-driven fields.
+
+    Unrestricted fields: Acceptance Test Plan, Part Number, Revision, and dates.
+    """
+    try:
+        from openpyxl.utils import get_column_letter  # type: ignore
+    except Exception:
+        return
+
+    lists = _build_validation_lists(docs, extra_meta=extra_meta)
+    ws_val = _ensure_validation_sheet(wb, sheet_name=EIDAT_VALIDATION_SHEET)
+    ranges = _write_validation_sheet(ws_val, lists)
+
+    # Remove previously-applied validations before re-adding.
+    _remove_eidat_data_validations(ws_master, sheet_name=EIDAT_VALIDATION_SHEET)
+    if ws_metadata is not None:
+        _remove_eidat_data_validations(ws_metadata, sheet_name=EIDAT_VALIDATION_SHEET)
+
+    # Apply to master-sheet metadata rows across SN columns.
+    if master_meta_rows and master_sn_col_range:
+        sn_first, sn_last = master_sn_col_range
+        if sn_first > 0 and sn_last >= sn_first:
+            first_col = get_column_letter(int(sn_first))
+            last_col = get_column_letter(int(sn_last))
+            row_map = {k.casefold(): int(v) for k, v in dict(master_meta_rows).items() if v}
+
+            def _row(term: str) -> int | None:
+                return row_map.get(str(term).casefold())
+
+            for term, key in (
+                ("Program", "program_title"),
+                ("Asset Type", "asset_type"),
+                ("Vendor", "vendor"),
+                ("Document Type", "document_type"),
+                ("Document Acronym", "document_type_acronym"),
+                ("Similarity Group", "similarity_group"),
+            ):
+                r = _row(term)
+                if not r:
+                    continue
+                fr = ranges.get(key)
+                if not fr:
+                    continue
+                sqref = f"{first_col}{int(r)}:{last_col}{int(r)}"
+                _apply_list_validation(ws_master, formula_range=fr, sqref=sqref, title=term)
+
+    # Apply to metadata sheet columns across existing rows.
+    if ws_metadata is not None:
+        # header -> col
+        header_map: dict[str, int] = {}
+        try:
+            for col in range(1, ws_metadata.max_column + 1):
+                val = str(ws_metadata.cell(1, col).value or "").strip()
+                if val:
+                    header_map[_normalize_text(val)] = col
+        except Exception:
+            header_map = {}
+
+        max_rows = max(int(ws_metadata.max_row or 1), 500)
+
+        def _col(name: str) -> int | None:
+            return header_map.get(_normalize_text(name))
+
+        for header, key in (
+            ("Program", "program_title"),
+            ("Asset Type", "asset_type"),
+            ("Vendor", "vendor"),
+            ("Document Type", "document_type"),
+            ("Document Acronym", "document_type_acronym"),
+            ("Similarity Group", "similarity_group"),
+        ):
+            col = _col(header)
+            fr = ranges.get(key)
+            if not col or not fr:
+                continue
+            col_letter = get_column_letter(int(col))
+            sqref = f"{col_letter}2:{col_letter}{int(max_rows)}"
+            _apply_list_validation(ws_metadata, formula_range=fr, sqref=sqref, title=header)
 
 
 def _meta_get(meta: Mapping[str, object], path: str) -> object | None:
@@ -4429,6 +4727,95 @@ def update_eidp_trending_project_workbook(
             except Exception:
                 pass
 
+    # Ensure Document Type / Document Acronym reflect current metadata, and add dropdown restrictions.
+    try:
+        meta_rows: dict[str, int] = {}
+        for row in range(2, ws.max_row + 1):
+            term = str(ws.cell(row, col_term).value or "").strip()
+            if not term:
+                continue
+            dg = str(ws.cell(row, col_data_group).value or "").strip()
+            if dg and _normalize_text(dg) != _normalize_text("Metadata"):
+                continue
+            if _normalize_text(dg) == _normalize_text("Metadata"):
+                if term not in meta_rows:
+                    meta_rows[term] = row
+
+        sn_first = min(sn_cols.values()) if sn_cols else 0
+        sn_last = max(sn_cols.values()) if sn_cols else 0
+
+        def _best_meta_value(sn_header: str, key: str) -> str:
+            v = ""
+            meta = meta_cache.get(sn_header) or {}
+            if isinstance(meta, Mapping):
+                try:
+                    v = str(_meta_get(meta, key) or "").strip()
+                except Exception:
+                    v = ""
+            if v:
+                return v
+            sn = _match_serial_key(sn_header, known_serials)
+            doc = _best_doc_for_serial(support_dir, docs_by_serial.get(sn, []))
+            try:
+                return str((doc or {}).get(key) or "").strip()
+            except Exception:
+                return ""
+
+        # Update master-sheet metadata rows (always overwrite for these two fields).
+        def _meta_row(label: str) -> int | None:
+            want = _normalize_text(label)
+            for k, r in meta_rows.items():
+                if _normalize_text(k) == want:
+                    try:
+                        return int(r)
+                    except Exception:
+                        return None
+            return None
+
+        row_doc_type = _meta_row("Document Type")
+        row_doc_acr = _meta_row("Document Acronym")
+        if row_doc_type or row_doc_acr:
+            for sn_header, col in sn_cols.items():
+                if row_doc_type:
+                    ws.cell(int(row_doc_type), int(col)).value = _best_meta_value(sn_header, "document_type")
+                if row_doc_acr:
+                    ws.cell(int(row_doc_acr), int(col)).value = _best_meta_value(sn_header, "document_type_acronym")
+
+        # Update metadata sheet values + validations.
+        ws_meta = wb["metadata"] if "metadata" in wb.sheetnames else None
+        if ws_meta is not None:
+            header_map: dict[str, int] = {}
+            for col in range(1, ws_meta.max_column + 1):
+                val = str(ws_meta.cell(1, col).value or "").strip()
+                if val:
+                    header_map[_normalize_text(val)] = col
+
+            col_sn = header_map.get("serialnumber")
+            col_dt = header_map.get("documenttype")
+            col_da = header_map.get("documentacronym")
+            if col_sn and (col_dt or col_da):
+                for row in range(2, ws_meta.max_row + 1):
+                    sn = str(ws_meta.cell(row, int(col_sn)).value or "").strip()
+                    if not sn:
+                        continue
+                    if col_dt:
+                        ws_meta.cell(row, int(col_dt)).value = _best_meta_value(sn, "document_type")
+                    if col_da:
+                        ws_meta.cell(row, int(col_da)).value = _best_meta_value(sn, "document_type_acronym")
+
+        extra_meta = [m for m in (meta_cache.values() or []) if isinstance(m, Mapping)]
+        _ensure_project_metadata_validations(
+            wb,
+            ws_master=ws,
+            ws_metadata=ws_meta,
+            docs=docs,
+            extra_meta=extra_meta,
+            master_meta_rows=meta_rows,
+            master_sn_col_range=(sn_first, sn_last) if sn_first and sn_last else None,
+        )
+    except Exception:
+        pass
+
     try:
         wb.save(str(wb_path))
     except PermissionError as exc:
@@ -5433,6 +5820,36 @@ def _write_eidp_trending_workbook(path: Path, *, serials: list[str], docs: list[
 
     ws_meta.freeze_panes = "A2"
 
+    # Restrict metadata-driven fields (doc type/acronym, etc.) to dropdown lists.
+    try:
+        meta_rows: dict[str, int] = {}
+        col_term = headers.index("Term") + 1
+        col_data_group = headers.index("Data Group") + 1
+        for row in range(2, ws.max_row + 1):
+            term = str(ws.cell(row, col_term).value or "").strip()
+            if not term:
+                continue
+            dg = str(ws.cell(row, col_data_group).value or "").strip()
+            if _normalize_text(dg) != _normalize_text("Metadata"):
+                continue
+            if term not in meta_rows:
+                meta_rows[term] = row
+
+        fixed_cols = headers.index("Max") + 1
+        sn_count = len([s for s in serials if str(s).strip()])
+        if sn_count > 0:
+            _ensure_project_metadata_validations(
+                wb,
+                ws_master=ws,
+                ws_metadata=ws_meta,
+                docs=(docs or []),
+                extra_meta=None,
+                master_meta_rows=meta_rows,
+                master_sn_col_range=(fixed_cols + 1, fixed_cols + sn_count),
+            )
+    except Exception:
+        pass
+
     path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(str(path))
     try:
@@ -5515,6 +5932,37 @@ def _write_eidp_raw_trending_workbook(
         ws.append(["" for _ in headers])
 
     ws.freeze_panes = "A2"
+
+    # Restrict metadata-driven fields (doc type/acronym, etc.) to dropdown lists.
+    try:
+        meta_rows: dict[str, int] = {}
+        col_term = headers.index("Term") + 1
+        col_data_group = headers.index("Data Group") + 1
+        for row in range(2, ws.max_row + 1):
+            term = str(ws.cell(row, col_term).value or "").strip()
+            if not term:
+                continue
+            dg = str(ws.cell(row, col_data_group).value or "").strip()
+            if _normalize_text(dg) != _normalize_text("Metadata"):
+                continue
+            if term not in meta_rows:
+                meta_rows[term] = row
+
+        fixed_cols = headers.index("Max") + 1
+        sn_count = len([s for s in serials if str(s).strip()])
+        if sn_count > 0:
+            _ensure_project_metadata_validations(
+                wb,
+                ws_master=ws,
+                ws_metadata=None,
+                docs=(docs or []),
+                extra_meta=None,
+                master_meta_rows=meta_rows,
+                master_sn_col_range=(fixed_cols + 1, fixed_cols + sn_count),
+            )
+    except Exception:
+        pass
+
     path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(str(path))
     try:

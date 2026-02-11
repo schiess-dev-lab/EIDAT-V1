@@ -47,6 +47,21 @@ def _load_scanner_core() -> Any:
 EXCEL_EXTENSIONS = {".xlsx", ".xls", ".xlsm"}
 EXCEL_ARTIFACT_SUFFIX = "__excel"
 
+_IGNORED_REPO_DIRNAMES_CASEFOLD = {
+    "eidat",
+    "eidat support",
+    "edat",
+    "edat support",
+}
+
+
+def _ignore_rel_path(rel_path: str) -> bool:
+    try:
+        parts = [p.casefold() for p in Path(str(rel_path or "")).parts]
+    except Exception:
+        parts = []
+    return any(p in _IGNORED_REPO_DIRNAMES_CASEFOLD for p in parts)
+
 
 def _export_extracted_terms_db(artifacts_dir: Path, combined_txt_path: Path) -> None:
     """
@@ -613,6 +628,8 @@ def process_candidates(
                 if limit is not None and processed >= int(limit):
                     break
                 rel_path = str(row["rel_path"])
+                if _ignore_rel_path(rel_path):
+                    continue
                 abs_path = (paths.global_repo / Path(rel_path)).expanduser()
                 try:
                     if not abs_path.exists():
