@@ -563,21 +563,24 @@ def _split_table_on_vline_mismatch(
 def _build_variants(ocr_dpi: int, detection_dpi: int) -> List[Dict]:
     variants: List[Dict] = []
 
-    table_ocr_psms = (11, 6)
+    # Expand PSM coverage to improve robustness on imperfect table text.
+    # - 11: sparse text
+    # - 6 : single uniform block of text
+    # - 3 : fully automatic page segmentation
+    table_ocr_psms = (11, 6, 3)
     table_ocr_scales = (0.66, 1.0)
     line_strip_levels = ("default", "light")
 
     for scale in table_ocr_scales:
         for psm in table_ocr_psms:
-            if psm != 6:
-                variants.append({
-                    "method": "table_region_ocr",
-                    "ocr_mode": "table_region",
-                    "psm": int(psm),
-                    "remove_lines": False,
-                    "line_strip_level": None,
-                    "scale": float(scale),
-                })
+            variants.append({
+                "method": "table_region_ocr",
+                "ocr_mode": "table_region",
+                "psm": int(psm),
+                "remove_lines": False,
+                "line_strip_level": None,
+                "scale": float(scale),
+            })
             for level in line_strip_levels:
                 variants.append({
                     "method": "table_region_ocr",

@@ -16,13 +16,21 @@ Variants:
 - table_region_ocr psm=11 scale=0.66 rl0
 - table_region_ocr psm=11 scale=0.66 rl1(default)
 - table_region_ocr psm=11 scale=0.66 rl1(light)
+- table_region_ocr psm=6 scale=0.66 rl0
 - table_region_ocr psm=6 scale=0.66 rl1(default)
 - table_region_ocr psm=6 scale=0.66 rl1(light)
+- table_region_ocr psm=3 scale=0.66 rl0
+- table_region_ocr psm=3 scale=0.66 rl1(default)
+- table_region_ocr psm=3 scale=0.66 rl1(light)
 - table_region_ocr psm=11 scale=1.0 rl0
 - table_region_ocr psm=11 scale=1.0 rl1(default)
 - table_region_ocr psm=11 scale=1.0 rl1(light)
+- table_region_ocr psm=6 scale=1.0 rl0
 - table_region_ocr psm=6 scale=1.0 rl1(default)
 - table_region_ocr psm=6 scale=1.0 rl1(light)
+- table_region_ocr psm=3 scale=1.0 rl0
+- table_region_ocr psm=3 scale=1.0 rl1(default)
+- table_region_ocr psm=3 scale=1.0 rl1(light)
 
 Line-strip debug images (per input):
 - Only nolines images are saved.
