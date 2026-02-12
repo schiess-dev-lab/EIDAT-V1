@@ -189,26 +189,60 @@ def _filter_rows_by_anchors(rows: List[List[str]], group_after: Optional[str], g
         return rows
     start_idx = 0
     end_idx = len(rows)
-    found_any = False
+
+    def _row_text(r: List[str]) -> str:
+        return " ".join(str(x or '') for x in r).strip()
+
+    # group_after is a hard anchor: if provided and not found, return no rows.
     if ga:
-        needle = ga.lower()
+        ga_l = ga.lower()
+        ga_norm = _normalize_anchor_token(ga)
+        best_i: Optional[int] = None
+        best_score = 0.0
         for i, r in enumerate(rows):
-            line = " ".join(str(x or '') for x in r).lower()
-            if needle and (needle in line):
-                start_idx = i + 1
-                found_any = True
+            raw = _row_text(r)
+            if not raw:
+                continue
+            raw_l = raw.lower()
+            if ga_l and ga_l in raw_l:
+                best_i = i
+                best_score = 1.0
                 break
-    if gb:
-        needle = gb.lower()
+            score = _fuzzy_ratio(ga, raw)
+            raw_norm = _normalize_anchor_token(raw)
+            if ga_norm and ga_norm in raw_norm:
+                score = max(score, 0.99)
+            if score > best_score:
+                best_score = score
+                best_i = i
+        if best_i is None or best_score < 0.6:
+            return []
+        start_idx = min(best_i + 1, len(rows))
+
+    if gb and start_idx < len(rows):
+        gb_l = gb.lower()
+        gb_norm = _normalize_anchor_token(gb)
+        best_i2: Optional[int] = None
+        best_score2 = 0.0
         for i in range(start_idx, len(rows)):
-            line = " ".join(str(x or '') for x in rows[i]).lower()
-            if needle and (needle in line):
-                end_idx = i
-                found_any = True or found_any
+            raw = _row_text(rows[i])
+            if not raw:
+                continue
+            raw_l = raw.lower()
+            if gb_l and gb_l in raw_l:
+                best_i2 = i
+                best_score2 = 1.0
                 break
-    if not found_any:
-        # Default to full page content when anchors absent
-        return rows
+            score = _fuzzy_ratio(gb, raw)
+            raw_norm = _normalize_anchor_token(raw)
+            if gb_norm and gb_norm in raw_norm:
+                score = max(score, 0.99)
+            if score > best_score2:
+                best_score2 = score
+                best_i2 = i
+        if best_i2 is not None and best_score2 >= 0.6:
+            end_idx = best_i2
+
     return rows[start_idx:end_idx]
 
 

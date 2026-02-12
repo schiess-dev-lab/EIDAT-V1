@@ -2977,11 +2977,57 @@ def _extract_value_from_lines(
     end = min(len(lines), start + max(50, int(window_lines)))
 
     if group_after.strip():
+        # "group_after" is a hard anchor: when provided, we must not use any values
+        # that occur before its first match (within the scan window).
         ga_n = _normalize_text(group_after)
-        for i in range(start, end):
-            if ga_n and ga_n in _normalize_text(lines[i]):
-                start = min(i + 1, end)
-                break
+        ga_k = _normalize_key(group_after)
+        try:
+            min_ratio = float(
+                (os.environ.get("EIDAT_GROUP_ANCHOR_MIN_RATIO") or os.environ.get("EIDAT_FUZZY_HEADER_MIN_RATIO") or "0.72").strip()
+            )
+        except Exception:
+            min_ratio = 0.72
+
+        def _best_anchor_line_index() -> int | None:
+            if ga_n:
+                for j in range(start, end):
+                    if ga_n in _normalize_text(lines[j]):
+                        return j
+            if not ga_k or len(ga_k) < 6:
+                return None
+            anchor_words = [w for w in ga_n.split() if w]
+            wlen = len(anchor_words)
+            best_j: int | None = None
+            best_score = 0.0
+            for j in range(start, end):
+                ln_n = _normalize_text(lines[j])
+                if not ln_n:
+                    continue
+                words = ln_n.split()
+                if not words:
+                    continue
+                # Slide a window so anchors embedded in longer lines can still match well.
+                windows: list[str]
+                if wlen >= 2 and len(words) > wlen:
+                    windows = [" ".join(words[k : k + wlen]) for k in range(0, len(words) - wlen + 1)]
+                else:
+                    windows = [ln_n]
+                for w in windows:
+                    wk = _normalize_key(w)
+                    if not wk:
+                        continue
+                    score = 1.0 if (ga_k and (ga_k in wk)) else SequenceMatcher(None, ga_k, wk).ratio()
+                    if score > best_score:
+                        best_score = score
+                        best_j = j
+            if best_j is not None and best_score >= float(min_ratio or 0.0):
+                return best_j
+            return None
+
+        hit = _best_anchor_line_index()
+        if hit is None:
+            return None, ""
+        start = min(hit + 1, end)
 
     for i in range(start, end):
         ln = lines[i]
@@ -3403,16 +3449,81 @@ def _extract_from_tables(
 
     anchor = _normalize_text(header_anchor).strip()
     ga = _normalize_text(group_after).strip()
+    ga_k = _normalize_key(group_after)
+    try:
+        ga_min_ratio = float(
+            (os.environ.get("EIDAT_GROUP_ANCHOR_MIN_RATIO") or os.environ.get("EIDAT_FUZZY_HEADER_MIN_RATIO") or "0.72").strip()
+        )
+    except Exception:
+        ga_min_ratio = 0.72
+
+    def _block_anchor_hit(block: dict) -> tuple[bool, int | None]:
+        if not ga:
+            return True, None
+        heading = _normalize_text(str(block.get("heading") or ""))
+        if heading and ga in heading:
+            return True, None
+        if ga_k and heading:
+            hk = _normalize_key(heading)
+            if hk and (ga_k in hk):
+                return True, None
+            if ga_k and hk and len(ga_k) >= 6 and SequenceMatcher(None, ga_k, hk).ratio() >= ga_min_ratio:
+                return True, None
+        rows = block.get("rows") or []
+        if not isinstance(rows, list):
+            return False, None
+        if not ga_k or len(ga_k) < 6:
+            # For very short anchors, avoid fuzzy matching to reduce false positives.
+            for idx, r in enumerate(rows):
+                try:
+                    row_text = _normalize_text(" ".join(str(x or "") for x in r))
+                except Exception:
+                    row_text = ""
+                if row_text and ga and ga in row_text:
+                    return True, idx
+            return False, None
+        best_idx: int | None = None
+        best_score = 0.0
+        for idx, r in enumerate(rows):
+            try:
+                row_text = _normalize_text(" ".join(str(x or "") for x in r))
+            except Exception:
+                row_text = ""
+            if not row_text:
+                continue
+            rk = _normalize_key(row_text)
+            if not rk:
+                continue
+            score = 1.0 if (ga_k and (ga_k in rk)) else SequenceMatcher(None, ga_k, rk).ratio()
+            if score > best_score:
+                best_score = score
+                best_idx = idx
+        if best_idx is not None and best_score >= ga_min_ratio:
+            return True, best_idx
+        return False, None
+
+    anchor_found = not bool(ga)
+    slice_rows_after: int | None = None
 
     for b in blocks:
+        if ga and not anchor_found:
+            ok, row_idx = _block_anchor_hit(b)
+            if not ok:
+                continue
+            anchor_found = True
+            slice_rows_after = (row_idx + 1) if row_idx is not None else None
+
         heading = _normalize_text(str(b.get("heading") or ""))
         if anchor and anchor not in heading:
             continue
-        # group_after as secondary check: it can be a phrase that occurs in heading too
-        if ga and ga not in heading and ga != anchor:
-            pass
+        # Enforce "group_after": nothing before the anchor may be used.
+        if ga and not anchor_found:
+            continue
+
         kv = b.get("kv") or {}
-        if isinstance(kv, dict):
+        # If the anchor was found inside this table block (row hit), kv may include
+        # rows that occur before the anchor row; avoid kv in that case.
+        if slice_rows_after is None and isinstance(kv, dict):
             v = kv.get(term_k)
             if not v and len(term_k) >= 4:
                 for kk, vv in kv.items():
@@ -3430,7 +3541,9 @@ def _extract_from_tables(
         rows = b.get("rows") or []
         if not isinstance(rows, list):
             continue
-        for r in rows:
+        start_idx = int(slice_rows_after or 0)
+        slice_rows_after = None  # only applies to the first block where the anchor is hit
+        for r in rows[start_idx:]:
             if not isinstance(r, list) or not r:
                 continue
             left = _normalize_key(r[0])
@@ -3442,6 +3555,8 @@ def _extract_from_tables(
                         break
                 if val:
                     return val, f"{b.get('heading')}: {r[0]} -> {val}"
+    if ga and not anchor_found:
+        return None, ""
     return None, ""
 
 
@@ -3478,6 +3593,7 @@ def _extract_from_tables_by_header(
     term: str,
     term_label: str = "",
     header_anchor: str = "",
+    group_after: str = "",
     fuzzy_header: bool = False,
     fuzzy_min_ratio: float = 0.72,
 ) -> tuple[str | None, str, dict]:
@@ -3485,6 +3601,14 @@ def _extract_from_tables_by_header(
     term_n = _normalize_text(term)
     term_label_n = _normalize_text(term_label)
     anchor_n = _normalize_text(header_anchor)
+    ga = _normalize_text(group_after).strip()
+    ga_k = _normalize_key(group_after)
+    try:
+        ga_min_ratio = float(
+            (os.environ.get("EIDAT_GROUP_ANCHOR_MIN_RATIO") or os.environ.get("EIDAT_FUZZY_HEADER_MIN_RATIO") or "0.72").strip()
+        )
+    except Exception:
+        ga_min_ratio = 0.72
     if not term_k and not term_label_n:
         return None, "", {}
 
@@ -3667,7 +3791,58 @@ def _extract_from_tables_by_header(
         max_len = max(len(c) for c in cells) if cells else 0
         return (keyword_hits >= 1) or (numeric == 0 and max_len <= 24)
 
+    anchor_found = not bool(ga)
+    slice_rows_after: int | None = None
+
     for b in blocks or []:
+        if ga and not anchor_found:
+            heading = _normalize_text(str(b.get("heading") or ""))
+            if heading and ga in heading:
+                anchor_found = True
+                slice_rows_after = None
+            elif ga_k and heading:
+                hk = _normalize_key(heading)
+                if hk and (ga_k in hk):
+                    anchor_found = True
+                    slice_rows_after = None
+                elif hk and len(ga_k) >= 6 and SequenceMatcher(None, ga_k, hk).ratio() >= ga_min_ratio:
+                    anchor_found = True
+                    slice_rows_after = None
+            if not anchor_found:
+                rows0 = b.get("rows") or []
+                if isinstance(rows0, list):
+                    # For very short anchors, avoid fuzzy matching to reduce false positives.
+                    if not ga_k or len(ga_k) < 6:
+                        for idx, r in enumerate(rows0):
+                            if not isinstance(r, list):
+                                continue
+                            row_text = _normalize_text(" ".join(str(x or "") for x in r))
+                            if row_text and ga and ga in row_text:
+                                anchor_found = True
+                                slice_rows_after = idx + 1
+                                break
+                    else:
+                        best_idx: int | None = None
+                        best_score = 0.0
+                        for idx, r in enumerate(rows0):
+                            if not isinstance(r, list):
+                                continue
+                            row_text = _normalize_text(" ".join(str(x or "") for x in r))
+                            if not row_text:
+                                continue
+                            rk = _normalize_key(row_text)
+                            if not rk:
+                                continue
+                            score = 1.0 if (ga_k and (ga_k in rk)) else SequenceMatcher(None, ga_k, rk).ratio()
+                            if score > best_score:
+                                best_score = score
+                                best_idx = idx
+                        if best_idx is not None and best_score >= ga_min_ratio:
+                            anchor_found = True
+                            slice_rows_after = best_idx + 1
+            if not anchor_found:
+                continue
+
         rows = b.get("rows") or []
         if not isinstance(rows, list) or len(rows) < 2:
             continue
@@ -3720,6 +3895,9 @@ def _extract_from_tables_by_header(
             continue
 
         data_start = 2 if header2_norm else 1
+        if slice_rows_after is not None:
+            data_start = max(data_start, int(slice_rows_after))
+            slice_rows_after = None
         for r in rows[data_start:]:
             if not isinstance(r, list) or not r:
                 continue
@@ -3811,6 +3989,8 @@ def _extract_from_tables_by_header(
             snippet = f"{heading}: {tag} -> {val}".strip()
             return val, snippet, extra
 
+    if ga and not anchor_found:
+        return None, "", {}
     return None, "", {}
 
 def _row_has_headers(row: list[str], headers: list[str]) -> bool:
@@ -4412,6 +4592,7 @@ def update_eidp_trending_project_workbook(
                     term=term,
                     term_label=term_label,
                     header_anchor=header_anchor,
+                    group_after=group_after,
                     fuzzy_header=fuzzy_header_stick,
                     fuzzy_min_ratio=fuzzy_header_min_ratio,
                 )
@@ -4468,6 +4649,7 @@ def update_eidp_trending_project_workbook(
                     term=term,
                     term_label=term_label,
                     header_anchor="",
+                    group_after=group_after,
                     fuzzy_header=False,
                     fuzzy_min_ratio=fuzzy_header_min_ratio,
                 )
@@ -4571,6 +4753,20 @@ def update_eidp_trending_project_workbook(
                                     val = _clean_cell_text(tval2)
                                     used_method = "golden_paired_tables"
                                     snippet = tsnip2
+                        else:
+                            tval, tsnip, extra = _extract_from_tables_by_header(
+                                gblocks,
+                                term=term,
+                                term_label=term_label,
+                                header_anchor=header_anchor,
+                                group_after=group_after,
+                                fuzzy_header=False,
+                                fuzzy_min_ratio=fuzzy_header_min_ratio,
+                            )
+                            if val in (None, "") and tval not in (None, ""):
+                                val = _clean_cell_text(str(tval))
+                                used_method = "golden_table_header"
+                                snippet = tsnip
                         fallback, snip = _extract_value_from_lines(
                             golden,
                             term=term,
@@ -5121,6 +5317,7 @@ def update_eidp_raw_trending_project_workbook(
             term=term,
             term_label=term_label,
             header_anchor=header_anchor,
+            group_after=group_after,
             fuzzy_header=fuzzy_header_stick,
             fuzzy_min_ratio=fuzzy_header_min_ratio,
         )

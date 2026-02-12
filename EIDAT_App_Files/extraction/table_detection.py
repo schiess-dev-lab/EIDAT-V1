@@ -6,6 +6,7 @@ then clusters cells into logical tables.
 """
 
 from pathlib import Path
+import os
 from typing import List, Dict, Tuple, Optional, Set
 
 try:
@@ -14,6 +15,82 @@ try:
     HAVE_CV2 = True
 except ImportError:
     HAVE_CV2 = False
+
+
+def _env_int(key: str, default: int) -> int:
+    try:
+        return int(float(str(os.environ.get(key, str(default)) or str(default)).strip()))
+    except Exception:
+        return int(default)
+
+
+def _env_float(key: str, default: float) -> float:
+    try:
+        return float(str(os.environ.get(key, str(default)) or str(default)).strip())
+    except Exception:
+        return float(default)
+
+
+def _env_bool(key: str, default: bool) -> bool:
+    raw = str(os.environ.get(key, "1" if default else "0") or "").strip().lower()
+    if raw in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if raw in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    return bool(default)
+
+
+def _odd_ksize(v: int, *, min_v: int = 3, max_v: int = 255, default: int = 25) -> int:
+    try:
+        v = int(v)
+    except Exception:
+        v = int(default)
+    if v < int(min_v):
+        v = int(min_v)
+    if v > int(max_v):
+        v = int(max_v)
+    if v % 2 == 0:
+        v += 1
+        if v > int(max_v):
+            v -= 2
+    if v < int(min_v):
+        v = int(min_v) | 1
+    return int(v)
+
+
+def _preprocess_for_lines(img_gray: "np.ndarray") -> "np.ndarray":
+    """
+    Optional contrast/denoise preprocessing to improve faint-line binarization.
+
+    Controlled via env vars (safe defaults):
+      - EIDAT_TABLE_DETECT_CLAHE=0/1
+      - EIDAT_TABLE_DETECT_CLAHE_CLIP=2.0
+      - EIDAT_TABLE_DETECT_CLAHE_TILE=16
+      - EIDAT_TABLE_DETECT_BLUR_K=0  (0 disables; otherwise odd >=3)
+    """
+    if not HAVE_CV2:
+        return img_gray
+
+    out = img_gray
+    if _env_bool("EIDAT_TABLE_DETECT_CLAHE", False):
+        try:
+            clip = _env_float("EIDAT_TABLE_DETECT_CLAHE_CLIP", 2.0)
+            tile = _env_int("EIDAT_TABLE_DETECT_CLAHE_TILE", 16)
+            tile = max(4, min(64, int(tile)))
+            clahe = cv2.createCLAHE(clipLimit=float(clip), tileGridSize=(int(tile), int(tile)))
+            out = clahe.apply(out)
+        except Exception:
+            pass
+
+    blur_k = _env_int("EIDAT_TABLE_DETECT_BLUR_K", 0)
+    if blur_k and int(blur_k) >= 3:
+        k = _odd_ksize(int(blur_k), min_v=3, max_v=101, default=0)
+        try:
+            out = cv2.GaussianBlur(out, (int(k), int(k)), 0)
+        except Exception:
+            pass
+
+    return out
 
 
 def detect_tables(
@@ -49,7 +126,7 @@ def detect_tables(
     # Step 2.5: Filter out thin cells (border line artifacts)
     # At 900 DPI, real cells should be at least 30px in both dimensions
     # A 2px wide "cell" is clearly a border line being detected as a cell
-    min_cell_dim = 30  # ~0.85mm at 900 DPI
+    min_cell_dim = _env_int("EIDAT_TABLE_DETECT_MIN_CELL_DIM_PX", 30)  # ~0.85mm at 900 DPI
     all_cells = [c for c in all_cells
                  if (c['bbox_px'][2] - c['bbox_px'][0]) >= min_cell_dim and
                     (c['bbox_px'][3] - c['bbox_px'][1]) >= min_cell_dim]
@@ -106,25 +183,54 @@ def detect_tables(
 def _find_cells_contour(img_gray: np.ndarray) -> List[Dict]:
     """Find cells by detecting closed rectangular contours."""
     h, w = img_gray.shape
+    img_gray = _preprocess_for_lines(img_gray)
 
     # Multi-threshold binarization
     _, bin_otsu = cv2.threshold(img_gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    _, bin_high = cv2.threshold(img_gray, 200, 255, cv2.THRESH_BINARY_INV)
-    bin_adapt = cv2.adaptiveThreshold(img_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                       cv2.THRESH_BINARY_INV, 25, 8)
+    high_thr = _env_int("EIDAT_TABLE_DETECT_BIN_HIGH_THRESH", 200)
+    high_thr = max(0, min(255, int(high_thr)))
+    _, bin_high = cv2.threshold(img_gray, high_thr, 255, cv2.THRESH_BINARY_INV)
+    adapt_block = _odd_ksize(_env_int("EIDAT_TABLE_DETECT_ADAPT_BLOCK", 25), min_v=3, max_v=151, default=25)
+    adapt_c = _env_int("EIDAT_TABLE_DETECT_ADAPT_C", 8)
+    bin_adapt = cv2.adaptiveThreshold(
+        img_gray,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        int(adapt_block),
+        int(adapt_c),
+    )
     combined = cv2.bitwise_or(cv2.bitwise_or(bin_otsu, bin_high), bin_adapt)
 
     # Extract lines
-    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(int(w * 0.03), 20), 1))
-    v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(int(h * 0.015), 15)))
+    h_ratio = _env_float("EIDAT_TABLE_DETECT_H_KERNEL_RATIO", 0.03)
+    v_ratio = _env_float("EIDAT_TABLE_DETECT_V_KERNEL_RATIO", 0.015)
+    h_min = _env_int("EIDAT_TABLE_DETECT_H_KERNEL_MIN", 20)
+    v_min = _env_int("EIDAT_TABLE_DETECT_V_KERNEL_MIN", 15)
+    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(int(w * float(h_ratio)), int(h_min)), 1))
+    v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(int(h * float(v_ratio)), int(v_min))))
 
-    horiz = cv2.dilate(cv2.morphologyEx(combined, cv2.MORPH_OPEN, h_kernel),
-                       cv2.getStructuringElement(cv2.MORPH_RECT, (5, 3)))
-    vert = cv2.dilate(cv2.morphologyEx(combined, cv2.MORPH_OPEN, v_kernel),
-                      cv2.getStructuringElement(cv2.MORPH_RECT, (3, 5)))
+    h_d_w = _env_int("EIDAT_TABLE_DETECT_H_DILATE_W", 5)
+    h_d_h = _env_int("EIDAT_TABLE_DETECT_H_DILATE_H", 3)
+    v_d_w = _env_int("EIDAT_TABLE_DETECT_V_DILATE_W", 3)
+    v_d_h = _env_int("EIDAT_TABLE_DETECT_V_DILATE_H", 5)
+
+    horiz = cv2.dilate(
+        cv2.morphologyEx(combined, cv2.MORPH_OPEN, h_kernel),
+        cv2.getStructuringElement(cv2.MORPH_RECT, (max(1, int(h_d_w)), max(1, int(h_d_h)))),
+    )
+    vert = cv2.dilate(
+        cv2.morphologyEx(combined, cv2.MORPH_OPEN, v_kernel),
+        cv2.getStructuringElement(cv2.MORPH_RECT, (max(1, int(v_d_w)), max(1, int(v_d_h)))),
+    )
 
     # Combine and close gaps
-    grid = cv2.dilate(cv2.bitwise_or(horiz, vert), cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
+    g_d = _env_int("EIDAT_TABLE_DETECT_GRID_DILATE", 3)
+    g_d = max(1, min(15, int(g_d)))
+    grid = cv2.dilate(
+        cv2.bitwise_or(horiz, vert),
+        cv2.getStructuringElement(cv2.MORPH_RECT, (int(g_d), int(g_d))),
+    )
 
     # Find contours in inverted grid
     contours, _ = cv2.findContours(cv2.bitwise_not(grid), cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
@@ -144,7 +250,8 @@ def _find_cells_contour(img_gray: np.ndarray) -> List[Dict]:
             continue
 
         fill_ratio = area / (cw * ch) if cw * ch > 0 else 0
-        if fill_ratio < 0.7:
+        fill_min = float(_env_float("EIDAT_TABLE_DETECT_CONTOUR_FILL_MIN", 0.7))
+        if fill_ratio < fill_min:
             continue
 
         cells.append({'bbox_px': [x, y, x + cw, y + ch]})
@@ -155,17 +262,32 @@ def _find_cells_contour(img_gray: np.ndarray) -> List[Dict]:
 def _find_cells_corner(img_gray: np.ndarray) -> List[Dict]:
     """Find cells by detecting line intersections (corners) and connecting lines."""
     h, w = img_gray.shape
+    img_gray = _preprocess_for_lines(img_gray)
 
     # Binarize
     _, bin_otsu = cv2.threshold(img_gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    _, bin_high = cv2.threshold(img_gray, 200, 255, cv2.THRESH_BINARY_INV)
-    bin_adapt = cv2.adaptiveThreshold(img_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                       cv2.THRESH_BINARY_INV, 25, 8)
+    high_thr = _env_int("EIDAT_TABLE_DETECT_BIN_HIGH_THRESH", 200)
+    high_thr = max(0, min(255, int(high_thr)))
+    _, bin_high = cv2.threshold(img_gray, high_thr, 255, cv2.THRESH_BINARY_INV)
+    adapt_block = _odd_ksize(_env_int("EIDAT_TABLE_DETECT_ADAPT_BLOCK", 25), min_v=3, max_v=151, default=25)
+    adapt_c = _env_int("EIDAT_TABLE_DETECT_ADAPT_C", 8)
+    bin_adapt = cv2.adaptiveThreshold(
+        img_gray,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        int(adapt_block),
+        int(adapt_c),
+    )
     combined = cv2.bitwise_or(cv2.bitwise_or(bin_otsu, bin_high), bin_adapt)
 
     # Extract lines
-    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(int(w * 0.03), 20), 1))
-    v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(int(h * 0.015), 15)))
+    h_ratio = _env_float("EIDAT_TABLE_DETECT_H_KERNEL_RATIO", 0.03)
+    v_ratio = _env_float("EIDAT_TABLE_DETECT_V_KERNEL_RATIO", 0.015)
+    h_min = _env_int("EIDAT_TABLE_DETECT_H_KERNEL_MIN", 20)
+    v_min = _env_int("EIDAT_TABLE_DETECT_V_KERNEL_MIN", 15)
+    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(int(w * float(h_ratio)), int(h_min)), 1))
+    v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(int(h * float(v_ratio)), int(v_min))))
 
     horiz = cv2.morphologyEx(combined, cv2.MORPH_OPEN, h_kernel)
     vert = cv2.morphologyEx(combined, cv2.MORPH_OPEN, v_kernel)

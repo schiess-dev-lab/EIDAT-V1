@@ -388,7 +388,8 @@ def _run_debug_method_extraction(pdf_path: Path, dpi: int | None, output_dir: Pa
             emit_variants=False,
             emit_fused=True,
             allow_no_tables=True,
-            enable_borderless=False,
+            enable_borderless=_parse_bool_env("EIDAT_TABLE_ENABLE_BORDERLESS", False)
+            or _parse_bool_env("EIDAT_ENABLE_BORDERLESS_TABLES", False),
             return_fused=True,
         )
 
