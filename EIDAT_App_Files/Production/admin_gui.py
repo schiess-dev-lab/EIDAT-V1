@@ -38,6 +38,7 @@ def _fmt_ts(epoch_ns: int | None) -> str:
 
 class _Worker(QtCore.QThread):
     log = QtCore.Signal(str)
+    status = QtCore.Signal(str)
     # Use `object` for timestamps to avoid PySide6/shiboken coercing to 32-bit C++ int.
     finished_one = QtCore.Signal(str, object, object, bool, str)  # node_id, started_ns, finished_ns, ok, error
 
@@ -52,20 +53,37 @@ class _Worker(QtCore.QThread):
         from .admin_runner import run_scan_force_candidates
 
         for node_id, node_root, runtime_root, node_env_enabled, action in self._tasks:
+            def _emit(line: str) -> None:
+                s = str(line or "").strip()
+                if not s:
+                    return
+                self.log.emit(s)
+                # Keep the popup status short and always reflect the most recent event.
+                try:
+                    self.status.emit(f"{Path(node_root).name}: {s}")
+                except Exception:
+                    self.status.emit(s)
+
             self.log.emit(f"[RUN] {node_root}")
+            self.status.emit(f"{Path(node_root).name}: starting…")
             started = now_ns()
             if action == "scan_force_candidates":
-                self.log.emit("[ACTION] scan -> force candidates only")
+                _emit("[ACTION] scan -> force candidates only")
                 res = run_scan_force_candidates(
                     node_root=node_root,
                     runtime_root=runtime_root,
                     node_env_enabled=node_env_enabled,
+                    on_log=_emit,
                 )
             else:
+                from .admin_runner import run_pipeline
+
+                _emit("[ACTION] pipeline (scan -> process -> index)")
                 res = run_pipeline(
                     node_root=node_root,
                     runtime_root=runtime_root,
                     node_env_enabled=node_env_enabled,
+                    on_log=_emit,
                 )
             finished = now_ns()
             if res.ok:
@@ -79,11 +97,72 @@ class _Worker(QtCore.QThread):
                     groups = int((idx or {}).get("groups_count", 0))
                 except Exception:
                     cand = ok = bad = groups = 0
-                self.log.emit(f"[OK] candidates={cand} processed_ok={ok} processed_failed={bad} groups={groups}")
+                _emit(f"[OK] candidates={cand} processed_ok={ok} processed_failed={bad} groups={groups}")
                 self.finished_one.emit(node_id, started, finished, True, "")
             else:
-                self.log.emit(f"[FAIL] {res.error}")
+                _emit(f"[FAIL] {res.error}")
                 self.finished_one.emit(node_id, started, finished, False, res.error or "Unknown error")
+
+
+class _RunStatusDialog(QtWidgets.QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Run Status")
+        self.resize(760, 420)
+        self.setWindowModality(QtCore.Qt.WindowModality.ApplicationModal)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        self.lbl_heading = QtWidgets.QLabel("Running…")
+        self.lbl_heading.setStyleSheet("font-size: 14px; font-weight: 700; color: #0f172a;")
+        layout.addWidget(self.lbl_heading)
+
+        self.lbl_status = QtWidgets.QLabel("")
+        self.lbl_status.setStyleSheet("font-size: 12px; color: #334155;")
+        self.lbl_status.setWordWrap(True)
+        layout.addWidget(self.lbl_status)
+
+        self.progress = QtWidgets.QProgressBar()
+        self.progress.setRange(0, 0)  # indeterminate
+        layout.addWidget(self.progress)
+
+        self.txt = QtWidgets.QPlainTextEdit()
+        self.txt.setReadOnly(True)
+        self.txt.setMaximumBlockCount(500)
+        layout.addWidget(self.txt, 1)
+
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_row.addStretch(1)
+        self.btn_close = QtWidgets.QPushButton("Close")
+        self.btn_close.setEnabled(False)
+        self.btn_close.clicked.connect(self.accept)
+        btn_row.addWidget(self.btn_close)
+        layout.addLayout(btn_row)
+
+    def begin(self, heading: str) -> None:
+        self.lbl_heading.setText(str(heading or "Running…"))
+        self.lbl_status.setText("")
+        self.txt.clear()
+        self.progress.setRange(0, 0)
+        self.btn_close.setEnabled(False)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def append_line(self, line: str) -> None:
+        s = str(line or "").strip()
+        if not s:
+            return
+        self.txt.appendPlainText(s)
+
+    def set_status(self, status: str) -> None:
+        self.lbl_status.setText(str(status or ""))
+
+    def finish(self, summary: str = "") -> None:
+        self.progress.setRange(0, 1)
+        self.progress.setValue(1)
+        if summary:
+            self.lbl_status.setText(summary)
+        self.btn_close.setEnabled(True)
 
 
 class AdminWindow(QtWidgets.QMainWindow):
@@ -145,6 +224,9 @@ class AdminWindow(QtWidgets.QMainWindow):
         self.worker = _Worker(self)
         self.worker.log.connect(self._append_log)
         self.worker.finished_one.connect(self._on_finished_one)
+        self.worker.status.connect(self._on_worker_status)
+        self.worker.finished.connect(self._on_worker_all_done)
+        self._run_status = _RunStatusDialog(self)
 
         self.btn_add.clicked.connect(self._act_add_deploy)
         self.btn_refresh.clicked.connect(self.refresh)
@@ -164,6 +246,25 @@ class AdminWindow(QtWidgets.QMainWindow):
 
     def _append_log(self, line: str) -> None:
         self.log.appendPlainText(line)
+        try:
+            if self._run_status.isVisible():
+                self._run_status.append_line(line)
+        except Exception:
+            pass
+
+    def _on_worker_status(self, status: str) -> None:
+        try:
+            if self._run_status.isVisible():
+                self._run_status.set_status(status)
+        except Exception:
+            pass
+
+    def _on_worker_all_done(self) -> None:
+        try:
+            if self._run_status.isVisible():
+                self._run_status.finish("Run complete.")
+        except Exception:
+            pass
 
     def _default_scanner_env_path(self) -> Path:
         return self._runtime_root / "user_inputs" / "scanner.env"
@@ -401,6 +502,7 @@ class AdminWindow(QtWidgets.QMainWindow):
             return
         self.worker.set_tasks([(n.node_id, n.node_root, n.runtime_root, bool(n.node_env_enabled), "pipeline")])
         self.btn_process_enabled.setEnabled(False)
+        self._run_status.begin(f"Processing node: {Path(n.node_root).name}")
         self.worker.start()
 
     def _act_process_enabled(self) -> None:
@@ -414,6 +516,7 @@ class AdminWindow(QtWidgets.QMainWindow):
         tasks = [(n.node_id, n.node_root, n.runtime_root, bool(n.node_env_enabled)) for n in nodes]
         self.worker.set_tasks([(nid, root, rr, env_on, "pipeline") for (nid, root, rr, env_on) in tasks])
         self.btn_process_enabled.setEnabled(False)
+        self._run_status.begin(f"Processing {len(tasks)} enabled node(s)")
         self.worker.start()
 
     def _act_scan_force_candidates(self, node_id: str) -> None:
@@ -426,6 +529,7 @@ class AdminWindow(QtWidgets.QMainWindow):
             return
         self.worker.set_tasks([(n.node_id, n.node_root, n.runtime_root, bool(n.node_env_enabled), "scan_force_candidates")])
         self.btn_process_enabled.setEnabled(False)
+        self._run_status.begin(f"Scan+Force Candidates: {Path(n.node_root).name}")
         self.worker.start()
 
     def _on_finished_one(self, node_id: str, started_ns: int, finished_ns: int, ok: bool, error: str) -> None:

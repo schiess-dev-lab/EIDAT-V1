@@ -1,13 +1,15 @@
 Run Summary (auto-generated)
 
 Inputs:
-- C:\Users\zachs\Documents\DevProjects\PDF_Scanner\EIDAT_PROTO_V2\EIDAT_App_Files\debug_method\debug_file\FakeProgram_SV1_SN1111\page_4.png
+- node_mirror\nodes\program_a__d00a493d9a\EIDAT Support\debug\ocr\DEBUG_outer_frames_2pages\pages\page_1\page_1.png
 
-Output root: C:\Users\zachs\Documents\DevProjects\PDF_Scanner\EIDAT_PROTO_V2\EIDAT_App_Files\debug_method\results\FakeProgram_SV1_SN1111
+Output root: node_mirror\nodes\program_a__d00a493d9a\EIDAT Support\debug\ocr\DEBUG_outer_frames_2pages\pages\page_1\_rerun_replica2
 Per-input outputs: <output root>/<input_stem>/
 
 Base OCR DPI: 450
 Detection DPI (table geometry): 900
+Table cluster gap ratio: 0.005
+Table cluster gap px: 25.0
 Fuse enabled: True
 
 Variants:

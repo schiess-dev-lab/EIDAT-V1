@@ -624,12 +624,19 @@ def process_candidates(
         prev_env = _set_env_for_support(paths)
         try:
             processed = 0
+            attempted = 0
+            total = len(rows)
             for row in rows:
                 if limit is not None and processed >= int(limit):
                     break
                 rel_path = str(row["rel_path"])
                 if _ignore_rel_path(rel_path):
                     continue
+                attempted += 1
+                try:
+                    print(f"[PROCESS] {attempted}/{total} start: {rel_path}", file=sys.stderr, flush=True)
+                except Exception:
+                    pass
                 abs_path = (paths.global_repo / Path(rel_path)).expanduser()
                 try:
                     if not abs_path.exists():
@@ -752,6 +759,10 @@ def process_candidates(
                         )
                     )
                     processed += 1
+                    try:
+                        print(f"[PROCESS] {attempted}/{total} done: {rel_path}", file=sys.stderr, flush=True)
+                    except Exception:
+                        pass
                 except Exception as exc:
                     results.append(
                         ProcessResult(
@@ -761,6 +772,10 @@ def process_candidates(
                             error=str(exc),
                         )
                     )
+                    try:
+                        print(f"[PROCESS] {attempted}/{total} failed: {rel_path} ({exc})", file=sys.stderr, flush=True)
+                    except Exception:
+                        pass
             conn.commit()
         finally:
             _restore_env(prev_env)

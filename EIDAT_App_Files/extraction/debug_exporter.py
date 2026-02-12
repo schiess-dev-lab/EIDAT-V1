@@ -417,16 +417,30 @@ def export_chart_debug_images(
         cv2.imwrite(str(crop_path), crop)
 
 
-def _render_table_ascii(table: Dict) -> str:
-    """Render a table as ASCII text with borders."""
-    cells = table.get('cells', [])
+def _render_table_ascii(table: Dict, *, mode: str | None = None) -> str:
+    """
+    Render a table as ASCII text.
+
+    Modes:
+    - "default": render using pre-assigned row/col indices (stable, but can't represent colspans well).
+    - "replica": render using snapped bbox gridlines to better approximate the scanned layout.
+    """
+    mode = str(mode or "default").strip().lower()
+    if mode in ("replica", "snap", "grid"):
+        try:
+            return _render_table_ascii_replica(table)
+        except Exception:
+            # Fall back to the original renderer if anything goes wrong.
+            mode = "default"
+
+    cells = table.get("cells", [])
     if not cells:
         return ""
 
-    # Organize cells into rows
+    # Organize cells into rows (requires row/col indices).
     rows_dict = {}
     for cell in cells:
-        row_idx = cell.get('row', 0)
+        row_idx = cell.get("row", 0)
         if row_idx not in rows_dict:
             rows_dict[row_idx] = []
         rows_dict[row_idx].append(cell)
@@ -437,7 +451,7 @@ def _render_table_ascii(table: Dict) -> str:
     # Sort rows and cells within rows
     sorted_rows = []
     for row_idx in sorted(rows_dict.keys()):
-        row_cells = sorted(rows_dict[row_idx], key=lambda c: c.get('col', 0))
+        row_cells = sorted(rows_dict[row_idx], key=lambda c: c.get("col", 0))
         sorted_rows.append(row_cells)
 
     # Calculate column widths
@@ -447,26 +461,638 @@ def _render_table_ascii(table: Dict) -> str:
     for row in sorted_rows:
         for i, cell in enumerate(row):
             if i < max_cols:
-                text = str(cell.get('text', ''))
+                text = str(cell.get("text", ""))
                 col_widths[i] = max(col_widths[i], min(40, len(text) + 2))
 
     # Build ASCII table
     lines = []
-    separator = '+' + '+'.join('-' * w for w in col_widths) + '+'
+    separator = "+" + "+".join("-" * w for w in col_widths) + "+"
     lines.append(separator)
 
     for row in sorted_rows:
         row_text = []
         for i in range(max_cols):
             if i < len(row):
-                text = str(row[i].get('text', ''))[:col_widths[i]-2]
+                text = str(row[i].get("text", ""))[: col_widths[i] - 2]
             else:
-                text = ''
-            row_text.append(f" {text.ljust(col_widths[i]-2)} ")
-        lines.append('|' + '|'.join(row_text) + '|')
+                text = ""
+            row_text.append(f" {text.ljust(col_widths[i] - 2)} ")
+        lines.append("|" + "|".join(row_text) + "|")
         lines.append(separator)
 
-    return '\n'.join(lines)
+    return "\n".join(lines)
+
+
+def _render_table_ascii_replica(table: Dict) -> str:
+    cells = table.get("cells", [])
+    if not cells:
+        return ""
+
+    # Collect bbox edges.
+    edges_x: list[float] = []
+    edges_y: list[float] = []
+    usable_cells: list[dict] = []
+    for cell in cells:
+        bbox = cell.get("bbox_px") or []
+        if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+            continue
+        try:
+            x0, y0, x1, y1 = (float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]))
+        except Exception:
+            continue
+        if x1 <= x0 or y1 <= y0:
+            continue
+        usable_cells.append(cell)
+        edges_x.extend([x0, x1])
+        edges_y.extend([y0, y1])
+
+    if not usable_cells or len(edges_x) < 2 or len(edges_y) < 2:
+        return ""
+
+    min_x, max_x = min(edges_x), max(edges_x)
+    min_y, max_y = min(edges_y), max(edges_y)
+    table_w = max(1.0, max_x - min_x)
+    table_h = max(1.0, max_y - min_y)
+
+    def _infer_border_thickness_px(edges: list[float]) -> Optional[float]:
+        vals = sorted(set(int(round(v)) for v in edges))
+        if len(vals) < 3:
+            return None
+        gaps = [int(vals[i + 1] - vals[i]) for i in range(len(vals) - 1)]
+        gaps_pos = [g for g in gaps if g > 0]
+        if not gaps_pos:
+            return None
+        gaps_pos_sorted = sorted(gaps_pos)
+        median_gap = float(gaps_pos_sorted[len(gaps_pos_sorted) // 2])
+        small = [g for g in gaps if 2 <= g <= 12]
+        if not small:
+            return None
+        counts: dict[int, int] = {}
+        for g in small:
+            counts[g] = counts.get(g, 0) + 1
+
+        # Use the largest repeated "small" gap as a proxy for border thickness / row-to-row
+        # bbox misalignment. This helps collapse tiny sliver columns created by outer-frame
+        # insets (e.g. one row starts a few pixels to the right of another).
+        repeated = [g for g, ct in counts.items() if int(ct) >= 2]
+        if repeated:
+            return float(max(repeated))
+
+        # Fall back: allow singletons only on very small tables when the gap is clearly much
+        # smaller than typical column widths.
+        best_gap, best_count = max(counts.items(), key=lambda kv: (kv[1], -kv[0]))
+        if best_count < 2:
+            if len(gaps_pos) > 5:
+                return None
+            if median_gap <= 0 or float(best_gap) > (median_gap * 0.5):
+                return None
+        return float(best_gap)
+
+    def _env_float(key: str, default: float) -> float:
+        try:
+            return float(str(os.environ.get(key, str(default))))
+        except Exception:
+            return default
+
+    snap_tol_px = _env_float("EIDAT_TABLE_ASCII_SNAP_TOL_PX", 0.0)
+    snap_ratio = _env_float("EIDAT_TABLE_ASCII_SNAP_TOL_RATIO", 0.006)
+    snap_max_px = _env_float("EIDAT_TABLE_ASCII_SNAP_MAX_PX", 25.0)
+    max_width = int(_env_float("EIDAT_TABLE_ASCII_MAX_WIDTH", 160.0))
+    if max_width < 60:
+        max_width = 60
+
+    if snap_tol_px and snap_tol_px > 0:
+        tol_x = float(snap_tol_px)
+        tol_y = float(snap_tol_px)
+    else:
+        # Use axis-specific auto tolerances:
+        # - X snapping should remain stable even for short (few-row) table segments.
+        # - Y snapping needs a higher floor to collapse double-thickness horizontal borders
+        #   (common in scanned tables) even when the table segment is short.
+        tol_x = max(2.0, min(float(snap_max_px), float(table_w) * float(snap_ratio)))
+        tol_y = max(6.0, min(float(snap_max_px), float(table_h) * float(snap_ratio)))
+
+        # Extra robustness: collapse double-thickness borders even for small/short tables.
+        thick_x = _infer_border_thickness_px(edges_x)
+        thick_y = _infer_border_thickness_px(edges_y)
+        if thick_x:
+            tol_x = max(tol_x, min(float(snap_max_px), float(thick_x) * 1.25))
+        if thick_y:
+            tol_y = max(tol_y, min(float(snap_max_px), float(thick_y) * 1.25))
+
+    def _cluster_positions(vals: list[float], tol_px: float) -> list[float]:
+        if not vals:
+            return []
+        vals_sorted = sorted(float(v) for v in vals)
+        clusters: list[list[float]] = [[vals_sorted[0]]]
+        for v in vals_sorted[1:]:
+            if abs(v - clusters[-1][-1]) <= tol_px:
+                clusters[-1].append(v)
+            else:
+                clusters.append([v])
+        centers = [sum(c) / float(len(c)) for c in clusters if c]
+        # Ensure strictly increasing and unique-ish.
+        out: list[float] = []
+        for c in centers:
+            if not out or abs(c - out[-1]) > (tol_px * 0.25 + 1e-6):
+                out.append(c)
+        return out
+
+    x_lines = _cluster_positions(edges_x, tol_x)
+    y_lines = _cluster_positions(edges_y, tol_y)
+    if len(x_lines) < 2 or len(y_lines) < 2:
+        return ""
+
+    # Ensure bounds are included.
+    if abs(x_lines[0] - min_x) > tol_x:
+        x_lines = [min_x] + x_lines
+    if abs(x_lines[-1] - max_x) > tol_x:
+        x_lines = x_lines + [max_x]
+    if abs(y_lines[0] - min_y) > tol_y:
+        y_lines = [min_y] + y_lines
+    if abs(y_lines[-1] - max_y) > tol_y:
+        y_lines = y_lines + [max_y]
+    x_lines = sorted(set(float(v) for v in x_lines))
+    y_lines = sorted(set(float(v) for v in y_lines))
+
+    ncols = len(x_lines) - 1
+    nrows = len(y_lines) - 1
+    if ncols <= 0 or nrows <= 0:
+        return ""
+
+    # Column widths (chars) proportional to pixel widths, bounded by max width.
+    col_px = [max(1.0, float(x_lines[i + 1] - x_lines[i])) for i in range(ncols)]
+    total_px = float(sum(col_px)) or 1.0
+    budget = max(20, int(max_width) - (ncols + 1))  # account for border/boundary chars
+    col_widths = [max(3, int(round(budget * (w / total_px)))) for w in col_px]
+    # Fix rounding drift.
+    drift = int(budget - sum(col_widths))
+    i = 0
+    while drift != 0 and ncols > 0:
+        j = i % ncols
+        if drift > 0:
+            col_widths[j] += 1
+            drift -= 1
+        else:
+            if col_widths[j] > 3:
+                col_widths[j] -= 1
+                drift += 1
+        i += 1
+
+    def _closest_line_idx(lines: list[float], v: float) -> int:
+        # Linear scan is fine for typical small tables.
+        best_i = 0
+        best_d = abs(float(lines[0]) - float(v))
+        for i, lv in enumerate(lines[1:], start=1):
+            d = abs(float(lv) - float(v))
+            if d < best_d:
+                best_d = d
+                best_i = i
+        return best_i
+
+    # Build snapped grid occupancy for colspans.
+    grid: list[list[int | None]] = [[None for _ in range(ncols)] for _ in range(nrows)]
+    cell_spans: dict[int, dict] = {}
+    cells_by_area: list[tuple[float, int, dict]] = []
+    for idx, cell in enumerate(usable_cells):
+        bbox = cell.get("bbox_px") or []
+        x0, y0, x1, y1 = (float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]))
+        area = max(1.0, (x1 - x0) * (y1 - y0))
+        cells_by_area.append((area, idx, cell))
+    cells_by_area.sort(key=lambda t: t[0])  # small first
+
+    for _area, cid, cell in cells_by_area:
+        bbox = cell.get("bbox_px") or []
+        x0, y0, x1, y1 = (float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]))
+        xi0 = _closest_line_idx(x_lines, x0)
+        xi1 = _closest_line_idx(x_lines, x1)
+        yi0 = _closest_line_idx(y_lines, y0)
+        yi1 = _closest_line_idx(y_lines, y1)
+        if xi1 < xi0:
+            xi0, xi1 = xi1, xi0
+        if yi1 < yi0:
+            yi0, yi1 = yi1, yi0
+        if xi0 == xi1:
+            xi1 = min(len(x_lines) - 1, xi0 + 1)
+        if yi0 == yi1:
+            yi1 = min(len(y_lines) - 1, yi0 + 1)
+        if xi0 >= xi1 or yi0 >= yi1:
+            continue
+        cell_spans[cid] = {
+            "x0": int(xi0),
+            "x1": int(xi1),
+            "y0": int(yi0),
+            "y1": int(yi1),
+            "text": str(cell.get("text", "") or ""),
+        }
+        for r in range(int(yi0), int(yi1)):
+            for c in range(int(xi0), int(xi1)):
+                if 0 <= r < nrows and 0 <= c < ncols and grid[r][c] is None:
+                    grid[r][c] = int(cid)
+
+    if not cell_spans:
+        return ""
+
+    def _v_present_for_row(r: int) -> list[bool]:
+        present = [True] * (ncols + 1)
+        for b in range(1, ncols):
+            left = grid[r][b - 1]
+            right = grid[r][b]
+            # Hide boundary only when the same non-empty cell spans across it.
+            present[b] = not (left is not None and left == right)
+        present[0] = True
+        present[-1] = True
+        return present
+
+    v_present_rows = [_v_present_for_row(r) for r in range(nrows)]
+
+    # Drop fully empty grid rows. These can appear when snapped horizontal lines create
+    # "gap" bands between real cell rows (e.g. slight bbox misalignment / scan noise).
+    # Keeping them creates spurious blank ASCII rows that downstream parsers interpret
+    # as real table rows.
+    kept_rows: list[int] = []
+    for r in range(nrows):
+        if any(grid[r][c] is not None for c in range(ncols)):
+            kept_rows.append(r)
+    if not kept_rows:
+        return ""
+
+    def _sep_line(v_present: list[bool]) -> str:
+        parts: list[str] = ["+"]
+        for c in range(ncols):
+            parts.append("-" * int(col_widths[c]))
+            parts.append("+" if v_present[c + 1] else "-")
+        return "".join(parts)
+
+    def _row_line(r: int) -> str:
+        v_present = v_present_rows[r]
+        # Build segments based on which vertical boundaries are present.
+        segs: list[tuple[int, int]] = []
+        start = 0
+        for c in range(1, ncols):
+            if v_present[c]:
+                segs.append((start, c))
+                start = c
+        segs.append((start, ncols))
+
+        out: list[str] = ["|"]
+        for (c0, c1) in segs:
+            seg_ids = [grid[r][c] for c in range(c0, c1)]
+            cell_id = next((cid for cid in seg_ids if cid is not None), None)
+            text = ""
+            if cell_id is not None and cell_id in cell_spans:
+                span = cell_spans[cell_id]
+                # Only render once: at the top-left of the spanning region.
+                if r == int(span["y0"]) and c0 == int(span["x0"]):
+                    text = str(span.get("text", "") or "")
+            seg_width = int(sum(col_widths[c] for c in range(c0, c1))) + max(0, (c1 - c0 - 1))
+            if seg_width <= 0:
+                seg_width = 1
+            clipped = text[:seg_width]
+            out.append(clipped.ljust(seg_width))
+            out.append("|")
+        return "".join(out)
+
+    lines: list[str] = []
+    # Top separator uses the first kept row's vertical boundaries.
+    first_r = kept_rows[0]
+    lines.append(_sep_line(v_present_rows[first_r]))
+    for idx, r in enumerate(kept_rows):
+        lines.append(_row_line(r))
+        if idx == len(kept_rows) - 1:
+            lines.append(_sep_line(v_present_rows[r]))
+        else:
+            nxt = kept_rows[idx + 1]
+            # Union of boundaries above/below to make the separator consistent.
+            vp = [bool(a or b) for a, b in zip(v_present_rows[r], v_present_rows[nxt])]
+            vp[0] = True
+            vp[-1] = True
+            lines.append(_sep_line(vp))
+
+    return "\n".join(lines)
+
+
+def _merge_positions_1d(values: List[float], tol_px: float) -> List[float]:
+    if not values:
+        return []
+    tol = max(0.0, float(tol_px))
+    vals = sorted(float(v) for v in values)
+    if tol <= 0:
+        out: List[float] = []
+        last = None
+        for v in vals:
+            key = int(round(v))
+            if last is None or key != last:
+                out.append(float(key))
+                last = key
+        return out
+
+    clusters: List[List[float]] = []
+    cur = [vals[0]]
+    for v in vals[1:]:
+        if abs(v - cur[-1]) <= tol:
+            cur.append(v)
+        else:
+            clusters.append(cur)
+            cur = [v]
+    clusters.append(cur)
+    return [sum(c) / float(len(c)) for c in clusters if c]
+
+
+def _group_cells_into_rows_bbox(cells: List[Dict]) -> List[List[Dict]]:
+    usable: List[Dict] = []
+    heights: List[float] = []
+    for c in cells:
+        bbox = c.get("bbox_px") or []
+        if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+            continue
+        try:
+            y0 = float(bbox[1])
+            y1 = float(bbox[3])
+        except Exception:
+            continue
+        h = y1 - y0
+        if h <= 0:
+            continue
+        usable.append(c)
+        heights.append(h)
+    if not usable:
+        return []
+
+    heights.sort()
+    median_h = float(heights[len(heights) // 2]) if heights else 0.0
+    row_tol = max(8.0, median_h * 0.60)
+
+    def _cy(cell: Dict) -> float:
+        x0, y0, x1, y1 = cell["bbox_px"]
+        return (float(y0) + float(y1)) / 2.0
+
+    sorted_cells = sorted(usable, key=lambda c: (_cy(c), float(c["bbox_px"][0])))
+    rows: List[List[Dict]] = []
+    cur: List[Dict] = []
+    cur_cy: Optional[float] = None
+
+    for cell in sorted_cells:
+        cy = _cy(cell)
+        if cur and cur_cy is not None and abs(cy - cur_cy) > row_tol:
+            rows.append(sorted(cur, key=lambda c: float(c["bbox_px"][0])))
+            cur = [cell]
+            cur_cy = cy
+            continue
+        cur.append(cell)
+        if cur_cy is None:
+            cur_cy = cy
+        else:
+            cur_cy = (cur_cy * (len(cur) - 1) + cy) / float(len(cur))
+
+    if cur:
+        rows.append(sorted(cur, key=lambda c: float(c["bbox_px"][0])))
+    return rows
+
+
+def _row_vline_signature_bbox(
+    row_cells: List[Dict],
+    *,
+    table_left: float,
+    table_right: float,
+    tol_px: float,
+) -> Optional[List[float]]:
+    if len(row_cells) < 2:
+        return None
+    xs: List[float] = []
+    for c in row_cells:
+        bbox = c.get("bbox_px") or []
+        if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+            continue
+        try:
+            xs.append(float(bbox[0]))
+            xs.append(float(bbox[2]))
+        except Exception:
+            continue
+    if not xs:
+        return None
+    merged = _merge_positions_1d(xs, tol_px=float(tol_px))
+    tol = max(0.0, float(tol_px))
+    internal = [
+        x
+        for x in merged
+        if (x - float(table_left)) > tol and (float(table_right) - x) > tol
+    ]
+    internal.sort()
+    return internal
+
+
+def _vline_signatures_match(a: Optional[List[float]], b: Optional[List[float]], tol_px: float) -> bool:
+    if a is None or b is None:
+        return a == b
+    if len(a) != len(b):
+        return False
+    tol = max(0.0, float(tol_px))
+    for x, y in zip(a, b):
+        if abs(float(x) - float(y)) > tol:
+            return False
+    return True
+
+
+def _split_table_on_vline_mismatch_for_display(
+    table: Dict,
+    tol_px: float,
+    *,
+    min_mismatch_run: int = 1,
+    enable_single_cell_separator: bool = True,
+    single_cell_separator_max_h_ratio: float = 0.0,
+) -> List[Dict]:
+    """
+    Pure ASCII/layout split: splits a detected bordered table into multiple tables when
+    internal vertical gridlines are not aligned from row to row.
+
+    This does NOT perform any OCR; it just re-groups existing cells for rendering/output order.
+    """
+    try:
+        tol = float(tol_px)
+    except Exception:
+        tol = 0.0
+    tol = max(0.0, tol)
+    try:
+        min_run = int(min_mismatch_run)
+    except Exception:
+        min_run = 1
+    if min_run < 1:
+        min_run = 1
+    try:
+        sep_max_h_ratio = float(single_cell_separator_max_h_ratio)
+    except Exception:
+        sep_max_h_ratio = 0.0
+    if sep_max_h_ratio < 0:
+        sep_max_h_ratio = 0.0
+
+    if bool(table.get("borderless", False)):
+        return [table]
+    cells = table.get("cells") or []
+    if not isinstance(cells, list) or len(cells) < 2:
+        return [table]
+
+    rows = _group_cells_into_rows_bbox(cells)
+    if len(rows) < 2:
+        return [table]
+
+    # Global bounds from cells.
+    xs0: List[float] = []
+    xs1: List[float] = []
+    for c in cells:
+        bbox = c.get("bbox_px") or []
+        if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+            continue
+        try:
+            xs0.append(float(bbox[0]))
+            xs1.append(float(bbox[2]))
+        except Exception:
+            continue
+    if not xs0 or not xs1:
+        return [table]
+    table_left = min(xs0)
+    table_right = max(xs1)
+    if table_right <= table_left:
+        return [table]
+
+    def _row_h(row_cells: List[Dict]) -> float:
+        ys0: List[float] = []
+        ys1: List[float] = []
+        for c in row_cells:
+            bbox = c.get("bbox_px") or []
+            if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+                continue
+            try:
+                ys0.append(float(bbox[1]))
+                ys1.append(float(bbox[3]))
+            except Exception:
+                continue
+        if not ys0 or not ys1:
+            return 0.0
+        return max(0.0, max(ys1) - min(ys0))
+
+    median_multi_row_h = 0.0
+    multi_heights = sorted([_row_h(r) for r in rows if len(r) >= 2 and _row_h(r) > 0])
+    if multi_heights:
+        median_multi_row_h = float(multi_heights[len(multi_heights) // 2])
+
+    is_multi = [len(r) >= 2 for r in rows]
+    prefix_has_multi = []
+    seen = False
+    for flag in is_multi:
+        prefix_has_multi.append(seen)
+        seen = seen or bool(flag)
+    suffix_has_multi = [False] * len(rows)
+    seen = False
+    for i in range(len(rows) - 1, -1, -1):
+        suffix_has_multi[i] = seen
+        seen = seen or bool(is_multi[i])
+
+    sigs: List[Optional[List[float]]] = []
+    for row in rows:
+        sig = (
+            _row_vline_signature_bbox(
+                row, table_left=table_left, table_right=table_right, tol_px=tol
+            )
+            if len(row) >= 2
+            else None
+        )
+        sigs.append(sig)
+
+    segments: List[List[List[Dict]]] = []
+    cur: List[List[Dict]] = []
+    cur_sig: Optional[List[float]] = None
+
+    i = 0
+    while i < len(rows):
+        row = rows[i]
+        sig = sigs[i]
+
+        if (
+            enable_single_cell_separator
+            and len(row) <= 1
+            and prefix_has_multi[i]
+            and suffix_has_multi[i]
+        ):
+            is_sep = True
+            if sep_max_h_ratio > 0 and median_multi_row_h > 0:
+                is_sep = _row_h(row) <= (median_multi_row_h * sep_max_h_ratio)
+            if is_sep:
+                if cur:
+                    segments.append(cur)
+                    cur = []
+                    cur_sig = None
+                segments.append([row])
+                i += 1
+                continue
+
+        if not cur:
+            cur = [row]
+            cur_sig = sig
+            i += 1
+            continue
+
+        if sig is None:
+            cur.append(row)
+            i += 1
+            continue
+
+        if cur_sig is None:
+            cur.append(row)
+            cur_sig = sig
+            i += 1
+            continue
+
+        if _vline_signatures_match(cur_sig, sig, tol_px=tol):
+            cur.append(row)
+            i += 1
+            continue
+
+        run = 1
+        j = i + 1
+        while j < len(rows) and run < min_run:
+            nxt = sigs[j]
+            if nxt is None:
+                j += 1
+                continue
+            if _vline_signatures_match(sig, nxt, tol_px=tol):
+                run += 1
+                j += 1
+                continue
+            break
+
+        if run >= min_run:
+            segments.append(cur)
+            cur = [row]
+            cur_sig = sig
+            i += 1
+            continue
+
+        cur.append(row)
+        i += 1
+
+    if cur:
+        segments.append(cur)
+
+    if len(segments) <= 1:
+        return [table]
+
+    out: List[Dict] = []
+    for seg_rows in segments:
+        seg_cells = [c for r in seg_rows for c in r]
+        if not seg_cells:
+            continue
+        x0 = min(float(c["bbox_px"][0]) for c in seg_cells)
+        y0 = min(float(c["bbox_px"][1]) for c in seg_cells)
+        x1 = max(float(c["bbox_px"][2]) for c in seg_cells)
+        y1 = max(float(c["bbox_px"][3]) for c in seg_cells)
+        tb = dict(table)
+        tb["cells"] = seg_cells
+        tb["bbox_px"] = [x0, y0, x1, y1]
+        tb["num_cells"] = len(seg_cells)
+        out.append(tb)
+
+    return out or [table]
 
 
 def export_combined_text(pdf_path: Path, pages_data: List[Dict],
@@ -620,6 +1246,48 @@ def export_combined_text(pdf_path: Path, pages_data: List[Dict],
     _ensure_chart_crops(pdf_path, pages_data, output_dir)
 
     combined_text = []
+    split_mode = str(os.environ.get("EIDAT_TABLE_SPLIT_MODE", "vline") or "vline").strip().lower()
+    ascii_mode = "replica" if split_mode in ("replica", "snap", "grid") else "default"
+    combined_split_mode = str(
+        os.environ.get("EIDAT_COMBINED_TABLE_SPLIT_MODE", "inherit") or "inherit"
+    ).strip().lower()
+    if combined_split_mode in ("inherit", "same"):
+        combined_split_mode = split_mode
+    enable_combined_vline_split = combined_split_mode in ("vline", "default", "on", "true", "1", "yes")
+    try:
+        combined_vline_tol_px = float(
+            os.environ.get(
+                "EIDAT_COMBINED_TABLE_SPLIT_VLINE_MISALIGN_PX",
+                os.environ.get("EIDAT_TABLE_SPLIT_VLINE_MISALIGN_PX", "6.0"),
+            )
+        )
+    except Exception:
+        combined_vline_tol_px = 6.0
+    try:
+        combined_vline_min_run = int(
+            os.environ.get(
+                "EIDAT_COMBINED_TABLE_SPLIT_VLINE_MIN_RUN",
+                os.environ.get("EIDAT_TABLE_SPLIT_VLINE_MIN_RUN", "1"),
+            )
+        )
+    except Exception:
+        combined_vline_min_run = 1
+    single_cell_sep = str(
+        os.environ.get(
+            "EIDAT_COMBINED_TABLE_SPLIT_SINGLE_CELL_SEPARATOR",
+            os.environ.get("EIDAT_TABLE_SPLIT_SINGLE_CELL_SEPARATOR", "1"),
+        )
+        or "1"
+    ).strip().lower() in ("1", "true", "yes", "on")
+    try:
+        single_cell_sep_max_h_ratio = float(
+            os.environ.get(
+                "EIDAT_COMBINED_TABLE_SPLIT_SINGLE_CELL_SEPARATOR_MAX_H_RATIO",
+                os.environ.get("EIDAT_TABLE_SPLIT_SINGLE_CELL_SEPARATOR_MAX_H_RATIO", "0.0"),
+            )
+        )
+    except Exception:
+        single_cell_sep_max_h_ratio = 0.0
     for page_idx, page_data in enumerate(pages_data):
         page_num = page_data.get('page', 0)
         tokens = page_data.get('tokens', [])
@@ -701,6 +1369,7 @@ def export_combined_text(pdf_path: Path, pages_data: List[Dict],
                 artifacts.append({
                     'category': "Table",
                     'table_idx': table_idx,
+                    'table': table,
                     'y0': float(bbox[1]),
                     'x0': float(bbox[0]),
                     'order': order_idx
@@ -727,16 +1396,32 @@ def export_combined_text(pdf_path: Path, pages_data: List[Dict],
                     _add_artifact("Paragraph", filtered)
 
             for i, table in enumerate(tables):
-                _add_table_artifact(i, table)
+                if enable_combined_vline_split:
+                    try:
+                        parts = _split_table_on_vline_mismatch_for_display(
+                            table,
+                            tol_px=float(combined_vline_tol_px),
+                            min_mismatch_run=int(combined_vline_min_run),
+                            enable_single_cell_separator=bool(single_cell_sep),
+                            single_cell_separator_max_h_ratio=float(single_cell_sep_max_h_ratio),
+                        )
+                    except Exception:
+                        parts = [table]
+                else:
+                    parts = [table]
+                for part in parts:
+                    _add_table_artifact(i, part)
 
             artifacts.sort(key=lambda a: (a['y0'], a['x0'], a['order']))
 
+            table_counter = 0
             for art in artifacts:
                 combined_text.append(f"[{art['category']}]\n")
                 if art['category'] == "Table":
-                    table_idx = int(art.get('table_idx', 0))
-                    combined_text.append(f"\n[Table {table_idx + 1}]\n")
-                    table_ascii = _render_table_ascii(tables[table_idx])
+                    table_counter += 1
+                    combined_text.append(f"\n[Table {table_counter}]\n")
+                    table_obj = art.get("table") or {}
+                    table_ascii = _render_table_ascii(table_obj, mode=ascii_mode)
                     if table_ascii:
                         combined_text.append(table_ascii)
                         combined_text.append("\n")

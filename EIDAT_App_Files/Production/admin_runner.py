@@ -7,6 +7,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 
 @dataclass(frozen=True)
@@ -103,6 +104,7 @@ def _run_manager(
     extra: list[str] | None = None,
     *,
     node_env_enabled: bool = False,
+    on_log: Callable[[str], None] | None = None,
 ) -> dict[str, object]:
     script = _eidat_manager_path(runtime_root)
     if not script.exists():
@@ -122,11 +124,46 @@ def _run_manager(
         except Exception:
             pass
 
-    proc = subprocess.run(argv, capture_output=True, text=True, check=False, env=env)
-    if proc.returncode != 0:
-        err = (proc.stderr or proc.stdout or "").strip()
-        raise RuntimeError(err or f"{cmd} failed with exit code {proc.returncode}")
-    out = (proc.stdout or "").strip()
+    proc = subprocess.Popen(
+        argv,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+        env=env,
+    )
+
+    stderr_lines: list[str] = []
+    try:
+        if proc.stderr is not None:
+            for line in proc.stderr:
+                s = str(line or "").rstrip("\n")
+                if s:
+                    stderr_lines.append(s)
+                    if on_log is not None:
+                        on_log(s)
+    finally:
+        try:
+            if proc.stderr is not None:
+                proc.stderr.close()
+        except Exception:
+            pass
+
+    out = ""
+    try:
+        if proc.stdout is not None:
+            out = (proc.stdout.read() or "").strip()
+    finally:
+        try:
+            if proc.stdout is not None:
+                proc.stdout.close()
+        except Exception:
+            pass
+
+    rc = int(proc.wait() or 0)
+    if rc != 0:
+        err = ("\n".join(stderr_lines) or out or "").strip()
+        raise RuntimeError(err or f"{cmd} failed with exit code {rc}")
     try:
         payload = json.loads(out) if out else {}
         if not isinstance(payload, dict):
@@ -146,6 +183,7 @@ def run_pipeline(
     dpi: int = 0,
     similarity: float = 0.86,
     node_env_enabled: bool = False,
+    on_log: Callable[[str], None] | None = None,
 ) -> PipelineResult:
     node = _as_abs(node_root)
     runtime = _as_abs(runtime_root)
@@ -163,8 +201,31 @@ def run_pipeline(
         if not manager.exists():
             raise RuntimeError(f"EIDAT Manager not found: {manager}")
 
-        outputs["init"] = _run_manager(python_exe, runtime, node, "init", node_env_enabled=node_env_enabled)
-        outputs["scan"] = _run_manager(python_exe, runtime, node, "scan", node_env_enabled=node_env_enabled)
+        if on_log is not None:
+            on_log(f"[NODE] {node}")
+        outputs["init"] = _run_manager(python_exe, runtime, node, "init", node_env_enabled=node_env_enabled, on_log=on_log)
+        scan = _run_manager(python_exe, runtime, node, "scan", node_env_enabled=node_env_enabled, on_log=on_log)
+        outputs["scan"] = scan
+
+        if on_log is not None:
+            try:
+                cand_list = list((scan or {}).get("candidates") or [])
+            except Exception:
+                cand_list = []
+            if cand_list:
+                on_log(f"[SCAN] candidates={len(cand_list)}")
+                max_show = 80
+                for c in cand_list[:max_show]:
+                    try:
+                        rel = str(c.get("rel_path") or "").strip()
+                        reason = str(c.get("reason") or "").strip() or "unknown"
+                    except Exception:
+                        rel = ""
+                        reason = "unknown"
+                    if rel:
+                        on_log(f"[CANDIDATE] {reason}: {rel}")
+                if len(cand_list) > max_show:
+                    on_log(f"[SCAN] (truncated; showing first {max_show} candidates)")
 
         cfg = _load_node_config(runtime, node, node_env_enabled=node_env_enabled)
         # Dashboard inputs are now optional; allow config-driven processing via node .env/scanner.env:
@@ -186,7 +247,7 @@ def run_pipeline(
             extra += ["--dpi", str(int(eff_dpi))]
         if eff_force:
             extra += ["--force"]
-        outputs["process"] = _run_manager(python_exe, runtime, node, "process", extra=extra, node_env_enabled=node_env_enabled)
+        outputs["process"] = _run_manager(python_exe, runtime, node, "process", extra=extra, node_env_enabled=node_env_enabled, on_log=on_log)
         outputs["index"] = _run_manager(
             python_exe,
             runtime,
@@ -194,6 +255,7 @@ def run_pipeline(
             "index",
             extra=["--similarity", str(float(similarity))],
             node_env_enabled=node_env_enabled,
+            on_log=on_log,
         )
         return PipelineResult(ok=True, node_root=node, outputs=outputs)
     except Exception as exc:
@@ -211,6 +273,7 @@ def run_scan_force_candidates(
     py: str | None = None,
     similarity: float = 0.86,
     node_env_enabled: bool = False,
+    on_log: Callable[[str], None] | None = None,
 ) -> PipelineResult:
     """
     Scan for new/changed files, then force-process ONLY those scan candidates (needs_processing=1).
@@ -230,9 +293,32 @@ def run_scan_force_candidates(
         if not (runtime / "EIDAT_App_Files").exists():
             raise RuntimeError(f"Runtime root does not contain EIDAT_App_Files: {runtime}")
 
-        outputs["init"] = _run_manager(python_exe, runtime, node, "init", node_env_enabled=node_env_enabled)
-        scan = _run_manager(python_exe, runtime, node, "scan", node_env_enabled=node_env_enabled)
+        if on_log is not None:
+            on_log(f"[NODE] {node}")
+        outputs["init"] = _run_manager(python_exe, runtime, node, "init", node_env_enabled=node_env_enabled, on_log=on_log)
+        scan = _run_manager(python_exe, runtime, node, "scan", node_env_enabled=node_env_enabled, on_log=on_log)
         outputs["scan"] = scan
+
+        # Log which files are candidates (new/changed/etc.).
+        if on_log is not None:
+            try:
+                cand_list = list((scan or {}).get("candidates") or [])
+            except Exception:
+                cand_list = []
+            if cand_list:
+                on_log(f"[SCAN] candidates={len(cand_list)}")
+                max_show = 80
+                for i, c in enumerate(cand_list[:max_show]):
+                    try:
+                        rel = str(c.get("rel_path") or "").strip()
+                        reason = str(c.get("reason") or "").strip() or "unknown"
+                    except Exception:
+                        rel = ""
+                        reason = "unknown"
+                    if rel:
+                        on_log(f"[CANDIDATE] {reason}: {rel}")
+                if len(cand_list) > max_show:
+                    on_log(f"[SCAN] (truncated; showing first {max_show} candidates)")
 
         candidates = int((scan or {}).get("candidates_count", 0) or 0)
         if candidates <= 0:
@@ -244,6 +330,7 @@ def run_scan_force_candidates(
                 "index",
                 extra=["--similarity", str(float(similarity))],
                 node_env_enabled=node_env_enabled,
+                on_log=on_log,
             )
             return PipelineResult(ok=True, node_root=node, outputs=outputs)
 
@@ -264,6 +351,7 @@ def run_scan_force_candidates(
             "process",
             extra=extra,
             node_env_enabled=node_env_enabled,
+            on_log=on_log,
         )
         outputs["index"] = _run_manager(
             python_exe,
@@ -272,6 +360,7 @@ def run_scan_force_candidates(
             "index",
             extra=["--similarity", str(float(similarity))],
             node_env_enabled=node_env_enabled,
+            on_log=on_log,
         )
         return PipelineResult(ok=True, node_root=node, outputs=outputs)
     except Exception as exc:

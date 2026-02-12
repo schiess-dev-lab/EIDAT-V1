@@ -360,7 +360,14 @@ def _signatures_match(a: Optional[List[float]], b: Optional[List[float]], tol_px
     return True
 
 
-def _split_table_on_vline_mismatch(table: Dict, tol_px: float) -> List[Dict]:
+def _split_table_on_vline_mismatch(
+    table: Dict,
+    tol_px: float,
+    *,
+    min_mismatch_run: int = 1,
+    enable_single_cell_separator: bool = True,
+    single_cell_separator_max_h_ratio: float = 0.0,
+) -> List[Dict]:
     """
     Split a detected bordered table into multiple tables when internal vertical gridlines
     are not aligned from row to row.
@@ -374,6 +381,18 @@ def _split_table_on_vline_mismatch(table: Dict, tol_px: float) -> List[Dict]:
     except Exception:
         tol = 0.0
     tol = max(0.0, tol)
+    try:
+        min_run = int(min_mismatch_run)
+    except Exception:
+        min_run = 1
+    if min_run < 1:
+        min_run = 1
+    try:
+        sep_max_h_ratio = float(single_cell_separator_max_h_ratio)
+    except Exception:
+        sep_max_h_ratio = 0.0
+    if sep_max_h_ratio < 0:
+        sep_max_h_ratio = 0.0
 
     if bool(table.get("borderless", False)):
         return [table]
@@ -384,6 +403,22 @@ def _split_table_on_vline_mismatch(table: Dict, tol_px: float) -> List[Dict]:
     rows = _group_cells_into_rows(cells)
     if len(rows) < 2:
         return [table]
+
+    def _row_h(row_cells: List[Dict]) -> float:
+        ys0: List[float] = []
+        ys1: List[float] = []
+        for c in row_cells:
+            bbox = c.get("bbox_px") or []
+            if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+                continue
+            try:
+                ys0.append(float(bbox[1]))
+                ys1.append(float(bbox[3]))
+            except Exception:
+                continue
+        if not ys0 or not ys1:
+            return 0.0
+        return max(0.0, max(ys1) - min(ys0))
 
     # Global table bounds based on cells (more reliable than any precomputed bbox).
     xs0: List[float] = []
@@ -413,43 +448,93 @@ def _split_table_on_vline_mismatch(table: Dict, tol_px: float) -> List[Dict]:
         suffix_has_multi[i] = seen
         seen = seen or bool(is_multi[i])
 
+    median_multi_row_h = 0.0
+    multi_heights = sorted([_row_h(r) for r in rows if len(r) >= 2 and _row_h(r) > 0])
+    if multi_heights:
+        median_multi_row_h = float(multi_heights[len(multi_heights) // 2])
+
+    sigs: List[Optional[List[float]]] = []
+    for row in rows:
+        sig = (
+            _row_vline_signature(row, table_left=table_left, table_right=table_right, tol_px=tol)
+            if len(row) >= 2
+            else None
+        )
+        sigs.append(sig)
+
     segments: List[List[List[Dict]]] = []
     cur: List[List[Dict]] = []
     cur_sig: Optional[List[float]] = None
 
-    for i, row in enumerate(rows):
-        # Special separator rule for single-cell (or empty) rows.
-        if len(row) <= 1 and prefix_has_multi[i] and suffix_has_multi[i]:
-            if cur:
-                segments.append(cur)
-                cur = []
-                cur_sig = None
-            segments.append([row])
-            continue
+    i = 0
+    while i < len(rows):
+        row = rows[i]
+        sig = sigs[i]
 
-        sig = _row_vline_signature(row, table_left=table_left, table_right=table_right, tol_px=tol) if len(row) >= 2 else None
+        # Special separator rule for single-cell (or empty) rows.
+        # This is useful for true spacer rows between stacked tables, but it is also common to have
+        # "header" rows that span the full table width (colspan) and should NOT cause splitting.
+        if enable_single_cell_separator and len(row) <= 1 and prefix_has_multi[i] and suffix_has_multi[i]:
+            is_sep = True
+            if sep_max_h_ratio > 0 and median_multi_row_h > 0:
+                is_sep = _row_h(row) <= (median_multi_row_h * sep_max_h_ratio)
+            if is_sep:
+                if cur:
+                    segments.append(cur)
+                    cur = []
+                    cur_sig = None
+                segments.append([row])
+                i += 1
+                continue
+
         if not cur:
             cur = [row]
             cur_sig = sig
+            i += 1
             continue
 
         # If we can't compute a signature for a row, keep it with the current segment.
         if sig is None:
             cur.append(row)
+            i += 1
             continue
 
         if cur_sig is None:
             cur.append(row)
             cur_sig = sig
+            i += 1
             continue
 
-        if not _signatures_match(cur_sig, sig, tol_px=tol):
+        if _signatures_match(cur_sig, sig, tol_px=tol):
+            cur.append(row)
+            i += 1
+            continue
+
+        # Mismatch: optionally require the new signature to persist for >= min_run non-None rows
+        # to avoid splitting on a single bad row (e.g. a merged cell row or a detection artifact).
+        run = 1
+        j = i + 1
+        while j < len(rows) and run < min_run:
+            nxt = sigs[j]
+            if nxt is None:
+                j += 1
+                continue
+            if _signatures_match(sig, nxt, tol_px=tol):
+                run += 1
+                j += 1
+                continue
+            break
+
+        if run >= min_run:
             segments.append(cur)
             cur = [row]
             cur_sig = sig
+            i += 1
             continue
 
+        # Treat as noise: keep row with current segment, keep current signature.
         cur.append(row)
+        i += 1
 
     if cur:
         segments.append(cur)
@@ -723,17 +808,35 @@ def _run_for_input(
     # Split tables when internal vertical gridlines are not aligned (per-row column structure differs).
     # This helps avoid "one big table" detections that actually contain multiple stacked tables with
     # different column widths/counts, or a single-cell separator row between tables.
-    vline_tol_px = _parse_float_env("EIDAT_TABLE_SPLIT_VLINE_MISALIGN_PX", 6.0)
-    if vline_tol_px < 0:
-        vline_tol_px = 0.0
-    if tables and vline_tol_px >= 0:
-        split_tables: List[Dict] = []
-        for t in tables:
-            try:
-                split_tables.extend(_split_table_on_vline_mismatch(t, tol_px=float(vline_tol_px)))
-            except Exception:
-                split_tables.append(t)
-        tables = split_tables
+    split_mode = str(os.environ.get("EIDAT_TABLE_SPLIT_MODE", "vline") or "vline").strip().lower()
+    enable_vline_split = split_mode in ("vline", "default", "on", "true", "1", "yes")
+    if enable_vline_split:
+        vline_tol_px = _parse_float_env("EIDAT_TABLE_SPLIT_VLINE_MISALIGN_PX", 6.0)
+        vline_min_run = _parse_int_env("EIDAT_TABLE_SPLIT_VLINE_MIN_RUN", 1)
+        single_cell_sep = _parse_bool_env("EIDAT_TABLE_SPLIT_SINGLE_CELL_SEPARATOR", True)
+        single_cell_sep_max_h_ratio = _parse_float_env(
+            "EIDAT_TABLE_SPLIT_SINGLE_CELL_SEPARATOR_MAX_H_RATIO", 0.0
+        )
+        if vline_tol_px < 0:
+            vline_tol_px = 0.0
+        if tables and vline_tol_px >= 0:
+            split_tables: List[Dict] = []
+            for t in tables:
+                try:
+                    split_tables.extend(
+                        _split_table_on_vline_mismatch(
+                            t,
+                            tol_px=float(vline_tol_px),
+                            min_mismatch_run=int(vline_min_run),
+                            enable_single_cell_separator=bool(single_cell_sep),
+                            single_cell_separator_max_h_ratio=float(single_cell_sep_max_h_ratio),
+                        )
+                    )
+                except Exception:
+                    split_tables.append(t)
+            tables = split_tables
+
+    ascii_mode = "replica" if split_mode in ("replica", "snap", "grid") else "default"
 
     base_tables: List[Dict] = []
     for t in tables:
@@ -1064,7 +1167,7 @@ def _run_for_input(
                 lines.append("[Table]")
                 lines.append("")
                 lines.append(f"[Table {idx + 1}]")
-                table_ascii = debug_exporter._render_table_ascii(table)
+                table_ascii = debug_exporter._render_table_ascii(table, mode=ascii_mode)
                 if table_ascii:
                     lines.append(table_ascii)
                 lines.append("")
@@ -1178,7 +1281,7 @@ def _run_for_input(
                 lines.append("[Table]")
                 lines.append("")
                 lines.append(f"[Table {idx + 1}]")
-                table_ascii = debug_exporter._render_table_ascii(table)
+                table_ascii = debug_exporter._render_table_ascii(table, mode=ascii_mode)
                 if table_ascii:
                     lines.append(table_ascii)
                 lines.append("")
