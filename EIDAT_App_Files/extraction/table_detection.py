@@ -210,17 +210,42 @@ def _find_cells_contour(img_gray: np.ndarray) -> List[Dict]:
     h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(int(w * float(h_ratio)), int(h_min)), 1))
     v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(int(h * float(v_ratio)), int(v_min))))
 
+    # Optional bridge step for faint/broken lines: close first, then open.
+    # This can help when borders are not fully inked (common on low-contrast scans),
+    # but may increase false positives on very noisy pages.
+    pre_close = _env_bool("EIDAT_TABLE_DETECT_PRE_CLOSE", False)
+    if pre_close:
+        h_close_w = max(1, _env_int("EIDAT_TABLE_DETECT_H_CLOSE_W", 3))
+        h_close_h = max(1, _env_int("EIDAT_TABLE_DETECT_H_CLOSE_H", 1))
+        v_close_w = max(1, _env_int("EIDAT_TABLE_DETECT_V_CLOSE_W", 1))
+        v_close_h = max(1, _env_int("EIDAT_TABLE_DETECT_V_CLOSE_H", 3))
+        try:
+            combined_h = cv2.morphologyEx(
+                combined, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (h_close_w, h_close_h))
+            )
+        except Exception:
+            combined_h = combined
+        try:
+            combined_v = cv2.morphologyEx(
+                combined, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (v_close_w, v_close_h))
+            )
+        except Exception:
+            combined_v = combined
+    else:
+        combined_h = combined
+        combined_v = combined
+
     h_d_w = _env_int("EIDAT_TABLE_DETECT_H_DILATE_W", 5)
     h_d_h = _env_int("EIDAT_TABLE_DETECT_H_DILATE_H", 3)
     v_d_w = _env_int("EIDAT_TABLE_DETECT_V_DILATE_W", 3)
     v_d_h = _env_int("EIDAT_TABLE_DETECT_V_DILATE_H", 5)
 
     horiz = cv2.dilate(
-        cv2.morphologyEx(combined, cv2.MORPH_OPEN, h_kernel),
+        cv2.morphologyEx(combined_h, cv2.MORPH_OPEN, h_kernel),
         cv2.getStructuringElement(cv2.MORPH_RECT, (max(1, int(h_d_w)), max(1, int(h_d_h)))),
     )
     vert = cv2.dilate(
-        cv2.morphologyEx(combined, cv2.MORPH_OPEN, v_kernel),
+        cv2.morphologyEx(combined_v, cv2.MORPH_OPEN, v_kernel),
         cv2.getStructuringElement(cv2.MORPH_RECT, (max(1, int(v_d_w)), max(1, int(v_d_h)))),
     )
 
@@ -289,8 +314,30 @@ def _find_cells_corner(img_gray: np.ndarray) -> List[Dict]:
     h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(int(w * float(h_ratio)), int(h_min)), 1))
     v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(int(h * float(v_ratio)), int(v_min))))
 
-    horiz = cv2.morphologyEx(combined, cv2.MORPH_OPEN, h_kernel)
-    vert = cv2.morphologyEx(combined, cv2.MORPH_OPEN, v_kernel)
+    pre_close = _env_bool("EIDAT_TABLE_DETECT_PRE_CLOSE", False)
+    if pre_close:
+        h_close_w = max(1, _env_int("EIDAT_TABLE_DETECT_H_CLOSE_W", 3))
+        h_close_h = max(1, _env_int("EIDAT_TABLE_DETECT_H_CLOSE_H", 1))
+        v_close_w = max(1, _env_int("EIDAT_TABLE_DETECT_V_CLOSE_W", 1))
+        v_close_h = max(1, _env_int("EIDAT_TABLE_DETECT_V_CLOSE_H", 3))
+        try:
+            combined_h = cv2.morphologyEx(
+                combined, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (h_close_w, h_close_h))
+            )
+        except Exception:
+            combined_h = combined
+        try:
+            combined_v = cv2.morphologyEx(
+                combined, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (v_close_w, v_close_h))
+            )
+        except Exception:
+            combined_v = combined
+    else:
+        combined_h = combined
+        combined_v = combined
+
+    horiz = cv2.morphologyEx(combined_h, cv2.MORPH_OPEN, h_kernel)
+    vert = cv2.morphologyEx(combined_v, cv2.MORPH_OPEN, v_kernel)
 
     # Find intersections
     horiz_d = cv2.dilate(horiz, cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)))
