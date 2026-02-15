@@ -5,6 +5,8 @@ Assigns OCR tokens to table cells based on spatial overlap,
 then organizes cells into row/column structure.
 """
 
+import os
+import re
 from typing import List, Dict, Tuple, Optional
 
 # Legacy constant - kept for backward compatibility
@@ -12,6 +14,61 @@ REOCR_CONFIDENCE_THRESHOLD = 0.5
 
 # Minimum overlap to consider assigning a token to a cell
 CELL_OVERLAP_MIN = 0.3
+
+
+_TABLE_VERTICAL_ARTIFACT_CHARS = "|¦│┃丨"
+_TABLE_SECONDARY_PREFIX_ARTIFACT_CHARS = "[](){}\"'`“”‘’\\/"  # common OCR border/quote variants
+_TABLE_QUOTE_ARTIFACT_CHARS = "\"'`“”‘’"
+_TABLE_OPENERS = {"[": "]", "(": ")", "{": "}"}
+
+
+def normalize_table_cell_text(text: str) -> str:
+    """
+    Normalize table cell text for common border/line-detection OCR artifacts.
+
+    We frequently see left-border remnants recognized as punctuation like:
+    - |"Pressure  -> Pressure
+    - ["Flow     -> Flow
+    - │ 10.0     -> 10.0
+
+    This is intentionally conservative and only strips *leading* artifacts.
+
+    Disable with: EIDAT_TABLE_CELL_PREFIX_CLEAN=0
+    """
+    s = "" if text is None else str(text)
+    s = s.replace("\u00a0", " ").strip()
+    if not s:
+        return ""
+
+    enabled = str(os.environ.get("EIDAT_TABLE_CELL_PREFIX_CLEAN", "1")).strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    if not enabled:
+        return s
+
+    s2 = s.lstrip()
+
+    # 1) Strip vertical border artifacts (and any immediately-adjacent punctuation).
+    if s2 and s2[0] in _TABLE_VERTICAL_ARTIFACT_CHARS:
+        s2 = re.sub(rf"^[{re.escape(_TABLE_VERTICAL_ARTIFACT_CHARS)}]+", "", s2).lstrip()
+        s2 = re.sub(rf"^[{re.escape(_TABLE_SECONDARY_PREFIX_ARTIFACT_CHARS)}]+", "", s2).lstrip()
+        return s2.strip()
+
+    # 2) Strip bracket-like artifacts when they don't look like a balanced short reference (e.g. [1]).
+    if s2 and s2[0] in _TABLE_OPENERS:
+        closer = _TABLE_OPENERS[s2[0]]
+        first_token = s2.split(None, 1)[0]
+        opens_with_quote = len(s2) > 1 and s2[1] in _TABLE_QUOTE_ARTIFACT_CHARS
+        has_early_closer = (closer in first_token) or (closer in s2[:6])
+        if opens_with_quote or not has_early_closer:
+            s2 = s2[1:].lstrip()
+            s2 = re.sub(rf"^[{re.escape(_TABLE_QUOTE_ARTIFACT_CHARS)}]+", "", s2).lstrip()
+            return s2.strip()
+
+    return s
 
 
 def scale_tokens_to_dpi(tokens: List[Dict], from_dpi: int, to_dpi: int) -> List[Dict]:
@@ -56,7 +113,8 @@ def _build_cell_text(tokens: List[Dict], char_gap_ratio: Optional[float] = None,
         return ""
 
     if char_gap_ratio is None:
-        return ' '.join(t.get('text', '') for t in tokens).strip()
+        joined = ' '.join(t.get('text', '') for t in tokens).strip()
+        return normalize_table_cell_text(joined)
 
     parts: List[str] = []
     prev = tokens[0]
@@ -86,7 +144,8 @@ def _build_cell_text(tokens: List[Dict], char_gap_ratio: Optional[float] = None,
         parts.append(text)
         prev = tok
 
-    return ''.join(parts).strip()
+    joined = ''.join(parts).strip()
+    return normalize_table_cell_text(joined)
 
 
 def _sort_tokens_reading_order(

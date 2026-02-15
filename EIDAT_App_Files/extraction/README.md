@@ -147,6 +147,7 @@ for page_result in results:
 Environment variables:
 - `EIDAT_TESS_LANG` - Tesseract language (default: `eng`)
 - `EIDAT_TESS_PSM` - Tesseract PSM mode (default: `6`)
+- `EIDAT_TABLE_CELL_PREFIX_CLEAN` - Strip leading table-border OCR artifacts in cell text (default: `1`)
 
 ## Performance
 

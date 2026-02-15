@@ -981,7 +981,8 @@ class ExtractionPipeline:
                             padding=0,
                             remove_borders=False,
                         )
-                        if text.strip():
+                        text = token_projector.normalize_table_cell_text(text)
+                        if text:
                             cell["text"] = text
                             cell["ocr_method"] = "header_row_psm3"
                             cell["ocr_psm"] = 3
@@ -1124,6 +1125,7 @@ class ExtractionPipeline:
                             remove_borders=False,
                             tesseract_config=numeric_config,
                         ).strip()
+                        rescued_text = token_projector.normalize_table_cell_text(rescued_text)
                         _record_candidate("numeric_rescue", table_idx, cell, rescued_text)
                         if not rescued_text or not _is_numeric_like(rescued_text):
                             continue
@@ -1337,8 +1339,9 @@ class ExtractionPipeline:
                             remove_borders=False,
                             tesseract_config=tesseract_config,
                         )
+                        text = token_projector.normalize_table_cell_text(text)
                         _record_candidate("cell_interior_ocr", table_idx, cell, text)
-                        if text.strip():
+                        if text:
                             if force_cell_interior_override or not str(cell.get("text", "")).strip():
                                 cell["text"] = text
                                 cell["ocr_method"] = "cell_interior_ocr"
@@ -1421,6 +1424,7 @@ class ExtractionPipeline:
                             remove_borders=False,
                             tesseract_config=tesseract_config,
                         ).strip()
+                        new_text = token_projector.normalize_table_cell_text(new_text)
                         _record_candidate("cell_cleanup_ocr", table_idx, cell, new_text)
                         if not new_text:
                             continue
@@ -1515,8 +1519,8 @@ class ExtractionPipeline:
                             img_gray_hires, tuple(bbox),
                             lang=self.lang, psm=6, padding=5
                         )
-
-                        if text.strip():
+                        text = token_projector.normalize_table_cell_text(text)
+                        if text:
                             if was_low_conf:
                                 # For low-conf projections, prefer cell OCR result
                                 cell['text'] = text
