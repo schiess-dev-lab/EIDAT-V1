@@ -2463,10 +2463,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.resize(1280, 860)
 
         be.ensure_scaffold()
-        # Initialize core OCR settings only if scanner.env doesn't already exist
+        # Initialize core OCR settings only if scanner.local.env doesn't already exist
         try:
-            if not be.SCANNER_ENV.exists():
-                env = be.parse_scanner_env()
+            if not be.SCANNER_ENV_LOCAL.exists():
+                env = be.parse_scanner_env(be.SCANNER_ENV_LOCAL)
                 if not (env.get("OCR_ROW_EPS") or "").strip():
                     env["OCR_ROW_EPS"] = "15"
                 if not (env.get("OCR_DPI") or "").strip():
@@ -5344,10 +5344,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _act_open_env(self):
         try:
-            be.SCANNER_ENV.parent.mkdir(parents=True, exist_ok=True)
-            if not be.SCANNER_ENV.exists():
+            be.SCANNER_ENV_LOCAL.parent.mkdir(parents=True, exist_ok=True)
+            if not be.SCANNER_ENV_LOCAL.exists():
                 be.save_scanner_env({"QUIET": "1"})
-            be.open_path(be.SCANNER_ENV)
+            be.open_path(be.SCANNER_ENV_LOCAL)
         except Exception as e:
             QtWidgets.QMessageBox.warning(self, "Open failed", str(e))
 
@@ -6145,7 +6145,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _background_processing_enabled(self) -> bool:
         try:
-            env = be.parse_scanner_env()
+            env = be.load_scanner_env()
             raw = str(env.get("force_background_processes") or "").strip().lower()
             return raw in ("1", "true", "yes", "on")
         except Exception:
@@ -7126,7 +7126,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Sync settings from env
         try:
-            env = be.parse_scanner_env()
+            env = be.load_scanner_env()
             mode = env.get("OCR_MODE", "fallback").strip().lower()
             display = self._ocr_value_to_display.get(mode, self._ocr_value_to_display["fallback"]) if hasattr(self, "_ocr_value_to_display") else mode
             if self.cmb_ocr_mode.currentText() != display:
@@ -7480,7 +7480,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _persist_settings_from_panel(self):
         try:
-            env = be.parse_scanner_env()
+            env = be.parse_scanner_env(be.SCANNER_ENV_LOCAL)
             disp = self.cmb_ocr_mode.currentText()
             env["OCR_MODE"] = self._ocr_display_to_value.get(disp, "fallback") if hasattr(self, "_ocr_display_to_value") else disp.strip().lower()
             env["OCR_ROW_EPS"] = str(int(self.sld_ocr_row_tol.value()))

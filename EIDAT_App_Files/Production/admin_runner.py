@@ -44,6 +44,8 @@ def _base_env(runtime_root: Path) -> dict[str, str]:
 
         scanner_env = runtime_root / "user_inputs" / "scanner.env"
         env.update(parse_scanner_env(scanner_env))
+        scanner_local = runtime_root / "user_inputs" / "scanner.local.env"
+        env.update(parse_scanner_env(scanner_local))
     except Exception:
         pass
     return env
@@ -73,7 +75,7 @@ def _env_int(val: object, default: int = 0) -> int:
 
 
 def _load_node_config(runtime_root: Path, node_root: Path, *, node_env_enabled: bool) -> dict[str, str]:
-    """Load scanner.env + optional node .env into a single config map (node overrides scanner)."""
+    """Load scanner.env (+ scanner.local.env) + optional node .env into a single config map (node overrides)."""
     try:
         from ui_next.backend import parse_scanner_env  # type: ignore
     except Exception:
@@ -82,6 +84,7 @@ def _load_node_config(runtime_root: Path, node_root: Path, *, node_env_enabled: 
     cfg: dict[str, str] = {}
     try:
         cfg.update(parse_scanner_env(runtime_root / "user_inputs" / "scanner.env"))
+        cfg.update(parse_scanner_env(runtime_root / "user_inputs" / "scanner.local.env"))
     except Exception:
         pass
 

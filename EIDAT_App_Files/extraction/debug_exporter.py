@@ -557,7 +557,22 @@ def _render_table_ascii_replica(table: Dict) -> str:
     snap_tol_px = _env_float("EIDAT_TABLE_ASCII_SNAP_TOL_PX", 0.0)
     snap_ratio = _env_float("EIDAT_TABLE_ASCII_SNAP_TOL_RATIO", 0.006)
     snap_max_px = _env_float("EIDAT_TABLE_ASCII_SNAP_MAX_PX", 25.0)
-    max_width = int(_env_float("EIDAT_TABLE_ASCII_MAX_WIDTH", 160.0))
+    # NOTE: This is the *display* width used when writing ASCII tables into artifacts
+    # (e.g. combined.txt). If this is too small, wide/landscape tables will have very
+    # narrow columns and cell text will be clipped.
+    #
+    # If EIDAT_TABLE_ASCII_MAX_WIDTH is unset (or <= 0), we will auto-bump the width
+    # for very wide tables so columns don't collapse to a few characters each.
+    max_width_raw = os.environ.get("EIDAT_TABLE_ASCII_MAX_WIDTH")
+    max_width = 160
+    if max_width_raw is not None and str(max_width_raw).strip() != "":
+        try:
+            max_width = int(float(str(max_width_raw).strip()))
+        except Exception:
+            max_width = 160
+        if max_width <= 0:
+            max_width_raw = None
+            max_width = 160
     if max_width < 60:
         max_width = 60
 
@@ -621,23 +636,44 @@ def _render_table_ascii_replica(table: Dict) -> str:
         return ""
 
     # Column widths (chars) proportional to pixel widths, bounded by max width.
+    if max_width_raw is None:
+        auto_min_col_chars = int(_env_float("EIDAT_TABLE_ASCII_AUTO_MIN_COL_CHARS", 16.0))
+        if auto_min_col_chars < 3:
+            auto_min_col_chars = 3
+        auto_cap = int(_env_float("EIDAT_TABLE_ASCII_AUTO_CAP", 2000.0))
+        if auto_cap < 120:
+            auto_cap = 120
+        target = int((ncols * auto_min_col_chars) + (ncols + 1))
+        if target > max_width:
+            max_width = min(int(auto_cap), int(target))
+
     col_px = [max(1.0, float(x_lines[i + 1] - x_lines[i])) for i in range(ncols)]
     total_px = float(sum(col_px)) or 1.0
     budget = max(20, int(max_width) - (ncols + 1))  # account for border/boundary chars
-    col_widths = [max(3, int(round(budget * (w / total_px)))) for w in col_px]
+    min_col_width = 3
+    col_widths = [max(min_col_width, int(round(budget * (w / total_px)))) for w in col_px]
     # Fix rounding drift.
     drift = int(budget - sum(col_widths))
     i = 0
-    while drift != 0 and ncols > 0:
+    # Guard against extremely wide tables (or very small max_width) where the min column
+    # width makes it impossible to hit the budget exactly; avoid an infinite loop.
+    max_iters = max(0, abs(drift)) + (ncols * 4)
+    iters = 0
+    while drift != 0 and ncols > 0 and iters < max_iters:
         j = i % ncols
         if drift > 0:
             col_widths[j] += 1
             drift -= 1
         else:
-            if col_widths[j] > 3:
+            if col_widths[j] > min_col_width:
                 col_widths[j] -= 1
                 drift += 1
+            else:
+                # If nothing is reducible, we can't satisfy the budget; stop adjusting.
+                if all(w <= min_col_width for w in col_widths):
+                    break
         i += 1
+        iters += 1
 
     def _closest_line_idx(lines: list[float], v: float) -> int:
         # Linear scan is fine for typical small tables.

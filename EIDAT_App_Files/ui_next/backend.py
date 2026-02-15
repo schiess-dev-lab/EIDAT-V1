@@ -46,6 +46,7 @@ EXCEL_ARTIFACT_SUFFIX = "__excel"
 DEFAULT_REPO_ROOT = ROOT / "Data Packages"
 DEFAULT_PDF_DIR = DEFAULT_REPO_ROOT
 SCANNER_ENV = DATA_ROOT / "user_inputs" / "scanner.env"
+SCANNER_ENV_LOCAL = DATA_ROOT / "user_inputs" / "scanner.local.env"
 OCR_FORCE_ENV = DATA_ROOT / "user_inputs" / "ocr_force.env"
 DOTENV_FILES = [
     DATA_ROOT / ".env",
@@ -212,6 +213,29 @@ def parse_scanner_env(path: Path = SCANNER_ENV) -> Dict[str, str]:
     return env
 
 
+def load_scanner_env() -> Dict[str, str]:
+    """Load effective scanner config from all supported env files (last wins)."""
+    env: Dict[str, str] = {}
+    # Precedence (last wins):
+    #   1) Legacy user_inputs/ocr_force.env (deprecated; fallback only)
+    #   2) user_inputs/scanner.env (shared template/docs)
+    #   3) user_inputs/scanner.local.env (machine-specific overrides)
+    #   4) project/user_inputs .env overrides
+    env.update(parse_scanner_env(OCR_FORCE_ENV))
+    env.update(parse_scanner_env(SCANNER_ENV))
+    env.update(parse_scanner_env(SCANNER_ENV_LOCAL))
+    for path in DOTENV_FILES:
+        env.update(parse_scanner_env(path))
+    # Remove deprecated force flags (no longer used)
+    for key in (
+        "EIDAT_FORCE_NUMERIC_RESCUE",
+        "EIDAT_FORCE_NUMERIC_STRICT",
+        "EIDAT_FORCE_CELL_INTERIOR",
+    ):
+        env.pop(key, None)
+    return env
+
+
 def _env_truthy(val: object) -> bool:
     if val is None:
         return False
@@ -221,7 +245,7 @@ def _env_truthy(val: object) -> bool:
     return s in {"1", "true", "yes", "on", "enable", "enabled"}
 
 
-def save_scanner_env(env_map: Dict[str, str], path: Path = SCANNER_ENV) -> None:
+def save_scanner_env(env_map: Dict[str, str], path: Path = SCANNER_ENV_LOCAL) -> None:
     order = [
         "QUIET",
         "force_background_processes",
@@ -311,7 +335,7 @@ def get_repo_root() -> Path:
     """Return repository root from scanner.env or DEFAULT_REPO_ROOT."""
     ensure_repo_root_name_file()
     node_root = (os.environ.get("EIDAT_NODE_ROOT") or "").strip()
-    env = parse_scanner_env(SCANNER_ENV)
+    env = load_scanner_env()
     val = env.get("REPO_ROOT", "").strip()
     try:
         if val:
@@ -334,7 +358,7 @@ def set_repo_root(p: Path) -> None:
     target = Path(p).expanduser()
     if not target.is_absolute():
         target = ROOT / target
-    env = parse_scanner_env(SCANNER_ENV)
+    env = parse_scanner_env(SCANNER_ENV_LOCAL)
     try:
         if DATA_ROOT != ROOT:
             env["REPO_ROOT"] = str(target.resolve())
@@ -343,7 +367,7 @@ def set_repo_root(p: Path) -> None:
             env["REPO_ROOT"] = str(rel)
     except Exception:
         env["REPO_ROOT"] = str(target)
-    save_scanner_env(env)
+    save_scanner_env(env, path=SCANNER_ENV_LOCAL)
 
 
 def _run_eidat_manager(global_repo: Path, cmd: str, extra_args: Optional[list[str]] = None) -> Dict[str, object]:
@@ -607,7 +631,7 @@ def _venv_python_from(path: Path) -> Path:
 
 
 def resolve_project_python() -> str:
-    env = parse_scanner_env(SCANNER_ENV)
+    env = load_scanner_env()
     vdir = env.get("VENV_DIR", "").strip()
     if vdir:
         cand = _venv_python_from(Path(vdir))
@@ -625,13 +649,15 @@ def _base_env() -> Dict[str, str]:
     #
     # Precedence (last wins):
     #   1) Legacy user_inputs/ocr_force.env (deprecated; fallback only)
-    #   2) user_inputs/scanner.env (canonical)
-    #   3) project/node .env overrides
+    #   2) user_inputs/scanner.env (shared template/docs)
+    #   3) user_inputs/scanner.local.env (machine-specific overrides)
+    #   4) project/node .env overrides
     #
     # This lets us "move" OCR DPI settings into scanner.env without ocr_force.env continuing
     # to override them when both exist.
     env.update(parse_scanner_env(OCR_FORCE_ENV))
     env.update(parse_scanner_env(SCANNER_ENV))
+    env.update(parse_scanner_env(SCANNER_ENV_LOCAL))
     for path in DOTENV_FILES:
         env.update(parse_scanner_env(path))
     # Remove deprecated force flags (no longer used)
@@ -1889,7 +1915,10 @@ def ensure_scaffold() -> None:
     # RUNS_DIR.mkdir(parents=True, exist_ok=True)
     # MASTER_DB_ROOT.mkdir(parents=True, exist_ok=True)
     if not SCANNER_ENV.exists():
-        save_scanner_env({"QUIET": "1"})
+        # Fallback minimal shared template (normally tracked in repo).
+        save_scanner_env({"QUIET": "1"}, path=SCANNER_ENV)
+    if not SCANNER_ENV_LOCAL.exists():
+        save_scanner_env({"QUIET": "1"}, path=SCANNER_ENV_LOCAL)
 
 
 # --- Health checks / analysis helpers ---
@@ -4122,7 +4151,7 @@ def update_eidp_trending_project_workbook(
         raise FileNotFoundError(f"Project workbook not found: {wb_path}")
 
     # scanner.env: EIDAT_TRENDING_COMBINED_ONLY=1 (or EIDAT_COMBINED_ONLY=1) skips acceptance data entirely.
-    env = parse_scanner_env(SCANNER_ENV)
+    env = load_scanner_env()
     combined_only = _env_truthy(env.get("EIDAT_TRENDING_COMBINED_ONLY") or env.get("EIDAT_COMBINED_ONLY"))
     fuzzy_header_stick = _env_truthy(env.get("EIDAT_FUZZY_HEADER_STICK"))
     try:
@@ -5111,7 +5140,7 @@ def update_eidp_raw_trending_project_workbook(
     if not wb_path.exists():
         raise FileNotFoundError(f"Project workbook not found: {wb_path}")
 
-    env = parse_scanner_env(SCANNER_ENV)
+    env = load_scanner_env()
     fuzzy_header_stick = _env_truthy(env.get("EIDAT_FUZZY_HEADER_STICK"))
     try:
         fuzzy_header_min_ratio = float(env.get("EIDAT_FUZZY_HEADER_MIN_RATIO", "0.72") or 0.72)

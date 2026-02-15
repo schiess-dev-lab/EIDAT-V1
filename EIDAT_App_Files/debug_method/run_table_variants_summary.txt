@@ -1,15 +1,14 @@
 Run Summary (auto-generated)
 
 Inputs:
-- node_mirror\nodes\program_a__d00a493d9a\EIDAT Support\debug\ocr\DEBUG_outer_frames_2pages\pages\page_1\page_1.png
+- Stored PDF\DEBUG_outer_frame_triggers_2pages.pdf
 
-Output root: node_mirror\nodes\program_a__d00a493d9a\EIDAT Support\debug\ocr\DEBUG_outer_frames_2pages\pages\page_1\_rerun_replica2
+Output root: EIDAT_App_Files\debug_method\results\_tmp_widetest
 Per-input outputs: <output root>/<input_stem>/
 
 Base OCR DPI: 450
 Detection DPI (table geometry): 900
-Table cluster gap ratio: 0.005
-Table cluster gap px: 25.0
+Table cluster gap ratio: 0.02
 Fuse enabled: True
 
 Variants:

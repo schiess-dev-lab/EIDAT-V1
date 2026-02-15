@@ -104,16 +104,23 @@ if not exist "%ROOT%user_inputs\scanner.env" (
   >> "%ROOT%user_inputs\scanner.env" echo #OCR_DPI=600
 )
 
-rem Add local Tesseract config to scanner.env if available
+rem Create scanner.local.env (machine-specific overrides) if missing
+if not exist "%ROOT%user_inputs\scanner.local.env" (
+  echo [SETUP] Creating default user_inputs\scanner.local.env
+  >  "%ROOT%user_inputs\scanner.local.env" echo # Local overrides (KEY=VALUE^)
+  >> "%ROOT%user_inputs\scanner.local.env" echo QUIET=1
+)
+
+rem Add local Tesseract config to scanner.local.env if available
 if exist "%TESS_EXE%" (
-  if not exist "%ROOT%user_inputs\scanner.env" (
-    > "%ROOT%user_inputs\scanner.env" echo # Scanner configuration (KEY=VALUE^)
+  if not exist "%ROOT%user_inputs\scanner.local.env" (
+    > "%ROOT%user_inputs\scanner.local.env" echo # Local overrides (KEY=VALUE^)
   )
-  findstr /B /I /C:"TESSERACT_CMD=" "%ROOT%user_inputs\scanner.env" >nul || ^
-    >> "%ROOT%user_inputs\scanner.env" echo TESSERACT_CMD=%TESS_EXE%
+  findstr /B /I /C:"TESSERACT_CMD=" "%ROOT%user_inputs\scanner.local.env" >nul || ^
+    >> "%ROOT%user_inputs\scanner.local.env" echo TESSERACT_CMD=%TESS_EXE%
   if exist "%TESSDATA_DIR%" (
-    findstr /B /I /C:"TESSDATA_PREFIX=" "%ROOT%user_inputs\scanner.env" >nul || ^
-      >> "%ROOT%user_inputs\scanner.env" echo TESSDATA_PREFIX=%TESSDATA_DIR%
+    findstr /B /I /C:"TESSDATA_PREFIX=" "%ROOT%user_inputs\scanner.local.env" >nul || ^
+      >> "%ROOT%user_inputs\scanner.local.env" echo TESSDATA_PREFIX=%TESSDATA_DIR%
   )
 )
 

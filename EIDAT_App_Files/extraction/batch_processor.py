@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import List, Dict, Optional
 import traceback
 import os
+import multiprocessing
 
 try:
     import cv2
@@ -27,6 +28,30 @@ from . import token_projector
 from . import page_analyzer
 from . import chart_detection
 from . import debug_exporter
+
+
+def _env_int(key: str, default: int) -> int:
+    try:
+        return int(float(str(os.environ.get(key, str(default)) or str(default)).strip()))
+    except Exception:
+        return int(default)
+
+
+def _process_page_worker(
+    pipeline_kwargs: Dict,
+    pdf_path_str: str,
+    page_num: int,
+    debug_dir_str: Optional[str],
+    verbose: bool,
+    out_q,
+) -> None:
+    try:
+        pipeline = ExtractionPipeline(**pipeline_kwargs)
+        debug_dir = Path(debug_dir_str) if debug_dir_str else None
+        result = pipeline.process_page(Path(pdf_path_str), int(page_num), debug_dir, bool(verbose))
+        out_q.put(("ok", result))
+    except Exception as e:
+        out_q.put(("err", f"{type(e).__name__}: {e}"))
 
 
 class ExtractionPipeline:
@@ -1699,6 +1724,20 @@ class ExtractionPipeline:
 
         results = []
 
+        page_timeout_sec = _env_int("EIDAT_PAGE_TIMEOUT_SEC", _env_int("EIDAT_PAGE_TIMEOUT_SECONDS", 300))
+        if page_timeout_sec < 0:
+            page_timeout_sec = 0
+
+        pipeline_kwargs = {
+            "ocr_dpi": int(self.ocr_dpi),
+            "detection_dpi": int(self.detection_dpi),
+            "lang": str(self.lang),
+            "psm": int(self.psm),
+            "token_reocr_threshold": float(self.token_reocr_threshold),
+            "reocr_threshold": self.reocr_threshold,
+            "dpi": None,
+        }
+
         for page_num in pages:
             try:
                 # Setup debug dir for this page
@@ -1707,7 +1746,56 @@ class ExtractionPipeline:
                     page_debug_dir = output_dir / "debug" / "ocr" / pdf_path.stem
                     page_debug_dir.mkdir(parents=True, exist_ok=True)
 
-                result = self.process_page(pdf_path, page_num, page_debug_dir, verbose)
+                if page_timeout_sec and int(page_timeout_sec) > 0:
+                    ctx = multiprocessing.get_context("spawn")
+                    q = ctx.Queue(maxsize=1)
+                    proc = ctx.Process(
+                        target=_process_page_worker,
+                        args=(pipeline_kwargs, str(pdf_path), int(page_num), str(page_debug_dir) if page_debug_dir else None, bool(verbose), q),
+                        daemon=True,
+                    )
+                    proc.start()
+                    proc.join(timeout=float(page_timeout_sec))
+
+                    if proc.is_alive():
+                        try:
+                            proc.terminate()
+                        except Exception:
+                            pass
+                        proc.join(timeout=5)
+                        result = {
+                            'page': int(page_num) + 1,
+                            'error': f"Timeout: exceeded {int(page_timeout_sec)}s",
+                            'timeout': True,
+                            'tokens': [],
+                            'tables': [],
+                            'charts': [],
+                            'img_w': 0,
+                            'img_h': 0,
+                            'dpi': int(self.detection_dpi),
+                            'ocr_dpi': int(self.ocr_dpi),
+                        }
+                    else:
+                        try:
+                            status, payload = q.get_nowait()
+                        except Exception:
+                            status, payload = ("err", "No result returned from worker")
+                        if status == "ok" and isinstance(payload, dict):
+                            result = payload
+                        else:
+                            result = {
+                                'page': int(page_num) + 1,
+                                'error': str(payload),
+                                'tokens': [],
+                                'tables': [],
+                                'charts': [],
+                                'img_w': 0,
+                                'img_h': 0,
+                                'dpi': int(self.detection_dpi),
+                                'ocr_dpi': int(self.ocr_dpi),
+                            }
+                else:
+                    result = self.process_page(pdf_path, page_num, page_debug_dir, verbose)
                 results.append(result)
 
             except Exception as e:
@@ -1719,7 +1807,12 @@ class ExtractionPipeline:
                     'page': page_num + 1,
                     'error': str(e),
                     'tokens': [],
-                    'tables': []
+                    'tables': [],
+                    'charts': [],
+                    'img_w': 0,
+                    'img_h': 0,
+                    'dpi': int(self.detection_dpi),
+                    'ocr_dpi': int(self.ocr_dpi),
                 })
 
         # Export combined outputs

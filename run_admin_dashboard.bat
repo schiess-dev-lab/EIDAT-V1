@@ -40,6 +40,28 @@ if exist "%CFG%" (
   if not "%QUIET%"=="1" echo [RUN] Config parsed.
 )
 
+rem Load optional local overrides (user_inputs\scanner.local.env) after scanner.env
+set "CFG_LOCAL=%ROOT%user_inputs\scanner.local.env"
+if exist "%CFG_LOCAL%" (
+  if not "%QUIET%"=="1" echo [RUN] Loading local overrides: "%CFG_LOCAL%"
+  for /f "usebackq tokens=* delims=" %%L in ("%CFG_LOCAL%") do (
+    set "LINE=%%L"
+    if not "!LINE!"=="" if not "!LINE:~0,1!"==" " if not "!LINE:~0,1!"=="#" if not "!LINE:~0,1!"==";" if not "!LINE!"=="!LINE:=!" (
+      for /f "tokens=1,* delims==" %%A in ("!LINE!") do (
+        set "K=%%~A"
+        set "V=%%~B"
+        if defined K (
+          for /f "tokens=1 delims=#;" %%C in ("!V!") do set "V=%%~C"
+          set "V=!V:~0!"
+          for /f "tokens=* delims= " %%D in ("!V!") do set "V=%%~D"
+          if not "!V!"=="" set "!K!=!V!"
+        )
+      )
+    )
+  )
+  if not "%QUIET%"=="1" echo [RUN] Local overrides parsed.
+)
+
 rem Optional venv override via scanner.env (activate to ensure env vars / PATH are set)
 if defined VENV_DIR (
   set "VENV_PY=%VENV_DIR%\Scripts\python.exe"

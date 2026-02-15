@@ -15,7 +15,7 @@ set "TOOLS_DIR=%ROOT%tools"
 set "DEST_DIR=%TOOLS_DIR%\tesseract"
 set "DEST_EXE=%DEST_DIR%\tesseract.exe"
 set "DEST_TESSDATA=%DEST_DIR%\tessdata"
-set "SCANNER_ENV=%ROOT%user_inputs\scanner.env"
+set "SCANNER_ENV_LOCAL=%ROOT%user_inputs\scanner.local.env"
 set "ROBO_LOG=%TOOLS_DIR%\deploy_tesseract.robocopy.log"
 
 if not exist "%SOURCE_DIR%" (
@@ -72,21 +72,21 @@ if not exist "%DEST_EXE%" (
   exit /b 1
 )
 
-if not exist "%SCANNER_ENV%" (
+if not exist "%SCANNER_ENV_LOCAL%" (
   if not exist "%ROOT%user_inputs" mkdir "%ROOT%user_inputs"
-  > "%SCANNER_ENV%" echo # Scanner configuration (KEY=VALUE^)
+  > "%SCANNER_ENV_LOCAL%" echo # Local overrides (KEY=VALUE^)
 )
 
-findstr /B /I /C:"TESSERACT_CMD=" "%SCANNER_ENV%" >nul || ^
-  >> "%SCANNER_ENV%" echo TESSERACT_CMD=%DEST_EXE%
+findstr /B /I /C:"TESSERACT_CMD=" "%SCANNER_ENV_LOCAL%" >nul || ^
+  >> "%SCANNER_ENV_LOCAL%" echo TESSERACT_CMD=%DEST_EXE%
 if exist "%DEST_TESSDATA%" (
-  findstr /B /I /C:"TESSDATA_PREFIX=" "%SCANNER_ENV%" >nul || ^
-    >> "%SCANNER_ENV%" echo TESSDATA_PREFIX=%DEST_TESSDATA%
+  findstr /B /I /C:"TESSDATA_PREFIX=" "%SCANNER_ENV_LOCAL%" >nul || ^
+    >> "%SCANNER_ENV_LOCAL%" echo TESSDATA_PREFIX=%DEST_TESSDATA%
 )
 
 echo [READY] Tesseract deployed to repo.
 echo   - %DEST_EXE%
 echo   - %DEST_TESSDATA%
-echo   - Updated: %SCANNER_ENV%
+echo   - Updated: %SCANNER_ENV_LOCAL%
 
 endlocal & exit /b 0

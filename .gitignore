@@ -41,6 +41,12 @@ __pycache__/
 debug_output*.txt
 nul
 
+# Local scanner overrides (keep out of git)
+/user_inputs/scanner.local.env
+/user_inputs/scanner.secrets.env
+/user_inputs/scanner.env.bak.*
+/user_inputs/scanner.local.env.bak.*
+
 # Local tool configs
 /.claude/
 

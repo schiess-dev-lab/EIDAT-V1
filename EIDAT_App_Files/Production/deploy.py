@@ -242,24 +242,38 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     # Node-level env overrides (merged after central runtime scanner.env when enabled from the Admin Dashboard).
+    #
+    # Behavior change: on every deploy/repair we refresh the node's .env from the central runtime's
+    # user_inputs/scanner.env so "as-run" defaults match the repo-saved config (with a simple .env.bak
+    # backup when overwriting an existing file).
     node_env = layout.user_data_root / ".env"
-    if not node_env.exists():
-        default_env = (runtime_root / "user_inputs" / "scanner.env")
-        try:
-            if default_env.exists():
-                node_env.parent.mkdir(parents=True, exist_ok=True)
-                node_env.write_bytes(default_env.read_bytes())
-            else:
-                _write_text(
-                    node_env,
-                    "# Node-level overrides (KEY=VALUE)\n"
-                    "#\n"
-                    "# This file is NOT required. When enabled for this node in the Admin Dashboard,\n"
-                    "# values here override the central runtime scanner.env.\n"
-                    "\n",
-                )
-        except Exception:
-            pass
+    default_env = (runtime_root / "user_inputs" / "scanner.env")
+    try:
+        if default_env.exists():
+            node_env.parent.mkdir(parents=True, exist_ok=True)
+            new_bytes = default_env.read_bytes()
+            if node_env.exists():
+                try:
+                    old_bytes = node_env.read_bytes()
+                except Exception:
+                    old_bytes = None
+                if old_bytes is not None and old_bytes != new_bytes:
+                    try:
+                        (node_env.parent / (node_env.name + ".bak")).write_bytes(old_bytes)
+                    except Exception:
+                        pass
+            node_env.write_bytes(new_bytes)
+        elif not node_env.exists():
+            _write_text(
+                node_env,
+                "# Node-level overrides (KEY=VALUE)\n"
+                "#\n"
+                "# This file is NOT required. When enabled for this node in the Admin Dashboard,\n"
+                "# values here override the central runtime scanner.env.\n"
+                "\n",
+            )
+    except Exception:
+        pass
 
     req_src = Path(args.requirements_source).expanduser() if str(args.requirements_source or "").strip() else (Path(__file__).resolve().parent / "requirements-node-ui.txt")
     if not req_src.exists():

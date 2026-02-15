@@ -194,8 +194,7 @@ class AdminWindow(QtWidgets.QMainWindow):
         self.btn_add = QtWidgets.QPushButton("Add/Deploy Node…")
         self.btn_refresh = QtWidgets.QPushButton("Refresh")
         self.btn_remove = QtWidgets.QPushButton("Remove From List")
-        self.btn_process_enabled = QtWidgets.QPushButton("Process Enabled Nodes")
-        self.lbl_proc_cfg = QtWidgets.QLabel("Process config: use Node .env (EIDAT_PROCESS_FORCE/LIMIT/DPI)")
+        self.lbl_proc_cfg = QtWidgets.QLabel("Process config: Node .env (EIDAT_PROCESS_FORCE/LIMIT/DPI)")
         self.lbl_proc_cfg.setStyleSheet("color:#475569;")
         self.lbl_proc_cfg.setToolTip("Open Node .env to set EIDAT_PROCESS_FORCE, EIDAT_PROCESS_LIMIT, EIDAT_PROCESS_DPI.")
         actions.addWidget(self.btn_add)
@@ -203,7 +202,6 @@ class AdminWindow(QtWidgets.QMainWindow):
         actions.addWidget(self.btn_remove)
         actions.addStretch(1)
         actions.addWidget(self.lbl_proc_cfg, 1)
-        actions.addWidget(self.btn_process_enabled)
         layout.addLayout(actions)
 
         self.tbl = QtWidgets.QTableWidget(0, 6)
@@ -231,7 +229,7 @@ class AdminWindow(QtWidgets.QMainWindow):
         self.btn_add.clicked.connect(self._act_add_deploy)
         self.btn_refresh.clicked.connect(self.refresh)
         self.btn_remove.clicked.connect(self._act_remove)
-        self.btn_process_enabled.clicked.connect(self._act_process_enabled)
+        # Per-node processing is initiated from each row's "Process" button.
 
         self.tbl.itemChanged.connect(self._on_item_changed)
 
@@ -304,8 +302,8 @@ class AdminWindow(QtWidgets.QMainWindow):
             text = (
                 "# Node-level overrides (KEY=VALUE)\n"
                 "#\n"
-                "# This file is merged AFTER the central runtime scanner.env (when enabled in the Admin Dashboard).\n"
-                "# Put overrides here.\n"
+                "# This file is the per-node processing config (KEY=VALUE).\n"
+                "# It is initially seeded from the Central Runtime user_inputs/scanner.env.\n"
                 "\n"
             )
             try:
@@ -333,17 +331,6 @@ class AdminWindow(QtWidgets.QMainWindow):
             self._open_path(env_path)
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "Node .env", str(exc))
-
-    def _act_use_default_env(self, node_id: str) -> None:
-        try:
-            admin_db.set_node_env_enabled(self._conn, node_id=node_id, enabled=False)
-            self.refresh()
-            # Convenience: open the default scanner.env after resetting.
-            default_env = self._default_scanner_env_path()
-            if default_env.exists():
-                self._open_path(default_env)
-        except Exception as exc:
-            QtWidgets.QMessageBox.warning(self, "Default scanner.env", str(exc))
 
     def _selected_node_id(self) -> str | None:
         row = self.tbl.currentRow()
@@ -394,25 +381,18 @@ class AdminWindow(QtWidgets.QMainWindow):
                 el.setContentsMargins(0, 0, 0, 0)
                 el.setSpacing(6)
 
-                lbl_env = QtWidgets.QLabel("Node .env" if n.node_env_enabled else "Default")
+                lbl_env = QtWidgets.QLabel("Node .env")
                 lbl_env.setStyleSheet("color:#0f172a;")
-                lbl_env.setToolTip(
-                    str(self._node_env_path(n.node_root))
-                    if n.node_env_enabled
-                    else str(self._default_scanner_env_path())
-                )
+                lbl_env.setToolTip(str(self._node_env_path(n.node_root)))
 
                 b_env = QtWidgets.QPushButton("Open Node .env")
-                b_reset = QtWidgets.QPushButton("Use scanner.env")
-                for b in (b_env, b_reset):
+                for b in (b_env,):
                     b.setMaximumWidth(130)
 
                 b_env.clicked.connect(lambda _=False, nid=n.node_id: self._act_open_node_env(nid))
-                b_reset.clicked.connect(lambda _=False, nid=n.node_id: self._act_use_default_env(nid))
 
                 el.addWidget(lbl_env)
                 el.addWidget(b_env)
-                el.addWidget(b_reset)
                 self.tbl.setCellWidget(r, 4, envw)
 
                 btns = QtWidgets.QWidget()
@@ -462,7 +442,16 @@ class AdminWindow(QtWidgets.QMainWindow):
             from .deploy import main as deploy_main
 
             deploy_main(["--node-root", node_root, "--runtime-root", str(self._runtime_root)])
-            admin_db.upsert_node(self._conn, node_root=str(_as_abs(node_root)), runtime_root=str(self._runtime_root), enabled=True, notes=None)
+            node_id = admin_db.upsert_node(
+                self._conn,
+                node_root=str(_as_abs(node_root)),
+                runtime_root=str(self._runtime_root),
+                enabled=True,
+                notes=None,
+            )
+            # Processing always uses the node .env (seeded/refreshed during deploy/repair).
+            admin_db.set_node_env_enabled(self._conn, node_id=node_id, enabled=True)
+            self._append_log("[ENV] Processing uses: Node .env")
             self._append_log(f"[DEPLOY] {node_root}")
             self.refresh()
         except Exception as exc:
@@ -500,23 +489,10 @@ class AdminWindow(QtWidgets.QMainWindow):
         if self.worker.isRunning():
             QtWidgets.QMessageBox.information(self, "Busy", "Processing is already running.")
             return
-        self.worker.set_tasks([(n.node_id, n.node_root, n.runtime_root, bool(n.node_env_enabled), "pipeline")])
-        self.btn_process_enabled.setEnabled(False)
+        # Ensure the node env file exists; processing always uses Node .env.
+        self._ensure_node_env_file(n.node_root)
+        self.worker.set_tasks([(n.node_id, n.node_root, n.runtime_root, True, "pipeline")])
         self._run_status.begin(f"Processing node: {Path(n.node_root).name}")
-        self.worker.start()
-
-    def _act_process_enabled(self) -> None:
-        if self.worker.isRunning():
-            QtWidgets.QMessageBox.information(self, "Busy", "Processing is already running.")
-            return
-        nodes = [n for n in admin_db.list_nodes(self._conn) if n.enabled]
-        if not nodes:
-            QtWidgets.QMessageBox.information(self, "No nodes", "No enabled nodes to process.")
-            return
-        tasks = [(n.node_id, n.node_root, n.runtime_root, bool(n.node_env_enabled)) for n in nodes]
-        self.worker.set_tasks([(nid, root, rr, env_on, "pipeline") for (nid, root, rr, env_on) in tasks])
-        self.btn_process_enabled.setEnabled(False)
-        self._run_status.begin(f"Processing {len(tasks)} enabled node(s)")
         self.worker.start()
 
     def _act_scan_force_candidates(self, node_id: str) -> None:
@@ -527,8 +503,9 @@ class AdminWindow(QtWidgets.QMainWindow):
         if self.worker.isRunning():
             QtWidgets.QMessageBox.information(self, "Busy", "Processing is already running.")
             return
-        self.worker.set_tasks([(n.node_id, n.node_root, n.runtime_root, bool(n.node_env_enabled), "scan_force_candidates")])
-        self.btn_process_enabled.setEnabled(False)
+        # Ensure the node env file exists; processing always uses Node .env.
+        self._ensure_node_env_file(n.node_root)
+        self.worker.set_tasks([(n.node_id, n.node_root, n.runtime_root, True, "scan_force_candidates")])
         self._run_status.begin(f"Scan+Force Candidates: {Path(n.node_root).name}")
         self.worker.start()
 
@@ -548,7 +525,6 @@ class AdminWindow(QtWidgets.QMainWindow):
         except Exception as exc:
             self._append_log(f"[WARN] Failed to record run: {exc}")
         finally:
-            self.btn_process_enabled.setEnabled(True)
             self.refresh()
 
 

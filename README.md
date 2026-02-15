@@ -128,9 +128,10 @@ Notes:
   If a file does not appear in the Files list, it has not been scanned/tracked yet.
 
 ### 5) Admin node processing
-Process nodes from the admin dashboard (**Process Enabled Nodes**).
+Process nodes from the admin dashboard (per-node **Process** button).
 
-Admin processing settings live in the node’s `.env` (open from the dashboard):
+Admin processing always uses the node’s `EIDAT/UserData/.env` (open from the dashboard).
+This file is refreshed from the Central Runtime `user_inputs/scanner.env` during Deploy/Repair.
 
 - `EIDAT_PROCESS_FORCE=1` to reprocess already-processed PDFs
 - `EIDAT_PROCESS_LIMIT=100` to cap PDFs per run
@@ -180,8 +181,8 @@ If you use **EIDP Trending** (Trend / Analyze Data), the node UI environment mus
 If the UI shows “Plotting unavailable. Install matplotlib…”, re-run `EIDAT\\EIDAT.bat` after fixing pip access, or delete the node UI venv and launch again to force a clean bootstrap.
 
 ### OCR DPI settings
-OCR DPI knobs are configured via `user_inputs/scanner.env` (for both GUI and pipelines).
-Legacy `user_inputs/ocr_force.env` is kept for backward compatibility, but `scanner.env` takes precedence.
+OCR DPI knobs are documented in `user_inputs/scanner.env` and overridden locally via `user_inputs/scanner.local.env` (for both GUI and pipelines).
+Legacy `user_inputs/ocr_force.env` is kept for backward compatibility, but `scanner.env`/`scanner.local.env` take precedence.
 
 ### Excel workbook update errors
 If EIDAT tells you the workbook isn’t writable, close it in Excel and retry.

@@ -7,6 +7,8 @@ cell bounding boxes so the existing bordered-table pipeline can be reused.
 
 from typing import Dict, List, Optional, Tuple
 
+import os
+
 from . import page_analyzer
 
 
@@ -406,6 +408,16 @@ def _build_table_from_block(
     )
     if not cells:
         cells = []
+        try:
+            tiny_min_h = int(float(os.environ.get("EIDAT_TABLE_DETECT_TINY_CELL_H_PX", "10")))
+        except Exception:
+            tiny_min_h = 10
+        try:
+            tiny_min_w = int(float(os.environ.get("EIDAT_TABLE_DETECT_TINY_CELL_W_PX", "0")))
+        except Exception:
+            tiny_min_w = 0
+        tiny_min_h = max(0, int(tiny_min_h))
+        tiny_min_w = max(0, int(tiny_min_w))
         for r in range(len(row_edges) - 1):
             for c in range(len(col_edges) - 1):
                 cx0 = col_edges[c]
@@ -413,6 +425,10 @@ def _build_table_from_block(
                 cx1 = col_edges[c + 1]
                 cy1 = row_edges[r + 1]
                 if (cx1 - cx0) < 2.0 or (cy1 - cy0) < 2.0:
+                    continue
+                if tiny_min_h and (cy1 - cy0) < float(tiny_min_h):
+                    continue
+                if tiny_min_w and (cx1 - cx0) < float(tiny_min_w):
                     continue
                 cells.append({
                     "bbox_px": [
@@ -1189,6 +1205,16 @@ def _cells_from_synthetic_grid(
         return None
 
     out = []
+    try:
+        tiny_min_h = int(float(os.environ.get("EIDAT_TABLE_DETECT_TINY_CELL_H_PX", "10")))
+    except Exception:
+        tiny_min_h = 10
+    try:
+        tiny_min_w = int(float(os.environ.get("EIDAT_TABLE_DETECT_TINY_CELL_W_PX", "0")))
+    except Exception:
+        tiny_min_w = 0
+    tiny_min_h = max(0, int(tiny_min_h))
+    tiny_min_w = max(0, int(tiny_min_w))
     for cell in cells:
         bbox = cell.get("bbox_px") or []
         if len(bbox) != 4:
@@ -1199,6 +1225,10 @@ def _cells_from_synthetic_grid(
             int(bbox[2] + x0),
             int(bbox[3] + y0),
         ]
+        if tiny_min_h and (bbox[3] - bbox[1]) < int(tiny_min_h):
+            continue
+        if tiny_min_w and (bbox[2] - bbox[0]) < int(tiny_min_w):
+            continue
         out.append({
             "bbox_px": list(bbox),
             "borderless": True,

@@ -1,6 +1,6 @@
 param(
   [Parameter(Mandatory = $false)]
-  [string]$ScannerEnvPath = ".\\user_inputs\\scanner.env",
+  [string]$ScannerEnvPath = ".\\user_inputs\\scanner.local.env",
 
   [Parameter(Mandatory = $false)]
   [string]$SupportDirName = "EIDAT Support",
@@ -39,6 +39,13 @@ function Read-EnvFileValue([string]$Path, [string]$Key) {
 }
 
 $repoRoot = Read-EnvFileValue -Path $ScannerEnvPath -Key "REPO_ROOT"
+if (-not $repoRoot) {
+  $fallback = ".\\user_inputs\\scanner.env"
+  if ($ScannerEnvPath -ne $fallback) {
+    $repoRoot = Read-EnvFileValue -Path $fallback -Key "REPO_ROOT"
+    if ($repoRoot) { $ScannerEnvPath = $fallback }
+  }
+}
 if (-not $repoRoot) { throw "REPO_ROOT not found in $ScannerEnvPath" }
 
 $repoRootFull = [System.IO.Path]::GetFullPath($repoRoot)

@@ -131,6 +131,20 @@ def detect_tables(
                  if (c['bbox_px'][2] - c['bbox_px'][0]) >= min_cell_dim and
                     (c['bbox_px'][3] - c['bbox_px'][1]) >= min_cell_dim]
 
+    # Step 2.6: Filter out "tiny" cells (chart grid artifacts).
+    # These can explode cell counts and make clustering O(n^2) effectively hang.
+    # Defaults are intentionally conservative; override via env if needed.
+    tiny_min_h = _env_int("EIDAT_TABLE_DETECT_TINY_CELL_H_PX", 10)
+    tiny_min_w = _env_int("EIDAT_TABLE_DETECT_TINY_CELL_W_PX", 0)
+    if int(tiny_min_h) > 0 or int(tiny_min_w) > 0:
+        _min_h = max(0, int(tiny_min_h))
+        _min_w = max(0, int(tiny_min_w))
+        all_cells = [
+            c for c in all_cells
+            if (c['bbox_px'][3] - c['bbox_px'][1]) >= _min_h and
+               (c['bbox_px'][2] - c['bbox_px'][0]) >= _min_w
+        ]
+
     # Step 3: Filter out container cells (large frames around actual cells)
     actual_cells = _filter_containers(all_cells)
 
@@ -139,6 +153,14 @@ def detect_tables(
     max_cell_area = page_area * 0.15
     actual_cells = [c for c in actual_cells
                     if (c['bbox_px'][2] - c['bbox_px'][0]) * (c['bbox_px'][3] - c['bbox_px'][1]) <= max_cell_area]
+
+    # Step 4.5: Guard against pathological cell counts (charts / dense grids).
+    # Clustering is O(n^2); beyond a point it becomes impractical.
+    max_cluster_cells = _env_int("EIDAT_TABLE_DETECT_MAX_CLUSTER_CELLS", 200)
+    if int(max_cluster_cells) > 0 and len(actual_cells) > int(max_cluster_cells):
+        if verbose:
+            print(f"  - Skipping table clustering: {len(actual_cells)} cells exceeds max {int(max_cluster_cells)}")
+        return {'tables': [], 'cells': []}
 
     # Step 5: Cluster cells into tables
     tables = _cluster_into_tables(
