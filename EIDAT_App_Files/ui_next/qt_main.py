@@ -4072,12 +4072,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_files_open_pdf = QtWidgets.QPushButton("Open PDF")
         self.btn_files_open_metadata = QtWidgets.QPushButton("Open Metadata")
         self.btn_files_open_artifacts = QtWidgets.QPushButton("Open Artifacts")
+        self.btn_files_open_combined = QtWidgets.QPushButton("Open combined.txt")
         self.btn_files_show_explorer = QtWidgets.QPushButton("Show in Explorer")
         self.btn_files_update_metadata = QtWidgets.QPushButton("Update Metadata")
         self.btn_files_certify_all = QtWidgets.QPushButton("Certify All")
 
+        self.btn_files_open_combined.setToolTip("Open the merged OCR artifact combined.txt for this document (if present).")
+
         for b in (self.btn_files_open_pdf, self.btn_files_open_metadata,
-                  self.btn_files_open_artifacts, self.btn_files_show_explorer,
+                  self.btn_files_open_artifacts, self.btn_files_open_combined, self.btn_files_show_explorer,
                   self.btn_files_update_metadata, self.btn_files_certify_all):
             b.setStyleSheet("""
                 QPushButton {
@@ -4095,6 +4098,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_files_open_pdf.clicked.connect(self._act_files_open_pdf)
         self.btn_files_open_metadata.clicked.connect(self._act_files_open_metadata)
         self.btn_files_open_artifacts.clicked.connect(self._act_files_open_artifacts)
+        self.btn_files_open_combined.clicked.connect(self._act_files_open_combined)
         self.btn_files_show_explorer.clicked.connect(self._act_files_show_explorer)
         self.btn_files_update_metadata.clicked.connect(self._act_files_update_metadata)
         self.btn_files_certify_all.clicked.connect(self._act_files_certify_all)
@@ -4102,6 +4106,7 @@ class MainWindow(QtWidgets.QMainWindow):
         actions.addWidget(self.btn_files_open_pdf)
         actions.addWidget(self.btn_files_open_metadata)
         actions.addWidget(self.btn_files_open_artifacts)
+        actions.addWidget(self.btn_files_open_combined)
         actions.addWidget(self.btn_files_show_explorer)
         actions.addWidget(self.btn_files_update_metadata)
         actions.addWidget(self.btn_files_certify_all)
@@ -4845,6 +4850,30 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "Open Artifacts", str(exc))
 
+    def _act_files_open_combined(self) -> None:
+        """Open the combined.txt artifact for the selected file (if available)."""
+        info = self._selected_file_info()
+        if not info:
+            return
+        repo_raw = (self.ed_global_repo.text() or "").strip()
+        if not repo_raw:
+            return
+        rel_path = info.get("rel_path", "")
+        if not rel_path:
+            return
+        artifacts = be.get_file_artifacts_path(Path(repo_raw), rel_path)
+        if not artifacts or not artifacts.exists():
+            QtWidgets.QMessageBox.warning(self, "combined.txt", "No artifacts folder found")
+            return
+        combined = artifacts / "combined.txt"
+        if not combined.exists():
+            QtWidgets.QMessageBox.warning(self, "combined.txt", "combined.txt not found in artifacts folder")
+            return
+        try:
+            be.open_path(combined)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Open combined.txt", str(exc))
+
     def _act_files_show_explorer(self) -> None:
         """Show file in OS file explorer."""
         info = self._selected_file_info()
@@ -5012,6 +5041,7 @@ class MainWindow(QtWidgets.QMainWindow):
         act_open_pdf = menu.addAction("Open PDF")
         act_open_metadata = menu.addAction("Open Metadata JSON")
         act_open_artifacts = menu.addAction("Open Artifacts Folder")
+        act_open_combined = menu.addAction("Open combined.txt")
         menu.addSeparator()
         act_show_explorer = menu.addAction("Show in Explorer")
         act_update_metadata = menu.addAction("Update Metadata Only")
@@ -5021,6 +5051,7 @@ class MainWindow(QtWidgets.QMainWindow):
         act_open_pdf.triggered.connect(self._act_files_open_pdf)
         act_open_metadata.triggered.connect(self._act_files_open_metadata)
         act_open_artifacts.triggered.connect(self._act_files_open_artifacts)
+        act_open_combined.triggered.connect(self._act_files_open_combined)
         act_show_explorer.triggered.connect(self._act_files_show_explorer)
         act_update_metadata.triggered.connect(self._act_files_update_metadata)
         act_recertify.triggered.connect(self._act_files_recertify)

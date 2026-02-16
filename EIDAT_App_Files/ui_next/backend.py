@@ -2662,14 +2662,40 @@ def _normalize_key(s: str) -> str:
 
 
 def _token_overlap_score(a: str, b: str) -> float:
-    """Return overlap ratio of normalized token sets (0..1)."""
-    a_toks = set(re.findall(r"[a-z0-9]+", _normalize_text(a)))
-    b_toks = set(re.findall(r"[a-z0-9]+", _normalize_text(b)))
+    """
+    Return how well `b` covers the tokens in `a` (0..1).
+
+    This is intentionally *asymmetric*: it answers "what fraction of the query tokens
+    appear in the candidate?", which avoids over-scoring short/generic candidates
+    (e.g., "upstream valve") against longer terms.
+
+    Supports abbreviation-style prefix matches for longer tokens (>=4 chars):
+      - "prop" ~= "propellant"
+      - "press" ~= "pressure"
+    """
+
+    a_toks = [t for t in re.findall(r"[a-z0-9]+", _normalize_text(a)) if t]
+    b_toks = [t for t in re.findall(r"[a-z0-9]+", _normalize_text(b)) if t]
     if not a_toks or not b_toks:
         return 0.0
-    shared = len(a_toks & b_toks)
-    denom = min(len(a_toks), len(b_toks))
-    return (shared / float(denom)) if denom else 0.0
+
+    a_unique: list[str] = list(dict.fromkeys(a_toks))
+    b_unique: list[str] = list(dict.fromkeys(b_toks))
+
+    def _tok_match(q: str, c: str) -> bool:
+        if q == c:
+            return True
+        if len(q) >= 4 and len(c) >= 4 and (q.startswith(c) or c.startswith(q)):
+            return True
+        return False
+
+    matched = 0
+    for qt in a_unique:
+        for ct in b_unique:
+            if _tok_match(qt, ct):
+                matched += 1
+                break
+    return matched / float(len(a_unique)) if a_unique else 0.0
 
 
 def _fuzzy_term_score(term: str, term_label: str, candidate: str) -> float:
@@ -2688,22 +2714,24 @@ def _fuzzy_term_score(term: str, term_label: str, candidate: str) -> float:
     cand_k = _normalize_key(cand_s)
     cand_n = _normalize_text(cand_s)
 
-    if term_k and cand_k and (term_k == cand_k or term_k in cand_k or cand_k in term_k):
+    if term_k and cand_k and term_k == cand_k:
         return 1.0
-    if label_k and cand_k and (label_k == cand_k or label_k in cand_k or cand_k in label_k):
+    if label_k and cand_k and label_k == cand_k:
         return 1.0
+
+    def _score_query(q_raw: str, q_key: str) -> float:
+        if not q_raw:
+            return 0.0
+        seq = SequenceMatcher(None, q_key, cand_k).ratio() if (q_key and cand_k) else 0.0
+        cov = _token_overlap_score(q_raw, cand_n)
+        # Do not let a high SequenceMatcher score override low token coverage.
+        return max(cov, (seq + cov) / 2.0)
 
     best = 0.0
-    if label_k and cand_k:
-        best = max(best, SequenceMatcher(None, label_k, cand_k).ratio())
-    if term_k and cand_k:
-        best = max(best, SequenceMatcher(None, term_k, cand_k).ratio())
-
     if term_label:
-        best = max(best, _token_overlap_score(term_label, cand_n))
+        best = max(best, _score_query(term_label, label_k))
     if term:
-        best = max(best, _token_overlap_score(term, cand_n))
-
+        best = max(best, _score_query(term, term_k))
     return float(best)
 
 
@@ -3169,10 +3197,11 @@ def _extract_value_from_lines(
         ln = lines[i]
         ln_n = _normalize_text(ln)
         match_n = ""
-        if term_n and term_n in ln_n:
-            match_n = term_n
-        elif term_label_n and term_label_n in ln_n:
+        # Prefer TermLabel when present; Term can be generic and collide across rows.
+        if term_label_n and term_label_n in ln_n:
             match_n = term_label_n
+        elif term_n and term_n in ln_n:
+            match_n = term_n
         elif fuzzy_term:
             score = _fuzzy_term_score(term, term_label, ln_n)
             if score >= float(fuzzy_min_ratio or 0.0):
@@ -3706,11 +3735,18 @@ def _extract_from_tables(
             left_n = _normalize_text(left_raw)
 
             direct = False
-            if term_k and (left_k == term_k or (len(term_k) >= 4 and (term_k in left_k or left_k in term_k))):
+            # Prefer TermLabel when present; Term can be generic and collide across rows.
+            if term_label_n and term_label_n in left_n:
                 direct = True
-            elif term_label_n and term_label_n in left_n:
+            elif term_label_k and (
+                left_k == term_label_k or (len(term_label_k) >= 6 and (term_label_k in left_k or left_k in term_label_k))
+            ):
                 direct = True
-            elif term_label_k and (left_k == term_label_k or (len(term_label_k) >= 6 and (term_label_k in left_k or left_k in term_label_k))):
+            elif term_k and left_k == term_k:
+                direct = True
+            elif (not term_label_n and not term_label_k) and term_k and (
+                len(term_k) >= 4 and (term_k in left_k or left_k in term_k)
+            ):
                 direct = True
 
             if not direct:
@@ -4096,10 +4132,8 @@ def _extract_from_tables_by_header(
             desc_n = _normalize_text(desc)
             matched = False
             matched_col: int | None = None
-            if term_k and tag_k and (term_k == tag_k or term_k in tag_k or tag_k in term_k):
-                matched = True
-                matched_col = term_col
-            elif term_label_n and tag_n and term_label_n in tag_n:
+            # Prefer TermLabel when present; Term can be generic and collide across rows.
+            if term_label_n and tag_n and term_label_n in tag_n:
                 matched = True
                 matched_col = term_col
             elif term_label_n and desc_n and term_label_n in desc_n:
@@ -4108,7 +4142,16 @@ def _extract_from_tables_by_header(
             elif term_n and desc_n and term_n in desc_n:
                 matched = True
                 matched_col = desc_col if isinstance(desc_col, int) else term_col
-            elif term_k and desc_k and (term_k == desc_k or term_k in desc_k or desc_k in term_k):
+            elif term_k and tag_k and term_k == tag_k:
+                matched = True
+                matched_col = term_col
+            elif (not term_label_n) and term_k and tag_k and (term_k in tag_k or tag_k in term_k):
+                matched = True
+                matched_col = term_col
+            elif term_k and desc_k and term_k == desc_k:
+                matched = True
+                matched_col = desc_col if isinstance(desc_col, int) else term_col
+            elif (not term_label_n) and term_k and desc_k and (term_k in desc_k or desc_k in term_k):
                 matched = True
                 matched_col = desc_col if isinstance(desc_col, int) else term_col
             else:
@@ -4119,7 +4162,15 @@ def _extract_from_tables_by_header(
                         continue
                     cell_k = _normalize_key(cell_s)
                     cell_n = _normalize_text(cell_s)
-                    if term_k and cell_k and (term_k == cell_k or term_k in cell_k or cell_k in term_k):
+                    if term_label_n and cell_n and term_label_n in cell_n:
+                        matched = True
+                        matched_col = ci
+                        break
+                    if term_k and cell_k and term_k == cell_k:
+                        matched = True
+                        matched_col = ci
+                        break
+                    if (not term_label_n) and term_k and cell_k and (term_k in cell_k or cell_k in term_k):
                         matched = True
                         matched_col = ci
                         break

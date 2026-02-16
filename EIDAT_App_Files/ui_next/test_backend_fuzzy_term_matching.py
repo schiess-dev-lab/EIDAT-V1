@@ -61,7 +61,37 @@ class TestBackendFuzzyTermMatching(unittest.TestCase):
         )
         self.assertEqual(val, 1.23)
 
+    def test_fuzzy_term_score_does_not_overmatch_generic_subset(self) -> None:
+        term = "Res, Upstream Propellant Valve"
+        term_label = "Res, Upstream Prop. Valve"
+
+        self.assertLess(backend._fuzzy_term_score(term, term_label, "Upstream Valve"), 0.78)
+        self.assertLess(backend._fuzzy_term_score(term, term_label, "Drop-Out Voltage, Upstream Valve"), 0.78)
+        self.assertGreaterEqual(backend._fuzzy_term_score(term, term_label, "Res, Upstream Prop. Valve"), 0.99)
+
+    def test_extract_from_tables_prefers_termlabel_over_generic_term(self) -> None:
+        blocks = [
+            {
+                "heading": "Example",
+                "rows": [
+                    ["Parameter", "Value"],
+                    ["Drop-Out Voltage, Upstream Valve", "111"],
+                    ["Res, Upstream Prop. Valve", "222"],
+                ],
+                "kv": {},
+            }
+        ]
+
+        # Simulate a workbook row where `Term` is generic and collides, but `TermLabel` is specific.
+        val, _ = backend._extract_from_tables(
+            blocks,
+            term="Upstream Valve",
+            term_label="Res, Upstream Prop. Valve",
+            fuzzy_term=True,
+            fuzzy_min_ratio=0.78,
+        )
+        self.assertEqual(val, "222")
+
 
 if __name__ == "__main__":
     unittest.main()
-
