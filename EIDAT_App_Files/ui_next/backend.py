@@ -2661,6 +2661,109 @@ def _normalize_key(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", _normalize_text(s))
 
 
+def _token_overlap_score(a: str, b: str) -> float:
+    """Return overlap ratio of normalized token sets (0..1)."""
+    a_toks = set(re.findall(r"[a-z0-9]+", _normalize_text(a)))
+    b_toks = set(re.findall(r"[a-z0-9]+", _normalize_text(b)))
+    if not a_toks or not b_toks:
+        return 0.0
+    shared = len(a_toks & b_toks)
+    denom = min(len(a_toks), len(b_toks))
+    return (shared / float(denom)) if denom else 0.0
+
+
+def _fuzzy_term_score(term: str, term_label: str, candidate: str) -> float:
+    """
+    Score how well `candidate` matches a requested term/label (0..1).
+
+    Workbooks often store canonical IDs in `Term`, but documents use human
+    labels in tables; when available, term_label should carry matching weight.
+    """
+    cand_s = str(candidate or "").strip()
+    if not cand_s:
+        return 0.0
+
+    term_k = _normalize_key(term)
+    label_k = _normalize_key(term_label)
+    cand_k = _normalize_key(cand_s)
+    cand_n = _normalize_text(cand_s)
+
+    if term_k and cand_k and (term_k == cand_k or term_k in cand_k or cand_k in term_k):
+        return 1.0
+    if label_k and cand_k and (label_k == cand_k or label_k in cand_k or cand_k in label_k):
+        return 1.0
+
+    best = 0.0
+    if label_k and cand_k:
+        best = max(best, SequenceMatcher(None, label_k, cand_k).ratio())
+    if term_k and cand_k:
+        best = max(best, SequenceMatcher(None, term_k, cand_k).ratio())
+
+    if term_label:
+        best = max(best, _token_overlap_score(term_label, cand_n))
+    if term:
+        best = max(best, _token_overlap_score(term, cand_n))
+
+    return float(best)
+
+
+def _resolve_acceptance_term_key(
+    lookup: dict[str, str],
+    *,
+    term: str,
+    term_label: str = "",
+    fuzzy_term: bool = False,
+    fuzzy_min_ratio: float = 0.78,
+) -> str | None:
+    """Resolve a workbook row's (term, term_label) to an acceptance_cache key."""
+    if not isinstance(lookup, dict) or not lookup:
+        return None
+
+    term_k = _normalize_key(term)
+    label_k = _normalize_key(term_label)
+
+    # Direct hit (lookup keys are already normalized)
+    if term_k and term_k in lookup:
+        return lookup.get(term_k)
+    if label_k and label_k in lookup:
+        return lookup.get(label_k)
+
+    # Substring/containment (prefer longest match to reduce false positives)
+    best_len = 0
+    best_orig: str | None = None
+    for lk, orig in lookup.items():
+        if not lk:
+            continue
+        if term_k and (lk == term_k or lk in term_k or term_k in lk):
+            if len(lk) > best_len:
+                best_len = len(lk)
+                best_orig = orig
+                continue
+        if label_k and (lk == label_k or lk in label_k or label_k in lk):
+            if len(lk) > best_len:
+                best_len = len(lk)
+                best_orig = orig
+    if best_orig:
+        return best_orig
+
+    # Fuzzy fallback
+    if not fuzzy_term:
+        return None
+
+    best_score = 0.0
+    best_key: str | None = None
+    for lk, orig in lookup.items():
+        if not lk:
+            continue
+        score = _fuzzy_term_score(term, term_label, orig or lk)
+        if score > best_score:
+            best_score = score
+            best_key = orig
+    if best_key is not None and best_score >= float(fuzzy_min_ratio or 0.0):
+        return best_key
+    return None
+
+
 def _split_term_instance(term: str) -> tuple[str, int | None]:
     """
     Split a term like "Torque (2)" into ("Torque", 2).
@@ -2989,10 +3092,14 @@ def _extract_value_from_lines(
     group_after: str = "",
     window_lines: int = 600,
     want_type: str = "string",
+    term_label: str = "",
+    fuzzy_term: bool = False,
+    fuzzy_min_ratio: float = 0.78,
 ) -> tuple[str | float | None, str]:
     """Return (value, provenance_snippet)."""
     term_n = _normalize_text(term)
-    if not term_n:
+    term_label_n = _normalize_text(term_label)
+    if not term_n and not term_label_n:
         return None, ""
 
     start = 0
@@ -3061,11 +3168,23 @@ def _extract_value_from_lines(
     for i in range(start, end):
         ln = lines[i]
         ln_n = _normalize_text(ln)
-        if term_n not in ln_n:
+        match_n = ""
+        if term_n and term_n in ln_n:
+            match_n = term_n
+        elif term_label_n and term_label_n in ln_n:
+            match_n = term_label_n
+        elif fuzzy_term:
+            score = _fuzzy_term_score(term, term_label, ln_n)
+            if score >= float(fuzzy_min_ratio or 0.0):
+                match_n = term_label_n or term_n
+        if not match_n:
             continue
         # try to parse a number from the text after the term occurrence
-        idx = ln_n.find(term_n)
-        tail = ln[idx + len(term_n) :]
+        idx = ln_n.find(match_n)
+        if idx < 0:
+            tail = str(ln)
+        else:
+            tail = ln[idx + len(match_n) :]
         if want_type == "number":
             m = re.search(r"[-+]?\d{1,3}(?:,\d{3})*(?:\.\d+)?(?:[eE][-+]?\d+)?", tail)
             if m:
@@ -3098,7 +3217,7 @@ def _extract_value_from_lines(
                     except Exception:
                         return raw.strip(), (ln.strip() + " | " + nxt)[:300]
         # If there's no obvious number, return the rest of the line as a string value.
-        tail_s = re.sub(r"^[\s:\-–—]+", "", ln[idx + len(term) :]).strip()
+        tail_s = re.sub(r"^[\s:\-–—]+", "", str(tail)).strip()
         if tail_s:
             return tail_s[:200], ln.strip()[:300]
     return None, ""
@@ -3470,10 +3589,13 @@ def _extract_from_tables(
     term_label: str = "",
     header_anchor: str = "",
     group_after: str = "",
+    fuzzy_term: bool = False,
+    fuzzy_min_ratio: float = 0.78,
 ) -> tuple[str | None, str]:
     term_k = _normalize_key(term)
     term_label_n = _normalize_text(term_label)
-    if not term_k:
+    term_label_k = _normalize_key(term_label)
+    if not term_k and not term_label_n:
         return None, ""
 
     anchor = _normalize_text(header_anchor).strip()
@@ -3553,16 +3675,18 @@ def _extract_from_tables(
         # If the anchor was found inside this table block (row hit), kv may include
         # rows that occur before the anchor row; avoid kv in that case.
         if slice_rows_after is None and isinstance(kv, dict):
-            v = kv.get(term_k)
-            if not v and len(term_k) >= 4:
+            v = kv.get(term_k) if term_k else None
+            if not v and term_label_k:
+                v = kv.get(term_label_k)
+            if not v and term_k and len(term_k) >= 4:
                 for kk, vv in kv.items():
-                    try:
-                        kkn = _normalize_key(kk)
-                    except Exception:
-                        kkn = str(kk)
+                    kkn = str(kk or "")
                     if not kkn:
                         continue
-                    if term_k == kkn or term_k in kkn or kkn in term_k:
+                    if term_k and (term_k == kkn or term_k in kkn or kkn in term_k):
+                        v = vv
+                        break
+                    if term_label_k and (term_label_k == kkn or term_label_k in kkn or kkn in term_label_k):
                         v = vv
                         break
             if v:
@@ -3575,15 +3699,49 @@ def _extract_from_tables(
         for r in rows[start_idx:]:
             if not isinstance(r, list) or not r:
                 continue
-            left = _normalize_key(r[0])
-            if (left == term_k or (len(term_k) >= 4 and (term_k in left or left in term_k))) and len(r) >= 2:
+            if len(r) < 2:
+                continue
+            left_raw = str(r[0] or "")
+            left_k = _normalize_key(left_raw)
+            left_n = _normalize_text(left_raw)
+
+            direct = False
+            if term_k and (left_k == term_k or (len(term_k) >= 4 and (term_k in left_k or left_k in term_k))):
+                direct = True
+            elif term_label_n and term_label_n in left_n:
+                direct = True
+            elif term_label_k and (left_k == term_label_k or (len(term_label_k) >= 6 and (term_label_k in left_k or left_k in term_label_k))):
+                direct = True
+
+            if not direct:
+                continue
+
+            val = ""
+            for c in reversed(r[1:]):
+                if str(c).strip():
+                    val = str(c).strip()
+                    break
+            if val:
+                return val, f"{b.get('heading')}: {r[0]} -> {val}"
+
+        if fuzzy_term:
+            best_score = 0.0
+            best_row: list | None = None
+            for r in rows[start_idx:]:
+                if not isinstance(r, list) or not r or len(r) < 2:
+                    continue
+                score = _fuzzy_term_score(term, term_label, str(r[0] or ""))
+                if score > best_score:
+                    best_score = score
+                    best_row = r
+            if best_row is not None and best_score >= float(fuzzy_min_ratio or 0.0):
                 val = ""
-                for c in reversed(r[1:]):
+                for c in reversed(best_row[1:]):
                     if str(c).strip():
                         val = str(c).strip()
                         break
                 if val:
-                    return val, f"{b.get('heading')}: {r[0]} -> {val}"
+                    return val, f"{b.get('heading')}: {best_row[0]} -> {val}"
     if ga and not anchor_found:
         return None, ""
     return None, ""
@@ -4159,6 +4317,12 @@ def update_eidp_trending_project_workbook(
     except Exception:
         fuzzy_header_min_ratio = 0.72
 
+    fuzzy_term_stick = _env_truthy(env.get("EIDAT_FUZZY_TERM_STICK", "1"))
+    try:
+        fuzzy_term_min_ratio = float(env.get("EIDAT_FUZZY_TERM_MIN_RATIO", "0.78") or 0.78)
+    except Exception:
+        fuzzy_term_min_ratio = 0.78
+
     docs = read_eidat_index_documents(repo)
     docs_by_serial: dict[str, list[dict]] = {}
     for d in docs:
@@ -4517,16 +4681,13 @@ def update_eidp_trending_project_workbook(
                     if header_anchor and _parse_float_loose(cell.value) is None:
                         allow_replace = True
                     lookup = acceptance_lookup.get(sn_header, {})
-                    term_key = lookup.get(term_k)
-                    if not term_key and term_k and lookup:
-                        best_len = 0
-                        for lk, orig in lookup.items():
-                            if not lk:
-                                continue
-                            if lk == term_k or lk in term_k or term_k in lk:
-                                if len(lk) > best_len:
-                                    best_len = len(lk)
-                                    term_key = orig
+                    term_key = _resolve_acceptance_term_key(
+                        lookup,
+                        term=term,
+                        term_label=term_label,
+                        fuzzy_term=fuzzy_term_stick,
+                        fuzzy_min_ratio=fuzzy_term_min_ratio,
+                    )
                     if term_key:
                         data_list = acceptance_cache.get(sn_header, {}).get(term_key, [])
                         data = _select_acceptance_entry(data_list, term_instance)
@@ -4553,16 +4714,13 @@ def update_eidp_trending_project_workbook(
             # measured value for the same term (acceptance DB is term-instance based and not header aware).
             if sn_header in acceptance_cache:
                 lookup = acceptance_lookup.get(sn_header, {})
-                term_key = lookup.get(term_k)
-                if not term_key and term_k and lookup:
-                    best_len = 0
-                    for lk, orig in lookup.items():
-                        if not lk:
-                            continue
-                        if lk == term_k or lk in term_k or term_k in lk:
-                            if len(lk) > best_len:
-                                best_len = len(lk)
-                                term_key = orig
+                term_key = _resolve_acceptance_term_key(
+                    lookup,
+                    term=term,
+                    term_label=term_label,
+                    fuzzy_term=fuzzy_term_stick,
+                    fuzzy_min_ratio=fuzzy_term_min_ratio,
+                )
                 if term_key:
                     data_list = acceptance_cache[sn_header].get(term_key, [])
                     data = _select_acceptance_entry(data_list, term_instance)
@@ -4738,6 +4896,8 @@ def update_eidp_trending_project_workbook(
                     term_label=term_label,
                     header_anchor=header_anchor,
                     group_after=group_after,
+                    fuzzy_term=fuzzy_term_stick,
+                    fuzzy_min_ratio=fuzzy_term_min_ratio,
                 )
                 if tval:
                     val = _clean_cell_text(tval)
@@ -4769,6 +4929,8 @@ def update_eidp_trending_project_workbook(
                                 term_label=term_label,
                                 header_anchor=header_anchor,
                                 group_after=group_after,
+                                fuzzy_term=fuzzy_term_stick,
+                                fuzzy_min_ratio=fuzzy_term_min_ratio,
                             )
                             if tval:
                                 val = _clean_cell_text(tval)
@@ -4803,6 +4965,9 @@ def update_eidp_trending_project_workbook(
                             group_after=group_after,
                             window_lines=window_lines,
                             want_type=want_type,
+                            term_label=term_label,
+                            fuzzy_term=fuzzy_term_stick,
+                            fuzzy_min_ratio=fuzzy_term_min_ratio,
                         )
                         if fallback not in (None, ""):
                             val = fallback
@@ -4838,6 +5003,9 @@ def update_eidp_trending_project_workbook(
                         group_after=group_after,
                         window_lines=window_lines,
                         want_type=want_type,
+                        term_label=term_label,
+                        fuzzy_term=fuzzy_term_stick,
+                        fuzzy_min_ratio=fuzzy_term_min_ratio,
                     )
                     if fallback not in (None, ""):
                         val = fallback
@@ -5147,6 +5315,12 @@ def update_eidp_raw_trending_project_workbook(
     except Exception:
         fuzzy_header_min_ratio = 0.72
 
+    fuzzy_term_stick = _env_truthy(env.get("EIDAT_FUZZY_TERM_STICK", "1"))
+    try:
+        fuzzy_term_min_ratio = float(env.get("EIDAT_FUZZY_TERM_MIN_RATIO", "0.78") or 0.78)
+    except Exception:
+        fuzzy_term_min_ratio = 0.78
+
     docs = read_eidat_index_documents(repo)
     docs_by_serial: dict[str, list[dict]] = {}
     for d in docs:
@@ -5362,6 +5536,8 @@ def update_eidp_raw_trending_project_workbook(
                 term_label=term_label,
                 header_anchor=header_anchor,
                 group_after=group_after,
+                fuzzy_term=fuzzy_term_stick,
+                fuzzy_min_ratio=fuzzy_term_min_ratio,
             )
             if tval2:
                 val = _clean_cell_text(str(tval2))
@@ -5376,6 +5552,9 @@ def update_eidp_raw_trending_project_workbook(
                 group_after=group_after,
                 window_lines=window_lines,
                 want_type=want_type,
+                term_label=term_label,
+                fuzzy_term=fuzzy_term_stick,
+                fuzzy_min_ratio=fuzzy_term_min_ratio,
             )
             if fallback not in (None, ""):
                 val = fallback
