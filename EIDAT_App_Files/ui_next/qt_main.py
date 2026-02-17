@@ -2456,6 +2456,184 @@ class ImplementationTrendDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.warning(self, "Save All Auto-Plots", str(exc))
 
 
+class ProjectEnvDialog(QtWidgets.QDialog):
+    def __init__(self, project_dir: Path, parent=None):
+        super().__init__(parent)
+        self._project_dir = Path(project_dir).expanduser()
+        self._env_path = be.project_scanner_env_path(self._project_dir)
+
+        self.setWindowTitle("Project Env Overrides")
+        self.resize(680, 340)
+
+        root = QtWidgets.QVBoxLayout(self)
+        root.setContentsMargins(14, 14, 14, 14)
+        root.setSpacing(10)
+
+        title = QtWidgets.QLabel("Project-level scanner overrides")
+        title.setStyleSheet("font-size: 14px; font-weight: 700; color: #0f172a;")
+        root.addWidget(title)
+
+        self.lbl_path = QtWidgets.QLabel("")
+        self.lbl_path.setStyleSheet("font-size: 11px; color: #475569;")
+        self.lbl_path.setWordWrap(True)
+        root.addWidget(self.lbl_path)
+
+        note = QtWidgets.QLabel(
+            "These values override Central Runtime `user_inputs/scanner.env` and `user_inputs/scanner.local.env` for this project only."
+        )
+        note.setStyleSheet("font-size: 11px; color: #475569;")
+        note.setWordWrap(True)
+        root.addWidget(note)
+
+        form = QtWidgets.QFormLayout()
+        form.setLabelAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
+        form.setFormAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
+
+        self.cb_combined_only = QtWidgets.QCheckBox("Use combined.txt only (skip acceptance data)")
+        form.addRow("Trending:", self.cb_combined_only)
+
+        self.cb_fuzzy_header = QtWidgets.QCheckBox("Enable fuzzy header stick")
+        form.addRow("KV Header:", self.cb_fuzzy_header)
+
+        self.sp_fuzzy_header_ratio = QtWidgets.QDoubleSpinBox()
+        self.sp_fuzzy_header_ratio.setRange(0.0, 1.0)
+        self.sp_fuzzy_header_ratio.setSingleStep(0.01)
+        self.sp_fuzzy_header_ratio.setDecimals(3)
+        form.addRow("Header min ratio:", self.sp_fuzzy_header_ratio)
+
+        self.cb_fuzzy_term = QtWidgets.QCheckBox("Enable fuzzy term stick")
+        form.addRow("Trending Terms:", self.cb_fuzzy_term)
+
+        self.sp_fuzzy_term_ratio = QtWidgets.QDoubleSpinBox()
+        self.sp_fuzzy_term_ratio.setRange(0.0, 1.0)
+        self.sp_fuzzy_term_ratio.setSingleStep(0.01)
+        self.sp_fuzzy_term_ratio.setDecimals(3)
+        form.addRow("Term min ratio:", self.sp_fuzzy_term_ratio)
+
+        root.addLayout(form)
+
+        btns = QtWidgets.QHBoxLayout()
+        btns.addStretch(1)
+        self.btn_open = QtWidgets.QPushButton("Open File")
+        self.btn_delete = QtWidgets.QPushButton("Delete Overrides")
+        self.btn_save = QtWidgets.QPushButton("Save")
+        self.btn_cancel = QtWidgets.QPushButton("Cancel")
+        for b in (self.btn_open, self.btn_delete, self.btn_save, self.btn_cancel):
+            b.setStyleSheet(
+                """
+                QPushButton {
+                    padding: 8px 12px;
+                    border-radius: 8px;
+                    background: #ffffff;
+                    color: #374151;
+                    border: 1px solid #d1d5db;
+                    font-size: 12px;
+                    font-weight: 600;
+                }
+                QPushButton:hover { background: #f9fafb; }
+                """
+            )
+        self.btn_save.setStyleSheet(
+            """
+            QPushButton {
+                padding: 8px 12px;
+                border-radius: 8px;
+                background: #0f766e;
+                color: #ffffff;
+                border: 1px solid #0f766e;
+                font-size: 12px;
+                font-weight: 700;
+            }
+            QPushButton:hover { background: #0d9488; }
+            """
+        )
+        self.btn_open.clicked.connect(self._act_open)
+        self.btn_delete.clicked.connect(self._act_delete)
+        self.btn_save.clicked.connect(self._act_save)
+        self.btn_cancel.clicked.connect(self.reject)
+        btns.addWidget(self.btn_open)
+        btns.addWidget(self.btn_delete)
+        btns.addWidget(self.btn_save)
+        btns.addWidget(self.btn_cancel)
+        root.addLayout(btns)
+
+        self._load()
+
+    def _load(self) -> None:
+        try:
+            env = be.load_scanner_env(project_dir=self._project_dir)
+        except Exception:
+            env = {}
+
+        exists = bool(self._env_path.exists())
+        self.lbl_path.setText(f"File: {self._env_path}  ({'exists' if exists else 'not created'})")
+        self.btn_delete.setEnabled(exists)
+
+        def _truthy(key: str, default: str = "0") -> bool:
+            v = str(env.get(key, default) or "").strip().lower()
+            return v in {"1", "true", "yes", "on", "enable", "enabled"}
+
+        self.cb_combined_only.setChecked(
+            _truthy("EIDAT_TRENDING_COMBINED_ONLY") or _truthy("EIDAT_COMBINED_ONLY")
+        )
+        self.cb_fuzzy_header.setChecked(_truthy("EIDAT_FUZZY_HEADER_STICK"))
+        self.cb_fuzzy_term.setChecked(_truthy("EIDAT_FUZZY_TERM_STICK", "1"))
+
+        def _float(key: str, fallback: float) -> float:
+            try:
+                return float(env.get(key, str(fallback)) or fallback)
+            except Exception:
+                return fallback
+
+        self.sp_fuzzy_header_ratio.setValue(_float("EIDAT_FUZZY_HEADER_MIN_RATIO", 0.72))
+        self.sp_fuzzy_term_ratio.setValue(_float("EIDAT_FUZZY_TERM_MIN_RATIO", 0.78))
+
+    def _current_overrides(self) -> dict[str, str]:
+        def _ratio_str(v: float) -> str:
+            s = f"{float(v):.3f}"
+            s = s.rstrip("0").rstrip(".")
+            return s or "0"
+
+        return {
+            "EIDAT_TRENDING_COMBINED_ONLY": "1" if self.cb_combined_only.isChecked() else "0",
+            "EIDAT_FUZZY_HEADER_STICK": "1" if self.cb_fuzzy_header.isChecked() else "0",
+            "EIDAT_FUZZY_HEADER_MIN_RATIO": _ratio_str(self.sp_fuzzy_header_ratio.value()),
+            "EIDAT_FUZZY_TERM_STICK": "1" if self.cb_fuzzy_term.isChecked() else "0",
+            "EIDAT_FUZZY_TERM_MIN_RATIO": _ratio_str(self.sp_fuzzy_term_ratio.value()),
+        }
+
+    def _act_save(self) -> None:
+        try:
+            be.save_project_scanner_env(self._current_overrides(), self._project_dir)
+            self._load()
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Save Project Env", str(exc))
+
+    def _act_open(self) -> None:
+        try:
+            if not self._env_path.exists():
+                be.save_project_scanner_env(self._current_overrides(), self._project_dir)
+            be.open_path(self._env_path)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Open Project Env", str(exc))
+
+    def _act_delete(self) -> None:
+        try:
+            if not self._env_path.exists():
+                return
+            resp = QtWidgets.QMessageBox.question(
+                self,
+                "Delete Overrides",
+                "Delete this project's overrides file and revert to inherited scanner.env values?",
+            )
+            if resp != QtWidgets.QMessageBox.StandardButton.Yes:
+                return
+            be.delete_project_scanner_env(self._project_dir)
+            self._load()
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Delete Overrides", str(exc))
+
+
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
@@ -4291,10 +4469,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cb_project_overwrite.setChecked(False)
         self.cb_project_overwrite.setStyleSheet("color:#0f172a; font-size: 12px;")
         self.btn_project_update = QtWidgets.QPushButton("Update Project")
+        self.btn_project_env = QtWidgets.QPushButton("Project Env")
         self.btn_project_delete = QtWidgets.QPushButton("Delete Project")
         self.btn_project_open_folder = QtWidgets.QPushButton("Open Folder")
         self.btn_project_open_workbook = QtWidgets.QPushButton("Open Workbook")
-        for b in (self.btn_project_update, self.btn_project_delete, self.btn_project_open_folder, self.btn_project_open_workbook):
+        for b in (
+            self.btn_project_update,
+            self.btn_project_env,
+            self.btn_project_delete,
+            self.btn_project_open_folder,
+            self.btn_project_open_workbook,
+        ):
             b.setStyleSheet(
                 """
                 QPushButton {
@@ -4310,11 +4495,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 """
             )
         self.btn_project_update.clicked.connect(self._act_update_project)
+        self.btn_project_env.clicked.connect(self._act_project_env)
         self.btn_project_delete.clicked.connect(self._act_delete_project)
         self.btn_project_open_folder.clicked.connect(self._act_open_project_folder)
         self.btn_project_open_workbook.clicked.connect(self._act_open_project_workbook)
         actions.addWidget(self.cb_project_overwrite)
         actions.addWidget(self.btn_project_update)
+        actions.addWidget(self.btn_project_env)
         actions.addWidget(self.btn_project_delete)
         actions.addWidget(self.btn_project_open_folder)
         actions.addWidget(self.btn_project_open_workbook)
@@ -4419,6 +4606,8 @@ class MainWindow(QtWidgets.QMainWindow):
             )
         if hasattr(self, "btn_project_implementation"):
             self.btn_project_implementation.setEnabled(bool(record) and is_trending)
+        if hasattr(self, "btn_project_env"):
+            self.btn_project_env.setEnabled(bool(record))
 
     def _act_open_project_folder(self) -> None:
         item = self._selected_project_item(2)
@@ -4439,6 +4628,20 @@ class MainWindow(QtWidgets.QMainWindow):
             be.open_path(path)
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "Open Workbook", str(exc))
+
+    def _act_project_env(self) -> None:
+        try:
+            record = self._selected_project_record()
+            if not record:
+                raise RuntimeError("Select a project in the list first.")
+            project_dir = Path(str(record.get("folder") or "")).expanduser()
+            if not project_dir.exists():
+                raise RuntimeError(f"Project folder not found: {project_dir}")
+            dlg = ProjectEnvDialog(project_dir, self)
+            self._prepare_dialog(dlg)
+            dlg.exec()
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Project Env", str(exc))
 
     def _act_open_project_implementation(self) -> None:
         try:

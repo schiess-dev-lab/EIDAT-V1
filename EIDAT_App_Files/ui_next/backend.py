@@ -48,6 +48,7 @@ DEFAULT_PDF_DIR = DEFAULT_REPO_ROOT
 SCANNER_ENV = DATA_ROOT / "user_inputs" / "scanner.env"
 SCANNER_ENV_LOCAL = DATA_ROOT / "user_inputs" / "scanner.local.env"
 OCR_FORCE_ENV = DATA_ROOT / "user_inputs" / "ocr_force.env"
+PROJECT_SCANNER_ENV_NAME = "scanner.project.env"
 DOTENV_FILES = [
     DATA_ROOT / ".env",
     DATA_ROOT / "user_inputs" / ".env",
@@ -213,19 +214,41 @@ def parse_scanner_env(path: Path = SCANNER_ENV) -> Dict[str, str]:
     return env
 
 
-def load_scanner_env() -> Dict[str, str]:
+def project_scanner_env_path(project_dir: Path) -> Path:
+    return Path(project_dir).expanduser() / PROJECT_SCANNER_ENV_NAME
+
+
+def load_project_scanner_env(project_dir: Path) -> Dict[str, str]:
+    """Load per-project overrides from `<project>/scanner.project.env` (if present)."""
+    return parse_scanner_env(project_scanner_env_path(project_dir))
+
+
+def delete_project_scanner_env(project_dir: Path) -> None:
+    """Delete the per-project env override file, if it exists."""
+    p = project_scanner_env_path(project_dir)
+    try:
+        if p.exists():
+            p.unlink()
+    except Exception:
+        pass
+
+
+def load_scanner_env(project_dir: Optional[Path] = None) -> Dict[str, str]:
     """Load effective scanner config from all supported env files (last wins)."""
     env: Dict[str, str] = {}
     # Precedence (last wins):
     #   1) Legacy user_inputs/ocr_force.env (deprecated; fallback only)
     #   2) user_inputs/scanner.env (shared template/docs)
     #   3) user_inputs/scanner.local.env (machine-specific overrides)
-    #   4) project/user_inputs .env overrides
+    #   4) repo-local .env overrides (DATA_ROOT/.env, DATA_ROOT/user_inputs/.env)
+    #   5) per-project overrides (<project>/scanner.project.env)
     env.update(parse_scanner_env(OCR_FORCE_ENV))
     env.update(parse_scanner_env(SCANNER_ENV))
     env.update(parse_scanner_env(SCANNER_ENV_LOCAL))
     for path in DOTENV_FILES:
         env.update(parse_scanner_env(path))
+    if project_dir:
+        env.update(load_project_scanner_env(Path(project_dir)))
     # Remove deprecated force flags (no longer used)
     for key in (
         "EIDAT_FORCE_NUMERIC_RESCUE",
@@ -245,8 +268,15 @@ def _env_truthy(val: object) -> bool:
     return s in {"1", "true", "yes", "on", "enable", "enabled"}
 
 
-def save_scanner_env(env_map: Dict[str, str], path: Path = SCANNER_ENV_LOCAL) -> None:
-    order = [
+def save_scanner_env(
+    env_map: Dict[str, str],
+    path: Path = SCANNER_ENV_LOCAL,
+    *,
+    order: Optional[list[str]] = None,
+    header_lines: Optional[list[str]] = None,
+) -> None:
+    if order is None:
+        order = [
         "QUIET",
         "force_background_processes",
         "REPO_ROOT",
@@ -257,7 +287,13 @@ def save_scanner_env(env_map: Dict[str, str], path: Path = SCANNER_ENV_LOCAL) ->
         "XY_LOG",
         "OCR_ROW_EPS",
         "VENV_DIR",
-    ]
+        ]
+    if header_lines is None:
+        header_lines = [
+            "# Scanner configuration (KEY=VALUE)",
+            "# Edited via new GUI",
+            "# EIDAT_TRENDING_COMBINED_ONLY=1 forces trending extraction to use combined.txt only",
+        ]
 
     # Normalize input (preserve original key case for new lines)
     env_norm: dict[str, tuple[str, str]] = {}
@@ -313,11 +349,7 @@ def save_scanner_env(env_map: Dict[str, str], path: Path = SCANNER_ENV_LOCAL) ->
         return
 
     # No existing file: create a clean template with defaults ordering.
-    lines = [
-        "# Scanner configuration (KEY=VALUE)",
-        "# Edited via new GUI",
-        "# EIDAT_TRENDING_COMBINED_ONLY=1 forces trending extraction to use combined.txt only",
-    ]
+    lines = list(header_lines or [])
     written = set()
     for k in order:
         k_norm = k.upper()
@@ -331,11 +363,38 @@ def save_scanner_env(env_map: Dict[str, str], path: Path = SCANNER_ENV_LOCAL) ->
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def save_project_scanner_env(env_map: Dict[str, str], project_dir: Path) -> Path:
+    """
+    Save per-project overrides into `<project>/scanner.project.env`.
+
+    This file is intended to hold only overrides that apply to that project (last-wins vs scanner.env).
+    """
+    proj_dir = Path(project_dir).expanduser()
+    p = project_scanner_env_path(proj_dir)
+    save_scanner_env(
+        env_map,
+        path=p,
+        order=[
+            "EIDAT_TRENDING_COMBINED_ONLY",
+            "EIDAT_FUZZY_HEADER_STICK",
+            "EIDAT_FUZZY_HEADER_MIN_RATIO",
+            "EIDAT_FUZZY_TERM_STICK",
+            "EIDAT_FUZZY_TERM_MIN_RATIO",
+        ],
+        header_lines=[
+            "# Project scanner overrides (KEY=VALUE)",
+            "# This file overrides user_inputs/scanner.env + user_inputs/scanner.local.env for THIS project only.",
+            "# Delete this file to revert to inherited scanner.env values.",
+        ],
+    )
+    return p
+
+
 def get_repo_root() -> Path:
     """Return repository root from scanner.env or DEFAULT_REPO_ROOT."""
     ensure_repo_root_name_file()
     node_root = (os.environ.get("EIDAT_NODE_ROOT") or "").strip()
-    env = load_scanner_env()
+    env = load_scanner_env(project_dir=wb_path.parent)
     val = env.get("REPO_ROOT", "").strip()
     try:
         if val:
@@ -631,7 +690,7 @@ def _venv_python_from(path: Path) -> Path:
 
 
 def resolve_project_python() -> str:
-    env = load_scanner_env()
+    env = load_scanner_env(project_dir=wb_path.parent)
     vdir = env.get("VENV_DIR", "").strip()
     if vdir:
         cand = _venv_python_from(Path(vdir))

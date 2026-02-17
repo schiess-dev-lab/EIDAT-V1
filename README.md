@@ -149,6 +149,21 @@ Projects are registered in:
 This replaces the old shared JSON registry and is safe for concurrent writers using SQLite WAL.
 If `projects.json` exists, EIDAT will migrate it into SQLite automatically the first time.
 
+## Project-level overrides (per project)
+For **EIDP Trending** / **EIDP Raw File Trending** projects, you can override selected `scanner.env` knobs for a single project by creating:
+
+- `<project_dir>\scanner.project.env`
+
+Precedence (last wins):
+
+- Central Runtime `user_inputs/scanner.env`
+- Node-local `user_inputs/scanner.local.env`
+- Project override `<project_dir>\scanner.project.env`
+
+Node GUI access:
+
+- **Projects** tab → select a project → **Project Env**
+
 ## Node-local writable config/data (avoids writing into Central Runtime)
 When launched from a node run file, EIDAT sets:
 
