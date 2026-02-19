@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS documents (
   document_type_acronym TEXT,
   vendor TEXT,
   acceptance_test_plan_number TEXT,
+  excel_sqlite_rel TEXT,
   title_norm TEXT,
   similarity_group TEXT,
   indexed_epoch_ns INTEGER NOT NULL,
@@ -242,6 +243,7 @@ def build_index(paths: SupportPaths, *, similarity: float = 0.86) -> IndexSummar
                 "document_type_acronym": meta.get("document_type_acronym"),
                 "vendor": meta.get("vendor"),
                 "acceptance_test_plan_number": meta.get("acceptance_test_plan_number"),
+                "excel_sqlite_rel": meta.get("excel_sqlite_rel"),
                 "title_norm": title_norm,
                 "similarity_group": "",
                 "certification_status": cert_info.get("certification_status"),
@@ -262,6 +264,7 @@ def build_index(paths: SupportPaths, *, similarity: float = 0.86) -> IndexSummar
             ("document_type_acronym", "TEXT"),
             ("vendor", "TEXT"),
             ("acceptance_test_plan_number", "TEXT"),
+            ("excel_sqlite_rel", "TEXT"),
         ]
         for col_name, col_type in migration_columns:
             try:
@@ -277,9 +280,9 @@ def build_index(paths: SupportPaths, *, similarity: float = 0.86) -> IndexSummar
                   metadata_rel, artifacts_rel, program_title, asset_type,
                   serial_number, part_number, revision, test_date, report_date, document_type,
                   document_type_acronym, vendor, acceptance_test_plan_number,
-                  title_norm, similarity_group, indexed_epoch_ns,
+                  excel_sqlite_rel, title_norm, similarity_group, indexed_epoch_ns,
                   certification_status, certification_pass_rate
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     d["metadata_rel"],
@@ -295,6 +298,7 @@ def build_index(paths: SupportPaths, *, similarity: float = 0.86) -> IndexSummar
                     d.get("document_type_acronym"),
                     d.get("vendor"),
                     d.get("acceptance_test_plan_number"),
+                    d.get("excel_sqlite_rel"),
                     d["title_norm"],
                     d["similarity_group"],
                     now_ns,

@@ -1176,10 +1176,10 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
 
         title = QtWidgets.QLabel("New Project")
         title.setStyleSheet("font-size: 18px; font-weight: 700; color: #0f172a;")
-        subtitle = QtWidgets.QLabel("Projects live inside the selected Global Repo and start as a project workbook.")
-        subtitle.setStyleSheet("font-size: 12px; color: #475569;")
+        self.lbl_subtitle = QtWidgets.QLabel("Projects live inside the selected Global Repo and start as a project workbook.")
+        self.lbl_subtitle.setStyleSheet("font-size: 12px; color: #475569;")
         v.addWidget(title)
-        v.addWidget(subtitle)
+        v.addWidget(self.lbl_subtitle)
 
         self._stack = QtWidgets.QStackedWidget()
         v.addWidget(self._stack, 1)
@@ -1225,6 +1225,7 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
         self.cb_type.addItems([
             getattr(be, "EIDAT_PROJECT_TYPE_TRENDING", "EIDP Trending"),
             getattr(be, "EIDAT_PROJECT_TYPE_RAW_TRENDING", "EIDP Raw File Trending"),
+            getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending"),
         ])
         self.cb_type.currentIndexChanged.connect(self._on_project_type_changed)
 
@@ -1269,7 +1270,9 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
     def _on_project_type_changed(self) -> None:
         ptype = str(self.cb_type.currentText() or "").strip()
         is_raw = ptype == getattr(be, "EIDAT_PROJECT_TYPE_RAW_TRENDING", "EIDP Raw File Trending")
-        if is_raw:
+        is_test_data = ptype == getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending")
+        is_eidp = ptype == getattr(be, "EIDAT_PROJECT_TYPE_TRENDING", "EIDP Trending")
+        if is_raw or is_test_data:
             self.rb_auto_populate.setChecked(False)
             self.rb_blank.setChecked(True)
             self.rb_auto_populate.setEnabled(False)
@@ -1278,17 +1281,85 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
             self.rb_auto_populate.setEnabled(True)
             self.rb_blank.setEnabled(True)
 
+        try:
+            if is_test_data and (self.ed_name.text() or "").strip() == "EIDP Trending Project":
+                self.ed_name.setText("Test Data Trending Project")
+            elif is_eidp and (self.ed_name.text() or "").strip() == "Test Data Trending Project":
+                self.ed_name.setText("EIDP Trending Project")
+        except Exception:
+            pass
+
         cont = getattr(self, "_continued_container", None)
         if cont is not None:
-            cont.setEnabled(not is_raw)
-            if is_raw:
+            cont.setEnabled(not (is_raw or is_test_data))
+            if is_raw or is_test_data:
                 for cb in (self.cb_cont_program, self.cb_cont_part, self.cb_cont_vendor, self.cb_cont_asset):
                     cb.setChecked(False)
+
+        try:
+            if is_test_data:
+                self.lbl_subtitle.setText(
+                    "Test Data Trending projects are created from TD reports with extracted Excel SQLite packages."
+                )
+            else:
+                self.lbl_subtitle.setText(
+                    "Projects live inside the selected Global Repo and start as a project workbook."
+                )
+        except Exception:
+            pass
+
+        # Test Data projects are currently "All only" (no program/asset/group pre-filtering).
+        try:
+            if is_test_data:
+                self.rb_all.setChecked(True)
+                self.rb_all.setText("All indexed TD reports")
+                for w in (self.rb_program, self.rb_asset, self.rb_group):
+                    w.setEnabled(False)
+                for w in (self.cb_program, self.cb_asset, self.cb_group):
+                    w.setEnabled(False)
+                if hasattr(self, "lbl_select_hint"):
+                    self.lbl_select_hint.setText(
+                        "Select TD reports only (must have extracted Excel data). EIDP Trending projects cannot be created from TD reports."
+                    )
+                if hasattr(self, "_cont_label"):
+                    self._cont_label.setVisible(False)
+                if hasattr(self, "_cont_hint"):
+                    self._cont_hint.setVisible(False)
+                if hasattr(self, "_continued_container"):
+                    self._continued_container.setVisible(False)
+            else:
+                self.rb_all.setText("All indexed EIDPs")
+                for w in (self.rb_program, self.rb_asset, self.rb_group):
+                    w.setEnabled(True)
+                for w in (self.cb_program, self.cb_asset, self.cb_group):
+                    w.setEnabled(True)
+                if hasattr(self, "lbl_select_hint"):
+                    self.lbl_select_hint.setText(
+                        "Select EIDPs only (non-TD). Use Test Data Trending for TD reports."
+                    )
+                if hasattr(self, "_cont_label"):
+                    self._cont_label.setVisible(True)
+                if hasattr(self, "_cont_hint"):
+                    self._cont_hint.setVisible(True)
+                if hasattr(self, "_continued_container"):
+                    self._continued_container.setVisible(True)
+        except Exception:
+            pass
+
+        try:
+            self._apply_filter_and_refresh_table(select_all=True)
+        except Exception:
+            pass
 
     def _build_page_select(self) -> None:
         v = QtWidgets.QVBoxLayout(self._page_select)
         v.setContentsMargins(0, 0, 0, 0)
         v.setSpacing(10)
+
+        self.lbl_select_hint = QtWidgets.QLabel("Select EIDPs only (non-TD). Use Test Data Trending for TD reports.")
+        self.lbl_select_hint.setStyleSheet("color: #475569; font-size: 11px;")
+        self.lbl_select_hint.setWordWrap(True)
+        v.addWidget(self.lbl_select_hint)
 
         top = QtWidgets.QHBoxLayout()
         top.setSpacing(12)
@@ -1318,7 +1389,7 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
         top.addWidget(self.cb_group, 1)
         v.addLayout(top)
 
-        tbl_cols = ["Select", "Program", "Serial", "Asset Type", "Metadata (rel)", "Group"]
+        tbl_cols = ["Select", "Program", "Serial", "Doc Type", "Asset Type", "Metadata (rel)", "Group"]
         self.tbl = QtWidgets.QTableWidget(0, len(tbl_cols))
         self.tbl.setHorizontalHeaderLabels(tbl_cols)
         self.tbl.verticalHeader().setVisible(False)
@@ -1342,16 +1413,16 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
         bottom.addWidget(self.btn_sel_none)
         v.addLayout(bottom)
 
-        cont_label = QtWidgets.QLabel("Allow Continued EIDP Population By:")
-        cont_label.setStyleSheet("font-weight: 600; color: #374151; margin-top: 8px;")
-        v.addWidget(cont_label)
+        self._cont_label = QtWidgets.QLabel("Allow Continued EIDP Population By:")
+        self._cont_label.setStyleSheet("font-weight: 600; color: #374151; margin-top: 8px;")
+        v.addWidget(self._cont_label)
 
-        cont_hint = QtWidgets.QLabel(
+        self._cont_hint = QtWidgets.QLabel(
             "Any future EIDP that matches these metadata values is auto-added to the project on refresh/update."
         )
-        cont_hint.setStyleSheet("color: #64748b; font-size: 11px;")
-        cont_hint.setWordWrap(True)
-        v.addWidget(cont_hint)
+        self._cont_hint.setStyleSheet("color: #64748b; font-size: 11px;")
+        self._cont_hint.setWordWrap(True)
+        v.addWidget(self._cont_hint)
 
         self.cb_cont_program = QtWidgets.QCheckBox("Program")
         self.cb_cont_part = QtWidgets.QCheckBox("Part Number")
@@ -1460,6 +1531,37 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
             self.cb_group.addItem("(none)", "")
 
     def _filtered_docs(self, docs: list[dict]) -> list[dict]:
+        ptype = str(self.cb_type.currentText() or "").strip()
+        is_test_data = ptype == getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending")
+        def _is_td(d: dict) -> bool:
+            try:
+                dt = str(d.get("document_type") or "").strip().lower()
+            except Exception:
+                dt = ""
+            try:
+                acr = str(d.get("document_type_acronym") or "").strip().lower()
+            except Exception:
+                acr = ""
+            return dt in {"test data", "testdata", "td"} or acr in {"test data", "testdata", "td"}
+
+        if is_test_data:
+            def _is_test_data_excel(d: dict) -> bool:
+                ok_dt = _is_td(d)
+                try:
+                    art = str(d.get("artifacts_rel") or "").strip().lower()
+                except Exception:
+                    art = ""
+                try:
+                    sqlite_rel = str(d.get("excel_sqlite_rel") or "").strip()
+                except Exception:
+                    sqlite_rel = ""
+                ok_excel = bool(sqlite_rel) or "__excel" in art
+                return bool(ok_dt and ok_excel)
+
+            docs = [d for d in docs if isinstance(d, dict) and _is_test_data_excel(d)]
+        else:
+            # EIDP projects must not be created from TD reports.
+            docs = [d for d in docs if isinstance(d, dict) and not _is_td(d)]
         if self.rb_program.isChecked():
             wanted = str(self.cb_program.currentText() or "").strip()
             return [d for d in docs if str(d.get("program_title") or "").strip() == wanted]
@@ -1499,12 +1601,13 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
 
             self.tbl.setItem(r, 1, QtWidgets.QTableWidgetItem(str(d.get("program_title") or "")))
             self.tbl.setItem(r, 2, QtWidgets.QTableWidgetItem(str(d.get("serial_number") or "")))
-            self.tbl.setItem(r, 3, QtWidgets.QTableWidgetItem(str(d.get("asset_type") or "")))
-            self.tbl.setItem(r, 4, QtWidgets.QTableWidgetItem(str(d.get("metadata_rel") or "")))
-            self.tbl.setItem(r, 5, QtWidgets.QTableWidgetItem(str(d.get("similarity_group") or "")))
+            self.tbl.setItem(r, 3, QtWidgets.QTableWidgetItem(str(d.get("document_type") or d.get("document_type_acronym") or "")))
+            self.tbl.setItem(r, 4, QtWidgets.QTableWidgetItem(str(d.get("asset_type") or "")))
+            self.tbl.setItem(r, 5, QtWidgets.QTableWidgetItem(str(d.get("metadata_rel") or "")))
+            self.tbl.setItem(r, 6, QtWidgets.QTableWidgetItem(str(d.get("similarity_group") or "")))
 
         self.tbl.resizeColumnsToContents()
-        self.tbl.horizontalHeader().setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.tbl.horizontalHeader().setSectionResizeMode(5, QtWidgets.QHeaderView.ResizeMode.Stretch)
 
     def _set_all_checks(self, checked: bool) -> None:
         for r in range(self.tbl.rowCount()):
@@ -1522,7 +1625,7 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
             widget = self.tbl.cellWidget(r, 0)
             cb = widget.findChild(QtWidgets.QCheckBox) if widget else None
             if cb and cb.isChecked():
-                item = self.tbl.item(r, 4)
+                item = self.tbl.item(r, 5)
                 if item and item.text().strip():
                     selected.append(item.text().strip())
         return selected
@@ -1595,6 +1698,9 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
             location = Path((self.ed_location.text() or "").strip())
             selected = self._selected_metadata_rel()
             if not selected:
+                ptype = str(self.cb_type.currentText() or "").strip()
+                if ptype == getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending"):
+                    raise RuntimeError("Select at least one Test Data Excel document.")
                 raise RuntimeError("Select at least one EIDP.")
             continued_rules, missing = self._selected_continued_population()
             if missing:
@@ -2451,6 +2557,827 @@ class ImplementationTrendDialog(QtWidgets.QDialog):
                     name = str(plot.get("name") or "").strip()
                     title_text = f"Trend Plot — {name}" if name else self._compose_title(payloads)
                     fig = self._render_plot_to_figure(payloads, title_text=title_text)
+                    pdf.savefig(fig)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Save All Auto-Plots", str(exc))
+
+
+class TestDataTrendDialog(QtWidgets.QDialog):
+    def __init__(self, project_dir: Path, workbook_path: Path, parent=None):
+        super().__init__(parent)
+        self._project_dir = Path(project_dir).expanduser()
+        self._workbook_path = Path(workbook_path).expanduser()
+        self._db_path: Path | None = None
+        self._plot_ready = False
+        self._mode = "curves"  # or "metrics"
+        self._highlight_sn = ""
+        self._auto_plots: list[dict] = []
+        self._last_plot_def: dict | None = None
+        self._auto_plot_path = self._project_dir / "auto_plots_test_data.json"
+
+        self.setWindowTitle("Test Data - Trend / Analyze")
+        self.resize(1180, 760)
+        self.setStyleSheet(
+            """
+            QDialog { background: #f8fafc; color: #0f172a; }
+            QLabel { color: #0f172a; }
+            QListWidget {
+                background: #ffffff;
+                border: 1px solid #e2e8f0;
+                border-radius: 8px;
+                padding: 6px;
+            }
+            QListWidget::item { color: #0f172a; padding: 4px 6px; }
+            QListWidget::item:selected { background: #dbeafe; color: #1e3a8a; }
+            QTableWidget {
+                background: #ffffff;
+                border: 1px solid #e2e8f0;
+                border-radius: 8px;
+                gridline-color: #e2e8f0;
+            }
+            QHeaderView::section {
+                background: #f1f5f9;
+                color: #0f172a;
+                padding: 6px 8px;
+                border: 1px solid #e2e8f0;
+                font-weight: 600;
+            }
+            """
+        )
+
+        root = QtWidgets.QHBoxLayout(self)
+        root.setContentsMargins(16, 16, 16, 16)
+        root.setSpacing(16)
+
+        splitter = QtWidgets.QSplitter()
+        splitter.setOrientation(QtCore.Qt.Orientation.Horizontal)
+        root.addWidget(splitter)
+
+        # Left panel: controls
+        left = QtWidgets.QFrame()
+        left.setStyleSheet("QFrame { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 10px; }")
+        left_layout = QtWidgets.QVBoxLayout(left)
+        left_layout.setContentsMargins(12, 12, 12, 12)
+        left_layout.setSpacing(10)
+
+        title = QtWidgets.QLabel("Test Data Trend / Analyze")
+        title.setStyleSheet("font-size: 14px; font-weight: 700;")
+        left_layout.addWidget(title)
+
+        # Clear mode switcher (tabs hidden; these buttons are the main UI).
+        switch_row = QtWidgets.QHBoxLayout()
+        switch_lbl = QtWidgets.QLabel("Mode:")
+        switch_lbl.setStyleSheet("font-size: 12px; font-weight: 700; color: #334155;")
+        self.btn_mode_curves = QtWidgets.QPushButton("Plot Curves")
+        self.btn_mode_metrics = QtWidgets.QPushButton("Plot Metrics")
+        for b in (self.btn_mode_curves, self.btn_mode_metrics):
+            b.setCheckable(True)
+            b.setStyleSheet(
+                """
+                QPushButton {
+                    padding: 6px 10px;
+                    border-radius: 8px;
+                    background: #ffffff;
+                    border: 1px solid #cbd5e1;
+                    font-size: 12px;
+                    font-weight: 700;
+                    color: #0f172a;
+                }
+                QPushButton:checked {
+                    background: #dbeafe;
+                    border-color: #60a5fa;
+                    color: #1e3a8a;
+                }
+                """
+            )
+        self._mode_group = QtWidgets.QButtonGroup(self)
+        self._mode_group.setExclusive(True)
+        self._mode_group.addButton(self.btn_mode_curves)
+        self._mode_group.addButton(self.btn_mode_metrics)
+        self.btn_mode_curves.clicked.connect(lambda: self._set_mode("curves"))
+        self.btn_mode_metrics.clicked.connect(lambda: self._set_mode("metrics"))
+
+        switch_row.addWidget(switch_lbl)
+        switch_row.addWidget(self.btn_mode_curves)
+        switch_row.addWidget(self.btn_mode_metrics)
+        switch_row.addStretch(1)
+        left_layout.addLayout(switch_row)
+
+        cache_row = QtWidgets.QHBoxLayout()
+        self.btn_refresh_cache = QtWidgets.QPushButton("Build / Refresh Cache")
+        self.btn_refresh_cache.clicked.connect(lambda: self._load_cache(rebuild=True))
+        self.btn_plot = QtWidgets.QPushButton("Plot Curves")
+        self.btn_plot.clicked.connect(self._plot_current_mode)
+        self.lbl_cache = QtWidgets.QLabel("")
+        self.lbl_cache.setStyleSheet("color: #64748b; font-size: 11px;")
+        self.lbl_cache.setWordWrap(True)
+        cache_row.addWidget(self.btn_refresh_cache)
+        cache_row.addWidget(self.btn_plot)
+        cache_row.addStretch(1)
+        left_layout.addLayout(cache_row)
+        left_layout.addWidget(self.lbl_cache)
+
+        form = QtWidgets.QFormLayout()
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setSpacing(8)
+
+        self.cb_run = QtWidgets.QComboBox()
+        self.cb_run.currentIndexChanged.connect(self._refresh_columns_for_run)
+        form.addRow("Run:", self.cb_run)
+        left_layout.addLayout(form)
+
+        tabs = QtWidgets.QTabWidget()
+        try:
+            tabs.tabBar().hide()
+        except Exception:
+            pass
+        self._tabs = tabs
+
+        # Metrics tab
+        tab_metrics = QtWidgets.QWidget()
+        metrics_layout = QtWidgets.QVBoxLayout(tab_metrics)
+        metrics_layout.setContentsMargins(10, 10, 10, 10)
+        metrics_layout.setSpacing(8)
+
+        lbl_y_multi = QtWidgets.QLabel("Y Columns (multi-select)")
+        lbl_y_multi.setStyleSheet("font-size: 12px; font-weight: 700; color: #334155;")
+        metrics_layout.addWidget(lbl_y_multi)
+
+        self.list_y_metrics = QtWidgets.QListWidget()
+        self.list_y_metrics.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.list_y_metrics.itemSelectionChanged.connect(self._refresh_stats_preview)
+        metrics_layout.addWidget(self.list_y_metrics, 1)
+
+        y_sel_row = QtWidgets.QHBoxLayout()
+        self.btn_y_select_all = QtWidgets.QPushButton("Select All")
+        self.btn_y_clear_all = QtWidgets.QPushButton("Clear")
+        self.btn_y_select_all.clicked.connect(lambda: self.list_y_metrics.selectAll())
+        self.btn_y_clear_all.clicked.connect(lambda: self.list_y_metrics.clearSelection())
+        y_sel_row.addWidget(self.btn_y_select_all)
+        y_sel_row.addWidget(self.btn_y_clear_all)
+        y_sel_row.addStretch(1)
+        metrics_layout.addLayout(y_sel_row)
+
+        row_metrics = QtWidgets.QHBoxLayout()
+        self.cb_stat = QtWidgets.QComboBox()
+        self.cb_stat.addItems(["mean", "min", "max", "std", "median", "count"])
+        row_metrics.addWidget(QtWidgets.QLabel("Stat:"))
+        row_metrics.addWidget(self.cb_stat, 1)
+        metrics_layout.addLayout(row_metrics)
+
+        # Curves tab
+        tab_curves = QtWidgets.QWidget()
+        curves_layout = QtWidgets.QVBoxLayout(tab_curves)
+        curves_layout.setContentsMargins(10, 10, 10, 10)
+        curves_layout.setSpacing(8)
+
+        row_y_curve = QtWidgets.QHBoxLayout()
+        row_y_curve.addWidget(QtWidgets.QLabel("Y Column:"))
+        self.cb_y_curve = QtWidgets.QComboBox()
+        self.cb_y_curve.currentIndexChanged.connect(self._refresh_stats_preview)
+        row_y_curve.addWidget(self.cb_y_curve, 1)
+        curves_layout.addLayout(row_y_curve)
+
+        row_curves = QtWidgets.QHBoxLayout()
+        self.cb_x = QtWidgets.QComboBox()
+        row_curves.addWidget(QtWidgets.QLabel("X Column:"))
+        row_curves.addWidget(self.cb_x, 1)
+        curves_layout.addLayout(row_curves)
+
+        tabs.addTab(tab_metrics, "Metrics")
+        tabs.addTab(tab_curves, "Curves")
+        left_layout.addWidget(tabs)
+
+        # Serial highlight (not selection/filtering for plotting)
+        lbl_serials = QtWidgets.QLabel("Highlight Serial (optional)")
+        lbl_serials.setStyleSheet("font-size: 12px; font-weight: 700;")
+        left_layout.addWidget(lbl_serials)
+
+        self.ed_filter_serials = QtWidgets.QLineEdit()
+        self.ed_filter_serials.setPlaceholderText("Filter serials (e.g., SN0001)")
+        self.ed_filter_serials.textChanged.connect(self._apply_serial_filter)
+        left_layout.addWidget(self.ed_filter_serials)
+
+        self.list_serials = QtWidgets.QListWidget()
+        self.list_serials.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        self.list_serials.setMaximumHeight(140)
+        self.list_serials.itemSelectionChanged.connect(self._on_highlight_changed)
+        left_layout.addWidget(self.list_serials)
+
+        auto_lbl = QtWidgets.QLabel("Auto-Plots")
+        auto_lbl.setStyleSheet("font-size: 12px; font-weight: 700;")
+        left_layout.addWidget(auto_lbl)
+
+        self.list_auto_plots = QtWidgets.QListWidget()
+        self.list_auto_plots.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.list_auto_plots.itemDoubleClicked.connect(lambda *_: self._open_selected_auto_plot())
+        self.list_auto_plots.itemSelectionChanged.connect(self._update_auto_actions)
+        self.list_auto_plots.setMaximumHeight(170)
+        left_layout.addWidget(self.list_auto_plots)
+
+        auto_row = QtWidgets.QHBoxLayout()
+        self.btn_open_auto = QtWidgets.QPushButton("Open")
+        self.btn_open_auto.setEnabled(False)
+        self.btn_open_auto.clicked.connect(self._open_selected_auto_plot)
+        self.btn_delete_auto = QtWidgets.QPushButton("Delete")
+        self.btn_delete_auto.setEnabled(False)
+        self.btn_delete_auto.clicked.connect(self._delete_selected_auto_plots)
+        self.btn_save_all_auto = QtWidgets.QPushButton("Save All PDF")
+        self.btn_save_all_auto.setEnabled(False)
+        self.btn_save_all_auto.clicked.connect(self._save_all_auto_plots_pdf)
+        auto_row.addWidget(self.btn_open_auto)
+        auto_row.addWidget(self.btn_delete_auto)
+        auto_row.addWidget(self.btn_save_all_auto)
+        left_layout.addLayout(auto_row)
+
+        splitter.addWidget(left)
+
+        # Right panel: plot + stats
+        right = QtWidgets.QFrame()
+        right.setStyleSheet("QFrame { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 10px; }")
+        right_layout = QtWidgets.QVBoxLayout(right)
+        right_layout.setContentsMargins(12, 12, 12, 12)
+        right_layout.setSpacing(10)
+
+        plot_header = QtWidgets.QHBoxLayout()
+        plot_title = QtWidgets.QLabel("Plot")
+        plot_title.setStyleSheet("font-size: 14px; font-weight: 700;")
+        self.btn_add_auto_plot = QtWidgets.QPushButton("Add to Auto-Plots")
+        self.btn_add_auto_plot.setEnabled(False)
+        self.btn_add_auto_plot.clicked.connect(self._add_current_plot_to_autoplots)
+        self.btn_save_plot_pdf = QtWidgets.QPushButton("Save Plot PDF")
+        self.btn_save_plot_pdf.setEnabled(False)
+        self.btn_save_plot_pdf.clicked.connect(self._save_plot_pdf)
+        self.lbl_source = QtWidgets.QLabel("")
+        self.lbl_source.setStyleSheet("color: #64748b; font-size: 11px;")
+        plot_header.addWidget(plot_title)
+        plot_header.addStretch(1)
+        plot_header.addWidget(self.btn_add_auto_plot)
+        plot_header.addWidget(self.btn_save_plot_pdf)
+        plot_header.addWidget(self.lbl_source)
+        right_layout.addLayout(plot_header)
+
+        self.plot_container = QtWidgets.QFrame()
+        plot_layout = QtWidgets.QVBoxLayout(self.plot_container)
+        plot_layout.setContentsMargins(0, 0, 0, 0)
+        self._canvas = None
+        self._figure = None
+        self._axes = None
+        self._init_plot_area(plot_layout)
+        right_layout.addWidget(self.plot_container, 2)
+
+        stats_label = QtWidgets.QLabel("Highlighted Serial Stats")
+        stats_label.setStyleSheet("font-size: 13px; font-weight: 700;")
+        right_layout.addWidget(stats_label)
+
+        cols = ["Serial", "Count", "Mean", "Std", "Min", "Max"]
+        self.tbl_stats = QtWidgets.QTableWidget(0, len(cols))
+        self.tbl_stats.setHorizontalHeaderLabels(cols)
+        self.tbl_stats.verticalHeader().setVisible(False)
+        self.tbl_stats.setAlternatingRowColors(True)
+        self.tbl_stats.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
+        self.tbl_stats.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.tbl_stats.horizontalHeader().setStretchLastSection(True)
+        right_layout.addWidget(self.tbl_stats, 1)
+
+        splitter.addWidget(right)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 3)
+
+        self._load_cache(rebuild=False)
+        self._load_auto_plots()
+        self._set_mode("curves")
+
+    def _init_plot_area(self, layout: QtWidgets.QVBoxLayout) -> None:
+        try:
+            from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+            from matplotlib.figure import Figure
+
+            self._figure = Figure(figsize=(8, 4), dpi=100)
+            self._axes = self._figure.add_subplot(111)
+            self._axes.set_facecolor("#ffffff")
+            self._figure.patch.set_facecolor("#ffffff")
+            self._canvas = FigureCanvas(self._figure)
+            layout.addWidget(self._canvas)
+            self._plot_ready = True
+        except Exception as exc:
+            self._plot_ready = False
+            label = QtWidgets.QLabel(
+                "Plotting unavailable. Install matplotlib to enable charts.\n"
+                f"Details: {exc}"
+            )
+            label.setWordWrap(True)
+            label.setStyleSheet("color: #b91c1c; font-size: 12px;")
+            layout.addWidget(label)
+
+    def _load_cache(self, *, rebuild: bool) -> None:
+        try:
+            self._db_path = be.ensure_test_data_project_cache(
+                self._project_dir, self._workbook_path, rebuild=bool(rebuild)
+            )
+            self.lbl_source.setText(str(self._db_path))
+            self.lbl_cache.setText(f"Cache DB: {self._db_path}")
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Test Data Cache", str(exc))
+            return
+        self._refresh_from_cache()
+
+    def _refresh_from_cache(self) -> None:
+        if not self._db_path:
+            return
+        try:
+            runs = be.td_list_runs(self._db_path)
+            serials = be.td_list_serials(self._db_path)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Test Data Cache", str(exc))
+            return
+
+        prev_run = self.cb_run.currentText()
+        self.cb_run.blockSignals(True)
+        self.cb_run.clear()
+        self.cb_run.addItems(runs)
+        if prev_run and prev_run in runs:
+            self.cb_run.setCurrentText(prev_run)
+        self.cb_run.blockSignals(False)
+
+        self.list_serials.clear()
+        for sn in serials:
+            item = QtWidgets.QListWidgetItem(sn)
+            item.setData(QtCore.Qt.ItemDataRole.UserRole, sn)
+            self.list_serials.addItem(item)
+
+        # Default highlight: none (user can click one if desired).
+        self._highlight_sn = ""
+
+        self._refresh_columns_for_run()
+        self._refresh_stats_preview()
+
+    def _refresh_columns_for_run(self) -> None:
+        if not self._db_path:
+            return
+        run = (self.cb_run.currentText() or "").strip()
+        if not run:
+            self.cb_y_curve.clear()
+            self.cb_x.clear()
+            self.list_y_metrics.clear()
+            return
+        try:
+            y_cols = be.td_list_y_columns(self._db_path, run)
+            x_cols = be.td_list_x_columns(self._db_path, run)
+        except Exception:
+            y_cols, x_cols = [], []
+
+        prev_y = self.cb_y_curve.currentText()
+        self.cb_y_curve.blockSignals(True)
+        self.cb_y_curve.clear()
+        y_names = [str(c.get("name") or "") for c in y_cols if str(c.get("name") or "").strip()]
+        self.cb_y_curve.addItems(y_names)
+        if prev_y and prev_y in y_names:
+            self.cb_y_curve.setCurrentText(prev_y)
+        self.cb_y_curve.blockSignals(False)
+
+        # Multi-select Y list for metrics mode
+        prev_selected = {it.text() for it in self.list_y_metrics.selectedItems()} if hasattr(self, "list_y_metrics") else set()
+        self.list_y_metrics.blockSignals(True)
+        self.list_y_metrics.clear()
+        for name in y_names:
+            self.list_y_metrics.addItem(QtWidgets.QListWidgetItem(name))
+        # Restore selection if possible; otherwise select all by default.
+        restored = False
+        if prev_selected:
+            for i in range(self.list_y_metrics.count()):
+                it = self.list_y_metrics.item(i)
+                if it.text() in prev_selected:
+                    it.setSelected(True)
+                    restored = True
+        if not restored and self.list_y_metrics.count() > 0:
+            self.list_y_metrics.selectAll()
+        self.list_y_metrics.blockSignals(False)
+
+        prev_x = self.cb_x.currentText()
+        self.cb_x.blockSignals(True)
+        self.cb_x.clear()
+        self.cb_x.addItems([x for x in x_cols if str(x or "").strip()])
+        if prev_x and prev_x in x_cols:
+            self.cb_x.setCurrentText(prev_x)
+        self.cb_x.blockSignals(False)
+
+    def _apply_serial_filter(self) -> None:
+        needle = (self.ed_filter_serials.text() or "").strip().lower()
+        for i in range(self.list_serials.count()):
+            item = self.list_serials.item(i)
+            sn = str(item.data(QtCore.Qt.ItemDataRole.UserRole) or item.text() or "").lower()
+            item.setHidden(bool(needle) and needle not in sn)
+
+    def _on_highlight_changed(self) -> None:
+        items = self.list_serials.selectedItems()
+        sn = ""
+        if items:
+            sn = str(items[0].data(QtCore.Qt.ItemDataRole.UserRole) or items[0].text() or "").strip()
+        self._highlight_sn = sn
+        self._refresh_stats_preview()
+
+    def _populate_stats_table(self, run: str, y_col: str, highlight_sn: str) -> None:
+        if not self._db_path or not run or not y_col:
+            self.tbl_stats.setRowCount(0)
+            return
+
+        want = [highlight_sn] if highlight_sn else []
+        if not want:
+            self.tbl_stats.setRowCount(0)
+            return
+        stats = ["count", "mean", "std", "min", "max"]
+        maps: dict[str, dict[str, float | None]] = {}
+        for st in stats:
+            try:
+                series = be.td_load_metric_series(self._db_path, run, y_col, st)
+            except Exception:
+                series = []
+            maps[st] = {str(r.get("serial") or "").strip(): r.get("value_num") for r in series if str(r.get("serial") or "").strip()}
+
+        self.tbl_stats.setRowCount(0)
+        for r, sn in enumerate(want):
+            self.tbl_stats.insertRow(r)
+
+            def _set(c: int, v: object) -> None:
+                item = QtWidgets.QTableWidgetItem("" if v is None else str(v))
+                item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+                self.tbl_stats.setItem(r, c, item)
+
+            _set(0, sn)
+            _set(1, maps.get("count", {}).get(sn))
+            for idx, st in enumerate(["mean", "std", "min", "max"], start=2):
+                v = maps.get(st, {}).get(sn)
+                if isinstance(v, (int, float)):
+                    _set(idx, f"{float(v):.6g}")
+                else:
+                    _set(idx, "" if v is None else v)
+
+        self.tbl_stats.resizeColumnsToContents()
+
+    def _refresh_stats_preview(self) -> None:
+        run = (self.cb_run.currentText() or "").strip()
+        y_col = ""
+        if self._mode == "curves":
+            y_col = (getattr(self, "cb_y_curve", None).currentText() or "").strip() if hasattr(self, "cb_y_curve") else ""
+        else:
+            # Preview first selected Y column (keeps table compact).
+            selected = [it.text() for it in self.list_y_metrics.selectedItems()] if hasattr(self, "list_y_metrics") else []
+            y_col = (selected[0] if selected else "").strip()
+        self._populate_stats_table(run, y_col, self._highlight_sn)
+
+    def _set_mode(self, mode: str) -> None:
+        m = str(mode or "").strip().lower()
+        if m not in {"curves", "metrics"}:
+            return
+        self._mode = m
+        if hasattr(self, "_tabs"):
+            self._tabs.setCurrentIndex(0 if m == "metrics" else 1)
+        self.btn_mode_curves.setChecked(m == "curves")
+        self.btn_mode_metrics.setChecked(m == "metrics")
+        self.btn_plot.setText("Plot Curves" if m == "curves" else "Plot Metrics")
+        self._refresh_stats_preview()
+
+    def _plot_current_mode(self) -> None:
+        if self._mode == "metrics":
+            self._plot_metrics()
+        else:
+            self._plot_curves()
+
+    def _plot_metrics(self) -> None:
+        if not self._plot_ready or not self._db_path:
+            return
+        run = (self.cb_run.currentText() or "").strip()
+        stat = (self.cb_stat.currentText() or "").strip().lower()
+        if not run or not stat:
+            return
+        y_cols = [it.text().strip() for it in self.list_y_metrics.selectedItems()] if hasattr(self, "list_y_metrics") else []
+        y_cols = [c for c in y_cols if c]
+        if not y_cols:
+            QtWidgets.QMessageBox.information(self, "Plot Metrics", "Select at least one Y column.")
+            return
+
+        # Always plot all serials.
+        try:
+            labels = be.td_list_serials(self._db_path)
+        except Exception:
+            labels = []
+        if not labels:
+            QtWidgets.QMessageBox.information(self, "Plot Metrics", "No serial numbers available.")
+            return
+
+        self._axes.clear()
+        self._axes.set_title(f"{run} — {stat}")
+        self._axes.set_xlabel("Serial Number")
+        self._axes.set_ylabel(stat)
+        x = list(range(len(labels)))
+        any_plotted = False
+        for y_col in y_cols:
+            try:
+                series = be.td_load_metric_series(self._db_path, run, y_col, stat)
+            except Exception:
+                series = []
+            vmap = {str(r.get("serial") or "").strip(): r.get("value_num") for r in series if str(r.get("serial") or "").strip()}
+            y = [
+                (float(vmap.get(sn)) if isinstance(vmap.get(sn), (int, float)) else float("nan"))
+                for sn in labels
+            ]
+            try:
+                line = self._axes.plot(x, y, marker="o", linewidth=1.4, label=f"{y_col}.{stat}")[0]
+                # Highlight the chosen serial with a larger marker (per series).
+                if self._highlight_sn and self._highlight_sn in labels:
+                    idx = labels.index(self._highlight_sn)
+                    self._axes.plot([x[idx]], [y[idx]], marker="o", markersize=9, color=line.get_color())
+                any_plotted = True
+            except Exception:
+                continue
+        if not any_plotted:
+            QtWidgets.QMessageBox.information(self, "Plot Metrics", "No metric values found for this selection.")
+            return
+        self._axes.set_xticks(x)
+        self._axes.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
+        self._axes.grid(True, alpha=0.25)
+        try:
+            self._axes.legend(fontsize=8, loc="best")
+        except Exception:
+            pass
+        try:
+            self._figure.tight_layout()
+        except Exception:
+            pass
+        try:
+            self._canvas.draw()
+        except Exception:
+            pass
+        self.btn_save_plot_pdf.setEnabled(True)
+        self._last_plot_def = {"mode": "metrics", "run": run, "stat": stat, "y": list(y_cols)}
+        self.btn_add_auto_plot.setEnabled(True)
+        # Keep table compact: preview first selected Y column (and highlight).
+        self._refresh_stats_preview()
+
+    def _plot_curves(self) -> None:
+        if not self._plot_ready or not self._db_path:
+            return
+        run = (self.cb_run.currentText() or "").strip()
+        y_col = (self.cb_y_curve.currentText() or "").strip() if hasattr(self, "cb_y_curve") else ""
+        x_col = (self.cb_x.currentText() or "").strip()
+        if not run or not y_col or not x_col:
+            return
+        try:
+            # Always plot all serials.
+            curves = be.td_load_curves(self._db_path, run, y_col, x_col, serials=None)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Plot Curves", str(exc))
+            return
+
+        if not curves:
+            QtWidgets.QMessageBox.information(self, "Plot Curves", "No curve data found for this selection.")
+            return
+
+        self._axes.clear()
+        self._axes.set_title(f"{run} — {y_col} vs {x_col}")
+        self._axes.set_xlabel(x_col)
+        self._axes.set_ylabel(y_col)
+        for s in curves:
+            sn = str(s.get("serial") or "").strip()
+            xs = s.get("x") or []
+            ys = s.get("y") or []
+            if not isinstance(xs, list) or not isinstance(ys, list) or not xs or not ys:
+                continue
+            try:
+                is_hi = bool(self._highlight_sn) and sn == self._highlight_sn
+                self._axes.plot(
+                    xs,
+                    ys,
+                    linewidth=(2.6 if is_hi else 1.1),
+                    alpha=(1.0 if is_hi else 0.75),
+                    label=sn or "SN",
+                )
+            except Exception:
+                continue
+        self._axes.grid(True, alpha=0.25)
+        try:
+            self._axes.legend(fontsize=8, loc="best")
+        except Exception:
+            pass
+        try:
+            self._figure.tight_layout()
+        except Exception:
+            pass
+        try:
+            self._canvas.draw()
+        except Exception:
+            pass
+        self.btn_save_plot_pdf.setEnabled(True)
+        self._last_plot_def = {"mode": "curves", "run": run, "x": x_col, "y": [y_col]}
+        self.btn_add_auto_plot.setEnabled(True)
+        self._populate_stats_table(run, y_col, self._highlight_sn)
+
+    def _save_plot_pdf(self) -> None:
+        if not self._plot_ready or not self._figure:
+            return
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Save Plot PDF",
+            str(self._project_dir / "test_data_plot.pdf"),
+            "PDF Files (*.pdf)",
+        )
+        if not path:
+            return
+        try:
+            self._figure.savefig(path, format="pdf")
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Save Plot PDF", str(exc))
+
+    def _load_auto_plots(self) -> None:
+        self._auto_plots = []
+        try:
+            if self._auto_plot_path.exists():
+                data = json.loads(self._auto_plot_path.read_text(encoding="utf-8"))
+                if isinstance(data, list):
+                    self._auto_plots = [d for d in data if isinstance(d, dict)]
+        except Exception:
+            self._auto_plots = []
+        self._refresh_auto_plots_list()
+
+    def _refresh_auto_plots_list(self) -> None:
+        if not hasattr(self, "list_auto_plots"):
+            return
+        self.list_auto_plots.clear()
+        for d in self._auto_plots:
+            name = str(d.get("name") or "").strip()
+            if not name:
+                mode = str(d.get("mode") or "").strip()
+                run = str(d.get("run") or "").strip()
+                if mode == "curves":
+                    y = ", ".join([str(x) for x in (d.get("y") or []) if str(x).strip()])
+                    x = str(d.get("x") or "").strip()
+                    name = f"Curves: {run} {y} vs {x}".strip()
+                else:
+                    y = ", ".join([str(x) for x in (d.get("y") or []) if str(x).strip()])
+                    st = str(d.get("stat") or "").strip()
+                    name = f"Metrics: {run} {st} ({y})".strip()
+            item = QtWidgets.QListWidgetItem(name or "Auto-Plot")
+            item.setData(QtCore.Qt.ItemDataRole.UserRole, d)
+            self.list_auto_plots.addItem(item)
+        self._update_auto_actions()
+
+    def _update_auto_actions(self) -> None:
+        selected = self.list_auto_plots.selectedItems() if hasattr(self, "list_auto_plots") else []
+        has = bool(selected)
+        if hasattr(self, "btn_open_auto"):
+            self.btn_open_auto.setEnabled(has and self._plot_ready and bool(self._db_path))
+        if hasattr(self, "btn_delete_auto"):
+            self.btn_delete_auto.setEnabled(has)
+        if hasattr(self, "btn_save_all_auto"):
+            self.btn_save_all_auto.setEnabled(bool(self._auto_plots) and self._plot_ready and bool(self._db_path))
+
+    def _add_current_plot_to_autoplots(self) -> None:
+        if not self._last_plot_def:
+            return
+        d = dict(self._last_plot_def)
+        if "name" not in d:
+            if d.get("mode") == "curves":
+                run = str(d.get("run") or "").strip()
+                y = ", ".join([str(x) for x in (d.get("y") or []) if str(x).strip()])
+                x = str(d.get("x") or "").strip()
+                d["name"] = f"Curves: {run} {y} vs {x}".strip()
+            else:
+                run = str(d.get("run") or "").strip()
+                y = ", ".join([str(x) for x in (d.get("y") or []) if str(x).strip()])
+                st = str(d.get("stat") or "").strip()
+                d["name"] = f"Metrics: {run} {st} ({y})".strip()
+        self._auto_plots.append(d)
+        try:
+            self._auto_plot_path.write_text(json.dumps(self._auto_plots, indent=2), encoding="utf-8")
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Auto-Plots", str(exc))
+            return
+        self._refresh_auto_plots_list()
+
+    def _open_selected_auto_plot(self) -> None:
+        if not self._db_path or not self._plot_ready:
+            return
+        items = self.list_auto_plots.selectedItems() if hasattr(self, "list_auto_plots") else []
+        if not items:
+            return
+        d = items[0].data(QtCore.Qt.ItemDataRole.UserRole)
+        if not isinstance(d, dict):
+            return
+        mode = str(d.get("mode") or "").strip().lower()
+        if mode not in {"curves", "metrics"}:
+            return
+        run = str(d.get("run") or "").strip()
+        if run:
+            self.cb_run.setCurrentText(run)
+        self._set_mode(mode)
+        if mode == "curves":
+            ys = d.get("y") or []
+            if isinstance(ys, list) and ys:
+                self.cb_y_curve.setCurrentText(str(ys[0]))
+            x = str(d.get("x") or "").strip()
+            if x:
+                self.cb_x.setCurrentText(x)
+            self._plot_curves()
+        else:
+            st = str(d.get("stat") or "").strip()
+            if st:
+                self.cb_stat.setCurrentText(st)
+            ys = d.get("y") or []
+            want = {str(x).strip() for x in ys if str(x).strip()} if isinstance(ys, list) else set()
+            if want and hasattr(self, "list_y_metrics"):
+                self.list_y_metrics.clearSelection()
+                for i in range(self.list_y_metrics.count()):
+                    it = self.list_y_metrics.item(i)
+                    if it.text() in want:
+                        it.setSelected(True)
+            self._plot_metrics()
+
+    def _delete_selected_auto_plots(self) -> None:
+        items = self.list_auto_plots.selectedItems() if hasattr(self, "list_auto_plots") else []
+        if not items:
+            return
+        to_del = []
+        for it in items:
+            d = it.data(QtCore.Qt.ItemDataRole.UserRole)
+            if isinstance(d, dict):
+                to_del.append(d)
+        if not to_del:
+            return
+        self._auto_plots = [d for d in self._auto_plots if d not in to_del]
+        try:
+            self._auto_plot_path.write_text(json.dumps(self._auto_plots, indent=2), encoding="utf-8")
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Auto-Plots", str(exc))
+            return
+        self._refresh_auto_plots_list()
+
+    def _render_plot_def_to_figure(self, d: dict):
+        from matplotlib.figure import Figure
+
+        fig = Figure(figsize=(8, 4), dpi=100)
+        ax = fig.add_subplot(111)
+
+        mode = str(d.get("mode") or "").strip().lower()
+        run = str(d.get("run") or "").strip()
+        if mode == "curves":
+            ys = d.get("y") or []
+            y = str(ys[0] if isinstance(ys, list) and ys else "").strip()
+            x = str(d.get("x") or "").strip()
+            ax.set_title(str(d.get("name") or "") or f"{run} — {y} vs {x}")
+            ax.set_xlabel(x)
+            ax.set_ylabel(y)
+            curves = be.td_load_curves(self._db_path, run, y, x, serials=None)  # type: ignore[arg-type]
+            for s in curves:
+                sn = str(s.get("serial") or "").strip()
+                xs = s.get("x") or []
+                ys2 = s.get("y") or []
+                if not isinstance(xs, list) or not isinstance(ys2, list) or not xs or not ys2:
+                    continue
+                ax.plot(xs, ys2, linewidth=1.1, alpha=0.85, label=sn or "SN")
+            ax.grid(True, alpha=0.25)
+            ax.legend(fontsize=8, loc="best")
+        else:
+            stat = str(d.get("stat") or "").strip().lower()
+            ys = d.get("y") or []
+            y_cols = [str(x).strip() for x in ys] if isinstance(ys, list) else []
+            ax.set_title(str(d.get("name") or "") or f"{run} — {stat}")
+            ax.set_xlabel("Serial Number")
+            ax.set_ylabel(stat)
+            labels = be.td_list_serials(self._db_path)  # type: ignore[arg-type]
+            x_idx = list(range(len(labels)))
+            for y_col in y_cols:
+                series = be.td_load_metric_series(self._db_path, run, y_col, stat)  # type: ignore[arg-type]
+                vmap = {str(r.get("serial") or "").strip(): r.get("value_num") for r in series if str(r.get("serial") or "").strip()}
+                yv = [(float(vmap.get(sn)) if isinstance(vmap.get(sn), (int, float)) else float("nan")) for sn in labels]
+                ax.plot(x_idx, yv, marker="o", linewidth=1.2, label=f"{y_col}.{stat}")
+            ax.set_xticks(x_idx)
+            ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
+            ax.grid(True, alpha=0.25)
+            ax.legend(fontsize=8, loc="best")
+
+        fig.tight_layout()
+        return fig
+
+    def _save_all_auto_plots_pdf(self) -> None:
+        if not self._plot_ready or not self._auto_plots or not self._db_path:
+            return
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Save All Auto-Plots",
+            str(self._project_dir / "auto_plots_test_data.pdf"),
+            "PDF Files (*.pdf)",
+        )
+        if not path:
+            return
+        try:
+            from matplotlib.backends.backend_pdf import PdfPages
+
+            with PdfPages(path) as pdf:
+                for d in self._auto_plots:
+                    if not isinstance(d, dict):
+                        continue
+                    fig = self._render_plot_def_to_figure(d)
                     pdf.savefig(fig)
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "Save All Auto-Plots", str(exc))
@@ -4247,7 +5174,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Action buttons
         actions = QtWidgets.QHBoxLayout()
         actions.addStretch(1)
-        self.btn_files_open_pdf = QtWidgets.QPushButton("Open PDF")
+        self.btn_files_open_pdf = QtWidgets.QPushButton("Open File")
         self.btn_files_open_metadata = QtWidgets.QPushButton("Open Metadata")
         self.btn_files_open_artifacts = QtWidgets.QPushButton("Open Artifacts")
         self.btn_files_open_combined = QtWidgets.QPushButton("Open combined.txt")
@@ -4597,15 +5524,20 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _update_project_actions(self) -> None:
         record = self._selected_project_record()
-        is_trending = False
+        is_impl_supported = False
+        is_update_supported = False
         if record:
             ptype = str(record.get("type") or "").strip()
-            is_trending = ptype in (
+            is_impl_supported = ptype in (
                 getattr(be, "EIDAT_PROJECT_TYPE_TRENDING", "EIDP Trending"),
                 getattr(be, "EIDAT_PROJECT_TYPE_RAW_TRENDING", "EIDP Raw File Trending"),
+                getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending"),
             )
+            is_update_supported = is_impl_supported
         if hasattr(self, "btn_project_implementation"):
-            self.btn_project_implementation.setEnabled(bool(record) and is_trending)
+            self.btn_project_implementation.setEnabled(bool(record) and is_impl_supported)
+        if hasattr(self, "btn_project_update"):
+            self.btn_project_update.setEnabled(bool(record) and is_update_supported)
         if hasattr(self, "btn_project_env"):
             self.btn_project_env.setEnabled(bool(record))
 
@@ -4652,8 +5584,11 @@ class MainWindow(QtWidgets.QMainWindow):
             if ptype not in (
                 getattr(be, "EIDAT_PROJECT_TYPE_TRENDING", "EIDP Trending"),
                 getattr(be, "EIDAT_PROJECT_TYPE_RAW_TRENDING", "EIDP Raw File Trending"),
+                getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending"),
             ):
-                raise RuntimeError("Implementation is available only for EIDP Trending or Raw File Trending projects.")
+                raise RuntimeError(
+                    "Implementation is available only for EIDP Trending, Raw File Trending, or Test Data Trending projects."
+                )
 
             project_dir = Path(str(record.get("folder") or "")).expanduser()
             workbook = Path(str(record.get("workbook") or "")).expanduser()
@@ -4662,7 +5597,10 @@ class MainWindow(QtWidgets.QMainWindow):
             if not workbook.exists():
                 raise RuntimeError(f"Project workbook not found: {workbook}")
 
-            dlg = ImplementationTrendDialog(project_dir, workbook, self)
+            if ptype == getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending"):
+                dlg = TestDataTrendDialog(project_dir, workbook, self)
+            else:
+                dlg = ImplementationTrendDialog(project_dir, workbook, self)
             self._prepare_dialog(dlg)
             dlg.exec()
         except Exception as exc:
@@ -4684,6 +5622,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 payload = be.update_eidp_trending_project_workbook(repo, wb_path, overwrite=overwrite)
             elif ptype == getattr(be, "EIDAT_PROJECT_TYPE_RAW_TRENDING", "EIDP Raw File Trending"):
                 payload = be.update_eidp_raw_trending_project_workbook(repo, wb_path, overwrite=overwrite)
+            elif ptype == getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending"):
+                payload = be.update_test_data_trending_project_workbook(repo, wb_path, overwrite=overwrite)
             else:
                 raise RuntimeError(f"Unsupported project type: {ptype}")
             updated = int(payload.get("updated_cells") or 0)
@@ -4769,7 +5709,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._refresh_files_tab()
         except Exception:
             pass
-        # Then scan the repo to pick up new/changed PDFs (no processing).
+        # Then scan the repo to pick up new/changed files (PDF/Excel) (no processing).
         try:
             self._act_manager_scan_all(auto=True, auto_process=False)
         except Exception:
@@ -4999,7 +5939,7 @@ class MainWindow(QtWidgets.QMainWindow):
         return infos
 
     def _act_files_open_pdf(self) -> None:
-        """Open the source PDF file."""
+        """Open the source file (PDF or Excel)."""
         info = self._selected_file_info()
         if not info:
             return
@@ -5013,7 +5953,7 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             be.open_path(full_path)
         except Exception as exc:
-            QtWidgets.QMessageBox.warning(self, "Open PDF", str(exc))
+            QtWidgets.QMessageBox.warning(self, "Open File", str(exc))
 
     def _act_files_open_metadata(self) -> None:
         """Open the metadata JSON file."""
@@ -5241,7 +6181,7 @@ class MainWindow(QtWidgets.QMainWindow):
             }
         """)
 
-        act_open_pdf = menu.addAction("Open PDF")
+        act_open_pdf = menu.addAction("Open File")
         act_open_metadata = menu.addAction("Open Metadata JSON")
         act_open_artifacts = menu.addAction("Open Artifacts Folder")
         act_open_combined = menu.addAction("Open combined.txt")
@@ -5300,6 +6240,17 @@ class MainWindow(QtWidgets.QMainWindow):
     def _maybe_update_run_file(self, text: str):
         """Track which EIDP/PDF is currently being processed based on stdout."""
         if not self._progress_popup_active:
+            return
+        # Excel conversion emits one line per workbook.
+        if text.strip().startswith("[EXCEL]"):
+            try:
+                current_file = text.split("[EXCEL]", 1)[1].strip()
+            except Exception:
+                current_file = ""
+            if current_file:
+                self._progress_file_index = max(1, self._progress_file_index + 1)
+                self._progress_file_name = current_file
+                self._update_progress_widgets()
             return
         # Missing-terms batch helper script emits a higher-level INFO line per EIDP.
         if "[INFO] Starting missing-terms extraction for serial" in text:
@@ -5923,7 +6874,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
     def _act_start_excel_scan(self):
-        """Run Excel data extraction on all .xlsx files in the data folder."""
+        """Run Excel data extraction on all Excel files in the data folder."""
         config = be.DEFAULT_EXCEL_TREND_CONFIG
         if not config.exists():
             QtWidgets.QMessageBox.critical(
@@ -5941,14 +6892,17 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._enrich_after_run = True
         try:
-            total_files = sum(1 for p in data_dir.rglob("*.xlsx")
-                             if p.is_file() and not p.name.startswith("~$"))
+            total_files = sum(
+                1
+                for p in data_dir.rglob("*")
+                if p.is_file() and p.suffix.lower() in be.EXCEL_EXTENSIONS and not p.name.startswith("~$")
+            )
         except Exception:
             total_files = 0
         if total_files == 0:
             QtWidgets.QMessageBox.information(
                 self, "No Excel files",
-                f"No .xlsx data files found under:\n{data_dir}")
+                f"No Excel data files found under:\n{data_dir}")
             return
         self._start_worker(
             lambda: be.run_excel_scanner(data_dir),
@@ -6403,8 +7357,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         def _on_success(payload: dict):
             candidates = int(payload.get("candidates_count") or 0)
-            pdf_count = int(payload.get("pdf_count") or 0)
-            self._append_log(f"[EIDAT MANAGER] Scanned {pdf_count} file(s); {candidates} candidate(s) need processing.")
+            file_count = int(payload.get("pdf_count") or 0)
+            self._append_log(f"[EIDAT MANAGER] Scanned {file_count} file(s); {candidates} candidate(s) need processing.")
             try:
                 self._refresh_files_tab()
             except Exception:
@@ -6414,14 +7368,14 @@ class MainWindow(QtWidgets.QMainWindow):
                     QtWidgets.QMessageBox.information(
                         self,
                         "EIDAT Manager",
-                        f"Detected {candidates} new/changed PDF(s).\n\nUse 'Process New Files' to generate EIDAT Support artifacts.",
+                        f"Detected {candidates} new/changed file(s) (PDF/Excel).\n\nUse 'Process New Files' to generate EIDAT Support artifacts.",
                     )
                 if auto_process:
                     self._act_manager_process_new(auto=True)
                 return f"Scan complete - {candidates} candidate(s) ready"
             if not auto:
-                self._show_toast("No new PDFs detected.")
-            return "Scan complete - no new PDFs detected"
+                self._show_toast("No new files detected.")
+            return "Scan complete - no new files detected"
 
         self._start_manager_action(
             heading="Global Repo Scan",
@@ -6479,7 +7433,7 @@ class MainWindow(QtWidgets.QMainWindow):
         reply = QtWidgets.QMessageBox.question(
             self,
             "Force Process All",
-            "This will re-process all tracked PDFs and overwrite outputs. Continue?",
+            "This will re-process all tracked files (PDF/Excel) and overwrite outputs. Continue?",
             QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
         )
         if reply != QtWidgets.QMessageBox.StandardButton.Yes:
@@ -7432,12 +8386,12 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             dest_dir = be.resolve_pdf_root(Path(self.ed_pdfs.text()).expanduser())
         except Exception as exc:
-            QtWidgets.QMessageBox.critical(self, "PDFs folder", str(exc))
+            QtWidgets.QMessageBox.critical(self, "Data folder", str(exc))
             return
         try:
             dest_dir.mkdir(parents=True, exist_ok=True)
         except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Folder error", f"Cannot create PDFs folder:\n{dest_dir}\n\n{e}")
+            QtWidgets.QMessageBox.critical(self, "Folder error", f"Cannot create data folder:\n{dest_dir}\n\n{e}")
             return
         copied, skipped, errors = 0, 0, 0
         to_visit: list[Path] = []
@@ -7446,21 +8400,27 @@ class MainWindow(QtWidgets.QMainWindow):
                 to_visit.append(Path(p))
             except Exception:
                 continue
-        def is_pdf(p: Path) -> bool:
-            return p.suffix.lower() == ".pdf"
+        allowed = {".pdf", *{str(s).lower() for s in getattr(be, "EXCEL_EXTENSIONS", {".xlsx", ".xlsm", ".xls"})}}
+
+        def is_allowed(p: Path) -> bool:
+            try:
+                return (p.suffix or "").lower() in allowed and not p.name.startswith("~$")
+            except Exception:
+                return False
         visit_files: list[Path] = []
         for p in to_visit:
             try:
                 if p.is_dir():
-                    for sub in p.rglob("*.pdf"):
-                        visit_files.append(sub)
+                    for ext in sorted(allowed):
+                        for sub in p.rglob(f"*{ext}"):
+                            visit_files.append(sub)
                 elif p.is_file():
                     visit_files.append(p)
             except Exception:
                 errors += 1
         for src in visit_files:
             try:
-                if not is_pdf(src):
+                if not is_allowed(src):
                     skipped += 1
                     continue
                 dst = self._unique_destination(dest_dir / src.name)
@@ -7489,7 +8449,14 @@ class MainWindow(QtWidgets.QMainWindow):
         rows: list[tuple[str, str, str]] = []
         if folder.exists():
             try:
-                for p in sorted(folder.glob("*.pdf"), key=lambda x: x.name.lower()):
+                allowed = {".pdf", *{str(s).lower() for s in getattr(be, "EXCEL_EXTENSIONS", {".xlsx", ".xlsm", ".xls"})}}
+                for p in sorted(folder.iterdir(), key=lambda x: x.name.lower()):
+                    if not p.is_file():
+                        continue
+                    if p.name.startswith("~$"):
+                        continue
+                    if (p.suffix or "").lower() not in allowed:
+                        continue
                     size = self._fmt_size(p.stat().st_size)
                     mtime = self._fmt_mtime(p.stat().st_mtime)
                     rows.append((p.name, size, mtime))
@@ -7517,7 +8484,7 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             return ""
 
-    def _selected_pdf_paths(self) -> list[Path]:
+    def _selected_data_paths(self) -> list[Path]:
         folder = Path(self.ed_pdfs.text()).expanduser()
         sel = []
         for idx in self.list_pdfs.selectionModel().selectedRows():
@@ -7528,14 +8495,14 @@ class MainWindow(QtWidgets.QMainWindow):
         return sel
 
     def _act_remove_selected(self):
-        files = self._selected_pdf_paths()
+        files = self._selected_data_paths()
         if not files:
             return
         names = "\n".join(p.name for p in files[:10])
         extra = "" if len(files) <= 10 else f"\nÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¾ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¾ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¦ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¾ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¦ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¦ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¾ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¦ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦and {len(files)-10} more"
         if (
             QtWidgets.QMessageBox.question(
-                self, "Remove files", f"Delete these from PDFs folder?\n\n{names}{extra}"
+                self, "Remove files", f"Delete these from data folder?\n\n{names}{extra}"
             )
             != QtWidgets.QMessageBox.StandardButton.Yes
         ):
@@ -7556,14 +8523,21 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         if (
             QtWidgets.QMessageBox.question(
-                self, "Remove all", f"Delete ALL PDFs in:\n{folder}?"
+                self, "Remove all", f"Delete ALL data files in:\n{folder}?"
             )
             != QtWidgets.QMessageBox.StandardButton.Yes
         ):
             return
         removed, errors = 0, 0
-        for p in folder.glob("*.pdf"):
+        allowed = {".pdf", *{str(s).lower() for s in getattr(be, "EXCEL_EXTENSIONS", {".xlsx", ".xlsm", ".xls"})}}
+        for p in folder.iterdir():
             try:
+                if not p.is_file():
+                    continue
+                if p.name.startswith("~$"):
+                    continue
+                if (p.suffix or "").lower() not in allowed:
+                    continue
                 p.unlink(missing_ok=True)
                 removed += 1
             except Exception:
@@ -7572,12 +8546,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_upload_list()
 
     def _act_add_files(self):
-        paths, _ = QtWidgets.QFileDialog.getOpenFileNames(self, "Select PDFs", str(Path(self.ed_pdfs.text()).expanduser()), "PDF files (*.pdf);;All files (*.*)")
+        paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
+            self,
+            "Select data files",
+            str(Path(self.ed_pdfs.text()).expanduser()),
+            "Data files (*.pdf *.xlsx *.xlsm *.xls);;PDF files (*.pdf);;Excel files (*.xlsx *.xlsm *.xls);;All files (*.*)",
+        )
         if paths:
             self._ingest_paths(paths)
 
     def _act_add_folder(self):
-        path = QtWidgets.QFileDialog.getExistingDirectory(self, "Select folder with PDFs", str(Path(self.ed_pdfs.text()).expanduser()))
+        path = QtWidgets.QFileDialog.getExistingDirectory(self, "Select folder with data files", str(Path(self.ed_pdfs.text()).expanduser()))
         if path:
             self._ingest_paths([path])
 

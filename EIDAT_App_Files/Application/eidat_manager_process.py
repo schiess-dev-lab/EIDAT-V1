@@ -16,6 +16,7 @@ from eidat_manager_db import SupportPaths, connect_db, ensure_schema
 from eidat_manager_embed import build_pointer_token, embed_pointer_token, has_pointer_token
 from eidat_manager_metadata import (
     derive_minimal_metadata,
+    extract_metadata_from_excel,
     extract_metadata_from_text,
     load_metadata_for_pdf,
     load_metadata_from_artifacts,
@@ -579,6 +580,7 @@ def process_candidates(
     core = None
     excel_mod = None
     excel_config_path = _default_excel_config_path()
+    excel_sqlite_mod = None
 
     def _get_core() -> Any:
         nonlocal core
@@ -591,6 +593,16 @@ def process_candidates(
         if excel_mod is None:
             excel_mod = _load_excel_extractor()
         return excel_mod
+
+    def _get_excel_sqlite_mod() -> Any:
+        nonlocal excel_sqlite_mod
+        if excel_sqlite_mod is None:
+            try:
+                from eidat_manager_excel_to_sqlite import excel_to_sqlite  # type: ignore
+            except Exception:
+                from .eidat_manager_excel_to_sqlite import excel_to_sqlite  # type: ignore
+            excel_sqlite_mod = excel_to_sqlite
+        return excel_sqlite_mod
 
     with connect_db(paths.db_path) as conn:
         ensure_schema(conn)
@@ -655,14 +667,76 @@ def process_candidates(
                     if is_excel:
                         excel_mod = _get_excel_mod()
                         artifacts_root = _excel_artifacts_dir(paths, abs_path)
-                        res = _run_excel_extraction(
-                            excel_mod,
-                            abs_path,
-                            artifacts_root,
-                            excel_config_path,
-                        )
                         artifacts_dir = str(artifacts_root)
-                        raw_meta = _derive_excel_metadata(excel_mod, abs_path)
+
+                        # Extract metadata from workbook cells + filename (like PDFs use combined/title).
+                        try:
+                            raw_meta = extract_metadata_from_excel(abs_path)
+                        except Exception:
+                            raw_meta = _derive_excel_metadata(excel_mod, abs_path)
+
+                        def _is_test_data(meta: dict) -> bool:
+                            try:
+                                dt = str(meta.get("document_type") or "").strip().lower()
+                            except Exception:
+                                dt = ""
+                            try:
+                                acr = str(meta.get("document_type_acronym") or "").strip().lower()
+                            except Exception:
+                                acr = ""
+                            return dt in {"test data", "testdata", "td"} or acr in {"test data", "testdata", "td"}
+
+                        is_test_data = _is_test_data(raw_meta if isinstance(raw_meta, dict) else {})
+
+                        # Always run config-driven extraction as part of processing.
+                        # If pandas is missing, allow Test Data flows to continue (SQLite is the key output).
+                        try:
+                            res = _run_excel_extraction(
+                                excel_mod,
+                                abs_path,
+                                artifacts_root,
+                                excel_config_path,
+                            )
+                        except Exception:
+                            if not is_test_data:
+                                raise
+                            res = {"error": "excel_extraction_failed"}
+
+                        # Test Data: also create a per-workbook SQLite DB (header row unknown; detect automatically).
+                        if is_test_data:
+                            try:
+                                excel_to_sqlite = _get_excel_sqlite_mod()
+                                payload = excel_to_sqlite(
+                                    global_repo=paths.global_repo,
+                                    excel_files=[abs_path],
+                                    data_dir=None,
+                                    out_dir=Path(artifacts_root),
+                                    overwrite=True,
+                                )
+                                sqlite_rel = ""
+                                try:
+                                    results_list = list((payload or {}).get("results") or [])
+                                except Exception:
+                                    results_list = []
+                                for r0 in results_list:
+                                    try:
+                                        sp = str((r0 or {}).get("sqlite_path") or "").strip()
+                                    except Exception:
+                                        sp = ""
+                                    if sp:
+                                        try:
+                                            sqlite_rel = str(Path(sp).resolve().relative_to(paths.global_repo.resolve()))
+                                        except Exception:
+                                            sqlite_rel = sp
+                                        break
+                                if not sqlite_rel:
+                                    raise RuntimeError("excel_to_sqlite did not report an output sqlite_path")
+                                if isinstance(raw_meta, dict):
+                                    raw_meta["excel_sqlite_rel"] = sqlite_rel
+                            except Exception as exc:
+                                # For Test Data, SQLite creation is required (so the file remains pending if it fails).
+                                raise RuntimeError(f"Test Data Excel -> SQLite failed: {exc}") from exc
+
                         clean_meta = sanitize_metadata(raw_meta, default_document_type="Data file")
                         metadata_path = write_metadata(Path(artifacts_dir), abs_path, clean_meta)
                     else:

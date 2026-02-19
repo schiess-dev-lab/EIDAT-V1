@@ -368,3 +368,59 @@ def run_scan_force_candidates(
         return PipelineResult(ok=True, node_root=node, outputs=outputs)
     except Exception as exc:
         return PipelineResult(ok=False, node_root=node, outputs=outputs, error=str(exc))
+
+
+def run_excel_to_sqlite(
+    *,
+    node_root: str | Path,
+    runtime_root: str | Path,
+    data_dir: str | Path | None = None,
+    out_dir: str | Path | None = None,
+    overwrite: bool = True,
+    py: str | None = None,
+    node_env_enabled: bool = False,
+    on_log: Callable[[str], None] | None = None,
+) -> PipelineResult:
+    """Convert Excel files under a data directory into per-workbook SQLite outputs."""
+    node = _as_abs(node_root)
+    runtime = _as_abs(runtime_root)
+    python_exe = py or sys.executable
+
+    outputs: dict[str, object] = {}
+    try:
+        if not node.exists():
+            raise RuntimeError(f"Node root does not exist: {node}")
+        if not node.is_dir():
+            raise RuntimeError(f"Node root is not a directory: {node}")
+        if not (runtime / "EIDAT_App_Files").exists():
+            raise RuntimeError(f"Runtime root does not contain EIDAT_App_Files: {runtime}")
+
+        if on_log is not None:
+            on_log(f"[NODE] {node}")
+            on_log("[ACTION] excel_to_sqlite")
+
+        # Prefer a node-local data folder if it exists; fall back to scanning the whole repo.
+        if data_dir is None:
+            cand = node / "EIDPs"
+            data_root = cand if cand.exists() and cand.is_dir() else node
+        else:
+            data_root = _as_abs(data_dir)
+
+        extra: list[str] = ["--data-dir", str(data_root)]
+        if overwrite:
+            extra += ["--overwrite"]
+        if out_dir is not None and str(out_dir).strip():
+            extra += ["--out-dir", str(_as_abs(out_dir))]
+
+        outputs["excel_to_sqlite"] = _run_manager(
+            python_exe,
+            runtime,
+            node,
+            "excel_to_sqlite",
+            extra=extra,
+            node_env_enabled=node_env_enabled,
+            on_log=on_log,
+        )
+        return PipelineResult(ok=True, node_root=node, outputs=outputs)
+    except Exception as exc:
+        return PipelineResult(ok=False, node_root=node, outputs=outputs, error=str(exc))

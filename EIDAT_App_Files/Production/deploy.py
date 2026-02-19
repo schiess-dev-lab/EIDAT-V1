@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import argparse
+import os
 import platform
 import sqlite3
+import stat
 import subprocess
 import sys
 import time
@@ -36,6 +38,27 @@ def _safe_rmtree_if_present(path: Path) -> None:
     if not path.is_dir():
         return
     shutil.rmtree(path, ignore_errors=True)
+
+
+def _rmtree_strict_if_present(path: Path) -> None:
+    if not path.exists():
+        return
+    if not path.is_dir():
+        raise RuntimeError(f"Expected directory but found file: {path}")
+
+    def _onerror(func, p, exc_info):  # noqa: ANN001
+        try:
+            os.chmod(p, stat.S_IWRITE)
+        except Exception:
+            pass
+        try:
+            func(p)
+        except Exception:
+            pass
+
+    shutil.rmtree(path, onerror=_onerror)
+    if path.exists():
+        raise RuntimeError(f"Failed to delete directory: {path}")
 
 
 def _node_ui_venv_dir(layout) -> Path:
@@ -177,6 +200,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--node-root", required=True, help="Root directory to manage (the node).")
     ap.add_argument("--runtime-root", required=True, help="Central runtime root (contains EIDAT_App_Files).")
     ap.add_argument("--parent-node-root", default="", help="Optional parent node root (breadcrumbs only).")
+    ap.add_argument(
+        "--reset-node",
+        action="store_true",
+        help="Delete <node_root>\\EIDAT and <node_root>\\EIDAT Support before re-deploying (does not touch EIDPs).",
+    )
     ap.add_argument("--ensure-node-venv", action="store_true", help="Pre-create the node venv folder location (no packages).")
     ap.add_argument(
         "--bootstrap-node-ui",
@@ -215,6 +243,9 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(f"runtime-root does not contain EIDAT_App_Files: {runtime_root}")
 
     layout = node_layout(node_root)
+    if args.reset_node:
+        _rmtree_strict_if_present(layout.eidat_root)
+        _rmtree_strict_if_present(layout.support_dir)
     # Legacy folders from older node layouts (safe to delete; they only held launcher .bat files).
     _safe_rmtree_if_present(layout.eidat_root / "FileExplorer")
     _safe_rmtree_if_present(layout.eidat_root / "Projects")

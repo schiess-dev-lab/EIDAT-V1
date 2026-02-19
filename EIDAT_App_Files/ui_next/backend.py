@@ -394,7 +394,8 @@ def get_repo_root() -> Path:
     """Return repository root from scanner.env or DEFAULT_REPO_ROOT."""
     ensure_repo_root_name_file()
     node_root = (os.environ.get("EIDAT_NODE_ROOT") or "").strip()
-    env = load_scanner_env(project_dir=wb_path.parent)
+    # Repo root is a global setting, not tied to any specific workbook/project.
+    env = load_scanner_env()
     val = env.get("REPO_ROOT", "").strip()
     try:
         if val:
@@ -690,7 +691,7 @@ def _venv_python_from(path: Path) -> Path:
 
 
 def resolve_project_python() -> str:
-    env = load_scanner_env(project_dir=wb_path.parent)
+    env = load_scanner_env()
     vdir = env.get("VENV_DIR", "").strip()
     if vdir:
         cand = _venv_python_from(Path(vdir))
@@ -892,14 +893,27 @@ def run_excel_extraction(excel_paths: list[Path], config: Optional[Path] = None,
 
 
 def run_excel_scanner(data_dir: Path, config: Optional[Path] = None) -> subprocess.Popen:
-    """Run Excel extraction on all .xlsx files under the provided directory."""
+    """Run Excel extraction on all Excel files under the provided directory."""
     cfg = Path(config) if config else DEFAULT_EXCEL_TREND_CONFIG
     data_root = resolve_pdf_root(data_dir)
-    excels = [p for p in data_root.rglob("*.xlsx") if p.is_file()
-              and not p.name.startswith("~$")]
+    excels = [
+        p
+        for p in data_root.rglob("*")
+        if p.is_file() and p.suffix.lower() in EXCEL_EXTENSIONS and not p.name.startswith("~$")
+    ]
     if not excels:
         raise RuntimeError(f"No Excel data files found under: {data_root}")
     return run_excel_extraction(excels, cfg, data_root)
+
+
+def run_excel_to_sqlite_scanner(data_dir: Path, *, overwrite: bool = True) -> subprocess.Popen:
+    """Create per-workbook SQLite outputs for all Excel files under the provided directory."""
+    repo = get_repo_root()
+    data_root = resolve_pdf_root(data_dir)
+    args: list[str] = ["--global-repo", str(repo), "excel_to_sqlite", "--data-dir", str(data_root)]
+    if overwrite:
+        args.append("--overwrite")
+    return run_script("Application/eidat_manager.py", *args)
 
 
 def open_path(p: Path) -> None:
@@ -2175,10 +2189,14 @@ EIDAT_PROJECTS_REGISTRY_DB = "projects_registry.sqlite3"
 EIDAT_PROJECT_META = "project.json"
 EIDAT_PROJECT_TYPE_TRENDING = "EIDP Trending"
 EIDAT_PROJECT_TYPE_RAW_TRENDING = "EIDP Raw File Trending"
+EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING = "Test Data Trending"
 EIDAT_PROJECT_IMPLEMENTATION_DB = "implementation_trending.sqlite3"
 GLOBAL_RUN_MIRROR_DIRNAME = "global_run_mirror"
 LOCAL_PROJECTS_MIRROR_DIRNAME = "projects"
 PROJECT_UPDATE_DEBUG_JSON = "update_debug.json"
+
+# Central runtime config used to define Test Data trending workbooks (independent of node-local DATA_ROOT).
+CENTRAL_EXCEL_TREND_CONFIG = ROOT / "user_inputs" / "excel_trend_config.json"
 
 
 def eidat_support_dir(global_repo: Path) -> Path:
@@ -2231,6 +2249,17 @@ def ensure_trending_project_sqlite(project_dir: Path, workbook_path: Path) -> Pa
         _build_trending_project_sqlite(db_path, wb_path)
 
     return db_path
+
+
+def _sqlite_drop_table(conn: sqlite3.Connection, table: str) -> None:
+    try:
+        name = str(table or "").strip()
+        if not name:
+            return
+        safe = name.replace('"', '""')
+        conn.execute(f'DROP TABLE IF EXISTS "{safe}"')
+    except Exception:
+        pass
 
 
 def load_trending_project_terms(db_path: Path) -> list[dict]:
@@ -2340,13 +2369,12 @@ def _build_trending_project_sqlite(db_path: Path, workbook_path: Path) -> None:
 
     db_path = Path(db_path).expanduser()
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    if db_path.exists():
-        try:
-            db_path.unlink()
-        except Exception:
-            pass
-
+    # IMPORTANT: Do not delete the entire DB file. This project cache DB may also hold
+    # Test Data trending caches (td_*). Only drop/recreate the EIDP Trending tables.
     with sqlite3.connect(str(db_path)) as conn:
+        for t in ("meta", "serials", "terms", "term_values"):
+            _sqlite_drop_table(conn, t)
+
         conn.execute(
             """
             CREATE TABLE meta (
@@ -2478,6 +2506,853 @@ def _build_trending_project_sqlite(db_path: Path, workbook_path: Path) -> None:
         pass
 
 
+def _infer_node_root_from_workbook_path(workbook_path: Path) -> Path:
+    """
+    Best-effort: if workbook lives under `<node_root>/EIDAT Support/...`, return `<node_root>`.
+    Otherwise, return workbook parent.
+    """
+    p = Path(workbook_path).expanduser()
+    try:
+        p = p.resolve()
+    except Exception:
+        p = p.absolute()
+    cur = p.parent
+    for _ in range(12):
+        if cur.name.strip().lower() == "eidat support":
+            return cur.parent
+        if cur == cur.parent:
+            break
+        cur = cur.parent
+    return p.parent
+
+
+def _resolve_excel_sqlite_path_from_workbook(workbook_path: Path, excel_sqlite_rel: str) -> Path:
+    """
+    Resolve workbook-relative excel_sqlite_rel values into absolute paths.
+
+    Supports:
+    - absolute paths
+    - paths starting with `EIDAT Support\\...` (relative to node root)
+    - paths starting with `debug\\...` (relative to `<node_root>/EIDAT Support`)
+    - other relative paths (relative to workbook folder)
+    """
+    raw = str(excel_sqlite_rel or "").strip().strip('"')
+    if not raw:
+        return Path()
+    p = Path(raw).expanduser()
+    if p.is_absolute():
+        return p
+
+    node_root = _infer_node_root_from_workbook_path(workbook_path)
+    support_dir = node_root / "EIDAT Support"
+    norm = raw.replace("/", "\\").lstrip("\\")
+    low = norm.lower()
+
+    if low.startswith("eidat support\\"):
+        return (node_root / Path(norm)).expanduser()
+    if low.startswith("debug\\") or low.startswith("projects\\") or low.startswith("cache\\"):
+        return (support_dir / Path(norm)).expanduser()
+
+    return (Path(workbook_path).expanduser().parent / p).expanduser()
+
+
+def _ensure_test_data_tables(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS td_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS td_sources (
+            serial TEXT PRIMARY KEY,
+            sqlite_path TEXT,
+            mtime_ns INTEGER,
+            size_bytes INTEGER,
+            status TEXT,
+            last_ingested_epoch_ns INTEGER
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS td_runs (
+            run_name TEXT PRIMARY KEY,
+            default_x TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS td_columns (
+            run_name TEXT NOT NULL,
+            name TEXT NOT NULL,
+            units TEXT,
+            kind TEXT NOT NULL,
+            PRIMARY KEY (run_name, name)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS td_curves (
+            run_name TEXT NOT NULL,
+            y_name TEXT NOT NULL,
+            x_name TEXT NOT NULL,
+            serial TEXT NOT NULL,
+            x_json TEXT NOT NULL,
+            y_json TEXT NOT NULL,
+            n_points INTEGER NOT NULL,
+            source_mtime_ns INTEGER,
+            computed_epoch_ns INTEGER NOT NULL,
+            PRIMARY KEY (run_name, y_name, x_name, serial)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS td_curves_lookup
+        ON td_curves (run_name, y_name, x_name, serial)
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS td_metrics (
+            serial TEXT NOT NULL,
+            run_name TEXT NOT NULL,
+            column_name TEXT NOT NULL,
+            stat TEXT NOT NULL,
+            value_num REAL,
+            computed_epoch_ns INTEGER NOT NULL,
+            source_mtime_ns INTEGER,
+            PRIMARY KEY (serial, run_name, column_name, stat)
+        )
+        """
+    )
+
+
+def _read_test_data_config_columns(workbook_path: Path) -> list[dict]:
+    try:
+        from openpyxl import load_workbook  # type: ignore
+    except Exception as exc:
+        raise RuntimeError(
+            "openpyxl is required to read Test Data Trending workbooks. "
+            "Install it with `py -m pip install openpyxl` within the project environment."
+        ) from exc
+
+    wb = load_workbook(str(Path(workbook_path).expanduser()), read_only=True, data_only=True)
+    try:
+        if "Config" not in wb.sheetnames:
+            return []
+        ws = wb["Config"]
+        header_row_idx: int | None = None
+        for r in range(1, (ws.max_row or 0) + 1):
+            a = str(ws.cell(r, 1).value or "").strip().lower()
+            b = str(ws.cell(r, 2).value or "").strip().lower()
+            if a == "name" and b == "units":
+                header_row_idx = r
+                break
+        if header_row_idx is None:
+            return []
+
+        cols: list[dict] = []
+        for r in range(header_row_idx + 1, (ws.max_row or 0) + 1):
+            name = str(ws.cell(r, 1).value or "").strip()
+            if not name:
+                break
+            units = str(ws.cell(r, 2).value or "").strip()
+            cols.append({"name": name, "units": units})
+        return cols
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
+
+
+def _read_test_data_sources(workbook_path: Path) -> list[dict]:
+    try:
+        from openpyxl import load_workbook  # type: ignore
+    except Exception as exc:
+        raise RuntimeError(
+            "openpyxl is required to read Test Data Trending workbooks. "
+            "Install it with `py -m pip install openpyxl` within the project environment."
+        ) from exc
+
+    wb = load_workbook(str(Path(workbook_path).expanduser()), read_only=True, data_only=True)
+    try:
+        if "Sources" not in wb.sheetnames:
+            return []
+        ws = wb["Sources"]
+        headers: dict[str, int] = {}
+        for col in range(1, (ws.max_column or 0) + 1):
+            key = str(ws.cell(1, col).value or "").strip().lower()
+            if key:
+                headers[key] = col
+        if "serial_number" not in headers or "excel_sqlite_rel" not in headers:
+            return []
+
+        out: list[dict] = []
+        for row in range(2, (ws.max_row or 0) + 1):
+            sn = str(ws.cell(row, headers["serial_number"]).value or "").strip()
+            rel = str(ws.cell(row, headers["excel_sqlite_rel"]).value or "").strip()
+            if not sn:
+                continue
+            out.append({"serial": sn, "excel_sqlite_rel": rel})
+        return out
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
+
+
+def ensure_test_data_project_cache(
+    project_dir: Path,
+    workbook_path: Path,
+    *,
+    rebuild: bool = False,
+) -> Path:
+    """
+    Ensure `td_*` cache tables exist and are up-to-date inside the project's
+    `implementation_trending.sqlite3`.
+    """
+    proj_dir = Path(project_dir).expanduser()
+    wb_path = Path(workbook_path).expanduser()
+    if not wb_path.exists():
+        raise FileNotFoundError(f"Workbook not found: {wb_path}")
+
+    db_path = proj_dir / EIDAT_PROJECT_IMPLEMENTATION_DB
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with sqlite3.connect(str(db_path)) as conn:
+        _ensure_test_data_tables(conn)
+        conn.commit()
+
+    if rebuild:
+        rebuild_test_data_project_cache(db_path, wb_path)
+        return db_path
+
+    # Quick staleness check: compare workbook Sources list + mtimes against td_sources.
+    try:
+        sources = _read_test_data_sources(wb_path)
+        expected = {
+            str(s.get("serial") or "").strip(): str(s.get("excel_sqlite_rel") or "").strip()
+            for s in sources
+            if str(s.get("serial") or "").strip()
+        }
+    except Exception:
+        expected = {}
+
+    with sqlite3.connect(str(db_path)) as conn:
+        _ensure_test_data_tables(conn)
+        try:
+            rows = conn.execute("SELECT serial, sqlite_path, mtime_ns, status FROM td_sources").fetchall()
+        except Exception:
+            rows = []
+        cached = {
+            str(r[0] or "").strip(): {"path": str(r[1] or "").strip(), "mtime_ns": r[2], "status": str(r[3] or "").strip()}
+            for r in rows
+            if str(r[0] or "").strip()
+        }
+        try:
+            curve_count = int(conn.execute("SELECT COUNT(*) FROM td_curves").fetchone()[0] or 0)
+        except Exception:
+            curve_count = 0
+
+    # If we have no curves at all, treat as stale.
+    if curve_count == 0 and expected:
+        rebuild_test_data_project_cache(db_path, wb_path)
+        return db_path
+
+    # If serial set differs, rebuild.
+    if expected and set(expected.keys()) != set(cached.keys()):
+        rebuild_test_data_project_cache(db_path, wb_path)
+        return db_path
+
+    # If any path/mtime differs, rebuild.
+    stale = False
+    for sn, rel in expected.items():
+        p = _resolve_excel_sqlite_path_from_workbook(wb_path, rel)
+        c = cached.get(sn) or {}
+        if str(c.get("path") or "") != str(p):
+            stale = True
+            break
+        try:
+            st = p.stat()
+            mtime_ns = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)))
+        except Exception:
+            mtime_ns = None
+        if mtime_ns is None:
+            if str(c.get("status") or "").lower() == "ok":
+                stale = True
+                break
+        else:
+            if int(c.get("mtime_ns") or 0) != int(mtime_ns):
+                stale = True
+                break
+    if stale:
+        rebuild_test_data_project_cache(db_path, wb_path)
+
+    return db_path
+
+
+def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
+    """
+    Rebuild `td_*` cache tables inside `implementation_trending.sqlite3` from the
+    workbook's `Sources` + `Config` sheets.
+    """
+    import time
+    import statistics
+
+    wb_path = Path(workbook_path).expanduser()
+    if not wb_path.exists():
+        raise FileNotFoundError(f"Workbook not found: {wb_path}")
+    db_path = Path(db_path).expanduser()
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    cfg_cols = _read_test_data_config_columns(wb_path)
+    y_cols: list[tuple[str, str]] = []
+    for c in cfg_cols:
+        name = str(c.get("name") or "").strip()
+        units = str(c.get("units") or "").strip()
+        if name:
+            y_cols.append((name, units))
+
+    sources = _read_test_data_sources(wb_path)
+    entries = [
+        (str(s.get("serial") or "").strip(), str(s.get("excel_sqlite_rel") or "").strip())
+        for s in sources
+        if str(s.get("serial") or "").strip()
+    ]
+
+    computed_epoch_ns = time.time_ns()
+    x_priority = ["time_s", "cycle", "excel_row"]
+    run_x_union: dict[str, set[str]] = {}
+
+    def _finite_float(v: object) -> float | None:
+        if v is None:
+            return None
+        if isinstance(v, (int, float)):
+            f = float(v)
+        else:
+            t = str(v).strip().replace(",", "")
+            if not t:
+                return None
+            try:
+                f = float(t)
+            except Exception:
+                return None
+        if math.isfinite(f):
+            return f
+        return None
+
+    def _compute_stats(values: list[float]) -> dict[str, float | int | None]:
+        n = len(values)
+        if n == 0:
+            return {"mean": None, "min": None, "max": None, "std": None, "median": None, "count": 0}
+        out: dict[str, float | int | None] = {
+            "mean": (sum(values) / n),
+            "min": min(values),
+            "max": max(values),
+            "median": statistics.median(values),
+            "count": n,
+        }
+        out["std"] = statistics.stdev(values) if n >= 2 else None
+        return out
+
+    def _quote_ident(name: str) -> str:
+        return '"' + (name or "").replace('"', '""') + '"'
+
+    # Reset td_* tables (only).
+    with sqlite3.connect(str(db_path)) as conn:
+        _ensure_test_data_tables(conn)
+        for t in ("td_meta", "td_sources", "td_runs", "td_columns", "td_curves", "td_metrics"):
+            try:
+                conn.execute(f"DELETE FROM {t}")
+            except Exception:
+                pass
+        conn.execute("INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)", ("workbook_path", str(wb_path)))
+        conn.execute("INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)", ("built_epoch_ns", str(computed_epoch_ns)))
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)",
+                ("node_root", str(_infer_node_root_from_workbook_path(wb_path))),
+            )
+        except Exception:
+            pass
+        conn.commit()
+
+    missing_sources = 0
+    invalid_sources = 0
+    curves_written = 0
+    metrics_written = 0
+
+    for sn, rel in entries:
+        sqlite_path = _resolve_excel_sqlite_path_from_workbook(wb_path, rel)
+        status = "ok"
+        try:
+            st = sqlite_path.stat()
+            mtime_ns = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)))
+            size_bytes = int(st.st_size)
+        except Exception:
+            mtime_ns = None
+            size_bytes = None
+        if not sqlite_path.exists():
+            status = "missing"
+            missing_sources += 1
+        elif not sqlite_path.is_file():
+            status = "invalid"
+            invalid_sources += 1
+
+        with sqlite3.connect(str(db_path)) as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO td_sources(serial, sqlite_path, mtime_ns, size_bytes, status, last_ingested_epoch_ns)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (sn, str(sqlite_path), mtime_ns, size_bytes, status, computed_epoch_ns),
+            )
+            conn.commit()
+
+        if status != "ok":
+            continue
+
+        try:
+            with sqlite3.connect(str(sqlite_path)) as src:
+                # Discover runs
+                try:
+                    runs_rows = src.execute("SELECT sheet_name FROM __sheet_info ORDER BY sheet_name").fetchall()
+                    runs = [str(r[0] or "").strip() for r in runs_rows if str(r[0] or "").strip()]
+                except Exception:
+                    runs = []
+                if not runs:
+                    try:
+                        tbls = src.execute(
+                            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'sheet__%' ORDER BY name"
+                        ).fetchall()
+                        runs = [str(r[0] or "")[7:] for r in tbls if str(r[0] or "").startswith("sheet__")]
+                    except Exception:
+                        runs = []
+
+                for run in runs:
+                    # Resolve table name for the run
+                    table = ""
+                    try:
+                        row = src.execute(
+                            "SELECT table_name FROM __sheet_info WHERE sheet_name=? LIMIT 1",
+                            (run,),
+                        ).fetchone()
+                        if row and row[0]:
+                            table = str(row[0] or "").strip()
+                    except Exception:
+                        table = ""
+                    if not table:
+                        table = f"sheet__{run}"
+
+                    # Columns present
+                    try:
+                        info = src.execute(f"PRAGMA table_info([{table}])").fetchall()
+                        cols = {str(r[1] or "").strip() for r in info if str(r[1] or "").strip()}
+                    except Exception:
+                        cols = set()
+                    if not cols:
+                        continue
+
+                    avail_x = {x for x in x_priority if x in cols}
+                    if avail_x:
+                        run_x_union.setdefault(run, set()).update(avail_x)
+                    order_by = "excel_row ASC" if "excel_row" in cols else "rowid ASC"
+
+                    # Local default_x for metrics
+                    default_x = ""
+                    for x in x_priority:
+                        if x in avail_x:
+                            default_x = x
+                            break
+
+                    for y_name, _units in y_cols:
+                        if y_name not in cols:
+                            continue
+
+                        # Build curves for each available X column (supports x dropdown)
+                        for x_name in sorted(
+                            avail_x,
+                            key=lambda k: x_priority.index(k) if k in x_priority else 999,
+                        ):
+                            q_table = _quote_ident(table)
+                            qx = _quote_ident(x_name)
+                            qy = _quote_ident(y_name)
+                            try:
+                                rows = src.execute(
+                                    f"SELECT {qx}, {qy} FROM {q_table} "
+                                    f"WHERE {qx} IS NOT NULL AND {qy} IS NOT NULL "
+                                    f"ORDER BY {order_by}"
+                                ).fetchall()
+                            except Exception:
+                                rows = []
+                            xs: list[float] = []
+                            ys: list[float] = []
+                            for rx, ry in rows:
+                                fx = _finite_float(rx)
+                                fy = _finite_float(ry)
+                                if fx is None or fy is None:
+                                    continue
+                                xs.append(float(fx))
+                                ys.append(float(fy))
+
+                            with sqlite3.connect(str(db_path)) as conn:
+                                conn.execute(
+                                    """
+                                    INSERT OR REPLACE INTO td_curves
+                                    (run_name, y_name, x_name, serial, x_json, y_json, n_points, source_mtime_ns, computed_epoch_ns)
+                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                    """,
+                                    (
+                                        run,
+                                        y_name,
+                                        x_name,
+                                        sn,
+                                        json.dumps(xs, separators=(",", ":"), ensure_ascii=False),
+                                        json.dumps(ys, separators=(",", ":"), ensure_ascii=False),
+                                        int(len(xs)),
+                                        mtime_ns,
+                                        computed_epoch_ns,
+                                    ),
+                                )
+                                conn.commit()
+                            curves_written += 1
+
+                        # Metrics computed from the default X curve (if any)
+                        y_for_stats: list[float] = []
+                        if default_x:
+                            q_table = _quote_ident(table)
+                            qx = _quote_ident(default_x)
+                            qy = _quote_ident(y_name)
+                            try:
+                                rows = src.execute(
+                                    f"SELECT {qx}, {qy} FROM {q_table} "
+                                    f"WHERE {qx} IS NOT NULL AND {qy} IS NOT NULL "
+                                    f"ORDER BY {order_by}"
+                                ).fetchall()
+                            except Exception:
+                                rows = []
+                            for _rx, ry in rows:
+                                fy = _finite_float(ry)
+                                if fy is None:
+                                    continue
+                                y_for_stats.append(float(fy))
+
+                        stats_map = _compute_stats(y_for_stats)
+                        with sqlite3.connect(str(db_path)) as conn:
+                            for stat, val in stats_map.items():
+                                conn.execute(
+                                    """
+                                    INSERT OR REPLACE INTO td_metrics
+                                    (serial, run_name, column_name, stat, value_num, computed_epoch_ns, source_mtime_ns)
+                                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                                    """,
+                                    (sn, run, y_name, str(stat), val, computed_epoch_ns, mtime_ns),
+                                )
+                                metrics_written += 1
+                            conn.commit()
+
+        except Exception:
+            with sqlite3.connect(str(db_path)) as conn:
+                conn.execute(
+                    "UPDATE td_sources SET status=?, last_ingested_epoch_ns=? WHERE serial=?",
+                    ("invalid", computed_epoch_ns, sn),
+                )
+                conn.commit()
+            invalid_sources += 1
+
+    # Write runs + columns tables for dropdowns.
+    with sqlite3.connect(str(db_path)) as conn:
+        for run, xs in run_x_union.items():
+            default_x = ""
+            for x in x_priority:
+                if x in xs:
+                    default_x = x
+                    break
+            conn.execute(
+                "INSERT OR REPLACE INTO td_runs(run_name, default_x) VALUES (?, ?)",
+                (run, default_x),
+            )
+            for x in sorted(xs, key=lambda k: x_priority.index(k) if k in x_priority else 999):
+                conn.execute(
+                    "INSERT OR REPLACE INTO td_columns(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
+                    (run, x, "", "x"),
+                )
+            for y_name, units in y_cols:
+                conn.execute(
+                    "INSERT OR REPLACE INTO td_columns(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
+                    (run, y_name, units, "y"),
+                )
+        conn.commit()
+
+    return {
+        "db_path": str(db_path),
+        "workbook": str(wb_path),
+        "serials_count": len(entries),
+        "missing_sources": missing_sources,
+        "invalid_sources": invalid_sources,
+        "curves_written": curves_written,
+        "metrics_written": metrics_written,
+        "runs": sorted(run_x_union.keys()),
+    }
+
+
+def td_list_runs(db_path: Path) -> list[str]:
+    path = Path(db_path).expanduser()
+    if not path.exists():
+        return []
+    with sqlite3.connect(str(path)) as conn:
+        _ensure_test_data_tables(conn)
+        rows = conn.execute("SELECT run_name FROM td_runs ORDER BY run_name").fetchall()
+    return [str(r[0] or "").strip() for r in rows if str(r[0] or "").strip()]
+
+
+def td_list_serials(db_path: Path) -> list[str]:
+    path = Path(db_path).expanduser()
+    if not path.exists():
+        return []
+    with sqlite3.connect(str(path)) as conn:
+        _ensure_test_data_tables(conn)
+        rows = conn.execute("SELECT serial FROM td_sources ORDER BY serial").fetchall()
+    return [str(r[0] or "").strip() for r in rows if str(r[0] or "").strip()]
+
+
+def td_list_y_columns(db_path: Path, run_name: str) -> list[dict]:
+    path = Path(db_path).expanduser()
+    if not path.exists():
+        return []
+    run = str(run_name or "").strip()
+    if not run:
+        return []
+    with sqlite3.connect(str(path)) as conn:
+        _ensure_test_data_tables(conn)
+        rows = conn.execute(
+            "SELECT name, units FROM td_columns WHERE run_name=? AND kind='y' ORDER BY name",
+            (run,),
+        ).fetchall()
+    return [
+        {"name": str(r[0] or "").strip(), "units": str(r[1] or "").strip()}
+        for r in rows
+        if str(r[0] or "").strip()
+    ]
+
+
+def td_list_x_columns(db_path: Path, run_name: str) -> list[str]:
+    path = Path(db_path).expanduser()
+    if not path.exists():
+        return []
+    run = str(run_name or "").strip()
+    if not run:
+        return []
+    with sqlite3.connect(str(path)) as conn:
+        _ensure_test_data_tables(conn)
+        row = conn.execute("SELECT default_x FROM td_runs WHERE run_name=?", (run,)).fetchone()
+        default_x = str(row[0] or "").strip() if row else ""
+        rows = conn.execute(
+            "SELECT name FROM td_columns WHERE run_name=? AND kind='x' ORDER BY name",
+            (run,),
+        ).fetchall()
+    xs = [str(r[0] or "").strip() for r in rows if str(r[0] or "").strip()]
+    if default_x and default_x in xs:
+        xs = [default_x] + [x for x in xs if x != default_x]
+    return xs
+
+
+def td_load_metric_series(db_path: Path, run_name: str, column_name: str, stat: str) -> list[dict]:
+    path = Path(db_path).expanduser()
+    if not path.exists():
+        return []
+    run = str(run_name or "").strip()
+    col = str(column_name or "").strip()
+    st = str(stat or "").strip().lower()
+    if not run or not col or not st:
+        return []
+    with sqlite3.connect(str(path)) as conn:
+        _ensure_test_data_tables(conn)
+        rows = conn.execute(
+            """
+            SELECT serial, value_num
+            FROM td_metrics
+            WHERE run_name=? AND column_name=? AND stat=?
+            ORDER BY serial
+            """,
+            (run, col, st),
+        ).fetchall()
+    return [{"serial": str(r[0] or "").strip(), "value_num": r[1]} for r in rows if str(r[0] or "").strip()]
+
+
+def td_load_curves(
+    db_path: Path,
+    run_name: str,
+    y_name: str,
+    x_name: str,
+    serials: list[str] | None = None,
+) -> list[dict]:
+    path = Path(db_path).expanduser()
+    if not path.exists():
+        return []
+    run = str(run_name or "").strip()
+    y = str(y_name or "").strip()
+    x = str(x_name or "").strip()
+    if not run or not y or not x:
+        return []
+    want = [str(s or "").strip() for s in (serials or []) if str(s or "").strip()]
+    with sqlite3.connect(str(path)) as conn:
+        _ensure_test_data_tables(conn)
+        if want:
+            q = ",".join(["?"] * len(want))
+            rows = conn.execute(
+                f"""
+                SELECT serial, x_json, y_json
+                FROM td_curves
+                WHERE run_name=? AND y_name=? AND x_name=? AND serial IN ({q})
+                ORDER BY serial
+                """,
+                (run, y, x, *want),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT serial, x_json, y_json
+                FROM td_curves
+                WHERE run_name=? AND y_name=? AND x_name=?
+                ORDER BY serial
+                """,
+                (run, y, x),
+            ).fetchall()
+    out: list[dict] = []
+    for sn, xj, yj in rows:
+        try:
+            xs = json.loads(xj or "[]")
+            ys = json.loads(yj or "[]")
+        except Exception:
+            xs, ys = [], []
+        out.append({"serial": str(sn or "").strip(), "x": xs, "y": ys})
+    return out
+
+
+def update_test_data_trending_project_workbook(
+    global_repo: Path,
+    workbook_path: Path,
+    *,
+    overwrite: bool = False,
+) -> dict:
+    """
+    Populate a Test Data Trending workbook's `Data` sheet using cached `td_metrics`.
+    """
+    try:
+        from openpyxl import load_workbook  # type: ignore
+    except Exception as exc:
+        raise RuntimeError(
+            "openpyxl is required to update Test Data Trending workbooks. "
+            "Install it with `py -m pip install openpyxl` within the project environment."
+        ) from exc
+
+    wb_path = Path(workbook_path).expanduser()
+    if not wb_path.exists():
+        raise FileNotFoundError(f"Project workbook not found: {wb_path}")
+
+    project_dir = wb_path.parent
+    db_path = ensure_test_data_project_cache(project_dir, wb_path, rebuild=True)
+
+    try:
+        wb = load_workbook(str(wb_path))
+    except PermissionError as exc:
+        raise RuntimeError(f"Workbook is not writable (close it in Excel first): {wb_path}") from exc
+
+    if "Data" not in wb.sheetnames:
+        raise RuntimeError("Workbook missing required sheet: Data")
+    ws = wb["Data"]
+
+    serial_cols: dict[str, int] = {}
+    for col in range(2, (ws.max_column or 0) + 1):
+        sn = str(ws.cell(1, col).value or "").strip()
+        if sn:
+            serial_cols[sn] = col
+    if not serial_cols:
+        raise RuntimeError("No serial columns found in Data sheet header row.")
+
+    def _parse_metric(s: object) -> tuple[str, str, str] | None:
+        txt = str(s or "").strip()
+        if not txt or "." not in txt:
+            return None
+        parts = [p.strip() for p in txt.split(".") if p.strip()]
+        if len(parts) < 3:
+            return None
+        return parts[0], parts[1], parts[2].lower()
+
+    with sqlite3.connect(str(db_path)) as conn:
+        _ensure_test_data_tables(conn)
+        src_missing = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM td_sources WHERE lower(status) <> 'ok'"
+            ).fetchone()[0]
+            or 0
+        )
+        rows = conn.execute(
+            """
+            SELECT serial, run_name, column_name, stat, value_num
+            FROM td_metrics
+            """
+        ).fetchall()
+
+    metric_map: dict[tuple[str, str, str, str], float | int | None] = {}
+    for sn, run, col, stat, val in rows:
+        metric_map[(str(sn or "").strip(), str(run or "").strip(), str(col or "").strip(), str(stat or "").strip().lower())] = val
+
+    updated_cells = 0
+    missing_value = 0
+    for row in range(2, (ws.max_row or 0) + 1):
+        parsed = _parse_metric(ws.cell(row, 1).value)
+        if parsed is None:
+            continue
+        run, col, stat = parsed
+        for sn, cidx in serial_cols.items():
+            key = (sn, run, col, stat)
+            val = metric_map.get(key)
+            if val is None:
+                if not overwrite and ws.cell(row, cidx).value not in (None, ""):
+                    continue
+                ws.cell(row, cidx).value = None
+                missing_value += 1
+                continue
+            if not overwrite and ws.cell(row, cidx).value not in (None, ""):
+                continue
+            if stat == "count":
+                try:
+                    ws.cell(row, cidx).value = int(float(val))
+                except Exception:
+                    ws.cell(row, cidx).value = val
+            else:
+                ws.cell(row, cidx).value = float(val)
+            updated_cells += 1
+
+    try:
+        wb.save(str(wb_path))
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
+
+    return {
+        "workbook": str(wb_path),
+        "db_path": str(db_path),
+        "updated_cells": int(updated_cells),
+        "missing_source": int(src_missing),
+        "missing_value": int(missing_value),
+        "serials_in_workbook": int(len(serial_cols)),
+    }
+
+
 def eidat_debug_ocr_root(global_repo: Path) -> Path:
     return eidat_support_dir(global_repo) / "debug" / "ocr"
 
@@ -2558,36 +3433,36 @@ def read_eidat_index_documents(global_repo: Path) -> list[dict]:
         raise FileNotFoundError(f"EIDAT index DB not found: {db_path}")
     with sqlite3.connect(str(db_path)) as conn:
         conn.row_factory = sqlite3.Row
-        try:
-            rows = conn.execute(
-                """
-                SELECT
-                  id, program_title, asset_type, serial_number, part_number,
-                  revision, test_date, report_date, document_type,
-                  document_type_acronym, vendor, acceptance_test_plan_number,
-                  metadata_rel, artifacts_rel, similarity_group
-                FROM documents
-                ORDER BY program_title, asset_type, serial_number, metadata_rel
-                """
-            ).fetchall()
-        except sqlite3.OperationalError:
-            # Back-compat with older index schema (no vendor/doc_type_acronym/ATP cols).
-            rows = conn.execute(
-                """
-                SELECT
-                  id, program_title, asset_type, serial_number, part_number,
-                  revision, test_date, report_date, document_type,
-                  metadata_rel, artifacts_rel, similarity_group
-                FROM documents
-                ORDER BY program_title, asset_type, serial_number, metadata_rel
-                """
-            ).fetchall()
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(documents)").fetchall()}
+        select_cols: list[str] = [
+            "id",
+            "program_title",
+            "asset_type",
+            "serial_number",
+            "part_number",
+            "revision",
+            "test_date",
+            "report_date",
+            "document_type",
+        ]
+        for opt in ("document_type_acronym", "vendor", "acceptance_test_plan_number", "excel_sqlite_rel"):
+            if opt in cols:
+                select_cols.append(opt)
+        select_cols += ["metadata_rel", "artifacts_rel", "similarity_group"]
+        rows = conn.execute(
+            f"""
+            SELECT {", ".join(select_cols)}
+            FROM documents
+            ORDER BY program_title, asset_type, serial_number, metadata_rel
+            """
+        ).fetchall()
     docs: list[dict] = []
     for r in rows:
         d = {k: r[k] for k in r.keys()}
         d.setdefault("document_type_acronym", None)
         d.setdefault("vendor", None)
         d.setdefault("acceptance_test_plan_number", None)
+        d.setdefault("excel_sqlite_rel", None)
         docs.append(d)
     return docs
 
@@ -6215,6 +7090,163 @@ def _ensure_file_written(path: Path, *, create_fn) -> None:
         raise RuntimeError(f"Failed to create file: {path} ({exc})") from exc
 
 
+def _load_excel_trend_config(path: Path) -> dict:
+    p = Path(path).expanduser()
+    if not p.exists():
+        raise FileNotFoundError(f"Excel trend config not found: {p}")
+    data = json.loads(p.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("Excel trend config must be a JSON object.")
+    cols = data.get("columns")
+    if not isinstance(cols, list) or not cols:
+        raise ValueError("Excel trend config must include a non-empty `columns` list.")
+    stats = data.get("statistics") or ["mean", "min", "max", "std", "median", "count"]
+    if not isinstance(stats, list) or not all(isinstance(s, str) and s for s in stats):
+        raise ValueError("Excel trend config `statistics` must be a list of strings.")
+    data["statistics"] = [str(s).strip().lower() for s in stats]
+    if "header_row" not in data:
+        data["header_row"] = 0
+    return data
+
+
+def _write_test_data_trending_workbook(
+    path: Path,
+    *,
+    global_repo: Path | None,
+    serials: list[str],
+    docs: list[dict] | None,
+    config: dict,
+) -> None:
+    try:
+        from openpyxl import Workbook  # type: ignore
+    except Exception as exc:
+        raise RuntimeError(
+            "openpyxl is required to create the Test Data Trending workbook. "
+            "Install it with `py -m pip install openpyxl` within the project environment."
+        ) from exc
+
+    cfg_cols = config.get("columns") or []
+    cfg_stats = config.get("statistics") or []
+    col_names: list[str] = []
+    for c in cfg_cols:
+        if not isinstance(c, dict):
+            continue
+        name = str(c.get("name") or "").strip()
+        if name:
+            col_names.append(name)
+    stats = [str(s).strip().lower() for s in cfg_stats if str(s).strip()]
+    if not stats:
+        stats = ["mean", "min", "max", "std", "median", "count"]
+
+    def _read_runs_from_sqlite(sqlite_path: Path) -> list[str]:
+        p = Path(sqlite_path).expanduser()
+        if not p.exists() or not p.is_file():
+            return []
+        try:
+            with sqlite3.connect(str(p)) as conn:
+                rows = conn.execute("SELECT sheet_name FROM __sheet_info ORDER BY sheet_name").fetchall()
+            out = []
+            for r in rows:
+                try:
+                    sname = str(r[0] or "").strip()
+                except Exception:
+                    sname = ""
+                if sname:
+                    out.append(sname)
+            return out
+        except Exception:
+            return []
+
+    runs: list[str] = []
+    seen_runs: set[str] = set()
+    repo = Path(global_repo).expanduser() if global_repo is not None else None
+    for d in (docs or []):
+        raw = str((d or {}).get("excel_sqlite_rel") or "").strip()
+        if not raw:
+            continue
+        p = Path(raw).expanduser()
+        if not p.is_absolute() and repo is not None:
+            p = repo / p
+        for rn in _read_runs_from_sqlite(p):
+            key = rn.strip().lower()
+            if not key or key in seen_runs:
+                continue
+            seen_runs.add(key)
+            runs.append(rn)
+    if not runs:
+        runs = ["Run1"]
+
+    wb = Workbook()
+    ws_data = wb.active
+    ws_data.title = "Data"
+    sn_cols = [str(s).strip() for s in serials if str(s).strip()]
+    ws_data.append(["Metric"] + sn_cols)
+    try:
+        ws_data.freeze_panes = "B2"
+    except Exception:
+        pass
+
+    # Rows are grouped by run/sheet, then by configured columns/statistics.
+    try:
+        from openpyxl.styles import Font  # type: ignore
+    except Exception:
+        Font = None  # type: ignore
+    bold = Font(bold=True) if Font is not None else None
+    for run_name in runs:
+        # run group header row
+        ws_data.append([str(run_name)] + [""] * len(sn_cols))
+        if bold is not None:
+            try:
+                ws_data.cell(row=ws_data.max_row, column=1).font = bold
+            except Exception:
+                pass
+        for name in col_names:
+            for stat in stats:
+                ws_data.append([f"{run_name}.{name}.{stat}"] + [""] * len(sn_cols))
+        ws_data.append([""] + [""] * len(sn_cols))
+
+    ws_cfg = wb.create_sheet("Config")
+    ws_cfg.append(["Key", "Value"])
+    for k in ("description", "data_group", "sheet_name", "header_row"):
+        ws_cfg.append([k, json.dumps(config.get(k), ensure_ascii=False)])
+    ws_cfg.append(["statistics", ", ".join(stats)])
+    ws_cfg.append(["", ""])
+    ws_cfg.append(["Columns", ""])
+    ws_cfg.append(["name", "units", "range_min", "range_max"])
+    for c in cfg_cols:
+        if not isinstance(c, dict):
+            continue
+        ws_cfg.append(
+            [
+                str(c.get("name") or "").strip(),
+                str(c.get("units") or "").strip(),
+                json.dumps(c.get("range_min"), ensure_ascii=False),
+                json.dumps(c.get("range_max"), ensure_ascii=False),
+            ]
+        )
+
+    ws_src = wb.create_sheet("Sources")
+    ws_src.append(["serial_number", "program_title", "document_type", "metadata_rel", "artifacts_rel", "excel_sqlite_rel"])
+    for d in (docs or []):
+        ws_src.append(
+            [
+                str(d.get("serial_number") or "").strip(),
+                str(d.get("program_title") or "").strip(),
+                str(d.get("document_type") or "").strip(),
+                str(d.get("metadata_rel") or "").strip(),
+                str(d.get("artifacts_rel") or "").strip(),
+                str(d.get("excel_sqlite_rel") or "").strip(),
+            ]
+        )
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(str(path))
+    try:
+        wb.close()
+    except Exception:
+        pass
+
+
 def _write_eidp_trending_workbook(path: Path, *, serials: list[str], docs: list[dict] | None = None) -> None:
     """
     Create a blank EIDP trending workbook with header row and serial columns.
@@ -6819,6 +7851,50 @@ def create_eidat_project(
     chosen_docs = [d for d in docs if str(d.get("metadata_rel") or "").strip() in selected]
     continued_population_clean = _sanitize_continued_population(continued_population)
 
+    def _is_td_doc(d: dict) -> bool:
+        try:
+            dt = str(d.get("document_type") or "").strip().lower()
+        except Exception:
+            dt = ""
+        try:
+            acr = str(d.get("document_type_acronym") or "").strip().lower()
+        except Exception:
+            acr = ""
+        return dt in {"test data", "testdata", "td"} or acr in {"test data", "testdata", "td"}
+
+    def _is_test_data_eligible(d: dict) -> bool:
+        if not _is_td_doc(d):
+            return False
+        try:
+            sqlite_rel = str(d.get("excel_sqlite_rel") or "").strip()
+        except Exception:
+            sqlite_rel = ""
+        if sqlite_rel:
+            return True
+        try:
+            art = str(d.get("artifacts_rel") or "").strip().lower()
+        except Exception:
+            art = ""
+        return "__excel" in art
+
+    if project_type in (EIDAT_PROJECT_TYPE_TRENDING, EIDAT_PROJECT_TYPE_RAW_TRENDING):
+        bad = [d for d in chosen_docs if isinstance(d, dict) and _is_td_doc(d)]
+        if bad:
+            bad_sn = sorted({str(d.get("serial_number") or "").strip() for d in bad if str(d.get("serial_number") or "").strip()})
+            raise RuntimeError(
+                "TD reports cannot be used to create an EIDP Trending project. "
+                "Create a Test Data Trending project instead. "
+                + (f"(TD serials selected: {', '.join(bad_sn[:12])})" if bad_sn else "")
+            )
+    if project_type == EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING:
+        bad = [d for d in chosen_docs if isinstance(d, dict) and not _is_test_data_eligible(d)]
+        if bad:
+            bad_sn = sorted({str(d.get("serial_number") or "").strip() for d in bad if str(d.get("serial_number") or "").strip()})
+            raise RuntimeError(
+                "Test Data Trending projects must be created from TD reports with extracted Excel data. "
+                + (f"(Invalid serials selected: {', '.join(bad_sn[:12])})" if bad_sn else "")
+            )
+
     serials = sorted({str(d.get("serial_number") or "").strip() for d in chosen_docs if str(d.get("serial_number") or "").strip()})
     if not serials:
         raise RuntimeError("Selected EIDPs have no serial numbers in the index. Re-run indexing or choose different items.")
@@ -6828,6 +7904,8 @@ def create_eidat_project(
 
     auto_populate_result = None
     terms_count = 0
+    excel_trend_config_path = ""
+    config_snapshot: dict | None = None
 
     if project_type == EIDAT_PROJECT_TYPE_TRENDING:
         # Create workbook with header row, serial columns, and metadata sheet.
@@ -6869,6 +7947,27 @@ def create_eidat_project(
             ),
         )
 
+    elif project_type == EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING:
+        # Test Data trending: config-driven skeleton workbook (no auto-populate yet).
+        auto_populate = False
+        cfg_path = CENTRAL_EXCEL_TREND_CONFIG
+        cfg = _load_excel_trend_config(cfg_path)
+        excel_trend_config_path = str(cfg_path)
+        config_snapshot = cfg
+        _ensure_file_written(
+            workbook_path,
+            create_fn=lambda: _write_test_data_trending_workbook(
+                workbook_path,
+                global_repo=repo,
+                serials=serials,
+                docs=chosen_docs,
+                config=cfg,
+            ),
+        )
+        # Create/populate the project-local cache DB at project creation time so
+        # Trend/Analyze can plot immediately from `implementation_trending.sqlite3`.
+        ensure_test_data_project_cache(project_dir, workbook_path, rebuild=True)
+
     else:
         raise RuntimeError(f"Unsupported project type: {project_type}")
 
@@ -6887,6 +7986,10 @@ def create_eidat_project(
         "auto_populate": auto_populate_result,
         "population_mode": "auto" if auto_populate else "blank",
     }
+    if excel_trend_config_path:
+        meta["excel_trend_config_path"] = excel_trend_config_path
+    if isinstance(config_snapshot, dict):
+        meta["config_snapshot"] = config_snapshot
     description = _format_continued_population_description(continued_population_clean)
     if description:
         meta["description"] = description

@@ -19,6 +19,7 @@ ALLOWED_KEYS = {
     "document_type_acronym",
     "vendor",
     "acceptance_test_plan_number",
+    "excel_sqlite_rel",
 }
 
 DEFAULT_CANDIDATES = {
@@ -621,6 +622,127 @@ def extract_metadata_from_text(text: str, *, asset_types: Optional[list[str]] = 
             meta[key] = "Unknown"
 
     return {k: v for k, v in meta.items() if v is not None}
+
+
+def extract_metadata_from_excel(
+    excel_path: Path,
+    *,
+    max_sheets: int = 6,
+    max_rows: int = 120,
+    max_cols: int = 30,
+) -> dict:
+    """
+    Extract metadata from an Excel workbook by sampling early sheet cells and reusing the
+    standard text-based metadata extractor.
+
+    This builds a small "table-like" text blob with `|` separators so the existing parsing
+    heuristics (label/value, table fields, doc type candidates) work consistently across PDFs and Excel.
+    """
+    p = Path(excel_path).expanduser()
+    if not p.exists():
+        raise FileNotFoundError(str(p))
+
+    lines: list[str] = []
+    try:
+        stem = str(p.stem)
+        lines.append(stem)
+        # Add separator-normalized variants so candidate matching can succeed on `Test_Data`, etc.
+        lines.append(re.sub(r"[_\\-]+", " ", stem))
+    except Exception:
+        pass
+
+    meta: dict
+    try:
+        from openpyxl import load_workbook  # type: ignore
+
+        wb = load_workbook(str(p), read_only=True, data_only=True)
+        try:
+            sheetnames = list(getattr(wb, "sheetnames", []) or [])
+            for sheet_name in sheetnames[: int(max_sheets)]:
+                try:
+                    ws = wb[sheet_name]
+                except Exception:
+                    continue
+                try:
+                    lines.append(f"Sheet | {sheet_name}")
+                except Exception:
+                    pass
+
+                try:
+                    row_iter = ws.iter_rows(
+                        min_row=1,
+                        max_row=int(max_rows),
+                        min_col=1,
+                        max_col=int(max_cols),
+                        values_only=True,
+                    )
+                except Exception:
+                    continue
+
+                for row in row_iter:
+                    vals: list[str] = []
+                    for v in list(row or [])[: int(max_cols)]:
+                        if v is None:
+                            continue
+                        s = str(v).strip()
+                        if not s:
+                            continue
+                        if len(s) > 160:
+                            s = s[:160]
+                        vals.append(s)
+                        if len(vals) >= 6:
+                            break
+                    if len(vals) >= 2:
+                        lines.append(" | ".join(vals))
+        finally:
+            try:
+                wb.close()
+            except Exception:
+                pass
+    except Exception:
+        # Best-effort fallback (e.g., unsupported .xls): extract from filename/title only.
+        pass
+
+    blob = "\n".join([ln for ln in lines if str(ln).strip()])
+    meta = extract_metadata_from_text(blob, pdf_path=p)
+
+    # Fallback: derive program/title + serial from filename if missing.
+    try:
+        import importlib.util
+
+        project_root = Path(__file__).resolve().parents[1]
+        mod_path = project_root / "scripts" / "excel_extraction.py"
+        spec = importlib.util.spec_from_file_location("excel_extraction", mod_path)
+        if spec is not None and spec.loader is not None:
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)  # type: ignore[attr-defined]
+            program, vehicle, serial = mod.derive_file_identity(p)  # type: ignore[attr-defined]
+        else:
+            program = vehicle = serial = ""
+    except Exception:
+        program = vehicle = serial = ""
+
+    try:
+        prog_val = str(meta.get("program_title") or "").strip()
+    except Exception:
+        prog_val = ""
+    if not prog_val or prog_val.lower() == "unknown":
+        title = ""
+        if program and vehicle:
+            title = f"{program} {vehicle}".strip()
+        else:
+            title = (program or vehicle or "").strip()
+        if title:
+            meta["program_title"] = title
+
+    try:
+        sn_val = str(meta.get("serial_number") or "").strip()
+    except Exception:
+        sn_val = ""
+    if (not sn_val or sn_val.lower() == "unknown") and str(serial or "").strip():
+        meta["serial_number"] = str(serial).strip()
+
+    return meta
 
 
 def write_metadata(artifacts_dir: Path, pdf_path: Path, metadata: dict) -> Optional[Path]:

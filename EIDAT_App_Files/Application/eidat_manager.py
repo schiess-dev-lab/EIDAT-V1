@@ -19,6 +19,7 @@ from eidat_manager_db import SupportPaths, support_paths  # noqa: E402
 from eidat_manager_scan import scan_global_repo  # noqa: E402
 from eidat_manager_process import process_candidates  # noqa: E402
 from eidat_manager_index import build_index  # noqa: E402
+from eidat_manager_excel_to_sqlite import excel_to_sqlite  # noqa: E402
 
 
 def _cmd_init(paths: SupportPaths) -> dict:
@@ -92,6 +93,35 @@ def _cmd_index(paths: SupportPaths, *, similarity: float) -> dict:
     }
 
 
+def _cmd_excel_to_sqlite(
+    paths: SupportPaths,
+    *,
+    excel_files: list[Path] | None,
+    data_dir: Path | None,
+    out_dir: Path | None,
+    overwrite: bool,
+    max_scan_rows: int,
+    max_cols: int,
+    lookahead_rows: int,
+    min_numeric_count: int,
+    min_numeric_ratio: float,
+    min_data_cols: int,
+) -> dict:
+    return excel_to_sqlite(
+        global_repo=paths.global_repo,
+        excel_files=excel_files,
+        data_dir=data_dir,
+        out_dir=out_dir,
+        overwrite=overwrite,
+        max_scan_rows=max_scan_rows,
+        max_cols=max_cols,
+        lookahead_rows=lookahead_rows,
+        min_numeric_count=min_numeric_count,
+        min_numeric_ratio=min_numeric_ratio,
+        min_data_cols=min_data_cols,
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="EIDAT Manager: orchestrates scanning a Global Repo and managing EIDAT Support.",
@@ -117,6 +147,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     si = sub.add_parser("index", help="Build serial index + similarity grouping from EIDAT Support metadata.")
     si.add_argument("--similarity", type=float, default=0.86, help="Similarity threshold for grouping titles.")
+    se = sub.add_parser("excel_to_sqlite", help="Convert Excel data files into per-workbook SQLite databases.")
+    se.add_argument("--data-dir", type=str, default="", help="Scan this directory for Excel files (default: global repo).")
+    se.add_argument("--excel", action="append", default=[], help="Explicit Excel file path (repeatable).")
+    se.add_argument("--out-dir", type=str, default="", help="Output folder for SQLite files (default: <global-repo>/EIDAT Support/excel_sqlite).")
+    se.add_argument("--overwrite", action="store_true", help="Overwrite existing .sqlite3 outputs.")
+    se.add_argument("--max-scan-rows", type=int, default=200, help="Max rows to scan for header detection.")
+    se.add_argument("--max-cols", type=int, default=200, help="Max columns to scan for header detection.")
+    se.add_argument("--lookahead-rows", type=int, default=60, help="Rows below header to confirm numeric columns.")
+    se.add_argument("--min-numeric-count", type=int, default=8, help="Minimum numeric cells under a header to treat it as a data column.")
+    se.add_argument("--min-numeric-ratio", type=float, default=0.60, help="Minimum numeric/filled ratio under a header.")
+    se.add_argument("--min-data-cols", type=int, default=1, help="Minimum detected numeric columns required to accept a header row.")
     return p
 
 
@@ -143,6 +184,26 @@ def main(argv: list[str] | None = None) -> int:
     elif args.cmd == "index":
         sim = float(getattr(args, "similarity", 0.86) or 0.86)
         payload = _cmd_index(paths, similarity=sim)
+    elif args.cmd == "excel_to_sqlite":
+        raw_excels = list(getattr(args, "excel", []) or [])
+        excel_files = [Path(p).expanduser() for p in raw_excels if str(p).strip()] or None
+        raw_data_dir = str(getattr(args, "data_dir", "") or "").strip()
+        data_dir = Path(raw_data_dir).expanduser() if raw_data_dir else None
+        raw_out_dir = str(getattr(args, "out_dir", "") or "").strip()
+        out_dir = Path(raw_out_dir).expanduser() if raw_out_dir else None
+        payload = _cmd_excel_to_sqlite(
+            paths,
+            excel_files=excel_files,
+            data_dir=data_dir,
+            out_dir=out_dir,
+            overwrite=bool(getattr(args, "overwrite", False)),
+            max_scan_rows=int(getattr(args, "max_scan_rows", 200) or 200),
+            max_cols=int(getattr(args, "max_cols", 200) or 200),
+            lookahead_rows=int(getattr(args, "lookahead_rows", 60) or 60),
+            min_numeric_count=int(getattr(args, "min_numeric_count", 8) or 8),
+            min_numeric_ratio=float(getattr(args, "min_numeric_ratio", 0.60) or 0.60),
+            min_data_cols=int(getattr(args, "min_data_cols", 1) or 1),
+        )
     else:
         raise SystemExit(f"Unknown command: {args.cmd}")
 

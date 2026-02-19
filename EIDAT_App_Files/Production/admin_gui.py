@@ -400,14 +400,17 @@ class AdminWindow(QtWidgets.QMainWindow):
                 bl.setContentsMargins(0, 0, 0, 0)
                 b_open = QtWidgets.QPushButton("Open")
                 b_deploy = QtWidgets.QPushButton("Deploy/Repair")
+                b_reset = QtWidgets.QPushButton("Reset")
                 b_proc = QtWidgets.QPushButton("Process")
-                for b in (b_open, b_deploy, b_proc):
-                    b.setMaximumWidth(110)
+                for b in (b_open, b_deploy, b_reset, b_proc):
+                    b.setMaximumWidth(120)
                 b_open.clicked.connect(lambda _=False, root=n.node_root: self._open_folder(root))
                 b_deploy.clicked.connect(lambda _=False, root=n.node_root: self._deploy_node(root))
+                b_reset.clicked.connect(lambda _=False, root=n.node_root: self._reset_node(root))
                 b_proc.clicked.connect(lambda _=False, nid=n.node_id: self._process_one(nid))
                 bl.addWidget(b_open)
                 bl.addWidget(b_deploy)
+                bl.addWidget(b_reset)
                 bl.addWidget(b_proc)
                 self.tbl.setCellWidget(r, 5, btns)
         finally:
@@ -456,6 +459,43 @@ class AdminWindow(QtWidgets.QMainWindow):
             self.refresh()
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "Deploy", str(exc))
+
+    def _reset_node(self, node_root: str) -> None:
+        if self.worker.isRunning():
+            QtWidgets.QMessageBox.information(self, "Busy", "Processing is already running.")
+            return
+        root = str(_as_abs(node_root))
+        msg = (
+            "This will completely delete and recreate the node runtime folders:\n\n"
+            f"  {Path(root) / 'EIDAT'}\n"
+            f"  {Path(root) / 'EIDAT Support'}\n\n"
+            "This does NOT delete EIDPs.\n\n"
+            "Continue?"
+        )
+        resp = QtWidgets.QMessageBox.question(
+            self,
+            "Reset Node",
+            msg,
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+        )
+        if resp != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        try:
+            from .deploy import main as deploy_main
+
+            deploy_main(["--node-root", root, "--runtime-root", str(self._runtime_root), "--reset-node"])
+            node_id = admin_db.upsert_node(
+                self._conn,
+                node_root=str(_as_abs(root)),
+                runtime_root=str(self._runtime_root),
+                enabled=True,
+                notes=None,
+            )
+            admin_db.set_node_env_enabled(self._conn, node_id=node_id, enabled=True)
+            self._append_log(f"[RESET] {root}")
+            self.refresh()
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Reset", str(exc))
 
     def _act_add_deploy(self) -> None:
         node_root = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Node Root (repo folder)")

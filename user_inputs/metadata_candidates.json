@@ -37,6 +37,11 @@
       "name": "Data file",
       "acronym": "DATA",
       "aliases": ["Data file", "Data File", "Excel", "Spreadsheet", "Excel file data"]
+    },
+    {
+      "name": "Test Data",
+      "acronym": "TD",
+      "aliases": ["Test Data", "Test-Data", "TestData", "TD"]
     }
   ]
 }

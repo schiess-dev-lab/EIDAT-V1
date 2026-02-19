@@ -2,11 +2,61 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
 import os
 import re
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+
+def _repo_root() -> Path:
+    # EIDAT_App_Files/scripts/excel_extraction.py -> repo root is parents[2]
+    return Path(__file__).resolve().parents[2]
+
+
+def _parse_env_file(path: Path) -> Dict[str, str]:
+    p = Path(path).expanduser()
+    if not p.exists() or not p.is_file():
+        return {}
+    out: Dict[str, str] = {}
+    for raw in p.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k = k.strip()
+        if not k:
+            continue
+        out[k] = v.strip()
+    return out
+
+
+def _load_test_data_env() -> Dict[str, str]:
+    env_path = _repo_root() / "user_inputs" / "test_data.env"
+    env = _parse_env_file(env_path)
+    # Environment variables win
+    for k in list(env.keys()):
+        if k in os.environ:
+            env[k] = str(os.environ.get(k) or "").strip()
+    for k, v in os.environ.items():
+        if k.startswith("EIDAT_TEST_DATA_") and k not in env:
+            env[k] = str(v or "").strip()
+    return env
+
+
+def _truthy(s: Any) -> bool:
+    v = str(s or "").strip().lower()
+    return v in {"1", "true", "yes", "y", "on"}
+
+
+def _float(s: Any, default: float) -> float:
+    try:
+        return float(str(s or "").strip())
+    except Exception:
+        return float(default)
 
 
 def load_config(path: Path) -> Dict[str, Any]:
@@ -64,7 +114,270 @@ def _read_dataframe(excel_path: Path, *, sheet_name: Optional[str], header_row: 
 
 
 def _normalize_col_name(name: Any) -> str:
-    return str(name).strip().lower()
+    s = str(name or "").strip().lower()
+    # Remove units/parentheticals and non-alphanumerics for fuzzy matching.
+    s = re.sub(r"\(.*?\)", " ", s)
+    s = re.sub(r"[^0-9a-z]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _best_fuzzy_column_match(target: str, candidates: List[str], *, min_ratio: float) -> Tuple[Optional[str], float]:
+    """
+    Return (best_candidate, score) for a target column name against normalized candidate strings.
+    """
+    tgt = _normalize_col_name(target)
+    if not tgt:
+        return None, 0.0
+    best: Optional[str] = None
+    best_score = 0.0
+    for cand in candidates:
+        c = _normalize_col_name(cand)
+        if not c:
+            continue
+        if c == tgt:
+            return cand, 1.0
+        if tgt in c or c in tgt:
+            score = 0.92
+        else:
+            score = difflib.SequenceMatcher(a=tgt, b=c).ratio()
+        if score > best_score:
+            best_score = score
+            best = cand
+    if best is None or best_score < float(min_ratio):
+        return None, float(best_score)
+    return best, float(best_score)
+
+
+def _try_float(v: Any) -> Optional[float]:
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        try:
+            fv = float(v)
+            if fv == fv:
+                return fv
+        except Exception:
+            return None
+        return None
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return None
+        s2 = s.replace(",", "").replace(" ", "")
+        try:
+            fv = float(s2)
+            if fv == fv:
+                return fv
+        except Exception:
+            return None
+    return None
+
+
+def _is_header_value(v: Any) -> bool:
+    if v is None:
+        return False
+    if isinstance(v, bool):
+        return False
+    if isinstance(v, (int, float)):
+        return False
+    s = str(v).strip()
+    if not s or len(s) > 120:
+        return False
+    if not any(ch.isalpha() for ch in s):
+        return False
+    if _try_float(s) is not None:
+        return False
+    return True
+
+
+def _auto_detect_header_row(excel_path: Path, *, max_scan_rows: int = 200, max_cols: int = 200, lookahead_rows: int = 60):
+    """Best-effort (sheet_name, header_row_0_based_for_pandas) across the workbook."""
+    try:
+        from openpyxl import load_workbook  # type: ignore
+    except Exception:
+        return None, 0
+
+    wb = load_workbook(str(excel_path), data_only=True, read_only=True)
+    try:
+        sheetnames = list(getattr(wb, "sheetnames", []) or [])
+        if not sheetnames:
+            return None, 0
+
+        best_sheet: Optional[str] = None
+        best_header_row_1b: Optional[int] = None
+        best_score = -1.0
+
+        for sname in sheetnames:
+            ws = wb[sname]
+            try:
+                max_row = int(getattr(ws, "max_row", 0) or 0)
+                max_col = int(getattr(ws, "max_column", 0) or 0)
+            except Exception:
+                continue
+            if max_row <= 0 or max_col <= 0:
+                continue
+
+            scan_rows = max(1, min(int(max_scan_rows), max_row))
+            scan_cols = max(1, min(int(max_cols), max_col))
+
+            for r in range(1, scan_rows + 1):
+                try:
+                    header_vals = list(
+                        next(ws.iter_rows(min_row=r, max_row=r, min_col=1, max_col=scan_cols, values_only=True))
+                    )
+                except Exception:
+                    continue
+                if not any(_is_header_value(v) for v in header_vals):
+                    continue
+
+                la_start = r + 1
+                la_end = min(max_row, r + int(lookahead_rows))
+                if la_start > la_end:
+                    continue
+                try:
+                    lookahead = list(
+                        ws.iter_rows(
+                            min_row=la_start, max_row=la_end, min_col=1, max_col=scan_cols, values_only=True
+                        )
+                    )
+                except Exception:
+                    lookahead = []
+                if not lookahead:
+                    continue
+
+                # score: count numeric-heavy columns beneath header cells
+                score = 0.0
+                evidence_cols = 0
+                for ci, hv in enumerate(header_vals, start=1):
+                    if not _is_header_value(hv):
+                        continue
+                    filled = 0
+                    numeric = 0
+                    for row_vals in lookahead:
+                        try:
+                            v = row_vals[ci - 1]
+                        except Exception:
+                            v = None
+                        if v is None or (isinstance(v, str) and not v.strip()):
+                            continue
+                        filled += 1
+                        if _try_float(v) is not None:
+                            numeric += 1
+                    if numeric >= 8 and filled > 0 and (float(numeric) / float(filled)) >= 0.60:
+                        evidence_cols += 1
+                        score += float(numeric)
+
+                if evidence_cols <= 0:
+                    continue
+                # prefer earlier rows when tie
+                score += 0.001 * float(scan_rows - r)
+                if score > best_score:
+                    best_score = score
+                    best_sheet = sname
+                    best_header_row_1b = r
+
+        if best_sheet is None or best_header_row_1b is None:
+            return None, 0
+        return best_sheet, int(best_header_row_1b) - 1
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
+
+
+def _auto_detect_header_rows_by_sheet(
+    excel_path: Path, *, max_scan_rows: int = 200, max_cols: int = 200, lookahead_rows: int = 60
+) -> List[Tuple[str, int]]:
+    """Return [(sheet_name, header_row_0_based_for_pandas), ...] for sheets with detectable numeric headers."""
+    try:
+        from openpyxl import load_workbook  # type: ignore
+    except Exception:
+        return []
+
+    wb = load_workbook(str(excel_path), data_only=True, read_only=True)
+    try:
+        sheetnames = list(getattr(wb, "sheetnames", []) or [])
+        out: List[Tuple[str, int]] = []
+        for sname in sheetnames:
+            ws = wb[sname]
+            try:
+                max_row = int(getattr(ws, "max_row", 0) or 0)
+                max_col = int(getattr(ws, "max_column", 0) or 0)
+            except Exception:
+                continue
+            if max_row <= 0 or max_col <= 0:
+                continue
+
+            scan_rows = max(1, min(int(max_scan_rows), max_row))
+            scan_cols = max(1, min(int(max_cols), max_col))
+
+            best_row_1b: Optional[int] = None
+            best_score = -1.0
+            for r in range(1, scan_rows + 1):
+                try:
+                    header_vals = list(
+                        next(ws.iter_rows(min_row=r, max_row=r, min_col=1, max_col=scan_cols, values_only=True))
+                    )
+                except Exception:
+                    continue
+                if not any(_is_header_value(v) for v in header_vals):
+                    continue
+
+                la_start = r + 1
+                la_end = min(max_row, r + int(lookahead_rows))
+                if la_start > la_end:
+                    continue
+                try:
+                    lookahead = list(
+                        ws.iter_rows(
+                            min_row=la_start, max_row=la_end, min_col=1, max_col=scan_cols, values_only=True
+                        )
+                    )
+                except Exception:
+                    lookahead = []
+                if not lookahead:
+                    continue
+
+                score = 0.0
+                evidence_cols = 0
+                for ci, hv in enumerate(header_vals, start=1):
+                    if not _is_header_value(hv):
+                        continue
+                    filled = 0
+                    numeric = 0
+                    for row_vals in lookahead:
+                        try:
+                            v = row_vals[ci - 1]
+                        except Exception:
+                            v = None
+                        if v is None or (isinstance(v, str) and not v.strip()):
+                            continue
+                        filled += 1
+                        if _try_float(v) is not None:
+                            numeric += 1
+                    if numeric >= 8 and filled > 0 and (float(numeric) / float(filled)) >= 0.60:
+                        evidence_cols += 1
+                        score += float(numeric)
+
+                if evidence_cols <= 0:
+                    continue
+                score += 0.001 * float(scan_rows - r)
+                if score > best_score:
+                    best_score = score
+                    best_row_1b = r
+
+            if best_row_1b is not None and best_score > 0.0:
+                out.append((str(sname), int(best_row_1b) - 1))
+        return out
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
 
 
 def _stat_value(series, stat: str):
@@ -86,9 +399,35 @@ def _stat_value(series, stat: str):
 
 
 def extract_from_excel(excel_path: Path, config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    env = _load_test_data_env()
+    fuzzy_enabled = _truthy(env.get("EIDAT_TEST_DATA_FUZZY_HEADER_STICK", "1"))
+    fuzzy_min_ratio = _float(env.get("EIDAT_TEST_DATA_FUZZY_HEADER_MIN_RATIO", "0.82"), 0.82)
+    auto_detect_header = _truthy(env.get("EIDAT_TEST_DATA_AUTO_DETECT_HEADER_ROW", "1"))
+    debug = _truthy(env.get("EIDAT_TEST_DATA_FUZZY_DEBUG", "0"))
+
     sheet_name = config.get("sheet_name", None)
     header_row = int(config.get("header_row", 0) or 0)
-    df = _read_dataframe(excel_path, sheet_name=sheet_name, header_row=header_row)
+
+    # Decide which sheets to process.
+    # - If config specifies a sheet_name, process only that sheet.
+    # - Else if header_row=0 and auto-detect is enabled, process all sheets with detectable headers.
+    # - Else, use the first sheet + configured header_row.
+    sheet_jobs: List[Tuple[Optional[str], int]] = []
+    if sheet_name not in ("", None):
+        sheet_jobs = [(str(sheet_name), int(max(0, header_row)))]
+    elif int(header_row) <= 0 and auto_detect_header:
+        detected = _auto_detect_header_rows_by_sheet(excel_path)
+        if detected:
+            sheet_jobs = [(s, int(h)) for s, h in detected]
+            if debug:
+                for s, h in detected:
+                    print(f"[TEST_DATA] auto header: sheet={s} header_row_0b={h}", file=os.sys.stderr)
+        else:
+            # Fall back to best guess across workbook, then to first sheet.
+            auto_sheet, auto_header_0b = _auto_detect_header_row(excel_path)
+            sheet_jobs = [(auto_sheet, int(auto_header_0b))]
+    else:
+        sheet_jobs = [(None, int(max(0, header_row)))]
 
     try:
         import pandas as pd  # type: ignore
@@ -100,91 +439,122 @@ def extract_from_excel(excel_path: Path, config: Dict[str, Any]) -> List[Dict[st
     if not stats:
         stats = ["mean", "min", "max", "std", "median", "count"]
 
-    col_map = {_normalize_col_name(c): c for c in list(df.columns)}
     program, vehicle, serial = derive_file_identity(excel_path)
 
     rows: List[Dict[str, Any]] = []
-    for col in cols_cfg:
-        if not isinstance(col, dict):
-            continue
-        name = str(col.get("name") or "").strip()
-        if not name:
-            continue
-        units = col.get("units")
-        range_min = col.get("range_min")
-        range_max = col.get("range_max")
-        df_col = col_map.get(name.strip().lower())
-        if df_col is None:
-            rows.append(
-                {
-                    "source_file": str(excel_path),
-                    "program": program,
-                    "vehicle": vehicle,
-                    "serial": serial,
-                    "column": name,
-                    "units": units,
-                    "stat": "error",
-                    "value": None,
-                    "error": f"Missing column: {name}",
-                    "range_min": range_min,
-                    "range_max": range_max,
-                }
-            )
-            continue
-        numeric = pd.to_numeric(df[df_col], errors="coerce")
-        numeric = numeric.dropna()
-        if numeric.empty:
-            rows.append(
-                {
-                    "source_file": str(excel_path),
-                    "program": program,
-                    "vehicle": vehicle,
-                    "serial": serial,
-                    "column": name,
-                    "units": units,
-                    "stat": "error",
-                    "value": None,
-                    "error": f"No numeric data in column: {name}",
-                    "range_min": range_min,
-                    "range_max": range_max,
-                }
-            )
-            continue
-        for stat in stats:
-            try:
-                val = _stat_value(numeric, stat)
-            except Exception as exc:
+    for sheet, hdr_for_pandas in sheet_jobs:
+        df = _read_dataframe(excel_path, sheet_name=sheet, header_row=int(hdr_for_pandas))
+        df_cols = list(df.columns)
+        col_map = {_normalize_col_name(c): c for c in df_cols}
+
+        for col in cols_cfg:
+            if not isinstance(col, dict):
+                continue
+            name = str(col.get("name") or "").strip()
+            if not name:
+                continue
+            units = col.get("units")
+            range_min = col.get("range_min")
+            range_max = col.get("range_max")
+            df_col = col_map.get(_normalize_col_name(name))
+            matched_col = None
+            matched_score = None
+            if df_col is None and fuzzy_enabled:
+                best, score = _best_fuzzy_column_match(
+                    name, [str(c) for c in df_cols], min_ratio=float(fuzzy_min_ratio)
+                )
+                if best is not None:
+                    df_col = best
+                    matched_col = str(best)
+                    matched_score = float(score)
+                    if debug:
+                        print(
+                            f"[TEST_DATA] fuzzy match: sheet={sheet!r} target={name!r} -> {matched_col!r} score={matched_score:.3f}",
+                            file=os.sys.stderr,
+                        )
+            if df_col is None:
                 rows.append(
                     {
                         "source_file": str(excel_path),
                         "program": program,
                         "vehicle": vehicle,
                         "serial": serial,
+                        "sheet_name": str(sheet or ""),
+                        "header_row": int(hdr_for_pandas),
                         "column": name,
                         "units": units,
-                        "stat": stat,
+                        "stat": "error",
                         "value": None,
-                        "error": str(exc),
+                        "error": f"Missing column: {name}",
                         "range_min": range_min,
                         "range_max": range_max,
                     }
                 )
                 continue
-            rows.append(
-                {
-                    "source_file": str(excel_path),
-                    "program": program,
-                    "vehicle": vehicle,
-                    "serial": serial,
-                    "column": name,
-                    "units": units,
-                    "stat": stat,
-                    "value": val,
-                    "error": None,
-                    "range_min": range_min,
-                    "range_max": range_max,
-                }
-            )
+            numeric = pd.to_numeric(df[df_col], errors="coerce")
+            numeric = numeric.dropna()
+            if numeric.empty:
+                rows.append(
+                    {
+                        "source_file": str(excel_path),
+                        "program": program,
+                        "vehicle": vehicle,
+                        "serial": serial,
+                        "sheet_name": str(sheet or ""),
+                        "header_row": int(hdr_for_pandas),
+                        "column": name,
+                        "units": units,
+                        "stat": "error",
+                        "value": None,
+                        "error": f"No numeric data in column: {name}",
+                        "range_min": range_min,
+                        "range_max": range_max,
+                    }
+                )
+                continue
+            for stat in stats:
+                try:
+                    val = _stat_value(numeric, stat)
+                except Exception as exc:
+                    rows.append(
+                        {
+                            "source_file": str(excel_path),
+                            "program": program,
+                            "vehicle": vehicle,
+                            "serial": serial,
+                            "sheet_name": str(sheet or ""),
+                            "header_row": int(hdr_for_pandas),
+                            "column": name,
+                            "units": units,
+                            "stat": stat,
+                            "value": None,
+                            "error": str(exc),
+                            "range_min": range_min,
+                            "range_max": range_max,
+                            "matched_column": matched_col,
+                            "matched_score": matched_score,
+                        }
+                    )
+                    continue
+                rows.append(
+                    {
+                        "source_file": str(excel_path),
+                        "program": program,
+                        "vehicle": vehicle,
+                        "serial": serial,
+                        "sheet_name": str(sheet or ""),
+                        "header_row": int(hdr_for_pandas),
+                        "column": name,
+                        "units": units,
+                        "stat": stat,
+                        "value": val,
+                        "error": None,
+                        "range_min": range_min,
+                        "range_max": range_max,
+                        "matched_column": matched_col,
+                        "matched_score": matched_score,
+                    }
+                )
     return rows
 
 
@@ -270,4 +640,3 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
