@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS documents (
   vendor TEXT,
   acceptance_test_plan_number TEXT,
   excel_sqlite_rel TEXT,
+  file_extension TEXT,
   title_norm TEXT,
   similarity_group TEXT,
   indexed_epoch_ns INTEGER NOT NULL,
@@ -102,6 +103,94 @@ def _infer_serial_from_filename(meta_path: Path) -> str | None:
     except Exception:
         pass
     return None
+
+
+def _infer_is_test_data_from_path(meta_path: Path) -> bool:
+    """
+    Heuristic fallback: classify as Test Data when the *filename/folder* contains
+    'test data' (including hyphen/underscore variants) or a standalone 'TD' token.
+    """
+    return _infer_is_test_data_from_path_with_aliases(meta_path, _load_test_data_aliases())
+
+
+def _infer_is_test_data_from_path_with_aliases(meta_path: Path, td_aliases: list[str]) -> bool:
+    """
+    Classify as Test Data when the *filename/folder* contains any user-configured alias for TD.
+    """
+    try:
+        parts = [
+            meta_path.name,
+            meta_path.stem,
+            meta_path.parent.name,
+        ]
+        try:
+            parts.append(meta_path.parent.parent.name)
+        except Exception:
+            pass
+        blob = "\n".join([p for p in parts if str(p).strip()])
+    except Exception:
+        blob = str(meta_path)
+
+    def _norm(s: str) -> str:
+        return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
+
+    blob_norm = _norm(blob)
+    blob_tokens = set(blob_norm.split())
+
+    # If candidates aren't available, retain a conservative fallback.
+    aliases = [str(a).strip() for a in (td_aliases or []) if str(a).strip()] or ["Test Data", "Test-Data", "TestData", "TD"]
+    for alias in aliases:
+        a_norm = _norm(alias)
+        if not a_norm:
+            continue
+        if len(a_norm) <= 3 and len(a_norm.split()) == 1:
+            if a_norm in blob_tokens:
+                return True
+        else:
+            if a_norm in blob_norm:
+                return True
+    return False
+
+
+def _load_test_data_aliases() -> list[str]:
+    """Load TD aliases from user_inputs/metadata_candidates.json (document_types entry with acronym TD)."""
+    try:
+        root = Path(__file__).resolve().parents[2]
+        cand_path = root / "user_inputs" / "metadata_candidates.json"
+        if not cand_path.exists():
+            return []
+        data = json.loads(cand_path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return []
+        raw = data.get("document_types") or []
+        if not isinstance(raw, list):
+            return []
+        out: list[str] = []
+        for entry in raw:
+            if not isinstance(entry, dict):
+                continue
+            acr = str(entry.get("acronym") or "").strip()
+            if acr.upper() != "TD":
+                continue
+            aliases = entry.get("aliases")
+            if isinstance(aliases, list):
+                out.extend([str(a).strip() for a in aliases if str(a).strip()])
+            name = str(entry.get("name") or "").strip()
+            if name:
+                out.append(name)
+            out.append("TD")
+        # Dedup, preserve order-ish
+        seen = set()
+        result = []
+        for a in out:
+            k = a.casefold()
+            if k in seen:
+                continue
+            seen.add(k)
+            result.append(a)
+        return result
+    except Exception:
+        return []
 
 
 def _connect(db_path: Path) -> sqlite3.Connection:
@@ -184,7 +273,6 @@ def build_index(paths: SupportPaths, *, similarity: float = 0.86) -> IndexSummar
     index_db = support_dir / "eidat_index.sqlite3"
 
     metadata_files = _load_metadata_files(support_dir)
-    program_title_candidates = _load_program_title_candidates()
     docs: list[dict] = []
     for meta_path in metadata_files:
         try:
@@ -194,27 +282,7 @@ def build_index(paths: SupportPaths, *, similarity: float = 0.86) -> IndexSummar
         is_excel_artifacts = str(meta_path.parent.name).endswith("__excel")
         default_doc_type = "Data file" if is_excel_artifacts else "EIDP"
         meta = sanitize_metadata(raw, default_document_type=default_doc_type)
-        # Normalize legacy Excel doc type values to the new default.
-        try:
-            if is_excel_artifacts and str(meta.get("document_type") or "").strip().lower() in {"excel file data", "excel"}:
-                meta["document_type"] = "Data file"
-                meta["document_type_acronym"] = "DATA"
-        except Exception:
-            pass
         title = str(meta.get("program_title") or "")
-        # If program title is unknown, infer it from the filename using candidates.
-        if not title or title.strip().lower() == "unknown":
-            inferred_title = _infer_program_title_from_filename(meta_path, program_title_candidates)
-            if inferred_title:
-                meta["program_title"] = inferred_title
-                title = inferred_title
-
-        # If serial number is unknown, infer it from the filename (e.g., SN2222).
-        serial_val = str(meta.get("serial_number") or "")
-        if not serial_val or serial_val.strip().lower() == "unknown":
-            inferred_serial = _infer_serial_from_filename(meta_path)
-            if inferred_serial:
-                meta["serial_number"] = inferred_serial
 
         title_norm = normalize_title(title)
         artifacts_rel = None
@@ -244,6 +312,7 @@ def build_index(paths: SupportPaths, *, similarity: float = 0.86) -> IndexSummar
                 "vendor": meta.get("vendor"),
                 "acceptance_test_plan_number": meta.get("acceptance_test_plan_number"),
                 "excel_sqlite_rel": meta.get("excel_sqlite_rel"),
+                "file_extension": meta.get("file_extension"),
                 "title_norm": title_norm,
                 "similarity_group": "",
                 "certification_status": cert_info.get("certification_status"),
@@ -265,6 +334,7 @@ def build_index(paths: SupportPaths, *, similarity: float = 0.86) -> IndexSummar
             ("vendor", "TEXT"),
             ("acceptance_test_plan_number", "TEXT"),
             ("excel_sqlite_rel", "TEXT"),
+            ("file_extension", "TEXT"),
         ]
         for col_name, col_type in migration_columns:
             try:
@@ -280,9 +350,9 @@ def build_index(paths: SupportPaths, *, similarity: float = 0.86) -> IndexSummar
                   metadata_rel, artifacts_rel, program_title, asset_type,
                   serial_number, part_number, revision, test_date, report_date, document_type,
                   document_type_acronym, vendor, acceptance_test_plan_number,
-                  excel_sqlite_rel, title_norm, similarity_group, indexed_epoch_ns,
+                  excel_sqlite_rel, file_extension, title_norm, similarity_group, indexed_epoch_ns,
                   certification_status, certification_pass_rate
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     d["metadata_rel"],
@@ -299,6 +369,7 @@ def build_index(paths: SupportPaths, *, similarity: float = 0.86) -> IndexSummar
                     d.get("vendor"),
                     d.get("acceptance_test_plan_number"),
                     d.get("excel_sqlite_rel"),
+                    d.get("file_extension"),
                     d["title_norm"],
                     d["similarity_group"],
                     now_ns,

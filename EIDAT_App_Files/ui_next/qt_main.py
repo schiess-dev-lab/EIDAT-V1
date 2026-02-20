@@ -1534,6 +1534,13 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
         ptype = str(self.cb_type.currentText() or "").strip()
         is_test_data = ptype == getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending")
         def _is_td(d: dict) -> bool:
+            fn = getattr(be, "is_test_data_doc", None)
+            if callable(fn):
+                try:
+                    return bool(fn(d))
+                except Exception:
+                    pass
+            # Back-compat fallback if backend helper isn't available.
             try:
                 dt = str(d.get("document_type") or "").strip().lower()
             except Exception:

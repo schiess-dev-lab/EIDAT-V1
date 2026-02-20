@@ -43,5 +43,9 @@
       "acronym": "TD",
       "aliases": ["Test Data", "Test-Data", "TestData", "TD"]
     }
-  ]
+  ],
+  "label_aliases": {
+    "part_number": ["par tno", "par t no"]
+  },
+  "part_number_field_patterns": ["par tno", "par t no"]
 }

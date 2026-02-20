@@ -20,6 +20,7 @@ ALLOWED_KEYS = {
     "vendor",
     "acceptance_test_plan_number",
     "excel_sqlite_rel",
+    "file_extension",
 }
 
 DEFAULT_CANDIDATES = {
@@ -55,6 +56,7 @@ LABEL_ALIASES = {
     "program_title": ["program title", "program name"],
     "asset_type": ["asset type", "component type", "component", "asset"],
     "serial_number": ["serial number", "serial no", "serial #", "serial"],
+    "part_number": ["part number", "part no", "part no.", "part #", "p/n", "pn", "par tno", "par t no", "par tno."],
     "revision": ["revision", "rev"],
     "test_date": ["test date", "date of test"],
     "report_date": ["report date", "date of report"],
@@ -65,7 +67,7 @@ LABEL_ALIASES = {
 # Field name patterns that typically contain part numbers
 # These are checked against table field names (keys) to extract part numbers
 PART_NUMBER_FIELD_PATTERNS = [
-    "part number", "part no", "part #", "p/n", "pn",
+    "part number", "part no", "part #", "p/n", "pn", "par tno", "par t no",
     "model", "model number", "model no", "model #",
     "item number", "item no", "item #",
     "catalog number", "catalog no", "catalog #", "cat no", "cat #",
@@ -75,6 +77,332 @@ PART_NUMBER_FIELD_PATTERNS = [
     "valve model", "pump model", "actuator model",  # asset-specific model fields
     "component model", "unit model",
 ]
+
+
+def _dedupe_strings(values: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for v in values:
+        s = str(v or "").strip()
+        if not s:
+            continue
+        k = s.casefold()
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(s)
+    return out
+
+
+def _merge_label_aliases(candidates: dict) -> dict[str, list[str]]:
+    """
+    Merge built-in LABEL_ALIASES with optional user overrides in user_inputs/metadata_candidates.json:
+      { "label_aliases": { "<allowed_key>": ["alias1", ...] } }
+    Unknown keys are ignored. Aliases are deduped, preserving order.
+    """
+    merged: dict[str, list[str]] = {k: list(v) for k, v in LABEL_ALIASES.items()}
+    raw = candidates.get("label_aliases") if isinstance(candidates, dict) else None
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            key = str(k or "").strip()
+            if not key or key not in ALLOWED_KEYS:
+                continue
+            if not isinstance(v, list):
+                continue
+            merged.setdefault(key, [])
+            merged[key].extend([str(x or "").strip() for x in v])
+    return {k: _dedupe_strings(v) for k, v in merged.items()}
+
+
+def _merge_part_number_field_patterns(candidates: dict) -> list[str]:
+    """
+    Extend PART_NUMBER_FIELD_PATTERNS with optional user additions in user_inputs/metadata_candidates.json:
+      { "part_number_field_patterns": ["pattern1", ...] }
+    """
+    out = list(PART_NUMBER_FIELD_PATTERNS)
+    raw = candidates.get("part_number_field_patterns") if isinstance(candidates, dict) else None
+    if isinstance(raw, list):
+        out.extend([str(x or "").strip() for x in raw])
+    return _dedupe_strings(out)
+
+
+def _is_missing(v: object) -> bool:
+    if v is None:
+        return True
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return True
+        if s.casefold() == "unknown":
+            return True
+    return False
+
+
+def _as_clean_str(v: object) -> str:
+    if v is None:
+        return ""
+    return str(v).strip()
+
+
+def _infer_serial_from_path(path: Path) -> str | None:
+    try:
+        stem = str(path.stem or "")
+    except Exception:
+        stem = str(path)
+    m = re.search(r"SN\d+", stem, flags=re.IGNORECASE)
+    if m:
+        return m.group(0).upper()
+    return None
+
+
+def _normalize_serial(value: object) -> str | None:
+    s = _as_clean_str(value)
+    if not s:
+        return None
+    s0 = s.strip().upper().replace(" ", "")
+    s0 = s0.replace("S/N", "SN")
+    if re.fullmatch(r"SN\d{1,12}", s0):
+        return s0
+    if re.fullmatch(r"\d{1,8}", s0):
+        # Best-effort: treat raw digits as SN; pad short values to 4 digits.
+        digits = s0
+        if len(digits) <= 4:
+            digits = digits.zfill(4)
+        return f"SN{digits}"
+    return s.strip().upper()
+
+
+def _best_candidate_match(value: str, candidates: list[str]) -> str | None:
+    """
+    Return best candidate that matches value.
+    Preference:
+      1) exact match (case/space insensitive)
+      2) longest candidate contained in value (case insensitive)
+    """
+    if not value or not candidates:
+        return None
+    v_norm = re.sub(r"\s+", " ", value).strip().lower()
+    best = None
+    for c in candidates:
+        c_s = str(c or "").strip()
+        if not c_s:
+            continue
+        c_norm = re.sub(r"\s+", " ", c_s).strip().lower()
+        if not c_norm:
+            continue
+        if v_norm == c_norm:
+            return c_s
+        if c_norm in v_norm:
+            if best is None or len(c_norm) > len(re.sub(r"\s+", " ", best).strip().lower()):
+                best = c_s
+    return best
+
+
+def canonicalize_metadata_for_file(
+    abs_path: Path,
+    *,
+    existing_meta: Any = None,
+    extracted_meta: Any = None,
+    default_document_type: str | None = None,
+) -> dict:
+    """
+    Produce a single canonical metadata dict for a file, with stable precedence:
+      - existing_meta wins unless missing/Unknown
+      - else extracted_meta
+      - else derived-from-filename/path
+
+    Then normalize fields (doc type pairing, dates, revision, serial format, candidates).
+    """
+    p = Path(abs_path).expanduser()
+    ext = str(p.suffix or "").lower()
+    is_excel = ext in {".xlsx", ".xls", ".xlsm"}
+
+    existing = existing_meta if isinstance(existing_meta, dict) else {}
+    extracted = extracted_meta if isinstance(extracted_meta, dict) else {}
+
+    if default_document_type is None:
+        default_document_type = "Data file" if is_excel else "EIDP"
+
+    candidates = _load_candidates()
+    program_titles = candidates.get("program_titles") or []
+    vendors = candidates.get("vendors") or []
+    asset_types = candidates.get("asset_types") or []
+
+    derived: dict[str, object] = {}
+    derived["file_extension"] = ext or "Unknown"
+
+    # Serial fallback from filename.
+    sn_from_name = _infer_serial_from_path(p)
+    if sn_from_name:
+        derived["serial_number"] = sn_from_name
+
+    # Excel filename identity can carry serial/program.
+    if is_excel:
+        try:
+            import importlib.util
+
+            project_root = Path(__file__).resolve().parents[1]
+            mod_path = project_root / "scripts" / "excel_extraction.py"
+            spec = importlib.util.spec_from_file_location("excel_extraction", mod_path)
+            if spec is not None and spec.loader is not None:
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)  # type: ignore[attr-defined]
+                program, vehicle, serial = mod.derive_file_identity(p)  # type: ignore[attr-defined]
+            else:
+                program = vehicle = serial = ""
+        except Exception:
+            program = vehicle = serial = ""
+        if not _is_missing(serial) and str(serial).strip():
+            derived["serial_number"] = str(serial).strip()
+        if (not _is_missing(program) and str(program).strip()) or (not _is_missing(vehicle) and str(vehicle).strip()):
+            title = ""
+            if str(program or "").strip() and str(vehicle or "").strip():
+                title = f"{str(program).strip()} {str(vehicle).strip()}".strip()
+            else:
+                title = (str(program or "").strip() or str(vehicle or "").strip())
+            if title:
+                derived["program_title"] = title
+
+    # Program/vendor/asset from filename (contains-match against candidates).
+    try:
+        stem_blob = re.sub(r"[_\\-]+", " ", str(p.stem or "")).strip()
+    except Exception:
+        stem_blob = str(p)
+    if stem_blob:
+        pm = _best_candidate_match(stem_blob, [str(x) for x in program_titles if str(x).strip()])
+        if pm:
+            derived["program_title"] = pm
+        vm = _best_candidate_match(stem_blob, [str(x) for x in vendors if str(x).strip()])
+        if vm:
+            derived["vendor"] = vm
+        am = _best_candidate_match(stem_blob, [str(x) for x in asset_types if str(x).strip()])
+        if am:
+            derived["asset_type"] = am
+
+    # Doc type inference from filename/path.
+    inferred_dt, inferred_acr = _infer_doc_type_from_filename(p)
+    if inferred_dt:
+        derived["document_type"] = inferred_dt
+    if inferred_acr:
+        derived["document_type_acronym"] = inferred_acr
+
+    merged: dict[str, object] = {}
+    for key in ALLOWED_KEYS:
+        if key == "excel_sqlite_rel":
+            # Keep optional; only set when present in some input.
+            pass
+        v = existing.get(key)
+        if not _is_missing(v):
+            merged[key] = v
+            continue
+        v = extracted.get(key)
+        if not _is_missing(v):
+            merged[key] = v
+            continue
+        v = derived.get(key)
+        if not _is_missing(v):
+            merged[key] = v
+
+    # Always set extension deterministically.
+    merged["file_extension"] = ext or "Unknown"
+
+    # Normalize serial format.
+    sn = _normalize_serial(merged.get("serial_number"))
+    if sn:
+        merged["serial_number"] = sn
+
+    # Normalize revision + dates (only if present).
+    rev = _normalize_revision(_as_clean_str(merged.get("revision")))
+    if rev:
+        merged["revision"] = rev
+    td = _normalize_date(_as_clean_str(merged.get("test_date")))
+    if td:
+        merged["test_date"] = td
+    rd = _normalize_date(_as_clean_str(merged.get("report_date")))
+    if rd:
+        merged["report_date"] = rd
+
+    # Doc type pairing defaults.
+    def _meta_is_td(m: dict) -> bool:
+        try:
+            dt = str(m.get("document_type") or "").strip().upper()
+        except Exception:
+            dt = ""
+        try:
+            acr = str(m.get("document_type_acronym") or "").strip().upper()
+        except Exception:
+            acr = ""
+        return dt == "TD" or acr == "TD"
+
+    is_td = _meta_is_td(existing) or _meta_is_td(extracted) or _meta_is_td(derived) or _meta_is_td(merged)
+    if is_td or (str(inferred_dt or "").strip().upper() == "TD") or (str(inferred_acr or "").strip().upper() == "TD"):
+        merged["document_type"] = "TD"
+        merged["document_type_acronym"] = "TD"
+    else:
+        dt_val = _as_clean_str(merged.get("document_type"))
+        acr_val = _as_clean_str(merged.get("document_type_acronym"))
+        if _is_missing(dt_val):
+            dt_val = str(default_document_type or "").strip() or ("Data file" if is_excel else "EIDP")
+        if _is_missing(acr_val):
+            if dt_val.strip().casefold() == "data file":
+                acr_val = "DATA"
+            else:
+                acr_val = dt_val
+        # Ensure Data file acronym is DATA.
+        if dt_val.strip().casefold() == "data file":
+            acr_val = "DATA"
+        merged["document_type"] = dt_val
+        merged["document_type_acronym"] = acr_val
+
+    # Candidate-based canonicalization.
+    try:
+        pt = _as_clean_str(merged.get("program_title"))
+        ptm = _best_candidate_match(pt, [str(x) for x in program_titles if str(x).strip()])
+        if ptm:
+            merged["program_title"] = ptm
+    except Exception:
+        pass
+    try:
+        vv = _as_clean_str(merged.get("vendor"))
+        vvm = _best_candidate_match(vv, [str(x) for x in vendors if str(x).strip()])
+        if vvm:
+            merged["vendor"] = vvm
+    except Exception:
+        pass
+    try:
+        av = _as_clean_str(merged.get("asset_type"))
+        avm = _best_candidate_match(av, [str(x) for x in asset_types if str(x).strip()])
+        if avm:
+            merged["asset_type"] = avm
+    except Exception:
+        pass
+
+    # Fill common keys with Unknown so JSON and index consumers are stable.
+    for k in [
+        "program_title",
+        "asset_type",
+        "serial_number",
+        "part_number",
+        "revision",
+        "test_date",
+        "report_date",
+        "document_type",
+        "document_type_acronym",
+        "vendor",
+        "acceptance_test_plan_number",
+        "file_extension",
+    ]:
+        if k in ALLOWED_KEYS and _is_missing(merged.get(k)):
+            merged[k] = "Unknown"
+
+    # Preserve excel_sqlite_rel if present in any input and non-missing.
+    for src in (existing, extracted, derived):
+        v = src.get("excel_sqlite_rel")
+        if not _is_missing(v):
+            merged["excel_sqlite_rel"] = v
+            break
+
+    return sanitize_metadata(merged, default_document_type=str(default_document_type or "").strip() or ("Data file" if is_excel else "EIDP"))
 
 
 def sanitize_metadata(raw: Any, *, default_document_type: str = "EIDP") -> dict:
@@ -287,7 +615,10 @@ def _find_label_value(lines: list[str], label: str) -> Optional[str]:
         elif "-" in chunk:
             chunk = chunk.split("-", 1)[1]
         else:
-            chunk = chunk.replace(label, "")
+            try:
+                chunk = re.sub(re.escape(label), "", chunk, flags=re.IGNORECASE)
+            except Exception:
+                chunk = chunk.replace(label, "")
         value = chunk.strip()
         if value:
             return value
@@ -345,7 +676,7 @@ def _find_asset_type_from_fields(lines: list[str], asset_types: list[str]) -> Op
     return None
 
 
-def _find_part_number_from_fields(lines: list[str], max_lines: int = 150) -> Optional[str]:
+def _find_part_number_from_fields(lines: list[str], patterns: list[str], max_lines: int = 150) -> Optional[str]:
     """
     Find part number by looking for table fields with model/part-related names.
     Only searches the first max_lines to focus on header tables (pages 1-2).
@@ -359,7 +690,7 @@ def _find_part_number_from_fields(lines: list[str], max_lines: int = 150) -> Opt
         if not value:
             continue
         # Check if the field name matches any part number pattern
-        for pattern in PART_NUMBER_FIELD_PATTERNS:
+        for pattern in patterns:
             if pattern in key or key in pattern:
                 # Validate: part numbers typically have letters and/or numbers, often with dashes
                 # Reject values that are too short or look like other fields
@@ -449,10 +780,75 @@ def _find_asset_type_by_frequency(first_page_text: str, asset_types: list[str]) 
     return None
 
 
+def _infer_doc_type_from_filename(path: Optional[Path]) -> tuple[Optional[str], Optional[str]]:
+    """
+    Heuristic fallback when the document text doesn't contain a recognizable doc type.
+    """
+    if path is None:
+        return None, None
+    try:
+        blob = (path.stem or "")
+    except Exception:
+        blob = str(path).lower()
+
+    def _norm(s: str) -> str:
+        return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
+
+    blob_norm = _norm(str(blob))
+    blob_tokens = set(blob_norm.split())
+
+    # Prefer user-configured doc-type candidates + aliases (metadata_candidates.json).
+    try:
+        cand = _load_candidates()
+        entries = _iter_doc_type_entries(cand.get("document_types") if isinstance(cand, dict) else [])
+    except Exception:
+        entries = []
+
+    best: tuple[int, str | None, str | None] | None = None  # (alias_len, name, acronym)
+    for e in entries:
+        name = str(e.get("name") or "").strip() or None
+        acr = str(e.get("acronym") or "").strip() or None
+        aliases = list(e.get("aliases") or [])
+        if name:
+            aliases.append(name)
+        if acr:
+            aliases.append(acr)
+        for a in aliases:
+            a_s = str(a or "").strip()
+            if not a_s:
+                continue
+            a_norm = _norm(a_s)
+            if not a_norm:
+                continue
+            hit = False
+            if len(a_norm) <= 3 and len(a_norm.split()) == 1:
+                # Short token like "TD" should match whole-token only.
+                hit = a_norm in blob_tokens
+            else:
+                hit = a_norm in blob_norm
+            if not hit:
+                continue
+            score = len(a_norm)
+            if best is None or score > best[0]:
+                best = (score, (acr or name), acr)
+
+    if best is not None:
+        return best[1], best[2]
+
+    # Back-compat hardcoded fallback (only if candidate parsing failed).
+    if "test data" in blob_norm or "testdata" in blob_norm:
+        return "TD", "TD"
+    if "td" in blob_tokens:
+        return "TD", "TD"
+    return None, None
+
+
 def extract_metadata_from_text(text: str, *, asset_types: Optional[list[str]] = None, pdf_path: Optional[Path] = None) -> dict:
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     asset_lines = _strip_doc_type_lines(lines)
     candidates = _load_candidates()
+    label_aliases = _merge_label_aliases(candidates if isinstance(candidates, dict) else {})
+    pn_patterns = _merge_part_number_field_patterns(candidates if isinstance(candidates, dict) else {})
     asset_list = asset_types or candidates.get("asset_types") or []
     program_titles = candidates.get("program_titles") or []
     vendors = candidates.get("vendors") or []
@@ -506,7 +902,7 @@ def extract_metadata_from_text(text: str, *, asset_types: Optional[list[str]] = 
     if not meta.get("program_title"):
         meta["program_title"] = _find_program_title(lines)
 
-    for key, aliases in LABEL_ALIASES.items():
+    for key, aliases in label_aliases.items():
         for label in aliases:
             val = _find_label_value(lines, label)
             if val:
@@ -578,7 +974,7 @@ def extract_metadata_from_text(text: str, *, asset_types: Optional[list[str]] = 
 
     # Extract part number from table fields (model, part number, etc.)
     if not meta.get("part_number"):
-        part_num = _find_part_number_from_fields(lines)
+        part_num = _find_part_number_from_fields(lines, pn_patterns)
         if part_num:
             meta["part_number"] = part_num
 
@@ -597,11 +993,20 @@ def extract_metadata_from_text(text: str, *, asset_types: Optional[list[str]] = 
         match = _match_from_list(meta.get("asset_type") or "", asset_list)
         meta["asset_type"] = match or "Unknown"
 
-    # Document type: match on early-page/title text, standardize to acronym when available.
+    # Document type:
+    # 1) Always allow the filename to force TD (many TD files won't contain explicit "Test Data" text).
+    # 2) Otherwise, match on early-page/title text and standardize to acronym when available.
+    inferred_dt, inferred_acr = _infer_doc_type_from_filename(pdf_path)
     doc_match, acr = _pick_document_type(title_blob + "\n" + _first_nonempty(lines, max_lines=120), doc_type_entries)
-    if doc_match:
+    if inferred_dt and str(inferred_dt).strip().upper() == "TD":
+        meta["document_type"] = "TD"
+        meta["document_type_acronym"] = "TD"
+    elif doc_match:
         meta["document_type"] = doc_match
         meta["document_type_acronym"] = acr or doc_match
+    elif inferred_dt:
+        meta["document_type"] = inferred_dt
+        meta["document_type_acronym"] = inferred_acr or inferred_dt
     else:
         meta["document_type"] = "Unknown"
         meta["document_type_acronym"] = None
@@ -651,6 +1056,9 @@ def extract_metadata_from_excel(
     except Exception:
         pass
 
+    candidates = _load_candidates()
+    label_aliases = _merge_label_aliases(candidates if isinstance(candidates, dict) else {})
+
     meta: dict
     try:
         from openpyxl import load_workbook  # type: ignore
@@ -658,6 +1066,67 @@ def extract_metadata_from_excel(
         wb = load_workbook(str(p), read_only=True, data_only=True)
         try:
             sheetnames = list(getattr(wb, "sheetnames", []) or [])
+            synthetic: list[str] = []
+            seen_synth: set[tuple[str, str]] = set()
+
+            def _norm(s: str) -> str:
+                return re.sub(r"[^a-z0-9]+", "", str(s or "").strip().lower())
+
+            preferred_label: dict[str, str] = {}
+            for k, aliases in label_aliases.items():
+                if not aliases:
+                    continue
+                preferred_label[k] = str(aliases[0]).strip() or k
+
+            compiled_value: dict[str, list[re.Pattern]] = {}
+            compiled_label_only: dict[str, list[re.Pattern]] = {}
+            for k, aliases in label_aliases.items():
+                value_pats: list[re.Pattern] = []
+                label_pats: list[re.Pattern] = []
+                for a in aliases:
+                    a_s = str(a or "").strip()
+                    if not a_s:
+                        continue
+                    try:
+                        value_pats.append(
+                            re.compile(
+                                rf"^\s*{re.escape(a_s)}\s*(?:[:=\-#]\s*)?(?P<val>.+?)\s*$",
+                                flags=re.IGNORECASE,
+                            )
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        label_pats.append(
+                            re.compile(
+                                rf"^\s*{re.escape(a_s)}\s*(?:[:=\-#]\s*)?\s*$",
+                                flags=re.IGNORECASE,
+                            )
+                        )
+                    except Exception:
+                        pass
+                if value_pats:
+                    compiled_value[k] = value_pats
+                if label_pats:
+                    compiled_label_only[k] = label_pats
+
+            all_alias_norm: set[str] = set()
+            for aliases in label_aliases.values():
+                for a in aliases:
+                    na = _norm(str(a or ""))
+                    if na:
+                        all_alias_norm.add(na)
+
+            def _looks_like_part_number(v: str) -> bool:
+                s = str(v or "").strip()
+                if len(s) < 3 or len(s) > 80:
+                    return False
+                if not re.search(r"[A-Za-z0-9]", s):
+                    return False
+                if len(s.split()) > 6:
+                    return False
+                return True
+
             for sheet_name in sheetnames[: int(max_sheets)]:
                 try:
                     ws = wb[sheet_name]
@@ -667,6 +1136,95 @@ def extract_metadata_from_excel(
                     lines.append(f"Sheet | {sheet_name}")
                 except Exception:
                     pass
+
+                # Excel-only: recover label/value fields from table-style layouts.
+                # Example: "Part No" in one cell, value in the cell to the right.
+                if compiled_value and len(synthetic) < 80:
+                    try:
+                        grid_rows = list(
+                            ws.iter_rows(
+                                min_row=1,
+                                max_row=int(max_rows),
+                                min_col=1,
+                                max_col=int(max_cols),
+                                values_only=True,
+                            )
+                        )
+                    except Exception:
+                        grid_rows = []
+                    for row in grid_rows:
+                        if len(synthetic) >= 80:
+                            break
+                        row_vals = list(row or [])
+                        for ci, raw in enumerate(row_vals):
+                            if len(synthetic) >= 80:
+                                break
+                            if raw is None:
+                                continue
+                            cell_text = str(raw).strip()
+                            if not cell_text or len(cell_text) > 200:
+                                continue
+
+                            for key, pats in compiled_value.items():
+                                label_only = compiled_label_only.get(key) or []
+                                found_val: Optional[str] = None
+                                label_only_hit = any(lp.match(cell_text) for lp in label_only) if label_only else False
+
+                                # Same-cell value (e.g., "Part No: XYZ-123")
+                                for pat in pats:
+                                    m = pat.match(cell_text)
+                                    if not m:
+                                        continue
+                                    cand_val = str(m.group("val") or "").strip()
+                                    if not cand_val:
+                                        continue
+                                    if key == "part_number" and not _looks_like_part_number(cand_val):
+                                        continue
+                                    found_val = cand_val
+                                    break
+
+                                # Part number: allow "label <space> value" in same cell.
+                                if found_val is None and key == "part_number":
+                                    for a in (label_aliases.get("part_number") or []):
+                                        a_s = str(a or "").strip()
+                                        if not a_s:
+                                            continue
+                                        if cell_text.lower().startswith(a_s.lower() + " "):
+                                            cand_val = cell_text[len(a_s) :].strip()
+                                            if _looks_like_part_number(cand_val):
+                                                found_val = cand_val
+                                                break
+
+                                # Right-cell scan (up to 3 cells) when the label cell is value-less.
+                                if found_val is None and label_only_hit:
+                                    for step in (1, 2, 3):
+                                        if ci + step >= len(row_vals):
+                                            break
+                                        rv = row_vals[ci + step]
+                                        if rv is None:
+                                            continue
+                                        rv_s = str(rv).strip()
+                                        if not rv_s or len(rv_s) > 200:
+                                            continue
+                                        if _norm(rv_s) in all_alias_norm:
+                                            continue
+                                        if key == "part_number" and not _looks_like_part_number(rv_s):
+                                            continue
+                                        found_val = rv_s
+                                        break
+
+                                if found_val:
+                                    k_norm = _norm(key)
+                                    v_norm = _norm(found_val)
+                                    if not k_norm or not v_norm:
+                                        continue
+                                    tup = (k_norm, v_norm)
+                                    if tup in seen_synth:
+                                        continue
+                                    seen_synth.add(tup)
+                                    synth_key = preferred_label.get(key) or key
+                                    synthetic.append(f"{synth_key} | {found_val}")
+                                    break
 
                 try:
                     row_iter = ws.iter_rows(
@@ -694,6 +1252,10 @@ def extract_metadata_from_excel(
                             break
                     if len(vals) >= 2:
                         lines.append(" | ".join(vals))
+
+            if synthetic:
+                lines.append("Sheet | Extracted Labels")
+                lines.extend(synthetic[:80])
         finally:
             try:
                 wb.close()

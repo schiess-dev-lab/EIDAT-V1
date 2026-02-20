@@ -9,6 +9,7 @@ import sys
 import shutil
 import subprocess
 import re
+from functools import lru_cache
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Dict, Iterable, Mapping, Optional
@@ -542,6 +543,7 @@ def refresh_metadata_only(global_repo: Path, rel_paths: list[str]) -> Dict[str, 
     updated = 0
     failed = 0
     skipped = 0
+    updated_metadata_rels: set[str] = set()
 
     clean_rel_paths = [str(p).strip() for p in (rel_paths or []) if str(p).strip()]
     for rel_path in clean_rel_paths:
@@ -553,21 +555,6 @@ def refresh_metadata_only(global_repo: Path, rel_paths: list[str]) -> Dict[str, 
             if not artifacts_dir or not artifacts_dir.exists():
                 raise FileNotFoundError(f"Artifacts folder not found for: {rel_path}")
 
-            combined_path = artifacts_dir / "combined.txt"
-            combined_text = ""
-            if combined_path.exists():
-                try:
-                    combined_text = combined_path.read_text(encoding="utf-8", errors="ignore")
-                except Exception:
-                    combined_text = ""
-
-            extracted_meta = None
-            if combined_text.strip():
-                try:
-                    extracted_meta = emd.extract_metadata_from_text(combined_text, pdf_path=abs_path)
-                except Exception:
-                    extracted_meta = None
-
             existing_meta = None
             try:
                 existing_meta = emd.load_metadata_from_artifacts(artifacts_dir, abs_path)
@@ -575,28 +562,38 @@ def refresh_metadata_only(global_repo: Path, rel_paths: list[str]) -> Dict[str, 
                 existing_meta = None
             if not existing_meta:
                 try:
-                    existing_meta = emd.load_metadata_for_pdf(abs_path)
-                except Exception:
-                    existing_meta = None
-            if not existing_meta:
-                try:
                     existing_meta = _load_metadata_from_artifacts_dir(artifacts_dir)
                 except Exception:
                     existing_meta = None
 
-            if extracted_meta:
-                raw_meta = _merge_metadata(extracted_meta, existing_meta)
-            else:
-                raw_meta = existing_meta
-
-            if not raw_meta:
+            extracted_meta = None
+            is_excel = abs_path.suffix.lower() in EXCEL_EXTENSIONS
+            if is_excel:
                 try:
-                    raw_meta = emd.derive_minimal_metadata(None, abs_path)
+                    extracted_meta = emd.extract_metadata_from_excel(abs_path)
                 except Exception:
-                    raw_meta = {"document_type": "EIDP"}
+                    extracted_meta = None
+            else:
+                combined_path = artifacts_dir / "combined.txt"
+                combined_text = ""
+                if combined_path.exists():
+                    try:
+                        combined_text = combined_path.read_text(encoding="utf-8", errors="ignore")
+                    except Exception:
+                        combined_text = ""
+                if combined_text.strip():
+                    try:
+                        extracted_meta = emd.extract_metadata_from_text(combined_text, pdf_path=abs_path)
+                    except Exception:
+                        extracted_meta = None
 
-            default_doc_type = "Data file" if abs_path.suffix.lower() in EXCEL_EXTENSIONS else "EIDP"
-            clean_meta = emd.sanitize_metadata(raw_meta, default_document_type=default_doc_type)
+            default_doc_type = "Data file" if is_excel else "EIDP"
+            clean_meta = emd.canonicalize_metadata_for_file(
+                abs_path,
+                existing_meta=existing_meta,
+                extracted_meta=extracted_meta,
+                default_document_type=default_doc_type,
+            )
             metadata_path = emd.write_metadata(Path(artifacts_dir), abs_path, clean_meta)
 
             # Remove stale metadata files in this artifacts folder (keep the new one if present)
@@ -610,6 +607,13 @@ def refresh_metadata_only(global_repo: Path, rel_paths: list[str]) -> Dict[str, 
                             p.unlink()
                         except Exception:
                             continue
+                # Track updated metadata rel for project syncing.
+                try:
+                    rel = str(Path(metadata_path).resolve().relative_to(eidat_support_dir(repo).resolve()))
+                    if rel:
+                        updated_metadata_rels.add(rel)
+                except Exception:
+                    pass
 
             results.append(
                 {
@@ -636,6 +640,49 @@ def refresh_metadata_only(global_repo: Path, rel_paths: list[str]) -> Dict[str, 
     except Exception as exc:
         index_error = str(exc)
 
+    projects_synced: list[dict] = []
+    projects_sync_failed: list[dict] = []
+    if updated_metadata_rels:
+        try:
+            projects = list_eidat_projects(repo)
+        except Exception:
+            projects = []
+        for pr in projects:
+            try:
+                raw_dir = str(pr.get("project_dir") or "").strip()
+                proj_dir = Path(raw_dir).expanduser()
+                if not proj_dir.is_absolute():
+                    proj_dir = repo / proj_dir
+
+                selected = _project_selected_metadata_rels(proj_dir)
+                if not selected:
+                    continue
+                if not (selected.intersection(updated_metadata_rels)):
+                    continue
+
+                raw_wb = str(pr.get("workbook") or "").strip()
+                wb_path = Path(raw_wb).expanduser()
+                if not wb_path.is_absolute():
+                    wb_path = repo / wb_path
+
+                res = sync_project_workbook_metadata(repo, wb_path)
+                projects_synced.append(
+                    {
+                        "name": pr.get("name"),
+                        "type": pr.get("type"),
+                        "workbook": str(wb_path),
+                        "result": res,
+                    }
+                )
+            except Exception as exc:
+                projects_sync_failed.append(
+                    {
+                        "name": pr.get("name"),
+                        "type": pr.get("type"),
+                        "error": str(exc),
+                    }
+                )
+
     return {
         "updated": updated,
         "failed": failed,
@@ -643,6 +690,9 @@ def refresh_metadata_only(global_repo: Path, rel_paths: list[str]) -> Dict[str, 
         "results": results,
         "index": index_result,
         "index_error": index_error,
+        "updated_metadata_rel": sorted(updated_metadata_rels),
+        "projects_synced": projects_synced,
+        "projects_sync_failed": projects_sync_failed,
     }
 
 
@@ -3260,6 +3310,7 @@ def update_test_data_trending_project_workbook(
     if not wb_path.exists():
         raise FileNotFoundError(f"Project workbook not found: {wb_path}")
 
+    repo = Path(global_repo).expanduser()
     project_dir = wb_path.parent
     db_path = ensure_test_data_project_cache(project_dir, wb_path, rebuild=True)
 
@@ -3334,6 +3385,21 @@ def update_test_data_trending_project_workbook(
             else:
                 ws.cell(row, cidx).value = float(val)
             updated_cells += 1
+
+    # Sync workbook metadata sheets/rows to the canonical index (best-effort).
+    try:
+        support_dir = eidat_support_dir(repo)
+        docs = read_eidat_index_documents(repo)
+        selected = _project_selected_metadata_rels(project_dir)
+        docs_preferred = [d for d in docs if str(d.get("metadata_rel") or "").strip() in selected] if selected else None
+        _sync_project_workbook_metadata_inplace(
+            wb,
+            support_dir=support_dir,
+            docs_all=docs,
+            docs_preferred=docs_preferred,
+        )
+    except Exception:
+        pass
 
     try:
         wb.save(str(wb_path))
@@ -3445,7 +3511,7 @@ def read_eidat_index_documents(global_repo: Path) -> list[dict]:
             "report_date",
             "document_type",
         ]
-        for opt in ("document_type_acronym", "vendor", "acceptance_test_plan_number", "excel_sqlite_rel"):
+        for opt in ("document_type_acronym", "vendor", "acceptance_test_plan_number", "excel_sqlite_rel", "file_extension"):
             if opt in cols:
                 select_cols.append(opt)
         select_cols += ["metadata_rel", "artifacts_rel", "similarity_group"]
@@ -3463,6 +3529,7 @@ def read_eidat_index_documents(global_repo: Path) -> list[dict]:
         d.setdefault("vendor", None)
         d.setdefault("acceptance_test_plan_number", None)
         d.setdefault("excel_sqlite_rel", None)
+        d.setdefault("file_extension", None)
         docs.append(d)
     return docs
 
@@ -3505,6 +3572,7 @@ def read_files_with_index_metadata(global_repo: Path) -> list[dict]:
     repo = Path(global_repo).expanduser()
     support_db = eidat_support_dir(repo) / "eidat_support.sqlite3"
     index_db = eidat_support_dir(repo) / "eidat_index.sqlite3"
+    support_dir = eidat_support_dir(repo)
 
     def _ignore_rel_path(rel_path: str) -> bool:
         # Hide generated PDFs/Excels from the Files tab. These are outputs, not
@@ -3539,13 +3607,21 @@ def read_files_with_index_metadata(global_repo: Path) -> list[dict]:
     # Join: for each file, try to find its document metadata
     result: list[dict] = []
     for rel_path, file_info in files_by_path.items():
-        # Try to match file to document via artifacts path
-        pdf_stem = Path(rel_path).stem
+        # Match file to document by exact artifacts folder (avoids stem substring collisions).
         matched_doc = None
-        for art_rel, doc in docs_by_artifacts.items():
-            if pdf_stem in art_rel:
-                matched_doc = doc
-                break
+        try:
+            art_dir = get_file_artifacts_path(repo, rel_path)
+        except Exception:
+            art_dir = None
+        if art_dir:
+            try:
+                art_rel = str(Path(art_dir).resolve().relative_to(support_dir.resolve()))
+            except Exception:
+                try:
+                    art_rel = str(Path(art_dir).relative_to(support_dir))
+                except Exception:
+                    art_rel = str(art_dir)
+            matched_doc = docs_by_artifacts.get(art_rel)
 
         merged = {**file_info}
         if matched_doc:
@@ -4213,6 +4289,266 @@ def _best_doc_for_serial(support_dir: Path, docs: list[dict]) -> dict | None:
     return best or docs[0]
 
 
+def _project_selected_metadata_rels(project_dir: Path) -> set[str]:
+    try:
+        pj = Path(project_dir).expanduser() / EIDAT_PROJECT_META
+        if not pj.exists():
+            return set()
+        raw = json.loads(pj.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return set()
+        vals = raw.get("selected_metadata_rel") or []
+        if not isinstance(vals, list):
+            return set()
+        return {str(v).strip() for v in vals if str(v).strip()}
+    except Exception:
+        return set()
+
+
+def _sync_project_workbook_metadata_inplace(
+    wb,
+    *,
+    support_dir: Path,
+    docs_all: list[dict],
+    docs_preferred: list[dict] | None = None,
+) -> dict:
+    """
+    Update workbook metadata cells/sheets from the index docs list.
+
+    - Prefers docs from docs_preferred per-serial when available; falls back to docs_all.
+    - Updates only metadata rows/sheets; does not touch user-entered term data.
+    """
+    # Build serial -> docs lists.
+    docs_by_serial_all: dict[str, list[dict]] = {}
+    for d in docs_all:
+        sn = str(d.get("serial_number") or "").strip()
+        if sn:
+            docs_by_serial_all.setdefault(sn, []).append(d)
+    known_serials = set(docs_by_serial_all.keys())
+
+    docs_by_serial_pref: dict[str, list[dict]] = {}
+    for d in (docs_preferred or []):
+        sn = str(d.get("serial_number") or "").strip()
+        if sn:
+            docs_by_serial_pref.setdefault(sn, []).append(d)
+
+    def _best_doc(sn: str) -> dict | None:
+        if sn and sn in docs_by_serial_pref:
+            return _best_doc_for_serial(support_dir, docs_by_serial_pref.get(sn, []))
+        return _best_doc_for_serial(support_dir, docs_by_serial_all.get(sn, []))
+
+    updated_sources_cells = 0
+    if "Sources" in getattr(wb, "sheetnames", []):
+        ws_src = wb["Sources"]
+        hdrs: dict[str, int] = {}
+        for col in range(1, (ws_src.max_column or 0) + 1):
+            key = str(ws_src.cell(1, col).value or "").strip().lower()
+            if key:
+                hdrs[key] = col
+        col_sn = hdrs.get("serial_number")
+        if col_sn:
+            for row in range(2, (ws_src.max_row or 0) + 1):
+                sn = str(ws_src.cell(row, int(col_sn)).value or "").strip()
+                if not sn:
+                    continue
+                sn_key = _match_serial_key(sn, known_serials) or sn
+                doc = _best_doc(sn_key)
+                if not doc:
+                    continue
+                for k in ("program_title", "document_type", "metadata_rel", "artifacts_rel", "excel_sqlite_rel"):
+                    col = hdrs.get(k)
+                    if not col:
+                        continue
+                    ws_src.cell(row, int(col)).value = str(doc.get(k) or "")
+                    updated_sources_cells += 1
+
+    ws_master = wb["master"] if "master" in getattr(wb, "sheetnames", []) else wb.active
+
+    # Detect header columns on master sheet.
+    header_row = 1
+    headers: dict[str, int] = {}
+    for col in range(1, (ws_master.max_column or 0) + 1):
+        val = ws_master.cell(header_row, col).value
+        if val is None or str(val).strip() == "":
+            continue
+        key = _normalize_text(str(val))
+        headers[key] = col
+        compact = key.replace(" ", "")
+        if compact and compact not in headers:
+            headers[compact] = col
+
+    if "term" not in headers:
+        # Not an EIDP-style workbook; Sources-only updates may still apply.
+        return {
+            "ok": True,
+            "updated_sources_cells": int(updated_sources_cells),
+            "updated_master_cells": 0,
+            "updated_metadata_cells": 0,
+        }
+
+    col_term = headers["term"]
+    col_data_group = headers.get("datagroup") or headers.get("data group")
+    fixed_cols = headers.get("max") or headers.get("maximum") or 0
+    if not fixed_cols:
+        # Fall back to the last known fixed column in this workbook schema.
+        for k in ("units", "min", "max"):
+            if k in headers:
+                fixed_cols = max(fixed_cols, int(headers[k] or 0))
+
+    sn_cols: dict[str, int] = {}
+    for col in range(1, (ws_master.max_column or 0) + 1):
+        if fixed_cols and col <= fixed_cols:
+            continue
+        name = str(ws_master.cell(header_row, col).value or "").strip()
+        if not name:
+            continue
+        sn_cols[name] = col
+
+    meta_rows: dict[str, int] = {}
+    for row in range(2, (ws_master.max_row or 0) + 1):
+        term = str(ws_master.cell(row, col_term).value or "").strip()
+        if not term:
+            continue
+        if col_data_group:
+            dg = str(ws_master.cell(row, col_data_group).value or "").strip()
+            if dg and _normalize_text(dg) != _normalize_text("Metadata"):
+                continue
+        key = _normalize_text(term)
+        if key and key not in meta_rows:
+            meta_rows[key] = row
+
+    meta_field_map = {
+        _normalize_text("Program"): "program_title",
+        _normalize_text("Asset Type"): "asset_type",
+        _normalize_text("Vendor"): "vendor",
+        _normalize_text("Acceptance Test Plan"): "acceptance_test_plan_number",
+        _normalize_text("Part Number"): "part_number",
+        _normalize_text("Revision"): "revision",
+        _normalize_text("Test Date"): "test_date",
+        _normalize_text("Report Date"): "report_date",
+        _normalize_text("Document Type"): "document_type",
+        _normalize_text("Document Acronym"): "document_type_acronym",
+        _normalize_text("Similarity Group"): "similarity_group",
+    }
+
+    updated_master_cells = 0
+    for sn_header, col in sn_cols.items():
+        sn = _match_serial_key(sn_header, known_serials) or str(sn_header).strip()
+        doc = _best_doc(sn)
+        for term_key, doc_field in meta_field_map.items():
+            row = meta_rows.get(term_key)
+            if not row:
+                continue
+            val = doc.get(doc_field) if doc else ""
+            ws_master.cell(row, col).value = str(val or "")
+            updated_master_cells += 1
+
+    updated_meta_cells = 0
+    if "metadata" in getattr(wb, "sheetnames", []):
+        ws_meta = wb["metadata"]
+        header_map: dict[str, int] = {}
+        for col in range(1, (ws_meta.max_column or 0) + 1):
+            val = str(ws_meta.cell(1, col).value or "").strip()
+            if not val:
+                continue
+            header_map[_normalize_text(val)] = col
+        col_sn = header_map.get("serialnumber") or header_map.get("serial")
+        row_by_sn: dict[str, int] = {}
+        if col_sn:
+            for row in range(2, (ws_meta.max_row or 0) + 1):
+                sn_val = str(ws_meta.cell(row, col_sn).value or "").strip()
+                if sn_val:
+                    row_by_sn[sn_val] = row
+
+        fields = {
+            "serialnumber": "serial_number",
+            "program": "program_title",
+            "assettype": "asset_type",
+            "vendor": "vendor",
+            "acceptancetestplan": "acceptance_test_plan_number",
+            "partnumber": "part_number",
+            "revision": "revision",
+            "testdate": "test_date",
+            "reportdate": "report_date",
+            "documenttype": "document_type",
+            "documentacronym": "document_type_acronym",
+            "similaritygroup": "similarity_group",
+        }
+
+        for sn_header in sn_cols.keys():
+            sn = _match_serial_key(sn_header, known_serials) or str(sn_header).strip()
+            if not sn:
+                continue
+            row = row_by_sn.get(sn)
+            if row is None:
+                row = (ws_meta.max_row or 0) + 1
+                if col_sn:
+                    ws_meta.cell(row, col_sn).value = sn
+                row_by_sn[sn] = row
+            doc = _best_doc(sn)
+            for key, doc_field in fields.items():
+                col = header_map.get(key)
+                if not col:
+                    continue
+                if key in ("serialnumber", "serial"):
+                    val = sn
+                else:
+                    val = doc.get(doc_field) if doc else ""
+                ws_meta.cell(row, col).value = str(val or "")
+                updated_meta_cells += 1
+
+    return {
+        "ok": True,
+        "serials": sorted({_match_serial_key(s, known_serials) or str(s).strip() for s in sn_cols.keys()}),
+        "updated_master_cells": int(updated_master_cells),
+        "updated_metadata_cells": int(updated_meta_cells),
+        "updated_sources_cells": int(updated_sources_cells),
+    }
+
+
+def sync_project_workbook_metadata(global_repo: Path, workbook_path: Path) -> dict:
+    """
+    Sync a project workbook's metadata sheets/rows to match the canonical index metadata.
+    """
+    try:
+        from openpyxl import load_workbook  # type: ignore
+    except Exception as exc:
+        raise RuntimeError(
+            "openpyxl is required to sync project workbooks. "
+            "Install it with `py -m pip install openpyxl` within the project environment."
+        ) from exc
+
+    repo = Path(global_repo).expanduser()
+    wb_path = Path(workbook_path).expanduser()
+    if not wb_path.exists():
+        raise FileNotFoundError(f"Project workbook not found: {wb_path}")
+
+    support_dir = eidat_support_dir(repo)
+    docs = read_eidat_index_documents(repo)
+    selected = _project_selected_metadata_rels(wb_path.parent)
+    docs_preferred = [d for d in docs if str(d.get("metadata_rel") or "").strip() in selected] if selected else None
+
+    try:
+        wb = load_workbook(str(wb_path))
+    except PermissionError as exc:
+        raise RuntimeError(f"Workbook is not writable (close it in Excel first): {wb_path}") from exc
+
+    try:
+        res = _sync_project_workbook_metadata_inplace(
+            wb,
+            support_dir=support_dir,
+            docs_all=docs,
+            docs_preferred=docs_preferred,
+        )
+        wb.save(str(wb_path))
+        return {"workbook": str(wb_path), **res}
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
+
+
 _META_TERM_MAP: dict[str, tuple[str, str]] = {
     # term -> (metadata_key_path, value_type)
     "program": ("program_code", "string"),
@@ -4275,6 +4611,125 @@ def _load_metadata_candidates() -> dict:
         except Exception:
             continue
     return {}
+
+
+def _norm_alnum_spaces(value: object) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+
+
+def _iter_doc_type_entries(raw: object) -> list[dict]:
+    """
+    Normalize doc-type entries from metadata_candidates.json.
+
+    Accepts:
+      - list[str] (treated as {"name": s, "acronym": s, "aliases":[s]})
+      - list[dict] with keys name/acronym/aliases
+    """
+    if not isinstance(raw, list):
+        return []
+    out: list[dict] = []
+    for item in raw:
+        if isinstance(item, str) and item.strip():
+            s = item.strip()
+            out.append({"name": s, "acronym": s, "aliases": [s]})
+            continue
+        if not isinstance(item, Mapping):
+            continue
+        name = str(item.get("name") or "").strip()
+        acronym = str(item.get("acronym") or "").strip()
+        aliases_raw = item.get("aliases")
+        aliases: list[str] = []
+        if isinstance(aliases_raw, list):
+            aliases = [str(a).strip() for a in aliases_raw if str(a).strip()]
+        if name and name not in aliases:
+            aliases.append(name)
+        if acronym and acronym not in aliases:
+            aliases.append(acronym)
+        if not name and aliases:
+            name = aliases[0]
+        if not acronym and name:
+            acronym = name
+        if name:
+            out.append({"name": name, "acronym": acronym, "aliases": aliases})
+    return out
+
+
+@lru_cache(maxsize=1)
+def _doc_type_entries_from_candidates() -> list[dict]:
+    cand = _load_metadata_candidates()
+    raw = cand.get("document_types") if isinstance(cand, dict) else []
+    return _iter_doc_type_entries(raw)
+
+
+@lru_cache(maxsize=1)
+def _td_alias_norms() -> tuple[set[str], set[str]]:
+    """
+    Return (short_token_aliases, long_aliases) normalized for matching.
+
+    short_token_aliases: things like "td" that should match whole tokens only.
+    long_aliases: things like "test data" that can match as a substring in normalized blobs.
+    """
+    entries = _doc_type_entries_from_candidates()
+    aliases: list[str] = []
+    for e in entries:
+        acr = str(e.get("acronym") or "").strip().upper()
+        if acr != "TD":
+            continue
+        aliases.extend([str(a).strip() for a in (e.get("aliases") or []) if str(a).strip()])
+    # Conservative fallback if candidates are missing/malformed.
+    if not aliases:
+        aliases = ["Test Data", "Test-Data", "TestData", "TD"]
+    short_tokens: set[str] = set()
+    long_aliases: set[str] = set()
+    for a in aliases:
+        a_norm = _norm_alnum_spaces(a)
+        if not a_norm:
+            continue
+        if len(a_norm) <= 3 and len(a_norm.split()) == 1:
+            short_tokens.add(a_norm)
+        else:
+            long_aliases.add(a_norm)
+    # Always treat "td" as a valid token if TD exists at all.
+    short_tokens.add("td")
+    return short_tokens, long_aliases
+
+
+def is_test_data_doc(doc: Mapping[str, object]) -> bool:
+    """
+    Determine whether an index document is a Test Data (TD) report.
+
+    Uses metadata_candidates.json doc-type aliases (acronym TD) to control acceptable variants.
+    Falls back to path-based inference for older indexes.
+    """
+    try:
+        dt = str(doc.get("document_type") or "").strip()
+    except Exception:
+        dt = ""
+    try:
+        acr = str(doc.get("document_type_acronym") or "").strip()
+    except Exception:
+        acr = ""
+
+    short_tokens, long_aliases = _td_alias_norms()
+    dt_norm = _norm_alnum_spaces(dt)
+    acr_norm = _norm_alnum_spaces(acr)
+    if dt_norm in short_tokens or dt_norm in long_aliases:
+        return True
+    if acr_norm in short_tokens or acr_norm in long_aliases:
+        return True
+
+    # Older/partial metadata: infer from stored paths too.
+    try:
+        blob = f"{doc.get('metadata_rel')}\n{doc.get('artifacts_rel')}\n{doc.get('excel_sqlite_rel')}"
+    except Exception:
+        blob = str(doc)
+    blob_norm = _norm_alnum_spaces(blob)
+    blob_tokens = set(blob_norm.split())
+    if long_aliases and any(a in blob_norm for a in long_aliases):
+        return True
+    if short_tokens and any(t in blob_tokens for t in short_tokens):
+        return True
+    return False
 
 
 def _build_validation_lists(docs: Iterable[Mapping[str, object]], *, extra_meta: Iterable[Mapping[str, object]] | None = None) -> dict[str, list[str]]:
@@ -6122,6 +6577,27 @@ def update_eidp_trending_project_workbook(
         sn_first = min(sn_cols.values()) if sn_cols else 0
         sn_last = max(sn_cols.values()) if sn_cols else 0
 
+        # Refresh all workbook metadata fields from canonical index docs.
+        try:
+            selected_rels = set()
+            if isinstance(project_meta, dict):
+                vals = project_meta.get("selected_metadata_rel") or []
+                if isinstance(vals, list):
+                    selected_rels = {str(v).strip() for v in vals if str(v).strip()}
+            docs_preferred = (
+                [d for d in docs if str(d.get("metadata_rel") or "").strip() in selected_rels]
+                if selected_rels
+                else None
+            )
+            _sync_project_workbook_metadata_inplace(
+                wb,
+                support_dir=support_dir,
+                docs_all=docs,
+                docs_preferred=docs_preferred,
+            )
+        except Exception:
+            pass
+
         def _best_meta_value(sn_header: str, key: str) -> str:
             v = ""
             meta = meta_cache.get(sn_header) or {}
@@ -7227,15 +7703,26 @@ def _write_test_data_trending_workbook(
 
     ws_src = wb.create_sheet("Sources")
     ws_src.append(["serial_number", "program_title", "document_type", "metadata_rel", "artifacts_rel", "excel_sqlite_rel"])
+    docs_by_serial: dict[str, list[dict]] = {}
     for d in (docs or []):
+        sn = str(d.get("serial_number") or "").strip()
+        if sn:
+            docs_by_serial.setdefault(sn, []).append(d)
+    support_dir = eidat_support_dir(repo) if repo is not None else None
+    for sn in sn_cols:
+        doc = (
+            _best_doc_for_serial(support_dir, docs_by_serial.get(sn, []))
+            if support_dir is not None
+            else (docs_by_serial.get(sn, [{}])[0] if docs_by_serial.get(sn) else {})
+        )
         ws_src.append(
             [
-                str(d.get("serial_number") or "").strip(),
-                str(d.get("program_title") or "").strip(),
-                str(d.get("document_type") or "").strip(),
-                str(d.get("metadata_rel") or "").strip(),
-                str(d.get("artifacts_rel") or "").strip(),
-                str(d.get("excel_sqlite_rel") or "").strip(),
+                str(sn or "").strip(),
+                str(doc.get("program_title") or "").strip(),
+                str(doc.get("document_type") or "").strip(),
+                str(doc.get("metadata_rel") or "").strip(),
+                str(doc.get("artifacts_rel") or "").strip(),
+                str(doc.get("excel_sqlite_rel") or "").strip(),
             ]
         )
 
@@ -7247,7 +7734,13 @@ def _write_test_data_trending_workbook(
         pass
 
 
-def _write_eidp_trending_workbook(path: Path, *, serials: list[str], docs: list[dict] | None = None) -> None:
+def _write_eidp_trending_workbook(
+    path: Path,
+    *,
+    serials: list[str],
+    docs: list[dict] | None = None,
+    support_dir: Path | None = None,
+) -> None:
     """
     Create a blank EIDP trending workbook with header row and serial columns.
 
@@ -7288,12 +7781,12 @@ def _write_eidp_trending_workbook(path: Path, *, serials: list[str], docs: list[
     # Add metadata rows to master sheet.
     # These appear as the first rows before any term data (both manual + auto-populate flows).
     if docs:
-        # Build serial -> best doc mapping
-        docs_by_serial: dict[str, dict] = {}
+        # Build serial -> best doc mapping (use newest metadata JSON when available).
+        docs_by_serial: dict[str, list[dict]] = {}
         for d in docs:
             sn = str(d.get("serial_number") or "").strip()
-            if sn and sn not in docs_by_serial:
-                docs_by_serial[sn] = d
+            if sn:
+                docs_by_serial.setdefault(sn, []).append(d)
 
         # Metadata fields to add as rows in master sheet
         # Format: (term_name, doc_field, term_label)
@@ -7316,7 +7809,11 @@ def _write_eidp_trending_workbook(path: Path, *, serials: list[str], docs: list[
             row = [term_name, "", "", "string", "Metadata", term_label, "", "", ""]
             for sn in serials:
                 sn_clean = str(sn).strip()
-                doc = docs_by_serial.get(sn_clean, {})
+                doc = (
+                    _best_doc_for_serial(support_dir, docs_by_serial.get(sn_clean, []))
+                    if support_dir is not None
+                    else (docs_by_serial.get(sn_clean, [{}])[0] if docs_by_serial.get(sn_clean) else {})
+                )
                 row.append(str(doc.get(doc_field) or ""))
             ws.append(row)
 
@@ -7349,7 +7846,11 @@ def _write_eidp_trending_workbook(path: Path, *, serials: list[str], docs: list[
         # Populate metadata rows for each serial in workbook order
         for sn in serials:
             sn_clean = str(sn).strip()
-            doc = docs_by_serial.get(sn_clean, {})
+            doc = (
+                _best_doc_for_serial(support_dir, docs_by_serial.get(sn_clean, []))
+                if support_dir is not None
+                else (docs_by_serial.get(sn_clean, [{}])[0] if docs_by_serial.get(sn_clean) else {})
+            )
             ws_meta.append([
                 sn_clean,
                 str(doc.get("program_title") or ""),
@@ -7851,19 +8352,8 @@ def create_eidat_project(
     chosen_docs = [d for d in docs if str(d.get("metadata_rel") or "").strip() in selected]
     continued_population_clean = _sanitize_continued_population(continued_population)
 
-    def _is_td_doc(d: dict) -> bool:
-        try:
-            dt = str(d.get("document_type") or "").strip().lower()
-        except Exception:
-            dt = ""
-        try:
-            acr = str(d.get("document_type_acronym") or "").strip().lower()
-        except Exception:
-            acr = ""
-        return dt in {"test data", "testdata", "td"} or acr in {"test data", "testdata", "td"}
-
     def _is_test_data_eligible(d: dict) -> bool:
-        if not _is_td_doc(d):
+        if not is_test_data_doc(d):
             return False
         try:
             sqlite_rel = str(d.get("excel_sqlite_rel") or "").strip()
@@ -7878,7 +8368,7 @@ def create_eidat_project(
         return "__excel" in art
 
     if project_type in (EIDAT_PROJECT_TYPE_TRENDING, EIDAT_PROJECT_TYPE_RAW_TRENDING):
-        bad = [d for d in chosen_docs if isinstance(d, dict) and _is_td_doc(d)]
+        bad = [d for d in chosen_docs if isinstance(d, dict) and is_test_data_doc(d)]
         if bad:
             bad_sn = sorted({str(d.get("serial_number") or "").strip() for d in bad if str(d.get("serial_number") or "").strip()})
             raise RuntimeError(
@@ -7912,7 +8402,12 @@ def create_eidat_project(
         # Metadata sheet is always populated regardless of auto_populate setting.
         _ensure_file_written(
             workbook_path,
-            create_fn=lambda: _write_eidp_trending_workbook(workbook_path, serials=serials, docs=chosen_docs),
+            create_fn=lambda: _write_eidp_trending_workbook(
+                workbook_path,
+                serials=serials,
+                docs=chosen_docs,
+                support_dir=eidat_support_dir(repo),
+            ),
         )
 
         # Best-effort: build a project-local SQLite cache for Implementation/Trending.

@@ -15,12 +15,12 @@ import uuid
 from eidat_manager_db import SupportPaths, connect_db, ensure_schema
 from eidat_manager_embed import build_pointer_token, embed_pointer_token, has_pointer_token
 from eidat_manager_metadata import (
+    canonicalize_metadata_for_file,
     derive_minimal_metadata,
     extract_metadata_from_excel,
     extract_metadata_from_text,
     load_metadata_for_pdf,
     load_metadata_from_artifacts,
-    sanitize_metadata,
     write_metadata,
 )
 
@@ -669,11 +669,28 @@ def process_candidates(
                         artifacts_root = _excel_artifacts_dir(paths, abs_path)
                         artifacts_dir = str(artifacts_root)
 
+                        # Load any existing artifacts metadata first (treated as curated when present).
+                        try:
+                            existing_meta = load_metadata_from_artifacts(artifacts_root, abs_path)
+                        except Exception:
+                            existing_meta = None
+
                         # Extract metadata from workbook cells + filename (like PDFs use combined/title).
                         try:
-                            raw_meta = extract_metadata_from_excel(abs_path)
+                            extracted_meta = extract_metadata_from_excel(abs_path)
                         except Exception:
-                            raw_meta = _derive_excel_metadata(excel_mod, abs_path)
+                            extracted_meta = _derive_excel_metadata(excel_mod, abs_path)
+
+                        # Canonicalize once up front so TD detection is stable.
+                        try:
+                            raw_meta = canonicalize_metadata_for_file(
+                                abs_path,
+                                existing_meta=existing_meta,
+                                extracted_meta=extracted_meta,
+                                default_document_type="Data file",
+                            )
+                        except Exception:
+                            raw_meta = extracted_meta if isinstance(extracted_meta, dict) else {}
 
                         def _is_test_data(meta: dict) -> bool:
                             try:
@@ -737,7 +754,13 @@ def process_candidates(
                                 # For Test Data, SQLite creation is required (so the file remains pending if it fails).
                                 raise RuntimeError(f"Test Data Excel -> SQLite failed: {exc}") from exc
 
-                        clean_meta = sanitize_metadata(raw_meta, default_document_type="Data file")
+                        # Final canonicalization pass to preserve any existing curated fields and fill blanks.
+                        clean_meta = canonicalize_metadata_for_file(
+                            abs_path,
+                            existing_meta=existing_meta,
+                            extracted_meta=raw_meta,
+                            default_document_type="Data file",
+                        )
                         metadata_path = write_metadata(Path(artifacts_dir), abs_path, clean_meta)
                     else:
                         core = _get_core()
@@ -762,14 +785,28 @@ def process_candidates(
 
                         if artifacts_dir and combined_txt_path is not None:
                             _export_extracted_terms_db(Path(artifacts_dir), combined_txt_path)
-                        raw_meta = extract_metadata_from_text(combined_text, pdf_path=abs_path) if combined_text else None
-                        if raw_meta is None:
-                            raw_meta = load_metadata_for_pdf(abs_path)
-                        if raw_meta is None and artifacts_dir:
-                            raw_meta = load_metadata_from_artifacts(Path(artifacts_dir), abs_path)
-                        if raw_meta is None:
-                            raw_meta = derive_minimal_metadata(core, abs_path)
-                        clean_meta = sanitize_metadata(raw_meta, default_document_type="EIDP")
+                        extracted_meta = extract_metadata_from_text(combined_text, pdf_path=abs_path) if combined_text else None
+                        embedded_meta = None
+                        if extracted_meta is None:
+                            embedded_meta = load_metadata_for_pdf(abs_path)
+                        if extracted_meta is None and embedded_meta is None and artifacts_dir:
+                            embedded_meta = load_metadata_from_artifacts(Path(artifacts_dir), abs_path)
+                        if extracted_meta is None and embedded_meta is None:
+                            embedded_meta = derive_minimal_metadata(core, abs_path)
+
+                        existing_meta = None
+                        if artifacts_dir:
+                            try:
+                                existing_meta = load_metadata_from_artifacts(Path(artifacts_dir), abs_path)
+                            except Exception:
+                                existing_meta = None
+
+                        clean_meta = canonicalize_metadata_for_file(
+                            abs_path,
+                            existing_meta=existing_meta,
+                            extracted_meta=(extracted_meta if extracted_meta is not None else embedded_meta),
+                            default_document_type="EIDP",
+                        )
                         if artifacts_dir:
                             metadata_path = write_metadata(Path(artifacts_dir), abs_path, clean_meta)
 
