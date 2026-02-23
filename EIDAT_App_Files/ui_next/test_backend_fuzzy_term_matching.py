@@ -92,6 +92,68 @@ class TestBackendFuzzyTermMatching(unittest.TestCase):
         )
         self.assertEqual(val, "222")
 
+    def test_extract_value_from_lines_header_anchor_missing_returns_none(self) -> None:
+        lines = ["Valve Resistance: 2.22 ohm"]
+        val, _ = backend._extract_value_from_lines(
+            lines,
+            term="VALVE_RES",
+            term_label="Valve Resistance",
+            header_anchor="Measured",
+            want_type="number",
+        )
+        self.assertIsNone(val)
+
+    def test_extract_from_tables_by_header_ranks_best_fuzzy_term_match(self) -> None:
+        blocks = [
+            {
+                "heading": "Example",
+                "rows": [
+                    ["Tag", "Measured Value", "Units"],
+                    ["Valve Pressure", "111", "psi"],
+                    ["Valv Resist.", "222", "ohm"],
+                    ["Valve Resistivity", "333", "ohm"],
+                ],
+                "kv": {},
+            }
+        ]
+
+        val, _snip, _extra = backend._extract_from_tables_by_header(
+            blocks,
+            term="VALVE_RES",
+            term_label="Valve Resistance",
+            header_anchor="Measured",
+            fuzzy_header=False,
+            fuzzy_min_ratio=0.72,
+            fuzzy_term=True,
+            fuzzy_term_min_ratio=0.78,
+        )
+        self.assertEqual(val, "222")
+
+    def test_extract_from_tables_by_header_tie_breaks_by_earliest_row(self) -> None:
+        blocks = [
+            {
+                "heading": "Example",
+                "rows": [
+                    ["Tag", "Measured Value"],
+                    ["Valv Resist.", "222"],
+                    ["Valv Resist.", "333"],
+                ],
+                "kv": {},
+            }
+        ]
+
+        val, _snip, _extra = backend._extract_from_tables_by_header(
+            blocks,
+            term="VALVE_RES",
+            term_label="Valve Resistance",
+            header_anchor="Measured",
+            fuzzy_header=False,
+            fuzzy_min_ratio=0.72,
+            fuzzy_term=True,
+            fuzzy_term_min_ratio=0.78,
+        )
+        self.assertEqual(val, "222")
+
 
 if __name__ == "__main__":
     unittest.main()

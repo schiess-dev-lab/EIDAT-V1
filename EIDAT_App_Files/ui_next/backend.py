@@ -2320,13 +2320,24 @@ def load_trending_project_terms(db_path: Path) -> list[dict]:
     rows: list[dict] = []
     with sqlite3.connect(str(path)) as conn:
         conn.row_factory = sqlite3.Row
-        for r in conn.execute(
-            """
-            SELECT term_key, term, term_label, units, min_val, max_val, data_group, row_index
-            FROM terms
-            ORDER BY row_index ASC
-            """
-        ).fetchall():
+        try:
+            fetched = conn.execute(
+                """
+                SELECT term_key, term, term_label, units, min_val, max_val, data_group, table_label, row_index
+                FROM terms
+                ORDER BY row_index ASC
+                """
+            ).fetchall()
+        except Exception:
+            # Backwards compat: older caches won't have the table_label column.
+            fetched = conn.execute(
+                """
+                SELECT term_key, term, term_label, units, min_val, max_val, data_group, row_index
+                FROM terms
+                ORDER BY row_index ASC
+                """
+            ).fetchall()
+        for r in fetched:
             rows.append(dict(r))
     return rows
 
@@ -2409,8 +2420,46 @@ def _build_trending_project_sqlite(db_path: Path, workbook_path: Path) -> None:
         raise RuntimeError("Workbook master sheet is empty.")
 
     header = list(header)
+    header_norm = [_normalize_text(str(h or "")) for h in header]
+
+    # Serial columns start after the final fixed column (Max).
+    serial_start = 9  # legacy default: Term..Max (9 fixed cols)
+    try:
+        if "max" in header_norm:
+            serial_start = int(header_norm.index("max") + 1)
+    except Exception:
+        serial_start = 9
+
+    # Fixed column indices (by name; Table Label is optional).
+    header_map: dict[str, int] = {}
+    for idx, val in enumerate(header):
+        key = _normalize_text(str(val or ""))
+        if not key:
+            continue
+        header_map[key] = idx
+        compact = key.replace(" ", "")
+        if compact and compact not in header_map:
+            header_map[compact] = idx
+
+    def _h(name: str) -> int | None:
+        key = _normalize_text(name)
+        if key in header_map:
+            return header_map[key]
+        compact = key.replace(" ", "")
+        return header_map.get(compact)
+
+    idx_term = _h("Term") or 0
+    idx_header = _h("Header") or 1
+    idx_groupafter = _h("GroupAfter") or 2
+    idx_table_label = _h("Table Label")
+    idx_valuetype = _h("ValueType") or _h("Value Type") or 3
+    idx_datagroup = _h("Data Group") or 4
+    idx_termlabel = _h("Term Label") or 5
+    idx_units = _h("Units") or 6
+    idx_min = _h("Min") or 7
+    idx_max = _h("Max") or 8
     serial_cols: list[tuple[int, str]] = []
-    for idx in range(9, len(header)):
+    for idx in range(int(serial_start), len(header)):
         val = header[idx]
         sn = str(val).strip() if val is not None else ""
         if sn:
@@ -2451,6 +2500,7 @@ def _build_trending_project_sqlite(db_path: Path, workbook_path: Path) -> None:
                 valuetype TEXT,
                 data_group TEXT,
                 term_label TEXT,
+                table_label TEXT,
                 units TEXT,
                 min_val REAL,
                 max_val REAL,
@@ -2491,17 +2541,18 @@ def _build_trending_project_sqlite(db_path: Path, workbook_path: Path) -> None:
             if not row:
                 continue
             row = list(row)
-            term = str(row[0] or "").strip()
+            term = str(row[idx_term] or "").strip() if idx_term < len(row) else ""
             if not term:
                 continue
-            header_val = str(row[1] or "").strip()
-            group_after = str(row[2] or "").strip()
-            value_type = str(row[3] or "").strip()
-            data_group = str(row[4] or "").strip()
-            term_label = str(row[5] or "").strip()
-            units = str(row[6] or "").strip()
-            min_val = _to_float(row[7] if len(row) > 7 else None)
-            max_val = _to_float(row[8] if len(row) > 8 else None)
+            header_val = str(row[idx_header] or "").strip() if idx_header < len(row) else ""
+            group_after = str(row[idx_groupafter] or "").strip() if idx_groupafter < len(row) else ""
+            table_label = str(row[idx_table_label] or "").strip() if idx_table_label is not None and idx_table_label < len(row) else ""
+            value_type = str(row[idx_valuetype] or "").strip() if idx_valuetype < len(row) else ""
+            data_group = str(row[idx_datagroup] or "").strip() if idx_datagroup < len(row) else ""
+            term_label = str(row[idx_termlabel] or "").strip() if idx_termlabel < len(row) else ""
+            units = str(row[idx_units] or "").strip() if idx_units < len(row) else ""
+            min_val = _to_float(row[idx_min] if idx_min < len(row) else None)
+            max_val = _to_float(row[idx_max] if idx_max < len(row) else None)
 
             term_key = f"{term}__row_{row_index}"
             term_rows.append(
@@ -2513,6 +2564,7 @@ def _build_trending_project_sqlite(db_path: Path, workbook_path: Path) -> None:
                     value_type,
                     data_group,
                     term_label,
+                    table_label,
                     units,
                     min_val,
                     max_val,
@@ -2534,8 +2586,8 @@ def _build_trending_project_sqlite(db_path: Path, workbook_path: Path) -> None:
                 """
                 INSERT INTO terms (
                     term_key, term, header, groupafter, valuetype,
-                    data_group, term_label, units, min_val, max_val, row_index
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    data_group, term_label, table_label, units, min_val, max_val, row_index
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 term_rows,
             )
@@ -3745,6 +3797,141 @@ def _fuzzy_term_score(term: str, term_label: str, candidate: str) -> float:
     return float(best)
 
 
+def _score_term_candidate(
+    term: str,
+    term_label: str,
+    candidate_text: str,
+    *,
+    fuzzy_term: bool,
+    min_ratio: float,
+) -> float:
+    """
+    Score a candidate label/description against a requested term (0..1).
+
+    Perfect match (1.0) is reserved for exact normalized-key equality.
+    Everything else ranks below 1.0 so exact hits always win deterministically.
+    """
+    cand_s = str(candidate_text or "").strip()
+    if not cand_s:
+        return 0.0
+
+    term_k = _normalize_key(term)
+    label_k = _normalize_key(term_label)
+    cand_k = _normalize_key(cand_s)
+    cand_n = _normalize_text(cand_s)
+
+    if label_k and cand_k and label_k == cand_k:
+        return 1.0
+    if term_k and cand_k and term_k == cand_k:
+        return 1.0
+
+    def _uniq_tokens(s: str) -> list[str]:
+        toks = [t for t in re.findall(r"[a-z0-9]+", _normalize_text(s)) if t]
+        return list(dict.fromkeys(toks))
+
+    def _coverage_score(query: str) -> float:
+        q = str(query or "").strip()
+        if not q:
+            return 0.0
+        cov = _token_overlap_score(q, cand_n)
+        if cov <= 0.0:
+            return 0.0
+        # Penalize candidates with lots of extra tokens to avoid generic over-matches.
+        qt = _uniq_tokens(q)
+        ct = _uniq_tokens(cand_n)
+        extra = max(0, len(ct) - len(qt))
+        penalty = min(0.12, 0.01 * float(extra))
+        if cov >= 1.0:
+            return max(0.0, 0.99 - penalty)
+        return max(0.0, float(cov) - penalty)
+
+    best = 0.0
+    if term_label:
+        best = max(best, _coverage_score(term_label))
+    if term:
+        best = max(best, 0.95 * _coverage_score(term))
+
+    # Substring containment: helpful for short queries like "measured" vs "measured val".
+    try:
+        tl_n = _normalize_text(term_label)
+        if tl_n and tl_n in cand_n:
+            best = max(best, 0.97)
+    except Exception:
+        pass
+    try:
+        t_n = _normalize_text(term)
+        if t_n and t_n in cand_n:
+            best = max(best, 0.90)
+    except Exception:
+        pass
+
+    if fuzzy_term:
+        score = _fuzzy_term_score(term, term_label, cand_s)
+        if score >= float(min_ratio or 0.0):
+            # Keep strict ordering: only exact-key equality can be 1.0.
+            best = max(best, min(0.99, float(score)))
+    return float(best)
+
+
+def _score_header_anchor(
+    anchor: str,
+    header_cell_text: str,
+    *,
+    fuzzy_header: bool,
+    min_ratio: float,
+) -> float:
+    """
+    Score how well a header cell matches a requested header anchor (0..1).
+
+    Perfect match (1.0) means all anchor tokens are contained within header tokens
+    (with abbreviation-style prefix matching for tokens >= 4 chars).
+    """
+    a = str(anchor or "").strip()
+    h = str(header_cell_text or "").strip()
+    if not a or not h:
+        return 0.0
+
+    # Perfect token coverage (asymmetric): all query tokens appear in the header.
+    cov = _token_overlap_score(a, h)
+    if cov >= 1.0:
+        return 1.0
+    if not fuzzy_header:
+        return 0.0
+
+    # Fuzzy fallback: sequence similarity on normalized keys + an abbreviation-style token score.
+    def _tokens(s: str) -> list[str]:
+        return re.findall(r"[a-z0-9]+", _normalize_text(s))
+
+    def _abbr_score(query: str, candidate: str) -> float:
+        qt = _tokens(query)
+        ct = _tokens(candidate)
+        if not qt or not ct:
+            return 0.0
+        qi = 0
+        matched = 0
+        for c in ct:
+            found = False
+            for j in range(qi, len(qt)):
+                q = qt[j]
+                if q.startswith(c) or c.startswith(q):
+                    matched += 1
+                    qi = j + 1
+                    found = True
+                    break
+            if not found:
+                continue
+        return matched / float(len(ct)) if ct else 0.0
+
+    akey = _normalize_key(a)
+    hkey = _normalize_key(h)
+    seq = SequenceMatcher(None, akey, hkey).ratio() if (akey and hkey) else 0.0
+    abbr = _abbr_score(a, h)
+    score = float(max(seq, abbr))
+    if score >= float(min_ratio or 0.0):
+        return score
+    return 0.0
+
+
 def _resolve_acceptance_term_key(
     lookup: dict[str, str],
     *,
@@ -3766,37 +3953,39 @@ def _resolve_acceptance_term_key(
     if label_k and label_k in lookup:
         return lookup.get(label_k)
 
-    # Substring/containment (prefer longest match to reduce false positives)
-    best_len = 0
-    best_orig: str | None = None
-    for lk, orig in lookup.items():
-        if not lk:
-            continue
-        if term_k and (lk == term_k or lk in term_k or term_k in lk):
-            if len(lk) > best_len:
-                best_len = len(lk)
-                best_orig = orig
+    # Containment ranking (non-fuzzy mode): pick the best "contains" candidate, not just first/longest.
+    if not fuzzy_term:
+        best: tuple[float, int, str] | None = None  # (score, len, orig)
+        for lk, orig in lookup.items():
+            if not lk:
                 continue
-        if label_k and (lk == label_k or lk in label_k or label_k in lk):
-            if len(lk) > best_len:
-                best_len = len(lk)
-                best_orig = orig
-    if best_orig:
-        return best_orig
+            ok = False
+            if term_k and (lk == term_k or lk in term_k or term_k in lk):
+                ok = True
+            elif label_k and (lk == label_k or lk in label_k or label_k in lk):
+                ok = True
+            if not ok:
+                continue
+            score = _score_term_candidate(term, term_label, orig or lk, fuzzy_term=False, min_ratio=fuzzy_min_ratio)
+            key = (float(score), int(len(lk)), str(orig))
+            if best is None or key > best:
+                best = key
+        return best[2] if best else None
 
     # Fuzzy fallback
-    if not fuzzy_term:
-        return None
-
     best_score = 0.0
     best_key: str | None = None
+    best_len = -1
     for lk, orig in lookup.items():
         if not lk:
             continue
-        score = _fuzzy_term_score(term, term_label, orig or lk)
-        if score > best_score:
-            best_score = score
+        score = _score_term_candidate(term, term_label, orig or lk, fuzzy_term=True, min_ratio=fuzzy_min_ratio)
+        if score <= 0.0:
+            continue
+        if score > best_score or (score == best_score and len(lk) > best_len):
+            best_score = float(score)
             best_key = orig
+            best_len = len(lk)
     if best_key is not None and best_score >= float(fuzzy_min_ratio or 0.0):
         return best_key
     return None
@@ -4051,6 +4240,7 @@ def _parse_ascii_tables(lines: list[str]) -> list[dict]:
     """
     blocks: list[dict] = []
     current_heading = ""
+    pending_table_label = ""
 
     def _looks_like_border(ln: str) -> bool:
         s = ln.strip()
@@ -4066,6 +4256,16 @@ def _parse_ascii_tables(lines: list[str]) -> list[dict]:
                 j += 1
             if j < len(lines):
                 current_heading = _clean_cell_text(lines[j])
+            i = j + 1
+            continue
+
+        if ln.strip() == "[TABLE_LABEL]":
+            # next non-empty line is the label (applies to the next ASCII table block)
+            j = i + 1
+            while j < len(lines) and not str(lines[j]).strip():
+                j += 1
+            if j < len(lines):
+                pending_table_label = str(lines[j]).strip()
             i = j + 1
             continue
 
@@ -4114,7 +4314,15 @@ def _parse_ascii_tables(lines: list[str]) -> list[dict]:
                                 break
                     if val:
                         kv[key] = val
-            blocks.append({"heading": current_heading, "rows": rows, "kv": kv})
+            blocks.append(
+                {
+                    "heading": current_heading,
+                    "table_label": pending_table_label,
+                    "rows": rows,
+                    "kv": kv,
+                }
+            )
+            pending_table_label = ""
             i = j + 1
             continue
 
@@ -4143,10 +4351,14 @@ def _extract_value_from_lines(
     start = 0
     if header_anchor.strip():
         anchor_n = _normalize_text(header_anchor)
+        anchor_found = False
         for i, ln in enumerate(lines):
             if anchor_n and anchor_n in _normalize_text(ln):
                 start = i
+                anchor_found = True
                 break
+        if not anchor_found:
+            return None, ""
 
     end = min(len(lines), start + max(50, int(window_lines)))
 
@@ -5009,6 +5221,7 @@ def _extract_from_tables(
     group_after: str = "",
     fuzzy_term: bool = False,
     fuzzy_min_ratio: float = 0.78,
+    table_label: str = "",
 ) -> tuple[str | None, str]:
     term_k = _normalize_key(term)
     term_label_n = _normalize_text(term_label)
@@ -5019,6 +5232,7 @@ def _extract_from_tables(
     anchor = _normalize_text(header_anchor).strip()
     ga = _normalize_text(group_after).strip()
     ga_k = _normalize_key(group_after)
+    want_label = _normalize_text(table_label).strip()
     try:
         ga_min_ratio = float(
             (os.environ.get("EIDAT_GROUP_ANCHOR_MIN_RATIO") or os.environ.get("EIDAT_FUZZY_HEADER_MIN_RATIO") or "0.72").strip()
@@ -5074,7 +5288,21 @@ def _extract_from_tables(
     anchor_found = not bool(ga)
     slice_rows_after: int | None = None
 
+    def _ctx(block: dict) -> str:
+        parts: list[str] = []
+        tl = str(block.get("table_label") or "").strip()
+        hd = str(block.get("heading") or "").strip()
+        if tl:
+            parts.append(tl)
+        if hd:
+            parts.append(hd)
+        return " ".join(parts).strip()
+
     for b in blocks:
+        if want_label:
+            b_label = _normalize_text(str(b.get("table_label") or "")).strip()
+            if b_label != want_label:
+                continue
         if ga and not anchor_found:
             ok, row_idx = _block_anchor_hit(b)
             if not ok:
@@ -5108,7 +5336,8 @@ def _extract_from_tables(
                         v = vv
                         break
             if v:
-                return str(v), f"{b.get('heading')}: {term} -> {v}"
+                ctx = _ctx(b)
+                return str(v), f"{ctx}: {term} -> {v}".strip(": ")
         rows = b.get("rows") or []
         if not isinstance(rows, list):
             continue
@@ -5147,7 +5376,8 @@ def _extract_from_tables(
                     val = str(c).strip()
                     break
             if val:
-                return val, f"{b.get('heading')}: {r[0]} -> {val}"
+                ctx = _ctx(b)
+                return val, f"{ctx}: {r[0]} -> {val}".strip(": ")
 
         if fuzzy_term:
             best_score = 0.0
@@ -5166,7 +5396,8 @@ def _extract_from_tables(
                         val = str(c).strip()
                         break
                 if val:
-                    return val, f"{b.get('heading')}: {best_row[0]} -> {val}"
+                    ctx = _ctx(b)
+                    return val, f"{ctx}: {best_row[0]} -> {val}".strip(": ")
     if ga and not anchor_found:
         return None, ""
     return None, ""
@@ -5208,6 +5439,9 @@ def _extract_from_tables_by_header(
     group_after: str = "",
     fuzzy_header: bool = False,
     fuzzy_min_ratio: float = 0.72,
+    fuzzy_term: bool = False,
+    fuzzy_term_min_ratio: float = 0.78,
+    table_label: str = "",
 ) -> tuple[str | None, str, dict]:
     term_k = _normalize_key(term)
     term_n = _normalize_text(term)
@@ -5215,6 +5449,7 @@ def _extract_from_tables_by_header(
     anchor_n = _normalize_text(header_anchor)
     ga = _normalize_text(group_after).strip()
     ga_k = _normalize_key(group_after)
+    want_label = _normalize_text(table_label).strip()
     try:
         ga_min_ratio = float(
             (os.environ.get("EIDAT_GROUP_ANCHOR_MIN_RATIO") or os.environ.get("EIDAT_FUZZY_HEADER_MIN_RATIO") or "0.72").strip()
@@ -5405,8 +5640,26 @@ def _extract_from_tables_by_header(
 
     anchor_found = not bool(ga)
     slice_rows_after: int | None = None
+    best_key: tuple[float, float, float, int, int] | None = None
+    best_val: str | None = None
+    best_snip = ""
+    best_extra: dict = {}
 
-    for b in blocks or []:
+    def _ctx(block: dict) -> str:
+        parts: list[str] = []
+        tl = str(block.get("table_label") or "").strip()
+        hd = str(block.get("heading") or "").strip()
+        if tl:
+            parts.append(tl)
+        if hd:
+            parts.append(hd)
+        return " ".join(parts).strip()
+
+    for b_idx, b in enumerate(blocks or []):
+        if want_label:
+            b_label = _normalize_text(str(b.get("table_label") or "")).strip()
+            if b_label != want_label:
+                continue
         if ga and not anchor_found:
             heading = _normalize_text(str(b.get("heading") or ""))
             if heading and ga in heading:
@@ -5486,11 +5739,35 @@ def _extract_from_tables_by_header(
             header_norms, ["description", "desc", "name", "kpi", "metric", "test descr", "test description"]
         )
 
-        value_col = _find_col_in_headers(header_norms, anchor_n) if anchor_n else None
-        if value_col is None and anchor_n:
-            value_col = _find_col_keywords_in_headers(header_norms, [anchor_n])
-        if value_col is None and anchor_n and fuzzy_header:
-            value_col = _find_col_in_headers_fuzzy(header_norms, anchor_n, fuzzy_min_ratio)
+        value_col: int | None = None
+        header_score = 0.0
+        if anchor_n:
+            # Pick the best matching column by score (not first match).
+            max_cols = max((len(h) for h in header_norms if isinstance(h, list)), default=0)
+            best_col: int | None = None
+            best_hs = 0.0
+            for ci in range(int(max_cols)):
+                # Use the best scoring header variant for this column (merged/header2/etc).
+                cell_best = 0.0
+                for hnorm in header_norms:
+                    try:
+                        htxt = str(hnorm[ci] if ci < len(hnorm) else "")
+                    except Exception:
+                        htxt = ""
+                    hs = _score_header_anchor(
+                        header_anchor,
+                        htxt,
+                        fuzzy_header=fuzzy_header,
+                        min_ratio=fuzzy_min_ratio,
+                    )
+                    if hs > cell_best:
+                        cell_best = hs
+                if cell_best > best_hs:
+                    best_hs = cell_best
+                    best_col = ci
+            if best_col is not None and best_hs > 0.0:
+                value_col = int(best_col)
+                header_score = float(best_hs)
         if value_col is None and not anchor_n:
             # Auto column selection: prefer measured/value only (ignore result/voltage/etc).
             value_col = _find_col_keywords_in_headers(header_norms, ["measured", "measured value", "value", "actual"])
@@ -5510,68 +5787,54 @@ def _extract_from_tables_by_header(
         if slice_rows_after is not None:
             data_start = max(data_start, int(slice_rows_after))
             slice_rows_after = None
-        for r in rows[data_start:]:
+        for row_idx, r in enumerate(rows[data_start:], start=int(data_start)):
             if not isinstance(r, list) or not r:
                 continue
             tag = str(r[term_col] if term_col < len(r) else "").strip()
-            tag_k = _normalize_key(tag)
-            tag_n = _normalize_text(tag)
             desc = str(r[desc_col] if isinstance(desc_col, int) and desc_col < len(r) else "").strip()
-            desc_k = _normalize_key(desc)
-            desc_n = _normalize_text(desc)
-            matched = False
             matched_col: int | None = None
-            # Prefer TermLabel when present; Term can be generic and collide across rows.
-            if term_label_n and tag_n and term_label_n in tag_n:
-                matched = True
-                matched_col = term_col
-            elif term_label_n and desc_n and term_label_n in desc_n:
-                matched = True
-                matched_col = desc_col if isinstance(desc_col, int) else term_col
-            elif term_n and desc_n and term_n in desc_n:
-                matched = True
-                matched_col = desc_col if isinstance(desc_col, int) else term_col
-            elif term_k and tag_k and term_k == tag_k:
-                matched = True
-                matched_col = term_col
-            elif (not term_label_n) and term_k and tag_k and (term_k in tag_k or tag_k in term_k):
-                matched = True
-                matched_col = term_col
-            elif term_k and desc_k and term_k == desc_k:
-                matched = True
-                matched_col = desc_col if isinstance(desc_col, int) else term_col
-            elif (not term_label_n) and term_k and desc_k and (term_k in desc_k or desc_k in term_k):
-                matched = True
-                matched_col = desc_col if isinstance(desc_col, int) else term_col
+            score_tag = _score_term_candidate(
+                term,
+                term_label,
+                tag,
+                fuzzy_term=fuzzy_term,
+                min_ratio=fuzzy_term_min_ratio,
+            )
+            score_desc = _score_term_candidate(
+                term,
+                term_label,
+                desc,
+                fuzzy_term=fuzzy_term,
+                min_ratio=fuzzy_term_min_ratio,
+            ) if desc else 0.0
+            term_score = float(max(score_tag, score_desc))
+            if term_score > 0.0:
+                if score_tag >= score_desc:
+                    matched_col = int(term_col)
+                else:
+                    matched_col = int(desc_col) if isinstance(desc_col, int) else int(term_col)
             else:
-                # Match against any column if the term appears elsewhere in the row.
+                # Weak fallback: term appears elsewhere in the row.
+                best_cell = 0.0
+                best_ci: int | None = None
                 for ci, cell in enumerate(r):
                     cell_s = str(cell or "").strip()
                     if not cell_s:
                         continue
-                    cell_k = _normalize_key(cell_s)
-                    cell_n = _normalize_text(cell_s)
-                    if term_label_n and cell_n and term_label_n in cell_n:
-                        matched = True
-                        matched_col = ci
-                        break
-                    if term_k and cell_k and term_k == cell_k:
-                        matched = True
-                        matched_col = ci
-                        break
-                    if (not term_label_n) and term_k and cell_k and (term_k in cell_k or cell_k in term_k):
-                        matched = True
-                        matched_col = ci
-                        break
-                    if term_label_n and cell_n and term_label_n in cell_n:
-                        matched = True
-                        matched_col = ci
-                        break
-                    if term_n and cell_n and term_n in cell_n:
-                        matched = True
-                        matched_col = ci
-                        break
-            if not matched:
+                    sc = _score_term_candidate(
+                        term,
+                        term_label,
+                        cell_s,
+                        fuzzy_term=fuzzy_term,
+                        min_ratio=fuzzy_term_min_ratio,
+                    )
+                    if sc > best_cell:
+                        best_cell = float(sc)
+                        best_ci = int(ci)
+                if best_ci is not None and best_cell > 0.0:
+                    term_score = 0.70 * float(best_cell)
+                    matched_col = best_ci
+            if term_score <= 0.0:
                 continue
 
             val = None
@@ -5606,18 +5869,35 @@ def _extract_from_tables_by_header(
                     if str(c).strip():
                         val = str(c).strip()
                         break
+            if not val:
+                continue
+
+            overall = float(term_score)
+            if anchor_n:
+                if header_score <= 0.0:
+                    continue
+                overall = 0.5 * float(term_score) + 0.5 * float(header_score)
+
             extra = {
                 "units": str(r[units_col]).strip() if units_col is not None and units_col < len(r) else "",
                 "requirement_raw": str(r[req_col]).strip() if req_col is not None and req_col < len(r) else "",
                 "min_raw": str(r[min_col]).strip() if min_col is not None and min_col < len(r) else "",
                 "max_raw": str(r[max_col]).strip() if max_col is not None and max_col < len(r) else "",
             }
-            heading = str(b.get("heading") or "").strip()
-            snippet = f"{heading}: {tag} -> {val}".strip()
-            return val, snippet, extra
+            ctx = _ctx(b)
+            snippet = f"{ctx}: {tag} -> {val}".strip(": ").strip()
+
+            key = (overall, float(term_score), float(header_score), -int(b_idx), -int(row_idx))
+            if best_key is None or key > best_key:
+                best_key = key
+                best_val = str(val)
+                best_snip = snippet
+                best_extra = dict(extra)
 
     if ga and not anchor_found:
         return None, "", {}
+    if best_val is not None:
+        return best_val, best_snip, best_extra
     return None, "", {}
 
 def _row_has_headers(row: list[str], headers: list[str]) -> bool:
@@ -5799,13 +6079,24 @@ def update_eidp_trending_project_workbook(
     col_term = headers["term"]
     col_header = headers["header"]
     col_group_after = headers["groupafter"]
+    col_table_label = headers.get("tablelabel") or headers.get("table label")
     col_data_group = headers["datagroup"]
     col_term_label = headers["termlabel"]
     col_units = headers["units"]
     col_min = headers["min"]
     col_max = headers["max"]
 
-    fixed_cols = max(col_term, col_header, col_group_after, col_data_group, col_term_label, col_units, col_min, col_max)
+    fixed_cols = max(
+        col_term,
+        col_header,
+        col_group_after,
+        int(col_table_label or 0),
+        col_data_group,
+        col_term_label,
+        col_units,
+        col_min,
+        col_max,
+    )
     sn_cols: dict[str, int] = {}
     for col in range(1, ws.max_column + 1):
         if col <= fixed_cols:
@@ -6097,12 +6388,15 @@ def update_eidp_trending_project_workbook(
             continue
         header_anchor = str(ws.cell(row, col_header).value or "").strip()
         group_after = str(ws.cell(row, col_group_after).value or "").strip()
+        table_label = str(ws.cell(row, col_table_label).value or "").strip() if col_table_label else ""
         data_group = str(ws.cell(row, col_data_group).value or "").strip()
         term_label = str(ws.cell(row, col_term_label).value or "").strip()
         units = str(ws.cell(row, col_units).value or "").strip()
         mn = _parse_float_loose(ws.cell(row, col_min).value)
         mx = _parse_float_loose(ws.cell(row, col_max).value)
         explicit_type = str(ws.cell(row, col_value_type).value or "").strip() if col_value_type else ""
+
+        label_mode = bool(str(table_label or "").strip())
 
         # Use Data Group as anchor if Header is generic like "Value"
         if _normalize_text(header_anchor) in ("value", "val", "result"):
@@ -6120,21 +6414,22 @@ def update_eidp_trending_project_workbook(
                 try:
                     if header_anchor and _parse_float_loose(cell.value) is None:
                         allow_replace = True
-                    lookup = acceptance_lookup.get(sn_header, {})
-                    term_key = _resolve_acceptance_term_key(
-                        lookup,
-                        term=term,
-                        term_label=term_label,
-                        fuzzy_term=fuzzy_term_stick,
-                        fuzzy_min_ratio=fuzzy_term_min_ratio,
-                    )
-                    if term_key:
-                        data_list = acceptance_cache.get(sn_header, {}).get(term_key, [])
-                        data = _select_acceptance_entry(data_list, term_instance)
-                        if data.get("value") is not None:
-                            existing_num = _parse_float_loose(cell.value)
-                            if existing_num is None:
-                                allow_replace = True
+                    if not label_mode:
+                        lookup = acceptance_lookup.get(sn_header, {})
+                        term_key = _resolve_acceptance_term_key(
+                            lookup,
+                            term=term,
+                            term_label=term_label,
+                            fuzzy_term=fuzzy_term_stick,
+                            fuzzy_min_ratio=fuzzy_term_min_ratio,
+                        )
+                        if term_key:
+                            data_list = acceptance_cache.get(sn_header, {}).get(term_key, [])
+                            data = _select_acceptance_entry(data_list, term_instance)
+                            if data.get("value") is not None:
+                                existing_num = _parse_float_loose(cell.value)
+                                if existing_num is None:
+                                    allow_replace = True
                 except Exception:
                     allow_replace = False
                 if not allow_replace:
@@ -6152,7 +6447,7 @@ def update_eidp_trending_project_workbook(
             # IMPORTANT: If the workbook row specifies an explicit `Header`, prefer header-driven extraction
             # from the table blocks (combined.txt) so we don't accidentally fill the cell with a different
             # measured value for the same term (acceptance DB is term-instance based and not header aware).
-            if sn_header in acceptance_cache:
+            if (not label_mode) and sn_header in acceptance_cache:
                 lookup = acceptance_lookup.get(sn_header, {})
                 term_key = _resolve_acceptance_term_key(
                     lookup,
@@ -6195,7 +6490,7 @@ def update_eidp_trending_project_workbook(
                             snippet = str(data.get("requirement_raw") or "")
 
             # 1) Metadata-first for known document-profile fields.
-            if val in (None, "") and term_k in _META_TERM_MAP and isinstance(meta, Mapping):
+            if (not label_mode) and val in (None, "") and term_k in _META_TERM_MAP and isinstance(meta, Mapping):
                 meta_path, meta_kind = _META_TERM_MAP[term_k]
                 raw = _meta_get(meta, meta_path)
                 # Fallbacks for incomplete metadata files.
@@ -6222,6 +6517,9 @@ def update_eidp_trending_project_workbook(
                     group_after=group_after,
                     fuzzy_header=fuzzy_header_stick,
                     fuzzy_min_ratio=fuzzy_header_min_ratio,
+                    fuzzy_term=fuzzy_term_stick,
+                    fuzzy_term_min_ratio=fuzzy_term_min_ratio,
+                    table_label=table_label,
                 )
                 if val in (None, "") and tval not in (None, ""):
                     val = _clean_cell_text(str(tval))
@@ -6279,6 +6577,9 @@ def update_eidp_trending_project_workbook(
                     group_after=group_after,
                     fuzzy_header=False,
                     fuzzy_min_ratio=fuzzy_header_min_ratio,
+                    fuzzy_term=fuzzy_term_stick,
+                    fuzzy_term_min_ratio=fuzzy_term_min_ratio,
+                    table_label=table_label,
                 )
                 if tval not in (None, ""):
                     val = _clean_cell_text(str(tval))
@@ -6338,6 +6639,7 @@ def update_eidp_trending_project_workbook(
                     group_after=group_after,
                     fuzzy_term=fuzzy_term_stick,
                     fuzzy_min_ratio=fuzzy_term_min_ratio,
+                    table_label=table_label,
                 )
                 if tval:
                     val = _clean_cell_text(tval)
@@ -6346,7 +6648,7 @@ def update_eidp_trending_project_workbook(
 
             # 2b) Paired acceptance/measured tables (common in synthetic debug PDFs)
             # Skip if a specific Header is provided (header overrides value selection).
-            if val in (None, "") and not header_anchor:
+            if (not label_mode) and val in (None, "") and not header_anchor:
                 blocks = tables_cache.get(sn_header) or []
                 tval, tsnip = _extract_from_paired_acceptance_tables(blocks, term=term, term_label=term_label)
                 if tval:
@@ -6355,7 +6657,7 @@ def update_eidp_trending_project_workbook(
                     snippet = tsnip
 
             # 3) Fallback: line-based scan
-            if val in (None, ""):
+            if (not label_mode) and val in (None, ""):
                 lines = combined_cache.get(sn_header)
                 if not lines:
                     # Optional synthetic golden fallback when combined isn't available.
@@ -6393,6 +6695,8 @@ def update_eidp_trending_project_workbook(
                                 group_after=group_after,
                                 fuzzy_header=False,
                                 fuzzy_min_ratio=fuzzy_header_min_ratio,
+                                fuzzy_term=fuzzy_term_stick,
+                                fuzzy_term_min_ratio=fuzzy_term_min_ratio,
                             )
                             if val in (None, "") and tval not in (None, ""):
                                 val = _clean_cell_text(str(tval))
@@ -6819,6 +7123,7 @@ def update_eidp_raw_trending_project_workbook(
     col_term_header = _col(["termheader", "term header"])
     col_header = _col(["header"])
     col_group_after = _col(["groupafter", "group after"])
+    col_table_label = _col(["tablelabel", "table label"])
     col_value_type = _col(["valuetype", "value type", "value_type"])
     col_data_group = _col(["datagroup", "data group"])
     col_term_label = _col(["termlabel", "term label"])
@@ -6886,6 +7191,7 @@ def update_eidp_raw_trending_project_workbook(
             col_term_header or 0,
             col_header or 0,
             col_group_after or 0,
+            col_table_label or 0,
             col_value_type or 0,
             col_data_group or 0,
             col_term_label or 0,
@@ -6930,11 +7236,12 @@ def update_eidp_raw_trending_project_workbook(
     missing_source = 0
     missing_value = 0
 
-    def _resolve_row_fields(row_idx: int) -> tuple[str, str, str, str, str, str, float | None, float | None, str]:
+    def _resolve_row_fields(row_idx: int) -> tuple[str, str, str, str, str, str, str, float | None, float | None, str]:
         term = str(ws.cell(row_idx, col_term).value or "").strip() if col_term else ""
         term_header_raw = str(ws.cell(row_idx, col_term_header).value or "").strip() if col_term_header else ""
         header_anchor = str(ws.cell(row_idx, col_header).value or "").strip() if col_header else ""
         group_after = str(ws.cell(row_idx, col_group_after).value or "").strip() if col_group_after else ""
+        table_label = str(ws.cell(row_idx, col_table_label).value or "").strip() if col_table_label else ""
         data_group = str(ws.cell(row_idx, col_data_group).value or "").strip() if col_data_group else ""
         term_label = str(ws.cell(row_idx, col_term_label).value or "").strip() if col_term_label else ""
         units = str(ws.cell(row_idx, col_units).value or "").strip() if col_units else ""
@@ -6959,7 +7266,7 @@ def update_eidp_raw_trending_project_workbook(
             header_anchor = data_group or header_anchor
 
         want_type = _infer_value_type(term, explicit=explicit_type, units=units, mn=mn, mx=mx)
-        return term, header_anchor, group_after, data_group, term_label, units, mn, mx, want_type
+        return term, header_anchor, group_after, table_label, data_group, term_label, units, mn, mx, want_type
 
     def _extract_value_for_serial(
         *,
@@ -6967,6 +7274,7 @@ def update_eidp_raw_trending_project_workbook(
         term_label: str,
         header_anchor: str,
         group_after: str,
+        table_label: str,
         want_type: str,
         lines: list[str],
         tables: list[dict],
@@ -6984,6 +7292,9 @@ def update_eidp_raw_trending_project_workbook(
             group_after=group_after,
             fuzzy_header=fuzzy_header_stick,
             fuzzy_min_ratio=fuzzy_header_min_ratio,
+            fuzzy_term=fuzzy_term_stick,
+            fuzzy_term_min_ratio=fuzzy_term_min_ratio,
+            table_label=table_label,
         )
         if tval not in (None, ""):
             val = _clean_cell_text(str(tval))
@@ -6999,13 +7310,14 @@ def update_eidp_raw_trending_project_workbook(
                 group_after=group_after,
                 fuzzy_term=fuzzy_term_stick,
                 fuzzy_min_ratio=fuzzy_term_min_ratio,
+                table_label=table_label,
             )
             if tval2:
                 val = _clean_cell_text(str(tval2))
                 used_method = "table"
                 snippet = tsnip2
 
-        if val in (None, ""):
+        if val in (None, "") and not str(table_label or "").strip():
             fallback, snip = _extract_value_from_lines(
                 lines,
                 term=term,
@@ -7025,7 +7337,7 @@ def update_eidp_raw_trending_project_workbook(
         return val, used_method, snippet, extra
 
     for row in range(2, ws.max_row + 1):
-        term, header_anchor, group_after, data_group, term_label, units, mn, mx, want_type = _resolve_row_fields(row)
+        term, header_anchor, group_after, table_label, data_group, term_label, units, mn, mx, want_type = _resolve_row_fields(row)
         if not term:
             continue
         if _normalize_text(data_group) == "metadata":
@@ -7054,6 +7366,7 @@ def update_eidp_raw_trending_project_workbook(
                 term_label=term_label,
                 header_anchor=header_anchor,
                 group_after=group_after,
+                table_label=table_label,
                 want_type=want_type,
                 lines=lines,
                 tables=tables,
@@ -7145,6 +7458,7 @@ def update_eidp_raw_trending_project_workbook(
                 term_label=term_label,
                 header_anchor=header_anchor,
                 group_after=group_after,
+                table_label=table_label,
                 want_type=want_type,
                 lines=lines,
                 tables=tables,
@@ -7760,7 +8074,7 @@ def _write_eidp_trending_workbook(
             "Install it with `py -m pip install openpyxl` within the project environment."
         ) from exc
 
-    headers = ["Term", "Header", "GroupAfter", "ValueType", "Data Group", "Term Label", "Units", "Min", "Max"]
+    headers = ["Term", "Header", "GroupAfter", "Table Label", "ValueType", "Data Group", "Term Label", "Units", "Min", "Max"]
     headers.extend([str(s) for s in serials if str(s).strip()])
     wb = Workbook()
     ws = wb.active
@@ -7805,8 +8119,8 @@ def _write_eidp_trending_workbook(
         ]
 
         for term_name, doc_field, term_label in metadata_fields:
-            # Build row: Term, Header, GroupAfter, ValueType, Data Group, Term Label, Units, Min, Max, then serial values
-            row = [term_name, "", "", "string", "Metadata", term_label, "", "", ""]
+            # Build row: Term, Header, GroupAfter, Table Label, ValueType, Data Group, Term Label, Units, Min, Max, then serial values
+            row = [term_name, "", "", "", "string", "Metadata", term_label, "", "", ""]
             for sn in serials:
                 sn_clean = str(sn).strip()
                 doc = (
@@ -7927,7 +8241,7 @@ def _write_eidp_raw_trending_workbook(
             "Install it with `py -m pip install openpyxl` within the project environment."
         ) from exc
 
-    headers = ["Term", "Header", "GroupAfter", "ValueType", "Data Group", "Term Label", "Units", "Min", "Max"]
+    headers = ["Term", "Header", "GroupAfter", "Table Label", "ValueType", "Data Group", "Term Label", "Units", "Min", "Max"]
     headers.extend([str(s) for s in serials if str(s).strip()])
 
     wb = Workbook()
@@ -7937,7 +8251,7 @@ def _write_eidp_raw_trending_workbook(
 
     # Value Type dropdown to prevent invalid inputs (blank = auto).
     try:
-        value_type_col = headers.index("Value Type") + 1  # 1-based
+        value_type_col = headers.index("ValueType") + 1  # 1-based
         max_rows = 1000
         dv = DataValidation(type="list", formula1='"auto,string,number"', allow_blank=True, showDropDown=True)
         ws.add_data_validation(dv)
@@ -7969,7 +8283,7 @@ def _write_eidp_raw_trending_workbook(
         ]
 
         for term_name, doc_field, term_label in metadata_fields:
-            row = [term_name, "", "", "string", "Metadata", term_label, "", "", ""]
+            row = [term_name, "", "", "", "string", "Metadata", term_label, "", "", ""]
             for sn in serials:
                 sn_clean = str(sn).strip()
                 doc = docs_by_serial.get(sn_clean, {})

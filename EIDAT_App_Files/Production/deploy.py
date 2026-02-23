@@ -61,6 +61,18 @@ def _rmtree_strict_if_present(path: Path) -> None:
         raise RuntimeError(f"Failed to delete directory: {path}")
 
 
+def _safe_move_dir_if_present(src: Path, dst: Path) -> bool:
+    if not src.exists():
+        return False
+    if not src.is_dir():
+        return False
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists():
+        _rmtree_strict_if_present(dst)
+    shutil.move(str(src), str(dst))
+    return True
+
+
 def _node_ui_venv_dir(layout) -> Path:
     # Keep consistent with the launcher generated in _render_eidat_bat (EIDAT_VENV_DIR default).
     return layout.extraction_node_dir / "node-ui" / ".venv"
@@ -205,6 +217,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Delete <node_root>\\EIDAT and <node_root>\\EIDAT Support before re-deploying (does not touch EIDPs).",
     )
+    ap.add_argument(
+        "--reset-keep-site-packages",
+        action="store_true",
+        help="When using --reset-node, preserve any existing node venv folders so Lib/site-packages are not removed/replaced.",
+    )
     ap.add_argument("--ensure-node-venv", action="store_true", help="Pre-create the node venv folder location (no packages).")
     ap.add_argument(
         "--bootstrap-node-ui",
@@ -244,8 +261,70 @@ def main(argv: list[str] | None = None) -> int:
 
     layout = node_layout(node_root)
     if args.reset_node:
-        _rmtree_strict_if_present(layout.eidat_root)
-        _rmtree_strict_if_present(layout.support_dir)
+        moved: list[tuple[Path, Path]] = []  # (backup_path, original_path)
+        preserved_node_ui_venv = False
+        backup_root: Path | None = None
+
+        if bool(args.reset_keep_site_packages):
+            # Preserve node-local venvs so installed packages are not removed/reinstalled.
+            #
+            # NOTE: The venv directory structure (python.exe/Scripts/pyvenv.cfg) is required
+            # for a working venv; preserving only Lib/site-packages would be unsafe.
+            backup_root = node_root / ".eidat_reset_backup" / str(uuid.uuid4())
+            try:
+                backup_root.mkdir(parents=True, exist_ok=True)
+            except Exception as exc:
+                raise RuntimeError(f"Failed to create venv backup directory: {backup_root}") from exc
+
+            # Known venv locations in the node layout.
+            preserve_paths: list[Path] = [layout.venv_dir]
+            # Resolve node-ui venv dir the same way as the bootstrap section.
+            if str(args.node_ui_venv_dir or "").strip():
+                venv_dir = Path(args.node_ui_venv_dir).expanduser()
+                if not venv_dir.is_absolute():
+                    venv_dir = (node_root / venv_dir).resolve()
+            else:
+                venv_dir = _node_ui_venv_dir(layout)
+            preserve_paths.append(venv_dir)
+
+            for p in preserve_paths:
+                try:
+                    rel = p.relative_to(node_root)
+                except Exception:
+                    rel = Path(p.name)
+                dst = backup_root / rel
+                if _safe_move_dir_if_present(p, dst):
+                    moved.append((dst, p))
+                    if p == venv_dir:
+                        preserved_node_ui_venv = True
+
+        try:
+            _rmtree_strict_if_present(layout.eidat_root)
+            _rmtree_strict_if_present(layout.support_dir)
+        except Exception:
+            # Best-effort restore if we moved venvs out but failed to reset.
+            for backup_p, orig_p in reversed(moved):
+                try:
+                    orig_p.parent.mkdir(parents=True, exist_ok=True)
+                    if orig_p.exists():
+                        _rmtree_strict_if_present(orig_p)
+                    shutil.move(str(backup_p), str(orig_p))
+                except Exception:
+                    pass
+            raise
+
+        # Restore preserved venvs after reset (if any).
+        for backup_p, orig_p in reversed(moved):
+            orig_p.parent.mkdir(parents=True, exist_ok=True)
+            if orig_p.exists():
+                _rmtree_strict_if_present(orig_p)
+            shutil.move(str(backup_p), str(orig_p))
+        if backup_root is not None:
+            _safe_rmtree_if_present(backup_root)
+
+        # If we preserved the node-ui venv, skip bootstrapping to avoid changing site-packages.
+        if preserved_node_ui_venv:
+            args.bootstrap_node_ui = False
     # Legacy folders from older node layouts (safe to delete; they only held launcher .bat files).
     _safe_rmtree_if_present(layout.eidat_root / "FileExplorer")
     _safe_rmtree_if_present(layout.eidat_root / "Projects")

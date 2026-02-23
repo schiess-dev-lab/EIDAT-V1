@@ -810,6 +810,23 @@ def process_candidates(
                         if artifacts_dir:
                             metadata_path = write_metadata(Path(artifacts_dir), abs_path, clean_meta)
 
+                        # Best-effort: apply rules-driven table labels to combined.txt (post-processing).
+                        # This overwrites combined.txt in-place and is intentionally decoupled from
+                        # extracted_terms.db export and metadata extraction.
+                        if artifacts_dir and combined_txt_path is not None:
+                            try:
+                                from extraction.table_labeler import load_table_label_rules, label_combined_lines
+
+                                rules_path = paths.global_repo / "user_inputs" / "table_label_rules.json"
+                                rules_cfg = load_table_label_rules(rules_path)
+                                if rules_cfg and combined_txt_path.exists():
+                                    raw_lines = combined_txt_path.read_text(encoding="utf-8", errors="ignore").splitlines(True)
+                                    labeled = label_combined_lines(raw_lines, rules_cfg)
+                                    if labeled and labeled != raw_lines:
+                                        combined_txt_path.write_text("".join(labeled), encoding="utf-8")
+                            except Exception:
+                                pass
+
                         if force or not has_pointer_token(abs_path):
                             eidat_uuid = uuid.uuid4().hex
                             support_rel = None

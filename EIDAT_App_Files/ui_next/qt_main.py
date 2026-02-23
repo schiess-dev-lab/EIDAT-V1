@@ -1224,7 +1224,6 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
         self.cb_type = QtWidgets.QComboBox()
         self.cb_type.addItems([
             getattr(be, "EIDAT_PROJECT_TYPE_TRENDING", "EIDP Trending"),
-            getattr(be, "EIDAT_PROJECT_TYPE_RAW_TRENDING", "EIDP Raw File Trending"),
             getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending"),
         ])
         self.cb_type.currentIndexChanged.connect(self._on_project_type_changed)
@@ -5254,7 +5253,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         lbl = QtWidgets.QLabel("Project Builder")
         lbl.setStyleSheet("font-size: 14px; font-weight: 700; color: #0f172a;")
-        desc = QtWidgets.QLabel("Create projects from indexed EIDPs.\n(Trending or Raw File Trending workbooks)")
+        desc = QtWidgets.QLabel("Create projects from indexed EIDPs or TD reports.\n(EIDP Trending / Test Data Trending)")
         desc.setStyleSheet("font-size: 11px; color: #0f172a;")
         desc.setWordWrap(True)
         l.addWidget(lbl)

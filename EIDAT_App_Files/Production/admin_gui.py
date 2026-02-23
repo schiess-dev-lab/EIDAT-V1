@@ -469,6 +469,7 @@ class AdminWindow(QtWidgets.QMainWindow):
             "This will completely delete and recreate the node runtime folders:\n\n"
             f"  {Path(root) / 'EIDAT'}\n"
             f"  {Path(root) / 'EIDAT Support'}\n\n"
+            "Node-local venv packages are preserved (Lib/site-packages is NOT removed/replaced).\n\n"
             "This does NOT delete EIDPs.\n\n"
             "Continue?"
         )
@@ -483,7 +484,16 @@ class AdminWindow(QtWidgets.QMainWindow):
         try:
             from .deploy import main as deploy_main
 
-            deploy_main(["--node-root", root, "--runtime-root", str(self._runtime_root), "--reset-node"])
+            deploy_main(
+                [
+                    "--node-root",
+                    root,
+                    "--runtime-root",
+                    str(self._runtime_root),
+                    "--reset-node",
+                    "--reset-keep-site-packages",
+                ]
+            )
             node_id = admin_db.upsert_node(
                 self._conn,
                 node_root=str(_as_abs(root)),
