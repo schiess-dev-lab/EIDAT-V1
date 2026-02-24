@@ -580,7 +580,7 @@ def process_candidates(
     core = None
     excel_mod = None
     excel_config_path = _default_excel_config_path()
-    excel_sqlite_mod = None
+    excel_sqlite_helpers = None
 
     def _get_core() -> Any:
         nonlocal core
@@ -594,15 +594,33 @@ def process_candidates(
             excel_mod = _load_excel_extractor()
         return excel_mod
 
-    def _get_excel_sqlite_mod() -> Any:
-        nonlocal excel_sqlite_mod
-        if excel_sqlite_mod is None:
+    def _get_excel_sqlite_helpers() -> tuple[Any, Any, Any, Any, Any]:
+        nonlocal excel_sqlite_helpers
+        if excel_sqlite_helpers is None:
             try:
-                from eidat_manager_excel_to_sqlite import excel_to_sqlite  # type: ignore
+                from eidat_manager_excel_to_sqlite import (  # type: ignore
+                    _load_test_data_env,
+                    _truthy,
+                    excel_to_sqlite,
+                    export_sqlite_excel_mirror,
+                    export_sqlite_text_mirror,
+                )
             except Exception:
-                from .eidat_manager_excel_to_sqlite import excel_to_sqlite  # type: ignore
-            excel_sqlite_mod = excel_to_sqlite
-        return excel_sqlite_mod
+                from .eidat_manager_excel_to_sqlite import (  # type: ignore
+                    _load_test_data_env,
+                    _truthy,
+                    excel_to_sqlite,
+                    export_sqlite_excel_mirror,
+                    export_sqlite_text_mirror,
+                )
+            excel_sqlite_helpers = (
+                excel_to_sqlite,
+                export_sqlite_text_mirror,
+                export_sqlite_excel_mirror,
+                _load_test_data_env,
+                _truthy,
+            )
+        return excel_sqlite_helpers
 
     with connect_db(paths.db_path) as conn:
         ensure_schema(conn)
@@ -722,7 +740,13 @@ def process_candidates(
                         # Test Data: also create a per-workbook SQLite DB (header row unknown; detect automatically).
                         if is_test_data:
                             try:
-                                excel_to_sqlite = _get_excel_sqlite_mod()
+                                (
+                                    excel_to_sqlite,
+                                    export_sqlite_text_mirror,
+                                    export_sqlite_excel_mirror,
+                                    _load_test_data_env,
+                                    _truthy,
+                                ) = _get_excel_sqlite_helpers()
                                 payload = excel_to_sqlite(
                                     global_repo=paths.global_repo,
                                     excel_files=[abs_path],
@@ -731,6 +755,7 @@ def process_candidates(
                                     overwrite=True,
                                 )
                                 sqlite_rel = ""
+                                sqlite_abs: Path | None = None
                                 try:
                                     results_list = list((payload or {}).get("results") or [])
                                 except Exception:
@@ -742,6 +767,10 @@ def process_candidates(
                                         sp = ""
                                     if sp:
                                         try:
+                                            sqlite_abs = Path(sp).expanduser()
+                                        except Exception:
+                                            sqlite_abs = None
+                                        try:
                                             sqlite_rel = str(Path(sp).resolve().relative_to(paths.global_repo.resolve()))
                                         except Exception:
                                             sqlite_rel = sp
@@ -750,6 +779,24 @@ def process_candidates(
                                     raise RuntimeError("excel_to_sqlite did not report an output sqlite_path")
                                 if isinstance(raw_meta, dict):
                                     raw_meta["excel_sqlite_rel"] = sqlite_rel
+
+                                # Mirror the SQLite contents to a readable .txt next to the DB (artifact folder).
+                                # This is intentionally best-effort so it doesn't fail the TD pipeline.
+                                if sqlite_abs is not None:
+                                    try:
+                                        export_sqlite_text_mirror(sqlite_abs)
+                                    except Exception:
+                                        pass
+                                    try:
+                                        env = _load_test_data_env()
+                                        want_xlsx = _truthy(env.get("EIDAT_TEST_DATA_SQLITE_MIRROR_XLSX", "1"))
+                                    except Exception:
+                                        want_xlsx = False
+                                    if want_xlsx:
+                                        try:
+                                            export_sqlite_excel_mirror(sqlite_abs)
+                                        except Exception:
+                                            pass
                             except Exception as exc:
                                 # For Test Data, SQLite creation is required (so the file remains pending if it fails).
                                 raise RuntimeError(f"Test Data Excel -> SQLite failed: {exc}") from exc

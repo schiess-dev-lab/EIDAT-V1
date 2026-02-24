@@ -2734,6 +2734,25 @@ def _ensure_test_data_tables(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS td_terms (
+            row_index INTEGER PRIMARY KEY,
+            term TEXT,
+            header TEXT,
+            table_label TEXT,
+            value_type TEXT,
+            data_group TEXT,
+            term_label TEXT,
+            units TEXT,
+            min_val TEXT,
+            max_val TEXT,
+            active INTEGER NOT NULL,
+            normalized_stat TEXT,
+            computed_epoch_ns INTEGER NOT NULL
+        )
+        """
+    )
 
 
 def _read_test_data_config_columns(workbook_path: Path) -> list[dict]:
@@ -2804,6 +2823,112 @@ def _read_test_data_sources(workbook_path: Path) -> list[dict]:
             if not sn:
                 continue
             out.append({"serial": sn, "excel_sqlite_rel": rel})
+        return out
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
+
+
+def _normalize_td_stat(s: object) -> str:
+    raw = str(s or "").strip().lower()
+    if not raw:
+        return ""
+    aliases = {
+        "avg": "mean",
+        "average": "mean",
+        "stdev": "std",
+        "st.dev": "std",
+        "st dev": "std",
+        "stddev": "std",
+        "standard deviation": "std",
+    }
+    return aliases.get(raw, raw)
+
+
+def _read_test_data_data_definitions(workbook_path: Path) -> list[dict]:
+    """
+    Read the user-editable EIDP-style `Data` sheet (Test Data Trending) as metric definitions.
+
+    Mapping:
+      - Data Group: run/sheet name
+      - Header: column name
+      - Table Label: stat (mean/min/max/std/median/count)
+    """
+    try:
+        from openpyxl import load_workbook  # type: ignore
+    except Exception as exc:
+        raise RuntimeError(
+            "openpyxl is required to read Test Data Trending workbooks. "
+            "Install it with `py -m pip install openpyxl` within the project environment."
+        ) from exc
+
+    wb = load_workbook(str(Path(workbook_path).expanduser()), read_only=True, data_only=True)
+    try:
+        if "Data" not in wb.sheetnames:
+            return []
+        ws = wb["Data"]
+        a1 = str(ws.cell(1, 1).value or "").strip().lower()
+        if a1 == "metric":
+            # Legacy TD workbook layout: old Data sheet is the computed metrics list.
+            return []
+
+        headers: dict[str, int] = {}
+        for col in range(1, (ws.max_column or 0) + 1):
+            key = str(ws.cell(1, col).value or "").strip().lower()
+            if key:
+                headers[key] = col
+
+        def _h(*names: str) -> int | None:
+            for n in names:
+                c = headers.get(str(n).strip().lower())
+                if c:
+                    return int(c)
+            return None
+
+        col_term = _h("term")
+        col_header = _h("header")
+        col_group_after = _h("groupafter")
+        col_table_label = _h("table label", "table_label", "tablelabel")
+        col_value_type = _h("valuetype", "value type")
+        col_data_group = _h("data group", "data_group", "datagroup")
+        col_term_label = _h("term label", "term_label", "termlabel")
+        col_units = _h("units")
+        col_min = _h("min", "range (min)", "range_min")
+        col_max = _h("max", "range (max)", "range_max")
+
+        if col_header is None or col_table_label is None or col_data_group is None:
+            return []
+
+        allowed = {"mean", "min", "max", "std", "median", "count"}
+        out: list[dict] = []
+        for row in range(2, (ws.max_row or 0) + 1):
+            dg = str(ws.cell(row, int(col_data_group)).value or "").strip()
+            hdr = str(ws.cell(row, int(col_header)).value or "").strip()
+            tl = str(ws.cell(row, int(col_table_label)).value or "").strip()
+            norm = _normalize_td_stat(tl)
+            active = bool(dg and hdr and norm in allowed)
+            if not (dg or hdr or tl):
+                continue
+
+            out.append(
+                {
+                    "row_index": int(row),
+                    "term": str(ws.cell(row, int(col_term)).value or "").strip() if col_term else "",
+                    "header": hdr,
+                    "group_after": str(ws.cell(row, int(col_group_after)).value or "").strip() if col_group_after else "",
+                    "table_label": tl,
+                    "value_type": str(ws.cell(row, int(col_value_type)).value or "").strip() if col_value_type else "",
+                    "data_group": dg,
+                    "term_label": str(ws.cell(row, int(col_term_label)).value or "").strip() if col_term_label else "",
+                    "units": str(ws.cell(row, int(col_units)).value or "").strip() if col_units else "",
+                    "min": str(ws.cell(row, int(col_min)).value or "").strip() if col_min else "",
+                    "max": str(ws.cell(row, int(col_max)).value or "").strip() if col_max else "",
+                    "active": bool(active),
+                    "normalized_stat": norm if active else "",
+                }
+            )
         return out
     finally:
         try:
@@ -2918,11 +3043,30 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
 
     cfg_cols = _read_test_data_config_columns(wb_path)
     y_cols: list[tuple[str, str]] = []
+    cfg_units: dict[str, str] = {}
     for c in cfg_cols:
         name = str(c.get("name") or "").strip()
         units = str(c.get("units") or "").strip()
         if name:
             y_cols.append((name, units))
+            if units:
+                cfg_units[name] = units
+
+    data_defs = _read_test_data_data_definitions(wb_path)
+    data_y_by_run: dict[str, dict[str, str]] = {}
+    for d in data_defs:
+        if not bool(d.get("active")):
+            continue
+        run = str(d.get("data_group") or "").strip()
+        name = str(d.get("header") or "").strip()
+        units = str(d.get("units") or "").strip()
+        if not run or not name:
+            continue
+        existing = data_y_by_run.setdefault(run, {})
+        if name not in existing:
+            existing[name] = units
+        elif not existing.get(name) and units:
+            existing[name] = units
 
     sources = _read_test_data_sources(wb_path)
     entries = [
@@ -2972,7 +3116,7 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
     # Reset td_* tables (only).
     with sqlite3.connect(str(db_path)) as conn:
         _ensure_test_data_tables(conn)
-        for t in ("td_meta", "td_sources", "td_runs", "td_columns", "td_curves", "td_metrics"):
+        for t in ("td_meta", "td_sources", "td_runs", "td_columns", "td_curves", "td_metrics", "td_terms"):
             try:
                 conn.execute(f"DELETE FROM {t}")
             except Exception:
@@ -2986,12 +3130,41 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
             )
         except Exception:
             pass
+
+        # Store workbook-defined term rows (Data sheet) for one-to-one comparison.
+        for d in data_defs:
+            try:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO td_terms
+                    (row_index, term, header, table_label, value_type, data_group, term_label, units, min_val, max_val, active, normalized_stat, computed_epoch_ns)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        int(d.get("row_index") or 0),
+                        str(d.get("term") or "").strip(),
+                        str(d.get("header") or "").strip(),
+                        str(d.get("table_label") or "").strip(),
+                        str(d.get("value_type") or "").strip(),
+                        str(d.get("data_group") or "").strip(),
+                        str(d.get("term_label") or "").strip(),
+                        str(d.get("units") or "").strip(),
+                        str(d.get("min") or "").strip(),
+                        str(d.get("max") or "").strip(),
+                        (1 if bool(d.get("active")) else 0),
+                        str(d.get("normalized_stat") or "").strip(),
+                        int(computed_epoch_ns),
+                    ),
+                )
+            except Exception:
+                continue
         conn.commit()
 
     missing_sources = 0
     invalid_sources = 0
     curves_written = 0
     metrics_written = 0
+    run_y_union: dict[str, dict[str, str]] = {}
 
     for sn, rel in entries:
         sqlite_path = _resolve_excel_sqlite_path_from_workbook(wb_path, rel)
@@ -3076,7 +3249,22 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
                             default_x = x
                             break
 
+                    desired_y: list[str] = []
                     for y_name, _units in y_cols:
+                        if y_name:
+                            desired_y.append(y_name)
+                    extra = data_y_by_run.get(str(run), {}) or {}
+                    for y_name in extra.keys():
+                        if y_name and y_name not in desired_y:
+                            desired_y.append(y_name)
+
+                    run_units = run_y_union.setdefault(str(run), {})
+                    for y_name in desired_y:
+                        if y_name not in run_units or not run_units.get(y_name):
+                            u = cfg_units.get(y_name) or str((data_y_by_run.get(str(run), {}) or {}).get(y_name) or "").strip()
+                            run_units[y_name] = str(u or "").strip()
+
+                    for y_name in desired_y:
                         if y_name not in cols:
                             continue
 
@@ -3173,7 +3361,10 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
 
     # Write runs + columns tables for dropdowns.
     with sqlite3.connect(str(db_path)) as conn:
-        for run, xs in run_x_union.items():
+        runs_all = set(run_x_union.keys()) | set(run_y_union.keys())
+        cfg_order = [n for n, _u in y_cols if n]
+        for run in sorted(runs_all, key=lambda s: str(s).lower()):
+            xs = run_x_union.get(run, set())
             default_x = ""
             for x in x_priority:
                 if x in xs:
@@ -3188,7 +3379,11 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
                     "INSERT OR REPLACE INTO td_columns(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
                     (run, x, "", "x"),
                 )
-            for y_name, units in y_cols:
+
+            y_map = run_y_union.get(run, {}) or {}
+            y_ordered = [n for n in cfg_order if n in y_map] + sorted([n for n in y_map.keys() if n not in cfg_order], key=lambda s: str(s).lower())
+            for y_name in y_ordered:
+                units = str(y_map.get(y_name) or "").strip()
                 conn.execute(
                     "INSERT OR REPLACE INTO td_columns(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
                     (run, y_name, units, "y"),
@@ -3346,9 +3541,11 @@ def update_test_data_trending_project_workbook(
     workbook_path: Path,
     *,
     overwrite: bool = False,
+    dry_run: bool = False,
 ) -> dict:
     """
-    Populate a Test Data Trending workbook's `Data` sheet using cached `td_metrics`.
+    Populate a Test Data Trending workbook's `Data_calc` (computed) and `Data` (user-defined)
+    sheets using cached `td_metrics`.
     """
     try:
         from openpyxl import load_workbook  # type: ignore
@@ -3364,24 +3561,183 @@ def update_test_data_trending_project_workbook(
 
     repo = Path(global_repo).expanduser()
     project_dir = wb_path.parent
-    db_path = ensure_test_data_project_cache(project_dir, wb_path, rebuild=True)
 
     try:
         wb = load_workbook(str(wb_path))
     except PermissionError as exc:
         raise RuntimeError(f"Workbook is not writable (close it in Excel first): {wb_path}") from exc
 
-    if "Data" not in wb.sheetnames:
-        raise RuntimeError("Workbook missing required sheet: Data")
-    ws = wb["Data"]
+    if "Sources" not in wb.sheetnames:
+        raise RuntimeError("Workbook missing required sheet: Sources")
 
-    serial_cols: dict[str, int] = {}
-    for col in range(2, (ws.max_column or 0) + 1):
-        sn = str(ws.cell(1, col).value or "").strip()
-        if sn:
-            serial_cols[sn] = col
-    if not serial_cols:
-        raise RuntimeError("No serial columns found in Data sheet header row.")
+    ws_src = wb["Sources"]
+    src_headers: dict[str, int] = {}
+    for col in range(1, (ws_src.max_column or 0) + 1):
+        key = str(ws_src.cell(1, col).value or "").strip().lower()
+        if key:
+            src_headers[key] = col
+    if "serial_number" not in src_headers:
+        raise RuntimeError("Sources sheet missing required column: serial_number")
+
+    serials: list[str] = []
+    for r in range(2, (ws_src.max_row or 0) + 1):
+        sn = str(ws_src.cell(r, src_headers["serial_number"]).value or "").strip()
+        if sn and sn not in serials:
+            serials.append(sn)
+    if not serials:
+        raise RuntimeError("No serial numbers found in Sources sheet.")
+
+    def _config_snapshot() -> dict:
+        if "Config" not in wb.sheetnames:
+            return {}
+        ws_cfg = wb["Config"]
+        # Parse columns block: header row contains name/units/range_min/range_max.
+        header_row = None
+        for r in range(1, (ws_cfg.max_row or 0) + 1):
+            a = str(ws_cfg.cell(r, 1).value or "").strip().lower()
+            b = str(ws_cfg.cell(r, 2).value or "").strip().lower()
+            if a == "name" and b == "units":
+                header_row = r
+                break
+        cols: list[dict] = []
+        if header_row is not None:
+            def _clean_jsonish(v: object) -> object:
+                txt = str(v or "").strip()
+                if not txt or txt.lower() in {"null", "none"}:
+                    return ""
+                try:
+                    # Config sheet stores JSON-ish strings like "null" or numbers.
+                    return json.loads(txt)
+                except Exception:
+                    return txt
+
+            for r in range(header_row + 1, (ws_cfg.max_row or 0) + 1):
+                name = str(ws_cfg.cell(r, 1).value or "").strip()
+                if not name:
+                    break
+                units = str(ws_cfg.cell(r, 2).value or "").strip()
+                rmin = _clean_jsonish(ws_cfg.cell(r, 3).value)
+                rmax = _clean_jsonish(ws_cfg.cell(r, 4).value)
+                cols.append({"name": name, "units": units, "range_min": rmin, "range_max": rmax})
+        # Stats: row where key is "statistics"
+        stats: list[str] = []
+        for r in range(1, (ws_cfg.max_row or 0) + 1):
+            k = str(ws_cfg.cell(r, 1).value or "").strip().lower()
+            if k == "statistics":
+                raw = str(ws_cfg.cell(r, 2).value or "").strip()
+                stats = [s.strip().lower() for s in raw.split(",") if s.strip()]
+                break
+        return {"columns": cols, "statistics": stats}
+
+    cfg = _config_snapshot()
+    cfg_cols = list(cfg.get("columns") or [])
+    cfg_stats = [str(s).strip().lower() for s in (cfg.get("statistics") or []) if str(s).strip()]
+    if not cfg_stats:
+        cfg_stats = ["mean", "min", "max", "std", "median", "count"]
+
+    cfg_by_name: dict[str, dict] = {}
+    cfg_order: list[str] = []
+    for c in cfg_cols:
+        if not isinstance(c, dict):
+            continue
+        name = str(c.get("name") or "").strip()
+        if not name:
+            continue
+        cfg_order.append(name)
+        cfg_by_name[name] = c
+
+    # Migration: legacy workbooks used `Data` as the computed metrics sheet ("Metric" in A1).
+    if "Data_calc" not in wb.sheetnames and "Data" in wb.sheetnames:
+        a1 = str(wb["Data"].cell(1, 1).value or "").strip().lower()
+        if a1 == "metric":
+            wb["Data"].title = "Data_calc"
+
+    # Ensure computed sheet exists.
+    if "Data_calc" not in wb.sheetnames:
+        ws_data_calc = wb.create_sheet("Data_calc")
+        ws_data_calc.append(["Metric"] + [str(s) for s in serials])
+    else:
+        ws_data_calc = wb["Data_calc"]
+
+    # Ensure user-editable Data sheet exists (EIDP-style).
+    ws_data = None
+    if "Data" in wb.sheetnames:
+        a1 = str(wb["Data"].cell(1, 1).value or "").strip().lower()
+        if a1 != "metric":
+            ws_data = wb["Data"]
+    if ws_data is None:
+        ws_data = wb.create_sheet("Data", 0)
+        headers = ["Term", "Header", "GroupAfter", "Table Label", "ValueType", "Data Group", "Term Label", "Units", "Min", "Max"]
+        headers.extend([str(s) for s in serials])
+        ws_data.append(headers)
+        try:
+            ws_data.freeze_panes = "A2"
+        except Exception:
+            pass
+
+        # Seed definitions from Data_calc metric keys (if present).
+        seen: set[tuple[str, str, str]] = set()
+        for r in range(2, (ws_data_calc.max_row or 0) + 1):
+            key = str(ws_data_calc.cell(r, 1).value or "").strip()
+            if not key or "." not in key:
+                continue
+            parts = [p.strip() for p in key.split(".") if p.strip()]
+            if len(parts) < 3:
+                continue
+            run, col, stat = parts[0], parts[1], parts[2].lower()
+            norm = _normalize_td_stat(stat)
+            if not run or not col or not norm:
+                continue
+            t = (run, col, norm)
+            if t in seen:
+                continue
+            seen.add(t)
+            c = cfg_by_name.get(col) or {}
+            units = str(c.get("units") or "").strip()
+            rmin = str(c.get("range_min") or "").strip()
+            rmax = str(c.get("range_max") or "").strip()
+            ws_data.append(
+                [
+                    col,
+                    col,
+                    "",
+                    norm,
+                    "number",
+                    run,
+                    f"{run}.{col}.{norm}",
+                    units,
+                    rmin,
+                    rmax,
+                ]
+                + [""] * len(serials)
+            )
+
+    # Ensure serial columns exist on both sheets (by matching header cells to serial numbers).
+    def _ensure_serial_headers_by_name(ws) -> dict[str, int]:
+        serial_cols: dict[str, int] = {}
+        for col in range(1, (ws.max_column or 0) + 1):
+            sn = str(ws.cell(1, col).value or "").strip()
+            if sn and sn in serials:
+                serial_cols[sn] = col
+        for sn in serials:
+            if sn in serial_cols:
+                continue
+            ws.cell(row=1, column=(ws.max_column or 0) + 1).value = sn
+            serial_cols[sn] = int(ws.max_column or 0)
+        return serial_cols
+
+    serial_cols_data = _ensure_serial_headers_by_name(ws_data)
+    serial_cols_calc = _ensure_serial_headers_by_name(ws_data_calc)
+    try:
+        ws_data_calc.freeze_panes = "B2"
+    except Exception:
+        pass
+
+    # Save any migration/creation before rebuilding cache (cache rebuild reads workbook from disk).
+    if not dry_run:
+        wb.save(str(wb_path))
+
+    db_path = ensure_test_data_project_cache(project_dir, wb_path, rebuild=True)
 
     def _parse_metric(s: object) -> tuple[str, str, str] | None:
         txt = str(s or "").strip()
@@ -3406,37 +3762,155 @@ def update_test_data_trending_project_workbook(
             FROM td_metrics
             """
         ).fetchall()
+        y_units_rows = conn.execute(
+            "SELECT run_name, name, units FROM td_columns WHERE kind='y'"
+        ).fetchall()
+        runs_rows = conn.execute("SELECT run_name FROM td_runs ORDER BY run_name").fetchall()
 
     metric_map: dict[tuple[str, str, str, str], float | int | None] = {}
     for sn, run, col, stat, val in rows:
         metric_map[(str(sn or "").strip(), str(run or "").strip(), str(col or "").strip(), str(stat or "").strip().lower())] = val
 
+    units_map: dict[tuple[str, str], str] = {}
+    for run, name, units in y_units_rows:
+        k = (str(run or "").strip(), str(name or "").strip())
+        u = str(units or "").strip()
+        if k[0] and k[1] and u:
+            units_map[k] = u
+
+    # Stats list for Data_calc: config stats + any stats referenced in Data definitions.
+    stats = list(cfg_stats)
+    try:
+        defs_now = _read_test_data_data_definitions(wb_path)
+    except Exception:
+        defs_now = []
+    for d in defs_now:
+        if not bool(d.get("active")):
+            continue
+        s = str(d.get("normalized_stat") or "").strip().lower()
+        if s and s not in stats:
+            stats.append(s)
+
+    # Rebuild Data_calc rows from cache runs + y columns union.
+    runs = [str(r[0] or "").strip() for r in runs_rows if str(r[0] or "").strip()]
+    y_by_run: dict[str, list[str]] = {}
+    for run, name, _units in y_units_rows:
+        r = str(run or "").strip()
+        n = str(name or "").strip()
+        if not r or not n:
+            continue
+        y_by_run.setdefault(r, []).append(n)
+
+    # Clear and rebuild Data_calc sheet.
+    try:
+        ws_data_calc.delete_rows(1, ws_data_calc.max_row or 1)
+    except Exception:
+        # fallback: create a fresh sheet if deletion fails
+        try:
+            wb.remove(ws_data_calc)
+        except Exception:
+            pass
+        ws_data_calc = wb.create_sheet("Data_calc")
+    ws_data_calc.append(["Metric"] + [str(s) for s in serials])
+    try:
+        ws_data_calc.freeze_panes = "B2"
+    except Exception:
+        pass
+
+    for run in runs:
+        ws_data_calc.append([run] + [""] * len(serials))
+        ys = y_by_run.get(run, []) or []
+        # Prefer config order first.
+        ys_ordered = [n for n in cfg_order if n in ys] + sorted([n for n in ys if n not in cfg_order], key=lambda s: str(s).lower())
+        for col in ys_ordered:
+            for stat in stats:
+                ws_data_calc.append([f"{run}.{col}.{stat}"] + [""] * len(serials))
+        ws_data_calc.append([""] + [""] * len(serials))
+
     updated_cells = 0
     missing_value = 0
-    for row in range(2, (ws.max_row or 0) + 1):
-        parsed = _parse_metric(ws.cell(row, 1).value)
+
+    # Populate Data_calc values.
+    serial_cols_calc = {str(sn): idx + 2 for idx, sn in enumerate(serials)}
+    for r in range(2, (ws_data_calc.max_row or 0) + 1):
+        parsed = _parse_metric(ws_data_calc.cell(r, 1).value)
         if parsed is None:
             continue
         run, col, stat = parsed
-        for sn, cidx in serial_cols.items():
+        for sn, cidx in serial_cols_calc.items():
             key = (sn, run, col, stat)
             val = metric_map.get(key)
             if val is None:
-                if not overwrite and ws.cell(row, cidx).value not in (None, ""):
+                if not overwrite and ws_data_calc.cell(r, cidx).value not in (None, ""):
                     continue
-                ws.cell(row, cidx).value = None
+                ws_data_calc.cell(r, cidx).value = None
                 missing_value += 1
                 continue
-            if not overwrite and ws.cell(row, cidx).value not in (None, ""):
+            if not overwrite and ws_data_calc.cell(r, cidx).value not in (None, ""):
                 continue
             if stat == "count":
                 try:
-                    ws.cell(row, cidx).value = int(float(val))
+                    ws_data_calc.cell(r, cidx).value = int(float(val))
                 except Exception:
-                    ws.cell(row, cidx).value = val
+                    ws_data_calc.cell(r, cidx).value = val
             else:
-                ws.cell(row, cidx).value = float(val)
+                ws_data_calc.cell(r, cidx).value = float(val)
             updated_cells += 1
+
+    # Populate Data values from (Data Group, Header, Table Label).
+    headers: dict[str, int] = {}
+    for col in range(1, (ws_data.max_column or 0) + 1):
+        k = str(ws_data.cell(1, col).value or "").strip().lower()
+        if k:
+            headers[k] = col
+
+    def _h(*names: str) -> int | None:
+        for n in names:
+            c = headers.get(str(n).strip().lower())
+            if c:
+                return int(c)
+        return None
+
+    col_data_group = _h("data group", "data_group", "datagroup")
+    col_header = _h("header")
+    col_table_label = _h("table label", "table_label", "tablelabel")
+    col_units = _h("units")
+
+    if col_data_group and col_header and col_table_label:
+        for r in range(2, (ws_data.max_row or 0) + 1):
+            run = str(ws_data.cell(r, int(col_data_group)).value or "").strip()
+            col = str(ws_data.cell(r, int(col_header)).value or "").strip()
+            raw_stat = str(ws_data.cell(r, int(col_table_label)).value or "").strip()
+            stat = _normalize_td_stat(raw_stat)
+            if not run or not col or not stat:
+                continue
+            # Fill Units from cache if blank (optional)
+            if col_units:
+                ucell = ws_data.cell(r, int(col_units))
+                if (ucell.value is None or str(ucell.value).strip() == ""):
+                    u = units_map.get((run, col))
+                    if u:
+                        ucell.value = u
+
+            for sn, cidx in serial_cols_data.items():
+                key = (sn, run, col, stat)
+                val = metric_map.get(key)
+                if val is None:
+                    if not overwrite and ws_data.cell(r, cidx).value not in (None, ""):
+                        continue
+                    ws_data.cell(r, cidx).value = None
+                    missing_value += 1
+                    continue
+                if not overwrite and ws_data.cell(r, cidx).value not in (None, ""):
+                    continue
+                if stat == "count":
+                    try:
+                        ws_data.cell(r, cidx).value = int(float(val))
+                    except Exception:
+                        ws_data.cell(r, cidx).value = val
+                else:
+                    ws_data.cell(r, cidx).value = float(val)
+                updated_cells += 1
 
     # Sync workbook metadata sheets/rows to the canonical index (best-effort).
     try:
@@ -3454,7 +3928,8 @@ def update_test_data_trending_project_workbook(
         pass
 
     try:
-        wb.save(str(wb_path))
+        if not dry_run:
+            wb.save(str(wb_path))
     finally:
         try:
             wb.close()
@@ -3467,7 +3942,8 @@ def update_test_data_trending_project_workbook(
         "updated_cells": int(updated_cells),
         "missing_source": int(src_missing),
         "missing_value": int(missing_value),
-        "serials_in_workbook": int(len(serial_cols)),
+        "serials_in_workbook": int(len(serials)),
+        "dry_run": bool(dry_run),
     }
 
 
@@ -7967,12 +8443,59 @@ def _write_test_data_trending_workbook(
         runs = ["Run1"]
 
     wb = Workbook()
+
+    sn_cols = [str(s).strip() for s in serials if str(s).strip()]
+
+    # New user-editable EIDP-style Data sheet (definitions + values).
     ws_data = wb.active
     ws_data.title = "Data"
-    sn_cols = [str(s).strip() for s in serials if str(s).strip()]
-    ws_data.append(["Metric"] + sn_cols)
+    data_headers = ["Term", "Header", "GroupAfter", "Table Label", "ValueType", "Data Group", "Term Label", "Units", "Min", "Max"]
+    data_headers.extend(sn_cols)
+    ws_data.append(data_headers)
     try:
-        ws_data.freeze_panes = "B2"
+        ws_data.freeze_panes = "A2"
+    except Exception:
+        pass
+
+    # Seed Data definitions from config (one row per run/column/stat).
+    cfg_by_name: dict[str, dict] = {}
+    for c in cfg_cols:
+        if not isinstance(c, dict):
+            continue
+        name = str(c.get("name") or "").strip()
+        if name:
+            cfg_by_name[name] = c
+
+    for run_name in runs:
+        for name in col_names:
+            c = cfg_by_name.get(name) or {}
+            units = str(c.get("units") or "").strip()
+            rmin = c.get("range_min")
+            rmax = c.get("range_max")
+            for stat in stats:
+                ws_data.append(
+                    [
+                        name,  # Term (display)
+                        name,  # Header (TD column)
+                        "",  # GroupAfter
+                        stat,  # Table Label (TD stat)
+                        "number",  # ValueType
+                        str(run_name),  # Data Group (TD run/sheet)
+                        f"{run_name}.{name}.{stat}",  # Term Label (stable key)
+                        units,
+                        ("" if rmin is None else rmin),
+                        ("" if rmax is None else rmax),
+                    ]
+                    + [""] * len(sn_cols)
+                )
+        # visual separator between runs
+        ws_data.append([""] * len(data_headers))
+
+    # Data_calc is computed/debug: metric keys + serial columns.
+    ws_data_calc = wb.create_sheet("Data_calc")
+    ws_data_calc.append(["Metric"] + sn_cols)
+    try:
+        ws_data_calc.freeze_panes = "B2"
     except Exception:
         pass
 
@@ -7984,16 +8507,16 @@ def _write_test_data_trending_workbook(
     bold = Font(bold=True) if Font is not None else None
     for run_name in runs:
         # run group header row
-        ws_data.append([str(run_name)] + [""] * len(sn_cols))
+        ws_data_calc.append([str(run_name)] + [""] * len(sn_cols))
         if bold is not None:
             try:
-                ws_data.cell(row=ws_data.max_row, column=1).font = bold
+                ws_data_calc.cell(row=ws_data_calc.max_row, column=1).font = bold
             except Exception:
                 pass
         for name in col_names:
             for stat in stats:
-                ws_data.append([f"{run_name}.{name}.{stat}"] + [""] * len(sn_cols))
-        ws_data.append([""] + [""] * len(sn_cols))
+                ws_data_calc.append([f"{run_name}.{name}.{stat}"] + [""] * len(sn_cols))
+        ws_data_calc.append([""] + [""] * len(sn_cols))
 
     ws_cfg = wb.create_sheet("Config")
     ws_cfg.append(["Key", "Value"])

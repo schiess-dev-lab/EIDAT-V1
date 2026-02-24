@@ -35,6 +35,270 @@ def _stderr(line: str) -> None:
     print(s, file=sys.stderr, flush=True)
 
 
+def export_sqlite_text_mirror(
+    sqlite_path: Path,
+    *,
+    out_txt: Path | None = None,
+    max_rows_per_table: int = 80,
+    max_cell_chars: int = 240,
+    max_total_chars: int = 2_000_000,
+) -> Path:
+    """
+    Write a human-readable text mirror of a workbook SQLite DB for debugging.
+    Intended for TD artifacts folders so we can inspect row/column issues without opening SQLite.
+    """
+    db = Path(sqlite_path).expanduser()
+    if not db.exists() or not db.is_file():
+        raise FileNotFoundError(str(db))
+
+    out = Path(out_txt) if out_txt is not None else db.with_suffix(db.suffix + ".txt")
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    def _quote_ident(name: str) -> str:
+        return "[" + str(name).replace("]", "]]") + "]"
+
+    def _safe_cell(v: object) -> str:
+        if v is None:
+            return ""
+        s = str(v)
+        s = s.replace("\r\n", "\n").replace("\r", "\n")
+        if len(s) > int(max_cell_chars):
+            s = s[: int(max_cell_chars) - 3] + "..."
+        return s
+
+    chunks: list[str] = []
+    total = 0
+
+    def _append(s: str) -> None:
+        nonlocal total
+        if total >= int(max_total_chars):
+            return
+        if total + len(s) > int(max_total_chars):
+            s = s[: max(0, int(max_total_chars) - total)]
+        chunks.append(s)
+        total += len(s)
+
+    _append(f"sqlite_path: {db}\n")
+    try:
+        st = db.stat()
+        _append(f"size_bytes: {int(st.st_size)}\n")
+        _append(f"mtime_ns: {int(getattr(st, 'st_mtime_ns', int(st.st_mtime * 1e9)))}\n")
+    except Exception:
+        pass
+    _append("\n")
+
+    with sqlite3.connect(str(db)) as conn:
+        conn.row_factory = sqlite3.Row
+        try:
+            schema_rows = conn.execute(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
+            ).fetchall()
+        except Exception:
+            schema_rows = []
+
+        _append("== schema ==\n")
+        for r in schema_rows:
+            try:
+                typ = str(r["type"] or "")
+                name = str(r["name"] or "")
+                sql = str(r["sql"] or "").strip()
+            except Exception:
+                continue
+            if not name:
+                continue
+            _append(f"-- {typ}: {name}\n")
+            if sql:
+                _append(sql + "\n")
+            _append("\n")
+
+        tables: list[str] = []
+        for r in schema_rows:
+            try:
+                if str(r["type"] or "") == "table":
+                    tables.append(str(r["name"] or ""))
+            except Exception:
+                continue
+        _append("== table_previews ==\n")
+        for t in tables:
+            if not t or t.startswith("sqlite_"):
+                continue
+            if total >= int(max_total_chars):
+                break
+
+            q_t = _quote_ident(t)
+            try:
+                info = conn.execute(f"PRAGMA table_info({q_t})").fetchall()
+                cols = [str(rr[1] or "") for rr in info if rr and rr[1]]
+            except Exception:
+                cols = []
+
+            try:
+                n = int(conn.execute(f"SELECT COUNT(*) FROM {q_t}").fetchone()[0] or 0)
+            except Exception:
+                n = -1
+
+            _append(f"-- table: {t} rows={n}\n")
+            if cols:
+                _append("columns: " + ", ".join(cols) + "\n")
+
+            if cols:
+                try:
+                    rows = conn.execute(
+                        f"SELECT * FROM {q_t} ORDER BY rowid ASC LIMIT {int(max_rows_per_table)}"
+                    ).fetchall()
+                except Exception:
+                    rows = []
+                if rows:
+                    _append("\t".join(cols) + "\n")
+                    for rr in rows:
+                        try:
+                            _append("\t".join(_safe_cell(rr[c]) for c in cols) + "\n")
+                        except Exception:
+                            continue
+            _append("\n")
+
+    out.write_text("".join(chunks), encoding="utf-8", errors="ignore")
+    return out
+
+
+def export_sqlite_excel_mirror(
+    sqlite_path: Path,
+    *,
+    out_xlsx: Path | None = None,
+    max_rows_per_table: int | None = None,
+    max_cell_chars: int = 32_000,
+) -> Path:
+    """
+    Export a SQLite DB to an Excel workbook for one-to-one inspection.
+
+    - Adds a `__schema` sheet with sqlite_master SQL.
+    - Adds one sheet per table (name truncated/deduped to Excel's 31-char limit).
+    """
+    try:
+        import openpyxl  # type: ignore
+        from openpyxl.styles import Alignment, Font, PatternFill  # type: ignore
+        from openpyxl.utils import get_column_letter  # type: ignore
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError("openpyxl is required to export SQLite mirrors to .xlsx") from exc
+
+    db = Path(sqlite_path).expanduser()
+    if not db.exists() or not db.is_file():
+        raise FileNotFoundError(str(db))
+
+    out = Path(out_xlsx) if out_xlsx is not None else db.with_suffix(db.suffix + ".xlsx")
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    header_font = Font(bold=True)
+    header_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+    header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    def _safe_sheet_name(name: str, used: set[str]) -> str:
+        base = (name or "sheet").strip() or "sheet"
+        # Excel sheet name constraints: max 31 chars, cannot contain : \ / ? * [ ]
+        base = re.sub(r"[:\\\\/\\?\\*\\[\\]]+", "_", base)
+        base = base[:31].rstrip() or "sheet"
+        cand = base
+        i = 2
+        while cand.lower() in {u.lower() for u in used}:
+            suffix = f"_{i}"
+            cand = (base[: max(0, 31 - len(suffix))] + suffix).rstrip() or f"sheet{i}"
+            i += 1
+        used.add(cand)
+        return cand
+
+    def _safe_cell(v: object) -> object:
+        if v is None:
+            return None
+        if isinstance(v, (int, float, bool)):
+            return v
+        s = str(v)
+        s = s.replace("\r\n", "\n").replace("\r", "\n")
+        if len(s) > int(max_cell_chars):
+            s = s[: int(max_cell_chars) - 3] + "..."
+        # Avoid writing raw bytes reprs as huge strings
+        return s
+
+    with sqlite3.connect(str(db)) as conn:
+        cur = conn.cursor()
+        schema_rows = cur.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
+        ).fetchall()
+        table_names = [r[1] for r in schema_rows if str(r[0] or "") == "table" and str(r[1] or "").strip()]
+
+        wb = openpyxl.Workbook()
+        # Remove default sheet
+        try:
+            wb.remove(wb.active)
+        except Exception:
+            pass
+
+        used_names: set[str] = set()
+
+        # Schema sheet
+        ws_schema = wb.create_sheet(title=_safe_sheet_name("__schema", used_names))
+        ws_schema.append(["type", "name", "tbl_name", "sql"])
+        for c in range(1, 5):
+            cell = ws_schema.cell(row=1, column=c)
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = header_align
+        ws_schema.freeze_panes = "A2"
+        for r in schema_rows:
+            ws_schema.append([_safe_cell(r[0]), _safe_cell(r[1]), _safe_cell(r[2]), _safe_cell(r[3])])
+
+        # Table sheets
+        excel_max_rows = 1_048_576  # includes header row
+        for t in table_names:
+            if not t:
+                continue
+            cols = [c[1] for c in cur.execute(f"PRAGMA table_info([{t}])").fetchall()]
+            ws = wb.create_sheet(title=_safe_sheet_name(str(t), used_names))
+            ws.append([_safe_cell(c) for c in cols])
+            for col_idx in range(1, len(cols) + 1):
+                cell = ws.cell(row=1, column=col_idx)
+                cell.font = header_font
+                cell.fill = header_fill
+                cell.alignment = header_align
+
+            limit = None
+            if max_rows_per_table is not None:
+                limit = int(max_rows_per_table)
+            # Header occupies row 1
+            hard_cap = excel_max_rows - 1
+            if limit is None or limit > hard_cap:
+                limit = hard_cap
+
+            try:
+                rows = cur.execute(f"SELECT * FROM [{t}] LIMIT {int(limit)}").fetchall()
+            except Exception:
+                rows = []
+
+            for row in rows:
+                ws.append([_safe_cell(v) for v in row])
+
+            ws.freeze_panes = "A2"
+            # Approx auto-fit widths (capped)
+            try:
+                for col_idx, col_name in enumerate(cols, start=1):
+                    max_len = min(60, len(str(col_name or "")))
+                    for r_idx in range(2, min(ws.max_row, 200) + 1):
+                        v = ws.cell(row=r_idx, column=col_idx).value
+                        if v is None:
+                            continue
+                        max_len = max(max_len, min(60, len(str(v))))
+                    ws.column_dimensions[get_column_letter(col_idx)].width = max_len + 3
+            except Exception:
+                pass
+
+        wb.save(str(out))
+        try:
+            wb.close()
+        except Exception:
+            pass
+
+    return out
+
+
 def _is_blank(v: Any) -> bool:
     if v is None:
         return True
@@ -355,6 +619,11 @@ def _iter_data_rows(
     header_row: int,
     excel_col_indices: Sequence[int],
     max_consecutive_empty: int = 500,
+    headers: Sequence[str] | None = None,
+    sheet_name: str = "",
+    debug: bool = False,
+    row_id_min_run: int = 5,
+    row_id_probe_limit: int = 400,
 ) -> Iterator[tuple[int, list[float | None]]]:
     """
     Yield rows as (excel_row_index_1_based, [values...]) for the selected columns.
@@ -375,8 +644,82 @@ def _iter_data_rows(
     max_col = max(cols)
     col_offsets = [c - min_col for c in cols]
 
+    def _int_like(v: float | None) -> bool:
+        if v is None:
+            return False
+        try:
+            rv = round(float(v))
+            return abs(float(v) - float(rv)) < 1e-9
+        except Exception:
+            return False
+
+    def _find_row_id_run(rows: list[tuple[int, list[float | None]]]) -> tuple[int, int] | None:
+        """
+        Return (row_id_col_idx, start_offset_in_rows) for a detected run of consecutive integers.
+        rows are the numeric-bearing rows (any numeric across selected columns) encountered so far.
+        """
+        if not rows:
+            return None
+        ncols = len(rows[0][1]) if rows[0][1] else 0
+        if ncols <= 0:
+            return None
+        min_run = max(3, int(row_id_min_run))
+        if len(rows) < min_run:
+            return None
+
+        # Search for the earliest run of length >= min_run in any column.
+        best: tuple[int, int] | None = None  # (start_offset, col_idx)
+        for ci in range(ncols):
+            for start in range(0, len(rows) - min_run + 1):
+                window = [rows[start + k][1][ci] for k in range(min_run)]
+                if not all(_int_like(v) for v in window):
+                    continue
+                base = int(round(float(window[0] or 0.0)))
+                if any(int(round(float(window[k] or 0.0))) != base + k for k in range(min_run)):
+                    continue
+                if best is None or start < best[0] or (start == best[0] and ci < best[1]):
+                    best = (start, ci)
+                    break
+        if best is None:
+            return None
+        start, ci = best
+        return ci, start
+
+    def _format_preview(
+        rows: list[tuple[int, list[float | None]]],
+        *,
+        keep_excel_row_min: int | None,
+        row_id_ci: int | None,
+        max_rows: int = 30,
+    ) -> str:
+        hdrs = list(headers) if headers else [f"col_{i+1}" for i in range(len(cols))]
+        hdrs = [str(h or "").strip() for h in hdrs]
+        col_tags = [f"{c}:{h}" for c, h in zip(cols, hdrs)]
+        head = "excel_row\tkeep\t" + "\t".join(col_tags)
+        lines = [head]
+        for excel_row, values in rows[: int(max_rows)]:
+            keep = True
+            if keep_excel_row_min is not None and excel_row < int(keep_excel_row_min):
+                keep = False
+            if keep and row_id_ci is not None:
+                keep = _int_like(values[row_id_ci])
+            vtxt = []
+            for v in values:
+                if v is None:
+                    vtxt.append("")
+                else:
+                    try:
+                        vtxt.append(str(float(v)))
+                    except Exception:
+                        vtxt.append("")
+            lines.append(f"{excel_row}\t{'KEEP' if keep else 'DROP'}\t" + "\t".join(vtxt))
+        return "\n".join(lines)
+
     started = False
     empty_run = 0
+    buffer_any_numeric: list[tuple[int, list[float | None]]] = []
+    row_id_ci: int | None = None
+    keep_excel_row_min: int | None = None
 
     for r in range(int(header_row) + 1, max_row + 1):
         try:
@@ -402,11 +745,85 @@ def _iter_data_rows(
 
         if any_num:
             empty_run = 0
+            # Buffer "any numeric" rows until we can detect a row-id column to filter out summary blocks.
+            if row_id_ci is None and keep_excel_row_min is None:
+                buffer_any_numeric.append((int(r), values))
+                found = _find_row_id_run(buffer_any_numeric)
+                if found is not None:
+                    row_id_ci, start_off = found
+                    keep_excel_row_min = int(buffer_any_numeric[start_off][0])
+                    if debug:
+                        try:
+                            hdr = ""
+                            if headers and 0 <= int(row_id_ci) < len(list(headers)):
+                                hdr = str(list(headers)[int(row_id_ci)] or "").strip()
+                            _stderr(
+                                f"[TEST_DATA] row-id detected: sheet={sheet_name!r} "
+                                f"col_idx={row_id_ci} header={hdr!r} start_excel_row={keep_excel_row_min}"
+                            )
+                            _stderr("[TEST_DATA] row preview (excel_col:header):\n" + _format_preview(
+                                buffer_any_numeric,
+                                keep_excel_row_min=keep_excel_row_min,
+                                row_id_ci=row_id_ci,
+                                max_rows=30,
+                            ))
+                        except Exception:
+                            pass
+
+                    # Flush buffered rows from the detected start row, keeping only those with an int-like row id.
+                    for br, bvals in buffer_any_numeric[start_off:]:
+                        if row_id_ci is not None and _int_like(bvals[row_id_ci]):
+                            yield int(br), bvals
+                    buffer_any_numeric.clear()
+                    continue
+
+                # Avoid unbounded buffering on sheets with no detectable row-id column.
+                if len(buffer_any_numeric) >= int(row_id_probe_limit):
+                    if debug:
+                        try:
+                            _stderr(
+                                f"[TEST_DATA] row-id probe limit hit: sheet={sheet_name!r} "
+                                f"(buffer={len(buffer_any_numeric)}). Using legacy row iteration."
+                            )
+                        except Exception:
+                            pass
+                    for br, bvals in buffer_any_numeric:
+                        yield int(br), bvals
+                    buffer_any_numeric.clear()
+                    keep_excel_row_min = 0  # sentinel: stop buffering, no filtering
+                    continue
+
+                continue
+
+            if row_id_ci is not None and keep_excel_row_min is not None:
+                if int(r) < int(keep_excel_row_min):
+                    continue
+                if not _int_like(values[row_id_ci]):
+                    continue
             yield r, values
         else:
             empty_run += 1
             if empty_run >= int(max_consecutive_empty):
                 break
+
+    # Fallback: if we never detected a row-id run, yield buffered numeric rows as-is (legacy behavior).
+    if buffer_any_numeric:
+        if debug:
+            try:
+                _stderr(
+                    f"[TEST_DATA] row-id not detected: sheet={sheet_name!r} "
+                    f"(yielding {len(buffer_any_numeric)} buffered rows; legacy behavior)"
+                )
+                _stderr("[TEST_DATA] row preview (legacy):\n" + _format_preview(
+                    buffer_any_numeric,
+                    keep_excel_row_min=None,
+                    row_id_ci=None,
+                    max_rows=30,
+                ))
+            except Exception:
+                pass
+        for br, bvals in buffer_any_numeric:
+            yield int(br), bvals
 
 
 def _write_workbook_sqlite(
@@ -454,7 +871,8 @@ def _write_workbook_sqlite(
     env = _load_test_data_env()
     fuzzy_enabled = _truthy(env.get("EIDAT_TEST_DATA_FUZZY_HEADER_STICK", "1"))
     fuzzy_min_ratio = _float(env.get("EIDAT_TEST_DATA_FUZZY_HEADER_MIN_RATIO", "0.82"), 0.82)
-    debug = _truthy(env.get("EIDAT_TEST_DATA_FUZZY_DEBUG", "0"))
+    debug_fuzzy = _truthy(env.get("EIDAT_TEST_DATA_FUZZY_DEBUG", "0"))
+    debug_table = _truthy(env.get("EIDAT_TEST_DATA_DEBUG_TABLE", "0")) or debug_fuzzy
     trend_cols = _load_trend_column_names() if fuzzy_enabled else []
 
     wb = load_workbook(str(excel_path), data_only=True, read_only=True)
@@ -484,7 +902,7 @@ def _write_workbook_sqlite(
                 if trend_cols
                 else list(headers)
             )
-            if debug and mapped_headers != headers:
+            if debug_fuzzy and mapped_headers != headers:
                 for oh, mh in zip(headers, mapped_headers):
                     if oh != mh:
                         _stderr(f"[TEST_DATA] header map: {sheet_name}: {oh!r} -> {mh!r}")
@@ -603,7 +1021,14 @@ def _write_workbook_sqlite(
                 ins_sql = f"INSERT INTO \"{s.table_name}\" (excel_row, " + ", ".join([f"\"{c}\"" for c in s.col_idents]) + f") VALUES({placeholders})"
 
                 batch: list[tuple[Any, ...]] = []
-                for excel_row, values in _iter_data_rows(ws, header_row=s.header_row, excel_col_indices=s.excel_col_indices):
+                for excel_row, values in _iter_data_rows(
+                    ws,
+                    header_row=s.header_row,
+                    excel_col_indices=s.excel_col_indices,
+                    headers=list(s.headers),
+                    sheet_name=str(s.sheet_name),
+                    debug=bool(debug_table),
+                ):
                     batch.append((int(excel_row), *values))
                     if len(batch) >= 1000:
                         conn.executemany(ins_sql, batch)

@@ -1,0 +1,16 @@
+{
+  "description": "Debug config for the sample pulse-table Excel workbook under tools/debug_samples.",
+  "data_group": "Excel Data",
+  "columns": [
+    { "name": "Pulse Width", "units": "sec", "range_min": null, "range_max": null },
+    { "name": "T1/2 impulse", "units": "msec", "range_min": null, "range_max": null },
+    { "name": "Centroid", "units": "msec", "range_min": null, "range_max": null },
+    { "name": "Ti 10% Pc", "units": "msec", "range_min": null, "range_max": null },
+    { "name": "Tr 90% Pc", "units": "msec", "range_min": null, "range_max": null },
+    { "name": "Td 10% Pc", "units": "msec", "range_min": null, "range_max": null }
+  ],
+  "statistics": ["mean", "min", "max", "std", "median", "count"],
+  "sheet_name": null,
+  "header_row": 0
+}
+

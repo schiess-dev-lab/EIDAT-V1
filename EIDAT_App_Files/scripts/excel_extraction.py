@@ -398,12 +398,160 @@ def _stat_value(series, stat: str):
     raise ValueError(f"Unknown statistic: {stat}")
 
 
+def _excel_col_letter(n_1b: int) -> str:
+    n = int(n_1b)
+    if n <= 0:
+        return "?"
+    out = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        out = chr(65 + int(r)) + out
+    return out
+
+
+def _detect_row_id_mask(df, *, min_run: int = 5):
+    """
+    Best-effort detection of a "row id" column (e.g., Pulse Number / Cycle) to
+    filter out summary/stat rows that contain numeric values but are not part of
+    the main data table.
+
+    Returns (id_col_name, keep_mask, start_pos) or (None, None, None).
+    """
+    try:
+        import pandas as pd  # type: ignore
+    except Exception:
+        return None, None, None
+
+    if df is None or df.empty:
+        return None, None, None
+
+    cols = list(df.columns)
+    min_run = max(3, int(min_run))
+
+    best = None  # (start_pos, -kept_count, col_idx, col_name, keep_mask)
+    for col_idx, col_name in enumerate(cols):
+        numeric = pd.to_numeric(df[col_name], errors="coerce")
+        not_na = numeric.notna()
+        if int(not_na.sum()) < min_run:
+            continue
+        int_like = not_na & (numeric.sub(numeric.round()).abs() < 1e-9)
+        if int(int_like.sum()) < min_run:
+            continue
+
+        vals = list(numeric.tolist())
+        il = list(bool(x) for x in int_like.tolist())
+
+        start_pos = None
+        for start in range(0, len(vals) - min_run + 1):
+            if not all(il[start + k] for k in range(min_run)):
+                continue
+            base = int(round(float(vals[start] or 0.0)))
+            ok = True
+            for k in range(min_run):
+                if int(round(float(vals[start + k] or 0.0))) != base + k:
+                    ok = False
+                    break
+            if ok:
+                start_pos = int(start)
+                break
+        if start_pos is None:
+            continue
+
+        keep_mask = int_like.copy()
+        # Guard against stray integer-like values earlier in the sheet.
+        if start_pos > 0:
+            keep_mask.iloc[:start_pos] = False
+
+        cand = (start_pos, -int(keep_mask.sum()), int(col_idx), str(col_name), keep_mask)
+        if best is None or cand[:4] < best[:4]:
+            best = cand
+
+    if best is None:
+        return None, None, None
+    return best[3], best[4], best[0]
+
+
+def _debug_print_row_table(
+    *,
+    df,
+    sheet_name: str,
+    header_row_0b: int,
+    keep_mask,
+    show_cols: list[str],
+    max_rows: int = 30,
+) -> None:
+    try:
+        import os
+    except Exception:
+        return
+
+    if df is None or df.empty:
+        return
+
+    df_cols = list(df.columns)
+    col_positions = []
+    for c in show_cols:
+        try:
+            col_positions.append((c, int(df_cols.index(c)) + 1))
+        except Exception:
+            continue
+
+    # Excel row number (1-based): header_row + 1 is header, data starts at header_row + 2.
+    def _excel_row_for_pos(pos_0b: int) -> int:
+        return int(header_row_0b) + 2 + int(pos_0b)
+
+    # Choose a window around the first kept row (if any).
+    try:
+        kept_positions = [i for i, v in enumerate(list(bool(x) for x in keep_mask.tolist())) if v]
+    except Exception:
+        kept_positions = []
+    if kept_positions:
+        start = max(0, int(kept_positions[0]) - 10)
+    else:
+        start = 0
+    end = min(len(df), start + int(max_rows))
+
+    head = ["excel_row", "keep"]
+    for c, pos_1b in col_positions:
+        head.append(f"{_excel_col_letter(pos_1b)}:{c}")
+    lines = ["\t".join(head)]
+
+    for pos in range(int(start), int(end)):
+        try:
+            row = df.iloc[int(pos)]
+        except Exception:
+            continue
+        keep = False
+        try:
+            keep = bool(keep_mask.iloc[int(pos)])
+        except Exception:
+            pass
+        fields = [str(_excel_row_for_pos(pos)), "KEEP" if keep else "DROP"]
+        for c, _pos_1b in col_positions:
+            try:
+                v = row[c]
+            except Exception:
+                v = None
+            s = "" if v is None else str(v).strip()
+            if len(s) > 32:
+                s = s[:29] + "..."
+            fields.append(s)
+        lines.append("\t".join(fields))
+
+    print(
+        f"[TEST_DATA] row filter preview: sheet={sheet_name!r} header_row_0b={int(header_row_0b)} rows={len(df)}",
+        file=os.sys.stderr,
+    )
+    print("\n".join(lines), file=os.sys.stderr)
+
+
 def extract_from_excel(excel_path: Path, config: Dict[str, Any]) -> List[Dict[str, Any]]:
     env = _load_test_data_env()
     fuzzy_enabled = _truthy(env.get("EIDAT_TEST_DATA_FUZZY_HEADER_STICK", "1"))
     fuzzy_min_ratio = _float(env.get("EIDAT_TEST_DATA_FUZZY_HEADER_MIN_RATIO", "0.82"), 0.82)
     auto_detect_header = _truthy(env.get("EIDAT_TEST_DATA_AUTO_DETECT_HEADER_ROW", "1"))
-    debug = _truthy(env.get("EIDAT_TEST_DATA_FUZZY_DEBUG", "0"))
+    debug_fuzzy = _truthy(env.get("EIDAT_TEST_DATA_FUZZY_DEBUG", "0"))
+    debug_table = _truthy(env.get("EIDAT_TEST_DATA_DEBUG_TABLE", "0")) or debug_fuzzy
 
     sheet_name = config.get("sheet_name", None)
     header_row = int(config.get("header_row", 0) or 0)
@@ -419,7 +567,7 @@ def extract_from_excel(excel_path: Path, config: Dict[str, Any]) -> List[Dict[st
         detected = _auto_detect_header_rows_by_sheet(excel_path)
         if detected:
             sheet_jobs = [(s, int(h)) for s, h in detected]
-            if debug:
+            if debug_fuzzy:
                 for s, h in detected:
                     print(f"[TEST_DATA] auto header: sheet={s} header_row_0b={h}", file=os.sys.stderr)
         else:
@@ -447,6 +595,39 @@ def extract_from_excel(excel_path: Path, config: Dict[str, Any]) -> List[Dict[st
         df_cols = list(df.columns)
         col_map = {_normalize_col_name(c): c for c in df_cols}
 
+        row_id_col, keep_mask, _start_pos = _detect_row_id_mask(df, min_run=5)
+        if keep_mask is not None and keep_mask.any():
+            df_data = df.loc[keep_mask].copy()
+            if debug_table:
+                show_cols: list[str] = []
+                if row_id_col and row_id_col in df_cols:
+                    show_cols.append(str(row_id_col))
+                # Prefer configured columns in preview (after row id).
+                for col in cols_cfg:
+                    if not isinstance(col, dict):
+                        continue
+                    target = str(col.get("name") or "").strip()
+                    if not target:
+                        continue
+                    df_col = col_map.get(_normalize_col_name(target))
+                    if df_col and df_col not in show_cols:
+                        show_cols.append(str(df_col))
+                # Fill remaining with the first few worksheet columns.
+                for c in df_cols:
+                    if c not in show_cols:
+                        show_cols.append(str(c))
+                    if len(show_cols) >= 7:
+                        break
+                _debug_print_row_table(
+                    df=df,
+                    sheet_name=str(sheet or ""),
+                    header_row_0b=int(hdr_for_pandas),
+                    keep_mask=keep_mask,
+                    show_cols=show_cols,
+                )
+        else:
+            df_data = df
+
         for col in cols_cfg:
             if not isinstance(col, dict):
                 continue
@@ -467,7 +648,7 @@ def extract_from_excel(excel_path: Path, config: Dict[str, Any]) -> List[Dict[st
                     df_col = best
                     matched_col = str(best)
                     matched_score = float(score)
-                    if debug:
+                    if debug_fuzzy:
                         print(
                             f"[TEST_DATA] fuzzy match: sheet={sheet!r} target={name!r} -> {matched_col!r} score={matched_score:.3f}",
                             file=os.sys.stderr,
@@ -491,7 +672,7 @@ def extract_from_excel(excel_path: Path, config: Dict[str, Any]) -> List[Dict[st
                     }
                 )
                 continue
-            numeric = pd.to_numeric(df[df_col], errors="coerce")
+            numeric = pd.to_numeric(df_data[df_col], errors="coerce")
             numeric = numeric.dropna()
             if numeric.empty:
                 rows.append(

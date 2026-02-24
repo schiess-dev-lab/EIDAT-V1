@@ -4,9 +4,9 @@
   "marker": "TABLE_LABEL",
   "rules": [
     {
-      "label": "Acceptance Test Data",
+      "label": "Acceptance Test crap",
       "priority": 1000,
-      "must_contain_all": ["fake_eidp_repeat_table"],
+      "must_contain_all": ["Foo"],
       "must_contain_any": [],
       "must_not_contain": [],
       "min_rows": 3,
@@ -16,7 +16,7 @@
       "match_scope": "any_cell"
     },
     {
-      "label": "Acceptance Test Data",
+      "label": "Acceptance Test Information",
       "priority": 100,
       "must_contain_all": ["resistance", "voltage", "test temp", "valve voltage", "kohm"],
       "must_contain_any": [],
