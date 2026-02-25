@@ -1290,9 +1290,11 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
 
         cont = getattr(self, "_continued_container", None)
         if cont is not None:
-            cont.setEnabled(not (is_raw or is_test_data))
-            if is_raw or is_test_data:
-                for cb in (self.cb_cont_program, self.cb_cont_part, self.cb_cont_vendor, self.cb_cont_asset):
+            cont.setEnabled(not is_raw)
+            if is_raw:
+                for cb in (self.cb_cont_program, self.cb_cont_part, self.cb_cont_vendor, self.cb_cont_asset, getattr(self, "cb_cont_test_plan", None)):
+                    if cb is None:
+                        continue
                     cb.setChecked(False)
 
         try:
@@ -1320,12 +1322,30 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
                     self.lbl_select_hint.setText(
                         "Select TD reports only (must have extracted Excel data). EIDP Trending projects cannot be created from TD reports."
                     )
+                if hasattr(self, "lbl_select_hint_sub"):
+                    self.lbl_select_hint_sub.setText(
+                        "Tip: keep this list short by selecting continued population filters below (optional)."
+                    )
+                if hasattr(self, "_hint_frame"):
+                    self._hint_frame.setStyleSheet(
+                        """
+                        QFrame {
+                            background: #eff6ff;
+                            border: 1px solid #93c5fd;
+                            border-radius: 8px;
+                        }
+                        """
+                    )
                 if hasattr(self, "_cont_label"):
-                    self._cont_label.setVisible(False)
+                    self._cont_label.setVisible(True)
+                    self._cont_label.setText("Allow Continued Test Data Population By:")
                 if hasattr(self, "_cont_hint"):
-                    self._cont_hint.setVisible(False)
+                    self._cont_hint.setVisible(True)
+                    self._cont_hint.setText(
+                        "Any future TD Excel document that matches these metadata values is auto-added to the project on refresh/update."
+                    )
                 if hasattr(self, "_continued_container"):
-                    self._continued_container.setVisible(False)
+                    self._continued_container.setVisible(True)
             else:
                 self.rb_all.setText("All indexed EIDPs")
                 for w in (self.rb_program, self.rb_asset, self.rb_group):
@@ -1336,12 +1356,52 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
                     self.lbl_select_hint.setText(
                         "Select EIDPs only (non-TD). Use Test Data Trending for TD reports."
                     )
+                if hasattr(self, "lbl_select_hint_sub"):
+                    self.lbl_select_hint_sub.setText("")
+                if hasattr(self, "_hint_frame"):
+                    self._hint_frame.setStyleSheet(
+                        """
+                        QFrame {
+                            background: #f8fafc;
+                            border: 1px solid #e5e7eb;
+                            border-radius: 8px;
+                        }
+                        """
+                    )
                 if hasattr(self, "_cont_label"):
                     self._cont_label.setVisible(True)
+                    self._cont_label.setText("Allow Continued EIDP Population By:")
                 if hasattr(self, "_cont_hint"):
                     self._cont_hint.setVisible(True)
+                    self._cont_hint.setText(
+                        "Any future EIDP that matches these metadata values is auto-added to the project on refresh/update."
+                    )
                 if hasattr(self, "_continued_container"):
                     self._continued_container.setVisible(True)
+            if is_raw:
+                if hasattr(self, "_cont_label"):
+                    self._cont_label.setVisible(False)
+                if hasattr(self, "_cont_hint"):
+                    self._cont_hint.setVisible(False)
+                if hasattr(self, "_continued_container"):
+                    self._continued_container.setVisible(False)
+                if hasattr(self, "lbl_select_hint_sub"):
+                    self.lbl_select_hint_sub.setText("")
+                if hasattr(self, "_hint_frame"):
+                    self._hint_frame.setStyleSheet(
+                        """
+                        QFrame {
+                            background: #f8fafc;
+                            border: 1px solid #e5e7eb;
+                            border-radius: 8px;
+                        }
+                        """
+                    )
+        except Exception:
+            pass
+
+        try:
+            self._refresh_filters()
         except Exception:
             pass
 
@@ -1355,10 +1415,31 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
         v.setContentsMargins(0, 0, 0, 0)
         v.setSpacing(10)
 
+        self._hint_frame = QtWidgets.QFrame()
+        self._hint_frame.setStyleSheet(
+            """
+            QFrame {
+                background: #f8fafc;
+                border: 1px solid #e5e7eb;
+                border-radius: 8px;
+            }
+            """
+        )
+        hint_lay = QtWidgets.QVBoxLayout(self._hint_frame)
+        hint_lay.setContentsMargins(10, 8, 10, 8)
+        hint_lay.setSpacing(4)
+
         self.lbl_select_hint = QtWidgets.QLabel("Select EIDPs only (non-TD). Use Test Data Trending for TD reports.")
-        self.lbl_select_hint.setStyleSheet("color: #475569; font-size: 11px;")
+        self.lbl_select_hint.setStyleSheet("color: #0f172a; font-size: 12px; font-weight: 600;")
         self.lbl_select_hint.setWordWrap(True)
-        v.addWidget(self.lbl_select_hint)
+        hint_lay.addWidget(self.lbl_select_hint)
+
+        self.lbl_select_hint_sub = QtWidgets.QLabel("")
+        self.lbl_select_hint_sub.setStyleSheet("color: #475569; font-size: 11px;")
+        self.lbl_select_hint_sub.setWordWrap(True)
+        hint_lay.addWidget(self.lbl_select_hint_sub)
+
+        v.addWidget(self._hint_frame)
 
         top = QtWidgets.QHBoxLayout()
         top.setSpacing(12)
@@ -1412,12 +1493,12 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
         bottom.addWidget(self.btn_sel_none)
         v.addLayout(bottom)
 
-        self._cont_label = QtWidgets.QLabel("Allow Continued EIDP Population By:")
-        self._cont_label.setStyleSheet("font-weight: 600; color: #374151; margin-top: 8px;")
+        self._cont_label = QtWidgets.QLabel("Allow Continued Population By:")
+        self._cont_label.setStyleSheet("font-weight: 600; color: #374151; margin-top: 6px;")
         v.addWidget(self._cont_label)
 
         self._cont_hint = QtWidgets.QLabel(
-            "Any future EIDP that matches these metadata values is auto-added to the project on refresh/update."
+            "Any future document that matches these metadata values is auto-added to the project on refresh/update."
         )
         self._cont_hint.setStyleSheet("color: #64748b; font-size: 11px;")
         self._cont_hint.setWordWrap(True)
@@ -1427,40 +1508,61 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
         self.cb_cont_part = QtWidgets.QCheckBox("Part Number")
         self.cb_cont_vendor = QtWidgets.QCheckBox("Vendor Name")
         self.cb_cont_asset = QtWidgets.QCheckBox("Asset Type")
+        self.cb_cont_test_plan = QtWidgets.QCheckBox("Acceptance Test Plan")
 
         self.list_cont_program = QtWidgets.QListWidget()
         self.list_cont_part = QtWidgets.QListWidget()
         self.list_cont_vendor = QtWidgets.QListWidget()
         self.list_cont_asset = QtWidgets.QListWidget()
+        self.list_cont_test_plan = QtWidgets.QListWidget()
 
-        for lst in (self.list_cont_program, self.list_cont_part, self.list_cont_vendor, self.list_cont_asset):
+        for lst in (
+            self.list_cont_program,
+            self.list_cont_part,
+            self.list_cont_vendor,
+            self.list_cont_asset,
+            self.list_cont_test_plan,
+        ):
             lst.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
             lst.setMinimumHeight(70)
             lst.setMaximumHeight(120)
 
-        self.cb_cont_program.toggled.connect(self.list_cont_program.setEnabled)
-        self.cb_cont_part.toggled.connect(self.list_cont_part.setEnabled)
-        self.cb_cont_vendor.toggled.connect(self.list_cont_vendor.setEnabled)
-        self.cb_cont_asset.toggled.connect(self.list_cont_asset.setEnabled)
+        def _bind_toggle(cb: QtWidgets.QCheckBox, lst: QtWidgets.QListWidget) -> None:
+            def _apply(checked: bool) -> None:
+                lst.setEnabled(bool(checked))
+                lst.setVisible(bool(checked))
+            cb.toggled.connect(_apply)
+            _apply(False)
 
-        for lst in (self.list_cont_program, self.list_cont_part, self.list_cont_vendor, self.list_cont_asset):
-            lst.setEnabled(False)
+        _bind_toggle(self.cb_cont_program, self.list_cont_program)
+        _bind_toggle(self.cb_cont_part, self.list_cont_part)
+        _bind_toggle(self.cb_cont_vendor, self.list_cont_vendor)
+        _bind_toggle(self.cb_cont_asset, self.list_cont_asset)
+        _bind_toggle(self.cb_cont_test_plan, self.list_cont_test_plan)
 
         grid = QtWidgets.QGridLayout()
         grid.setHorizontalSpacing(14)
         grid.setVerticalSpacing(10)
 
-        def _add_cont_row(row: int, col: int, cb: QtWidgets.QCheckBox, lst: QtWidgets.QListWidget) -> None:
+        def _add_cont_row(
+            row: int,
+            col: int,
+            cb: QtWidgets.QCheckBox,
+            lst: QtWidgets.QListWidget,
+            *,
+            col_span: int = 1,
+        ) -> None:
             box = QtWidgets.QVBoxLayout()
             box.setSpacing(6)
             box.addWidget(cb)
             box.addWidget(lst)
-            grid.addLayout(box, row, col)
+            grid.addLayout(box, row, col, 1, int(col_span))
 
         _add_cont_row(0, 0, self.cb_cont_program, self.list_cont_program)
         _add_cont_row(0, 1, self.cb_cont_vendor, self.list_cont_vendor)
         _add_cont_row(1, 0, self.cb_cont_part, self.list_cont_part)
         _add_cont_row(1, 1, self.cb_cont_asset, self.list_cont_asset)
+        _add_cont_row(2, 0, self.cb_cont_test_plan, self.list_cont_test_plan, col_span=2)
 
         self._continued_container = QtWidgets.QWidget()
         self._continued_container.setLayout(grid)
@@ -1485,10 +1587,57 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.warning(self, "Index not available", str(exc))
             docs = []
 
+        ptype = str(getattr(self, "cb_type", None).currentText() if hasattr(self, "cb_type") else "").strip()
+        is_td_mode = ptype == getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending")
+
+        def _is_td(d: dict) -> bool:
+            fn = getattr(be, "is_test_data_doc", None)
+            if callable(fn):
+                try:
+                    return bool(fn(d))
+                except Exception:
+                    return False
+            try:
+                dt = str(d.get("document_type") or "").strip().lower()
+            except Exception:
+                dt = ""
+            try:
+                acr = str(d.get("document_type_acronym") or "").strip().lower()
+            except Exception:
+                acr = ""
+            return dt in {"test data", "testdata", "td"} or acr in {"test data", "testdata", "td"}
+
+        def _is_td_excel(d: dict) -> bool:
+            if not _is_td(d):
+                return False
+            try:
+                sqlite_rel = str(d.get("excel_sqlite_rel") or "").strip()
+            except Exception:
+                sqlite_rel = ""
+            if sqlite_rel:
+                return True
+            try:
+                art = str(d.get("artifacts_rel") or "").strip().lower()
+            except Exception:
+                art = ""
+            return "__excel" in art
+
+        if is_td_mode:
+            docs = [d for d in docs if isinstance(d, dict) and _is_td_excel(d)]
+        else:
+            docs = [d for d in docs if isinstance(d, dict) and not _is_td(d)]
+
         programs = sorted({str(d.get("program_title") or "").strip() for d in docs if str(d.get("program_title") or "").strip()})
         assets = sorted({str(d.get("asset_type") or "").strip() for d in docs if str(d.get("asset_type") or "").strip()})
         vendors = sorted({str(d.get("vendor") or "").strip() for d in docs if str(d.get("vendor") or "").strip()})
         parts = sorted({str(d.get("part_number") or "").strip() for d in docs if str(d.get("part_number") or "").strip()})
+        test_plans = sorted(
+            {
+                str(d.get("acceptance_test_plan_number") or "").strip()
+                for d in docs
+                if str(d.get("acceptance_test_plan_number") or "").strip()
+            }
+        )
 
         self.cb_program.clear()
         self.cb_asset.clear()
@@ -1511,6 +1660,8 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
             _populate_list(self.list_cont_vendor, vendors)
         if hasattr(self, "list_cont_asset"):
             _populate_list(self.list_cont_asset, assets)
+        if hasattr(self, "list_cont_test_plan"):
+            _populate_list(self.list_cont_test_plan, test_plans)
 
         groups = []
         try:
@@ -1657,6 +1808,8 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
         _collect(self.cb_cont_part, self.list_cont_part, "part_number", "Part Number")
         _collect(self.cb_cont_vendor, self.list_cont_vendor, "vendor", "Vendor Name")
         _collect(self.cb_cont_asset, self.list_cont_asset, "asset_type", "Asset Type")
+        if hasattr(self, "cb_cont_test_plan") and hasattr(self, "list_cont_test_plan"):
+            _collect(self.cb_cont_test_plan, self.list_cont_test_plan, "acceptance_test_plan_number", "Acceptance Test Plan")
 
         return rules, missing
 
@@ -2671,8 +2824,26 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
         cache_row = QtWidgets.QHBoxLayout()
         self.btn_refresh_cache = QtWidgets.QPushButton("Build / Refresh Cache")
+        self.btn_refresh_cache.setMinimumHeight(40)
         self.btn_refresh_cache.clicked.connect(lambda: self._load_cache(rebuild=True))
         self.btn_plot = QtWidgets.QPushButton("Plot Curves")
+        self.btn_plot.setMinimumHeight(40)
+        self.btn_plot.setStyleSheet(
+            """
+            QPushButton {
+                padding: 10px 16px;
+                border-radius: 10px;
+                background: #2563eb;
+                border: 1px solid #1d4ed8;
+                font-size: 13px;
+                font-weight: 800;
+                color: #ffffff;
+            }
+            QPushButton:hover { background: #1d4ed8; }
+            QPushButton:pressed { background: #1e40af; }
+            QPushButton:disabled { background: #94a3b8; border-color: #94a3b8; }
+            """
+        )
         self.btn_plot.clicked.connect(self._plot_current_mode)
         self.lbl_cache = QtWidgets.QLabel("")
         self.lbl_cache.setStyleSheet("color: #64748b; font-size: 11px;")
@@ -2770,32 +2941,6 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self.list_serials.itemSelectionChanged.connect(self._on_highlight_changed)
         left_layout.addWidget(self.list_serials)
 
-        auto_lbl = QtWidgets.QLabel("Auto-Plots")
-        auto_lbl.setStyleSheet("font-size: 12px; font-weight: 700;")
-        left_layout.addWidget(auto_lbl)
-
-        self.list_auto_plots = QtWidgets.QListWidget()
-        self.list_auto_plots.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.list_auto_plots.itemDoubleClicked.connect(lambda *_: self._open_selected_auto_plot())
-        self.list_auto_plots.itemSelectionChanged.connect(self._update_auto_actions)
-        self.list_auto_plots.setMaximumHeight(170)
-        left_layout.addWidget(self.list_auto_plots)
-
-        auto_row = QtWidgets.QHBoxLayout()
-        self.btn_open_auto = QtWidgets.QPushButton("Open")
-        self.btn_open_auto.setEnabled(False)
-        self.btn_open_auto.clicked.connect(self._open_selected_auto_plot)
-        self.btn_delete_auto = QtWidgets.QPushButton("Delete")
-        self.btn_delete_auto.setEnabled(False)
-        self.btn_delete_auto.clicked.connect(self._delete_selected_auto_plots)
-        self.btn_save_all_auto = QtWidgets.QPushButton("Save All PDF")
-        self.btn_save_all_auto.setEnabled(False)
-        self.btn_save_all_auto.clicked.connect(self._save_all_auto_plots_pdf)
-        auto_row.addWidget(self.btn_open_auto)
-        auto_row.addWidget(self.btn_delete_auto)
-        auto_row.addWidget(self.btn_save_all_auto)
-        left_layout.addLayout(auto_row)
-
         splitter.addWidget(left)
 
         # Right panel: plot + stats
@@ -2808,19 +2953,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         plot_header = QtWidgets.QHBoxLayout()
         plot_title = QtWidgets.QLabel("Plot")
         plot_title.setStyleSheet("font-size: 14px; font-weight: 700;")
-        self.btn_add_auto_plot = QtWidgets.QPushButton("Add to Auto-Plots")
-        self.btn_add_auto_plot.setEnabled(False)
-        self.btn_add_auto_plot.clicked.connect(self._add_current_plot_to_autoplots)
-        self.btn_save_plot_pdf = QtWidgets.QPushButton("Save Plot PDF")
-        self.btn_save_plot_pdf.setEnabled(False)
-        self.btn_save_plot_pdf.clicked.connect(self._save_plot_pdf)
-        self.lbl_source = QtWidgets.QLabel("")
-        self.lbl_source.setStyleSheet("color: #64748b; font-size: 11px;")
         plot_header.addWidget(plot_title)
         plot_header.addStretch(1)
-        plot_header.addWidget(self.btn_add_auto_plot)
-        plot_header.addWidget(self.btn_save_plot_pdf)
-        plot_header.addWidget(self.lbl_source)
         right_layout.addLayout(plot_header)
 
         self.plot_container = QtWidgets.QFrame()
@@ -2830,21 +2964,137 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._figure = None
         self._axes = None
         self._init_plot_area(plot_layout)
-        right_layout.addWidget(self.plot_container, 2)
+        right_layout.addWidget(self.plot_container, 6)
 
-        stats_label = QtWidgets.QLabel("Highlighted Serial Stats")
-        stats_label.setStyleSheet("font-size: 13px; font-weight: 700;")
-        right_layout.addWidget(stats_label)
+        # Highlighted stats: centered dropdown button + single-row summary (keeps the plot area larger).
+        self.btn_stats_toggle = QtWidgets.QPushButton("Highlighted Serial Stats ▸")
+        self.btn_stats_toggle.setCheckable(True)
+        self.btn_stats_toggle.setChecked(False)
+        self.btn_stats_toggle.setStyleSheet(
+            """
+            QPushButton {
+                padding: 6px 12px;
+                border-radius: 10px;
+                background: #ffffff;
+                border: 1px solid #e2e8f0;
+                font-size: 12px;
+                font-weight: 800;
+                color: #0f172a;
+            }
+            QPushButton:hover { background: #f8fafc; }
+            QPushButton:checked {
+                background: #f1f5f9;
+                border-color: #cbd5e1;
+            }
+            """
+        )
+        stats_toggle_row = QtWidgets.QHBoxLayout()
+        stats_toggle_row.addStretch(1)
+        stats_toggle_row.addWidget(self.btn_stats_toggle)
+        stats_toggle_row.addStretch(1)
+        right_layout.addLayout(stats_toggle_row)
 
-        cols = ["Serial", "Count", "Mean", "Std", "Min", "Max"]
-        self.tbl_stats = QtWidgets.QTableWidget(0, len(cols))
-        self.tbl_stats.setHorizontalHeaderLabels(cols)
-        self.tbl_stats.verticalHeader().setVisible(False)
-        self.tbl_stats.setAlternatingRowColors(True)
-        self.tbl_stats.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
-        self.tbl_stats.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.tbl_stats.horizontalHeader().setStretchLastSection(True)
-        right_layout.addWidget(self.tbl_stats, 1)
+        self._stats_frame = QtWidgets.QFrame()
+        self._stats_frame.setStyleSheet(
+            "QFrame { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 10px; }"
+        )
+        stats_lay = QtWidgets.QHBoxLayout(self._stats_frame)
+        stats_lay.setContentsMargins(10, 8, 10, 8)
+        stats_lay.setSpacing(16)
+
+        def _stat_pair(label: str) -> tuple[QtWidgets.QLabel, QtWidgets.QLabel]:
+            k = QtWidgets.QLabel(label)
+            k.setStyleSheet("color:#334155; font-size: 11px; font-weight: 800;")
+            v = QtWidgets.QLabel("—")
+            v.setStyleSheet("color:#0f172a; font-size: 11px; font-weight: 700;")
+            return k, v
+
+        self._stats_values: dict[str, QtWidgets.QLabel] = {}
+        for key, label in (
+            ("serial", "Serial"),
+            ("count", "Count"),
+            ("mean", "Mean"),
+            ("std", "Std"),
+            ("min", "Min"),
+            ("max", "Max"),
+        ):
+            k_lbl, v_lbl = _stat_pair(label)
+            box = QtWidgets.QHBoxLayout()
+            box.setSpacing(6)
+            box.addWidget(k_lbl)
+            box.addWidget(v_lbl)
+            stats_lay.addLayout(box)
+            self._stats_values[key] = v_lbl
+        stats_lay.addStretch(1)
+        self._stats_frame.setVisible(False)
+        right_layout.addWidget(self._stats_frame, 0)
+
+        def _toggle_stats(opened: bool) -> None:
+            self._stats_frame.setVisible(bool(opened))
+            self.btn_stats_toggle.setText("Highlighted Serial Stats ▾" if opened else "Highlighted Serial Stats ▸")
+
+        self.btn_stats_toggle.toggled.connect(_toggle_stats)
+        _toggle_stats(False)
+
+        # Bottom actions: saving + auto-plots (kept within plot panel; centered, not full-width)
+        self.btn_add_auto_plot = QtWidgets.QPushButton("Add to Auto-Plots")
+        self.btn_add_auto_plot.setEnabled(False)
+        self.btn_add_auto_plot.clicked.connect(self._add_current_plot_to_autoplots)
+        self.btn_save_plot_pdf = QtWidgets.QPushButton("Save Plot PDF")
+        self.btn_save_plot_pdf.setEnabled(False)
+        self.btn_save_plot_pdf.clicked.connect(self._save_plot_pdf)
+        self.lbl_source = QtWidgets.QLabel("")
+        self.lbl_source.setStyleSheet("color: #64748b; font-size: 11px;")
+        self.lbl_source.setWordWrap(True)
+
+        self.list_auto_plots = QtWidgets.QListWidget()
+        self.list_auto_plots.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.list_auto_plots.itemDoubleClicked.connect(lambda *_: self._open_selected_auto_plot())
+        self.list_auto_plots.itemSelectionChanged.connect(self._update_auto_actions)
+        self.list_auto_plots.setMinimumHeight(110)
+        self.list_auto_plots.setMaximumHeight(160)
+
+        self.btn_open_auto = QtWidgets.QPushButton("Open")
+        self.btn_open_auto.setEnabled(False)
+        self.btn_open_auto.clicked.connect(self._open_selected_auto_plot)
+        self.btn_delete_auto = QtWidgets.QPushButton("Delete")
+        self.btn_delete_auto.setEnabled(False)
+        self.btn_delete_auto.clicked.connect(self._delete_selected_auto_plots)
+        self.btn_save_all_auto = QtWidgets.QPushButton("Save All PDF")
+        self.btn_save_all_auto.setEnabled(False)
+        self.btn_save_all_auto.clicked.connect(self._save_all_auto_plots_pdf)
+
+        self._actions_frame = QtWidgets.QFrame()
+        self._actions_frame.setStyleSheet(
+            "QFrame { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 10px; }"
+        )
+        self._actions_frame.setMinimumHeight(130)
+
+        actions = QtWidgets.QVBoxLayout(self._actions_frame)
+        actions.setContentsMargins(10, 8, 10, 8)
+        actions.setSpacing(8)
+
+        # Ordered buttons row (current plot actions, then auto-plot list actions).
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_row.setSpacing(8)
+        btn_row.addWidget(self.btn_add_auto_plot)
+        btn_row.addWidget(self.btn_save_plot_pdf)
+        btn_row.addSpacing(10)
+        btn_row.addWidget(self.btn_open_auto)
+        btn_row.addWidget(self.btn_delete_auto)
+        btn_row.addWidget(self.btn_save_all_auto)
+        btn_row.addStretch(1)
+        actions.addLayout(btn_row)
+
+        auto_lbl = QtWidgets.QLabel("Auto-Plots")
+        auto_lbl.setStyleSheet("font-size: 12px; font-weight: 800; color: #0f172a;")
+        actions.addWidget(auto_lbl)
+        self.list_auto_plots.setMaximumHeight(120)
+        self.list_auto_plots.setMinimumHeight(90)
+        actions.addWidget(self.list_auto_plots, 1)
+
+        actions.addWidget(self.lbl_source)
+        right_layout.addWidget(self._actions_frame, 2)
 
         splitter.addWidget(right)
         splitter.setStretchFactor(0, 1)
@@ -2984,42 +3234,41 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._refresh_stats_preview()
 
     def _populate_stats_table(self, run: str, y_col: str, highlight_sn: str) -> None:
-        if not self._db_path or not run or not y_col:
-            self.tbl_stats.setRowCount(0)
+        def _set_val(key: str, v: object) -> None:
+            lbl = (self._stats_values or {}).get(key)
+            if lbl is None:
+                return
+            if v is None or str(v).strip() == "":
+                lbl.setText("—")
+            else:
+                lbl.setText(str(v))
+
+        if not getattr(self, "_db_path", None) or not str(run or "").strip() or not str(y_col or "").strip():
+            for k in ("serial", "count", "mean", "std", "min", "max"):
+                _set_val(k, None)
             return
 
-        want = [highlight_sn] if highlight_sn else []
-        if not want:
-            self.tbl_stats.setRowCount(0)
+        sn = str(highlight_sn or "").strip()
+        if not sn:
+            for k in ("serial", "count", "mean", "std", "min", "max"):
+                _set_val(k, None)
             return
-        stats = ["count", "mean", "std", "min", "max"]
-        maps: dict[str, dict[str, float | None]] = {}
-        for st in stats:
+
+        _set_val("serial", sn)
+        for st in ("count", "mean", "std", "min", "max"):
+            val = None
             try:
                 series = be.td_load_metric_series(self._db_path, run, y_col, st)
             except Exception:
                 series = []
-            maps[st] = {str(r.get("serial") or "").strip(): r.get("value_num") for r in series if str(r.get("serial") or "").strip()}
-
-        self.tbl_stats.setRowCount(0)
-        for r, sn in enumerate(want):
-            self.tbl_stats.insertRow(r)
-
-            def _set(c: int, v: object) -> None:
-                item = QtWidgets.QTableWidgetItem("" if v is None else str(v))
-                item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
-                self.tbl_stats.setItem(r, c, item)
-
-            _set(0, sn)
-            _set(1, maps.get("count", {}).get(sn))
-            for idx, st in enumerate(["mean", "std", "min", "max"], start=2):
-                v = maps.get(st, {}).get(sn)
-                if isinstance(v, (int, float)):
-                    _set(idx, f"{float(v):.6g}")
-                else:
-                    _set(idx, "" if v is None else v)
-
-        self.tbl_stats.resizeColumnsToContents()
+            for r in series:
+                if str(r.get("serial") or "").strip() == sn:
+                    val = r.get("value_num")
+                    break
+            if isinstance(val, (int, float)) and st != "count":
+                _set_val(st, f"{float(val):.6g}")
+            else:
+                _set_val(st, val)
 
     def _refresh_stats_preview(self) -> None:
         run = (self.cb_run.currentText() or "").strip()
@@ -5637,18 +5886,32 @@ class MainWindow(QtWidgets.QMainWindow):
             missing_val = int(payload.get("missing_value") or 0)
             serials = int(payload.get("serials_in_workbook") or 0)
             have_src = int(payload.get("serials_with_source") or 0)
+            serials_added = int(payload.get("serials_added") or 0)
+            added_serials = payload.get("added_serials") or []
             dbg = str(payload.get("debug_json") or "").strip()
             self._append_log(
-                f"[PROJECT UPDATE] updated={updated}, serials={serials}, sources={have_src}, missing_source={missing_src}, missing_value={missing_val}"
+                f"[PROJECT UPDATE] updated={updated}, serials={serials}, added={serials_added}, sources={have_src}, missing_source={missing_src}, missing_value={missing_val}"
             )
-            msg = (
-                f"Updated cells: {updated}\n"
-                f"Serials in workbook: {serials}\n"
-                f"Serials with debug source: {have_src}\n"
-                f"Missing debug source: {missing_src}\n"
-                f"No value found: {missing_val}\n\n"
-                f"Workbook: {payload.get('workbook') or wb_path}"
+            lines = [
+                f"Updated cells: {updated}",
+                f"Serials in workbook: {serials}",
+            ]
+            if serials_added:
+                lines.append(f"Serials auto-added: {serials_added}")
+            lines.extend(
+                [
+                    f"Serials with debug source: {have_src}",
+                    f"Missing debug source: {missing_src}",
+                    f"No value found: {missing_val}",
+                    "",
+                    f"Workbook: {payload.get('workbook') or wb_path}",
+                ]
             )
+            msg = "\n".join(lines)
+            if serials_added and isinstance(added_serials, list) and added_serials:
+                shown = ", ".join(str(s).strip() for s in added_serials[:20] if str(s).strip())
+                if shown:
+                    msg += f"\nAdded serials: {shown}" + (" ..." if len(added_serials) > 20 else "")
             if dbg:
                 msg += f"\nDebug JSON: {dbg}"
             QtWidgets.QMessageBox.information(

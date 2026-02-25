@@ -49,6 +49,19 @@ End users must have **Modify** rights on:
 
 If these are read-only, the Projects UI will show a clear error telling you what path needs rights.
 
+## Strict metadata allowlists (Program / PN / ATP)
+EIDAT can enforce strict allowlists for metadata fields via `user_inputs/metadata_candidates.json`:
+
+- Node-local (production nodes): `<node_root>\EIDAT\UserData\user_inputs\metadata_candidates.json`
+- Repo-local (dev/runtime fallback): `<runtime_root>\user_inputs\metadata_candidates.json`
+
+Keys:
+- `program_titles`: allowed `program_title` values (non-empty list enables enforcement)
+- `part_numbers`: allowed `part_number` values (empty/missing → extracted PN becomes `Unknown`)
+- `acceptance_test_plan_numbers`: allowed `acceptance_test_plan_number` values (empty/missing → extracted ATP becomes `Unknown`)
+
+To backfill old metadata (e.g., remove non-allowlisted program titles), run **Files Explorer → Refresh Metadata Only** on the affected files (it rewrites metadata JSONs and triggers an index refresh).
+
 ## Quickstart (admin, shared-drive testing)
 
 ### 1) Prepare Central Runtime

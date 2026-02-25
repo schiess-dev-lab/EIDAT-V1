@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
 import time
@@ -57,9 +58,22 @@ CREATE TABLE IF NOT EXISTS groups (
 def _load_program_title_candidates() -> list[str]:
     """Load program title candidates from user_inputs/metadata_candidates.json."""
     try:
-        root = Path(__file__).resolve().parents[2]
-        cand_path = root / "user_inputs" / "metadata_candidates.json"
-        if cand_path.exists():
+        repo_root = Path(__file__).resolve().parents[2]
+        cand_paths: list[Path] = []
+        raw_data_root = (os.environ.get("EIDAT_DATA_ROOT") or "").strip()
+        if raw_data_root:
+            try:
+                data_root = Path(raw_data_root).expanduser()
+                if not data_root.is_absolute():
+                    data_root = (repo_root / data_root).resolve()
+                cand_paths.append(data_root / "user_inputs" / "metadata_candidates.json")
+            except Exception:
+                pass
+        cand_paths.append(repo_root / "user_inputs" / "metadata_candidates.json")
+
+        for cand_path in cand_paths:
+            if not cand_path.exists():
+                continue
             data = json.loads(cand_path.read_text(encoding="utf-8"))
             if isinstance(data, dict):
                 titles = data.get("program_titles") or []
@@ -155,11 +169,27 @@ def _infer_is_test_data_from_path_with_aliases(meta_path: Path, td_aliases: list
 def _load_test_data_aliases() -> list[str]:
     """Load TD aliases from user_inputs/metadata_candidates.json (document_types entry with acronym TD)."""
     try:
-        root = Path(__file__).resolve().parents[2]
-        cand_path = root / "user_inputs" / "metadata_candidates.json"
-        if not cand_path.exists():
-            return []
-        data = json.loads(cand_path.read_text(encoding="utf-8"))
+        repo_root = Path(__file__).resolve().parents[2]
+        cand_paths: list[Path] = []
+        raw_data_root = (os.environ.get("EIDAT_DATA_ROOT") or "").strip()
+        if raw_data_root:
+            try:
+                data_root = Path(raw_data_root).expanduser()
+                if not data_root.is_absolute():
+                    data_root = (repo_root / data_root).resolve()
+                cand_paths.append(data_root / "user_inputs" / "metadata_candidates.json")
+            except Exception:
+                pass
+        cand_paths.append(repo_root / "user_inputs" / "metadata_candidates.json")
+
+        data: dict | None = None
+        for cand_path in cand_paths:
+            if not cand_path.exists():
+                continue
+            loaded = json.loads(cand_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                data = loaded
+                break
         if not isinstance(data, dict):
             return []
         raw = data.get("document_types") or []

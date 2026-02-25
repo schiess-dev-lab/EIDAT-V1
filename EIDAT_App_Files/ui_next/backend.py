@@ -3576,16 +3576,102 @@ def update_test_data_trending_project_workbook(
         key = str(ws_src.cell(1, col).value or "").strip().lower()
         if key:
             src_headers[key] = col
+
+    # Ensure modern Sources schema exists (older workbooks may have only serial_number).
+    required_src_cols = [
+        "serial_number",
+        "program_title",
+        "document_type",
+        "metadata_rel",
+        "artifacts_rel",
+        "excel_sqlite_rel",
+    ]
+    for key in required_src_cols:
+        if key in src_headers:
+            continue
+        col = int((ws_src.max_column or 0) + 1)
+        ws_src.cell(1, col).value = key
+        src_headers[key] = col
+
+    project_meta: dict = {}
+    project_meta_changed = False
+    continued_rules: dict[str, set[str]] = {}
+    try:
+        pj = project_dir / EIDAT_PROJECT_META
+        if pj.exists():
+            raw = json.loads(pj.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                project_meta = raw
+                continued_rules = _extract_continued_population_rules(project_meta)
+    except Exception:
+        project_meta = {}
+        continued_rules = {}
     if "serial_number" not in src_headers:
         raise RuntimeError("Sources sheet missing required column: serial_number")
 
     serials: list[str] = []
+    serials_set: set[str] = set()
     for r in range(2, (ws_src.max_row or 0) + 1):
         sn = str(ws_src.cell(r, src_headers["serial_number"]).value or "").strip()
-        if sn and sn not in serials:
+        if sn and sn not in serials_set:
             serials.append(sn)
+            serials_set.add(sn)
     if not serials:
         raise RuntimeError("No serial numbers found in Sources sheet.")
+
+    added_serials: list[str] = []
+    if continued_rules and not dry_run:
+        try:
+            docs = read_eidat_index_documents(repo)
+            matched_docs = _docs_matching_population_rules(docs, continued_rules)
+
+            eligible_docs: list[dict] = []
+            for d in matched_docs:
+                if not isinstance(d, dict) or not is_test_data_doc(d):
+                    continue
+                sqlite_rel = str(d.get("excel_sqlite_rel") or "").strip()
+                if not sqlite_rel:
+                    continue
+                eligible_docs.append(d)
+
+            docs_by_serial: dict[str, list[dict]] = {}
+            for d in eligible_docs:
+                sn = str(d.get("serial_number") or "").strip()
+                if sn:
+                    docs_by_serial.setdefault(sn, []).append(d)
+
+            support_dir = eidat_support_dir(repo)
+            for sn in sorted(docs_by_serial.keys()):
+                if sn in serials_set:
+                    continue
+                doc = _best_doc_for_serial(support_dir, docs_by_serial.get(sn, [])) or {}
+                row = int((ws_src.max_row or 0) + 1)
+                ws_src.cell(row, int(src_headers["serial_number"])).value = str(sn)
+                ws_src.cell(row, int(src_headers["program_title"])).value = str(doc.get("program_title") or "")
+                ws_src.cell(row, int(src_headers["document_type"])).value = str(doc.get("document_type") or "")
+                ws_src.cell(row, int(src_headers["metadata_rel"])).value = str(doc.get("metadata_rel") or "")
+                ws_src.cell(row, int(src_headers["artifacts_rel"])).value = str(doc.get("artifacts_rel") or "")
+                ws_src.cell(row, int(src_headers["excel_sqlite_rel"])).value = str(doc.get("excel_sqlite_rel") or "")
+                serials.append(sn)
+                serials_set.add(sn)
+                added_serials.append(sn)
+
+                if project_meta:
+                    try:
+                        existing_rels = [
+                            str(v).strip()
+                            for v in (project_meta.get("selected_metadata_rel") or [])
+                            if str(v).strip()
+                        ]
+                    except Exception:
+                        existing_rels = []
+                    mr = str(doc.get("metadata_rel") or "").strip()
+                    if mr and mr not in existing_rels:
+                        existing_rels.append(mr)
+                        project_meta["selected_metadata_rel"] = existing_rels
+                        project_meta_changed = True
+        except Exception:
+            pass
 
     def _config_snapshot() -> dict:
         if "Config" not in wb.sheetnames:
@@ -3936,6 +4022,31 @@ def update_test_data_trending_project_workbook(
         except Exception:
             pass
 
+    if project_meta and not dry_run:
+        try:
+            if added_serials:
+                project_meta_changed = True
+            if project_meta_changed:
+                serials_now = sorted({str(s).strip() for s in serials if str(s).strip()})
+                project_meta["serials"] = serials_now
+                project_meta["serials_count"] = len(serials_now)
+                if "selected_metadata_rel" in project_meta:
+                    rels_now = sorted(
+                        {
+                            str(v).strip()
+                            for v in (project_meta.get("selected_metadata_rel") or [])
+                            if str(v).strip()
+                        }
+                    )
+                    project_meta["selected_metadata_rel"] = rels_now
+                    project_meta["selected_count"] = len(rels_now)
+                desc = _format_continued_population_description(project_meta.get("continued_population") or {})
+                if desc:
+                    project_meta["description"] = desc
+                (project_dir / EIDAT_PROJECT_META).write_text(json.dumps(project_meta, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
     return {
         "workbook": str(wb_path),
         "db_path": str(db_path),
@@ -3943,6 +4054,8 @@ def update_test_data_trending_project_workbook(
         "missing_source": int(src_missing),
         "missing_value": int(missing_value),
         "serials_in_workbook": int(len(serials)),
+        "serials_added": int(len(added_serials)),
+        "added_serials": list(added_serials),
         "dry_run": bool(dry_run),
     }
 
@@ -4583,6 +4696,15 @@ def _match_serial_key(sn_header: str, known_serials: set[str]) -> str:
 _CONTINUED_POPULATION_FIELDS: dict[str, tuple[str, ...]] = {
     "program_title": ("program", "programs", "program_title", "programtitle"),
     "part_number": ("part", "part_number", "partnumber", "part_numbers", "partnumbers", "pn"),
+    "acceptance_test_plan_number": (
+        "acceptance_test_plan_number",
+        "acceptance_test_plan",
+        "acceptancetestplan",
+        "acceptancetestplannumber",
+        "test_plan",
+        "testplan",
+        "atp",
+    ),
     "vendor": ("vendor", "vendors", "vendor_name", "vendorname"),
     "asset_type": ("asset", "asset_type", "assettype", "asset_types", "assettypes"),
 }
@@ -4654,11 +4776,12 @@ def _format_continued_population_description(rules: Mapping[str, Iterable[str]])
     labels = {
         "program_title": "Program",
         "part_number": "Part Number",
+        "acceptance_test_plan_number": "Acceptance Test Plan",
         "vendor": "Vendor",
         "asset_type": "Asset Type",
     }
     parts: list[str] = []
-    for key in ("program_title", "part_number", "vendor", "asset_type"):
+    for key in ("program_title", "part_number", "acceptance_test_plan_number", "vendor", "asset_type"):
         raw_vals = rules.get(key) if isinstance(rules, Mapping) else None
         if not raw_vals:
             continue
@@ -5433,6 +5556,8 @@ def _build_validation_lists(docs: Iterable[Mapping[str, object]], *, extra_meta:
     cand_program_titles = cand.get("program_titles") if isinstance(cand, dict) else []
     cand_asset_types = cand.get("asset_types") if isinstance(cand, dict) else []
     cand_vendors = cand.get("vendors") if isinstance(cand, dict) else []
+    cand_part_numbers = cand.get("part_numbers") if isinstance(cand, dict) else []
+    cand_atp_numbers = cand.get("acceptance_test_plan_numbers") if isinstance(cand, dict) else []
 
     cand_doc_types_raw = cand.get("document_types") if isinstance(cand, dict) else []
     cand_doc_type_names: list[object] = []
@@ -5467,6 +5592,13 @@ def _build_validation_lists(docs: Iterable[Mapping[str, object]], *, extra_meta:
             [d.get("vendor") for d in docs_list]
             + [m.get("vendor") for m in meta_list]
             + (cand_vendors if isinstance(cand_vendors, list) else [])
+        ),
+        # Strict allowlists: do not union in arbitrary extracted values.
+        "acceptance_test_plan_number": _collect_unique_nonempty(
+            (cand_atp_numbers if isinstance(cand_atp_numbers, list) else [])
+        ),
+        "part_number": _collect_unique_nonempty(
+            (cand_part_numbers if isinstance(cand_part_numbers, list) else [])
         ),
         "document_type": _collect_unique_nonempty(
             [d.get("document_type") for d in docs_list]
@@ -5513,6 +5645,8 @@ def _write_validation_sheet(ws, lists: dict[str, list[str]]) -> dict[str, str]:
         ("Program", "program_title"),
         ("Asset Type", "asset_type"),
         ("Vendor", "vendor"),
+        ("Acceptance Test Plan", "acceptance_test_plan_number"),
+        ("Part Number", "part_number"),
         ("Document Type", "document_type"),
         ("Document Acronym", "document_type_acronym"),
         ("Similarity Group", "similarity_group"),
@@ -5583,8 +5717,6 @@ def _ensure_project_metadata_validations(
 ) -> None:
     """
     Ensure workbook has restricted dropdowns for metadata-driven fields.
-
-    Unrestricted fields: Acceptance Test Plan, Part Number, Revision, and dates.
     """
     try:
         from openpyxl.utils import get_column_letter  # type: ignore
@@ -5615,6 +5747,8 @@ def _ensure_project_metadata_validations(
                 ("Program", "program_title"),
                 ("Asset Type", "asset_type"),
                 ("Vendor", "vendor"),
+                ("Acceptance Test Plan", "acceptance_test_plan_number"),
+                ("Part Number", "part_number"),
                 ("Document Type", "document_type"),
                 ("Document Acronym", "document_type_acronym"),
                 ("Similarity Group", "similarity_group"),
@@ -5649,6 +5783,8 @@ def _ensure_project_metadata_validations(
             ("Program", "program_title"),
             ("Asset Type", "asset_type"),
             ("Vendor", "vendor"),
+            ("Acceptance Test Plan", "acceptance_test_plan_number"),
+            ("Part Number", "part_number"),
             ("Document Type", "document_type"),
             ("Document Acronym", "document_type_acronym"),
             ("Similarity Group", "similarity_group"),
