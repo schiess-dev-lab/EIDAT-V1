@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,7 +37,54 @@ _IGNORED_REPO_DIRNAMES_CASEFOLD = {
     # Common typo/legacy naming without the "I"
     "edat",
     "edat support",
+    # Common heavy directories to prune while scanning node roots.
+    ".git",
+    ".hg",
+    ".svn",
+    ".idea",
+    ".vscode",
+    "__pycache__",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".cache",
+    "node_modules",
+    "dist",
+    "build",
+    ".next",
+    ".venv",
+    "venv",
 }
+
+def _parse_ignore_dirs_env() -> set[str]:
+    raw = str(os.environ.get("EIDAT_SCAN_IGNORE_DIRS") or "").strip()
+    if not raw:
+        return set()
+    parts: list[str] = []
+    for chunk in raw.replace(",", ";").split(";"):
+        s = str(chunk or "").strip()
+        if s:
+            parts.append(s.casefold())
+    return set(parts)
+
+
+def _progress_every_env(default: int = 2000) -> int:
+    raw = str(os.environ.get("EIDAT_SCAN_PROGRESS_EVERY") or "").strip()
+    if not raw:
+        return int(default)
+    try:
+        n = int(float(raw))
+    except Exception:
+        return int(default)
+    return int(n) if int(n) > 0 else 0
+
+
+def _scan_log(line: str) -> None:
+    try:
+        sys.stderr.write(str(line or "").rstrip("\n") + "\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
 
 
 @dataclass(frozen=True)
@@ -62,13 +110,23 @@ class ScanSummary:
 def _iter_data_files(global_repo: Path, *, exclude_dir: Path) -> list[Path]:
     """Iterate over all supported data files (PDFs and Excel) in the repository."""
     files: list[Path] = []
+    extra_ignored = _parse_ignore_dirs_env()
+    progress_every = _progress_every_env()
+    visited_dirs = 0
+    files_seen = 0
+    matched_supported = 0
     try:
         exclude_dir_res = exclude_dir.resolve()
     except Exception:
         exclude_dir_res = exclude_dir.expanduser().absolute()
 
+    _scan_log(f"[SCAN] Walking: {global_repo}")
+    if extra_ignored:
+        _scan_log(f"[SCAN] Extra ignored dirs from EIDAT_SCAN_IGNORE_DIRS: {sorted(extra_ignored)}")
+
     # Use os.walk so we can prune ignored/support directories efficiently.
     for dirpath, dirnames, filenames in os.walk(str(global_repo), topdown=True):
+        visited_dirs += 1
         base = Path(dirpath)
 
         # Prune directories we never want to scan.
@@ -76,6 +134,8 @@ def _iter_data_files(global_repo: Path, *, exclude_dir: Path) -> list[Path]:
         for d in dirnames:
             try:
                 if str(d).casefold() in _IGNORED_REPO_DIRNAMES_CASEFOLD:
+                    continue
+                if extra_ignored and str(d).casefold() in extra_ignored:
                     continue
             except Exception:
                 pass
@@ -93,6 +153,7 @@ def _iter_data_files(global_repo: Path, *, exclude_dir: Path) -> list[Path]:
         dirnames[:] = kept
 
         for name in filenames:
+            files_seen += 1
             p = base / name
             try:
                 ext = p.suffix.lower()
@@ -111,6 +172,11 @@ def _iter_data_files(global_repo: Path, *, exclude_dir: Path) -> list[Path]:
                 continue
 
             files.append(p)
+            matched_supported += 1
+            if progress_every and (matched_supported % int(progress_every) == 0):
+                _scan_log(
+                    f"[SCAN] visited_dirs={visited_dirs} files_seen={files_seen} matched_supported={matched_supported}"
+                )
     return files
 
 

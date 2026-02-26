@@ -3076,8 +3076,62 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
     ]
 
     computed_epoch_ns = time.time_ns()
-    x_priority = ["time_s", "cycle", "excel_row"]
+
+    # For TD curve plots, only allow canonical X axes:
+    # - Time
+    # - Pulse Number
+    #
+    # Never offer excel_row as an X axis (it is still used for stable ordering when present).
+    X_TIME = "Time"
+    X_PULSE = "Pulse Number"
+    x_priority = [X_TIME, X_PULSE]
     run_x_union: dict[str, set[str]] = {}
+    run_default_x: dict[str, str] = {}
+
+    def _norm_name(s: str) -> str:
+        return "".join(ch.lower() for ch in str(s or "") if ch.isalnum())
+
+    time_candidates = [
+        "Time",
+        "Time (s)",
+        "Time(s)",
+        "time",
+        "time_s",
+        "time_sec",
+        "time (s)",
+        "time(s)",
+    ]
+    pulse_candidates = [
+        "Pulse Number",
+        "Pulse #",
+        "Pulse",
+        "pulse number",
+        "pulse_number",
+        "pulsenumber",
+        "pulse",
+        "cycle",
+        "Cycle",
+    ]
+    time_norms = {_norm_name(x) for x in time_candidates}
+    pulse_norms = {_norm_name(x) for x in pulse_candidates}
+    x_exclude_norms = time_norms | pulse_norms | {_norm_name("excel_row")}
+
+    def _find_actual_col(cols: set[str], candidates: list[str]) -> str:
+        # Prefer exact matches in the given priority order.
+        for cand in candidates:
+            if cand in cols:
+                return cand
+        # Fallback: normalized match (handles underscores / spaces / punctuation).
+        by_norm: dict[str, str] = {}
+        for c in cols:
+            n = _norm_name(c)
+            if n and n not in by_norm:
+                by_norm[n] = c
+        for cand in candidates:
+            c = by_norm.get(_norm_name(cand))
+            if c:
+                return c
+        return ""
 
     def _finite_float(v: object) -> float | None:
         if v is None:
@@ -3237,17 +3291,28 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
                     if not cols:
                         continue
 
-                    avail_x = {x for x in x_priority if x in cols}
+                    x_map: dict[str, str] = {}
+                    actual_time = _find_actual_col(cols, time_candidates)
+                    actual_pulse = _find_actual_col(cols, pulse_candidates)
+                    if actual_time:
+                        x_map[X_TIME] = actual_time
+                    if actual_pulse:
+                        x_map[X_PULSE] = actual_pulse
+
+                    avail_x = [x for x in x_priority if x in x_map]
                     if avail_x:
                         run_x_union.setdefault(run, set()).update(avail_x)
+                        existing = run_default_x.get(run, "")
+                        if not existing:
+                            run_default_x[run] = avail_x[0]
+                        else:
+                            # Prefer Time over Pulse Number.
+                            if x_priority.index(avail_x[0]) < x_priority.index(existing):
+                                run_default_x[run] = avail_x[0]
                     order_by = "excel_row ASC" if "excel_row" in cols else "rowid ASC"
 
                     # Local default_x for metrics
-                    default_x = ""
-                    for x in x_priority:
-                        if x in avail_x:
-                            default_x = x
-                            break
+                    default_x = avail_x[0] if avail_x else ""
 
                     desired_y: list[str] = []
                     for y_name, _units in y_cols:
@@ -3267,14 +3332,16 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
                     for y_name in desired_y:
                         if y_name not in cols:
                             continue
+                        if _norm_name(y_name) in x_exclude_norms:
+                            continue
 
                         # Build curves for each available X column (supports x dropdown)
-                        for x_name in sorted(
-                            avail_x,
-                            key=lambda k: x_priority.index(k) if k in x_priority else 999,
-                        ):
+                        for x_name in avail_x:
+                            actual_x = x_map.get(x_name, "")
+                            if not actual_x:
+                                continue
                             q_table = _quote_ident(table)
-                            qx = _quote_ident(x_name)
+                            qx = _quote_ident(actual_x)
                             qy = _quote_ident(y_name)
                             try:
                                 rows = src.execute(
@@ -3319,8 +3386,11 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
                         # Metrics computed from the default X curve (if any)
                         y_for_stats: list[float] = []
                         if default_x:
+                            actual_x = x_map.get(default_x, "")
+                            if not actual_x:
+                                actual_x = default_x
                             q_table = _quote_ident(table)
-                            qx = _quote_ident(default_x)
+                            qx = _quote_ident(actual_x)
                             qy = _quote_ident(y_name)
                             try:
                                 rows = src.execute(
@@ -3365,11 +3435,12 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
         cfg_order = [n for n, _u in y_cols if n]
         for run in sorted(runs_all, key=lambda s: str(s).lower()):
             xs = run_x_union.get(run, set())
-            default_x = ""
-            for x in x_priority:
-                if x in xs:
-                    default_x = x
-                    break
+            default_x = run_default_x.get(run, "")
+            if not default_x:
+                for x in x_priority:
+                    if x in xs:
+                        default_x = x
+                        break
             conn.execute(
                 "INSERT OR REPLACE INTO td_runs(run_name, default_x) VALUES (?, ?)",
                 (run, default_x),
@@ -3383,6 +3454,8 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
             y_map = run_y_union.get(run, {}) or {}
             y_ordered = [n for n in cfg_order if n in y_map] + sorted([n for n in y_map.keys() if n not in cfg_order], key=lambda s: str(s).lower())
             for y_name in y_ordered:
+                if _norm_name(y_name) in x_exclude_norms:
+                    continue
                 units = str(y_map.get(y_name) or "").strip()
                 conn.execute(
                     "INSERT OR REPLACE INTO td_columns(run_name, name, units, kind) VALUES (?, ?, ?, ?)",

@@ -2895,12 +2895,22 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         y_sel_row.addStretch(1)
         metrics_layout.addLayout(y_sel_row)
 
-        row_metrics = QtWidgets.QHBoxLayout()
-        self.cb_stat = QtWidgets.QComboBox()
-        self.cb_stat.addItems(["mean", "min", "max", "std", "median", "count"])
-        row_metrics.addWidget(QtWidgets.QLabel("Stat:"))
-        row_metrics.addWidget(self.cb_stat, 1)
-        metrics_layout.addLayout(row_metrics)
+        lbl_stats = QtWidgets.QLabel("Stats (multi-select)")
+        lbl_stats.setStyleSheet("font-size: 12px; font-weight: 700; color: #334155;")
+        metrics_layout.addWidget(lbl_stats)
+
+        self.list_stats = QtWidgets.QListWidget()
+        self.list_stats.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.list_stats.setMaximumHeight(92)
+        for st in ["mean", "min", "max", "std", "median", "count"]:
+            self.list_stats.addItem(QtWidgets.QListWidgetItem(st))
+        # Default selection: mean (matches prior single-select default behavior).
+        for i in range(self.list_stats.count()):
+            it = self.list_stats.item(i)
+            if it.text().strip().lower() == "mean":
+                it.setSelected(True)
+                break
+        metrics_layout.addWidget(self.list_stats)
 
         # Curves tab
         tab_curves = QtWidgets.QWidget()
@@ -3057,6 +3067,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self.btn_open_auto = QtWidgets.QPushButton("Open")
         self.btn_open_auto.setEnabled(False)
         self.btn_open_auto.clicked.connect(self._open_selected_auto_plot)
+        self.btn_open_all_auto = QtWidgets.QPushButton("Open All")
+        self.btn_open_all_auto.setEnabled(False)
+        self.btn_open_all_auto.clicked.connect(self._open_all_auto_plots_panel)
         self.btn_delete_auto = QtWidgets.QPushButton("Delete")
         self.btn_delete_auto.setEnabled(False)
         self.btn_delete_auto.clicked.connect(self._delete_selected_auto_plots)
@@ -3081,6 +3094,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         btn_row.addWidget(self.btn_save_plot_pdf)
         btn_row.addSpacing(10)
         btn_row.addWidget(self.btn_open_auto)
+        btn_row.addWidget(self.btn_open_all_auto)
         btn_row.addWidget(self.btn_delete_auto)
         btn_row.addWidget(self.btn_save_all_auto)
         btn_row.addStretch(1)
@@ -3186,7 +3200,19 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         prev_y = self.cb_y_curve.currentText()
         self.cb_y_curve.blockSignals(True)
         self.cb_y_curve.clear()
-        y_names = [str(c.get("name") or "") for c in y_cols if str(c.get("name") or "").strip()]
+        def _norm_name(s: str) -> str:
+            return "".join(ch.lower() for ch in str(s or "") if ch.isalnum())
+
+        # Keep curve/metric Y selectors free of curve X-axis columns.
+        time_norms = {_norm_name(x) for x in ("time", "time_s", "time(sec)", "time(s)", "time (s)", "time_sec", "times")}
+        pulse_norms = {_norm_name(x) for x in ("pulse number", "pulse#", "pulse #", "pulse_number", "pulsenumber", "cycle")}
+        x_exclude_norms = time_norms | pulse_norms | {_norm_name("excel_row")}
+
+        y_names = [
+            str(c.get("name") or "")
+            for c in y_cols
+            if str(c.get("name") or "").strip() and _norm_name(str(c.get("name") or "")) not in x_exclude_norms
+        ]
         self.cb_y_curve.addItems(y_names)
         if prev_y and prev_y in y_names:
             self.cb_y_curve.setCurrentText(prev_y)
@@ -3213,10 +3239,95 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         prev_x = self.cb_x.currentText()
         self.cb_x.blockSignals(True)
         self.cb_x.clear()
-        self.cb_x.addItems([x for x in x_cols if str(x or "").strip()])
-        if prev_x and prev_x in x_cols:
-            self.cb_x.setCurrentText(prev_x)
+        xs_raw = [str(x or "").strip() for x in (x_cols or []) if str(x or "").strip()]
+        xs_by_norm: dict[str, str] = {}
+        for x in xs_raw:
+            n = _norm_name(x)
+            if n and n not in xs_by_norm:
+                xs_by_norm[n] = x
+
+        def _pick_best(preferred: list[str]) -> str:
+            have = set(xs_raw)
+            for p in preferred:
+                if p in have:
+                    return p
+            for p in preferred:
+                v = xs_by_norm.get(_norm_name(p))
+                if v:
+                    return v
+            return ""
+
+        # Only show Time + Pulse Number as curve X-axis options (never excel_row).
+        time_key = _pick_best(["Time", "Time (s)", "Time(s)", "time_s", "time", "time_sec", "time (s)", "time(s)"])
+        pulse_key = _pick_best(["Pulse Number", "Pulse #", "cycle", "Cycle", "pulse_number", "pulsenumber", "Pulse", "pulse"])
+        if time_key:
+            self.cb_x.addItem("Time", time_key)
+        if pulse_key and pulse_key != time_key:
+            self.cb_x.addItem("Pulse Number", pulse_key)
+
+        want = (prev_x or "").strip()
+        if _norm_name(want) in time_norms:
+            want = "Time"
+        elif _norm_name(want) in pulse_norms:
+            want = "Pulse Number"
+        if want:
+            self.cb_x.setCurrentText(want)
         self.cb_x.blockSignals(False)
+
+    def _resolve_curve_x_key(self, run: str, x_label: str) -> str:
+        """
+        Resolve a user-facing X label ("Time" / "Pulse Number") to the underlying td_curves.x_name key.
+
+        Supports older caches where X keys were stored as variants like "time_s" / "cycle".
+        """
+        if not self._db_path:
+            return str(x_label or "").strip()
+        run_name = str(run or "").strip()
+        label = str(x_label or "").strip()
+        if not run_name or not label:
+            return label
+
+        def _norm_name(s: str) -> str:
+            return "".join(ch.lower() for ch in str(s or "") if ch.isalnum())
+
+        time_norms = {_norm_name(x) for x in ("time", "time_s", "time(sec)", "time(s)", "time (s)", "time_sec", "times")}
+        pulse_norms = {_norm_name(x) for x in ("pulse number", "pulse#", "pulse #", "pulse_number", "pulsenumber", "cycle")}
+
+        try:
+            xs = be.td_list_x_columns(self._db_path, run_name)  # type: ignore[arg-type]
+        except Exception:
+            xs = []
+        xs = [str(x or "").strip() for x in (xs or []) if str(x or "").strip()]
+        if label in xs:
+            return label
+
+        by_norm: dict[str, str] = {}
+        for x in xs:
+            n = _norm_name(x)
+            if n and n not in by_norm:
+                by_norm[n] = x
+
+        n = _norm_name(label)
+        if n == _norm_name("excel_row"):
+            for pref in ("Time", "Time (s)", "Time(s)", "time_s", "time"):
+                v = by_norm.get(_norm_name(pref))
+                if v:
+                    return v
+            for pref in ("Pulse Number", "Pulse #", "cycle", "Cycle", "pulse_number", "pulsenumber"):
+                v = by_norm.get(_norm_name(pref))
+                if v:
+                    return v
+        if n in time_norms:
+            for pref in ("Time", "Time (s)", "Time(s)", "time_s", "time"):
+                v = by_norm.get(_norm_name(pref))
+                if v:
+                    return v
+        if n in pulse_norms:
+            for pref in ("Pulse Number", "Pulse #", "cycle", "Cycle", "pulse_number", "pulsenumber"):
+                v = by_norm.get(_norm_name(pref))
+                if v:
+                    return v
+        return label
 
     def _apply_serial_filter(self) -> None:
         needle = (self.ed_filter_serials.text() or "").strip().lower()
@@ -3303,8 +3414,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         if not self._plot_ready or not self._db_path:
             return
         run = (self.cb_run.currentText() or "").strip()
-        stat = (self.cb_stat.currentText() or "").strip().lower()
-        if not run or not stat:
+        stats = [it.text().strip().lower() for it in self.list_stats.selectedItems()] if hasattr(self, "list_stats") else []
+        stats = [s for s in stats if s]
+        if not run or not stats:
             return
         y_cols = [it.text().strip() for it in self.list_y_metrics.selectedItems()] if hasattr(self, "list_y_metrics") else []
         y_cols = [c for c in y_cols if c]
@@ -3321,31 +3433,38 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.information(self, "Plot Metrics", "No serial numbers available.")
             return
 
+        stats_label = "/".join(stats)
+        y_label = stats[0] if len(stats) == 1 else "Metric value"
         self._axes.clear()
-        self._axes.set_title(f"{run} — {stat}")
+        self._axes.set_title(f"{run} — {stats_label}")
         self._axes.set_xlabel("Serial Number")
-        self._axes.set_ylabel(stat)
+        self._axes.set_ylabel(y_label)
         x = list(range(len(labels)))
         any_plotted = False
         for y_col in y_cols:
-            try:
-                series = be.td_load_metric_series(self._db_path, run, y_col, stat)
-            except Exception:
-                series = []
-            vmap = {str(r.get("serial") or "").strip(): r.get("value_num") for r in series if str(r.get("serial") or "").strip()}
-            y = [
-                (float(vmap.get(sn)) if isinstance(vmap.get(sn), (int, float)) else float("nan"))
-                for sn in labels
-            ]
-            try:
-                line = self._axes.plot(x, y, marker="o", linewidth=1.4, label=f"{y_col}.{stat}")[0]
-                # Highlight the chosen serial with a larger marker (per series).
-                if self._highlight_sn and self._highlight_sn in labels:
-                    idx = labels.index(self._highlight_sn)
-                    self._axes.plot([x[idx]], [y[idx]], marker="o", markersize=9, color=line.get_color())
-                any_plotted = True
-            except Exception:
-                continue
+            for stat in stats:
+                try:
+                    series = be.td_load_metric_series(self._db_path, run, y_col, stat)
+                except Exception:
+                    series = []
+                vmap = {
+                    str(r.get("serial") or "").strip(): r.get("value_num")
+                    for r in series
+                    if str(r.get("serial") or "").strip()
+                }
+                y = [
+                    (float(vmap.get(sn)) if isinstance(vmap.get(sn), (int, float)) else float("nan"))
+                    for sn in labels
+                ]
+                try:
+                    line = self._axes.plot(x, y, marker="o", linewidth=1.4, label=f"{y_col}.{stat}")[0]
+                    # Highlight the chosen serial with a larger marker (per series).
+                    if self._highlight_sn and self._highlight_sn in labels:
+                        idx = labels.index(self._highlight_sn)
+                        self._axes.plot([x[idx]], [y[idx]], marker="o", markersize=9, color=line.get_color())
+                    any_plotted = True
+                except Exception:
+                    continue
         if not any_plotted:
             QtWidgets.QMessageBox.information(self, "Plot Metrics", "No metric values found for this selection.")
             return
@@ -3365,7 +3484,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         except Exception:
             pass
         self.btn_save_plot_pdf.setEnabled(True)
-        self._last_plot_def = {"mode": "metrics", "run": run, "stat": stat, "y": list(y_cols)}
+        self._last_plot_def = {"mode": "metrics", "run": run, "stats": list(stats), "y": list(y_cols)}
         self.btn_add_auto_plot.setEnabled(True)
         # Keep table compact: preview first selected Y column (and highlight).
         self._refresh_stats_preview()
@@ -3375,8 +3494,17 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             return
         run = (self.cb_run.currentText() or "").strip()
         y_col = (self.cb_y_curve.currentText() or "").strip() if hasattr(self, "cb_y_curve") else ""
-        x_col = (self.cb_x.currentText() or "").strip()
-        if not run or not y_col or not x_col:
+        x_label = (self.cb_x.currentText() or "").strip()
+        x_key = self.cb_x.currentData()
+        x_col = (str(x_key or "") or x_label).strip()
+        if not run or not y_col:
+            return
+        if not x_col:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Plot Curves",
+                "No valid X column found.\n\nOnly Time / Pulse Number are supported for the X-axis (never excel_row).",
+            )
             return
         try:
             # Always plot all serials.
@@ -3390,8 +3518,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             return
 
         self._axes.clear()
-        self._axes.set_title(f"{run} — {y_col} vs {x_col}")
-        self._axes.set_xlabel(x_col)
+        self._axes.set_title(f"{run} — {y_col} vs {x_label or x_col}")
+        self._axes.set_xlabel(x_label or x_col)
         self._axes.set_ylabel(y_col)
         for s in curves:
             sn = str(s.get("serial") or "").strip()
@@ -3424,7 +3552,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         except Exception:
             pass
         self.btn_save_plot_pdf.setEnabled(True)
-        self._last_plot_def = {"mode": "curves", "run": run, "x": x_col, "y": [y_col]}
+        self._last_plot_def = {"mode": "curves", "run": run, "x": (x_label or x_col), "y": [y_col]}
         self.btn_add_auto_plot.setEnabled(True)
         self._populate_stats_table(run, y_col, self._highlight_sn)
 
@@ -3470,8 +3598,18 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     name = f"Curves: {run} {y} vs {x}".strip()
                 else:
                     y = ", ".join([str(x) for x in (d.get("y") or []) if str(x).strip()])
-                    st = str(d.get("stat") or "").strip()
-                    name = f"Metrics: {run} {st} ({y})".strip()
+                    stats_val = d.get("stats")
+                    stats = (
+                        [str(x).strip() for x in stats_val if str(x).strip()]
+                        if isinstance(stats_val, list)
+                        else []
+                    )
+                    if not stats:
+                        st = str(d.get("stat") or "").strip()
+                        if st:
+                            stats = [st]
+                    stats_label = "/".join(stats) if stats else "mean"
+                    name = f"Metrics: {run} {stats_label} ({y})".strip()
             item = QtWidgets.QListWidgetItem(name or "Auto-Plot")
             item.setData(QtCore.Qt.ItemDataRole.UserRole, d)
             self.list_auto_plots.addItem(item)
@@ -3482,6 +3620,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         has = bool(selected)
         if hasattr(self, "btn_open_auto"):
             self.btn_open_auto.setEnabled(has and self._plot_ready and bool(self._db_path))
+        if hasattr(self, "btn_open_all_auto"):
+            self.btn_open_all_auto.setEnabled(bool(self._auto_plots) and self._plot_ready and bool(self._db_path))
         if hasattr(self, "btn_delete_auto"):
             self.btn_delete_auto.setEnabled(has)
         if hasattr(self, "btn_save_all_auto"):
@@ -3500,8 +3640,18 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             else:
                 run = str(d.get("run") or "").strip()
                 y = ", ".join([str(x) for x in (d.get("y") or []) if str(x).strip()])
-                st = str(d.get("stat") or "").strip()
-                d["name"] = f"Metrics: {run} {st} ({y})".strip()
+                stats_val = d.get("stats")
+                stats = (
+                    [str(x).strip() for x in stats_val if str(x).strip()]
+                    if isinstance(stats_val, list)
+                    else []
+                )
+                if not stats:
+                    st = str(d.get("stat") or "").strip()
+                    if st:
+                        stats = [st]
+                stats_label = "/".join(stats) if stats else "mean"
+                d["name"] = f"Metrics: {run} {stats_label} ({y})".strip()
         self._auto_plots.append(d)
         try:
             self._auto_plot_path.write_text(json.dumps(self._auto_plots, indent=2), encoding="utf-8")
@@ -3532,12 +3682,38 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 self.cb_y_curve.setCurrentText(str(ys[0]))
             x = str(d.get("x") or "").strip()
             if x:
-                self.cb_x.setCurrentText(x)
+                def _norm_name(s: str) -> str:
+                    return "".join(ch.lower() for ch in str(s or "") if ch.isalnum())
+
+                time_norms = {_norm_name(v) for v in ("time", "time_s", "time(sec)", "time(s)", "time (s)", "time_sec", "times")}
+                pulse_norms = {_norm_name(v) for v in ("pulse number", "pulse#", "pulse #", "pulse_number", "pulsenumber", "cycle")}
+                want = x
+                if _norm_name(want) in time_norms:
+                    want = "Time"
+                elif _norm_name(want) in pulse_norms:
+                    want = "Pulse Number"
+                self.cb_x.setCurrentText(want)
             self._plot_curves()
         else:
-            st = str(d.get("stat") or "").strip()
-            if st:
-                self.cb_stat.setCurrentText(st)
+            stats_val = d.get("stats")
+            stats = (
+                [str(x).strip().lower() for x in stats_val if str(x).strip()]
+                if isinstance(stats_val, list)
+                else []
+            )
+            if not stats:
+                st = str(d.get("stat") or "").strip().lower()
+                if st:
+                    stats = [st]
+            if not stats:
+                stats = ["mean"]
+            want_stats = {s for s in stats if s}
+            if want_stats and hasattr(self, "list_stats"):
+                self.list_stats.clearSelection()
+                for i in range(self.list_stats.count()):
+                    it = self.list_stats.item(i)
+                    if it.text().strip().lower() in want_stats:
+                        it.setSelected(True)
             ys = d.get("y") or []
             want = {str(x).strip() for x in ys if str(x).strip()} if isinstance(ys, list) else set()
             if want and hasattr(self, "list_y_metrics"):
@@ -3547,6 +3723,99 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     if it.text() in want:
                         it.setSelected(True)
             self._plot_metrics()
+
+    def _open_all_auto_plots_panel(self) -> None:
+        if not self._plot_ready or not self._db_path:
+            QtWidgets.QMessageBox.information(self, "Auto-Plots", "Plotting is unavailable.")
+            return
+        if not self._auto_plots:
+            QtWidgets.QMessageBox.information(self, "Auto-Plots", "No auto-plots available.")
+            return
+
+        plots: list[tuple[str, dict]] = []
+        for d in self._auto_plots:
+            if not isinstance(d, dict):
+                continue
+            name = str(d.get("name") or "").strip()
+            if not name:
+                mode = str(d.get("mode") or "").strip()
+                run = str(d.get("run") or "").strip()
+                if mode == "curves":
+                    y = ", ".join([str(x) for x in (d.get("y") or []) if str(x).strip()])
+                    x = str(d.get("x") or "").strip()
+                    name = f"Curves: {run} {y} vs {x}".strip()
+                else:
+                    y = ", ".join([str(x) for x in (d.get("y") or []) if str(x).strip()])
+                    stats_val = d.get("stats")
+                    stats = (
+                        [str(x).strip() for x in stats_val if str(x).strip()]
+                        if isinstance(stats_val, list)
+                        else []
+                    )
+                    if not stats:
+                        st = str(d.get("stat") or "").strip()
+                        if st:
+                            stats = [st]
+                    stats_label = "/".join(stats) if stats else "mean"
+                    name = f"Metrics: {run} {stats_label} ({y})".strip()
+            plots.append((name or "Auto Plot", d))
+
+        if not plots:
+            QtWidgets.QMessageBox.information(self, "Auto-Plots", "No auto-plots available.")
+            return
+
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Auto-Plots")
+        dlg.resize(980, 720)
+        dlg.setStyleSheet(
+            """
+            QDialog { background: #ffffff; color: #1f2937; }
+            QLabel { color: #1f2937; }
+            QTabWidget::pane { border: 1px solid #e2e8f0; }
+            QTabBar::tab {
+                background: #f8fafc;
+                border: 1px solid #e2e8f0;
+                color: #0f172a;
+                padding: 6px 10px;
+                margin-right: 4px;
+            }
+            QTabBar::tab:selected {
+                background: #ffffff;
+                color: #0f172a;
+                border-bottom-color: #ffffff;
+            }
+            """
+        )
+        layout = QtWidgets.QVBoxLayout(dlg)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
+        tabs = QtWidgets.QTabWidget()
+        layout.addWidget(tabs, 1)
+
+        try:
+            from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(dlg, "Auto-Plots", f"Plotting unavailable: {exc}")
+            return
+
+        for name, d in plots:
+            tab = QtWidgets.QWidget()
+            tab_layout = QtWidgets.QVBoxLayout(tab)
+            tab_layout.setContentsMargins(8, 8, 8, 8)
+            fig = self._render_plot_def_to_figure(d)
+            canvas = FigureCanvas(fig)
+            tab_layout.addWidget(canvas, 1)
+            tabs.addTab(tab, name or "Auto Plot")
+
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_row.addStretch(1)
+        btn_close = QtWidgets.QPushButton("Close")
+        btn_close.clicked.connect(dlg.accept)
+        btn_row.addWidget(btn_close)
+        layout.addLayout(btn_row)
+
+        dlg.exec()
 
     def _delete_selected_auto_plots(self) -> None:
         items = self.list_auto_plots.selectedItems() if hasattr(self, "list_auto_plots") else []
@@ -3578,9 +3847,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         if mode == "curves":
             ys = d.get("y") or []
             y = str(ys[0] if isinstance(ys, list) and ys else "").strip()
-            x = str(d.get("x") or "").strip()
-            ax.set_title(str(d.get("name") or "") or f"{run} — {y} vs {x}")
-            ax.set_xlabel(x)
+            x_label = str(d.get("x") or "").strip()
+            x = self._resolve_curve_x_key(run, x_label)
+            ax.set_title(str(d.get("name") or "") or f"{run} — {y} vs {x_label or x}")
+            ax.set_xlabel(x_label or x)
             ax.set_ylabel(y)
             curves = be.td_load_curves(self._db_path, run, y, x, serials=None)  # type: ignore[arg-type]
             for s in curves:
@@ -3593,19 +3863,39 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             ax.grid(True, alpha=0.25)
             ax.legend(fontsize=8, loc="best")
         else:
-            stat = str(d.get("stat") or "").strip().lower()
+            stats_val = d.get("stats")
+            stats = (
+                [str(x).strip().lower() for x in stats_val if str(x).strip()]
+                if isinstance(stats_val, list)
+                else []
+            )
+            if not stats:
+                st = str(d.get("stat") or "").strip().lower()
+                if st:
+                    stats = [st]
+            if not stats:
+                stats = ["mean"]
+            stats_label = "/".join(stats)
             ys = d.get("y") or []
             y_cols = [str(x).strip() for x in ys] if isinstance(ys, list) else []
-            ax.set_title(str(d.get("name") or "") or f"{run} — {stat}")
+            ax.set_title(str(d.get("name") or "") or f"{run} — {stats_label}")
             ax.set_xlabel("Serial Number")
-            ax.set_ylabel(stat)
+            ax.set_ylabel(stats[0] if len(stats) == 1 else "Metric value")
             labels = be.td_list_serials(self._db_path)  # type: ignore[arg-type]
             x_idx = list(range(len(labels)))
             for y_col in y_cols:
-                series = be.td_load_metric_series(self._db_path, run, y_col, stat)  # type: ignore[arg-type]
-                vmap = {str(r.get("serial") or "").strip(): r.get("value_num") for r in series if str(r.get("serial") or "").strip()}
-                yv = [(float(vmap.get(sn)) if isinstance(vmap.get(sn), (int, float)) else float("nan")) for sn in labels]
-                ax.plot(x_idx, yv, marker="o", linewidth=1.2, label=f"{y_col}.{stat}")
+                for stat in stats:
+                    series = be.td_load_metric_series(self._db_path, run, y_col, stat)  # type: ignore[arg-type]
+                    vmap = {
+                        str(r.get("serial") or "").strip(): r.get("value_num")
+                        for r in series
+                        if str(r.get("serial") or "").strip()
+                    }
+                    yv = [
+                        (float(vmap.get(sn)) if isinstance(vmap.get(sn), (int, float)) else float("nan"))
+                        for sn in labels
+                    ]
+                    ax.plot(x_idx, yv, marker="o", linewidth=1.2, label=f"{y_col}.{stat}")
             ax.set_xticks(x_idx)
             ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
             ax.grid(True, alpha=0.25)

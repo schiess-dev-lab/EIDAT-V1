@@ -4,7 +4,9 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -127,6 +129,22 @@ def _run_manager(
         except Exception:
             pass
 
+    return _run_subprocess_json(argv, env=env, cmd=cmd, on_log=on_log)
+
+def _run_subprocess_json(
+    argv: list[str],
+    *,
+    env: dict[str, str],
+    cmd: str,
+    on_log: Callable[[str], None] | None = None,
+) -> dict[str, object]:
+    """
+    Run a subprocess that emits JSON to stdout, while streaming stderr lines to `on_log`.
+
+    NOTE: On Windows, reading stderr to completion before draining stdout can deadlock
+    if the child writes enough data to fill the stdout pipe buffer. We must drain both
+    pipes concurrently.
+    """
     proc = subprocess.Popen(
         argv,
         stdout=subprocess.PIPE,
@@ -136,26 +154,36 @@ def _run_manager(
         env=env,
     )
 
-    stderr_lines: list[str] = []
-    try:
-        if proc.stderr is not None:
+    stderr_lines: deque[str] = deque(maxlen=5000)
+
+    def _drain_stderr() -> None:
+        try:
+            if proc.stderr is None:
+                return
             for line in proc.stderr:
                 s = str(line or "").rstrip("\n")
-                if s:
-                    stderr_lines.append(s)
-                    if on_log is not None:
-                        on_log(s)
-    finally:
-        try:
-            if proc.stderr is not None:
-                proc.stderr.close()
+                if not s:
+                    continue
+                stderr_lines.append(s)
+                if on_log is not None:
+                    on_log(s)
         except Exception:
-            pass
+            # Best-effort logging only.
+            return
+        finally:
+            try:
+                if proc.stderr is not None:
+                    proc.stderr.close()
+            except Exception:
+                pass
+
+    t = threading.Thread(target=_drain_stderr, name="eidat-admin-runner-stderr", daemon=True)
+    t.start()
 
     out = ""
     try:
         if proc.stdout is not None:
-            out = (proc.stdout.read() or "").strip()
+            out = proc.stdout.read() or ""
     finally:
         try:
             if proc.stdout is not None:
@@ -164,8 +192,14 @@ def _run_manager(
             pass
 
     rc = int(proc.wait() or 0)
+    try:
+        t.join(timeout=2.0)
+    except Exception:
+        pass
+
+    out = (out or "").strip()
     if rc != 0:
-        err = ("\n".join(stderr_lines) or out or "").strip()
+        err = ("\n".join(list(stderr_lines)) or out or "").strip()
         raise RuntimeError(err or f"{cmd} failed with exit code {rc}")
     try:
         payload = json.loads(out) if out else {}

@@ -207,7 +207,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         raise SystemExit(f"Unknown command: {args.cmd}")
 
-    sys.stdout.write(json.dumps(payload, indent=2))
+    sys.stdout.write(json.dumps(payload, separators=(",", ":")))
     sys.stdout.write("\n")
     return 0
 
