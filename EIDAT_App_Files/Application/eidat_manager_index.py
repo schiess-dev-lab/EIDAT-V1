@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS documents (
   artifacts_rel TEXT,
   program_title TEXT,
   asset_type TEXT,
+  asset_specific_type TEXT,
   serial_number TEXT,
   part_number TEXT,
   revision TEXT,
@@ -76,8 +77,19 @@ def _load_program_title_candidates() -> list[str]:
                 continue
             data = json.loads(cand_path.read_text(encoding="utf-8"))
             if isinstance(data, dict):
-                titles = data.get("program_titles") or []
-                return [str(t).strip() for t in titles if str(t).strip()]
+                raw = data.get("program_titles") or []
+                if not isinstance(raw, list):
+                    return []
+                out: list[str] = []
+                for item in raw:
+                    if isinstance(item, str) and item.strip():
+                        out.append(item.strip())
+                        continue
+                    if isinstance(item, dict):
+                        name = str(item.get("name") or "").strip()
+                        if name:
+                            out.append(name)
+                return [t for t in out if t]
     except Exception:
         pass
     return []
@@ -332,6 +344,7 @@ def build_index(paths: SupportPaths, *, similarity: float = 0.86) -> IndexSummar
                 "artifacts_rel": artifacts_rel,
                 "program_title": meta.get("program_title"),
                 "asset_type": meta.get("asset_type"),
+                "asset_specific_type": meta.get("asset_specific_type"),
                 "serial_number": meta.get("serial_number"),
                 "part_number": meta.get("part_number"),
                 "revision": meta.get("revision"),
@@ -363,6 +376,7 @@ def build_index(paths: SupportPaths, *, similarity: float = 0.86) -> IndexSummar
             ("document_type_acronym", "TEXT"),
             ("vendor", "TEXT"),
             ("acceptance_test_plan_number", "TEXT"),
+            ("asset_specific_type", "TEXT"),
             ("excel_sqlite_rel", "TEXT"),
             ("file_extension", "TEXT"),
         ]
@@ -377,18 +391,19 @@ def build_index(paths: SupportPaths, *, similarity: float = 0.86) -> IndexSummar
             conn.execute(
                 """
                 INSERT INTO documents(
-                  metadata_rel, artifacts_rel, program_title, asset_type,
+                  metadata_rel, artifacts_rel, program_title, asset_type, asset_specific_type,
                   serial_number, part_number, revision, test_date, report_date, document_type,
                   document_type_acronym, vendor, acceptance_test_plan_number,
                   excel_sqlite_rel, file_extension, title_norm, similarity_group, indexed_epoch_ns,
                   certification_status, certification_pass_rate
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     d["metadata_rel"],
                     d["artifacts_rel"],
                     d["program_title"],
                     d["asset_type"],
+                    d.get("asset_specific_type"),
                     d["serial_number"],
                     d["part_number"],
                     d["revision"],

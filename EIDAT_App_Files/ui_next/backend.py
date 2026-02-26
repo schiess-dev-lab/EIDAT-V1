@@ -4707,6 +4707,7 @@ _CONTINUED_POPULATION_FIELDS: dict[str, tuple[str, ...]] = {
     ),
     "vendor": ("vendor", "vendors", "vendor_name", "vendorname"),
     "asset_type": ("asset", "asset_type", "assettype", "asset_types", "assettypes"),
+    "asset_specific_type": ("asset_specific", "asset_specific_type", "assetspecifictype", "asset_model", "model"),
 }
 
 
@@ -4779,9 +4780,10 @@ def _format_continued_population_description(rules: Mapping[str, Iterable[str]])
         "acceptance_test_plan_number": "Acceptance Test Plan",
         "vendor": "Vendor",
         "asset_type": "Asset Type",
+        "asset_specific_type": "Asset Specific Type",
     }
     parts: list[str] = []
-    for key in ("program_title", "part_number", "acceptance_test_plan_number", "vendor", "asset_type"):
+    for key in ("program_title", "part_number", "acceptance_test_plan_number", "vendor", "asset_type", "asset_specific_type"):
         raw_vals = rules.get(key) if isinstance(rules, Mapping) else None
         if not raw_vals:
             continue
@@ -5231,6 +5233,7 @@ def _sync_project_workbook_metadata_inplace(
     meta_field_map = {
         _normalize_text("Program"): "program_title",
         _normalize_text("Asset Type"): "asset_type",
+        _normalize_text("Asset Specific Type"): "asset_specific_type",
         _normalize_text("Vendor"): "vendor",
         _normalize_text("Acceptance Test Plan"): "acceptance_test_plan_number",
         _normalize_text("Part Number"): "part_number",
@@ -5465,6 +5468,43 @@ def _iter_doc_type_entries(raw: object) -> list[dict]:
     return out
 
 
+def _iter_named_alias_entries(raw: object) -> list[dict]:
+    """
+    Normalize allowlist entries that may be:
+      - list[str]
+      - list[{"name": str, "aliases": [str, ...]}]
+
+    Output entries:
+      {"name": <canonical>, "aliases": [<alias1>, ...]}
+    """
+    if not isinstance(raw, list):
+        return []
+    out: list[dict] = []
+    for item in raw:
+        if isinstance(item, str) and item.strip():
+            s = item.strip()
+            out.append({"name": s, "aliases": [s]})
+            continue
+        if not isinstance(item, Mapping):
+            continue
+        name = str(item.get("name") or "").strip()
+        aliases_raw = item.get("aliases")
+        aliases: list[str] = []
+        if isinstance(aliases_raw, list):
+            aliases = [str(a).strip() for a in aliases_raw if str(a).strip()]
+        if name and name not in aliases:
+            aliases.append(name)
+        if not name and aliases:
+            name = aliases[0]
+        if name:
+            out.append({"name": name, "aliases": aliases})
+    return out
+
+
+def _canonical_names(raw: object) -> list[str]:
+    return [str(e.get("name") or "").strip() for e in _iter_named_alias_entries(raw) if str(e.get("name") or "").strip()]
+
+
 @lru_cache(maxsize=1)
 def _doc_type_entries_from_candidates() -> list[dict]:
     cand = _load_metadata_candidates()
@@ -5553,66 +5593,40 @@ def _build_validation_lists(docs: Iterable[Mapping[str, object]], *, extra_meta:
     meta_list = list(extra_meta or [])
     cand = _load_metadata_candidates()
 
-    cand_program_titles = cand.get("program_titles") if isinstance(cand, dict) else []
-    cand_asset_types = cand.get("asset_types") if isinstance(cand, dict) else []
-    cand_vendors = cand.get("vendors") if isinstance(cand, dict) else []
-    cand_part_numbers = cand.get("part_numbers") if isinstance(cand, dict) else []
-    cand_atp_numbers = cand.get("acceptance_test_plan_numbers") if isinstance(cand, dict) else []
+    # Strict allowlists: dropdowns come only from allowlists (not extracted values).
+    cand_program_titles = _canonical_names(cand.get("program_titles") if isinstance(cand, dict) else [])
+    cand_asset_types = _canonical_names(cand.get("asset_types") if isinstance(cand, dict) else [])
+    cand_asset_specific_types = _canonical_names(cand.get("asset_specific_types") if isinstance(cand, dict) else [])
+    cand_vendors = _canonical_names(cand.get("vendors") if isinstance(cand, dict) else [])
+    cand_part_numbers = _canonical_names(cand.get("part_numbers") if isinstance(cand, dict) else [])
+    cand_atp_numbers = _canonical_names(cand.get("acceptance_test_plan_numbers") if isinstance(cand, dict) else [])
 
-    cand_doc_types_raw = cand.get("document_types") if isinstance(cand, dict) else []
-    cand_doc_type_names: list[object] = []
-    cand_doc_type_acronyms: list[object] = []
-    if isinstance(cand_doc_types_raw, list):
-        for entry in cand_doc_types_raw:
-            if isinstance(entry, str):
-                # Treat as a document type name.
-                cand_doc_type_names.append(entry)
-                continue
-            if isinstance(entry, Mapping):
-                cand_doc_type_names.append(entry.get("name"))
-                cand_doc_type_acronyms.append(entry.get("acronym"))
-                # Keep aliases as a fallback so older metadata remains selectable.
-                aliases = entry.get("aliases")
-                if isinstance(aliases, list):
-                    cand_doc_type_names.extend(aliases)
-                continue
+    # Document types: use canonical stored values (acronym when present) and canonical acronyms.
+    doc_entries = _iter_doc_type_entries(cand.get("document_types") if isinstance(cand, dict) else [])
+    cand_doc_types: list[str] = []
+    cand_doc_acronyms: list[str] = []
+    for e in doc_entries:
+        name = str(e.get("name") or "").strip()
+        acr = str(e.get("acronym") or "").strip()
+        stored = (acr or name).strip()
+        if stored:
+            cand_doc_types.append(stored)
+        if acr:
+            cand_doc_acronyms.append(acr)
+        elif stored:
+            cand_doc_acronyms.append(stored)
 
     return {
-        "program_title": _collect_unique_nonempty(
-            [d.get("program_title") for d in docs_list]
-            + [m.get("program_title") for m in meta_list]
-            + (cand_program_titles if isinstance(cand_program_titles, list) else [])
-        ),
-        "asset_type": _collect_unique_nonempty(
-            [d.get("asset_type") for d in docs_list]
-            + [m.get("asset_type") for m in meta_list]
-            + (cand_asset_types if isinstance(cand_asset_types, list) else [])
-        ),
-        "vendor": _collect_unique_nonempty(
-            [d.get("vendor") for d in docs_list]
-            + [m.get("vendor") for m in meta_list]
-            + (cand_vendors if isinstance(cand_vendors, list) else [])
-        ),
-        # Strict allowlists: do not union in arbitrary extracted values.
-        "acceptance_test_plan_number": _collect_unique_nonempty(
-            (cand_atp_numbers if isinstance(cand_atp_numbers, list) else [])
-        ),
-        "part_number": _collect_unique_nonempty(
-            (cand_part_numbers if isinstance(cand_part_numbers, list) else [])
-        ),
-        "document_type": _collect_unique_nonempty(
-            [d.get("document_type") for d in docs_list]
-            + [m.get("document_type") for m in meta_list]
-            + cand_doc_type_names
-        ),
-        "document_type_acronym": _collect_unique_nonempty(
-            [d.get("document_type_acronym") for d in docs_list]
-            + [m.get("document_type_acronym") for m in meta_list]
-            + cand_doc_type_acronyms
-        ),
+        "program_title": _collect_unique_nonempty(cand_program_titles),
+        "asset_type": _collect_unique_nonempty(cand_asset_types),
+        "asset_specific_type": _collect_unique_nonempty(cand_asset_specific_types),
+        "vendor": _collect_unique_nonempty(cand_vendors),
+        "acceptance_test_plan_number": _collect_unique_nonempty(cand_atp_numbers),
+        "part_number": _collect_unique_nonempty(cand_part_numbers),
+        "document_type": _collect_unique_nonempty(cand_doc_types),
+        "document_type_acronym": _collect_unique_nonempty(cand_doc_acronyms),
         "similarity_group": _collect_unique_nonempty(
-            [d.get("similarity_group") for d in docs_list]
-            + [m.get("similarity_group") for m in meta_list]
+            [d.get("similarity_group") for d in docs_list] + [m.get("similarity_group") for m in meta_list]
         ),
     }
 
@@ -5644,6 +5658,7 @@ def _write_validation_sheet(ws, lists: dict[str, list[str]]) -> dict[str, str]:
     cols: list[tuple[str, str]] = [
         ("Program", "program_title"),
         ("Asset Type", "asset_type"),
+        ("Asset Specific Type", "asset_specific_type"),
         ("Vendor", "vendor"),
         ("Acceptance Test Plan", "acceptance_test_plan_number"),
         ("Part Number", "part_number"),
@@ -5746,6 +5761,7 @@ def _ensure_project_metadata_validations(
             for term, key in (
                 ("Program", "program_title"),
                 ("Asset Type", "asset_type"),
+                ("Asset Specific Type", "asset_specific_type"),
                 ("Vendor", "vendor"),
                 ("Acceptance Test Plan", "acceptance_test_plan_number"),
                 ("Part Number", "part_number"),
@@ -5782,6 +5798,7 @@ def _ensure_project_metadata_validations(
         for header, key in (
             ("Program", "program_title"),
             ("Asset Type", "asset_type"),
+            ("Asset Specific Type", "asset_specific_type"),
             ("Vendor", "vendor"),
             ("Acceptance Test Plan", "acceptance_test_plan_number"),
             ("Part Number", "part_number"),
@@ -6750,6 +6767,7 @@ def update_eidp_trending_project_workbook(
         meta_field_map = {
             _normalize_text("Program"): "program_title",
             _normalize_text("Asset Type"): "asset_type",
+            _normalize_text("Asset Specific Type"): "asset_specific_type",
             _normalize_text("Vendor"): "vendor",
             _normalize_text("Acceptance Test Plan"): "acceptance_test_plan_number",
             _normalize_text("Part Number"): "part_number",
@@ -8766,6 +8784,7 @@ def _write_eidp_trending_workbook(
         metadata_fields = [
             ("Program", "program_title", "Program"),
             ("Asset Type", "asset_type", "Asset Type"),
+            ("Asset Specific Type", "asset_specific_type", "Asset Specific Type"),
             ("Vendor", "vendor", "Vendor"),
             ("Acceptance Test Plan", "acceptance_test_plan_number", "Acceptance Test Plan"),
             ("Part Number", "part_number", "Part Number"),
@@ -8803,6 +8822,7 @@ def _write_eidp_trending_workbook(
         "Serial Number",
         "Program",
         "Asset Type",
+        "Asset Specific Type",
         "Vendor",
         "Acceptance Test Plan",
         "Part Number",
@@ -8828,6 +8848,7 @@ def _write_eidp_trending_workbook(
                 sn_clean,
                 str(doc.get("program_title") or ""),
                 str(doc.get("asset_type") or ""),
+                str(doc.get("asset_specific_type") or ""),
                 str(doc.get("vendor") or ""),
                 str(doc.get("acceptance_test_plan_number") or ""),
                 str(doc.get("part_number") or ""),
@@ -8930,6 +8951,7 @@ def _write_eidp_raw_trending_workbook(
         metadata_fields = [
             ("Program", "program_title", "Program"),
             ("Asset Type", "asset_type", "Asset Type"),
+            ("Asset Specific Type", "asset_specific_type", "Asset Specific Type"),
             ("Vendor", "vendor", "Vendor"),
             ("Acceptance Test Plan", "acceptance_test_plan_number", "Acceptance Test Plan"),
             ("Part Number", "part_number", "Part Number"),

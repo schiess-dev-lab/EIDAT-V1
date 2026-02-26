@@ -11,6 +11,7 @@ REMOVED_KEYS = {"valve", "test_setup", "files", "operator", "facility", "program
 ALLOWED_KEYS = {
     "program_title",
     "asset_type",
+    "asset_specific_type",
     "serial_number",
     "part_number",
     "revision",
@@ -28,6 +29,7 @@ DEFAULT_CANDIDATES = {
     "program_titles": [],
     "part_numbers": [],
     "acceptance_test_plan_numbers": [],
+    "asset_specific_types": [],
     "vendors": [],
     "asset_types": [
         "Valve",
@@ -52,12 +54,17 @@ DEFAULT_CANDIDATES = {
         "Structure",
     ],
     # Back-compat: this can be a list[str] or list[{"name","acronym","aliases"}]
-    "document_types": ["EIDP", "Excel file data"],
+    "document_types": [
+        {"name": "End Item Data Package", "acronym": "EIDP", "aliases": ["EIDP", "End Item Data Package", "End-Item Data Package"]},
+        {"name": "Data file", "acronym": "DATA", "aliases": ["DATA", "Data file", "Excel file data", "Spreadsheet", "Excel"]},
+        {"name": "Test Data", "acronym": "TD", "aliases": ["TD", "Test Data", "Test-Data", "TestData"]},
+    ],
 }
 
 LABEL_ALIASES = {
     "program_title": ["program title", "program name"],
     "asset_type": ["asset type", "component type", "component", "asset"],
+    "asset_specific_type": ["asset specific type", "asset model", "model", "valve model", "pump model", "actuator model"],
     "serial_number": ["serial number", "serial no", "serial #", "serial"],
     "part_number": ["part number", "part no", "part no.", "part #", "p/n", "pn", "par tno", "par t no", "par tno."],
     "revision": ["revision", "rev"],
@@ -205,55 +212,309 @@ def _norm_alnum_spaces(value: object) -> str:
     return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
 
 
-def _best_allowlist_match(blob: str, allowlist: list[str]) -> str | None:
+def _iter_named_alias_entries(raw: object) -> list[dict]:
     """
-    Return the best allowlist entry that appears in `blob` under normalized matching:
-      - case-insensitive
-      - non-alnum collapsed to spaces
-      - whole-token boundary match in normalized space-separated text
-      - pick the longest matching allowlist entry (by normalized length)
+    Normalize allowlist entries that may be:
+      - list[str]
+      - list[{"name": str, "aliases": [str, ...]}]
 
-    Returns the *canonical* allowlist entry string.
+    Output entries:
+      {"name": <canonical>, "aliases": [<alias1>, ...]}
     """
-    if not blob or not allowlist:
+    if not isinstance(raw, list):
+        return []
+    out: list[dict] = []
+    for item in raw:
+        if isinstance(item, str) and item.strip():
+            s = item.strip()
+            out.append({"name": s, "aliases": [s]})
+            continue
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        aliases_raw = item.get("aliases")
+        aliases: list[str] = []
+        if isinstance(aliases_raw, list):
+            aliases = [str(a).strip() for a in aliases_raw if str(a).strip()]
+        if name and name not in aliases:
+            aliases.append(name)
+        if not name and aliases:
+            name = aliases[0]
+        if name:
+            out.append({"name": name, "aliases": aliases})
+    return out
+
+
+def _best_named_entry_match_in_blob(blob: str, entries: list[dict]) -> str | None:
+    """
+    Find the best allowlist entry whose alias appears in `blob` using normalized token-boundary matching.
+    Returns the canonical entry name.
+
+    Preference: longest normalized alias contained in the blob.
+    """
+    if not blob or not entries:
         return None
     blob_norm = _norm_alnum_spaces(blob)
     if not blob_norm:
         return None
     blob_pad = f" {blob_norm} "
-    best: tuple[int, str] | None = None  # (norm_len, canonical)
-    for entry in allowlist:
-        canonical = str(entry or "").strip()
+    best: tuple[int, str] | None = None  # (alias_norm_len, canonical_name)
+    for e in entries:
+        canonical = str(e.get("name") or "").strip()
         if not canonical:
             continue
-        entry_norm = _norm_alnum_spaces(canonical)
-        if not entry_norm:
-            continue
-        if f" {entry_norm} " not in blob_pad:
-            continue
-        score = len(entry_norm)
-        if best is None or score > best[0]:
-            best = (score, canonical)
+        aliases = list(e.get("aliases") or [])
+        if canonical not in aliases:
+            aliases.append(canonical)
+        for a in aliases:
+            a_s = str(a or "").strip()
+            if not a_s:
+                continue
+            a_norm = _norm_alnum_spaces(a_s)
+            if not a_norm:
+                continue
+            if f" {a_norm} " not in blob_pad:
+                continue
+            score = len(a_norm)
+            if best is None or score > best[0]:
+                best = (score, canonical)
     return best[1] if best else None
 
 
-def _allowlist_exact_match(value: str, allowlist: list[str]) -> str | None:
+def _infer_named_entry_from_path(path: Optional[Path], entries: list[dict], *, max_levels: int = 5) -> str | None:
     """
-    Exact allowlist match under normalized matching (alnum+spaces, case-insensitive).
-    Returns the canonical allowlist entry string.
+    Walk up parent directories (up to max_levels) and return the first entry whose alias
+    exactly equals a directory name under normalized matching.
     """
-    if not value or not allowlist:
+    if path is None or not entries:
         return None
-    v_norm = _norm_alnum_spaces(value)
-    if not v_norm:
-        return None
-    for entry in allowlist:
-        canonical = str(entry or "").strip()
+
+    alias_norm_to_best: dict[str, tuple[int, str]] = {}  # alias_norm -> (alias_norm_len, canonical)
+    for e in entries:
+        canonical = str(e.get("name") or "").strip()
         if not canonical:
             continue
-        if _norm_alnum_spaces(canonical) == v_norm:
-            return canonical
-    return None
+        aliases = list(e.get("aliases") or [])
+        if canonical not in aliases:
+            aliases.append(canonical)
+        for a in aliases:
+            a_norm = _norm_alnum_spaces(a)
+            if not a_norm:
+                continue
+            # Preserve first-seen canonical when alias norms collide; longest alias is irrelevant for equality match,
+            # but store length so we can pick the most specific if duplicates arise.
+            prev = alias_norm_to_best.get(a_norm)
+            score = len(a_norm)
+            if prev is None or score > prev[0]:
+                alias_norm_to_best[a_norm] = (score, canonical)
+
+    try:
+        cur = Path(path).expanduser().resolve().parent
+    except Exception:
+        cur = Path(path).parent
+
+    best: tuple[int, str] | None = None
+    for _ in range(int(max_levels)):
+        try:
+            dname = str(cur.name or "").strip()
+        except Exception:
+            dname = ""
+        if dname:
+            hit = alias_norm_to_best.get(_norm_alnum_spaces(dname))
+            if hit is not None:
+                if best is None or hit[0] > best[0]:
+                    best = hit
+        try:
+            if cur.parent == cur:
+                break
+            cur = cur.parent
+        except Exception:
+            break
+
+    return best[1] if best else None
+
+
+def _first_pages_blob(lines: list[str], *, pages: int = 3, max_lines: int = 800) -> str:
+    stop_page = int(pages) + 1
+    stop_marker = f"=== Page {stop_page} ==="
+    out: list[str] = []
+    for ln in lines:
+        s = str(ln or "").strip()
+        if s.startswith(stop_marker):
+            break
+        if s:
+            out.append(s)
+        if len(out) >= int(max_lines):
+            break
+    return "\n".join(out)
+
+
+def resolve_strict_field(
+    field: str,
+    *,
+    lines: list[str],
+    pdf_path: Optional[Path],
+    entries: list[dict],
+    label_aliases: dict[str, list[str]],
+    pages: int = 3,
+    max_folder_levels: int = 5,
+) -> str | None:
+    """
+    Strict allowlist resolver:
+      1) document text via label-value (if label aliases exist), then allowlist match inside that value
+      2) document text blob match (pages 1..N)
+      3) filename blob match (stem+name)
+      4) folder walk (exact dir-name match, up to max levels)
+    """
+    if not entries:
+        return None
+
+    # 1) label-value extraction (if configured for this field)
+    aliases = label_aliases.get(field) or []
+    for lbl in aliases:
+        val = _find_label_value(lines, str(lbl))
+        if not val:
+            continue
+        m = _best_named_entry_match_in_blob(val, entries)
+        if m:
+            return m
+
+    # 2) early-pages text blob
+    blob = _first_pages_blob(lines, pages=pages)
+    m = _best_named_entry_match_in_blob(blob, entries)
+    if m:
+        return m
+
+    # 3) filename
+    if pdf_path is not None:
+        try:
+            fn_blob = f"{pdf_path.stem}\n{pdf_path.name}"
+        except Exception:
+            fn_blob = str(pdf_path)
+        m = _best_named_entry_match_in_blob(fn_blob, entries)
+        if m:
+            return m
+
+    # 4) folders
+    return _infer_named_entry_from_path(pdf_path, entries, max_levels=max_folder_levels)
+
+
+def _best_doc_type_match_in_blob(blob: str, entries: list[dict]) -> tuple[str | None, str | None]:
+    """
+    Return (document_type, acronym) for the best-matching doc type entry in blob, using the same
+    normalized token-boundary matching strategy.
+
+    document_type is standardized to acronym when present; otherwise name.
+    """
+    if not blob or not entries:
+        return None, None
+    blob_norm = _norm_alnum_spaces(blob)
+    if not blob_norm:
+        return None, None
+    blob_pad = f" {blob_norm} "
+    best: tuple[int, str, str | None] | None = None  # (alias_len, doc_type, acronym)
+    for e in entries:
+        name = str(e.get("name") or "").strip() or None
+        acr = str(e.get("acronym") or "").strip() or None
+        aliases = list(e.get("aliases") or [])
+        if name:
+            aliases.append(name)
+        if acr:
+            aliases.append(acr)
+        for a in aliases:
+            a_s = str(a or "").strip()
+            if not a_s:
+                continue
+            a_norm = _norm_alnum_spaces(a_s)
+            if not a_norm:
+                continue
+            if f" {a_norm} " not in blob_pad:
+                continue
+            score = len(a_norm)
+            doc_type = (acr or name or "").strip()
+            if not doc_type:
+                continue
+            if best is None or score > best[0]:
+                best = (score, doc_type, acr)
+    if best is None:
+        return None, None
+    doc_type, acr = best[1], best[2]
+    return doc_type, (acr or doc_type)
+
+
+def _infer_doc_type_from_path_strict(path: Optional[Path], entries: list[dict], *, max_levels: int = 5) -> tuple[str | None, str | None]:
+    if path is None or not entries:
+        return None, None
+
+    alias_norm_to_best: dict[str, tuple[int, str, str | None]] = {}  # alias_norm -> (alias_len, doc_type, acronym)
+    for e in entries:
+        name = str(e.get("name") or "").strip() or None
+        acr = str(e.get("acronym") or "").strip() or None
+        aliases = list(e.get("aliases") or [])
+        if name:
+            aliases.append(name)
+        if acr:
+            aliases.append(acr)
+        for a in aliases:
+            a_norm = _norm_alnum_spaces(a)
+            if not a_norm:
+                continue
+            doc_type = (acr or name or "").strip()
+            if not doc_type:
+                continue
+            score = len(a_norm)
+            prev = alias_norm_to_best.get(a_norm)
+            if prev is None or score > prev[0]:
+                alias_norm_to_best[a_norm] = (score, doc_type, acr)
+
+    try:
+        cur = Path(path).expanduser().resolve().parent
+    except Exception:
+        cur = Path(path).parent
+
+    best: tuple[int, str, str | None] | None = None
+    for _ in range(int(max_levels)):
+        try:
+            dname = str(cur.name or "").strip()
+        except Exception:
+            dname = ""
+        if dname:
+            hit = alias_norm_to_best.get(_norm_alnum_spaces(dname))
+            if hit is not None:
+                if best is None or hit[0] > best[0]:
+                    best = hit
+        try:
+            if cur.parent == cur:
+                break
+            cur = cur.parent
+        except Exception:
+            break
+
+    if best is None:
+        return None, None
+    doc_type = best[1]
+    acr = best[2] or doc_type
+    return doc_type, acr
+
+
+def _doc_type_default_if_allowlisted(entries: list[dict], *, is_excel: bool) -> tuple[str | None, str | None]:
+    """
+    Default doc types:
+      - PDFs -> EIDP
+      - Excel -> DATA
+    Only if a matching entry exists in allowlisted document_types.
+    """
+    want = "DATA" if is_excel else "EIDP"
+    for e in entries:
+        name = str(e.get("name") or "").strip() or ""
+        acr = str(e.get("acronym") or "").strip() or ""
+        doc_type = (acr or name).strip()
+        if not doc_type:
+            continue
+        if doc_type.strip().upper() == want:
+            return doc_type, (acr or doc_type)
+    # Also allow matching by name normalization (e.g., "Data file" name w/ acronym DATA should have been caught above).
+    return None, None
 
 
 def canonicalize_metadata_for_file(
@@ -282,12 +543,14 @@ def canonicalize_metadata_for_file(
         default_document_type = "Data file" if is_excel else "EIDP"
 
     candidates = _load_candidates()
-    program_titles = candidates.get("program_titles") or []
-    part_numbers = candidates.get("part_numbers") or []
-    atp_numbers = candidates.get("acceptance_test_plan_numbers") or []
-    vendors = candidates.get("vendors") or []
-    asset_types = candidates.get("asset_types") or []
-    doc_type_entries = _iter_doc_type_entries((candidates.get("document_types") or []) if isinstance(candidates, dict) else [])
+    cand = candidates if isinstance(candidates, dict) else {}
+    program_entries = _iter_named_alias_entries(cand.get("program_titles") or [])
+    pn_entries = _iter_named_alias_entries(cand.get("part_numbers") or [])
+    atp_entries = _iter_named_alias_entries(cand.get("acceptance_test_plan_numbers") or [])
+    vendor_entries = _iter_named_alias_entries(cand.get("vendors") or [])
+    asset_type_entries = _iter_named_alias_entries(cand.get("asset_types") or [])
+    asset_specific_entries = _iter_named_alias_entries(cand.get("asset_specific_types") or [])
+    doc_type_entries = _iter_doc_type_entries(cand.get("document_types") or [])
 
     derived: dict[str, object] = {}
     derived["file_extension"] = ext or "Unknown"
@@ -297,7 +560,7 @@ def canonicalize_metadata_for_file(
     if sn_from_name:
         derived["serial_number"] = sn_from_name
 
-    # Excel filename identity can carry serial/program.
+    # Excel filename identity can carry serial/program (treated as filename-stage hints for strict fields).
     if is_excel:
         try:
             import importlib.util
@@ -315,44 +578,19 @@ def canonicalize_metadata_for_file(
             program = vehicle = serial = ""
         if not _is_missing(serial) and str(serial).strip():
             derived["serial_number"] = str(serial).strip()
-        if (not _is_missing(program) and str(program).strip()) or (not _is_missing(vehicle) and str(vehicle).strip()):
-            title = ""
-            if str(program or "").strip() and str(vehicle or "").strip():
-                title = f"{str(program).strip()} {str(vehicle).strip()}".strip()
-            else:
-                title = (str(program or "").strip() or str(vehicle or "").strip())
-            if title:
-                derived["program_title"] = title
 
-    # Program/vendor/asset from filename (contains-match against candidates).
+    # Filename blob is used for strict field inference (document text is not available here).
+    fn_parts: list[str] = []
     try:
-        stem_blob = re.sub(r"[_\\-]+", " ", str(p.stem or "")).strip()
+        fn_parts.extend([str(p.stem or ""), str(p.name or "")])
     except Exception:
-        stem_blob = str(p)
-    if stem_blob:
-        pm = _best_candidate_match(stem_blob, [str(x) for x in program_titles if str(x).strip()])
-        if pm:
-            derived["program_title"] = pm
-        vm = _best_candidate_match(stem_blob, [str(x) for x in vendors if str(x).strip()])
-        if vm:
-            derived["vendor"] = vm
-        am = _best_candidate_match(stem_blob, [str(x) for x in asset_types if str(x).strip()])
-        if am:
-            derived["asset_type"] = am
-
-    # Doc type inference from filename/path.
-    inferred_dt, inferred_acr = _infer_doc_type_from_filename(p)
-    if inferred_dt:
-        derived["document_type"] = inferred_dt
-    if inferred_acr:
-        derived["document_type_acronym"] = inferred_acr
-
-    # Doc type inference from parent folders (exact folder-name match, up to 5 levels).
-    dt_path, acr_path = _infer_doc_type_from_path(p, doc_type_entries, max_levels=5)
-    if dt_path and not _is_missing(dt_path):
-        derived["document_type"] = dt_path
-    if acr_path and not _is_missing(acr_path):
-        derived["document_type_acronym"] = acr_path
+        fn_parts.append(str(p))
+    if is_excel:
+        try:
+            fn_parts.extend([str(program or ""), str(vehicle or ""), str(serial or "")])
+        except Exception:
+            pass
+    filename_blob = "\n".join([s for s in fn_parts if str(s).strip()])
 
     merged: dict[str, object] = {}
     for key in ALLOWED_KEYS:
@@ -390,87 +628,56 @@ def canonicalize_metadata_for_file(
     if rd:
         merged["report_date"] = rd
 
-    # Doc type pairing defaults.
-    def _meta_is_td(m: dict) -> bool:
-        try:
-            dt = str(m.get("document_type") or "").strip().upper()
-        except Exception:
-            dt = ""
-        try:
-            acr = str(m.get("document_type_acronym") or "").strip().upper()
-        except Exception:
-            acr = ""
-        return dt == "TD" or acr == "TD"
+    # Strict fields: existing -> extracted -> filename -> folders -> Unknown.
+    def _strict(entries: list[dict], field: str) -> str:
+        if not entries:
+            return "Unknown"
+        for src in (existing, extracted):
+            v = _as_clean_str(src.get(field))
+            if not v:
+                continue
+            m = _best_named_entry_match_in_blob(v, entries)
+            if m:
+                return m
+        m = _best_named_entry_match_in_blob(filename_blob, entries)
+        if m:
+            return m
+        m = _infer_named_entry_from_path(p, entries, max_levels=5)
+        if m:
+            return m
+        return "Unknown"
 
-    is_td = _meta_is_td(existing) or _meta_is_td(extracted) or _meta_is_td(derived) or _meta_is_td(merged)
-    if is_td or (str(inferred_dt or "").strip().upper() == "TD") or (str(inferred_acr or "").strip().upper() == "TD"):
-        merged["document_type"] = "TD"
-        merged["document_type_acronym"] = "TD"
-    else:
-        dt_val = _as_clean_str(merged.get("document_type"))
-        acr_val = _as_clean_str(merged.get("document_type_acronym"))
-        if _is_missing(dt_val):
-            dt_val = str(default_document_type or "").strip() or ("Data file" if is_excel else "EIDP")
-        if _is_missing(acr_val):
-            if dt_val.strip().casefold() == "data file":
-                acr_val = "DATA"
-            else:
-                acr_val = dt_val
-        # Ensure Data file acronym is DATA.
-        if dt_val.strip().casefold() == "data file":
-            acr_val = "DATA"
-        merged["document_type"] = dt_val
-        merged["document_type_acronym"] = acr_val
+    merged["program_title"] = _strict(program_entries, "program_title")
+    merged["vendor"] = _strict(vendor_entries, "vendor")
+    merged["asset_type"] = _strict(asset_type_entries, "asset_type")
+    merged["asset_specific_type"] = _strict(asset_specific_entries, "asset_specific_type")
+    merged["part_number"] = _strict(pn_entries, "part_number")
+    merged["acceptance_test_plan_number"] = _strict(atp_entries, "acceptance_test_plan_number")
 
-    # Strict allowlist canonicalization.
-    pt_allow = [str(x) for x in program_titles if str(x).strip()]
-    if pt_allow:
-        pt_raw = _as_clean_str(merged.get("program_title"))
-        ptm = _allowlist_exact_match(pt_raw, pt_allow) if pt_raw else None
-        if ptm:
-            merged["program_title"] = ptm
-        else:
-            merged["program_title"] = "Unknown"
-            path_match = _infer_program_title_from_path(p, pt_allow, max_levels=5)
-            if path_match:
-                merged["program_title"] = path_match
-
-    pn_allow = [str(x) for x in part_numbers if str(x).strip()]
-    if pn_allow:
-        pn_raw = _as_clean_str(merged.get("part_number"))
-        pn = _best_allowlist_match(pn_raw, pn_allow) if pn_raw else None
-        merged["part_number"] = pn or "Unknown"
-    else:
-        merged["part_number"] = "Unknown"
-
-    atp_allow = [str(x) for x in atp_numbers if str(x).strip()]
-    if atp_allow:
-        atp_raw = _as_clean_str(merged.get("acceptance_test_plan_number"))
-        atp = _best_allowlist_match(atp_raw, atp_allow) if atp_raw else None
-        merged["acceptance_test_plan_number"] = atp or "Unknown"
-    else:
-        merged["acceptance_test_plan_number"] = "Unknown"
-
-    # Candidate-based canonicalization (non-strict fields).
-    try:
-        vv = _as_clean_str(merged.get("vendor"))
-        vvm = _best_candidate_match(vv, [str(x) for x in vendors if str(x).strip()])
-        if vvm:
-            merged["vendor"] = vvm
-    except Exception:
-        pass
-    try:
-        av = _as_clean_str(merged.get("asset_type"))
-        avm = _best_candidate_match(av, [str(x) for x in asset_types if str(x).strip()])
-        if avm:
-            merged["asset_type"] = avm
-    except Exception:
-        pass
+    # Document type: existing -> extracted -> filename -> folders -> extension default (if allowlisted) -> Unknown
+    dt: str | None = None
+    acr: str | None = None
+    for src in (existing, extracted):
+        blob = "\n".join([_as_clean_str(src.get("document_type")), _as_clean_str(src.get("document_type_acronym"))]).strip()
+        if not blob:
+            continue
+        dt, acr = _best_doc_type_match_in_blob(blob, doc_type_entries)
+        if dt:
+            break
+    if not dt:
+        dt, acr = _best_doc_type_match_in_blob(filename_blob, doc_type_entries)
+    if not dt:
+        dt, acr = _infer_doc_type_from_path_strict(p, doc_type_entries, max_levels=5)
+    if not dt:
+        dt, acr = _doc_type_default_if_allowlisted(doc_type_entries, is_excel=is_excel)
+    merged["document_type"] = dt or "Unknown"
+    merged["document_type_acronym"] = (acr or dt) if dt else "Unknown"
 
     # Fill common keys with Unknown so JSON and index consumers are stable.
     for k in [
         "program_title",
         "asset_type",
+        "asset_specific_type",
         "serial_number",
         "part_number",
         "revision",
@@ -507,42 +714,44 @@ def sanitize_metadata(raw: Any, *, default_document_type: str = "EIDP") -> dict:
             continue
         cleaned[key] = v
 
-    # Enforce strict allowlists for fields that must be curated.
+    # Enforce strict allowlists for curated fields (value-only; no filename/folder context here).
     try:
-        cand = _load_candidates()
+        cand_raw = _load_candidates()
     except Exception:
-        cand = {}
-    if isinstance(cand, dict):
-        pt_allow = [str(x) for x in (cand.get("program_titles") or []) if str(x).strip()]
-        pn_allow = [str(x) for x in (cand.get("part_numbers") or []) if str(x).strip()]
-        atp_allow = [str(x) for x in (cand.get("acceptance_test_plan_numbers") or []) if str(x).strip()]
-    else:
-        pt_allow = []
-        pn_allow = []
-        atp_allow = []
+        cand_raw = {}
+    cand = cand_raw if isinstance(cand_raw, dict) else {}
 
-    if "program_title" in cleaned and pt_allow:
-        pt = _as_clean_str(cleaned.get("program_title"))
-        cleaned["program_title"] = _allowlist_exact_match(pt, pt_allow) or "Unknown"
+    program_entries = _iter_named_alias_entries(cand.get("program_titles") or [])
+    pn_entries = _iter_named_alias_entries(cand.get("part_numbers") or [])
+    atp_entries = _iter_named_alias_entries(cand.get("acceptance_test_plan_numbers") or [])
+    vendor_entries = _iter_named_alias_entries(cand.get("vendors") or [])
+    asset_type_entries = _iter_named_alias_entries(cand.get("asset_types") or [])
+    asset_specific_entries = _iter_named_alias_entries(cand.get("asset_specific_types") or [])
+    doc_type_entries = _iter_doc_type_entries(cand.get("document_types") or [])
 
-    if "part_number" in cleaned:
-        pn = _as_clean_str(cleaned.get("part_number"))
-        if pn_allow:
-            cleaned["part_number"] = _best_allowlist_match(pn, pn_allow) or "Unknown"
-        else:
-            cleaned["part_number"] = "Unknown"
+    def _enforce(field: str, entries: list[dict]) -> None:
+        if field not in cleaned:
+            return
+        if not entries:
+            cleaned[field] = "Unknown"
+            return
+        val = _as_clean_str(cleaned.get(field))
+        cleaned[field] = _best_named_entry_match_in_blob(val, entries) or "Unknown"
 
-    if "acceptance_test_plan_number" in cleaned:
-        atp = _as_clean_str(cleaned.get("acceptance_test_plan_number"))
-        if atp_allow:
-            cleaned["acceptance_test_plan_number"] = _best_allowlist_match(atp, atp_allow) or "Unknown"
-        else:
-            cleaned["acceptance_test_plan_number"] = "Unknown"
+    _enforce("program_title", program_entries)
+    _enforce("vendor", vendor_entries)
+    _enforce("asset_type", asset_type_entries)
+    _enforce("asset_specific_type", asset_specific_entries)
+    _enforce("part_number", pn_entries)
+    _enforce("acceptance_test_plan_number", atp_entries)
 
-    if not cleaned.get("document_type"):
-        cleaned["document_type"] = default_document_type
-    if not cleaned.get("document_type_acronym") and cleaned.get("document_type") and cleaned.get("document_type") != "Unknown":
-        cleaned["document_type_acronym"] = cleaned.get("document_type")
+    # Document type enforcement.
+    dt_blob = "\n".join([_as_clean_str(cleaned.get("document_type")), _as_clean_str(cleaned.get("document_type_acronym"))]).strip()
+    dt, acr = _best_doc_type_match_in_blob(dt_blob, doc_type_entries) if dt_blob else (None, None)
+    if not dt and default_document_type:
+        dt, acr = _best_doc_type_match_in_blob(str(default_document_type), doc_type_entries)
+    cleaned["document_type"] = dt or "Unknown"
+    cleaned["document_type_acronym"] = (acr or dt) if dt else "Unknown"
     return cleaned
 
 
@@ -698,6 +907,7 @@ def derive_minimal_metadata(core: Any, pdf_path: Path) -> dict:
     meta = {
         "program_title": "Unknown",
         "asset_type": "Unknown",
+        "asset_specific_type": "Unknown",
         "serial_number": "Unknown",
         "part_number": "Unknown",
         "revision": "Unknown",
@@ -919,163 +1129,6 @@ def _find_asset_type_by_frequency(first_page_text: str, asset_types: list[str]) 
     return None
 
 
-def _infer_doc_type_from_filename(path: Optional[Path]) -> tuple[Optional[str], Optional[str]]:
-    """
-    Heuristic fallback when the document text doesn't contain a recognizable doc type.
-    """
-    if path is None:
-        return None, None
-    try:
-        blob = (path.stem or "")
-    except Exception:
-        blob = str(path).lower()
-
-    def _norm(s: str) -> str:
-        return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
-
-    blob_norm = _norm(str(blob))
-    blob_tokens = set(blob_norm.split())
-
-    # Prefer user-configured doc-type candidates + aliases (metadata_candidates.json).
-    try:
-        cand = _load_candidates()
-        entries = _iter_doc_type_entries(cand.get("document_types") if isinstance(cand, dict) else [])
-    except Exception:
-        entries = []
-
-    best: tuple[int, str | None, str | None] | None = None  # (alias_len, name, acronym)
-    for e in entries:
-        name = str(e.get("name") or "").strip() or None
-        acr = str(e.get("acronym") or "").strip() or None
-        aliases = list(e.get("aliases") or [])
-        if name:
-            aliases.append(name)
-        if acr:
-            aliases.append(acr)
-        for a in aliases:
-            a_s = str(a or "").strip()
-            if not a_s:
-                continue
-            a_norm = _norm(a_s)
-            if not a_norm:
-                continue
-            hit = False
-            if len(a_norm) <= 3 and len(a_norm.split()) == 1:
-                # Short token like "TD" should match whole-token only.
-                hit = a_norm in blob_tokens
-            else:
-                hit = a_norm in blob_norm
-            if not hit:
-                continue
-            score = len(a_norm)
-            if best is None or score > best[0]:
-                best = (score, (acr or name), acr)
-
-    if best is not None:
-        return best[1], best[2]
-
-    # Back-compat hardcoded fallback (only if candidate parsing failed).
-    if "test data" in blob_norm or "testdata" in blob_norm:
-        return "TD", "TD"
-    if "td" in blob_tokens:
-        return "TD", "TD"
-    return None, None
-
-
-def _infer_doc_type_from_path(path: Optional[Path], entries: list[dict], *, max_levels: int = 5) -> tuple[Optional[str], Optional[str]]:
-    """
-    Walk up parent directories (up to max_levels) and infer document type from an exact directory-name match
-    against doc-type aliases (normalized equality).
-
-    Returns (document_type, acronym) where document_type is standardized to acronym when present.
-    """
-    if path is None or not entries:
-        return None, None
-
-    norm_to_best: dict[str, tuple[int, str, str | None]] = {}  # norm -> (score, doc_type, acronym)
-    for e in entries:
-        name = str(e.get("name") or "").strip() or None
-        acr = str(e.get("acronym") or "").strip() or None
-        aliases = list(e.get("aliases") or [])
-        if name:
-            aliases.append(name)
-        if acr:
-            aliases.append(acr)
-        for a in aliases:
-            a_s = str(a or "").strip()
-            if not a_s:
-                continue
-            a_norm = _norm_alnum_spaces(a_s)
-            if not a_norm:
-                continue
-            doc_type = (acr or name or a_s).strip()
-            acronym = (acr or doc_type).strip() or None
-            score = len(a_norm)
-            prev = norm_to_best.get(a_norm)
-            if prev is None or score > prev[0]:
-                norm_to_best[a_norm] = (score, doc_type, acronym)
-
-    try:
-        cur = Path(path).expanduser().resolve().parent
-    except Exception:
-        cur = Path(path).parent
-
-    for _ in range(int(max_levels)):
-        try:
-            dname = str(cur.name or "").strip()
-        except Exception:
-            dname = ""
-        if dname:
-            hit = norm_to_best.get(_norm_alnum_spaces(dname))
-            if hit is not None:
-                return hit[1], hit[2]
-        try:
-            if cur.parent == cur:
-                break
-            cur = cur.parent
-        except Exception:
-            break
-
-    return None, None
-
-
-def _infer_program_title_from_path(path: Optional[Path], program_titles: list[str], *, max_levels: int = 5) -> str | None:
-    """
-    Walk up parent directories (up to max_levels) and return a program title that exactly matches
-    a directory name under normalized matching.
-    """
-    if path is None or not program_titles:
-        return None
-    norm_to_canonical: dict[str, str] = {}
-    for t in program_titles:
-        canonical = str(t or "").strip()
-        if not canonical:
-            continue
-        norm_to_canonical.setdefault(_norm_alnum_spaces(canonical), canonical)
-
-    try:
-        cur = Path(path).expanduser().resolve().parent
-    except Exception:
-        cur = Path(path).parent if path is not None else Path(".")
-
-    for _ in range(int(max_levels)):
-        try:
-            name = str(cur.name or "").strip()
-        except Exception:
-            name = ""
-        if name:
-            hit = norm_to_canonical.get(_norm_alnum_spaces(name))
-            if hit:
-                return hit
-        try:
-            if cur.parent == cur:
-                break
-            cur = cur.parent
-        except Exception:
-            break
-    return None
-
-
 def _extract_date_from_text(text: str) -> str | None:
     if not text:
         return None
@@ -1149,19 +1202,23 @@ def _infer_report_date(lines: list[str], *, pages: int = 3, report_date_aliases:
 
 def extract_metadata_from_text(text: str, *, asset_types: Optional[list[str]] = None, pdf_path: Optional[Path] = None) -> dict:
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    asset_lines = _strip_doc_type_lines(lines)
     candidates = _load_candidates()
-    cand_dict = candidates if isinstance(candidates, dict) else {}
-    label_aliases = _merge_label_aliases(cand_dict)
-    asset_list = asset_types or cand_dict.get("asset_types") or []
-    program_titles = cand_dict.get("program_titles") or []
-    part_numbers = cand_dict.get("part_numbers") or []
-    atp_numbers = cand_dict.get("acceptance_test_plan_numbers") or []
-    vendors = cand_dict.get("vendors") or []
-    doc_type_entries = _iter_doc_type_entries(cand_dict.get("document_types") or [])
+    cand = candidates if isinstance(candidates, dict) else {}
+
+    label_aliases = _merge_label_aliases(cand)
+
+    program_entries = _iter_named_alias_entries(cand.get("program_titles") or [])
+    pn_entries = _iter_named_alias_entries(cand.get("part_numbers") or [])
+    atp_entries = _iter_named_alias_entries(cand.get("acceptance_test_plan_numbers") or [])
+    vendor_entries = _iter_named_alias_entries(cand.get("vendors") or [])
+    asset_type_entries = _iter_named_alias_entries(asset_types if asset_types is not None else (cand.get("asset_types") or []))
+    asset_specific_entries = _iter_named_alias_entries(cand.get("asset_specific_types") or [])
+    doc_type_entries = _iter_doc_type_entries(cand.get("document_types") or [])
+
     meta: dict[str, Optional[str]] = {
         "program_title": None,
         "asset_type": None,
+        "asset_specific_type": None,
         "serial_number": None,
         "part_number": None,
         "revision": None,
@@ -1173,71 +1230,12 @@ def extract_metadata_from_text(text: str, *, asset_types: Optional[list[str]] = 
         "acceptance_test_plan_number": None,
     }
 
-    first_page_text = _first_nonempty(lines, max_lines=220)
     title_blob = _first_nonempty(lines, max_lines=60)
     if pdf_path is not None:
         try:
             title_blob = f"{title_blob}\n{pdf_path.stem}"
         except Exception:
             pass
-
-    # Precompute an early-pages blob for allowlist-only matching (pages 1-3 by default).
-    first_pages_lines: list[str] = []
-    for ln in lines:
-        s = str(ln or "").strip()
-        if s.startswith("=== Page 4 ==="):
-            break
-        first_pages_lines.append(s)
-        if len(first_pages_lines) >= 800:
-            break
-    first_pages_blob = "\n".join([s for s in first_pages_lines if s])
-
-    header_line = ""
-    for line in lines[:80]:
-        if "data package" in line.lower():
-            header_line = line
-            break
-    if header_line:
-        m = re.search(
-            r"^(?P<title>.+?)\s+-\s+(?P<asset>.+?)\s+end item data package\s+(?P<serial>SN\d+)?\s*\|\s*(?P<date>\d{4}-\d{2}-\d{2})",
-            header_line,
-            flags=re.IGNORECASE,
-        )
-        if m:
-            if not meta.get("program_title"):
-                meta["program_title"] = m.group("title").strip()
-            if not meta.get("asset_type"):
-                asset = _find_asset_type(m.group("asset"), asset_list)
-                meta["asset_type"] = asset or m.group("asset").strip().title()
-            if not meta.get("serial_number"):
-                meta["serial_number"] = (m.group("serial") or "").strip()
-            if not meta.get("report_date"):
-                meta["report_date"] = (m.group("date") or "").strip()
-            if not meta.get("test_date"):
-                meta["test_date"] = (m.group("date") or "").strip()
-
-    if not meta.get("program_title"):
-        meta["program_title"] = _find_program_title(lines)
-
-    for key, aliases in label_aliases.items():
-        for label in aliases:
-            val = _find_label_value(lines, label)
-            if val:
-                meta[key] = val.strip()
-                break
-
-    # Vendor: match known vendor candidates if not found by label.
-    if not meta.get("vendor") and vendors:
-        for v in vendors:
-            sv = str(v or "").strip()
-            if not sv:
-                continue
-            if re.search(rf"\b{re.escape(sv)}\b", title_blob, flags=re.IGNORECASE):
-                meta["vendor"] = sv
-                break
-            if re.search(rf"\b{re.escape(sv)}\b", first_page_text, flags=re.IGNORECASE):
-                meta["vendor"] = sv
-                break
 
     # Report date: prioritize proximity to "report date" text on pages 1-3.
     try:
@@ -1247,84 +1245,68 @@ def extract_metadata_from_text(text: str, *, asset_types: Optional[list[str]] = 
     if inferred_report:
         meta["report_date"] = inferred_report
 
-    # Strict allowlists (no heuristics) for Part Number and Acceptance Test Plan.
-    # - Accept label-derived values only if they match the allowlist.
-    # - Otherwise, search the early-pages blob + filename stem (allowlist-bounded).
-    if part_numbers:
-        pn_label = _as_clean_str(meta.get("part_number"))
-        pn = _best_allowlist_match(pn_label, [str(x) for x in part_numbers if str(x).strip()]) if pn_label else None
-        if not pn:
-            blob = first_pages_blob
-            if pdf_path is not None:
-                try:
-                    blob = f"{blob}\n{pdf_path.stem}"
-                except Exception:
-                    pass
-            pn = _best_allowlist_match(blob, [str(x) for x in part_numbers if str(x).strip()])
-        meta["part_number"] = pn
-    else:
-        meta["part_number"] = None
-
-    if atp_numbers:
-        atp_label = _as_clean_str(meta.get("acceptance_test_plan_number"))
-        atp = _best_allowlist_match(atp_label, [str(x) for x in atp_numbers if str(x).strip()]) if atp_label else None
-        if not atp:
-            blob = first_pages_blob
-            if pdf_path is not None:
-                try:
-                    blob = f"{blob}\n{pdf_path.stem}"
-                except Exception:
-                    pass
-            atp = _best_allowlist_match(blob, [str(x) for x in atp_numbers if str(x).strip()])
-        meta["acceptance_test_plan_number"] = atp
-    else:
-        meta["acceptance_test_plan_number"] = None
-
-    # If asset_type was found via label (e.g. "Control Valve (End Item)"),
-    # try to extract the actual asset type from it
-    if meta.get("asset_type"):
-        extracted_asset = _find_asset_type(meta["asset_type"], asset_list)
-        if extracted_asset:
-            meta["asset_type"] = extracted_asset
-        else:
-            # Value doesn't contain a known asset type, clear it so heuristics can try
-            meta["asset_type"] = None
-
-    if not meta.get("asset_type"):
-        field_asset = _find_asset_type_from_fields(asset_lines, asset_list)
-        if field_asset:
-            meta["asset_type"] = field_asset
-
-    if not meta.get("asset_type"):
-        asset = _find_asset_type("\n".join(asset_lines[:200]), asset_list)
-        if asset:
-            meta["asset_type"] = asset
-
-    # Heuristic: check PDF filename for asset type
-    if not meta.get("asset_type"):
-        filename_asset = _find_asset_type_from_filename(pdf_path, asset_list)
-        if filename_asset:
-            meta["asset_type"] = filename_asset
-
-    # Heuristic: check frequency of asset type mentions on first page
-    if not meta.get("asset_type"):
-        # Extract first page text (up to first "=== Page 2 ===" marker or first 200 lines)
-        first_page_lines = []
-        for line in asset_lines:
-            if "=== Page 2 ===" in line or "=== Page 3 ===" in line:
-                break
-            first_page_lines.append(line)
-            if len(first_page_lines) >= 200:
-                break
-        first_page_text_freq = "\n".join(first_page_lines)
-        freq_asset = _find_asset_type_by_frequency(first_page_text_freq, asset_list)
-        if freq_asset:
-            meta["asset_type"] = freq_asset
-
+    # Serial number (non-allowlisted): best-effort.
     if not meta.get("serial_number"):
         m = re.search(r"\bSN\d+\b", "\n".join(lines[:200]), flags=re.IGNORECASE)
         if m:
             meta["serial_number"] = m.group(0).upper()
+
+    # Revision/test date: label-derived best-effort (non-allowlisted).
+    for key in ("revision", "test_date"):
+        if meta.get(key):
+            continue
+        for lbl in (label_aliases.get(key) or []):
+            val = _find_label_value(lines, str(lbl))
+            if val:
+                meta[key] = val.strip()
+                break
+
+    # Strict fields: document text -> filename -> folders -> Unknown.
+    meta["program_title"] = resolve_strict_field(
+        "program_title", lines=lines, pdf_path=pdf_path, entries=program_entries, label_aliases=label_aliases, pages=3, max_folder_levels=5
+    ) or "Unknown"
+    meta["vendor"] = resolve_strict_field(
+        "vendor", lines=lines, pdf_path=pdf_path, entries=vendor_entries, label_aliases=label_aliases, pages=3, max_folder_levels=5
+    ) or "Unknown"
+    meta["asset_type"] = resolve_strict_field(
+        "asset_type", lines=lines, pdf_path=pdf_path, entries=asset_type_entries, label_aliases=label_aliases, pages=3, max_folder_levels=5
+    ) or "Unknown"
+    meta["asset_specific_type"] = resolve_strict_field(
+        "asset_specific_type", lines=lines, pdf_path=pdf_path, entries=asset_specific_entries, label_aliases=label_aliases, pages=3, max_folder_levels=5
+    ) or "Unknown"
+    meta["part_number"] = resolve_strict_field(
+        "part_number", lines=lines, pdf_path=pdf_path, entries=pn_entries, label_aliases=label_aliases, pages=3, max_folder_levels=5
+    ) or "Unknown"
+    meta["acceptance_test_plan_number"] = resolve_strict_field(
+        "acceptance_test_plan_number", lines=lines, pdf_path=pdf_path, entries=atp_entries, label_aliases=label_aliases, pages=3, max_folder_levels=5
+    ) or "Unknown"
+
+    # Document type (strict): document text -> filename -> folders -> extension default (if allowlisted) -> Unknown
+    if doc_type_entries:
+        first_pages = _first_pages_blob(lines, pages=3)
+        doc_text_blob = f"{title_blob}\n{first_pages}".strip()
+        dt, acr = _best_doc_type_match_in_blob(doc_text_blob, doc_type_entries)
+        if not dt and pdf_path is not None:
+            try:
+                fn_blob = f"{pdf_path.stem}\n{pdf_path.name}"
+            except Exception:
+                fn_blob = str(pdf_path)
+            dt, acr = _best_doc_type_match_in_blob(fn_blob, doc_type_entries)
+        if not dt:
+            dt, acr = _infer_doc_type_from_path_strict(pdf_path, doc_type_entries, max_levels=5)
+        if not dt:
+            ext = ""
+            try:
+                ext = str(getattr(pdf_path, "suffix", "") or "").lower()
+            except Exception:
+                ext = ""
+            is_excel = ext in {".xlsx", ".xls", ".xlsm"}
+            dt, acr = _doc_type_default_if_allowlisted(doc_type_entries, is_excel=is_excel)
+        meta["document_type"] = dt or "Unknown"
+        meta["document_type_acronym"] = (acr or dt) if dt else "Unknown"
+    else:
+        meta["document_type"] = "Unknown"
+        meta["document_type_acronym"] = "Unknown"
 
     if meta.get("revision"):
         meta["revision"] = _normalize_revision(meta["revision"] or "") or "Unknown"
@@ -1333,50 +1315,17 @@ def extract_metadata_from_text(text: str, *, asset_types: Optional[list[str]] = 
     if meta.get("report_date"):
         meta["report_date"] = _normalize_date(meta["report_date"] or "") or "Unknown"
 
-    if program_titles:
-        match = _allowlist_exact_match(_as_clean_str(meta.get("program_title")), [str(x) for x in program_titles if str(x).strip()])
-        meta["program_title"] = match or "Unknown"
-        if (meta.get("program_title") or "").strip().casefold() == "unknown":
-            path_match = _infer_program_title_from_path(pdf_path, [str(x) for x in program_titles if str(x).strip()], max_levels=5)
-            if path_match:
-                meta["program_title"] = path_match
-
-    if asset_list:
-        match = _match_from_list(meta.get("asset_type") or "", asset_list)
-        meta["asset_type"] = match or "Unknown"
-
-    # Document type:
-    # 1) Always allow the filename to force TD (many TD files won't contain explicit "Test Data" text).
-    # 2) Otherwise, match on early-page/title text and standardize to acronym when available.
-    inferred_dt, inferred_acr = _infer_doc_type_from_filename(pdf_path)
-    doc_match, acr = _pick_document_type(title_blob + "\n" + _first_nonempty(lines, max_lines=120), doc_type_entries)
-    if inferred_dt and str(inferred_dt).strip().upper() == "TD":
-        meta["document_type"] = "TD"
-        meta["document_type_acronym"] = "TD"
-    elif doc_match:
-        meta["document_type"] = doc_match
-        meta["document_type_acronym"] = acr or doc_match
-    elif inferred_dt:
-        meta["document_type"] = inferred_dt
-        meta["document_type_acronym"] = inferred_acr or inferred_dt
-    else:
-        dt_path, acr_path = _infer_doc_type_from_path(pdf_path, doc_type_entries, max_levels=5)
-        if dt_path:
-            meta["document_type"] = dt_path
-            meta["document_type_acronym"] = acr_path or dt_path
-        else:
-            meta["document_type"] = "Unknown"
-            meta["document_type_acronym"] = None
-
     for key in [
         "program_title",
         "asset_type",
+        "asset_specific_type",
         "serial_number",
         "part_number",
         "revision",
         "test_date",
         "report_date",
         "document_type",
+        "document_type_acronym",
         "vendor",
         "acceptance_test_plan_number",
     ]:

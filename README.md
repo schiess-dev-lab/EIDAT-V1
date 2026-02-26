@@ -49,7 +49,7 @@ End users must have **Modify** rights on:
 
 If these are read-only, the Projects UI will show a clear error telling you what path needs rights.
 
-## Strict metadata allowlists (Program / PN / ATP)
+## Strict metadata allowlists (Program / Vendor / Asset / Doc Type)
 EIDAT can enforce strict allowlists for metadata fields via `user_inputs/metadata_candidates.json`:
 
 - Node-local (production nodes): `<node_root>\EIDAT\UserData\user_inputs\metadata_candidates.json`
@@ -57,8 +57,18 @@ EIDAT can enforce strict allowlists for metadata fields via `user_inputs/metadat
 
 Keys:
 - `program_titles`: allowed `program_title` values (non-empty list enables enforcement)
-- `part_numbers`: allowed `part_number` values (empty/missing → extracted PN becomes `Unknown`)
-- `acceptance_test_plan_numbers`: allowed `acceptance_test_plan_number` values (empty/missing → extracted ATP becomes `Unknown`)
+- `vendors`: allowed `vendor` values
+- `asset_types`: allowed `asset_type` values
+- `asset_specific_types`: allowed `asset_specific_type` values
+- `part_numbers`: allowed `part_number` values
+- `acceptance_test_plan_numbers`: allowed `acceptance_test_plan_number` values
+- `document_types`: allowed document types (uses `name`/`acronym`/`aliases`)
+
+Each allowlist can be either:
+- `list[str]` (canonical values only), or
+- `list[{"name": "...", "aliases": ["...", "..."]}]` (canonical + alias variants)
+
+If an allowlist is empty/missing, the extracted value is forced to `Unknown`.
 
 To backfill old metadata (e.g., remove non-allowlisted program titles), run **Files Explorer → Refresh Metadata Only** on the affected files (it rewrites metadata JSONs and triggers an index refresh).
 
