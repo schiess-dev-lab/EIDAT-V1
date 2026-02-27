@@ -116,12 +116,11 @@ def detect_tables(
     h, w = img_gray.shape
 
     # Step 1: Detect cells using contour and corner methods
-    cells_contour = _find_cells_contour(img_gray)
-    cells_corner = _find_cells_corner(img_gray)
+    cells_contour = _find_cells_contour(img_gray, verbose=verbose)
+    cells_corner = _find_cells_corner(img_gray, verbose=verbose)
 
     # Step 2: Merge and deduplicate
     all_cells = cells_contour + cells_corner
-    all_cells = _remove_duplicate_cells(all_cells)
 
     # Step 2.5: Filter out thin cells (border line artifacts)
     # At 900 DPI, real cells should be at least 30px in both dimensions
@@ -145,6 +144,21 @@ def detect_tables(
                (c['bbox_px'][2] - c['bbox_px'][0]) >= _min_w
         ]
 
+    # Guardrail: avoid quadratic work on pathological cell counts (charts / dense grids).
+    # NOTE: The original max-cluster guard is applied after container filtering, but pages can hang
+    # earlier (dedupe/container) when the raw cell count explodes.
+    max_cluster_cells = _env_int("EIDAT_TABLE_DETECT_MAX_CLUSTER_CELLS", 200)
+    pre_dedupe_cap = max(0, int(max_cluster_cells) * 4) if int(max_cluster_cells) > 0 else 0
+    if pre_dedupe_cap and len(all_cells) > int(pre_dedupe_cap):
+        if verbose:
+            print(
+                f"  - Skipping table detection: raw cells {len(all_cells)} exceeds pre-dedupe cap {int(pre_dedupe_cap)}"
+            )
+        return {'tables': [], 'cells': []}
+
+    # Step 2.7: Merge and deduplicate (can be quadratic; keep after cheap filters + cap)
+    all_cells = _remove_duplicate_cells(all_cells)
+
     # Step 3: Filter out container cells (large frames around actual cells)
     actual_cells = _filter_containers(all_cells)
 
@@ -156,7 +170,6 @@ def detect_tables(
 
     # Step 4.5: Guard against pathological cell counts (charts / dense grids).
     # Clustering is O(n^2); beyond a point it becomes impractical.
-    max_cluster_cells = _env_int("EIDAT_TABLE_DETECT_MAX_CLUSTER_CELLS", 200)
     if int(max_cluster_cells) > 0 and len(actual_cells) > int(max_cluster_cells):
         if verbose:
             print(f"  - Skipping table clustering: {len(actual_cells)} cells exceeds max {int(max_cluster_cells)}")
@@ -202,7 +215,7 @@ def detect_tables(
     }
 
 
-def _find_cells_contour(img_gray: np.ndarray) -> List[Dict]:
+def _find_cells_contour(img_gray: np.ndarray, *, verbose: bool = False) -> List[Dict]:
     """Find cells by detecting closed rectangular contours."""
     h, w = img_gray.shape
     img_gray = _preprocess_for_lines(img_gray)
@@ -306,7 +319,7 @@ def _find_cells_contour(img_gray: np.ndarray) -> List[Dict]:
     return cells
 
 
-def _find_cells_corner(img_gray: np.ndarray) -> List[Dict]:
+def _find_cells_corner(img_gray: np.ndarray, *, verbose: bool = False) -> List[Dict]:
     """Find cells by detecting line intersections (corners) and connecting lines."""
     h, w = img_gray.shape
     img_gray = _preprocess_for_lines(img_gray)
@@ -367,7 +380,22 @@ def _find_cells_corner(img_gray: np.ndarray) -> List[Dict]:
     intersections = cv2.bitwise_and(horiz_d, vert_d)
 
     # Get corners
-    corners = _extract_corners(intersections)
+    max_cluster_cells = _env_int("EIDAT_TABLE_DETECT_MAX_CLUSTER_CELLS", 200)
+    # Corner-based reconstruction is extremely expensive (roughly O(n^2) pairs with inner scans),
+    # so we cap the number of corners to keep chart/grid pages from hanging.
+    max_corners_default = 300
+    max_corners = _env_int("EIDAT_TABLE_DETECT_MAX_CORNERS", int(max_corners_default))
+    if int(max_corners) <= 0:
+        if verbose:
+            print("  - Skipping corner-based cells: EIDAT_TABLE_DETECT_MAX_CORNERS <= 0")
+        return []
+    corners = _extract_corners(intersections, max_corners=int(max_corners))
+    if corners is None:
+        if verbose and int(max_corners) > 0:
+            print(f"  - Skipping corner-based cells: corners exceeded max {int(max_corners)}")
+        return []
+    if not corners:
+        return []
 
     # Get line segments
     h_segs = _extract_line_segments(horiz, 'h', w, h)
@@ -379,7 +407,12 @@ def _find_cells_corner(img_gray: np.ndarray) -> List[Dict]:
     return _remove_duplicate_cells(cells)
 
 
-def _extract_corners(mask: np.ndarray, tolerance: int = 10) -> List[Tuple[int, int]]:
+def _extract_corners(
+    mask: np.ndarray,
+    tolerance: int = 10,
+    *,
+    max_corners: Optional[int] = None,
+) -> Optional[List[Tuple[int, int]]]:
     """Extract corner positions from intersection mask."""
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
@@ -388,6 +421,8 @@ def _extract_corners(mask: np.ndarray, tolerance: int = 10) -> List[Tuple[int, i
         M = cv2.moments(cnt)
         if M['m00'] > 0:
             corners.append((int(M['m10'] / M['m00']), int(M['m01'] / M['m00'])))
+        if max_corners is not None and int(max_corners) > 0 and len(corners) > int(max_corners):
+            return None
 
     # Cluster nearby
     merged = []

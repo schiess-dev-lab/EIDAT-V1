@@ -14,6 +14,7 @@ from typing import List, Dict, Optional
 import traceback
 import os
 import multiprocessing
+from multiprocessing import shared_memory
 
 try:
     import cv2
@@ -35,6 +36,97 @@ def _env_int(key: str, default: int) -> int:
         return int(float(str(os.environ.get(key, str(default)) or str(default)).strip()))
     except Exception:
         return int(default)
+
+
+def _detect_tables_worker(
+    shm_name: str,
+    shape: tuple[int, int],
+    dtype_str: str,
+    verbose: bool,
+    out_q,
+) -> None:
+    shm = None
+    try:
+        import numpy as np
+
+        shm = shared_memory.SharedMemory(name=str(shm_name))
+        img = np.ndarray(tuple(shape), dtype=np.dtype(dtype_str), buffer=shm.buf)
+        # Defensive copy: OpenCV ops should treat input as read-only, but don't risk mutating shared memory.
+        img_local = img.copy()
+        out_q.put(("ok", table_detection.detect_tables(img_local, verbose=bool(verbose))))
+    except Exception as e:
+        out_q.put(("err", f"{type(e).__name__}: {e}"))
+    finally:
+        if shm is not None:
+            try:
+                shm.close()
+            except Exception:
+                pass
+
+
+def _detect_tables_with_timeout(img_gray_hires, *, verbose: bool, timeout_sec: int) -> Dict:
+    """
+    Run bordered table detection with a hard timeout.
+
+    If it times out or errors, return an empty detection result so the page can continue (OCR still runs).
+    """
+    try:
+        import numpy as np
+
+        if img_gray_hires is None:
+            return {"tables": [], "cells": []}
+        if not isinstance(img_gray_hires, np.ndarray) or img_gray_hires.dtype != np.uint8 or img_gray_hires.ndim != 2:
+            return table_detection.detect_tables(img_gray_hires, verbose=bool(verbose))
+
+        shm = shared_memory.SharedMemory(create=True, size=int(img_gray_hires.nbytes))
+        try:
+            buf = np.ndarray(img_gray_hires.shape, dtype=img_gray_hires.dtype, buffer=shm.buf)
+            buf[:] = img_gray_hires
+
+            ctx = multiprocessing.get_context("spawn")
+            q = ctx.Queue(maxsize=1)
+            proc = ctx.Process(
+                target=_detect_tables_worker,
+                args=(shm.name, tuple(int(x) for x in img_gray_hires.shape), str(img_gray_hires.dtype), bool(verbose), q),
+                daemon=True,
+            )
+            proc.start()
+            proc.join(timeout=float(max(0, int(timeout_sec))))
+
+            if proc.is_alive():
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+                proc.join(timeout=5)
+                if verbose:
+                    print(f"  - Table detection timeout: exceeded {int(timeout_sec)}s (skipping bordered tables)")
+                return {"tables": [], "cells": []}
+
+            try:
+                status, payload = q.get_nowait()
+            except Exception:
+                status, payload = ("err", "No result returned from detect_tables worker")
+            if status == "ok" and isinstance(payload, dict):
+                return payload
+            if verbose:
+                print(f"  - Table detection error: {payload} (skipping bordered tables)")
+            return {"tables": [], "cells": []}
+        finally:
+            try:
+                shm.close()
+            except Exception:
+                pass
+            try:
+                shm.unlink()
+            except Exception:
+                pass
+    except Exception:
+        # Best-effort: never crash page processing because table detection couldn't be isolated.
+        try:
+            return table_detection.detect_tables(img_gray_hires, verbose=bool(verbose))
+        except Exception:
+            return {"tables": [], "cells": []}
 
 
 def _process_page_worker(
@@ -143,7 +235,15 @@ class ExtractionPipeline:
                 'dpi': self.detection_dpi
             }
 
-        table_result = table_detection.detect_tables(img_gray_hires, verbose=verbose)
+        table_timeout_sec = _env_int("EIDAT_TABLE_DETECT_TIMEOUT_SEC", _env_int("EIDAT_PAGE_TABLE_TIMEOUT_SEC", 0))
+        if table_timeout_sec < 0:
+            table_timeout_sec = 0
+        if table_timeout_sec and int(table_timeout_sec) > 0:
+            table_result = _detect_tables_with_timeout(
+                img_gray_hires, verbose=bool(verbose), timeout_sec=int(table_timeout_sec)
+            )
+        else:
+            table_result = table_detection.detect_tables(img_gray_hires, verbose=verbose)
         tables = table_result['tables']
         cells = table_result['cells']
 

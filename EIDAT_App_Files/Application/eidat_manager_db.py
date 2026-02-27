@@ -16,7 +16,12 @@ class SupportPaths:
 
 def support_paths(global_repo: Path) -> SupportPaths:
     repo = Path(global_repo).expanduser()
-    support_dir = repo / "EIDAT Support"
+    new = repo / "EIDAT" / "EIDAT Support"
+    legacy = repo / "EIDAT Support"
+    try:
+        support_dir = new if new.is_dir() else (legacy if legacy.is_dir() else new)
+    except Exception:
+        support_dir = new
     return SupportPaths(
         global_repo=repo,
         support_dir=support_dir,

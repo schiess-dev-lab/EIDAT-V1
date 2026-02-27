@@ -20,12 +20,12 @@ You update EIDAT by updating this Central Runtime folder (git pull / copy new ve
 
 ### Node Root
 The “bite-size” repository root you want EIDAT to manage for a team (where their docs live).
-EIDAT deposits an `EIDAT\` folder alongside their content and writes artifacts to `EIDAT Support\`.
+EIDAT deposits an `EIDAT\` folder alongside their content and writes artifacts to `EIDAT\EIDAT Support\` (legacy nodes may still use `EIDAT Support\`).
 
 Example:
 - `\\share\TeamA\Repo1\` *(node root)*
   - `EIDAT\...` *(deposited)*
-  - `EIDAT Support\...` *(generated/managed)*
+  - `EIDAT\EIDAT Support\...` *(generated/managed)*
 
 ## Node layout (deposited into each Node Root)
 After deploying a node, the node root contains:
@@ -37,14 +37,14 @@ After deploying a node, the node root contains:
   - `sys_python.txt` *(optional; only needed if `py -3` and `python` are unavailable)*
 - `EIDAT\ExtractionNode\`
   - `eidat_node.sqlite3`
-- `EIDAT Support\`
+- `EIDAT\EIDAT Support\`
   - `projects\projects_registry.sqlite3` *(multi-writer projects registry; WAL)*
   - other pipeline artifacts (debug/ocr, logs, staging, eidat_index.sqlite3, …)
 
 ## Permissions (important)
 End users must have **Modify** rights on:
 
-- `<node_root>\EIDAT Support\projects\` *(to create/edit projects and update registry)*
+- `<node_root>\EIDAT\EIDAT Support\projects\` *(to create/edit projects and update registry)*
 - `<node_root>\EIDAT\UserData\` *(to persist user_inputs + GUI settings under the node)*
 
 If these are read-only, the Projects UI will show a clear error telling you what path needs rights.
@@ -167,7 +167,7 @@ Per-node shortcut:
 ## Projects: multi-writer registry
 Projects are registered in:
 
-- `<node_root>\EIDAT Support\projects\projects_registry.sqlite3`
+- `<node_root>\EIDAT\EIDAT Support\projects\projects_registry.sqlite3` *(legacy: `<node_root>\EIDAT Support\projects\...`)*
 
 This replaces the old shared JSON registry and is safe for concurrent writers using SQLite WAL.
 If `projects.json` exists, EIDAT will migrate it into SQLite automatically the first time.
@@ -206,7 +206,7 @@ Install Python 3 (Windows) and ensure either:
 ### “Projects folder is not writable”
 Grant Modify rights to:
 
-- `<node_root>\EIDAT Support\projects\`
+- `<node_root>\EIDAT\EIDAT Support\projects\` *(legacy: `<node_root>\EIDAT Support\projects\`)*
 
 ### Package installation prompts fail (pip/network)
 If your company requires an internal index, set env vars before running the `.bat`:

@@ -150,7 +150,12 @@ def build_parser() -> argparse.ArgumentParser:
     se = sub.add_parser("excel_to_sqlite", help="Convert Excel data files into per-workbook SQLite databases.")
     se.add_argument("--data-dir", type=str, default="", help="Scan this directory for Excel files (default: global repo).")
     se.add_argument("--excel", action="append", default=[], help="Explicit Excel file path (repeatable).")
-    se.add_argument("--out-dir", type=str, default="", help="Output folder for SQLite files (default: <global-repo>/EIDAT Support/excel_sqlite).")
+    se.add_argument(
+        "--out-dir",
+        type=str,
+        default="",
+        help="Output folder for SQLite files (default: <global-repo>/EIDAT/EIDAT Support/excel_sqlite, or legacy <global-repo>/EIDAT Support/excel_sqlite).",
+    )
     se.add_argument("--overwrite", action="store_true", help="Overwrite existing .sqlite3 outputs.")
     se.add_argument("--max-scan-rows", type=int, default=200, help="Max rows to scan for header detection.")
     se.add_argument("--max-cols", type=int, default=200, help="Max columns to scan for header detection.")

@@ -2250,7 +2250,21 @@ CENTRAL_EXCEL_TREND_CONFIG = ROOT / "user_inputs" / "excel_trend_config.json"
 
 
 def eidat_support_dir(global_repo: Path) -> Path:
-    return Path(global_repo).expanduser() / "EIDAT Support"
+    repo = Path(global_repo).expanduser()
+    # New node layout: support lives under the deposited EIDAT folder.
+    new = repo / "EIDAT" / "EIDAT Support"
+    legacy = repo / "EIDAT Support"
+    try:
+        if new.is_dir():
+            return new
+    except Exception:
+        pass
+    try:
+        if legacy.is_dir():
+            return legacy
+    except Exception:
+        pass
+    return new
 
 
 def eidat_projects_root(global_repo: Path) -> Path:
@@ -2610,7 +2624,10 @@ def _build_trending_project_sqlite(db_path: Path, workbook_path: Path) -> None:
 
 def _infer_node_root_from_workbook_path(workbook_path: Path) -> Path:
     """
-    Best-effort: if workbook lives under `<node_root>/EIDAT Support/...`, return `<node_root>`.
+    Best-effort: if workbook lives under:
+      - `<node_root>/EIDAT Support/...` (legacy), or
+      - `<node_root>/EIDAT/EIDAT Support/...` (current),
+    return `<node_root>`.
     Otherwise, return workbook parent.
     """
     p = Path(workbook_path).expanduser()
@@ -2621,6 +2638,10 @@ def _infer_node_root_from_workbook_path(workbook_path: Path) -> Path:
     cur = p.parent
     for _ in range(12):
         if cur.name.strip().lower() == "eidat support":
+            # Legacy layout: <node_root>/EIDAT Support/...
+            # Current layout: <node_root>/EIDAT/EIDAT Support/...
+            if cur.parent.name.strip().lower() == "eidat":
+                return cur.parent.parent
             return cur.parent
         if cur == cur.parent:
             break
@@ -2634,8 +2655,9 @@ def _resolve_excel_sqlite_path_from_workbook(workbook_path: Path, excel_sqlite_r
 
     Supports:
     - absolute paths
-    - paths starting with `EIDAT Support\\...` (relative to node root)
-    - paths starting with `debug\\...` (relative to `<node_root>/EIDAT Support`)
+    - paths starting with `EIDAT Support\\...` (legacy; relative to support dir)
+    - paths starting with `EIDAT\\EIDAT Support\\...` (current; relative to node root)
+    - paths starting with `debug\\...` (relative to the node's support dir)
     - other relative paths (relative to workbook folder)
     """
     raw = str(excel_sqlite_rel or "").strip().strip('"')
@@ -2646,11 +2668,14 @@ def _resolve_excel_sqlite_path_from_workbook(workbook_path: Path, excel_sqlite_r
         return p
 
     node_root = _infer_node_root_from_workbook_path(workbook_path)
-    support_dir = node_root / "EIDAT Support"
+    support_dir = eidat_support_dir(node_root)
     norm = raw.replace("/", "\\").lstrip("\\")
     low = norm.lower()
 
     if low.startswith("eidat support\\"):
+        rest = norm[len("EIDAT Support\\") :]
+        return (support_dir / Path(rest)).expanduser()
+    if low.startswith("eidat\\eidat support\\"):
         return (node_root / Path(norm)).expanduser()
     if low.startswith("debug\\") or low.startswith("projects\\") or low.startswith("cache\\"):
         return (support_dir / Path(norm)).expanduser()

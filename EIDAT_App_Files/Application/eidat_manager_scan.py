@@ -238,6 +238,23 @@ def _pointer_artifacts_exist(global_repo: Path, file_path: Path) -> bool:
     if not isinstance(payload, dict) or not payload:
         return False
 
+    repo = Path(global_repo).expanduser()
+    new_support_dir = repo / "EIDAT" / "EIDAT Support"
+    legacy_support_dir = repo / "EIDAT Support"
+
+    def _support_dir() -> Path:
+        try:
+            if new_support_dir.is_dir():
+                return new_support_dir
+        except Exception:
+            pass
+        try:
+            if legacy_support_dir.is_dir():
+                return legacy_support_dir
+        except Exception:
+            pass
+        return new_support_dir
+
     def _resolve(rel_or_abs: object) -> Path | None:
         try:
             raw = str(rel_or_abs or "").strip()
@@ -245,10 +262,19 @@ def _pointer_artifacts_exist(global_repo: Path, file_path: Path) -> bool:
             return None
         if not raw:
             return None
-        p = Path(raw)
+        p = Path(raw.replace("/", "\\"))
         if p.is_absolute():
             return p
-        return Path(global_repo).expanduser() / p
+
+        # Back-compat: older pointer tokens stored paths rooted at "EIDAT Support\..."
+        # even when support is now nested under "EIDAT\EIDAT Support".
+        parts = list(p.parts)
+        if parts and str(parts[0]).strip().casefold() == "eidat support":
+            return _support_dir() / Path(*parts[1:])
+        if len(parts) >= 2 and str(parts[0]).strip().casefold() == "eidat" and str(parts[1]).strip().casefold() == "eidat support":
+            return repo / p
+
+        return repo / p
 
     artifacts_path = _resolve(payload.get("artifacts_rel"))
     metadata_path = _resolve(payload.get("metadata_rel"))

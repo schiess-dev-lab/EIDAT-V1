@@ -251,7 +251,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--reset-node",
         action="store_true",
-        help="Delete <node_root>\\EIDAT and <node_root>\\EIDAT Support before re-deploying (does not touch EIDPs).",
+        help="Delete <node_root>\\EIDAT (including its EIDAT Support) and legacy <node_root>\\EIDAT Support before re-deploying (does not touch EIDPs).",
     )
     ap.add_argument(
         "--reset-keep-site-packages",
@@ -337,6 +337,8 @@ def main(argv: list[str] | None = None) -> int:
         try:
             _rmtree_strict_if_present(layout.eidat_root)
             _rmtree_strict_if_present(layout.support_dir)
+            # Back-compat: older nodes stored support/artifacts at the node root.
+            _rmtree_strict_if_present(node_root / "EIDAT Support")
         except Exception:
             # Best-effort restore if we moved venvs out but failed to reset.
             for backup_p, orig_p in reversed(moved):
@@ -356,7 +358,9 @@ def main(argv: list[str] | None = None) -> int:
                 _rmtree_strict_if_present(orig_p)
             shutil.move(str(backup_p), str(orig_p))
         if backup_root is not None:
-            _safe_rmtree_if_present(backup_root)
+            # Remove the entire backup root so it never becomes a persistent node artifact
+            # (node_mirror would otherwise surface it as a top-level output).
+            _safe_rmtree_if_present(node_root / ".eidat_reset_backup")
 
         # If we preserved the node-ui venv, skip bootstrapping to avoid changing site-packages.
         if preserved_node_ui_venv:
@@ -364,14 +368,39 @@ def main(argv: list[str] | None = None) -> int:
     # Legacy folders from older node layouts (safe to delete; they only held launcher .bat files).
     _safe_rmtree_if_present(layout.eidat_root / "FileExplorer")
     _safe_rmtree_if_present(layout.eidat_root / "Projects")
-    for d in (
-        layout.eidat_root,
-        layout.runtime_dir,
-        layout.extraction_node_dir,
-        layout.support_projects_dir,
-        layout.user_data_root / "user_inputs",
-    ):
+    for d in (layout.eidat_root, layout.runtime_dir, layout.extraction_node_dir, layout.user_data_root / "user_inputs"):
         d.mkdir(parents=True, exist_ok=True)
+
+    # Ensure support/artifacts live under <node_root>\EIDAT\EIDAT Support.
+    legacy_support_dir = node_root / "EIDAT Support"
+    if legacy_support_dir.exists() and legacy_support_dir.is_dir():
+        # Migration from older layouts: move <node_root>\EIDAT Support -> <node_root>\EIDAT\EIDAT Support.
+        #
+        # NOTE: We intentionally migrate during deploy so callers don't end up with two support roots
+        # and so pointer-token relative paths can be remapped consistently.
+        new_support_dir = layout.support_dir
+        new_support_dir.parent.mkdir(parents=True, exist_ok=True)
+        if not new_support_dir.exists():
+            shutil.move(str(legacy_support_dir), str(new_support_dir))
+        else:
+            # Merge into the new location; preserve any name collisions under a conflict bucket.
+            conflict_dir = new_support_dir / ".legacy_support_migration" / str(uuid.uuid4())
+            moved_conflicts = False
+            for child in legacy_support_dir.iterdir():
+                dst = new_support_dir / child.name
+                if dst.exists():
+                    conflict_dir.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(child), str(conflict_dir / child.name))
+                    moved_conflicts = True
+                else:
+                    shutil.move(str(child), str(dst))
+            _rmtree_strict_if_present(legacy_support_dir)
+            if not moved_conflicts:
+                _safe_rmtree_if_present(new_support_dir / ".legacy_support_migration")
+
+    layout.support_projects_dir.mkdir(parents=True, exist_ok=True)
+    # Clean up any leftover reset backups from older deploy versions.
+    _safe_rmtree_if_present(node_root / ".eidat_reset_backup")
 
     if args.ensure_node_venv:
         layout.venv_dir.mkdir(parents=True, exist_ok=True)
