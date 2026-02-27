@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "min_body_rows": 8,
+  "max_col_width_delta_ratio": 0.15,
+  "max_col_width_delta_abs": 3,
+  "max_plus_pos_delta_chars": 2,
+  "candidate_tables_prev": 2,
+  "candidate_tables_next": 2,
+  "header_block_similarity_below": 0.2,
+  "title_block_fuzzy_ratio_below": 0.5
+}
+

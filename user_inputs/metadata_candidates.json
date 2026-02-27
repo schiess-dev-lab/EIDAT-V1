@@ -2,9 +2,12 @@
   "program_titles": [
     "Starlink"
   ],
-  "part_numbers": [],
-  "acceptance_test_plan_numbers": [],
-  "asset_specific_types": [],
+  "part_numbers": [
+    
+  ],
+  "acceptance_test_plan_numbers": [
+    
+  ],
   "vendors": [
     "MOOG"
   ],

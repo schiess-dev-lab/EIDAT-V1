@@ -2683,10 +2683,16 @@ def _ensure_test_data_tables(conn: sqlite3.Connection) -> None:
         """
         CREATE TABLE IF NOT EXISTS td_runs (
             run_name TEXT PRIMARY KEY,
-            default_x TEXT
+            default_x TEXT,
+            display_name TEXT
         )
         """
     )
+    # Backward-compatible upgrade for older caches.
+    try:
+        conn.execute("ALTER TABLE td_runs ADD COLUMN display_name TEXT")
+    except Exception:
+        pass
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS td_columns (
@@ -2937,6 +2943,72 @@ def _read_test_data_data_definitions(workbook_path: Path) -> list[dict]:
             pass
 
 
+def _read_test_data_run_labeling(workbook_path: Path) -> dict | None:
+    """
+    Read optional `td_run_labeling` JSON from the Test Data Trending workbook's Config sheet.
+
+    Stored as a Key/Value row where Value is JSON (stringified).
+    """
+    try:
+        from openpyxl import load_workbook  # type: ignore
+    except Exception:
+        return None
+
+    wb = load_workbook(str(Path(workbook_path).expanduser()), read_only=True, data_only=True)
+    try:
+        if "Config" not in wb.sheetnames:
+            return None
+        ws = wb["Config"]
+        for r in range(2, (ws.max_row or 0) + 1):
+            k = str(ws.cell(r, 1).value or "").strip()
+            if not k:
+                continue
+            if k.strip().lower() != "td_run_labeling":
+                continue
+            raw = ws.cell(r, 2).value
+            if raw is None:
+                return None
+            try:
+                data = json.loads(str(raw))
+            except Exception:
+                return None
+            return data if isinstance(data, dict) else None
+        return None
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
+
+
+def td_read_run_labeling_config(workbook_path: Path) -> dict | None:
+    """Public wrapper for UI: read `td_run_labeling` config from a workbook."""
+    try:
+        return _read_test_data_run_labeling(workbook_path)
+    except Exception:
+        return None
+
+
+def td_list_runs_ex(db_path: Path) -> list[dict]:
+    """Return runs with optional display_name for UI dropdowns."""
+    path = Path(db_path).expanduser()
+    if not path.exists():
+        return []
+    with sqlite3.connect(str(path)) as conn:
+        _ensure_test_data_tables(conn)
+        rows = conn.execute(
+            "SELECT run_name, display_name FROM td_runs ORDER BY run_name"
+        ).fetchall()
+    out: list[dict] = []
+    for run_name, display_name in rows:
+        rn = str(run_name or "").strip()
+        if not rn:
+            continue
+        dn = str(display_name or "").strip()
+        out.append({"run_name": rn, "display_name": dn})
+    return out
+
+
 def ensure_test_data_project_cache(
     project_dir: Path,
     workbook_path: Path,
@@ -3077,6 +3149,15 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
 
     computed_epoch_ns = time.time_ns()
 
+    # Optional: run/sequence condition labeling (user-controlled via JSON stored in workbook Config).
+    td_run_labeling = None
+    try:
+        td_run_labeling = _read_test_data_run_labeling(wb_path)
+    except Exception:
+        td_run_labeling = None
+    td_run_labeling_enabled = bool(isinstance(td_run_labeling, dict) and td_run_labeling.get("enabled"))
+    run_var_samples: dict[str, dict[str, list[object]]] = {}
+
     # For TD curve plots, only allow canonical X axes:
     # - Time
     # - Pulse Number
@@ -3166,6 +3247,164 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
 
     def _quote_ident(name: str) -> str:
         return '"' + (name or "").replace('"', '""') + '"'
+
+    # --- Optional: Run/sequence labeling helpers (used only when enabled) ---
+    label_template = ""
+    label_missing = "blank"
+    label_value_pick = "most_common"
+    label_fuzzy_enabled = True
+    label_fuzzy_min_ratio = 0.82
+    label_disamb_enabled = True
+    label_disamb_template = "{label} — {run_name}"
+    label_variables: dict[str, dict] = {}
+    if td_run_labeling_enabled and isinstance(td_run_labeling, dict):
+        label_template = str(td_run_labeling.get("template") or "").strip()
+        label_missing = str(td_run_labeling.get("missing_value") or "blank").strip() or "blank"
+        label_value_pick = str(td_run_labeling.get("value_pick") or "most_common").strip().lower() or "most_common"
+        fm = td_run_labeling.get("fuzzy_match") or {}
+        if isinstance(fm, dict):
+            label_fuzzy_enabled = bool(fm.get("enabled", True))
+            try:
+                label_fuzzy_min_ratio = float(fm.get("min_ratio", 0.82))
+            except Exception:
+                label_fuzzy_min_ratio = 0.82
+        dd = td_run_labeling.get("duplicate_disambiguation") or {}
+        if isinstance(dd, dict):
+            label_disamb_enabled = bool(dd.get("enabled", True))
+            label_disamb_template = str(dd.get("template") or label_disamb_template).strip() or label_disamb_template
+        vars_cfg = td_run_labeling.get("variables") or {}
+        if isinstance(vars_cfg, dict):
+            for k, v in vars_cfg.items():
+                kk = str(k or "").strip()
+                if not kk or not isinstance(v, dict):
+                    continue
+                label_variables[kk] = dict(v)
+
+    from collections import Counter
+    from difflib import SequenceMatcher
+    import re
+
+    def _normalize_text(s: object) -> str:
+        return re.sub(r"\s+", " ", str(s or "").strip()).lower()
+
+    def _token_overlap_score(query: str, candidate: str) -> float:
+        q = _normalize_text(query)
+        c = _normalize_text(candidate)
+        q_toks = [t for t in re.findall(r"[a-z0-9]+", q) if t]
+        c_toks = [t for t in re.findall(r"[a-z0-9]+", c) if t]
+        if not q_toks or not c_toks:
+            return 0.0
+        q_unique = list(dict.fromkeys(q_toks))
+        c_unique = list(dict.fromkeys(c_toks))
+
+        def _tok_match(a: str, b: str) -> bool:
+            if a == b:
+                return True
+            if len(a) >= 4 and len(b) >= 4 and (a.startswith(b) or b.startswith(a)):
+                return True
+            return False
+
+        matched = 0
+        for qt in q_unique:
+            for ct in c_unique:
+                if _tok_match(qt, ct):
+                    matched += 1
+                    break
+        return matched / float(len(q_unique)) if q_unique else 0.0
+
+    def _fuzzy_col_score(target: str, candidate: str) -> float:
+        t_key = _norm_name(target)
+        c_key = _norm_name(candidate)
+        seq = SequenceMatcher(None, t_key, c_key).ratio() if (t_key and c_key) else 0.0
+        cov = _token_overlap_score(target, candidate)
+        return max(cov, (seq + cov) / 2.0)
+
+    def _best_match_col(target: str, cols: set[str]) -> str:
+        t = str(target or "").strip()
+        if not t or not cols:
+            return ""
+        # Exact/normalized match first.
+        t_norm = _norm_name(t)
+        for c in cols:
+            if _norm_name(c) == t_norm:
+                return c
+        if not label_fuzzy_enabled:
+            return ""
+        best = ("", 0.0)
+        for c in cols:
+            score = _fuzzy_col_score(t, c)
+            if score > best[1]:
+                best = (c, float(score))
+        if best[0] and best[1] >= float(label_fuzzy_min_ratio):
+            return best[0]
+        return ""
+
+    def _most_common_nonempty_value(src: sqlite3.Connection, table: str, col: str) -> object | None:
+        q_table = _quote_ident(table)
+        q_col = _quote_ident(col)
+        try:
+            row = src.execute(
+                f"""
+                SELECT {q_col} AS v, COUNT(*) AS n
+                FROM {q_table}
+                WHERE {q_col} IS NOT NULL AND TRIM(CAST({q_col} AS TEXT)) <> ''
+                GROUP BY {q_col}
+                ORDER BY n DESC, CAST({q_col} AS TEXT) ASC
+                LIMIT 1
+                """
+            ).fetchone()
+        except Exception:
+            row = None
+        if not row:
+            return None
+        return row[0]
+
+    def _canonical_label_value(v: object) -> object | None:
+        if v is None:
+            return None
+        if isinstance(v, (int, float)):
+            f = float(v)
+            if not math.isfinite(f):
+                return None
+            if abs(f - round(f)) < 1e-9:
+                return int(round(f))
+            return float(f)
+        s = str(v).strip()
+        if not s:
+            return None
+        t = s.replace(",", "")
+        try:
+            f = float(t)
+            if math.isfinite(f):
+                if abs(f - round(f)) < 1e-9:
+                    return int(round(f))
+                return float(f)
+        except Exception:
+            pass
+        return s
+
+    def _pick_most_common(values: list[object]) -> object | None:
+        vals = [v for v in values if v is not None and str(v).strip() != ""]
+        if not vals:
+            return None
+        counts = Counter(vals)
+        # Deterministic tie-break: lexicographic on lowercase string form.
+        best = sorted(counts.items(), key=lambda kv: (-int(kv[1]), str(kv[0]).strip().lower()))[0]
+        return best[0]
+
+    def _format_label_value(v: object | None, fmt_spec: str | None) -> str:
+        if v is None or str(v).strip() == "":
+            return label_missing
+        if fmt_spec:
+            try:
+                if isinstance(v, (int, float)):
+                    return format(float(v), fmt_spec)
+                f = _finite_float(v)
+                if f is not None:
+                    return format(float(f), fmt_spec)
+            except Exception:
+                pass
+        return str(v).strip()
 
     # Reset td_* tables (only).
     with sqlite3.connect(str(db_path)) as conn:
@@ -3290,6 +3529,21 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
                         cols = set()
                     if not cols:
                         continue
+
+                    # Collect per-run variable values for optional user-defined condition labels.
+                    if td_run_labeling_enabled and label_template and label_variables and label_value_pick == "most_common":
+                        for var_name, spec in label_variables.items():
+                            target = str((spec or {}).get("column") or "").strip()
+                            if not target:
+                                continue
+                            actual = _best_match_col(target, cols)
+                            if not actual:
+                                continue
+                            v = _most_common_nonempty_value(src, table, actual)
+                            cv = _canonical_label_value(v)
+                            if cv is None:
+                                continue
+                            run_var_samples.setdefault(str(run), {}).setdefault(str(var_name), []).append(cv)
 
                     x_map: dict[str, str] = {}
                     actual_time = _find_actual_col(cols, time_candidates)
@@ -3429,9 +3683,45 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
                 conn.commit()
             invalid_sources += 1
 
+    # Compute optional display labels per run (condition labeling).
+    runs_all = set(run_x_union.keys()) | set(run_y_union.keys())
+    display_by_run: dict[str, str] = {}
+    if td_run_labeling_enabled and label_template:
+        def _collapse_ws(s: object) -> str:
+            return re.sub(r"\s+", " ", str(s or "")).strip()
+
+        class _DefaultingDict(dict):
+            def __missing__(self, key: object) -> str:  # type: ignore[override]
+                return label_missing
+
+        base_by_run: dict[str, str] = {}
+        for run in sorted(runs_all, key=lambda s: str(s).lower()):
+            vals: dict[str, str] = {}
+            for var_name, spec in label_variables.items():
+                fmt_spec = str((spec or {}).get("format") or "").strip() or None
+                chosen = _pick_most_common((run_var_samples.get(run, {}) or {}).get(var_name, []))
+                vals[var_name] = _format_label_value(chosen, fmt_spec)
+            try:
+                base = str(label_template).format_map(_DefaultingDict(vals))
+            except Exception:
+                base = ""
+            base = _collapse_ws(base)
+            if not base:
+                base = label_missing
+            base_by_run[run] = base
+
+        counts = Counter(base_by_run.values())
+        for run, base in base_by_run.items():
+            disp = base
+            if label_disamb_enabled and int(counts.get(base) or 0) > 1:
+                try:
+                    disp = str(label_disamb_template).format(label=base, run_name=run)
+                except Exception:
+                    disp = f"{base} — {run}"
+            display_by_run[run] = _collapse_ws(disp) or base
+
     # Write runs + columns tables for dropdowns.
     with sqlite3.connect(str(db_path)) as conn:
-        runs_all = set(run_x_union.keys()) | set(run_y_union.keys())
         cfg_order = [n for n, _u in y_cols if n]
         for run in sorted(runs_all, key=lambda s: str(s).lower()):
             xs = run_x_union.get(run, set())
@@ -3441,9 +3731,10 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
                     if x in xs:
                         default_x = x
                         break
+            display_name = str(display_by_run.get(run) or "").strip()
             conn.execute(
-                "INSERT OR REPLACE INTO td_runs(run_name, default_x) VALUES (?, ?)",
-                (run, default_x),
+                "INSERT OR REPLACE INTO td_runs(run_name, default_x, display_name) VALUES (?, ?, ?)",
+                (run, default_x, display_name),
             )
             for x in sorted(xs, key=lambda k: x_priority.index(k) if k in x_priority else 999):
                 conn.execute(
@@ -8749,6 +9040,8 @@ def _write_test_data_trending_workbook(
     ws_cfg.append(["Key", "Value"])
     for k in ("description", "data_group", "sheet_name", "header_row"):
         ws_cfg.append([k, json.dumps(config.get(k), ensure_ascii=False)])
+    if "td_run_labeling" in (config or {}):
+        ws_cfg.append(["td_run_labeling", json.dumps(config.get("td_run_labeling"), ensure_ascii=False)])
     ws_cfg.append(["statistics", ", ".join(stats)])
     ws_cfg.append(["", ""])
     ws_cfg.append(["Columns", ""])

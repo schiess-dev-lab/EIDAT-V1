@@ -2858,9 +2858,20 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         form.setContentsMargins(0, 0, 0, 0)
         form.setSpacing(8)
 
+        self._runs_ex: list[dict] = []
+        self._run_display_by_name: dict[str, str] = {}
+        self._run_name_by_display: dict[str, str] = {}
+        cfg = be.td_read_run_labeling_config(self._workbook_path)
+        self._run_labeling_enabled = bool(isinstance(cfg, dict) and cfg.get("enabled"))
+
         self.cb_run = QtWidgets.QComboBox()
         self.cb_run.currentIndexChanged.connect(self._refresh_columns_for_run)
         form.addRow("Run:", self.cb_run)
+        self.cb_show_run_labels = QtWidgets.QCheckBox("Show condition labels")
+        self.cb_show_run_labels.setChecked(self._run_labeling_enabled)
+        self.cb_show_run_labels.setEnabled(self._run_labeling_enabled)
+        self.cb_show_run_labels.toggled.connect(lambda *_: self._refresh_run_dropdown())
+        form.addRow("", self.cb_show_run_labels)
         left_layout.addLayout(form)
 
         tabs = QtWidgets.QTabWidget()
@@ -3156,19 +3167,39 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         if not self._db_path:
             return
         try:
-            runs = be.td_list_runs(self._db_path)
+            runs_ex = be.td_list_runs_ex(self._db_path)
             serials = be.td_list_serials(self._db_path)
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "Test Data Cache", str(exc))
             return
 
-        prev_run = self.cb_run.currentText()
-        self.cb_run.blockSignals(True)
-        self.cb_run.clear()
-        self.cb_run.addItems(runs)
-        if prev_run and prev_run in runs:
-            self.cb_run.setCurrentText(prev_run)
-        self.cb_run.blockSignals(False)
+        prev_ref = self.cb_run.currentData()
+        if prev_ref is None:
+            prev_ref = self.cb_run.currentText()
+        prev_ref = str(prev_ref or "").strip()
+
+        self._runs_ex = [d for d in (runs_ex or []) if isinstance(d, dict) and str(d.get("run_name") or "").strip()]
+        self._run_display_by_name = {
+            str(d.get("run_name") or "").strip(): str(d.get("display_name") or "").strip()
+            for d in self._runs_ex
+        }
+        # Only keep unique display->run mappings (for legacy auto-plots that stored display text).
+        counts: dict[str, int] = {}
+        for rn, dn in self._run_display_by_name.items():
+            if dn:
+                counts[dn] = int(counts.get(dn, 0)) + 1
+        self._run_name_by_display = {
+            dn: rn for rn, dn in self._run_display_by_name.items() if dn and int(counts.get(dn, 0)) == 1
+        }
+
+        has_any_display = any(bool(v) for v in self._run_display_by_name.values())
+        if hasattr(self, "cb_show_run_labels"):
+            self.cb_show_run_labels.setEnabled(bool(self._run_labeling_enabled) or has_any_display)
+            if not (bool(self._run_labeling_enabled) or has_any_display):
+                self.cb_show_run_labels.setChecked(False)
+
+        prev_run = self._run_name_by_display.get(prev_ref, prev_ref)
+        self._refresh_run_dropdown(prev_run_name=prev_run)
 
         self.list_serials.clear()
         for sn in serials:
@@ -3182,10 +3213,52 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._refresh_columns_for_run()
         self._refresh_stats_preview()
 
+    def _current_run_name(self) -> str:
+        ref = self.cb_run.currentData() if hasattr(self, "cb_run") else None
+        run = str(ref or (self.cb_run.currentText() if hasattr(self, "cb_run") else "") or "").strip()
+        # Legacy auto-plots may have stored the display label instead of the underlying run_name.
+        return str(self._run_name_by_display.get(run, run) or "").strip()
+
+    def _run_display_text(self, run_name: str) -> str:
+        rn = str(run_name or "").strip()
+        if not rn:
+            return ""
+        dn = str((self._run_display_by_name or {}).get(rn) or "").strip()
+        return dn or rn
+
+    def _select_run_by_name(self, run_name: str) -> None:
+        rn = str(run_name or "").strip()
+        if not rn or not hasattr(self, "cb_run"):
+            return
+        idx = self.cb_run.findData(rn)
+        if idx >= 0:
+            self.cb_run.setCurrentIndex(idx)
+
+    def _refresh_run_dropdown(self, prev_run_name: str | None = None) -> None:
+        if not hasattr(self, "cb_run"):
+            return
+        if prev_run_name is None:
+            prev_run_name = self._current_run_name()
+        show = bool(getattr(self, "cb_show_run_labels", None) and self.cb_show_run_labels.isChecked())
+        runs = [str(d.get("run_name") or "").strip() for d in (self._runs_ex or []) if str(d.get("run_name") or "").strip()]
+        self.cb_run.blockSignals(True)
+        self.cb_run.clear()
+        for rn in runs:
+            text = self._run_display_text(rn) if show else rn
+            self.cb_run.addItem(text, rn)
+        if prev_run_name:
+            self._select_run_by_name(prev_run_name)
+        self.cb_run.blockSignals(False)
+        try:
+            self._refresh_columns_for_run()
+            self._refresh_stats_preview()
+        except Exception:
+            pass
+
     def _refresh_columns_for_run(self) -> None:
         if not self._db_path:
             return
-        run = (self.cb_run.currentText() or "").strip()
+        run = self._current_run_name()
         if not run:
             self.cb_y_curve.clear()
             self.cb_x.clear()
@@ -3382,7 +3455,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 _set_val(st, val)
 
     def _refresh_stats_preview(self) -> None:
-        run = (self.cb_run.currentText() or "").strip()
+        run = self._current_run_name()
         y_col = ""
         if self._mode == "curves":
             y_col = (getattr(self, "cb_y_curve", None).currentText() or "").strip() if hasattr(self, "cb_y_curve") else ""
@@ -3413,7 +3486,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
     def _plot_metrics(self) -> None:
         if not self._plot_ready or not self._db_path:
             return
-        run = (self.cb_run.currentText() or "").strip()
+        run = self._current_run_name()
         stats = [it.text().strip().lower() for it in self.list_stats.selectedItems()] if hasattr(self, "list_stats") else []
         stats = [s for s in stats if s]
         if not run or not stats:
@@ -3433,10 +3506,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.information(self, "Plot Metrics", "No serial numbers available.")
             return
 
+        show = bool(getattr(self, "cb_show_run_labels", None) and self.cb_show_run_labels.isChecked())
+        run_title = self._run_display_text(run) if show else run
         stats_label = "/".join(stats)
         y_label = stats[0] if len(stats) == 1 else "Metric value"
         self._axes.clear()
-        self._axes.set_title(f"{run} — {stats_label}")
+        self._axes.set_title(f"{run_title} — {stats_label}")
         self._axes.set_xlabel("Serial Number")
         self._axes.set_ylabel(y_label)
         x = list(range(len(labels)))
@@ -3492,7 +3567,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
     def _plot_curves(self) -> None:
         if not self._plot_ready or not self._db_path:
             return
-        run = (self.cb_run.currentText() or "").strip()
+        run = self._current_run_name()
         y_col = (self.cb_y_curve.currentText() or "").strip() if hasattr(self, "cb_y_curve") else ""
         x_label = (self.cb_x.currentText() or "").strip()
         x_key = self.cb_x.currentData()
@@ -3518,7 +3593,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             return
 
         self._axes.clear()
-        self._axes.set_title(f"{run} — {y_col} vs {x_label or x_col}")
+        show = bool(getattr(self, "cb_show_run_labels", None) and self.cb_show_run_labels.isChecked())
+        run_title = self._run_display_text(run) if show else run
+        self._axes.set_title(f"{run_title} — {y_col} vs {x_label or x_col}")
         self._axes.set_xlabel(x_label or x_col)
         self._axes.set_ylabel(y_col)
         for s in curves:
@@ -3587,15 +3664,18 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         if not hasattr(self, "list_auto_plots"):
             return
         self.list_auto_plots.clear()
+        show = bool(getattr(self, "cb_show_run_labels", None) and self.cb_show_run_labels.isChecked())
         for d in self._auto_plots:
             name = str(d.get("name") or "").strip()
             if not name:
                 mode = str(d.get("mode") or "").strip()
-                run = str(d.get("run") or "").strip()
+                run_ref = str(d.get("run") or "").strip()
+                run = self._run_name_by_display.get(run_ref, run_ref)
+                run_disp = self._run_display_text(run) if show else run
                 if mode == "curves":
                     y = ", ".join([str(x) for x in (d.get("y") or []) if str(x).strip()])
                     x = str(d.get("x") or "").strip()
-                    name = f"Curves: {run} {y} vs {x}".strip()
+                    name = f"Curves: {run_disp} {y} vs {x}".strip()
                 else:
                     y = ", ".join([str(x) for x in (d.get("y") or []) if str(x).strip()])
                     stats_val = d.get("stats")
@@ -3609,7 +3689,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                         if st:
                             stats = [st]
                     stats_label = "/".join(stats) if stats else "mean"
-                    name = f"Metrics: {run} {stats_label} ({y})".strip()
+                    name = f"Metrics: {run_disp} {stats_label} ({y})".strip()
             item = QtWidgets.QListWidgetItem(name or "Auto-Plot")
             item.setData(QtCore.Qt.ItemDataRole.UserRole, d)
             self.list_auto_plots.addItem(item)
@@ -3632,13 +3712,16 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             return
         d = dict(self._last_plot_def)
         if "name" not in d:
+            show = bool(getattr(self, "cb_show_run_labels", None) and self.cb_show_run_labels.isChecked())
             if d.get("mode") == "curves":
                 run = str(d.get("run") or "").strip()
+                run_disp = self._run_display_text(run) if show else run
                 y = ", ".join([str(x) for x in (d.get("y") or []) if str(x).strip()])
                 x = str(d.get("x") or "").strip()
-                d["name"] = f"Curves: {run} {y} vs {x}".strip()
+                d["name"] = f"Curves: {run_disp} {y} vs {x}".strip()
             else:
                 run = str(d.get("run") or "").strip()
+                run_disp = self._run_display_text(run) if show else run
                 y = ", ".join([str(x) for x in (d.get("y") or []) if str(x).strip()])
                 stats_val = d.get("stats")
                 stats = (
@@ -3651,7 +3734,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     if st:
                         stats = [st]
                 stats_label = "/".join(stats) if stats else "mean"
-                d["name"] = f"Metrics: {run} {stats_label} ({y})".strip()
+                d["name"] = f"Metrics: {run_disp} {stats_label} ({y})".strip()
         self._auto_plots.append(d)
         try:
             self._auto_plot_path.write_text(json.dumps(self._auto_plots, indent=2), encoding="utf-8")
@@ -3672,9 +3755,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         mode = str(d.get("mode") or "").strip().lower()
         if mode not in {"curves", "metrics"}:
             return
-        run = str(d.get("run") or "").strip()
+        run_ref = str(d.get("run") or "").strip()
+        run = self._run_name_by_display.get(run_ref, run_ref)
         if run:
-            self.cb_run.setCurrentText(run)
+            self._select_run_by_name(run)
         self._set_mode(mode)
         if mode == "curves":
             ys = d.get("y") or []
@@ -3733,17 +3817,20 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             return
 
         plots: list[tuple[str, dict]] = []
+        show = bool(getattr(self, "cb_show_run_labels", None) and self.cb_show_run_labels.isChecked())
         for d in self._auto_plots:
             if not isinstance(d, dict):
                 continue
             name = str(d.get("name") or "").strip()
             if not name:
                 mode = str(d.get("mode") or "").strip()
-                run = str(d.get("run") or "").strip()
+                run_ref = str(d.get("run") or "").strip()
+                run = self._run_name_by_display.get(run_ref, run_ref)
+                run_disp = self._run_display_text(run) if show else run
                 if mode == "curves":
                     y = ", ".join([str(x) for x in (d.get("y") or []) if str(x).strip()])
                     x = str(d.get("x") or "").strip()
-                    name = f"Curves: {run} {y} vs {x}".strip()
+                    name = f"Curves: {run_disp} {y} vs {x}".strip()
                 else:
                     y = ", ".join([str(x) for x in (d.get("y") or []) if str(x).strip()])
                     stats_val = d.get("stats")
@@ -3757,7 +3844,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                         if st:
                             stats = [st]
                     stats_label = "/".join(stats) if stats else "mean"
-                    name = f"Metrics: {run} {stats_label} ({y})".strip()
+                    name = f"Metrics: {run_disp} {stats_label} ({y})".strip()
             plots.append((name or "Auto Plot", d))
 
         if not plots:
@@ -3843,7 +3930,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         ax = fig.add_subplot(111)
 
         mode = str(d.get("mode") or "").strip().lower()
-        run = str(d.get("run") or "").strip()
+        run_ref = str(d.get("run") or "").strip()
+        run = self._run_name_by_display.get(run_ref, run_ref)
         if mode == "curves":
             ys = d.get("y") or []
             y = str(ys[0] if isinstance(ys, list) and ys else "").strip()

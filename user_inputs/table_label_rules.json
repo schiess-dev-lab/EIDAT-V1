@@ -8,6 +8,8 @@
       "priority": 1000,
       "must_contain_all": ["Foo"],
       "must_contain_any": [],
+
+      
       "must_not_contain": [],
       "min_rows": 3,
       "min_cols": 3,

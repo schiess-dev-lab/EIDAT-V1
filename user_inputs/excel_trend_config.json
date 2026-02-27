@@ -8,5 +8,25 @@
   ],
   "statistics": ["mean", "min", "max", "std", "median", "count"],
   "sheet_name": null,
-  "header_row": 0
+  "header_row": 0,
+  "td_run_labeling": {
+    "enabled": false,
+    "template": "{pressure}psia, {run_type}, {pulse_on}ON/{pulse_off}OFF",
+    "missing_value": "blank",
+    "value_pick": "most_common",
+    "duplicate_disambiguation": {
+      "enabled": true,
+      "template": "{label} — {run_name}"
+    },
+    "fuzzy_match": {
+      "enabled": true,
+      "min_ratio": 0.82
+    },
+    "variables": {
+      "pressure": { "column": "pressure", "format": ".0f" },
+      "run_type": { "column": "run type" },
+      "pulse_on": { "column": "pulse on", "format": ".0f" },
+      "pulse_off": { "column": "pulse off", "format": ".0f" }
+    }
+  }
 }

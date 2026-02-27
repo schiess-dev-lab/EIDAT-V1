@@ -491,6 +491,38 @@ def _default_excel_config_path() -> Path:
     return repo_root / "user_inputs" / "excel_trend_config.json"
 
 
+def _resolve_user_inputs_file(name: str) -> Path:
+    """
+    Resolve a user_inputs/<name> file for both dev-repo and production-node runs.
+
+    In production-node runs, EIDAT.bat sets EIDAT_DATA_ROOT to a node-local writable
+    folder (e.g. <node_root>\\EIDAT\\UserData). Prefer that first, then fall back to
+    the runtime repo root's user_inputs.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    candidates: list[Path] = []
+
+    raw_data_root = (os.environ.get("EIDAT_DATA_ROOT") or "").strip()
+    if raw_data_root:
+        try:
+            data_root = Path(raw_data_root).expanduser()
+            if not data_root.is_absolute():
+                data_root = (repo_root / data_root).resolve()
+            candidates.append(data_root / "user_inputs" / str(name))
+        except Exception:
+            pass
+
+    candidates.append(repo_root / "user_inputs" / str(name))
+
+    for p in candidates:
+        try:
+            if p.exists():
+                return p
+        except Exception:
+            continue
+    return candidates[-1]
+
+
 def _excel_artifacts_dir(paths: SupportPaths, excel_path: Path) -> Path:
     return paths.support_dir / "debug" / "ocr" / f"{excel_path.stem}{EXCEL_ARTIFACT_SUFFIX}"
 
@@ -830,6 +862,26 @@ def process_candidates(
                             combined_text = ""
                             combined_txt_path = None
 
+                        # Post-processing (combined.txt-only): merge multi-page run-on tables in-place.
+                        # This is intentionally decoupled from OCR and operates only on the final merged artifact.
+                        if artifacts_dir and combined_txt_path is not None:
+                            try:
+                                from extraction.table_multipage_merger import (
+                                    load_table_merge_heuristics,
+                                    merge_multipage_tables_in_combined_lines,
+                                )
+
+                                heur_path = _resolve_user_inputs_file("table_merge_heuristics.json")
+                                cfg = load_table_merge_heuristics(heur_path)
+                                if combined_txt_path.exists():
+                                    raw_lines = combined_txt_path.read_text(encoding="utf-8", errors="ignore").splitlines(True)
+                                    merged_lines = merge_multipage_tables_in_combined_lines(raw_lines, cfg=cfg)
+                                    if merged_lines and merged_lines != raw_lines:
+                                        combined_txt_path.write_text("".join(merged_lines), encoding="utf-8")
+                                        combined_text = "".join(merged_lines)
+                            except Exception:
+                                pass
+
                         if artifacts_dir and combined_txt_path is not None:
                             _export_extracted_terms_db(Path(artifacts_dir), combined_txt_path)
                         extracted_meta = extract_metadata_from_text(combined_text, pdf_path=abs_path) if combined_text else None
@@ -864,7 +916,7 @@ def process_candidates(
                             try:
                                 from extraction.table_labeler import load_table_label_rules, label_combined_lines
 
-                                rules_path = paths.global_repo / "user_inputs" / "table_label_rules.json"
+                                rules_path = _resolve_user_inputs_file("table_label_rules.json")
                                 rules_cfg = load_table_label_rules(rules_path)
                                 if rules_cfg and combined_txt_path.exists():
                                     raw_lines = combined_txt_path.read_text(encoding="utf-8", errors="ignore").splitlines(True)
