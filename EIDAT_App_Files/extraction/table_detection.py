@@ -114,10 +114,11 @@ def detect_tables(
         return {'tables': [], 'cells': []}
 
     h, w = img_gray.shape
+    guardrails = _env_bool("EIDAT_TABLE_DETECT_GUARDRAILS", True)
 
     # Step 1: Detect cells using contour and corner methods
     cells_contour = _find_cells_contour(img_gray, verbose=verbose)
-    cells_corner = _find_cells_corner(img_gray, verbose=verbose)
+    cells_corner = _find_cells_corner(img_gray, verbose=verbose, guardrails=guardrails)
 
     # Step 2: Merge and deduplicate
     all_cells = cells_contour + cells_corner
@@ -148,13 +149,14 @@ def detect_tables(
     # NOTE: The original max-cluster guard is applied after container filtering, but pages can hang
     # earlier (dedupe/container) when the raw cell count explodes.
     max_cluster_cells = _env_int("EIDAT_TABLE_DETECT_MAX_CLUSTER_CELLS", 200)
-    pre_dedupe_cap = max(0, int(max_cluster_cells) * 4) if int(max_cluster_cells) > 0 else 0
-    if pre_dedupe_cap and len(all_cells) > int(pre_dedupe_cap):
-        if verbose:
-            print(
-                f"  - Skipping table detection: raw cells {len(all_cells)} exceeds pre-dedupe cap {int(pre_dedupe_cap)}"
-            )
-        return {'tables': [], 'cells': []}
+    if guardrails:
+        pre_dedupe_cap = max(0, int(max_cluster_cells) * 4) if int(max_cluster_cells) > 0 else 0
+        if pre_dedupe_cap and len(all_cells) > int(pre_dedupe_cap):
+            if verbose:
+                print(
+                    f"  - Skipping table detection: raw cells {len(all_cells)} exceeds pre-dedupe cap {int(pre_dedupe_cap)}"
+                )
+            return {'tables': [], 'cells': []}
 
     # Step 2.7: Merge and deduplicate (can be quadratic; keep after cheap filters + cap)
     all_cells = _remove_duplicate_cells(all_cells)
@@ -170,10 +172,11 @@ def detect_tables(
 
     # Step 4.5: Guard against pathological cell counts (charts / dense grids).
     # Clustering is O(n^2); beyond a point it becomes impractical.
-    if int(max_cluster_cells) > 0 and len(actual_cells) > int(max_cluster_cells):
-        if verbose:
-            print(f"  - Skipping table clustering: {len(actual_cells)} cells exceeds max {int(max_cluster_cells)}")
-        return {'tables': [], 'cells': []}
+    if guardrails:
+        if int(max_cluster_cells) > 0 and len(actual_cells) > int(max_cluster_cells):
+            if verbose:
+                print(f"  - Skipping table clustering: {len(actual_cells)} cells exceeds max {int(max_cluster_cells)}")
+            return {'tables': [], 'cells': []}
 
     # Step 5: Cluster cells into tables
     tables = _cluster_into_tables(
@@ -319,7 +322,7 @@ def _find_cells_contour(img_gray: np.ndarray, *, verbose: bool = False) -> List[
     return cells
 
 
-def _find_cells_corner(img_gray: np.ndarray, *, verbose: bool = False) -> List[Dict]:
+def _find_cells_corner(img_gray: np.ndarray, *, verbose: bool = False, guardrails: bool = True) -> List[Dict]:
     """Find cells by detecting line intersections (corners) and connecting lines."""
     h, w = img_gray.shape
     img_gray = _preprocess_for_lines(img_gray)
@@ -380,16 +383,17 @@ def _find_cells_corner(img_gray: np.ndarray, *, verbose: bool = False) -> List[D
     intersections = cv2.bitwise_and(horiz_d, vert_d)
 
     # Get corners
-    max_cluster_cells = _env_int("EIDAT_TABLE_DETECT_MAX_CLUSTER_CELLS", 200)
-    # Corner-based reconstruction is extremely expensive (roughly O(n^2) pairs with inner scans),
-    # so we cap the number of corners to keep chart/grid pages from hanging.
     max_corners_default = 300
     max_corners = _env_int("EIDAT_TABLE_DETECT_MAX_CORNERS", int(max_corners_default))
     if int(max_corners) <= 0:
         if verbose:
             print("  - Skipping corner-based cells: EIDAT_TABLE_DETECT_MAX_CORNERS <= 0")
         return []
-    corners = _extract_corners(intersections, max_corners=int(max_corners))
+
+    # Corner-based reconstruction is extremely expensive (roughly O(n^2) pairs with inner scans).
+    # When guardrails are disabled for debugging, do not cap corners.
+    cap = int(max_corners) if guardrails else None
+    corners = _extract_corners(intersections, max_corners=cap)
     if corners is None:
         if verbose and int(max_corners) > 0:
             print(f"  - Skipping corner-based cells: corners exceeded max {int(max_corners)}")

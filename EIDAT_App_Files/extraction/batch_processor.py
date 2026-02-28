@@ -235,10 +235,18 @@ class ExtractionPipeline:
                 'dpi': self.detection_dpi
             }
 
+        guardrails = str(os.environ.get("EIDAT_TABLE_DETECT_GUARDRAILS", "1") or "1").strip().lower() in (
+            "1",
+            "true",
+            "t",
+            "yes",
+            "y",
+            "on",
+        )
         table_timeout_sec = _env_int("EIDAT_TABLE_DETECT_TIMEOUT_SEC", _env_int("EIDAT_PAGE_TABLE_TIMEOUT_SEC", 0))
         if table_timeout_sec < 0:
             table_timeout_sec = 0
-        if table_timeout_sec and int(table_timeout_sec) > 0:
+        if guardrails and table_timeout_sec and int(table_timeout_sec) > 0:
             table_result = _detect_tables_with_timeout(
                 img_gray_hires, verbose=bool(verbose), timeout_sec=int(table_timeout_sec)
             )
