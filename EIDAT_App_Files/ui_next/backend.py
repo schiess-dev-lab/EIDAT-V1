@@ -4701,6 +4701,27 @@ def _normalize_key(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", _normalize_text(s))
 
 
+def _table_label_matches(want_label: str, block_label: str) -> bool:
+    """
+    Return True if `block_label` matches `want_label`.
+
+    This treats labeler-generated numeric suffixes as equivalent:
+      "Acceptance Test Data" matches "Acceptance Test Data (2)".
+    """
+    want = _normalize_text(want_label).strip()
+    if not want:
+        return True
+    got = _normalize_text(block_label).strip()
+    if got == want:
+        return True
+    if got.startswith(want + " "):
+        rest = got[len(want) :].strip()
+        if rest.isdigit():
+            return True
+        return bool(re.fullmatch(r"\(\s*\d+\s*\)", rest))
+    return False
+
+
 def _token_overlap_score(a: str, b: str) -> float:
     """
     Return how well `b` covers the tokens in `a` (0..1).
@@ -5259,7 +5280,7 @@ def _parse_ascii_tables(lines: list[str]) -> list[dict]:
             i = j + 1
             continue
 
-        if ln.strip().startswith("+") and "-" in ln and ln.strip().endswith("+"):
+        if ln.strip().startswith("+") and (("-" in ln) or ("=" in ln)) and ln.strip().endswith("+"):
             # collect table block
             tbl_lines: list[str] = []
             j = i
@@ -6318,8 +6339,8 @@ def _extract_from_tables(
 
     for b in blocks:
         if want_label:
-            b_label = _normalize_text(str(b.get("table_label") or "")).strip()
-            if b_label != want_label:
+            b_label = str(b.get("table_label") or "").strip()
+            if not _table_label_matches(table_label, b_label):
                 continue
         if ga and not anchor_found:
             ok, row_idx = _block_anchor_hit(b)
@@ -6675,8 +6696,8 @@ def _extract_from_tables_by_header(
 
     for b_idx, b in enumerate(blocks or []):
         if want_label:
-            b_label = _normalize_text(str(b.get("table_label") or "")).strip()
-            if b_label != want_label:
+            b_label = str(b.get("table_label") or "").strip()
+            if not _table_label_matches(table_label, b_label):
                 continue
         if ga and not anchor_found:
             heading = _normalize_text(str(b.get("heading") or ""))

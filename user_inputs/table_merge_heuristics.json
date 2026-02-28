@@ -7,6 +7,28 @@
   "candidate_tables_prev": 2,
   "candidate_tables_next": 2,
   "header_block_similarity_below": 0.2,
-  "title_block_fuzzy_ratio_below": 0.5
-}
+  "title_block_fuzzy_ratio_below": 0.5,
 
+  "label_merge_rules": [
+    {
+      "label": "Acceptance Test crap",
+      "search_prev_tables": 8,
+      "search_next_tables": 12,
+      "min_body_rows_override": 0,
+      "require_layout_compatible": true,
+      "allow_unlabeled_continuation": false,
+      "union_must_contain_all": []
+    },
+    {
+      "label": "Acceptance Test InformationZ",
+      "search_prev_tables": 8,
+      "search_next_tables": 12,
+      "min_body_rows_override": 0,
+      "require_layout_compatible": true,
+      "allow_unlabeled_continuation": false,
+      "union_must_contain_all": []
+    }
+  ],
+
+  "protect_labeled_tables": true
+}

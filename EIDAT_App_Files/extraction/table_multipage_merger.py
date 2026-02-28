@@ -22,9 +22,11 @@ from typing import Any, Optional
 PAGE_MARKER_RE = re.compile(r"^=== Page (\d+) ===\s*$")
 TABLE_TITLE_MARKER = "[Table/Chart Title]"
 TABLE_MARKER_RE = re.compile(r"^\[Table(?:\s+\d+)?\]\s*$")
+TABLE_LABEL_MARKER = "[TABLE_LABEL]"
 
 ASCII_BORDER_RE = re.compile(r"^\s*\+[-=+]+\+\s*$")
 ASCII_PIPE_ROW_RE = re.compile(r"^\s*\|.*\|\s*$")
+_LABEL_SUFFIX_RE = re.compile(r"\s*\(\s*\d+\s*\)\s*$")
 
 
 _DEFAULT_CFG: dict[str, Any] = {
@@ -141,6 +143,8 @@ class _AsciiTable:
     ascii_start: int
     ascii_end: int
     title: str
+    table_label: str
+    table_label_base: str
     indent: int
     plus_positions: tuple[int, ...]
     col_widths: tuple[int, ...]
@@ -176,6 +180,42 @@ def _find_preceding_title(lines: list[str], *, page_start: int, before_idx: int)
             if j < before_idx:
                 return str(lines[j]).rstrip("\r\n").strip()
             return ""
+        i -= 1
+    return ""
+
+
+def _base_table_label(label: str) -> str:
+    s = str(label or "").strip()
+    if not s:
+        return ""
+    s2 = _LABEL_SUFFIX_RE.sub("", s).strip()
+    return s2 or s
+
+
+def _find_preceding_table_label(lines: list[str], *, page_start: int, before_idx: int) -> str:
+    """
+    Best-effort: find the closest preceding [TABLE_LABEL] payload line in-page.
+
+    Only returns a label if the marker/payload block appears to apply to the
+    table that begins at `before_idx` (i.e., only blank lines between payload and table start).
+    """
+    i = before_idx - 1
+    while i >= page_start:
+        if str(lines[i]).rstrip("\r\n").strip() == TABLE_LABEL_MARKER:
+            j = i + 1
+            while j < before_idx and not str(lines[j]).strip():
+                j += 1
+            if j >= before_idx:
+                return ""
+            payload = str(lines[j]).rstrip("\r\n").strip()
+            if not payload:
+                return ""
+            k = j + 1
+            while k < before_idx:
+                if str(lines[k]).strip():
+                    return ""
+                k += 1
+            return payload
         i -= 1
     return ""
 
@@ -233,6 +273,7 @@ def _iter_ascii_tables(lines: list[str], pages: list[_PageRange]) -> list[_Ascii
                 header_cells = _extract_header_cells(block)
                 pipe_row_count = sum(1 for ln2 in block if _is_pipe_row(ln2))
                 title = _find_preceding_title(lines, page_start=page_start, before_idx=start)
+                table_label = _find_preceding_table_label(lines, page_start=page_start, before_idx=start)
                 indent, plus_positions, col_widths, _total_len = _extract_layout_signature(block[0])
                 out.append(
                     _AsciiTable(
@@ -240,6 +281,8 @@ def _iter_ascii_tables(lines: list[str], pages: list[_PageRange]) -> list[_Ascii
                         ascii_start=start,
                         ascii_end=j,
                         title=title,
+                        table_label=table_label,
+                        table_label_base=_base_table_label(table_label),
                         indent=int(indent),
                         plus_positions=tuple(plus_positions),
                         col_widths=tuple(col_widths),
@@ -420,7 +463,7 @@ def _find_blank_span_start(
                 continue
             if s == TABLE_TITLE_MARKER:
                 return False
-            if s == "[TABLE_LABEL]":
+            if s == TABLE_LABEL_MARKER:
                 j += 1
                 while j < table_ascii_start and not str(lines[j]).strip():
                     j += 1
@@ -449,7 +492,7 @@ def _find_blank_span_start(
             if not s:
                 k += 1
                 continue
-            if s == "[TABLE_LABEL]":
+            if s == TABLE_LABEL_MARKER:
                 k += 1
                 while k < table_ascii_start and not str(lines[k]).strip():
                     k += 1
@@ -464,6 +507,21 @@ def _find_blank_span_start(
             return False
         return True
 
+    def _label_directly_precedes(marker_idx: int) -> bool:
+        # Label marker must have a payload line; after payload, only allow blanks until the table.
+        j = marker_idx + 1
+        while j < table_ascii_start and not str(lines[j]).strip():
+            j += 1
+        if j >= table_ascii_start:
+            return False
+        # j is payload (label text); allow it even though it's non-marker content.
+        k = j + 1
+        while k < table_ascii_start:
+            if str(lines[k]).strip():
+                return False
+            k += 1
+        return True
+
     # Prefer [Table/Chart Title]
     for i in range(table_ascii_start - 1, lo - 1, -1):
         if str(lines[i]).rstrip("\r\n").strip() == TABLE_TITLE_MARKER and _title_directly_precedes(i):
@@ -476,7 +534,31 @@ def _find_blank_span_start(
             if _directly_precedes(i):
                 return i
 
+    # Else [TABLE_LABEL]
+    for i in range(table_ascii_start - 1, lo - 1, -1):
+        if str(lines[i]).rstrip("\r\n").strip() == TABLE_LABEL_MARKER and _label_directly_precedes(i):
+            return i
+
     return start
+
+
+def _norm_phrase_list(raw: object) -> list[str]:
+    if not isinstance(raw, list):
+        return []
+    out: list[str] = []
+    for p in raw:
+        s = _norm_cell(str(p or ""))
+        if s:
+            out.append(s)
+    return out
+
+
+def _norm_table_text(lines: list[str], t: _AsciiTable) -> str:
+    cells: list[str] = []
+    for ln in lines[t.ascii_start : t.ascii_end]:
+        if _is_pipe_row(ln):
+            cells.extend(_split_cells_from_pipe_row(ln))
+    return _norm_cell(" ".join(cells))
 
 
 def _find_blank_span_end(lines: list[str], *, page_end: int, table_ascii_end: int) -> int:
@@ -527,6 +609,39 @@ def merge_multipage_tables_in_combined_lines(lines: list[str], cfg: dict[str, An
     except Exception:
         min_body = 8
 
+    label_merge_rules = cfg2.get("label_merge_rules")
+    label_rules: list[dict[str, Any]] = label_merge_rules if isinstance(label_merge_rules, list) else []
+    try:
+        protect_labeled = bool(cfg2.get("protect_labeled_tables", False))
+    except Exception:
+        protect_labeled = False
+    allowed_label_bases: set[str] = {_base_table_label(r.get("label")) for r in label_rules if isinstance(r, dict)}
+    allowed_label_bases = {x for x in allowed_label_bases if x}
+
+    debug_dump_path = str(cfg2.get("debug_dump_path") or "").strip()
+    debug_enabled = bool(debug_dump_path)
+    debug_report: dict[str, Any] = {"version": 1, "pages": [], "decisions": []}
+    if debug_enabled:
+        # Precompute per-page table summaries.
+        for p in sorted(tables_by_page.keys()):
+            debug_report["pages"].append(
+                {
+                    "page": int(p),
+                    "tables": [
+                        {
+                            "ascii_start": int(t.ascii_start),
+                            "ascii_end": int(t.ascii_end),
+                            "cols": int(len(t.col_widths)),
+                            "body_rows_est": int(t.body_row_count_est),
+                            "title": str(t.title or ""),
+                            "table_label": str(t.table_label or ""),
+                            "table_label_base": str(t.table_label_base or ""),
+                        }
+                        for t in tables_by_page.get(p, [])
+                    ],
+                }
+            )
+
     # Build continuation groups: leader -> [continuations...]
     leader_for: dict[tuple[int, int], tuple[int, int]] = {}
     groups: dict[tuple[int, int], list[tuple[int, int]]] = {}
@@ -541,32 +656,149 @@ def merge_multipage_tables_in_combined_lines(lines: list[str], cfg: dict[str, An
         next_list = tables_by_page.get(p_next, [])
         if not prev_list or not next_list:
             continue
+        decision: dict[str, Any] = {"boundary": f"{int(p)}->{int(p_next)}", "forced": [], "legacy": None}
+
+        # 0) Label-driven forced merges (best-effort, per allowlisted label).
+        for rr in label_rules:
+            if not isinstance(rr, dict):
+                continue
+            rule_label = _base_table_label(rr.get("label"))
+            if not rule_label:
+                continue
+            try:
+                sp = int(rr.get("search_prev_tables", 0) or 0)
+            except Exception:
+                sp = 0
+            try:
+                sn = int(rr.get("search_next_tables", 0) or 0)
+            except Exception:
+                sn = 0
+            sp = max(sp, 1) if sp else max(k_prev, 1)
+            sn = max(sn, 1) if sn else max(k_next, 1)
+            try:
+                min_override_raw = rr.get("min_body_rows_override", None)
+                min_override = None if min_override_raw is None else int(min_override_raw)
+            except Exception:
+                min_override = None
+            try:
+                require_layout = bool(rr.get("require_layout_compatible", True))
+            except Exception:
+                require_layout = True
+            try:
+                allow_unlabeled = bool(rr.get("allow_unlabeled_continuation", False))
+            except Exception:
+                allow_unlabeled = False
+            must_all = _norm_phrase_list(rr.get("union_must_contain_all") or [])
+
+            prev_cands_r = prev_list[-max(sp, 1) :]
+            next_cands_r = next_list[: max(sn, 1)]
+            leader_opts = [t for t in prev_cands_r if t.table_label_base and t.table_label_base == rule_label]
+            if not leader_opts:
+                decision["forced"].append({"label": rule_label, "ok": False, "reason": "leader_not_found"})
+                continue
+            a = leader_opts[-1]
+            ak = _table_key(a)
+            min_body_rule = min_body if min_override is None else max(int(min_override), 0)
+            if ak not in leader_for and int(a.body_row_count_est) < min_body_rule:
+                decision["forced"].append(
+                    {"label": rule_label, "ok": False, "reason": "leader_too_small", "body_rows_est": int(a.body_row_count_est)}
+                )
+                continue
+
+            cont_opts = [t for t in next_cands_r if t.table_label_base and t.table_label_base == rule_label]
+            b: _AsciiTable | None = None
+            if cont_opts:
+                b = cont_opts[0]
+            elif allow_unlabeled:
+                # Conservative: only accept an unlabeled continuation if it is the only compatible candidate.
+                unl = [t for t in next_cands_r if not t.table_label_base]
+                compat = []
+                for cand in unl:
+                    if require_layout and not _layout_compatible(a, cand, cfg2):
+                        continue
+                    compat.append(cand)
+                if len(compat) == 1:
+                    b = compat[0]
+
+            if b is None:
+                decision["forced"].append({"label": rule_label, "ok": False, "reason": "continuation_not_found"})
+                continue
+
+            bk = _table_key(b)
+            if bk in used_as_continuation:
+                decision["forced"].append({"label": rule_label, "ok": False, "reason": "continuation_already_used"})
+                continue
+            if require_layout and not _layout_compatible(a, b, cfg2):
+                decision["forced"].append({"label": rule_label, "ok": False, "reason": "layout_incompatible"})
+                continue
+            if must_all:
+                hay = f"{_norm_table_text(lines, a)} {_norm_table_text(lines, b)}".strip()
+                if not hay or any(ph not in hay for ph in must_all):
+                    decision["forced"].append({"label": rule_label, "ok": False, "reason": "union_keywords_missing"})
+                    continue
+
+            leader = leader_for.get(ak, ak)
+            groups.setdefault(leader, [])
+            groups[leader].append(bk)
+            leader_for[bk] = leader
+            used_as_continuation.add(bk)
+            decision["forced"].append({"label": rule_label, "ok": True, "leader": ak, "cont": bk})
+
+        # 1) Legacy heuristic merge for unlabeled tables (or label-allowed if protection disabled).
         prev_cands = prev_list[-max(k_prev, 1) :]
         next_cands = next_list[: max(k_next, 1)]
-        pair = _pick_boundary_pair(prev_cands, next_cands, cfg=cfg2)
-        if not pair:
-            continue
-        a, b = pair
-        ak = _table_key(a)
-        # Only enforce the "big enough" guardrail for the first page where the run-on
-        # table begins. Continuation pages can legitimately have fewer visible rows.
-        if ak not in leader_for and int(a.body_row_count_est) < min_body:
-            continue
-        bk = _table_key(b)
-        # Allow chaining: a table that was already a continuation can still be the "prev" side
-        # of the next boundary (page p+1 -> p+2). But a table should not be used as a
-        # continuation more than once.
-        if bk in used_as_continuation:
-            continue
+        if protect_labeled:
+            # Disallow legacy merges involving labeled tables unless the label is explicitly allowlisted and matches.
+            def _legacy_ok(a: _AsciiTable, b: _AsciiTable) -> bool:
+                if not a.table_label_base and not b.table_label_base:
+                    return True
+                if a.table_label_base and b.table_label_base and a.table_label_base == b.table_label_base:
+                    return a.table_label_base in allowed_label_bases
+                return False
 
-        # Attach b under leader of a, if a itself is already a continuation, chain under its leader.
-        leader = leader_for.get(ak, ak)
-        groups.setdefault(leader, [])
-        groups[leader].append(bk)
-        leader_for[bk] = leader
-        used_as_continuation.add(bk)
+            # Reduce the cartesian search space by filtering obvious no-gos.
+            prev_cands = [t for t in prev_cands if (not t.table_label_base) or (t.table_label_base in allowed_label_bases)]
+            next_cands = [t for t in next_cands if (not t.table_label_base) or (t.table_label_base in allowed_label_bases)]
+        else:
+            _legacy_ok = None  # type: ignore[assignment]
+
+        pair = _pick_boundary_pair(prev_cands, next_cands, cfg=cfg2) if (prev_cands and next_cands) else None
+        if pair:
+            a, b = pair
+            if protect_labeled and _legacy_ok is not None and not _legacy_ok(a, b):
+                decision["legacy"] = {"ok": False, "reason": "protected_labels_blocked"}
+            else:
+                ak = _table_key(a)
+                if ak not in leader_for and int(a.body_row_count_est) < min_body:
+                    decision["legacy"] = {"ok": False, "reason": "leader_too_small", "body_rows_est": int(a.body_row_count_est)}
+                else:
+                    bk = _table_key(b)
+                    if bk in used_as_continuation:
+                        decision["legacy"] = {"ok": False, "reason": "continuation_already_used"}
+                    else:
+                        leader = leader_for.get(ak, ak)
+                        groups.setdefault(leader, [])
+                        groups[leader].append(bk)
+                        leader_for[bk] = leader
+                        used_as_continuation.add(bk)
+                        decision["legacy"] = {"ok": True, "leader": ak, "cont": bk}
+        else:
+            decision["legacy"] = {"ok": False, "reason": "no_pair"}
+
+        if debug_enabled:
+            debug_report["decisions"].append(decision)
 
     if not groups:
+        if debug_enabled:
+            try:
+                dp = Path(debug_dump_path).expanduser()
+                if not dp.is_absolute():
+                    repo_root = Path(__file__).resolve().parents[2]
+                    dp = repo_root / dp
+                dp.parent.mkdir(parents=True, exist_ok=True)
+                dp.write_text(json.dumps(debug_report, indent=2), encoding="utf-8")
+            except Exception:
+                pass
         return lines
 
     # Build replacements as slice operations on the original lines indices.
@@ -639,6 +871,17 @@ def merge_multipage_tables_in_combined_lines(lines: list[str], cfg: dict[str, An
             continue
         end2 = min(end, len(out_lines))
         out_lines[start:end2] = list(new_lines)
+
+    if debug_enabled:
+        try:
+            dp = Path(debug_dump_path).expanduser()
+            if not dp.is_absolute():
+                repo_root = Path(__file__).resolve().parents[2]
+                dp = repo_root / dp
+            dp.parent.mkdir(parents=True, exist_ok=True)
+            dp.write_text(json.dumps(debug_report, indent=2), encoding="utf-8")
+        except Exception:
+            pass
 
     return out_lines
 

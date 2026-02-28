@@ -72,6 +72,22 @@ If an allowlist is empty/missing, the extracted value is forced to `Unknown`.
 
 To backfill old metadata (e.g., remove non-allowlisted program titles), run **Files Explorer → Refresh Metadata Only** on the affected files (it rewrites metadata JSONs and triggers an index refresh).
 
+## Table labeling (combined.txt)
+EIDAT can insert stable table labels into OCR `combined.txt` output using rules in `user_inputs/table_label_rules.json`.
+
+- Each matching table gets a label block inserted immediately before it:
+  - `[TABLE_LABEL]`
+  - `Your Label` (or `Your Label (2)` for repeats)
+- Multiple table types are supported by adding multiple entries under `rules`.
+- Rule selection is per-table: the highest `priority` match wins (ties default to earlier rule order).
+- Optional: set `"tie_breaker": "priority_then_specificity"` to prefer the most-specific rule when priorities tie.
+
+## Table merging (multi-page ASCII tables)
+EIDAT can merge bordered ASCII tables that continue across page boundaries in `combined.txt` using `user_inputs/table_merge_heuristics.json`.
+
+- Default behavior is heuristic (layout/headers/titles) and only considers adjacent pages.
+- Optional: enable label-driven merging by setting `label_merge_rules` (allowlist of base table labels) and `protect_labeled_tables` to avoid accidental merges of labeled tables.
+
 ## Quickstart (admin, shared-drive testing)
 
 ### 1) Prepare Central Runtime

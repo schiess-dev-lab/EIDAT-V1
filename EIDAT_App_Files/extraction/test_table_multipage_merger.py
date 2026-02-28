@@ -153,6 +153,108 @@ class TestTableMultipageMerger(unittest.TestCase):
         out2 = merge_multipage_tables_in_combined_lines(out1)
         self.assertEqual(out2, out1)
 
+    def test_label_forced_merge_finds_non_first_continuation_table(self) -> None:
+        cols = [("A", 6), ("B", 6), ("C", 6)]
+        header = ["col1", "col2", "col3"]
+        rows_p1 = [[f"r{i}a", f"r{i}b", f"r{i}c"] for i in range(1, 4)]  # short leader
+        rows_p2 = [[f"r{i}a", f"r{i}b", f"r{i}c"] for i in range(4, 7)]
+        table1 = _mk_table(cols=cols, header=header, rows=rows_p1, use_eq_header_sep=True)
+        table2 = _mk_table(cols=cols, header=header, rows=rows_p2, use_eq_header_sep=True)
+
+        junk1 = _mk_table(cols=cols, header=header, rows=[["x1", "y1", "z1"]], use_eq_header_sep=True)
+        junk2 = _mk_table(cols=cols, header=header, rows=[["x2", "y2", "z2"]], use_eq_header_sep=True)
+
+        lines: list[str] = []
+        lines += ["=== Page 1 ===\n", "\n", "[TABLE_LABEL]\n", "Acceptance Test crap\n", "\n"]
+        lines += table1
+        lines += ["\n", "=== Page 2 ===\n", "\n"]
+        lines += junk1
+        lines += ["\n"]
+        lines += junk2
+        lines += ["\n", "carry-over text that should remain\n", "\n", "[TABLE_LABEL]\n", "Acceptance Test crap (2)\n", "\n"]
+        lines += table2
+        lines += ["\n", "After table text\n"]
+
+        cfg = {
+            "version": 1,
+            "protect_labeled_tables": True,
+            "label_merge_rules": [
+                {
+                    "label": "Acceptance Test crap",
+                    "search_prev_tables": 8,
+                    "search_next_tables": 12,
+                    "min_body_rows_override": 0,
+                    "require_layout_compatible": True,
+                    "allow_unlabeled_continuation": False,
+                    "union_must_contain_all": [],
+                }
+            ],
+        }
+
+        out = merge_multipage_tables_in_combined_lines(lines, cfg=cfg)
+        txt = "".join(out)
+
+        # Leader should now contain continuation content.
+        self.assertIn("|r1a", txt)
+        self.assertIn("|r6a", txt)
+
+        # Carry-over text should remain on page 2.
+        self.assertIn("carry-over text that should remain", txt)
+
+        # Continuation table label marker should be blanked out (no orphan label left on page 2).
+        self.assertNotIn("\n[TABLE_LABEL]\nAcceptance Test crap (2)\n", txt)
+
+    def test_does_not_merge_different_labels_even_if_layout_matches(self) -> None:
+        cols = [("A", 6), ("B", 6)]
+        header = ["h1", "h2"]
+        p1 = [[f"a{i}", f"b{i}"] for i in range(1, 4)]
+        p2 = [[f"a{i}", f"b{i}"] for i in range(4, 7)]
+        t1 = _mk_table(cols=cols, header=header, rows=p1, use_eq_header_sep=True)
+        t2 = _mk_table(cols=cols, header=header, rows=p2, use_eq_header_sep=True)
+        lines = ["=== Page 1 ===\n", "\n", "[TABLE_LABEL]\n", "Acceptance Test crap\n", "\n"] + t1 + ["\n"]
+        lines += ["=== Page 2 ===\n", "\n", "[TABLE_LABEL]\n", "Acceptance Test InformationZ\n", "\n"] + t2 + ["\n"]
+
+        cfg = {
+            "version": 1,
+            "protect_labeled_tables": True,
+            "label_merge_rules": [
+                {"label": "Acceptance Test crap", "search_prev_tables": 8, "search_next_tables": 8, "min_body_rows_override": 0},
+                {"label": "Acceptance Test InformationZ", "search_prev_tables": 8, "search_next_tables": 8, "min_body_rows_override": 0},
+            ],
+        }
+
+        out = merge_multipage_tables_in_combined_lines(lines, cfg=cfg)
+        self.assertEqual(out, lines)
+
+    def test_protect_labeled_tables_blocks_legacy_merge_when_not_allowlisted(self) -> None:
+        cols = [("A", 6), ("B", 6), ("C", 6)]
+        header = ["col1", "col2", "col3"]
+        rows_p1 = [[f"r{i}a", f"r{i}b", f"r{i}c"] for i in range(1, 10)]  # 9 body rows (would merge under legacy)
+        rows_p2 = [[f"r{i}a", f"r{i}b", f"r{i}c"] for i in range(10, 13)]
+        table1 = _mk_table(cols=cols, header=header, rows=rows_p1, use_eq_header_sep=True)
+        table2 = _mk_table(cols=cols, header=header, rows=rows_p2, use_eq_header_sep=True)
+        lines: list[str] = []
+        lines += ["=== Page 1 ===\n", "\n", "[TABLE_LABEL]\n", "Some Other Label\n", "\n"]
+        lines += table1
+        lines += ["\n", "=== Page 2 ===\n", "\n", "[TABLE_LABEL]\n", "Some Other Label (2)\n", "\n"]
+        lines += table2
+        lines += ["\n"]
+
+        cfg = {
+            "version": 1,
+            "protect_labeled_tables": True,
+            "label_merge_rules": [{"label": "Acceptance Test crap", "search_prev_tables": 8, "search_next_tables": 8}],
+            # Keep legacy merge knobs permissive enough that it would otherwise merge.
+            "min_body_rows": 8,
+            "candidate_tables_prev": 2,
+            "candidate_tables_next": 2,
+            "header_block_similarity_below": 0.0,
+            "title_block_fuzzy_ratio_below": 0.0,
+        }
+
+        out = merge_multipage_tables_in_combined_lines(lines, cfg=cfg)
+        self.assertEqual(out, lines)
+
 
 if __name__ == "__main__":
     unittest.main()

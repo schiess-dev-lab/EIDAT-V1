@@ -848,6 +848,7 @@ def process_candidates(
 
                         combined_text = ""
                         combined_txt_path: Path | None = None
+                        table_labels_done = False
                         try:
                             artifacts_dir = str(res.get("dir") or res.get("target_dir") or "")
                             artifacts_dir = artifacts_dir or None
@@ -862,7 +863,7 @@ def process_candidates(
                             combined_text = ""
                             combined_txt_path = None
 
-                        # Post-processing (combined.txt-only): merge multi-page run-on tables in-place.
+                        # Post-processing (combined.txt-only): optional label-driven merge of multi-page run-on tables.
                         # This is intentionally decoupled from OCR and operates only on the final merged artifact.
                         if artifacts_dir and combined_txt_path is not None:
                             try:
@@ -873,12 +874,53 @@ def process_candidates(
 
                                 heur_path = _resolve_user_inputs_file("table_merge_heuristics.json")
                                 cfg = load_table_merge_heuristics(heur_path)
+                                has_label_merge_rules = False
+                                try:
+                                    has_label_merge_rules = bool(cfg and isinstance(cfg.get("label_merge_rules"), list) and cfg.get("label_merge_rules"))
+                                except Exception:
+                                    has_label_merge_rules = False
+
                                 if combined_txt_path.exists():
                                     raw_lines = combined_txt_path.read_text(encoding="utf-8", errors="ignore").splitlines(True)
+
+                                    # If label-based merging is configured, ensure tables are labeled before merging.
+                                    if has_label_merge_rules:
+                                        try:
+                                            from extraction.table_labeler import load_table_label_rules, label_combined_lines
+
+                                            rules_path = _resolve_user_inputs_file("table_label_rules.json")
+                                            rules_cfg = load_table_label_rules(rules_path)
+                                            if rules_cfg:
+                                                labeled0 = label_combined_lines(raw_lines, rules_cfg)
+                                                if labeled0 and labeled0 != raw_lines:
+                                                    combined_txt_path.write_text("".join(labeled0), encoding="utf-8")
+                                                    raw_lines = labeled0
+                                                table_labels_done = True
+                                        except Exception:
+                                            pass
+
                                     merged_lines = merge_multipage_tables_in_combined_lines(raw_lines, cfg=cfg)
                                     if merged_lines and merged_lines != raw_lines:
                                         combined_txt_path.write_text("".join(merged_lines), encoding="utf-8")
-                                        combined_text = "".join(merged_lines)
+                                        raw_lines = merged_lines
+
+                                    # Re-label after merge to remove orphaned label blocks and renumber consistently.
+                                    if has_label_merge_rules:
+                                        try:
+                                            from extraction.table_labeler import load_table_label_rules, label_combined_lines
+
+                                            rules_path = _resolve_user_inputs_file("table_label_rules.json")
+                                            rules_cfg = load_table_label_rules(rules_path)
+                                            if rules_cfg:
+                                                labeled1 = label_combined_lines(raw_lines, rules_cfg)
+                                                if labeled1 and labeled1 != raw_lines:
+                                                    combined_txt_path.write_text("".join(labeled1), encoding="utf-8")
+                                                    raw_lines = labeled1
+                                                table_labels_done = True
+                                        except Exception:
+                                            pass
+
+                                    combined_text = "".join(raw_lines) if raw_lines else combined_text
                             except Exception:
                                 pass
 
@@ -913,18 +955,19 @@ def process_candidates(
                         # This overwrites combined.txt in-place and is intentionally decoupled from
                         # extracted_terms.db export and metadata extraction.
                         if artifacts_dir and combined_txt_path is not None:
-                            try:
-                                from extraction.table_labeler import load_table_label_rules, label_combined_lines
+                            if not table_labels_done:
+                                try:
+                                    from extraction.table_labeler import load_table_label_rules, label_combined_lines
 
-                                rules_path = _resolve_user_inputs_file("table_label_rules.json")
-                                rules_cfg = load_table_label_rules(rules_path)
-                                if rules_cfg and combined_txt_path.exists():
-                                    raw_lines = combined_txt_path.read_text(encoding="utf-8", errors="ignore").splitlines(True)
-                                    labeled = label_combined_lines(raw_lines, rules_cfg)
-                                    if labeled and labeled != raw_lines:
-                                        combined_txt_path.write_text("".join(labeled), encoding="utf-8")
-                            except Exception:
-                                pass
+                                    rules_path = _resolve_user_inputs_file("table_label_rules.json")
+                                    rules_cfg = load_table_label_rules(rules_path)
+                                    if rules_cfg and combined_txt_path.exists():
+                                        raw_lines = combined_txt_path.read_text(encoding="utf-8", errors="ignore").splitlines(True)
+                                        labeled = label_combined_lines(raw_lines, rules_cfg)
+                                        if labeled and labeled != raw_lines:
+                                            combined_txt_path.write_text("".join(labeled), encoding="utf-8")
+                                except Exception:
+                                    pass
 
                         if force or not has_pointer_token(abs_path):
                             eidat_uuid = uuid.uuid4().hex

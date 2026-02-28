@@ -40,6 +40,27 @@ class TestTableLabelParsing(unittest.TestCase):
         self.assertEqual(blocks[0].get("heading"), "My Heading")
         self.assertEqual(blocks[1].get("table_label"), "")
 
+    def test_parse_ascii_tables_accepts_equals_border(self) -> None:
+        lines = [
+            "[TABLE_LABEL]",
+            "EqBorder Table",
+            "",
+            "+=====+=====+",
+            "| A | B |",
+            "+=====+=====+",
+            "| 1 | 2 |",
+            "+=====+=====+",
+            "",
+        ]
+        blocks = backend._parse_ascii_tables(lines)  # type: ignore[attr-defined]
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0].get("table_label"), "EqBorder Table")
+
+    def test_table_label_matches_base_label(self) -> None:
+        self.assertTrue(backend._table_label_matches("Acceptance Test Data", "Acceptance Test Data (2)"))  # type: ignore[attr-defined]
+        self.assertTrue(backend._table_label_matches("Acceptance Test Data (2)", "Acceptance Test Data (2)"))  # type: ignore[attr-defined]
+        self.assertFalse(backend._table_label_matches("Acceptance Test Data (2)", "Acceptance Test Data (3)"))  # type: ignore[attr-defined]
+
 
 if __name__ == "__main__":
     unittest.main()
