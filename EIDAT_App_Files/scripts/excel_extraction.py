@@ -70,6 +70,12 @@ def load_config(path: Path) -> Dict[str, Any]:
     if not isinstance(stats, list) or not all(isinstance(s, str) and s for s in stats):
         raise ValueError("Excel trend config `statistics` must be a list of strings.")
     data["statistics"] = [str(s).strip().lower() for s in stats]
+    ign = data.get("statistics_ignore_first_n", 0)
+    try:
+        ign_i = int(str(ign).strip()) if not isinstance(ign, bool) else 0
+    except Exception:
+        ign_i = 0
+    data["statistics_ignore_first_n"] = max(0, int(ign_i))
     if "header_row" not in data:
         data["header_row"] = 0
     return data
@@ -674,6 +680,12 @@ def extract_from_excel(excel_path: Path, config: Dict[str, Any]) -> List[Dict[st
                 continue
             numeric = pd.to_numeric(df_data[df_col], errors="coerce")
             numeric = numeric.dropna()
+            ign = int(config.get("statistics_ignore_first_n") or 0)
+            if ign > 0 and not numeric.empty:
+                try:
+                    numeric = numeric.iloc[int(ign):]
+                except Exception:
+                    pass
             if numeric.empty:
                 rows.append(
                     {

@@ -7,6 +7,17 @@
     { "name": "pc", "units": "psia", "range_min": null, "range_max": null }
   ],
   "statistics": ["mean", "min", "max", "std", "median", "count"],
+  "statistics_ignore_first_n": 0,
+  "performance_plotters": [
+    {
+      "name": "Standard Thrust Equation",
+      "x": { "column": "isp" },
+      "y": { "column": "thrust" },
+      "stats": ["mean", "min", "max"],
+      "fit": { "degree": 2, "normalize_x": true },
+      "require_min_points": 2
+    }
+  ],
   "sheet_name": null,
   "header_row": 0,
   "td_run_labeling": {

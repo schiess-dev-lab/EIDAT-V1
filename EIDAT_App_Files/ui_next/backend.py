@@ -40,6 +40,7 @@ DEFAULT_TERMS_XLSX = DATA_ROOT / "user_inputs" / "terms.schema.simple.xlsx"
 DEFAULT_PLOT_TERMS_XLSX = DATA_ROOT / "user_inputs" / "plot_terms.xlsx"
 DEFAULT_PROPOSED_PLOTS_JSON = DATA_ROOT / "user_inputs" / "proposed_plots.json"
 DEFAULT_EXCEL_TREND_CONFIG = DATA_ROOT / "user_inputs" / "excel_trend_config.json"
+DEFAULT_TREND_AUTO_REPORT_CONFIG = DATA_ROOT / "user_inputs" / "trend_auto_report_config.json"
 DEFAULT_ACCEPTANCE_HEURISTICS = DATA_ROOT / "user_inputs" / "acceptance_heuristics.json"
 EXCEL_EXTENSIONS = {".xlsx", ".xls", ".xlsm"}
 EXCEL_ARTIFACT_SUFFIX = "__excel"
@@ -954,6 +955,63 @@ def run_excel_scanner(data_dir: Path, config: Optional[Path] = None) -> subproce
     if not excels:
         raise RuntimeError(f"No Excel data files found under: {data_root}")
     return run_excel_extraction(excels, cfg, data_root)
+
+
+def load_excel_trend_config(path: Path | None = None) -> dict:
+    cfg = Path(path).expanduser() if path is not None else DEFAULT_EXCEL_TREND_CONFIG
+    return _load_excel_trend_config(cfg)
+
+
+def load_trend_auto_report_config(project_dir: Path | None = None) -> dict:
+    """
+    Load report-tuning config for Test Data Trend / Analyze auto-report.
+
+    Precedence:
+      1) <project_dir>/trend_auto_report_config.json (if provided and exists)
+      2) user_inputs/trend_auto_report_config.json
+      3) internal defaults (in trend_auto_report module)
+    """
+    from . import trend_auto_report as tar  # local import (optional deps)
+
+    proj = Path(project_dir).expanduser() if project_dir is not None else None
+    return tar.load_trend_auto_report_config(project_dir=proj, central_path=DEFAULT_TREND_AUTO_REPORT_CONFIG)
+
+
+def autofill_excel_trend_config_from_td_cache(
+    db_path: Path,
+    excel_trend_config_path: Path | None = None,
+    *,
+    fill_units: bool = True,
+    fill_ranges: bool = True,
+    add_missing_columns: bool = False,
+) -> tuple[dict, str]:
+    from . import trend_auto_report as tar  # local import (optional deps)
+
+    cfg_path = Path(excel_trend_config_path).expanduser() if excel_trend_config_path is not None else DEFAULT_EXCEL_TREND_CONFIG
+    return tar.autofill_excel_trend_config_from_td_cache(
+        Path(db_path).expanduser(),
+        cfg_path,
+        fill_units=bool(fill_units),
+        fill_ranges=bool(fill_ranges),
+        add_missing_columns=bool(add_missing_columns),
+    )
+
+
+def generate_test_data_auto_report(
+    project_dir: Path,
+    workbook_path: Path,
+    output_pdf: Path,
+    highlighted_serials: list[str] | None = None,
+    options: dict | None = None,
+) -> dict:
+    from . import trend_auto_report as tar  # local import (optional deps)
+
+    proj = Path(project_dir).expanduser()
+    wb = Path(workbook_path).expanduser()
+    out = Path(output_pdf).expanduser()
+    hi = [str(s).strip() for s in (highlighted_serials or []) if str(s).strip()]
+    opts = dict(options or {})
+    return tar.generate_test_data_auto_report(proj, wb, out, highlighted_serials=hi, options=opts)
 
 
 def run_excel_to_sqlite_scanner(data_dir: Path, *, overwrite: bool = True) -> subprocess.Popen:
@@ -3086,9 +3144,26 @@ def ensure_test_data_project_cache(
             curve_count = int(conn.execute("SELECT COUNT(*) FROM td_curves").fetchone()[0] or 0)
         except Exception:
             curve_count = 0
+        try:
+            row = conn.execute("SELECT value FROM td_meta WHERE key='statistics_ignore_first_n' LIMIT 1").fetchone()
+            cached_ignore_first_n = int(str(row[0]).strip()) if row and row[0] is not None else 0
+        except Exception:
+            cached_ignore_first_n = 0
+
+    current_ignore_first_n = 0
+    try:
+        current_ignore_first_n = int((_load_excel_trend_config(DEFAULT_EXCEL_TREND_CONFIG) or {}).get("statistics_ignore_first_n") or 0)
+    except Exception:
+        current_ignore_first_n = 0
+    current_ignore_first_n = max(0, int(current_ignore_first_n))
 
     # If we have no curves at all, treat as stale.
     if curve_count == 0 and expected:
+        rebuild_test_data_project_cache(db_path, wb_path)
+        return db_path
+
+    # If the stats ignore-first config changed, rebuild so td_metrics are consistent.
+    if int(cached_ignore_first_n) != int(current_ignore_first_n):
         rebuild_test_data_project_cache(db_path, wb_path)
         return db_path
 
@@ -3173,6 +3248,14 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
     ]
 
     computed_epoch_ns = time.time_ns()
+    # Optional: ignore the first N samples when computing per-serial statistics (mean/min/max/std/median/count).
+    # This is configured via user_inputs/excel_trend_config.json.
+    stats_ignore_first_n = 0
+    try:
+        stats_ignore_first_n = int((_load_excel_trend_config(DEFAULT_EXCEL_TREND_CONFIG) or {}).get("statistics_ignore_first_n") or 0)
+    except Exception:
+        stats_ignore_first_n = 0
+    stats_ignore_first_n = max(0, int(stats_ignore_first_n))
 
     # Optional: run/sequence condition labeling (user-controlled via JSON stored in workbook Config).
     td_run_labeling = None
@@ -3441,6 +3524,10 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
                 pass
         conn.execute("INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)", ("workbook_path", str(wb_path)))
         conn.execute("INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)", ("built_epoch_ns", str(computed_epoch_ns)))
+        conn.execute(
+            "INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)",
+            ("statistics_ignore_first_n", str(int(stats_ignore_first_n))),
+        )
         try:
             conn.execute(
                 "INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)",
@@ -3685,6 +3772,8 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
                                     continue
                                 y_for_stats.append(float(fy))
 
+                        if stats_ignore_first_n > 0 and len(y_for_stats) > 0:
+                            y_for_stats = y_for_stats[int(stats_ignore_first_n) :]
                         stats_map = _compute_stats(y_for_stats)
                         with sqlite3.connect(str(db_path)) as conn:
                             for stat, val in stats_map.items():
@@ -8934,6 +9023,78 @@ def _load_excel_trend_config(path: Path) -> dict:
     if not isinstance(stats, list) or not all(isinstance(s, str) and s for s in stats):
         raise ValueError("Excel trend config `statistics` must be a list of strings.")
     data["statistics"] = [str(s).strip().lower() for s in stats]
+
+    ign = data.get("statistics_ignore_first_n", 0)
+    try:
+        ign_i = int(str(ign).strip()) if not isinstance(ign, bool) else 0
+    except Exception:
+        ign_i = 0
+    data["statistics_ignore_first_n"] = max(0, int(ign_i))
+
+    # Optional: performance plot definitions for Test Data Trend/Analyze.
+    perf = data.get("performance_plotters")
+    if perf is None:
+        data["performance_plotters"] = []
+    elif not isinstance(perf, list):
+        raise ValueError("Excel trend config `performance_plotters` must be a list.")
+    else:
+        # Normalize/validate entries (backward compatible with legacy x.stat/y.stat).
+        normalized: list[dict] = []
+        for idx, raw in enumerate(perf):
+            if not isinstance(raw, dict):
+                raise ValueError(f"Excel trend config `performance_plotters[{idx}]` must be an object.")
+            name = str(raw.get("name") or "").strip() or f"Performance Plot {idx + 1}"
+
+            x_spec = raw.get("x") or {}
+            y_spec = raw.get("y") or {}
+            if not isinstance(x_spec, dict) or not isinstance(y_spec, dict):
+                raise ValueError(f"Excel trend config `performance_plotters[{idx}].x/.y` must be objects.")
+            x_col = str(x_spec.get("column") or "").strip()
+            y_col = str(y_spec.get("column") or "").strip()
+            if not x_col or not y_col:
+                raise ValueError(
+                    f"Excel trend config `performance_plotters[{idx}]` must include `x.column` and `y.column`."
+                )
+
+            stats_raw = raw.get("stats", None)
+            if stats_raw is None:
+                # Legacy format: x.stat/y.stat (single stat applied to both axes in v2).
+                legacy = str(x_spec.get("stat") or y_spec.get("stat") or "mean").strip().lower()
+                stats = [legacy] if legacy else ["mean"]
+            else:
+                if not isinstance(stats_raw, list) or not all(isinstance(s, str) for s in stats_raw):
+                    raise ValueError(f"Excel trend config `performance_plotters[{idx}].stats` must be a list of strings.")
+                stats = [str(s).strip().lower() for s in stats_raw if str(s).strip()]
+                if not stats:
+                    stats = ["mean"]
+
+            fit_raw = raw.get("fit") or {}
+            if fit_raw is not None and not isinstance(fit_raw, dict):
+                raise ValueError(f"Excel trend config `performance_plotters[{idx}].fit` must be an object.")
+            try:
+                degree = int((fit_raw.get("degree") if isinstance(fit_raw, dict) else 0) or 0)
+            except Exception:
+                degree = 0
+            degree = max(0, int(degree))
+            normalize_x = bool((fit_raw.get("normalize_x") if isinstance(fit_raw, dict) else True))
+
+            try:
+                require_min_points = int(raw.get("require_min_points") or 2)
+            except Exception:
+                require_min_points = 2
+            require_min_points = max(2, int(require_min_points))
+
+            normalized.append(
+                {
+                    "name": name,
+                    "x": {"column": x_col},
+                    "y": {"column": y_col},
+                    "stats": stats,
+                    "fit": {"degree": degree, "normalize_x": normalize_x},
+                    "require_min_points": require_min_points,
+                }
+            )
+        data["performance_plotters"] = normalized
     if "header_row" not in data:
         data["header_row"] = 0
     return data

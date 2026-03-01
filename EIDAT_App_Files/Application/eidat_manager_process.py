@@ -923,9 +923,6 @@ def process_candidates(
                                     combined_text = "".join(raw_lines) if raw_lines else combined_text
                             except Exception:
                                 pass
-
-                        if artifacts_dir and combined_txt_path is not None:
-                            _export_extracted_terms_db(Path(artifacts_dir), combined_txt_path)
                         extracted_meta = extract_metadata_from_text(combined_text, pdf_path=abs_path) if combined_text else None
                         embedded_meta = None
                         if extracted_meta is None:
@@ -968,6 +965,35 @@ def process_candidates(
                                             combined_txt_path.write_text("".join(labeled), encoding="utf-8")
                                 except Exception:
                                     pass
+
+                        # Best-effort: heal table cells inside combined.txt (post-processing).
+                        # Runs after table labeling + multipage merge so we can key by [TABLE_LABEL] later.
+                        if artifacts_dir and combined_txt_path is not None and combined_txt_path.exists():
+                            try:
+                                enable_heal = str(os.environ.get("EIDAT_TABLE_CELL_HEAL", "1") or "1").strip().lower() in (
+                                    "1",
+                                    "true",
+                                    "yes",
+                                    "on",
+                                )
+                            except Exception:
+                                enable_heal = True
+                            if enable_heal:
+                                try:
+                                    from extraction.table_cell_healer import (
+                                        heal_combined_txt_file_inplace,
+                                        load_table_cell_heal_heuristics,
+                                    )
+
+                                    heal_path = _resolve_user_inputs_file("table_cell_heal_heuristics.json")
+                                    heal_cfg = load_table_cell_heal_heuristics(heal_path)
+                                    heal_combined_txt_file_inplace(combined_txt_path, cfg=heal_cfg, history=None)
+                                except Exception:
+                                    pass
+
+                        # Export extracted_terms.db from the final post-processed combined.txt.
+                        if artifacts_dir and combined_txt_path is not None:
+                            _export_extracted_terms_db(Path(artifacts_dir), combined_txt_path)
 
                         if force or not has_pointer_token(abs_path):
                             eidat_uuid = uuid.uuid4().hex
