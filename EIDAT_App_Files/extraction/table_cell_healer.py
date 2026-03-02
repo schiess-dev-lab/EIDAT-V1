@@ -29,6 +29,9 @@ DEFAULT_TABLE_CELL_HEAL_PATH = _REPO_ROOT / "user_inputs" / "table_cell_heal_heu
 
 TABLE_LABEL_MARKER = "[TABLE_LABEL]"
 
+PAGE_MARKER_RE = re.compile(r"^===\s*Page\s+(\d+)\s*===\s*$")
+TABLE_NUM_RE = re.compile(r"^\[Table\s+(\d+)\]\s*$")
+
 _BORDER_RE = re.compile(r"^\s*\+[-=+]+\+\s*$")
 _PIPE_ROW_RE = re.compile(r"^\s*\|.*\|\s*$")
 
@@ -95,6 +98,12 @@ _DEFAULT_CFG: dict[str, Any] = {
         "unicode_minus_to_dash": True,
         "allow_o_to_zero": True,
         "allow_i_l_to_one": True,
+        "variant_rescue": {
+            "enabled": True,
+            "require_alpha": True,
+            "min_digit_ratio": 0.4,
+            "sidecar_filename": "table_variant_candidates.json",
+        },
     },
     "history": {
         "enabled": False,
@@ -185,10 +194,172 @@ class TableHealHistory(Protocol):
     ) -> None: ...
 
 
+class VariantCandidatesProvider(Protocol):
+    """
+    Provide per-cell OCR candidates from alternate variants.
+
+    Indices are the combined.txt indices:
+      - page: from "=== Page N ==="
+      - table_idx: from "[Table X]" within that page (1-based)
+      - row: ASCII pipe-row index within that table (0-based; header row is 0)
+      - col: ASCII column index within that row (0-based)
+    """
+
+    def get(self, *, page: int, table_idx: int, row: int, col: int) -> list[str]: ...
+
+    # Optional: richer candidate info (meta + ordering).
+    def get_detailed(self, *, page: int, table_idx: int, row: int, col: int) -> list[dict]: ...  # type: ignore[override]
+
+
+class VariantRescueDebugSink(Protocol):
+    def record(self, event: dict[str, Any]) -> None: ...
+
+
+class JsonlDebugSink:
+    def __init__(self, path: Path, *, truncate: bool = False) -> None:
+        self._path = Path(path)
+        self._truncate = bool(truncate)
+        self._initialized = False
+
+    def _ensure(self) -> None:
+        if self._initialized:
+            return
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        if self._truncate:
+            try:
+                self._path.write_text("", encoding="utf-8")
+            except Exception:
+                pass
+        self._initialized = True
+
+    def record(self, event: dict[str, Any]) -> None:
+        try:
+            self._ensure()
+            line = json.dumps(event, ensure_ascii=False)
+            with self._path.open("a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception:
+            return
+
+
+class JsonSidecarVariantCandidatesProvider:
+    """
+    Load per-page sidecar files written under:
+      <artifacts_dir>/pages/page_<N>/table_variant_candidates.json
+    """
+
+    def __init__(self, artifacts_dir: Path, *, sidecar_filename: str = "table_variant_candidates.json") -> None:
+        self._artifacts_dir = Path(artifacts_dir)
+        self._sidecar_filename = str(sidecar_filename or "table_variant_candidates.json")
+        self._cache: dict[int, dict[str, Any]] = {}
+
+    def _load_page(self, page: int) -> dict[str, Any] | None:
+        try:
+            p = int(page)
+        except Exception:
+            return None
+        if p <= 0:
+            return None
+        if p in self._cache:
+            return self._cache[p]
+        path = self._artifacts_dir / "pages" / f"page_{p}" / self._sidecar_filename
+        try:
+            if not path.exists():
+                return None
+            data = json.loads(path.read_text(encoding="utf-8", errors="ignore"))
+            if not isinstance(data, dict) or int(data.get("version") or 0) != 1:
+                return None
+            self._cache[p] = data
+            return data
+        except Exception:
+            return None
+
+    def get(self, *, page: int, table_idx: int, row: int, col: int) -> list[str]:
+        data = self._load_page(page)
+        if not data:
+            return []
+        try:
+            t = int(table_idx)
+            r = int(row)
+            c = int(col)
+        except Exception:
+            return []
+        if t <= 0 or r < 0 or c < 0:
+            return []
+        tables = data.get("tables") or []
+        if not isinstance(tables, list) or (t - 1) >= len(tables):
+            return []
+        tbl = tables[t - 1]
+        if not isinstance(tbl, dict):
+            return []
+        rows_by_variant = tbl.get("rows_by_variant") or []
+        if not isinstance(rows_by_variant, list):
+            return []
+        out: list[str] = []
+        for v in rows_by_variant:
+            if not isinstance(v, list) or r >= len(v):
+                continue
+            rr = v[r]
+            if not isinstance(rr, list) or c >= len(rr):
+                continue
+            out.append(str(rr[c] or "").strip())
+        return out
+
+    def get_detailed(self, *, page: int, table_idx: int, row: int, col: int) -> list[dict]:
+        data = self._load_page(page)
+        if not data:
+            return []
+        try:
+            t = int(table_idx)
+            r = int(row)
+            c = int(col)
+        except Exception:
+            return []
+        if t <= 0 or r < 0 or c < 0:
+            return []
+        # Guard: if the sidecar declares an ascii_mode other than "default", mapping can be unreliable.
+        try:
+            ascii_mode = str(data.get("ascii_mode") or "default").strip().lower()
+            if ascii_mode and ascii_mode not in ("default", "index"):
+                return []
+        except Exception:
+            pass
+
+        variants = data.get("variants") or []
+        tables = data.get("tables") or []
+        if not isinstance(tables, list) or (t - 1) >= len(tables):
+            return []
+        tbl = tables[t - 1]
+        if not isinstance(tbl, dict):
+            return []
+        rows_by_variant = tbl.get("rows_by_variant") or []
+        if not isinstance(rows_by_variant, list):
+            return []
+
+        out: list[dict] = []
+        for idx, v in enumerate(rows_by_variant):
+            if not isinstance(v, list) or r >= len(v):
+                continue
+            rr = v[r]
+            if not isinstance(rr, list) or c >= len(rr):
+                continue
+            meta = variants[idx] if isinstance(variants, list) and idx < len(variants) else None
+            out.append(
+                {
+                    "variant_idx": int(idx),
+                    "variant": meta if isinstance(meta, dict) else {},
+                    "text": str(rr[c] or "").strip(),
+                }
+            )
+        return out
+
+
 @dataclass(frozen=True)
 class _AsciiTableBlock:
     start: int
     end: int
+    page_num: int
+    table_idx: int
     table_label: str
     lines: list[str]
 
@@ -205,9 +376,28 @@ def _find_next_non_empty(lines: list[str], start: int, end: int) -> int | None:
 def _iter_tables(lines: list[str]) -> Iterable[_AsciiTableBlock]:
     i = 0
     pending_label = ""
+    current_page = 0
+    current_table_idx = 0
     n = len(lines)
     while i < n:
         s = str(lines[i]).strip()
+        m_page = PAGE_MARKER_RE.match(s)
+        if m_page:
+            try:
+                current_page = int(m_page.group(1))
+            except Exception:
+                current_page = 0
+            current_table_idx = 0
+            i += 1
+            continue
+        m_tbl = TABLE_NUM_RE.match(s)
+        if m_tbl:
+            try:
+                current_table_idx = int(m_tbl.group(1))
+            except Exception:
+                current_table_idx = 0
+            i += 1
+            continue
         if s == TABLE_LABEL_MARKER:
             j = _find_next_non_empty(lines, i + 1, n)
             if j is not None:
@@ -227,7 +417,14 @@ def _iter_tables(lines: list[str]) -> Iterable[_AsciiTableBlock]:
                 tbl_lines.append(lines[j])
                 j += 1
             if tbl_lines:
-                yield _AsciiTableBlock(start=i, end=j, table_label=pending_label, lines=tbl_lines)
+                yield _AsciiTableBlock(
+                    start=i,
+                    end=j,
+                    page_num=int(current_page),
+                    table_idx=int(current_table_idx),
+                    table_label=pending_label,
+                    lines=tbl_lines,
+                )
                 pending_label = ""
                 i = j
                 continue
@@ -406,6 +603,7 @@ _GLUED_TO_RE = re.compile(r"(\d)\s*to\s*(\d)", re.IGNORECASE)
 _DIGIT_LETTER_RE = re.compile(r"(\d)([a-zA-Z])")
 _LETTER_DIGIT_RE = re.compile(r"([a-zA-Z])(\d)")
 _OP_GLUED_RE = re.compile(r"([<>]=?)\s*(\d)")
+_DIGIT_AMP_DIGIT_RE = re.compile(r"(\d)\s*&\s*(\d)")
 
 
 def _apply_spacing(text: str) -> str:
@@ -424,6 +622,7 @@ def _apply_spacing(text: str) -> str:
 
     s2 = s2.replace("\u00A0", " ")
     s2 = _GLUED_TO_RE.sub(r"\1 to \2", s2)
+    s2 = _DIGIT_AMP_DIGIT_RE.sub(r"\1 & \2", s2)
     s2 = _OP_GLUED_RE.sub(r"\1 \2", s2)
     s2 = _DIGIT_LETTER_RE.sub(r"\1 \2", s2)
     s2 = _LETTER_DIGIT_RE.sub(r"\1 \2", s2)
@@ -495,6 +694,9 @@ def _prune_empty_narrow_columns(
     table_lines: list[str],
     *,
     max_empty_col_width: int,
+    variant_provider: VariantCandidatesProvider | None = None,
+    page_num: int = 0,
+    table_idx: int = 0,
 ) -> tuple[list[str], dict[str, int]]:
     stats = {"cols_dropped": 0}
     border0 = next((ln for ln in table_lines if _is_border(ln)), "")
@@ -508,8 +710,10 @@ def _prune_empty_narrow_columns(
         return table_lines, stats
 
     all_empty = [True for _ in widths]
+    parsed_rows: list[list[str]] = []
     for ln in pipe_rows:
         _, cells, _ = _extract_trimmed_cells_from_row(ln, plus_pos)
+        parsed_rows.append(list(cells))
         for c in range(min(len(all_empty), len(cells))):
             if str(cells[c]).strip():
                 all_empty[c] = False
@@ -520,6 +724,23 @@ def _prune_empty_narrow_columns(
     ]
     if not drop_cols or len(drop_cols) >= len(widths):
         return table_lines, stats
+
+    # Variant-aware guard: don't drop a column if any variant ever produced content there.
+    if variant_provider is not None and int(page_num) > 0 and int(table_idx) > 0:
+        keep: set[int] = set()
+        for col in drop_cols:
+            for rpos in range(len(parsed_rows)):
+                try:
+                    cands = variant_provider.get(page=int(page_num), table_idx=int(table_idx), row=int(rpos), col=int(col))
+                except Exception:
+                    cands = []
+                if any(str(v or "").strip() for v in (cands or [])):
+                    keep.add(int(col))
+                    break
+        if keep:
+            drop_cols = [c for c in drop_cols if int(c) not in keep]
+            if not drop_cols or len(drop_cols) >= len(widths):
+                return table_lines, stats
 
     out_lines: list[str] = []
     for ln in table_lines:
@@ -538,7 +759,13 @@ def _prune_empty_narrow_columns(
     return out_lines, stats
 
 
-def _prune_empty_rows(table_lines: list[str]) -> tuple[list[str], dict[str, int]]:
+def _prune_empty_rows(
+    table_lines: list[str],
+    *,
+    variant_provider: VariantCandidatesProvider | None = None,
+    page_num: int = 0,
+    table_idx: int = 0,
+) -> tuple[list[str], dict[str, int]]:
     stats = {"rows_dropped": 0}
     border0 = next((ln for ln in table_lines if _is_border(ln)), "")
     plus_pos = _plus_positions(border0) if border0 else []
@@ -550,9 +777,25 @@ def _prune_empty_rows(table_lines: list[str]) -> tuple[list[str], dict[str, int]
     if not pipe_indices:
         return table_lines, stats
 
+    pipe_pos_by_line_idx: dict[int, int] = {ln_idx: pos for pos, ln_idx in enumerate(pipe_indices)}
     for idx in pipe_indices:
         _, cells, _ = _extract_trimmed_cells_from_row(table_lines[idx], plus_pos)
         if cells and all(not str(c).strip() for c in cells):
+            # Variant-aware guard: don't drop an empty row if any variant ever produced content there.
+            if variant_provider is not None and int(page_num) > 0 and int(table_idx) > 0:
+                rpos = int(pipe_pos_by_line_idx.get(idx, -1))
+                if rpos >= 0:
+                    has_any = False
+                    for cpos in range(len(cells)):
+                        try:
+                            cands = variant_provider.get(page=int(page_num), table_idx=int(table_idx), row=int(rpos), col=int(cpos))
+                        except Exception:
+                            cands = []
+                        if any(str(v or "").strip() for v in (cands or [])):
+                            has_any = True
+                            break
+                    if has_any:
+                        continue
             drop.add(idx)
             if idx + 1 < len(table_lines) and _is_border(table_lines[idx + 1]):
                 drop.add(idx + 1)
@@ -570,8 +813,12 @@ def _heal_table_lines(
     table_lines: list[str],
     *,
     cfg: dict[str, Any],
+    page_num: int,
+    table_idx: int,
     table_label: str,
     history: Optional[TableHealHistory],
+    variant_provider: VariantCandidatesProvider | None,
+    variant_debug: VariantRescueDebugSink | None = None,
 ) -> tuple[list[str], dict[str, int]]:
     stats: dict[str, int] = {
         "tables_seen": 1,
@@ -579,6 +826,7 @@ def _heal_table_lines(
         "rows_dropped": 0,
         "cells_spaced": 0,
         "cells_numeric_healed": 0,
+        "cells_variant_rescued": 0,
     }
     prune_cfg = cfg.get("prune") if isinstance(cfg.get("prune"), dict) else {}
     spacing_cfg = cfg.get("spacing") if isinstance(cfg.get("spacing"), dict) else {}
@@ -590,10 +838,21 @@ def _heal_table_lines(
                 maxw = int(prune_cfg.get("max_empty_col_width", 5))
             except Exception:
                 maxw = 5
-            table_lines, st = _prune_empty_narrow_columns(table_lines, max_empty_col_width=maxw)
+            table_lines, st = _prune_empty_narrow_columns(
+                table_lines,
+                max_empty_col_width=maxw,
+                variant_provider=variant_provider,
+                page_num=int(page_num),
+                table_idx=int(table_idx),
+            )
             stats["cols_dropped"] += int(st.get("cols_dropped", 0))
         if bool(prune_cfg.get("drop_empty_rows", True)):
-            table_lines, st = _prune_empty_rows(table_lines)
+            table_lines, st = _prune_empty_rows(
+                table_lines,
+                variant_provider=variant_provider,
+                page_num=int(page_num),
+                table_idx=int(table_idx),
+            )
             stats["rows_dropped"] += int(st.get("rows_dropped", 0))
 
     border0 = next((ln for ln in table_lines if _is_border(ln)), "")
@@ -660,6 +919,24 @@ def _heal_table_lines(
     allow_o_to_zero = bool(numeric_cfg.get("allow_o_to_zero", True))
     allow_i_l_to_one = bool(numeric_cfg.get("allow_i_l_to_one", True))
 
+    variant_rescue_cfg = numeric_cfg.get("variant_rescue") if isinstance(numeric_cfg.get("variant_rescue"), dict) else {}
+    variant_rescue_enabled = bool(variant_rescue_cfg.get("enabled", False))
+    require_alpha = bool(variant_rescue_cfg.get("require_alpha", True))
+    try:
+        min_digit_ratio = float(variant_rescue_cfg.get("min_digit_ratio", 0.4))
+    except Exception:
+        min_digit_ratio = 0.4
+
+    def _digit_ratio(s: str) -> float:
+        txt = str(s or "").strip()
+        if not txt:
+            return 0.0
+        alnum = [ch for ch in txt if ch.isalnum()]
+        if not alnum:
+            return 0.0
+        digits = sum(1 for ch in alnum if ch.isdigit())
+        return float(digits) / float(len(alnum))
+
     for r in range(len(matrix)):
         for c in range(len(widths)):
             orig = str(matrix[r][c] or "").strip()
@@ -699,6 +976,91 @@ def _heal_table_lines(
                     except Exception:
                         pass
 
+            # Variant rescue pass: if a numeric-column cell is still garbled, consult per-variant
+            # candidates and replace with the best numeric-like candidate if any exists.
+            if (
+                variant_rescue_enabled
+                and variant_provider is not None
+                and int(page_num) > 0
+                and int(table_idx) > 0
+                and numeric_enabled
+                and c in numeric_cols
+                and r > 0
+            ):
+                cur2 = str(matrix[r][c] or "").strip()
+                if cur2 and (not _is_numeric_like(cur2)):
+                    has_alpha = bool(re.search(r"[A-Za-z]", cur2))
+                    dr = _digit_ratio(cur2)
+                    if (require_alpha and has_alpha) or (dr < float(min_digit_ratio or 0.0)):
+                        try:
+                            candidates = variant_provider.get(
+                                page=int(page_num), table_idx=int(table_idx), row=int(r), col=int(c)
+                            )
+                        except Exception:
+                            candidates = []
+                        counts: dict[str, int] = {}
+                        neigh2 = _neighbors_for(r, c)
+                        for cand in candidates or []:
+                            raw_cand = str(cand or "").strip()
+                            if not raw_cand:
+                                continue
+                            cand_spaced = _apply_spacing(raw_cand)
+                            cand_num = _heal_numeric_text(
+                                cand_spaced,
+                                neighbors=neigh2,
+                                unicode_minus_to_dash=unicode_minus_to_dash,
+                                allow_o_to_zero=allow_o_to_zero,
+                                allow_i_l_to_one=allow_i_l_to_one,
+                            ).strip()
+                            if not cand_num or not _is_numeric_like(cand_num):
+                                continue
+                            counts[cand_num] = counts.get(cand_num, 0) + 1
+                        if counts:
+                            best = sorted(counts.items(), key=lambda kv: (-int(kv[1]), -len(str(kv[0])), str(kv[0])))[0][0]
+                            if best and best != cur2:
+                                if variant_debug is not None:
+                                    try:
+                                        detailed = None
+                                        if hasattr(variant_provider, "get_detailed"):
+                                            try:
+                                                detailed = variant_provider.get_detailed(
+                                                    page=int(page_num),
+                                                    table_idx=int(table_idx),
+                                                    row=int(r),
+                                                    col=int(c),
+                                                )
+                                            except Exception:
+                                                detailed = None
+                                        if detailed is None:
+                                            detailed = [{"variant_idx": i, "variant": {}, "text": t} for i, t in enumerate(candidates or [])]
+                                        variant_debug.record(
+                                            {
+                                                "event": "variant_numeric_rescue",
+                                                "page": int(page_num),
+                                                "table_idx": int(table_idx),
+                                                "row": int(r),
+                                                "col": int(c),
+                                                "table_label": str(table_label or ""),
+                                                "header_text": str(header_cells[c] if c < len(header_cells) else ""),
+                                                "header_role": str(header_roles.get(c, "")),
+                                                "before": str(cur2),
+                                                "after": str(best),
+                                                "reason": {
+                                                    "has_alpha": bool(re.search(r"[A-Za-z]", cur2)),
+                                                    "digit_ratio": float(dr),
+                                                    "require_alpha": bool(require_alpha),
+                                                    "min_digit_ratio": float(min_digit_ratio),
+                                                },
+                                                "candidates": detailed,
+                                                "numeric_candidates_counts": counts,
+                                                "selected": str(best),
+                                            }
+                                        )
+                                    except Exception:
+                                        pass
+                                matrix[r][c] = best
+                                stats["cells_variant_rescued"] += 1
+
     out_lines = list(table_lines)
     for row_idx, tbl_idx in enumerate(pipe_indices):
         nl = _newline_for_line(out_lines[tbl_idx])
@@ -724,6 +1086,8 @@ def heal_combined_tables_in_lines(
     cfg: dict[str, Any] | None = None,
     *,
     history: Optional[TableHealHistory] = None,
+    variant_provider: VariantCandidatesProvider | None = None,
+    variant_debug: VariantRescueDebugSink | None = None,
 ) -> tuple[list[str], dict[str, int]]:
     cfg2 = _cfg(cfg)
     stats: dict[str, int] = {
@@ -732,6 +1096,7 @@ def heal_combined_tables_in_lines(
         "rows_dropped": 0,
         "cells_spaced": 0,
         "cells_numeric_healed": 0,
+        "cells_variant_rescued": 0,
     }
     if not bool(cfg2.get("enabled", True)):
         return lines, stats
@@ -739,12 +1104,22 @@ def heal_combined_tables_in_lines(
     out = list(lines)
     # Replace from the end so index ranges remain valid even if we drop rows.
     for block in reversed(list(_iter_tables(lines))):
-        healed, st = _heal_table_lines(block.lines, cfg=cfg2, table_label=block.table_label, history=history)
+        healed, st = _heal_table_lines(
+            block.lines,
+            cfg=cfg2,
+            page_num=int(block.page_num),
+            table_idx=int(block.table_idx),
+            table_label=block.table_label,
+            history=history,
+            variant_provider=variant_provider,
+            variant_debug=variant_debug,
+        )
         stats["tables_seen"] += int(st.get("tables_seen", 0))
         stats["cols_dropped"] += int(st.get("cols_dropped", 0))
         stats["rows_dropped"] += int(st.get("rows_dropped", 0))
         stats["cells_spaced"] += int(st.get("cells_spaced", 0))
         stats["cells_numeric_healed"] += int(st.get("cells_numeric_healed", 0))
+        stats["cells_variant_rescued"] += int(st.get("cells_variant_rescued", 0))
         if healed != block.lines:
             out[block.start : block.end] = healed
     return out, stats
@@ -755,6 +1130,8 @@ def heal_combined_txt_file_inplace(
     cfg: dict[str, Any] | None = None,
     *,
     history: Optional[TableHealHistory] = None,
+    variant_provider: VariantCandidatesProvider | None = None,
+    variant_debug: VariantRescueDebugSink | None = None,
 ) -> dict[str, int]:
     """
     Heal ASCII tables inside combined.txt in-place.
@@ -766,7 +1143,13 @@ def heal_combined_txt_file_inplace(
         if not p.exists():
             return {}
         raw_lines = p.read_text(encoding="utf-8", errors="ignore").splitlines(True)
-        healed, stats = heal_combined_tables_in_lines(raw_lines, cfg=cfg, history=history)
+        healed, stats = heal_combined_tables_in_lines(
+            raw_lines,
+            cfg=cfg,
+            history=history,
+            variant_provider=variant_provider,
+            variant_debug=variant_debug,
+        )
         if healed != raw_lines:
             p.write_text("".join(healed), encoding="utf-8")
         return stats

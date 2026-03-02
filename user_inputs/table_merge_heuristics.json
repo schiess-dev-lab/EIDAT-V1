@@ -9,6 +9,8 @@
   "header_block_similarity_below": 0.2,
   "title_block_fuzzy_ratio_below": 0.5,
 
+  "normalize_to_leader_layout": true,
+
   "label_merge_rules": [
     {
       "label": "Acceptance Test crap",

@@ -19,6 +19,13 @@
     "allow_o_to_zero": true,
     "allow_i_l_to_one": true,
     "apply_to_header": false,
+    "variant_rescue": {
+      "enabled": true,
+      "_comment_debug_output": "If you want to see which OCR variants were considered and which value was selected during variant rescue, set env var EIDAT_TABLE_CELL_HEAL_VARIANT_DEBUG=1 (or EIDAT_TABLE_CELL_HEAL_DEBUG=1). The healer will write JSONL events to <artifacts_dir>/table_cell_heal_variant_rescue.jsonl for that run.",
+      "require_alpha": true,
+      "min_digit_ratio": 0.4,
+      "sidecar_filename": "table_variant_candidates.json"
+    },
     "numeric_roles": ["value", "min", "max", "requirement", "target"],
     "role_synonyms": {
       "value": ["measured", "measured value", "actual", "value", "reading"],

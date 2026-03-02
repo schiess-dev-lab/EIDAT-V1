@@ -95,7 +95,7 @@ class TestTableCellHealer(unittest.TestCase):
     def test_spacing_fix_to_glue_preserves_scientific(self) -> None:
         cols = [("A", 14), ("B", 10)]
         header = ["desc", "val"]
-        rows = [["1 to4", "1e-3"]]
+        rows = [["1 to4", "1e-3"], ["1 &4", "ok"]]
         table = _mk_table(cols=cols, header=header, rows=rows, use_eq_header_sep=True)
         lines = ["=== Page 1 ===\n", "\n"] + table + ["\n"]
 
@@ -110,6 +110,7 @@ class TestTableCellHealer(unittest.TestCase):
         rows_out = _first_table_rows(out)
         self.assertEqual(rows_out[1][0], "1 to 4")
         self.assertEqual(rows_out[1][1], "1e-3")
+        self.assertEqual(rows_out[2][0], "1 & 4")
 
     def test_numeric_heal_uses_neighbors(self) -> None:
         cols = [("Measured", 10)]
@@ -138,7 +139,40 @@ class TestTableCellHealer(unittest.TestCase):
         self.assertEqual(rows_out[2][0], "10.5")
         self.assertGreaterEqual(int(stats.get("cells_numeric_healed") or 0), 1)
 
+    def test_variant_rescue_prefers_any_numeric_candidate(self) -> None:
+        class _FakeProvider:
+            def get(self, *, page: int, table_idx: int, row: int, col: int) -> list[str]:
+                if page == 1 and table_idx == 1 and row == 1 and col == 0:
+                    return ["d1", "d1", "1.1"]
+                return []
+
+        cols = [("Measured", 10)]
+        header = ["Measured"]
+        rows = [["d1"]]
+        table = _mk_table(cols=cols, header=header, rows=rows, use_eq_header_sep=True)
+        lines = ["=== Page 1 ===\n", "\n", "[Table]\n", "\n", "[Table 1]\n"] + table + ["\n"]
+
+        cfg = {
+            "version": 1,
+            "enabled": True,
+            "prune": {"enabled": False},
+            "spacing": {"enabled": True, "default_scope": "all_cells"},
+            "numeric": {
+                "enabled": True,
+                "numeric_ratio_min": 0.0,
+                "numeric_roles": ["value"],
+                "role_synonyms": {"value": ["measured", "value"]},
+                "variant_rescue": {"enabled": True, "require_alpha": True, "min_digit_ratio": 0.9},
+                "unicode_minus_to_dash": True,
+                "allow_o_to_zero": True,
+                "allow_i_l_to_one": True,
+            },
+        }
+        out, stats = heal_combined_tables_in_lines(lines, cfg=cfg, variant_provider=_FakeProvider())
+        rows_out = _first_table_rows(out)
+        self.assertEqual(rows_out[1][0], "1.1")
+        self.assertGreaterEqual(int(stats.get("cells_variant_rescued") or 0), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
-

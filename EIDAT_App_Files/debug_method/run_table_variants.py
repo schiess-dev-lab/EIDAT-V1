@@ -671,8 +671,9 @@ def _run_for_input(
     allow_no_tables: bool = False,
     enable_borderless: bool = False,
     return_fused: bool = False,
+    return_variant_rows: bool = False,
 ) -> object:
-    from extraction import table_detection, token_projector, ocr_engine, debug_exporter
+    from extraction import table_detection, token_projector, ocr_engine, debug_exporter, table_detect_timeout
     if enable_borderless:
         from extraction import borderless_table_detection
 
@@ -748,13 +749,31 @@ def _run_for_input(
         cluster_gap_px_val = None
     else:
         cluster_gap_px_val = float(cluster_gap_px)
-    table_result = table_detection.detect_tables(
-        detection_img,
-        verbose=False,
-        cluster_gap_ratio=cluster_gap_ratio,
-        cluster_gap_px=cluster_gap_px_val,
-    )
+    guardrails = _parse_bool_env("EIDAT_TABLE_DETECT_GUARDRAILS", True)
+    table_timeout_sec = _parse_int_env("EIDAT_TABLE_DETECT_TIMEOUT_SEC", 300)
+    if table_timeout_sec < 0:
+        table_timeout_sec = 0
+    if guardrails and int(table_timeout_sec) > 0:
+        table_result = table_detect_timeout.detect_tables_hard_timeout(
+            detection_img,
+            verbose=False,
+            timeout_sec=int(table_timeout_sec),
+            detect_kwargs={
+                "cluster_gap_ratio": cluster_gap_ratio,
+                "cluster_gap_px": cluster_gap_px_val,
+            },
+        )
+    else:
+        table_result = table_detection.detect_tables(
+            detection_img,
+            verbose=False,
+            cluster_gap_ratio=cluster_gap_ratio,
+            cluster_gap_px=cluster_gap_px_val,
+        )
     tables = table_result.get("tables") or []
+    warnings: list[str] = []
+    if isinstance(table_result, dict) and table_result.get("timed_out"):
+        warnings.append("bordered_table_detection_timeout")
 
     # Borderless table detection is disabled by default (bordered tables expected).
     if enable_borderless:
@@ -877,7 +896,7 @@ def _run_for_input(
             fused_txt = out_dir / "variant_fused_majority.txt"
             fused_txt.write_text("", encoding="utf-8")
         if return_fused:
-            return {
+            payload = {
                 "tables": [],
                 "input_dpi": float(base_dpi) if base_dpi else None,
                 "ocr_dpi": int(ocr_dpi_base),
@@ -885,6 +904,26 @@ def _run_for_input(
                 "input_size": input_size,
                 "detection_size": detection_size,
             }
+            if warnings:
+                payload["warnings"] = warnings
+            if return_variant_rows:
+                try:
+                    variants0 = _build_variants(ocr_dpi_base, detection_dpi)
+                except Exception:
+                    variants0 = []
+                payload["variants"] = [
+                    {
+                        "method": v.get("method"),
+                        "psm": v.get("psm"),
+                        "remove_lines": bool(v.get("remove_lines", False)),
+                        "line_strip_level": v.get("line_strip_level"),
+                        "dpi": v.get("dpi"),
+                        "scale": v.get("scale"),
+                    }
+                    for v in (variants0 or [])
+                ]
+                payload["variant_rows_all"] = []
+            return payload
         return 0
 
     variants = _build_variants(ocr_dpi_base, detection_dpi)
@@ -1292,7 +1331,7 @@ def _run_for_input(
             fused_txt.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
     if return_fused:
-        return {
+        payload = {
             "tables": fused_tables if fuse else [],
             "input_dpi": float(base_dpi) if base_dpi else None,
             "ocr_dpi": int(ocr_dpi_base),
@@ -1300,6 +1339,22 @@ def _run_for_input(
             "input_size": input_size,
             "detection_size": detection_size,
         }
+        if warnings:
+            payload["warnings"] = warnings
+        if return_variant_rows:
+            payload["variants"] = [
+                {
+                    "method": v.get("method"),
+                    "psm": v.get("psm"),
+                    "remove_lines": bool(v.get("remove_lines", False)),
+                    "line_strip_level": v.get("line_strip_level"),
+                    "dpi": v.get("dpi"),
+                    "scale": v.get("scale"),
+                }
+                for v in (variants or [])
+            ]
+            payload["variant_rows_all"] = variant_rows_all
+        return payload
 
     if emit_variants:
         print(f"Wrote {len(results)} variants to {out_dir}")

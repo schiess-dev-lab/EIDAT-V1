@@ -153,6 +153,76 @@ class TestTableMultipageMerger(unittest.TestCase):
         out2 = merge_multipage_tables_in_combined_lines(out1)
         self.assertEqual(out2, out1)
 
+    def test_normalize_to_leader_layout_aligns_width_mismatch(self) -> None:
+        def _positions(s: str, ch: str) -> list[int]:
+            return [i for i, c in enumerate(s) if c == ch]
+
+        cols1 = [("A", 6), ("B", 6), ("C", 6)]
+        cols2 = [("A", 6), ("B", 7), ("C", 6)]  # small width mismatch (should still merge)
+        header = ["col1", "col2", "col3"]
+        rows_p1 = [[f"r{i}a", f"r{i}b", f"r{i}c"] for i in range(1, 10)]  # 9 body rows
+        rows_p2 = [[f"r{i}a", f"r{i}b", f"r{i}c"] for i in range(10, 13)]  # continuation
+
+        table1 = _mk_table(cols=cols1, header=header, rows=rows_p1, use_eq_header_sep=True)
+        table2 = _mk_table(cols=cols2, header=header, rows=rows_p2, use_eq_header_sep=True)
+
+        lines = ["=== Page 1 ===\n", "\n"] + table1 + ["\n", "=== Page 2 ===\n", "\n"] + table2 + ["\n"]
+        cfg = {"version": 1, "normalize_to_leader_layout": True}
+
+        out = merge_multipage_tables_in_combined_lines(lines, cfg=cfg)
+        txt = "".join(out)
+        self.assertIn("|r12a", txt)
+
+        # Continuation row pipes should align with leader border plus positions.
+        leader_border = next(ln for ln in out if ln.startswith("+") and "-" in ln)
+        leader_plus = _positions(leader_border.rstrip("\r\n"), "+")
+        cont_row = next(ln for ln in out if "r12a" in ln and ln.lstrip().startswith("|"))
+        cont_pipes = _positions(cont_row.rstrip("\r\n"), "|")
+        self.assertEqual(cont_pipes, leader_plus)
+
+        # Border lines in the merged table should match the leader border width/layout.
+        for ln in out:
+            if ln.startswith("+") and ("-" in ln or "=" in ln):
+                self.assertEqual(len(ln.rstrip("\r\n")), len(leader_border.rstrip("\r\n")))
+                self.assertEqual(_positions(ln.rstrip("\r\n"), "+"), leader_plus)
+
+    def test_normalize_to_leader_layout_removes_indent_drift(self) -> None:
+        def _positions(s: str, ch: str) -> list[int]:
+            return [i for i, c in enumerate(s) if c == ch]
+
+        cols = [("A", 6), ("B", 6), ("C", 6)]
+        header = ["col1", "col2", "col3"]
+        rows_p1 = [[f"r{i}a", f"r{i}b", f"r{i}c"] for i in range(1, 10)]  # 9
+        rows_p2 = [[f"r{i}a", f"r{i}b", f"r{i}c"] for i in range(10, 13)]
+        table1 = _mk_table(cols=cols, header=header, rows=rows_p1, use_eq_header_sep=True)
+        table2 = _mk_table(cols=cols, header=header, rows=rows_p2, use_eq_header_sep=True)
+        table2 = [("   " + ln) for ln in table2]  # indent continuation segment
+
+        lines = ["=== Page 1 ===\n", "\n"] + table1 + ["\n", "=== Page 2 ===\n", "\n"] + table2 + ["\n"]
+        cfg = {"version": 1, "normalize_to_leader_layout": True}
+
+        out = merge_multipage_tables_in_combined_lines(lines, cfg=cfg)
+        leader_border = next(ln for ln in out if ln.startswith("+") and "-" in ln)
+        leader_plus = _positions(leader_border.rstrip("\r\n"), "+")
+        cont_row = next(ln for ln in out if "r10a" in ln and ln.lstrip().startswith("|"))
+        cont_pipes = _positions(cont_row.rstrip("\r\n"), "|")
+        self.assertEqual(cont_pipes, leader_plus)
+
+    def test_normalize_to_leader_layout_idempotent(self) -> None:
+        cols1 = [("A", 6), ("B", 6), ("C", 6)]
+        cols2 = [("A", 6), ("B", 7), ("C", 6)]
+        header = ["col1", "col2", "col3"]
+        rows_p1 = [[f"r{i}a", f"r{i}b", f"r{i}c"] for i in range(1, 10)]
+        rows_p2 = [[f"r{i}a", f"r{i}b", f"r{i}c"] for i in range(10, 13)]
+        table1 = _mk_table(cols=cols1, header=header, rows=rows_p1, use_eq_header_sep=True)
+        table2 = _mk_table(cols=cols2, header=header, rows=rows_p2, use_eq_header_sep=True)
+        lines = ["=== Page 1 ===\n", "\n"] + table1 + ["\n", "=== Page 2 ===\n", "\n"] + table2 + ["\n"]
+        cfg = {"version": 1, "normalize_to_leader_layout": True}
+
+        out1 = merge_multipage_tables_in_combined_lines(lines, cfg=cfg)
+        out2 = merge_multipage_tables_in_combined_lines(out1, cfg=cfg)
+        self.assertEqual(out2, out1)
+
     def test_label_forced_merge_finds_non_first_continuation_table(self) -> None:
         cols = [("A", 6), ("B", 6), ("C", 6)]
         header = ["col1", "col2", "col3"]

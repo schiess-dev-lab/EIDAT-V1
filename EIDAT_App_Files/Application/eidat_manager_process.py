@@ -392,10 +392,183 @@ def _run_debug_method_extraction(pdf_path: Path, dpi: int | None, output_dir: Pa
             enable_borderless=_parse_bool_env("EIDAT_TABLE_ENABLE_BORDERLESS", False)
             or _parse_bool_env("EIDAT_ENABLE_BORDERLESS_TABLES", False),
             return_fused=True,
+            return_variant_rows=True,
         )
 
         fused_tables = list(fused_result.get("tables") or [])
         detection_dpi_used = int(fused_result.get("detection_dpi") or detection_dpi)
+        warnings = list(fused_result.get("warnings") or []) if isinstance(fused_result, dict) else []
+        if "bordered_table_detection_timeout" in warnings:
+            timeout_sec = _parse_int_env("EIDAT_TABLE_DETECT_TIMEOUT_SEC", 300)
+            if timeout_sec < 0:
+                timeout_sec = 0
+            pages_data.append(
+                {
+                    "page": page_num,
+                    "error": f"Timeout: bordered table detection exceeded {int(timeout_sec)}s",
+                    "timeout": True,
+                    "tokens": [],
+                    "tables": [],
+                    "charts": [],
+                    "img_w": 0,
+                    "img_h": 0,
+                    "dpi": detection_dpi_used,
+                    "ocr_dpi": ocr_dpi,
+                    "flow": {},
+                    "warnings": warnings,
+                }
+            )
+            continue
+
+        # Persist per-variant table cell candidates (single sidecar JSON per page) so the
+        # combined.txt healer can later rescue garbled numeric cells from alternate variants.
+        try:
+            enable_candidates = _parse_bool_env("EIDAT_TABLE_VARIANT_CANDIDATES", True)
+        except Exception:
+            enable_candidates = True
+        if enable_candidates:
+            try:
+                variants_meta = list(fused_result.get("variants") or [])
+                variant_rows_all = list(fused_result.get("variant_rows_all") or [])
+
+                split_mode = str(os.environ.get("EIDAT_TABLE_SPLIT_MODE", "vline") or "vline").strip().lower()
+                ascii_mode = "replica" if split_mode in ("replica", "snap", "grid") else "default"
+                combined_split_mode = str(os.environ.get("EIDAT_COMBINED_TABLE_SPLIT_MODE", "inherit") or "inherit").strip().lower()
+                if combined_split_mode in ("inherit", "same"):
+                    combined_split_mode = split_mode
+                enable_combined_vline_split = combined_split_mode in ("vline", "default", "on", "true", "1", "yes")
+                try:
+                    combined_vline_tol_px = float(
+                        os.environ.get(
+                            "EIDAT_COMBINED_TABLE_SPLIT_VLINE_MISALIGN_PX",
+                            os.environ.get("EIDAT_TABLE_SPLIT_VLINE_MISALIGN_PX", "6.0"),
+                        )
+                    )
+                except Exception:
+                    combined_vline_tol_px = 6.0
+                try:
+                    combined_vline_min_run = int(
+                        os.environ.get(
+                            "EIDAT_COMBINED_TABLE_SPLIT_VLINE_MIN_RUN",
+                            os.environ.get("EIDAT_TABLE_SPLIT_VLINE_MIN_RUN", "1"),
+                        )
+                    )
+                except Exception:
+                    combined_vline_min_run = 1
+                single_cell_sep = str(
+                    os.environ.get(
+                        "EIDAT_COMBINED_TABLE_SPLIT_SINGLE_CELL_SEPARATOR",
+                        os.environ.get("EIDAT_TABLE_SPLIT_SINGLE_CELL_SEPARATOR", "1"),
+                    )
+                    or "1"
+                ).strip().lower() in ("1", "true", "yes", "on")
+                try:
+                    single_cell_sep_max_h_ratio = float(
+                        os.environ.get(
+                            "EIDAT_COMBINED_TABLE_SPLIT_SINGLE_CELL_SEPARATOR_MAX_H_RATIO",
+                            os.environ.get("EIDAT_TABLE_SPLIT_SINGLE_CELL_SEPARATOR_MAX_H_RATIO", "0.0"),
+                        )
+                    )
+                except Exception:
+                    single_cell_sep_max_h_ratio = 0.0
+
+                def _part_row_col_map(part_table: Dict[str, Any]) -> tuple[list[int], list[list[int]], int]:
+                    cells = part_table.get("cells") or []
+                    rows: dict[int, list[Dict[str, Any]]] = {}
+                    for cell in cells:
+                        try:
+                            r = int(cell.get("row"))
+                            c = int(cell.get("col"))
+                        except Exception:
+                            continue
+                        rows.setdefault(r, []).append({"col": c})
+                    row_ids = sorted(rows.keys())
+                    col_ids_by_row: list[list[int]] = []
+                    max_cols = 0
+                    for r in row_ids:
+                        cols = sorted({int(x.get("col")) for x in rows.get(r) or []})
+                        col_ids_by_row.append(cols)
+                        max_cols = max(max_cols, len(cols))
+                    return row_ids, col_ids_by_row, int(max_cols)
+
+                parts: list[dict[str, Any]] = []
+                order_counter = 0
+                for src_idx, t in enumerate(fused_tables):
+                    if enable_combined_vline_split:
+                        try:
+                            parts_local = debug_exporter._split_table_on_vline_mismatch_for_display(
+                                t,
+                                tol_px=float(combined_vline_tol_px),
+                                min_mismatch_run=int(combined_vline_min_run),
+                                enable_single_cell_separator=bool(single_cell_sep),
+                                single_cell_separator_max_h_ratio=float(single_cell_sep_max_h_ratio),
+                            )
+                        except Exception:
+                            parts_local = [t]
+                    else:
+                        parts_local = [t]
+                    for part in parts_local:
+                        bbox = part.get("bbox_px") or []
+                        if not bbox or len(bbox) != 4:
+                            continue
+                        parts.append(
+                            {
+                                "source_table_idx": int(src_idx),
+                                "part": part,
+                                "y0": float(bbox[1]),
+                                "x0": float(bbox[0]),
+                                "order": int(order_counter),
+                            }
+                        )
+                        order_counter += 1
+
+                parts_sorted = sorted(parts, key=lambda p: (p.get("y0", 0.0), p.get("x0", 0.0), p.get("order", 0)))
+                out_tables: list[dict[str, Any]] = []
+                for entry in parts_sorted:
+                    src_idx = int(entry.get("source_table_idx", 0))
+                    part = entry.get("part") or {}
+                    row_ids, col_ids_by_row, max_cols = _part_row_col_map(part)
+                    rows_by_variant: list[list[list[str]]] = []
+                    for variant_tables in variant_rows_all:
+                        try:
+                            tbl = variant_tables[src_idx] if src_idx < len(variant_tables) else {}
+                            full_rows = tbl.get("rows") if isinstance(tbl, dict) else []
+                        except Exception:
+                            full_rows = []
+                        v_rows: list[list[str]] = []
+                        for rpos, r_id in enumerate(row_ids):
+                            cols = col_ids_by_row[rpos] if rpos < len(col_ids_by_row) else []
+                            row_out: list[str] = []
+                            for cpos in range(int(max_cols)):
+                                if cpos < len(cols):
+                                    c_id = int(cols[cpos])
+                                    try:
+                                        val = str(full_rows[r_id][c_id]) if (r_id < len(full_rows) and c_id < len(full_rows[r_id])) else ""
+                                    except Exception:
+                                        val = ""
+                                    row_out.append(val)
+                                else:
+                                    row_out.append("")
+                            v_rows.append(row_out)
+                        rows_by_variant.append(v_rows)
+
+                    out_tables.append(
+                        {
+                            "source_table_idx": int(src_idx),
+                            "rows_by_variant": rows_by_variant,
+                        }
+                    )
+
+                sidecar = {
+                    "version": 1,
+                    "variant_count": int(len(variants_meta)),
+                    "variants": variants_meta,
+                    "ascii_mode": str(ascii_mode),
+                    "tables": out_tables,
+                }
+                (page_dir / "table_variant_candidates.json").write_text(json.dumps(sidecar, indent=2), encoding="utf-8")
+            except Exception:
+                pass
 
         tokens, ocr_img_w, ocr_img_h, _img_path = ocr_engine.ocr_page(
             pdf_path, page_num - 1, ocr_dpi, ocr_lang, 3, debug_dir=None
@@ -440,6 +613,8 @@ def _run_debug_method_extraction(pdf_path: Path, dpi: int | None, output_dir: Pa
             "ocr_dpi": ocr_dpi,
             "flow": flow_data,
         }
+        if warnings:
+            page_data["warnings"] = warnings
         pages_data.append(page_data)
 
         debug_exporter.export_page_debug(
@@ -982,12 +1157,56 @@ def process_candidates(
                                 try:
                                     from extraction.table_cell_healer import (
                                         heal_combined_txt_file_inplace,
+                                        JsonlDebugSink,
+                                        JsonSidecarVariantCandidatesProvider,
                                         load_table_cell_heal_heuristics,
                                     )
 
                                     heal_path = _resolve_user_inputs_file("table_cell_heal_heuristics.json")
                                     heal_cfg = load_table_cell_heal_heuristics(heal_path)
-                                    heal_combined_txt_file_inplace(combined_txt_path, cfg=heal_cfg, history=None)
+                                    variant_provider = None
+                                    try:
+                                        enable_candidates = _parse_bool_env("EIDAT_TABLE_VARIANT_CANDIDATES", True)
+                                    except Exception:
+                                        enable_candidates = True
+                                    if enable_candidates and artifacts_dir:
+                                        try:
+                                            numeric_cfg = heal_cfg.get("numeric") if isinstance(heal_cfg.get("numeric"), dict) else {}
+                                            rescue_cfg = (
+                                                numeric_cfg.get("variant_rescue")
+                                                if isinstance(numeric_cfg.get("variant_rescue"), dict)
+                                                else {}
+                                            )
+                                            if bool(rescue_cfg.get("enabled", False)):
+                                                sidecar_name = str(rescue_cfg.get("sidecar_filename") or "table_variant_candidates.json")
+                                                variant_provider = JsonSidecarVariantCandidatesProvider(
+                                                    Path(artifacts_dir),
+                                                    sidecar_filename=sidecar_name,
+                                                )
+                                        except Exception:
+                                            variant_provider = None
+
+                                    variant_debug = None
+                                    try:
+                                        enable_variant_debug = _parse_bool_env("EIDAT_TABLE_CELL_HEAL_VARIANT_DEBUG", False) or _parse_bool_env(
+                                            "EIDAT_TABLE_CELL_HEAL_DEBUG", False
+                                        )
+                                    except Exception:
+                                        enable_variant_debug = False
+                                    if enable_variant_debug and artifacts_dir:
+                                        try:
+                                            debug_path = Path(artifacts_dir) / "table_cell_heal_variant_rescue.jsonl"
+                                            variant_debug = JsonlDebugSink(debug_path, truncate=True)
+                                        except Exception:
+                                            variant_debug = None
+
+                                    heal_combined_txt_file_inplace(
+                                        combined_txt_path,
+                                        cfg=heal_cfg,
+                                        history=None,
+                                        variant_provider=variant_provider,
+                                        variant_debug=variant_debug,
+                                    )
                                 except Exception:
                                     pass
 

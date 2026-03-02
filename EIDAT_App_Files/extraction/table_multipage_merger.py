@@ -220,12 +220,113 @@ def _find_preceding_table_label(lines: list[str], *, page_start: int, before_idx
     return ""
 
 
-def _extract_layout_signature(border_line: str) -> tuple[int, tuple[int, ...], int, int]:
+def _extract_layout_signature(border_line: str) -> tuple[int, tuple[int, ...], tuple[int, ...], int]:
     b = str(border_line).rstrip("\r\n")
     plus = [k for k, ch in enumerate(b) if ch == "+"]
     indent = plus[0] if plus else 0
     widths = tuple((plus[k + 1] - plus[k] - 1) for k in range(len(plus) - 1))
     return indent, tuple(plus), widths, len(b)
+
+
+def _pick_canonical_border_template(block_lines: list[str]) -> str:
+    """
+    Pick a "canonical" border line to use as a layout template.
+
+    Prefer a '-' border (not '=') with the most '+' characters; this typically corresponds
+    to the richest set of vertical boundaries. Fall back to the first border line.
+    """
+    borders = [ln for ln in block_lines if _is_border(ln)]
+    if not borders:
+        return ""
+    dash_borders = [ln for ln in borders if ("-" in str(ln)) and ("=" not in str(ln))]
+    cands = dash_borders or borders
+
+    def _score(ln: str) -> tuple[int, int]:
+        s = str(ln).rstrip("\r\n")
+        return (s.count("+"), len(s))
+
+    return max(cands, key=_score)
+
+
+def _split_pipe_row_cells_preserve(line: str) -> list[str] | None:
+    s = str(line).rstrip("\r\n")
+    pipe_i = s.find("|")
+    if pipe_i < 0:
+        return None
+    # Drop any indent/noise before the first pipe.
+    s = s[pipe_i:]
+    s = s.rstrip()
+    if not s.startswith("|"):
+        return None
+    last = s.rfind("|")
+    if last <= 0:
+        return None
+    inner = s[1:last]
+    return inner.split("|")
+
+
+def _sanitize_cell_for_ascii(cell: str) -> str:
+    s = "" if cell is None else str(cell)
+    s = s.replace("\u00A0", " ")
+    s = s.replace("\t", " ").replace("\r", " ").replace("\n", " ")
+    return s
+
+
+def _normalize_segment_to_leader_layout(
+    seg_lines: list[str],
+    *,
+    leader_border_template: str,
+    leader_col_widths: tuple[int, ...],
+    leader_indent: int,
+) -> list[str]:
+    """
+    Rewrite a continuation segment to match the leader's ASCII layout.
+
+    - Border lines become the leader's border template.
+    - Pipe rows are rebuilt to match the leader's column widths and indent.
+    """
+    if not seg_lines or not leader_border_template or not leader_col_widths:
+        return seg_lines
+
+    expected_cols = int(len(leader_col_widths))
+    leader_border_no_nl = str(leader_border_template).rstrip("\r\n")
+
+    out: list[str] = []
+    for ln in seg_lines:
+        nl = _newline_for_line(ln)
+        if _is_border(ln):
+            out.append(leader_border_no_nl + nl)
+            continue
+        if _is_pipe_row(ln):
+            cells0 = _split_pipe_row_cells_preserve(ln)
+            if cells0 is None:
+                out.append(str(ln).rstrip("\r\n") + nl)
+                continue
+            cells = [_sanitize_cell_for_ascii(c) for c in cells0]
+            # Normalize to expected number of columns.
+            if len(cells) > expected_cols:
+                if expected_cols <= 0:
+                    out.append(str(ln).rstrip("\r\n") + nl)
+                    continue
+                cells = cells[: expected_cols - 1] + ["|".join(cells[expected_cols - 1 :])]
+            elif len(cells) < expected_cols:
+                cells = cells + ([""] * (expected_cols - len(cells)))
+
+            rebuilt: list[str] = [" " * int(max(0, leader_indent)), "|"]
+            for idx, w in enumerate(leader_col_widths):
+                c = cells[idx] if idx < len(cells) else ""
+                c = str(c).strip()
+                if len(c) > int(w):
+                    c = c[: int(w)]
+                else:
+                    c = c.ljust(int(w))
+                rebuilt.append(c)
+                rebuilt.append("|")
+            out.append("".join(rebuilt) + nl)
+            continue
+        # Unknown line type: keep it, but ensure it has a newline.
+        out.append(str(ln).rstrip("\r\n") + nl)
+    return out
 
 
 def _extract_header_cells(block_lines: list[str]) -> list[str]:
@@ -595,6 +696,7 @@ def merge_multipage_tables_in_combined_lines(lines: list[str], cfg: dict[str, An
 
     page_range_by_page = {p.page: p for p in pages}
     sorted_pages = sorted(page_range_by_page.keys())
+    prev_page_in_chain: dict[int, int] = {int(sorted_pages[i + 1]): int(sorted_pages[i]) for i in range(len(sorted_pages) - 1)}
 
     try:
         k_prev = int(cfg2.get("candidate_tables_prev", 2) or 2)
@@ -608,6 +710,10 @@ def merge_multipage_tables_in_combined_lines(lines: list[str], cfg: dict[str, An
         min_body = int(cfg2.get("min_body_rows", 8) or 8)
     except Exception:
         min_body = 8
+    try:
+        normalize_to_leader = bool(cfg2.get("normalize_to_leader_layout", False))
+    except Exception:
+        normalize_to_leader = False
 
     label_merge_rules = cfg2.get("label_merge_rules")
     label_rules: list[dict[str, Any]] = label_merge_rules if isinstance(label_merge_rules, list) else []
@@ -621,6 +727,7 @@ def merge_multipage_tables_in_combined_lines(lines: list[str], cfg: dict[str, An
     debug_dump_path = str(cfg2.get("debug_dump_path") or "").strip()
     debug_enabled = bool(debug_dump_path)
     debug_report: dict[str, Any] = {"version": 1, "pages": [], "decisions": []}
+    decision_by_boundary: dict[str, dict[str, Any]] = {}
     if debug_enabled:
         # Precompute per-page table summaries.
         for p in sorted(tables_by_page.keys()):
@@ -656,7 +763,15 @@ def merge_multipage_tables_in_combined_lines(lines: list[str], cfg: dict[str, An
         next_list = tables_by_page.get(p_next, [])
         if not prev_list or not next_list:
             continue
-        decision: dict[str, Any] = {"boundary": f"{int(p)}->{int(p_next)}", "forced": [], "legacy": None}
+        boundary_key = f"{int(p)}->{int(p_next)}"
+        decision: dict[str, Any] = {
+            "boundary": boundary_key,
+            "forced": [],
+            "legacy": None,
+            "normalize_to_leader_layout": bool(normalize_to_leader),
+        }
+        if debug_enabled:
+            decision_by_boundary[boundary_key] = decision
 
         # 0) Label-driven forced merges (best-effort, per allowlisted label).
         for rr in label_rules:
@@ -816,11 +931,28 @@ def merge_multipage_tables_in_combined_lines(lines: list[str], cfg: dict[str, An
         if not cont_tables:
             continue
 
-        leader_block = list(lines[leader.ascii_start : leader.ascii_end])
-        if not leader_block:
+        leader_block0 = list(lines[leader.ascii_start : leader.ascii_end])
+        if not leader_block0:
             continue
-        dash_border = _find_dash_border_line(leader_block)
-        bottom_idx, bottom_border = _find_bottom_border(leader_block)
+        dash_border = _find_dash_border_line(leader_block0)
+        bottom_idx, bottom_border = _find_bottom_border(leader_block0)
+
+        leader_border_template = ""
+        leader_indent = 0
+        leader_col_widths: tuple[int, ...] = ()
+        leader_total_len = 0
+        if normalize_to_leader:
+            leader_border_template = _pick_canonical_border_template(leader_block0) or dash_border
+            if leader_border_template:
+                try:
+                    leader_indent, _pp, leader_col_widths, leader_total_len = _extract_layout_signature(leader_border_template)
+                except Exception:
+                    leader_border_template = ""
+                    leader_indent = 0
+                    leader_col_widths = ()
+                    leader_total_len = 0
+
+        leader_block = list(leader_block0)
         # Remove bottom border from leader block (we'll re-add after appending rows).
         if 0 <= bottom_idx < len(leader_block):
             leader_block = leader_block[:bottom_idx] + leader_block[bottom_idx + 1 :]
@@ -834,6 +966,60 @@ def merge_multipage_tables_in_combined_lines(lines: list[str], cfg: dict[str, An
             )
             if not seg:
                 continue
+            seg_sig_before = None
+            if debug_enabled and normalize_to_leader:
+                try:
+                    b0 = next((x for x in seg if _is_border(x)), None)
+                    if b0 is not None:
+                        seg_sig_before = _extract_layout_signature(b0)
+                except Exception:
+                    seg_sig_before = None
+
+            if normalize_to_leader and leader_border_template and leader_col_widths:
+                seg = _normalize_segment_to_leader_layout(
+                    seg,
+                    leader_border_template=leader_border_template,
+                    leader_col_widths=leader_col_widths,
+                    leader_indent=int(leader_indent),
+                )
+
+            if debug_enabled and normalize_to_leader:
+                try:
+                    prev_p = prev_page_in_chain.get(int(ct.page))
+                    boundary_key = f"{int(prev_p)}->{int(ct.page)}" if prev_p is not None else f"{int(leader.page)}->{int(ct.page)}"
+                    decision = decision_by_boundary.get(boundary_key)
+                    if decision is not None:
+                        entry: dict[str, Any] = {
+                            "leader": {"page": int(leader.page), "ascii_start": int(leader.ascii_start)},
+                            "cont": {"page": int(ct.page), "ascii_start": int(ct.ascii_start)},
+                            "leader_template_sig": {
+                                "indent": int(leader_indent),
+                                "col_widths": list(leader_col_widths),
+                                "total_len": int(leader_total_len),
+                            },
+                            "segment_sig_before": None,
+                            "segment_sig_after": None,
+                        }
+                        if seg_sig_before is not None:
+                            entry["segment_sig_before"] = {
+                                "indent": int(seg_sig_before[0]),
+                                "col_widths": list(seg_sig_before[2]),
+                                "total_len": int(seg_sig_before[3]),
+                            }
+                        try:
+                            b1 = next((x for x in seg if _is_border(x)), None)
+                            if b1 is not None:
+                                seg_sig_after = _extract_layout_signature(b1)
+                                entry["segment_sig_after"] = {
+                                    "indent": int(seg_sig_after[0]),
+                                    "col_widths": list(seg_sig_after[2]),
+                                    "total_len": int(seg_sig_after[3]),
+                                }
+                        except Exception:
+                            pass
+                        decision.setdefault("normalized_segments", []).append(entry)
+                except Exception:
+                    pass
             # Drop segment's final border; leader's final border will close the merged table.
             if seg and _is_border(seg[-1]):
                 seg = seg[:-1]
