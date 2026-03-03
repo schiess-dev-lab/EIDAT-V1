@@ -20,12 +20,12 @@ You update EIDAT by updating this Central Runtime folder (git pull / copy new ve
 
 ### Node Root
 The “bite-size” repository root you want EIDAT to manage for a team (where their docs live).
-EIDAT deposits an `EIDAT\` folder alongside their content and writes artifacts to `EIDAT Support\`.
+EIDAT deposits an `EIDAT\` folder alongside their content and writes artifacts to `EIDAT\EIDAT Support\` (legacy nodes may still use `EIDAT Support\`).
 
 Example:
 - `\\share\TeamA\Repo1\` *(node root)*
   - `EIDAT\...` *(deposited)*
-  - `EIDAT Support\...` *(generated/managed)*
+  - `EIDAT\EIDAT Support\...` *(generated/managed)*
 
 ## Node layout (deposited into each Node Root)
 After deploying a node, the node root contains:
@@ -37,14 +37,14 @@ After deploying a node, the node root contains:
   - `sys_python.txt` *(optional; only needed if `py -3` and `python` are unavailable)*
 - `EIDAT\ExtractionNode\`
   - `eidat_node.sqlite3`
-- `EIDAT Support\`
+- `EIDAT\EIDAT Support\`
   - `projects\projects_registry.sqlite3` *(multi-writer projects registry; WAL)*
   - other pipeline artifacts (debug/ocr, logs, staging, eidat_index.sqlite3, …)
 
 ## Permissions (important)
 End users must have **Modify** rights on:
 
-- `<node_root>\EIDAT Support\projects\` *(to create/edit projects and update registry)*
+- `<node_root>\EIDAT\EIDAT Support\projects\` *(to create/edit projects and update registry)*
 - `<node_root>\EIDAT\UserData\` *(to persist user_inputs + GUI settings under the node)*
 
 If these are read-only, the Projects UI will show a clear error telling you what path needs rights.
@@ -71,6 +71,22 @@ Each allowlist can be either:
 If an allowlist is empty/missing, the extracted value is forced to `Unknown`.
 
 To backfill old metadata (e.g., remove non-allowlisted program titles), run **Files Explorer → Refresh Metadata Only** on the affected files (it rewrites metadata JSONs and triggers an index refresh).
+
+## Table labeling (combined.txt)
+EIDAT can insert stable table labels into OCR `combined.txt` output using rules in `user_inputs/table_label_rules.json`.
+
+- Each matching table gets a label block inserted immediately before it:
+  - `[TABLE_LABEL]`
+  - `Your Label` (or `Your Label (2)` for repeats)
+- Multiple table types are supported by adding multiple entries under `rules`.
+- Rule selection is per-table: the highest `priority` match wins (ties default to earlier rule order).
+- Optional: set `"tie_breaker": "priority_then_specificity"` to prefer the most-specific rule when priorities tie.
+
+## Table merging (multi-page ASCII tables)
+EIDAT can merge bordered ASCII tables that continue across page boundaries in `combined.txt` using `user_inputs/table_merge_heuristics.json`.
+
+- Default behavior is heuristic (layout/headers/titles) and only considers adjacent pages.
+- Optional: enable label-driven merging by setting `label_merge_rules` (allowlist of base table labels) and `protect_labeled_tables` to avoid accidental merges of labeled tables.
 
 ## Quickstart (admin, shared-drive testing)
 
@@ -167,7 +183,7 @@ Per-node shortcut:
 ## Projects: multi-writer registry
 Projects are registered in:
 
-- `<node_root>\EIDAT Support\projects\projects_registry.sqlite3`
+- `<node_root>\EIDAT\EIDAT Support\projects\projects_registry.sqlite3` *(legacy: `<node_root>\EIDAT Support\projects\...`)*
 
 This replaces the old shared JSON registry and is safe for concurrent writers using SQLite WAL.
 If `projects.json` exists, EIDAT will migrate it into SQLite automatically the first time.
@@ -206,7 +222,7 @@ Install Python 3 (Windows) and ensure either:
 ### “Projects folder is not writable”
 Grant Modify rights to:
 
-- `<node_root>\EIDAT Support\projects\`
+- `<node_root>\EIDAT\EIDAT Support\projects\` *(legacy: `<node_root>\EIDAT Support\projects\`)*
 
 ### Package installation prompts fail (pip/network)
 If your company requires an internal index, set env vars before running the `.bat`:

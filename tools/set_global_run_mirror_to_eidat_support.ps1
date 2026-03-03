@@ -3,7 +3,7 @@ param(
   [string]$ScannerEnvPath = ".\\user_inputs\\scanner.local.env",
 
   [Parameter(Mandatory = $false)]
-  [string]$SupportDirName = "EIDAT Support",
+  [string]$SupportDirName = "EIDAT\EIDAT Support",
 
   [Parameter(Mandatory = $false)]
   [string]$LinkPath = ".\\global_run_mirror",
@@ -49,9 +49,20 @@ if (-not $repoRoot) {
 if (-not $repoRoot) { throw "REPO_ROOT not found in $ScannerEnvPath" }
 
 $repoRootFull = [System.IO.Path]::GetFullPath($repoRoot)
-$supportDir = Join-Path $repoRootFull $SupportDirName
-if (-not (Test-Path -LiteralPath $supportDir)) {
-  throw "Support dir not found: $supportDir"
+
+# Prefer the current node layout (`EIDAT\\EIDAT Support`) but allow legacy nodes (`EIDAT Support`)
+# and allow callers to pass an explicit relative path via -SupportDirName.
+$supportCandidates = @()
+if ($SupportDirName) { $supportCandidates += (Join-Path $repoRootFull $SupportDirName) }
+$supportCandidates += (Join-Path $repoRootFull "EIDAT\EIDAT Support")
+$supportCandidates += (Join-Path $repoRootFull "EIDAT Support")
+
+$supportDir = $null
+foreach ($cand in $supportCandidates) {
+  if (Test-Path -LiteralPath $cand) { $supportDir = $cand; break }
+}
+if (-not $supportDir) {
+  throw ("Support dir not found. Tried: " + ($supportCandidates -join ", "))
 }
 
 $linkFull = [System.IO.Path]::GetFullPath($LinkPath)

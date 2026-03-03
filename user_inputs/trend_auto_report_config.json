@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "model": {
+    "type": "poly",
+    "degree": 3,
+    "aggregate": "median",
+    "grid_points": 200,
+    "normalize_x": true
+  },
+  "watch": {
+    "curve_deviation": {
+      "max_abs": null,
+      "max_pct": 10.0,
+      "rms_pct": 5.0
+    }
+  },
+  "grading": {
+    "zscore_pass_max": 2.0,
+    "zscore_watch_max": 3.0
+  },
+  "report": {
+    "statistics": "from_excel_trend_config",
+    "include_metrics": true,
+    "graphs_at_end": true,
+    "max_findings": 12
+  },
+  "highlight": {
+    "default_serials": [],
+    "policy": "watch_only",
+    "colors": ["#ef4444", "#3b82f6", "#22c55e", "#a855f7", "#f97316"]
+  }
+}
+

@@ -85,7 +85,8 @@ def _iter_tables(lines: List[str]) -> List[Tuple[int, int, List[str], List[List[
     while i < n:
         ln = lines[i]
         s = str(ln).strip()
-        if s.startswith("+") and "-" in s and s.endswith("+"):
+        # Some ASCII tables use '=' borders (or mixed '='/'-'); accept either as a table start.
+        if s.startswith("+") and s.endswith("+") and (("-" in s) or ("=" in s)):
             tbl_lines: List[str] = []
             j = i
             while j < n:
@@ -200,8 +201,47 @@ def _rule_matches(rule: Dict[str, Any], *, rows: List[List[str]]) -> bool:
     return True
 
 
-def _pick_rule(rules: List[Dict[str, Any]], *, rows: List[List[str]]) -> Optional[Dict[str, Any]]:
+def _rule_specificity(rule: Dict[str, Any]) -> int:
+    score = 0
+
+    def _count_phrases(key: str) -> int:
+        raw = rule.get(key) or []
+        if not isinstance(raw, list):
+            return 0
+        return sum(1 for p in raw if _norm_text(str(p or "")))
+
+    score += _count_phrases("must_contain_all")
+    score += _count_phrases("must_contain_any")
+    score += _count_phrases("must_not_contain")
+
+    for k in ("min_rows", "min_cols", "max_rows", "max_cols"):
+        try:
+            if int(rule.get(k) or 0):
+                score += 1
+        except Exception:
+            continue
+
+    scope = str(rule.get("match_scope") or "any_cell").strip().lower()
+    if scope and scope != "any_cell":
+        score += 1
+
+    return int(score)
+
+
+def _pick_rule(
+    rules: List[Dict[str, Any]],
+    *,
+    rows: List[List[str]],
+    tie_breaker: str = "priority_then_order",
+) -> Optional[Dict[str, Any]]:
     matches: List[Tuple[int, int, Dict[str, Any]]] = []
+    tb = str(tie_breaker or "priority_then_order").strip().lower()
+    use_specificity = tb in (
+        "priority_then_specificity",
+        "specificity",
+        "specific",
+        "most_specific",
+    )
     for idx, rule in enumerate(rules or []):
         if not isinstance(rule, dict):
             continue
@@ -214,11 +254,17 @@ def _pick_rule(rules: List[Dict[str, Any]], *, rows: List[List[str]]) -> Optiona
             priority = int(rule.get("priority") or 0)
         except Exception:
             priority = 0
-        matches.append((priority, -idx, rule))
+        if use_specificity:
+            # Higher specificity wins on priority ties; rule order is last-resort tie-breaker.
+            spec = _rule_specificity(rule)
+            matches.append((priority, spec, -idx, rule))  # type: ignore[list-item]
+        else:
+            matches.append((priority, -idx, rule))
     if not matches:
         return None
     matches.sort(reverse=True)
-    return matches[0][2]
+    top = matches[0]
+    return top[-1]  # type: ignore[return-value]
 
 
 def label_combined_lines(lines: List[str], rules_cfg: Dict[str, Any]) -> List[str]:
@@ -231,6 +277,7 @@ def label_combined_lines(lines: List[str], rules_cfg: Dict[str, Any]) -> List[st
     marker = str(rules_cfg.get("marker") or "TABLE_LABEL").strip() or "TABLE_LABEL"
     marker_line = f"[{marker}]"
     append_index_after_first = bool(rules_cfg.get("append_index_after_first", True))
+    tie_breaker = str(rules_cfg.get("tie_breaker") or "priority_then_order").strip() or "priority_then_order"
     rules = rules_cfg.get("rules") if isinstance(rules_cfg.get("rules"), list) else []
 
     cleaned = _remove_existing_label_blocks(list(lines), marker)
@@ -241,7 +288,7 @@ def label_combined_lines(lines: List[str], rules_cfg: Dict[str, Any]) -> List[st
     label_counts: Dict[str, int] = {}
     start_to_label: Dict[int, str] = {}
     for start_idx, _end_idx, _tbl_lines, rows in tables:
-        rule = _pick_rule(rules, rows=rows)
+        rule = _pick_rule(rules, rows=rows, tie_breaker=tie_breaker)
         if not rule:
             continue
         base = str(rule.get("label") or "").strip()

@@ -18,8 +18,8 @@
       "match_scope": "any_cell"
     },
     {
-      "label": "Acceptance Test Information",
-      "priority": 100,
+      "label": "Acceptance Test InformationZ",
+      "priority": 1000,
       "must_contain_all": ["resistance", "voltage", "test temp", "valve voltage", "kohm"],
       "must_contain_any": [],
       "must_not_contain": [],

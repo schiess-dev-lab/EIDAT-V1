@@ -158,7 +158,7 @@ def _install_requirements(vpy: Path, requirements_path: Path, *, log_path: Path)
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Bootstrap a venv (node-local or shared) and required packages.")
-    ap.add_argument("--node-root", required=True, help="Node root directory (contains 'EIDAT Support').")
+    ap.add_argument("--node-root", required=True, help="Node root directory (contains 'EIDAT/EIDAT Support').")
     ap.add_argument(
         "--profile",
         choices=["ui", "full"],

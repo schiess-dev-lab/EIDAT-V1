@@ -30,7 +30,8 @@ class NodeLayout:
 
     @property
     def support_dir(self) -> Path:
-        return self.node_root / "EIDAT Support"
+        # Support/artifacts live inside the deposited EIDAT folder so node roots stay tidy.
+        return self.eidat_root / "EIDAT Support"
 
     @property
     def support_projects_dir(self) -> Path:

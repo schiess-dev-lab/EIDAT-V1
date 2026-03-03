@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "enabled": true,
+  "prune": {
+    "enabled": true,
+    "drop_empty_rows": true,
+    "drop_empty_cols": true,
+    "max_empty_col_width": 5
+  },
+  "spacing": {
+    "enabled": true,
+    "_comment_default_scope": "Controls which ASCII table cells get the spacing heuristic pass (e.g., \"1 to4\" -> \"1 to 4\", \"12psi\" -> \"12 psi\"). Valid values: \"all_cells\" (apply to every table cell, including headers/labels) or \"numeric_cols_only\" (apply only to columns inferred as numeric/value columns; inference uses header role keywords/synonyms and/or numeric ratios in body rows).",
+    "default_scope": "all_cells"
+  },
+  "numeric": {
+    "enabled": true,
+    "numeric_ratio_min": 0.6,
+    "unicode_minus_to_dash": true,
+    "allow_o_to_zero": true,
+    "allow_i_l_to_one": true,
+    "apply_to_header": false,
+    "variant_rescue": {
+      "enabled": true,
+      "_comment_debug_output": "If you want to see which OCR variants were considered and which value was selected during variant rescue, set env var EIDAT_TABLE_CELL_HEAL_VARIANT_DEBUG=1 (or EIDAT_TABLE_CELL_HEAL_DEBUG=1). The healer will write JSONL events to <artifacts_dir>/table_cell_heal_variant_rescue.jsonl for that run.",
+      "require_alpha": true,
+      "min_digit_ratio": 0.4,
+      "sidecar_filename": "table_variant_candidates.json"
+    },
+    "numeric_roles": ["value", "min", "max", "requirement", "target"],
+    "role_synonyms": {
+      "value": ["measured", "measured value", "actual", "value", "reading"],
+      "min": ["min", "minimum", "lower", "low"],
+      "max": ["max", "maximum", "upper", "high"],
+      "requirement": ["requirement", "criteria", "spec", "acceptance", "limit", "threshold"],
+      "target": ["target", "setpoint", "set point", "goal"]
+    }
+  },
+  "history": {
+    "enabled": false
+  }
+}

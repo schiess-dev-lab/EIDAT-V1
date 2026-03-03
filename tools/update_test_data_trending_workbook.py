@@ -13,7 +13,7 @@ Usage:
   python tools/update_test_data_trending_workbook.py "C:\\path\\to\\Project.xlsx"
 
 Options:
-  --global-repo "C:\\path\\to\\NodeRoot"   # folder that contains `EIDAT Support/` (auto-detected if omitted)
+  --global-repo "C:\\path\\to\\NodeRoot"   # folder that contains `EIDAT/EIDAT Support/` (or legacy `EIDAT Support/`; auto-detected if omitted)
   --overwrite                              # overwrite existing non-empty cells
   --dry-run                                # do not save the workbook
 """
@@ -29,13 +29,17 @@ from pathlib import Path
 
 def _find_node_root_from_workbook(workbook_path: Path) -> Path:
     """
-    Best-effort: if workbook lives under `<node_root>/EIDAT Support/...`,
+    Best-effort: if workbook lives under:
+      - `<node_root>/EIDAT Support/...` (legacy), or
+      - `<node_root>/EIDAT/EIDAT Support/...` (current),
     return `<node_root>`. Otherwise return workbook parent.
     """
     p = Path(workbook_path).resolve()
     cur = p.parent
     for _ in range(12):
         if cur.name.lower() == "eidat support":
+            if cur.parent.name.lower() == "eidat":
+                return cur.parent.parent
             return cur.parent
         cur = cur.parent
         if cur == cur.parent:
@@ -61,7 +65,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--global-repo",
         default="",
-        help="Folder containing `EIDAT Support/` (auto-detected from workbook path if omitted).",
+        help="Folder containing `EIDAT/EIDAT Support/` (or legacy `EIDAT Support/`; auto-detected from workbook path if omitted).",
     )
     ap.add_argument("--overwrite", action="store_true", help="Overwrite existing non-empty cells in Data/Data_calc.")
     ap.add_argument("--dry-run", action="store_true", help="Do not save the workbook (cache DB may still rebuild).")
@@ -95,4 +99,3 @@ if __name__ == "__main__":
     except Exception as exc:
         print(f"[FAIL] {exc}", file=sys.stderr)
         raise
-

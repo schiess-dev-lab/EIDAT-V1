@@ -40,7 +40,7 @@ class _Worker(QtCore.QThread):
     log = QtCore.Signal(str)
     status = QtCore.Signal(str)
     # Use `object` for timestamps to avoid PySide6/shiboken coercing to 32-bit C++ int.
-    finished_one = QtCore.Signal(str, object, object, bool, str)  # node_id, started_ns, finished_ns, ok, error
+    finished_one = QtCore.Signal(str, str, object, object, bool, str)  # node_id, action, started_ns, finished_ns, ok, error
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -75,6 +75,16 @@ class _Worker(QtCore.QThread):
                     node_env_enabled=node_env_enabled,
                     on_log=_emit,
                 )
+            elif action == "update_processor":
+                from .admin_runner import run_update_processor
+
+                _emit("[ACTION] update processor (keep caches)")
+                res = run_update_processor(
+                    node_root=node_root,
+                    runtime_root=runtime_root,
+                    node_env_enabled=node_env_enabled,
+                    on_log=_emit,
+                )
             else:
                 from .admin_runner import run_pipeline
 
@@ -87,21 +97,24 @@ class _Worker(QtCore.QThread):
                 )
             finished = now_ns()
             if res.ok:
-                scan = res.outputs.get("scan") or {}
-                proc = res.outputs.get("process") or {}
-                idx = res.outputs.get("index") or {}
-                try:
-                    cand = int((scan or {}).get("candidates_count", 0))
-                    ok = int((proc or {}).get("processed_ok", 0))
-                    bad = int((proc or {}).get("processed_failed", 0))
-                    groups = int((idx or {}).get("groups_count", 0))
-                except Exception:
-                    cand = ok = bad = groups = 0
-                _emit(f"[OK] candidates={cand} processed_ok={ok} processed_failed={bad} groups={groups}")
-                self.finished_one.emit(node_id, started, finished, True, "")
+                if action == "update_processor":
+                    _emit("[OK] update_processor")
+                else:
+                    scan = res.outputs.get("scan") or {}
+                    proc = res.outputs.get("process") or {}
+                    idx = res.outputs.get("index") or {}
+                    try:
+                        cand = int((scan or {}).get("candidates_count", 0))
+                        ok = int((proc or {}).get("processed_ok", 0))
+                        bad = int((proc or {}).get("processed_failed", 0))
+                        groups = int((idx or {}).get("groups_count", 0))
+                    except Exception:
+                        cand = ok = bad = groups = 0
+                    _emit(f"[OK] candidates={cand} processed_ok={ok} processed_failed={bad} groups={groups}")
+                self.finished_one.emit(node_id, action, started, finished, True, "")
             else:
                 _emit(f"[FAIL] {res.error}")
-                self.finished_one.emit(node_id, started, finished, False, res.error or "Unknown error")
+                self.finished_one.emit(node_id, action, started, finished, False, res.error or "Unknown error")
 
 
 class _RunStatusDialog(QtWidgets.QDialog):
@@ -406,22 +419,36 @@ class AdminWindow(QtWidgets.QMainWindow):
                 self.tbl.setCellWidget(r, 4, envw)
 
                 btns = QtWidgets.QWidget()
-                bl = QtWidgets.QHBoxLayout(btns)
-                bl.setContentsMargins(0, 0, 0, 0)
+                outer = QtWidgets.QVBoxLayout(btns)
+                outer.setContentsMargins(0, 0, 0, 0)
+                outer.setSpacing(4)
+                row1 = QtWidgets.QHBoxLayout()
+                row2 = QtWidgets.QHBoxLayout()
+                for rl in (row1, row2):
+                    rl.setContentsMargins(0, 0, 0, 0)
+                    rl.setSpacing(6)
                 b_open = QtWidgets.QPushButton("Open")
                 b_deploy = QtWidgets.QPushButton("Deploy/Repair")
                 b_reset = QtWidgets.QPushButton("Reset")
                 b_proc = QtWidgets.QPushButton("Process")
-                for b in (b_open, b_deploy, b_reset, b_proc):
+                b_update = QtWidgets.QPushButton("Update Proc")
+                b_update.setToolTip("Update backend processor (node runtime venv) without deleting node caches/artifacts.")
+                for b in (b_open, b_deploy, b_reset, b_proc, b_update):
                     b.setMaximumWidth(120)
                 b_open.clicked.connect(lambda _=False, root=n.node_root: self._open_folder(root))
                 b_deploy.clicked.connect(lambda _=False, root=n.node_root: self._deploy_node(root))
                 b_reset.clicked.connect(lambda _=False, root=n.node_root: self._reset_node(root))
                 b_proc.clicked.connect(lambda _=False, nid=n.node_id: self._process_one(nid))
-                bl.addWidget(b_open)
-                bl.addWidget(b_deploy)
-                bl.addWidget(b_reset)
-                bl.addWidget(b_proc)
+                b_update.clicked.connect(lambda _=False, nid=n.node_id: self._update_processor(nid))
+                row1.addWidget(b_open)
+                row1.addWidget(b_deploy)
+                row1.addWidget(b_reset)
+                row2.addWidget(b_proc)
+                row2.addWidget(b_update)
+                row1.addStretch(1)
+                row2.addStretch(1)
+                outer.addLayout(row1)
+                outer.addLayout(row2)
                 self.tbl.setCellWidget(r, 5, btns)
         finally:
             self.tbl.blockSignals(False)
@@ -478,7 +505,8 @@ class AdminWindow(QtWidgets.QMainWindow):
         msg = (
             "This will completely delete and recreate the node runtime folders:\n\n"
             f"  {Path(root) / 'EIDAT'}\n"
-            f"  {Path(root) / 'EIDAT Support'}\n\n"
+            f"  {Path(root) / 'EIDAT' / 'EIDAT Support'}\n"
+            f"  {Path(root) / 'EIDAT Support'} (legacy, if present)\n\n"
             "Node-local venv packages are preserved (Lib/site-packages is NOT removed/replaced).\n\n"
             "This does NOT delete EIDPs.\n\n"
             "Continue?"
@@ -555,6 +583,20 @@ class AdminWindow(QtWidgets.QMainWindow):
         self._run_status.begin(f"Processing node: {Path(n.node_root).name}")
         self.worker.start()
 
+    def _update_processor(self, node_id: str) -> None:
+        nodes = {n.node_id: n for n in admin_db.list_nodes(self._conn)}
+        n = nodes.get(node_id)
+        if not n:
+            return
+        if self.worker.isRunning():
+            QtWidgets.QMessageBox.information(self, "Busy", "Processing is already running.")
+            return
+        # Ensure the node env file exists (even though update currently doesn't read it).
+        self._ensure_node_env_file(n.node_root)
+        self.worker.set_tasks([(n.node_id, n.node_root, n.runtime_root, True, "update_processor")])
+        self._run_status.begin(f"Update Processor: {Path(n.node_root).name}")
+        self.worker.start()
+
     def _act_scan_force_candidates(self, node_id: str) -> None:
         nodes = {n.node_id: n for n in admin_db.list_nodes(self._conn)}
         n = nodes.get(node_id)
@@ -569,19 +611,21 @@ class AdminWindow(QtWidgets.QMainWindow):
         self._run_status.begin(f"Scan+Force Candidates: {Path(n.node_root).name}")
         self.worker.start()
 
-    def _on_finished_one(self, node_id: str, started_ns: int, finished_ns: int, ok: bool, error: str) -> None:
+    def _on_finished_one(self, node_id: str, action: str, started_ns: int, finished_ns: int, ok: bool, error: str) -> None:
         try:
-            status = "ok" if ok else "failed"
-            summary = {"ok": ok, "error": error} if error else {"ok": ok}
-            admin_db.insert_run(
-                self._conn,
-                node_id=node_id,
-                started_epoch_ns=int(started_ns or 0),
-                finished_epoch_ns=int(finished_ns or 0),
-                status=status,
-                summary_json=json.dumps(summary),
-                error=error or None,
-            )
+            # Only record actual processing runs in the run registry.
+            if action in {"pipeline", "scan_force_candidates"}:
+                status = "ok" if ok else "failed"
+                summary = {"ok": ok, "action": action, "error": error} if error else {"ok": ok, "action": action}
+                admin_db.insert_run(
+                    self._conn,
+                    node_id=node_id,
+                    started_epoch_ns=int(started_ns or 0),
+                    finished_epoch_ns=int(finished_ns or 0),
+                    status=status,
+                    summary_json=json.dumps(summary),
+                    error=error or None,
+                )
         except Exception as exc:
             self._append_log(f"[WARN] Failed to record run: {exc}")
         finally:

@@ -2728,11 +2728,17 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._workbook_path = Path(workbook_path).expanduser()
         self._db_path: Path | None = None
         self._plot_ready = False
-        self._mode = "curves"  # or "metrics"
+        self._mode = "curves"  # curves | metrics | performance
         self._highlight_sn = ""
         self._auto_plots: list[dict] = []
         self._last_plot_def: dict | None = None
         self._auto_plot_path = self._project_dir / "auto_plots_test_data.json"
+        self._plot_base_xlim: tuple[float, float] | None = None
+        self._plot_base_ylim: tuple[float, float] | None = None
+        self._plot_last_cursor_xy: tuple[float, float] | None = None
+        self._zone_zoom_press_xy: tuple[float, float] | None = None
+        self._zone_zoom_rect = None
+        self._perf_plotters: list[dict] = []
 
         self.setWindowTitle("Test Data - Trend / Analyze")
         self.resize(1180, 760)
@@ -2789,7 +2795,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         switch_lbl.setStyleSheet("font-size: 12px; font-weight: 700; color: #334155;")
         self.btn_mode_curves = QtWidgets.QPushButton("Plot Curves")
         self.btn_mode_metrics = QtWidgets.QPushButton("Plot Metrics")
-        for b in (self.btn_mode_curves, self.btn_mode_metrics):
+        self.btn_mode_perf = QtWidgets.QPushButton("Performance")
+        for b in (self.btn_mode_curves, self.btn_mode_metrics, self.btn_mode_perf):
             b.setCheckable(True)
             b.setStyleSheet(
                 """
@@ -2813,12 +2820,15 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._mode_group.setExclusive(True)
         self._mode_group.addButton(self.btn_mode_curves)
         self._mode_group.addButton(self.btn_mode_metrics)
+        self._mode_group.addButton(self.btn_mode_perf)
         self.btn_mode_curves.clicked.connect(lambda: self._set_mode("curves"))
         self.btn_mode_metrics.clicked.connect(lambda: self._set_mode("metrics"))
+        self.btn_mode_perf.clicked.connect(lambda: self._set_mode("performance"))
 
         switch_row.addWidget(switch_lbl)
         switch_row.addWidget(self.btn_mode_curves)
         switch_row.addWidget(self.btn_mode_metrics)
+        switch_row.addWidget(self.btn_mode_perf)
         switch_row.addStretch(1)
         left_layout.addLayout(switch_row)
 
@@ -2942,8 +2952,90 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         row_curves.addWidget(self.cb_x, 1)
         curves_layout.addLayout(row_curves)
 
+        # Performance tab (X vs Y metric plot per serial across runs; all runs/serials always)
+        tab_perf = QtWidgets.QWidget()
+        perf_layout = QtWidgets.QVBoxLayout(tab_perf)
+        perf_layout.setContentsMargins(10, 10, 10, 10)
+        perf_layout.setSpacing(8)
+
+        lbl_perf = QtWidgets.QLabel("Performance plot (all runs, all serials)")
+        lbl_perf.setStyleSheet("font-size: 12px; font-weight: 800; color: #0f172a;")
+        perf_layout.addWidget(lbl_perf)
+
+        row_perf = QtWidgets.QHBoxLayout()
+        row_perf.addWidget(QtWidgets.QLabel("Preset:"))
+        self.cb_perf_plotter = QtWidgets.QComboBox()
+        row_perf.addWidget(self.cb_perf_plotter, 1)
+        perf_layout.addLayout(row_perf)
+
+        col_grid = QtWidgets.QGridLayout()
+        col_grid.setColumnStretch(1, 1)
+        col_grid.addWidget(QtWidgets.QLabel("X column:"), 0, 0)
+        self.cb_perf_x_col = QtWidgets.QComboBox()
+        self.cb_perf_x_col.setEditable(True)
+        self.cb_perf_x_col.setInsertPolicy(QtWidgets.QComboBox.InsertPolicy.NoInsert)
+        col_grid.addWidget(self.cb_perf_x_col, 0, 1)
+        col_grid.addWidget(QtWidgets.QLabel("Y column:"), 1, 0)
+        self.cb_perf_y_col = QtWidgets.QComboBox()
+        self.cb_perf_y_col.setEditable(True)
+        self.cb_perf_y_col.setInsertPolicy(QtWidgets.QComboBox.InsertPolicy.NoInsert)
+        col_grid.addWidget(self.cb_perf_y_col, 1, 1)
+        perf_layout.addLayout(col_grid)
+
+        fit_row = QtWidgets.QHBoxLayout()
+        self.cb_perf_fit = QtWidgets.QCheckBox("Fit polynomial")
+        self.cb_perf_fit.setChecked(True)
+        self.sp_perf_degree = QtWidgets.QSpinBox()
+        self.sp_perf_degree.setRange(1, 6)
+        self.sp_perf_degree.setValue(2)
+        self.cb_perf_norm_x = QtWidgets.QCheckBox("Normalize X")
+        self.cb_perf_norm_x.setChecked(True)
+        fit_row.addWidget(self.cb_perf_fit)
+        fit_row.addWidget(QtWidgets.QLabel("Degree:"))
+        fit_row.addWidget(self.sp_perf_degree)
+        fit_row.addWidget(self.cb_perf_norm_x)
+        fit_row.addStretch(1)
+        perf_layout.addLayout(fit_row)
+
+        # Runs are always all runs in the cache (no selector).
+
+        # Serials are always all serials in the cache (no selector); highlighted serial is chosen below.
+
+        lbl_stats_perf = QtWidgets.QLabel("Stats (applies to both axes)")
+        lbl_stats_perf.setStyleSheet("font-size: 12px; font-weight: 700; color: #0f172a;")
+        perf_layout.addWidget(lbl_stats_perf)
+
+        self.list_perf_stats = QtWidgets.QListWidget()
+        self.list_perf_stats.setMaximumHeight(110)
+        perf_layout.addWidget(self.list_perf_stats)
+
+        view_row = QtWidgets.QHBoxLayout()
+        view_row.addWidget(QtWidgets.QLabel("View stat:"))
+        self.cb_perf_view_stat = QtWidgets.QComboBox()
+        view_row.addWidget(self.cb_perf_view_stat, 1)
+        perf_layout.addLayout(view_row)
+
+        lbl_eq = QtWidgets.QLabel("Equations (per stat)")
+        lbl_eq.setStyleSheet("font-size: 12px; font-weight: 700; color: #0f172a;")
+        perf_layout.addWidget(lbl_eq)
+
+        self.tbl_perf_equations = QtWidgets.QTableWidget(0, 5)
+        self.tbl_perf_equations.setHorizontalHeaderLabels(
+            ["stat", "master_equation", "master_rmse", "highlighted_equation", "highlighted_rmse"]
+        )
+        self.tbl_perf_equations.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.tbl_perf_equations.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.tbl_perf_equations.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        try:
+            self.tbl_perf_equations.horizontalHeader().setStretchLastSection(True)
+        except Exception:
+            pass
+        self.tbl_perf_equations.setMinimumHeight(160)
+        perf_layout.addWidget(self.tbl_perf_equations, 1)
+
         tabs.addTab(tab_metrics, "Metrics")
         tabs.addTab(tab_curves, "Curves")
+        tabs.addTab(tab_perf, "Performance")
         left_layout.addWidget(tabs)
 
         # Serial highlight (not selection/filtering for plotting)
@@ -2976,6 +3068,49 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         plot_title.setStyleSheet("font-size: 14px; font-weight: 700;")
         plot_header.addWidget(plot_title)
         plot_header.addStretch(1)
+
+        zoom_btn_css = """
+        QPushButton {
+            padding: 5px 10px;
+            border-radius: 8px;
+            background: #ffffff;
+            border: 1px solid #e2e8f0;
+            font-size: 12px;
+            font-weight: 800;
+            color: #0f172a;
+        }
+        QPushButton:hover { background: #f8fafc; }
+        QPushButton:disabled { color: #94a3b8; border-color: #e2e8f0; }
+        """
+        self.btn_zone_zoom = QtWidgets.QPushButton("Magnify")
+        self.btn_zone_zoom.setCheckable(True)
+        self.btn_zoom_out = QtWidgets.QPushButton("Zoom -")
+        self.btn_zoom_in = QtWidgets.QPushButton("Zoom +")
+        self.btn_zoom_reset = QtWidgets.QPushButton("Reset")
+        self.btn_expand_plot = QtWidgets.QPushButton("Expand")
+        for b in (
+            self.btn_zone_zoom,
+            self.btn_zoom_out,
+            self.btn_zoom_in,
+            self.btn_zoom_reset,
+            self.btn_expand_plot,
+        ):
+            b.setEnabled(False)
+            b.setStyleSheet(zoom_btn_css)
+        self.btn_zone_zoom.setToolTip("Magnify zones: click-drag a rectangle on the plot to zoom to that area")
+        self.btn_zoom_out.setToolTip("Zoom out (mouse wheel also works)")
+        self.btn_zoom_in.setToolTip("Zoom in (mouse wheel also works)")
+        self.btn_zoom_reset.setToolTip("Reset zoom to the default view")
+        self.btn_expand_plot.setToolTip("Open a larger popup for zooming/panning")
+        self.btn_zoom_out.clicked.connect(lambda: self._zoom_main_plot(1.25))
+        self.btn_zoom_in.clicked.connect(lambda: self._zoom_main_plot(0.8))
+        self.btn_zoom_reset.clicked.connect(self._reset_main_plot_zoom)
+        self.btn_expand_plot.clicked.connect(self._open_main_plot_popup)
+        plot_header.addWidget(self.btn_zone_zoom)
+        plot_header.addWidget(self.btn_zoom_out)
+        plot_header.addWidget(self.btn_zoom_in)
+        plot_header.addWidget(self.btn_zoom_reset)
+        plot_header.addWidget(self.btn_expand_plot)
         right_layout.addLayout(plot_header)
 
         self.plot_container = QtWidgets.QFrame()
@@ -3087,6 +3222,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self.btn_save_all_auto = QtWidgets.QPushButton("Save All PDF")
         self.btn_save_all_auto.setEnabled(False)
         self.btn_save_all_auto.clicked.connect(self._save_all_auto_plots_pdf)
+        self.btn_auto_report = QtWidgets.QPushButton("Auto Report…")
+        self.btn_auto_report.setEnabled(False)
+        self.btn_auto_report.clicked.connect(self._open_auto_report_options)
 
         self._actions_frame = QtWidgets.QFrame()
         self._actions_frame.setStyleSheet(
@@ -3108,6 +3246,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         btn_row.addWidget(self.btn_open_all_auto)
         btn_row.addWidget(self.btn_delete_auto)
         btn_row.addWidget(self.btn_save_all_auto)
+        btn_row.addSpacing(10)
+        btn_row.addWidget(self.btn_auto_report)
         btn_row.addStretch(1)
         actions.addLayout(btn_row)
 
@@ -3129,6 +3269,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._load_auto_plots()
         self._set_mode("curves")
 
+        self._report_progress = RunProgressDialog(self)
+        try:
+            self._report_progress.btn_cancel.hide()
+        except Exception:
+            pass
+
     def _init_plot_area(self, layout: QtWidgets.QVBoxLayout) -> None:
         try:
             from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
@@ -3139,6 +3285,20 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             self._axes.set_facecolor("#ffffff")
             self._figure.patch.set_facecolor("#ffffff")
             self._canvas = FigureCanvas(self._figure)
+            try:
+                self._canvas.setFocusPolicy(QtCore.Qt.FocusPolicy.ClickFocus)
+            except Exception:
+                pass
+            try:
+                self._canvas.mpl_connect("scroll_event", self._on_main_plot_scroll)
+            except Exception:
+                pass
+            try:
+                self._canvas.mpl_connect("motion_notify_event", self._on_main_plot_motion)
+                self._canvas.mpl_connect("button_press_event", self._on_main_plot_press)
+                self._canvas.mpl_connect("button_release_event", self._on_main_plot_release)
+            except Exception:
+                pass
             layout.addWidget(self._canvas)
             self._plot_ready = True
         except Exception as exc:
@@ -3151,6 +3311,476 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             label.setStyleSheet("color: #b91c1c; font-size: 12px;")
             layout.addWidget(label)
 
+    @staticmethod
+    def _apply_axes_zoom(ax, factor: float, *, center: tuple[float, float] | None = None, axis: str = "both") -> None:
+        if ax is None:
+            return
+        try:
+            x0, x1 = ax.get_xlim()
+            y0, y1 = ax.get_ylim()
+        except Exception:
+            return
+
+        def _zoom_1d(lo: float, hi: float, c: float) -> tuple[float, float]:
+            span = float(hi) - float(lo)
+            if span == 0:
+                return lo, hi
+            direction = 1.0 if span >= 0 else -1.0
+            span_abs = abs(span) * float(factor)
+            new_lo = float(c) - (span_abs / 2.0) * direction
+            new_hi = float(c) + (span_abs / 2.0) * direction
+            return new_lo, new_hi
+
+        xc = (x0 + x1) / 2.0
+        yc = (y0 + y1) / 2.0
+        if center and all(isinstance(v, (int, float)) for v in center):
+            cx, cy = center
+            if isinstance(cx, (int, float)):
+                xc = float(cx)
+            if isinstance(cy, (int, float)):
+                yc = float(cy)
+
+        want = str(axis or "both").strip().lower()
+        try:
+            if want in {"x", "both"}:
+                ax.set_xlim(*_zoom_1d(x0, x1, xc))
+            if want in {"y", "both"}:
+                ax.set_ylim(*_zoom_1d(y0, y1, yc))
+        except Exception:
+            return
+
+    def _capture_main_plot_base_view(self) -> None:
+        if not self._axes:
+            return
+        try:
+            self._plot_base_xlim = tuple(float(v) for v in self._axes.get_xlim())  # type: ignore[assignment]
+            self._plot_base_ylim = tuple(float(v) for v in self._axes.get_ylim())  # type: ignore[assignment]
+        except Exception:
+            self._plot_base_xlim = None
+            self._plot_base_ylim = None
+        self._update_plot_zoom_actions()
+
+    def _update_plot_zoom_actions(self) -> None:
+        enabled = bool(self._plot_ready and self._axes and self._canvas and self._last_plot_def)
+        for b in ("btn_zone_zoom", "btn_zoom_out", "btn_zoom_in", "btn_zoom_reset", "btn_expand_plot"):
+            if hasattr(self, b):
+                try:
+                    getattr(self, b).setEnabled(enabled)
+                except Exception:
+                    pass
+        # Auto report requires a built cache and matplotlib plotting support.
+        try:
+            self.btn_auto_report.setEnabled(bool(self._plot_ready and self._db_path))
+        except Exception:
+            pass
+
+    def _zoom_main_plot(self, factor: float) -> None:
+        if not self._axes or not self._canvas:
+            return
+        center = self._plot_last_cursor_xy
+        self._apply_axes_zoom(self._axes, float(factor), center=center, axis="both")
+        try:
+            self._canvas.draw_idle()
+        except Exception:
+            try:
+                self._canvas.draw()
+            except Exception:
+                pass
+
+    def _reset_main_plot_zoom(self) -> None:
+        if not self._axes or not self._canvas:
+            return
+        if self._plot_base_xlim and self._plot_base_ylim:
+            try:
+                self._axes.set_xlim(*self._plot_base_xlim)
+                self._axes.set_ylim(*self._plot_base_ylim)
+            except Exception:
+                pass
+        else:
+            try:
+                self._axes.relim()
+                self._axes.autoscale_view()
+            except Exception:
+                pass
+        try:
+            self._canvas.draw_idle()
+        except Exception:
+            pass
+
+    def _on_main_plot_scroll(self, event) -> None:
+        if not self._axes or not self._canvas:
+            return
+        if getattr(event, "inaxes", None) is not self._axes:
+            return
+        direction = str(getattr(event, "button", "") or "").strip().lower()
+        if direction not in {"up", "down"}:
+            return
+        factor = 0.8 if direction == "up" else 1.25
+
+        key = str(getattr(event, "key", "") or "").lower()
+        axis = "both"
+        if "shift" in key:
+            axis = "x"
+        elif "control" in key or "ctrl" in key:
+            axis = "y"
+
+        self._apply_axes_zoom(
+            self._axes,
+            factor,
+            center=(getattr(event, "xdata", None), getattr(event, "ydata", None)),
+            axis=axis,
+        )
+        try:
+            self._canvas.draw_idle()
+        except Exception:
+            pass
+
+    def _on_main_plot_motion(self, event) -> None:
+        if not self._axes or not self._canvas:
+            return
+        if getattr(event, "inaxes", None) is self._axes:
+            xdata = getattr(event, "xdata", None)
+            ydata = getattr(event, "ydata", None)
+            if isinstance(xdata, (int, float)) and isinstance(ydata, (int, float)):
+                self._plot_last_cursor_xy = (float(xdata), float(ydata))
+
+        if not (hasattr(self, "btn_zone_zoom") and self.btn_zone_zoom.isChecked()):
+            return
+        if not self._zone_zoom_press_xy or self._zone_zoom_rect is None:
+            return
+
+        x0, y0 = self._zone_zoom_press_xy
+        x1 = getattr(event, "xdata", None)
+        y1 = getattr(event, "ydata", None)
+        if not isinstance(x1, (int, float)) or not isinstance(y1, (int, float)):
+            return
+        try:
+            self._zone_zoom_rect.set_bounds(min(x0, x1), min(y0, y1), abs(x1 - x0), abs(y1 - y0))
+        except Exception:
+            return
+        try:
+            self._canvas.draw_idle()
+        except Exception:
+            pass
+
+    def _on_main_plot_press(self, event) -> None:
+        if not self._axes or not self._canvas:
+            return
+        if not (hasattr(self, "btn_zone_zoom") and self.btn_zone_zoom.isChecked()):
+            return
+        if getattr(event, "inaxes", None) is not self._axes:
+            return
+        if int(getattr(event, "button", 0) or 0) != 1:
+            return
+        x0 = getattr(event, "xdata", None)
+        y0 = getattr(event, "ydata", None)
+        if not isinstance(x0, (int, float)) or not isinstance(y0, (int, float)):
+            return
+        self._zone_zoom_press_xy = (float(x0), float(y0))
+        try:
+            from matplotlib.patches import Rectangle
+
+            if self._zone_zoom_rect is not None:
+                try:
+                    self._zone_zoom_rect.remove()
+                except Exception:
+                    pass
+            rect = Rectangle(
+                (float(x0), float(y0)),
+                0.0,
+                0.0,
+                fill=False,
+                linewidth=1.2,
+                linestyle="--",
+                edgecolor="#0f766e",
+                alpha=0.9,
+            )
+            self._axes.add_patch(rect)
+            self._zone_zoom_rect = rect
+        except Exception:
+            self._zone_zoom_rect = None
+            return
+        try:
+            self._canvas.draw_idle()
+        except Exception:
+            pass
+
+    def _on_main_plot_release(self, event) -> None:
+        if not self._axes or not self._canvas:
+            return
+        if not self._zone_zoom_press_xy or self._zone_zoom_rect is None:
+            return
+
+        x0, y0 = self._zone_zoom_press_xy
+        x1 = getattr(event, "xdata", None)
+        y1 = getattr(event, "ydata", None)
+        if not isinstance(x1, (int, float)) or not isinstance(y1, (int, float)):
+            # If released outside axes, cancel the selection.
+            try:
+                self._zone_zoom_rect.remove()
+            except Exception:
+                pass
+            self._zone_zoom_press_xy = None
+            self._zone_zoom_rect = None
+            try:
+                self._canvas.draw_idle()
+            except Exception:
+                pass
+            return
+
+        x0f, y0f, x1f, y1f = float(x0), float(y0), float(x1), float(y1)
+        try:
+            self._zone_zoom_rect.remove()
+        except Exception:
+            pass
+        self._zone_zoom_press_xy = None
+        self._zone_zoom_rect = None
+
+        # Ignore tiny drags (treat as a click; keep cursor center for Zoom +/- buttons).
+        if abs(x1f - x0f) < 1e-9 or abs(y1f - y0f) < 1e-9:
+            self._plot_last_cursor_xy = (x1f, y1f)
+            return
+
+        lo_x, hi_x = (x0f, x1f) if x0f <= x1f else (x1f, x0f)
+        lo_y, hi_y = (y0f, y1f) if y0f <= y1f else (y1f, y0f)
+        try:
+            self._axes.set_xlim(lo_x, hi_x)
+            self._axes.set_ylim(lo_y, hi_y)
+        except Exception:
+            return
+        try:
+            self._canvas.draw_idle()
+        except Exception:
+            pass
+
+    def _open_main_plot_popup(self) -> None:
+        if not self._plot_ready or not self._db_path or not self._last_plot_def:
+            return
+        try:
+            from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Plot", f"Plotting unavailable: {exc}")
+            return
+
+        fig = self._render_plot_def_to_figure(dict(self._last_plot_def))
+        ax = fig.axes[0] if getattr(fig, "axes", None) else None
+        if ax is None:
+            return
+
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Plot (Zoom)")
+        dlg.resize(1180, 820)
+        layout = QtWidgets.QVBoxLayout(dlg)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
+        top = QtWidgets.QHBoxLayout()
+        btn_mag = QtWidgets.QPushButton("Magnify")
+        btn_mag.setCheckable(True)
+        btn_out = QtWidgets.QPushButton("Zoom -")
+        btn_in = QtWidgets.QPushButton("Zoom +")
+        btn_reset = QtWidgets.QPushButton("Reset")
+        for b in (btn_mag, btn_out, btn_in, btn_reset):
+            b.setStyleSheet(
+                """
+                QPushButton {
+                    padding: 6px 10px;
+                    border-radius: 8px;
+                    background: #ffffff;
+                    border: 1px solid #e2e8f0;
+                    font-size: 12px;
+                    font-weight: 800;
+                    color: #0f172a;
+                }
+                QPushButton:hover { background: #f8fafc; }
+                """
+            )
+        btn_mag.setToolTip("Magnify zones: click-drag a rectangle on the plot to zoom to that area")
+        hint = QtWidgets.QLabel("Tip: mouse wheel zoom (Shift = X only, Ctrl = Y only)")
+        hint.setStyleSheet("color: #64748b; font-size: 11px;")
+        top.addWidget(btn_mag)
+        top.addWidget(btn_out)
+        top.addWidget(btn_in)
+        top.addWidget(btn_reset)
+        top.addSpacing(10)
+        top.addWidget(hint)
+        top.addStretch(1)
+        layout.addLayout(top)
+
+        canvas = FigureCanvas(fig)
+        layout.addWidget(canvas, 1)
+
+        base_xlim = ax.get_xlim()
+        base_ylim = ax.get_ylim()
+
+        def _reset():
+            try:
+                ax.set_xlim(*base_xlim)
+                ax.set_ylim(*base_ylim)
+            except Exception:
+                pass
+            try:
+                canvas.draw_idle()
+            except Exception:
+                pass
+
+        def _zoom(factor: float):
+            self._apply_axes_zoom(ax, factor, axis="both")
+            try:
+                canvas.draw_idle()
+            except Exception:
+                pass
+
+        btn_out.clicked.connect(lambda: _zoom(1.25))
+        btn_in.clicked.connect(lambda: _zoom(0.8))
+        btn_reset.clicked.connect(_reset)
+
+        last_xy: tuple[float, float] | None = None
+        press_xy: tuple[float, float] | None = None
+        rect_patch = None
+
+        def _on_scroll(event):
+            if getattr(event, "inaxes", None) is not ax:
+                return
+            direction = str(getattr(event, "button", "") or "").strip().lower()
+            if direction not in {"up", "down"}:
+                return
+            factor = 0.8 if direction == "up" else 1.25
+            key = str(getattr(event, "key", "") or "").lower()
+            axis = "both"
+            if "shift" in key:
+                axis = "x"
+            elif "control" in key or "ctrl" in key:
+                axis = "y"
+            self._apply_axes_zoom(
+                ax,
+                factor,
+                center=(getattr(event, "xdata", None), getattr(event, "ydata", None)),
+                axis=axis,
+            )
+            try:
+                canvas.draw_idle()
+            except Exception:
+                pass
+
+        def _on_motion(event):
+            nonlocal last_xy, press_xy, rect_patch
+            if getattr(event, "inaxes", None) is ax:
+                xdata = getattr(event, "xdata", None)
+                ydata = getattr(event, "ydata", None)
+                if isinstance(xdata, (int, float)) and isinstance(ydata, (int, float)):
+                    last_xy = (float(xdata), float(ydata))
+            if not btn_mag.isChecked():
+                return
+            if press_xy is None or rect_patch is None:
+                return
+            x1 = getattr(event, "xdata", None)
+            y1 = getattr(event, "ydata", None)
+            if not isinstance(x1, (int, float)) or not isinstance(y1, (int, float)):
+                return
+            x0, y0 = press_xy
+            try:
+                rect_patch.set_bounds(min(x0, x1), min(y0, y1), abs(x1 - x0), abs(y1 - y0))
+            except Exception:
+                return
+            try:
+                canvas.draw_idle()
+            except Exception:
+                pass
+
+        def _on_press(event):
+            nonlocal press_xy, rect_patch
+            if not btn_mag.isChecked():
+                return
+            if getattr(event, "inaxes", None) is not ax:
+                return
+            if int(getattr(event, "button", 0) or 0) != 1:
+                return
+            x0 = getattr(event, "xdata", None)
+            y0 = getattr(event, "ydata", None)
+            if not isinstance(x0, (int, float)) or not isinstance(y0, (int, float)):
+                return
+            press_xy = (float(x0), float(y0))
+            try:
+                from matplotlib.patches import Rectangle
+
+                if rect_patch is not None:
+                    try:
+                        rect_patch.remove()
+                    except Exception:
+                        pass
+                rect_patch = Rectangle(
+                    (float(x0), float(y0)),
+                    0.0,
+                    0.0,
+                    fill=False,
+                    linewidth=1.2,
+                    linestyle="--",
+                    edgecolor="#0f766e",
+                    alpha=0.9,
+                )
+                ax.add_patch(rect_patch)
+            except Exception:
+                rect_patch = None
+                press_xy = None
+                return
+            try:
+                canvas.draw_idle()
+            except Exception:
+                pass
+
+        def _on_release(event):
+            nonlocal press_xy, rect_patch
+            if press_xy is None or rect_patch is None:
+                return
+            x1 = getattr(event, "xdata", None)
+            y1 = getattr(event, "ydata", None)
+            try:
+                rect_patch.remove()
+            except Exception:
+                pass
+            rect_patch = None
+            x0, y0 = press_xy
+            press_xy = None
+
+            if not isinstance(x1, (int, float)) or not isinstance(y1, (int, float)):
+                try:
+                    canvas.draw_idle()
+                except Exception:
+                    pass
+                return
+            x0f, y0f, x1f, y1f = float(x0), float(y0), float(x1), float(y1)
+            if abs(x1f - x0f) < 1e-9 or abs(y1f - y0f) < 1e-9:
+                return
+            lo_x, hi_x = (x0f, x1f) if x0f <= x1f else (x1f, x0f)
+            lo_y, hi_y = (y0f, y1f) if y0f <= y1f else (y1f, y0f)
+            try:
+                ax.set_xlim(lo_x, hi_x)
+                ax.set_ylim(lo_y, hi_y)
+            except Exception:
+                return
+            try:
+                canvas.draw_idle()
+            except Exception:
+                pass
+
+        try:
+            canvas.mpl_connect("scroll_event", _on_scroll)
+            canvas.mpl_connect("motion_notify_event", _on_motion)
+            canvas.mpl_connect("button_press_event", _on_press)
+            canvas.mpl_connect("button_release_event", _on_release)
+        except Exception:
+            pass
+
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_row.addStretch(1)
+        btn_close = QtWidgets.QPushButton("Close")
+        btn_close.clicked.connect(dlg.accept)
+        btn_row.addWidget(btn_close)
+        layout.addLayout(btn_row)
+
+        dlg.exec()
+
     def _load_cache(self, *, rebuild: bool) -> None:
         try:
             self._db_path = be.ensure_test_data_project_cache(
@@ -3162,6 +3792,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.warning(self, "Test Data Cache", str(exc))
             return
         self._refresh_from_cache()
+        self._update_plot_zoom_actions()
 
     def _refresh_from_cache(self) -> None:
         if not self._db_path:
@@ -3212,6 +3843,500 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
         self._refresh_columns_for_run()
         self._refresh_stats_preview()
+        self._refresh_performance_ui()
+        self._update_plot_zoom_actions()
+
+    @staticmethod
+    def _set_all_perf_checks(listw: QtWidgets.QListWidget, checked: bool) -> None:
+        for i in range(listw.count()):
+            it = listw.item(i)
+            if not it:
+                continue
+            it.setCheckState(QtCore.Qt.CheckState.Checked if checked else QtCore.Qt.CheckState.Unchecked)
+
+    def _refresh_performance_ui(self) -> None:
+        if not getattr(self, "_db_path", None):
+            return
+        if (
+            not hasattr(self, "cb_perf_plotter")
+            or not hasattr(self, "cb_perf_x_col")
+            or not hasattr(self, "cb_perf_y_col")
+            or not hasattr(self, "list_perf_stats")
+            or not hasattr(self, "cb_perf_view_stat")
+            or not hasattr(self, "tbl_perf_equations")
+        ):
+            return
+
+        # Load plotter definitions + available stats from excel_trend_config.json (central).
+        try:
+            cfg = be.load_excel_trend_config(be.DEFAULT_EXCEL_TREND_CONFIG)
+        except Exception:
+            cfg = {}
+        plotters = cfg.get("performance_plotters") if isinstance(cfg, dict) else []
+        self._perf_plotters = [p for p in plotters if isinstance(p, dict)] if isinstance(plotters, list) else []
+        stats = cfg.get("statistics") if isinstance(cfg, dict) else []
+        self._perf_available_stats = (
+            [str(s).strip().lower() for s in stats if isinstance(s, str) and str(s).strip()]
+            if isinstance(stats, list)
+            else ["mean", "min", "max", "std", "median", "count"]
+        )
+        if not self._perf_available_stats:
+            self._perf_available_stats = ["mean", "min", "max", "std", "median", "count"]
+
+        self.cb_perf_plotter.blockSignals(True)
+        self.cb_perf_plotter.clear()
+        self.cb_perf_plotter.setEnabled(True)
+        self.cb_perf_plotter.addItem("Custom", None)
+        for p in self._perf_plotters:
+            name = str(p.get("name") or "Performance Plot").strip()
+            self.cb_perf_plotter.addItem(name or "Performance Plot", p)
+        self.cb_perf_plotter.blockSignals(False)
+
+        def _norm(s: str) -> str:
+            return "".join(ch.lower() for ch in str(s or "").strip() if ch.isalnum())
+
+        # Available columns = union of td_columns(kind='y') across all runs.
+        try:
+            runs = be.td_list_runs(self._db_path)
+        except Exception:
+            runs = []
+        union: dict[str, dict] = {}
+        for rn in runs:
+            try:
+                cols = be.td_list_y_columns(self._db_path, rn)
+            except Exception:
+                cols = []
+            for c in cols:
+                nm = str((c or {}).get("name") or "").strip()
+                if not nm:
+                    continue
+                units = str((c or {}).get("units") or "").strip()
+                key = _norm(nm)
+                if key not in union:
+                    union[key] = {"name": nm, "units": units}
+                else:
+                    if not str(union[key].get("units") or "").strip() and units:
+                        union[key]["units"] = units
+        self._perf_available_columns = sorted(union.values(), key=lambda d: str(d.get("name") or "").lower())
+
+        def _fill_col_combo(cb: QtWidgets.QComboBox) -> None:
+            prev_text = str(cb.currentText() or "").strip()
+            prev_data = cb.currentData() if hasattr(cb, "currentData") else None
+            cb.blockSignals(True)
+            cb.clear()
+            for c in self._perf_available_columns:
+                nm = str(c.get("name") or "").strip()
+                if not nm:
+                    continue
+                units = str(c.get("units") or "").strip()
+                label = f"{nm} ({units})" if units else nm
+                cb.addItem(label, nm)
+            cb.blockSignals(False)
+            # Restore selection as best-effort.
+            want = str(prev_data or "").strip() or prev_text
+            want = want.split(" (", 1)[0].strip()
+            if want:
+                for i in range(cb.count()):
+                    if str(cb.itemData(i) or "").strip() == want:
+                        cb.setCurrentIndex(i)
+                        break
+                else:
+                    cb.setEditText(want)
+
+        _fill_col_combo(self.cb_perf_x_col)
+        _fill_col_combo(self.cb_perf_y_col)
+
+        # Stats checklist
+        prev_checked = set()
+        for i in range(self.list_perf_stats.count()):
+            it = self.list_perf_stats.item(i)
+            if it and it.checkState() == QtCore.Qt.CheckState.Checked:
+                prev_checked.add(it.text().strip().lower())
+
+        self.list_perf_stats.blockSignals(True)
+        self.list_perf_stats.clear()
+        for st in self._perf_available_stats:
+            it = QtWidgets.QListWidgetItem(st)
+            it.setFlags(it.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+            it.setCheckState(QtCore.Qt.CheckState.Checked if (st in prev_checked) else QtCore.Qt.CheckState.Unchecked)
+            self.list_perf_stats.addItem(it)
+        if not prev_checked:
+            # Default selection: mean
+            for i in range(self.list_perf_stats.count()):
+                it = self.list_perf_stats.item(i)
+                if it and it.text().strip().lower() == "mean":
+                    it.setCheckState(QtCore.Qt.CheckState.Checked)
+                    break
+        self.list_perf_stats.blockSignals(False)
+
+        # View stat is derived from checked stats.
+        checked_now = [
+            self.list_perf_stats.item(i).text().strip().lower()
+            for i in range(self.list_perf_stats.count())
+            if self.list_perf_stats.item(i) and self.list_perf_stats.item(i).checkState() == QtCore.Qt.CheckState.Checked
+        ]
+        self.cb_perf_view_stat.blockSignals(True)
+        prev_view = str(self.cb_perf_view_stat.currentText() or "").strip().lower()
+        self.cb_perf_view_stat.clear()
+        for st in checked_now:
+            self.cb_perf_view_stat.addItem(st, st)
+        if prev_view and prev_view in checked_now:
+            self.cb_perf_view_stat.setCurrentText(prev_view)
+        elif checked_now:
+            self.cb_perf_view_stat.setCurrentIndex(0)
+        self.cb_perf_view_stat.blockSignals(False)
+
+        # Signals (connect once)
+        if not getattr(self, "_perf_signals_connected", False):
+            self.cb_perf_plotter.currentIndexChanged.connect(self._on_perf_preset_changed)
+            self.list_perf_stats.itemChanged.connect(self._on_perf_stats_changed)
+            self.cb_perf_view_stat.currentIndexChanged.connect(self._on_perf_view_stat_changed)
+            self._perf_signals_connected = True
+
+        # If we have presets and no user selections yet, apply the first preset.
+        if self.cb_perf_plotter.count() > 1 and self.cb_perf_plotter.currentIndex() == 0:
+            self.cb_perf_plotter.setCurrentIndex(1)
+
+    def _open_auto_report_options(self) -> None:
+        if not self._plot_ready:
+            QtWidgets.QMessageBox.information(self, "Auto Report", "Plotting is unavailable (install matplotlib).")
+            return
+        if not self._db_path:
+            QtWidgets.QMessageBox.information(self, "Auto Report", "Build/refresh cache first.")
+            return
+
+        # Build a lightweight options dialog on-demand (keeps startup fast).
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Auto Report Options")
+        dlg.resize(860, 680)
+        # Force readable light theme regardless of OS/app palette (prevents white-on-white / low-contrast text).
+        dlg.setStyleSheet(
+            """
+            QDialog { background: #ffffff; color: #000000; }
+            QLabel { color: #000000; }
+            QCheckBox { color: #000000; }
+            QLineEdit {
+                background: #ffffff;
+                color: #000000;
+                border: 1px solid #d1d5db;
+                border-radius: 6px;
+                padding: 6px 8px;
+            }
+            QLineEdit::placeholder { color: #6b7280; }
+            QListWidget {
+                background: #ffffff;
+                color: #000000;
+                border: 1px solid #d1d5db;
+                border-radius: 8px;
+                padding: 6px;
+            }
+            QListWidget::item:selected { background: #dbeafe; color: #000000; }
+            QPushButton {
+                background: #ffffff;
+                color: #000000;
+                border: 1px solid #d1d5db;
+                border-radius: 8px;
+                padding: 8px 12px;
+                font-weight: 600;
+            }
+            QPushButton:hover { background: #f3f4f6; }
+            """
+        )
+        layout = QtWidgets.QVBoxLayout(dlg)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(12)
+
+        title = QtWidgets.QLabel("Auto Report (Certification Style)")
+        title.setStyleSheet("font-size: 14px; font-weight: 800;")
+        layout.addWidget(title)
+
+        cfg = {}
+        try:
+            cfg = be.load_trend_auto_report_config(self._project_dir)
+        except Exception:
+            cfg = {}
+
+        # Output path
+        row_out = QtWidgets.QHBoxLayout()
+        row_out.addWidget(QtWidgets.QLabel("Output PDF:"))
+        ed_out = QtWidgets.QLineEdit()
+        default_name = f"auto_report_{time.strftime('%Y-%m-%d')}.pdf"
+        ed_out.setText(str(self._project_dir / default_name))
+        btn_browse = QtWidgets.QPushButton("Browse…")
+        def _browse():
+            path, _ = QtWidgets.QFileDialog.getSaveFileName(
+                dlg,
+                "Save Auto Report",
+                ed_out.text().strip() or str(self._project_dir / default_name),
+                "PDF Files (*.pdf)",
+            )
+            if path:
+                ed_out.setText(path)
+        btn_browse.clicked.connect(_browse)
+        row_out.addWidget(ed_out, 1)
+        row_out.addWidget(btn_browse)
+        layout.addLayout(row_out)
+
+        # Options checkboxes
+        opts_row = QtWidgets.QHBoxLayout()
+        cb_rebuild = QtWidgets.QCheckBox("Rebuild cache before report")
+        cb_rebuild.setChecked(False)
+        cb_update_cfg = QtWidgets.QCheckBox("Update excel_trend_config.json (fill missing units/ranges)")
+        cb_update_cfg.setChecked(True)
+        cb_add_missing = QtWidgets.QCheckBox("Add missing columns to excel_trend_config.json")
+        cb_add_missing.setChecked(False)
+        cb_metrics = QtWidgets.QCheckBox("Include metrics section/pages")
+        include_metrics_default = True
+        try:
+            if isinstance(cfg, dict):
+                rep = cfg.get("report") or {}
+                if isinstance(rep, dict) and rep.get("include_metrics") is not None:
+                    include_metrics_default = bool(rep.get("include_metrics"))
+        except Exception:
+            include_metrics_default = True
+        cb_metrics.setChecked(include_metrics_default)
+        for c in (cb_rebuild, cb_update_cfg, cb_add_missing, cb_metrics):
+            opts_row.addWidget(c)
+        opts_row.addStretch(1)
+        layout.addLayout(opts_row)
+
+        note = QtWidgets.QLabel("Highlight policy: watch-only (highlighted overlays are shown only when watch items trigger).")
+        note.setStyleSheet("color: #64748b; font-size: 11px;")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        splitter = QtWidgets.QSplitter()
+        splitter.setOrientation(QtCore.Qt.Orientation.Horizontal)
+        layout.addWidget(splitter, 1)
+
+        # Left: Highlight serials
+        left = QtWidgets.QFrame()
+        left_l = QtWidgets.QVBoxLayout(left)
+        left_l.setContentsMargins(10, 10, 10, 10)
+        left_l.setSpacing(8)
+        left_l.addWidget(QtWidgets.QLabel("Highlighted Serials (optional)"))
+        ed_sn_filter = QtWidgets.QLineEdit()
+        ed_sn_filter.setPlaceholderText("Filter serials…")
+        left_l.addWidget(ed_sn_filter)
+        list_sn = QtWidgets.QListWidget()
+        list_sn.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        left_l.addWidget(list_sn, 1)
+
+        serials = []
+        try:
+            serials = be.td_list_serials(self._db_path) if self._db_path else []
+        except Exception:
+            serials = []
+        for sn in serials:
+            list_sn.addItem(QtWidgets.QListWidgetItem(str(sn)))
+
+        default_hi = []
+        try:
+            default_hi = (cfg.get("highlight") or {}).get("default_serials") if isinstance(cfg, dict) else []
+        except Exception:
+            default_hi = []
+        want_hi = {str(s).strip() for s in (default_hi or []) if str(s).strip()}
+        if want_hi:
+            for i in range(list_sn.count()):
+                it = list_sn.item(i)
+                if it and it.text().strip() in want_hi:
+                    it.setSelected(True)
+
+        def _apply_sn_filter():
+            needle = (ed_sn_filter.text() or "").strip().lower()
+            for i in range(list_sn.count()):
+                it = list_sn.item(i)
+                if not it:
+                    continue
+                it.setHidden(bool(needle) and needle not in it.text().lower())
+        ed_sn_filter.textChanged.connect(_apply_sn_filter)
+
+        splitter.addWidget(left)
+
+        # Right: Runs (checkbox list). Parameters are auto-detected from the cache/workbook.
+        right = QtWidgets.QFrame()
+        right_l = QtWidgets.QVBoxLayout(right)
+        right_l.setContentsMargins(10, 10, 10, 10)
+        right_l.setSpacing(10)
+
+        right_l.addWidget(QtWidgets.QLabel("Runs included"))
+        list_runs = QtWidgets.QListWidget()
+        right_l.addWidget(list_runs, 1)
+
+        runs_ex = []
+        try:
+            runs_ex = be.td_list_runs_ex(self._db_path) if self._db_path else []
+        except Exception:
+            runs_ex = []
+        run_names = [str(r.get("run_name") or "").strip() for r in (runs_ex or []) if str(r.get("run_name") or "").strip()]
+
+        list_runs.blockSignals(True)
+        for rn in run_names:
+            it = QtWidgets.QListWidgetItem(rn)
+            it.setFlags(it.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+            it.setCheckState(QtCore.Qt.CheckState.Checked)
+            list_runs.addItem(it)
+        list_runs.blockSignals(False)
+
+        lbl_params_auto = QtWidgets.QLabel("Auto-detected parameters: —")
+        lbl_params_auto.setStyleSheet("color: #64748b; font-size: 11px;")
+        lbl_params_auto.setWordWrap(True)
+        right_l.addWidget(lbl_params_auto)
+
+        def _collect_checked(listw: QtWidgets.QListWidget) -> list[str]:
+            out = []
+            for i in range(listw.count()):
+                it = listw.item(i)
+                if it and it.checkState() == QtCore.Qt.CheckState.Checked:
+                    out.append(it.text().strip())
+            return [x for x in out if x]
+
+        def _refresh_auto_param_label():
+            runs_sel = _collect_checked(list_runs)
+            if not runs_sel or not self._db_path:
+                lbl_params_auto.setText("Auto-detected parameters: —")
+                return
+            y_norms: set[str] = set()
+            y_names: list[str] = []
+            try:
+                for rn in runs_sel:
+                    for c in be.td_list_y_columns(self._db_path, rn):
+                        name = str((c or {}).get("name") or "").strip()
+                        if not name:
+                            continue
+                        nk = "".join(ch.lower() for ch in name if ch.isalnum())
+                        if nk in y_norms:
+                            continue
+                        y_norms.add(nk)
+                        y_names.append(name)
+            except Exception:
+                y_names = []
+            lbl_params_auto.setText(f"Auto-detected parameters: {len(y_names)}")
+
+        list_runs.itemChanged.connect(lambda *_: _refresh_auto_param_label())
+        _refresh_auto_param_label()
+
+        splitter.addWidget(right)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 2)
+
+        # Bottom buttons
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_row.addStretch(1)
+        btn_gen = QtWidgets.QPushButton("Generate Report")
+        btn_cancel = QtWidgets.QPushButton("Cancel")
+        btn_row.addWidget(btn_gen)
+        btn_row.addWidget(btn_cancel)
+        layout.addLayout(btn_row)
+
+        def _do_generate():
+            out_path = (ed_out.text() or "").strip()
+            if not out_path:
+                QtWidgets.QMessageBox.information(dlg, "Auto Report", "Select an output PDF path.")
+                return
+            runs_sel = _collect_checked(list_runs)
+            hi_sel = [it.text().strip() for it in list_sn.selectedItems() if it and it.text().strip()]
+            if not runs_sel:
+                QtWidgets.QMessageBox.information(dlg, "Auto Report", "Select at least one run.")
+                return
+            payload = {
+                "output_pdf": out_path,
+                "runs": runs_sel,
+                "highlighted_serials": hi_sel,
+                "rebuild_cache": bool(cb_rebuild.isChecked()),
+                "update_excel_trend_config": bool(cb_update_cfg.isChecked()),
+                "add_missing_columns": bool(cb_add_missing.isChecked()),
+                "include_metrics": bool(cb_metrics.isChecked()),
+            }
+            dlg.setProperty("_auto_report_payload", payload)
+            dlg.accept()
+
+        btn_gen.clicked.connect(_do_generate)
+        btn_cancel.clicked.connect(dlg.reject)
+
+        _fit_widget_to_screen(dlg)
+        if dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        payload = dlg.property("_auto_report_payload") or {}
+        if not isinstance(payload, dict):
+            return
+        self._run_auto_report(payload)
+
+    def _run_auto_report(self, payload: dict) -> None:
+        try:
+            out_pdf = Path(str(payload.get("output_pdf") or "")).expanduser()
+            if not out_pdf:
+                raise RuntimeError("Missing output path.")
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Auto Report", str(exc))
+            return
+
+        runs = payload.get("runs") or []
+        hi = payload.get("highlighted_serials") or []
+
+        options = {
+            "runs": runs,
+            "rebuild_cache": bool(payload.get("rebuild_cache")),
+            "update_excel_trend_config": bool(payload.get("update_excel_trend_config", True)),
+            "add_missing_columns": bool(payload.get("add_missing_columns")),
+            "include_metrics": bool(payload.get("include_metrics", True)),
+        }
+
+        self._report_progress.lbl_heading.setText("Generating Auto Report")
+        self._report_progress.begin("Building report…")
+        self._report_progress.show()
+
+        def _task():
+            return be.generate_test_data_auto_report(
+                self._project_dir,
+                self._workbook_path,
+                out_pdf,
+                highlighted_serials=list(hi) if isinstance(hi, list) else [],
+                options=options,
+            )
+
+        worker = ManagerTaskWorker(_task, self)
+
+        def _done(result):
+            try:
+                self._report_progress.finish("Report complete", success=True)
+            except Exception:
+                pass
+            try:
+                pdf_path = str(result.get("output_pdf") or out_pdf)
+                summary_path = str(result.get("summary_json") or "")
+                msg = f"Auto report generated:\n{pdf_path}"
+                if summary_path:
+                    msg += f"\n\nSummary JSON:\n{summary_path}"
+                mbox = QtWidgets.QMessageBox(self)
+                mbox.setWindowTitle("Auto Report")
+                try:
+                    mbox.setStyleSheet("QMessageBox { background: #ffffff; color: #000000; } QLabel { color: #000000; }")
+                except Exception:
+                    pass
+                mbox.setText(msg)
+                btn_open = mbox.addButton("Open PDF", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+                btn_close = mbox.addButton("Close", QtWidgets.QMessageBox.ButtonRole.RejectRole)
+                mbox.exec()
+                if mbox.clickedButton() == btn_open:
+                    try:
+                        be.open_path(Path(pdf_path))
+                    except Exception:
+                        pass
+                _ = btn_close
+            except Exception:
+                pass
+
+        def _fail(err: str):
+            try:
+                self._report_progress.finish(f"Report failed: {err}", success=False)
+            except Exception:
+                pass
+            QtWidgets.QMessageBox.warning(self, "Auto Report", str(err))
+
+        worker.completed.connect(_done)
+        worker.failed.connect(_fail)
+        worker.start()
 
     def _current_run_name(self) -> str:
         ref = self.cb_run.currentData() if hasattr(self, "cb_run") else None
@@ -3416,6 +4541,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             sn = str(items[0].data(QtCore.Qt.ItemDataRole.UserRole) or items[0].text() or "").strip()
         self._highlight_sn = sn
         self._refresh_stats_preview()
+        if self._mode == "performance" and getattr(self, "_perf_results_by_stat", None):
+            self._update_perf_highlight_models()
+            self._fill_perf_equations_table()
+            self._redraw_performance_view()
 
     def _populate_stats_table(self, run: str, y_col: str, highlight_sn: str) -> None:
         def _set_val(key: str, v: object) -> None:
@@ -3467,18 +4596,30 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
     def _set_mode(self, mode: str) -> None:
         m = str(mode or "").strip().lower()
-        if m not in {"curves", "metrics"}:
+        if m not in {"curves", "metrics", "performance"}:
             return
         self._mode = m
         if hasattr(self, "_tabs"):
-            self._tabs.setCurrentIndex(0 if m == "metrics" else 1)
+            if m == "metrics":
+                self._tabs.setCurrentIndex(0)
+            elif m == "curves":
+                self._tabs.setCurrentIndex(1)
+            else:
+                self._tabs.setCurrentIndex(2)
         self.btn_mode_curves.setChecked(m == "curves")
         self.btn_mode_metrics.setChecked(m == "metrics")
-        self.btn_plot.setText("Plot Curves" if m == "curves" else "Plot Metrics")
-        self._refresh_stats_preview()
+        if hasattr(self, "btn_mode_perf"):
+            self.btn_mode_perf.setChecked(m == "performance")
+        self.btn_plot.setText(
+            "Plot Curves" if m == "curves" else ("Plot Metrics" if m == "metrics" else "Plot Performance")
+        )
+        if m != "performance":
+            self._refresh_stats_preview()
 
     def _plot_current_mode(self) -> None:
-        if self._mode == "metrics":
+        if self._mode == "performance":
+            self._plot_performance()
+        elif self._mode == "metrics":
             self._plot_metrics()
         else:
             self._plot_curves()
@@ -3558,6 +4699,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             self._canvas.draw()
         except Exception:
             pass
+        self._capture_main_plot_base_view()
         self.btn_save_plot_pdf.setEnabled(True)
         self._last_plot_def = {"mode": "metrics", "run": run, "stats": list(stats), "y": list(y_cols)}
         self.btn_add_auto_plot.setEnabled(True)
@@ -3628,10 +4770,681 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             self._canvas.draw()
         except Exception:
             pass
+        self._capture_main_plot_base_view()
         self.btn_save_plot_pdf.setEnabled(True)
         self._last_plot_def = {"mode": "curves", "run": run, "x": (x_label or x_col), "y": [y_col]}
         self.btn_add_auto_plot.setEnabled(True)
         self._populate_stats_table(run, y_col, self._highlight_sn)
+
+    def _selected_perf_runs(self) -> list[str]:
+        if not getattr(self, "_db_path", None):
+            return []
+        try:
+            return be.td_list_runs(self._db_path)
+        except Exception:
+            return []
+
+    def _selected_perf_serials(self) -> list[str]:
+        if not getattr(self, "_db_path", None):
+            return []
+        try:
+            return be.td_list_serials(self._db_path)
+        except Exception:
+            return []
+
+    def _perf_current_col_name(self, cb: QtWidgets.QComboBox) -> str:
+        try:
+            d = cb.currentData()
+        except Exception:
+            d = None
+        if isinstance(d, str) and d.strip():
+            return d.strip()
+        txt = str(cb.currentText() or "").strip()
+        if txt.endswith(")") and " (" in txt:
+            txt = txt.split(" (", 1)[0].strip()
+        return txt
+
+    def _perf_checked_stats(self) -> list[str]:
+        if not hasattr(self, "list_perf_stats"):
+            return []
+        out: list[str] = []
+        for i in range(self.list_perf_stats.count()):
+            it = self.list_perf_stats.item(i)
+            if it and it.checkState() == QtCore.Qt.CheckState.Checked:
+                st = it.text().strip().lower()
+                if st:
+                    out.append(st)
+        return out
+
+    def _sync_perf_view_stats(self) -> None:
+        if not hasattr(self, "cb_perf_view_stat") or not hasattr(self, "list_perf_stats"):
+            return
+        checked = self._perf_checked_stats()
+        prev = str(self.cb_perf_view_stat.currentText() or "").strip().lower()
+        self.cb_perf_view_stat.blockSignals(True)
+        self.cb_perf_view_stat.clear()
+        for st in checked:
+            self.cb_perf_view_stat.addItem(st, st)
+        if prev and prev in checked:
+            self.cb_perf_view_stat.setCurrentText(prev)
+        elif checked:
+            self.cb_perf_view_stat.setCurrentIndex(0)
+        self.cb_perf_view_stat.blockSignals(False)
+
+    def _clear_perf_results(self) -> None:
+        self._perf_results_by_stat = {}
+        if hasattr(self, "tbl_perf_equations"):
+            try:
+                self.tbl_perf_equations.setRowCount(0)
+            except Exception:
+                pass
+
+    def _on_perf_preset_changed(self) -> None:
+        plotter = self._selected_perf_plotter()
+        if not plotter:
+            return
+        x_spec = plotter.get("x") or {}
+        y_spec = plotter.get("y") or {}
+        x_target = str((x_spec.get("column") if isinstance(x_spec, dict) else "") or "").strip()
+        y_target = str((y_spec.get("column") if isinstance(y_spec, dict) else "") or "").strip()
+        stats = plotter.get("stats") or []
+        if not isinstance(stats, list) or not all(isinstance(s, str) for s in stats):
+            stats = ["mean"]
+        stats = [str(s).strip().lower() for s in stats if str(s).strip()]
+        if not stats:
+            stats = ["mean"]
+
+        fit = plotter.get("fit") or {}
+        if not isinstance(fit, dict):
+            fit = {}
+        try:
+            deg = int(fit.get("degree") or 0)
+        except Exception:
+            deg = 0
+        deg = max(0, deg)
+        normx = bool(fit.get("normalize_x", True))
+        try:
+            req = int(plotter.get("require_min_points") or 2)
+        except Exception:
+            req = 2
+        self._perf_require_min_points = max(2, int(req))
+
+        # Apply X/Y selections.
+        for cb, want in ((self.cb_perf_x_col, x_target), (self.cb_perf_y_col, y_target)):
+            if not want:
+                continue
+            want_key = want.strip()
+            found = False
+            for i in range(cb.count()):
+                if str(cb.itemData(i) or "").strip() == want_key:
+                    cb.setCurrentIndex(i)
+                    found = True
+                    break
+            if not found:
+                cb.setEditText(want_key)
+
+        # Apply stats checkboxes.
+        if hasattr(self, "list_perf_stats"):
+            self.list_perf_stats.blockSignals(True)
+            for i in range(self.list_perf_stats.count()):
+                it = self.list_perf_stats.item(i)
+                if not it:
+                    continue
+                st = it.text().strip().lower()
+                it.setCheckState(QtCore.Qt.CheckState.Checked if st in set(stats) else QtCore.Qt.CheckState.Unchecked)
+            self.list_perf_stats.blockSignals(False)
+            self._sync_perf_view_stats()
+
+        # Apply fit defaults.
+        if hasattr(self, "cb_perf_fit"):
+            self.cb_perf_fit.setChecked(deg > 0)
+        if hasattr(self, "sp_perf_degree") and deg > 0:
+            self.sp_perf_degree.setValue(min(max(1, deg), 6))
+        if hasattr(self, "cb_perf_norm_x"):
+            self.cb_perf_norm_x.setChecked(bool(normx))
+
+        self._clear_perf_results()
+
+    def _on_perf_stats_changed(self) -> None:
+        self._sync_perf_view_stats()
+        self._clear_perf_results()
+
+    def _on_perf_view_stat_changed(self) -> None:
+        if self._mode != "performance":
+            return
+        self._redraw_performance_view()
+
+    def _selected_perf_plotter(self) -> dict | None:
+        if not hasattr(self, "cb_perf_plotter"):
+            return None
+        try:
+            d = self.cb_perf_plotter.currentData()
+        except Exception:
+            d = None
+        return d if isinstance(d, dict) else None
+
+    def _resolve_td_y_name(self, run_name: str, target: str) -> str:
+        tgt = str(target or "").strip()
+        if not tgt or not self._db_path:
+            return ""
+
+        def _norm(s: str) -> str:
+            return "".join(ch.lower() for ch in str(s or "").strip() if ch.isalnum())
+
+        want = _norm(tgt)
+        try:
+            cols = be.td_list_y_columns(self._db_path, run_name)
+        except Exception:
+            cols = []
+        by_norm = {
+            _norm(str(c.get("name") or "")): str(c.get("name") or "").strip()
+            for c in cols
+            if str(c.get("name") or "").strip()
+        }
+        return by_norm.get(want, "")
+
+    def _load_metric_map(self, run_name: str, col_name: str, stat: str) -> dict[str, float]:
+        if not self._db_path:
+            return {}
+        try:
+            series = be.td_load_metric_series(self._db_path, run_name, col_name, stat)
+        except Exception:
+            series = []
+        out: dict[str, float] = {}
+        for r in series:
+            sn = str(r.get("serial") or "").strip()
+            v = r.get("value_num")
+            if not sn or not isinstance(v, (int, float)) or not math.isfinite(float(v)):
+                continue
+            out[sn] = float(v)
+        return out
+
+    def _resolve_td_y_col_units(self, run_name: str, target: str) -> tuple[str, str]:
+        tgt = str(target or "").strip()
+        if not tgt or not self._db_path:
+            return "", ""
+
+        def _norm(s: str) -> str:
+            return "".join(ch.lower() for ch in str(s or "").strip() if ch.isalnum())
+
+        want = _norm(tgt)
+        try:
+            cols = be.td_list_y_columns(self._db_path, run_name)
+        except Exception:
+            cols = []
+        for c in cols:
+            nm = str((c or {}).get("name") or "").strip()
+            if not nm:
+                continue
+            if _norm(nm) == want:
+                return nm, str((c or {}).get("units") or "").strip()
+        return tgt, ""
+
+    @staticmethod
+    def _perf_fmt_equation(coeffs: list[float], degree: int, *, x0: float | None, sx: float | None) -> str:
+        if not coeffs:
+            return ""
+        deg = int(degree)
+        parts: list[str] = []
+        for i, c in enumerate(coeffs):
+            power = deg - i
+            try:
+                cf = float(c)
+            except Exception:
+                continue
+            if power == 0:
+                parts.append(f"{cf:+.4g}")
+            elif power == 1:
+                parts.append(f"{cf:+.4g}*x")
+            else:
+                parts.append(f"{cf:+.4g}*x^{power}")
+        expr = " ".join(parts).lstrip("+").strip()
+        if x0 is not None and sx is not None:
+            return f"y = {expr}  (x'=(x-{float(x0):.4g})/{float(sx):.4g})"
+        return f"y = {expr}"
+
+    def _perf_poly_fit(
+        self, xs: list[float], ys: list[float], degree: int, *, normalize_x: bool
+    ) -> dict | None:
+        try:
+            import numpy as np  # type: ignore
+        except Exception as exc:
+            raise RuntimeError("numpy is required for polynomial fitting.") from exc
+        deg = int(degree)
+        if deg <= 0:
+            return None
+        if len(xs) < max(2, deg + 1):
+            return None
+        x_arr = np.array([float(v) for v in xs], dtype=float)
+        y_arr = np.array([float(v) for v in ys], dtype=float)
+        if normalize_x:
+            x0 = float(np.mean(x_arr))
+            sx = float(np.std(x_arr)) or 1.0
+            xn = (x_arr - x0) / sx
+        else:
+            x0 = 0.0
+            sx = 1.0
+            xn = x_arr
+        coeffs = np.polyfit(xn, y_arr, deg).tolist()
+        p = np.poly1d(coeffs)
+        yhat = p(xn)
+        rmse = float(np.sqrt(np.mean((y_arr - yhat) ** 2)))
+        eqn = self._perf_fmt_equation([float(c) for c in coeffs], deg, x0=(x0 if normalize_x else None), sx=(sx if normalize_x else None))
+        return {"degree": deg, "coeffs": [float(c) for c in coeffs], "rmse": rmse, "x0": x0, "sx": sx, "normalize_x": bool(normalize_x), "equation": eqn}
+
+    def _fill_perf_equations_table(self) -> None:
+        if not hasattr(self, "tbl_perf_equations"):
+            return
+        rows = []
+        for st, r in (getattr(self, "_perf_results_by_stat", {}) or {}).items():
+            master = (r or {}).get("master_model") or {}
+            hi = (r or {}).get("highlight_model") or {}
+            rows.append(
+                (
+                    str(st),
+                    str(master.get("equation") or ""),
+                    (f"{float(master.get('rmse')):.4g}" if isinstance(master.get("rmse"), (int, float)) else ""),
+                    str(hi.get("equation") or ""),
+                    (f"{float(hi.get('rmse')):.4g}" if isinstance(hi.get("rmse"), (int, float)) else ""),
+                )
+            )
+        rows.sort(key=lambda t: str(t[0]).lower())
+        self.tbl_perf_equations.setRowCount(len(rows))
+        for r_i, row in enumerate(rows):
+            for c_i, val in enumerate(row):
+                it = QtWidgets.QTableWidgetItem(str(val))
+                it.setFlags(it.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+                self.tbl_perf_equations.setItem(r_i, c_i, it)
+        try:
+            self.tbl_perf_equations.resizeColumnsToContents()
+        except Exception:
+            pass
+
+    def _select_perf_equation_row(self, stat: str) -> None:
+        st = str(stat or "").strip().lower()
+        if not st or not hasattr(self, "tbl_perf_equations"):
+            return
+        for i in range(self.tbl_perf_equations.rowCount()):
+            it = self.tbl_perf_equations.item(i, 0)
+            if it and it.text().strip().lower() == st:
+                try:
+                    self.tbl_perf_equations.selectRow(i)
+                except Exception:
+                    pass
+                break
+
+    def _update_perf_highlight_models(self) -> None:
+        if not getattr(self, "_perf_results_by_stat", None):
+            return
+        hi_sn = str(getattr(self, "_highlight_sn", "") or "").strip()
+        fit_enabled = bool(getattr(self, "cb_perf_fit", None) and self.cb_perf_fit.isChecked())
+        degree = int(self.sp_perf_degree.value()) if hasattr(self, "sp_perf_degree") else 2
+        normx = bool(getattr(self, "cb_perf_norm_x", None) and self.cb_perf_norm_x.isChecked())
+        if not fit_enabled:
+            for st, r in self._perf_results_by_stat.items():
+                if isinstance(r, dict):
+                    r["highlight_serial"] = hi_sn
+                    r["highlight_model"] = {}
+            return
+        for st, r in self._perf_results_by_stat.items():
+            if not isinstance(r, dict):
+                continue
+            if str(r.get("highlight_serial") or "") == hi_sn:
+                continue
+            curves = r.get("curves") or {}
+            pts = curves.get(hi_sn) if isinstance(curves, dict) and hi_sn else None
+            if not pts:
+                r["highlight_serial"] = hi_sn
+                r["highlight_model"] = {}
+                continue
+            xs = [float(p[0]) for p in pts]
+            ys = [float(p[1]) for p in pts]
+            try:
+                model = self._perf_poly_fit(xs, ys, degree, normalize_x=normx) if degree > 0 else None
+            except Exception:
+                model = None
+            if model:
+                try:
+                    import numpy as np  # type: ignore
+
+                    x_min = float(min(xs))
+                    x_max = float(max(xs))
+                    xfit = np.linspace(x_min, x_max, 200)
+                    coeffs = model.get("coeffs") or []
+                    p = np.poly1d(coeffs)
+                    if bool(model.get("normalize_x")):
+                        x0 = float(model.get("x0") or 0.0)
+                        sx = float(model.get("sx") or 1.0) or 1.0
+                        xfit_n = (xfit - x0) / sx
+                    else:
+                        xfit_n = xfit
+                    yfit = p(xfit_n)
+                    model["xfit"] = xfit.tolist()
+                    model["yfit"] = yfit.tolist()
+                except Exception:
+                    pass
+            r["highlight_serial"] = hi_sn
+            r["highlight_model"] = model or {}
+
+    def _redraw_performance_view(self) -> None:
+        if not getattr(self, "_perf_results_by_stat", None):
+            return
+        st = ""
+        if hasattr(self, "cb_perf_view_stat"):
+            st = str(self.cb_perf_view_stat.currentText() or "").strip().lower()
+        if not st:
+            return
+        r = (self._perf_results_by_stat or {}).get(st) or {}
+        if not isinstance(r, dict):
+            return
+
+        curves = r.get("curves") or {}
+        if not isinstance(curves, dict) or not curves:
+            return
+        x_target = str(r.get("x_target") or "").strip()
+        y_target = str(r.get("y_target") or "").strip()
+        x_units = str(r.get("x_units") or "").strip()
+        y_units = str(r.get("y_units") or "").strip()
+
+        hi_sn = str(getattr(self, "_highlight_sn", "") or "").strip()
+        preset_name = str(getattr(self, "cb_perf_plotter", None).currentText() if hasattr(self, "cb_perf_plotter") else "Performance").strip()
+        title = f"Performance — {preset_name} — {st}"
+
+        self._axes.clear()
+        self._axes.set_title(title)
+        self._axes.set_xlabel(f"{x_target}.{st}" + (f" ({x_units})" if x_units else ""))
+        self._axes.set_ylabel(f"{y_target}.{st}" + (f" ({y_units})" if y_units else ""))
+
+        # Draw all serials faint.
+        for sn, pts in curves.items():
+            if not isinstance(pts, list) or len(pts) < 2:
+                continue
+            if hi_sn and sn == hi_sn:
+                continue
+            xs = [p[0] for p in pts]
+            ys = [p[1] for p in pts]
+            try:
+                self._axes.plot(xs, ys, linewidth=0.9, alpha=0.14, color="#64748b")
+            except Exception:
+                continue
+
+        # Highlighted serial.
+        hi_color = "#ef4444"
+        if hi_sn and hi_sn in curves:
+            pts = curves.get(hi_sn) or []
+            if isinstance(pts, list) and len(pts) >= 2:
+                xs = [p[0] for p in pts]
+                ys = [p[1] for p in pts]
+                self._axes.plot(xs, ys, marker="o", linewidth=2.4, alpha=0.98, color=hi_color, label=hi_sn)
+                for x, y, lbl in pts:
+                    try:
+                        self._axes.annotate(str(lbl), (x, y), textcoords="offset points", xytext=(4, 4), fontsize=7, alpha=0.8, color=hi_color)
+                    except Exception:
+                        pass
+
+        # Fit overlays (optional).
+        master = r.get("master_model") or {}
+        if isinstance(master, dict) and master.get("xfit") and master.get("yfit"):
+            try:
+                self._axes.plot(master["xfit"], master["yfit"], linestyle="--", linewidth=1.5, alpha=0.75, color="#0f172a", label="master fit")
+            except Exception:
+                pass
+        hi_model = r.get("highlight_model") or {}
+        if isinstance(hi_model, dict) and hi_model.get("xfit") and hi_model.get("yfit"):
+            try:
+                self._axes.plot(hi_model["xfit"], hi_model["yfit"], linestyle="--", linewidth=1.5, alpha=0.8, color=hi_color, label=f"{hi_sn} fit")
+            except Exception:
+                pass
+
+        self._axes.grid(True, alpha=0.25)
+        try:
+            if hi_sn:
+                self._axes.legend(fontsize=8, loc="best")
+        except Exception:
+            pass
+        try:
+            self._figure.tight_layout()
+        except Exception:
+            pass
+        try:
+            self._canvas.draw()
+        except Exception:
+            pass
+        self._capture_main_plot_base_view()
+        self._select_perf_equation_row(st)
+
+    def _plot_performance(self) -> None:
+        if not self._plot_ready or not self._db_path:
+            return
+        x_target = self._perf_current_col_name(self.cb_perf_x_col) if hasattr(self, "cb_perf_x_col") else ""
+        y_target = self._perf_current_col_name(self.cb_perf_y_col) if hasattr(self, "cb_perf_y_col") else ""
+        if not x_target or not y_target:
+            QtWidgets.QMessageBox.information(self, "Performance", "Select X and Y columns.")
+            return
+        stats = self._perf_checked_stats()
+        if not stats:
+            QtWidgets.QMessageBox.information(self, "Performance", "Select at least one stat.")
+            return
+
+        runs = self._selected_perf_runs()
+        if not runs:
+            QtWidgets.QMessageBox.information(self, "Performance", "No runs found in cache.")
+            return
+        serials = self._selected_perf_serials()
+        if not serials:
+            QtWidgets.QMessageBox.information(self, "Performance", "No serial numbers found in cache.")
+            return
+
+        fit_enabled = bool(getattr(self, "cb_perf_fit", None) and self.cb_perf_fit.isChecked())
+        degree = int(self.sp_perf_degree.value()) if hasattr(self, "sp_perf_degree") else 2
+        normx = bool(getattr(self, "cb_perf_norm_x", None) and self.cb_perf_norm_x.isChecked())
+        require_min_points = int(getattr(self, "_perf_require_min_points", 2) or 2)
+        require_min_points = max(2, require_min_points)
+
+        self._perf_results_by_stat = {}
+
+        for st in stats:
+            # Per-run maps for the selected stat.
+            per_run: list[tuple[str, str, dict[str, float], dict[str, float], str, str]] = []
+            for rn in runs:
+                x_col, x_units = self._resolve_td_y_col_units(rn, x_target)
+                y_col, y_units = self._resolve_td_y_col_units(rn, y_target)
+                xmap = self._load_metric_map(rn, x_col, st)
+                ymap = self._load_metric_map(rn, y_col, st)
+                per_run.append((rn, self._run_display_text(rn), xmap, ymap, x_units, y_units))
+
+            curves: dict[str, list[tuple[float, float, str]]] = {}
+            pooled_x: list[float] = []
+            pooled_y: list[float] = []
+            for sn in serials:
+                pts: list[tuple[float, float, str]] = []
+                for _rn, rdisp, xmap, ymap, _xu, _yu in per_run:
+                    if sn not in xmap or sn not in ymap:
+                        continue
+                    pts.append((float(xmap[sn]), float(ymap[sn]), str(rdisp or _rn)))
+                if len(pts) >= require_min_points:
+                    pts.sort(key=lambda t: t[0])
+                    curves[sn] = pts
+                    pooled_x.extend([p[0] for p in pts])
+                    pooled_y.extend([p[1] for p in pts])
+
+            if not curves:
+                continue
+
+            # Units: prefer first non-empty.
+            x_units = next((u for *_rest, u, _ in per_run if str(u).strip()), "")
+            y_units = next((u for *_rest, _, u in per_run if str(u).strip()), "")
+
+            master_model: dict = {}
+            highlight_model: dict = {}
+            if fit_enabled and degree > 0 and pooled_x:
+                try:
+                    m = self._perf_poly_fit(pooled_x, pooled_y, degree, normalize_x=normx)
+                except Exception as exc:
+                    QtWidgets.QMessageBox.warning(self, "Performance", str(exc))
+                    m = None
+                if m:
+                    # Fit line for plotting.
+                    try:
+                        import numpy as np  # type: ignore
+
+                        x_min = float(min(pooled_x))
+                        x_max = float(max(pooled_x))
+                        xfit = np.linspace(x_min, x_max, 220)
+                        coeffs = m.get("coeffs") or []
+                        p = np.poly1d(coeffs)
+                        if bool(m.get("normalize_x")):
+                            x0 = float(m.get("x0") or 0.0)
+                            sx = float(m.get("sx") or 1.0) or 1.0
+                            xfit_n = (xfit - x0) / sx
+                        else:
+                            xfit_n = xfit
+                        yfit = p(xfit_n)
+                        m["xfit"] = xfit.tolist()
+                        m["yfit"] = yfit.tolist()
+                    except Exception:
+                        pass
+                    master_model = m
+
+            # Highlight model computed later in _update_perf_highlight_models (and cached per highlight).
+            self._perf_results_by_stat[st] = {
+                "x_target": x_target,
+                "y_target": y_target,
+                "x_units": x_units,
+                "y_units": y_units,
+                "curves": curves,
+                "master_model": master_model,
+                "highlight_serial": "",
+                "highlight_model": highlight_model,
+            }
+
+        if not self._perf_results_by_stat:
+            QtWidgets.QMessageBox.information(self, "Performance", "No metric data found for the selected columns/stats.")
+            return
+
+        # View stat options = stats we actually computed.
+        prev_view = str(self.cb_perf_view_stat.currentText() or "").strip().lower() if hasattr(self, "cb_perf_view_stat") else ""
+        if hasattr(self, "cb_perf_view_stat"):
+            self.cb_perf_view_stat.blockSignals(True)
+            self.cb_perf_view_stat.clear()
+            for st in sorted(self._perf_results_by_stat.keys(), key=lambda s: str(s).lower()):
+                self.cb_perf_view_stat.addItem(st, st)
+            if prev_view and prev_view in self._perf_results_by_stat:
+                self.cb_perf_view_stat.setCurrentText(prev_view)
+            else:
+                self.cb_perf_view_stat.setCurrentIndex(0)
+            self.cb_perf_view_stat.blockSignals(False)
+
+        self._update_perf_highlight_models()
+        self._fill_perf_equations_table()
+        self._redraw_performance_view()
+
+        self.btn_save_plot_pdf.setEnabled(True)
+        self.btn_add_auto_plot.setEnabled(False)
+
+    def _open_performance_tabs_dialog(self) -> None:
+        QtWidgets.QMessageBox.information(
+            self,
+            "Performance",
+            "The per-serial Performance tabs view was removed in Performance Plotter v2.\n\n"
+            "Use the main Performance plot (all serials) and the Highlight Serial selector to inspect a single unit.",
+        )
+        return
+        if not self._plot_ready or not self._db_path:
+            return
+        serials = self._selected_perf_serials()
+        if not serials:
+            QtWidgets.QMessageBox.information(self, "Performance", "Select at least one serial.")
+            return
+        if len(serials) > 40:
+            QtWidgets.QMessageBox.information(
+                self, "Performance", f"Too many serials selected ({len(serials)}). Select 40 or fewer for tabs."
+            )
+            return
+        plotter = self._selected_perf_plotter()
+        if not plotter:
+            return
+        x_spec = plotter.get("x") or {}
+        y_spec = plotter.get("y") or {}
+        x_target = str((x_spec.get("column") if isinstance(x_spec, dict) else "") or "").strip()
+        y_target = str((y_spec.get("column") if isinstance(y_spec, dict) else "") or "").strip()
+        x_stat = str((x_spec.get("stat") if isinstance(x_spec, dict) else "mean") or "mean").strip().lower()
+        y_stat = str((y_spec.get("stat") if isinstance(y_spec, dict) else "mean") or "mean").strip().lower()
+        runs = self._selected_perf_runs()
+        if not runs:
+            QtWidgets.QMessageBox.information(self, "Performance", "Select at least one run/condition.")
+            return
+
+        try:
+            from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+            from matplotlib.figure import Figure
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Performance", f"Plotting unavailable: {exc}")
+            return
+
+        run_maps: list[tuple[str, str, dict[str, float], dict[str, float]]] = []
+        for rn in runs:
+            x_col = self._resolve_td_y_name(rn, x_target) or x_target
+            y_col = self._resolve_td_y_name(rn, y_target) or y_target
+            run_maps.append(
+                (
+                    rn,
+                    self._run_display_text(rn),
+                    self._load_metric_map(rn, x_col, x_stat),
+                    self._load_metric_map(rn, y_col, y_stat),
+                )
+            )
+
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Performance Curves")
+        dlg.resize(1040, 780)
+        layout = QtWidgets.QVBoxLayout(dlg)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
+        tabs = QtWidgets.QTabWidget()
+        layout.addWidget(tabs, 1)
+
+        for sn in serials:
+            fig = Figure(figsize=(8, 4), dpi=100)
+            ax = fig.add_subplot(111)
+            ax.set_title(f"{sn} — {str(plotter.get('name') or '').strip() or 'Performance'}")
+            ax.set_xlabel(f"{x_target}.{x_stat}")
+            ax.set_ylabel(f"{y_target}.{y_stat}")
+            pts: list[tuple[float, float, str]] = []
+            for _rn, dn, xmap, ymap in run_maps:
+                if sn not in xmap or sn not in ymap:
+                    continue
+                pts.append((float(xmap[sn]), float(ymap[sn]), dn or _rn))
+            pts.sort(key=lambda t: t[0])
+            if pts:
+                xs = [p[0] for p in pts]
+                ys = [p[1] for p in pts]
+                ax.plot(xs, ys, marker="o", linewidth=1.4)
+                for x, y, lbl in pts:
+                    ax.annotate(str(lbl), (x, y), textcoords="offset points", xytext=(4, 4), fontsize=7, alpha=0.75)
+            ax.grid(True, alpha=0.25)
+            try:
+                fig.tight_layout()
+            except Exception:
+                pass
+
+            tab = QtWidgets.QWidget()
+            tab_layout = QtWidgets.QVBoxLayout(tab)
+            tab_layout.setContentsMargins(8, 8, 8, 8)
+            canvas = FigureCanvas(fig)
+            tab_layout.addWidget(canvas, 1)
+            tabs.addTab(tab, sn)
+
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_row.addStretch(1)
+        btn_close = QtWidgets.QPushButton("Close")
+        btn_close.clicked.connect(dlg.accept)
+        btn_row.addWidget(btn_close)
+        layout.addLayout(btn_row)
+
+        _fit_widget_to_screen(dlg)
+        dlg.exec()
 
     def _save_plot_pdf(self) -> None:
         if not self._plot_ready or not self._figure:
@@ -3891,7 +5704,200 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             tab_layout = QtWidgets.QVBoxLayout(tab)
             tab_layout.setContentsMargins(8, 8, 8, 8)
             fig = self._render_plot_def_to_figure(d)
+            ax = fig.axes[0] if getattr(fig, "axes", None) else None
             canvas = FigureCanvas(fig)
+
+            # Zoom controls (also supports mouse wheel on the canvas).
+            if ax is not None:
+                base_xlim = ax.get_xlim()
+                base_ylim = ax.get_ylim()
+
+                ctrl = QtWidgets.QHBoxLayout()
+                btn_mag = QtWidgets.QPushButton("Magnify")
+                btn_mag.setCheckable(True)
+                btn_out = QtWidgets.QPushButton("Zoom -")
+                btn_in = QtWidgets.QPushButton("Zoom +")
+                btn_reset = QtWidgets.QPushButton("Reset")
+                for b in (btn_mag, btn_out, btn_in, btn_reset):
+                    b.setStyleSheet(
+                        """
+                        QPushButton {
+                            padding: 5px 10px;
+                            border-radius: 8px;
+                            background: #ffffff;
+                            border: 1px solid #e2e8f0;
+                            font-size: 12px;
+                            font-weight: 800;
+                            color: #0f172a;
+                        }
+                        QPushButton:hover { background: #f8fafc; }
+                        """
+                    )
+                btn_mag.setToolTip("Magnify zones: click-drag a rectangle on the plot to zoom to that area")
+                hint = QtWidgets.QLabel("Mouse wheel zoom (Shift = X only, Ctrl = Y only)")
+                hint.setStyleSheet("color: #64748b; font-size: 11px;")
+                ctrl.addWidget(btn_mag)
+                ctrl.addWidget(btn_out)
+                ctrl.addWidget(btn_in)
+                ctrl.addWidget(btn_reset)
+                ctrl.addSpacing(10)
+                ctrl.addWidget(hint)
+                ctrl.addStretch(1)
+                tab_layout.addLayout(ctrl)
+
+                def _reset():
+                    try:
+                        ax.set_xlim(*base_xlim)
+                        ax.set_ylim(*base_ylim)
+                    except Exception:
+                        pass
+                    try:
+                        canvas.draw_idle()
+                    except Exception:
+                        pass
+
+                def _zoom(factor: float):
+                    self._apply_axes_zoom(ax, factor, axis="both")
+                    try:
+                        canvas.draw_idle()
+                    except Exception:
+                        pass
+
+                btn_out.clicked.connect(lambda *_: _zoom(1.25))
+                btn_in.clicked.connect(lambda *_: _zoom(0.8))
+                btn_reset.clicked.connect(lambda *_: _reset())
+
+                press_xy: tuple[float, float] | None = None
+                rect_patch = None
+
+                def _on_scroll(event):
+                    if getattr(event, "inaxes", None) is not ax:
+                        return
+                    direction = str(getattr(event, "button", "") or "").strip().lower()
+                    if direction not in {"up", "down"}:
+                        return
+                    factor = 0.8 if direction == "up" else 1.25
+                    key = str(getattr(event, "key", "") or "").lower()
+                    axis = "both"
+                    if "shift" in key:
+                        axis = "x"
+                    elif "control" in key or "ctrl" in key:
+                        axis = "y"
+                    self._apply_axes_zoom(
+                        ax,
+                        factor,
+                        center=(getattr(event, "xdata", None), getattr(event, "ydata", None)),
+                        axis=axis,
+                    )
+                    try:
+                        canvas.draw_idle()
+                    except Exception:
+                        pass
+
+                def _on_motion(event):
+                    nonlocal press_xy, rect_patch
+                    if not btn_mag.isChecked():
+                        return
+                    if press_xy is None or rect_patch is None:
+                        return
+                    x1 = getattr(event, "xdata", None)
+                    y1 = getattr(event, "ydata", None)
+                    if not isinstance(x1, (int, float)) or not isinstance(y1, (int, float)):
+                        return
+                    x0, y0 = press_xy
+                    try:
+                        rect_patch.set_bounds(min(x0, x1), min(y0, y1), abs(x1 - x0), abs(y1 - y0))
+                    except Exception:
+                        return
+                    try:
+                        canvas.draw_idle()
+                    except Exception:
+                        pass
+
+                def _on_press(event):
+                    nonlocal press_xy, rect_patch
+                    if not btn_mag.isChecked():
+                        return
+                    if getattr(event, "inaxes", None) is not ax:
+                        return
+                    if int(getattr(event, "button", 0) or 0) != 1:
+                        return
+                    x0 = getattr(event, "xdata", None)
+                    y0 = getattr(event, "ydata", None)
+                    if not isinstance(x0, (int, float)) or not isinstance(y0, (int, float)):
+                        return
+                    press_xy = (float(x0), float(y0))
+                    try:
+                        from matplotlib.patches import Rectangle
+
+                        if rect_patch is not None:
+                            try:
+                                rect_patch.remove()
+                            except Exception:
+                                pass
+                        rect_patch = Rectangle(
+                            (float(x0), float(y0)),
+                            0.0,
+                            0.0,
+                            fill=False,
+                            linewidth=1.2,
+                            linestyle="--",
+                            edgecolor="#0f766e",
+                            alpha=0.9,
+                        )
+                        ax.add_patch(rect_patch)
+                    except Exception:
+                        rect_patch = None
+                        press_xy = None
+                        return
+                    try:
+                        canvas.draw_idle()
+                    except Exception:
+                        pass
+
+                def _on_release(event):
+                    nonlocal press_xy, rect_patch
+                    if press_xy is None or rect_patch is None:
+                        return
+                    x1 = getattr(event, "xdata", None)
+                    y1 = getattr(event, "ydata", None)
+                    try:
+                        rect_patch.remove()
+                    except Exception:
+                        pass
+                    rect_patch = None
+                    x0, y0 = press_xy
+                    press_xy = None
+
+                    if not isinstance(x1, (int, float)) or not isinstance(y1, (int, float)):
+                        try:
+                            canvas.draw_idle()
+                        except Exception:
+                            pass
+                        return
+                    x0f, y0f, x1f, y1f = float(x0), float(y0), float(x1), float(y1)
+                    if abs(x1f - x0f) < 1e-9 or abs(y1f - y0f) < 1e-9:
+                        return
+                    lo_x, hi_x = (x0f, x1f) if x0f <= x1f else (x1f, x0f)
+                    lo_y, hi_y = (y0f, y1f) if y0f <= y1f else (y1f, y0f)
+                    try:
+                        ax.set_xlim(lo_x, hi_x)
+                        ax.set_ylim(lo_y, hi_y)
+                    except Exception:
+                        return
+                    try:
+                        canvas.draw_idle()
+                    except Exception:
+                        pass
+
+                try:
+                    canvas.mpl_connect("scroll_event", _on_scroll)
+                    canvas.mpl_connect("motion_notify_event", _on_motion)
+                    canvas.mpl_connect("button_press_event", _on_press)
+                    canvas.mpl_connect("button_release_event", _on_release)
+                except Exception:
+                    pass
+
             tab_layout.addWidget(canvas, 1)
             tabs.addTab(tab, name or "Auto Plot")
 

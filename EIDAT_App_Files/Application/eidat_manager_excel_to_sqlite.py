@@ -11,6 +11,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 
+try:
+    # Common execution mode: `python EIDAT_App_Files/Application/eidat_manager.py ...`
+    # where `Application/` is not a package.
+    from eidat_manager_db import support_paths  # type: ignore
+except Exception:  # pragma: no cover
+    # Package mode fallback.
+    from .eidat_manager_db import support_paths  # type: ignore
+
 
 EXCEL_EXTENSIONS = {".xlsx", ".xlsm", ".xls"}
 
@@ -1174,7 +1182,10 @@ def excel_to_sqlite(
     if not targets:
         raise RuntimeError("No Excel files found.")
 
-    out_root = Path(out_dir).expanduser() if out_dir is not None else (repo / "EIDAT Support" / "excel_sqlite")
+    if out_dir is not None:
+        out_root = Path(out_dir).expanduser()
+    else:
+        out_root = support_paths(repo).support_dir / "excel_sqlite"
     out_root.mkdir(parents=True, exist_ok=True)
 
     results: list[dict[str, Any]] = []

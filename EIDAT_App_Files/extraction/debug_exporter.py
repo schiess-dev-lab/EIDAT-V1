@@ -1357,6 +1357,9 @@ def export_combined_text(pdf_path: Path, pages_data: List[Dict],
             return False
 
         combined_text.append(f"=== Page {page_num} ===\n")
+        if page_data.get("timeout") or page_data.get("error"):
+            msg = str(page_data.get("error") or "skipped").strip()
+            combined_text.append(f"--- PAGE {page_num} SKIPPED: {msg} ---\n\n")
 
         if flow:
             header_entries = header_page_entries[page_idx] if page_idx < len(header_page_entries) else []

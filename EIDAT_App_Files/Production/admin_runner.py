@@ -299,6 +299,94 @@ def run_pipeline(
         return PipelineResult(ok=False, node_root=node, outputs=outputs, error=str(exc))
 
 
+def run_update_processor(
+    *,
+    node_root: str | Path,
+    runtime_root: str | Path,
+    py: str | None = None,
+    node_env_enabled: bool = False,  # kept for signature parity; not used
+    on_log: Callable[[str], None] | None = None,
+) -> PipelineResult:
+    """
+    Update the node-local backend processor environment without deleting node caches/artifacts.
+
+    Today this means ensuring/updating the node runtime venv packages under:
+      <node_root>\\EIDAT\\Runtime\\.venv
+    """
+    node = _as_abs(node_root)
+    runtime = _as_abs(runtime_root)
+    _ = bool(node_env_enabled)  # not used yet; keep for future config-driven behavior
+    python_exe = py or sys.executable
+
+    outputs: dict[str, object] = {}
+    try:
+        if not node.exists():
+            raise RuntimeError(f"Node root does not exist: {node}")
+        if not node.is_dir():
+            raise RuntimeError(f"Node root is not a directory: {node}")
+        if not (runtime / "EIDAT_App_Files").exists():
+            raise RuntimeError(f"Runtime root does not contain EIDAT_App_Files: {runtime}")
+
+        # Prefer the requirements file from the central runtime to keep updates consistent.
+        req = runtime / "EIDAT_App_Files" / "Production" / "requirements-node.txt"
+        if not req.exists():
+            req = Path(__file__).resolve().parent / "requirements-node.txt"
+
+        if on_log is not None:
+            on_log(f"[NODE] {node}")
+            on_log("[ACTION] update_processor (bootstrap node runtime venv; keep caches)")
+            on_log(f"[REQ] {req}")
+
+        from .bootstrap_env import main as bootstrap_main
+        from .node_layout import node_layout
+
+        layout = node_layout(node)
+        log_path = layout.runtime_dir / "last_install_log.txt"
+        pre_mtime = log_path.stat().st_mtime_ns if log_path.exists() else None
+
+        rc = int(
+            bootstrap_main(
+                [
+                    "--yes",
+                    "--profile",
+                    "full",
+                    "--node-root",
+                    str(node),
+                    "--requirements",
+                    str(req),
+                    "--sys-python",
+                    str(python_exe),
+                ]
+            )
+        )
+
+        post_mtime = log_path.stat().st_mtime_ns if log_path.exists() else None
+        updated = bool(pre_mtime != post_mtime)
+
+        outputs["update_processor"] = {
+            "rc": rc,
+            "python": python_exe,
+            "requirements": str(req),
+            "install_log": str(log_path),
+            "updated": updated,
+        }
+
+        if rc != 0:
+            raise RuntimeError(f"bootstrap_env failed (rc={rc})")
+
+        if on_log is not None:
+            if updated:
+                on_log("[OK] Backend processor updated.")
+            else:
+                on_log("[OK] Backend processor already up to date.")
+            if log_path.exists():
+                on_log(f"[LOG] {log_path}")
+
+        return PipelineResult(ok=True, node_root=node, outputs=outputs)
+    except Exception as exc:
+        return PipelineResult(ok=False, node_root=node, outputs=outputs, error=str(exc))
+
+
 def now_ns() -> int:
     return int(time.time_ns())
 
