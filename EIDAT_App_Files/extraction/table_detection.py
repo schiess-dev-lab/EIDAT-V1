@@ -193,6 +193,8 @@ def _gate_weak_lines(
     w: int,
     h: int,
     verbose: bool = False,
+    orth_strong: Optional["np.ndarray"] = None,
+    robust: bool = False,
 ) -> "np.ndarray":
     """
     Filter weak line components to avoid flooding (keep only plausible or strongly-supported lines).
@@ -222,6 +224,23 @@ def _gate_weak_lines(
     major_dim = int(w) if axis == "h" else int(h)
     min_len_px = max(80, int(round(float(major_dim) * float(min_len_ratio))))
 
+    anchor_end_px = _env_int("EIDAT_TABLE_DETECT_WEAK_ANCHOR_END_PX", 12 if robust else 0)
+    anchor_dilate_px = _env_int("EIDAT_TABLE_DETECT_WEAK_ANCHOR_DILATE_PX", 6 if robust else 0)
+    orth_dilated = None
+    if (
+        orth_strong is not None
+        and int(anchor_end_px) > 0
+        and int(anchor_dilate_px) > 0
+        and isinstance(orth_strong, np.ndarray)
+        and orth_strong.size > 0
+        and np.any(orth_strong)
+    ):
+        d = max(1, min(50, int(anchor_dilate_px)))
+        try:
+            orth_dilated = cv2.dilate(orth_strong, cv2.getStructuringElement(cv2.MORPH_RECT, (d, d)))
+        except Exception:
+            orth_dilated = orth_strong
+
     weak_u8 = (weak_lines > 0).astype(np.uint8, copy=False)
     num, labels, stats, _centroids = cv2.connectedComponentsWithStats(weak_u8, connectivity=8)
     if num <= 1:
@@ -241,7 +260,43 @@ def _gate_weak_lines(
         minor_thick = int(ch) if axis == "h" else int(cw)
         ov = int(overlaps[lab]) if lab < len(overlaps) else 0
 
-        if ov >= int(keep_overlap_px) or (major_len >= int(min_len_px) and minor_thick <= int(max_thick_px)):
+        anchored = False
+        if orth_dilated is not None and int(anchor_end_px) > 0:
+            end_w = max(1, min(int(cw if axis == "h" else ch), int(anchor_end_px)))
+            pad = max(0, min(50, int(anchor_dilate_px)))
+            try:
+                if axis == "h":
+                    y0 = max(0, int(y) - pad)
+                    y1 = min(int(h), int(y + ch) + pad)
+                    # Left end
+                    lx0 = max(0, int(x) - pad)
+                    lx1 = min(int(w), int(x + end_w) + pad)
+                    # Right end
+                    rx0 = max(0, int(x + cw - end_w) - pad)
+                    rx1 = min(int(w), int(x + cw) + pad)
+                    left_ok = bool(np.any(orth_dilated[y0:y1, lx0:lx1]))
+                    right_ok = bool(np.any(orth_dilated[y0:y1, rx0:rx1]))
+                    anchored = left_ok and right_ok
+                else:
+                    x0 = max(0, int(x) - pad)
+                    x1 = min(int(w), int(x + cw) + pad)
+                    # Top end
+                    ty0 = max(0, int(y) - pad)
+                    ty1 = min(int(h), int(y + end_w) + pad)
+                    # Bottom end
+                    by0 = max(0, int(y + ch - end_w) - pad)
+                    by1 = min(int(h), int(y + ch) + pad)
+                    top_ok = bool(np.any(orth_dilated[ty0:ty1, x0:x1]))
+                    bot_ok = bool(np.any(orth_dilated[by0:by1, x0:x1]))
+                    anchored = top_ok and bot_ok
+            except Exception:
+                anchored = False
+
+        if (
+            ov >= int(keep_overlap_px)
+            or (major_len >= int(min_len_px) and minor_thick <= int(max_thick_px))
+            or anchored
+        ):
             out[labels == lab] = 255
             kept += 1
 
@@ -323,6 +378,8 @@ def _extract_open_line_masks(
     prepared: Dict[str, object],
     *,
     verbose: bool = False,
+    force_curation: bool = False,
+    robust: bool = False,
 ) -> Tuple["np.ndarray", "np.ndarray"]:
     """Extract opened horizontal/vertical line masks (optionally curated)."""
     w = int(prepared.get("w") or 0)
@@ -330,10 +387,79 @@ def _extract_open_line_masks(
     bin_otsu = prepared["bin_otsu"]  # type: ignore[assignment]
     bin_high = prepared["bin_high"]  # type: ignore[assignment]
     bin_adapt = prepared["bin_adapt"]  # type: ignore[assignment]
+    img_gray_pre = prepared.get("img_gray")  # type: ignore[assignment]
     h_kernel = prepared["h_kernel"]  # type: ignore[assignment]
     v_kernel = prepared["v_kernel"]  # type: ignore[assignment]
 
-    curation = _env_bool("EIDAT_TABLE_DETECT_LINE_CURATION", False)
+    curation = bool(force_curation) or _env_bool("EIDAT_TABLE_DETECT_LINE_CURATION", False)
+
+    def _axis_gap_repair(mask: "np.ndarray", *, axis: str, gap_px: int) -> "np.ndarray":
+        if mask is None:
+            return mask
+        if not HAVE_CV2:
+            return mask
+        if int(gap_px) <= 0:
+            return mask
+        gap = max(1, min(50, int(gap_px)))
+        try:
+            if axis == "h":
+                k = cv2.getStructuringElement(cv2.MORPH_RECT, (gap, 1))
+            else:
+                k = cv2.getStructuringElement(cv2.MORPH_RECT, (1, gap))
+            return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
+        except Exception:
+            return mask
+
+    def _open_multiscale(mask: "np.ndarray", *, axis: str, kernel: "np.ndarray", short_scale: float) -> "np.ndarray":
+        try:
+            out = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        except Exception:
+            return mask
+        if not short_scale or float(short_scale) <= 0 or float(short_scale) >= 1:
+            return out
+        try:
+            base_len = int(kernel.shape[1] if axis == "h" else kernel.shape[0])
+            if base_len <= 0:
+                return out
+            short_len = int(round(float(base_len) * float(short_scale)))
+            short_len = max(10, short_len)
+            if short_len >= base_len:
+                return out
+            if axis == "h":
+                k2 = cv2.getStructuringElement(cv2.MORPH_RECT, (int(short_len), 1))
+            else:
+                k2 = cv2.getStructuringElement(cv2.MORPH_RECT, (1, int(short_len)))
+            out2 = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k2)
+            return cv2.bitwise_or(out, out2)
+        except Exception:
+            return out
+
+    def _edge_mask() -> Optional["np.ndarray"]:
+        if not HAVE_CV2:
+            return None
+        if not isinstance(img_gray_pre, np.ndarray) or img_gray_pre.size == 0:
+            return None
+        edge_aid = _env_bool("EIDAT_TABLE_DETECT_EDGE_AID", True if robust else False)
+        if not edge_aid:
+            return None
+        low = _env_int("EIDAT_TABLE_DETECT_CANNY_LOW", 50)
+        high = _env_int("EIDAT_TABLE_DETECT_CANNY_HIGH", 150)
+        low = max(0, min(255, int(low)))
+        high = max(0, min(255, int(high)))
+        if high < low:
+            high = min(255, int(low) + 50)
+        try:
+            edges = cv2.Canny(img_gray_pre, int(low), int(high))
+        except Exception:
+            return None
+        dil = _env_int("EIDAT_TABLE_DETECT_EDGE_DILATE", 1 if robust else 0)
+        if int(dil) > 0:
+            d = max(1, min(5, int(dil)))
+            try:
+                edges = cv2.dilate(edges, cv2.getStructuringElement(cv2.MORPH_RECT, (d, d)))
+            except Exception:
+                pass
+        return edges
 
     if not curation:
         combined = cv2.bitwise_or(cv2.bitwise_or(bin_otsu, bin_high), bin_adapt)
@@ -345,6 +471,7 @@ def _extract_open_line_masks(
     # Curation mode: treat BIN_HIGH_THRESH as weak evidence; keep only supported/line-like components.
     strong = cv2.bitwise_or(bin_otsu, bin_adapt)
     weak = bin_high
+    edges = _edge_mask()
 
     weak_density_cap = float(_env_float("EIDAT_TABLE_DETECT_WEAK_DENSITY_CAP", 0.35))
     weak_density = float(np.count_nonzero(weak)) / float(max(1, int(weak.size)))
@@ -355,19 +482,60 @@ def _extract_open_line_masks(
         else:
             print(f"  - Line curation: weak skipped (density={weak_density:.3f} > cap={weak_density_cap:.3f})")
 
+    repair_gap_px = _env_int("EIDAT_TABLE_DETECT_REPAIR_GAP_PX", 4 if robust else 0)
+    short_scale = float(_env_float("EIDAT_TABLE_DETECT_KERNEL_SHORT_SCALE", 0.6 if robust else 0.0))
+
     strong_h, strong_v = _apply_pre_close(strong)
-    h_strong = cv2.morphologyEx(strong_h, cv2.MORPH_OPEN, h_kernel)
-    v_strong = cv2.morphologyEx(strong_v, cv2.MORPH_OPEN, v_kernel)
+    if int(repair_gap_px) > 0 and robust:
+        strong_h = _axis_gap_repair(strong_h, axis="h", gap_px=int(repair_gap_px))
+        strong_v = _axis_gap_repair(strong_v, axis="v", gap_px=int(repair_gap_px))
+    h_strong = _open_multiscale(strong_h, axis="h", kernel=h_kernel, short_scale=short_scale)
+    v_strong = _open_multiscale(strong_v, axis="v", kernel=v_kernel, short_scale=short_scale)
 
     if use_weak:
         weak_h, weak_v = _apply_pre_close(weak)
-        h_weak = cv2.morphologyEx(weak_h, cv2.MORPH_OPEN, h_kernel)
-        v_weak = cv2.morphologyEx(weak_v, cv2.MORPH_OPEN, v_kernel)
-        h_weak = _gate_weak_lines(h_weak, h_strong, axis="h", w=w, h=h, verbose=bool(verbose))
-        v_weak = _gate_weak_lines(v_weak, v_strong, axis="v", w=w, h=h, verbose=bool(verbose))
+        if int(repair_gap_px) > 0:
+            weak_h = _axis_gap_repair(weak_h, axis="h", gap_px=int(repair_gap_px))
+            weak_v = _axis_gap_repair(weak_v, axis="v", gap_px=int(repair_gap_px))
+        h_weak = _open_multiscale(weak_h, axis="h", kernel=h_kernel, short_scale=short_scale)
+        v_weak = _open_multiscale(weak_v, axis="v", kernel=v_kernel, short_scale=short_scale)
     else:
         h_weak = np.zeros_like(h_strong)
         v_weak = np.zeros_like(v_strong)
+
+    if edges is not None and isinstance(edges, np.ndarray) and edges.size > 0 and np.any(edges):
+        e_h, e_v = _apply_pre_close(edges)
+        if int(repair_gap_px) > 0:
+            e_h = _axis_gap_repair(e_h, axis="h", gap_px=int(repair_gap_px))
+            e_v = _axis_gap_repair(e_v, axis="v", gap_px=int(repair_gap_px))
+        h_edge = _open_multiscale(e_h, axis="h", kernel=h_kernel, short_scale=short_scale)
+        v_edge = _open_multiscale(e_v, axis="v", kernel=v_kernel, short_scale=short_scale)
+        try:
+            h_weak = cv2.bitwise_or(h_weak, h_edge)
+            v_weak = cv2.bitwise_or(v_weak, v_edge)
+        except Exception:
+            pass
+
+    h_weak = _gate_weak_lines(
+        h_weak,
+        h_strong,
+        axis="h",
+        w=w,
+        h=h,
+        verbose=bool(verbose),
+        orth_strong=v_strong,
+        robust=bool(robust),
+    )
+    v_weak = _gate_weak_lines(
+        v_weak,
+        v_strong,
+        axis="v",
+        w=w,
+        h=h,
+        verbose=bool(verbose),
+        orth_strong=h_strong,
+        robust=bool(robust),
+    )
 
     horiz_open = cv2.bitwise_or(h_strong, h_weak)
     vert_open = cv2.bitwise_or(v_strong, v_weak)
@@ -396,134 +564,150 @@ def detect_tables(
     if not HAVE_CV2:
         return {'tables': [], 'cells': []}
 
-    h, w = img_gray.shape
-    guardrails = _env_bool("EIDAT_TABLE_DETECT_GUARDRAILS", True)
+    def _run_once(*, robust: bool) -> Dict:
+        h, w = img_gray.shape
+        guardrails = _env_bool("EIDAT_TABLE_DETECT_GUARDRAILS", True)
 
-    prepared = _prepare_line_detection(img_gray)
-    horiz_open, vert_open = _extract_open_line_masks(prepared, verbose=bool(verbose))
+        prepared = _prepare_line_detection(img_gray)
+        horiz_open, vert_open = _extract_open_line_masks(
+            prepared,
+            verbose=bool(verbose),
+            force_curation=bool(robust),
+            robust=bool(robust),
+        )
 
-    # Step 1: Detect cells using contour and corner methods
-    cells_contour = _find_cells_contour(
-        img_gray,
-        verbose=verbose,
-        prepared=prepared,
-        opened_lines=(horiz_open, vert_open),
-    )
-    cells_corner = _find_cells_corner(
-        img_gray,
-        verbose=verbose,
-        guardrails=guardrails,
-        prepared=prepared,
-        opened_lines=(horiz_open, vert_open),
-    )
+        # Step 1: Detect cells using contour and corner methods
+        cells_contour = _find_cells_contour(
+            img_gray,
+            verbose=verbose,
+            prepared=prepared,
+            opened_lines=(horiz_open, vert_open),
+        )
+        cells_corner = _find_cells_corner(
+            img_gray,
+            verbose=verbose,
+            guardrails=guardrails,
+            prepared=prepared,
+            opened_lines=(horiz_open, vert_open),
+        )
 
-    # Step 2: Merge and deduplicate
-    all_cells = cells_contour + cells_corner
+        # Step 2: Merge and deduplicate
+        all_cells = cells_contour + cells_corner
 
-    # Step 2.5: Filter out thin cells (border line artifacts)
-    # At 900 DPI, real cells should be at least 30px in both dimensions
-    # A 2px wide "cell" is clearly a border line being detected as a cell
-    min_cell_dim = _env_int("EIDAT_TABLE_DETECT_MIN_CELL_DIM_PX", 30)  # ~0.85mm at 900 DPI
-    all_cells = [c for c in all_cells
-                 if (c['bbox_px'][2] - c['bbox_px'][0]) >= min_cell_dim and
-                    (c['bbox_px'][3] - c['bbox_px'][1]) >= min_cell_dim]
+        # Step 2.5: Filter out thin cells (border line artifacts)
+        # At 900 DPI, real cells should be at least 30px in both dimensions
+        # A 2px wide "cell" is clearly a border line being detected as a cell
+        min_cell_dim = _env_int("EIDAT_TABLE_DETECT_MIN_CELL_DIM_PX", 30)  # ~0.85mm at 900 DPI
+        all_cells = [c for c in all_cells
+                     if (c['bbox_px'][2] - c['bbox_px'][0]) >= min_cell_dim and
+                        (c['bbox_px'][3] - c['bbox_px'][1]) >= min_cell_dim]
 
-    # Step 2.6: Filter out "tiny" cells (chart grid artifacts).
-    # These can explode cell counts and make clustering O(n^2) effectively hang.
-    # Defaults are intentionally conservative; override via env if needed.
-    tiny_min_h = _env_int("EIDAT_TABLE_DETECT_TINY_CELL_H_PX", 10)
-    tiny_min_w = _env_int("EIDAT_TABLE_DETECT_TINY_CELL_W_PX", 0)
-    if int(tiny_min_h) > 0 or int(tiny_min_w) > 0:
-        _min_h = max(0, int(tiny_min_h))
-        _min_w = max(0, int(tiny_min_w))
-        all_cells = [
-            c for c in all_cells
-            if (c['bbox_px'][3] - c['bbox_px'][1]) >= _min_h and
-               (c['bbox_px'][2] - c['bbox_px'][0]) >= _min_w
-        ]
+        # Step 2.6: Filter out "tiny" cells (chart grid artifacts).
+        # These can explode cell counts and make clustering O(n^2) effectively hang.
+        # Defaults are intentionally conservative; override via env if needed.
+        tiny_min_h = _env_int("EIDAT_TABLE_DETECT_TINY_CELL_H_PX", 10)
+        tiny_min_w = _env_int("EIDAT_TABLE_DETECT_TINY_CELL_W_PX", 0)
+        if int(tiny_min_h) > 0 or int(tiny_min_w) > 0:
+            _min_h = max(0, int(tiny_min_h))
+            _min_w = max(0, int(tiny_min_w))
+            all_cells = [
+                c for c in all_cells
+                if (c['bbox_px'][3] - c['bbox_px'][1]) >= _min_h and
+                   (c['bbox_px'][2] - c['bbox_px'][0]) >= _min_w
+            ]
 
-    # Guardrail: avoid quadratic work on pathological cell counts (charts / dense grids).
-    # NOTE: The original max-cluster guard is applied after container filtering, but pages can hang
-    # earlier (dedupe/container) when the raw cell count explodes.
-    max_cluster_cells = _env_int("EIDAT_TABLE_DETECT_MAX_CLUSTER_CELLS", 0)
-    hard_max_cells = _env_int("EIDAT_TABLE_DETECT_HARD_MAX_CELLS", 8000)
-    if int(hard_max_cells) < 0:
-        hard_max_cells = 0
-    if guardrails:
-        if int(hard_max_cells) > 0 and len(all_cells) > int(hard_max_cells):
-            if verbose:
-                print(f"  - Skipping table detection: raw cells {len(all_cells)} exceeds hard max {int(hard_max_cells)}")
-            return {'tables': [], 'cells': []}
-        pre_dedupe_cap = max(0, int(max_cluster_cells) * 4) if int(max_cluster_cells) > 0 else 0
-        if pre_dedupe_cap and len(all_cells) > int(pre_dedupe_cap):
-            if verbose:
-                print(
-                    f"  - Skipping table detection: raw cells {len(all_cells)} exceeds pre-dedupe cap {int(pre_dedupe_cap)}"
-                )
-            return {'tables': [], 'cells': []}
+        # Guardrail: avoid quadratic work on pathological cell counts (charts / dense grids).
+        # NOTE: The original max-cluster guard is applied after container filtering, but pages can hang
+        # earlier (dedupe/container) when the raw cell count explodes.
+        max_cluster_cells = _env_int("EIDAT_TABLE_DETECT_MAX_CLUSTER_CELLS", 0)
+        hard_max_cells = _env_int("EIDAT_TABLE_DETECT_HARD_MAX_CELLS", 8000)
+        if int(hard_max_cells) < 0:
+            hard_max_cells = 0
+        if guardrails:
+            if int(hard_max_cells) > 0 and len(all_cells) > int(hard_max_cells):
+                if verbose:
+                    print(f"  - Skipping table detection: raw cells {len(all_cells)} exceeds hard max {int(hard_max_cells)}")
+                return {'tables': [], 'cells': []}
+            pre_dedupe_cap = max(0, int(max_cluster_cells) * 4) if int(max_cluster_cells) > 0 else 0
+            if pre_dedupe_cap and len(all_cells) > int(pre_dedupe_cap):
+                if verbose:
+                    print(
+                        f"  - Skipping table detection: raw cells {len(all_cells)} exceeds pre-dedupe cap {int(pre_dedupe_cap)}"
+                    )
+                return {'tables': [], 'cells': []}
 
-    # Step 2.7: Merge and deduplicate (can be quadratic; keep after cheap filters + cap)
-    all_cells = _remove_duplicate_cells(all_cells)
+        # Step 2.7: Merge and deduplicate (can be quadratic; keep after cheap filters + cap)
+        all_cells = _remove_duplicate_cells(all_cells)
 
-    # Step 3: Filter out container cells (large frames around actual cells)
-    actual_cells = _filter_containers(all_cells)
+        # Step 3: Filter out container cells (large frames around actual cells)
+        actual_cells = _filter_containers(all_cells)
 
-    # Step 4: Filter out oversized cells (likely chart frames)
-    page_area = w * h
-    max_cell_area = page_area * 0.15
-    actual_cells = [c for c in actual_cells
-                    if (c['bbox_px'][2] - c['bbox_px'][0]) * (c['bbox_px'][3] - c['bbox_px'][1]) <= max_cell_area]
+        # Step 4: Filter out oversized cells (likely chart frames)
+        page_area = w * h
+        max_cell_area = page_area * 0.15
+        actual_cells = [c for c in actual_cells
+                        if (c['bbox_px'][2] - c['bbox_px'][0]) * (c['bbox_px'][3] - c['bbox_px'][1]) <= max_cell_area]
 
-    # Step 4.5: Guard against pathological cell counts (charts / dense grids).
-    # Clustering is O(n^2); beyond a point it becomes impractical.
-    if guardrails:
-        if int(hard_max_cells) > 0 and len(actual_cells) > int(hard_max_cells):
-            if verbose:
-                print(f"  - Skipping table detection: {len(actual_cells)} cells exceeds hard max {int(hard_max_cells)}")
-            return {'tables': [], 'cells': []}
-        if int(max_cluster_cells) > 0 and len(actual_cells) > int(max_cluster_cells):
-            if verbose:
-                print(f"  - Skipping table clustering: {len(actual_cells)} cells exceeds max {int(max_cluster_cells)}")
-            return {'tables': [], 'cells': []}
+        # Step 4.5: Guard against pathological cell counts (charts / dense grids).
+        # Clustering is O(n^2); beyond a point it becomes impractical.
+        if guardrails:
+            if int(hard_max_cells) > 0 and len(actual_cells) > int(hard_max_cells):
+                if verbose:
+                    print(f"  - Skipping table detection: {len(actual_cells)} cells exceeds hard max {int(hard_max_cells)}")
+                return {'tables': [], 'cells': []}
+            if int(max_cluster_cells) > 0 and len(actual_cells) > int(max_cluster_cells):
+                if verbose:
+                    print(f"  - Skipping table clustering: {len(actual_cells)} cells exceeds max {int(max_cluster_cells)}")
+                return {'tables': [], 'cells': []}
 
-    # Step 5: Cluster cells into tables
-    tables = _cluster_into_tables(
-        actual_cells,
-        w,
-        h,
-        gap_ratio=float(cluster_gap_ratio),
-        gap_px=cluster_gap_px,
-    )
+        # Step 5: Cluster cells into tables
+        tables = _cluster_into_tables(
+            actual_cells,
+            w,
+            h,
+            gap_ratio=float(cluster_gap_ratio),
+            gap_px=cluster_gap_px,
+        )
 
-    # Step 5.5: Merge overlapping cells within each row band (dedupe artifacts)
-    drop_ids = set()
-    for table in tables:
-        table_cells = table.get('cells', [])
-        merged, dropped = _merge_overlapping_cells_in_rows(table_cells)
-        if dropped:
-            drop_ids.update(id(c) for c in dropped)
-            table['cells'] = merged
-            table['num_cells'] = len(merged)
-            if merged:
-                x0 = min(c['bbox_px'][0] for c in merged)
-                y0 = min(c['bbox_px'][1] for c in merged)
-                x1 = max(c['bbox_px'][2] for c in merged)
-                y1 = max(c['bbox_px'][3] for c in merged)
-                table['bbox_px'] = [x0, y0, x1, y1]
+        # Step 5.5: Merge overlapping cells within each row band (dedupe artifacts)
+        drop_ids = set()
+        for table in tables:
+            table_cells = table.get('cells', [])
+            merged, dropped = _merge_overlapping_cells_in_rows(table_cells)
+            if dropped:
+                drop_ids.update(id(c) for c in dropped)
+                table['cells'] = merged
+                table['num_cells'] = len(merged)
+                if merged:
+                    x0 = min(c['bbox_px'][0] for c in merged)
+                    y0 = min(c['bbox_px'][1] for c in merged)
+                    x1 = max(c['bbox_px'][2] for c in merged)
+                    y1 = max(c['bbox_px'][3] for c in merged)
+                    table['bbox_px'] = [x0, y0, x1, y1]
 
-    if drop_ids:
-        actual_cells = [c for c in actual_cells if id(c) not in drop_ids]
+        if drop_ids:
+            actual_cells = [c for c in actual_cells if id(c) not in drop_ids]
 
-    # Step 6: Filter out single-cell tables (noise)
-    tables = [t for t in tables if t['num_cells'] >= 2]
+        # Step 6: Filter out single-cell tables (noise)
+        tables = [t for t in tables if t['num_cells'] >= 2]
 
-    if verbose:
-        print(f"  Detected {len(actual_cells)} cells in {len(tables)} tables")
+        if verbose:
+            mode = "ROBUST" if robust else "NORMAL"
+            print(f"  [{mode}] Detected {len(actual_cells)} cells in {len(tables)} tables")
 
-    return {
-        'tables': tables,
-        'cells': actual_cells
-    }
+        return {
+            'tables': tables,
+            'cells': actual_cells
+        }
+
+    result = _run_once(robust=False)
+    robust_retry = _env_bool("EIDAT_TABLE_DETECT_ROBUST_RETRY", False)
+    if robust_retry and (len(result.get("tables") or []) == 0 or len(result.get("cells") or []) == 0):
+        if verbose:
+            print("  - Robust retry enabled: re-running bordered line/cell detection with repair + edge aid")
+        result = _run_once(robust=True)
+
+    return result
 
 
 def _find_cells_contour(

@@ -44,6 +44,8 @@ DEFAULT_TREND_AUTO_REPORT_CONFIG = DATA_ROOT / "user_inputs" / "trend_auto_repor
 DEFAULT_ACCEPTANCE_HEURISTICS = DATA_ROOT / "user_inputs" / "acceptance_heuristics.json"
 EXCEL_EXTENSIONS = {".xlsx", ".xls", ".xlsm"}
 EXCEL_ARTIFACT_SUFFIX = "__excel"
+TD_ALLOWED_STATS_ORDER = ["mean", "min", "max", "std", "median", "count"]
+TD_ALLOWED_STATS = set(TD_ALLOWED_STATS_ORDER)
 # Default repository root where PDFs may live (user-organized, nested or flat)
 DEFAULT_REPO_ROOT = ROOT / "Data Packages"
 DEFAULT_PDF_DIR = DEFAULT_REPO_ROOT
@@ -2990,7 +2992,7 @@ def _read_test_data_data_definitions(workbook_path: Path) -> list[dict]:
         if col_header is None or col_table_label is None or col_data_group is None:
             return []
 
-        allowed = {"mean", "min", "max", "std", "median", "count"}
+        allowed = TD_ALLOWED_STATS
         out: list[dict] = []
         for row in range(2, (ws.max_row or 0) + 1):
             dg = str(ws.cell(row, int(col_data_group)).value or "").strip()
@@ -3162,8 +3164,27 @@ def ensure_test_data_project_cache(
         rebuild_test_data_project_cache(db_path, wb_path)
         return db_path
 
-    # If the stats ignore-first config changed, rebuild so td_metrics are consistent.
-    if int(cached_ignore_first_n) != int(current_ignore_first_n):
+    cached_stats_csv = ""
+    try:
+        with sqlite3.connect(str(db_path)) as conn:
+            row = conn.execute("SELECT value FROM td_meta WHERE key='statistics' LIMIT 1").fetchone()
+            cached_stats_csv = str(row[0] or "").strip() if row and row[0] is not None else ""
+    except Exception:
+        cached_stats_csv = ""
+
+    current_stats: list[str] = []
+    try:
+        current_stats = list((_load_excel_trend_config(DEFAULT_EXCEL_TREND_CONFIG) or {}).get("statistics") or [])
+    except Exception:
+        current_stats = []
+    current_stats = [str(s).strip().lower() for s in current_stats if str(s).strip()]
+    current_stats = [s for s in current_stats if s in TD_ALLOWED_STATS]
+    if not current_stats:
+        current_stats = list(TD_ALLOWED_STATS_ORDER)
+    current_stats_csv = ",".join(current_stats)
+
+    # If the stats selection or ignore-first config changed, rebuild so td_metrics are consistent.
+    if int(cached_ignore_first_n) != int(current_ignore_first_n) or cached_stats_csv != current_stats_csv:
         rebuild_test_data_project_cache(db_path, wb_path)
         return db_path
 
@@ -3248,6 +3269,18 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
     ]
 
     computed_epoch_ns = time.time_ns()
+
+    # Stats selection is driven entirely by user_inputs/excel_trend_config.json.
+    selected_stats: list[str] = []
+    try:
+        selected_stats = list((_load_excel_trend_config(DEFAULT_EXCEL_TREND_CONFIG) or {}).get("statistics") or [])
+    except Exception:
+        selected_stats = []
+    selected_stats = [str(s).strip().lower() for s in selected_stats if str(s).strip()]
+    selected_stats = [s for s in selected_stats if s in TD_ALLOWED_STATS]
+    if not selected_stats:
+        selected_stats = list(TD_ALLOWED_STATS_ORDER)
+
     # Optional: ignore the first N samples when computing per-serial statistics (mean/min/max/std/median/count).
     # This is configured via user_inputs/excel_trend_config.json.
     stats_ignore_first_n = 0
@@ -3528,6 +3561,10 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
             "INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)",
             ("statistics_ignore_first_n", str(int(stats_ignore_first_n))),
         )
+        conn.execute(
+            "INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)",
+            ("statistics", ",".join(selected_stats)),
+        )
         try:
             conn.execute(
                 "INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)",
@@ -3776,7 +3813,8 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
                             y_for_stats = y_for_stats[int(stats_ignore_first_n) :]
                         stats_map = _compute_stats(y_for_stats)
                         with sqlite3.connect(str(db_path)) as conn:
-                            for stat, val in stats_map.items():
+                            for stat in selected_stats:
+                                val = stats_map.get(stat)
                                 conn.execute(
                                     """
                                     INSERT OR REPLACE INTO td_metrics
@@ -4197,7 +4235,7 @@ def update_test_data_trending_project_workbook(
     cfg_cols = list(cfg.get("columns") or [])
     cfg_stats = [str(s).strip().lower() for s in (cfg.get("statistics") or []) if str(s).strip()]
     if not cfg_stats:
-        cfg_stats = ["mean", "min", "max", "std", "median", "count"]
+        cfg_stats = list(TD_ALLOWED_STATS_ORDER)
 
     cfg_by_name: dict[str, dict] = {}
     cfg_order: list[str] = []
@@ -4630,7 +4668,14 @@ def read_eidat_index_documents(global_repo: Path) -> list[dict]:
             "report_date",
             "document_type",
         ]
-        for opt in ("document_type_acronym", "vendor", "acceptance_test_plan_number", "excel_sqlite_rel", "file_extension"):
+        for opt in (
+            "document_type_acronym",
+            "vendor",
+            "acceptance_test_plan_number",
+            "excel_sqlite_rel",
+            "tables_sqlite_rel",
+            "file_extension",
+        ):
             if opt in cols:
                 select_cols.append(opt)
         select_cols += ["metadata_rel", "artifacts_rel", "similarity_group"]
@@ -4648,6 +4693,7 @@ def read_eidat_index_documents(global_repo: Path) -> list[dict]:
         d.setdefault("vendor", None)
         d.setdefault("acceptance_test_plan_number", None)
         d.setdefault("excel_sqlite_rel", None)
+        d.setdefault("tables_sqlite_rel", None)
         d.setdefault("file_extension", None)
         docs.append(d)
     return docs
@@ -4745,17 +4791,27 @@ def read_files_with_index_metadata(global_repo: Path) -> list[dict]:
         merged = {**file_info}
         if matched_doc:
             merged.update({
+                # Keep document id separate from support DB file id.
+                "document_id": matched_doc.get("id"),
                 "program_title": matched_doc.get("program_title"),
                 "asset_type": matched_doc.get("asset_type"),
+                "asset_specific_type": matched_doc.get("asset_specific_type"),
                 "serial_number": matched_doc.get("serial_number"),
                 "part_number": matched_doc.get("part_number"),
                 "revision": matched_doc.get("revision"),
                 "test_date": matched_doc.get("test_date"),
                 "report_date": matched_doc.get("report_date"),
                 "document_type": matched_doc.get("document_type"),
+                "document_type_acronym": matched_doc.get("document_type_acronym"),
+                "vendor": matched_doc.get("vendor"),
+                "acceptance_test_plan_number": matched_doc.get("acceptance_test_plan_number"),
+                "excel_sqlite_rel": matched_doc.get("excel_sqlite_rel"),
+                "file_extension": matched_doc.get("file_extension"),
+                "title_norm": matched_doc.get("title_norm"),
                 "metadata_rel": matched_doc.get("metadata_rel"),
                 "artifacts_rel": matched_doc.get("artifacts_rel"),
                 "similarity_group": matched_doc.get("similarity_group"),
+                "indexed_epoch_ns": matched_doc.get("indexed_epoch_ns"),
                 "certification_status": matched_doc.get("certification_status"),
                 "certification_pass_rate": matched_doc.get("certification_pass_rate"),
             })
@@ -4779,6 +4835,85 @@ def get_file_artifacts_path(global_repo: Path, rel_path: str) -> Path | None:
         if cand.exists():
             return cand
     return None
+
+
+def deep_search_combined_txt(
+    global_repo: Path,
+    rel_paths: list[str],
+    query: str,
+    *,
+    case_sensitive: bool = False,
+    max_combined_bytes: int | None = None,
+) -> dict:
+    """
+    Deep search for `query` across per-document `combined.txt` artifacts.
+
+    Returns a dict:
+      - matched_rel_paths: list[str]
+      - scanned: int (combined.txt files opened)
+      - missing: int (documents with no combined.txt found)
+      - errors: list[str] (best-effort; truncated)
+    """
+    repo = Path(global_repo).expanduser()
+    q = str(query or "")
+    q = q.strip("\ufeff").strip()
+    if not q:
+        return {"matched_rel_paths": [], "scanned": 0, "missing": 0, "errors": []}
+
+    want = q if case_sensitive else q.casefold()
+    matched: list[str] = []
+    scanned = 0
+    missing = 0
+    errors: list[str] = []
+
+    def _text_contains(path: Path) -> bool:
+        nonlocal scanned
+        scanned += 1
+        try:
+            if max_combined_bytes is not None and max_combined_bytes > 0:
+                # Heuristic: skip overly large combined.txt files (avoid UI hangs).
+                try:
+                    if path.stat().st_size > int(max_combined_bytes):
+                        return False
+                except Exception:
+                    pass
+            with path.open("r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    hay = line if case_sensitive else line.casefold()
+                    if want in hay:
+                        return True
+        except Exception as exc:
+            msg = f"{path}: {exc}"
+            errors.append(msg[:500])
+        return False
+
+    for rel_path in rel_paths:
+        rel = str(rel_path or "").strip()
+        if not rel:
+            continue
+        try:
+            artifacts = get_file_artifacts_path(repo, rel)
+        except Exception as exc:
+            errors.append(f"{rel}: {exc}"[:500])
+            continue
+        if not artifacts or not artifacts.exists():
+            missing += 1
+            continue
+        combined = artifacts / "combined.txt"
+        if not combined.exists():
+            missing += 1
+            continue
+        if _text_contains(combined):
+            matched.append(rel)
+
+    # Stable ordering for UI
+    matched = sorted(set(matched), key=lambda s: s.casefold())
+    return {
+        "matched_rel_paths": matched,
+        "scanned": int(scanned),
+        "missing": int(missing),
+        "errors": errors,
+    }
 
 
 def _normalize_text(s: str) -> str:
@@ -9019,10 +9154,14 @@ def _load_excel_trend_config(path: Path) -> dict:
     cols = data.get("columns")
     if not isinstance(cols, list) or not cols:
         raise ValueError("Excel trend config must include a non-empty `columns` list.")
-    stats = data.get("statistics") or ["mean", "min", "max", "std", "median", "count"]
+    stats = data.get("statistics") or list(TD_ALLOWED_STATS_ORDER)
     if not isinstance(stats, list) or not all(isinstance(s, str) and s for s in stats):
         raise ValueError("Excel trend config `statistics` must be a list of strings.")
-    data["statistics"] = [str(s).strip().lower() for s in stats]
+    stats_norm = [str(s).strip().lower() for s in stats if str(s).strip()]
+    stats_norm = [s for s in stats_norm if s in TD_ALLOWED_STATS]
+    if not stats_norm:
+        stats_norm = list(TD_ALLOWED_STATS_ORDER)
+    data["statistics"] = stats_norm
 
     ign = data.get("statistics_ignore_first_n", 0)
     try:
@@ -9067,6 +9206,9 @@ def _load_excel_trend_config(path: Path) -> dict:
                 stats = [str(s).strip().lower() for s in stats_raw if str(s).strip()]
                 if not stats:
                     stats = ["mean"]
+            stats = [s for s in stats if s in TD_ALLOWED_STATS]
+            if not stats:
+                stats = ["mean"]
 
             fit_raw = raw.get("fit") or {}
             if fit_raw is not None and not isinstance(fit_raw, dict):
@@ -9127,7 +9269,10 @@ def _write_test_data_trending_workbook(
             col_names.append(name)
     stats = [str(s).strip().lower() for s in cfg_stats if str(s).strip()]
     if not stats:
-        stats = ["mean", "min", "max", "std", "median", "count"]
+        stats = list(TD_ALLOWED_STATS_ORDER)
+    stats = [s for s in stats if s in TD_ALLOWED_STATS]
+    if not stats:
+        stats = list(TD_ALLOWED_STATS_ORDER)
 
     def _read_runs_from_sqlite(sqlite_path: Path) -> list[str]:
         p = Path(sqlite_path).expanduser()

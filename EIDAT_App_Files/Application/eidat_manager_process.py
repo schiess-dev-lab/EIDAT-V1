@@ -94,6 +94,55 @@ def _export_extracted_terms_db(artifacts_dir: Path, combined_txt_path: Path) -> 
         return
 
 
+def _resolve_table_label_marker() -> str:
+    """
+    Best-effort resolve the combined.txt label marker from user_inputs/table_label_rules.json.
+
+    If missing/invalid, defaults to "TABLE_LABEL".
+    """
+    try:
+        rules_path = _resolve_user_inputs_file("table_label_rules.json")
+    except Exception:
+        return "TABLE_LABEL"
+    try:
+        if not rules_path.exists():
+            return "TABLE_LABEL"
+        raw = json.loads(rules_path.read_text(encoding="utf-8", errors="ignore"))
+        if not isinstance(raw, dict):
+            return "TABLE_LABEL"
+        marker = str(raw.get("marker") or "TABLE_LABEL").strip() or "TABLE_LABEL"
+        return marker
+    except Exception:
+        return "TABLE_LABEL"
+
+
+def _export_labeled_tables_db(artifacts_dir: Path, combined_txt_path: Path) -> None:
+    """
+    Export `[TABLE_LABEL]`-labeled ASCII tables from the final combined.txt into labeled_tables.db.
+
+    Best-effort: failures should not fail document processing.
+    """
+    try:
+        from extraction.labeled_tables_exporter import export_labeled_tables_db
+    except Exception:
+        return
+
+    try:
+        marker = _resolve_table_label_marker()
+    except Exception:
+        marker = "TABLE_LABEL"
+
+    try:
+        export_labeled_tables_db(
+            artifacts_dir=artifacts_dir,
+            combined_txt_path=combined_txt_path,
+            marker=marker,
+            db_name="labeled_tables.db",
+        )
+    except Exception:
+        return
+
+
 def _load_excel_extractor() -> Any:
     """Load the Excel extraction helper module from scripts/."""
     project_root = Path(__file__).resolve().parent.parent
@@ -1213,6 +1262,7 @@ def process_candidates(
                         # Export extracted_terms.db from the final post-processed combined.txt.
                         if artifacts_dir and combined_txt_path is not None:
                             _export_extracted_terms_db(Path(artifacts_dir), combined_txt_path)
+                            _export_labeled_tables_db(Path(artifacts_dir), combined_txt_path)
 
                         if force or not has_pointer_token(abs_path):
                             eidat_uuid = uuid.uuid4().hex

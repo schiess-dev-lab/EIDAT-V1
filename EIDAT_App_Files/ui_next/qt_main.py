@@ -8,6 +8,7 @@ import sys
 import threading
 import math
 import statistics
+import datetime
 from pathlib import Path
 from typing import Callable
 
@@ -2982,6 +2983,11 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         col_grid.addWidget(self.cb_perf_y_col, 1, 1)
         perf_layout.addLayout(col_grid)
 
+        self.lbl_perf_common_runs = QtWidgets.QLabel("Common runs for X/Y: —")
+        self.lbl_perf_common_runs.setStyleSheet("color: #64748b; font-size: 11px;")
+        self.lbl_perf_common_runs.setWordWrap(True)
+        perf_layout.addWidget(self.lbl_perf_common_runs)
+
         fit_row = QtWidgets.QHBoxLayout()
         self.cb_perf_fit = QtWidgets.QCheckBox("Fit polynomial")
         self.cb_perf_fit.setChecked(True)
@@ -3883,6 +3889,31 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         if not self._perf_available_stats:
             self._perf_available_stats = ["mean", "min", "max", "std", "median", "count"]
 
+        # Keep the Metrics tab stat selector consistent with excel_trend_config.json.
+        if hasattr(self, "list_stats"):
+            try:
+                prev = {it.text().strip().lower() for it in self.list_stats.selectedItems() if it and it.text().strip()}
+            except Exception:
+                prev = set()
+            self.list_stats.blockSignals(True)
+            try:
+                self.list_stats.clear()
+                for st in self._perf_available_stats:
+                    self.list_stats.addItem(QtWidgets.QListWidgetItem(st))
+
+                # Restore selection where possible; otherwise default to the first entry.
+                restored = False
+                if prev:
+                    for i in range(self.list_stats.count()):
+                        it = self.list_stats.item(i)
+                        if it and it.text().strip().lower() in prev:
+                            it.setSelected(True)
+                            restored = True
+                if not restored and self.list_stats.count() > 0:
+                    self.list_stats.item(0).setSelected(True)
+            finally:
+                self.list_stats.blockSignals(False)
+
         self.cb_perf_plotter.blockSignals(True)
         self.cb_perf_plotter.clear()
         self.cb_perf_plotter.setEnabled(True)
@@ -3901,6 +3932,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         except Exception:
             runs = []
         union: dict[str, dict] = {}
+        col_runs: dict[str, set[str]] = {}
         for rn in runs:
             try:
                 cols = be.td_list_y_columns(self._db_path, rn)
@@ -3912,12 +3944,15 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     continue
                 units = str((c or {}).get("units") or "").strip()
                 key = _norm(nm)
+                col_runs.setdefault(key, set()).add(str(rn))
                 if key not in union:
                     union[key] = {"name": nm, "units": units}
                 else:
                     if not str(union[key].get("units") or "").strip() and units:
                         union[key]["units"] = units
         self._perf_available_columns = sorted(union.values(), key=lambda d: str(d.get("name") or "").lower())
+        self._perf_col_runs = col_runs
+        self._perf_all_runs = [str(r).strip() for r in runs if str(r).strip()]
 
         def _fill_col_combo(cb: QtWidgets.QComboBox) -> None:
             prev_text = str(cb.currentText() or "").strip()
@@ -3945,6 +3980,93 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
         _fill_col_combo(self.cb_perf_x_col)
         _fill_col_combo(self.cb_perf_y_col)
+
+        def _common_runs_for_pair(x_name: str, y_name: str) -> list[str]:
+            xn = _norm(x_name)
+            yn = _norm(y_name)
+            xr = set(self._perf_col_runs.get(xn) or set())
+            yr = set(self._perf_col_runs.get(yn) or set())
+            common = xr & yr
+            if not common:
+                return []
+            order = {r: i for i, r in enumerate(self._perf_all_runs or [])}
+            return sorted(common, key=lambda r: order.get(r, 10**9))
+
+        def _update_common_runs_label() -> None:
+            if not hasattr(self, "lbl_perf_common_runs"):
+                return
+            x_name = self._perf_current_col_name(self.cb_perf_x_col)
+            y_name = self._perf_current_col_name(self.cb_perf_y_col)
+            common = _common_runs_for_pair(x_name, y_name) if x_name and y_name else []
+            if not x_name or not y_name:
+                self.lbl_perf_common_runs.setText("Common runs for X/Y: —")
+                return
+            if x_name.strip().lower() == y_name.strip().lower():
+                self.lbl_perf_common_runs.setText("Common runs for X/Y: — (X and Y must be different)")
+                return
+            if not common:
+                self.lbl_perf_common_runs.setText("Common runs for X/Y: 0 (no run contains both columns)")
+                return
+            shown = ", ".join(common[:4])
+            extra = f" (+{len(common) - 4})" if len(common) > 4 else ""
+            self.lbl_perf_common_runs.setText(f"Common runs for X/Y: {len(common)} — {shown}{extra}")
+
+        def _filter_axis_options(*, changed: str) -> None:
+            # Keep the dropdowns focused: when one axis is selected from the list,
+            # restrict the other axis choices to columns that co-occur on at least one run.
+            if not hasattr(self, "_perf_col_runs"):
+                return
+            if changed not in {"x", "y"}:
+                return
+            try:
+                if changed == "x":
+                    pivot = self._perf_current_col_name(self.cb_perf_x_col)
+                    other = self.cb_perf_y_col
+                else:
+                    pivot = self._perf_current_col_name(self.cb_perf_y_col)
+                    other = self.cb_perf_x_col
+                pnorm = _norm(pivot)
+                pruns = set(self._perf_col_runs.get(pnorm) or set())
+                if not pivot or not pruns:
+                    return
+                # Allowed = any col that shares at least one run with pivot (and isn't the pivot itself).
+                allowed_norms = {k for k, rs in (self._perf_col_runs or {}).items() if (set(rs or set()) & pruns)}
+                allowed_norms.discard(pnorm)
+
+                prev = self._perf_current_col_name(other)
+                prev_norm = _norm(prev)
+                other.blockSignals(True)
+                other.clear()
+                for c in self._perf_available_columns:
+                    nm = str(c.get("name") or "").strip()
+                    if not nm:
+                        continue
+                    nk = _norm(nm)
+                    if nk not in allowed_norms:
+                        continue
+                    units = str(c.get("units") or "").strip()
+                    label = f"{nm} ({units})" if units else nm
+                    other.addItem(label, nm)
+                other.blockSignals(False)
+                if prev_norm and prev_norm in allowed_norms:
+                    other.setCurrentText(prev)
+                elif other.count() > 0:
+                    other.setCurrentIndex(0)
+            finally:
+                _update_common_runs_label()
+
+        # Signals (connect once)
+        if not getattr(self, "_perf_axis_signals_connected", False):
+            self.cb_perf_x_col.currentIndexChanged.connect(lambda *_: _filter_axis_options(changed="x"))
+            self.cb_perf_y_col.currentIndexChanged.connect(lambda *_: _filter_axis_options(changed="y"))
+            try:
+                self.cb_perf_x_col.editTextChanged.connect(lambda *_: _update_common_runs_label())
+                self.cb_perf_y_col.editTextChanged.connect(lambda *_: _update_common_runs_label())
+            except Exception:
+                pass
+            self._perf_axis_signals_connected = True
+
+        _update_common_runs_label()
 
         # Stats checklist
         prev_checked = set()
@@ -4109,12 +4231,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         splitter.setOrientation(QtCore.Qt.Orientation.Horizontal)
         layout.addWidget(splitter, 1)
 
-        # Left: Highlight serials
+        # Left: Serials under certification
         left = QtWidgets.QFrame()
         left_l = QtWidgets.QVBoxLayout(left)
         left_l.setContentsMargins(10, 10, 10, 10)
         left_l.setSpacing(8)
-        left_l.addWidget(QtWidgets.QLabel("Highlighted Serials (optional)"))
+        left_l.addWidget(QtWidgets.QLabel("Serials Under Certification (required)"))
         ed_sn_filter = QtWidgets.QLineEdit()
         ed_sn_filter.setPlaceholderText("Filter serials…")
         left_l.addWidget(ed_sn_filter)
@@ -4153,7 +4275,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
         splitter.addWidget(left)
 
-        # Right: Runs (checkbox list). Parameters are auto-detected from the cache/workbook.
+        # Right: Runs + report analysis params (checkbox lists)
         right = QtWidgets.QFrame()
         right_l = QtWidgets.QVBoxLayout(right)
         right_l.setContentsMargins(10, 10, 10, 10)
@@ -4178,7 +4300,14 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             list_runs.addItem(it)
         list_runs.blockSignals(False)
 
-        lbl_params_auto = QtWidgets.QLabel("Auto-detected parameters: —")
+        right_l.addWidget(QtWidgets.QLabel("Report Analysis Params (required)"))
+        ed_param_filter = QtWidgets.QLineEdit()
+        ed_param_filter.setPlaceholderText("Filter params…")
+        right_l.addWidget(ed_param_filter)
+        list_params = QtWidgets.QListWidget()
+        right_l.addWidget(list_params, 1)
+
+        lbl_params_auto = QtWidgets.QLabel("Selected params: —")
         lbl_params_auto.setStyleSheet("color: #64748b; font-size: 11px;")
         lbl_params_auto.setWordWrap(True)
         right_l.addWidget(lbl_params_auto)
@@ -4191,34 +4320,259 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     out.append(it.text().strip())
             return [x for x in out if x]
 
-        def _refresh_auto_param_label():
+        def _norm_name(s: str) -> str:
+            return "".join(ch.lower() for ch in str(s or "") if ch.isalnum())
+
+        time_norms = {_norm_name(x) for x in ("time", "time_s", "time(sec)", "time(s)", "time (s)", "time_sec", "times")}
+        pulse_norms = {_norm_name(x) for x in ("pulse number", "pulse#", "pulse #", "pulse_number", "pulsenumber", "cycle")}
+        x_exclude_norms = time_norms | pulse_norms | {_norm_name("excel_row")}
+
+        def _apply_param_filter():
+            needle = (ed_param_filter.text() or "").strip().lower()
+            for i in range(list_params.count()):
+                it = list_params.item(i)
+                if not it:
+                    continue
+                it.setHidden(bool(needle) and needle not in it.text().lower())
+
+        ed_param_filter.textChanged.connect(_apply_param_filter)
+
+        def _update_params_label():
+            total = list_params.count()
+            checked_now = len(_collect_checked(list_params))
+            lbl_params_auto.setText(f"Selected params: {checked_now} / {total}" if total else "Selected params: —")
+
+        def _refresh_params_from_runs():
             runs_sel = _collect_checked(list_runs)
             if not runs_sel or not self._db_path:
-                lbl_params_auto.setText("Auto-detected parameters: —")
+                list_params.clear()
+                _update_params_label()
+                try:
+                    _refresh_perf_eq_options()
+                except Exception:
+                    pass
                 return
+
+            prev_checked: dict[str, bool] = {}
+            for i in range(list_params.count()):
+                it = list_params.item(i)
+                if not it:
+                    continue
+                prev_checked[_norm_name(it.text())] = it.checkState() == QtCore.Qt.CheckState.Checked
+
             y_norms: set[str] = set()
             y_names: list[str] = []
+            y_by_run_norm: dict[str, set[str]] = {}
             try:
                 for rn in runs_sel:
+                    y_by_run_norm.setdefault(rn, set())
                     for c in be.td_list_y_columns(self._db_path, rn):
                         name = str((c or {}).get("name") or "").strip()
                         if not name:
                             continue
-                        nk = "".join(ch.lower() for ch in name if ch.isalnum())
+                        nk = _norm_name(name)
+                        if nk in x_exclude_norms:
+                            continue
+                        try:
+                            y_by_run_norm[rn].add(nk)
+                        except Exception:
+                            pass
                         if nk in y_norms:
                             continue
                         y_norms.add(nk)
                         y_names.append(name)
             except Exception:
                 y_names = []
-            lbl_params_auto.setText(f"Auto-detected parameters: {len(y_names)}")
+                y_by_run_norm = {}
 
-        list_runs.itemChanged.connect(lambda *_: _refresh_auto_param_label())
-        _refresh_auto_param_label()
+            y_names = sorted(y_names, key=lambda s: s.lower())
+            list_params.blockSignals(True)
+            list_params.clear()
+            for name in y_names:
+                it = QtWidgets.QListWidgetItem(name)
+                it.setFlags(it.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+                checked = prev_checked.get(_norm_name(name))
+                if checked is None:
+                    checked = True
+                it.setCheckState(QtCore.Qt.CheckState.Checked if checked else QtCore.Qt.CheckState.Unchecked)
+                list_params.addItem(it)
+            list_params.blockSignals(False)
+
+            _update_params_label()
+            _apply_param_filter()
+
+            try:
+                _refresh_perf_eq_options()
+            except Exception:
+                pass
+
+        list_runs.itemChanged.connect(lambda *_: _refresh_params_from_runs())
+        list_params.itemChanged.connect(lambda *_: _update_params_label())
+        _refresh_params_from_runs()
 
         splitter.addWidget(right)
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 2)
+
+        # Performance equations (optional, user-selectable in GUI)
+        gb_perf = QtWidgets.QGroupBox("Performance Equations (optional)")
+        gb_perf.setStyleSheet("QGroupBox { font-weight: 700; }")
+        perf_l = QtWidgets.QVBoxLayout(gb_perf)
+        perf_l.setContentsMargins(10, 10, 10, 10)
+        perf_l.setSpacing(8)
+
+        lbl_perf_note = QtWidgets.QLabel(
+            "Define X vs Y equations from metrics (pooled across selected runs where both columns exist). "
+            "X and Y must be Y-columns/parameters on at least two common selected runs."
+        )
+        lbl_perf_note.setWordWrap(True)
+        lbl_perf_note.setStyleSheet("color: #64748b; font-size: 11px; font-weight: 400;")
+        perf_l.addWidget(lbl_perf_note)
+
+        tbl_perf = QtWidgets.QTableWidget(0, 4)
+        tbl_perf.setHorizontalHeaderLabels(["X Param", "Y Param", "Degree", "Normalize X"])
+        try:
+            hdr = tbl_perf.horizontalHeader()
+            hdr.setStretchLastSection(False)
+            hdr.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
+            hdr.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Stretch)
+            hdr.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+            hdr.setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        except Exception:
+            pass
+        tbl_perf.setMaximumHeight(180)
+        perf_l.addWidget(tbl_perf)
+
+        perf_btn_row = QtWidgets.QHBoxLayout()
+        btn_perf_add = QtWidgets.QPushButton("Add Equation")
+        btn_perf_del = QtWidgets.QPushButton("Remove Selected")
+        perf_btn_row.addWidget(btn_perf_add)
+        perf_btn_row.addWidget(btn_perf_del)
+        perf_btn_row.addStretch(1)
+        perf_l.addLayout(perf_btn_row)
+
+        def _combo_for_perf() -> QtWidgets.QComboBox:
+            cb = QtWidgets.QComboBox()
+            cb.setEditable(True)
+            cb.setInsertPolicy(QtWidgets.QComboBox.InsertPolicy.NoInsert)
+            return cb
+
+        def _perf_available_names() -> list[str]:
+            # Pull from the current param list (y columns across checked runs).
+            out: list[str] = []
+            for i in range(list_params.count()):
+                it = list_params.item(i)
+                if it and it.text().strip():
+                    out.append(it.text().strip())
+            return out
+
+        def _refresh_perf_eq_options() -> None:
+            names = _perf_available_names()
+            for r in range(tbl_perf.rowCount()):
+                for c in (0, 1):
+                    cb = tbl_perf.cellWidget(r, c)
+                    if not isinstance(cb, QtWidgets.QComboBox):
+                        continue
+                    prev = str(cb.currentText() or "").strip()
+                    cb.blockSignals(True)
+                    cb.clear()
+                    for n in names:
+                        cb.addItem(n, n)
+                    if prev:
+                        cb.setCurrentText(prev)
+                    cb.blockSignals(False)
+
+        def _add_perf_row(
+            x_val: str = "",
+            y_val: str = "",
+            degree: int = 2,
+            normx: bool = True,
+            *,
+            stats_list: list[str] | None = None,
+            require_min_points: int | None = None,
+            display_name: str | None = None,
+        ) -> None:
+            r = tbl_perf.rowCount()
+            tbl_perf.insertRow(r)
+
+            cbx = _combo_for_perf()
+            cby = _combo_for_perf()
+            if stats_list is not None:
+                try:
+                    cbx.setProperty("_perf_stats", list(stats_list))
+                except Exception:
+                    pass
+            if require_min_points is not None:
+                try:
+                    cbx.setProperty("_perf_require_min_points", int(require_min_points))
+                except Exception:
+                    pass
+            if display_name is not None:
+                try:
+                    cbx.setProperty("_perf_name", str(display_name))
+                except Exception:
+                    pass
+            sp_deg = QtWidgets.QSpinBox()
+            sp_deg.setRange(0, 6)
+            sp_deg.setValue(int(degree))
+            cb_norm = QtWidgets.QCheckBox()
+            cb_norm.setChecked(bool(normx))
+
+            tbl_perf.setCellWidget(r, 0, cbx)
+            tbl_perf.setCellWidget(r, 1, cby)
+            tbl_perf.setCellWidget(r, 2, sp_deg)
+            tbl_perf.setCellWidget(r, 3, cb_norm)
+
+            _refresh_perf_eq_options()
+            if x_val:
+                cbx.setCurrentText(str(x_val))
+            if y_val:
+                cby.setCurrentText(str(y_val))
+            if not x_val or not y_val:
+                names = _perf_available_names()
+                if names:
+                    if not x_val:
+                        cbx.setCurrentText(names[0])
+                    if not y_val:
+                        cby.setCurrentText(names[1] if len(names) > 1 else names[0])
+
+        def _remove_perf_selected() -> None:
+            r = tbl_perf.currentRow()
+            if r >= 0:
+                tbl_perf.removeRow(r)
+
+        btn_perf_add.clicked.connect(lambda *_: _add_perf_row())
+        btn_perf_del.clicked.connect(lambda *_: _remove_perf_selected())
+
+        # Pre-populate from excel_trend_config.json if available (user can edit in-place)
+        try:
+            xl_cfg = be.load_excel_trend_config(Path(be.DEFAULT_EXCEL_TREND_CONFIG).expanduser())
+            plotters = xl_cfg.get("performance_plotters") if isinstance(xl_cfg, dict) else []
+            if isinstance(plotters, list):
+                for pd in plotters:
+                    if not isinstance(pd, dict):
+                        continue
+                    nm = str(pd.get("name") or "").strip() or None
+                    x_spec = pd.get("x") or {}
+                    y_spec = pd.get("y") or {}
+                    x_col = str((x_spec.get("column") if isinstance(x_spec, dict) else "") or "").strip()
+                    y_col = str((y_spec.get("column") if isinstance(y_spec, dict) else "") or "").strip()
+                    raw_stats = pd.get("stats")
+                    if isinstance(raw_stats, list) and all(isinstance(s, str) for s in raw_stats):
+                        stats_list = [str(s).strip().lower() for s in raw_stats if str(s).strip()]
+                    else:
+                        legacy = str((x_spec.get("stat") if isinstance(x_spec, dict) else "mean") or "mean").strip().lower()
+                        stats_list = [legacy] if legacy else ["mean"]
+                    req_pts = int(pd.get("require_min_points") or 2)
+                    fit_cfg = pd.get("fit") or {}
+                    deg = int((fit_cfg.get("degree") if isinstance(fit_cfg, dict) else 0) or 0)
+                    normx = bool((fit_cfg.get("normalize_x") if isinstance(fit_cfg, dict) else True))
+                    if x_col and y_col:
+                        _add_perf_row(x_col, y_col, deg, normx, stats_list=stats_list, require_min_points=req_pts, display_name=nm)
+        except Exception:
+            pass
+
+        layout.addWidget(gb_perf)
 
         # Bottom buttons
         btn_row = QtWidgets.QHBoxLayout()
@@ -4239,15 +4593,103 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             if not runs_sel:
                 QtWidgets.QMessageBox.information(dlg, "Auto Report", "Select at least one run.")
                 return
+            if not hi_sel:
+                QtWidgets.QMessageBox.information(dlg, "Auto Report", "Select at least one serial under certification.")
+                return
+            params_sel = _collect_checked(list_params)
+            if not params_sel:
+                QtWidgets.QMessageBox.information(dlg, "Auto Report", "Select at least one report analysis parameter.")
+                return
+
+            # Performance plotters (optional override; if empty, backend falls back to excel_trend_config presets)
+            perf_plotters = []
+            try:
+                perf_stat = "mean"
+                try:
+                    xl_cfg2 = be.load_excel_trend_config(Path(be.DEFAULT_EXCEL_TREND_CONFIG).expanduser())
+                    st_list = xl_cfg2.get("statistics") if isinstance(xl_cfg2, dict) else None
+                    if isinstance(st_list, list) and st_list:
+                        perf_stat = str(st_list[0] or "").strip().lower() or "mean"
+                except Exception:
+                    perf_stat = "mean"
+                if perf_stat not in {"mean", "min", "max", "std"}:
+                    perf_stat = "mean"
+
+                # Build a quick per-run availability map (normed names) to validate "same run" constraint.
+                by_run_norm: dict[str, set[str]] = {}
+                if self._db_path:
+                    for rn in runs_sel:
+                        by_run_norm[rn] = {_norm_name(str((c or {}).get("name") or "")) for c in be.td_list_y_columns(self._db_path, rn)}
+
+                for r in range(tbl_perf.rowCount()):
+                    cbx = tbl_perf.cellWidget(r, 0)
+                    cby = tbl_perf.cellWidget(r, 1)
+                    sp = tbl_perf.cellWidget(r, 2)
+                    cn = tbl_perf.cellWidget(r, 3)
+                    x_col = str(cbx.currentText() if isinstance(cbx, QtWidgets.QComboBox) else "").strip()
+                    y_col = str(cby.currentText() if isinstance(cby, QtWidgets.QComboBox) else "").strip()
+                    deg = int(sp.value() if isinstance(sp, QtWidgets.QSpinBox) else 2)
+                    normx = bool(cn.isChecked() if isinstance(cn, QtWidgets.QCheckBox) else True)
+                    nm = str(cbx.property("_perf_name") or "").strip() if isinstance(cbx, QtWidgets.QComboBox) else ""
+                    stats_list = cbx.property("_perf_stats") if isinstance(cbx, QtWidgets.QComboBox) else None
+                    req_pts = cbx.property("_perf_require_min_points") if isinstance(cbx, QtWidgets.QComboBox) else None
+                    if not isinstance(stats_list, list) or not all(isinstance(s, str) for s in stats_list):
+                        stats_list = [perf_stat]
+                    req_pts_i = 2
+                    try:
+                        req_pts_i = max(2, int(req_pts or 2))
+                    except Exception:
+                        req_pts_i = 2
+
+                    if not x_col and not y_col:
+                        continue
+                    if not x_col or not y_col:
+                        QtWidgets.QMessageBox.information(dlg, "Auto Report", "Performance equation rows must include both X and Y.")
+                        return
+                    if _norm_name(x_col) == _norm_name(y_col):
+                        QtWidgets.QMessageBox.information(dlg, "Auto Report", "Performance equation X and Y must be different parameters.")
+                        return
+
+                    common_runs = 0
+                    nx = _norm_name(x_col)
+                    ny = _norm_name(y_col)
+                    for rn in runs_sel:
+                        avail = by_run_norm.get(rn) or set()
+                        if nx in avail and ny in avail:
+                            common_runs += 1
+                    if common_runs < req_pts_i:
+                        QtWidgets.QMessageBox.information(
+                            dlg,
+                            "Auto Report",
+                            f"Performance equation '{y_col} vs {x_col}' requires at least {req_pts_i} selected runs where both columns exist.",
+                        )
+                        return
+
+                    perf_plotters.append(
+                        {
+                            "name": nm or f"{y_col} vs {x_col}",
+                            "x": {"column": x_col},
+                            "y": {"column": y_col},
+                            "stats": stats_list,
+                            "require_min_points": req_pts_i,
+                            "fit": {"degree": max(0, min(int(deg), 6)), "normalize_x": bool(normx)},
+                        }
+                    )
+            except Exception:
+                perf_plotters = []
+
             payload = {
                 "output_pdf": out_path,
                 "runs": runs_sel,
                 "highlighted_serials": hi_sel,
+                "params": params_sel,
                 "rebuild_cache": bool(cb_rebuild.isChecked()),
                 "update_excel_trend_config": bool(cb_update_cfg.isChecked()),
                 "add_missing_columns": bool(cb_add_missing.isChecked()),
                 "include_metrics": bool(cb_metrics.isChecked()),
             }
+            if perf_plotters:
+                payload["performance_plotters"] = perf_plotters
             dlg.setProperty("_auto_report_payload", payload)
             dlg.accept()
 
@@ -4276,11 +4718,14 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
         options = {
             "runs": runs,
+            "params": payload.get("params") or [],
             "rebuild_cache": bool(payload.get("rebuild_cache")),
             "update_excel_trend_config": bool(payload.get("update_excel_trend_config", True)),
             "add_missing_columns": bool(payload.get("add_missing_columns")),
             "include_metrics": bool(payload.get("include_metrics", True)),
         }
+        if isinstance(payload.get("performance_plotters"), list):
+            options["performance_plotters"] = payload.get("performance_plotters")
 
         self._report_progress.lbl_heading.setText("Generating Auto Report")
         self._report_progress.begin("Building report…")
@@ -4867,7 +5312,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             req = int(plotter.get("require_min_points") or 2)
         except Exception:
             req = 2
-        self._perf_require_min_points = max(2, int(req))
+        self._perf_require_min_points = max(1, int(req))
 
         # Apply X/Y selections.
         for cb, want in ((self.cb_perf_x_col, x_target), (self.cb_perf_y_col, y_target)):
@@ -5221,6 +5666,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         if not x_target or not y_target:
             QtWidgets.QMessageBox.information(self, "Performance", "Select X and Y columns.")
             return
+        if x_target.strip().lower() == y_target.strip().lower():
+            QtWidgets.QMessageBox.information(self, "Performance", "X and Y must be different columns.")
+            return
         stats = self._perf_checked_stats()
         if not stats:
             QtWidgets.QMessageBox.information(self, "Performance", "Select at least one stat.")
@@ -5230,6 +5678,28 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         if not runs:
             QtWidgets.QMessageBox.information(self, "Performance", "No runs found in cache.")
             return
+
+        # Enforce "same run" constraint: only consider runs where BOTH columns exist.
+        try:
+            def _norm(s: str) -> str:
+                return "".join(ch.lower() for ch in str(s or "").strip() if ch.isalnum())
+
+            xk = _norm(x_target)
+            yk = _norm(y_target)
+            xr = set(getattr(self, "_perf_col_runs", {}).get(xk) or set())
+            yr = set(getattr(self, "_perf_col_runs", {}).get(yk) or set())
+            common = xr & yr
+            if not common:
+                QtWidgets.QMessageBox.information(
+                    self, "Performance", "X and Y must both exist on at least one common run/condition."
+                )
+                return
+            order = {r: i for i, r in enumerate(getattr(self, "_perf_all_runs", runs) or [])}
+            runs = [r for r in runs if r in common]
+            runs.sort(key=lambda r: order.get(r, 10**9))
+        except Exception:
+            pass
+
         serials = self._selected_perf_serials()
         if not serials:
             QtWidgets.QMessageBox.information(self, "Performance", "No serial numbers found in cache.")
@@ -5238,8 +5708,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         fit_enabled = bool(getattr(self, "cb_perf_fit", None) and self.cb_perf_fit.isChecked())
         degree = int(self.sp_perf_degree.value()) if hasattr(self, "sp_perf_degree") else 2
         normx = bool(getattr(self, "cb_perf_norm_x", None) and self.cb_perf_norm_x.isChecked())
-        require_min_points = int(getattr(self, "_perf_require_min_points", 2) or 2)
-        require_min_points = max(2, require_min_points)
+        require_min_points = int(getattr(self, "_perf_require_min_points", 1) or 1)
+        require_min_points = max(1, require_min_points)
 
         self._perf_results_by_stat = {}
 
@@ -7759,7 +8229,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Search/filter box
         filter_row = QtWidgets.QHBoxLayout()
         self.ed_files_filter = QtWidgets.QLineEdit()
-        self.ed_files_filter.setPlaceholderText("Filter by filename, serial, program...")
+        self.ed_files_filter.setPlaceholderText("Filter across all metadata columns (filename, serial, vendor, hashes, ...)")
         self.ed_files_filter.setStyleSheet("""
             QLineEdit {
                 padding: 6px 10px;
@@ -7772,10 +8242,134 @@ class MainWindow(QtWidgets.QMainWindow):
         """)
         self.ed_files_filter.textChanged.connect(self._apply_files_filter)
         filter_row.addWidget(self.ed_files_filter, 1)
+
+        # Column visibility menu
+        self.btn_files_columns = QtWidgets.QPushButton("Columns")
+        self.btn_files_columns.setStyleSheet("""
+            QPushButton {
+                padding: 6px 10px;
+                border-radius: 6px;
+                background: #ffffff;
+                color: #374151;
+                border: 1px solid #d1d5db;
+                font-size: 12px;
+                font-weight: 600;
+            }
+            QPushButton:hover { background: #f9fafb; }
+        """)
+        self.btn_files_columns.clicked.connect(self._files_open_columns_menu)
+        filter_row.addWidget(self.btn_files_columns)
         r.addLayout(filter_row)
 
+        # Deep search (combined.txt content)
+        deep_row = QtWidgets.QHBoxLayout()
+        self.cmb_files_deep_search = QtWidgets.QComboBox()
+        self.cmb_files_deep_search.setEditable(True)
+        try:
+            le = self.cmb_files_deep_search.lineEdit()
+            le.setPlaceholderText("Deep search in combined.txt (OCR content) — click Search to find matching documents")
+            le.setClearButtonEnabled(True)
+            le.returnPressed.connect(self._act_files_deep_search)
+        except Exception:
+            pass
+        self.cmb_files_deep_search.setStyleSheet("""
+            QComboBox {
+                padding: 6px 10px;
+                border-radius: 6px;
+                background: #ffffff;
+                color: #374151;
+                border: 1px solid #d1d5db;
+                font-size: 12px;
+            }
+            QComboBox::drop-down { border: none; }
+            QComboBox QAbstractItemView {
+                background: #ffffff;
+                color: #1f2937;
+                selection-background-color: #dbeafe;
+                selection-color: #1f2937;
+                border: 1px solid #d1d5db;
+            }
+        """)
+        try:
+            self.cmb_files_deep_search.textActivated.connect(self._act_files_deep_pick_result)
+        except Exception:
+            # Fallback for older Qt bindings
+            try:
+                self.cmb_files_deep_search.activated.connect(lambda _idx: self._act_files_deep_pick_result(self.cmb_files_deep_search.currentText()))
+            except Exception:
+                pass
+        deep_row.addWidget(self.cmb_files_deep_search, 1)
+
+        self.btn_files_deep_search = QtWidgets.QPushButton("Search")
+        self.btn_files_deep_clear = QtWidgets.QPushButton("Clear")
+        for b in (self.btn_files_deep_search, self.btn_files_deep_clear):
+            b.setStyleSheet("""
+                QPushButton {
+                    padding: 6px 10px;
+                    border-radius: 6px;
+                    background: #ffffff;
+                    color: #374151;
+                    border: 1px solid #d1d5db;
+                    font-size: 12px;
+                    font-weight: 600;
+                }
+                QPushButton:hover { background: #f9fafb; }
+            """)
+        self.btn_files_deep_search.clicked.connect(self._act_files_deep_search)
+        self.btn_files_deep_clear.clicked.connect(self._act_files_deep_clear)
+        deep_row.addWidget(self.btn_files_deep_search)
+        deep_row.addWidget(self.btn_files_deep_clear)
+        r.addLayout(deep_row)
+
+        self.lbl_files_deep_status = QtWidgets.QLabel("")
+        self.lbl_files_deep_status.setStyleSheet("font-size: 11px; color: #6b7280;")
+        self.lbl_files_deep_status.setWordWrap(True)
+        r.addWidget(self.lbl_files_deep_status)
+
         # Table
-        cols = ["File Name", "Program", "Asset", "Serial", "Doc Type", "Report Date", "Test Date", "Status", "Certification"]
+        # Include all available metadata as columns so filtering can search across everything.
+        # (Support DB: files.*) + (Index DB: documents.*)
+        self._files_table_cols: list[tuple[str, str]] = [
+            ("File Name", "_filename"),
+            ("Program", "program_title"),
+            ("Asset", "asset_type"),
+            ("Asset Specific", "asset_specific_type"),
+            ("Serial", "serial_number"),
+            ("Part #", "part_number"),
+            ("Revision", "revision"),
+            ("Doc Type", "document_type"),
+            ("Doc Acronym", "document_type_acronym"),
+            ("Vendor", "vendor"),
+            ("ATP #", "acceptance_test_plan_number"),
+            ("Report Date", "report_date"),
+            ("Test Date", "test_date"),
+            ("Processed", "_processed"),
+            ("Needs Processing", "needs_processing"),
+            ("Certification", "_certification"),
+            ("Cert Status", "certification_status"),
+            ("Cert Pass Rate", "certification_pass_rate"),
+            ("Similarity Group", "similarity_group"),
+            ("Title Norm", "title_norm"),
+            ("File Ext", "file_extension"),
+            ("Indexed", "indexed_epoch_ns"),
+            ("Rel Path", "rel_path"),
+            ("Metadata Rel", "metadata_rel"),
+            ("Artifacts Rel", "artifacts_rel"),
+            ("Excel SQLite Rel", "excel_sqlite_rel"),
+            ("Size (bytes)", "size_bytes"),
+            ("Modified", "mtime_ns"),
+            ("First Seen", "first_seen_epoch_ns"),
+            ("Last Seen", "last_seen_epoch_ns"),
+            ("Last Processed", "last_processed_epoch_ns"),
+            ("Last Proc mtime", "last_processed_mtime_ns"),
+            ("Fingerprint", "file_fingerprint"),
+            ("Content SHA1", "content_sha1"),
+            ("EIDAT UUID", "eidat_uuid"),
+            ("Pointer Token", "pointer_token"),
+            ("File ID", "id"),
+            ("Document ID", "document_id"),
+        ]
+        cols = [c[0] for c in self._files_table_cols]
         self.tbl_files = QtWidgets.QTableWidget(0, len(cols))
         self.tbl_files.setHorizontalHeaderLabels(cols)
         self.tbl_files.verticalHeader().setVisible(False)
@@ -7809,6 +8403,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tbl_files.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
         self.tbl_files.customContextMenuRequested.connect(self._files_context_menu)
         r.addWidget(self.tbl_files, 1)
+
+        # Header right-click to show/hide columns
+        try:
+            hdr = self.tbl_files.horizontalHeader()
+            hdr.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+            hdr.customContextMenuRequested.connect(self._files_header_context_menu)
+        except Exception:
+            pass
+
+        # Default column visibility (users can override via Columns menu)
+        self._files_load_column_visibility()
 
         # Action buttons
         actions = QtWidgets.QHBoxLayout()
@@ -8390,6 +8995,7 @@ class MainWindow(QtWidgets.QMainWindow):
         """Rebuild the tree based on current grouping mode."""
         self.tree_files.clear()
         if not self._files_data:
+            self._files_filtered = []
             self._populate_files_table([])
             return
 
@@ -8454,7 +9060,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tree_files.expandToDepth(0)
 
         # Show all files initially
-        self._populate_files_table(self._files_data)
+        self._files_filtered = list(self._files_data)
+        self._files_refresh_table_view()
 
     def _on_files_tree_selection(self) -> None:
         """When tree selection changes, update table."""
@@ -8478,12 +9085,35 @@ class MainWindow(QtWidgets.QMainWindow):
 
             self._files_filtered = files
 
-        self._populate_files_table(self._files_filtered)
+        self._files_refresh_table_view()
+
+    def _files_refresh_table_view(self) -> None:
+        """Refresh the Files table based on tree selection + deep-search filter."""
+        base_files = getattr(self, "_files_filtered", None)
+        if base_files is None:
+            base_files = getattr(self, "_files_data", []) or []
+
+        deep_matches: set[str] | None = getattr(self, "_files_deep_matches", None)
+        if deep_matches is not None:
+            files = [f for f in (base_files or []) if str(f.get("rel_path") or "") in deep_matches]
+        else:
+            files = list(base_files or [])
+
+        self._populate_files_table(files)
 
     def _populate_files_table(self, files: list[dict]) -> None:
         """Populate the table with file data."""
         self.tbl_files.setSortingEnabled(False)
         self.tbl_files.setRowCount(0)
+
+        # New implementation: populate all available metadata columns (support DB + index DB).
+        self._populate_files_table_all_metadata(files)
+        try:
+            # Keep metadata filter applied when the table repopulates (tree selection, refresh, deep search).
+            self._apply_files_filter(self.ed_files_filter.text())
+        except Exception:
+            pass
+        return
 
         for row, f in enumerate(files):
             self.tbl_files.insertRow(row)
@@ -8554,16 +9184,503 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tbl_files.setSortingEnabled(True)
         self.lbl_files_count.setText(f"{len(files)} file(s)")
 
+    def _populate_files_table_all_metadata(self, files: list[dict]) -> None:
+        cols = getattr(self, "_files_table_cols", [])
+        if cols:
+            try:
+                if self.tbl_files.columnCount() != len(cols):
+                    self.tbl_files.setColumnCount(len(cols))
+                    self.tbl_files.setHorizontalHeaderLabels([c[0] for c in cols])
+                    # If the column count ever changes (e.g., after an update),
+                    # re-apply visibility preferences.
+                    self._files_load_column_visibility()
+            except Exception:
+                pass
+
+        # Cache role for fast filtering (avoid joining across many columns on every keystroke).
+        search_role = int(QtCore.Qt.ItemDataRole.UserRole) + 1
+
+        def fmt_epoch_ns(ns_val) -> str:
+            if ns_val is None or ns_val == "":
+                return ""
+            try:
+                ns_int = int(ns_val)
+            except Exception:
+                return str(ns_val)
+            if ns_int <= 0:
+                return ""
+            try:
+                dt = datetime.datetime.fromtimestamp(ns_int / 1_000_000_000)
+                return dt.strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                return str(ns_int)
+
+        epoch_ns_keys = {
+            "mtime_ns",
+            "first_seen_epoch_ns",
+            "last_seen_epoch_ns",
+            "last_processed_epoch_ns",
+            "last_processed_mtime_ns",
+            "indexed_epoch_ns",
+        }
+
+        for row, f in enumerate(files):
+            self.tbl_files.insertRow(row)
+
+            rel_path = f.get("rel_path", "")
+            filename = Path(rel_path).name if rel_path else ""
+            ext_fallback = ""
+            try:
+                ext_fallback = str(Path(rel_path).suffix or "").strip()
+            except Exception:
+                ext_fallback = ""
+
+            processed = f.get("last_processed_epoch_ns")
+            is_processed = bool(processed)
+
+            cert_status = str(f.get("certification_status") or "").strip()
+            cert_pass_rate = str(f.get("certification_pass_rate") or "").strip()
+            if cert_status and cert_pass_rate:
+                cert_text = f"{cert_status} ({cert_pass_rate})"
+            elif cert_status:
+                cert_text = cert_status
+            else:
+                cert_text = "-"
+
+            search_parts: list[str] = []
+            file_name_item: QtWidgets.QTableWidgetItem | None = None
+
+            for col_idx, (_label, key) in enumerate(cols):
+                item = QtWidgets.QTableWidgetItem("")
+
+                if key == "_filename":
+                    item.setText(filename)
+                    item.setData(QtCore.Qt.ItemDataRole.UserRole, f)
+                    file_name_item = item
+                    search_parts.append(filename)
+                elif key == "_processed":
+                    status_text = ("\u2713 Processed") if is_processed else ("\u2717 Unprocessed")
+                    item.setText(status_text)
+                    item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+                    item.setForeground(QtGui.QColor("#16a34a") if is_processed else QtGui.QColor("#dc2626"))
+                    font = item.font()
+                    font.setBold(True)
+                    item.setFont(font)
+                    search_parts.append(status_text)
+                elif key == "_certification":
+                    item.setText(cert_text)
+                    item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+                    cert_colors = {
+                        "CERTIFIED": "#16a34a",  # Green
+                        "FAILED": "#dc2626",     # Red
+                        "PENDING": "#f59e0b",    # Amber
+                        "NO_DATA": "#6b7280",    # Gray
+                    }
+                    cert_color = cert_colors.get(cert_status, "#6b7280")
+                    item.setForeground(QtGui.QColor(cert_color))
+                    cert_font = item.font()
+                    cert_font.setBold(True)
+                    item.setFont(cert_font)
+                    search_parts.append(cert_text)
+                elif key in epoch_ns_keys:
+                    val = fmt_epoch_ns(f.get(key))
+                    item.setText(val)
+                    search_parts.append(val)
+                elif key == "needs_processing":
+                    try:
+                        needs = int(f.get("needs_processing") or 0)
+                    except Exception:
+                        needs = 0
+                    val = "YES" if needs else "NO"
+                    item.setText(val)
+                    item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+                    item.setForeground(QtGui.QColor("#dc2626") if needs else QtGui.QColor("#16a34a"))
+                    search_parts.append(val)
+                elif key == "file_extension":
+                    raw = f.get("file_extension")
+                    s = "" if (raw is None) else str(raw).strip()
+                    if not s and ext_fallback:
+                        s = ext_fallback
+                    item.setText(s)
+                    search_parts.append(s)
+                else:
+                    raw = f.get(key)
+                    s = "" if (raw is None) else str(raw)
+                    item.setText(s)
+                    search_parts.append(s)
+
+                self.tbl_files.setItem(row, col_idx, item)
+
+            if file_name_item is not None:
+                try:
+                    blob = " ".join(p for p in search_parts if p).lower()
+                except Exception:
+                    blob = ""
+                file_name_item.setData(search_role, blob)
+
+        self.tbl_files.resizeColumnsToContents()
+        self.tbl_files.setSortingEnabled(True)
+        self.lbl_files_count.setText(f"{len(files)} file(s)")
+
     def _apply_files_filter(self, text: str) -> None:
         """Filter table rows by search text."""
         text = text.strip().lower()
+        search_role = int(QtCore.Qt.ItemDataRole.UserRole) + 1
         for row in range(self.tbl_files.rowCount()):
-            combined = " ".join(
-                (self.tbl_files.item(row, c).text() if self.tbl_files.item(row, c) else "")
-                for c in range(self.tbl_files.columnCount())
-            ).lower()
+            combined = ""
+            item0 = self.tbl_files.item(row, 0)
+            if item0 is not None:
+                try:
+                    combined = str(item0.data(search_role) or "")
+                except Exception:
+                    combined = ""
+            if not combined:
+                combined = " ".join(
+                    (self.tbl_files.item(row, c).text() if self.tbl_files.item(row, c) else "")
+                    for c in range(self.tbl_files.columnCount())
+                ).lower()
             match = (text in combined) if text else True
             self.tbl_files.setRowHidden(row, not match)
+
+    def _act_files_deep_clear(self) -> None:
+        """Clear deep-search results and show the normal Files view again."""
+        self._files_deep_matches = None
+        self._files_deep_last_query = ""
+        try:
+            self.lbl_files_deep_status.setText("")
+        except Exception:
+            pass
+        try:
+            self.cmb_files_deep_search.blockSignals(True)
+            self.cmb_files_deep_search.clear()
+            self.cmb_files_deep_search.setCurrentIndex(-1)
+            self.cmb_files_deep_search.setEditText("")
+        except Exception:
+            pass
+        finally:
+            try:
+                self.cmb_files_deep_search.blockSignals(False)
+            except Exception:
+                pass
+        self._files_refresh_table_view()
+
+    def _act_files_deep_search(self) -> None:
+        """Search inside combined.txt and filter the Files table to matching documents."""
+        try:
+            repo_raw = (self.ed_global_repo.text() or "").strip()
+        except Exception:
+            repo_raw = ""
+        if not repo_raw:
+            QtWidgets.QMessageBox.warning(self, "Deep Search", "Select a Global Repo in Setup tab first.")
+            return
+
+        query = ""
+        try:
+            query = (self.cmb_files_deep_search.lineEdit().text() or "").strip()
+        except Exception:
+            try:
+                query = (self.cmb_files_deep_search.currentText() or "").strip()
+            except Exception:
+                query = ""
+
+        if not query:
+            self._act_files_deep_clear()
+            return
+
+        base_files = getattr(self, "_files_filtered", None)
+        if base_files is None:
+            base_files = getattr(self, "_files_data", []) or []
+
+        rel_paths: list[str] = []
+        seen: set[str] = set()
+        for f in base_files:
+            rp = str(f.get("rel_path") or "").strip()
+            if rp and rp not in seen:
+                seen.add(rp)
+                rel_paths.append(rp)
+
+        if not rel_paths:
+            QtWidgets.QMessageBox.information(self, "Deep Search", "No files available to search.")
+            return
+
+        try:
+            self.btn_files_deep_search.setEnabled(False)
+            self.lbl_files_deep_status.setText(f"Searching combined.txt for: {query}")
+        except Exception:
+            pass
+
+        def task():
+            return be.deep_search_combined_txt(Path(repo_raw), rel_paths, query)
+
+        worker = ManagerTaskWorker(task, parent=self)
+        self._files_deep_worker = worker
+
+        def _done(payload: object) -> None:
+            try:
+                if not isinstance(payload, dict):
+                    raise RuntimeError("Deep search returned invalid payload.")
+                matched = payload.get("matched_rel_paths") or []
+                if not isinstance(matched, list):
+                    matched = []
+                matched_rel_paths = [str(x) for x in matched if str(x).strip()]
+                self._files_deep_matches = set(matched_rel_paths)
+                self._files_deep_last_query = query
+
+                scanned = int(payload.get("scanned") or 0)
+                missing = int(payload.get("missing") or 0)
+                self.lbl_files_deep_status.setText(
+                    f"Deep search: {len(matched_rel_paths)} match(es) (scanned {scanned}, missing combined.txt {missing})"
+                )
+
+                # Show matching documents in the search bar dropdown.
+                try:
+                    self.cmb_files_deep_search.blockSignals(True)
+                    self.cmb_files_deep_search.clear()
+                    self.cmb_files_deep_search.addItems(matched_rel_paths)
+                    self.cmb_files_deep_search.setCurrentIndex(-1)
+                    self.cmb_files_deep_search.setEditText(query)
+                finally:
+                    try:
+                        self.cmb_files_deep_search.blockSignals(False)
+                    except Exception:
+                        pass
+                self._files_refresh_table_view()
+
+                try:
+                    if matched_rel_paths:
+                        self.cmb_files_deep_search.showPopup()
+                except Exception:
+                    pass
+            except Exception as exc:
+                QtWidgets.QMessageBox.warning(self, "Deep Search", str(exc))
+            finally:
+                try:
+                    self.btn_files_deep_search.setEnabled(True)
+                except Exception:
+                    pass
+
+        def _fail(err: str) -> None:
+            try:
+                self.lbl_files_deep_status.setText(f"Deep search failed: {err}")
+            except Exception:
+                pass
+            try:
+                self.btn_files_deep_search.setEnabled(True)
+            except Exception:
+                pass
+            QtWidgets.QMessageBox.warning(self, "Deep Search", str(err))
+
+        worker.completed.connect(_done)
+        worker.failed.connect(_fail)
+        worker.start()
+
+    def _act_files_deep_pick_result(self, rel_path: str) -> None:
+        """Select a matched document from the deep-search dropdown without losing the query."""
+        rp = str(rel_path or "").strip()
+        if not rp:
+            return
+
+        # Select the row in the table
+        try:
+            for row in range(self.tbl_files.rowCount()):
+                item0 = self.tbl_files.item(row, 0)
+                if item0 is None:
+                    continue
+                info = item0.data(QtCore.Qt.ItemDataRole.UserRole)
+                if isinstance(info, dict) and str(info.get("rel_path") or "") == rp:
+                    self.tbl_files.selectRow(row)
+                    try:
+                        self.tbl_files.scrollToItem(item0, QtWidgets.QAbstractItemView.ScrollHint.PositionAtCenter)
+                    except Exception:
+                        pass
+                    break
+        except Exception:
+            pass
+
+        # Restore query text
+        q = str(getattr(self, "_files_deep_last_query", "") or "")
+        try:
+            self.cmb_files_deep_search.blockSignals(True)
+            self.cmb_files_deep_search.setCurrentIndex(-1)
+            self.cmb_files_deep_search.setEditText(q)
+        except Exception:
+            pass
+        finally:
+            try:
+                self.cmb_files_deep_search.blockSignals(False)
+            except Exception:
+                pass
+
+    def _files_default_visible_column_keys(self) -> list[str]:
+        # Keep the table compact by default, but still show the key “at-a-glance” metadata.
+        # Always keep filename visible so rows are identifiable and selection logic remains clear.
+        return [
+            "_filename",
+            "program_title",
+            "asset_type",
+            "file_extension",
+            "report_date",
+            "test_date",
+        ]
+
+    def _files_column_key_to_index(self) -> dict[str, int]:
+        cols = getattr(self, "_files_table_cols", []) or []
+        return {key: idx for idx, (_label, key) in enumerate(cols)}
+
+    def _files_visible_column_keys(self) -> list[str]:
+        key_to_idx = self._files_column_key_to_index()
+        visible: list[str] = []
+        for key, idx in key_to_idx.items():
+            try:
+                if not self.tbl_files.isColumnHidden(idx):
+                    visible.append(key)
+            except Exception:
+                continue
+        # Always include filename for safety
+        if "_filename" not in visible:
+            visible.insert(0, "_filename")
+        return visible
+
+    def _files_apply_visible_column_keys(self, keys: list[str] | None) -> None:
+        key_to_idx = self._files_column_key_to_index()
+        visible = set(keys or [])
+        visible.add("_filename")
+        for key, idx in key_to_idx.items():
+            try:
+                self.tbl_files.setColumnHidden(idx, key not in visible)
+            except Exception:
+                pass
+
+    def _files_load_column_visibility(self) -> None:
+        """Apply persisted visibility; if none, apply defaults."""
+        try:
+            settings = QtCore.QSettings("EIDAT", "EIDAT-V1")
+            raw = settings.value("files_table/visible_column_keys", "")
+        except Exception:
+            raw = ""
+
+        keys: list[str] | None = None
+        if isinstance(raw, str) and raw.strip():
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, list):
+                    keys = [str(x) for x in parsed if str(x).strip()]
+            except Exception:
+                keys = None
+        elif isinstance(raw, (list, tuple)):
+            try:
+                keys = [str(x) for x in raw if str(x).strip()]
+            except Exception:
+                keys = None
+
+        if not keys:
+            keys = self._files_default_visible_column_keys()
+
+        self._files_apply_visible_column_keys(keys)
+
+    def _files_save_column_visibility(self) -> None:
+        try:
+            keys = self._files_visible_column_keys()
+            settings = QtCore.QSettings("EIDAT", "EIDAT-V1")
+            settings.setValue("files_table/visible_column_keys", json.dumps(keys))
+        except Exception:
+            pass
+
+    def _files_columns_menu(self) -> QtWidgets.QMenu:
+        menu = QtWidgets.QMenu(self)
+        menu.setStyleSheet("""
+            QMenu {
+                background: #ffffff;
+                color: #1f2937;
+                border: 1px solid #d1d5db;
+                padding: 4px;
+            }
+            QMenu::item {
+                background: transparent;
+                color: #1f2937;
+                padding: 6px 20px;
+            }
+            QMenu::item:selected {
+                background: #dbeafe;
+                color: #1f2937;
+            }
+            QMenu::separator {
+                height: 1px;
+                background: #e5e7eb;
+                margin: 4px 8px;
+            }
+        """)
+
+        act_reset = menu.addAction("Reset to Default Columns")
+        act_show_all = menu.addAction("Show All Columns")
+        menu.addSeparator()
+
+        def _do_reset():
+            self._files_apply_visible_column_keys(self._files_default_visible_column_keys())
+            self._files_save_column_visibility()
+
+        def _do_show_all():
+            key_to_idx = self._files_column_key_to_index()
+            for idx in key_to_idx.values():
+                try:
+                    self.tbl_files.setColumnHidden(idx, False)
+                except Exception:
+                    pass
+            self._files_save_column_visibility()
+
+        act_reset.triggered.connect(_do_reset)
+        act_show_all.triggered.connect(_do_show_all)
+
+        cols = getattr(self, "_files_table_cols", []) or []
+        key_to_idx = self._files_column_key_to_index()
+
+        for label, key in cols:
+            idx = key_to_idx.get(key)
+            if idx is None:
+                continue
+            act = menu.addAction(label)
+            act.setCheckable(True)
+            try:
+                act.setChecked(not self.tbl_files.isColumnHidden(idx))
+            except Exception:
+                act.setChecked(True)
+
+            def _make_toggle(col_key: str, col_idx: int):
+                def _toggle(checked: bool):
+                    # Always keep filename visible
+                    if col_key == "_filename" and not checked:
+                        try:
+                            self.tbl_files.setColumnHidden(col_idx, False)
+                        except Exception:
+                            pass
+                        return
+                    try:
+                        self.tbl_files.setColumnHidden(col_idx, not checked)
+                    except Exception:
+                        pass
+                    self._files_save_column_visibility()
+
+                return _toggle
+
+            act.toggled.connect(_make_toggle(key, idx))
+
+        return menu
+
+    def _files_open_columns_menu(self) -> None:
+        try:
+            menu = self._files_columns_menu()
+            pos = self.btn_files_columns.mapToGlobal(QtCore.QPoint(0, self.btn_files_columns.height()))
+            menu.exec(pos)
+        except Exception:
+            pass
+
+    def _files_header_context_menu(self, pos) -> None:
+        try:
+            menu = self._files_columns_menu()
+            global_pos = self.tbl_files.horizontalHeader().mapToGlobal(pos)
+            menu.exec(global_pos)
+        except Exception:
+            pass
 
     def _selected_file_info(self) -> dict | None:
         """Return file info dict for selected row."""

@@ -22,7 +22,14 @@
     "statistics": "from_excel_trend_config",
     "include_metrics": true,
     "graphs_at_end": true,
-    "max_findings": 12
+    "max_findings": 12,
+    "max_pages": 30,
+    "metrics_stats": ["median"],
+    "metadata_columns": "extended",
+    "appendix_include_grade_matrix": true,
+    "appendix_include_pass_details": true,
+    "plot_only_nonpass": true,
+    "max_plots": null
   },
   "highlight": {
     "default_serials": [],
@@ -30,4 +37,3 @@
     "colors": ["#ef4444", "#3b82f6", "#22c55e", "#a855f7", "#f97316"]
   }
 }
-

@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS documents (
   vendor TEXT,
   acceptance_test_plan_number TEXT,
   excel_sqlite_rel TEXT,
+  tables_sqlite_rel TEXT,
   file_extension TEXT,
   title_norm TEXT,
   similarity_group TEXT,
@@ -338,6 +339,16 @@ def build_index(paths: SupportPaths, *, similarity: float = 0.86) -> IndexSummar
             metadata_rel = str(meta_path)
         # Get certification status from extracted_terms.db
         cert_info = _get_certification_from_db(meta_path.parent)
+        tables_sqlite_rel = None
+        try:
+            tables_db = meta_path.parent / "labeled_tables.db"
+            if tables_db.exists():
+                try:
+                    tables_sqlite_rel = str(tables_db.resolve().relative_to(support_dir.resolve()))
+                except Exception:
+                    tables_sqlite_rel = str(tables_db)
+        except Exception:
+            tables_sqlite_rel = None
         docs.append(
             {
                 "metadata_rel": metadata_rel,
@@ -355,6 +366,7 @@ def build_index(paths: SupportPaths, *, similarity: float = 0.86) -> IndexSummar
                 "vendor": meta.get("vendor"),
                 "acceptance_test_plan_number": meta.get("acceptance_test_plan_number"),
                 "excel_sqlite_rel": meta.get("excel_sqlite_rel"),
+                "tables_sqlite_rel": tables_sqlite_rel,
                 "file_extension": meta.get("file_extension"),
                 "title_norm": title_norm,
                 "similarity_group": "",
@@ -378,6 +390,7 @@ def build_index(paths: SupportPaths, *, similarity: float = 0.86) -> IndexSummar
             ("acceptance_test_plan_number", "TEXT"),
             ("asset_specific_type", "TEXT"),
             ("excel_sqlite_rel", "TEXT"),
+            ("tables_sqlite_rel", "TEXT"),
             ("file_extension", "TEXT"),
         ]
         for col_name, col_type in migration_columns:
@@ -394,9 +407,9 @@ def build_index(paths: SupportPaths, *, similarity: float = 0.86) -> IndexSummar
                   metadata_rel, artifacts_rel, program_title, asset_type, asset_specific_type,
                   serial_number, part_number, revision, test_date, report_date, document_type,
                   document_type_acronym, vendor, acceptance_test_plan_number,
-                  excel_sqlite_rel, file_extension, title_norm, similarity_group, indexed_epoch_ns,
+                  excel_sqlite_rel, tables_sqlite_rel, file_extension, title_norm, similarity_group, indexed_epoch_ns,
                   certification_status, certification_pass_rate
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     d["metadata_rel"],
@@ -414,6 +427,7 @@ def build_index(paths: SupportPaths, *, similarity: float = 0.86) -> IndexSummar
                     d.get("vendor"),
                     d.get("acceptance_test_plan_number"),
                     d.get("excel_sqlite_rel"),
+                    d.get("tables_sqlite_rel"),
                     d.get("file_extension"),
                     d["title_norm"],
                     d["similarity_group"],

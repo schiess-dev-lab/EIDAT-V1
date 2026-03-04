@@ -1,10 +1,18 @@
 import os
 import unittest
+from pathlib import Path
+import sys
+
+
+# Allow `import extraction.*` when running from repo root.
+APP_ROOT = Path(__file__).resolve().parents[1]
+if str(APP_ROOT) not in sys.path:
+    sys.path.insert(0, str(APP_ROOT))
 
 
 class TestGuardrailsToggle(unittest.TestCase):
     def setUp(self) -> None:
-        from . import batch_processor
+        from extraction import batch_processor
 
         self.batch_processor = batch_processor
         self._saved_env = os.environ.copy()
@@ -80,4 +88,3 @@ class TestGuardrailsToggle(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -81,6 +81,7 @@ EIDAT can insert stable table labels into OCR `combined.txt` output using rules 
 - Multiple table types are supported by adding multiple entries under `rules`.
 - Rule selection is per-table: the highest `priority` match wins (ties default to earlier rule order).
 - Optional: set `"tie_breaker": "priority_then_specificity"` to prefer the most-specific rule when priorities tie.
+- During processing, labeled ASCII tables are also exported into `<artifacts_dir>/labeled_tables.db` for querying, and the index DB exposes the relative path as `tables_sqlite_rel` when present.
 
 ## Table merging (multi-page ASCII tables)
 EIDAT can merge bordered ASCII tables that continue across page boundaries in `combined.txt` using `user_inputs/table_merge_heuristics.json`.

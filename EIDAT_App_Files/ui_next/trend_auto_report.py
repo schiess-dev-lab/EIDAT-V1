@@ -15,6 +15,7 @@ import json
 import math
 import sqlite3
 import statistics
+import textwrap
 import time
 
 
@@ -90,6 +91,13 @@ def default_trend_auto_report_config() -> dict:
             "include_metrics": True,
             "graphs_at_end": True,
             "max_findings": 12,
+            "max_pages": 30,
+            "metrics_stats": ["median"],
+            "metadata_columns": "extended",
+            "appendix_include_grade_matrix": True,
+            "appendix_include_pass_details": True,
+            "plot_only_nonpass": True,
+            "max_plots": None,
         },
         "highlight": {
             "default_serials": [],
@@ -499,6 +507,189 @@ def _grade_from_z(z: float, pass_max: float, watch_max: float) -> str:
     return "FAIL"
 
 
+def _overall_cert_status(grades: list[str]) -> str:
+    gs = [str(g or "").strip().upper() for g in (grades or [])]
+    if any(g == "FAIL" for g in gs):
+        return "FAILED"
+    if any(g == "WATCH" for g in gs):
+        return "WATCH"
+    if any(g == "NO_DATA" for g in gs) or not gs:
+        return "NO_DATA"
+    return "CERTIFIED"
+
+
+def _resolve_selected_runs(run_rows: list[dict], options: dict) -> list[str]:
+    run_by_name = {str(r.get("run_name") or ""): r for r in (run_rows or []) if str(r.get("run_name") or "")}
+    selected_runs = options.get("runs") or []
+    runs = [str(r).strip() for r in selected_runs if str(r).strip()] if isinstance(selected_runs, list) else []
+    if not runs:
+        runs = [str(r.get("run_name") or "").strip() for r in (run_rows or []) if str(r.get("run_name") or "").strip()]
+    return [r for r in runs if r in run_by_name]
+
+
+def _resolve_selected_params(conn: sqlite3.Connection, *, runs: list[str], options: dict) -> list[str]:
+    selected_params = options.get("params") or []
+    params = [str(p).strip() for p in selected_params if str(p).strip()] if isinstance(selected_params, list) else []
+    if params:
+        return params
+
+    # Auto-detect from cache/workbook (td_columns).
+    seen: set[str] = set()
+    auto: list[str] = []
+    for run in runs:
+        for c in _td_list_y_columns(conn, run):
+            name = str(c.get("name") or "").strip()
+            if not name:
+                continue
+            nk = _norm_key(name)
+            if nk in seen:
+                continue
+            seen.add(nk)
+            auto.append(name)
+    return sorted(auto, key=lambda s: s.lower())
+
+
+def _finding_sort_key(r: dict) -> tuple[int, float, float]:
+    g = str(r.get("grade") or "").strip().upper()
+    gk = 0 if g == "FAIL" else 1
+    try:
+        z = abs(float(r.get("z") or 0.0))
+    except Exception:
+        z = 0.0
+    try:
+        mp = float(r.get("max_pct") or 0.0)
+    except Exception:
+        mp = 0.0
+    return (gk, -z, -mp)
+
+
+def _build_chart_specs(
+    *,
+    run_param_pairs: list[tuple[str, str]],
+    nonpass_findings: list[dict],
+    max_plots: int | None = None,
+) -> list[tuple[tuple[int, float, float], str, str]]:
+    nonpass_run_param = {(str(r.get("run") or ""), str(r.get("param") or "")) for r in (nonpass_findings or [])}
+    out: list[tuple[tuple[int, float, float], str, str]] = []
+    for run, param in (run_param_pairs or []):
+        if (run, param) not in nonpass_run_param:
+            continue
+        rows = [rr for rr in (nonpass_findings or []) if str(rr.get("run") or "") == run and str(rr.get("param") or "") == param]
+        worst_grade = "WATCH"
+        best_abs_z = 0.0
+        best_max_pct = 0.0
+        for rr in rows:
+            g = str(rr.get("grade") or "").strip().upper()
+            if g == "FAIL":
+                worst_grade = "FAIL"
+            try:
+                best_abs_z = max(best_abs_z, abs(float(rr.get("z") or 0.0)))
+            except Exception:
+                pass
+            try:
+                best_max_pct = max(best_max_pct, float(rr.get("max_pct") or 0.0))
+            except Exception:
+                pass
+        gk = 0 if worst_grade == "FAIL" else 1
+        out.append(((gk, -best_abs_z, -best_max_pct), run, param))
+    out.sort(key=lambda t: t[0])
+    if isinstance(max_plots, int) and max_plots >= 0:
+        out = out[:max_plots]
+    return out
+
+
+def _plan_page_selections(
+    *,
+    max_pages: int,
+    appendix_include_grade_matrix: bool,
+    appendix_include_pass_details: bool,
+    include_metrics: bool,
+    grading_rows: list[dict],
+    run_param_pairs: list[tuple[str, str]],
+    serials_nonpass_sorted: list[str],
+    perf_defs_all: list[dict],
+    run_details_all: list[str],
+    chart_specs_all: list[tuple[tuple[int, float, float], str, str]],
+    metrics_pairs_all: list[tuple[str, str]],
+    metrics_pairs_nonpass: list[tuple[str, str]],
+) -> dict:
+    def _ceil_div(a: int, b: int) -> int:
+        return int((int(a) + int(b) - 1) // int(b)) if int(b) else 0
+
+    omitted_items: list[str] = []
+
+    matrix_pages = _ceil_div(len(run_param_pairs), 30) if appendix_include_grade_matrix else 0
+    by_serial_pages = _ceil_div(len(serials_nonpass_sorted), 2)
+    perf_defs_sel = list(perf_defs_all or [])
+    run_details_sel = list(run_details_all or [])
+    serials_sel = list(serials_nonpass_sorted or [])
+
+    base_pages = 3 + by_serial_pages + 1 + len(perf_defs_sel) + len(run_details_sel) + matrix_pages
+    if base_pages > max_pages:
+        while base_pages > max_pages and perf_defs_sel:
+            perf_defs_sel.pop()
+            base_pages -= 1
+            omitted_items.append("Performance equations: truncated to meet page cap.")
+        while base_pages > max_pages and run_details_sel:
+            dropped = run_details_sel.pop()
+            base_pages -= 1
+            omitted_items.append(f"Run details omitted: {dropped}")
+        if base_pages > max_pages and by_serial_pages:
+            max_by_serial_pages = max_pages - (3 + 1 + len(perf_defs_sel) + len(run_details_sel) + matrix_pages)
+            max_by_serial_pages = max(0, int(max_by_serial_pages))
+            keep_serials = int(max_by_serial_pages) * 2
+            if keep_serials < len(serials_sel):
+                serials_sel = serials_sel[:keep_serials]
+                omitted_items.append("Non-PASS by-serial: truncated to meet page cap.")
+            by_serial_pages = _ceil_div(len(serials_sel), 2)
+            base_pages = 3 + by_serial_pages + 1 + len(perf_defs_sel) + len(run_details_sel) + matrix_pages
+
+    include_deviations = bool(appendix_include_pass_details and grading_rows)
+    deviations_pages = 1 if include_deviations else 0
+
+    metrics_sel = list(metrics_pairs_all) if include_metrics else []
+    if base_pages + deviations_pages + len(metrics_sel) > max_pages and deviations_pages:
+        include_deviations = False
+        deviations_pages = 0
+        omitted_items.append("Appendix: full deviations table omitted to meet page cap.")
+    if base_pages + deviations_pages + len(metrics_sel) > max_pages and metrics_sel:
+        metrics_sel = list(metrics_pairs_nonpass)
+        omitted_items.append("Metrics: PASS-only run/param pages omitted to meet page cap.")
+    if base_pages + deviations_pages + len(metrics_sel) > max_pages and metrics_sel:
+        metrics_sel = []
+        omitted_items.append("Metrics: omitted remaining pages to meet page cap.")
+
+    remaining_for_charts = max_pages - (base_pages + deviations_pages + len(metrics_sel))
+    charts_sel = [t[1:] for t in (chart_specs_all or [])[: max(0, remaining_for_charts)]]
+    if len(charts_sel) < len(chart_specs_all or []):
+        omitted_items.append(f"Charts: omitted {len(chart_specs_all or []) - len(charts_sel)} lower-severity plots to meet page cap.")
+
+    include_omitted_page = bool(omitted_items)
+    if include_omitted_page:
+        total_no_omitted = base_pages + deviations_pages + len(metrics_sel) + len(charts_sel)
+        if total_no_omitted >= max_pages:
+            if charts_sel:
+                charts_sel.pop()
+            elif metrics_sel:
+                metrics_sel.pop()
+            elif deviations_pages:
+                deviations_pages = 0
+                include_deviations = False
+            include_omitted_page = True
+
+    return {
+        "perf_defs_sel": perf_defs_sel,
+        "run_details_sel": run_details_sel,
+        "serials_nonpass_sorted": serials_sel,
+        "include_deviations": include_deviations,
+        "deviations_pages": int(deviations_pages),
+        "metrics_sel": metrics_sel,
+        "charts_sel": charts_sel,
+        "include_omitted_page": include_omitted_page,
+        "omitted_items": omitted_items,
+    }
+
+
 def _summarize_units(excel_cfg: dict, *, params_used: set[str]) -> dict[str, int]:
     cols = excel_cfg.get("columns") or []
     out: dict[str, int] = {}
@@ -524,6 +715,89 @@ def _summarize_units_from_td(conn: sqlite3.Connection, *, runs: list[str], param
             u = str(c.get("units") or "").strip() or "(blank)"
             counts[u] = int(counts.get(u, 0)) + 1
     return dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
+
+
+def _read_workbook_metadata(workbook_path: Path) -> tuple[dict[str, dict[str, str]], str]:
+    """
+    Best-effort read of the project's trending workbook metadata sheet.
+
+    Returns:
+      (metadata_by_serial, note)
+    """
+    try:
+        from openpyxl import load_workbook  # type: ignore
+    except Exception:
+        return {}, "Workbook metadata unavailable (openpyxl not installed)."
+
+    wb_path = Path(workbook_path).expanduser()
+    if not wb_path.exists():
+        return {}, f"Workbook metadata unavailable (missing workbook: {wb_path})."
+
+    try:
+        wb = load_workbook(str(wb_path), data_only=True, read_only=True)
+    except Exception as exc:
+        return {}, f"Workbook metadata unavailable (failed to load workbook: {exc})."
+
+    try:
+        sheet = None
+        for name in wb.sheetnames:
+            if _norm_key(name) == _norm_key("metadata"):
+                sheet = wb[name]
+                break
+        if sheet is None:
+            return {}, "Workbook metadata unavailable (no 'metadata' sheet)."
+
+        rows = sheet.iter_rows(values_only=True)
+        try:
+            headers = next(rows)
+        except StopIteration:
+            return {}, "Workbook metadata unavailable (empty 'metadata' sheet)."
+
+        header_norm_to_idx: dict[str, int] = {}
+        for idx, h in enumerate(headers or []):
+            hn = _norm_key("" if h is None else str(h))
+            if hn and hn not in header_norm_to_idx:
+                header_norm_to_idx[hn] = int(idx)
+
+        def _get(row: tuple, *header_aliases: str) -> str:
+            for ha in header_aliases:
+                idx = header_norm_to_idx.get(_norm_key(ha))
+                if idx is None or idx >= len(row):
+                    continue
+                v = row[idx]
+                s = "" if v is None else str(v)
+                if s.strip():
+                    return s.strip()
+            return ""
+
+        meta_by_sn: dict[str, dict[str, str]] = {}
+        for r in rows:
+            if not r:
+                continue
+            sn = _get(r, "Serial Number", "Serial", "SN")
+            if not sn:
+                continue
+            if sn not in meta_by_sn:
+                meta_by_sn[sn] = {
+                    "program_title": _get(r, "Program"),
+                    "asset_type": _get(r, "Asset Type"),
+                    "asset_specific_type": _get(r, "Asset Specific Type"),
+                    "vendor": _get(r, "Vendor"),
+                    "acceptance_test_plan_number": _get(r, "Acceptance Test Plan", "Acceptance Test Plan Number"),
+                    "part_number": _get(r, "Part Number", "PN"),
+                    "revision": _get(r, "Revision", "Revision Letter"),
+                    "test_date": _get(r, "Test Date"),
+                    "report_date": _get(r, "Report Date"),
+                    "document_type": _get(r, "Document Type"),
+                    "document_type_acronym": _get(r, "Document Acronym", "Document Type Acronym"),
+                    "similarity_group": _get(r, "Similarity Group"),
+                }
+        return meta_by_sn, ""
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
 
 
 def _figure_text_page(title: str, lines: list[str]):
@@ -561,6 +835,159 @@ def _figure_table_page(title: str, columns: list[str], rows: list[list[object]])
                 cell.set_facecolor("#f1f5f9")
             if r % 2 == 0 and r != 0:
                 cell.set_facecolor("#fafafa")
+    except Exception:
+        pass
+    return fig
+
+
+def _figure_table_page2(
+    title: str,
+    columns: list[str],
+    rows: list[list[object]],
+    *,
+    landscape: bool = False,
+    font_size: int = 8,
+    title_size: int = 14,
+    scale_y: float = 1.2,
+    col_widths: list[float] | None = None,
+):
+    import matplotlib.pyplot as plt  # type: ignore
+
+    fig = plt.figure(figsize=(11.0, 8.5) if landscape else (8.5, 11.0), dpi=120)
+    fig.patch.set_facecolor("white")
+    ax = fig.add_subplot(111)
+    ax.axis("off")
+    ax.set_title(title, loc="left", fontsize=title_size, fontweight="bold", pad=12)
+    cell_text = [[("" if v is None else str(v)) for v in r] for r in rows]
+    table = ax.table(cellText=cell_text, colLabels=columns, cellLoc="left", loc="upper left")
+    table.auto_set_font_size(False)
+    table.set_fontsize(int(font_size))
+    table.scale(1.0, float(scale_y))
+    try:
+        for (r, c), cell in table.get_celld().items():
+            if r == 0:
+                cell.set_text_props(weight="bold")
+                cell.set_facecolor("#f1f5f9")
+            if r % 2 == 0 and r != 0:
+                cell.set_facecolor("#fafafa")
+            if col_widths and c < len(col_widths):
+                try:
+                    cell.set_width(float(col_widths[c]))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return fig
+
+
+def _figure_two_tables_page(
+    title: str,
+    *,
+    left_title: str,
+    left_columns: list[str],
+    left_rows: list[list[object]],
+    right_title: str,
+    right_columns: list[str],
+    right_rows: list[list[object]],
+):
+    import matplotlib.pyplot as plt  # type: ignore
+
+    fig = plt.figure(figsize=(11.0, 8.5), dpi=120)
+    fig.patch.set_facecolor("white")
+    fig.text(0.06, 0.96, title, fontsize=15, fontweight="bold", va="top")
+
+    ax_l = fig.add_axes([0.06, 0.10, 0.42, 0.80])
+    ax_r = fig.add_axes([0.52, 0.10, 0.42, 0.80])
+    for ax, sub_title in ((ax_l, left_title), (ax_r, right_title)):
+        ax.axis("off")
+        ax.set_title(sub_title, loc="left", fontsize=11, fontweight="bold", pad=6)
+
+    def _add_table(ax, cols, rows):
+        cell_text = [[("" if v is None else str(v)) for v in r] for r in rows]
+        tab = ax.table(cellText=cell_text, colLabels=cols, cellLoc="left", loc="upper left")
+        tab.auto_set_font_size(False)
+        tab.set_fontsize(7)
+        tab.scale(1.0, 1.15)
+        try:
+            for (r, _c), cell in tab.get_celld().items():
+                if r == 0:
+                    cell.set_text_props(weight="bold")
+                    cell.set_facecolor("#f1f5f9")
+                if r % 2 == 0 and r != 0:
+                    cell.set_facecolor("#fafafa")
+        except Exception:
+            pass
+
+    _add_table(ax_l, left_columns, left_rows)
+    _add_table(ax_r, right_columns, right_rows)
+    return fig
+
+
+def _wrap_cell(s: str, *, max_chars: int, max_lines: int) -> str:
+    txt = str(s or "").strip()
+    if not txt:
+        return ""
+    wrapped = textwrap.wrap(txt, width=max_chars) or [txt]
+    if len(wrapped) > max_lines:
+        wrapped = wrapped[:max_lines]
+        if wrapped:
+            wrapped[-1] = wrapped[-1].rstrip()
+            if not wrapped[-1].endswith("…"):
+                wrapped[-1] = (wrapped[-1][: max(0, max_chars - 1)]).rstrip() + "…"
+    return "\n".join(wrapped)
+
+
+def _grade_cell_color(g: str) -> str:
+    gg = str(g or "").strip().upper()
+    if gg == "PASS":
+        return "#dcfce7"
+    if gg == "WATCH":
+        return "#fef3c7"
+    if gg == "FAIL":
+        return "#fee2e2"
+    return "#f1f5f9"
+
+
+def _figure_grade_matrix_page(
+    title: str,
+    *,
+    columns: list[str],
+    rows: list[list[object]],
+    grade_cells: set[tuple[int, int]],
+):
+    """
+    grade_cells: set of (r_idx, c_idx) for rows/cols within `rows` (0-based in rows, 0-based in columns),
+    where the value is a grade token (PASS/WATCH/FAIL/NO_DATA).
+    """
+    import matplotlib.pyplot as plt  # type: ignore
+
+    fig = plt.figure(figsize=(11.0, 8.5), dpi=120)
+    fig.patch.set_facecolor("white")
+    ax = fig.add_subplot(111)
+    ax.axis("off")
+    ax.set_title(title, loc="left", fontsize=14, fontweight="bold", pad=12)
+    cell_text = [[("" if v is None else str(v)) for v in r] for r in rows]
+    table = ax.table(cellText=cell_text, colLabels=columns, cellLoc="center", loc="upper left")
+    table.auto_set_font_size(False)
+    table.set_fontsize(7)
+    table.scale(1.0, 1.15)
+    try:
+        for (r, c), cell in table.get_celld().items():
+            if r == 0:
+                cell.set_text_props(weight="bold")
+                cell.set_facecolor("#f1f5f9")
+                continue
+            if r % 2 == 0:
+                cell.set_facecolor("#fafafa")
+        for rr, cc in grade_cells:
+            # +1 because matplotlib table has header at row 0.
+            cell = table.get_celld().get((rr + 1, cc))
+            if not cell:
+                continue
+            try:
+                cell.set_facecolor(_grade_cell_color(cell.get_text().get_text()))
+            except Exception:
+                pass
     except Exception:
         pass
     return fig
@@ -610,47 +1037,28 @@ def generate_test_data_auto_report(
     else:
         change_summary = "excel_trend_config.json update disabled."
 
-    with sqlite3.connect(str(Path(db_path).expanduser())) as conn:
-        all_serials = _td_list_serials(conn)
-        run_rows = _td_list_runs(conn)
-        run_by_name = {str(r.get("run_name") or ""): r for r in run_rows if str(r.get("run_name") or "")}
+        with sqlite3.connect(str(Path(db_path).expanduser())) as conn:
+            all_serials = _td_list_serials(conn)
+            run_rows = _td_list_runs(conn)
 
-        selected_runs = options.get("runs") or []
-        runs = [str(r).strip() for r in selected_runs if str(r).strip()] if isinstance(selected_runs, list) else []
-        if not runs:
-            runs = [str(r.get("run_name") or "").strip() for r in run_rows if str(r.get("run_name") or "").strip()]
-        runs = [r for r in runs if r in run_by_name]
+            runs = _resolve_selected_runs(run_rows, options)
 
-        excel_cols = excel_cfg.get("columns") or []
-        excel_names = {
-            _norm_key(str(c.get("name") or "")): str(c.get("name") or "").strip()
-            for c in excel_cols
-            if isinstance(c, dict) and str(c.get("name") or "").strip()
-        }
+            excel_cols = excel_cfg.get("columns") or []
+            excel_names = {
+                _norm_key(str(c.get("name") or "")): str(c.get("name") or "").strip()
+                for c in excel_cols
+                if isinstance(c, dict) and str(c.get("name") or "").strip()
+            }
 
-        selected_params = options.get("params") or []
-        params = [str(p).strip() for p in selected_params if str(p).strip()] if isinstance(selected_params, list) else []
-        if not params:
-            # Auto-detect from cache/workbook (td_columns). Do not require excel_trend_config intersection.
-            seen: set[str] = set()
-            auto: list[str] = []
-            for run in runs:
-                for c in _td_list_y_columns(conn, run):
-                    name = str(c.get("name") or "").strip()
-                    if not name:
-                        continue
-                    nk = _norm_key(name)
-                    if nk in seen:
-                        continue
-                    seen.add(nk)
-                    auto.append(name)
-            params = sorted(auto, key=lambda s: s.lower())
+            params = _resolve_selected_params(conn, runs=runs, options=options)
 
-        params_norm = {_norm_key(p) for p in params if p}
-        hi = [s for s in highlighted_serials if s in all_serials]
+            params_norm = {_norm_key(p) for p in params if p}
+            hi = [s for s in highlighted_serials if s in all_serials]
 
         stats = excel_cfg.get("statistics") or ["mean", "min", "max", "std", "median", "count"]
         stats = [str(s).strip().lower() for s in stats if str(s).strip()]
+        if not stats:
+            stats = ["mean", "min", "max", "std", "median", "count"]
         include_metrics = bool(options.get("include_metrics", bool(report_opts.get("include_metrics", True))))
 
         grid_points = int(model_cfg.get("grid_points") or 200) or 200
@@ -769,6 +1177,8 @@ def generate_test_data_auto_report(
                             "run": run,
                             "param": y_name,
                             "units": units,
+                            "max_abs": dv.get("max_abs"),
+                            "rms": dv.get("rms"),
                             "max_pct": dv.get("max_pct"),
                             "rms_pct": dv.get("rms_pct"),
                             "x_at_max_abs": dv.get("x_at_max_abs"),
@@ -798,8 +1208,56 @@ def generate_test_data_auto_report(
                     "watch_any": any(w.get("run") == run and w.get("param") == y_name for w in watch_items),
                 }
 
+        meta_by_sn, meta_note = _read_workbook_metadata(wb)
+
+        def _meta(sn: str, key: str) -> str:
+            try:
+                return str((meta_by_sn.get(sn) or {}).get(key) or "").strip()
+            except Exception:
+                return ""
+
+        grade_map: dict[tuple[str, str, str], str] = {}
+        for r in grading_rows:
+            sn = str(r.get("serial") or "").strip()
+            run = str(r.get("run") or "").strip()
+            param = str(r.get("param") or "").strip()
+            grade = str(r.get("grade") or "").strip().upper()
+            if sn and run and param and grade:
+                grade_map[(run, param, sn)] = grade
+
+        run_param_pairs: list[tuple[str, str]] = []
+        for run in runs:
+            params_run = curves_summary.get(run, {}) or {}
+            by_norm = {_norm_key(pn): pn for pn in params_run.keys()}
+            for p in params:
+                actual = by_norm.get(_norm_key(p))
+                if actual:
+                    run_param_pairs.append((run, actual))
+
+        overall_by_sn = {sn: _overall_cert_status([grade_map.get((run, param, sn), "NO_DATA") for run, param in run_param_pairs]) for sn in hi}
+
+        nonpass_findings = [r for r in grading_rows if str(r.get("grade") or "").strip().upper() in ("WATCH", "FAIL")]
+        nonpass_findings = sorted(nonpass_findings, key=_finding_sort_key)
+        nonpass_run_param = {(str(r.get("run") or ""), str(r.get("param") or "")) for r in nonpass_findings}
+
+        by_sn_nonpass: dict[str, list[dict]] = {}
+        for r in nonpass_findings:
+            sn = str(r.get("serial") or "").strip()
+            if sn:
+                by_sn_nonpass.setdefault(sn, []).append(r)
+
+        serials_nonpass_sorted = sorted(
+            by_sn_nonpass.keys(),
+            key=lambda sn: (
+                0
+                if any(str(rr.get("grade") or "").strip().upper() == "FAIL" for rr in (by_sn_nonpass.get(sn) or []))
+                else 1,
+                -max((abs(float(rr.get("z") or 0.0)) for rr in (by_sn_nonpass.get(sn) or [])), default=0.0),
+            ),
+        )
+
         metrics_summary: dict[str, dict[str, dict]] = {}
-        if include_metrics and runs and params:
+        if False and include_metrics and runs and params:
             for run in runs:
                 y_cols = _td_list_y_columns(conn, run)
                 y_by_norm = {_norm_key(str(c.get("name") or "")): c for c in y_cols if str(c.get("name") or "").strip()}
@@ -826,39 +1284,117 @@ def generate_test_data_auto_report(
                         metrics_summary.setdefault(run, {}).setdefault(y_name, {"units": units, "stats": {}})
                         metrics_summary[run][y_name]["stats"][st] = vmap
 
-        units_summary = _summarize_units_from_td(conn, runs=runs, params=params)
-        max_findings = int(report_opts.get("max_findings") or 12) or 12
-        findings = sorted(
-            watch_items,
-            key=lambda d: (float(d.get("max_pct") or 0.0), abs(float(d.get("z") or 0.0))),
-            reverse=True,
-        )[:max_findings]
+        max_pages = int((report_opts.get("max_pages") or 30) or 30)
+        max_pages = max(4, max_pages)
+        metrics_stats_cfg = report_opts.get("metrics_stats")
+        metrics_stat = "median"
+        if isinstance(metrics_stats_cfg, list) and metrics_stats_cfg:
+            metrics_stat = str(metrics_stats_cfg[0]).strip().lower() or "median"
+        elif isinstance(metrics_stats_cfg, str) and metrics_stats_cfg.strip():
+            metrics_stat = metrics_stats_cfg.strip().lower()
+        if metrics_stat not in stats:
+            metrics_stat = stats[0] if stats else "median"
 
-        grade_counts = {"PASS": 0, "WATCH": 0, "FAIL": 0}
-        for r in grading_rows:
-            g = str(r.get("grade") or "").strip().upper()
-            if g in grade_counts:
-                grade_counts[g] += 1
+        appendix_include_grade_matrix = bool(report_opts.get("appendix_include_grade_matrix", True))
+        appendix_include_pass_details = bool(report_opts.get("appendix_include_pass_details", True))
 
-        summary_lines = [
-            f"Date: {_now_datestr()}",
-            f"Project: {proj}",
-            f"Workbook: {wb}",
-            f"Cache DB: {db_path}",
-            f"Runs: {len(runs)}",
-            f"Serials: {len(all_serials)}",
-            f"Highlighted Serials: {', '.join(hi) if hi else '(none)'}",
-            f"Watch Items: {len(watch_items)}",
-            f"Grades (highlighted): PASS={grade_counts['PASS']}  WATCH={grade_counts['WATCH']}  FAIL={grade_counts['FAIL']}",
+        assets_counts: dict[tuple[str, str, str, str], int] = {}
+        for sn in hi:
+            pn = _meta(sn, "part_number") or "—"
+            rev = _meta(sn, "revision") or "—"
+            at = _meta(sn, "asset_type") or "—"
+            vd = _meta(sn, "vendor") or "—"
+            assets_counts[(pn, rev, at, vd)] = int(assets_counts.get((pn, rev, at, vd), 0)) + 1
+        assets_lines = [f"  • PN {pn}  Rev {rev}  Asset {at}  Vendor {vd}  (x{n})" for (pn, rev, at, vd), n in sorted(assets_counts.items(), key=lambda kv: (-kv[1], kv[0]))]
+
+        programs = sorted({p for p in (_meta(sn, "program_title") for sn in hi) if p})
+        program_disp = programs[0] if len(programs) == 1 else ("(multiple)" if programs else "(unknown)")
+        sim_groups = sorted({g for g in (_meta(sn, "similarity_group") for sn in hi) if g})
+        sim_disp = ", ".join(sim_groups) if sim_groups else "(unknown)"
+
+        cover_lines = [
+            "Acceptance Test Certification of test data against family baseline.",
             "",
-            "excel_trend_config.json updates:",
-            *[f"  {ln}" for ln in str(change_summary).splitlines()[:14]],
+            "Assets involved:",
+            *(assets_lines if assets_lines else ["  • (metadata unavailable)"]),
+            "",
+            "Scope:",
+            f"  • Program: {program_disp}",
+            f"  • Similarity Group(s): {sim_disp}",
+            f"  • Serials under certification ({len(hi)}): {', '.join(hi)}",
+            f"  • Runs included: {', '.join(runs)}",
+            f"  • Params included: {', '.join(params)}",
+            f"  • Generated: {_now_datestr()}",
         ]
+        if meta_note:
+            cover_lines += ["", f"Note: {meta_note}"]
 
         performance_models: list[dict] = []
+        omitted_items: list[str] = []
+
+        params_norm_set = {_norm_key(p) for p in params if str(p).strip()}
+        run_details_runs = []
+        for run in runs:
+            params_run = curves_summary.get(run, {}) or {}
+            if any(_norm_key(k) in params_norm_set for k in params_run.keys()):
+                run_details_runs.append(run)
+
+        perf_defs_all = []
+        try:
+            raw_perf_opt = options.get("performance_plotters")
+            if isinstance(raw_perf_opt, list):
+                raw_perf = raw_perf_opt
+            else:
+                raw_perf = excel_cfg.get("performance_plotters") if isinstance(excel_cfg, dict) else []
+            if isinstance(raw_perf, list):
+                for pd in raw_perf:
+                    if not isinstance(pd, dict):
+                        continue
+                    x_spec = pd.get("x") or {}
+                    y_spec = pd.get("y") or {}
+                    x_target = str((x_spec.get("column") if isinstance(x_spec, dict) else "") or "").strip()
+                    y_target = str((y_spec.get("column") if isinstance(y_spec, dict) else "") or "").strip()
+                    if x_target and y_target:
+                        perf_defs_all.append(pd)
+        except Exception:
+            perf_defs_all = []
+
+        max_plots_cfg = report_opts.get("max_plots")
+        try:
+            max_plots = int(max_plots_cfg) if max_plots_cfg not in (None, "") else None
+        except Exception:
+            max_plots = None
+        chart_specs_all = _build_chart_specs(run_param_pairs=run_param_pairs, nonpass_findings=nonpass_findings, max_plots=max_plots)
+
+        metrics_pairs_all = list(run_param_pairs)
+        metrics_pairs_nonpass = [(run, param) for (run, param) in run_param_pairs if (run, param) in nonpass_run_param]
+
+        plan_sel = _plan_page_selections(
+            max_pages=max_pages,
+            appendix_include_grade_matrix=appendix_include_grade_matrix,
+            appendix_include_pass_details=appendix_include_pass_details,
+            include_metrics=include_metrics,
+            grading_rows=grading_rows,
+            run_param_pairs=run_param_pairs,
+            serials_nonpass_sorted=serials_nonpass_sorted,
+            perf_defs_all=perf_defs_all,
+            run_details_all=run_details_runs,
+            chart_specs_all=chart_specs_all,
+            metrics_pairs_all=metrics_pairs_all,
+            metrics_pairs_nonpass=metrics_pairs_nonpass,
+        )
+        perf_defs_sel = plan_sel["perf_defs_sel"]
+        run_details_sel = plan_sel["run_details_sel"]
+        serials_nonpass_sorted = plan_sel["serials_nonpass_sorted"]
+        include_deviations = bool(plan_sel["include_deviations"])
+        deviations_pages = int(plan_sel["deviations_pages"])
+        metrics_sel = plan_sel["metrics_sel"]
+        charts_sel = plan_sel["charts_sel"]
+        include_omitted_page = bool(plan_sel["include_omitted_page"])
+        omitted_items = plan_sel["omitted_items"]
 
         sidecar = {
-            "version": 1,
+            "version": 2,
             "generated_date": _now_datestr(),
             "project_dir": str(proj),
             "workbook_path": str(wb),
@@ -866,145 +1402,469 @@ def generate_test_data_auto_report(
             "output_pdf": str(out_pdf),
             "report_config": report_cfg,
             "options": options,
-            "highlighted_serials": hi,
+            "investigated_serials": hi,
+            "metadata_by_serial": {sn: (meta_by_sn.get(sn) or {}) for sn in hi},
+            "overall_results_by_serial": overall_by_sn,
+            "non_pass_findings": nonpass_findings,
             "runs": runs,
             "params": params,
-            "statistics": stats,
             "curve_models": curves_summary,
             "watch_items": watch_items,
             "grading": grading_rows,
+            "page_cap": int(max_pages),
+            "omitted_items": omitted_items,
         }
         sidecar_path = out_pdf.with_suffix(".summary.json")
         # Sidecar written after PDF generation (includes performance models).
 
         with PdfPages(out_pdf) as pdf:
-            pdf.savefig(_figure_text_page("Auto Report — Executive Summary", summary_lines))
-            if units_summary:
-                pdf.savefig(_figure_table_page("Units Summary", ["Units", "Parameters"], [[u, n] for u, n in units_summary.items()]))
-            if findings:
-                cols = ["Serial", "Run", "Param", "Max %", "RMS %", "x@max", "Grade"]
+            import matplotlib.pyplot as plt  # type: ignore
+
+            # 1) Cover
+            pdf.savefig(_figure_text_page("Acceptance Test Certification Report", cover_lines))
+
+            # 2) Executive summary (table + grading explanation)
+            exec_rows = []
+            for sn in hi:
+                exec_rows.append(
+                    [
+                        sn,
+                        overall_by_sn.get(sn, "NO_DATA"),
+                        _meta(sn, "part_number"),
+                        _meta(sn, "revision"),
+                        _meta(sn, "asset_type"),
+                        _meta(sn, "vendor"),
+                        _meta(sn, "acceptance_test_plan_number"),
+                        _meta(sn, "similarity_group"),
+                        _meta(sn, "test_date"),
+                        _meta(sn, "report_date"),
+                    ]
+                )
+
+            fig = plt.figure(figsize=(11.0, 8.5), dpi=120)
+            fig.patch.set_facecolor("white")
+            fig.text(0.06, 0.96, "Executive Summary", fontsize=15, fontweight="bold", va="top")
+            ax_t = fig.add_axes([0.06, 0.36, 0.92, 0.56])
+            ax_t.axis("off")
+            cols = ["Serial", "Overall", "Part #", "Rev", "Asset Type", "Vendor", "ATP", "Similarity Group", "Test Date", "Report Date"]
+            tab = ax_t.table(cellText=[[("" if v is None else str(v)) for v in r] for r in exec_rows], colLabels=cols, cellLoc="left", loc="upper left")
+            tab.auto_set_font_size(False)
+            tab.set_fontsize(7)
+            tab.scale(1.0, 1.2)
+            try:
+                for (r, _c), cell in tab.get_celld().items():
+                    if r == 0:
+                        cell.set_text_props(weight="bold")
+                        cell.set_facecolor("#f1f5f9")
+                    if r % 2 == 0 and r != 0:
+                        cell.set_facecolor("#fafafa")
+            except Exception:
+                pass
+
+            expl = [
+                "Grading metrics (family comparison):",
+                "  • Family curve: median across all serials in the project cache (per run/param).",
+                "  • Residual metrics: max_abs, max_pct, rms_pct, x@max.",
+                "  • Grade basis: z-score of max_abs vs family distribution.",
+                f"  • Thresholds: PASS if |z|≤{_fmt_num(z_pass)}; WATCH if |z|≤{_fmt_num(z_watch)}; else FAIL.",
+                "  • Main body shows WATCH/FAIL only; PASS details are in the appendix.",
+            ]
+            y = 0.30
+            for line in expl:
+                fig.text(0.06, y, line, fontsize=9, va="top", color="#0f172a")
+                y -= 0.03
+            pdf.savefig(fig)
+            plt.close(fig)
+
+            # 3) Non-PASS findings overview
+            if not nonpass_findings:
+                pdf.savefig(_figure_text_page("Non‑PASS Findings (Overview)", ["All investigated serials are CERTIFIED (all PASS)."]))
+            else:
+                cols = ["Serial", "Run", "Param", "Grade", "Max %", "RMS %", "x@max", "z"]
                 rows = [
                     [
-                        f.get("serial"),
-                        f.get("run"),
-                        f.get("param"),
-                        f"{float(f.get('max_pct') or 0.0):.3g}",
-                        f"{float(f.get('rms_pct') or 0.0):.3g}",
-                        f"{float(f.get('x_at_max_abs') or 0.0):.4g}" if f.get("x_at_max_abs") is not None else "",
-                        f.get("grade"),
+                        r.get("serial"),
+                        r.get("run"),
+                        r.get("param"),
+                        r.get("grade"),
+                        _fmt_num(r.get("max_pct")),
+                        _fmt_num(r.get("rms_pct")),
+                        _fmt_num(r.get("x_at_max_abs"), sig=5),
+                        _fmt_num(r.get("z"), sig=4),
                     ]
-                    for f in findings
+                    for r in nonpass_findings
                 ]
-                pdf.savefig(_figure_table_page("Top Findings (Watch Items)", cols, rows))
+                pdf.savefig(_figure_table_page2("Non‑PASS Findings (Overview)", cols, rows, landscape=True, font_size=7))
 
-            if hi:
-                by_sn: dict[str, list[dict]] = {}
-                for r in grading_rows:
-                    by_sn.setdefault(str(r.get("serial") or ""), []).append(r)
-                for sn in hi:
-                    rows = by_sn.get(sn, [])
-                    if not rows:
-                        pdf.savefig(_figure_text_page(f"Highlighted Serial — {sn}", ["No data found for this serial in cache."]))
-                        continue
-                    rows = sorted(rows, key=lambda d: (str(d.get("run") or ""), str(d.get("param") or "")))
-                    cols = ["Run", "Param", "Units", "Max %", "RMS %", "x@max", "z", "Grade"]
-                    tab = []
-                    for r in rows:
-                        tab.append(
-                            [
-                                r.get("run"),
-                                r.get("param"),
-                                r.get("units"),
-                                f"{float(r.get('max_pct') or 0.0):.3g}",
-                                f"{float(r.get('rms_pct') or 0.0):.3g}",
-                                f"{float(r.get('x_at_max_abs') or 0.0):.4g}" if r.get("x_at_max_abs") is not None else "",
-                                f"{float(r.get('z') or 0.0):+.3g}",
-                                r.get("grade"),
-                            ]
-                        )
-                    pdf.savefig(_figure_table_page(f"Highlighted Serial — {sn} (Family Grading)", cols, tab))
+            # 4) Non-PASS findings by serial (two per page)
+            cols_by_sn = ["Run", "Param", "Grade", "Max %", "RMS %", "x@max", "z"]
+            for i in range(0, len(serials_nonpass_sorted), 2):
+                left_sn = serials_nonpass_sorted[i]
+                right_sn = serials_nonpass_sorted[i + 1] if i + 1 < len(serials_nonpass_sorted) else ""
+                left_rows = [
+                    [
+                        rr.get("run"),
+                        rr.get("param"),
+                        rr.get("grade"),
+                        _fmt_num(rr.get("max_pct")),
+                        _fmt_num(rr.get("rms_pct")),
+                        _fmt_num(rr.get("x_at_max_abs"), sig=5),
+                        _fmt_num(rr.get("z"), sig=4),
+                    ]
+                    for rr in (by_sn_nonpass.get(left_sn) or [])
+                ]
+                right_rows = [
+                    [
+                        rr.get("run"),
+                        rr.get("param"),
+                        rr.get("grade"),
+                        _fmt_num(rr.get("max_pct")),
+                        _fmt_num(rr.get("rms_pct")),
+                        _fmt_num(rr.get("x_at_max_abs"), sig=5),
+                        _fmt_num(rr.get("z"), sig=4),
+                    ]
+                    for rr in (by_sn_nonpass.get(right_sn) or [])
+                ]
+                fig = _figure_two_tables_page(
+                    "Non‑PASS Findings (By Serial)",
+                    left_title=left_sn or "—",
+                    left_columns=cols_by_sn,
+                    left_rows=left_rows or [["", "", "", "", "", "", ""]],
+                    right_title=right_sn or "—",
+                    right_columns=cols_by_sn,
+                    right_rows=right_rows or [["", "", "", "", "", "", ""]],
+                )
+                pdf.savefig(fig)
+                plt.close(fig)
 
+            # 5) Unit-to-family summary: requested param medians (pooled across runs)
+            metric_map_cache: dict[tuple[str, str], dict[str, float]] = {}
+            units_by_param_norm: dict[str, str] = {}
+            col_by_run_param_norm: dict[tuple[str, str], str] = {}
             for run in runs:
+                for p in params:
+                    nk = _norm_key(p)
+                    col, units = _resolve_td_y_col(conn, run, p)
+                    if not col:
+                        continue
+                    col_by_run_param_norm[(run, nk)] = col
+                    if units and nk not in units_by_param_norm:
+                        units_by_param_norm[nk] = units
+                    key = (run, col)
+                    if key not in metric_map_cache:
+                        metric_map_cache[key] = _td_metric_map(conn, run, col, metrics_stat)
+
+            def _pooled_median(sn: str, p: str) -> float | None:
+                nk = _norm_key(p)
+                vals: list[float] = []
+                for run in runs:
+                    col = col_by_run_param_norm.get((run, nk))
+                    if not col:
+                        continue
+                    vmap = metric_map_cache.get((run, col)) or {}
+                    v = vmap.get(sn)
+                    if isinstance(v, (int, float)) and math.isfinite(float(v)):
+                        vals.append(float(v))
+                if not vals:
+                    return None
+                try:
+                    return float(statistics.median(vals))
+                except Exception:
+                    return None
+
+            family_median_by_param: dict[str, float | None] = {}
+            for p in params:
+                vals = []
+                for sn in all_serials:
+                    pv = _pooled_median(sn, p)
+                    if pv is not None and math.isfinite(float(pv)):
+                        vals.append(float(pv))
+                family_median_by_param[p] = float(statistics.median(vals)) if vals else None
+
+            cols = ["Parameter", "Units", "Family Median (pooled)"] + hi
+            rows = []
+            for p in params:
+                nk = _norm_key(p)
+                units = units_by_param_norm.get(nk, "")
+                fam = family_median_by_param.get(p)
+                row: list[object] = [p, units, _fmt_num(fam)]
+                for sn in hi:
+                    row.append(_fmt_num(_pooled_median(sn, p)))
+                rows.append(row)
+            pdf.savefig(_figure_table_page2("Unit‑to‑Family Summary — Requested Param Medians", cols, rows, landscape=True, font_size=7))
+
+            # 5B) Unit-to-family summary: performance equations (from excel_trend_config.performance_plotters)
+            perf_defs = perf_defs_sel
+            if isinstance(perf_defs, list) and perf_defs:
+                for pd in perf_defs:
+                    if not isinstance(pd, dict):
+                        continue
+                    name = str(pd.get("name") or "Performance").strip() or "Performance"
+                    x_spec = pd.get("x") or {}
+                    y_spec = pd.get("y") or {}
+                    x_target = str((x_spec.get("column") if isinstance(x_spec, dict) else "") or "").strip()
+                    y_target = str((y_spec.get("column") if isinstance(y_spec, dict) else "") or "").strip()
+                    if not x_target or not y_target:
+                        continue
+
+                    stats_list = pd.get("stats")
+                    if isinstance(stats_list, list) and all(isinstance(s, str) for s in stats_list):
+                        stats_list = [str(s).strip().lower() for s in stats_list if str(s).strip()]
+                    else:
+                        legacy = str((x_spec.get("stat") if isinstance(x_spec, dict) else "mean") or "mean").strip().lower()
+                        stats_list = [legacy] if legacy else ["mean"]
+                    if not stats_list:
+                        stats_list = ["mean"]
+                    st = (str(stats_list[0]).strip().lower() if stats_list else "mean") or "mean"
+
+                    require_min_points = int(pd.get("require_min_points") or 2)
+                    require_min_points = max(2, require_min_points)
+
+                    fit_cfg = pd.get("fit") or {}
+                    fit_degree = int((fit_cfg.get("degree") if isinstance(fit_cfg, dict) else 0) or 0)
+                    fit_degree = max(0, fit_degree)
+                    fit_norm = bool((fit_cfg.get("normalize_x") if isinstance(fit_cfg, dict) else True))
+
+                    per_run: list[tuple[str, str, dict[str, float], dict[str, float], str, str]] = []
+                    for rn in runs:
+                        x_col, x_units = _resolve_td_y_col(conn, rn, x_target)
+                        y_col, y_units = _resolve_td_y_col(conn, rn, y_target)
+                        xmap = _td_metric_map(conn, rn, x_col, st)
+                        ymap = _td_metric_map(conn, rn, y_col, st)
+                        dn = str((run_by_name.get(rn) or {}).get("display_name") or "").strip()
+                        per_run.append((rn, dn or rn, xmap, ymap, x_units, y_units))
+
+                    curves: dict[str, list[tuple[float, float, str]]] = {}
+                    pooled_x: list[float] = []
+                    pooled_y: list[float] = []
+                    for sn in all_serials:
+                        pts: list[tuple[float, float, str]] = []
+                        for _rn, rdisp, xmap, ymap, _xu, _yu in per_run:
+                            if sn not in xmap or sn not in ymap:
+                                continue
+                            pts.append((float(xmap[sn]), float(ymap[sn]), rdisp))
+                        if len(pts) >= require_min_points:
+                            pts.sort(key=lambda t: t[0])
+                            curves[sn] = pts
+                            pooled_x.extend([p[0] for p in pts])
+                            pooled_y.extend([p[1] for p in pts])
+                    if not curves:
+                        continue
+
+                    # Fits (master + investigated)
+                    master_poly: dict = {"degree": int(fit_degree), "coeffs": [], "rmse": None, "x0": None, "sx": None}
+                    master_eqn = ""
+                    if fit_degree > 0 and pooled_x:
+                        try:
+                            master_poly = _poly_fit(pooled_x, pooled_y, int(fit_degree), normalize_x=fit_norm)
+                            master_eqn = _fmt_equation(master_poly)
+                        except Exception:
+                            master_poly = {"degree": int(fit_degree), "coeffs": [], "rmse": None, "x0": None, "sx": None}
+                            master_eqn = ""
+
+                    highlighted_models: dict[str, dict] = {}
+                    for sn in hi:
+                        pts = curves.get(sn)
+                        if not pts:
+                            continue
+                        row: dict[str, object] = {"points": int(len(pts))}
+                        if fit_degree > 0:
+                            try:
+                                xs = [p[0] for p in pts]
+                                ys = [p[1] for p in pts]
+                                poly = _poly_fit(xs, ys, int(fit_degree), normalize_x=fit_norm)
+                                row.update({"poly": poly, "equation": _fmt_equation(poly), "rmse": poly.get("rmse")})
+                            except Exception:
+                                pass
+                        highlighted_models[sn] = row
+
+                    performance_models.append(
+                        {
+                            "name": name,
+                            "x": {"column": x_target},
+                            "y": {"column": y_target},
+                            "stat": st,
+                            "fit": {"degree": int(fit_degree), "normalize_x": bool(fit_norm)},
+                            "require_min_points": int(require_min_points),
+                            "points_total": int(len(pooled_x)),
+                            "serials_curves": int(len(curves)),
+                            "master": {"poly": master_poly, "equation": master_eqn, "rmse": master_poly.get("rmse")},
+                            "highlighted": highlighted_models,
+                        }
+                    )
+
+                    fig = plt.figure(figsize=(11.0, 8.5), dpi=120)
+                    fig.patch.set_facecolor("white")
+                    fig.text(0.06, 0.96, f"Unit‑to‑Family Summary — Performance Equation — {name} ({st})", fontsize=14, fontweight="bold", va="top")
+                    master_lines = []
+                    if master_eqn:
+                        master_lines.append(f"Master (family): {master_eqn}")
+                    if master_poly.get("rmse") is not None:
+                        master_lines.append(f"Master RMSE: {_fmt_num(master_poly.get('rmse'))}")
+                    if master_lines:
+                        fig.text(0.06, 0.90, "\n".join(master_lines), fontsize=9, va="top", color="#0f172a")
+
+                    ax = fig.add_axes([0.06, 0.10, 0.92, 0.74])
+                    ax.axis("off")
+                    tcols = ["Serial", "Points", "Equation", "RMSE"]
+                    trows = []
+                    for sn in hi:
+                        hm = highlighted_models.get(sn)
+                        if not isinstance(hm, dict):
+                            trows.append([sn, "", "", ""])
+                            continue
+                        eqn = _wrap_cell(str(hm.get("equation") or ""), max_chars=52, max_lines=2)
+                        trows.append([sn, str(hm.get("points") or ""), eqn, _fmt_num(hm.get("rmse"))])
+                    tab = ax.table(cellText=trows, colLabels=tcols, cellLoc="left", loc="upper left")
+                    tab.auto_set_font_size(False)
+                    tab.set_fontsize(7)
+                    tab.scale(1.0, 1.2)
+                    try:
+                        for (r, _c), cell in tab.get_celld().items():
+                            if r == 0:
+                                cell.set_text_props(weight="bold")
+                                cell.set_facecolor("#f1f5f9")
+                            if r % 2 == 0 and r != 0:
+                                cell.set_facecolor("#fafafa")
+                    except Exception:
+                        pass
+
+                    pdf.savefig(fig)
+                    plt.close(fig)
+
+            for run in run_details_sel:
                 run_meta = run_by_name.get(run) or {}
                 title = str(run_meta.get("display_name") or "").strip() or run
                 params_run = curves_summary.get(run, {}) or {}
                 cols = ["Parameter", "Units", "x-axis", "Domain", "Poly RMSE", "Equation"]
                 rows = []
-                for param_name, d in sorted(params_run.items(), key=lambda kv: kv[0].lower()):
+                by_norm = {_norm_key(k): k for k in params_run.keys()}
+                for p in params:
+                    actual = by_norm.get(_norm_key(p))
+                    if not actual:
+                        continue
+                    d = params_run.get(actual) or {}
                     poly = d.get("poly") or {}
+                    eqn = _wrap_cell(str(d.get("equation") or ""), max_chars=60, max_lines=2)
                     rows.append(
                         [
-                            param_name,
+                            actual,
                             d.get("units") or "",
                             d.get("x_name") or "",
                             "…".join(f"{float(x):.4g}" for x in (d.get("domain") or [])[:2]) if d.get("domain") else "",
-                            f"{float(poly.get('rmse') or 0.0):.4g}" if poly.get("rmse") is not None else "",
-                            (d.get("equation") or "")[:120],
+                            _fmt_num(poly.get("rmse"), sig=4),
+                            eqn,
                         ]
                     )
                 if rows:
-                    pdf.savefig(_figure_table_page(f"Run Details — {title}", cols, rows))
+                    pdf.savefig(_figure_table_page2(f"Run Details — {title}", cols, rows, landscape=True, font_size=7))
 
-            import matplotlib.pyplot as plt  # type: ignore
-
-            watch_set = {(str(w.get("run") or ""), str(w.get("param") or ""), str(w.get("serial") or "")) for w in watch_items}
-            watch_any_set = {(str(w.get("run") or ""), str(w.get("param") or "")) for w in watch_items}
-
-            for run in runs:
+            # 7) Charts — only non-PASS overlays (WATCH/FAIL)
+            for run, param_name in charts_sel:
                 run_meta = run_by_name.get(run) or {}
                 run_title = str(run_meta.get("display_name") or "").strip() or run
                 x_name = str(run_meta.get("default_x") or "").strip() or "Time"
-                params_run = curves_summary.get(run, {}) or {}
-                for param_name, model in sorted(params_run.items(), key=lambda kv: kv[0].lower()):
-                    series = _load_curves(conn, run, param_name, x_name)
-                    if not series:
+                model = (curves_summary.get(run, {}) or {}).get(param_name) or {}
+                series = _load_curves(conn, run, param_name, x_name)
+                if not series:
+                    continue
+                dom = model.get("domain") or []
+                if not isinstance(dom, list) or len(dom) < 2:
+                    continue
+                lo = float(dom[0])
+                hi_dom = float(dom[1])
+                x_grid = [lo + (hi_dom - lo) * (i / (grid_points - 1)) for i in range(grid_points)]
+                y_resampled_by_sn = {s.serial: _interp_linear(s.x, s.y, x_grid) for s in series}
+                y_matrix = list(y_resampled_by_sn.values())
+                master_y = _nan_median(y_matrix)
+                std_y = _nan_std(y_matrix)
+                units = str(model.get("units") or "").strip()
+
+                fig = plt.figure(figsize=(11.0, 8.5), dpi=120)
+                ax = fig.add_subplot(111)
+                ax.set_title(f"{run_title} — {param_name}")
+                ax.set_xlabel(x_name)
+                ax.set_ylabel(f"{param_name} ({units})" if units else param_name)
+                ax.plot(x_grid, master_y, linewidth=2.2, color="#0f172a", label="Family (median)")
+                try:
+                    band_lo = [a - b if (isinstance(a, (int, float)) and not math.isnan(float(a)) and isinstance(b, (int, float)) and not math.isnan(float(b))) else float("nan") for a, b in zip(master_y, std_y)]
+                    band_hi = [a + b if (isinstance(a, (int, float)) and not math.isnan(float(a)) and isinstance(b, (int, float)) and not math.isnan(float(b))) else float("nan") for a, b in zip(master_y, std_y)]
+                    ax.fill_between(x_grid, band_lo, band_hi, color="#93c5fd", alpha=0.25, label="±1σ band")
+                except Exception:
+                    pass
+
+                nonpass_sns = [sn for sn in hi if grade_map.get((run, param_name, sn), "NO_DATA") in ("WATCH", "FAIL")]
+                for idx, sn in enumerate(nonpass_sns):
+                    yv = y_resampled_by_sn.get(sn)
+                    if not yv:
                         continue
-                    dom = model.get("domain") or []
-                    if not isinstance(dom, list) or len(dom) < 2:
+                    g = grade_map.get((run, param_name, sn), "NO_DATA")
+                    ax.plot(x_grid, yv, linewidth=1.7, color=colors[idx % len(colors)], label=f"{sn} ({g})")
+
+                eqn = str(model.get("equation") or "").strip()
+                rmse = (model.get("poly") or {}).get("rmse")
+                notes = []
+                if eqn:
+                    notes.append(eqn)
+                if rmse is not None:
+                    notes.append(f"RMSE: {_fmt_num(rmse)}")
+                if notes:
+                    ax.text(0.01, 0.01, "\n".join(notes), transform=ax.transAxes, fontsize=8, va="bottom", ha="left", color="#334155")
+                ax.grid(True, alpha=0.25)
+                try:
+                    ax.legend(fontsize=8, loc="best")
+                except Exception:
+                    pass
+                try:
+                    fig.tight_layout()
+                except Exception:
+                    pass
+                pdf.savefig(fig)
+                plt.close(fig)
+
+            # 8) Metrics — SN vs Value (single stat)
+            if include_metrics:
+                for run, param_name in metrics_sel:
+                    run_meta = run_by_name.get(run) or {}
+                    run_title = str(run_meta.get("display_name") or "").strip() or run
+                    units = str(((curves_summary.get(run, {}) or {}).get(param_name) or {}).get("units") or "").strip()
+                    vmap = _td_metric_map(conn, run, param_name, metrics_stat)
+                    serials = all_serials
+                    x_idx = list(range(len(serials)))
+                    yv = [(float(vmap.get(sn)) if isinstance(vmap.get(sn), (int, float)) else float("nan")) for sn in serials]
+                    if not any(isinstance(v, (int, float)) and not math.isnan(float(v)) for v in yv):
                         continue
-                    lo = float(dom[0])
-                    hi_dom = float(dom[1])
-                    x_grid = [lo + (hi_dom - lo) * (i / (grid_points - 1)) for i in range(grid_points)]
-                    y_resampled_by_sn = {s.serial: _interp_linear(s.x, s.y, x_grid) for s in series}
-                    y_matrix = list(y_resampled_by_sn.values())
-                    master_y = _nan_median(y_matrix)
-                    std_y = _nan_std(y_matrix)
-                    units = str(model.get("units") or "").strip()
 
                     fig = plt.figure(figsize=(11.0, 8.5), dpi=120)
                     ax = fig.add_subplot(111)
-                    ax.set_title(f"{run_title} — {param_name}")
-                    ax.set_xlabel(x_name)
+                    ax.set_title(f"Metrics — {run_title} — {param_name} ({metrics_stat})")
+                    ax.set_xlabel("Serial Number")
                     ax.set_ylabel(f"{param_name} ({units})" if units else param_name)
-                    ax.plot(x_grid, master_y, linewidth=2.2, color="#0f172a", label="Master (median)")
+
+                    ax.plot(x_idx, yv, marker="o", linewidth=1.0, alpha=0.45, color="#64748b")
+                    for sn in hi:
+                        if sn not in serials:
+                            continue
+                        xi = serials.index(sn)
+                        g = grade_map.get((run, param_name, sn), "NO_DATA")
+                        color = "#3b82f6"
+                        if g == "WATCH":
+                            color = "#f59e0b"
+                        elif g == "FAIL":
+                            color = "#ef4444"
+                        ax.scatter([xi], [yv[xi]], s=36, color=color, zorder=5)
+                        ax.axvline(xi, color=color, linewidth=1.0, alpha=0.12)
+
                     try:
-                        band_lo = [a - b if (isinstance(a, (int, float)) and not math.isnan(float(a)) and isinstance(b, (int, float)) and not math.isnan(float(b))) else float("nan") for a, b in zip(master_y, std_y)]
-                        band_hi = [a + b if (isinstance(a, (int, float)) and not math.isnan(float(a)) and isinstance(b, (int, float)) and not math.isnan(float(b))) else float("nan") for a, b in zip(master_y, std_y)]
-                        ax.fill_between(x_grid, band_lo, band_hi, color="#93c5fd", alpha=0.25, label="±1σ band")
+                        finite_vals = [float(v) for v in yv if isinstance(v, (int, float)) and not math.isnan(float(v))]
+                        if finite_vals:
+                            fam_med = float(statistics.median(finite_vals))
+                            ax.axhline(fam_med, color="#0f172a", linestyle="--", linewidth=1.1, alpha=0.6, label="family median")
                     except Exception:
                         pass
 
-                    if (run, param_name) in watch_any_set and hi:
-                        for idx, sn in enumerate(hi):
-                            if (run, param_name, sn) not in watch_set:
-                                continue
-                            yv = y_resampled_by_sn.get(sn)
-                            if not yv:
-                                continue
-                            ax.plot(x_grid, yv, linewidth=1.6, color=colors[idx % len(colors)], label=f"{sn} (watch)")
-
-                    eqn = str(model.get("equation") or "").strip()
-                    rmse = (model.get("poly") or {}).get("rmse")
-                    notes = []
-                    if eqn:
-                        notes.append(eqn)
-                    if rmse is not None:
-                        try:
-                            notes.append(f"RMSE: {float(rmse):.4g}")
-                        except Exception:
-                            pass
-                    if notes:
-                        ax.text(0.01, 0.01, "\n".join(notes), transform=ax.transAxes, fontsize=8, va="bottom", ha="left", color="#334155")
+                    ax.set_xticks(x_idx)
+                    ax.set_xticklabels(serials, rotation=45, ha="right", fontsize=7)
                     ax.grid(True, alpha=0.25)
                     try:
                         ax.legend(fontsize=8, loc="best")
@@ -1017,59 +1877,53 @@ def generate_test_data_auto_report(
                     pdf.savefig(fig)
                     plt.close(fig)
 
-            if include_metrics and metrics_summary:
-                watch_any_param = {(str(w.get("run") or ""), str(w.get("param") or "")) for w in watch_items}
-                for run in runs:
-                    run_meta = run_by_name.get(run) or {}
-                    run_title = str(run_meta.get("display_name") or "").strip() or run
-                    for param_name, d in sorted((metrics_summary.get(run) or {}).items(), key=lambda kv: kv[0].lower()):
-                        stats_map = (d or {}).get("stats") or {}
-                        if not isinstance(stats_map, dict) or not stats_map:
-                            continue
-                        units = str((d or {}).get("units") or "").strip()
-                        fig = plt.figure(figsize=(11.0, 8.5), dpi=120)
-                        ax = fig.add_subplot(111)
-                        ax.set_title(f"{run_title} — Metrics: {param_name}")
-                        ax.set_xlabel("Serial Number")
-                        ax.set_ylabel(f"Value ({units})" if units else "Value")
-                        serials = all_serials
-                        x_idx = list(range(len(serials)))
-                        plotted_any = False
-                        for st in stats:
-                            vmap = stats_map.get(st) or {}
-                            if not isinstance(vmap, dict):
-                                continue
-                            yv = [(float(vmap.get(sn)) if isinstance(vmap.get(sn), (int, float)) else float("nan")) for sn in serials]
-                            try:
-                                ax.plot(x_idx, yv, marker="o", linewidth=1.2, alpha=0.85, label=st)
-                                plotted_any = True
-                            except Exception:
-                                continue
-                        if not plotted_any:
-                            plt.close(fig)
-                            continue
-                        if (run, param_name) in watch_any_param and hi:
-                            for idx, sn in enumerate(hi):
-                                if sn not in serials:
-                                    continue
-                                xi = serials.index(sn)
-                                ax.axvline(xi, color=colors[idx % len(colors)], linewidth=1.1, alpha=0.35)
-                        ax.set_xticks(x_idx)
-                        ax.set_xticklabels(serials, rotation=45, ha="right", fontsize=7)
-                        ax.grid(True, alpha=0.25)
-                        try:
-                            ax.legend(fontsize=8, loc="best")
-                        except Exception:
-                            pass
-                        try:
-                            fig.tight_layout()
-                        except Exception:
-                            pass
-                        pdf.savefig(fig)
-                        plt.close(fig)
+            # 9) Appendix — Grade matrix
+            if appendix_include_grade_matrix and run_param_pairs and hi:
+                cols = ["Run", "Param"] + hi
+                matrix_rows_all: list[list[object]] = []
+                for run, param in run_param_pairs:
+                    matrix_rows_all.append([run, param] + [grade_map.get((run, param, sn), "NO_DATA") for sn in hi])
+                for idx, start in enumerate(range(0, len(matrix_rows_all), 30), start=1):
+                    rows = matrix_rows_all[start : start + 30]
+                    grade_cells = {(rr, cc) for rr in range(len(rows)) for cc in range(2, len(cols))}
+                    title = "Appendix — Grade Matrix (PASS/WATCH/FAIL)"
+                    if len(matrix_rows_all) > 30:
+                        total_pages = _ceil_div(len(matrix_rows_all), 30)
+                        title += f" ({idx}/{total_pages})"
+                    fig = _figure_grade_matrix_page(title, columns=cols, rows=rows, grade_cells=grade_cells)
+                    pdf.savefig(fig)
+                    plt.close(fig)
+
+            # Optional appendix: full deviations table (kept tight)
+            if include_deviations and grading_rows:
+                cols = ["Serial", "Run", "Param", "Grade", "z", "Max Abs", "RMS", "Max %", "RMS %", "x@max"]
+                max_rows = 60
+                rows = []
+                for r in grading_rows[:max_rows]:
+                    rows.append(
+                        [
+                            r.get("serial"),
+                            r.get("run"),
+                            r.get("param"),
+                            r.get("grade"),
+                            _fmt_num(r.get("z"), sig=4),
+                            _fmt_num(r.get("max_abs"), sig=5),
+                            _fmt_num(r.get("rms"), sig=5),
+                            _fmt_num(r.get("max_pct")),
+                            _fmt_num(r.get("rms_pct")),
+                            _fmt_num(r.get("x_at_max_abs"), sig=5),
+                        ]
+                    )
+                note = f"(Showing first {len(rows)} rows.)" if len(grading_rows) > len(rows) else ""
+                pdf.savefig(_figure_table_page2(f"Appendix — Full Deviations {note}".strip(), cols, rows, landscape=True, font_size=7))
+
+            # Omitted items note (if we had to downselect to meet page cap)
+            if include_omitted_page and omitted_items:
+                lines = ["The following items were omitted to meet the max page cap:", *[f"  • {x}" for x in omitted_items]]
+                pdf.savefig(_figure_text_page("Omitted Items", lines))
 
             # Performance plotters (config-driven X vs Y metrics per serial across runs)
-            perf_defs = excel_cfg.get("performance_plotters") if isinstance(excel_cfg, dict) else []
+            perf_defs: list[object] = []
             if isinstance(perf_defs, list) and perf_defs:
                 for pd in perf_defs:
                     if not isinstance(pd, dict):

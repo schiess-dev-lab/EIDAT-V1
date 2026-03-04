@@ -6,7 +6,7 @@
     { "name": "isp", "units": "s", "range_min": null, "range_max": null },
     { "name": "pc", "units": "psia", "range_min": null, "range_max": null }
   ],
-  "statistics": ["mean", "min", "max", "std", "median", "count"],
+  "statistics": ["mean", "min", "max", "std"],
   "statistics_ignore_first_n": 0,
   "performance_plotters": [
     {

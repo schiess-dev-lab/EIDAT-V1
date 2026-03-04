@@ -1,10 +1,15 @@
 import json
 import math
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 import sqlite3
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 
 def _have_numpy() -> bool:
@@ -249,6 +254,97 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
             self.assertEqual(thrust.get("units"), "lbf")
             self.assertEqual(float(thrust.get("range_min")), 0.0)
             self.assertEqual(float(thrust.get("range_max")), 6.0)
+
+    def test_options_params_limits_selected_params(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            db = self._make_perf_db(root)
+            with sqlite3.connect(str(db)) as conn:
+                run_rows = tar._td_list_runs(conn)
+                runs = tar._resolve_selected_runs(run_rows, {"runs": ["Run1"]})
+                self.assertEqual(runs, ["Run1"])
+
+                params = tar._resolve_selected_params(conn, runs=runs, options={"params": ["isp"]})
+                self.assertEqual(params, ["isp"])
+
+                # If no params are passed, auto-detect returns all y columns.
+                auto = tar._resolve_selected_params(conn, runs=runs, options={})
+                self.assertIn("isp", [p.lower() for p in auto])
+                self.assertIn("thrust", [p.lower() for p in auto])
+
+    def test_overall_certification_status(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        self.assertEqual(tar._overall_cert_status(["PASS", "PASS"]), "CERTIFIED")
+        self.assertEqual(tar._overall_cert_status(["PASS", "WATCH"]), "WATCH")
+        self.assertEqual(tar._overall_cert_status(["WATCH", "FAIL"]), "FAILED")
+        self.assertEqual(tar._overall_cert_status(["NO_DATA", "PASS"]), "NO_DATA")
+        self.assertEqual(tar._overall_cert_status([]), "NO_DATA")
+
+    def test_build_chart_specs_severity_sort(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        run_param_pairs = [("Run1", "p1"), ("Run1", "p2"), ("Run1", "p3")]
+        nonpass_findings = [
+            {"run": "Run1", "param": "p1", "grade": "WATCH", "z": 10.0, "max_pct": 1.0},
+            {"run": "Run1", "param": "p2", "grade": "FAIL", "z": 2.0, "max_pct": 50.0},
+            {"run": "Run1", "param": "p3", "grade": "WATCH", "z": 3.0, "max_pct": 99.0},
+        ]
+        specs = tar._build_chart_specs(run_param_pairs=run_param_pairs, nonpass_findings=nonpass_findings, max_plots=None)
+        ordered = [(run, param) for _key, run, param in specs]
+        # FAIL always first; within grade, higher abs(z) first.
+        self.assertEqual(ordered[0], ("Run1", "p2"))
+        self.assertEqual(ordered[1], ("Run1", "p1"))
+        self.assertEqual(ordered[2], ("Run1", "p3"))
+
+    def test_page_planning_enforces_cap_deterministically(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        max_pages = 10
+        appendix_include_grade_matrix = True
+        appendix_include_pass_details = True
+        include_metrics = True
+        grading_rows = [{"serial": "SN1"}]  # presence toggles deviations on
+
+        run_param_pairs = [("Run1", "p1"), ("Run1", "p2"), ("Run1", "p3"), ("Run1", "p4")]
+        serials_nonpass_sorted = ["SN1", "SN2"]  # 1 by-serial page
+        perf_defs_all = [{"x": {"column": "a"}, "y": {"column": "b"}}]  # 1 page
+        run_details_all = ["Run1"]  # 1 page
+
+        nonpass_findings = [
+            {"run": "Run1", "param": "p1", "grade": "FAIL", "z": 5.0, "max_pct": 10.0},
+            {"run": "Run1", "param": "p2", "grade": "WATCH", "z": 4.0, "max_pct": 9.0},
+        ]
+        chart_specs_all = tar._build_chart_specs(run_param_pairs=run_param_pairs, nonpass_findings=nonpass_findings, max_plots=None)
+
+        metrics_pairs_all = list(run_param_pairs)
+        metrics_pairs_nonpass = [("Run1", "p1"), ("Run1", "p2")]
+
+        plan = tar._plan_page_selections(
+            max_pages=max_pages,
+            appendix_include_grade_matrix=appendix_include_grade_matrix,
+            appendix_include_pass_details=appendix_include_pass_details,
+            include_metrics=include_metrics,
+            grading_rows=grading_rows,
+            run_param_pairs=run_param_pairs,
+            serials_nonpass_sorted=serials_nonpass_sorted,
+            perf_defs_all=perf_defs_all,
+            run_details_all=run_details_all,
+            chart_specs_all=chart_specs_all,
+            metrics_pairs_all=metrics_pairs_all,
+            metrics_pairs_nonpass=metrics_pairs_nonpass,
+        )
+
+        # With a tight cap, deviations drop first, then metrics drop to non-pass only,
+        # and charts are trimmed to leave room for the omitted-items note.
+        self.assertFalse(plan["include_deviations"])
+        self.assertTrue(all(p in metrics_pairs_nonpass for p in plan["metrics_sel"]))
+        self.assertTrue(plan["include_omitted_page"])
+        self.assertEqual(plan["charts_sel"], [])  # popped to make room for omitted-items page
+        self.assertTrue(any("Appendix: full deviations table omitted" in x for x in plan["omitted_items"]))
+        self.assertTrue(any("Metrics: PASS-only" in x for x in plan["omitted_items"]))
 
     @unittest.skipUnless(_have_numpy(), "numpy not installed")
     def test_master_curve_and_poly_fit(self):
