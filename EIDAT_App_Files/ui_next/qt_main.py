@@ -3926,6 +3926,28 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         def _norm(s: str) -> str:
             return "".join(ch.lower() for ch in str(s or "").strip() if ch.isalnum())
 
+        # Include any columns referenced by performance_plotters presets even if they are not
+        # present in the current td_columns union yet (lets users pick without re-typing).
+        extra_cols: list[str] = []
+        try:
+            seen_cols: set[str] = set()
+            for p in self._perf_plotters:
+                if not isinstance(p, dict):
+                    continue
+                for spec in (p.get("x") or {}, p.get("y") or {}):
+                    if not isinstance(spec, dict):
+                        continue
+                    col = str(spec.get("column") or "").strip()
+                    if not col:
+                        continue
+                    nk = _norm(col)
+                    if not nk or nk in seen_cols:
+                        continue
+                    seen_cols.add(nk)
+                    extra_cols.append(col)
+        except Exception:
+            extra_cols = []
+
         # Available columns = union of td_columns(kind='y') across all runs.
         try:
             runs = be.td_list_runs(self._db_path)
@@ -3959,6 +3981,11 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             prev_data = cb.currentData() if hasattr(cb, "currentData") else None
             cb.blockSignals(True)
             cb.clear()
+            existing_norms = {_norm(str(c.get("name") or "")) for c in self._perf_available_columns if str(c.get("name") or "").strip()}
+            for nm in extra_cols:
+                if _norm(nm) in existing_norms:
+                    continue
+                cb.addItem(nm, nm)
             for c in self._perf_available_columns:
                 nm = str(c.get("name") or "").strip()
                 if not nm:
@@ -3971,8 +3998,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             want = str(prev_data or "").strip() or prev_text
             want = want.split(" (", 1)[0].strip()
             if want:
+                want_norm = _norm(want)
                 for i in range(cb.count()):
-                    if str(cb.itemData(i) or "").strip() == want:
+                    if _norm(str(cb.itemData(i) or "").strip()) == want_norm:
                         cb.setCurrentIndex(i)
                         break
                 else:
@@ -5319,9 +5347,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             if not want:
                 continue
             want_key = want.strip()
+            want_norm = "".join(ch.lower() for ch in want_key if ch.isalnum())
             found = False
             for i in range(cb.count()):
-                if str(cb.itemData(i) or "").strip() == want_key:
+                cur = str(cb.itemData(i) or "").strip()
+                cur_norm = "".join(ch.lower() for ch in cur if ch.isalnum())
+                if cur == want_key or (want_norm and cur_norm == want_norm):
                     cb.setCurrentIndex(i)
                     found = True
                     break
