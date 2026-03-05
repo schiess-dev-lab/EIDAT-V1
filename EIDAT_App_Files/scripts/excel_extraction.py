@@ -105,6 +105,77 @@ def derive_file_identity(excel_path: Path) -> Tuple[str, str, str]:
     return program, vehicle, serial
 
 
+class _XlsSheetAdapter:
+    def __init__(self, sheet) -> None:
+        self._sheet = sheet
+        try:
+            self.max_row = int(getattr(sheet, "nrows", 0) or 0)
+        except Exception:
+            self.max_row = 0
+        try:
+            self.max_column = int(getattr(sheet, "ncols", 0) or 0)
+        except Exception:
+            self.max_column = 0
+
+    def iter_rows(
+        self,
+        *,
+        min_row: int,
+        max_row: int,
+        min_col: int,
+        max_col: int,
+        values_only: bool = True,
+    ):
+        _ = bool(values_only)  # adapter always yields values
+        r0 = max(1, int(min_row)) - 1
+        r1 = max(r0, int(max_row) - 1)
+        c0 = max(1, int(min_col)) - 1
+        c1 = max(c0, int(max_col) - 1)
+        for rr in range(r0, r1 + 1):
+            try:
+                vals = list(self._sheet.row_values(int(rr), int(c0), int(c1) + 1))
+            except Exception:
+                vals = []
+            need = int(c1 - c0 + 1)
+            if len(vals) < need:
+                vals += [""] * (need - len(vals))
+            yield tuple(vals[:need])
+
+
+class _XlsWorkbookAdapter:
+    def __init__(self, book) -> None:
+        self._book = book
+        try:
+            self.sheetnames = list(getattr(book, "sheet_names", lambda: [])() or [])
+        except Exception:
+            self.sheetnames = []
+
+    def __getitem__(self, name: str):
+        return _XlsSheetAdapter(self._book.sheet_by_name(str(name)))
+
+    def close(self) -> None:
+        try:
+            self._book.release_resources()
+        except Exception:
+            pass
+
+
+def _load_workbook_any(excel_path: Path):
+    p = Path(excel_path).expanduser()
+    ext = p.suffix.lower()
+    if ext == ".xls":
+        try:
+            import xlrd  # type: ignore
+        except Exception as exc:
+            raise RuntimeError("Unsupported .xls input (install `xlrd` or convert to .xlsx).") from exc
+        return _XlsWorkbookAdapter(xlrd.open_workbook(str(p), on_demand=True))
+    try:
+        from openpyxl import load_workbook  # type: ignore
+    except Exception as exc:
+        raise RuntimeError("openpyxl is required to read .xlsx files in this runtime.") from exc
+    return load_workbook(str(p), data_only=True, read_only=True)
+
+
 def _read_dataframe(excel_path: Path, *, sheet_name: Optional[str], header_row: int):
     try:
         import pandas as pd  # type: ignore
@@ -113,9 +184,13 @@ def _read_dataframe(excel_path: Path, *, sheet_name: Optional[str], header_row: 
 
     sheet = sheet_name if sheet_name not in ("", None) else 0
     try:
+        if excel_path.suffix.lower() == ".xls":
+            return pd.read_excel(excel_path, sheet_name=sheet, header=int(header_row), engine="xlrd")
         return pd.read_excel(excel_path, sheet_name=sheet, header=int(header_row))
     except ValueError:
         # sheet name missing, fall back to first sheet
+        if excel_path.suffix.lower() == ".xls":
+            return pd.read_excel(excel_path, sheet_name=0, header=int(header_row), engine="xlrd")
         return pd.read_excel(excel_path, sheet_name=0, header=int(header_row))
 
 
@@ -202,11 +277,9 @@ def _is_header_value(v: Any) -> bool:
 def _auto_detect_header_row(excel_path: Path, *, max_scan_rows: int = 200, max_cols: int = 200, lookahead_rows: int = 60):
     """Best-effort (sheet_name, header_row_0_based_for_pandas) across the workbook."""
     try:
-        from openpyxl import load_workbook  # type: ignore
+        wb = _load_workbook_any(excel_path)
     except Exception:
         return None, 0
-
-    wb = load_workbook(str(excel_path), data_only=True, read_only=True)
     try:
         sheetnames = list(getattr(wb, "sheetnames", []) or [])
         if not sheetnames:
@@ -300,11 +373,9 @@ def _auto_detect_header_rows_by_sheet(
 ) -> List[Tuple[str, int]]:
     """Return [(sheet_name, header_row_0_based_for_pandas), ...] for sheets with detectable numeric headers."""
     try:
-        from openpyxl import load_workbook  # type: ignore
+        wb = _load_workbook_any(excel_path)
     except Exception:
         return []
-
-    wb = load_workbook(str(excel_path), data_only=True, read_only=True)
     try:
         sheetnames = list(getattr(wb, "sheetnames", []) or [])
         out: List[Tuple[str, int]] = []

@@ -4,6 +4,7 @@ PySide6>=6.6
 # Excel trending / export
 pandas
 openpyxl
+xlrd
 XlsxWriter
 
 # Plotting
