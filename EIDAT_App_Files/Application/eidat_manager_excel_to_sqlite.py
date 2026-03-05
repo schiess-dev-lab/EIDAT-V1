@@ -848,12 +848,62 @@ def _write_workbook_sqlite(
 ) -> dict[str, Any]:
     if excel_path.suffix.lower() not in EXCEL_EXTENSIONS:
         raise ValueError(f"Unsupported extension: {excel_path.suffix}")
-    if excel_path.suffix.lower() == ".xls":
-        # openpyxl cannot read .xls; xlrd is not shipped in this runtime by default.
-        raise RuntimeError("Unsupported .xls input (convert to .xlsx or install xlrd and add an .xls reader).")
 
     if not excel_path.exists():
         raise FileNotFoundError(str(excel_path))
+
+    class _XlsSheetAdapter:
+        def __init__(self, sheet) -> None:
+            self._sheet = sheet
+            try:
+                self.max_row = int(getattr(sheet, "nrows", 0) or 0)
+            except Exception:
+                self.max_row = 0
+            try:
+                self.max_column = int(getattr(sheet, "ncols", 0) or 0)
+            except Exception:
+                self.max_column = 0
+
+        def iter_rows(
+            self,
+            *,
+            min_row: int,
+            max_row: int,
+            min_col: int,
+            max_col: int,
+            values_only: bool = True,
+        ):
+            _ = bool(values_only)  # adapter always yields values
+            r0 = max(1, int(min_row)) - 1
+            r1 = max(r0, int(max_row) - 1)
+            c0 = max(1, int(min_col)) - 1
+            c1 = max(c0, int(max_col) - 1)
+            for rr in range(r0, r1 + 1):
+                try:
+                    vals = list(self._sheet.row_values(int(rr), int(c0), int(c1) + 1))
+                except Exception:
+                    vals = []
+                need = int(c1 - c0 + 1)
+                if len(vals) < need:
+                    vals += [""] * (need - len(vals))
+                yield tuple(vals[:need])
+
+    class _XlsWorkbookAdapter:
+        def __init__(self, book) -> None:
+            self._book = book
+            try:
+                self.sheetnames = list(getattr(book, "sheet_names", lambda: [])() or [])
+            except Exception:
+                self.sheetnames = []
+
+        def __getitem__(self, name: str):
+            return _XlsSheetAdapter(self._book.sheet_by_name(str(name)))
+
+        def close(self) -> None:
+            try:
+                self._book.release_resources()
+            except Exception:
+                pass
 
     sqlite_path.parent.mkdir(parents=True, exist_ok=True)
     if sqlite_path.exists():
@@ -869,10 +919,21 @@ def _write_workbook_sqlite(
         except Exception:
             pass
 
-    try:
-        from openpyxl import load_workbook  # type: ignore
-    except Exception as exc:
-        raise RuntimeError("openpyxl is required to read Excel files in this runtime.") from exc
+    wb = None
+    if excel_path.suffix.lower() == ".xls":
+        try:
+            import xlrd  # type: ignore
+        except Exception as exc:
+            raise RuntimeError(
+                "Unsupported .xls input in this runtime (install `xlrd` in the node runtime venv or convert the file to .xlsx)."
+            ) from exc
+        wb = _XlsWorkbookAdapter(xlrd.open_workbook(str(excel_path), on_demand=True))
+    else:
+        try:
+            from openpyxl import load_workbook  # type: ignore
+        except Exception as exc:
+            raise RuntimeError("openpyxl is required to read Excel files in this runtime.") from exc
+        wb = load_workbook(str(excel_path), data_only=True, read_only=True)
 
     _stderr(f"[EXCEL] {excel_path}")
 
@@ -883,7 +944,6 @@ def _write_workbook_sqlite(
     debug_table = _truthy(env.get("EIDAT_TEST_DATA_DEBUG_TABLE", "0")) or debug_fuzzy
     trend_cols = _load_trend_column_names() if fuzzy_enabled else []
 
-    wb = load_workbook(str(excel_path), data_only=True, read_only=True)
     try:
         sheetnames = list(getattr(wb, "sheetnames", []) or [])
         if not sheetnames:
