@@ -1014,6 +1014,33 @@ def generate_test_data_auto_report(
     out_pdf.parent.mkdir(parents=True, exist_ok=True)
 
     cfg_excel_path = Path(options.get("excel_trend_config_path") or be.DEFAULT_EXCEL_TREND_CONFIG).expanduser()
+    # In production-node mode, config files live under the node repo's `EIDAT\\UserData\\user_inputs`,
+    # but the authoritative copies are kept in the central runtime `<runtime_root>\\user_inputs`.
+    # Seed missing node-local configs on-demand so Auto Report can run without a separate deploy step.
+    try:
+        if getattr(be, "DATA_ROOT", None) != getattr(be, "ROOT", None):
+            runtime_user_inputs = Path(getattr(be, "ROOT")) / "user_inputs"
+            node_user_inputs = Path(getattr(be, "DATA_ROOT")) / "user_inputs"
+
+            def _seed_user_input_if_missing(dst: Path) -> None:
+                try:
+                    p = Path(dst).expanduser()
+                    if p.exists():
+                        return
+                    if not p.is_relative_to(node_user_inputs):
+                        return
+                    src = runtime_user_inputs / p.name
+                    if not src.exists():
+                        return
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                    p.write_bytes(src.read_bytes())
+                except Exception:
+                    return
+
+            _seed_user_input_if_missing(cfg_excel_path)
+            _seed_user_input_if_missing(Path(be.DEFAULT_TREND_AUTO_REPORT_CONFIG).expanduser())
+    except Exception:
+        pass
     excel_cfg = be.load_excel_trend_config(cfg_excel_path)
 
     report_cfg = be.load_trend_auto_report_config(proj)
@@ -1034,26 +1061,28 @@ def generate_test_data_auto_report(
             fill_ranges=True,
             add_missing_columns=bool(options.get("add_missing_columns")),
         )
-    else:
-        change_summary = "excel_trend_config.json update disabled."
+    if True:
+        if not bool(options.get("update_excel_trend_config", True)):
+            change_summary = "excel_trend_config.json update disabled."
 
-        with sqlite3.connect(str(Path(db_path).expanduser())) as conn:
-            all_serials = _td_list_serials(conn)
-            run_rows = _td_list_runs(conn)
+        conn = sqlite3.connect(str(Path(db_path).expanduser()))
+        all_serials = _td_list_serials(conn)
+        run_rows = _td_list_runs(conn)
+        run_by_name = {str(r.get("run_name") or "").strip(): r for r in (run_rows or []) if str(r.get("run_name") or "").strip()}
 
-            runs = _resolve_selected_runs(run_rows, options)
+        runs = _resolve_selected_runs(run_rows, options)
 
-            excel_cols = excel_cfg.get("columns") or []
-            excel_names = {
-                _norm_key(str(c.get("name") or "")): str(c.get("name") or "").strip()
-                for c in excel_cols
-                if isinstance(c, dict) and str(c.get("name") or "").strip()
-            }
+        excel_cols = excel_cfg.get("columns") or []
+        excel_names = {
+            _norm_key(str(c.get("name") or "")): str(c.get("name") or "").strip()
+            for c in excel_cols
+            if isinstance(c, dict) and str(c.get("name") or "").strip()
+        }
 
-            params = _resolve_selected_params(conn, runs=runs, options=options)
+        params = _resolve_selected_params(conn, runs=runs, options=options)
 
-            params_norm = {_norm_key(p) for p in params if p}
-            hi = [s for s in highlighted_serials if s in all_serials]
+        params_norm = {_norm_key(p) for p in params if p}
+        hi = [s for s in highlighted_serials if s in all_serials]
 
         stats = excel_cfg.get("statistics") or ["mean", "min", "max", "std", "median", "count"]
         stats = [str(s).strip().lower() for s in stats if str(s).strip()]
@@ -2156,6 +2185,10 @@ def generate_test_data_auto_report(
 
         sidecar["performance_models"] = performance_models
         _write_json(sidecar_path, sidecar)
+        try:
+            conn.close()
+        except Exception:
+            pass
 
     return {
         "output_pdf": str(out_pdf),
