@@ -673,7 +673,7 @@ def _run_for_input(
     return_fused: bool = False,
     return_variant_rows: bool = False,
 ) -> object:
-    from extraction import table_detection, token_projector, ocr_engine, debug_exporter, table_detect_timeout
+    from extraction import table_detection, token_projector, ocr_engine, debug_exporter, table_detect_timeout, table_cell_split_recovery
     if enable_borderless:
         from extraction import borderless_table_detection
 
@@ -860,10 +860,94 @@ def _run_for_input(
 
     ascii_mode = "replica" if split_mode in ("replica", "snap", "grid") else "default"
 
+    # Evidence-based split recovery for merged/spanning cells (missing internal borders).
+    split_recovery_enabled = _parse_bool_env("EIDAT_TABLE_CELL_SPLIT_RECOVERY", True)
+    split_recovery_variants = _parse_bool_env("EIDAT_TABLE_CELL_SPLIT_RECOVERY_VARIANTS", True)
+    split_recovery_debug = _parse_bool_env("EIDAT_TABLE_CELL_SPLIT_DEBUG", False)
+    if split_recovery_enabled and split_recovery_variants and tables:
+        try:
+            probe_img = None
+            probe_dpi = int(ocr_dpi_base)
+            if is_pdf:
+                probe_img = _get_pdf_image(probe_dpi)
+            else:
+                if base_dpi:
+                    probe_scale = float(probe_dpi) / float(base_dpi)
+                else:
+                    probe_scale = 1.0
+                probe_img = _get_png_image(probe_scale)
+
+            if probe_img is not None:
+                probe_h, probe_w = int(probe_img.shape[0]), int(probe_img.shape[1])
+                det_w = int(detection_size["w"]) if detection_size else int(detection_img.shape[1])
+                det_h = int(detection_size["h"]) if detection_size else int(detection_img.shape[0])
+                for t in tables:
+                    if bool(t.get("borderless", False)):
+                        continue
+                    bbox = t.get("bbox_px") or []
+                    cells0 = t.get("cells") or []
+                    if len(bbox) != 4 or not cells0:
+                        continue
+                    bbox_ocr = _scale_bbox_to_ocr(bbox, detection_dpi, probe_dpi, pad_px=8)
+                    bbox_ocr = _clip_bbox(bbox_ocr, probe_w, probe_h)
+                    if bbox_ocr is None:
+                        continue
+
+                    tokens_probe, _meta = ocr_engine.ocr_region_tokens(
+                        probe_img,
+                        bbox_ocr,
+                        lang=lang,
+                        psms=(11,),
+                        remove_lines=True,
+                    )
+                    if len(tokens_probe) < 6:
+                        tokens_probe, _meta = ocr_engine.ocr_region_tokens(
+                            probe_img,
+                            bbox_ocr,
+                            lang=lang,
+                            psms=(6,),
+                            remove_lines=True,
+                        )
+                    scaled_probe = token_projector.scale_tokens_to_dpi(tokens_probe, probe_dpi, detection_dpi)
+                    token_projector.project_tokens_to_cells_force(
+                        scaled_probe,
+                        cells0,
+                        verbose=False,
+                        debug_info=None,
+                        ocr_dpi=probe_dpi,
+                        detection_dpi=detection_dpi,
+                        reset_cells=True,
+                        center_margin_px=18.0,
+                        only_if_empty=False,
+                        char_gap_ratio=0.35,
+                        max_token_ratio=1.6,
+                        max_token_area_ratio=2.5,
+                    )
+
+                split_debug_dir = out_dir / "split_recovery_debug" if split_recovery_debug else None
+                table_cell_split_recovery.split_merged_cells_post_projection(
+                    tables,
+                    img_gray_det=detection_img,
+                    img_w=det_w,
+                    img_h=det_h,
+                    debug_dir=split_debug_dir,
+                )
+
+                for t in tables:
+                    token_projector.assign_row_col_indices_grid(
+                        t.get("cells") or [],
+                        table_bbox=t.get("bbox_px") or None,
+                    )
+        except Exception:
+            pass
+
     base_tables: List[Dict] = []
     for t in tables:
         base_cells = [dict(c) for c in (t.get("cells") or [])]
-        token_projector.assign_row_col_indices(base_cells)
+        token_projector.assign_row_col_indices_grid(
+            base_cells,
+            table_bbox=t.get("bbox_px") or None,
+        )
         base_tables.append({
             "bbox_px": list(t.get("bbox_px") or []),
             "cells": base_cells,

@@ -822,6 +822,89 @@ def assign_row_col_indices(cells: List[Dict]) -> List[Dict]:
     return cells
 
 
+def assign_row_col_indices_grid(cells: List[Dict], *, table_bbox: Optional[List[float]] = None) -> List[Dict]:
+    """
+    Assign stable row/col indices using snapped bbox gridlines.
+
+    Unlike `assign_row_col_indices`, this preserves column identity when a row has
+    missing cells (prevents left-shift) by mapping cell bboxes onto an inferred
+    grid and using each cell's top-left grid slot as (row,col).
+    """
+    if not cells:
+        return cells
+
+    # Local import to avoid introducing a hard dependency at module import time.
+    try:
+        from . import table_cell_split_recovery as split_recovery
+    except Exception:
+        return assign_row_col_indices(cells)
+
+    bbox = table_bbox
+    if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+        xs0 = []
+        ys0 = []
+        xs1 = []
+        ys1 = []
+        for c in cells:
+            bb = c.get("bbox_px") or []
+            if not isinstance(bb, (list, tuple)) or len(bb) != 4:
+                continue
+            try:
+                x0, y0, x1, y1 = (float(bb[0]), float(bb[1]), float(bb[2]), float(bb[3]))
+            except Exception:
+                continue
+            if x1 <= x0 or y1 <= y0:
+                continue
+            xs0.append(x0)
+            ys0.append(y0)
+            xs1.append(x1)
+            ys1.append(y1)
+        if xs0:
+            bbox = [min(xs0), min(ys0), max(xs1), max(ys1)]
+        else:
+            bbox = None
+
+    if bbox is None:
+        return assign_row_col_indices(cells)
+
+    # Grid snap tolerances (shared with split recovery).
+    try:
+        snap_tol_px = float(str(os.environ.get("EIDAT_TABLE_CELL_GRID_SNAP_TOL_PX", "0") or "0").strip())
+    except Exception:
+        snap_tol_px = 0.0
+    try:
+        snap_ratio = float(str(os.environ.get("EIDAT_TABLE_CELL_GRID_SNAP_TOL_RATIO", "0.006") or "0.006").strip())
+    except Exception:
+        snap_ratio = 0.006
+    try:
+        snap_max_px = float(str(os.environ.get("EIDAT_TABLE_CELL_GRID_SNAP_MAX_PX", "15") or "15").strip())
+    except Exception:
+        snap_max_px = 15.0
+
+    x0, y0, x1, y1 = (float(v) for v in bbox)
+    table_w = max(1.0, x1 - x0)
+    table_h = max(1.0, y1 - y0)
+    if snap_tol_px and snap_tol_px > 0:
+        tol_x = tol_y = float(snap_tol_px)
+    else:
+        tol_x = max(2.0, min(float(snap_max_px) if snap_max_px > 0 else 1e9, table_w * float(snap_ratio)))
+        tol_y = max(6.0, min(float(snap_max_px) if snap_max_px > 0 else 1e9, table_h * float(snap_ratio)))
+
+    edges_x, edges_y = split_recovery.infer_grid_edges_from_cells(
+        [float(x0), float(y0), float(x1), float(y1)],
+        cells,
+        float(tol_x),
+        float(tol_y),
+        img_w=None,
+        img_h=None,
+    )
+    if len(edges_x) < 2 or len(edges_y) < 2:
+        return assign_row_col_indices(cells)
+
+    split_recovery.assign_row_col_indices_grid(cells, edges_x, edges_y)
+    return cells
+
+
 def extract_table_data_matrix(table: Dict) -> List[List[str]]:
     """
     Extract table as 2D matrix of cell text values.

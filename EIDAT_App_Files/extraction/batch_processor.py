@@ -29,6 +29,7 @@ from . import token_projector
 from . import page_analyzer
 from . import chart_detection
 from . import debug_exporter
+from . import table_cell_split_recovery
 
 
 def _env_int(key: str, default: int) -> int:
@@ -939,11 +940,74 @@ class ExtractionPipeline:
                         cell['ocr_method'] = 'table_region_ocr'
 
                 if force_table_ocr:
+                    # Evidence-based split recovery for merged/spanning cells (missing internal borders).
+                    split_enabled = str(os.environ.get("EIDAT_TABLE_CELL_SPLIT_RECOVERY", "1")).strip().lower() not in (
+                        "0",
+                        "false",
+                        "f",
+                        "no",
+                        "n",
+                        "off",
+                    )
+                    split_pipeline = str(os.environ.get("EIDAT_TABLE_CELL_SPLIT_RECOVERY_PIPELINE", "1")).strip().lower() not in (
+                        "0",
+                        "false",
+                        "f",
+                        "no",
+                        "n",
+                        "off",
+                    )
+                    split_debug = str(os.environ.get("EIDAT_TABLE_CELL_SPLIT_DEBUG", "0")).strip().lower() in (
+                        "1",
+                        "true",
+                        "t",
+                        "yes",
+                        "y",
+                        "on",
+                    )
+                    split_stats = None
+                    if split_enabled and split_pipeline and tables:
+                        split_debug_dir = None
+                        if debug_dir and split_debug:
+                            split_debug_dir = debug_dir / "cell_split_recovery" / f"page_{page_num + 1}"
+                        try:
+                            split_stats = table_cell_split_recovery.split_merged_cells_post_projection(
+                                tables,
+                                img_gray_det=img_gray_hires if HAVE_CV2 else None,
+                                img_w=det_img_w,
+                                img_h=det_img_h,
+                                debug_dir=split_debug_dir,
+                            )
+                        except Exception:
+                            split_stats = None
+
+                        # Rebuild flattened cell list after any splits (avoids stale refs).
+                        try:
+                            cells = [c for t in (tables or []) for c in (t.get("cells") or [])]
+                        except Exception:
+                            pass
+
+                        # Optional: emit per-table JSON summaries into the page debug folder.
+                        if debug_dir and split_debug and isinstance(split_stats, dict):
+                            try:
+                                import json as _json
+                                for tdbg in split_stats.get("tables") or []:
+                                    tidx = int(tdbg.get("table_idx") or 0)
+                                    if tidx <= 0:
+                                        continue
+                                    out_path = debug_dir / f"page_{page_num + 1}_table_{tidx}_cell_split_recovery.json"
+                                    out_path.write_text(_json.dumps(tdbg, indent=2), encoding="utf-8")
+                            except Exception:
+                                pass
+
                     for table_idx, table in enumerate(tables):
                         table_cells = table.get("cells", []) or []
                         if not table_cells:
                             continue
-                        token_projector.assign_row_col_indices(table_cells)
+                        token_projector.assign_row_col_indices_grid(
+                            table_cells,
+                            table_bbox=table.get("bbox_px"),
+                        )
                         for cell in table_cells:
                             _record_candidate("table_region_ocr", table_idx, cell)
 
@@ -1049,7 +1113,10 @@ class ExtractionPipeline:
                     table_cells = table.get("cells", []) or []
                     if not table_cells:
                         continue
-                    token_projector.assign_row_col_indices(table_cells)
+                    token_projector.assign_row_col_indices_grid(
+                        table_cells,
+                        table_bbox=table.get("bbox_px"),
+                    )
                     header_cells = [c for c in table_cells if int(c.get("row", 0)) == 0]
                     if not header_cells:
                         continue
@@ -1163,11 +1230,14 @@ class ExtractionPipeline:
                 numeric_padding_px = int(
                     round(numeric_padding * (float(numeric_rescue_dpi) / float(self.ocr_dpi)))
                 ) if numeric_rescue_dpi else numeric_padding
-                for table in tables:
+                for table_idx, table in enumerate(tables):
                     table_cells = table.get("cells", []) or []
                     if not table_cells:
                         continue
-                    token_projector.assign_row_col_indices(table_cells)
+                    token_projector.assign_row_col_indices_grid(
+                        table_cells,
+                        table_bbox=table.get("bbox_px"),
+                    )
                     if force_numeric_rescue:
                         if interior_cols_cache is None:
                             interior_cols_cache = {}
@@ -1346,7 +1416,10 @@ class ExtractionPipeline:
                     table_cells = table.get("cells", []) or []
                     if not table_cells:
                         continue
-                    token_projector.assign_row_col_indices(table_cells)
+                    token_projector.assign_row_col_indices_grid(
+                        table_cells,
+                        table_bbox=table.get("bbox_px"),
+                    )
                     for cell in table_cells:
                         if int(cell.get("row", 0)) == 0:
                             continue
@@ -1427,7 +1500,10 @@ class ExtractionPipeline:
                     table_cells = table.get("cells", []) or []
                     if not table_cells:
                         continue
-                    token_projector.assign_row_col_indices(table_cells)
+                    token_projector.assign_row_col_indices_grid(
+                        table_cells,
+                        table_bbox=table.get("bbox_px"),
+                    )
                     numeric_cols = _compute_numeric_cols(table_cells, numeric_ratio_min, decimal_ratio_min)
                     for cell in table_cells:
                         if not force_cell_interior and str(cell.get("text", "")).strip():
@@ -1498,7 +1574,10 @@ class ExtractionPipeline:
                     table_cells = table.get("cells", []) or []
                     if not table_cells:
                         continue
-                    token_projector.assign_row_col_indices(table_cells)
+                    token_projector.assign_row_col_indices_grid(
+                        table_cells,
+                        table_bbox=table.get("bbox_px"),
+                    )
                     numeric_cols = _compute_numeric_cols(table_cells, numeric_ratio_min, decimal_ratio_min)
                     for cell in table_cells:
                         if int(cell.get("row", 0)) == 0:
@@ -1654,8 +1733,11 @@ class ExtractionPipeline:
 
         # Assign row/col indices to cells
         for table in tables:
-            table_cells = table.get('cells', [])
-            token_projector.assign_row_col_indices(table_cells)
+            table_cells = table.get("cells", []) or []
+            token_projector.assign_row_col_indices_grid(
+                table_cells,
+                table_bbox=table.get("bbox_px"),
+            )
 
         # Step 5.5: Build per-page pass summary (attempts + matches)
         def _build_pass_summary() -> Dict[str, object]:
@@ -1686,7 +1768,10 @@ class ExtractionPipeline:
                 table_cells = table.get("cells", []) or []
                 if not table_cells:
                     continue
-                token_projector.assign_row_col_indices(table_cells)
+                token_projector.assign_row_col_indices_grid(
+                    table_cells,
+                    table_bbox=table.get("bbox_px"),
+                )
                 for cell in table_cells:
                     key = _candidate_key(table_idx, cell)
                     if not key:
