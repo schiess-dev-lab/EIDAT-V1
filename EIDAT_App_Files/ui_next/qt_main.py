@@ -1310,15 +1310,15 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
         except Exception:
             pass
 
-        # Test Data projects are currently "All only" (no program/asset/group pre-filtering).
+        # Allow the same program/asset/group pre-filtering for Test Data projects as for EIDP projects.
         try:
             if is_test_data:
                 self.rb_all.setChecked(True)
                 self.rb_all.setText("All indexed TD reports")
                 for w in (self.rb_program, self.rb_asset, self.rb_group):
-                    w.setEnabled(False)
+                    w.setEnabled(True)
                 for w in (self.cb_program, self.cb_asset, self.cb_group):
-                    w.setEnabled(False)
+                    w.setEnabled(True)
                 if hasattr(self, "lbl_select_hint"):
                     self.lbl_select_hint.setText(
                         "Select TD reports only (must have extracted Excel data). EIDP Trending projects cannot be created from TD reports."

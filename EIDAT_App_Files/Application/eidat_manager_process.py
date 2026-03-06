@@ -521,24 +521,64 @@ def _run_debug_method_extraction(pdf_path: Path, dpi: int | None, output_dir: Pa
                 except Exception:
                     single_cell_sep_max_h_ratio = 0.0
 
-                def _part_row_col_map(part_table: Dict[str, Any]) -> tuple[list[int], list[list[int]], int]:
+                def _part_row_col_ids_pruned(part_table: Dict[str, Any]) -> tuple[list[int], list[int]]:
+                    """
+                    Build a stable (row_ids, col_ids) grid for a table part that matches the
+                    combined.txt ASCII renderer indices (after fully-empty row/col pruning).
+                    """
                     cells = part_table.get("cells") or []
-                    rows: dict[int, list[Dict[str, Any]]] = {}
+                    if not isinstance(cells, list) or not cells:
+                        return [], []
+
+                    row_ids_set: set[int] = set()
+                    col_ids_set: set[int] = set()
+                    text_by_rc: dict[tuple[int, int], str] = {}
                     for cell in cells:
                         try:
                             r = int(cell.get("row"))
                             c = int(cell.get("col"))
                         except Exception:
                             continue
-                        rows.setdefault(r, []).append({"col": c})
-                    row_ids = sorted(rows.keys())
-                    col_ids_by_row: list[list[int]] = []
-                    max_cols = 0
-                    for r in row_ids:
-                        cols = sorted({int(x.get("col")) for x in rows.get(r) or []})
-                        col_ids_by_row.append(cols)
-                        max_cols = max(max_cols, len(cols))
-                    return row_ids, col_ids_by_row, int(max_cols)
+                        if r < 0 or c < 0:
+                            continue
+                        row_ids_set.add(int(r))
+                        col_ids_set.add(int(c))
+
+                        txt = str(cell.get("text", "") or "")
+                        key = (int(r), int(c))
+                        prev = text_by_rc.get(key)
+                        if prev is None:
+                            text_by_rc[key] = txt
+                            continue
+                        prev_s = str(prev).strip()
+                        txt_s = str(txt).strip()
+                        if not prev_s and txt_s:
+                            text_by_rc[key] = txt
+                            continue
+                        if prev_s and txt_s and len(txt_s) > len(prev_s):
+                            text_by_rc[key] = txt
+                            continue
+
+                    row_ids = sorted(row_ids_set)
+                    col_ids = sorted(col_ids_set)
+                    if not row_ids or not col_ids:
+                        return [], []
+
+                    # Prune fully-empty rows first (renderer behavior), then columns.
+                    row_ids_keep = [
+                        r_id
+                        for r_id in row_ids
+                        if any(str(text_by_rc.get((int(r_id), int(c_id)), "") or "").strip() for c_id in col_ids)
+                    ]
+                    col_ids_keep = [
+                        c_id
+                        for c_id in col_ids
+                        if any(
+                            str(text_by_rc.get((int(r_id), int(c_id)), "") or "").strip()
+                            for r_id in row_ids_keep
+                        )
+                    ]
+                    return row_ids_keep, col_ids_keep
 
                 parts: list[dict[str, Any]] = []
                 order_counter = 0
@@ -576,7 +616,7 @@ def _run_debug_method_extraction(pdf_path: Path, dpi: int | None, output_dir: Pa
                 for entry in parts_sorted:
                     src_idx = int(entry.get("source_table_idx", 0))
                     part = entry.get("part") or {}
-                    row_ids, col_ids_by_row, max_cols = _part_row_col_map(part)
+                    row_ids, col_ids = _part_row_col_ids_pruned(part)
                     rows_by_variant: list[list[list[str]]] = []
                     for variant_tables in variant_rows_all:
                         try:
@@ -585,19 +625,18 @@ def _run_debug_method_extraction(pdf_path: Path, dpi: int | None, output_dir: Pa
                         except Exception:
                             full_rows = []
                         v_rows: list[list[str]] = []
-                        for rpos, r_id in enumerate(row_ids):
-                            cols = col_ids_by_row[rpos] if rpos < len(col_ids_by_row) else []
+                        for r_id in row_ids:
                             row_out: list[str] = []
-                            for cpos in range(int(max_cols)):
-                                if cpos < len(cols):
-                                    c_id = int(cols[cpos])
-                                    try:
-                                        val = str(full_rows[r_id][c_id]) if (r_id < len(full_rows) and c_id < len(full_rows[r_id])) else ""
-                                    except Exception:
-                                        val = ""
-                                    row_out.append(val)
-                                else:
-                                    row_out.append("")
+                            for c_id in col_ids:
+                                try:
+                                    val = (
+                                        str(full_rows[r_id][c_id])
+                                        if (r_id < len(full_rows) and c_id < len(full_rows[r_id]))
+                                        else ""
+                                    )
+                                except Exception:
+                                    val = ""
+                                row_out.append(val)
                             v_rows.append(row_out)
                         rows_by_variant.append(v_rows)
 

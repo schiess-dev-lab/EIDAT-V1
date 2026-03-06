@@ -433,50 +433,100 @@ def _render_table_ascii(table: Dict, *, mode: str | None = None) -> str:
             # Fall back to the original renderer if anything goes wrong.
             mode = "default"
 
-    cells = table.get("cells", [])
-    if not cells:
+    # Default mode: render by true (row,col) indices to avoid per-row left shifts.
+    matrix: list[list[str]] = []
+
+    cells = table.get("cells") or []
+    if isinstance(cells, list) and cells:
+        # First pass: find extents and select a single "best" text per (row,col).
+        max_row = -1
+        max_col = -1
+        by_rc: dict[tuple[int, int], str] = {}
+        for cell in cells:
+            try:
+                r = int(cell.get("row", 0) or 0)
+                c = int(cell.get("col", 0) or 0)
+            except Exception:
+                r, c = 0, 0
+            if r < 0 or c < 0:
+                continue
+            max_row = max(max_row, r)
+            max_col = max(max_col, c)
+
+            txt = str(cell.get("text", "") or "")
+            key = (r, c)
+            prev = by_rc.get(key)
+            if prev is None:
+                by_rc[key] = txt
+                continue
+            prev_s = str(prev).strip()
+            txt_s = str(txt).strip()
+            if not prev_s and txt_s:
+                by_rc[key] = txt
+                continue
+            if prev_s and txt_s and len(txt_s) > len(prev_s):
+                by_rc[key] = txt
+                continue
+
+        if max_row < 0 or max_col < 0:
+            return ""
+
+        matrix = [[""] * (int(max_col) + 1) for _ in range(int(max_row) + 1)]
+        for (r, c), txt in by_rc.items():
+            if 0 <= r <= max_row and 0 <= c <= max_col:
+                matrix[int(r)][int(c)] = str(txt or "")
+    else:
+        rows_obj = table.get("rows")
+        if isinstance(rows_obj, list) and all(isinstance(r, list) for r in rows_obj):
+            matrix = [[str(v or "") for v in r] for r in rows_obj]
+        else:
+            return ""
+
+    if not matrix:
         return ""
 
-    # Organize cells into rows (requires row/col indices).
-    rows_dict = {}
-    for cell in cells:
-        row_idx = cell.get("row", 0)
-        if row_idx not in rows_dict:
-            rows_dict[row_idx] = []
-        rows_dict[row_idx].append(cell)
+    # Pad ragged rows so pruning/rendering is consistent.
+    n_cols0 = max((len(r) for r in matrix), default=0)
+    if n_cols0 <= 0:
+        return ""
+    matrix = [list(r) + [""] * (n_cols0 - len(r)) for r in matrix]
 
-    if not rows_dict:
+    # Prune fully-empty rows (all cells blank after strip()).
+    matrix = [r for r in matrix if any(str(v or "").strip() for v in r)]
+    if not matrix:
         return ""
 
-    # Sort rows and cells within rows
-    sorted_rows = []
-    for row_idx in sorted(rows_dict.keys()):
-        row_cells = sorted(rows_dict[row_idx], key=lambda c: c.get("col", 0))
-        sorted_rows.append(row_cells)
+    # Prune fully-empty columns.
+    n_rows = len(matrix)
+    n_cols = n_cols0
+    keep_cols = [
+        c for c in range(n_cols) if any(str(matrix[r][c] or "").strip() for r in range(n_rows))
+    ]
+    if not keep_cols:
+        return ""
+    if len(keep_cols) != n_cols:
+        matrix = [[row[c] if c < len(row) else "" for c in keep_cols] for row in matrix]
+        n_cols = len(keep_cols)
 
-    # Calculate column widths
-    max_cols = max(len(row) for row in sorted_rows) if sorted_rows else 0
-    col_widths = [8] * max_cols  # minimum width
+    # Calculate column widths (keep existing min/max behavior).
+    col_widths = [8] * int(n_cols)  # minimum width
+    for row in matrix:
+        for i, text in enumerate(row):
+            if i >= n_cols:
+                break
+            t = str(text or "")
+            col_widths[i] = max(col_widths[i], min(40, len(t) + 2))
 
-    for row in sorted_rows:
-        for i, cell in enumerate(row):
-            if i < max_cols:
-                text = str(cell.get("text", ""))
-                col_widths[i] = max(col_widths[i], min(40, len(text) + 2))
-
-    # Build ASCII table
-    lines = []
+    # Build ASCII table.
+    lines: list[str] = []
     separator = "+" + "+".join("-" * w for w in col_widths) + "+"
     lines.append(separator)
 
-    for row in sorted_rows:
-        row_text = []
-        for i in range(max_cols):
-            if i < len(row):
-                text = str(row[i].get("text", ""))[: col_widths[i] - 2]
-            else:
-                text = ""
-            row_text.append(f" {text.ljust(col_widths[i] - 2)} ")
+    for row in matrix:
+        row_text: list[str] = []
+        for i in range(n_cols):
+            text = str(row[i] if i < len(row) else "" or "")[: max(0, col_widths[i] - 2)]
+            row_text.append(f" {text.ljust(max(0, col_widths[i] - 2))} ")
         lines.append("|" + "|".join(row_text) + "|")
         lines.append(separator)
 

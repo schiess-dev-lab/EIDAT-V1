@@ -937,6 +937,26 @@ def _heal_table_lines(
         digits = sum(1 for ch in alnum if ch.isdigit())
         return float(digits) / float(len(alnum))
 
+    def looks_like_numeric_with_units(text: str) -> bool:
+        """
+        True for strings that appear intentionally unit-bearing (e.g. "91.1scc/sec", "10Hz").
+
+        Policy: never replace these during variant numeric rescue.
+        """
+        s = str(text or "").strip()
+        if not s:
+            return False
+        while s.startswith("("):
+            s = s[1:].lstrip()
+        if s.startswith(("+", "-")):
+            s = s[1:].lstrip()
+        if not s or not s[0].isdigit():
+            return False
+        for ch in s:
+            if ch.isalpha() and ch not in {"O", "o", "I", "l"}:
+                return True
+        return False
+
     for r in range(len(matrix)):
         for c in range(len(widths)):
             orig = str(matrix[r][c] or "").strip()
@@ -989,6 +1009,8 @@ def _heal_table_lines(
             ):
                 cur2 = str(matrix[r][c] or "").strip()
                 if cur2 and (not _is_numeric_like(cur2)):
+                    if looks_like_numeric_with_units(cur2):
+                        continue
                     has_alpha = bool(re.search(r"[A-Za-z]", cur2))
                     dr = _digit_ratio(cur2)
                     if (require_alpha and has_alpha) or (dr < float(min_digit_ratio or 0.0)):

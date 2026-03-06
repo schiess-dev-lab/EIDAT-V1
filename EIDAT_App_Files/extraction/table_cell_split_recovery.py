@@ -862,6 +862,11 @@ def split_merged_cells_post_projection(
                 for sc in subcells
                 if _cell_meaningful(sc, min_chars=cfg.min_text_chars, min_tokens=cfg.min_tokens)
             )
+            # Protection: never commit a split that produces any blank/non-meaningful subcell.
+            # If any projected segment ends up empty, keep the original merged cell.
+            if nonempty != int(len(subcells)):
+                out_cells.append(cell)
+                continue
             if nonempty < int(cfg.min_nonempty_subcells):
                 out_cells.append(cell)
                 continue
@@ -907,4 +912,3 @@ def split_merged_cells_post_projection(
             pass
 
     return stats
-

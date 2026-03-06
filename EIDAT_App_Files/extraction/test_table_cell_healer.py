@@ -156,7 +156,7 @@ class TestTableCellHealer(unittest.TestCase):
             "version": 1,
             "enabled": True,
             "prune": {"enabled": False},
-            "spacing": {"enabled": True, "default_scope": "all_cells"},
+            "spacing": {"enabled": False},
             "numeric": {
                 "enabled": True,
                 "numeric_ratio_min": 0.0,
@@ -172,6 +172,40 @@ class TestTableCellHealer(unittest.TestCase):
         rows_out = _first_table_rows(out)
         self.assertEqual(rows_out[1][0], "1.1")
         self.assertGreaterEqual(int(stats.get("cells_variant_rescued") or 0), 1)
+
+    def test_variant_rescue_skips_unit_bearing_text(self) -> None:
+        class _FakeProvider:
+            def get(self, *, page: int, table_idx: int, row: int, col: int) -> list[str]:
+                if page == 1 and table_idx == 1 and row == 1 and col == 0:
+                    return ["014", "014", "14"]
+                return []
+
+        cols = [("Measured", 14)]
+        header = ["Measured"]
+        rows = [["91.1scc/sec"]]
+        table = _mk_table(cols=cols, header=header, rows=rows, use_eq_header_sep=True)
+        lines = ["=== Page 1 ===\n", "\n", "[Table]\n", "\n", "[Table 1]\n"] + table + ["\n"]
+
+        cfg = {
+            "version": 1,
+            "enabled": True,
+            "prune": {"enabled": False},
+            "spacing": {"enabled": False},
+            "numeric": {
+                "enabled": True,
+                "numeric_ratio_min": 0.0,
+                "numeric_roles": ["value"],
+                "role_synonyms": {"value": ["measured", "value"]},
+                "variant_rescue": {"enabled": True, "require_alpha": True, "min_digit_ratio": 0.9},
+                "unicode_minus_to_dash": True,
+                "allow_o_to_zero": True,
+                "allow_i_l_to_one": True,
+            },
+        }
+        out, stats = heal_combined_tables_in_lines(lines, cfg=cfg, variant_provider=_FakeProvider())
+        rows_out = _first_table_rows(out)
+        self.assertEqual(rows_out[1][0], "91.1scc/sec")
+        self.assertEqual(int(stats.get("cells_variant_rescued") or 0), 0)
 
 
 if __name__ == "__main__":
