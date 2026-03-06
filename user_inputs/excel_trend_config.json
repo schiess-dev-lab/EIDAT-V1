@@ -39,5 +39,14 @@
       "pulse_on": { "column": "pulse on", "format": ".0f" },
       "pulse_off": { "column": "pulse off", "format": ".0f" }
     }
+  },
+  "x_axis": {
+    "replace_defaults": false,
+    "time_aliases": ["Seq Time (sec)", "Seq Time (s)", "Time (sec)", "Time(s)", "Time (s)", "time_s", "time_sec", "time"],
+    "pulse_aliases": ["Pulse Number", "Pulse #", "Pulse", "cycle", "Cycle", "pulse_number", "pulsenumber"],
+    "fuzzy_match": { "enabled": true, "min_ratio": 0.82 },
+    "sequential_validation": { "enabled": true, "max_probe_rows": 250, "min_samples": 6, "pulse_min_run": 5 },
+    "fallback_mode": "alias_only",
+    "default_x": "Time"
   }
 }

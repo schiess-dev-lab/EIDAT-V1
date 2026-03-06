@@ -1367,11 +1367,30 @@ def extract_metadata_from_excel(
 
     meta: dict
     try:
-        from openpyxl import load_workbook  # type: ignore
+        ext = str(p.suffix or "").lower()
 
-        wb = load_workbook(str(p), read_only=True, data_only=True)
+        wb = None
+        sheetnames: list[str] = []
+
+        # NOTE: openpyxl does not support legacy .xls; use xlrd when available.
+        if ext == ".xls":
+            import xlrd  # type: ignore
+
+            wb = xlrd.open_workbook(str(p), on_demand=True)
+            try:
+                sheetnames = list(getattr(wb, "sheet_names", lambda: [])() or [])
+            except Exception:
+                sheetnames = []
+        else:
+            from openpyxl import load_workbook  # type: ignore
+
+            wb = load_workbook(str(p), read_only=True, data_only=True)
+            try:
+                sheetnames = list(getattr(wb, "sheetnames", []) or [])
+            except Exception:
+                sheetnames = []
+
         try:
-            sheetnames = list(getattr(wb, "sheetnames", []) or [])
             synthetic: list[str] = []
             seen_synth: set[tuple[str, str]] = set()
 
@@ -1434,9 +1453,18 @@ def extract_metadata_from_excel(
                 return True
 
             for sheet_name in sheetnames[: int(max_sheets)]:
-                try:
-                    ws = wb[sheet_name]
-                except Exception:
+                ws = None
+                if ext == ".xls":
+                    try:
+                        ws = wb.sheet_by_name(str(sheet_name))  # type: ignore[attr-defined]
+                    except Exception:
+                        ws = None
+                else:
+                    try:
+                        ws = wb[sheet_name]  # type: ignore[index]
+                    except Exception:
+                        ws = None
+                if ws is None:
                     continue
                 try:
                     lines.append(f"Sheet | {sheet_name}")
@@ -1446,18 +1474,36 @@ def extract_metadata_from_excel(
                 # Excel-only: recover label/value fields from table-style layouts.
                 # Example: "Part No" in one cell, value in the cell to the right.
                 if compiled_value and len(synthetic) < 80:
-                    try:
-                        grid_rows = list(
-                            ws.iter_rows(
-                                min_row=1,
-                                max_row=int(max_rows),
-                                min_col=1,
-                                max_col=int(max_cols),
-                                values_only=True,
+                    grid_rows = []
+                    if ext == ".xls":
+                        try:
+                            nrows = int(getattr(ws, "nrows", 0) or 0)
+                            ncols = int(getattr(ws, "ncols", 0) or 0)
+                            rmax = min(int(max_rows), max(0, nrows))
+                            cmax = min(int(max_cols), max(0, ncols))
+                            for rr in range(0, rmax):
+                                try:
+                                    vals = list(ws.row_values(int(rr), 0, int(cmax)))  # type: ignore[attr-defined]
+                                except Exception:
+                                    vals = []
+                                if len(vals) < int(cmax):
+                                    vals += [""] * (int(cmax) - len(vals))
+                                grid_rows.append(tuple(vals[: int(cmax)]))
+                        except Exception:
+                            grid_rows = []
+                    else:
+                        try:
+                            grid_rows = list(
+                                ws.iter_rows(
+                                    min_row=1,
+                                    max_row=int(max_rows),
+                                    min_col=1,
+                                    max_col=int(max_cols),
+                                    values_only=True,
+                                )
                             )
-                        )
-                    except Exception:
-                        grid_rows = []
+                        except Exception:
+                            grid_rows = []
                     for row in grid_rows:
                         if len(synthetic) >= 80:
                             break
@@ -1532,16 +1578,32 @@ def extract_metadata_from_excel(
                                     synthetic.append(f"{synth_key} | {found_val}")
                                     break
 
-                try:
-                    row_iter = ws.iter_rows(
-                        min_row=1,
-                        max_row=int(max_rows),
-                        min_col=1,
-                        max_col=int(max_cols),
-                        values_only=True,
-                    )
-                except Exception:
-                    continue
+                if ext == ".xls":
+                    # Reuse the same grid sampling approach as above.
+                    try:
+                        nrows = int(getattr(ws, "nrows", 0) or 0)
+                        ncols = int(getattr(ws, "ncols", 0) or 0)
+                        rmax = min(int(max_rows), max(0, nrows))
+                        cmax = min(int(max_cols), max(0, ncols))
+                        row_iter = (
+                            tuple(
+                                list(ws.row_values(int(rr), 0, int(cmax)))[: int(cmax)]  # type: ignore[attr-defined]
+                            )
+                            for rr in range(0, rmax)
+                        )
+                    except Exception:
+                        continue
+                else:
+                    try:
+                        row_iter = ws.iter_rows(
+                            min_row=1,
+                            max_row=int(max_rows),
+                            min_col=1,
+                            max_col=int(max_cols),
+                            values_only=True,
+                        )
+                    except Exception:
+                        continue
 
                 for row in row_iter:
                     vals: list[str] = []
@@ -1564,7 +1626,10 @@ def extract_metadata_from_excel(
                 lines.extend(synthetic[:80])
         finally:
             try:
-                wb.close()
+                if ext == ".xls":
+                    wb.release_resources()  # type: ignore[attr-defined]
+                else:
+                    wb.close()  # type: ignore[union-attr]
             except Exception:
                 pass
     except Exception:

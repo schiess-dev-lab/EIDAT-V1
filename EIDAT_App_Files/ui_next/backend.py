@@ -3225,6 +3225,7 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
     Rebuild `td_*` cache tables inside `implementation_trending.sqlite3` from the
     workbook's `Sources` + `Config` sheets.
     """
+    from contextlib import closing
     import time
     import statistics
 
@@ -3306,54 +3307,172 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
     # Never offer excel_row as an X axis (it is still used for stable ordering when present).
     X_TIME = "Time"
     X_PULSE = "Pulse Number"
-    x_priority = [X_TIME, X_PULSE]
     run_x_union: dict[str, set[str]] = {}
     run_default_x: dict[str, str] = {}
 
     def _norm_name(s: str) -> str:
         return "".join(ch.lower() for ch in str(s or "") if ch.isalnum())
 
-    time_candidates = [
-        "Time",
-        "Time (s)",
-        "Time(s)",
-        "time",
-        "time_s",
-        "time_sec",
-        "time (s)",
-        "time(s)",
-    ]
-    pulse_candidates = [
-        "Pulse Number",
-        "Pulse #",
-        "Pulse",
-        "pulse number",
-        "pulse_number",
-        "pulsenumber",
-        "pulse",
-        "cycle",
-        "Cycle",
-    ]
-    time_norms = {_norm_name(x) for x in time_candidates}
-    pulse_norms = {_norm_name(x) for x in pulse_candidates}
+    # X-axis header detection is controlled by `user_inputs/excel_trend_config.json` (optional).
+    # This is independent of the Test Data Trending workbook's Config sheet.
+    x_axis_cfg: dict = {}
+    try:
+        x_axis_cfg = dict((_load_excel_trend_config(DEFAULT_EXCEL_TREND_CONFIG) or {}).get("x_axis") or {})
+    except Exception:
+        x_axis_cfg = {}
+
+    time_aliases = [
+        str(s).strip()
+        for s in (x_axis_cfg.get("time_aliases") if isinstance(x_axis_cfg, dict) else []) or []
+        if str(s).strip()
+    ] or [X_TIME]
+    pulse_aliases = [
+        str(s).strip()
+        for s in (x_axis_cfg.get("pulse_aliases") if isinstance(x_axis_cfg, dict) else []) or []
+        if str(s).strip()
+    ] or [X_PULSE]
+    fm = (x_axis_cfg.get("fuzzy_match") if isinstance(x_axis_cfg, dict) else None) or {}
+    fm_enabled = bool(isinstance(fm, dict) and fm.get("enabled", True))
+    try:
+        fm_min_ratio = float((fm if isinstance(fm, dict) else {}).get("min_ratio", 0.82))
+    except Exception:
+        fm_min_ratio = 0.82
+    fm_min_ratio = min(1.0, max(0.0, float(fm_min_ratio)))
+
+    sv = (x_axis_cfg.get("sequential_validation") if isinstance(x_axis_cfg, dict) else None) or {}
+    sv_enabled = bool(isinstance(sv, dict) and sv.get("enabled", True))
+    try:
+        sv_max_probe_rows = int((sv if isinstance(sv, dict) else {}).get("max_probe_rows", 250))
+    except Exception:
+        sv_max_probe_rows = 250
+    try:
+        sv_min_samples = int((sv if isinstance(sv, dict) else {}).get("min_samples", 6))
+    except Exception:
+        sv_min_samples = 6
+    try:
+        sv_pulse_min_run = int((sv if isinstance(sv, dict) else {}).get("pulse_min_run", 5))
+    except Exception:
+        sv_pulse_min_run = 5
+    sv_max_probe_rows = max(20, int(sv_max_probe_rows))
+    sv_min_samples = max(4, int(sv_min_samples))
+    sv_pulse_min_run = max(3, int(sv_pulse_min_run))
+
+    # Default X preference (keep "Time" first unless overridden in config).
+    default_x_pref = str((x_axis_cfg.get("default_x") if isinstance(x_axis_cfg, dict) else None) or X_TIME).strip() or X_TIME
+    if _norm_name(default_x_pref) == _norm_name(X_PULSE):
+        x_priority = [X_PULSE, X_TIME]
+    else:
+        x_priority = [X_TIME, X_PULSE]
+
+    time_norms = {_norm_name(x) for x in ([X_TIME] + list(time_aliases))}
+    pulse_norms = {_norm_name(x) for x in ([X_PULSE] + list(pulse_aliases))}
     x_exclude_norms = time_norms | pulse_norms | {_norm_name("excel_row")}
 
-    def _find_actual_col(cols: set[str], candidates: list[str]) -> str:
-        # Prefer exact matches in the given priority order.
-        for cand in candidates:
-            if cand in cols:
-                return cand
-        # Fallback: normalized match (handles underscores / spaces / punctuation).
-        by_norm: dict[str, str] = {}
-        for c in cols:
-            n = _norm_name(c)
-            if n and n not in by_norm:
-                by_norm[n] = c
-        for cand in candidates:
-            c = by_norm.get(_norm_name(cand))
-            if c:
-                return c
-        return ""
+    def _match_by_aliases(
+        col_list: list[str],
+        aliases: list[str],
+        *,
+        fuzzy_enabled: bool,
+        min_ratio: float,
+    ) -> list[tuple[str, float, int]]:
+        """
+        Return [(col_name, score, col_index)] for columns whose header matches any alias.
+        Results are ordered by col_index (left-most first).
+        """
+        if not col_list or not aliases:
+            return []
+        # Precompute normalized forms for fast exact matching.
+        alias_norms = {_norm_name(a) for a in aliases if _norm_name(a)}
+        out: list[tuple[str, float, int]] = []
+        for idx, col in enumerate(col_list):
+            c = str(col or "").strip()
+            if not c:
+                continue
+            c_norm = _norm_name(c)
+            if not c_norm:
+                continue
+            if c_norm == _norm_name("excel_row"):
+                continue
+            if c_norm in alias_norms:
+                out.append((c, 1.0, int(idx)))
+                continue
+            if not fuzzy_enabled:
+                continue
+            best = 0.0
+            for a in aliases:
+                score = _fuzzy_col_score(str(a or ""), c)  # defined below (label helpers)
+                if score > best:
+                    best = float(score)
+            if best >= float(min_ratio):
+                out.append((c, float(best), int(idx)))
+        out.sort(key=lambda t: (int(t[2]), -float(t[1]), str(t[0]).lower()))
+        return out
+
+    def _probe_finite_values(
+        src: sqlite3.Connection,
+        table: str,
+        col: str,
+        *,
+        order_by: str,
+        max_rows: int,
+    ) -> list[float]:
+        q_table = _quote_ident(table)
+        q_col = _quote_ident(col)
+        try:
+            rows = src.execute(
+                f"SELECT {q_col} FROM {q_table} "
+                f"WHERE {q_col} IS NOT NULL "
+                f"ORDER BY {order_by} "
+                f"LIMIT {int(max_rows)}"
+            ).fetchall()
+        except Exception:
+            rows = []
+        out: list[float] = []
+        for (v,) in rows:
+            fv = _finite_float(v)
+            if fv is None:
+                continue
+            out.append(float(fv))
+        return out
+
+    def _is_time_sequential(values: list[float], *, min_samples: int) -> bool:
+        if len(values) < int(min_samples):
+            return False
+        pos = 0
+        prev = values[0]
+        for v in values[1:]:
+            d = float(v) - float(prev)
+            if d < -1e-9:
+                return False
+            if d > 1e-9:
+                pos += 1
+            prev = v
+        return pos >= 2
+
+    def _is_pulse_sequential(values: list[float], *, min_samples: int, min_run: int) -> bool:
+        if len(values) < int(min_samples):
+            return False
+        int_like = 0
+        ints: list[int] = []
+        for v in values:
+            rv = round(float(v))
+            if abs(float(v) - float(rv)) < 1e-9:
+                int_like += 1
+                ints.append(int(rv))
+            else:
+                ints.append(int(rv))
+        if float(int_like) / float(max(1, len(values))) < 0.98:
+            return False
+        best = 1
+        cur = 1
+        for i in range(1, len(ints)):
+            if int(ints[i]) == int(ints[i - 1]) + 1:
+                cur += 1
+                if cur > best:
+                    best = cur
+            else:
+                cur = 1
+        return best >= int(min_run)
 
     def _finite_float(v: object) -> float | None:
         if v is None:
@@ -3548,7 +3667,7 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
         return str(v).strip()
 
     # Reset td_* tables (only).
-    with sqlite3.connect(str(db_path)) as conn:
+    with closing(sqlite3.connect(str(db_path))) as conn:
         _ensure_test_data_tables(conn)
         for t in ("td_meta", "td_sources", "td_runs", "td_columns", "td_curves", "td_metrics", "td_terms"):
             try:
@@ -3625,7 +3744,7 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
             status = "invalid"
             invalid_sources += 1
 
-        with sqlite3.connect(str(db_path)) as conn:
+        with closing(sqlite3.connect(str(db_path))) as conn:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO td_sources(serial, sqlite_path, mtime_ns, size_bytes, status, last_ingested_epoch_ns)
@@ -3639,7 +3758,8 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
             continue
 
         try:
-            with sqlite3.connect(str(sqlite_path)) as src:
+            src = sqlite3.connect(str(sqlite_path))
+            try:
                 # Discover runs
                 try:
                     runs_rows = src.execute("SELECT sheet_name FROM __sheet_info ORDER BY sheet_name").fetchall()
@@ -3672,12 +3792,17 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
 
                     # Columns present
                     try:
-                        info = src.execute(f"PRAGMA table_info([{table}])").fetchall()
-                        cols = {str(r[1] or "").strip() for r in info if str(r[1] or "").strip()}
+                        q_table = _quote_ident(table)
+                        info = src.execute(f"PRAGMA table_info({q_table})").fetchall()
+                        col_list = [str(r[1] or "").strip() for r in info if str(r[1] or "").strip()]
+                        cols = set(col_list)
                     except Exception:
+                        col_list = []
                         cols = set()
                     if not cols:
                         continue
+
+                    order_by = "excel_row ASC" if "excel_row" in cols else "rowid ASC"
 
                     # Collect per-run variable values for optional user-defined condition labels.
                     if td_run_labeling_enabled and label_template and label_variables and label_value_pick == "most_common":
@@ -3695,8 +3820,49 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
                             run_var_samples.setdefault(str(run), {}).setdefault(str(var_name), []).append(cv)
 
                     x_map: dict[str, str] = {}
-                    actual_time = _find_actual_col(cols, time_candidates)
-                    actual_pulse = _find_actual_col(cols, pulse_candidates)
+                    actual_time = ""
+                    actual_pulse = ""
+
+                    # Pick the first (left-most) matching column that also looks sequential.
+                    for c, _score, _idx in _match_by_aliases(
+                        col_list,
+                        time_aliases,
+                        fuzzy_enabled=bool(fm_enabled),
+                        min_ratio=float(fm_min_ratio),
+                    ):
+                        if not sv_enabled:
+                            actual_time = c
+                            break
+                        vals = _probe_finite_values(
+                            src,
+                            table,
+                            c,
+                            order_by=order_by,
+                            max_rows=int(sv_max_probe_rows),
+                        )
+                        if _is_time_sequential(vals, min_samples=int(sv_min_samples)):
+                            actual_time = c
+                            break
+
+                    for c, _score, _idx in _match_by_aliases(
+                        col_list,
+                        pulse_aliases,
+                        fuzzy_enabled=bool(fm_enabled),
+                        min_ratio=float(fm_min_ratio),
+                    ):
+                        if not sv_enabled:
+                            actual_pulse = c
+                            break
+                        vals = _probe_finite_values(
+                            src,
+                            table,
+                            c,
+                            order_by=order_by,
+                            max_rows=int(sv_max_probe_rows),
+                        )
+                        if _is_pulse_sequential(vals, min_samples=int(sv_min_samples), min_run=int(sv_pulse_min_run)):
+                            actual_pulse = c
+                            break
                     if actual_time:
                         x_map[X_TIME] = actual_time
                     if actual_pulse:
@@ -3712,7 +3878,6 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
                             # Prefer Time over Pulse Number.
                             if x_priority.index(avail_x[0]) < x_priority.index(existing):
                                 run_default_x[run] = avail_x[0]
-                    order_by = "excel_row ASC" if "excel_row" in cols else "rowid ASC"
 
                     # Local default_x for metrics
                     default_x = avail_x[0] if avail_x else ""
@@ -3764,7 +3929,7 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
                                 xs.append(float(fx))
                                 ys.append(float(fy))
 
-                            with sqlite3.connect(str(db_path)) as conn:
+                            with closing(sqlite3.connect(str(db_path))) as conn:
                                 conn.execute(
                                     """
                                     INSERT OR REPLACE INTO td_curves
@@ -3812,7 +3977,7 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
                         if stats_ignore_first_n > 0 and len(y_for_stats) > 0:
                             y_for_stats = y_for_stats[int(stats_ignore_first_n) :]
                         stats_map = _compute_stats(y_for_stats)
-                        with sqlite3.connect(str(db_path)) as conn:
+                        with closing(sqlite3.connect(str(db_path))) as conn:
                             for stat in selected_stats:
                                 val = stats_map.get(stat)
                                 conn.execute(
@@ -3825,9 +3990,14 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
                                 )
                                 metrics_written += 1
                             conn.commit()
+            finally:
+                try:
+                    src.close()
+                except Exception:
+                    pass
 
         except Exception:
-            with sqlite3.connect(str(db_path)) as conn:
+            with closing(sqlite3.connect(str(db_path))) as conn:
                 conn.execute(
                     "UPDATE td_sources SET status=?, last_ingested_epoch_ns=? WHERE serial=?",
                     ("invalid", computed_epoch_ns, sn),
@@ -3873,7 +4043,7 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
             display_by_run[run] = _collapse_ws(disp) or base
 
     # Write runs + columns tables for dropdowns.
-    with sqlite3.connect(str(db_path)) as conn:
+    with closing(sqlite3.connect(str(db_path))) as conn:
         cfg_order = [n for n, _u in y_cols if n]
         for run in sorted(runs_all, key=lambda s: str(s).lower()):
             xs = run_x_union.get(run, set())
@@ -9145,6 +9315,154 @@ def _ensure_file_written(path: Path, *, create_fn) -> None:
 
 
 def _load_excel_trend_config(path: Path) -> dict:
+    def _normalize_td_x_axis_config(raw: object) -> dict:
+        """
+        Normalize optional `x_axis` config for Test Data Trending.
+
+        This controls how we detect canonical TD X axes ("Time" / "Pulse Number")
+        from source Excel-to-SQLite column headers.
+        """
+
+        def _norm(s: object) -> str:
+            return "".join(ch.lower() for ch in str(s or "") if ch.isalnum())
+
+        def _as_str_list(v: object, *, field: str) -> list[str]:
+            if v is None:
+                return []
+            if not isinstance(v, list):
+                raise ValueError(f"Excel trend config `x_axis.{field}` must be a list of strings.")
+            out: list[str] = []
+            for it in v:
+                if not isinstance(it, str):
+                    raise ValueError(f"Excel trend config `x_axis.{field}` must be a list of strings.")
+                s = it.strip()
+                if s:
+                    out.append(s)
+            return out
+
+        def _dedupe(values: list[str]) -> list[str]:
+            out: list[str] = []
+            seen: set[str] = set()
+            for s in values:
+                k = _norm(s)
+                if not k or k in seen:
+                    continue
+                seen.add(k)
+                out.append(s)
+            return out
+
+        # Built-in defaults (robust to common Excel headers and safe-ified SQLite idents).
+        default_time_aliases = [
+            "Time",
+            "Time (s)",
+            "Time(s)",
+            "Time (sec)",
+            "Time(sec)",
+            "Time sec",
+            "time",
+            "time_s",
+            "time_sec",
+            "time (s)",
+            "time(s)",
+            "seq time (sec)",
+            "seq time (s)",
+            "seq time sec",
+            "sequence time (sec)",
+        ]
+        default_pulse_aliases = [
+            "Pulse Number",
+            "Pulse #",
+            "Pulse",
+            "pulse number",
+            "pulse_number",
+            "pulsenumber",
+            "pulse",
+            "cycle",
+            "Cycle",
+        ]
+
+        x = raw if isinstance(raw, dict) else {}
+
+        replace_defaults = bool(x.get("replace_defaults", False))
+        time_aliases = _as_str_list(x.get("time_aliases"), field="time_aliases")
+        pulse_aliases = _as_str_list(x.get("pulse_aliases"), field="pulse_aliases")
+
+        # Always include canonical labels as implicit aliases.
+        canon_time = "Time"
+        canon_pulse = "Pulse Number"
+        if replace_defaults:
+            time_all = [canon_time] + time_aliases
+            pulse_all = [canon_pulse] + pulse_aliases
+        else:
+            time_all = [canon_time] + default_time_aliases + time_aliases
+            pulse_all = [canon_pulse] + default_pulse_aliases + pulse_aliases
+
+        time_all = _dedupe(time_all)
+        pulse_all = _dedupe(pulse_all)
+
+        fuzzy = x.get("fuzzy_match")
+        if fuzzy is None:
+            fuzzy = {}
+        if not isinstance(fuzzy, dict):
+            raise ValueError("Excel trend config `x_axis.fuzzy_match` must be an object.")
+        fuzzy_enabled = bool(fuzzy.get("enabled", True))
+        try:
+            min_ratio = float(fuzzy.get("min_ratio", 0.82))
+        except Exception:
+            min_ratio = 0.82
+        if not (0.0 <= float(min_ratio) <= 1.0):
+            raise ValueError("Excel trend config `x_axis.fuzzy_match.min_ratio` must be within [0.0, 1.0].")
+
+        seq = x.get("sequential_validation")
+        if seq is None:
+            seq = {}
+        if not isinstance(seq, dict):
+            raise ValueError("Excel trend config `x_axis.sequential_validation` must be an object.")
+        seq_enabled = bool(seq.get("enabled", True))
+        try:
+            max_probe_rows = int(seq.get("max_probe_rows", 250))
+        except Exception:
+            max_probe_rows = 250
+        try:
+            min_samples = int(seq.get("min_samples", 6))
+        except Exception:
+            min_samples = 6
+        try:
+            pulse_min_run = int(seq.get("pulse_min_run", 5))
+        except Exception:
+            pulse_min_run = 5
+        if max_probe_rows < 20:
+            raise ValueError("Excel trend config `x_axis.sequential_validation.max_probe_rows` must be >= 20.")
+        if min_samples < 4:
+            raise ValueError("Excel trend config `x_axis.sequential_validation.min_samples` must be >= 4.")
+        if pulse_min_run < 3:
+            raise ValueError("Excel trend config `x_axis.sequential_validation.pulse_min_run` must be >= 3.")
+
+        # Fixed behavior for now (documented in plan): no "any numeric column" fallback.
+        fallback_mode = "alias_only"
+
+        default_x_raw = str(x.get("default_x", canon_time) or "").strip()
+        dx = canon_time
+        if _norm(default_x_raw) == _norm(canon_pulse):
+            dx = canon_pulse
+        elif _norm(default_x_raw) == _norm(canon_time):
+            dx = canon_time
+
+        return {
+            "replace_defaults": bool(replace_defaults),
+            "time_aliases": list(time_all),
+            "pulse_aliases": list(pulse_all),
+            "fuzzy_match": {"enabled": bool(fuzzy_enabled), "min_ratio": float(min_ratio)},
+            "sequential_validation": {
+                "enabled": bool(seq_enabled),
+                "max_probe_rows": int(max_probe_rows),
+                "min_samples": int(min_samples),
+                "pulse_min_run": int(pulse_min_run),
+            },
+            "fallback_mode": fallback_mode,
+            "default_x": dx,
+        }
+
     p = Path(path).expanduser()
     if not p.exists():
         raise FileNotFoundError(f"Excel trend config not found: {p}")
@@ -9239,6 +9557,7 @@ def _load_excel_trend_config(path: Path) -> dict:
         data["performance_plotters"] = normalized
     if "header_row" not in data:
         data["header_row"] = 0
+    data["x_axis"] = _normalize_td_x_axis_config(data.get("x_axis"))
     return data
 
 

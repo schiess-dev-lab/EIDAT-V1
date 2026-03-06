@@ -19,6 +19,7 @@ PROFILE_REQUIRED_IMPORTS: dict[str, list[str]] = {
         "fitz",  # pymupdf
         "pandas",
         "openpyxl",
+        "xlrd",
         "xlsxwriter",  # XlsxWriter package
         "matplotlib",
     ],
@@ -28,6 +29,7 @@ PROFILE_REQUIRED_IMPORTS: dict[str, list[str]] = {
         "fitz",  # pymupdf
         "pandas",
         "openpyxl",
+        "xlrd",
         "xlsxwriter",
         "matplotlib",
         "cv2",  # opencv-python-headless

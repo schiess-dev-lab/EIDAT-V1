@@ -43,6 +43,23 @@ def _safe_float(v: object) -> float | None:
         return None
 
 
+def _fmt_num(v: object, *, sig: int = 4) -> str:
+    fv = _safe_float(v)
+    if fv is None:
+        return "—"
+    try:
+        x = float(fv)
+    except Exception:
+        return "—"
+    if not math.isfinite(x):
+        return "—"
+    try:
+        s = f"{x:.{max(1, int(sig))}g}"
+    except Exception:
+        s = str(x)
+    return "0" if s in {"-0", "-0.0", "-0.00"} else s
+
+
 def _norm_key(s: str) -> str:
     return "".join(ch.lower() for ch in str(s or "").strip() if ch.isalnum())
 

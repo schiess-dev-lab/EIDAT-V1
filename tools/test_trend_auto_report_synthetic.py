@@ -283,6 +283,15 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         self.assertEqual(tar._overall_cert_status(["NO_DATA", "PASS"]), "NO_DATA")
         self.assertEqual(tar._overall_cert_status([]), "NO_DATA")
 
+    def test_fmt_num_is_defined_and_safe(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        self.assertEqual(tar._fmt_num(None), "—")
+        self.assertEqual(tar._fmt_num(float("nan")), "—")
+        self.assertEqual(tar._fmt_num(float("inf")), "—")
+        self.assertEqual(tar._fmt_num(-0.0), "0")
+        self.assertEqual(tar._fmt_num(1.234567, sig=4), "1.235")
+
     def test_build_chart_specs_severity_sort(self):
         from EIDAT_App_Files.ui_next import trend_auto_report as tar
 
