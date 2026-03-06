@@ -1293,7 +1293,7 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
         if cont is not None:
             cont.setEnabled(not is_raw)
             if is_raw:
-                for cb in (self.cb_cont_program, self.cb_cont_part, self.cb_cont_vendor, self.cb_cont_asset, getattr(self, "cb_cont_test_plan", None)):
+                for cb in (self.cb_cont_program, self.cb_cont_part, self.cb_cont_vendor, self.cb_cont_asset, getattr(self, "cb_cont_asset_specific", None), getattr(self, "cb_cont_test_plan", None)):
                     if cb is None:
                         continue
                     cb.setChecked(False)
@@ -1315,9 +1315,9 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
             if is_test_data:
                 self.rb_all.setChecked(True)
                 self.rb_all.setText("All indexed TD reports")
-                for w in (self.rb_program, self.rb_asset, self.rb_group):
+                for w in (self.rb_program, self.rb_asset, self.rb_asset_specific, self.rb_group):
                     w.setEnabled(True)
-                for w in (self.cb_program, self.cb_asset, self.cb_group):
+                for w in (self.cb_program, self.cb_asset, self.cb_asset_specific, self.cb_group):
                     w.setEnabled(True)
                 if hasattr(self, "lbl_select_hint"):
                     self.lbl_select_hint.setText(
@@ -1349,9 +1349,9 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
                     self._continued_container.setVisible(True)
             else:
                 self.rb_all.setText("All indexed EIDPs")
-                for w in (self.rb_program, self.rb_asset, self.rb_group):
+                for w in (self.rb_program, self.rb_asset, self.rb_asset_specific, self.rb_group):
                     w.setEnabled(True)
-                for w in (self.cb_program, self.cb_asset, self.cb_group):
+                for w in (self.cb_program, self.cb_asset, self.cb_asset_specific, self.cb_group):
                     w.setEnabled(True)
                 if hasattr(self, "lbl_select_hint"):
                     self.lbl_select_hint.setText(
@@ -1448,17 +1448,20 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
         self.rb_all = QtWidgets.QRadioButton("All indexed EIDPs")
         self.rb_program = QtWidgets.QRadioButton("Program trending")
         self.rb_asset = QtWidgets.QRadioButton("Asset-type trending")
+        self.rb_asset_specific = QtWidgets.QRadioButton("Asset-specific trending")
         self.rb_group = QtWidgets.QRadioButton("Similarity group")
         self.rb_all.setChecked(True)
 
-        for rb in (self.rb_all, self.rb_program, self.rb_asset, self.rb_group):
+        for rb in (self.rb_all, self.rb_program, self.rb_asset, self.rb_asset_specific, self.rb_group):
             rb.toggled.connect(lambda _=False: self._apply_filter_and_refresh_table(select_all=True))
 
         self.cb_program = QtWidgets.QComboBox()
         self.cb_asset = QtWidgets.QComboBox()
+        self.cb_asset_specific = QtWidgets.QComboBox()
         self.cb_group = QtWidgets.QComboBox()
         self.cb_program.currentIndexChanged.connect(lambda *_: self._apply_filter_and_refresh_table(select_all=True))
         self.cb_asset.currentIndexChanged.connect(lambda *_: self._apply_filter_and_refresh_table(select_all=True))
+        self.cb_asset_specific.currentIndexChanged.connect(lambda *_: self._apply_filter_and_refresh_table(select_all=True))
         self.cb_group.currentIndexChanged.connect(lambda *_: self._apply_filter_and_refresh_table(select_all=True))
 
         top.addWidget(self.rb_all)
@@ -1466,11 +1469,13 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
         top.addWidget(self.cb_program, 1)
         top.addWidget(self.rb_asset)
         top.addWidget(self.cb_asset, 1)
+        top.addWidget(self.rb_asset_specific)
+        top.addWidget(self.cb_asset_specific, 1)
         top.addWidget(self.rb_group)
         top.addWidget(self.cb_group, 1)
         v.addLayout(top)
 
-        tbl_cols = ["Select", "Program", "Serial", "Doc Type", "Asset Type", "Metadata (rel)", "Group"]
+        tbl_cols = ["Select", "Program", "Serial", "Doc Type", "Asset Type", "Asset Specific Type", "Metadata (rel)", "Group"]
         self.tbl = QtWidgets.QTableWidget(0, len(tbl_cols))
         self.tbl.setHorizontalHeaderLabels(tbl_cols)
         self.tbl.verticalHeader().setVisible(False)
@@ -1509,12 +1514,14 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
         self.cb_cont_part = QtWidgets.QCheckBox("Part Number")
         self.cb_cont_vendor = QtWidgets.QCheckBox("Vendor Name")
         self.cb_cont_asset = QtWidgets.QCheckBox("Asset Type")
+        self.cb_cont_asset_specific = QtWidgets.QCheckBox("Asset Specific Type")
         self.cb_cont_test_plan = QtWidgets.QCheckBox("Acceptance Test Plan")
 
         self.list_cont_program = QtWidgets.QListWidget()
         self.list_cont_part = QtWidgets.QListWidget()
         self.list_cont_vendor = QtWidgets.QListWidget()
         self.list_cont_asset = QtWidgets.QListWidget()
+        self.list_cont_asset_specific = QtWidgets.QListWidget()
         self.list_cont_test_plan = QtWidgets.QListWidget()
 
         for lst in (
@@ -1522,6 +1529,7 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
             self.list_cont_part,
             self.list_cont_vendor,
             self.list_cont_asset,
+            self.list_cont_asset_specific,
             self.list_cont_test_plan,
         ):
             lst.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
@@ -1539,6 +1547,7 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
         _bind_toggle(self.cb_cont_part, self.list_cont_part)
         _bind_toggle(self.cb_cont_vendor, self.list_cont_vendor)
         _bind_toggle(self.cb_cont_asset, self.list_cont_asset)
+        _bind_toggle(self.cb_cont_asset_specific, self.list_cont_asset_specific)
         _bind_toggle(self.cb_cont_test_plan, self.list_cont_test_plan)
 
         grid = QtWidgets.QGridLayout()
@@ -1563,7 +1572,8 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
         _add_cont_row(0, 1, self.cb_cont_vendor, self.list_cont_vendor)
         _add_cont_row(1, 0, self.cb_cont_part, self.list_cont_part)
         _add_cont_row(1, 1, self.cb_cont_asset, self.list_cont_asset)
-        _add_cont_row(2, 0, self.cb_cont_test_plan, self.list_cont_test_plan, col_span=2)
+        _add_cont_row(2, 0, self.cb_cont_asset_specific, self.list_cont_asset_specific)
+        _add_cont_row(2, 1, self.cb_cont_test_plan, self.list_cont_test_plan)
 
         self._continued_container = QtWidgets.QWidget()
         self._continued_container.setLayout(grid)
@@ -1630,6 +1640,7 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
 
         programs = sorted({str(d.get("program_title") or "").strip() for d in docs if str(d.get("program_title") or "").strip()})
         assets = sorted({str(d.get("asset_type") or "").strip() for d in docs if str(d.get("asset_type") or "").strip()})
+        asset_specifics = sorted({str(d.get("asset_specific_type") or "").strip() for d in docs if str(d.get("asset_specific_type") or "").strip()})
         vendors = sorted({str(d.get("vendor") or "").strip() for d in docs if str(d.get("vendor") or "").strip()})
         parts = sorted({str(d.get("part_number") or "").strip() for d in docs if str(d.get("part_number") or "").strip()})
         test_plans = sorted(
@@ -1642,10 +1653,12 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
 
         self.cb_program.clear()
         self.cb_asset.clear()
+        self.cb_asset_specific.clear()
         self.cb_group.clear()
 
         self.cb_program.addItems(programs or ["(none)"])
         self.cb_asset.addItems(assets or ["(none)"])
+        self.cb_asset_specific.addItems(asset_specifics or ["(none)"])
 
         def _populate_list(widget: QtWidgets.QListWidget, items: list[str]) -> None:
             widget.blockSignals(True)
@@ -1661,6 +1674,8 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
             _populate_list(self.list_cont_vendor, vendors)
         if hasattr(self, "list_cont_asset"):
             _populate_list(self.list_cont_asset, assets)
+        if hasattr(self, "list_cont_asset_specific"):
+            _populate_list(self.list_cont_asset_specific, asset_specifics)
         if hasattr(self, "list_cont_test_plan"):
             _populate_list(self.list_cont_test_plan, test_plans)
 
@@ -1726,6 +1741,9 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
         if self.rb_asset.isChecked():
             wanted = str(self.cb_asset.currentText() or "").strip()
             return [d for d in docs if str(d.get("asset_type") or "").strip() == wanted]
+        if self.rb_asset_specific.isChecked():
+            wanted = str(self.cb_asset_specific.currentText() or "").strip()
+            return [d for d in docs if str(d.get("asset_specific_type") or "").strip() == wanted]
         if self.rb_group.isChecked():
             gid = str(self.cb_group.currentData() or "").strip()
             if not gid:
@@ -1761,11 +1779,12 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
             self.tbl.setItem(r, 2, QtWidgets.QTableWidgetItem(str(d.get("serial_number") or "")))
             self.tbl.setItem(r, 3, QtWidgets.QTableWidgetItem(str(d.get("document_type") or d.get("document_type_acronym") or "")))
             self.tbl.setItem(r, 4, QtWidgets.QTableWidgetItem(str(d.get("asset_type") or "")))
-            self.tbl.setItem(r, 5, QtWidgets.QTableWidgetItem(str(d.get("metadata_rel") or "")))
-            self.tbl.setItem(r, 6, QtWidgets.QTableWidgetItem(str(d.get("similarity_group") or "")))
+            self.tbl.setItem(r, 5, QtWidgets.QTableWidgetItem(str(d.get("asset_specific_type") or "")))
+            self.tbl.setItem(r, 6, QtWidgets.QTableWidgetItem(str(d.get("metadata_rel") or "")))
+            self.tbl.setItem(r, 7, QtWidgets.QTableWidgetItem(str(d.get("similarity_group") or "")))
 
         self.tbl.resizeColumnsToContents()
-        self.tbl.horizontalHeader().setSectionResizeMode(5, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.tbl.horizontalHeader().setSectionResizeMode(6, QtWidgets.QHeaderView.ResizeMode.Stretch)
 
     def _set_all_checks(self, checked: bool) -> None:
         for r in range(self.tbl.rowCount()):
@@ -1783,7 +1802,7 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
             widget = self.tbl.cellWidget(r, 0)
             cb = widget.findChild(QtWidgets.QCheckBox) if widget else None
             if cb and cb.isChecked():
-                item = self.tbl.item(r, 5)
+                item = self.tbl.item(r, 6)
                 if item and item.text().strip():
                     selected.append(item.text().strip())
         return selected
@@ -1809,6 +1828,8 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
         _collect(self.cb_cont_part, self.list_cont_part, "part_number", "Part Number")
         _collect(self.cb_cont_vendor, self.list_cont_vendor, "vendor", "Vendor Name")
         _collect(self.cb_cont_asset, self.list_cont_asset, "asset_type", "Asset Type")
+        if hasattr(self, "cb_cont_asset_specific") and hasattr(self, "list_cont_asset_specific"):
+            _collect(self.cb_cont_asset_specific, self.list_cont_asset_specific, "asset_specific_type", "Asset Specific Type")
         if hasattr(self, "cb_cont_test_plan") and hasattr(self, "list_cont_test_plan"):
             _collect(self.cb_cont_test_plan, self.list_cont_test_plan, "acceptance_test_plan_number", "Acceptance Test Plan")
 
@@ -4340,6 +4361,36 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         lbl_params_auto.setWordWrap(True)
         right_l.addWidget(lbl_params_auto)
 
+        gb_metrics = QtWidgets.QGroupBox("Metrics Pages (optional)")
+        gb_metrics.setStyleSheet("QGroupBox { font-weight: 700; }")
+        metrics_pick_l = QtWidgets.QVBoxLayout(gb_metrics)
+        metrics_pick_l.setContentsMargins(10, 10, 10, 10)
+        metrics_pick_l.setSpacing(6)
+        lbl_metrics_note = QtWidgets.QLabel("Choose which metric pages to include before WATCH plots.")
+        lbl_metrics_note.setWordWrap(True)
+        lbl_metrics_note.setStyleSheet("color: #64748b; font-size: 11px; font-weight: 400;")
+        metrics_pick_l.addWidget(lbl_metrics_note)
+        ed_metric_filter = QtWidgets.QLineEdit()
+        ed_metric_filter.setPlaceholderText("Filter metrics pagesâ€¦")
+        metrics_pick_l.addWidget(ed_metric_filter)
+        list_metric_params = QtWidgets.QListWidget()
+        list_metric_params.setMaximumHeight(150)
+        metrics_pick_l.addWidget(list_metric_params)
+        lbl_metrics_auto = QtWidgets.QLabel("Selected metric params: -")
+        lbl_metrics_auto.setStyleSheet("color: #64748b; font-size: 11px;")
+        lbl_metrics_auto.setWordWrap(True)
+        metrics_pick_l.addWidget(lbl_metrics_auto)
+        metrics_pick_l.addWidget(QtWidgets.QLabel("Stats"))
+        list_metric_stats = QtWidgets.QListWidget()
+        list_metric_stats.setMaximumHeight(110)
+        for st in ("mean", "min", "max", "median", "std"):
+            it = QtWidgets.QListWidgetItem(st)
+            it.setFlags(it.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+            it.setCheckState(QtCore.Qt.CheckState.Checked if st == "mean" else QtCore.Qt.CheckState.Unchecked)
+            list_metric_stats.addItem(it)
+        metrics_pick_l.addWidget(list_metric_stats)
+        right_l.addWidget(gb_metrics)
+
         def _collect_checked(listw: QtWidgets.QListWidget) -> list[str]:
             out = []
             for i in range(listw.count()):
@@ -4365,16 +4416,33 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
         ed_param_filter.textChanged.connect(_apply_param_filter)
 
+        def _apply_metric_filter():
+            needle = (ed_metric_filter.text() or "").strip().lower()
+            for i in range(list_metric_params.count()):
+                it = list_metric_params.item(i)
+                if not it:
+                    continue
+                it.setHidden(bool(needle) and needle not in it.text().lower())
+
+        ed_metric_filter.textChanged.connect(_apply_metric_filter)
+
         def _update_params_label():
             total = list_params.count()
             checked_now = len(_collect_checked(list_params))
             lbl_params_auto.setText(f"Selected params: {checked_now} / {total}" if total else "Selected params: —")
 
+        def _update_metric_params_label():
+            total = list_metric_params.count()
+            checked_now = len(_collect_checked(list_metric_params))
+            lbl_metrics_auto.setText(f"Selected metric params: {checked_now} / {total}" if total else "Selected metric params: -")
+
         def _refresh_params_from_runs():
             runs_sel = _collect_checked(list_runs)
             if not runs_sel or not self._db_path:
                 list_params.clear()
+                list_metric_params.clear()
                 _update_params_label()
+                _update_metric_params_label()
                 try:
                     _refresh_perf_eq_options()
                 except Exception:
@@ -4387,6 +4455,13 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 if not it:
                     continue
                 prev_checked[_norm_name(it.text())] = it.checkState() == QtCore.Qt.CheckState.Checked
+
+            prev_metric_checked: dict[str, bool] = {}
+            for i in range(list_metric_params.count()):
+                it = list_metric_params.item(i)
+                if not it:
+                    continue
+                prev_metric_checked[_norm_name(it.text())] = it.checkState() == QtCore.Qt.CheckState.Checked
 
             y_norms: set[str] = set()
             y_names: list[str] = []
@@ -4426,8 +4501,22 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 list_params.addItem(it)
             list_params.blockSignals(False)
 
+            list_metric_params.blockSignals(True)
+            list_metric_params.clear()
+            for name in y_names:
+                it = QtWidgets.QListWidgetItem(name)
+                it.setFlags(it.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+                checked = prev_metric_checked.get(_norm_name(name))
+                if checked is None:
+                    checked = prev_checked.get(_norm_name(name), False)
+                it.setCheckState(QtCore.Qt.CheckState.Checked if checked else QtCore.Qt.CheckState.Unchecked)
+                list_metric_params.addItem(it)
+            list_metric_params.blockSignals(False)
+
             _update_params_label()
             _apply_param_filter()
+            _update_metric_params_label()
+            _apply_metric_filter()
 
             try:
                 _refresh_perf_eq_options()
@@ -4436,6 +4525,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
         list_runs.itemChanged.connect(lambda *_: _refresh_params_from_runs())
         list_params.itemChanged.connect(lambda *_: _update_params_label())
+        list_metric_params.itemChanged.connect(lambda *_: _update_metric_params_label())
         _refresh_params_from_runs()
 
         splitter.addWidget(right)
@@ -4628,6 +4718,15 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             if not params_sel:
                 QtWidgets.QMessageBox.information(dlg, "Auto Report", "Select at least one report analysis parameter.")
                 return
+            metric_params_sel = _collect_checked(list_metric_params)
+            metric_stats_sel = _collect_checked(list_metric_stats)
+            if cb_metrics.isChecked():
+                if not metric_params_sel:
+                    QtWidgets.QMessageBox.information(dlg, "Auto Report", "Select at least one metric parameter for metrics pages.")
+                    return
+                if not metric_stats_sel:
+                    QtWidgets.QMessageBox.information(dlg, "Auto Report", "Select at least one metric statistic for metrics pages.")
+                    return
 
             # Performance plotters (optional override; if empty, backend falls back to excel_trend_config presets)
             perf_plotters = []
@@ -4711,6 +4810,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 "runs": runs_sel,
                 "highlighted_serials": hi_sel,
                 "params": params_sel,
+                "metric_params": metric_params_sel,
+                "metric_stats": metric_stats_sel,
                 "rebuild_cache": bool(cb_rebuild.isChecked()),
                 "update_excel_trend_config": bool(cb_update_cfg.isChecked()),
                 "add_missing_columns": bool(cb_add_missing.isChecked()),
@@ -4747,6 +4848,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         options = {
             "runs": runs,
             "params": payload.get("params") or [],
+            "metric_params": payload.get("metric_params") or [],
+            "metric_stats": payload.get("metric_stats") or [],
             "rebuild_cache": bool(payload.get("rebuild_cache")),
             "update_excel_trend_config": bool(payload.get("update_excel_trend_config", True)),
             "add_missing_columns": bool(payload.get("add_missing_columns")),

@@ -640,8 +640,8 @@ def _plan_page_selections(
     perf_defs_all: list[dict],
     run_details_all: list[str],
     chart_specs_all: list[tuple[tuple[int, float, float], str, str]],
-    metrics_pairs_all: list[tuple[str, str]],
-    metrics_pairs_nonpass: list[tuple[str, str]],
+    metrics_pairs_all: list[tuple[str, ...]],
+    metrics_pairs_nonpass: list[tuple[str, ...]],
 ) -> dict:
     omitted_items: list[str] = []
 
@@ -651,25 +651,27 @@ def _plan_page_selections(
     run_details_sel = list(run_details_all or [])
     serials_sel = list(serials_nonpass_sorted or [])
 
-    base_pages = 3 + by_serial_pages + 1 + len(perf_defs_sel) + len(run_details_sel) + matrix_pages
+    perf_pages = len(perf_defs_sel) * 2
+    base_pages = 3 + by_serial_pages + 1 + perf_pages + len(run_details_sel) + matrix_pages
     if base_pages > max_pages:
         while base_pages > max_pages and perf_defs_sel:
             perf_defs_sel.pop()
-            base_pages -= 1
+            perf_pages = len(perf_defs_sel) * 2
+            base_pages = 3 + by_serial_pages + 1 + perf_pages + len(run_details_sel) + matrix_pages
             omitted_items.append("Performance equations: truncated to meet page cap.")
         while base_pages > max_pages and run_details_sel:
             dropped = run_details_sel.pop()
             base_pages -= 1
             omitted_items.append(f"Run details omitted: {dropped}")
         if base_pages > max_pages and by_serial_pages:
-            max_by_serial_pages = max_pages - (3 + 1 + len(perf_defs_sel) + len(run_details_sel) + matrix_pages)
+            max_by_serial_pages = max_pages - (3 + 1 + perf_pages + len(run_details_sel) + matrix_pages)
             max_by_serial_pages = max(0, int(max_by_serial_pages))
             keep_serials = int(max_by_serial_pages) * 2
             if keep_serials < len(serials_sel):
                 serials_sel = serials_sel[:keep_serials]
                 omitted_items.append("Non-PASS by-serial: truncated to meet page cap.")
             by_serial_pages = _ceil_div(len(serials_sel), 2)
-            base_pages = 3 + by_serial_pages + 1 + len(perf_defs_sel) + len(run_details_sel) + matrix_pages
+            base_pages = 3 + by_serial_pages + 1 + perf_pages + len(run_details_sel) + matrix_pages
 
     include_deviations = bool(appendix_include_pass_details and grading_rows)
     deviations_pages = 1 if include_deviations else 0
@@ -766,60 +768,139 @@ def _read_workbook_metadata(workbook_path: Path) -> tuple[dict[str, dict[str, st
         return {}, f"Workbook metadata unavailable (failed to load workbook: {exc})."
 
     try:
-        sheet = None
+        def _read_metadata_sheet(sheet) -> tuple[dict[str, dict[str, str]], str]:
+            rows = sheet.iter_rows(values_only=True)
+            try:
+                headers = next(rows)
+            except StopIteration:
+                return {}, "Workbook metadata unavailable (empty 'metadata' sheet)."
+
+            header_norm_to_idx: dict[str, int] = {}
+            for idx, h in enumerate(headers or []):
+                hn = _norm_key("" if h is None else str(h))
+                if hn and hn not in header_norm_to_idx:
+                    header_norm_to_idx[hn] = int(idx)
+
+            def _get(row: tuple, *header_aliases: str) -> str:
+                for ha in header_aliases:
+                    idx = header_norm_to_idx.get(_norm_key(ha))
+                    if idx is None or idx >= len(row):
+                        continue
+                    v = row[idx]
+                    s = "" if v is None else str(v)
+                    if s.strip():
+                        return s.strip()
+                return ""
+
+            meta_by_sn: dict[str, dict[str, str]] = {}
+            for r in rows:
+                if not r:
+                    continue
+                sn = _get(r, "Serial Number", "Serial", "SN")
+                if not sn:
+                    continue
+                if sn not in meta_by_sn:
+                    meta_by_sn[sn] = {
+                        "program_title": _get(r, "Program"),
+                        "asset_type": _get(r, "Asset Type"),
+                        "asset_specific_type": _get(r, "Asset Specific Type"),
+                        "vendor": _get(r, "Vendor"),
+                        "acceptance_test_plan_number": _get(r, "Acceptance Test Plan", "Acceptance Test Plan Number"),
+                        "part_number": _get(r, "Part Number", "PN"),
+                        "revision": _get(r, "Revision", "Revision Letter"),
+                        "test_date": _get(r, "Test Date"),
+                        "report_date": _get(r, "Report Date"),
+                        "document_type": _get(r, "Document Type"),
+                        "document_type_acronym": _get(r, "Document Acronym", "Document Type Acronym"),
+                        "similarity_group": _get(r, "Similarity Group"),
+                    }
+            return meta_by_sn, ""
+
+        def _read_master_sheet_metadata(sheet) -> dict[str, dict[str, str]]:
+            rows = list(sheet.iter_rows(values_only=True))
+            if not rows:
+                return {}
+
+            headers = rows[0] or ()
+            header_norm_to_idx: dict[str, int] = {}
+            for idx, h in enumerate(headers):
+                hn = _norm_key("" if h is None else str(h))
+                if hn and hn not in header_norm_to_idx:
+                    header_norm_to_idx[hn] = int(idx)
+
+            data_group_idx = header_norm_to_idx.get(_norm_key("Data Group"))
+            term_idx = header_norm_to_idx.get(_norm_key("Term"))
+            term_label_idx = header_norm_to_idx.get(_norm_key("Term Label"))
+            max_idx = header_norm_to_idx.get(_norm_key("Max"))
+            if data_group_idx is None or max_idx is None:
+                return {}
+
+            field_by_term = {
+                _norm_key("Program"): "program_title",
+                _norm_key("Asset Type"): "asset_type",
+                _norm_key("Asset Specific Type"): "asset_specific_type",
+                _norm_key("Vendor"): "vendor",
+                _norm_key("Acceptance Test Plan"): "acceptance_test_plan_number",
+                _norm_key("Acceptance Test Plan Number"): "acceptance_test_plan_number",
+                _norm_key("Part Number"): "part_number",
+                _norm_key("PN"): "part_number",
+                _norm_key("Revision"): "revision",
+                _norm_key("Revision Letter"): "revision",
+                _norm_key("Test Date"): "test_date",
+                _norm_key("Report Date"): "report_date",
+                _norm_key("Document Type"): "document_type",
+                _norm_key("Document Acronym"): "document_type_acronym",
+                _norm_key("Document Type Acronym"): "document_type_acronym",
+                _norm_key("Similarity Group"): "similarity_group",
+            }
+
+            serial_cols: list[tuple[int, str]] = []
+            for idx in range(int(max_idx) + 1, len(headers)):
+                sn = "" if headers[idx] is None else str(headers[idx]).strip()
+                if sn:
+                    serial_cols.append((idx, sn))
+            if not serial_cols:
+                return {}
+
+            meta_by_sn: dict[str, dict[str, str]] = {}
+            for r in rows[1:]:
+                if not r:
+                    continue
+                dg = ""
+                if data_group_idx < len(r):
+                    dg = "" if r[data_group_idx] is None else str(r[data_group_idx]).strip()
+                if _norm_key(dg) != _norm_key("Metadata"):
+                    continue
+
+                term = ""
+                if term_idx is not None and term_idx < len(r):
+                    term = "" if r[term_idx] is None else str(r[term_idx]).strip()
+                if not term and term_label_idx is not None and term_label_idx < len(r):
+                    term = "" if r[term_label_idx] is None else str(r[term_label_idx]).strip()
+                field = field_by_term.get(_norm_key(term))
+                if not field:
+                    continue
+
+                for col_idx, sn in serial_cols:
+                    if col_idx >= len(r):
+                        continue
+                    val = "" if r[col_idx] is None else str(r[col_idx]).strip()
+                    if sn not in meta_by_sn:
+                        meta_by_sn[sn] = {}
+                    if val or field not in meta_by_sn[sn]:
+                        meta_by_sn[sn][field] = val
+            return meta_by_sn
+
         for name in wb.sheetnames:
             if _norm_key(name) == _norm_key("metadata"):
-                sheet = wb[name]
-                break
-        if sheet is None:
-            return {}, "Workbook metadata unavailable (no 'metadata' sheet)."
+                return _read_metadata_sheet(wb[name])
 
-        rows = sheet.iter_rows(values_only=True)
-        try:
-            headers = next(rows)
-        except StopIteration:
-            return {}, "Workbook metadata unavailable (empty 'metadata' sheet)."
+        for name in wb.sheetnames:
+            meta_by_sn = _read_master_sheet_metadata(wb[name])
+            if meta_by_sn:
+                return meta_by_sn, ""
 
-        header_norm_to_idx: dict[str, int] = {}
-        for idx, h in enumerate(headers or []):
-            hn = _norm_key("" if h is None else str(h))
-            if hn and hn not in header_norm_to_idx:
-                header_norm_to_idx[hn] = int(idx)
-
-        def _get(row: tuple, *header_aliases: str) -> str:
-            for ha in header_aliases:
-                idx = header_norm_to_idx.get(_norm_key(ha))
-                if idx is None or idx >= len(row):
-                    continue
-                v = row[idx]
-                s = "" if v is None else str(v)
-                if s.strip():
-                    return s.strip()
-            return ""
-
-        meta_by_sn: dict[str, dict[str, str]] = {}
-        for r in rows:
-            if not r:
-                continue
-            sn = _get(r, "Serial Number", "Serial", "SN")
-            if not sn:
-                continue
-            if sn not in meta_by_sn:
-                meta_by_sn[sn] = {
-                    "program_title": _get(r, "Program"),
-                    "asset_type": _get(r, "Asset Type"),
-                    "asset_specific_type": _get(r, "Asset Specific Type"),
-                    "vendor": _get(r, "Vendor"),
-                    "acceptance_test_plan_number": _get(r, "Acceptance Test Plan", "Acceptance Test Plan Number"),
-                    "part_number": _get(r, "Part Number", "PN"),
-                    "revision": _get(r, "Revision", "Revision Letter"),
-                    "test_date": _get(r, "Test Date"),
-                    "report_date": _get(r, "Report Date"),
-                    "document_type": _get(r, "Document Type"),
-                    "document_type_acronym": _get(r, "Document Acronym", "Document Type Acronym"),
-                    "similarity_group": _get(r, "Similarity Group"),
-                }
-        return meta_by_sn, ""
+        return {}, "Workbook metadata unavailable (no metadata sheet or metadata rows found)."
     finally:
         try:
             wb.close()
@@ -962,6 +1043,130 @@ def _wrap_cell(s: str, *, max_chars: int, max_lines: int) -> str:
             if not wrapped[-1].endswith("…"):
                 wrapped[-1] = (wrapped[-1][: max(0, max_chars - 1)]).rstrip() + "…"
     return "\n".join(wrapped)
+
+
+def _figure_performance_equation_page(
+    *,
+    title: str,
+    x_label: str,
+    y_label: str,
+    curves: dict[str, list[tuple[float, float, str]]],
+    highlighted_serials: list[str],
+    highlighted_models: dict[str, dict],
+    master_poly: dict,
+    master_eqn: str,
+    fit_norm: bool,
+    colors: list[str],
+):
+    import matplotlib.pyplot as plt  # type: ignore
+
+    fig = plt.figure(figsize=(11.0, 8.5), dpi=120)
+    fig.patch.set_facecolor("white")
+    fig.text(0.06, 0.96, title, fontsize=14, fontweight="bold", va="top")
+
+    ax = fig.add_axes([0.06, 0.12, 0.60, 0.76])
+    ax.set_xlabel(x_label)
+    ax.set_ylabel(y_label)
+
+    hi_set = {str(sn).strip() for sn in highlighted_serials if str(sn).strip()}
+    pooled_x: list[float] = []
+
+    for sn, pts in curves.items():
+        if sn in hi_set:
+            continue
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        pooled_x.extend(xs)
+        ax.plot(xs, ys, linewidth=0.9, alpha=0.12, color="#64748b")
+
+    for idx, sn in enumerate(highlighted_serials):
+        pts = curves.get(sn)
+        if not pts:
+            continue
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        pooled_x.extend(xs)
+        color = colors[idx % len(colors)] if colors else "#2563eb"
+        ax.plot(xs, ys, marker="o", linewidth=2.1, alpha=0.95, color=color, label=sn)
+        for x, y, run_label in pts:
+            ax.annotate(str(run_label), (x, y), textcoords="offset points", xytext=(4, 4), fontsize=7, alpha=0.75, color=color)
+
+        hm = highlighted_models.get(sn) or {}
+        poly = hm.get("poly") if isinstance(hm, dict) else None
+        if isinstance(poly, dict) and poly.get("coeffs"):
+            try:
+                import numpy as np  # type: ignore
+
+                xfit = np.linspace(float(min(xs)), float(max(xs)), 200)
+                pfit = np.poly1d(poly.get("coeffs") or [])
+                if fit_norm:
+                    x0 = float(poly.get("x0") or 0.0)
+                    sx = float(poly.get("sx") or 1.0) or 1.0
+                    xfit_n = (xfit - x0) / sx
+                else:
+                    xfit_n = xfit
+                yfit = pfit(xfit_n)
+                ax.plot(xfit.tolist(), yfit.tolist(), linestyle="--", linewidth=1.4, alpha=0.85, color=color)
+            except Exception:
+                pass
+
+    if master_poly.get("coeffs") and pooled_x:
+        try:
+            import numpy as np  # type: ignore
+
+            xfit = np.linspace(float(min(pooled_x)), float(max(pooled_x)), 240)
+            pfit = np.poly1d(master_poly.get("coeffs") or [])
+            if fit_norm:
+                x0 = float(master_poly.get("x0") or 0.0)
+                sx = float(master_poly.get("sx") or 1.0) or 1.0
+                xfit_n = (xfit - x0) / sx
+            else:
+                xfit_n = xfit
+            yfit = pfit(xfit_n)
+            ax.plot(xfit.tolist(), yfit.tolist(), linestyle="--", linewidth=1.8, alpha=0.75, color="#0f172a", label="Family fit")
+        except Exception:
+            pass
+
+    ax.grid(True, alpha=0.25)
+    try:
+        if highlighted_serials or master_poly.get("coeffs"):
+            ax.legend(fontsize=8, loc="best")
+    except Exception:
+        pass
+
+    ax_txt = fig.add_axes([0.70, 0.12, 0.26, 0.76])
+    ax_txt.axis("off")
+    text_lines: list[str] = []
+    if master_eqn:
+        text_lines.append("Family Equation")
+        text_lines.append(_wrap_cell(master_eqn, max_chars=34, max_lines=6))
+        text_lines.append(f"RMSE: {_fmt_num(master_poly.get('rmse'))}")
+        text_lines.append("")
+    for sn in highlighted_serials:
+        hm = highlighted_models.get(sn)
+        if not isinstance(hm, dict):
+            continue
+        eqn = str(hm.get("equation") or "").strip()
+        if not eqn:
+            continue
+        text_lines.append(f"{sn}")
+        text_lines.append(_wrap_cell(eqn, max_chars=34, max_lines=6))
+        text_lines.append(f"RMSE: {_fmt_num(hm.get('rmse'))}  Points: {int(hm.get('points') or 0)}")
+        text_lines.append("")
+    if not text_lines:
+        text_lines = ["No fitted equations available."]
+    ax_txt.text(
+        0.0,
+        1.0,
+        "\n".join(text_lines).rstrip(),
+        va="top",
+        ha="left",
+        fontsize=8,
+        color="#0f172a",
+        bbox=dict(boxstyle="round,pad=0.4", facecolor="#f8fafc", edgecolor="#cbd5e1", alpha=0.95),
+    )
+
+    return fig
 
 
 def _grade_cell_color(g: str) -> str:
@@ -1272,6 +1477,12 @@ def generate_test_data_auto_report(
             except Exception:
                 return ""
 
+        def _metric_tick_label(sn: str) -> str:
+            program = _meta(sn, "program_title")
+            if program:
+                return f"{program}\n{sn}"
+            return sn
+
         grade_map: dict[tuple[str, str, str], str] = {}
         for r in grading_rows:
             sn = str(r.get("serial") or "").strip()
@@ -1342,14 +1553,21 @@ def generate_test_data_auto_report(
 
         max_pages = int((report_opts.get("max_pages") or 30) or 30)
         max_pages = max(4, max_pages)
-        metrics_stats_cfg = report_opts.get("metrics_stats")
-        metrics_stat = "median"
-        if isinstance(metrics_stats_cfg, list) and metrics_stats_cfg:
-            metrics_stat = str(metrics_stats_cfg[0]).strip().lower() or "median"
+        metrics_stats_cfg = options.get("metric_stats")
+        if not isinstance(metrics_stats_cfg, list) or not metrics_stats_cfg:
+            metrics_stats_cfg = report_opts.get("metrics_stats")
+        metric_stats: list[str] = []
+        if isinstance(metrics_stats_cfg, list):
+            for st in metrics_stats_cfg:
+                ss = str(st or "").strip().lower()
+                if ss and ss in stats and ss not in metric_stats:
+                    metric_stats.append(ss)
         elif isinstance(metrics_stats_cfg, str) and metrics_stats_cfg.strip():
-            metrics_stat = metrics_stats_cfg.strip().lower()
-        if metrics_stat not in stats:
-            metrics_stat = stats[0] if stats else "median"
+            ss = metrics_stats_cfg.strip().lower()
+            if ss in stats:
+                metric_stats.append(ss)
+        if not metric_stats:
+            metric_stats = [stats[0] if stats else "median"]
 
         appendix_include_grade_matrix = bool(report_opts.get("appendix_include_grade_matrix", True))
         appendix_include_pass_details = bool(report_opts.get("appendix_include_pass_details", True))
@@ -1422,8 +1640,23 @@ def generate_test_data_auto_report(
             max_plots = None
         chart_specs_all = _build_chart_specs(run_param_pairs=run_param_pairs, nonpass_findings=nonpass_findings, max_plots=max_plots)
 
-        metrics_pairs_all = list(run_param_pairs)
-        metrics_pairs_nonpass = [(run, param) for (run, param) in run_param_pairs if (run, param) in nonpass_run_param]
+        metric_params_opt = options.get("metric_params")
+        if isinstance(metric_params_opt, list):
+            metric_params = [str(p).strip() for p in metric_params_opt if str(p).strip()]
+        else:
+            metric_params = list(params)
+
+        metrics_pairs_all: list[tuple[str, str, str]] = []
+        for run in runs:
+            params_run = curves_summary.get(run, {}) or {}
+            by_norm = {_norm_key(pn): pn for pn in params_run.keys()}
+            for p in metric_params:
+                actual = by_norm.get(_norm_key(p))
+                if not actual:
+                    continue
+                for st in metric_stats:
+                    metrics_pairs_all.append((run, actual, st))
+        metrics_pairs_nonpass = [(run, param, st) for (run, param, st) in metrics_pairs_all if (run, param) in nonpass_run_param]
 
         plan_sel = _plan_page_selections(
             max_pages=max_pages,
@@ -1707,6 +1940,9 @@ def generate_test_data_auto_report(
                     if not curves:
                         continue
 
+                    x_units = next((str(xu).strip() for *_rest, xu, _yu in per_run if str(xu).strip()), "")
+                    y_units = next((str(yu).strip() for *_rest, _xu, yu in per_run if str(yu).strip()), "")
+
                     # Fits (master + investigated)
                     master_poly: dict = {"degree": int(fit_degree), "coeffs": [], "rmse": None, "x0": None, "sx": None}
                     master_eqn = ""
@@ -1788,6 +2024,21 @@ def generate_test_data_auto_report(
                     pdf.savefig(fig)
                     plt.close(fig)
 
+                    fig = _figure_performance_equation_page(
+                        title=f"Unitâ€‘toâ€‘Family Summary â€” Performance Equation Chart â€” {name} ({st})",
+                        x_label=f"{x_target}.{st}" + (f" ({x_units})" if x_units else ""),
+                        y_label=f"{y_target}.{st}" + (f" ({y_units})" if y_units else ""),
+                        curves=curves,
+                        highlighted_serials=hi,
+                        highlighted_models=highlighted_models,
+                        master_poly=master_poly,
+                        master_eqn=master_eqn,
+                        fit_norm=fit_norm,
+                        colors=colors,
+                    )
+                    pdf.savefig(fig)
+                    plt.close(fig)
+
             for run in run_details_sel:
                 run_meta = run_by_name.get(run) or {}
                 title = str(run_meta.get("display_name") or "").strip() or run
@@ -1816,6 +2067,61 @@ def generate_test_data_auto_report(
                     pdf.savefig(_figure_table_page2(f"Run Details — {title}", cols, rows, landscape=True, font_size=7))
 
             # 7) Charts — only non-PASS overlays (WATCH/FAIL)
+            if include_metrics:
+                serials = all_serials
+                x_idx = list(range(len(serials)))
+                x_labels = [_metric_tick_label(sn) for sn in serials]
+                for run, param_name, metric_stat in metrics_sel:
+                    run_meta = run_by_name.get(run) or {}
+                    run_title = str(run_meta.get("display_name") or "").strip() or run
+                    units = str(((curves_summary.get(run, {}) or {}).get(param_name) or {}).get("units") or "").strip()
+                    vmap = _td_metric_map(conn, run, param_name, metric_stat)
+                    yv = [(float(vmap.get(sn)) if isinstance(vmap.get(sn), (int, float)) else float("nan")) for sn in serials]
+                    if not any(isinstance(v, (int, float)) and not math.isnan(float(v)) for v in yv):
+                        continue
+
+                    fig = plt.figure(figsize=(11.0, 8.5), dpi=120)
+                    ax = fig.add_subplot(111)
+                    ax.set_title(f"Metrics â€” {run_title} â€” {param_name} ({metric_stat})")
+                    ax.set_xlabel("Program + Serial Number")
+                    ax.set_ylabel(f"{param_name} ({units})" if units else param_name)
+                    ax.plot(x_idx, yv, marker="o", linewidth=1.0, alpha=0.45, color="#64748b")
+                    for sn in hi:
+                        if sn not in serials:
+                            continue
+                        xi = serials.index(sn)
+                        g = grade_map.get((run, param_name, sn), "NO_DATA")
+                        color = "#3b82f6"
+                        if g == "WATCH":
+                            color = "#f59e0b"
+                        elif g == "FAIL":
+                            color = "#ef4444"
+                        ax.scatter([xi], [yv[xi]], s=36, color=color, zorder=5)
+                        ax.axvline(xi, color=color, linewidth=1.0, alpha=0.12)
+
+                    try:
+                        finite_vals = [float(v) for v in yv if isinstance(v, (int, float)) and not math.isnan(float(v))]
+                        if finite_vals:
+                            fam_med = float(statistics.median(finite_vals))
+                            ax.axhline(fam_med, color="#0f172a", linestyle="--", linewidth=1.1, alpha=0.6, label="family median")
+                    except Exception:
+                        pass
+
+                    ax.set_xticks(x_idx)
+                    ax.set_xticklabels(x_labels, rotation=45, ha="right", fontsize=7)
+                    ax.grid(True, alpha=0.25)
+                    try:
+                        ax.legend(fontsize=8, loc="best")
+                    except Exception:
+                        pass
+                    try:
+                        fig.tight_layout()
+                    except Exception:
+                        pass
+                    pdf.savefig(fig)
+                    plt.close(fig)
+                metrics_sel = []
+
             for run, param_name in charts_sel:
                 run_meta = run_by_name.get(run) or {}
                 run_title = str(run_meta.get("display_name") or "").strip() or run
