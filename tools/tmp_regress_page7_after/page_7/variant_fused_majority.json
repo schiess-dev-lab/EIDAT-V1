@@ -1,0 +1,142 @@
+{
+  "input": "Stored PDF\\EIDAT Support\\debug\\ocr\\DEBUGPROG_V1_VALVE01_SN4001\\pages\\page_7\\page_7.png",
+  "input_type": "png",
+  "page": null,
+  "input_dpi": 450.0118,
+  "ocr_dpi": 450,
+  "detection_dpi": 450,
+  "input_size": {
+    "w": 3825,
+    "h": 4950
+  },
+  "detection_size": {
+    "w": 3825,
+    "h": 4950
+  },
+  "variant": {
+    "method": "fused_majority",
+    "source_variants": 18,
+    "threshold": null,
+    "mode": "plurality"
+  },
+  "tables": [
+    {
+      "bbox_px": [
+        227,
+        726,
+        1822,
+        1382
+      ],
+      "borderless": false,
+      "rows": [
+        [
+          "Tag",
+          "Type",
+          "Range",
+          "Units"
+        ],
+        [
+          "PT-01",
+          "Ror",
+          "0-150",
+          "psig"
+        ],
+        [
+          "PT-02",
+          "Pre a",
+          "0-150",
+          "psig"
+        ],
+        [
+          "FT-01",
+          "Flow Meter",
+          "0-30",
+          "gpm"
+        ],
+        [
+          "LVDT-01",
+          "Position Sensor",
+          "0-100",
+          "%"
+        ],
+        [
+          "TC-01",
+          "Thermocouple",
+          "-20-120",
+          "degC"
+        ]
+      ]
+    },
+    {
+      "bbox_px": [
+        2007,
+        724,
+        3598,
+        1381
+      ],
+      "borderless": false,
+      "rows": [
+        [
+          "Channel",
+          "As-Found",
+          "As-Left",
+          "Status"
+        ],
+        [
+          "",
+          "",
+          "",
+          ""
+        ],
+        [
+          "PT-01",
+          "1.0036",
+          "0.9974",
+          "PASS"
+        ],
+        [
+          "",
+          "",
+          "",
+          ""
+        ],
+        [
+          "PT-02",
+          "1.0004",
+          "1.0011",
+          "PASS"
+        ],
+        [
+          "FT-01",
+          "0.9902",
+          "0.9939",
+          "INVESTIGATE"
+        ],
+        [
+          "",
+          "",
+          "",
+          ""
+        ],
+        [
+          "LVDT-01",
+          "0.9997",
+          "1.0025",
+          "PASS"
+        ],
+        [
+          "",
+          "",
+          "",
+          ""
+        ],
+        [
+          "TC-01",
+          "1.0029",
+          "1.0034",
+          "PASS"
+        ]
+      ]
+    }
+  ]
+}

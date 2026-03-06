@@ -79,6 +79,7 @@ class _Cfg:
     min_nonempty_subcells: int
     min_text_chars: int
     min_tokens: int
+    require_all_subcells_meaningful: bool
 
     # Debug
     debug: bool
@@ -110,6 +111,10 @@ def _load_cfg() -> _Cfg:
         min_nonempty_subcells=_env_int("EIDAT_TABLE_CELL_SPLIT_MIN_NONEMPTY_SUBCELLS", 2),
         min_text_chars=_env_int("EIDAT_TABLE_CELL_SPLIT_MIN_TEXT_CHARS", 2),
         min_tokens=_env_int("EIDAT_TABLE_CELL_SPLIT_MIN_TOKENS", 1),
+        require_all_subcells_meaningful=_env_bool(
+            "EIDAT_TABLE_CELL_SPLIT_REQUIRE_ALL_SUBCELLS_MEANINGFUL",
+            False,
+        ),
         debug=_env_bool("EIDAT_TABLE_CELL_SPLIT_DEBUG", False),
         debug_save_overlays=_env_bool("EIDAT_TABLE_CELL_SPLIT_DEBUG_SAVE_OVERLAYS", False),
         debug_max_tables=_env_int("EIDAT_TABLE_CELL_SPLIT_DEBUG_MAX_TABLES", 0),
@@ -857,17 +862,36 @@ def split_merged_cells_post_projection(
                     }
                 )
 
-            nonempty = sum(
-                1
+            meaningful_flags = [
+                _cell_meaningful(sc, min_chars=cfg.min_text_chars, min_tokens=cfg.min_tokens)
                 for sc in subcells
-                if _cell_meaningful(sc, min_chars=cfg.min_text_chars, min_tokens=cfg.min_tokens)
-            )
-            # Protection: never commit a split that produces any blank/non-meaningful subcell.
-            # If any projected segment ends up empty, keep the original merged cell.
-            if nonempty != int(len(subcells)):
+            ]
+            nonempty = sum(1 for ok_sc in meaningful_flags if ok_sc)
+            if nonempty <= 0:
                 out_cells.append(cell)
                 continue
-            if nonempty < int(cfg.min_nonempty_subcells):
+
+            if cfg.require_all_subcells_meaningful:
+                # Strict protection: never commit a split that produces any blank/non-meaningful subcell.
+                if nonempty != int(len(subcells)):
+                    out_cells.append(cell)
+                    continue
+
+            # Strategy: allow blank "structural" subcells ONLY on the LEFT of the first meaningful
+            # subcell. Reject splits that create any blank subcell to the RIGHT of content (or an
+            # internal blank), since that tends to create columns out of nothing.
+            try:
+                first_meaningful = next(i for i, ok_sc in enumerate(meaningful_flags) if ok_sc)
+            except StopIteration:
+                out_cells.append(cell)
+                continue
+            if any(not ok_sc for ok_sc in meaningful_flags[int(first_meaningful) :]):
+                out_cells.append(cell)
+                continue
+
+            # Count leading structural blanks toward acceptance.
+            effective_nonempty = int(nonempty) + int(first_meaningful)
+            if effective_nonempty < int(cfg.min_nonempty_subcells):
                 out_cells.append(cell)
                 continue
 

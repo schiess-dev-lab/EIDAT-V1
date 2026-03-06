@@ -246,10 +246,96 @@ class TestTableCellSplitRecovery(unittest.TestCase):
             texts = sorted(str(c.get("text", "")).strip() for c in row2_cells)
             self.assertEqual(texts, ["A", "B", "C"])
 
-    def test_rejects_split_that_creates_blank_subcell(self) -> None:
-        # 3 columns, target merged cell spans all 3 but only has tokens in 2 segments.
-        # With evidence gates disabled, boundaries would otherwise pass; new protection
-        # must reject the split to avoid introducing a blank middle subcell.
+    def test_allows_leading_blank_structural_subcell(self) -> None:
+        # 2 columns: merged target spans both but has content only in the RIGHT segment.
+        # The LEFT blank is structural and should be allowed (no blank cells to the right of content).
+        table = {
+            "bbox_px": [0, 0, 200, 150],
+            "cells": [
+                # row 0 (support)
+                _cell([0, 0, 100, 50]),
+                _cell([100, 0, 200, 50]),
+                # row 1 (support)
+                _cell([0, 50, 100, 100]),
+                _cell([100, 50, 200, 100]),
+                # row 2 merged target (2 cols; left is intentionally blank)
+                _cell(
+                    [0, 100, 200, 150],
+                    tokens=[
+                        _tok("X", 160, 112, 190, 132),
+                    ],
+                    text="X",
+                ),
+            ],
+        }
+
+        cfg = {
+            "EIDAT_TABLE_CELL_SPLIT_RECOVERY": "1",
+            "EIDAT_TABLE_CELL_SPLIT_EVIDENCE_MULTIROW": "0",
+            "EIDAT_TABLE_CELL_SPLIT_EVIDENCE_WHITESPACE": "0",
+            "EIDAT_TABLE_CELL_SPLIT_EVIDENCE_TOKEN_OVERLAP": "0",
+            "EIDAT_TABLE_CELL_SPLIT_EVIDENCE_TOKEN_GAP": "0",
+            "EIDAT_TABLE_CELL_SPLIT_MIN_NONEMPTY_SUBCELLS": "2",
+            "EIDAT_TABLE_CELL_SPLIT_MIN_TOKENS": "1",
+            "EIDAT_TABLE_CELL_SPLIT_DEBUG": "0",
+        }
+
+        with _patch_env(cfg):
+            t0 = copy.deepcopy(table)
+            stats = table_cell_split_recovery.split_merged_cells_post_projection(
+                [t0], img_gray_det=None, img_w=200, img_h=150, debug_dir=None
+            )
+            self.assertEqual(int(stats.get("cells_split") or 0), 1)
+            self.assertFalse(any(c.get("bbox_px") == [0.0, 100.0, 200.0, 150.0] for c in (t0.get("cells") or [])))
+            self.assertTrue(any(c.get("bbox_px") == [0.0, 100.0, 100.0, 150.0] for c in (t0.get("cells") or [])))
+            self.assertTrue(any(c.get("bbox_px") == [100.0, 100.0, 200.0, 150.0] for c in (t0.get("cells") or [])))
+
+    def test_rejects_split_that_creates_trailing_blank_subcell(self) -> None:
+        # 2 columns: merged target spans both but has content only in the LEFT segment.
+        # Creating a blank cell to the RIGHT of content is disallowed.
+        table = {
+            "bbox_px": [0, 0, 200, 150],
+            "cells": [
+                # row 0 (support)
+                _cell([0, 0, 100, 50]),
+                _cell([100, 0, 200, 50]),
+                # row 1 (support)
+                _cell([0, 50, 100, 100]),
+                _cell([100, 50, 200, 100]),
+                # row 2 merged target (2 cols; right is blank)
+                _cell(
+                    [0, 100, 200, 150],
+                    tokens=[
+                        _tok("X", 10, 112, 35, 132),
+                    ],
+                    text="X",
+                ),
+            ],
+        }
+
+        cfg = {
+            "EIDAT_TABLE_CELL_SPLIT_RECOVERY": "1",
+            "EIDAT_TABLE_CELL_SPLIT_EVIDENCE_MULTIROW": "0",
+            "EIDAT_TABLE_CELL_SPLIT_EVIDENCE_WHITESPACE": "0",
+            "EIDAT_TABLE_CELL_SPLIT_EVIDENCE_TOKEN_OVERLAP": "0",
+            "EIDAT_TABLE_CELL_SPLIT_EVIDENCE_TOKEN_GAP": "0",
+            "EIDAT_TABLE_CELL_SPLIT_MIN_NONEMPTY_SUBCELLS": "2",
+            "EIDAT_TABLE_CELL_SPLIT_MIN_TOKENS": "1",
+            "EIDAT_TABLE_CELL_SPLIT_DEBUG": "0",
+        }
+
+        with _patch_env(cfg):
+            t0 = copy.deepcopy(table)
+            stats = table_cell_split_recovery.split_merged_cells_post_projection(
+                [t0], img_gray_det=None, img_w=200, img_h=150, debug_dir=None
+            )
+            self.assertEqual(int(stats.get("cells_split") or 0), 0)
+            self.assertTrue(any(c.get("bbox_px") == [0.0, 100.0, 200.0, 150.0] for c in (t0.get("cells") or [])))
+            self.assertFalse(any(c.get("bbox_px") == [100.0, 100.0, 200.0, 150.0] for c in (t0.get("cells") or [])))
+
+    def test_rejects_split_with_internal_blank_subcell(self) -> None:
+        # 3 columns: merged target spans all 3 but only has tokens in 2 segments.
+        # Reject to avoid introducing a blank middle subcell (blank to the right of content).
         table = {
             "bbox_px": [0, 0, 300, 250],
             "cells": [
