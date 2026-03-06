@@ -292,6 +292,20 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         self.assertEqual(tar._fmt_num(-0.0), "0")
         self.assertEqual(tar._fmt_num(1.234567, sig=4), "1.235")
 
+    def test_ceil_div_defined_and_correct(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        self.assertTrue(hasattr(tar, "_ceil_div"))
+        self.assertTrue(hasattr(tar, "ceil_div"))
+
+        self.assertEqual(tar._ceil_div(0, 30), 0)
+        self.assertEqual(tar._ceil_div(1, 30), 1)
+        self.assertEqual(tar._ceil_div(30, 30), 1)
+        self.assertEqual(tar._ceil_div(31, 30), 2)
+        self.assertEqual(tar._ceil_div(61, 30), 3)
+
+        self.assertEqual(tar.ceil_div(31, 30), tar._ceil_div(31, 30))
+
     def test_build_chart_specs_severity_sort(self):
         from EIDAT_App_Files.ui_next import trend_auto_report as tar
 

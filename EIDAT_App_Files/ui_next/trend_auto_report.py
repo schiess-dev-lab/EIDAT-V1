@@ -64,6 +64,19 @@ def _norm_key(s: str) -> str:
     return "".join(ch.lower() for ch in str(s or "").strip() if ch.isalnum())
 
 
+def _ceil_div(a: int, b: int) -> int:
+    try:
+        ai = int(a)
+        bi = int(b)
+    except Exception:
+        return 0
+    return int((ai + bi - 1) // bi) if bi else 0
+
+
+# Backwards-compat: some callers used the non-underscored name.
+ceil_div = _ceil_div
+
+
 def _read_json(path: Path) -> Any:
     return json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
 
@@ -630,9 +643,6 @@ def _plan_page_selections(
     metrics_pairs_all: list[tuple[str, str]],
     metrics_pairs_nonpass: list[tuple[str, str]],
 ) -> dict:
-    def _ceil_div(a: int, b: int) -> int:
-        return int((int(a) + int(b) - 1) // int(b)) if int(b) else 0
-
     omitted_items: list[str] = []
 
     matrix_pages = _ceil_div(len(run_param_pairs), 30) if appendix_include_grade_matrix else 0
