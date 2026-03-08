@@ -20,6 +20,21 @@ _TABLE_VERTICAL_ARTIFACT_CHARS = "|¦│┃丨"
 _TABLE_SECONDARY_PREFIX_ARTIFACT_CHARS = "[](){}\"'`“”‘’\\/"  # common OCR border/quote variants
 _TABLE_QUOTE_ARTIFACT_CHARS = "\"'`“”‘’"
 _TABLE_OPENERS = {"[": "]", "(": ")", "{": "}"}
+_TABLE_NUMERIC_TRAILING_ARTIFACT_CHARS = _TABLE_VERTICAL_ARTIFACT_CHARS + "]_["
+_TABLE_NUMERICISH_RE = re.compile(
+    r"""
+    ^\s*
+    \(?
+    \s*
+    [-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?
+    (?:\s*(?:to|[-–—])\s*[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)?
+    \s*
+    %?
+    \)?
+    \s*$
+    """,
+    re.VERBOSE | re.IGNORECASE,
+)
 
 
 def normalize_table_cell_text(text: str) -> str:
@@ -31,7 +46,9 @@ def normalize_table_cell_text(text: str) -> str:
     - ["Flow     -> Flow
     - │ 10.0     -> 10.0
 
-    This is intentionally conservative and only strips *leading* artifacts.
+    This is intentionally conservative and primarily strips leading artifacts.
+    It also trims trailing border-like artifacts from numeric-looking values
+    when the trimmed result is still clearly numeric.
 
     Disable with: EIDAT_TABLE_CELL_PREFIX_CLEAN=0
     """
@@ -67,6 +84,12 @@ def normalize_table_cell_text(text: str) -> str:
             s2 = s2[1:].lstrip()
             s2 = re.sub(rf"^[{re.escape(_TABLE_QUOTE_ARTIFACT_CHARS)}]+", "", s2).lstrip()
             return s2.strip()
+
+    # Strip trailing border artifacts only when the cleaned value is clearly numeric.
+    if any(ch.isdigit() for ch in s2):
+        s3 = re.sub(rf"[{re.escape(_TABLE_NUMERIC_TRAILING_ARTIFACT_CHARS)}]+\s*$", "", s2).rstrip()
+        if s3 != s2 and _TABLE_NUMERICISH_RE.match(s3):
+            return s3
 
     return s
 

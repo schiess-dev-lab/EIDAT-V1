@@ -40,7 +40,7 @@ class TestDebugExporterDefaultAscii(unittest.TestCase):
         self.assertEqual(rows[0], ["A", "", "C"], msg=f"Column shift detected:\n{ascii_table}")
         self.assertEqual(rows[1], ["1", "2", "3"], msg=f"Unexpected row content:\n{ascii_table}")
 
-    def test_default_ascii_prunes_fully_empty_column(self) -> None:
+    def test_default_ascii_preserves_fully_empty_column(self) -> None:
         table = {
             "cells": [
                 {"row": 0, "col": 0, "text": "A"},
@@ -53,10 +53,10 @@ class TestDebugExporterDefaultAscii(unittest.TestCase):
         ascii_table = debug_exporter._render_table_ascii(table, mode="default")
         rows = _pipe_rows(ascii_table)
         self.assertEqual(len(rows), 2, msg=f"Unexpected row count:\n{ascii_table}")
-        self.assertEqual(rows[0], ["A", "C"], msg=f"Empty column not pruned:\n{ascii_table}")
-        self.assertEqual(rows[1], ["1", "3"], msg=f"Unexpected row content:\n{ascii_table}")
+        self.assertEqual(rows[0], ["A", "", "C"], msg=f"Blank structural column was dropped:\n{ascii_table}")
+        self.assertEqual(rows[1], ["1", "", "3"], msg=f"Blank structural column was dropped:\n{ascii_table}")
 
-    def test_default_ascii_prunes_fully_empty_row(self) -> None:
+    def test_default_ascii_preserves_fully_empty_row(self) -> None:
         table = {
             "cells": [
                 {"row": 0, "col": 0, "text": "A"},
@@ -66,11 +66,11 @@ class TestDebugExporterDefaultAscii(unittest.TestCase):
         }
         ascii_table = debug_exporter._render_table_ascii(table, mode="default")
         rows = _pipe_rows(ascii_table)
-        self.assertEqual(len(rows), 2, msg=f"Unexpected row count:\n{ascii_table}")
+        self.assertEqual(len(rows), 3, msg=f"Blank structural row was dropped:\n{ascii_table}")
         self.assertEqual(rows[0], ["A"], msg=f"Unexpected row content:\n{ascii_table}")
-        self.assertEqual(rows[1], ["B"], msg=f"Unexpected row content:\n{ascii_table}")
+        self.assertEqual(rows[1], [""], msg=f"Blank structural row missing:\n{ascii_table}")
+        self.assertEqual(rows[2], ["B"], msg=f"Unexpected row content:\n{ascii_table}")
 
 
 if __name__ == "__main__":
     unittest.main()
-

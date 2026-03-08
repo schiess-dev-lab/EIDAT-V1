@@ -485,28 +485,13 @@ def _render_table_ascii(table: Dict, *, mode: str | None = None) -> str:
     if not matrix:
         return ""
 
-    # Pad ragged rows so pruning/rendering is consistent.
+    # Pad ragged rows so rendering is consistent.
     n_cols0 = max((len(r) for r in matrix), default=0)
     if n_cols0 <= 0:
         return ""
     matrix = [list(r) + [""] * (n_cols0 - len(r)) for r in matrix]
 
-    # Prune fully-empty rows (all cells blank after strip()).
-    matrix = [r for r in matrix if any(str(v or "").strip() for v in r)]
-    if not matrix:
-        return ""
-
-    # Prune fully-empty columns.
-    n_rows = len(matrix)
     n_cols = n_cols0
-    keep_cols = [
-        c for c in range(n_cols) if any(str(matrix[r][c] or "").strip() for r in range(n_rows))
-    ]
-    if not keep_cols:
-        return ""
-    if len(keep_cols) != n_cols:
-        matrix = [[row[c] if c < len(row) else "" for c in keep_cols] for row in matrix]
-        n_cols = len(keep_cols)
 
     # Calculate column widths (keep existing min/max behavior).
     col_widths = [8] * int(n_cols)  # minimum width

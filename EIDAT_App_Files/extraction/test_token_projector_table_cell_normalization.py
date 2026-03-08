@@ -23,6 +23,14 @@ class TestTokenProjectorTableCellNormalization(unittest.TestCase):
         self.assertEqual(token_projector.normalize_table_cell_text('["Flow'), "Flow")
         self.assertEqual(token_projector.normalize_table_cell_text("['Rate"), "Rate")
 
+    def test_strips_numeric_trailing_border_artifacts(self) -> None:
+        self.assertEqual(token_projector.normalize_table_cell_text("10.0|"), "10.0")
+        self.assertEqual(token_projector.normalize_table_cell_text("0-150]"), "0-150")
+        self.assertEqual(token_projector.normalize_table_cell_text("1.23e-4_"), "1.23e-4")
+
+    def test_preserves_non_numeric_trailing_artifacts(self) -> None:
+        self.assertEqual(token_projector.normalize_table_cell_text("PASS|"), "PASS|")
+
     def test_preserves_balanced_short_reference(self) -> None:
         self.assertEqual(token_projector.normalize_table_cell_text("[1]"), "[1]")
         self.assertEqual(token_projector.normalize_table_cell_text("(A)"), "(A)")

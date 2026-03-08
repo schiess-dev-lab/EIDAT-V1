@@ -105,7 +105,7 @@ class TestEidatManagerProcessGraphEscape(unittest.TestCase):
             "page_timeout_sec": 0,
         }
 
-    def test_graph_like_page_skips_table_work_but_keeps_flow(self) -> None:
+    def test_chart_regions_are_masked_for_table_work_but_keep_flow(self) -> None:
         try:
             import numpy as np
         except Exception:
@@ -119,14 +119,27 @@ class TestEidatManagerProcessGraphEscape(unittest.TestCase):
             settings = self._base_settings()
             tokens = [{"text": "Voltage", "x0": 1.0, "y0": 1.0, "x1": 10.0, "y1": 8.0}]
             flow = {"body_tokens": tokens, "table_titles": []}
+            masked_regions = [{"bbox": [10.0, 10.0, 30.0, 30.0], "h_lines": 8, "v_lines": 8}]
+            called = {"input_path": None}
+
+            def _run_for_input(input_path, **kwargs):
+                called["input_path"] = Path(input_path)
+                return {
+                    "tables": [],
+                    "warnings": [],
+                    "detection_dpi": 900,
+                    "detection_size": {"w": 60, "h": 60},
+                    "variants": [],
+                    "variant_rows_all": [],
+                }
 
             with (
-                mock.patch("extraction.graph_page_guard.inspect_page_for_graph_grid", return_value={
-                    "skip_table_work": True,
-                    "reason": "dense_regular_orthogonal_grid",
-                    "stats": {"h_lines": 12, "v_lines": 12},
-                }),
-                mock.patch("debug_method.run_table_variants._run_for_input", side_effect=AssertionError("run_table_variants called")),
+                mock.patch(
+                    "extraction.graph_page_guard.find_chart_like_regions",
+                    return_value={"regions": masked_regions, "stats": {"region_count": 1}},
+                ),
+                mock.patch("extraction.graph_page_guard.mask_regions", return_value=np.full((60, 60), 255, dtype=np.uint8)),
+                mock.patch("debug_method.run_table_variants._run_for_input", side_effect=_run_for_input),
                 mock.patch("debug_method.table_grid_debug.run_for_image", side_effect=AssertionError("table_grid prepass called")),
                 mock.patch("extraction.ocr_engine.get_tesseract_lang", return_value="eng"),
                 mock.patch("extraction.ocr_engine.ocr_page", return_value=(tokens, 60, 60, None)),
@@ -141,7 +154,9 @@ class TestEidatManagerProcessGraphEscape(unittest.TestCase):
 
         self.assertEqual(page_data.get("tables"), [])
         self.assertEqual(page_data.get("flow"), flow)
-        self.assertIn("graph_like_page_skip_table_work", page_data.get("warnings", []))
+        self.assertIn("graph_like_chart_region_masked", page_data.get("warnings", []))
+        self.assertEqual(page_data.get("masked_chart_regions"), masked_regions)
+        self.assertEqual((called["input_path"] or Path("")).name, "page_1_table_masked.png")
         self.assertFalse(bool(page_data.get("timeout")))
         self.assertIsNone(page_data.get("error"))
 
@@ -161,11 +176,7 @@ class TestEidatManagerProcessGraphEscape(unittest.TestCase):
             flow = {"body_tokens": tokens, "table_titles": []}
 
             with (
-                mock.patch("extraction.graph_page_guard.inspect_page_for_graph_grid", return_value={
-                    "skip_table_work": False,
-                    "reason": "",
-                    "stats": {},
-                }),
+                mock.patch("extraction.graph_page_guard.find_chart_like_regions", return_value={"regions": [], "stats": {}}),
                 mock.patch("debug_method.run_table_variants._run_for_input", return_value={
                     "tables": [],
                     "warnings": ["bordered_table_detection_timeout"],
@@ -208,8 +219,8 @@ class TestEidatManagerProcessGraphEscape(unittest.TestCase):
             with ExitStack() as stack:
                 stack.enter_context(
                     mock.patch(
-                        "extraction.graph_page_guard.inspect_page_for_graph_grid",
-                        return_value={"skip_table_work": False, "reason": "", "stats": {}},
+                        "extraction.graph_page_guard.find_chart_like_regions",
+                        return_value={"regions": [], "stats": {}},
                     )
                 )
                 stack.enter_context(
@@ -260,8 +271,8 @@ class TestEidatManagerProcessGraphEscape(unittest.TestCase):
             with ExitStack() as stack:
                 stack.enter_context(
                     mock.patch(
-                        "extraction.graph_page_guard.inspect_page_for_graph_grid",
-                        return_value={"skip_table_work": False, "reason": "", "stats": {}},
+                        "extraction.graph_page_guard.find_chart_like_regions",
+                        return_value={"regions": [], "stats": {}},
                     )
                 )
                 stack.enter_context(

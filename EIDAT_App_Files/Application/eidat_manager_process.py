@@ -422,21 +422,25 @@ def _process_debug_method_page(
         raise RuntimeError(f"Missing rendered page: {page_path}")
 
     warnings: list[str] = []
-    graph_guard: dict[str, Any] = {"skip_table_work": False, "reason": "", "stats": {}}
+    graph_guard: dict[str, Any] = {"regions": [], "stats": {}}
+    masked_table_page_path = page_path
     try:
         import cv2  # type: ignore
 
         page_img_gray = cv2.imread(str(page_path), cv2.IMREAD_GRAYSCALE)
         if page_img_gray is not None:
-            graph_guard = graph_page_guard.inspect_page_for_graph_grid(page_img_gray)
+            graph_guard = graph_page_guard.find_chart_like_regions(page_img_gray)
+            chart_regions = list(graph_guard.get("regions") or [])
+            if chart_regions:
+                masked_img = graph_page_guard.mask_regions(page_img_gray, chart_regions, pad_px=8)
+                masked_table_page_path = page_dir / f"page_{page_num}_table_masked.png"
+                cv2.imwrite(str(masked_table_page_path), masked_img)
+                warnings.append("graph_like_chart_region_masked")
     except Exception:
-        graph_guard = {"skip_table_work": False, "reason": "", "stats": {}}
+        graph_guard = {"regions": [], "stats": {}}
+        masked_table_page_path = page_path
 
-    skip_table_work = bool(graph_guard.get("skip_table_work"))
-    if skip_table_work:
-        warnings.append("graph_like_page_skip_table_work")
-
-    if bool(settings.get("table_grid_enable_prepass")) and not skip_table_work:
+    if bool(settings.get("table_grid_enable_prepass")):
         grid_dir = page_dir / "grid_debug"
         gap_override = None
         if float(settings.get("tg_gap_threshold") or 0.0) > 0:
@@ -444,7 +448,7 @@ def _process_debug_method_page(
         elif float(settings.get("tg_min_gap") or 0.0) > 0:
             gap_override = float(settings["tg_min_gap"])
         summary = table_grid_debug.run_for_image(
-            page_path,
+            masked_table_page_path,
             out_dir=grid_dir,
             merge_kx=int(settings.get("tg_merge_kx") or 0),
             min_gap=gap_override if gap_override else None,
@@ -464,37 +468,28 @@ def _process_debug_method_page(
         tables_grid = summary.get("tables") or []
         if bool(settings.get("tg_apply_borders_to_page")) and tables_grid:
             _draw_table_borders(
-                page_path,
+                masked_table_page_path,
                 tables_grid,
-                page_path,
+                masked_table_page_path,
                 line_thickness=int(settings.get("tg_border_thickness") or 4),
             )
 
-    fused_result: dict[str, Any]
-    if skip_table_work:
-        fused_result = {
-            "tables": [],
-            "detection_dpi": int(settings.get("detection_dpi") or 0),
-            "detection_size": {},
-            "warnings": [],
-        }
-    else:
-        fused_result = run_table_variants._run_for_input(
-            page_path,
-            out_dir=page_dir,
-            page=1,
-            ocr_dpi_base=int(settings.get("table_ocr_dpi") or settings.get("ocr_dpi") or 450),
-            detection_dpi=int(settings.get("detection_dpi") or 900),
-            lang=settings.get("table_variants_lang"),
-            clean=False,
-            fuse=True,
-            emit_variants=False,
-            emit_fused=True,
-            allow_no_tables=True,
-            enable_borderless=bool(settings.get("enable_borderless")),
-            return_fused=True,
-            return_variant_rows=True,
-        )
+    fused_result = run_table_variants._run_for_input(
+        masked_table_page_path,
+        out_dir=page_dir,
+        page=1,
+        ocr_dpi_base=int(settings.get("table_ocr_dpi") or settings.get("ocr_dpi") or 450),
+        detection_dpi=int(settings.get("detection_dpi") or 900),
+        lang=settings.get("table_variants_lang"),
+        clean=False,
+        fuse=True,
+        emit_variants=False,
+        emit_fused=True,
+        allow_no_tables=True,
+        enable_borderless=bool(settings.get("enable_borderless")),
+        return_fused=True,
+        return_variant_rows=True,
+    )
 
     fused_tables = list(fused_result.get("tables") or [])
     detection_dpi_used = int(fused_result.get("detection_dpi") or settings.get("detection_dpi") or 0)
@@ -503,186 +498,185 @@ def _process_debug_method_page(
         if warning not in warnings:
             warnings.append(str(warning))
 
-    if not skip_table_work:
+    try:
+        enable_candidates = _parse_bool_env("EIDAT_TABLE_VARIANT_CANDIDATES", True)
+    except Exception:
+        enable_candidates = True
+    if enable_candidates:
         try:
-            enable_candidates = _parse_bool_env("EIDAT_TABLE_VARIANT_CANDIDATES", True)
-        except Exception:
-            enable_candidates = True
-        if enable_candidates:
+            variants_meta = list(fused_result.get("variants") or [])
+            variant_rows_all = list(fused_result.get("variant_rows_all") or [])
+
+            split_mode = str(os.environ.get("EIDAT_TABLE_SPLIT_MODE", "vline") or "vline").strip().lower()
+            ascii_mode = "replica" if split_mode in ("replica", "snap", "grid") else "default"
+            combined_split_mode = str(
+                os.environ.get("EIDAT_COMBINED_TABLE_SPLIT_MODE", "inherit") or "inherit"
+            ).strip().lower()
+            if combined_split_mode in ("inherit", "same"):
+                combined_split_mode = split_mode
+            enable_combined_vline_split = combined_split_mode in ("vline", "default", "on", "true", "1", "yes")
             try:
-                variants_meta = list(fused_result.get("variants") or [])
-                variant_rows_all = list(fused_result.get("variant_rows_all") or [])
-
-                split_mode = str(os.environ.get("EIDAT_TABLE_SPLIT_MODE", "vline") or "vline").strip().lower()
-                ascii_mode = "replica" if split_mode in ("replica", "snap", "grid") else "default"
-                combined_split_mode = str(
-                    os.environ.get("EIDAT_COMBINED_TABLE_SPLIT_MODE", "inherit") or "inherit"
-                ).strip().lower()
-                if combined_split_mode in ("inherit", "same"):
-                    combined_split_mode = split_mode
-                enable_combined_vline_split = combined_split_mode in ("vline", "default", "on", "true", "1", "yes")
-                try:
-                    combined_vline_tol_px = float(
-                        os.environ.get(
-                            "EIDAT_COMBINED_TABLE_SPLIT_VLINE_MISALIGN_PX",
-                            os.environ.get("EIDAT_TABLE_SPLIT_VLINE_MISALIGN_PX", "6.0"),
-                        )
-                    )
-                except Exception:
-                    combined_vline_tol_px = 6.0
-                try:
-                    combined_vline_min_run = int(
-                        os.environ.get(
-                            "EIDAT_COMBINED_TABLE_SPLIT_VLINE_MIN_RUN",
-                            os.environ.get("EIDAT_TABLE_SPLIT_VLINE_MIN_RUN", "1"),
-                        )
-                    )
-                except Exception:
-                    combined_vline_min_run = 1
-                single_cell_sep = str(
+                combined_vline_tol_px = float(
                     os.environ.get(
-                        "EIDAT_COMBINED_TABLE_SPLIT_SINGLE_CELL_SEPARATOR",
-                        os.environ.get("EIDAT_TABLE_SPLIT_SINGLE_CELL_SEPARATOR", "1"),
+                        "EIDAT_COMBINED_TABLE_SPLIT_VLINE_MISALIGN_PX",
+                        os.environ.get("EIDAT_TABLE_SPLIT_VLINE_MISALIGN_PX", "6.0"),
                     )
-                    or "1"
-                ).strip().lower() in ("1", "true", "yes", "on")
-                try:
-                    single_cell_sep_max_h_ratio = float(
-                        os.environ.get(
-                            "EIDAT_COMBINED_TABLE_SPLIT_SINGLE_CELL_SEPARATOR_MAX_H_RATIO",
-                            os.environ.get("EIDAT_TABLE_SPLIT_SINGLE_CELL_SEPARATOR_MAX_H_RATIO", "0.0"),
+                )
+            except Exception:
+                combined_vline_tol_px = 6.0
+            try:
+                combined_vline_min_run = int(
+                    os.environ.get(
+                        "EIDAT_COMBINED_TABLE_SPLIT_VLINE_MIN_RUN",
+                        os.environ.get("EIDAT_TABLE_SPLIT_VLINE_MIN_RUN", "1"),
+                    )
+                )
+            except Exception:
+                combined_vline_min_run = 1
+            single_cell_sep = str(
+                os.environ.get(
+                    "EIDAT_COMBINED_TABLE_SPLIT_SINGLE_CELL_SEPARATOR",
+                    os.environ.get("EIDAT_TABLE_SPLIT_SINGLE_CELL_SEPARATOR", "1"),
+                )
+                or "1"
+            ).strip().lower() in ("1", "true", "yes", "on")
+            try:
+                single_cell_sep_max_h_ratio = float(
+                    os.environ.get(
+                        "EIDAT_COMBINED_TABLE_SPLIT_SINGLE_CELL_SEPARATOR_MAX_H_RATIO",
+                        os.environ.get("EIDAT_TABLE_SPLIT_SINGLE_CELL_SEPARATOR_MAX_H_RATIO", "0.0"),
+                    )
+                )
+            except Exception:
+                single_cell_sep_max_h_ratio = 0.0
+
+            def _part_row_col_ids_pruned(part_table: Dict[str, Any]) -> tuple[list[int], list[int]]:
+                cells = part_table.get("cells") or []
+                if not isinstance(cells, list) or not cells:
+                    return [], []
+
+                row_ids_set: set[int] = set()
+                col_ids_set: set[int] = set()
+                text_by_rc: dict[tuple[int, int], str] = {}
+                for cell in cells:
+                    try:
+                        r = int(cell.get("row"))
+                        c = int(cell.get("col"))
+                    except Exception:
+                        continue
+                    if r < 0 or c < 0:
+                        continue
+                    row_ids_set.add(int(r))
+                    col_ids_set.add(int(c))
+
+                    txt = str(cell.get("text", "") or "")
+                    key = (int(r), int(c))
+                    prev = text_by_rc.get(key)
+                    if prev is None:
+                        text_by_rc[key] = txt
+                        continue
+                    prev_s = str(prev).strip()
+                    txt_s = str(txt).strip()
+                    if not prev_s and txt_s:
+                        text_by_rc[key] = txt
+                        continue
+                    if prev_s and txt_s and len(txt_s) > len(prev_s):
+                        text_by_rc[key] = txt
+
+                row_ids = sorted(row_ids_set)
+                col_ids = sorted(col_ids_set)
+                if not row_ids or not col_ids:
+                    return [], []
+
+                row_ids_keep = [
+                    r_id
+                    for r_id in row_ids
+                    if any(str(text_by_rc.get((int(r_id), int(c_id)), "") or "").strip() for c_id in col_ids)
+                ]
+                col_ids_keep = [
+                    c_id
+                    for c_id in col_ids
+                    if any(str(text_by_rc.get((int(r_id), int(c_id)), "") or "").strip() for r_id in row_ids_keep)
+                ]
+                return row_ids_keep, col_ids_keep
+
+            parts: list[dict[str, Any]] = []
+            order_counter = 0
+            for src_idx, table in enumerate(fused_tables):
+                if enable_combined_vline_split:
+                    try:
+                        parts_local = debug_exporter._split_table_on_vline_mismatch_for_display(
+                            table,
+                            tol_px=float(combined_vline_tol_px),
+                            min_mismatch_run=int(combined_vline_min_run),
+                            enable_single_cell_separator=bool(single_cell_sep),
+                            single_cell_separator_max_h_ratio=float(single_cell_sep_max_h_ratio),
                         )
-                    )
-                except Exception:
-                    single_cell_sep_max_h_ratio = 0.0
-
-                def _part_row_col_ids_pruned(part_table: Dict[str, Any]) -> tuple[list[int], list[int]]:
-                    cells = part_table.get("cells") or []
-                    if not isinstance(cells, list) or not cells:
-                        return [], []
-
-                    row_ids_set: set[int] = set()
-                    col_ids_set: set[int] = set()
-                    text_by_rc: dict[tuple[int, int], str] = {}
-                    for cell in cells:
-                        try:
-                            r = int(cell.get("row"))
-                            c = int(cell.get("col"))
-                        except Exception:
-                            continue
-                        if r < 0 or c < 0:
-                            continue
-                        row_ids_set.add(int(r))
-                        col_ids_set.add(int(c))
-
-                        txt = str(cell.get("text", "") or "")
-                        key = (int(r), int(c))
-                        prev = text_by_rc.get(key)
-                        if prev is None:
-                            text_by_rc[key] = txt
-                            continue
-                        prev_s = str(prev).strip()
-                        txt_s = str(txt).strip()
-                        if not prev_s and txt_s:
-                            text_by_rc[key] = txt
-                            continue
-                        if prev_s and txt_s and len(txt_s) > len(prev_s):
-                            text_by_rc[key] = txt
-
-                    row_ids = sorted(row_ids_set)
-                    col_ids = sorted(col_ids_set)
-                    if not row_ids or not col_ids:
-                        return [], []
-
-                    row_ids_keep = [
-                        r_id
-                        for r_id in row_ids
-                        if any(str(text_by_rc.get((int(r_id), int(c_id)), "") or "").strip() for c_id in col_ids)
-                    ]
-                    col_ids_keep = [
-                        c_id
-                        for c_id in col_ids
-                        if any(str(text_by_rc.get((int(r_id), int(c_id)), "") or "").strip() for r_id in row_ids_keep)
-                    ]
-                    return row_ids_keep, col_ids_keep
-
-                parts: list[dict[str, Any]] = []
-                order_counter = 0
-                for src_idx, table in enumerate(fused_tables):
-                    if enable_combined_vline_split:
-                        try:
-                            parts_local = debug_exporter._split_table_on_vline_mismatch_for_display(
-                                table,
-                                tol_px=float(combined_vline_tol_px),
-                                min_mismatch_run=int(combined_vline_min_run),
-                                enable_single_cell_separator=bool(single_cell_sep),
-                                single_cell_separator_max_h_ratio=float(single_cell_sep_max_h_ratio),
-                            )
-                        except Exception:
-                            parts_local = [table]
-                    else:
+                    except Exception:
                         parts_local = [table]
-                    for part in parts_local:
-                        bbox = part.get("bbox_px") or []
-                        if not bbox or len(bbox) != 4:
-                            continue
-                        parts.append(
-                            {
-                                "source_table_idx": int(src_idx),
-                                "part": part,
-                                "y0": float(bbox[1]),
-                                "x0": float(bbox[0]),
-                                "order": int(order_counter),
-                            }
-                        )
-                        order_counter += 1
-
-                parts_sorted = sorted(parts, key=lambda p: (p.get("y0", 0.0), p.get("x0", 0.0), p.get("order", 0)))
-                out_tables: list[dict[str, Any]] = []
-                for entry in parts_sorted:
-                    src_idx = int(entry.get("source_table_idx", 0))
-                    part = entry.get("part") or {}
-                    row_ids, col_ids = _part_row_col_ids_pruned(part)
-                    rows_by_variant: list[list[list[str]]] = []
-                    for variant_tables in variant_rows_all:
-                        try:
-                            tbl = variant_tables[src_idx] if src_idx < len(variant_tables) else {}
-                            full_rows = tbl.get("rows") if isinstance(tbl, dict) else []
-                        except Exception:
-                            full_rows = []
-                        v_rows: list[list[str]] = []
-                        for r_id in row_ids:
-                            row_out: list[str] = []
-                            for c_id in col_ids:
-                                try:
-                                    val = (
-                                        str(full_rows[r_id][c_id])
-                                        if (r_id < len(full_rows) and c_id < len(full_rows[r_id]))
-                                        else ""
-                                    )
-                                except Exception:
-                                    val = ""
-                                row_out.append(val)
-                            v_rows.append(row_out)
-                        rows_by_variant.append(v_rows)
-
-                    out_tables.append(
+                else:
+                    parts_local = [table]
+                for part in parts_local:
+                    bbox = part.get("bbox_px") or []
+                    if not bbox or len(bbox) != 4:
+                        continue
+                    parts.append(
                         {
                             "source_table_idx": int(src_idx),
-                            "rows_by_variant": rows_by_variant,
+                            "part": part,
+                            "y0": float(bbox[1]),
+                            "x0": float(bbox[0]),
+                            "order": int(order_counter),
                         }
                     )
+                    order_counter += 1
 
-                sidecar = {
-                    "version": 1,
-                    "variant_count": int(len(variants_meta)),
-                    "variants": variants_meta,
-                    "ascii_mode": str(ascii_mode),
-                    "tables": out_tables,
-                }
-                (page_dir / "table_variant_candidates.json").write_text(json.dumps(sidecar, indent=2), encoding="utf-8")
-            except Exception:
-                pass
+            parts_sorted = sorted(parts, key=lambda p: (p.get("y0", 0.0), p.get("x0", 0.0), p.get("order", 0)))
+            out_tables: list[dict[str, Any]] = []
+            for entry in parts_sorted:
+                src_idx = int(entry.get("source_table_idx", 0))
+                part = entry.get("part") or {}
+                row_ids, col_ids = _part_row_col_ids_pruned(part)
+                rows_by_variant: list[list[list[str]]] = []
+                for variant_tables in variant_rows_all:
+                    try:
+                        tbl = variant_tables[src_idx] if src_idx < len(variant_tables) else {}
+                        full_rows = tbl.get("rows") if isinstance(tbl, dict) else []
+                    except Exception:
+                        full_rows = []
+                    v_rows: list[list[str]] = []
+                    for r_id in row_ids:
+                        row_out: list[str] = []
+                        for c_id in col_ids:
+                            try:
+                                val = (
+                                    str(full_rows[r_id][c_id])
+                                    if (r_id < len(full_rows) and c_id < len(full_rows[r_id]))
+                                    else ""
+                                )
+                            except Exception:
+                                val = ""
+                            row_out.append(val)
+                        v_rows.append(row_out)
+                    rows_by_variant.append(v_rows)
+
+                out_tables.append(
+                    {
+                        "source_table_idx": int(src_idx),
+                        "rows_by_variant": rows_by_variant,
+                    }
+                )
+
+            sidecar = {
+                "version": 1,
+                "variant_count": int(len(variants_meta)),
+                "variants": variants_meta,
+                "ascii_mode": str(ascii_mode),
+                "tables": out_tables,
+            }
+            (page_dir / "table_variant_candidates.json").write_text(json.dumps(sidecar, indent=2), encoding="utf-8")
+        except Exception:
+            pass
 
     ocr_lang = ocr_engine.get_tesseract_lang()
     tokens, ocr_img_w, ocr_img_h, _img_path = ocr_engine.ocr_page(
@@ -709,7 +703,8 @@ def _process_debug_method_page(
 
     charts: List[Dict] = []
     enable_charts = _parse_bool_env("EIDAT_ENABLE_CHART_EXTRACTION", True)
-    if enable_charts and det_img is not None and not skip_table_work:
+    skip_chart_extraction = bool(graph_guard.get("regions"))
+    if enable_charts and det_img is not None and not skip_chart_extraction:
         try:
             from extraction import chart_detection
 
@@ -730,9 +725,9 @@ def _process_debug_method_page(
     }
     if warnings:
         page_data["warnings"] = warnings
-    if skip_table_work:
-        page_data["table_work_skip_reason"] = str(graph_guard.get("reason") or "")
-        page_data["table_work_skip_stats"] = graph_guard.get("stats") or {}
+    if graph_guard.get("regions"):
+        page_data["masked_chart_regions"] = graph_guard.get("regions") or []
+        page_data["masked_chart_region_stats"] = graph_guard.get("stats") or {}
 
     debug_exporter.export_page_debug(
         pdf_path,
