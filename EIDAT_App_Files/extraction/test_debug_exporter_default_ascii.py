@@ -1,4 +1,5 @@
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -70,6 +71,39 @@ class TestDebugExporterDefaultAscii(unittest.TestCase):
         self.assertEqual(rows[0], ["A"], msg=f"Unexpected row content:\n{ascii_table}")
         self.assertEqual(rows[1], [""], msg=f"Blank structural row missing:\n{ascii_table}")
         self.assertEqual(rows[2], ["B"], msg=f"Unexpected row content:\n{ascii_table}")
+
+    def test_combined_text_salvages_fused_majority_for_timed_out_page(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp)
+            page_dir = out_dir / "pages" / "page_1"
+            page_dir.mkdir(parents=True, exist_ok=True)
+            fused_txt = "[Table 1]\n+----+\n| A |\n+----+\n"
+            (page_dir / "variant_fused_majority.txt").write_text(fused_txt, encoding="utf-8")
+
+            output_path = debug_exporter.export_combined_text(
+                Path("dummy.pdf"),
+                [
+                    {
+                        "page": 1,
+                        "timeout": True,
+                        "error": "Timeout: exceeded 3s",
+                        "tokens": [],
+                        "tables": [],
+                        "charts": [],
+                        "flow": {},
+                        "dpi": 900,
+                        "ocr_dpi": 450,
+                    }
+                ],
+                out_dir,
+            )
+
+            combined = output_path.read_text(encoding="utf-8")
+
+        self.assertIn("--- PAGE 1 SKIPPED: Timeout: exceeded 3s ---", combined)
+        self.assertIn("[Timed-Out Table Salvage]", combined)
+        self.assertIn("[Table 1]", combined)
+        self.assertIn("| A |", combined)
 
 
 if __name__ == "__main__":

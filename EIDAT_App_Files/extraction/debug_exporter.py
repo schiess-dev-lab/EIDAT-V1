@@ -1395,6 +1395,12 @@ def export_combined_text(pdf_path: Path, pages_data: List[Dict],
         if page_data.get("timeout") or page_data.get("error"):
             msg = str(page_data.get("error") or "skipped").strip()
             combined_text.append(f"--- PAGE {page_num} SKIPPED: {msg} ---\n\n")
+            if not flow and not tables and not tokens:
+                salvage_text = _load_timeout_table_salvage(output_dir, int(page_num or 0))
+                if salvage_text:
+                    combined_text.append("[Timed-Out Table Salvage]\n")
+                    combined_text.append(salvage_text)
+                    combined_text.append("\n\n")
 
         if flow:
             header_entries = header_page_entries[page_idx] if page_idx < len(header_page_entries) else []
@@ -1576,6 +1582,22 @@ def _ensure_chart_crops(pdf_path: Path, pages_data: List[Dict], output_dir: Path
         if img_gray is None:
             continue
         export_chart_debug_images(img_gray, charts, output_dir, page_num)
+
+
+def _load_timeout_table_salvage(output_dir: Path, page_num: int) -> str:
+    try:
+        page_num_i = int(page_num)
+    except Exception:
+        return ""
+    if page_num_i <= 0:
+        return ""
+    salvage_path = output_dir / "pages" / f"page_{page_num_i}" / "variant_fused_majority.txt"
+    try:
+        if not salvage_path.exists():
+            return ""
+        return salvage_path.read_text(encoding="utf-8", errors="ignore").strip()
+    except Exception:
+        return ""
 
 
 def create_summary_report(pdf_path: Path, pages_data: List[Dict],
