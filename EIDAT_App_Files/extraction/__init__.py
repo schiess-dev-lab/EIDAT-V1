@@ -22,6 +22,7 @@ __all__ = [
     "ocr_engine",
     "table_detection",
     "borderless_table_detection",
+    "graph_page_guard",
     "page_analyzer",
     "token_projector",
     "chart_detection",

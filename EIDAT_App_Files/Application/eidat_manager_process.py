@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import multiprocessing
 import os
 import shutil
 import sys
@@ -268,29 +269,15 @@ def _render_pdf_pages_to_dirs(pdf_path: Path, pages_root: Path, dpi: int) -> int
             pass
 
 
-def _run_debug_method_extraction(pdf_path: Path, dpi: int | None, output_dir: Path) -> dict[str, Any]:
-    """
-    New default extraction path:
-    - Render pages to PNG
-    - Draw table borders (debug_method/table_grid_debug)
-    - Run table variants on bordered PNGs (fused only)
-    - Build combined.txt with existing formatter
-    """
-    # Add EIDAT_App_Files to path for extraction imports
+def _build_debug_method_settings(dpi: int | None) -> dict[str, Any]:
     project_root = Path(__file__).resolve().parent.parent
     if str(project_root) not in sys.path:
         sys.path.insert(0, str(project_root))
 
     try:
-        from extraction import ocr_engine, token_projector, page_analyzer, debug_exporter
+        from extraction import ocr_engine
     except ImportError as e:
         raise RuntimeError(f"Unable to import extraction modules: {e}") from e
-
-    try:
-        from debug_method import table_grid_debug, run_table_variants
-        from debug_method.run_debug_master import _draw_table_borders
-    except ImportError as e:
-        raise RuntimeError(f"Unable to import debug_method pipeline: {e}") from e
 
     config = _load_debug_master_config(project_root)
     render_cfg = config.get("render", {}) if isinstance(config.get("render", {}), dict) else {}
@@ -356,121 +343,167 @@ def _run_debug_method_extraction(pdf_path: Path, dpi: int | None, output_dir: Pa
     if tg_border_thickness <= 0:
         tg_border_thickness = max(4, tg_line_thickness + 2)
 
-    # Table-grid overlays are debug-only and have been unstable (false positive borders / crashes).
-    # Default to disabling all overlay line projection unless explicitly enabled.
     tg_draw_overlay_lines = _parse_bool_env("EIDAT_TABLE_GRID_DRAW_LINES", False)
     tg_apply_borders_to_page = _parse_bool_env("EIDAT_TABLE_GRID_APPLY_BORDERS_TO_PAGE", False)
+    tg_enable_prepass = table_grid_enabled and _parse_bool_env("EIDAT_TABLE_GRID_ENABLE_PREPASS", False)
 
     table_variants_lang = table_variants_cfg.get("lang") or None
     if table_variants_lang is None:
         table_variants_lang = ocr_engine.get_tesseract_lang()
 
-    doc_name = pdf_path.stem
-    artifacts_dir = output_dir / "debug" / "ocr" / doc_name
-    pages_root = artifacts_dir / "pages"
+    return {
+        "project_root": str(project_root),
+        "render_dpi": int(render_dpi),
+        "ocr_dpi": int(ocr_dpi),
+        "table_ocr_dpi": int(table_ocr_dpi),
+        "detection_dpi": int(detection_dpi),
+        "table_variants_lang": table_variants_lang,
+        "table_grid_enable_prepass": bool(tg_enable_prepass),
+        "tg_merge_kx": int(tg_merge_kx),
+        "tg_min_gap": float(tg_min_gap),
+        "tg_min_gap_ratio": float(tg_min_gap_ratio),
+        "tg_gap_threshold": float(tg_gap_threshold),
+        "tg_offset_px": float(tg_offset_px),
+        "tg_line_thickness": int(tg_line_thickness),
+        "tg_line_pad": float(tg_line_pad),
+        "tg_min_token_h": float(tg_min_token_h),
+        "tg_min_token_h_ratio": float(tg_min_token_h_ratio),
+        "tg_draw_hlines": bool(tg_draw_hlines),
+        "tg_draw_seps_in_tables": bool(tg_draw_seps_in_tables),
+        "tg_draw_separators": bool(tg_draw_separators),
+        "tg_draw_overlay_lines": bool(tg_draw_overlay_lines),
+        "tg_apply_borders_to_page": bool(tg_apply_borders_to_page),
+        "tg_border_thickness": int(tg_border_thickness),
+        "enable_borderless": _parse_bool_env("EIDAT_TABLE_ENABLE_BORDERLESS", False)
+        or _parse_bool_env("EIDAT_ENABLE_BORDERLESS_TABLES", False),
+        "page_timeout_sec": max(0, _parse_int_env("EIDAT_PAGE_TIMEOUT_SEC", 0)),
+    }
 
-    # Clean prior per-page outputs to avoid stale pages
-    if pages_root.exists():
-        shutil.rmtree(pages_root, ignore_errors=True)
-    pages_root.mkdir(parents=True, exist_ok=True)
 
-    # Remove old root-level page artifacts if present (migrating layout)
-    for old in artifacts_dir.glob("page_*.*"):
-        try:
-            old.unlink()
-        except Exception:
-            pass
+def _page_timeout_result(page_num: int, settings: dict[str, Any], message: str, *, timeout: bool) -> dict[str, Any]:
+    return {
+        "page": int(page_num),
+        "error": str(message),
+        "timeout": bool(timeout),
+        "tokens": [],
+        "tables": [],
+        "charts": [],
+        "img_w": 0,
+        "img_h": 0,
+        "dpi": int(settings.get("detection_dpi") or 0),
+        "ocr_dpi": int(settings.get("ocr_dpi") or 0),
+        "flow": {},
+    }
 
-    page_count = _render_pdf_pages_to_dirs(pdf_path, pages_root, render_dpi)
-    if page_count <= 0:
-        raise RuntimeError(f"No pages rendered for {pdf_path}")
 
-    pages_data: List[Dict] = []
-    ocr_lang = ocr_engine.get_tesseract_lang()
+def _process_debug_method_page(
+    pdf_path: Path,
+    page_num: int,
+    page_dir: Path,
+    settings: dict[str, Any],
+) -> dict[str, Any]:
+    project_root = Path(str(settings.get("project_root") or Path(__file__).resolve().parent.parent))
+    if str(project_root) not in sys.path:
+        sys.path.insert(0, str(project_root))
 
-    for page_num in range(1, page_count + 1):
-        page_dir = pages_root / f"page_{page_num}"
-        page_path = page_dir / f"page_{page_num}.png"
-        if not page_path.exists():
-            raise RuntimeError(f"Missing rendered page: {page_path}")
+    try:
+        from extraction import debug_exporter, graph_page_guard, ocr_engine, page_analyzer, token_projector
+    except ImportError as e:
+        raise RuntimeError(f"Unable to import extraction modules: {e}") from e
 
-        if table_grid_enabled:
-            grid_dir = page_dir / "grid_debug"
-            gap_override = None
-            if tg_gap_threshold and tg_gap_threshold > 0:
-                gap_override = float(tg_gap_threshold)
-            elif tg_min_gap and float(tg_min_gap) > 0:
-                gap_override = float(tg_min_gap)
-            summary = table_grid_debug.run_for_image(
+    try:
+        from debug_method import run_table_variants, table_grid_debug
+        from debug_method.run_debug_master import _draw_table_borders
+    except ImportError as e:
+        raise RuntimeError(f"Unable to import debug_method pipeline: {e}") from e
+
+    page_path = page_dir / f"page_{page_num}.png"
+    if not page_path.exists():
+        raise RuntimeError(f"Missing rendered page: {page_path}")
+
+    warnings: list[str] = []
+    graph_guard: dict[str, Any] = {"skip_table_work": False, "reason": "", "stats": {}}
+    try:
+        import cv2  # type: ignore
+
+        page_img_gray = cv2.imread(str(page_path), cv2.IMREAD_GRAYSCALE)
+        if page_img_gray is not None:
+            graph_guard = graph_page_guard.inspect_page_for_graph_grid(page_img_gray)
+    except Exception:
+        graph_guard = {"skip_table_work": False, "reason": "", "stats": {}}
+
+    skip_table_work = bool(graph_guard.get("skip_table_work"))
+    if skip_table_work:
+        warnings.append("graph_like_page_skip_table_work")
+
+    if bool(settings.get("table_grid_enable_prepass")) and not skip_table_work:
+        grid_dir = page_dir / "grid_debug"
+        gap_override = None
+        if float(settings.get("tg_gap_threshold") or 0.0) > 0:
+            gap_override = float(settings["tg_gap_threshold"])
+        elif float(settings.get("tg_min_gap") or 0.0) > 0:
+            gap_override = float(settings["tg_min_gap"])
+        summary = table_grid_debug.run_for_image(
+            page_path,
+            out_dir=grid_dir,
+            merge_kx=int(settings.get("tg_merge_kx") or 0),
+            min_gap=gap_override if gap_override else None,
+            min_gap_ratio=float(settings.get("tg_min_gap_ratio") or 0.0),
+            offset_px=float(settings.get("tg_offset_px") or 24.0),
+            line_thickness=int(settings.get("tg_line_thickness") or 3),
+            line_pad_factor=float(settings.get("tg_line_pad") or 0.25),
+            min_token_h_px=float(settings.get("tg_min_token_h") or 0.0),
+            min_token_h_ratio=float(settings.get("tg_min_token_h_ratio") or 0.85),
+            draw_tables=bool(settings.get("tg_draw_overlay_lines")),
+            draw_hlines=bool(settings.get("tg_draw_overlay_lines") and settings.get("tg_draw_hlines")),
+            draw_seps_in_tables=bool(
+                settings.get("tg_draw_overlay_lines") and settings.get("tg_draw_seps_in_tables")
+            ),
+            draw_separators=bool(settings.get("tg_draw_overlay_lines") and settings.get("tg_draw_separators")),
+        )
+        tables_grid = summary.get("tables") or []
+        if bool(settings.get("tg_apply_borders_to_page")) and tables_grid:
+            _draw_table_borders(
                 page_path,
-                out_dir=grid_dir,
-                merge_kx=tg_merge_kx,
-                min_gap=gap_override if gap_override else None,
-                min_gap_ratio=tg_min_gap_ratio,
-                offset_px=tg_offset_px,
-                line_thickness=tg_line_thickness,
-                line_pad_factor=tg_line_pad,
-                min_token_h_px=tg_min_token_h,
-                min_token_h_ratio=tg_min_token_h_ratio,
-                draw_tables=bool(tg_draw_overlay_lines),
-                draw_hlines=bool(tg_draw_overlay_lines and tg_draw_hlines),
-                draw_seps_in_tables=bool(tg_draw_overlay_lines and tg_draw_seps_in_tables),
-                draw_separators=bool(tg_draw_overlay_lines and tg_draw_separators),
+                tables_grid,
+                page_path,
+                line_thickness=int(settings.get("tg_border_thickness") or 4),
             )
-            tables_grid = summary.get("tables") or []
-            if tg_apply_borders_to_page and tables_grid:
-                _draw_table_borders(
-                    page_path,
-                    tables_grid,
-                    page_path,
-                    line_thickness=tg_border_thickness,
-                )
 
+    fused_result: dict[str, Any]
+    if skip_table_work:
+        fused_result = {
+            "tables": [],
+            "detection_dpi": int(settings.get("detection_dpi") or 0),
+            "detection_size": {},
+            "warnings": [],
+        }
+    else:
         fused_result = run_table_variants._run_for_input(
             page_path,
             out_dir=page_dir,
             page=1,
-            ocr_dpi_base=table_ocr_dpi,
-            detection_dpi=detection_dpi,
-            lang=table_variants_lang,
+            ocr_dpi_base=int(settings.get("table_ocr_dpi") or settings.get("ocr_dpi") or 450),
+            detection_dpi=int(settings.get("detection_dpi") or 900),
+            lang=settings.get("table_variants_lang"),
             clean=False,
             fuse=True,
             emit_variants=False,
             emit_fused=True,
             allow_no_tables=True,
-            enable_borderless=_parse_bool_env("EIDAT_TABLE_ENABLE_BORDERLESS", False)
-            or _parse_bool_env("EIDAT_ENABLE_BORDERLESS_TABLES", False),
+            enable_borderless=bool(settings.get("enable_borderless")),
             return_fused=True,
             return_variant_rows=True,
         )
 
-        fused_tables = list(fused_result.get("tables") or [])
-        detection_dpi_used = int(fused_result.get("detection_dpi") or detection_dpi)
-        warnings = list(fused_result.get("warnings") or []) if isinstance(fused_result, dict) else []
-        if "bordered_table_detection_timeout" in warnings:
-            timeout_sec = _parse_int_env("EIDAT_TABLE_DETECT_TIMEOUT_SEC", 300)
-            if timeout_sec < 0:
-                timeout_sec = 0
-            pages_data.append(
-                {
-                    "page": page_num,
-                    "error": f"Timeout: bordered table detection exceeded {int(timeout_sec)}s",
-                    "timeout": True,
-                    "tokens": [],
-                    "tables": [],
-                    "charts": [],
-                    "img_w": 0,
-                    "img_h": 0,
-                    "dpi": detection_dpi_used,
-                    "ocr_dpi": ocr_dpi,
-                    "flow": {},
-                    "warnings": warnings,
-                }
-            )
-            continue
+    fused_tables = list(fused_result.get("tables") or [])
+    detection_dpi_used = int(fused_result.get("detection_dpi") or settings.get("detection_dpi") or 0)
+    child_warnings = list(fused_result.get("warnings") or []) if isinstance(fused_result, dict) else []
+    for warning in child_warnings:
+        if warning not in warnings:
+            warnings.append(str(warning))
 
-        # Persist per-variant table cell candidates (single sidecar JSON per page) so the
-        # combined.txt healer can later rescue garbled numeric cells from alternate variants.
+    if not skip_table_work:
         try:
             enable_candidates = _parse_bool_env("EIDAT_TABLE_VARIANT_CANDIDATES", True)
         except Exception:
@@ -482,7 +515,9 @@ def _run_debug_method_extraction(pdf_path: Path, dpi: int | None, output_dir: Pa
 
                 split_mode = str(os.environ.get("EIDAT_TABLE_SPLIT_MODE", "vline") or "vline").strip().lower()
                 ascii_mode = "replica" if split_mode in ("replica", "snap", "grid") else "default"
-                combined_split_mode = str(os.environ.get("EIDAT_COMBINED_TABLE_SPLIT_MODE", "inherit") or "inherit").strip().lower()
+                combined_split_mode = str(
+                    os.environ.get("EIDAT_COMBINED_TABLE_SPLIT_MODE", "inherit") or "inherit"
+                ).strip().lower()
                 if combined_split_mode in ("inherit", "same"):
                     combined_split_mode = split_mode
                 enable_combined_vline_split = combined_split_mode in ("vline", "default", "on", "true", "1", "yes")
@@ -522,10 +557,6 @@ def _run_debug_method_extraction(pdf_path: Path, dpi: int | None, output_dir: Pa
                     single_cell_sep_max_h_ratio = 0.0
 
                 def _part_row_col_ids_pruned(part_table: Dict[str, Any]) -> tuple[list[int], list[int]]:
-                    """
-                    Build a stable (row_ids, col_ids) grid for a table part that matches the
-                    combined.txt ASCII renderer indices (after fully-empty row/col pruning).
-                    """
                     cells = part_table.get("cells") or []
                     if not isinstance(cells, list) or not cells:
                         return [], []
@@ -557,14 +588,12 @@ def _run_debug_method_extraction(pdf_path: Path, dpi: int | None, output_dir: Pa
                             continue
                         if prev_s and txt_s and len(txt_s) > len(prev_s):
                             text_by_rc[key] = txt
-                            continue
 
                     row_ids = sorted(row_ids_set)
                     col_ids = sorted(col_ids_set)
                     if not row_ids or not col_ids:
                         return [], []
 
-                    # Prune fully-empty rows first (renderer behavior), then columns.
                     row_ids_keep = [
                         r_id
                         for r_id in row_ids
@@ -573,29 +602,26 @@ def _run_debug_method_extraction(pdf_path: Path, dpi: int | None, output_dir: Pa
                     col_ids_keep = [
                         c_id
                         for c_id in col_ids
-                        if any(
-                            str(text_by_rc.get((int(r_id), int(c_id)), "") or "").strip()
-                            for r_id in row_ids_keep
-                        )
+                        if any(str(text_by_rc.get((int(r_id), int(c_id)), "") or "").strip() for r_id in row_ids_keep)
                     ]
                     return row_ids_keep, col_ids_keep
 
                 parts: list[dict[str, Any]] = []
                 order_counter = 0
-                for src_idx, t in enumerate(fused_tables):
+                for src_idx, table in enumerate(fused_tables):
                     if enable_combined_vline_split:
                         try:
                             parts_local = debug_exporter._split_table_on_vline_mismatch_for_display(
-                                t,
+                                table,
                                 tol_px=float(combined_vline_tol_px),
                                 min_mismatch_run=int(combined_vline_min_run),
                                 enable_single_cell_separator=bool(single_cell_sep),
                                 single_cell_separator_max_h_ratio=float(single_cell_sep_max_h_ratio),
                             )
                         except Exception:
-                            parts_local = [t]
+                            parts_local = [table]
                     else:
-                        parts_local = [t]
+                        parts_local = [table]
                     for part in parts_local:
                         bbox = part.get("bbox_px") or []
                         if not bbox or len(bbox) != 4:
@@ -658,68 +684,172 @@ def _run_debug_method_extraction(pdf_path: Path, dpi: int | None, output_dir: Pa
             except Exception:
                 pass
 
-        tokens, ocr_img_w, ocr_img_h, _img_path = ocr_engine.ocr_page(
-            pdf_path, page_num - 1, ocr_dpi, ocr_lang, 3, debug_dir=None
-        )
+    ocr_lang = ocr_engine.get_tesseract_lang()
+    tokens, ocr_img_w, ocr_img_h, _img_path = ocr_engine.ocr_page(
+        pdf_path, page_num - 1, int(settings.get("ocr_dpi") or 450), ocr_lang, 3, debug_dir=None
+    )
+    try:
+        img_gray_ocr, _, _ = ocr_engine.render_pdf_page(pdf_path, page_num - 1, int(settings.get("ocr_dpi") or 450))
+        if img_gray_ocr is not None and tokens:
+            tokens = ocr_engine.reocr_low_confidence_tokens(
+                img_gray_ocr, tokens, conf_threshold=0.6, lang=ocr_lang, verbose=False
+            )
+    except Exception:
+        pass
+
+    det_img, det_w, det_h = ocr_engine.render_pdf_page(pdf_path, page_num - 1, detection_dpi_used)
+    if det_img is None:
+        det_w = int((fused_result.get("detection_size") or {}).get("w") or 0) or int(ocr_img_w or 0)
+        det_h = int((fused_result.get("detection_size") or {}).get("h") or 0) or int(ocr_img_h or 0)
+
+    flow_tokens = (
+        token_projector.scale_tokens_to_dpi(tokens, int(settings.get("ocr_dpi") or 450), detection_dpi_used) if tokens else []
+    )
+    flow_data = page_analyzer.extract_flow_text(flow_tokens, fused_tables, det_w, det_h)
+
+    charts: List[Dict] = []
+    enable_charts = _parse_bool_env("EIDAT_ENABLE_CHART_EXTRACTION", True)
+    if enable_charts and det_img is not None and not skip_table_work:
         try:
-            img_gray_ocr, _, _ = ocr_engine.render_pdf_page(pdf_path, page_num - 1, ocr_dpi)
-            if img_gray_ocr is not None and tokens:
-                tokens = ocr_engine.reocr_low_confidence_tokens(
-                    img_gray_ocr, tokens, conf_threshold=0.6, lang=ocr_lang, verbose=False
-                )
+            from extraction import chart_detection
+
+            charts = chart_detection.detect_charts(det_img, flow_tokens, fused_tables, det_w, det_h, flow_data)
+        except Exception:
+            charts = []
+
+    page_data = {
+        "page": int(page_num),
+        "tokens": tokens,
+        "tables": fused_tables,
+        "charts": charts,
+        "img_w": det_w,
+        "img_h": det_h,
+        "dpi": detection_dpi_used,
+        "ocr_dpi": int(settings.get("ocr_dpi") or 450),
+        "flow": flow_data,
+    }
+    if warnings:
+        page_data["warnings"] = warnings
+    if skip_table_work:
+        page_data["table_work_skip_reason"] = str(graph_guard.get("reason") or "")
+        page_data["table_work_skip_stats"] = graph_guard.get("stats") or {}
+
+    debug_exporter.export_page_debug(
+        pdf_path,
+        page_num - 1,
+        tokens,
+        fused_tables,
+        det_w,
+        det_h,
+        detection_dpi_used,
+        page_dir,
+        charts=charts,
+        flow_data=flow_data,
+        ocr_dpi=int(settings.get("ocr_dpi") or 450),
+        ocr_img_w=ocr_img_w,
+        ocr_img_h=ocr_img_h,
+    )
+
+    return page_data
+
+
+def _process_debug_method_page_worker(
+    pdf_path_str: str,
+    page_num: int,
+    page_dir_str: str,
+    settings: dict[str, Any],
+    out_q,
+) -> None:
+    try:
+        result = _process_debug_method_page(Path(pdf_path_str), int(page_num), Path(page_dir_str), dict(settings))
+        out_q.put(("ok", result))
+    except Exception as e:
+        out_q.put(("err", f"{type(e).__name__}: {e}"))
+
+
+def _run_debug_method_page_with_timeout(
+    pdf_path: Path,
+    page_num: int,
+    page_dir: Path,
+    settings: dict[str, Any],
+) -> dict[str, Any]:
+    timeout_sec = max(0, int(settings.get("page_timeout_sec") or 0))
+    if timeout_sec <= 0:
+        return _process_debug_method_page(pdf_path, page_num, page_dir, settings)
+
+    ctx = multiprocessing.get_context("spawn")
+    q = ctx.Queue(maxsize=1)
+    proc = ctx.Process(
+        target=_process_debug_method_page_worker,
+        args=(str(pdf_path), int(page_num), str(page_dir), dict(settings), q),
+        daemon=True,
+    )
+    proc.start()
+    proc.join(timeout=float(timeout_sec))
+
+    if proc.is_alive():
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        proc.join(timeout=5)
+        return _page_timeout_result(page_num, settings, f"Timeout: exceeded {int(timeout_sec)}s", timeout=True)
+
+    try:
+        status, payload = q.get_nowait()
+    except Exception:
+        status, payload = ("err", "No result returned from page worker")
+    if status == "ok" and isinstance(payload, dict):
+        return payload
+    return _page_timeout_result(page_num, settings, str(payload), timeout=False)
+
+
+def _run_debug_method_extraction(pdf_path: Path, dpi: int | None, output_dir: Path) -> dict[str, Any]:
+    """
+    New default extraction path:
+    - Render pages to PNG
+    - Draw table borders (debug_method/table_grid_debug)
+    - Run table variants on bordered PNGs (fused only)
+    - Build combined.txt with existing formatter
+    """
+    project_root = Path(__file__).resolve().parent.parent
+    if str(project_root) not in sys.path:
+        sys.path.insert(0, str(project_root))
+
+    try:
+        from extraction import debug_exporter
+    except ImportError as e:
+        raise RuntimeError(f"Unable to import extraction modules: {e}") from e
+
+    settings = _build_debug_method_settings(dpi)
+    doc_name = pdf_path.stem
+    artifacts_dir = output_dir / "debug" / "ocr" / doc_name
+    pages_root = artifacts_dir / "pages"
+
+    # Clean prior per-page outputs to avoid stale pages
+    if pages_root.exists():
+        shutil.rmtree(pages_root, ignore_errors=True)
+    pages_root.mkdir(parents=True, exist_ok=True)
+
+    # Remove old root-level page artifacts if present (migrating layout)
+    for old in artifacts_dir.glob("page_*.*"):
+        try:
+            old.unlink()
         except Exception:
             pass
 
-        det_img, det_w, det_h = ocr_engine.render_pdf_page(pdf_path, page_num - 1, detection_dpi_used)
-        if det_img is None:
-            det_w = int((fused_result.get("detection_size") or {}).get("w") or 0) or int(ocr_img_w or 0)
-            det_h = int((fused_result.get("detection_size") or {}).get("h") or 0) or int(ocr_img_h or 0)
+    page_count = _render_pdf_pages_to_dirs(pdf_path, pages_root, int(settings.get("render_dpi") or 450))
+    if page_count <= 0:
+        raise RuntimeError(f"No pages rendered for {pdf_path}")
 
-        flow_tokens = token_projector.scale_tokens_to_dpi(tokens, ocr_dpi, detection_dpi_used) if tokens else []
-        flow_data = page_analyzer.extract_flow_text(flow_tokens, fused_tables, det_w, det_h)
+    pages_data: List[Dict] = []
 
-        charts: List[Dict] = []
-        enable_charts = _parse_bool_env("EIDAT_ENABLE_CHART_EXTRACTION", True)
-        if enable_charts and det_img is not None:
-            try:
-                from extraction import chart_detection
-
-                charts = chart_detection.detect_charts(
-                    det_img, flow_tokens, fused_tables, det_w, det_h, flow_data
-                )
-            except Exception:
-                charts = []
-
-        page_data = {
-            "page": page_num,
-            "tokens": tokens,
-            "tables": fused_tables,
-            "charts": charts,
-            "img_w": det_w,
-            "img_h": det_h,
-            "dpi": detection_dpi_used,
-            "ocr_dpi": ocr_dpi,
-            "flow": flow_data,
-        }
-        if warnings:
-            page_data["warnings"] = warnings
-        pages_data.append(page_data)
-
-        debug_exporter.export_page_debug(
-            pdf_path,
-            page_num - 1,
-            tokens,
-            fused_tables,
-            det_w,
-            det_h,
-            detection_dpi_used,
-            page_dir,
-            charts=charts,
-            flow_data=flow_data,
-            ocr_dpi=ocr_dpi,
-            ocr_img_w=ocr_img_w,
-            ocr_img_h=ocr_img_h,
-        )
+    for page_num in range(1, page_count + 1):
+        page_dir = pages_root / f"page_{page_num}"
+        page_path = page_dir / f"page_{page_num}.png"
+        if not page_path.exists():
+            raise RuntimeError(f"Missing rendered page: {page_path}")
+        pages_data.append(_run_debug_method_page_with_timeout(pdf_path, page_num, page_dir, settings))
 
     combined_path = debug_exporter.export_combined_text(pdf_path, pages_data, artifacts_dir)
     summary_path = debug_exporter.create_summary_report(pdf_path, pages_data, artifacts_dir)

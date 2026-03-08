@@ -379,6 +379,123 @@ class TestTableCellSplitRecovery(unittest.TestCase):
             self.assertTrue(any(c.get("bbox_px") == [0.0, 100.0, 300.0, 150.0] for c in (t0.get("cells") or [])))
             self.assertFalse(any(c.get("bbox_px") == [100.0, 100.0, 200.0, 150.0] for c in (t0.get("cells") or [])))
 
+    def test_allow_blank_subcells_accepts_trailing_blank(self) -> None:
+        table = {
+            "bbox_px": [0, 0, 200, 150],
+            "cells": [
+                _cell([0, 0, 100, 50]),
+                _cell([100, 0, 200, 50]),
+                _cell([0, 50, 100, 100]),
+                _cell([100, 50, 200, 100]),
+                _cell(
+                    [0, 100, 200, 150],
+                    tokens=[_tok("X", 10, 112, 35, 132)],
+                    text="X",
+                ),
+            ],
+        }
+
+        cfg = {
+            "EIDAT_TABLE_CELL_SPLIT_RECOVERY": "1",
+            "EIDAT_TABLE_CELL_SPLIT_EVIDENCE_MULTIROW": "0",
+            "EIDAT_TABLE_CELL_SPLIT_EVIDENCE_WHITESPACE": "0",
+            "EIDAT_TABLE_CELL_SPLIT_EVIDENCE_TOKEN_OVERLAP": "0",
+            "EIDAT_TABLE_CELL_SPLIT_EVIDENCE_TOKEN_GAP": "0",
+            "EIDAT_TABLE_CELL_SPLIT_ALLOW_BLANK_SUBCELLS": "1",
+            "EIDAT_TABLE_CELL_SPLIT_MIN_NONEMPTY_SUBCELLS": "1",
+            "EIDAT_TABLE_CELL_SPLIT_MIN_TOKENS": "1",
+            "EIDAT_TABLE_CELL_SPLIT_DEBUG": "0",
+        }
+
+        with _patch_env(cfg):
+            t0 = copy.deepcopy(table)
+            stats = table_cell_split_recovery.split_merged_cells_post_projection(
+                [t0], img_gray_det=None, img_w=200, img_h=150, debug_dir=None
+            )
+            self.assertEqual(int(stats.get("cells_split") or 0), 1)
+            self.assertTrue(any(c.get("bbox_px") == [0.0, 100.0, 100.0, 150.0] for c in (t0.get("cells") or [])))
+            self.assertTrue(any(c.get("bbox_px") == [100.0, 100.0, 200.0, 150.0] for c in (t0.get("cells") or [])))
+
+    def test_allow_blank_subcells_accepts_internal_blank(self) -> None:
+        table = {
+            "bbox_px": [0, 0, 300, 150],
+            "cells": [
+                _cell([0, 0, 100, 50]),
+                _cell([100, 0, 200, 50]),
+                _cell([200, 0, 300, 50]),
+                _cell([0, 50, 100, 100]),
+                _cell([100, 50, 200, 100]),
+                _cell([200, 50, 300, 100]),
+                _cell(
+                    [0, 100, 300, 150],
+                    tokens=[
+                        _tok("A", 10, 112, 35, 132),
+                        _tok("C", 240, 112, 265, 132),
+                    ],
+                    text="A C",
+                ),
+            ],
+        }
+
+        cfg = {
+            "EIDAT_TABLE_CELL_SPLIT_RECOVERY": "1",
+            "EIDAT_TABLE_CELL_SPLIT_EVIDENCE_MULTIROW": "0",
+            "EIDAT_TABLE_CELL_SPLIT_EVIDENCE_WHITESPACE": "0",
+            "EIDAT_TABLE_CELL_SPLIT_EVIDENCE_TOKEN_OVERLAP": "0",
+            "EIDAT_TABLE_CELL_SPLIT_EVIDENCE_TOKEN_GAP": "0",
+            "EIDAT_TABLE_CELL_SPLIT_ALLOW_BLANK_SUBCELLS": "1",
+            "EIDAT_TABLE_CELL_SPLIT_MIN_NONEMPTY_SUBCELLS": "2",
+            "EIDAT_TABLE_CELL_SPLIT_MIN_TOKENS": "1",
+            "EIDAT_TABLE_CELL_SPLIT_DEBUG": "0",
+        }
+
+        with _patch_env(cfg):
+            t0 = copy.deepcopy(table)
+            stats = table_cell_split_recovery.split_merged_cells_post_projection(
+                [t0], img_gray_det=None, img_w=300, img_h=150, debug_dir=None
+            )
+            self.assertEqual(int(stats.get("cells_split") or 0), 1)
+            self.assertTrue(any(c.get("bbox_px") == [0.0, 100.0, 100.0, 150.0] for c in (t0.get("cells") or [])))
+            self.assertTrue(any(c.get("bbox_px") == [100.0, 100.0, 200.0, 150.0] for c in (t0.get("cells") or [])))
+            self.assertTrue(any(c.get("bbox_px") == [200.0, 100.0, 300.0, 150.0] for c in (t0.get("cells") or [])))
+
+    def test_require_all_subcells_meaningful_overrides_allow_blank_subcells(self) -> None:
+        table = {
+            "bbox_px": [0, 0, 200, 150],
+            "cells": [
+                _cell([0, 0, 100, 50]),
+                _cell([100, 0, 200, 50]),
+                _cell([0, 50, 100, 100]),
+                _cell([100, 50, 200, 100]),
+                _cell(
+                    [0, 100, 200, 150],
+                    tokens=[_tok("X", 10, 112, 35, 132)],
+                    text="X",
+                ),
+            ],
+        }
+
+        cfg = {
+            "EIDAT_TABLE_CELL_SPLIT_RECOVERY": "1",
+            "EIDAT_TABLE_CELL_SPLIT_EVIDENCE_MULTIROW": "0",
+            "EIDAT_TABLE_CELL_SPLIT_EVIDENCE_WHITESPACE": "0",
+            "EIDAT_TABLE_CELL_SPLIT_EVIDENCE_TOKEN_OVERLAP": "0",
+            "EIDAT_TABLE_CELL_SPLIT_EVIDENCE_TOKEN_GAP": "0",
+            "EIDAT_TABLE_CELL_SPLIT_ALLOW_BLANK_SUBCELLS": "1",
+            "EIDAT_TABLE_CELL_SPLIT_REQUIRE_ALL_SUBCELLS_MEANINGFUL": "1",
+            "EIDAT_TABLE_CELL_SPLIT_MIN_NONEMPTY_SUBCELLS": "1",
+            "EIDAT_TABLE_CELL_SPLIT_MIN_TOKENS": "1",
+            "EIDAT_TABLE_CELL_SPLIT_DEBUG": "0",
+        }
+
+        with _patch_env(cfg):
+            t0 = copy.deepcopy(table)
+            stats = table_cell_split_recovery.split_merged_cells_post_projection(
+                [t0], img_gray_det=None, img_w=200, img_h=150, debug_dir=None
+            )
+            self.assertEqual(int(stats.get("cells_split") or 0), 0)
+            self.assertTrue(any(c.get("bbox_px") == [0.0, 100.0, 200.0, 150.0] for c in (t0.get("cells") or [])))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -80,6 +80,7 @@ class _Cfg:
     min_text_chars: int
     min_tokens: int
     require_all_subcells_meaningful: bool
+    allow_blank_subcells: bool
 
     # Debug
     debug: bool
@@ -113,6 +114,10 @@ def _load_cfg() -> _Cfg:
         min_tokens=_env_int("EIDAT_TABLE_CELL_SPLIT_MIN_TOKENS", 1),
         require_all_subcells_meaningful=_env_bool(
             "EIDAT_TABLE_CELL_SPLIT_REQUIRE_ALL_SUBCELLS_MEANINGFUL",
+            False,
+        ),
+        allow_blank_subcells=_env_bool(
+            "EIDAT_TABLE_CELL_SPLIT_ALLOW_BLANK_SUBCELLS",
             False,
         ),
         debug=_env_bool("EIDAT_TABLE_CELL_SPLIT_DEBUG", False),
@@ -876,24 +881,28 @@ def split_merged_cells_post_projection(
                 if nonempty != int(len(subcells)):
                     out_cells.append(cell)
                     continue
+            elif cfg.allow_blank_subcells:
+                if int(nonempty) < int(cfg.min_nonempty_subcells):
+                    out_cells.append(cell)
+                    continue
+            else:
+                # Strategy: allow blank "structural" subcells ONLY on the LEFT of the first meaningful
+                # subcell. Reject splits that create any blank subcell to the RIGHT of content (or an
+                # internal blank), since that tends to create columns out of nothing.
+                try:
+                    first_meaningful = next(i for i, ok_sc in enumerate(meaningful_flags) if ok_sc)
+                except StopIteration:
+                    out_cells.append(cell)
+                    continue
+                if any(not ok_sc for ok_sc in meaningful_flags[int(first_meaningful) :]):
+                    out_cells.append(cell)
+                    continue
 
-            # Strategy: allow blank "structural" subcells ONLY on the LEFT of the first meaningful
-            # subcell. Reject splits that create any blank subcell to the RIGHT of content (or an
-            # internal blank), since that tends to create columns out of nothing.
-            try:
-                first_meaningful = next(i for i, ok_sc in enumerate(meaningful_flags) if ok_sc)
-            except StopIteration:
-                out_cells.append(cell)
-                continue
-            if any(not ok_sc for ok_sc in meaningful_flags[int(first_meaningful) :]):
-                out_cells.append(cell)
-                continue
-
-            # Count leading structural blanks toward acceptance.
-            effective_nonempty = int(nonempty) + int(first_meaningful)
-            if effective_nonempty < int(cfg.min_nonempty_subcells):
-                out_cells.append(cell)
-                continue
+                # Count leading structural blanks toward acceptance.
+                effective_nonempty = int(nonempty) + int(first_meaningful)
+                if effective_nonempty < int(cfg.min_nonempty_subcells):
+                    out_cells.append(cell)
+                    continue
 
             table_debug["splits_applied"] = int(table_debug["splits_applied"]) + 1
             table_debug["spanning_cells_split"] = int(table_debug["spanning_cells_split"]) + 1

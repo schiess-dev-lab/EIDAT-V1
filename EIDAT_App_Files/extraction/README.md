@@ -148,6 +148,8 @@ Environment variables:
 - `EIDAT_TESS_LANG` - Tesseract language (default: `eng`)
 - `EIDAT_TESS_PSM` - Tesseract PSM mode (default: `6`)
 - `EIDAT_TABLE_CELL_PREFIX_CLEAN` - Strip leading table-border OCR artifacts in cell text (default: `1`)
+- `EIDAT_TABLE_CELL_SPLIT_ALLOW_BLANK_SUBCELLS` - Allow split recovery to keep blank created subcells for debugging/inspection (default: `0`)
+- `EIDAT_TABLE_CELL_SPLIT_REQUIRE_ALL_SUBCELLS_MEANINGFUL` - Reject any split that creates a blank subcell; takes precedence over `...ALLOW_BLANK_SUBCELLS` (default: `0`)
 
 ## Performance
 
