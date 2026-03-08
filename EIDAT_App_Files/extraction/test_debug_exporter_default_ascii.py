@@ -1,7 +1,9 @@
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 # Allow `import extraction.*` when running from repo root.
@@ -104,6 +106,62 @@ class TestDebugExporterDefaultAscii(unittest.TestCase):
         self.assertIn("[Timed-Out Table Salvage]", combined)
         self.assertIn("[Table 1]", combined)
         self.assertIn("| A |", combined)
+
+    def test_combined_text_uses_default_ascii_after_vline_split(self) -> None:
+        old_env = {
+            "EIDAT_TABLE_SPLIT_MODE": os.environ.get("EIDAT_TABLE_SPLIT_MODE"),
+            "EIDAT_COMBINED_TABLE_SPLIT_MODE": os.environ.get("EIDAT_COMBINED_TABLE_SPLIT_MODE"),
+        }
+        try:
+            os.environ["EIDAT_TABLE_SPLIT_MODE"] = "replica"
+            os.environ["EIDAT_COMBINED_TABLE_SPLIT_MODE"] = "vline"
+
+            table = {
+                "bbox_px": [0.0, 10.0, 200.0, 80.0],
+                "cells": [
+                    {"row": 0, "col": 0, "text": "A", "bbox_px": [0.0, 10.0, 100.0, 30.0]},
+                    {"row": 0, "col": 2, "text": "C", "bbox_px": [100.0, 10.0, 200.0, 30.0]},
+                    {"row": 2, "col": 0, "text": "1", "bbox_px": [0.0, 50.0, 100.0, 80.0]},
+                    {"row": 2, "col": 2, "text": "3", "bbox_px": [100.0, 50.0, 200.0, 80.0]},
+                ],
+                "borderless": False,
+            }
+
+            with tempfile.TemporaryDirectory() as tmp:
+                out_dir = Path(tmp)
+                with mock.patch(
+                    "extraction.debug_exporter._split_table_on_vline_mismatch_for_display",
+                    return_value=[table],
+                ):
+                    output_path = debug_exporter.export_combined_text(
+                        Path("dummy.pdf"),
+                        [
+                            {
+                                "page": 1,
+                                "tokens": [],
+                                "tables": [table],
+                                "charts": [],
+                                "flow": {"body_tokens": [], "table_titles": []},
+                                "dpi": 900,
+                                "ocr_dpi": 450,
+                            }
+                        ],
+                        out_dir,
+                    )
+
+                combined = output_path.read_text(encoding="utf-8")
+
+            rows = _pipe_rows(combined)
+            self.assertEqual(len(rows), 3, msg=f"Blank structural row was dropped:\n{combined}")
+            self.assertEqual(rows[0], ["A", "", "C"], msg=f"Blank structural column was dropped:\n{combined}")
+            self.assertEqual(rows[1], ["", "", ""], msg=f"Blank structural row missing:\n{combined}")
+            self.assertEqual(rows[2], ["1", "", "3"], msg=f"Blank structural column was dropped:\n{combined}")
+        finally:
+            for k, v in old_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
 
 
 if __name__ == "__main__":

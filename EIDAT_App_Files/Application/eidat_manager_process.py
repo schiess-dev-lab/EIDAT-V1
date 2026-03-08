@@ -508,12 +508,12 @@ def _process_debug_method_page(
             variant_rows_all = list(fused_result.get("variant_rows_all") or [])
 
             split_mode = str(os.environ.get("EIDAT_TABLE_SPLIT_MODE", "vline") or "vline").strip().lower()
-            ascii_mode = "replica" if split_mode in ("replica", "snap", "grid") else "default"
             combined_split_mode = str(
                 os.environ.get("EIDAT_COMBINED_TABLE_SPLIT_MODE", "inherit") or "inherit"
             ).strip().lower()
             if combined_split_mode in ("inherit", "same"):
                 combined_split_mode = split_mode
+            combined_ascii_mode = "default"
             enable_combined_vline_split = combined_split_mode in ("vline", "default", "on", "true", "1", "yes")
             try:
                 combined_vline_tol_px = float(
@@ -671,7 +671,7 @@ def _process_debug_method_page(
                 "version": 1,
                 "variant_count": int(len(variants_meta)),
                 "variants": variants_meta,
-                "ascii_mode": str(ascii_mode),
+                "ascii_mode": str(combined_ascii_mode),
                 "tables": out_tables,
             }
             (page_dir / "table_variant_candidates.json").write_text(json.dumps(sidecar, indent=2), encoding="utf-8")

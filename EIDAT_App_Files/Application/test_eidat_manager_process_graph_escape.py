@@ -2,6 +2,7 @@ import os
 import sys
 import tempfile
 import unittest
+import json
 from contextlib import ExitStack
 from pathlib import Path
 from unittest import mock
@@ -371,6 +372,74 @@ class TestEidatManagerProcessGraphEscape(unittest.TestCase):
         self.assertTrue(pages[0].get("timeout"))
         self.assertEqual(pages[1].get("page"), 2)
         self.assertEqual(pages[1].get("flow"), {"body_tokens": [{"text": "ok"}]})
+
+    def test_variant_candidate_sidecar_uses_default_ascii_for_combined_mapping(self) -> None:
+        try:
+            import numpy as np
+        except Exception:
+            self.skipTest("numpy not available")
+
+        import eidat_manager_process as proc
+
+        os.environ["EIDAT_TABLE_SPLIT_MODE"] = "replica"
+        os.environ["EIDAT_COMBINED_TABLE_SPLIT_MODE"] = "vline"
+
+        table = {
+            "bbox_px": [0.0, 0.0, 120.0, 60.0],
+            "cells": [
+                {"row": 0, "col": 0, "text": "A", "bbox_px": [0.0, 0.0, 60.0, 20.0]},
+                {"row": 0, "col": 2, "text": "C", "bbox_px": [60.0, 0.0, 120.0, 20.0]},
+                {"row": 2, "col": 0, "text": "1", "bbox_px": [0.0, 40.0, 60.0, 60.0]},
+                {"row": 2, "col": 2, "text": "3", "bbox_px": [60.0, 40.0, 120.0, 60.0]},
+            ],
+            "borderless": False,
+        }
+        variant_table = {
+            "rows": [
+                ["A", "", "C"],
+                ["", "", ""],
+                ["1", "", "3"],
+            ]
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            page_dir = Path(tmp) / "page_1"
+            self._write_page_png(page_dir / "page_1.png")
+            settings = self._base_settings()
+            tokens = [{"text": "Voltage", "x0": 1.0, "y0": 1.0, "x1": 10.0, "y1": 8.0}]
+            flow = {"body_tokens": tokens, "table_titles": []}
+
+            with (
+                mock.patch("extraction.graph_page_guard.find_chart_like_regions", return_value={"regions": [], "stats": {}}),
+                mock.patch(
+                    "debug_method.run_table_variants._run_for_input",
+                    return_value={
+                        "tables": [table],
+                        "warnings": [],
+                        "detection_dpi": 900,
+                        "detection_size": {"w": 60, "h": 60},
+                        "variants": [{"name": "majority"}],
+                        "variant_rows_all": [[variant_table]],
+                    },
+                ),
+                mock.patch(
+                    "extraction.debug_exporter._split_table_on_vline_mismatch_for_display",
+                    return_value=[table],
+                ),
+                mock.patch("extraction.ocr_engine.get_tesseract_lang", return_value="eng"),
+                mock.patch("extraction.ocr_engine.ocr_page", return_value=(tokens, 60, 60, None)),
+                mock.patch("extraction.ocr_engine.render_pdf_page", return_value=(np.zeros((60, 60), dtype=np.uint8), 60, 60)),
+                mock.patch("extraction.ocr_engine.reocr_low_confidence_tokens", side_effect=lambda *args, **kwargs: tokens),
+                mock.patch("extraction.token_projector.scale_tokens_to_dpi", side_effect=lambda toks, *_args, **_kwargs: toks),
+                mock.patch("extraction.page_analyzer.extract_flow_text", return_value=flow),
+                mock.patch("extraction.chart_detection.detect_charts", return_value=[]),
+                mock.patch("extraction.debug_exporter.export_page_debug"),
+            ):
+                proc._process_debug_method_page(Path("dummy.pdf"), 1, page_dir, settings)
+
+            sidecar = json.loads((page_dir / "table_variant_candidates.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(sidecar.get("ascii_mode"), "default")
 
 
 if __name__ == "__main__":

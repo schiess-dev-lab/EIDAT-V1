@@ -1318,12 +1318,12 @@ def export_combined_text(pdf_path: Path, pages_data: List[Dict],
 
     combined_text = []
     split_mode = str(os.environ.get("EIDAT_TABLE_SPLIT_MODE", "vline") or "vline").strip().lower()
-    ascii_mode = "replica" if split_mode in ("replica", "snap", "grid") else "default"
     combined_split_mode = str(
         os.environ.get("EIDAT_COMBINED_TABLE_SPLIT_MODE", "inherit") or "inherit"
     ).strip().lower()
     if combined_split_mode in ("inherit", "same"):
         combined_split_mode = split_mode
+    combined_ascii_mode = "default"
     enable_combined_vline_split = combined_split_mode in ("vline", "default", "on", "true", "1", "yes")
     try:
         combined_vline_tol_px = float(
@@ -1501,7 +1501,7 @@ def export_combined_text(pdf_path: Path, pages_data: List[Dict],
                     table_counter += 1
                     combined_text.append(f"\n[Table {table_counter}]\n")
                     table_obj = art.get("table") or {}
-                    table_ascii = _render_table_ascii(table_obj, mode=ascii_mode)
+                    table_ascii = _render_table_ascii(table_obj, mode=combined_ascii_mode)
                     if table_ascii:
                         combined_text.append(table_ascii)
                         combined_text.append("\n")
