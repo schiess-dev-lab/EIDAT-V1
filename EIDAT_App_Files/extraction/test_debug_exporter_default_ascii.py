@@ -25,6 +25,28 @@ def _pipe_rows(ascii_table: str) -> list[list[str]]:
     return rows
 
 
+def _table_blocks(combined_text: str) -> list[str]:
+    blocks: list[str] = []
+    current: list[str] | None = None
+    for ln in str(combined_text or "").splitlines():
+        if ln.startswith("[Table ") and ln.endswith("]"):
+            if current:
+                blocks.append("\n".join(current))
+            current = []
+            continue
+        if current is None:
+            continue
+        if not ln.strip():
+            if current:
+                blocks.append("\n".join(current))
+                current = None
+            continue
+        current.append(ln)
+    if current:
+        blocks.append("\n".join(current))
+    return blocks
+
+
 class TestDebugExporterDefaultAscii(unittest.TestCase):
     def test_default_ascii_respects_true_column_indices(self) -> None:
         table = {
@@ -156,6 +178,73 @@ class TestDebugExporterDefaultAscii(unittest.TestCase):
             self.assertEqual(rows[0], ["A", "", "C"], msg=f"Blank structural column was dropped:\n{combined}")
             self.assertEqual(rows[1], ["", "", ""], msg=f"Blank structural row missing:\n{combined}")
             self.assertEqual(rows[2], ["1", "", "3"], msg=f"Blank structural column was dropped:\n{combined}")
+        finally:
+            for k, v in old_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    def test_combined_text_rebases_split_parts_to_local_indices(self) -> None:
+        old_env = {
+            "EIDAT_TABLE_SPLIT_MODE": os.environ.get("EIDAT_TABLE_SPLIT_MODE"),
+            "EIDAT_COMBINED_TABLE_SPLIT_MODE": os.environ.get("EIDAT_COMBINED_TABLE_SPLIT_MODE"),
+        }
+        try:
+            os.environ["EIDAT_TABLE_SPLIT_MODE"] = "replica"
+            os.environ["EIDAT_COMBINED_TABLE_SPLIT_MODE"] = "vline"
+
+            split_parts = [
+                {
+                    "bbox_px": [0.0, 10.0, 100.0, 40.0],
+                    "cells": [
+                        {"row": 0, "col": 0, "text": "A", "bbox_px": [0.0, 10.0, 50.0, 25.0]},
+                        {"row": 0, "col": 1, "text": "B", "bbox_px": [50.0, 10.0, 100.0, 25.0]},
+                        {"row": 1, "col": 0, "text": "1", "bbox_px": [0.0, 25.0, 50.0, 40.0]},
+                        {"row": 1, "col": 1, "text": "2", "bbox_px": [50.0, 25.0, 100.0, 40.0]},
+                    ],
+                    "borderless": False,
+                },
+                {
+                    "bbox_px": [0.0, 60.0, 150.0, 105.0],
+                    "cells": [
+                        {"row": 5, "col": 3, "text": "X", "bbox_px": [0.0, 60.0, 75.0, 75.0]},
+                        {"row": 5, "col": 4, "text": "Y", "bbox_px": [75.0, 60.0, 150.0, 75.0]},
+                        {"row": 6, "col": 3, "text": "7", "bbox_px": [0.0, 75.0, 75.0, 90.0]},
+                        {"row": 6, "col": 4, "text": "8", "bbox_px": [75.0, 75.0, 150.0, 90.0]},
+                    ],
+                    "borderless": False,
+                },
+            ]
+
+            with tempfile.TemporaryDirectory() as tmp:
+                out_dir = Path(tmp)
+                with mock.patch(
+                    "extraction.debug_exporter._split_table_on_vline_mismatch_for_display",
+                    return_value=split_parts,
+                ):
+                    output_path = debug_exporter.export_combined_text(
+                        Path("dummy.pdf"),
+                        [
+                            {
+                                "page": 1,
+                                "tokens": [],
+                                "tables": [split_parts[0]],
+                                "charts": [],
+                                "flow": {"body_tokens": [], "table_titles": []},
+                                "dpi": 900,
+                                "ocr_dpi": 450,
+                            }
+                        ],
+                        out_dir,
+                    )
+
+                combined = output_path.read_text(encoding="utf-8")
+
+            blocks = _table_blocks(combined)
+            self.assertEqual(len(blocks), 2, msg=f"Expected two distinct table blocks:\n{combined}")
+            self.assertEqual(_pipe_rows(blocks[0]), [["A", "B"], ["1", "2"]], msg=f"Unexpected first split table:\n{blocks[0]}")
+            self.assertEqual(_pipe_rows(blocks[1]), [["X", "Y"], ["7", "8"]], msg=f"Second split table was not rebased locally:\n{blocks[1]}")
         finally:
             for k, v in old_env.items():
                 if v is None:

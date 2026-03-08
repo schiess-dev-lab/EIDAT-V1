@@ -1166,6 +1166,50 @@ def _split_table_on_vline_mismatch_for_display(
     return out or [table]
 
 
+def _rebase_table_indices_for_ascii(table: Dict) -> Dict:
+    """
+    Rebase a split table's row/col indices to a local origin for default ASCII rendering.
+
+    This preserves any structural gaps inside the split segment while avoiding huge sparse
+    tables when a later segment keeps source-table row/col ids.
+    """
+    cells = table.get("cells") or []
+    if not isinstance(cells, list) or not cells:
+        return table
+
+    rows: list[int] = []
+    cols: list[int] = []
+    for cell in cells:
+        try:
+            rows.append(int(cell.get("row")))
+            cols.append(int(cell.get("col")))
+        except Exception:
+            continue
+    if not rows or not cols:
+        return table
+
+    row0 = min(rows)
+    col0 = min(cols)
+    if row0 == 0 and col0 == 0:
+        return table
+
+    out = dict(table)
+    out_cells: list[Dict] = []
+    for cell in cells:
+        try:
+            row = int(cell.get("row"))
+            col = int(cell.get("col"))
+        except Exception:
+            out_cells.append(dict(cell))
+            continue
+        new_cell = dict(cell)
+        new_cell["row"] = row - row0
+        new_cell["col"] = col - col0
+        out_cells.append(new_cell)
+    out["cells"] = out_cells
+    return out
+
+
 def export_combined_text(pdf_path: Path, pages_data: List[Dict],
                           output_dir: Path) -> Path:
     """
@@ -1501,7 +1545,10 @@ def export_combined_text(pdf_path: Path, pages_data: List[Dict],
                     table_counter += 1
                     combined_text.append(f"\n[Table {table_counter}]\n")
                     table_obj = art.get("table") or {}
-                    table_ascii = _render_table_ascii(table_obj, mode=combined_ascii_mode)
+                    table_ascii = _render_table_ascii(
+                        _rebase_table_indices_for_ascii(table_obj),
+                        mode=combined_ascii_mode,
+                    )
                     if table_ascii:
                         combined_text.append(table_ascii)
                         combined_text.append("\n")
