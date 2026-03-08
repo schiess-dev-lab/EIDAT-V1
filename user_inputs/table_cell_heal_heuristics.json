@@ -2,9 +2,9 @@
   "version": 1,
   "enabled": true,
   "prune": {
-    "enabled": true,
-    "drop_empty_rows": true,
-    "drop_empty_cols": true,
+    "enabled": false,
+    "drop_empty_rows": false,
+    "drop_empty_cols": false,
     "max_empty_col_width": 5
   },
   "spacing": {

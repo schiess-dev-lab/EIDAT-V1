@@ -4,7 +4,7 @@ Combined.txt table cell healer (post-processing).
 Operates on bordered ASCII tables inside a finished combined.txt.
 
 Pipeline (per table):
-  0) Prune: drop fully-empty narrow columns + fully-empty rows
+  0) Optional prune: drop fully-empty narrow columns + fully-empty rows
   1) Spacing heuristic: fix common glued tokens (e.g., "1 to4" -> "1 to 4")
   2) Numeric healing: use header roles + above/below reference in numeric columns
 
@@ -74,9 +74,9 @@ _DEFAULT_CFG: dict[str, Any] = {
     "version": 1,
     "enabled": True,
     "prune": {
-        "enabled": True,
-        "drop_empty_rows": True,
-        "drop_empty_cols": True,
+        "enabled": False,
+        "drop_empty_rows": False,
+        "drop_empty_cols": False,
         "max_empty_col_width": 5,
     },
     "spacing": {
