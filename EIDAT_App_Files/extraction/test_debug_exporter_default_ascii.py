@@ -252,6 +252,61 @@ class TestDebugExporterDefaultAscii(unittest.TestCase):
                 else:
                     os.environ[k] = v
 
+    def test_combined_text_collapses_multiple_artifact_empty_columns(self) -> None:
+        old_env = {
+            "EIDAT_TABLE_SPLIT_MODE": os.environ.get("EIDAT_TABLE_SPLIT_MODE"),
+            "EIDAT_COMBINED_TABLE_SPLIT_MODE": os.environ.get("EIDAT_COMBINED_TABLE_SPLIT_MODE"),
+        }
+        try:
+            os.environ["EIDAT_TABLE_SPLIT_MODE"] = "replica"
+            os.environ["EIDAT_COMBINED_TABLE_SPLIT_MODE"] = "vline"
+
+            table = {
+                "bbox_px": [0.0, 0.0, 250.0, 60.0],
+                "cells": [
+                    {"row": 0, "col": 0, "text": "Item", "bbox_px": [0.0, 0.0, 80.0, 20.0]},
+                    {"row": 0, "col": 2, "text": "Value", "bbox_px": [80.0, 0.0, 160.0, 20.0]},
+                    {"row": 0, "col": 4, "text": "Date", "bbox_px": [160.0, 0.0, 250.0, 20.0]},
+                    {"row": 1, "col": 0, "text": "Gage", "bbox_px": [0.0, 20.0, 80.0, 40.0]},
+                    {"row": 1, "col": 2, "text": "1804461", "bbox_px": [80.0, 20.0, 160.0, 40.0]},
+                    {"row": 1, "col": 4, "text": "7/30/25", "bbox_px": [160.0, 20.0, 250.0, 40.0]},
+                ],
+                "borderless": False,
+            }
+
+            with tempfile.TemporaryDirectory() as tmp:
+                out_dir = Path(tmp)
+                output_path = debug_exporter.export_combined_text(
+                    Path("dummy.pdf"),
+                    [
+                        {
+                            "page": 1,
+                            "tokens": [],
+                            "tables": [table],
+                            "charts": [],
+                            "flow": {"body_tokens": [], "table_titles": []},
+                            "dpi": 900,
+                            "ocr_dpi": 450,
+                        }
+                    ],
+                    out_dir,
+                )
+                combined = output_path.read_text(encoding="utf-8")
+
+            blocks = _table_blocks(combined)
+            self.assertEqual(len(blocks), 1, msg=f"Unexpected combined table count:\n{combined}")
+            self.assertEqual(
+                _pipe_rows(blocks[0]),
+                [["Item", "Value", "Date"], ["Gage", "1804461", "7/30/25"]],
+                msg=f"Artifact overlap columns were not collapsed:\n{blocks[0]}",
+            )
+        finally:
+            for k, v in old_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1210,6 +1210,92 @@ def _rebase_table_indices_for_ascii(table: Dict) -> Dict:
     return out
 
 
+def _collapse_artifact_empty_columns_for_ascii(table: Dict) -> Dict:
+    """
+    Collapse clearly spurious fully-empty columns introduced by fused-table overlap alignment.
+
+    Keep the existing behavior for isolated structural blank columns. Only collapse when a
+    table has multiple fully-empty interior columns, which matches the observed "blank column
+    between real columns" artifact from merged variants.
+    """
+    cells = table.get("cells") or []
+    if not isinstance(cells, list) or not cells:
+        return table
+
+    row_ids: set[int] = set()
+    col_ids: set[int] = set()
+    text_by_rc: dict[tuple[int, int], str] = {}
+    for cell in cells:
+        try:
+            r = int(cell.get("row"))
+            c = int(cell.get("col"))
+        except Exception:
+            continue
+        if r < 0 or c < 0:
+            continue
+        row_ids.add(r)
+        col_ids.add(c)
+        key = (r, c)
+        txt = str(cell.get("text", "") or "")
+        prev = text_by_rc.get(key)
+        if prev is None:
+            text_by_rc[key] = txt
+            continue
+        prev_s = str(prev).strip()
+        txt_s = str(txt).strip()
+        if not prev_s and txt_s:
+            text_by_rc[key] = txt
+            continue
+        if prev_s and txt_s and len(txt_s) > len(prev_s):
+            text_by_rc[key] = txt
+
+    if not row_ids or not col_ids:
+        return table
+
+    min_col = min(col_ids)
+    max_col = max(col_ids)
+    all_cols = list(range(min_col, max_col + 1))
+    empty_cols = [
+        c
+        for c in all_cols
+        if all(not str(text_by_rc.get((r, c), "") or "").strip() for r in row_ids)
+    ]
+    interior_empty_cols = [c for c in empty_cols if c > min_col and c < max_col]
+    if len(interior_empty_cols) < 2:
+        return table
+
+    keep_cols = [c for c in all_cols if c not in set(interior_empty_cols)]
+    if len(keep_cols) == len(all_cols) or not keep_cols:
+        return table
+
+    col_map = {old_c: new_c for new_c, old_c in enumerate(keep_cols)}
+    out = dict(table)
+    out_cells: list[Dict] = []
+    for cell in cells:
+        try:
+            old_c = int(cell.get("col"))
+        except Exception:
+            out_cells.append(dict(cell))
+            continue
+        if old_c not in col_map:
+            continue
+        new_cell = dict(cell)
+        new_cell["col"] = col_map[old_c]
+        out_cells.append(new_cell)
+    out["cells"] = out_cells
+
+    rows_obj = table.get("rows")
+    if isinstance(rows_obj, list) and rows_obj:
+        new_rows: list[list[str]] = []
+        for row in rows_obj:
+            if not isinstance(row, list):
+                new_rows.append(row)
+                continue
+            new_rows.append([str(row[c] or "") if c < len(row) else "" for c in keep_cols])
+        out["rows"] = new_rows
+    return out
+
+
 def export_combined_text(pdf_path: Path, pages_data: List[Dict],
                           output_dir: Path) -> Path:
     """
@@ -1545,8 +1631,11 @@ def export_combined_text(pdf_path: Path, pages_data: List[Dict],
                     table_counter += 1
                     combined_text.append(f"\n[Table {table_counter}]\n")
                     table_obj = art.get("table") or {}
+                    table_obj = _collapse_artifact_empty_columns_for_ascii(
+                        _rebase_table_indices_for_ascii(table_obj)
+                    )
                     table_ascii = _render_table_ascii(
-                        _rebase_table_indices_for_ascii(table_obj),
+                        table_obj,
                         mode=combined_ascii_mode,
                     )
                     if table_ascii:
