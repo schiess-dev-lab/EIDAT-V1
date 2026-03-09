@@ -307,6 +307,116 @@ class TestDebugExporterDefaultAscii(unittest.TestCase):
                 else:
                     os.environ[k] = v
 
+    def test_combined_text_splits_leading_single_cell_row(self) -> None:
+        old_env = {
+            "EIDAT_TABLE_SPLIT_MODE": os.environ.get("EIDAT_TABLE_SPLIT_MODE"),
+            "EIDAT_COMBINED_TABLE_SPLIT_MODE": os.environ.get("EIDAT_COMBINED_TABLE_SPLIT_MODE"),
+            "EIDAT_COMBINED_TABLE_SPLIT_SINGLE_CELL_SEPARATOR": os.environ.get(
+                "EIDAT_COMBINED_TABLE_SPLIT_SINGLE_CELL_SEPARATOR"
+            ),
+        }
+        try:
+            os.environ["EIDAT_TABLE_SPLIT_MODE"] = "replica"
+            os.environ["EIDAT_COMBINED_TABLE_SPLIT_MODE"] = "vline"
+            os.environ["EIDAT_COMBINED_TABLE_SPLIT_SINGLE_CELL_SEPARATOR"] = "1"
+
+            table = {
+                "bbox_px": [0.0, 0.0, 180.0, 60.0],
+                "cells": [
+                    {"row": 0, "col": 0, "text": "Header row", "bbox_px": [0.0, 0.0, 180.0, 20.0]},
+                    {"row": 1, "col": 0, "text": "A", "bbox_px": [0.0, 20.0, 90.0, 40.0]},
+                    {"row": 1, "col": 1, "text": "B", "bbox_px": [90.0, 20.0, 180.0, 40.0]},
+                    {"row": 2, "col": 0, "text": "1", "bbox_px": [0.0, 40.0, 90.0, 60.0]},
+                    {"row": 2, "col": 1, "text": "2", "bbox_px": [90.0, 40.0, 180.0, 60.0]},
+                ],
+                "borderless": False,
+            }
+
+            with tempfile.TemporaryDirectory() as tmp:
+                out_dir = Path(tmp)
+                output_path = debug_exporter.export_combined_text(
+                    Path("dummy.pdf"),
+                    [
+                        {
+                            "page": 1,
+                            "tokens": [],
+                            "tables": [table],
+                            "charts": [],
+                            "flow": {"body_tokens": [], "table_titles": []},
+                            "dpi": 900,
+                            "ocr_dpi": 450,
+                        }
+                    ],
+                    out_dir,
+                )
+                combined = output_path.read_text(encoding="utf-8")
+
+            blocks = _table_blocks(combined)
+            self.assertEqual(len(blocks), 2, msg=f"Leading single-cell row was not split:\n{combined}")
+            self.assertEqual(_pipe_rows(blocks[0]), [["Header row"]], msg=f"Unexpected leading single-cell block:\n{blocks[0]}")
+            self.assertEqual(_pipe_rows(blocks[1]), [["A", "B"], ["1", "2"]], msg=f"Unexpected trailing table block:\n{blocks[1]}")
+        finally:
+            for k, v in old_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    def test_combined_text_splits_trailing_single_cell_row(self) -> None:
+        old_env = {
+            "EIDAT_TABLE_SPLIT_MODE": os.environ.get("EIDAT_TABLE_SPLIT_MODE"),
+            "EIDAT_COMBINED_TABLE_SPLIT_MODE": os.environ.get("EIDAT_COMBINED_TABLE_SPLIT_MODE"),
+            "EIDAT_COMBINED_TABLE_SPLIT_SINGLE_CELL_SEPARATOR": os.environ.get(
+                "EIDAT_COMBINED_TABLE_SPLIT_SINGLE_CELL_SEPARATOR"
+            ),
+        }
+        try:
+            os.environ["EIDAT_TABLE_SPLIT_MODE"] = "replica"
+            os.environ["EIDAT_COMBINED_TABLE_SPLIT_MODE"] = "vline"
+            os.environ["EIDAT_COMBINED_TABLE_SPLIT_SINGLE_CELL_SEPARATOR"] = "1"
+
+            table = {
+                "bbox_px": [0.0, 0.0, 180.0, 60.0],
+                "cells": [
+                    {"row": 0, "col": 0, "text": "A", "bbox_px": [0.0, 0.0, 90.0, 20.0]},
+                    {"row": 0, "col": 1, "text": "B", "bbox_px": [90.0, 0.0, 180.0, 20.0]},
+                    {"row": 1, "col": 0, "text": "1", "bbox_px": [0.0, 20.0, 90.0, 40.0]},
+                    {"row": 1, "col": 1, "text": "2", "bbox_px": [90.0, 20.0, 180.0, 40.0]},
+                    {"row": 2, "col": 0, "text": "Footer row", "bbox_px": [0.0, 40.0, 180.0, 60.0]},
+                ],
+                "borderless": False,
+            }
+
+            with tempfile.TemporaryDirectory() as tmp:
+                out_dir = Path(tmp)
+                output_path = debug_exporter.export_combined_text(
+                    Path("dummy.pdf"),
+                    [
+                        {
+                            "page": 1,
+                            "tokens": [],
+                            "tables": [table],
+                            "charts": [],
+                            "flow": {"body_tokens": [], "table_titles": []},
+                            "dpi": 900,
+                            "ocr_dpi": 450,
+                        }
+                    ],
+                    out_dir,
+                )
+                combined = output_path.read_text(encoding="utf-8")
+
+            blocks = _table_blocks(combined)
+            self.assertEqual(len(blocks), 2, msg=f"Trailing single-cell row was not split:\n{combined}")
+            self.assertEqual(_pipe_rows(blocks[0]), [["A", "B"], ["1", "2"]], msg=f"Unexpected leading table block:\n{blocks[0]}")
+            self.assertEqual(_pipe_rows(blocks[1]), [["Footer row"]], msg=f"Unexpected trailing single-cell block:\n{blocks[1]}")
+        finally:
+            for k, v in old_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
 
 if __name__ == "__main__":
     unittest.main()

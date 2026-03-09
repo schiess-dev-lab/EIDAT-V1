@@ -1082,8 +1082,7 @@ def _split_table_on_vline_mismatch_for_display(
         if (
             enable_single_cell_separator
             and len(row) <= 1
-            and prefix_has_multi[i]
-            and suffix_has_multi[i]
+            and (prefix_has_multi[i] or suffix_has_multi[i])
         ):
             is_sep = True
             if sep_max_h_ratio > 0 and median_multi_row_h > 0:
