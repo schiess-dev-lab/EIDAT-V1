@@ -2302,6 +2302,7 @@ EIDAT_PROJECT_TYPE_TRENDING = "EIDP Trending"
 EIDAT_PROJECT_TYPE_RAW_TRENDING = "EIDP Raw File Trending"
 EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING = "Test Data Trending"
 EIDAT_PROJECT_IMPLEMENTATION_DB = "implementation_trending.sqlite3"
+TD_SUPPORT_WORKBOOK_SUFFIX = ".support.xlsx"
 GLOBAL_RUN_MIRROR_DIRNAME = "global_run_mirror"
 LOCAL_PROJECTS_MIRROR_DIRNAME = "projects"
 PROJECT_UPDATE_DEBUG_JSON = "update_debug.json"
@@ -3029,6 +3030,306 @@ def _read_test_data_data_definitions(workbook_path: Path) -> list[dict]:
             pass
 
 
+def td_support_workbook_path_for(workbook_path: Path, *, project_dir: Path | None = None) -> Path:
+    wb_path = Path(workbook_path).expanduser()
+    proj_dir = Path(project_dir).expanduser() if project_dir is not None else wb_path.parent
+    try:
+        pj = proj_dir / EIDAT_PROJECT_META
+        if pj.exists():
+            raw = json.loads(pj.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                val = str(raw.get("support_workbook") or "").strip()
+                if val:
+                    p = Path(val).expanduser()
+                    if not p.is_absolute():
+                        p = proj_dir / p
+                    return p
+    except Exception:
+        pass
+    stem = wb_path.stem or "td_project"
+    return proj_dir / f"{stem}{TD_SUPPORT_WORKBOOK_SUFFIX}"
+
+
+def _discover_td_runs_for_docs(global_repo: Path | None, docs: list[dict] | None) -> list[str]:
+    repo = Path(global_repo).expanduser() if global_repo is not None else None
+    runs: list[str] = []
+    seen_runs: set[str] = set()
+    for d in (docs or []):
+        raw = str((d or {}).get("excel_sqlite_rel") or "").strip()
+        if not raw:
+            continue
+        p = Path(raw).expanduser()
+        if not p.is_absolute() and repo is not None:
+            p = repo / p
+        if not p.exists() or not p.is_file():
+            continue
+        try:
+            with sqlite3.connect(str(p)) as conn:
+                rows = conn.execute("SELECT sheet_name FROM __sheet_info ORDER BY sheet_name").fetchall()
+        except Exception:
+            try:
+                with sqlite3.connect(str(p)) as conn:
+                    rows = conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'sheet__%' ORDER BY name"
+                    ).fetchall()
+                rows = [(str(r[0] or "")[7:],) for r in rows if str(r[0] or "").startswith("sheet__")]
+            except Exception:
+                rows = []
+        for row in rows:
+            rn = str(row[0] or "").strip()
+            key = rn.lower()
+            if not rn or key in seen_runs:
+                continue
+            seen_runs.add(key)
+            runs.append(rn)
+    return runs
+
+
+def _write_td_support_workbook(
+    path: Path,
+    *,
+    sequence_names: list[str],
+    param_defs: list[dict],
+) -> None:
+    try:
+        from openpyxl import Workbook  # type: ignore
+    except Exception as exc:
+        raise RuntimeError(
+            "openpyxl is required to create the TD support workbook. "
+            "Install it with `py -m pip install openpyxl` within the project environment."
+        ) from exc
+
+    wb = Workbook()
+    ws_settings = wb.active
+    ws_settings.title = "Settings"
+    ws_settings.append(["key", "value"])
+    ws_settings.append(["exclude_first_n_default", ""])
+    ws_settings.append(["last_n_rows_default", ""])
+
+    ws_seq = wb.create_sheet("Sequences")
+    ws_seq.append(
+        [
+            "sequence_name",
+            "source_run_name",
+            "feed_pressure",
+            "pulse_width_on",
+            "exclude_first_n",
+            "last_n_rows",
+            "enabled",
+        ]
+    )
+    seen_seq: set[str] = set()
+    for seq_name in sequence_names:
+        name = str(seq_name or "").strip()
+        if not name or name.lower() in seen_seq:
+            continue
+        seen_seq.add(name.lower())
+        ws_seq.append([name, name, "", "", "", "", True])
+
+    ws_bounds = wb.create_sheet("ParameterBounds")
+    ws_bounds.append(["sequence_name", "parameter_name", "units", "min_value", "max_value", "enabled"])
+    rows_seen: set[tuple[str, str]] = set()
+    for seq_name in sequence_names:
+        sname = str(seq_name or "").strip()
+        if not sname:
+            continue
+        for param in param_defs:
+            if not isinstance(param, dict):
+                continue
+            pname = str(param.get("name") or "").strip()
+            if not pname:
+                continue
+            key = (sname.lower(), pname.lower())
+            if key in rows_seen:
+                continue
+            rows_seen.add(key)
+            ws_bounds.append([sname, pname, str(param.get("units") or "").strip(), "", "", True])
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(str(path))
+    try:
+        wb.close()
+    except Exception:
+        pass
+
+
+def _to_support_int(v: object) -> int | None:
+    if v is None or isinstance(v, bool):
+        return None
+    txt = str(v).strip()
+    if not txt:
+        return None
+    try:
+        return max(0, int(float(txt)))
+    except Exception:
+        return None
+
+
+def _normalize_support_scalar(v: object) -> object | None:
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return str(v).strip().lower()
+    if isinstance(v, (int, float)):
+        f = float(v)
+        if not math.isfinite(f):
+            return None
+        if abs(f - round(f)) < 1e-9:
+            return int(round(f))
+        return float(f)
+    txt = str(v).strip()
+    if not txt:
+        return None
+    try:
+        f = float(txt.replace(",", ""))
+        if math.isfinite(f):
+            if abs(f - round(f)) < 1e-9:
+                return int(round(f))
+            return float(f)
+    except Exception:
+        pass
+    return txt.strip().lower()
+
+
+def _support_values_equal(lhs: object | None, rhs: object | None) -> bool:
+    a = _normalize_support_scalar(lhs)
+    b = _normalize_support_scalar(rhs)
+    if a is None or b is None:
+        return False
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        return abs(float(a) - float(b)) <= 1e-9
+    return str(a).strip().lower() == str(b).strip().lower()
+
+
+def _td_finite_float(v: object) -> float | None:
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        f = float(v)
+    else:
+        t = str(v).strip().replace(",", "")
+        if not t:
+            return None
+        try:
+            f = float(t)
+        except Exception:
+            return None
+    if math.isfinite(f):
+        return f
+    return None
+
+
+def _td_bool(v: object, default: bool = True) -> bool:
+    if v is None:
+        return bool(default)
+    if isinstance(v, bool):
+        return bool(v)
+    txt = str(v).strip().lower()
+    if not txt:
+        return bool(default)
+    if txt in {"1", "true", "yes", "y", "on"}:
+        return True
+    if txt in {"0", "false", "no", "n", "off"}:
+        return False
+    return bool(default)
+
+
+def _read_td_support_workbook(workbook_path: Path, *, project_dir: Path | None = None) -> dict:
+    try:
+        from openpyxl import load_workbook  # type: ignore
+    except Exception as exc:
+        raise RuntimeError(
+            "openpyxl is required to read the TD support workbook. "
+            "Install it with `py -m pip install openpyxl` within the project environment."
+        ) from exc
+
+    support_path = td_support_workbook_path_for(workbook_path, project_dir=project_dir)
+    if not support_path.exists():
+        return {"path": str(support_path), "exists": False, "settings": {}, "sequences": [], "bounds_by_sequence": {}}
+
+    wb = load_workbook(str(support_path), read_only=True, data_only=True)
+    try:
+        settings: dict[str, int] = {}
+        if "Settings" in wb.sheetnames:
+            ws = wb["Settings"]
+            for row in range(2, (ws.max_row or 0) + 1):
+                key = str(ws.cell(row, 1).value or "").strip()
+                if not key:
+                    continue
+                val = _to_support_int(ws.cell(row, 2).value)
+                if val is not None:
+                    settings[key] = val
+
+        sequences: list[dict] = []
+        if "Sequences" in wb.sheetnames:
+            ws = wb["Sequences"]
+            headers: dict[str, int] = {}
+            for col in range(1, (ws.max_column or 0) + 1):
+                key = str(ws.cell(1, col).value or "").strip().lower()
+                if key:
+                    headers[key] = col
+            for row in range(2, (ws.max_row or 0) + 1):
+                seq_name = str(ws.cell(row, headers.get("sequence_name", 1)).value or "").strip()
+                source_run = str(ws.cell(row, headers.get("source_run_name", 2)).value or "").strip()
+                if not seq_name and not source_run:
+                    continue
+                enabled_raw = ws.cell(row, headers.get("enabled", 7)).value if headers.get("enabled") else True
+                enabled = True
+                if enabled_raw is not None and str(enabled_raw).strip() != "":
+                    enabled = _td_bool(enabled_raw, True)
+                sequence_name = seq_name or source_run
+                sequences.append(
+                    {
+                        "sequence_name": sequence_name,
+                        "source_run_name": source_run or sequence_name,
+                        "feed_pressure": ws.cell(row, headers.get("feed_pressure", 3)).value if headers.get("feed_pressure") else None,
+                        "pulse_width_on": ws.cell(row, headers.get("pulse_width_on", 4)).value if headers.get("pulse_width_on") else None,
+                        "exclude_first_n": _to_support_int(ws.cell(row, headers.get("exclude_first_n", 5)).value if headers.get("exclude_first_n") else None),
+                        "last_n_rows": _to_support_int(ws.cell(row, headers.get("last_n_rows", 6)).value if headers.get("last_n_rows") else None),
+                        "enabled": bool(enabled),
+                    }
+                )
+
+        bounds_by_sequence: dict[str, dict[str, dict]] = {}
+        if "ParameterBounds" in wb.sheetnames:
+            ws = wb["ParameterBounds"]
+            headers: dict[str, int] = {}
+            for col in range(1, (ws.max_column or 0) + 1):
+                key = str(ws.cell(1, col).value or "").strip().lower()
+                if key:
+                    headers[key] = col
+            for row in range(2, (ws.max_row or 0) + 1):
+                seq_name = str(ws.cell(row, headers.get("sequence_name", 1)).value or "").strip()
+                pname = str(ws.cell(row, headers.get("parameter_name", 2)).value or "").strip()
+                if not seq_name or not pname:
+                    continue
+                enabled_raw = ws.cell(row, headers.get("enabled", 6)).value if headers.get("enabled") else True
+                enabled = True
+                if enabled_raw is not None and str(enabled_raw).strip() != "":
+                    enabled = _td_bool(enabled_raw, True)
+                bounds_by_sequence.setdefault(seq_name, {})[pname] = {
+                    "sequence_name": seq_name,
+                    "parameter_name": pname,
+                    "units": str(ws.cell(row, headers.get("units", 3)).value or "").strip(),
+                    "min_value": _td_finite_float(ws.cell(row, headers.get("min_value", 4)).value if headers.get("min_value") else None),
+                    "max_value": _td_finite_float(ws.cell(row, headers.get("max_value", 5)).value if headers.get("max_value") else None),
+                    "enabled": bool(enabled),
+                }
+
+        return {
+            "path": str(support_path),
+            "exists": True,
+            "settings": settings,
+            "sequences": sequences,
+            "bounds_by_sequence": bounds_by_sequence,
+        }
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
+
+
 def _read_test_data_run_labeling(workbook_path: Path) -> dict | None:
     """
     Read optional `td_run_labeling` JSON from the Test Data Trending workbook's Config sheet.
@@ -3152,6 +3453,11 @@ def ensure_test_data_project_cache(
             cached_ignore_first_n = int(str(row[0]).strip()) if row and row[0] is not None else 0
         except Exception:
             cached_ignore_first_n = 0
+        try:
+            row = conn.execute("SELECT value FROM td_meta WHERE key='support_workbook_mtime_ns' LIMIT 1").fetchone()
+            cached_support_mtime_ns = int(str(row[0]).strip()) if row and row[0] is not None else 0
+        except Exception:
+            cached_support_mtime_ns = 0
 
     current_ignore_first_n = 0
     try:
@@ -3159,6 +3465,15 @@ def ensure_test_data_project_cache(
     except Exception:
         current_ignore_first_n = 0
     current_ignore_first_n = max(0, int(current_ignore_first_n))
+
+    support_mtime_ns = 0
+    try:
+        support_path = td_support_workbook_path_for(wb_path, project_dir=proj_dir)
+        if support_path.exists():
+            st = support_path.stat()
+            support_mtime_ns = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)))
+    except Exception:
+        support_mtime_ns = 0
 
     # If we have no curves at all, treat as stale.
     if curve_count == 0 and expected:
@@ -3186,6 +3501,9 @@ def ensure_test_data_project_cache(
 
     # If the stats selection or ignore-first config changed, rebuild so td_metrics are consistent.
     if int(cached_ignore_first_n) != int(current_ignore_first_n) or cached_stats_csv != current_stats_csv:
+        rebuild_test_data_project_cache(db_path, wb_path)
+        return db_path
+    if int(cached_support_mtime_ns) != int(support_mtime_ns):
         rebuild_test_data_project_cache(db_path, wb_path)
         return db_path
 
@@ -3291,6 +3609,15 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
     except Exception:
         stats_ignore_first_n = 0
     stats_ignore_first_n = max(0, int(stats_ignore_first_n))
+
+    support_cfg = _read_td_support_workbook(wb_path, project_dir=db_path.parent)
+    support_settings = dict(support_cfg.get("settings") or {})
+    support_sequences = [dict(s) for s in (support_cfg.get("sequences") or []) if isinstance(s, dict) and bool(s.get("enabled", True))]
+    support_bounds_by_sequence = {
+        str(k): dict(v)
+        for k, v in (support_cfg.get("bounds_by_sequence") or {}).items()
+        if str(k).strip() and isinstance(v, dict)
+    }
 
     # Optional: run/sequence condition labeling (user-controlled via JSON stored in workbook Config).
     td_run_labeling = None
@@ -3667,6 +3994,137 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
                 pass
         return str(v).strip()
 
+    pressure_aliases = [
+        "feed pressure",
+        "feed_pressure",
+        "pressure",
+        "pc",
+    ]
+    pulse_on_aliases = [
+        "pulse width on",
+        "pulse_width_on",
+        "pulse width",
+        "pulse on",
+        "pulse_on",
+    ]
+
+    def _read_run_rows(src: sqlite3.Connection, table: str, *, cols: set[str], order_by: str) -> list[dict]:
+        q_table = _quote_ident(table)
+        q_cols = ", ".join(_quote_ident(c) for c in cols)
+        try:
+            cursor = src.execute(f"SELECT {q_cols} FROM {q_table} ORDER BY {order_by}")
+            names = [str(d[0] or "") for d in (cursor.description or [])]
+            rows = cursor.fetchall()
+        except Exception:
+            return []
+        out: list[dict] = []
+        for row in rows:
+            item = {names[i]: row[i] for i in range(min(len(names), len(row)))}
+            out.append(item)
+        return out
+
+    def _most_common_from_rows(rows: list[dict], col_name: str) -> object | None:
+        vals = [_canonical_label_value(row.get(col_name)) for row in rows]
+        return _pick_most_common(vals)
+
+    def _resolve_support_sequence(source_run: str, rows: list[dict], cols: set[str]) -> dict:
+        effective = {
+            "sequence_name": str(source_run or "").strip(),
+            "source_run_name": str(source_run or "").strip(),
+            "exclude_first_n": None,
+            "last_n_rows": None,
+            "matched_support": False,
+        }
+        if not support_sequences:
+            return effective
+
+        pressure_col = ""
+        pulse_col = ""
+        for alias in pressure_aliases:
+            pressure_col = _best_match_col(alias, cols)
+            if pressure_col:
+                break
+        for alias in pulse_on_aliases:
+            pulse_col = _best_match_col(alias, cols)
+            if pulse_col:
+                break
+        actual_pressure = _most_common_from_rows(rows, pressure_col) if pressure_col else None
+        actual_pulse = _most_common_from_rows(rows, pulse_col) if pulse_col else None
+
+        heur_matches: list[dict] = []
+        for seq in support_sequences:
+            source_match = str(seq.get("source_run_name") or "").strip()
+            if source_match and _norm_name(source_match) == _norm_name(source_run):
+                effective = {
+                    "sequence_name": str(seq.get("sequence_name") or source_run).strip() or str(source_run or "").strip(),
+                    "source_run_name": str(source_run or "").strip(),
+                    "exclude_first_n": seq.get("exclude_first_n"),
+                    "last_n_rows": seq.get("last_n_rows"),
+                    "matched_support": False,
+                }
+            wants_pressure = seq.get("feed_pressure") not in (None, "")
+            wants_pulse = seq.get("pulse_width_on") not in (None, "")
+            if not wants_pressure and not wants_pulse:
+                continue
+            if wants_pressure and not _support_values_equal(seq.get("feed_pressure"), actual_pressure):
+                continue
+            if wants_pulse and not _support_values_equal(seq.get("pulse_width_on"), actual_pulse):
+                continue
+            heur_matches.append(seq)
+        if len(heur_matches) > 1:
+            names = ", ".join(sorted({str(m.get("sequence_name") or "").strip() for m in heur_matches if str(m.get("sequence_name") or "").strip()}))
+            raise RuntimeError(f"Ambiguous TD support heuristics for source run '{source_run}': {names}")
+        if len(heur_matches) == 1:
+            seq = heur_matches[0]
+            effective = {
+                "sequence_name": str(seq.get("sequence_name") or source_run).strip() or str(source_run or "").strip(),
+                "source_run_name": str(source_run or "").strip(),
+                "exclude_first_n": seq.get("exclude_first_n"),
+                "last_n_rows": seq.get("last_n_rows"),
+                "matched_support": True,
+            }
+        return effective
+
+    def _filter_rows_for_metric(
+        run_info: dict,
+        *,
+        y_name: str,
+        actual_x: str,
+        rows: list[dict],
+    ) -> tuple[list[float], list[float]]:
+        seq_name = str(run_info.get("sequence_name") or "").strip()
+        seq_bounds = dict(support_bounds_by_sequence.get(seq_name) or {})
+        bound = dict(seq_bounds.get(str(y_name)) or {})
+        min_val = bound.get("min_value") if bool(bound.get("enabled", True)) else None
+        max_val = bound.get("max_value") if bool(bound.get("enabled", True)) else None
+
+        filtered: list[tuple[float, float]] = []
+        for row in rows:
+            fx = _finite_float(row.get(actual_x))
+            fy = _finite_float(row.get(y_name))
+            if fx is None or fy is None:
+                continue
+            if min_val is not None and float(fy) < float(min_val):
+                continue
+            if max_val is not None and float(fy) > float(max_val):
+                continue
+            filtered.append((float(fx), float(fy)))
+
+        exclude_first_n = run_info.get("exclude_first_n")
+        if exclude_first_n is None:
+            exclude_first_n = support_settings.get("exclude_first_n_default")
+        last_n_rows = run_info.get("last_n_rows")
+        if last_n_rows is None:
+            last_n_rows = support_settings.get("last_n_rows_default")
+
+        if exclude_first_n is not None and int(exclude_first_n) > 0:
+            filtered = filtered[int(exclude_first_n):]
+        if last_n_rows is not None and int(last_n_rows) > 0 and len(filtered) > int(last_n_rows):
+            filtered = filtered[-int(last_n_rows):]
+        xs = [x for x, _y in filtered]
+        ys = [y for _x, y in filtered]
+        return xs, ys
+
     # Reset td_* tables (only).
     with closing(sqlite3.connect(str(db_path))) as conn:
         _ensure_test_data_tables(conn)
@@ -3684,6 +4142,22 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
         conn.execute(
             "INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)",
             ("statistics", ",".join(selected_stats)),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)",
+            ("support_workbook_path", str(support_cfg.get("path") or "")),
+        )
+        support_mtime_ns = 0
+        try:
+            support_path_meta = Path(str(support_cfg.get("path") or "")).expanduser()
+            if support_path_meta.exists():
+                st = support_path_meta.stat()
+                support_mtime_ns = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)))
+        except Exception:
+            support_mtime_ns = 0
+        conn.execute(
+            "INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)",
+            ("support_workbook_mtime_ns", str(int(support_mtime_ns))),
         )
         try:
             conn.execute(
@@ -3804,6 +4278,9 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
                         continue
 
                     order_by = "excel_row ASC" if "excel_row" in cols else "rowid ASC"
+                    source_rows = _read_run_rows(src, table, cols=cols, order_by=order_by)
+                    run_info = _resolve_support_sequence(run, source_rows, cols)
+                    effective_run = str(run_info.get("sequence_name") or run).strip() or str(run or "").strip()
 
                     # Collect per-run variable values for optional user-defined condition labels.
                     if td_run_labeling_enabled and label_template and label_variables and label_value_pick == "most_common":
@@ -3818,7 +4295,7 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
                             cv = _canonical_label_value(v)
                             if cv is None:
                                 continue
-                            run_var_samples.setdefault(str(run), {}).setdefault(str(var_name), []).append(cv)
+                            run_var_samples.setdefault(str(effective_run), {}).setdefault(str(var_name), []).append(cv)
 
                     x_map: dict[str, str] = {}
                     actual_time = ""
@@ -3871,14 +4348,14 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
 
                     avail_x = [x for x in x_priority if x in x_map]
                     if avail_x:
-                        run_x_union.setdefault(run, set()).update(avail_x)
-                        existing = run_default_x.get(run, "")
+                        run_x_union.setdefault(effective_run, set()).update(avail_x)
+                        existing = run_default_x.get(effective_run, "")
                         if not existing:
-                            run_default_x[run] = avail_x[0]
+                            run_default_x[effective_run] = avail_x[0]
                         else:
                             # Prefer Time over Pulse Number.
                             if x_priority.index(avail_x[0]) < x_priority.index(existing):
-                                run_default_x[run] = avail_x[0]
+                                run_default_x[effective_run] = avail_x[0]
 
                     # Local default_x for metrics
                     default_x = avail_x[0] if avail_x else ""
@@ -3887,15 +4364,15 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
                     for y_name, _units in y_cols:
                         if y_name:
                             desired_y.append(y_name)
-                    extra = data_y_by_run.get(str(run), {}) or {}
+                    extra = data_y_by_run.get(str(effective_run), {}) or {}
                     for y_name in extra.keys():
                         if y_name and y_name not in desired_y:
                             desired_y.append(y_name)
 
-                    run_units = run_y_union.setdefault(str(run), {})
+                    run_units = run_y_union.setdefault(str(effective_run), {})
                     for y_name in desired_y:
                         if y_name not in run_units or not run_units.get(y_name):
-                            u = cfg_units.get(y_name) or str((data_y_by_run.get(str(run), {}) or {}).get(y_name) or "").strip()
+                            u = cfg_units.get(y_name) or str((data_y_by_run.get(str(effective_run), {}) or {}).get(y_name) or "").strip()
                             run_units[y_name] = str(u or "").strip()
 
                     for y_name in desired_y:
@@ -3912,23 +4389,7 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
                             q_table = _quote_ident(table)
                             qx = _quote_ident(actual_x)
                             qy = _quote_ident(y_name)
-                            try:
-                                rows = src.execute(
-                                    f"SELECT {qx}, {qy} FROM {q_table} "
-                                    f"WHERE {qx} IS NOT NULL AND {qy} IS NOT NULL "
-                                    f"ORDER BY {order_by}"
-                                ).fetchall()
-                            except Exception:
-                                rows = []
-                            xs: list[float] = []
-                            ys: list[float] = []
-                            for rx, ry in rows:
-                                fx = _finite_float(rx)
-                                fy = _finite_float(ry)
-                                if fx is None or fy is None:
-                                    continue
-                                xs.append(float(fx))
-                                ys.append(float(fy))
+                            xs, ys = _filter_rows_for_metric(run_info, y_name=y_name, actual_x=actual_x, rows=source_rows)
 
                             with closing(sqlite3.connect(str(db_path))) as conn:
                                 conn.execute(
@@ -3938,7 +4399,7 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
                                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                                     """,
                                     (
-                                        run,
+                                        effective_run,
                                         y_name,
                                         x_name,
                                         sn,
@@ -3958,24 +4419,9 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
                             actual_x = x_map.get(default_x, "")
                             if not actual_x:
                                 actual_x = default_x
-                            q_table = _quote_ident(table)
-                            qx = _quote_ident(actual_x)
-                            qy = _quote_ident(y_name)
-                            try:
-                                rows = src.execute(
-                                    f"SELECT {qx}, {qy} FROM {q_table} "
-                                    f"WHERE {qx} IS NOT NULL AND {qy} IS NOT NULL "
-                                    f"ORDER BY {order_by}"
-                                ).fetchall()
-                            except Exception:
-                                rows = []
-                            if stats_ignore_first_n > 0 and len(rows) > 0:
-                                rows = rows[int(stats_ignore_first_n) :]
-                            for _rx, ry in rows:
-                                fy = _finite_float(ry)
-                                if fy is None:
-                                    continue
-                                y_for_stats.append(float(fy))
+                            _xs_stats, y_for_stats = _filter_rows_for_metric(run_info, y_name=y_name, actual_x=actual_x, rows=source_rows)
+                            if stats_ignore_first_n > 0 and len(y_for_stats) > 0:
+                                y_for_stats = y_for_stats[int(stats_ignore_first_n):]
                         stats_map = _compute_stats(y_for_stats)
                         with closing(sqlite3.connect(str(db_path))) as conn:
                             for stat in selected_stats:
@@ -3986,7 +4432,7 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
                                     (serial, run_name, column_name, stat, value_num, computed_epoch_ns, source_mtime_ns)
                                     VALUES (?, ?, ?, ?, ?, ?, ?)
                                     """,
-                                    (sn, run, y_name, str(stat), val, computed_epoch_ns, mtime_ns),
+                                    (sn, effective_run, y_name, str(stat), val, computed_epoch_ns, mtime_ns),
                                 )
                                 metrics_written += 1
                             conn.commit()
@@ -4814,6 +5260,60 @@ def update_test_data_trending_project_workbook(
         if not r or not n:
             continue
         y_by_run.setdefault(r, []).append(n)
+
+    # Ensure Data definitions include any run/column/stat combos discovered from the rebuilt cache.
+    headers_now: dict[str, int] = {}
+    for col in range(1, (ws_data.max_column or 0) + 1):
+        k = str(ws_data.cell(1, col).value or "").strip().lower()
+        if k:
+            headers_now[k] = col
+
+    def _data_col(*names: str) -> int | None:
+        for name in names:
+            got = headers_now.get(str(name).strip().lower())
+            if got:
+                return int(got)
+        return None
+
+    col_header_data = _data_col("header")
+    col_data_group_data = _data_col("data group", "data_group", "datagroup")
+    col_table_label_data = _data_col("table label", "table_label", "tablelabel")
+    existing_defs: set[tuple[str, str, str]] = set()
+    if col_header_data and col_data_group_data and col_table_label_data:
+        for r in range(2, (ws_data.max_row or 0) + 1):
+            run = str(ws_data.cell(r, int(col_data_group_data)).value or "").strip()
+            col_name = str(ws_data.cell(r, int(col_header_data)).value or "").strip()
+            stat = _normalize_td_stat(ws_data.cell(r, int(col_table_label_data)).value)
+            if run and col_name and stat:
+                existing_defs.add((run, col_name, stat))
+        for run in runs:
+            ys = y_by_run.get(run, []) or []
+            ys_ordered = [n for n in cfg_order if n in ys] + sorted([n for n in ys if n not in cfg_order], key=lambda s: str(s).lower())
+            for col_name in ys_ordered:
+                c = cfg_by_name.get(col_name) or {}
+                units = str(c.get("units") or units_map.get((run, col_name)) or "").strip()
+                rmin = str(c.get("range_min") or "").strip()
+                rmax = str(c.get("range_max") or "").strip()
+                for stat in stats:
+                    key = (run, col_name, stat)
+                    if key in existing_defs:
+                        continue
+                    ws_data.append(
+                        [
+                            col_name,
+                            col_name,
+                            "",
+                            stat,
+                            "number",
+                            run,
+                            f"{run}.{col_name}.{stat}",
+                            units,
+                            rmin,
+                            rmax,
+                        ]
+                        + [""] * len(serials)
+                    )
+                    existing_defs.add(key)
 
     # Clear and rebuild Data_calc sheet.
     try:
@@ -9835,41 +10335,8 @@ def _write_test_data_trending_workbook(
     if not stats:
         stats = list(TD_DEFAULT_STATS_ORDER)
 
-    def _read_runs_from_sqlite(sqlite_path: Path) -> list[str]:
-        p = Path(sqlite_path).expanduser()
-        if not p.exists() or not p.is_file():
-            return []
-        try:
-            with sqlite3.connect(str(p)) as conn:
-                rows = conn.execute("SELECT sheet_name FROM __sheet_info ORDER BY sheet_name").fetchall()
-            out = []
-            for r in rows:
-                try:
-                    sname = str(r[0] or "").strip()
-                except Exception:
-                    sname = ""
-                if sname:
-                    out.append(sname)
-            return out
-        except Exception:
-            return []
-
-    runs: list[str] = []
-    seen_runs: set[str] = set()
     repo = Path(global_repo).expanduser() if global_repo is not None else None
-    for d in (docs or []):
-        raw = str((d or {}).get("excel_sqlite_rel") or "").strip()
-        if not raw:
-            continue
-        p = Path(raw).expanduser()
-        if not p.is_absolute() and repo is not None:
-            p = repo / p
-        for rn in _read_runs_from_sqlite(p):
-            key = rn.strip().lower()
-            if not key or key in seen_runs:
-                continue
-            seen_runs.add(key)
-            runs.append(rn)
+    runs = _discover_td_runs_for_docs(global_repo, docs)
     if not runs:
         runs = ["Run1"]
 
@@ -10670,6 +11137,7 @@ def create_eidat_project(
     terms_count = 0
     excel_trend_config_path = ""
     config_snapshot: dict | None = None
+    support_workbook_path = None
 
     if project_type == EIDAT_PROJECT_TYPE_TRENDING:
         # Create workbook with header row, serial columns, and metadata sheet.
@@ -10733,6 +11201,15 @@ def create_eidat_project(
                 config=cfg,
             ),
         )
+        support_workbook_path = td_support_workbook_path_for(workbook_path, project_dir=project_dir)
+        _ensure_file_written(
+            support_workbook_path,
+            create_fn=lambda: _write_td_support_workbook(
+                support_workbook_path,
+                sequence_names=_discover_td_runs_for_docs(repo, chosen_docs) or ["Run1"],
+                param_defs=list(cfg.get("columns") or []),
+            ),
+        )
         # Create/populate the project-local cache DB at project creation time so
         # Trend/Analyze can plot immediately from `implementation_trending.sqlite3`.
         ensure_test_data_project_cache(project_dir, workbook_path, rebuild=True)
@@ -10757,6 +11234,8 @@ def create_eidat_project(
     }
     if excel_trend_config_path:
         meta["excel_trend_config_path"] = excel_trend_config_path
+    if support_workbook_path is not None:
+        meta["support_workbook"] = str(Path(support_workbook_path).name)
     if isinstance(config_snapshot, dict):
         meta["config_snapshot"] = config_snapshot
     description = _format_continued_population_description(continued_population_clean)

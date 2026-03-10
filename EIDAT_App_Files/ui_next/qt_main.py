@@ -2860,6 +2860,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self.btn_refresh_cache = QtWidgets.QPushButton("Build / Refresh Cache")
         self.btn_refresh_cache.setMinimumHeight(40)
         self.btn_refresh_cache.clicked.connect(lambda: self._load_cache(rebuild=True))
+        self.btn_open_support = QtWidgets.QPushButton("Open Support Workbook")
+        self.btn_open_support.setMinimumHeight(40)
+        self.btn_open_support.clicked.connect(self._open_support_workbook)
         self.btn_plot = QtWidgets.QPushButton("Plot Curves")
         self.btn_plot.setMinimumHeight(40)
         self.btn_plot.setStyleSheet(
@@ -2883,6 +2886,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self.lbl_cache.setStyleSheet("color: #64748b; font-size: 11px;")
         self.lbl_cache.setWordWrap(True)
         cache_row.addWidget(self.btn_refresh_cache)
+        cache_row.addWidget(self.btn_open_support)
         cache_row.addWidget(self.btn_plot)
         cache_row.addStretch(1)
         left_layout.addLayout(cache_row)
@@ -3815,6 +3819,15 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             return
         self._refresh_from_cache()
         self._update_plot_zoom_actions()
+
+    def _open_support_workbook(self) -> None:
+        try:
+            path = be.td_support_workbook_path_for(self._workbook_path, project_dir=self._project_dir)
+            if not path.exists():
+                raise RuntimeError(f"Support workbook not found: {path}")
+            be.open_path(path)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Open Support Workbook", str(exc))
 
     def _refresh_from_cache(self) -> None:
         if not self._db_path:
@@ -9340,12 +9353,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_project_delete = QtWidgets.QPushButton("Delete Project")
         self.btn_project_open_folder = QtWidgets.QPushButton("Open Folder")
         self.btn_project_open_workbook = QtWidgets.QPushButton("Open Workbook")
+        self.btn_project_open_support = QtWidgets.QPushButton("Open Support Workbook")
         for b in (
             self.btn_project_update,
             self.btn_project_env,
             self.btn_project_delete,
             self.btn_project_open_folder,
             self.btn_project_open_workbook,
+            self.btn_project_open_support,
         ):
             b.setStyleSheet(
                 """
@@ -9366,12 +9381,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_project_delete.clicked.connect(self._act_delete_project)
         self.btn_project_open_folder.clicked.connect(self._act_open_project_folder)
         self.btn_project_open_workbook.clicked.connect(self._act_open_project_workbook)
+        self.btn_project_open_support.clicked.connect(self._act_open_project_support_workbook)
         actions.addWidget(self.cb_project_overwrite)
         actions.addWidget(self.btn_project_update)
         actions.addWidget(self.btn_project_env)
         actions.addWidget(self.btn_project_delete)
         actions.addWidget(self.btn_project_open_folder)
         actions.addWidget(self.btn_project_open_workbook)
+        actions.addWidget(self.btn_project_open_support)
         r.addLayout(actions)
 
         root.addWidget(left)
@@ -9435,6 +9452,18 @@ class MainWindow(QtWidgets.QMainWindow):
             self._prepare_dialog(dlg)
             if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
                 self._refresh_projects()
+                try:
+                    meta = dlg.project_meta if isinstance(dlg.project_meta, dict) else {}
+                    support_val = str(meta.get("support_workbook") or "").strip()
+                    project_dir = Path(str(meta.get("project_dir") or "")).expanduser()
+                    if support_val and project_dir.exists():
+                        support_path = Path(support_val).expanduser()
+                        if not support_path.is_absolute():
+                            support_path = project_dir / support_path
+                        if support_path.exists():
+                            be.open_path(support_path)
+                except Exception:
+                    pass
                 self._show_toast("Project created")
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "New Project", str(exc))
@@ -9480,6 +9509,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self.btn_project_update.setEnabled(bool(record) and is_update_supported)
         if hasattr(self, "btn_project_env"):
             self.btn_project_env.setEnabled(bool(record))
+        if hasattr(self, "btn_project_open_support"):
+            is_td = bool(record) and str(record.get("type") or "").strip() == getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending")
+            self.btn_project_open_support.setEnabled(bool(is_td))
 
     def _act_open_project_folder(self) -> None:
         item = self._selected_project_item(2)
@@ -9500,6 +9532,23 @@ class MainWindow(QtWidgets.QMainWindow):
             be.open_path(path)
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "Open Workbook", str(exc))
+
+    def _act_open_project_support_workbook(self) -> None:
+        try:
+            record = self._selected_project_record()
+            if not record:
+                raise RuntimeError("Select a project in the list first.")
+            ptype = str(record.get("type") or "").strip()
+            if ptype != getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending"):
+                raise RuntimeError("Support workbooks are available only for Test Data Trending projects.")
+            project_dir = Path(str(record.get("folder") or "")).expanduser()
+            workbook = Path(str(record.get("workbook") or "")).expanduser()
+            path = be.td_support_workbook_path_for(workbook, project_dir=project_dir)
+            if not path.exists():
+                raise RuntimeError(f"Support workbook not found: {path}")
+            be.open_path(path)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Open Support Workbook", str(exc))
 
     def _act_project_env(self) -> None:
         try:
@@ -9592,6 +9641,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     f"Workbook: {payload.get('workbook') or wb_path}",
                 ]
             )
+            if ptype == getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending"):
+                lines.append("Recalculation includes support-workbook heuristics when present.")
             msg = "\n".join(lines)
             if serials_added and isinstance(added_serials, list) and added_serials:
                 shown = ", ".join(str(s).strip() for s in added_serials[:20] if str(s).strip())
