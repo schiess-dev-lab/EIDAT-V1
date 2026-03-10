@@ -4727,7 +4727,11 @@ def td_load_metric_series(db_path: Path, run_name: str, column_name: str, stat: 
     return [{"serial": str(r[0] or "").strip(), "value_num": r[1]} for r in rows if str(r[0] or "").strip()]
 
 
-def td_list_available_performance_plotters(db_path: Path, config_path: Path | None = None) -> list[dict]:
+def _td_perf_norm_key(value: object) -> str:
+    return "".join(ch.lower() for ch in str(value or "").strip() if ch.isalnum())
+
+
+def td_discover_performance_candidates(db_path: Path, config_path: Path | None = None) -> list[dict]:
     path = Path(db_path).expanduser()
     if not path.exists():
         return []
@@ -4735,129 +4739,203 @@ def td_list_available_performance_plotters(db_path: Path, config_path: Path | No
         cfg = load_excel_trend_config(config_path or DEFAULT_EXCEL_TREND_CONFIG)
     except Exception:
         cfg = {}
-    plotters = cfg.get("performance_plotters") if isinstance(cfg, dict) else []
-    if not isinstance(plotters, list) or not plotters:
+    legacy_plotters = cfg.get("performance_plotters") if isinstance(cfg, dict) else []
+    if not isinstance(legacy_plotters, list):
+        legacy_plotters = []
+
+    stat_priority = ["mean", "min", "max"]
+    with sqlite3.connect(str(path)) as conn:
+        _ensure_test_data_tables(conn)
+        metric_rows = conn.execute(
+            """
+            SELECT serial, run_name, column_name, stat, value_num
+            FROM td_metrics
+            WHERE lower(stat) IN ('mean', 'min', 'max')
+            ORDER BY run_name, column_name, stat, serial
+            """
+        ).fetchall()
+        units_rows = conn.execute(
+            """
+            SELECT run_name, name, units
+            FROM td_columns
+            WHERE kind='y'
+            ORDER BY run_name, name
+            """
+        ).fetchall()
+
+    if not metric_rows:
         return []
 
-    runs = td_list_runs(path)
-    serials = td_list_serials(path)
-    if not runs or not serials:
+    units_by_run_col: dict[tuple[str, str], str] = {}
+    display_name_by_norm: dict[str, str] = {}
+    units_by_norm: dict[str, str] = {}
+    for run_name, col_name, units in units_rows:
+        run = str(run_name or "").strip()
+        col = str(col_name or "").strip()
+        unit = str(units or "").strip()
+        if not run or not col:
+            continue
+        units_by_run_col[(run, col)] = unit
+        norm = _td_perf_norm_key(col)
+        if norm and norm not in display_name_by_norm:
+            display_name_by_norm[norm] = col
+        if norm and unit and norm not in units_by_norm:
+            units_by_norm[norm] = unit
+
+    values_by_stat: dict[str, dict[str, dict[str, dict[str, float]]]] = {}
+    run_presence_by_norm: dict[str, dict[str, set[str]]] = {}
+    for serial, run_name, col_name, stat, value in metric_rows:
+        sn = str(serial or "").strip()
+        run = str(run_name or "").strip()
+        col = str(col_name or "").strip()
+        st = str(stat or "").strip().lower()
+        if not sn or not run or not col or st not in stat_priority:
+            continue
+        if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+            continue
+        norm = _td_perf_norm_key(col)
+        if not norm:
+            continue
+        values_by_stat.setdefault(st, {}).setdefault(sn, {}).setdefault(run, {})[norm] = float(value)
+        run_presence_by_norm.setdefault(norm, {}).setdefault(sn, set()).add(run)
+        if norm not in display_name_by_norm:
+            display_name_by_norm[norm] = col
+        unit = units_by_run_col.get((run, col), "")
+        if unit and norm not in units_by_norm:
+            units_by_norm[norm] = unit
+
+    mean_values = values_by_stat.get("mean") or {}
+    if not mean_values:
         return []
 
-    def _norm(s: str) -> str:
-        return "".join(ch.lower() for ch in str(s or "").strip() if ch.isalnum())
+    axis_candidates: list[str] = []
+    for norm in sorted(display_name_by_norm.keys(), key=lambda k: str(display_name_by_norm.get(k) or k).lower()):
+        qualifies = False
+        for sn, runs_map in mean_values.items():
+            distinct_vals = {
+                float(run_cols[norm])
+                for run_cols in (runs_map or {}).values()
+                if isinstance(run_cols, dict) and norm in run_cols
+            }
+            if len(distinct_vals) >= 2:
+                qualifies = True
+                break
+        if qualifies:
+            axis_candidates.append(norm)
 
-    run_cols: dict[str, dict[str, tuple[str, str]]] = {}
-    for rn in runs:
-        try:
-            cols = td_list_y_columns(path, rn)
-        except Exception:
-            cols = []
-        cur: dict[str, tuple[str, str]] = {}
-        for c in cols:
-            name = str((c or {}).get("name") or "").strip()
-            if not name:
-                continue
-            nk = _norm(name)
-            if nk and nk not in cur:
-                cur[nk] = (name, str((c or {}).get("units") or "").strip())
-        run_cols[rn] = cur
+    if len(axis_candidates) < 2:
+        return []
 
-    metric_cache: dict[tuple[str, str, str], dict[str, float]] = {}
-
-    def _metric_map(run_name: str, col_name: str, stat: str) -> dict[str, float]:
-        key = (str(run_name), str(col_name), str(stat).lower())
-        if key in metric_cache:
-            return metric_cache[key]
-        series = td_load_metric_series(path, run_name, col_name, stat)
-        out: dict[str, float] = {}
-        for row in series:
-            sn = str(row.get("serial") or "").strip()
-            val = row.get("value_num")
-            if not sn or not isinstance(val, (int, float)) or not math.isfinite(float(val)):
-                continue
-            out[sn] = float(val)
-        metric_cache[key] = out
-        return out
-
-    available: list[dict] = []
-    for raw in plotters:
+    legacy_by_pair: dict[tuple[str, str], dict] = {}
+    for raw in legacy_plotters:
         if not isinstance(raw, dict):
             continue
-        name = str(raw.get("name") or "").strip() or "Performance Plot"
         x_spec = raw.get("x") or {}
         y_spec = raw.get("y") or {}
         if not isinstance(x_spec, dict) or not isinstance(y_spec, dict):
             continue
-        x_target = str(x_spec.get("column") or "").strip()
-        y_target = str(y_spec.get("column") or "").strip()
-        if not x_target or not y_target:
-            continue
-        requested_stats = raw.get("stats") if isinstance(raw.get("stats"), list) else []
-        requested_stats = [str(s).strip().lower() for s in requested_stats if str(s).strip()]
-        if not requested_stats:
-            requested_stats = ["mean"]
-        requested_stats = [s for s in requested_stats if s in TD_ALLOWED_STATS]
-        if not requested_stats:
-            requested_stats = ["mean"]
-        try:
-            require_min_points = max(2, int(raw.get("require_min_points") or 2))
-        except Exception:
-            require_min_points = 2
+        x_norm = _td_perf_norm_key(x_spec.get("column"))
+        y_norm = _td_perf_norm_key(y_spec.get("column"))
+        if x_norm and y_norm and x_norm != y_norm and (x_norm, y_norm) not in legacy_by_pair:
+            legacy_by_pair[(x_norm, y_norm)] = dict(raw)
 
-        x_norm = _norm(x_target)
-        y_norm = _norm(y_target)
-        available_stats: list[str] = []
-        qualifying_serials_union: set[str] = set()
-        x_units = ""
-        y_units = ""
-
-        for stat in requested_stats:
-            per_run: list[tuple[str, dict[str, float], dict[str, float]]] = []
-            for rn in runs:
-                cols = run_cols.get(rn) or {}
-                x_col = cols.get(x_norm)
-                y_col = cols.get(y_norm)
-                if not x_col or not y_col:
-                    continue
-                x_name, x_unit = x_col
-                y_name, y_unit = y_col
-                xmap = _metric_map(rn, x_name, stat)
-                ymap = _metric_map(rn, y_name, stat)
-                if not xmap or not ymap:
-                    continue
-                if not x_units and x_unit:
-                    x_units = x_unit
-                if not y_units and y_unit:
-                    y_units = y_unit
-                per_run.append((rn, xmap, ymap))
-
-            qualifying_for_stat: set[str] = set()
-            for sn in serials:
+    serial_order = sorted(mean_values.keys(), key=lambda s: s.lower())
+    available: list[dict] = []
+    for x_norm in axis_candidates:
+        for y_norm in axis_candidates:
+            if not x_norm or not y_norm or x_norm == y_norm:
+                continue
+            legacy = legacy_by_pair.get((x_norm, y_norm)) or {}
+            try:
+                require_min_points = max(2, int(legacy.get("require_min_points") or 2))
+            except Exception:
+                require_min_points = 2
+            qualifying_serials: list[str] = []
+            point_inventory: dict[str, list[dict]] = {}
+            for sn in serial_order:
+                runs_map = mean_values.get(sn) or {}
+                points: list[dict] = []
                 unique_pairs: set[tuple[float, float]] = set()
-                for _rn, xmap, ymap in per_run:
-                    if sn not in xmap or sn not in ymap:
+                for run_name in sorted(runs_map.keys(), key=lambda r: r.lower()):
+                    cols = runs_map.get(run_name) or {}
+                    if x_norm not in cols or y_norm not in cols:
                         continue
-                    unique_pairs.add((float(xmap[sn]), float(ymap[sn])))
+                    x_val = float(cols[x_norm])
+                    y_val = float(cols[y_norm])
+                    points.append({"run_name": str(run_name), "x": x_val, "y": y_val})
+                    unique_pairs.add((x_val, y_val))
                 if len(unique_pairs) >= require_min_points:
-                    qualifying_for_stat.add(sn)
+                    qualifying_serials.append(sn)
+                    point_inventory[sn] = points
 
-            if qualifying_for_stat:
-                available_stats.append(stat)
-                qualifying_serials_union.update(qualifying_for_stat)
+            if not qualifying_serials:
+                continue
 
-        if not available_stats or not qualifying_serials_union:
-            continue
+            available_stats: list[str] = []
+            qualifying_by_stat: dict[str, list[str]] = {}
+            for st in stat_priority:
+                stat_values = values_by_stat.get(st) or {}
+                qualified_for_stat: list[str] = []
+                for sn in qualifying_serials:
+                    runs_map = stat_values.get(sn) or {}
+                    unique_pairs: set[tuple[float, float]] = set()
+                    for run_name, cols in runs_map.items():
+                        if not isinstance(cols, dict) or x_norm not in cols or y_norm not in cols:
+                            continue
+                        unique_pairs.add((float(cols[x_norm]), float(cols[y_norm])))
+                    if len(unique_pairs) >= require_min_points:
+                        qualified_for_stat.append(sn)
+                if qualified_for_stat:
+                    available_stats.append(st)
+                    qualifying_by_stat[st] = qualified_for_stat
 
-        item = dict(raw)
-        item["available_stats"] = list(available_stats)
-        item["qualifying_serial_count"] = len(qualifying_serials_union)
-        item["qualifying_serials"] = sorted(qualifying_serials_union)
-        item["x_units"] = x_units
-        item["y_units"] = y_units
-        available.append(item)
+            if "mean" not in available_stats:
+                continue
 
+            fit_cfg = legacy.get("fit") if isinstance(legacy.get("fit"), dict) else {}
+            try:
+                degree = int(fit_cfg.get("degree") or 2)
+            except Exception:
+                degree = 2
+
+            x_name = str(display_name_by_norm.get(x_norm) or x_norm).strip()
+            y_name = str(display_name_by_norm.get(y_norm) or y_norm).strip()
+            item = {
+                "name": str(legacy.get("name") or f"{y_name} vs {x_name}").strip() or f"{y_name} vs {x_name}",
+                "display_name": f"{y_name} vs {x_name}",
+                "x": {"column": x_name, "stat": "mean"},
+                "y": {"column": y_name, "stat": "mean"},
+                "x_norm": x_norm,
+                "y_norm": y_norm,
+                "x_units": str(units_by_norm.get(x_norm) or "").strip(),
+                "y_units": str(units_by_norm.get(y_norm) or "").strip(),
+                "available_stats": list(available_stats),
+                "available_equation_views": ["master"] + [st for st in ("min", "max") if st in available_stats] + ["serial"],
+                "qualifying_serial_count": len(qualifying_serials),
+                "qualifying_serials": list(qualifying_serials),
+                "qualifying_serials_by_stat": {k: list(v) for k, v in qualifying_by_stat.items()},
+                "points_by_serial": point_inventory,
+                "fit": {
+                    "degree": max(0, degree),
+                    "normalize_x": bool(fit_cfg.get("normalize_x", True)),
+                },
+                "require_min_points": require_min_points,
+                "source_point_count": int(sum(len(v) for v in point_inventory.values())),
+                "legacy_plotter": dict(legacy) if legacy else {},
+            }
+            available.append(item)
+
+    available.sort(
+        key=lambda item: (
+            -int(item.get("qualifying_serial_count") or 0),
+            str(item.get("display_name") or item.get("name") or "").lower(),
+        )
+    )
     return available
+
+
+def td_list_available_performance_plotters(db_path: Path, config_path: Path | None = None) -> list[dict]:
+    return td_discover_performance_candidates(db_path, config_path=config_path)
 
 
 def td_load_curves(
@@ -5425,6 +5503,64 @@ def update_test_data_trending_project_workbook(
                 else:
                     ws_data.cell(r, cidx).value = float(val)
                 updated_cells += 1
+
+    perf_sheet_name = "Performance_candidates"
+    if perf_sheet_name in wb.sheetnames:
+        ws_perf = wb[perf_sheet_name]
+        try:
+            ws_perf.delete_rows(1, ws_perf.max_row or 1)
+        except Exception:
+            try:
+                wb.remove(ws_perf)
+            except Exception:
+                pass
+            ws_perf = wb.create_sheet(perf_sheet_name)
+    else:
+        ws_perf = wb.create_sheet(perf_sheet_name)
+    ws_perf.append(
+        [
+            "candidate",
+            "x_column",
+            "x_units",
+            "y_column",
+            "y_units",
+            "qualifying_serial_count",
+            "qualifying_serials",
+            "source_point_count",
+            "available_stats",
+            "equation_views",
+        ]
+    )
+    try:
+        ws_perf.freeze_panes = "A2"
+    except Exception:
+        pass
+    try:
+        perf_candidates = td_discover_performance_candidates(db_path, DEFAULT_EXCEL_TREND_CONFIG)
+    except Exception:
+        perf_candidates = []
+    for item in perf_candidates:
+        x_spec = item.get("x") or {}
+        y_spec = item.get("y") or {}
+        x_col = str((x_spec.get("column") if isinstance(x_spec, dict) else "") or "").strip()
+        y_col = str((y_spec.get("column") if isinstance(y_spec, dict) else "") or "").strip()
+        serials_txt = ", ".join([str(sn).strip() for sn in (item.get("qualifying_serials") or []) if str(sn).strip()])
+        stats_txt = ", ".join([str(st).strip() for st in (item.get("available_stats") or []) if str(st).strip()])
+        views_txt = ", ".join([str(v).strip() for v in (item.get("available_equation_views") or []) if str(v).strip()])
+        ws_perf.append(
+            [
+                str(item.get("display_name") or item.get("name") or "").strip(),
+                x_col,
+                str(item.get("x_units") or "").strip(),
+                y_col,
+                str(item.get("y_units") or "").strip(),
+                int(item.get("qualifying_serial_count") or 0),
+                serials_txt,
+                int(item.get("source_point_count") or 0),
+                stats_txt,
+                views_txt,
+            ]
+        )
 
     # Sync workbook metadata sheets/rows to the canonical index (best-effort).
     try:

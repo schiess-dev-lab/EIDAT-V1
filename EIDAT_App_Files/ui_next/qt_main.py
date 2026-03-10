@@ -1638,6 +1638,45 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
         else:
             docs = [d for d in docs if isinstance(d, dict) and not _is_td(d)]
 
+        cand: dict = {}
+        try:
+            load_candidates = getattr(be, "_load_metadata_candidates", None)
+            if callable(load_candidates):
+                raw = load_candidates()
+                cand = raw if isinstance(raw, dict) else {}
+        except Exception:
+            cand = {}
+
+        def _candidate_names(key: str) -> list[str]:
+            try:
+                canonical = getattr(be, "_canonical_names", None)
+                if callable(canonical):
+                    return list(canonical(cand.get(key) if isinstance(cand, dict) else []))
+            except Exception:
+                pass
+            raw = cand.get(key) if isinstance(cand, dict) else []
+            if not isinstance(raw, list):
+                return []
+            out: list[str] = []
+            for item in raw:
+                if isinstance(item, str) and item.strip():
+                    out.append(item.strip())
+                    continue
+                if isinstance(item, dict):
+                    name = str(item.get("name") or "").strip()
+                    if name:
+                        out.append(name)
+            return sorted({v for v in out if v}, key=lambda v: v.casefold())
+
+        def _merge_values(*groups: list[str]) -> list[str]:
+            merged = {
+                str(value).strip()
+                for group in groups
+                for value in group
+                if str(value).strip()
+            }
+            return sorted(merged, key=lambda v: v.casefold())
+
         programs = sorted({str(d.get("program_title") or "").strip() for d in docs if str(d.get("program_title") or "").strip()})
         assets = sorted({str(d.get("asset_type") or "").strip() for d in docs if str(d.get("asset_type") or "").strip()})
         asset_specifics = sorted({str(d.get("asset_specific_type") or "").strip() for d in docs if str(d.get("asset_specific_type") or "").strip()})
@@ -1650,6 +1689,13 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
                 if str(d.get("acceptance_test_plan_number") or "").strip()
             }
         )
+
+        programs = _merge_values(programs, _candidate_names("program_titles"))
+        assets = _merge_values(assets, _candidate_names("asset_types"))
+        asset_specifics = _merge_values(asset_specifics, _candidate_names("asset_specific_types"))
+        vendors = _merge_values(vendors, _candidate_names("vendors"))
+        parts = _merge_values(parts, _candidate_names("part_numbers"))
+        test_plans = _merge_values(test_plans, _candidate_names("acceptance_test_plan_numbers"))
 
         self.cb_program.clear()
         self.cb_asset.clear()
@@ -2981,31 +3027,73 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         row_curves.addWidget(self.cb_x, 1)
         curves_layout.addLayout(row_curves)
 
-        # Performance tab (X vs Y metric plot per serial across runs; all runs/serials always)
+        # Performance tab (candidate discovery + project-wide plotting)
         tab_perf = QtWidgets.QWidget()
         perf_layout = QtWidgets.QVBoxLayout(tab_perf)
         perf_layout.setContentsMargins(10, 10, 10, 10)
         perf_layout.setSpacing(8)
 
-        lbl_perf = QtWidgets.QLabel("Performance plot (all runs, all serials)")
+        lbl_perf = QtWidgets.QLabel("Performance equations and plots (all runs, all serials)")
         lbl_perf.setStyleSheet("font-size: 12px; font-weight: 800; color: #0f172a;")
         perf_layout.addWidget(lbl_perf)
 
+        self.tabs_perf_sections = QtWidgets.QTabWidget()
+        perf_layout.addWidget(self.tabs_perf_sections, 1)
+
+        tab_perf_candidates = QtWidgets.QWidget()
+        perf_candidates_layout = QtWidgets.QVBoxLayout(tab_perf_candidates)
+        perf_candidates_layout.setContentsMargins(8, 8, 8, 8)
+        perf_candidates_layout.setSpacing(8)
+
+        self.ed_perf_candidate_filter = QtWidgets.QLineEdit()
+        self.ed_perf_candidate_filter.setPlaceholderText("Filter candidates by parameter, units, or serial...")
+        perf_candidates_layout.addWidget(self.ed_perf_candidate_filter)
+
+        self.tbl_perf_candidates = QtWidgets.QTableWidget(0, 6)
+        self.tbl_perf_candidates.setHorizontalHeaderLabels(
+            ["candidate", "x", "y", "serials", "points", "views"]
+        )
+        self.tbl_perf_candidates.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.tbl_perf_candidates.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.tbl_perf_candidates.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        self.tbl_perf_candidates.setAlternatingRowColors(True)
+        try:
+            self.tbl_perf_candidates.horizontalHeader().setStretchLastSection(True)
+        except Exception:
+            pass
+        perf_candidates_layout.addWidget(self.tbl_perf_candidates, 1)
+
+        self.lbl_perf_candidate_summary = QtWidgets.QLabel("Viable candidates: -")
+        self.lbl_perf_candidate_summary.setStyleSheet("color: #64748b; font-size: 11px;")
+        self.lbl_perf_candidate_summary.setWordWrap(True)
+        perf_candidates_layout.addWidget(self.lbl_perf_candidate_summary)
+
+        perf_candidate_btn_row = QtWidgets.QHBoxLayout()
+        self.btn_use_perf_candidate = QtWidgets.QPushButton("Use Selected Candidate")
+        perf_candidate_btn_row.addWidget(self.btn_use_perf_candidate)
+        perf_candidate_btn_row.addStretch(1)
+        perf_candidates_layout.addLayout(perf_candidate_btn_row)
+
+        tab_perf_plot = QtWidgets.QWidget()
+        perf_plot_layout = QtWidgets.QVBoxLayout(tab_perf_plot)
+        perf_plot_layout.setContentsMargins(8, 8, 8, 8)
+        perf_plot_layout.setSpacing(8)
+
         row_perf = QtWidgets.QHBoxLayout()
-        row_perf.addWidget(QtWidgets.QLabel("Performance Plot:"))
+        row_perf.addWidget(QtWidgets.QLabel("Performance Candidate:"))
         self.cb_perf_plotter = QtWidgets.QComboBox()
         row_perf.addWidget(self.cb_perf_plotter, 1)
-        perf_layout.addLayout(row_perf)
+        perf_plot_layout.addLayout(row_perf)
 
         self.lbl_perf_axes = QtWidgets.QLabel("X: - | Y: -")
         self.lbl_perf_axes.setStyleSheet("color: #334155; font-size: 11px;")
         self.lbl_perf_axes.setWordWrap(True)
-        perf_layout.addWidget(self.lbl_perf_axes)
+        perf_plot_layout.addWidget(self.lbl_perf_axes)
 
-        self.lbl_perf_common_runs = QtWidgets.QLabel("Available performance plots: -")
+        self.lbl_perf_common_runs = QtWidgets.QLabel("Available performance candidates: -")
         self.lbl_perf_common_runs.setStyleSheet("color: #64748b; font-size: 11px;")
         self.lbl_perf_common_runs.setWordWrap(True)
-        perf_layout.addWidget(self.lbl_perf_common_runs)
+        perf_plot_layout.addWidget(self.lbl_perf_common_runs)
 
         fit_row = QtWidgets.QHBoxLayout()
         self.cb_perf_fit = QtWidgets.QCheckBox("Fit polynomial")
@@ -3020,7 +3108,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         fit_row.addWidget(self.sp_perf_degree)
         fit_row.addWidget(self.cb_perf_norm_x)
         fit_row.addStretch(1)
-        perf_layout.addLayout(fit_row)
+        perf_plot_layout.addLayout(fit_row)
 
         # Runs are always all runs in the cache (no selector).
 
@@ -3028,21 +3116,21 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
         lbl_stats_perf = QtWidgets.QLabel("Stats (applies to both axes)")
         lbl_stats_perf.setStyleSheet("font-size: 12px; font-weight: 700; color: #0f172a;")
-        perf_layout.addWidget(lbl_stats_perf)
+        perf_plot_layout.addWidget(lbl_stats_perf)
 
         self.list_perf_stats = QtWidgets.QListWidget()
         self.list_perf_stats.setMaximumHeight(110)
-        perf_layout.addWidget(self.list_perf_stats)
+        perf_plot_layout.addWidget(self.list_perf_stats)
 
         view_row = QtWidgets.QHBoxLayout()
         view_row.addWidget(QtWidgets.QLabel("View stat:"))
         self.cb_perf_view_stat = QtWidgets.QComboBox()
         view_row.addWidget(self.cb_perf_view_stat, 1)
-        perf_layout.addLayout(view_row)
+        perf_plot_layout.addLayout(view_row)
 
         lbl_eq = QtWidgets.QLabel("Equations (per stat)")
         lbl_eq.setStyleSheet("font-size: 12px; font-weight: 700; color: #0f172a;")
-        perf_layout.addWidget(lbl_eq)
+        perf_plot_layout.addWidget(lbl_eq)
 
         self.tbl_perf_equations = QtWidgets.QTableWidget(0, 5)
         self.tbl_perf_equations.setHorizontalHeaderLabels(
@@ -3056,7 +3144,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         except Exception:
             pass
         self.tbl_perf_equations.setMinimumHeight(160)
-        perf_layout.addWidget(self.tbl_perf_equations, 1)
+        perf_plot_layout.addWidget(self.tbl_perf_equations, 1)
+
+        self.tabs_perf_sections.addTab(tab_perf_candidates, "Candidates")
+        self.tabs_perf_sections.addTab(tab_perf_plot, "Plot")
 
         tabs.addTab(tab_metrics, "Metrics")
         tabs.addTab(tab_curves, "Curves")
@@ -5768,6 +5859,117 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             d = None
         return d if isinstance(d, dict) else None
 
+    @staticmethod
+    def _perf_candidate_key(candidate: dict | None) -> tuple[str, str]:
+        if not isinstance(candidate, dict):
+            return "", ""
+        return (
+            str(candidate.get("x_norm") or "").strip().lower(),
+            str(candidate.get("y_norm") or "").strip().lower(),
+        )
+
+    def _set_selected_perf_candidate(self, candidate: dict | None, *, switch_to_plot: bool = False) -> None:
+        if not isinstance(candidate, dict) or not hasattr(self, "cb_perf_plotter"):
+            return
+        want_key = self._perf_candidate_key(candidate)
+        if not all(want_key):
+            return
+        for i in range(self.cb_perf_plotter.count()):
+            data = self.cb_perf_plotter.itemData(i)
+            if self._perf_candidate_key(data if isinstance(data, dict) else None) == want_key:
+                if self.cb_perf_plotter.currentIndex() != i:
+                    self.cb_perf_plotter.setCurrentIndex(i)
+                if switch_to_plot and hasattr(self, "tabs_perf_sections"):
+                    self.tabs_perf_sections.setCurrentIndex(1)
+                return
+
+    def _sync_perf_candidate_table_selection(self) -> None:
+        if not hasattr(self, "tbl_perf_candidates"):
+            return
+        current_key = self._perf_candidate_key(self._selected_perf_plotter())
+        self.tbl_perf_candidates.blockSignals(True)
+        try:
+            self.tbl_perf_candidates.clearSelection()
+            if not all(current_key):
+                return
+            for row in range(self.tbl_perf_candidates.rowCount()):
+                item = self.tbl_perf_candidates.item(row, 0)
+                candidate = item.data(QtCore.Qt.ItemDataRole.UserRole) if item is not None else None
+                if self._perf_candidate_key(candidate if isinstance(candidate, dict) else None) == current_key:
+                    self.tbl_perf_candidates.selectRow(row)
+                    break
+        finally:
+            self.tbl_perf_candidates.blockSignals(False)
+
+    def _refresh_perf_candidate_table(self) -> None:
+        if not hasattr(self, "tbl_perf_candidates"):
+            return
+        raw_filter = str(getattr(self, "ed_perf_candidate_filter", None).text() if hasattr(self, "ed_perf_candidate_filter") else "" or "")
+        tokens = [tok for tok in raw_filter.strip().lower().split() if tok]
+        all_candidates = list(getattr(self, "_perf_plotters", []) or [])
+        filtered: list[dict] = []
+        for candidate in all_candidates:
+            if not isinstance(candidate, dict):
+                continue
+            hay = " ".join(
+                [
+                    str(candidate.get("display_name") or candidate.get("name") or ""),
+                    str((candidate.get("x") or {}).get("column") if isinstance(candidate.get("x"), dict) else ""),
+                    str((candidate.get("y") or {}).get("column") if isinstance(candidate.get("y"), dict) else ""),
+                    str(candidate.get("x_units") or ""),
+                    str(candidate.get("y_units") or ""),
+                    " ".join([str(sn) for sn in (candidate.get("qualifying_serials") or []) if str(sn).strip()]),
+                ]
+            ).lower()
+            if tokens and not all(tok in hay for tok in tokens):
+                continue
+            filtered.append(candidate)
+
+        self.tbl_perf_candidates.setRowCount(len(filtered))
+        for row, candidate in enumerate(filtered):
+            x_spec = candidate.get("x") or {}
+            y_spec = candidate.get("y") or {}
+            values = [
+                str(candidate.get("display_name") or candidate.get("name") or "").strip(),
+                str((x_spec.get("column") if isinstance(x_spec, dict) else "") or "").strip(),
+                str((y_spec.get("column") if isinstance(y_spec, dict) else "") or "").strip(),
+                str(int(candidate.get("qualifying_serial_count") or 0)),
+                str(int(candidate.get("source_point_count") or 0)),
+                ", ".join([str(v).strip() for v in (candidate.get("available_equation_views") or []) if str(v).strip()]),
+            ]
+            for col, value in enumerate(values):
+                item = QtWidgets.QTableWidgetItem(value)
+                item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+                if col == 0:
+                    item.setData(QtCore.Qt.ItemDataRole.UserRole, candidate)
+                self.tbl_perf_candidates.setItem(row, col, item)
+        try:
+            self.tbl_perf_candidates.resizeColumnsToContents()
+        except Exception:
+            pass
+
+        if hasattr(self, "lbl_perf_candidate_summary"):
+            total = len(all_candidates)
+            shown = len(filtered)
+            self.lbl_perf_candidate_summary.setText(
+                f"Viable candidates: {total} | Showing: {shown} | Rule: exact distinct paired .mean points"
+            )
+        self._sync_perf_candidate_table_selection()
+
+    def _activate_selected_perf_candidate(self, *, switch_to_plot: bool = False) -> None:
+        if not hasattr(self, "tbl_perf_candidates"):
+            return
+        rows = sorted({idx.row() for idx in self.tbl_perf_candidates.selectionModel().selectedRows()}) if self.tbl_perf_candidates.selectionModel() else []
+        if not rows:
+            return
+        item = self.tbl_perf_candidates.item(rows[0], 0)
+        candidate = item.data(QtCore.Qt.ItemDataRole.UserRole) if item is not None else None
+        if isinstance(candidate, dict):
+            self._set_selected_perf_candidate(candidate, switch_to_plot=switch_to_plot)
+
+    def _on_perf_candidate_selection_changed(self) -> None:
+        self._activate_selected_perf_candidate(switch_to_plot=False)
+
     def _resolve_td_y_name(self, run_name: str, target: str) -> str:
         tgt = str(target or "").strip()
         if not tgt or not self._db_path:
@@ -6357,17 +6559,27 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             finally:
                 self.list_stats.blockSignals(False)
 
+        if not getattr(self, "_perf_browser_signals_connected", False):
+            if hasattr(self, "ed_perf_candidate_filter"):
+                self.ed_perf_candidate_filter.textChanged.connect(self._refresh_perf_candidate_table)
+            if hasattr(self, "tbl_perf_candidates"):
+                self.tbl_perf_candidates.itemSelectionChanged.connect(self._on_perf_candidate_selection_changed)
+                self.tbl_perf_candidates.itemDoubleClicked.connect(lambda *_: self._activate_selected_perf_candidate(switch_to_plot=True))
+            if hasattr(self, "btn_use_perf_candidate"):
+                self.btn_use_perf_candidate.clicked.connect(lambda *_: self._activate_selected_perf_candidate(switch_to_plot=True))
+            self._perf_browser_signals_connected = True
+
         try:
-            self._perf_plotters = be.td_list_available_performance_plotters(self._db_path, be.DEFAULT_EXCEL_TREND_CONFIG)
+            self._perf_plotters = be.td_discover_performance_candidates(self._db_path, be.DEFAULT_EXCEL_TREND_CONFIG)
         except Exception:
             self._perf_plotters = []
 
-        prev_name = str(self.cb_perf_plotter.currentText() or "").strip()
+        prev_key = self._perf_candidate_key(self._selected_perf_plotter())
         self.cb_perf_plotter.blockSignals(True)
         self.cb_perf_plotter.clear()
         for p in self._perf_plotters:
-            name = str(p.get("name") or "Performance Plot").strip()
-            self.cb_perf_plotter.addItem(name or "Performance Plot", p)
+            name = str(p.get("display_name") or p.get("name") or "Performance Candidate").strip()
+            self.cb_perf_plotter.addItem(name or "Performance Candidate", p)
         self.cb_perf_plotter.setEnabled(bool(self._perf_plotters))
         self.cb_perf_plotter.blockSignals(False)
 
@@ -6381,24 +6593,29 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self.sp_perf_degree.setEnabled(False)
         self.cb_perf_norm_x.setEnabled(False)
 
+        self._refresh_perf_candidate_table()
+
         if not self._perf_plotters:
             if hasattr(self, "lbl_perf_axes"):
                 self.lbl_perf_axes.setText("X: - | Y: -")
             if hasattr(self, "lbl_perf_common_runs"):
-                self.lbl_perf_common_runs.setText("No configured performance plots are viable for this project.")
+                self.lbl_perf_common_runs.setText("No viable discovered performance candidates are available for this project.")
+            if hasattr(self, "lbl_perf_candidate_summary"):
+                self.lbl_perf_candidate_summary.setText("Viable candidates: 0")
             self.list_perf_stats.clear()
             self.cb_perf_view_stat.clear()
             self._clear_perf_results()
             return
 
-        if prev_name:
+        restored = False
+        if all(prev_key):
             for i in range(self.cb_perf_plotter.count()):
-                if str(self.cb_perf_plotter.itemText(i) or "").strip() == prev_name:
+                data = self.cb_perf_plotter.itemData(i)
+                if self._perf_candidate_key(data if isinstance(data, dict) else None) == prev_key:
                     self.cb_perf_plotter.setCurrentIndex(i)
+                    restored = True
                     break
-            else:
-                self.cb_perf_plotter.setCurrentIndex(0)
-        else:
+        if not restored:
             self.cb_perf_plotter.setCurrentIndex(0)
         self._on_perf_preset_changed()
 
@@ -6406,6 +6623,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         plotter = self._selected_perf_plotter()
         if not plotter:
             return
+        self._sync_perf_candidate_table_selection()
 
         x_spec = plotter.get("x") or {}
         y_spec = plotter.get("y") or {}
@@ -6437,7 +6655,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             self.lbl_perf_axes.setText(f"X: {x_target or '-'} | Y: {y_target or '-'}")
         if hasattr(self, "lbl_perf_common_runs"):
             count = int(plotter.get("qualifying_serial_count") or 0)
-            self.lbl_perf_common_runs.setText(f"Qualifying serials: {count} | Stats: {', '.join(stats)}")
+            views = ", ".join([str(v).strip() for v in (plotter.get("available_equation_views") or []) if str(v).strip()])
+            self.lbl_perf_common_runs.setText(
+                f"Qualifying serials: {count} | Stats: {', '.join(stats)} | Views: {views or 'master, serial'}"
+            )
 
         if hasattr(self, "list_perf_stats"):
             self.list_perf_stats.blockSignals(True)

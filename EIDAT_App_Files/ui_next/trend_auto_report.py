@@ -1568,6 +1568,7 @@ def generate_test_data_auto_report(
                 metric_stats.append(ss)
         if not metric_stats:
             metric_stats = [stats[0] if stats else "median"]
+        summary_metric_stat = metric_stats[0]
 
         appendix_include_grade_matrix = bool(report_opts.get("appendix_include_grade_matrix", True))
         appendix_include_pass_details = bool(report_opts.get("appendix_include_pass_details", True))
@@ -1841,7 +1842,7 @@ def generate_test_data_auto_report(
                         units_by_param_norm[nk] = units
                     key = (run, col)
                     if key not in metric_map_cache:
-                        metric_map_cache[key] = _td_metric_map(conn, run, col, metrics_stat)
+                        metric_map_cache[key] = _td_metric_map(conn, run, col, summary_metric_stat)
 
             def _pooled_median(sn: str, p: str) -> float | None:
                 nk = _norm_key(p)
@@ -2186,11 +2187,11 @@ def generate_test_data_auto_report(
 
             # 8) Metrics — SN vs Value (single stat)
             if include_metrics:
-                for run, param_name in metrics_sel:
+                for run, param_name, metric_stat in metrics_sel:
                     run_meta = run_by_name.get(run) or {}
                     run_title = str(run_meta.get("display_name") or "").strip() or run
                     units = str(((curves_summary.get(run, {}) or {}).get(param_name) or {}).get("units") or "").strip()
-                    vmap = _td_metric_map(conn, run, param_name, metrics_stat)
+                    vmap = _td_metric_map(conn, run, param_name, metric_stat)
                     serials = all_serials
                     x_idx = list(range(len(serials)))
                     yv = [(float(vmap.get(sn)) if isinstance(vmap.get(sn), (int, float)) else float("nan")) for sn in serials]

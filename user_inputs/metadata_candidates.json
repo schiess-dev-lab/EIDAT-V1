@@ -33,6 +33,9 @@
     "Bracket",
     "Structure"
   ],
+    "asset_specific_types": [
+    "Valve1"
+  ],
   "document_types": [
     {
       "name": "End Item Data Package",
