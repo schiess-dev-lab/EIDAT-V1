@@ -44,6 +44,7 @@ DEFAULT_TREND_AUTO_REPORT_CONFIG = DATA_ROOT / "user_inputs" / "trend_auto_repor
 DEFAULT_ACCEPTANCE_HEURISTICS = DATA_ROOT / "user_inputs" / "acceptance_heuristics.json"
 EXCEL_EXTENSIONS = {".xlsx", ".xls", ".xlsm"}
 EXCEL_ARTIFACT_SUFFIX = "__excel"
+TD_DEFAULT_STATS_ORDER = ["mean", "min", "max", "std"]
 TD_ALLOWED_STATS_ORDER = ["mean", "min", "max", "std", "median", "count"]
 TD_ALLOWED_STATS = set(TD_ALLOWED_STATS_ORDER)
 # Default repository root where PDFs may live (user-organized, nested or flat)
@@ -3180,7 +3181,7 @@ def ensure_test_data_project_cache(
     current_stats = [str(s).strip().lower() for s in current_stats if str(s).strip()]
     current_stats = [s for s in current_stats if s in TD_ALLOWED_STATS]
     if not current_stats:
-        current_stats = list(TD_ALLOWED_STATS_ORDER)
+        current_stats = list(TD_DEFAULT_STATS_ORDER)
     current_stats_csv = ",".join(current_stats)
 
     # If the stats selection or ignore-first config changed, rebuild so td_metrics are consistent.
@@ -3280,9 +3281,9 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
     selected_stats = [str(s).strip().lower() for s in selected_stats if str(s).strip()]
     selected_stats = [s for s in selected_stats if s in TD_ALLOWED_STATS]
     if not selected_stats:
-        selected_stats = list(TD_ALLOWED_STATS_ORDER)
+        selected_stats = list(TD_DEFAULT_STATS_ORDER)
 
-    # Optional: ignore the first N samples when computing per-serial statistics (mean/min/max/std/median/count).
+    # Optional: ignore the first N ordered source rows when computing per-serial statistics.
     # This is configured via user_inputs/excel_trend_config.json.
     stats_ignore_first_n = 0
     try:
@@ -3968,14 +3969,13 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
                                 ).fetchall()
                             except Exception:
                                 rows = []
+                            if stats_ignore_first_n > 0 and len(rows) > 0:
+                                rows = rows[int(stats_ignore_first_n) :]
                             for _rx, ry in rows:
                                 fy = _finite_float(ry)
                                 if fy is None:
                                     continue
                                 y_for_stats.append(float(fy))
-
-                        if stats_ignore_first_n > 0 and len(y_for_stats) > 0:
-                            y_for_stats = y_for_stats[int(stats_ignore_first_n) :]
                         stats_map = _compute_stats(y_for_stats)
                         with closing(sqlite3.connect(str(db_path))) as conn:
                             for stat in selected_stats:
@@ -4108,6 +4108,47 @@ def td_list_serials(db_path: Path) -> list[str]:
     return [str(r[0] or "").strip() for r in rows if str(r[0] or "").strip()]
 
 
+def td_list_curve_y_columns(db_path: Path, run_name: str, x_name: str | None = None) -> list[dict]:
+    path = Path(db_path).expanduser()
+    if not path.exists():
+        return []
+    run = str(run_name or "").strip()
+    x = str(x_name or "").strip()
+    if not run:
+        return []
+    with sqlite3.connect(str(path)) as conn:
+        _ensure_test_data_tables(conn)
+        if x:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT c.y_name, COALESCE(col.units, '')
+                FROM td_curves c
+                LEFT JOIN td_columns col
+                  ON col.run_name = c.run_name AND col.name = c.y_name AND col.kind = 'y'
+                WHERE c.run_name=? AND c.x_name=?
+                ORDER BY c.y_name
+                """,
+                (run, x),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT c.y_name, COALESCE(col.units, '')
+                FROM td_curves c
+                LEFT JOIN td_columns col
+                  ON col.run_name = c.run_name AND col.name = c.y_name AND col.kind = 'y'
+                WHERE c.run_name=?
+                ORDER BY c.y_name
+                """,
+                (run,),
+            ).fetchall()
+    return [
+        {"name": str(r[0] or "").strip(), "units": str(r[1] or "").strip()}
+        for r in rows
+        if str(r[0] or "").strip()
+    ]
+
+
 def td_list_y_columns(db_path: Path, run_name: str) -> list[dict]:
     path = Path(db_path).expanduser()
     if not path.exists():
@@ -4119,6 +4160,33 @@ def td_list_y_columns(db_path: Path, run_name: str) -> list[dict]:
         _ensure_test_data_tables(conn)
         rows = conn.execute(
             "SELECT name, units FROM td_columns WHERE run_name=? AND kind='y' ORDER BY name",
+            (run,),
+        ).fetchall()
+    return [
+        {"name": str(r[0] or "").strip(), "units": str(r[1] or "").strip()}
+        for r in rows
+        if str(r[0] or "").strip()
+    ]
+
+
+def td_list_metric_y_columns(db_path: Path, run_name: str) -> list[dict]:
+    path = Path(db_path).expanduser()
+    if not path.exists():
+        return []
+    run = str(run_name or "").strip()
+    if not run:
+        return []
+    with sqlite3.connect(str(path)) as conn:
+        _ensure_test_data_tables(conn)
+        rows = conn.execute(
+            """
+            SELECT DISTINCT m.column_name, COALESCE(c.units, '')
+            FROM td_metrics m
+            LEFT JOIN td_columns c
+              ON c.run_name = m.run_name AND c.name = m.column_name AND c.kind = 'y'
+            WHERE m.run_name=? AND m.value_num IS NOT NULL
+            ORDER BY m.column_name
+            """,
             (run,),
         ).fetchall()
     return [
@@ -4149,6 +4217,47 @@ def td_list_x_columns(db_path: Path, run_name: str) -> list[str]:
     return xs
 
 
+def td_read_sources_metadata(workbook_path: Path) -> list[dict]:
+    try:
+        from openpyxl import load_workbook  # type: ignore
+    except Exception as exc:
+        raise RuntimeError(
+            "openpyxl is required to read Test Data Trending workbooks. "
+            "Install it with `py -m pip install openpyxl` within the project environment."
+        ) from exc
+
+    wb = load_workbook(str(Path(workbook_path).expanduser()), read_only=True, data_only=True)
+    try:
+        if "Sources" not in wb.sheetnames:
+            return []
+        ws = wb["Sources"]
+        headers: list[tuple[int, str]] = []
+        for col in range(1, (ws.max_column or 0) + 1):
+            raw = str(ws.cell(1, col).value or "").strip()
+            key = raw.lower()
+            if key:
+                headers.append((col, key))
+        if not headers:
+            return []
+
+        out: list[dict] = []
+        for row in range(2, (ws.max_row or 0) + 1):
+            item: dict[str, str] = {}
+            for col, key in headers:
+                item[key] = str(ws.cell(row, col).value or "").strip()
+            sn = str(item.get("serial_number") or "").strip()
+            if not sn:
+                continue
+            item["serial"] = sn
+            out.append(item)
+        return out
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
+
+
 def td_load_metric_series(db_path: Path, run_name: str, column_name: str, stat: str) -> list[dict]:
     path = Path(db_path).expanduser()
     if not path.exists():
@@ -4170,6 +4279,139 @@ def td_load_metric_series(db_path: Path, run_name: str, column_name: str, stat: 
             (run, col, st),
         ).fetchall()
     return [{"serial": str(r[0] or "").strip(), "value_num": r[1]} for r in rows if str(r[0] or "").strip()]
+
+
+def td_list_available_performance_plotters(db_path: Path, config_path: Path | None = None) -> list[dict]:
+    path = Path(db_path).expanduser()
+    if not path.exists():
+        return []
+    try:
+        cfg = load_excel_trend_config(config_path or DEFAULT_EXCEL_TREND_CONFIG)
+    except Exception:
+        cfg = {}
+    plotters = cfg.get("performance_plotters") if isinstance(cfg, dict) else []
+    if not isinstance(plotters, list) or not plotters:
+        return []
+
+    runs = td_list_runs(path)
+    serials = td_list_serials(path)
+    if not runs or not serials:
+        return []
+
+    def _norm(s: str) -> str:
+        return "".join(ch.lower() for ch in str(s or "").strip() if ch.isalnum())
+
+    run_cols: dict[str, dict[str, tuple[str, str]]] = {}
+    for rn in runs:
+        try:
+            cols = td_list_y_columns(path, rn)
+        except Exception:
+            cols = []
+        cur: dict[str, tuple[str, str]] = {}
+        for c in cols:
+            name = str((c or {}).get("name") or "").strip()
+            if not name:
+                continue
+            nk = _norm(name)
+            if nk and nk not in cur:
+                cur[nk] = (name, str((c or {}).get("units") or "").strip())
+        run_cols[rn] = cur
+
+    metric_cache: dict[tuple[str, str, str], dict[str, float]] = {}
+
+    def _metric_map(run_name: str, col_name: str, stat: str) -> dict[str, float]:
+        key = (str(run_name), str(col_name), str(stat).lower())
+        if key in metric_cache:
+            return metric_cache[key]
+        series = td_load_metric_series(path, run_name, col_name, stat)
+        out: dict[str, float] = {}
+        for row in series:
+            sn = str(row.get("serial") or "").strip()
+            val = row.get("value_num")
+            if not sn or not isinstance(val, (int, float)) or not math.isfinite(float(val)):
+                continue
+            out[sn] = float(val)
+        metric_cache[key] = out
+        return out
+
+    available: list[dict] = []
+    for raw in plotters:
+        if not isinstance(raw, dict):
+            continue
+        name = str(raw.get("name") or "").strip() or "Performance Plot"
+        x_spec = raw.get("x") or {}
+        y_spec = raw.get("y") or {}
+        if not isinstance(x_spec, dict) or not isinstance(y_spec, dict):
+            continue
+        x_target = str(x_spec.get("column") or "").strip()
+        y_target = str(y_spec.get("column") or "").strip()
+        if not x_target or not y_target:
+            continue
+        requested_stats = raw.get("stats") if isinstance(raw.get("stats"), list) else []
+        requested_stats = [str(s).strip().lower() for s in requested_stats if str(s).strip()]
+        if not requested_stats:
+            requested_stats = ["mean"]
+        requested_stats = [s for s in requested_stats if s in TD_ALLOWED_STATS]
+        if not requested_stats:
+            requested_stats = ["mean"]
+        try:
+            require_min_points = max(2, int(raw.get("require_min_points") or 2))
+        except Exception:
+            require_min_points = 2
+
+        x_norm = _norm(x_target)
+        y_norm = _norm(y_target)
+        available_stats: list[str] = []
+        qualifying_serials_union: set[str] = set()
+        x_units = ""
+        y_units = ""
+
+        for stat in requested_stats:
+            per_run: list[tuple[str, dict[str, float], dict[str, float]]] = []
+            for rn in runs:
+                cols = run_cols.get(rn) or {}
+                x_col = cols.get(x_norm)
+                y_col = cols.get(y_norm)
+                if not x_col or not y_col:
+                    continue
+                x_name, x_unit = x_col
+                y_name, y_unit = y_col
+                xmap = _metric_map(rn, x_name, stat)
+                ymap = _metric_map(rn, y_name, stat)
+                if not xmap or not ymap:
+                    continue
+                if not x_units and x_unit:
+                    x_units = x_unit
+                if not y_units and y_unit:
+                    y_units = y_unit
+                per_run.append((rn, xmap, ymap))
+
+            qualifying_for_stat: set[str] = set()
+            for sn in serials:
+                unique_pairs: set[tuple[float, float]] = set()
+                for _rn, xmap, ymap in per_run:
+                    if sn not in xmap or sn not in ymap:
+                        continue
+                    unique_pairs.add((float(xmap[sn]), float(ymap[sn])))
+                if len(unique_pairs) >= require_min_points:
+                    qualifying_for_stat.add(sn)
+
+            if qualifying_for_stat:
+                available_stats.append(stat)
+                qualifying_serials_union.update(qualifying_for_stat)
+
+        if not available_stats or not qualifying_serials_union:
+            continue
+
+        item = dict(raw)
+        item["available_stats"] = list(available_stats)
+        item["qualifying_serial_count"] = len(qualifying_serials_union)
+        item["qualifying_serials"] = sorted(qualifying_serials_union)
+        item["x_units"] = x_units
+        item["y_units"] = y_units
+        available.append(item)
+
+    return available
 
 
 def td_load_curves(
@@ -4405,7 +4647,7 @@ def update_test_data_trending_project_workbook(
     cfg_cols = list(cfg.get("columns") or [])
     cfg_stats = [str(s).strip().lower() for s in (cfg.get("statistics") or []) if str(s).strip()]
     if not cfg_stats:
-        cfg_stats = list(TD_ALLOWED_STATS_ORDER)
+        cfg_stats = list(TD_DEFAULT_STATS_ORDER)
 
     cfg_by_name: dict[str, dict] = {}
     cfg_order: list[str] = []
@@ -9472,13 +9714,13 @@ def _load_excel_trend_config(path: Path) -> dict:
     cols = data.get("columns")
     if not isinstance(cols, list) or not cols:
         raise ValueError("Excel trend config must include a non-empty `columns` list.")
-    stats = data.get("statistics") or list(TD_ALLOWED_STATS_ORDER)
+    stats = data.get("statistics") or list(TD_DEFAULT_STATS_ORDER)
     if not isinstance(stats, list) or not all(isinstance(s, str) and s for s in stats):
         raise ValueError("Excel trend config `statistics` must be a list of strings.")
     stats_norm = [str(s).strip().lower() for s in stats if str(s).strip()]
     stats_norm = [s for s in stats_norm if s in TD_ALLOWED_STATS]
     if not stats_norm:
-        stats_norm = list(TD_ALLOWED_STATS_ORDER)
+        stats_norm = list(TD_DEFAULT_STATS_ORDER)
     data["statistics"] = stats_norm
 
     ign = data.get("statistics_ignore_first_n", 0)
@@ -9588,10 +9830,10 @@ def _write_test_data_trending_workbook(
             col_names.append(name)
     stats = [str(s).strip().lower() for s in cfg_stats if str(s).strip()]
     if not stats:
-        stats = list(TD_ALLOWED_STATS_ORDER)
+        stats = list(TD_DEFAULT_STATS_ORDER)
     stats = [s for s in stats if s in TD_ALLOWED_STATS]
     if not stats:
-        stats = list(TD_ALLOWED_STATS_ORDER)
+        stats = list(TD_DEFAULT_STATS_ORDER)
 
     def _read_runs_from_sqlite(sqlite_path: Path) -> list[str]:
         p = Path(sqlite_path).expanduser()

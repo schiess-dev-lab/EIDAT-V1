@@ -2752,6 +2752,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._plot_ready = False
         self._mode = "curves"  # curves | metrics | performance
         self._highlight_sn = ""
+        self._highlight_sns: list[str] = []
+        self._serial_source_rows: list[dict] = []
         self._auto_plots: list[dict] = []
         self._last_plot_def: dict | None = None
         self._auto_plot_path = self._project_dir / "auto_plots_test_data.json"
@@ -2945,7 +2947,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self.list_stats = QtWidgets.QListWidget()
         self.list_stats.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
         self.list_stats.setMaximumHeight(92)
-        for st in ["mean", "min", "max", "std", "median", "count"]:
+        for st in ["mean", "min", "max", "std"]:
             self.list_stats.addItem(QtWidgets.QListWidgetItem(st))
         # Default selection: mean (matches prior single-select default behavior).
         for i in range(self.list_stats.count()):
@@ -2970,6 +2972,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
         row_curves = QtWidgets.QHBoxLayout()
         self.cb_x = QtWidgets.QComboBox()
+        self.cb_x.currentIndexChanged.connect(self._refresh_curve_y_columns)
         row_curves.addWidget(QtWidgets.QLabel("X Column:"))
         row_curves.addWidget(self.cb_x, 1)
         curves_layout.addLayout(row_curves)
@@ -2985,26 +2988,17 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         perf_layout.addWidget(lbl_perf)
 
         row_perf = QtWidgets.QHBoxLayout()
-        row_perf.addWidget(QtWidgets.QLabel("Preset:"))
+        row_perf.addWidget(QtWidgets.QLabel("Performance Plot:"))
         self.cb_perf_plotter = QtWidgets.QComboBox()
         row_perf.addWidget(self.cb_perf_plotter, 1)
         perf_layout.addLayout(row_perf)
 
-        col_grid = QtWidgets.QGridLayout()
-        col_grid.setColumnStretch(1, 1)
-        col_grid.addWidget(QtWidgets.QLabel("X column:"), 0, 0)
-        self.cb_perf_x_col = QtWidgets.QComboBox()
-        self.cb_perf_x_col.setEditable(True)
-        self.cb_perf_x_col.setInsertPolicy(QtWidgets.QComboBox.InsertPolicy.NoInsert)
-        col_grid.addWidget(self.cb_perf_x_col, 0, 1)
-        col_grid.addWidget(QtWidgets.QLabel("Y column:"), 1, 0)
-        self.cb_perf_y_col = QtWidgets.QComboBox()
-        self.cb_perf_y_col.setEditable(True)
-        self.cb_perf_y_col.setInsertPolicy(QtWidgets.QComboBox.InsertPolicy.NoInsert)
-        col_grid.addWidget(self.cb_perf_y_col, 1, 1)
-        perf_layout.addLayout(col_grid)
+        self.lbl_perf_axes = QtWidgets.QLabel("X: - | Y: -")
+        self.lbl_perf_axes.setStyleSheet("color: #334155; font-size: 11px;")
+        self.lbl_perf_axes.setWordWrap(True)
+        perf_layout.addWidget(self.lbl_perf_axes)
 
-        self.lbl_perf_common_runs = QtWidgets.QLabel("Common runs for X/Y: —")
+        self.lbl_perf_common_runs = QtWidgets.QLabel("Available performance plots: -")
         self.lbl_perf_common_runs.setStyleSheet("color: #64748b; font-size: 11px;")
         self.lbl_perf_common_runs.setWordWrap(True)
         perf_layout.addWidget(self.lbl_perf_common_runs)
@@ -3070,16 +3064,17 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         lbl_serials.setStyleSheet("font-size: 12px; font-weight: 700;")
         left_layout.addWidget(lbl_serials)
 
-        self.ed_filter_serials = QtWidgets.QLineEdit()
-        self.ed_filter_serials.setPlaceholderText("Filter serials (e.g., SN0001)")
-        self.ed_filter_serials.textChanged.connect(self._apply_serial_filter)
-        left_layout.addWidget(self.ed_filter_serials)
+        serial_pick_row = QtWidgets.QHBoxLayout()
+        self.btn_highlight_serials = QtWidgets.QPushButton("Select Highlighted Serials...")
+        self.btn_highlight_serials.clicked.connect(self._open_highlight_serials_popup)
+        serial_pick_row.addWidget(self.btn_highlight_serials)
+        serial_pick_row.addStretch(1)
+        left_layout.addLayout(serial_pick_row)
 
-        self.list_serials = QtWidgets.QListWidget()
-        self.list_serials.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
-        self.list_serials.setMaximumHeight(140)
-        self.list_serials.itemSelectionChanged.connect(self._on_highlight_changed)
-        left_layout.addWidget(self.list_serials)
+        self.lbl_highlight_serials = QtWidgets.QLabel("Highlighted serials: -")
+        self.lbl_highlight_serials.setStyleSheet("color: #64748b; font-size: 11px;")
+        self.lbl_highlight_serials.setWordWrap(True)
+        left_layout.addWidget(self.lbl_highlight_serials)
 
         splitter.addWidget(left)
 
@@ -3859,14 +3854,21 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         prev_run = self._run_name_by_display.get(prev_ref, prev_ref)
         self._refresh_run_dropdown(prev_run_name=prev_run)
 
-        self.list_serials.clear()
-        for sn in serials:
-            item = QtWidgets.QListWidgetItem(sn)
-            item.setData(QtCore.Qt.ItemDataRole.UserRole, sn)
-            self.list_serials.addItem(item)
+        try:
+            source_rows = be.td_read_sources_metadata(self._workbook_path)
+        except Exception:
+            source_rows = []
+        by_sn: dict[str, dict] = {}
+        for row in source_rows:
+            if not isinstance(row, dict):
+                continue
+            sn = str(row.get("serial") or row.get("serial_number") or "").strip()
+            if sn and sn not in by_sn:
+                by_sn[sn] = row
+        self._serial_source_rows = [by_sn.get(sn, {"serial": sn, "serial_number": sn}) for sn in serials if str(sn).strip()]
 
-        # Default highlight: none (user can click one if desired).
-        self._highlight_sn = ""
+        keep = [sn for sn in (self._highlight_sns or []) if sn in set(serials)]
+        self._set_highlight_serials(keep)
 
         self._refresh_columns_for_run()
         self._refresh_stats_preview()
@@ -3905,10 +3907,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._perf_available_stats = (
             [str(s).strip().lower() for s in stats if isinstance(s, str) and str(s).strip()]
             if isinstance(stats, list)
-            else ["mean", "min", "max", "std", "median", "count"]
+            else ["mean", "min", "max", "std"]
         )
         if not self._perf_available_stats:
-            self._perf_available_stats = ["mean", "min", "max", "std", "median", "count"]
+            self._perf_available_stats = ["mean", "min", "max", "std"]
 
         # Keep the Metrics tab stat selector consistent with excel_trend_config.json.
         if hasattr(self, "list_stats"):
@@ -4330,9 +4332,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         right_l.setContentsMargins(10, 10, 10, 10)
         right_l.setSpacing(10)
 
-        right_l.addWidget(QtWidgets.QLabel("Runs included"))
         list_runs = QtWidgets.QListWidget()
-        right_l.addWidget(list_runs, 1)
 
         runs_ex = []
         try:
@@ -4349,16 +4349,30 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             list_runs.addItem(it)
         list_runs.blockSignals(False)
 
-        right_l.addWidget(QtWidgets.QLabel("Report Analysis Params (required)"))
         ed_param_filter = QtWidgets.QLineEdit()
+
         ed_param_filter.setPlaceholderText("Filter params…")
-        right_l.addWidget(ed_param_filter)
         list_params = QtWidgets.QListWidget()
-        right_l.addWidget(list_params, 1)
+        lbl_runs_auto = QtWidgets.QLabel("Selected runs: -")
+        lbl_runs_auto.setStyleSheet("color: #64748b; font-size: 11px;")
+        lbl_runs_auto.setWordWrap(True)
+        row_runs = QtWidgets.QHBoxLayout()
+        row_runs.addWidget(QtWidgets.QLabel("Runs included"))
+        btn_runs_popup = QtWidgets.QPushButton("Select Runs...")
+        row_runs.addWidget(btn_runs_popup)
+        row_runs.addStretch(1)
+        right_l.addLayout(row_runs)
+        right_l.addWidget(lbl_runs_auto)
 
         lbl_params_auto = QtWidgets.QLabel("Selected params: —")
         lbl_params_auto.setStyleSheet("color: #64748b; font-size: 11px;")
         lbl_params_auto.setWordWrap(True)
+        row_params = QtWidgets.QHBoxLayout()
+        row_params.addWidget(QtWidgets.QLabel("Report Analysis Params (required)"))
+        btn_params_popup = QtWidgets.QPushButton("Select Params...")
+        row_params.addWidget(btn_params_popup)
+        row_params.addStretch(1)
+        right_l.addLayout(row_params)
         right_l.addWidget(lbl_params_auto)
 
         gb_metrics = QtWidgets.QGroupBox("Metrics Pages (optional)")
@@ -4372,23 +4386,19 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         metrics_pick_l.addWidget(lbl_metrics_note)
         ed_metric_filter = QtWidgets.QLineEdit()
         ed_metric_filter.setPlaceholderText("Filter metrics pagesâ€¦")
-        metrics_pick_l.addWidget(ed_metric_filter)
         list_metric_params = QtWidgets.QListWidget()
-        list_metric_params.setMaximumHeight(150)
-        metrics_pick_l.addWidget(list_metric_params)
         lbl_metrics_auto = QtWidgets.QLabel("Selected metric params: -")
         lbl_metrics_auto.setStyleSheet("color: #64748b; font-size: 11px;")
         lbl_metrics_auto.setWordWrap(True)
+        btn_metrics_popup = QtWidgets.QPushButton("Select Metrics Pages...")
+        metrics_pick_l.addWidget(btn_metrics_popup)
         metrics_pick_l.addWidget(lbl_metrics_auto)
-        metrics_pick_l.addWidget(QtWidgets.QLabel("Stats"))
         list_metric_stats = QtWidgets.QListWidget()
-        list_metric_stats.setMaximumHeight(110)
         for st in ("mean", "min", "max", "median", "std"):
             it = QtWidgets.QListWidgetItem(st)
             it.setFlags(it.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
             it.setCheckState(QtCore.Qt.CheckState.Checked if st == "mean" else QtCore.Qt.CheckState.Unchecked)
             list_metric_stats.addItem(it)
-        metrics_pick_l.addWidget(list_metric_stats)
         right_l.addWidget(gb_metrics)
 
         def _collect_checked(listw: QtWidgets.QListWidget) -> list[str]:
@@ -4406,41 +4416,112 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         pulse_norms = {_norm_name(x) for x in ("pulse number", "pulse#", "pulse #", "pulse_number", "pulsenumber", "cycle")}
         x_exclude_norms = time_norms | pulse_norms | {_norm_name("excel_row")}
 
-        def _apply_param_filter():
-            needle = (ed_param_filter.text() or "").strip().lower()
-            for i in range(list_params.count()):
-                it = list_params.item(i)
+        def _set_filtered_hidden(listw: QtWidgets.QListWidget, needle: str) -> None:
+            needle = (needle or "").strip().lower()
+            for i in range(listw.count()):
+                it = listw.item(i)
                 if not it:
                     continue
                 it.setHidden(bool(needle) and needle not in it.text().lower())
 
-        ed_param_filter.textChanged.connect(_apply_param_filter)
+        def _selection_summary(items: list[str], total: int) -> str:
+            if total <= 0:
+                return "-"
+            if not items:
+                return f"0 / {total}"
+            preview = ", ".join(items[:3])
+            extra = "" if len(items) <= 3 else f" +{len(items) - 3} more"
+            return f"{len(items)} / {total} ({preview}{extra})"
 
-        def _apply_metric_filter():
-            needle = (ed_metric_filter.text() or "").strip().lower()
-            for i in range(list_metric_params.count()):
-                it = list_metric_params.item(i)
-                if not it:
+        def _open_checklist_popup(
+            *,
+            title_text: str,
+            target_list: QtWidgets.QListWidget,
+            filter_placeholder: str,
+            extra_setup=None,
+            extra_apply=None,
+        ) -> None:
+            pop = QtWidgets.QDialog(dlg)
+            pop.setWindowTitle(title_text)
+            pop.resize(640, 560)
+            pop_l = QtWidgets.QVBoxLayout(pop)
+            pop_l.setContentsMargins(12, 12, 12, 12)
+            pop_l.setSpacing(8)
+
+            ed_filter = QtWidgets.QLineEdit()
+            ed_filter.setPlaceholderText(filter_placeholder)
+            pop_l.addWidget(ed_filter)
+
+            work_list = QtWidgets.QListWidget()
+            work_list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
+            pop_l.addWidget(work_list, 1)
+
+            for i in range(target_list.count()):
+                src = target_list.item(i)
+                if not src:
                     continue
-                it.setHidden(bool(needle) and needle not in it.text().lower())
+                it = QtWidgets.QListWidgetItem(src.text())
+                it.setFlags(it.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+                it.setCheckState(src.checkState())
+                work_list.addItem(it)
 
-        ed_metric_filter.textChanged.connect(_apply_metric_filter)
+            ed_filter.textChanged.connect(lambda text: _set_filtered_hidden(work_list, text))
+
+            ctx = {"popup": pop, "layout": pop_l, "list": work_list}
+            if callable(extra_setup):
+                extra_setup(ctx)
+
+            btns = QtWidgets.QHBoxLayout()
+            btns.addStretch(1)
+            btn_ok = QtWidgets.QPushButton("Apply")
+            btn_cancel2 = QtWidgets.QPushButton("Cancel")
+            btns.addWidget(btn_ok)
+            btns.addWidget(btn_cancel2)
+            pop_l.addLayout(btns)
+
+            def _apply() -> None:
+                states: dict[str, QtCore.Qt.CheckState] = {}
+                for i in range(work_list.count()):
+                    it = work_list.item(i)
+                    if it:
+                        states[it.text()] = it.checkState()
+                target_list.blockSignals(True)
+                for i in range(target_list.count()):
+                    it = target_list.item(i)
+                    if it and it.text() in states:
+                        it.setCheckState(states[it.text()])
+                target_list.blockSignals(False)
+                if callable(extra_apply):
+                    extra_apply(ctx)
+                pop.accept()
+
+            btn_ok.clicked.connect(_apply)
+            btn_cancel2.clicked.connect(pop.reject)
+            _fit_widget_to_screen(pop)
+            pop.exec()
+
+        def _update_runs_label() -> None:
+            sel = _collect_checked(list_runs)
+            lbl_runs_auto.setText(f"Selected runs: {_selection_summary(sel, list_runs.count())}")
 
         def _update_params_label():
-            total = list_params.count()
-            checked_now = len(_collect_checked(list_params))
-            lbl_params_auto.setText(f"Selected params: {checked_now} / {total}" if total else "Selected params: —")
+            sel = _collect_checked(list_params)
+            lbl_params_auto.setText(f"Selected params: {_selection_summary(sel, list_params.count())}")
 
         def _update_metric_params_label():
-            total = list_metric_params.count()
-            checked_now = len(_collect_checked(list_metric_params))
-            lbl_metrics_auto.setText(f"Selected metric params: {checked_now} / {total}" if total else "Selected metric params: -")
+            params_sel = _collect_checked(list_metric_params)
+            stats_sel = _collect_checked(list_metric_stats)
+            stats_text = ", ".join(stats_sel) if stats_sel else "none"
+            lbl_metrics_auto.setText(
+                f"Selected metric params: {_selection_summary(params_sel, list_metric_params.count())} | Stats: {stats_text}"
+            )
 
         def _refresh_params_from_runs():
             runs_sel = _collect_checked(list_runs)
             if not runs_sel or not self._db_path:
                 list_params.clear()
                 list_metric_params.clear()
+                _update_runs_label()
                 _update_params_label()
                 _update_metric_params_label()
                 try:
@@ -4513,19 +4594,76 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 list_metric_params.addItem(it)
             list_metric_params.blockSignals(False)
 
+            _update_runs_label()
             _update_params_label()
-            _apply_param_filter()
             _update_metric_params_label()
-            _apply_metric_filter()
 
             try:
                 _refresh_perf_eq_options()
             except Exception:
                 pass
 
+        def _open_runs_popup() -> None:
+            _open_checklist_popup(
+                title_text="Runs Included",
+                target_list=list_runs,
+                filter_placeholder="Filter runs...",
+                extra_apply=lambda _ctx: (_update_runs_label(), _refresh_params_from_runs()),
+            )
+
+        def _open_params_popup() -> None:
+            _open_checklist_popup(
+                title_text="Report Analysis Params",
+                target_list=list_params,
+                filter_placeholder="Filter params...",
+                extra_apply=lambda _ctx: (_update_params_label(), _refresh_perf_eq_options()),
+            )
+
+        def _open_metrics_popup() -> None:
+            def _metrics_extra_setup(ctx: dict) -> None:
+                layout2 = ctx["layout"]
+                layout2.addWidget(QtWidgets.QLabel("Stats"))
+                stats_list = QtWidgets.QListWidget()
+                stats_list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
+                for i in range(list_metric_stats.count()):
+                    src = list_metric_stats.item(i)
+                    if not src:
+                        continue
+                    it = QtWidgets.QListWidgetItem(src.text())
+                    it.setFlags(it.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+                    it.setCheckState(src.checkState())
+                    stats_list.addItem(it)
+                layout2.addWidget(stats_list)
+                ctx["stats_list"] = stats_list
+
+            def _metrics_extra_apply(ctx: dict) -> None:
+                stats_list = ctx.get("stats_list")
+                if isinstance(stats_list, QtWidgets.QListWidget):
+                    list_metric_stats.blockSignals(True)
+                    for i in range(list_metric_stats.count()):
+                        dst = list_metric_stats.item(i)
+                        src = stats_list.item(i)
+                        if dst and src:
+                            dst.setCheckState(src.checkState())
+                    list_metric_stats.blockSignals(False)
+                _update_metric_params_label()
+
+            _open_checklist_popup(
+                title_text="Metrics Pages",
+                target_list=list_metric_params,
+                filter_placeholder="Filter metrics pages...",
+                extra_setup=_metrics_extra_setup,
+                extra_apply=_metrics_extra_apply,
+            )
+
+        btn_runs_popup.clicked.connect(_open_runs_popup)
+        btn_params_popup.clicked.connect(_open_params_popup)
+        btn_metrics_popup.clicked.connect(_open_metrics_popup)
+
         list_runs.itemChanged.connect(lambda *_: _refresh_params_from_runs())
         list_params.itemChanged.connect(lambda *_: _update_params_label())
         list_metric_params.itemChanged.connect(lambda *_: _update_metric_params_label())
+        list_metric_stats.itemChanged.connect(lambda *_: _update_metric_params_label())
         _refresh_params_from_runs()
 
         splitter.addWidget(right)
@@ -4571,8 +4709,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
         def _combo_for_perf() -> QtWidgets.QComboBox:
             cb = QtWidgets.QComboBox()
-            cb.setEditable(True)
-            cb.setInsertPolicy(QtWidgets.QComboBox.InsertPolicy.NoInsert)
+            cb.setEditable(False)
             return cb
 
         def _perf_available_names() -> list[str]:
@@ -4967,13 +5104,11 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             return
         try:
             y_cols = be.td_list_y_columns(self._db_path, run)
+            metric_y_cols = be.td_list_metric_y_columns(self._db_path, run)
             x_cols = be.td_list_x_columns(self._db_path, run)
         except Exception:
-            y_cols, x_cols = [], []
+            y_cols, metric_y_cols, x_cols = [], [], []
 
-        prev_y = self.cb_y_curve.currentText()
-        self.cb_y_curve.blockSignals(True)
-        self.cb_y_curve.clear()
         def _norm_name(s: str) -> str:
             return "".join(ch.lower() for ch in str(s or "") if ch.isalnum())
 
@@ -4987,16 +5122,16 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             for c in y_cols
             if str(c.get("name") or "").strip() and _norm_name(str(c.get("name") or "")) not in x_exclude_norms
         ]
-        self.cb_y_curve.addItems(y_names)
-        if prev_y and prev_y in y_names:
-            self.cb_y_curve.setCurrentText(prev_y)
-        self.cb_y_curve.blockSignals(False)
+
+        metric_y_names = [str(c.get("name") or "").strip() for c in metric_y_cols if str(c.get("name") or "").strip()]
+        if not metric_y_names:
+            metric_y_names = list(y_names)
 
         # Multi-select Y list for metrics mode
         prev_selected = {it.text() for it in self.list_y_metrics.selectedItems()} if hasattr(self, "list_y_metrics") else set()
         self.list_y_metrics.blockSignals(True)
         self.list_y_metrics.clear()
-        for name in y_names:
+        for name in metric_y_names:
             self.list_y_metrics.addItem(QtWidgets.QListWidgetItem(name))
         # Restore selection if possible; otherwise select all by default.
         restored = False
@@ -5047,6 +5182,33 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         if want:
             self.cb_x.setCurrentText(want)
         self.cb_x.blockSignals(False)
+        self._refresh_curve_y_columns()
+
+    def _refresh_curve_y_columns(self) -> None:
+        if not self._db_path or not hasattr(self, "cb_y_curve") or not hasattr(self, "cb_x"):
+            return
+        run = self._current_run_name()
+        prev_y = self.cb_y_curve.currentText()
+        self.cb_y_curve.blockSignals(True)
+        self.cb_y_curve.clear()
+        if not run:
+            self.cb_y_curve.blockSignals(False)
+            return
+        x_label = (self.cb_x.currentText() or "").strip()
+        x_col = self._resolve_curve_x_key(run, x_label)
+        try:
+            y_cols = be.td_list_curve_y_columns(self._db_path, run, x_col)
+        except Exception:
+            y_cols = []
+        y_names = [str(c.get("name") or "").strip() for c in y_cols if str(c.get("name") or "").strip()]
+        self.cb_y_curve.addItems(y_names)
+        if prev_y and prev_y in y_names:
+            self.cb_y_curve.setCurrentText(prev_y)
+        elif y_names:
+            self.cb_y_curve.setCurrentIndex(0)
+        self.cb_y_curve.blockSignals(False)
+        if self._mode == "curves":
+            self._refresh_stats_preview()
 
     def _resolve_curve_x_key(self, run: str, x_label: str) -> str:
         """
@@ -5103,24 +5265,112 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     return v
         return label
 
-    def _apply_serial_filter(self) -> None:
-        needle = (self.ed_filter_serials.text() or "").strip().lower()
-        for i in range(self.list_serials.count()):
-            item = self.list_serials.item(i)
-            sn = str(item.data(QtCore.Qt.ItemDataRole.UserRole) or item.text() or "").lower()
-            item.setHidden(bool(needle) and needle not in sn)
+    def _serial_row_filter_text(self, row: dict) -> str:
+        if not isinstance(row, dict):
+            return ""
+        parts = [str(v).strip() for v in row.values() if str(v).strip()]
+        return " | ".join(parts).lower()
 
-    def _on_highlight_changed(self) -> None:
-        items = self.list_serials.selectedItems()
-        sn = ""
-        if items:
-            sn = str(items[0].data(QtCore.Qt.ItemDataRole.UserRole) or items[0].text() or "").strip()
-        self._highlight_sn = sn
+    def _highlight_summary_text(self) -> str:
+        sels = [str(sn).strip() for sn in (self._highlight_sns or []) if str(sn).strip()]
+        if not sels:
+            return "Highlighted serials: -"
+        shown = ", ".join(sels[:3])
+        extra = "" if len(sels) <= 3 else f" +{len(sels) - 3} more"
+        return f"Highlighted serials: {len(sels)} ({shown}{extra})"
+
+    def _set_highlight_serials(self, serials: list[str]) -> None:
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for sn in (serials or []):
+            val = str(sn or "").strip()
+            if not val or val in seen:
+                continue
+            seen.add(val)
+            cleaned.append(val)
+        self._highlight_sns = cleaned
+        self._highlight_sn = cleaned[0] if cleaned else ""
+        if hasattr(self, "lbl_highlight_serials"):
+            self.lbl_highlight_serials.setText(self._highlight_summary_text())
         self._refresh_stats_preview()
         if self._mode == "performance" and getattr(self, "_perf_results_by_stat", None):
             self._update_perf_highlight_models()
             self._fill_perf_equations_table()
             self._redraw_performance_view()
+
+    def _open_highlight_serials_popup(self) -> None:
+        rows = [r for r in (self._serial_source_rows or []) if isinstance(r, dict)]
+        if not rows:
+            QtWidgets.QMessageBox.information(self, "Highlighted Serials", "No serial metadata available.")
+            return
+
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Highlighted Serials")
+        dlg.resize(760, 560)
+        layout = QtWidgets.QVBoxLayout(dlg)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        ed_filter = QtWidgets.QLineEdit()
+        ed_filter.setPlaceholderText("Filter by serial or metadata...")
+        layout.addWidget(ed_filter)
+
+        listw = QtWidgets.QListWidget()
+        listw.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
+        layout.addWidget(listw, 1)
+
+        selected = {str(sn).strip() for sn in (self._highlight_sns or []) if str(sn).strip()}
+        for row in rows:
+            sn = str(row.get("serial") or row.get("serial_number") or "").strip()
+            if not sn:
+                continue
+            program = str(row.get("program_title") or "").strip()
+            doc_type = str(row.get("document_type") or "").strip()
+            label_parts = [sn]
+            if program:
+                label_parts.append(program)
+            if doc_type:
+                label_parts.append(doc_type)
+            item = QtWidgets.QListWidgetItem(" | ".join(label_parts))
+            item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(QtCore.Qt.CheckState.Checked if sn in selected else QtCore.Qt.CheckState.Unchecked)
+            item.setData(QtCore.Qt.ItemDataRole.UserRole, sn)
+            item.setData(QtCore.Qt.ItemDataRole.UserRole + 1, self._serial_row_filter_text(row))
+            listw.addItem(item)
+
+        def _apply_filter() -> None:
+            needle = (ed_filter.text() or "").strip().lower()
+            for i in range(listw.count()):
+                item = listw.item(i)
+                blob = str(item.data(QtCore.Qt.ItemDataRole.UserRole + 1) or "").strip()
+                item.setHidden(bool(needle) and needle not in blob)
+
+        ed_filter.textChanged.connect(_apply_filter)
+        _apply_filter()
+
+        btns = QtWidgets.QHBoxLayout()
+        btns.addStretch(1)
+        btn_ok = QtWidgets.QPushButton("Apply")
+        btn_cancel = QtWidgets.QPushButton("Cancel")
+        btns.addWidget(btn_ok)
+        btns.addWidget(btn_cancel)
+        layout.addLayout(btns)
+
+        def _apply_selection() -> None:
+            picked: list[str] = []
+            for i in range(listw.count()):
+                item = listw.item(i)
+                if item and item.checkState() == QtCore.Qt.CheckState.Checked:
+                    sn = str(item.data(QtCore.Qt.ItemDataRole.UserRole) or "").strip()
+                    if sn:
+                        picked.append(sn)
+            self._set_highlight_serials(picked)
+            dlg.accept()
+
+        btn_ok.clicked.connect(_apply_selection)
+        btn_cancel.clicked.connect(dlg.reject)
+        _fit_widget_to_screen(dlg)
+        dlg.exec()
 
     def _populate_stats_table(self, run: str, y_col: str, highlight_sn: str) -> None:
         def _set_val(key: str, v: object) -> None:
@@ -5251,9 +5501,11 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 try:
                     line = self._axes.plot(x, y, marker="o", linewidth=1.4, label=f"{y_col}.{stat}")[0]
                     # Highlight the chosen serial with a larger marker (per series).
-                    if self._highlight_sn and self._highlight_sn in labels:
-                        idx = labels.index(self._highlight_sn)
-                        self._axes.plot([x[idx]], [y[idx]], marker="o", markersize=9, color=line.get_color())
+                    hi_set = {str(sn).strip() for sn in (self._highlight_sns or []) if str(sn).strip()}
+                    for hi_sn in hi_set:
+                        if hi_sn in labels:
+                            idx = labels.index(hi_sn)
+                            self._axes.plot([x[idx]], [y[idx]], marker="o", markersize=9, color=line.get_color())
                     any_plotted = True
                 except Exception:
                     continue
@@ -5323,7 +5575,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             if not isinstance(xs, list) or not isinstance(ys, list) or not xs or not ys:
                 continue
             try:
-                is_hi = bool(self._highlight_sn) and sn == self._highlight_sn
+                hi_set = {str(v).strip() for v in (self._highlight_sns or []) if str(v).strip()}
+                is_hi = bool(hi_set) and sn in hi_set
                 self._axes.plot(
                     xs,
                     ys,
@@ -6049,6 +6302,315 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
         _fit_widget_to_screen(dlg)
         dlg.exec()
+
+    def _refresh_performance_ui(self) -> None:
+        if not getattr(self, "_db_path", None):
+            return
+        if not hasattr(self, "cb_perf_plotter") or not hasattr(self, "list_perf_stats") or not hasattr(self, "cb_perf_view_stat"):
+            return
+
+        try:
+            cfg = be.load_excel_trend_config(be.DEFAULT_EXCEL_TREND_CONFIG)
+        except Exception:
+            cfg = {}
+        stats = cfg.get("statistics") if isinstance(cfg, dict) else []
+        self._perf_available_stats = (
+            [str(s).strip().lower() for s in stats if isinstance(s, str) and str(s).strip()]
+            if isinstance(stats, list)
+            else ["mean", "min", "max", "std"]
+        )
+        if not self._perf_available_stats:
+            self._perf_available_stats = ["mean", "min", "max", "std"]
+
+        if hasattr(self, "list_stats"):
+            try:
+                prev = {it.text().strip().lower() for it in self.list_stats.selectedItems() if it and it.text().strip()}
+            except Exception:
+                prev = set()
+            self.list_stats.blockSignals(True)
+            try:
+                self.list_stats.clear()
+                for st in self._perf_available_stats:
+                    self.list_stats.addItem(QtWidgets.QListWidgetItem(st))
+                restored = False
+                if prev:
+                    for i in range(self.list_stats.count()):
+                        it = self.list_stats.item(i)
+                        if it and it.text().strip().lower() in prev:
+                            it.setSelected(True)
+                            restored = True
+                if not restored and self.list_stats.count() > 0:
+                    self.list_stats.item(0).setSelected(True)
+            finally:
+                self.list_stats.blockSignals(False)
+
+        try:
+            self._perf_plotters = be.td_list_available_performance_plotters(self._db_path, be.DEFAULT_EXCEL_TREND_CONFIG)
+        except Exception:
+            self._perf_plotters = []
+
+        prev_name = str(self.cb_perf_plotter.currentText() or "").strip()
+        self.cb_perf_plotter.blockSignals(True)
+        self.cb_perf_plotter.clear()
+        for p in self._perf_plotters:
+            name = str(p.get("name") or "Performance Plot").strip()
+            self.cb_perf_plotter.addItem(name or "Performance Plot", p)
+        self.cb_perf_plotter.setEnabled(bool(self._perf_plotters))
+        self.cb_perf_plotter.blockSignals(False)
+
+        if not getattr(self, "_perf_signals_connected", False):
+            self.cb_perf_plotter.currentIndexChanged.connect(self._on_perf_preset_changed)
+            self.cb_perf_view_stat.currentIndexChanged.connect(self._on_perf_view_stat_changed)
+            self._perf_signals_connected = True
+
+        self.list_perf_stats.setEnabled(False)
+        self.cb_perf_fit.setEnabled(False)
+        self.sp_perf_degree.setEnabled(False)
+        self.cb_perf_norm_x.setEnabled(False)
+
+        if not self._perf_plotters:
+            if hasattr(self, "lbl_perf_axes"):
+                self.lbl_perf_axes.setText("X: - | Y: -")
+            if hasattr(self, "lbl_perf_common_runs"):
+                self.lbl_perf_common_runs.setText("No configured performance plots are viable for this project.")
+            self.list_perf_stats.clear()
+            self.cb_perf_view_stat.clear()
+            self._clear_perf_results()
+            return
+
+        if prev_name:
+            for i in range(self.cb_perf_plotter.count()):
+                if str(self.cb_perf_plotter.itemText(i) or "").strip() == prev_name:
+                    self.cb_perf_plotter.setCurrentIndex(i)
+                    break
+            else:
+                self.cb_perf_plotter.setCurrentIndex(0)
+        else:
+            self.cb_perf_plotter.setCurrentIndex(0)
+        self._on_perf_preset_changed()
+
+    def _on_perf_preset_changed(self) -> None:
+        plotter = self._selected_perf_plotter()
+        if not plotter:
+            return
+
+        x_spec = plotter.get("x") or {}
+        y_spec = plotter.get("y") or {}
+        x_target = str((x_spec.get("column") if isinstance(x_spec, dict) else "") or "").strip()
+        y_target = str((y_spec.get("column") if isinstance(y_spec, dict) else "") or "").strip()
+        stats = plotter.get("available_stats") if isinstance(plotter.get("available_stats"), list) else plotter.get("stats")
+        if not isinstance(stats, list) or not all(isinstance(s, str) for s in stats):
+            stats = ["mean"]
+        stats = [str(s).strip().lower() for s in stats if str(s).strip()]
+        if not stats:
+            stats = ["mean"]
+
+        fit = plotter.get("fit") or {}
+        if not isinstance(fit, dict):
+            fit = {}
+        try:
+            deg = int(fit.get("degree") or 0)
+        except Exception:
+            deg = 0
+        deg = max(0, deg)
+        normx = bool(fit.get("normalize_x", True))
+        try:
+            req = int(plotter.get("require_min_points") or 2)
+        except Exception:
+            req = 2
+        self._perf_require_min_points = max(2, int(req))
+
+        if hasattr(self, "lbl_perf_axes"):
+            self.lbl_perf_axes.setText(f"X: {x_target or '-'} | Y: {y_target or '-'}")
+        if hasattr(self, "lbl_perf_common_runs"):
+            count = int(plotter.get("qualifying_serial_count") or 0)
+            self.lbl_perf_common_runs.setText(f"Qualifying serials: {count} | Stats: {', '.join(stats)}")
+
+        if hasattr(self, "list_perf_stats"):
+            self.list_perf_stats.blockSignals(True)
+            self.list_perf_stats.clear()
+            for st in stats:
+                it = QtWidgets.QListWidgetItem(st)
+                it.setFlags(it.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+                it.setCheckState(QtCore.Qt.CheckState.Checked)
+                self.list_perf_stats.addItem(it)
+            self.list_perf_stats.blockSignals(False)
+            self.list_perf_stats.setEnabled(False)
+
+        prev_view = str(self.cb_perf_view_stat.currentText() or "").strip().lower() if hasattr(self, "cb_perf_view_stat") else ""
+        if hasattr(self, "cb_perf_view_stat"):
+            self.cb_perf_view_stat.blockSignals(True)
+            self.cb_perf_view_stat.clear()
+            for st in stats:
+                self.cb_perf_view_stat.addItem(st, st)
+            if prev_view and prev_view in stats:
+                self.cb_perf_view_stat.setCurrentText(prev_view)
+            elif stats:
+                self.cb_perf_view_stat.setCurrentIndex(0)
+            self.cb_perf_view_stat.blockSignals(False)
+
+        if hasattr(self, "cb_perf_fit"):
+            self.cb_perf_fit.setChecked(deg > 0)
+            self.cb_perf_fit.setEnabled(False)
+        if hasattr(self, "sp_perf_degree"):
+            self.sp_perf_degree.setValue(min(max(1, deg), 6) if deg > 0 else 1)
+            self.sp_perf_degree.setEnabled(False)
+        if hasattr(self, "cb_perf_norm_x"):
+            self.cb_perf_norm_x.setChecked(bool(normx))
+            self.cb_perf_norm_x.setEnabled(False)
+
+        self._clear_perf_results()
+
+    def _plot_performance(self) -> None:
+        if not self._plot_ready or not self._db_path:
+            return
+        plotter = self._selected_perf_plotter()
+        if not plotter:
+            QtWidgets.QMessageBox.information(self, "Performance", "No viable performance plot is available.")
+            return
+
+        x_spec = plotter.get("x") or {}
+        y_spec = plotter.get("y") or {}
+        x_target = str((x_spec.get("column") if isinstance(x_spec, dict) else "") or "").strip()
+        y_target = str((y_spec.get("column") if isinstance(y_spec, dict) else "") or "").strip()
+        if not x_target or not y_target:
+            QtWidgets.QMessageBox.information(self, "Performance", "Selected performance plot is missing X or Y.")
+            return
+
+        stats = plotter.get("available_stats") if isinstance(plotter.get("available_stats"), list) else plotter.get("stats")
+        if not isinstance(stats, list) or not all(isinstance(s, str) for s in stats):
+            stats = ["mean"]
+        stats = [str(s).strip().lower() for s in stats if str(s).strip()]
+        if not stats:
+            QtWidgets.QMessageBox.information(self, "Performance", "Selected performance plot has no viable stats.")
+            return
+
+        runs = self._selected_perf_runs()
+        if not runs:
+            QtWidgets.QMessageBox.information(self, "Performance", "No runs found in cache.")
+            return
+        serials = self._selected_perf_serials()
+        if not serials:
+            QtWidgets.QMessageBox.information(self, "Performance", "No serial numbers found in cache.")
+            return
+
+        fit_cfg = plotter.get("fit") or {}
+        if not isinstance(fit_cfg, dict):
+            fit_cfg = {}
+        try:
+            degree = max(0, int(fit_cfg.get("degree") or 0))
+        except Exception:
+            degree = 0
+        normx = bool(fit_cfg.get("normalize_x", True))
+        fit_enabled = degree > 0
+        try:
+            require_min_points = max(2, int(plotter.get("require_min_points") or 2))
+        except Exception:
+            require_min_points = 2
+        self._perf_require_min_points = require_min_points
+
+        self._perf_results_by_stat = {}
+
+        for st in stats:
+            per_run: list[tuple[str, str, dict[str, float], dict[str, float], str, str]] = []
+            for rn in runs:
+                x_col, x_units = self._resolve_td_y_col_units(rn, x_target)
+                y_col, y_units = self._resolve_td_y_col_units(rn, y_target)
+                if not x_col or not y_col:
+                    continue
+                xmap = self._load_metric_map(rn, x_col, st)
+                ymap = self._load_metric_map(rn, y_col, st)
+                if not xmap or not ymap:
+                    continue
+                per_run.append((rn, self._run_display_text(rn), xmap, ymap, x_units, y_units))
+
+            curves: dict[str, list[tuple[float, float, str]]] = {}
+            pooled_x: list[float] = []
+            pooled_y: list[float] = []
+            for sn in serials:
+                pts: list[tuple[float, float, str]] = []
+                seen_pairs: set[tuple[float, float]] = set()
+                for _rn, rdisp, xmap, ymap, _xu, _yu in per_run:
+                    if sn not in xmap or sn not in ymap:
+                        continue
+                    pair = (float(xmap[sn]), float(ymap[sn]))
+                    if pair in seen_pairs:
+                        continue
+                    seen_pairs.add(pair)
+                    pts.append((pair[0], pair[1], str(rdisp or _rn)))
+                if len(seen_pairs) >= require_min_points:
+                    pts.sort(key=lambda t: t[0])
+                    curves[sn] = pts
+                    pooled_x.extend([p[0] for p in pts])
+                    pooled_y.extend([p[1] for p in pts])
+
+            if not curves:
+                continue
+
+            x_units = next((u for *_rest, u, _ in per_run if str(u).strip()), str(plotter.get("x_units") or "").strip())
+            y_units = next((u for *_rest, _, u in per_run if str(u).strip()), str(plotter.get("y_units") or "").strip())
+
+            master_model: dict = {}
+            if fit_enabled and degree > 0 and pooled_x:
+                try:
+                    model = self._perf_poly_fit(pooled_x, pooled_y, degree, normalize_x=normx)
+                except Exception as exc:
+                    QtWidgets.QMessageBox.warning(self, "Performance", str(exc))
+                    model = None
+                if model:
+                    try:
+                        import numpy as np  # type: ignore
+
+                        x_min = float(min(pooled_x))
+                        x_max = float(max(pooled_x))
+                        xfit = np.linspace(x_min, x_max, 220)
+                        coeffs = model.get("coeffs") or []
+                        p = np.poly1d(coeffs)
+                        if bool(model.get("normalize_x")):
+                            x0 = float(model.get("x0") or 0.0)
+                            sx = float(model.get("sx") or 1.0) or 1.0
+                            xfit_n = (xfit - x0) / sx
+                        else:
+                            xfit_n = xfit
+                        yfit = p(xfit_n)
+                        model["xfit"] = xfit.tolist()
+                        model["yfit"] = yfit.tolist()
+                    except Exception:
+                        pass
+                    master_model = model
+
+            self._perf_results_by_stat[st] = {
+                "x_target": x_target,
+                "y_target": y_target,
+                "x_units": x_units,
+                "y_units": y_units,
+                "curves": curves,
+                "master_model": master_model,
+                "highlight_serial": "",
+                "highlight_model": {},
+            }
+
+        if not self._perf_results_by_stat:
+            QtWidgets.QMessageBox.information(self, "Performance", "No qualifying performance data found for the selected plot.")
+            return
+
+        prev_view = str(self.cb_perf_view_stat.currentText() or "").strip().lower() if hasattr(self, "cb_perf_view_stat") else ""
+        if hasattr(self, "cb_perf_view_stat"):
+            self.cb_perf_view_stat.blockSignals(True)
+            self.cb_perf_view_stat.clear()
+            for st in sorted(self._perf_results_by_stat.keys(), key=lambda s: str(s).lower()):
+                self.cb_perf_view_stat.addItem(st, st)
+            if prev_view and prev_view in self._perf_results_by_stat:
+                self.cb_perf_view_stat.setCurrentText(prev_view)
+            else:
+                self.cb_perf_view_stat.setCurrentIndex(0)
+            self.cb_perf_view_stat.blockSignals(False)
+
+        self._update_perf_highlight_models()
+        self._fill_perf_equations_table()
+        self._redraw_performance_view()
+        self.btn_save_plot_pdf.setEnabled(True)
+        self.btn_add_auto_plot.setEnabled(False)
 
     def _save_plot_pdf(self) -> None:
         if not self._plot_ready or not self._figure:
