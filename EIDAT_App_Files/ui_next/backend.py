@@ -5154,7 +5154,20 @@ def td_list_x_columns(db_path: Path, run_name: str) -> list[str]:
             "SELECT name FROM td_columns_raw WHERE run_name=? AND kind='x' ORDER BY name",
             (run,),
         ).fetchall()
+        curve_rows = conn.execute(
+            """
+            SELECT DISTINCT x_name
+            FROM td_curves_raw
+            WHERE run_name=? AND x_name IS NOT NULL AND TRIM(x_name) <> ''
+            ORDER BY x_name
+            """,
+            (run,),
+        ).fetchall()
     xs = [str(r[0] or "").strip() for r in rows if str(r[0] or "").strip()]
+    for r in curve_rows:
+        x_name = str(r[0] or "").strip()
+        if x_name and x_name not in xs:
+            xs.append(x_name)
     if default_x and default_x in xs:
         xs = [default_x] + [x for x in xs if x != default_x]
     return xs

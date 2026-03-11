@@ -3888,14 +3888,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
     def _load_cache(self, *, rebuild: bool) -> None:
         try:
-            if rebuild:
-                self._db_path = be.ensure_test_data_project_cache(
-                    self._project_dir, self._workbook_path, rebuild=True
-                )
-            else:
-                self._db_path = be.validate_existing_test_data_project_cache(
-                    self._project_dir, self._workbook_path
-                )
+            self._db_path = be.ensure_test_data_project_cache(
+                self._project_dir, self._workbook_path, rebuild=bool(rebuild)
+            )
             self.lbl_source.setText(str(self._db_path))
             self.lbl_cache.setText(f"Cache DB: {self._db_path}")
         except Exception as exc:

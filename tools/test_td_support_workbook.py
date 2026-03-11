@@ -454,6 +454,39 @@ class TestTDSupportWorkbook(unittest.TestCase):
             validated = be.validate_existing_test_data_project_cache(root, wb_path)
             self.assertEqual(str(validated), str(root / "implementation_trending.sqlite3"))
 
+    def test_td_list_x_columns_falls_back_to_raw_curves(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            db_path = root / "implementation_trending.sqlite3"
+            with sqlite3.connect(str(db_path)) as conn:
+                be._ensure_test_data_tables(conn)
+                conn.execute(
+                    "INSERT OR REPLACE INTO td_runs(run_name, default_x, display_name) VALUES (?, ?, ?)",
+                    ("RunA", "Time", ""),
+                )
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO td_curves_raw
+                    (run_name, y_name, x_name, serial, x_json, y_json, n_points, source_mtime_ns, computed_epoch_ns)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    ("RunA", "thrust", "Time", "SN1", "[0,1,2]", "[1,2,3]", 3, 1, 1),
+                )
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO td_curves_raw
+                    (run_name, y_name, x_name, serial, x_json, y_json, n_points, source_mtime_ns, computed_epoch_ns)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    ("RunA", "thrust", "Pulse Number", "SN1", "[1,2,3]", "[1,2,3]", 3, 1, 1),
+                )
+                conn.commit()
+
+            xs = be.td_list_x_columns(db_path, "RunA")
+            self.assertEqual(xs, ["Time", "Pulse Number"])
+
     def test_cache_rebuild_tracks_source_metadata_updates(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
 
