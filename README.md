@@ -241,3 +241,15 @@ Legacy `user_inputs/ocr_force.env` is kept for backward compatibility, but `scan
 
 ### Excel workbook update errors
 If EIDAT tells you the workbook isn’t writable, close it in Excel and retry.
+
+### MATLAB `.mat` test data -> Excel
+If your test data is stored in MATLAB `.mat` files, you can convert it into `.xlsx` first and then use the existing Test Data Excel pipeline:
+
+```powershell
+EIDAT_App_Files\.venv\Scripts\python.exe tools\mat_to_excel.py "C:\path\to\data.mat"
+```
+
+Notes:
+- The converter writes one Excel sheet per MATLAB variable.
+- Numeric vectors/matrices are preserved as tabular sheets.
+- Struct-like data is flattened into columns so it can be mapped in `user_inputs/excel_trend_config.json`.
