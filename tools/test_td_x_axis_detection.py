@@ -77,10 +77,11 @@ class TestTDXAxisDetection(unittest.TestCase):
     def test_seq_time_header_maps_to_time(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
 
-        with tempfile.TemporaryDirectory() as td:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
             root = Path(td)
             src_db = root / "src.sqlite3"
             out_db = root / "td_cache.sqlite3"
+            raw_db = root / "test_data_raw_cache.sqlite3"
             wb_path = root / "td.xlsx"
             cfg_path = root / "excel_trend_config.json"
 
@@ -126,7 +127,7 @@ class TestTDXAxisDetection(unittest.TestCase):
             finally:
                 be.DEFAULT_EXCEL_TREND_CONFIG = old
 
-            conn = sqlite3.connect(str(out_db))
+            conn = sqlite3.connect(str(raw_db))
             try:
                 xcols = conn.execute(
                     "SELECT name FROM td_columns WHERE run_name='Run1' AND kind='x' ORDER BY name"
@@ -142,16 +143,17 @@ class TestTDXAxisDetection(unittest.TestCase):
             self.assertEqual([r[0] for r in xcols], ["Time"])
             self.assertEqual(default_x[0], "Time")
 
-            xs = self._read_single_curve_x(out_db, run="Run1", y="thrust", x_name="Time", serial="SN0001")
+            xs = self._read_single_curve_x(raw_db, run="Run1", y="thrust", x_name="Time", serial="SN0001")
             self.assertEqual(xs, [float(i) for i in range(20)])
 
     def test_cycle_header_maps_to_pulse_number(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
 
-        with tempfile.TemporaryDirectory() as td:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
             root = Path(td)
             src_db = root / "src.sqlite3"
             out_db = root / "td_cache.sqlite3"
+            raw_db = root / "test_data_raw_cache.sqlite3"
             wb_path = root / "td.xlsx"
             cfg_path = root / "excel_trend_config.json"
 
@@ -196,7 +198,7 @@ class TestTDXAxisDetection(unittest.TestCase):
             finally:
                 be.DEFAULT_EXCEL_TREND_CONFIG = old
 
-            conn = sqlite3.connect(str(out_db))
+            conn = sqlite3.connect(str(raw_db))
             try:
                 xcols = conn.execute(
                     "SELECT name FROM td_columns WHERE run_name='Run1' AND kind='x' ORDER BY name"
@@ -208,16 +210,17 @@ class TestTDXAxisDetection(unittest.TestCase):
                     pass
             self.assertEqual([r[0] for r in xcols], ["Pulse Number"])
 
-            xs = self._read_single_curve_x(out_db, run="Run1", y="thrust", x_name="Pulse Number", serial="SN0001")
+            xs = self._read_single_curve_x(raw_db, run="Run1", y="thrust", x_name="Pulse Number", serial="SN0001")
             self.assertEqual(xs, [float(i + 1) for i in range(20)])
 
     def test_non_sequential_time_like_metric_is_rejected(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
 
-        with tempfile.TemporaryDirectory() as td:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
             root = Path(td)
             src_db = root / "src.sqlite3"
             out_db = root / "td_cache.sqlite3"
+            raw_db = root / "test_data_raw_cache.sqlite3"
             wb_path = root / "td.xlsx"
             cfg_path = root / "excel_trend_config.json"
 
@@ -268,7 +271,7 @@ class TestTDXAxisDetection(unittest.TestCase):
             finally:
                 be.DEFAULT_EXCEL_TREND_CONFIG = old
 
-            xs = self._read_single_curve_x(out_db, run="Run1", y="thrust", x_name="Time", serial="SN0001")
+            xs = self._read_single_curve_x(raw_db, run="Run1", y="thrust", x_name="Time", serial="SN0001")
             self.assertEqual(xs, [float(i) for i in range(20)])
 
 

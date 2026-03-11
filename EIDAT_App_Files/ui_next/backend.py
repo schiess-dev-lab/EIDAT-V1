@@ -2824,7 +2824,7 @@ def _resolve_excel_sqlite_path_from_workbook(workbook_path: Path, excel_sqlite_r
     return (Path(workbook_path).expanduser().parent / p).expanduser()
 
 
-def _ensure_test_data_tables(conn: sqlite3.Connection) -> None:
+def _ensure_test_data_impl_tables(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS td_meta (
@@ -2884,6 +2884,70 @@ def _ensure_test_data_tables(conn: sqlite3.Connection) -> None:
         pass
     conn.execute(
         """
+        CREATE TABLE IF NOT EXISTS td_columns_calc (
+            run_name TEXT NOT NULL,
+            name TEXT NOT NULL,
+            units TEXT,
+            kind TEXT NOT NULL,
+            PRIMARY KEY (run_name, name)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS td_metrics_calc (
+            serial TEXT NOT NULL,
+            run_name TEXT NOT NULL,
+            column_name TEXT NOT NULL,
+            stat TEXT NOT NULL,
+            value_num REAL,
+            computed_epoch_ns INTEGER NOT NULL,
+            source_mtime_ns INTEGER,
+            PRIMARY KEY (serial, run_name, column_name, stat)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS td_terms (
+            row_index INTEGER PRIMARY KEY,
+            term TEXT,
+            header TEXT,
+            table_label TEXT,
+            value_type TEXT,
+            data_group TEXT,
+            term_label TEXT,
+            units TEXT,
+            min_val TEXT,
+            max_val TEXT,
+            active INTEGER NOT NULL,
+            normalized_stat TEXT,
+            computed_epoch_ns INTEGER NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS td_source_diagnostics (
+            serial TEXT NOT NULL,
+            resolved_sqlite_path TEXT,
+            status TEXT NOT NULL,
+            run_name TEXT NOT NULL,
+            x_axis_kind TEXT,
+            matched_y_json TEXT,
+            curves_written INTEGER NOT NULL DEFAULT 0,
+            metrics_written INTEGER NOT NULL DEFAULT 0,
+            reason TEXT,
+            PRIMARY KEY (serial, run_name)
+        )
+        """
+    )
+
+
+def _ensure_test_data_tables(conn: sqlite3.Connection) -> None:
+    _ensure_test_data_impl_tables(conn)
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS td_columns (
             run_name TEXT NOT NULL,
             name TEXT NOT NULL,
@@ -2896,17 +2960,6 @@ def _ensure_test_data_tables(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS td_columns_raw (
-            run_name TEXT NOT NULL,
-            name TEXT NOT NULL,
-            units TEXT,
-            kind TEXT NOT NULL,
-            PRIMARY KEY (run_name, name)
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS td_columns_calc (
             run_name TEXT NOT NULL,
             name TEXT NOT NULL,
             units TEXT,
@@ -2953,20 +3006,6 @@ def _ensure_test_data_tables(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         """
-        CREATE TABLE IF NOT EXISTS td_metrics_calc (
-            serial TEXT NOT NULL,
-            run_name TEXT NOT NULL,
-            column_name TEXT NOT NULL,
-            stat TEXT NOT NULL,
-            value_num REAL,
-            computed_epoch_ns INTEGER NOT NULL,
-            source_mtime_ns INTEGER,
-            PRIMARY KEY (serial, run_name, column_name, stat)
-        )
-        """
-    )
-    conn.execute(
-        """
         CREATE TABLE IF NOT EXISTS td_curves_raw (
             run_name TEXT NOT NULL,
             y_name TEXT NOT NULL,
@@ -2987,25 +3026,33 @@ def _ensure_test_data_tables(conn: sqlite3.Connection) -> None:
         ON td_curves_raw (run_name, y_name, x_name, serial)
         """
     )
-    conn.execute(
+
+
+def _purge_test_data_legacy_impl_raw_tables(conn: sqlite3.Connection) -> None:
+    def _q(name: str) -> str:
+        return '"' + str(name or "").replace('"', '""') + '"'
+
+    rows = conn.execute(
         """
-        CREATE TABLE IF NOT EXISTS td_terms (
-            row_index INTEGER PRIMARY KEY,
-            term TEXT,
-            header TEXT,
-            table_label TEXT,
-            value_type TEXT,
-            data_group TEXT,
-            term_label TEXT,
-            units TEXT,
-            min_val TEXT,
-            max_val TEXT,
-            active INTEGER NOT NULL,
-            normalized_stat TEXT,
-            computed_epoch_ns INTEGER NOT NULL
-        )
+        SELECT name
+        FROM sqlite_master
+        WHERE type='table' AND (name IN (
+            'td_raw_meta',
+            'td_raw_sequences',
+            'td_raw_curve_catalog',
+            'td_columns',
+            'td_columns_raw',
+            'td_curves',
+            'td_curves_raw',
+            'td_metrics'
+        ) OR name LIKE 'td_raw__%')
         """
-    )
+    ).fetchall()
+    for (name,) in rows:
+        table_name = str(name or "").strip()
+        if not table_name:
+            continue
+        conn.execute(f"DROP TABLE IF EXISTS {_q(table_name)}")
 
 
 def _read_test_data_config_columns(workbook_path: Path) -> list[dict]:
@@ -3169,6 +3216,111 @@ def _load_td_source_metadata(workbook_path: Path, source_row: Mapping[str, objec
     return out
 
 
+def _td_source_sqlite_artifact_candidates(
+    *,
+    node_root: Path,
+    artifacts_rel: str,
+) -> list[Path]:
+    art_rel = str(artifacts_rel or "").strip()
+    if not art_rel:
+        return []
+    support_dir = eidat_support_dir(node_root)
+    art_dir = _resolve_support_path(support_dir, art_rel)
+    if art_dir is None or not art_dir.exists() or not art_dir.is_dir():
+        return []
+    out: list[Path] = []
+    for path in sorted(art_dir.glob("*.sqlite3")):
+        if not path.exists() or not path.is_file():
+            continue
+        low = path.name.lower()
+        if low in {
+            EIDAT_PROJECT_IMPLEMENTATION_DB.lower(),
+            EIDAT_PROJECT_TD_RAW_CACHE_DB.lower(),
+        }:
+            continue
+        out.append(path)
+    return out
+
+
+def _resolve_td_source_sqlite_for_node(
+    node_root: Path,
+    *,
+    excel_sqlite_rel: str,
+    artifacts_rel: str,
+) -> dict[str, object]:
+    raw = str(excel_sqlite_rel or "").strip()
+    if raw:
+        candidate = _resolve_excel_sqlite_path_from_workbook(node_root / "dummy.xlsx", raw)
+        if candidate.exists() and candidate.is_file():
+            return {
+                "status": "ok",
+                "path": candidate,
+                "resolved_from": "excel_sqlite_rel",
+                "reason": "",
+            }
+        if candidate.exists() and not candidate.is_file():
+            return {
+                "status": "invalid",
+                "path": candidate,
+                "resolved_from": "excel_sqlite_rel",
+                "reason": f"Resolved source path is not a file: {candidate}",
+            }
+
+    candidates = _td_source_sqlite_artifact_candidates(node_root=node_root, artifacts_rel=artifacts_rel)
+    if len(candidates) == 1:
+        return {
+            "status": "ok",
+            "path": candidates[0],
+            "resolved_from": "artifacts_rel",
+            "reason": "",
+        }
+    if len(candidates) > 1:
+        names = ", ".join(p.name for p in candidates[:6])
+        return {
+            "status": "invalid",
+            "path": None,
+            "resolved_from": "artifacts_rel",
+            "reason": f"Multiple source SQLite files found in TD artifacts folder: {names}",
+        }
+    if raw:
+        candidate = _resolve_excel_sqlite_path_from_workbook(node_root / "dummy.xlsx", raw)
+        return {
+            "status": "missing",
+            "path": candidate,
+            "resolved_from": "excel_sqlite_rel",
+            "reason": f"Source SQLite not found: {candidate}",
+        }
+    return {
+        "status": "missing",
+        "path": None,
+        "resolved_from": "",
+        "reason": "No source SQLite could be resolved from excel_sqlite_rel or artifacts_rel.",
+    }
+
+
+def _resolve_td_source_sqlite_for_workbook(
+    workbook_path: Path,
+    source_row: Mapping[str, object],
+) -> dict[str, object]:
+    wb_path = Path(workbook_path).expanduser()
+    node_root = _infer_node_root_from_workbook_path(wb_path)
+    meta = _load_td_source_metadata(wb_path, source_row)
+    result = _resolve_td_source_sqlite_for_node(
+        node_root,
+        excel_sqlite_rel=str(source_row.get("excel_sqlite_rel") or meta.get("excel_sqlite_rel") or "").strip(),
+        artifacts_rel=str(source_row.get("artifacts_rel") or meta.get("artifacts_rel") or "").strip(),
+    )
+    if not result.get("path"):
+        return result
+    path = Path(result["path"]).expanduser()
+    return {
+        **result,
+        "path": path,
+        "excel_sqlite_rel": str(source_row.get("excel_sqlite_rel") or meta.get("excel_sqlite_rel") or "").strip(),
+        "artifacts_rel": str(source_row.get("artifacts_rel") or meta.get("artifacts_rel") or "").strip(),
+    }
+
+
 def _normalize_td_stat(s: object) -> str:
     raw = str(s or "").strip().lower()
     if not raw:
@@ -3300,12 +3452,17 @@ def _discover_td_runs_for_docs(global_repo: Path | None, docs: list[dict] | None
     runs: list[str] = []
     seen_runs: set[str] = set()
     for d in (docs or []):
-        raw = str((d or {}).get("excel_sqlite_rel") or "").strip()
-        if not raw:
+        if repo is None:
             continue
-        p = Path(raw).expanduser()
-        if not p.is_absolute() and repo is not None:
-            p = repo / p
+        resolved = _resolve_td_source_sqlite_for_node(
+            repo,
+            excel_sqlite_rel=str((d or {}).get("excel_sqlite_rel") or "").strip(),
+            artifacts_rel=str((d or {}).get("artifacts_rel") or "").strip(),
+        )
+        p = resolved.get("path")
+        if not p:
+            continue
+        p = Path(p).expanduser()
         if not p.exists() or not p.is_file():
             continue
         try:
@@ -3751,7 +3908,7 @@ def td_list_runs_ex(db_path: Path) -> list[dict]:
     if not path.exists():
         return []
     with sqlite3.connect(str(path)) as conn:
-        _ensure_test_data_tables(conn)
+        _ensure_test_data_impl_tables(conn)
         rows = conn.execute(
             "SELECT run_name, display_name FROM td_runs ORDER BY run_name"
         ).fetchall()
@@ -3785,7 +3942,7 @@ def ensure_test_data_project_cache(
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
     with sqlite3.connect(str(db_path)) as conn:
-        _ensure_test_data_tables(conn)
+        _ensure_test_data_impl_tables(conn)
         conn.commit()
     with sqlite3.connect(str(raw_db_path)) as conn:
         _ensure_test_data_raw_cache_tables(conn)
@@ -3805,7 +3962,7 @@ def ensure_test_data_project_cache(
         expected = {}
 
     with sqlite3.connect(str(db_path)) as conn:
-        _ensure_test_data_tables(conn)
+        _ensure_test_data_impl_tables(conn)
         try:
             rows = conn.execute("SELECT serial, sqlite_path, mtime_ns, status FROM td_sources").fetchall()
         except Exception:
@@ -4138,7 +4295,11 @@ def _rebuild_test_data_project_calc_cache_from_raw(db_path: Path, workbook_path:
     if not db_path.exists():
         raise FileNotFoundError(f"Project cache DB not found: {db_path}")
     raw_db_path = _td_resolve_raw_cache_db_path(db_path)
-    raw_read_path = raw_db_path if raw_db_path.exists() else db_path
+    if not raw_db_path.exists() or not raw_db_path.is_file():
+        raise RuntimeError(
+            f"Project raw cache DB not found: {raw_db_path}. "
+            f"Run 'Build / Refresh Cache' first to create or refresh {EIDAT_PROJECT_TD_RAW_CACHE_DB}."
+        )
 
     runtime_cfg = _load_runtime_td_trend_config()
     cfg_cols = [dict(c) for c in (runtime_cfg.get("columns") or []) if isinstance(c, dict)]
@@ -4161,15 +4322,10 @@ def _rebuild_test_data_project_calc_cache_from_raw(db_path: Path, workbook_path:
     }
     computed_epoch_ns = time.time_ns()
 
-    with sqlite3.connect(str(raw_read_path)) as raw_conn:
-        if raw_read_path == raw_db_path:
-            _ensure_test_data_raw_cache_tables(raw_conn)
-        else:
-            _ensure_test_data_tables(raw_conn)
+    with sqlite3.connect(str(raw_db_path)) as raw_conn:
+        _ensure_test_data_raw_cache_tables(raw_conn)
         raw_runs = raw_conn.execute(
             "SELECT run_name, COALESCE(x_axis_kind, '') FROM td_raw_sequences ORDER BY run_name"
-        ).fetchall() if raw_read_path == raw_db_path else raw_conn.execute(
-            "SELECT run_name, COALESCE(default_x, '') FROM td_runs ORDER BY run_name"
         ).fetchall()
         raw_x_cols = raw_conn.execute(
             "SELECT run_name, name FROM td_columns_raw WHERE kind='x' ORDER BY run_name, name"
@@ -4184,29 +4340,14 @@ def _rebuild_test_data_project_calc_cache_from_raw(db_path: Path, workbook_path:
             ORDER BY run_name, serial, y_name
             """
         ).fetchall()
-        if raw_read_path == raw_db_path and not raw_runs and not raw_x_cols and not raw_y_cols and not raw_curve_rows:
-            raw_read_path = db_path
-    if raw_read_path == db_path:
-        with sqlite3.connect(str(db_path)) as raw_conn:
-            _ensure_test_data_tables(raw_conn)
-            raw_runs = raw_conn.execute(
-                "SELECT run_name, COALESCE(default_x, '') FROM td_runs ORDER BY run_name"
-            ).fetchall()
-            raw_x_cols = raw_conn.execute(
-                "SELECT run_name, name FROM td_columns_raw WHERE kind='x' ORDER BY run_name, name"
-            ).fetchall()
-            raw_y_cols = raw_conn.execute(
-                "SELECT run_name, name FROM td_columns_raw WHERE kind='y' ORDER BY run_name, name"
-            ).fetchall()
-            raw_curve_rows = raw_conn.execute(
-                """
-                SELECT run_name, y_name, x_name, serial, x_json, y_json, source_mtime_ns
-                FROM td_curves_raw
-                ORDER BY run_name, serial, y_name
-                """
-            ).fetchall()
+    if not raw_runs or not raw_y_cols or not raw_curve_rows:
+        raise RuntimeError(
+            f"Project raw cache DB is incomplete: {raw_db_path}. "
+            f"Run 'Build / Refresh Cache' first to create or refresh {EIDAT_PROJECT_TD_RAW_CACHE_DB}."
+        )
     with sqlite3.connect(str(db_path)) as conn:
-        _ensure_test_data_tables(conn)
+        _ensure_test_data_impl_tables(conn)
+        _purge_test_data_legacy_impl_raw_tables(conn)
         existing_display_names = {
             str(run_name or "").strip(): str(display_name or "").strip()
             for run_name, display_name in conn.execute(
@@ -4216,9 +4357,7 @@ def _rebuild_test_data_project_calc_cache_from_raw(db_path: Path, workbook_path:
         }
 
         conn.execute("DELETE FROM td_runs")
-        conn.execute("DELETE FROM td_columns")
         conn.execute("DELETE FROM td_columns_calc")
-        conn.execute("DELETE FROM td_metrics")
         conn.execute("DELETE FROM td_metrics_calc")
 
         raw_x_by_run: dict[str, list[str]] = {}
@@ -4275,19 +4414,9 @@ def _rebuild_test_data_project_calc_cache_from_raw(db_path: Path, workbook_path:
                     "INSERT OR REPLACE INTO td_columns_calc(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
                     (run, y_name, units, "y"),
                 )
-                conn.execute(
-                    "INSERT OR REPLACE INTO td_columns(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
-                    (run, y_name, units, "y"),
-                )
                 calc_columns_written += 1
                 if y_name in raw_y_names:
                     calc_names.append(y_name)
-
-            for x_name in raw_x_by_run.get(run) or []:
-                conn.execute(
-                    "INSERT OR REPLACE INTO td_columns(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
-                    (run, x_name, "", "x"),
-                )
 
             if not default_x or not calc_names:
                 continue
@@ -4344,14 +4473,6 @@ def _rebuild_test_data_project_calc_cache_from_raw(db_path: Path, workbook_path:
                     conn.execute(
                         """
                         INSERT OR REPLACE INTO td_metrics_calc
-                        (serial, run_name, column_name, stat, value_num, computed_epoch_ns, source_mtime_ns)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        payload,
-                    )
-                    conn.execute(
-                        """
-                        INSERT OR REPLACE INTO td_metrics
                         (serial, run_name, column_name, stat, value_num, computed_epoch_ns, source_mtime_ns)
                         VALUES (?, ?, ?, ?, ?, ?, ?)
                         """,
@@ -4478,7 +4599,7 @@ def validate_existing_test_data_project_cache(project_dir: Path, workbook_path: 
 
     try:
         with sqlite3.connect(str(db_path)) as conn:
-            _ensure_test_data_tables(conn)
+            _ensure_test_data_impl_tables(conn)
             required_tables = (
                 "td_runs",
                 "td_columns_calc",
@@ -4504,6 +4625,7 @@ def validate_existing_test_data_project_cache(project_dir: Path, workbook_path: 
             metrics_count = int(conn.execute("SELECT COUNT(*) FROM td_metrics_calc").fetchone()[0] or 0)
         with sqlite3.connect(str(raw_db_path)) as conn:
             _ensure_test_data_raw_cache_tables(conn)
+            raw_runs_count = int(conn.execute("SELECT COUNT(*) FROM td_raw_sequences").fetchone()[0] or 0)
             raw_curve_count = int(conn.execute("SELECT COUNT(*) FROM td_curves_raw").fetchone()[0] or 0)
             raw_y_count = int(conn.execute("SELECT COUNT(*) FROM td_columns_raw WHERE kind='y'").fetchone()[0] or 0)
     except RuntimeError:
@@ -4511,7 +4633,7 @@ def validate_existing_test_data_project_cache(project_dir: Path, workbook_path: 
     except Exception as exc:
         raise RuntimeError(f"Failed to validate project cache DB: {db_path}. {guidance}") from exc
 
-    if runs_count <= 0 or raw_curve_count <= 0 or raw_y_count <= 0 or calc_y_count <= 0 or metrics_count <= 0:
+    if runs_count <= 0 or raw_runs_count <= 0 or raw_curve_count <= 0 or raw_y_count <= 0 or calc_y_count <= 0 or metrics_count <= 0:
         raise RuntimeError(f"Project cache DB is incomplete: {db_path}. {guidance}")
 
     return db_path
@@ -5075,22 +5197,65 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
         ys = [y for _x, y in filtered]
         return xs, ys
 
+    def _match_configured_y_columns(col_list: list[str], desired_defs: list[dict], *, used_x_actual: set[str]) -> tuple[dict[str, str], list[str]]:
+        actual_cols = [str(c or "").strip() for c in col_list if str(c or "").strip()]
+        available = [c for c in actual_cols if _norm_name(c) not in x_exclude_norms and c not in used_x_actual]
+        matched: dict[str, str] = {}
+        issues: list[str] = []
+        used_actual: set[str] = set()
+        eps = 1e-9
+        for raw_def in desired_defs:
+            cfg_name = str(raw_def.get("name") or "").strip()
+            if not cfg_name:
+                continue
+            aliases = [cfg_name] + [str(v or "").strip() for v in (raw_def.get("aliases") or []) if str(v or "").strip()]
+
+            exact_matches: list[str] = []
+            alias_norms = {_norm_name(alias) for alias in aliases if _norm_name(alias)}
+            for actual in available:
+                if actual in used_actual:
+                    continue
+                if _norm_name(actual) in alias_norms:
+                    exact_matches.append(actual)
+            if len(exact_matches) == 1:
+                matched[cfg_name] = exact_matches[0]
+                used_actual.add(exact_matches[0])
+                continue
+            if len(exact_matches) > 1:
+                issues.append(f"Ambiguous matches for '{cfg_name}': {', '.join(sorted(exact_matches))}")
+                continue
+
+            best_score = 0.0
+            best_actuals: list[str] = []
+            for actual in available:
+                if actual in used_actual:
+                    continue
+                score = max((_fuzzy_col_score(alias, actual) for alias in aliases), default=0.0)
+                if score > best_score + eps:
+                    best_score = float(score)
+                    best_actuals = [actual]
+                elif abs(score - best_score) <= eps and score >= float(fm_min_ratio):
+                    best_actuals.append(actual)
+            if best_score >= float(fm_min_ratio) and len(best_actuals) == 1:
+                matched[cfg_name] = best_actuals[0]
+                used_actual.add(best_actuals[0])
+            elif best_score >= float(fm_min_ratio) and len(best_actuals) > 1:
+                issues.append(f"Ambiguous fuzzy matches for '{cfg_name}': {', '.join(sorted(best_actuals))}")
+        return matched, issues
+
     # Reset implementation cache tables.
     with closing(sqlite3.connect(str(db_path))) as conn:
-        _ensure_test_data_tables(conn)
+        _ensure_test_data_impl_tables(conn)
+        _purge_test_data_legacy_impl_raw_tables(conn)
         for t in (
             "td_meta",
             "td_sources",
             "td_source_metadata",
             "td_runs",
-            "td_columns",
-            "td_columns_raw",
             "td_columns_calc",
-            "td_curves",
-            "td_curves_raw",
-            "td_metrics",
             "td_metrics_calc",
             "td_terms",
+            "td_source_diagnostics",
         ):
             try:
                 conn.execute(f"DELETE FROM {t}")
@@ -5164,12 +5329,15 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
     run_y_raw_union: dict[str, dict[str, str]] = {}
     run_y_calc_union: dict[str, dict[str, str]] = {}
     raw_tables_created: set[str] = set()
+    diagnostics_rows: list[tuple[str, str, str, str, str, str, int, int, str]] = []
 
     for entry in entries:
         sn = str(entry.get("serial") or "").strip()
-        rel = str(entry.get("excel_sqlite_rel") or "").strip()
-        sqlite_path = _resolve_excel_sqlite_path_from_workbook(wb_path, rel)
-        status = "ok"
+        source_resolution = _resolve_td_source_sqlite_for_workbook(wb_path, entry)
+        sqlite_path_raw = source_resolution.get("path")
+        sqlite_path = Path(sqlite_path_raw).expanduser() if sqlite_path_raw else Path()
+        status = str(source_resolution.get("status") or "missing").strip().lower() or "missing"
+        source_reason = str(source_resolution.get("reason") or "").strip()
         try:
             st = sqlite_path.stat()
             mtime_ns = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)))
@@ -5177,14 +5345,13 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
         except Exception:
             mtime_ns = None
             size_bytes = None
-        if not sqlite_path.exists():
-            status = "missing"
+        if status == "missing":
             missing_sources += 1
-        elif not sqlite_path.is_file():
-            status = "invalid"
+        elif status != "ok":
             invalid_sources += 1
 
         with closing(sqlite3.connect(str(db_path))) as conn:
+            _ensure_test_data_impl_tables(conn)
             conn.execute(
                 """
                 INSERT OR REPLACE INTO td_sources(serial, sqlite_path, mtime_ns, size_bytes, status, last_ingested_epoch_ns)
@@ -5234,6 +5401,14 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
                     str(source_meta.get("excel_sqlite_rel") or "").strip(),
                     int(source_meta.get("metadata_mtime_ns") or 0),
                 ),
+            )
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO td_source_diagnostics(
+                    serial, resolved_sqlite_path, status, run_name, x_axis_kind, matched_y_json, curves_written, metrics_written, reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (sn, str(sqlite_path) if sqlite_path else "", status, "", "", "[]", 0, 0, source_reason),
             )
             conn.commit()
 
@@ -5368,7 +5543,7 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
                     # Each sequence has one intrinsic X axis in the raw-cache model.
                     default_x = avail_x[0] if avail_x else ""
 
-                    raw_desired_y = [y_name for y_name, _units in y_cols if y_name]
+                    raw_param_defs = [dict(c) for c in cfg_cols if isinstance(c, dict) and str(c.get("name") or "").strip()]
                     calc_param_defs = _ordered_support_param_defs(
                         sequence_names=[str(effective_run), str(run)],
                         support_cfg=support_cfg,
@@ -5376,9 +5551,31 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
                     )
                     calc_desired_y = [str(d.get("name") or "").strip() for d in calc_param_defs if str(d.get("name") or "").strip()]
                     calc_units_by_name = {str(d.get("name") or "").strip(): str(d.get("units") or "").strip() for d in calc_param_defs}
+                    y_actual_by_name, y_match_issues = _match_configured_y_columns(
+                        col_list,
+                        raw_param_defs,
+                        used_x_actual=set(x_map.values()),
+                    )
+                    calc_y_actual_by_name, calc_match_issues = _match_configured_y_columns(
+                        col_list,
+                        calc_param_defs,
+                        used_x_actual=set(x_map.values()),
+                    )
+                    match_issues = list(dict.fromkeys(y_match_issues + calc_match_issues))
+                    matched_y_names = sorted(y_actual_by_name.keys(), key=lambda value: value.lower())
+                    if not default_x:
+                        match_issues.append(
+                            f"No canonical X axis detected. Available columns: {', '.join(col_list[:12])}"
+                        )
+                    if not matched_y_names:
+                        desired_names = [str(d.get("name") or "").strip() for d in raw_param_defs if str(d.get("name") or "").strip()]
+                        match_issues.append(
+                            "No configured Y columns matched. "
+                            f"Configured: {', '.join(desired_names[:12])}; Source: {', '.join(col_list[:12])}"
+                        )
 
                     raw_units = run_y_raw_union.setdefault(str(effective_run), {})
-                    for y_name in raw_desired_y:
+                    for y_name in matched_y_names:
                         if y_name not in raw_units or not raw_units.get(y_name):
                             raw_units[y_name] = str(cfg_units.get(y_name) or "").strip()
 
@@ -5389,14 +5586,12 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
 
                     if default_x:
                         actual_x = x_map.get(default_x, "")
-                        for y_name in raw_desired_y:
-                            if y_name not in cols:
+                        run_curves_written = 0
+                        for y_name in matched_y_names:
+                            actual_y = y_actual_by_name.get(y_name, "")
+                            if not actual_x or not actual_y:
                                 continue
-                            if _norm_name(y_name) in x_exclude_norms:
-                                continue
-                            if not actual_x:
-                                continue
-                            xs, ys = _raw_curve_points(rows=source_rows, actual_x=actual_x, y_name=y_name)
+                            xs, ys = _raw_curve_points(rows=source_rows, actual_x=actual_x, y_name=actual_y)
                             x_json_txt = json.dumps(xs, separators=(",", ":"), ensure_ascii=False)
                             y_json_txt = json.dumps(ys, separators=(",", ":"), ensure_ascii=False)
                             table_name = _td_raw_curve_table_name(effective_run, y_name)
@@ -5469,26 +5664,27 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
                                     ),
                                 )
                                 conn.commit()
-                            with closing(sqlite3.connect(str(db_path))) as conn:
-                                _ensure_test_data_tables(conn)
-                                conn.execute(
-                                    """
-                                    INSERT OR REPLACE INTO td_curves_raw
-                                    (run_name, y_name, x_name, serial, x_json, y_json, n_points, source_mtime_ns, computed_epoch_ns)
-                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                                    """,
-                                    payload,
-                                )
-                                conn.execute(
-                                    """
-                                    INSERT OR REPLACE INTO td_curves
-                                    (run_name, y_name, x_name, serial, x_json, y_json, n_points, source_mtime_ns, computed_epoch_ns)
-                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                                    """,
-                                    payload,
-                                )
-                                conn.commit()
                             curves_written += 1
+                            run_curves_written += 1
+                        diagnostics_rows.append(
+                            (
+                                sn,
+                                str(sqlite_path),
+                                "ok" if run_curves_written > 0 else "invalid",
+                                effective_run,
+                                default_x,
+                                json.dumps(
+                                    [
+                                        {"name": name, "source_column": y_actual_by_name.get(name, "")}
+                                        for name in matched_y_names
+                                    ],
+                                    ensure_ascii=False,
+                                ),
+                                int(run_curves_written),
+                                0,
+                                "; ".join(match_issues),
+                            )
+                        )
             finally:
                 try:
                     src.close()
@@ -5497,12 +5693,34 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
 
         except Exception:
             with closing(sqlite3.connect(str(db_path))) as conn:
+                _ensure_test_data_impl_tables(conn)
                 conn.execute(
                     "UPDATE td_sources SET status=?, last_ingested_epoch_ns=? WHERE serial=?",
                     ("invalid", computed_epoch_ns, sn),
                 )
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO td_source_diagnostics(
+                        serial, resolved_sqlite_path, status, run_name, x_axis_kind, matched_y_json, curves_written, metrics_written, reason
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (sn, str(sqlite_path) if sqlite_path else "", "invalid", "", "", "[]", 0, 0, "Failed to ingest source SQLite."),
+                )
                 conn.commit()
             invalid_sources += 1
+
+    if diagnostics_rows:
+        with closing(sqlite3.connect(str(db_path))) as conn:
+            _ensure_test_data_impl_tables(conn)
+            conn.executemany(
+                """
+                INSERT OR REPLACE INTO td_source_diagnostics(
+                    serial, resolved_sqlite_path, status, run_name, x_axis_kind, matched_y_json, curves_written, metrics_written, reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                diagnostics_rows,
+            )
+            conn.commit()
 
     # Compute optional display labels per run (condition labeling).
     runs_all = set(run_x_union.keys()) | set(run_y_raw_union.keys()) | set(run_y_calc_union.keys())
@@ -5541,10 +5759,9 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
                     disp = f"{base} — {run}"
             display_by_run[run] = _collapse_ws(disp) or base
 
-    # Write raw-cache runs + columns tables and mirror run metadata into implementation DB.
-    with closing(sqlite3.connect(str(raw_db_path))) as raw_conn, closing(sqlite3.connect(str(db_path))) as impl_conn:
+    # Write raw-cache runs + columns tables only.
+    with closing(sqlite3.connect(str(raw_db_path))) as raw_conn:
         _ensure_test_data_raw_cache_tables(raw_conn)
-        _ensure_test_data_tables(impl_conn)
         cfg_order = [n for n, _u in y_cols if n]
         for run in sorted(runs_all, key=lambda s: str(s).lower()):
             xs = run_x_union.get(run, set())
@@ -5566,24 +5783,12 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
                 """,
                 (run, display_name, default_x, run, computed_epoch_ns),
             )
-            impl_conn.execute(
-                "INSERT OR REPLACE INTO td_runs(run_name, default_x, display_name) VALUES (?, ?, ?)",
-                (run, default_x, display_name),
-            )
             for x in sorted(xs, key=lambda k: x_priority.index(k) if k in x_priority else 999):
                 raw_conn.execute(
                     "INSERT OR REPLACE INTO td_columns(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
                     (run, x, "", "x"),
                 )
                 raw_conn.execute(
-                    "INSERT OR REPLACE INTO td_columns_raw(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
-                    (run, x, "", "x"),
-                )
-                impl_conn.execute(
-                    "INSERT OR REPLACE INTO td_columns(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
-                    (run, x, "", "x"),
-                )
-                impl_conn.execute(
                     "INSERT OR REPLACE INTO td_columns_raw(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
                     (run, x, "", "x"),
                 )
@@ -5598,10 +5803,6 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
                     "INSERT OR REPLACE INTO td_columns_raw(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
                     (run, y_name, units, "y"),
                 )
-                impl_conn.execute(
-                    "INSERT OR REPLACE INTO td_columns_raw(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
-                    (run, y_name, units, "y"),
-                )
                 raw_conn.execute(
                     """
                     UPDATE td_raw_curve_catalog
@@ -5611,10 +5812,26 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
                     (units, default_x, display_name, run, y_name),
                 )
         raw_conn.commit()
-        impl_conn.commit()
 
     calc_payload = _rebuild_test_data_project_calc_cache_from_raw(db_path, wb_path)
     metrics_written = int(calc_payload.get("metrics_written") or 0)
+
+    if curves_written <= 0:
+        if missing_sources or invalid_sources:
+            raise RuntimeError(
+                "Test Data raw cache build produced no curves. "
+                f"Missing sources: {missing_sources}; invalid sources: {invalid_sources}. "
+                "Check the Sources sheet, source SQLite resolution, X-axis detection, and configured Y-column matches, then run 'Build / Refresh Cache' again."
+            )
+        raise RuntimeError(
+            "Test Data raw cache build produced no curves. "
+            "Check X-axis detection and configured Y-column matches, then run 'Build / Refresh Cache' again."
+        )
+    if metrics_written <= 0:
+        raise RuntimeError(
+            "Test Data implementation cache build produced no calculated metrics. "
+            "Check the support workbook filters/bounds and run 'Build / Refresh Cache' again."
+        )
 
     return {
         "db_path": str(db_path),
@@ -5634,7 +5851,7 @@ def td_list_runs(db_path: Path) -> list[str]:
     if not path.exists():
         return []
     with sqlite3.connect(str(path)) as conn:
-        _ensure_test_data_tables(conn)
+        _ensure_test_data_impl_tables(conn)
         rows = conn.execute("SELECT run_name FROM td_runs ORDER BY run_name").fetchall()
     return [str(r[0] or "").strip() for r in rows if str(r[0] or "").strip()]
 
@@ -5644,7 +5861,7 @@ def td_list_serials(db_path: Path) -> list[str]:
     if not path.exists():
         return []
     with sqlite3.connect(str(path)) as conn:
-        _ensure_test_data_tables(conn)
+        _ensure_test_data_impl_tables(conn)
         rows = conn.execute("SELECT serial FROM td_sources ORDER BY serial").fetchall()
     return [str(r[0] or "").strip() for r in rows if str(r[0] or "").strip()]
 
@@ -5654,96 +5871,56 @@ def td_list_curve_y_columns(db_path: Path, run_name: str, x_name: str | None = N
     x = str(x_name or "").strip()
     if not run:
         return []
-    for path in _td_raw_cache_candidate_paths(Path(db_path).expanduser()):
-        if not path.exists():
-            continue
-        with sqlite3.connect(str(path)) as conn:
-            if path.name.lower() == EIDAT_PROJECT_TD_RAW_CACHE_DB.lower():
-                _ensure_test_data_raw_cache_tables(conn)
-                if x:
-                    rows = conn.execute(
-                        """
-                        SELECT parameter_name, COALESCE(units, '')
-                        FROM td_raw_curve_catalog
-                        WHERE run_name=? AND x_axis_kind=?
-                        ORDER BY parameter_name
-                        """,
-                        (run, x),
-                    ).fetchall()
-                else:
-                    rows = conn.execute(
-                        """
-                        SELECT parameter_name, COALESCE(units, '')
-                        FROM td_raw_curve_catalog
-                        WHERE run_name=?
-                        ORDER BY parameter_name
-                        """,
-                        (run,),
-                    ).fetchall()
-            else:
-                _ensure_test_data_tables(conn)
-                if x:
-                    rows = conn.execute(
-                        """
-                        SELECT DISTINCT c.y_name, COALESCE(col.units, '')
-                        FROM td_curves_raw c
-                        LEFT JOIN td_columns_raw col
-                          ON col.run_name = c.run_name AND col.name = c.y_name AND col.kind = 'y'
-                        WHERE c.run_name=? AND c.x_name=?
-                        ORDER BY c.y_name
-                        """,
-                        (run, x),
-                    ).fetchall()
-                else:
-                    rows = conn.execute(
-                        """
-                        SELECT DISTINCT c.y_name, COALESCE(col.units, '')
-                        FROM td_curves_raw c
-                        LEFT JOIN td_columns_raw col
-                          ON col.run_name = c.run_name AND col.name = c.y_name AND col.kind = 'y'
-                        WHERE c.run_name=?
-                        ORDER BY c.y_name
-                        """,
-                        (run,),
-                    ).fetchall()
-        out = [
-            {"name": str(r[0] or "").strip(), "units": str(r[1] or "").strip()}
-            for r in rows
-            if str(r[0] or "").strip()
-        ]
-        if out:
-            return out
-    return []
+    path = _td_resolve_raw_cache_db_path(Path(db_path).expanduser())
+    if not path.exists():
+        return []
+    with sqlite3.connect(str(path)) as conn:
+        _ensure_test_data_raw_cache_tables(conn)
+        if x:
+            rows = conn.execute(
+                """
+                SELECT parameter_name, COALESCE(units, '')
+                FROM td_raw_curve_catalog
+                WHERE run_name=? AND x_axis_kind=?
+                ORDER BY parameter_name
+                """,
+                (run, x),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT parameter_name, COALESCE(units, '')
+                FROM td_raw_curve_catalog
+                WHERE run_name=?
+                ORDER BY parameter_name
+                """,
+                (run,),
+            ).fetchall()
+    return [
+        {"name": str(r[0] or "").strip(), "units": str(r[1] or "").strip()}
+        for r in rows
+        if str(r[0] or "").strip()
+    ]
 
 
 def td_list_raw_y_columns(db_path: Path, run_name: str) -> list[dict]:
     run = str(run_name or "").strip()
     if not run:
         return []
-    for path in _td_raw_cache_candidate_paths(Path(db_path).expanduser()):
-        if not path.exists():
-            continue
-        with sqlite3.connect(str(path)) as conn:
-            if path.name.lower() == EIDAT_PROJECT_TD_RAW_CACHE_DB.lower():
-                _ensure_test_data_raw_cache_tables(conn)
-                rows = conn.execute(
-                    "SELECT parameter_name, units FROM td_raw_curve_catalog WHERE run_name=? ORDER BY parameter_name",
-                    (run,),
-                ).fetchall()
-            else:
-                _ensure_test_data_tables(conn)
-                rows = conn.execute(
-                    "SELECT name, units FROM td_columns_raw WHERE run_name=? AND kind='y' ORDER BY name",
-                    (run,),
-                ).fetchall()
-        out = [
-            {"name": str(r[0] or "").strip(), "units": str(r[1] or "").strip()}
-            for r in rows
-            if str(r[0] or "").strip()
-        ]
-        if out:
-            return out
-    return []
+    path = _td_resolve_raw_cache_db_path(Path(db_path).expanduser())
+    if not path.exists():
+        return []
+    with sqlite3.connect(str(path)) as conn:
+        _ensure_test_data_raw_cache_tables(conn)
+        rows = conn.execute(
+            "SELECT parameter_name, units FROM td_raw_curve_catalog WHERE run_name=? ORDER BY parameter_name",
+            (run,),
+        ).fetchall()
+    return [
+        {"name": str(r[0] or "").strip(), "units": str(r[1] or "").strip()}
+        for r in rows
+        if str(r[0] or "").strip()
+    ]
 
 
 def td_list_y_columns(db_path: Path, run_name: str) -> list[dict]:
@@ -5754,7 +5931,7 @@ def td_list_y_columns(db_path: Path, run_name: str) -> list[dict]:
     if not run:
         return []
     with sqlite3.connect(str(path)) as conn:
-        _ensure_test_data_tables(conn)
+        _ensure_test_data_impl_tables(conn)
         rows = conn.execute(
             "SELECT name, units FROM td_columns_calc WHERE run_name=? AND kind='y' ORDER BY name",
             (run,),
@@ -5774,7 +5951,7 @@ def td_list_metric_y_columns(db_path: Path, run_name: str) -> list[dict]:
     if not run:
         return []
     with sqlite3.connect(str(path)) as conn:
-        _ensure_test_data_tables(conn)
+        _ensure_test_data_impl_tables(conn)
         rows = conn.execute(
             """
             SELECT DISTINCT m.column_name, COALESCE(c.units, '')
@@ -5797,36 +5974,28 @@ def td_list_x_columns(db_path: Path, run_name: str) -> list[str]:
     run = str(run_name or "").strip()
     if not run:
         return []
-    for path in _td_raw_cache_candidate_paths(Path(db_path).expanduser()):
-        if not path.exists():
-            continue
-        with sqlite3.connect(str(path)) as conn:
-            if path.name.lower() == EIDAT_PROJECT_TD_RAW_CACHE_DB.lower():
-                _ensure_test_data_raw_cache_tables(conn)
-                row = conn.execute("SELECT x_axis_kind FROM td_raw_sequences WHERE run_name=?", (run,)).fetchone()
-                default_x = str(row[0] or "").strip() if row else ""
-                out = [default_x] if default_x else []
-            else:
-                _ensure_test_data_tables(conn)
-                row = conn.execute("SELECT default_x FROM td_runs WHERE run_name=?", (run,)).fetchone()
-                default_x = str(row[0] or "").strip() if row else ""
-                rows = conn.execute(
-                    """
-                    SELECT DISTINCT x_name
-                    FROM td_curves_raw
-                    WHERE run_name=? AND x_name IS NOT NULL AND TRIM(x_name) <> ''
-                    ORDER BY x_name
-                    """,
-                    (run,),
-                ).fetchall()
-                out = [str(r[0] or "").strip() for r in rows if str(r[0] or "").strip()]
-                if default_x and default_x in out:
-                    out = [default_x] + [xv for xv in out if xv != default_x]
-                elif default_x:
-                    out = [default_x] + out
-        if out:
-            return out
-    return []
+    path = _td_resolve_raw_cache_db_path(Path(db_path).expanduser())
+    if not path.exists():
+        return []
+    with sqlite3.connect(str(path)) as conn:
+        _ensure_test_data_raw_cache_tables(conn)
+        row = conn.execute("SELECT x_axis_kind FROM td_raw_sequences WHERE run_name=?", (run,)).fetchone()
+        default_x = str(row[0] or "").strip() if row else ""
+        rows = conn.execute(
+            """
+            SELECT DISTINCT x_axis_kind
+            FROM td_raw_curve_catalog
+            WHERE run_name=? AND x_axis_kind IS NOT NULL AND TRIM(x_axis_kind) <> ''
+            ORDER BY x_axis_kind
+            """,
+            (run,),
+        ).fetchall()
+    out = [str(r[0] or "").strip() for r in rows if str(r[0] or "").strip()]
+    if default_x and default_x in out:
+        return [default_x] + [xv for xv in out if xv != default_x]
+    if default_x:
+        return [default_x] + out
+    return out
 
 
 def td_read_sources_metadata(workbook_path: Path) -> list[dict]:
@@ -5880,7 +6049,7 @@ def td_load_metric_series(db_path: Path, run_name: str, column_name: str, stat: 
     if not run or not col or not st:
         return []
     with sqlite3.connect(str(path)) as conn:
-        _ensure_test_data_tables(conn)
+        _ensure_test_data_impl_tables(conn)
         rows = conn.execute(
             """
             SELECT serial, value_num
@@ -5976,7 +6145,7 @@ def _td_perf_load_support_settings(db_path: Path) -> dict[str, object]:
     workbook_path_txt = ""
     try:
         with sqlite3.connect(str(db_path)) as conn:
-            _ensure_test_data_tables(conn)
+            _ensure_test_data_impl_tables(conn)
             row = conn.execute(
                 "SELECT value FROM td_meta WHERE key='workbook_path' LIMIT 1"
             ).fetchone()
@@ -6134,7 +6303,7 @@ def td_discover_performance_candidates(db_path: Path, config_path: Path | None =
 
     stat_priority = ["mean", "min", "max"]
     with sqlite3.connect(str(path)) as conn:
-        _ensure_test_data_tables(conn)
+        _ensure_test_data_impl_tables(conn)
         metric_rows = conn.execute(
             """
             SELECT serial, run_name, column_name, stat, value_num
@@ -6391,72 +6560,45 @@ def td_load_curves(
     if not run or not y or not x:
         return []
     want = [str(s or "").strip() for s in (serials or []) if str(s or "").strip()]
-    for path in _td_raw_cache_candidate_paths(Path(db_path).expanduser()):
-        if not path.exists():
-            continue
-        with sqlite3.connect(str(path)) as conn:
-            if path.name.lower() == EIDAT_PROJECT_TD_RAW_CACHE_DB.lower():
-                _ensure_test_data_raw_cache_tables(conn)
-                row = conn.execute(
-                    """
-                    SELECT table_name, x_axis_kind
-                    FROM td_raw_curve_catalog
-                    WHERE run_name=? AND parameter_name=?
-                    LIMIT 1
-                    """,
-                    (run, y),
-                ).fetchone()
-                if not row:
-                    rows = []
-                else:
-                    table_name = str(row[0] or "").strip()
-                    axis_kind = str(row[1] or "").strip()
-                    if x and axis_kind and x != axis_kind:
-                        return []
-                    if want:
-                        q = ",".join(["?"] * len(want))
-                        rows = conn.execute(
-                            f"SELECT serial, x_json, y_json FROM {_quote_ident(table_name)} WHERE serial IN ({q}) ORDER BY serial",
-                            (*want,),
-                        ).fetchall()
-                    else:
-                        rows = conn.execute(
-                            f"SELECT serial, x_json, y_json FROM {_quote_ident(table_name)} ORDER BY serial"
-                        ).fetchall()
-            else:
-                _ensure_test_data_tables(conn)
-                if want:
-                    q = ",".join(["?"] * len(want))
-                    rows = conn.execute(
-                        f"""
-                        SELECT serial, x_json, y_json
-                        FROM td_curves_raw
-                        WHERE run_name=? AND y_name=? AND x_name=? AND serial IN ({q})
-                        ORDER BY serial
-                        """,
-                        (run, y, x, *want),
-                    ).fetchall()
-                else:
-                    rows = conn.execute(
-                        """
-                        SELECT serial, x_json, y_json
-                        FROM td_curves_raw
-                        WHERE run_name=? AND y_name=? AND x_name=?
-                        ORDER BY serial
-                        """,
-                        (run, y, x),
-                    ).fetchall()
-        out: list[dict] = []
-        for sn, xj, yj in rows:
-            try:
-                xs = json.loads(xj or "[]")
-                ys = json.loads(yj or "[]")
-            except Exception:
-                xs, ys = [], []
-            out.append({"serial": str(sn or "").strip(), "x": xs, "y": ys})
-        if out:
-            return out
-    return []
+    path = _td_resolve_raw_cache_db_path(Path(db_path).expanduser())
+    if not path.exists():
+        return []
+    with sqlite3.connect(str(path)) as conn:
+        _ensure_test_data_raw_cache_tables(conn)
+        row = conn.execute(
+            """
+            SELECT table_name, x_axis_kind
+            FROM td_raw_curve_catalog
+            WHERE run_name=? AND parameter_name=?
+            LIMIT 1
+            """,
+            (run, y),
+        ).fetchone()
+        if not row:
+            return []
+        table_name = str(row[0] or "").strip()
+        axis_kind = str(row[1] or "").strip()
+        if x and axis_kind and x != axis_kind:
+            return []
+        if want:
+            q = ",".join(["?"] * len(want))
+            rows = conn.execute(
+                f"SELECT serial, x_json, y_json FROM {_quote_ident(table_name)} WHERE serial IN ({q}) ORDER BY serial",
+                (*want,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                f"SELECT serial, x_json, y_json FROM {_quote_ident(table_name)} ORDER BY serial"
+            ).fetchall()
+    out: list[dict] = []
+    for sn, xj, yj in rows:
+        try:
+            xs = json.loads(xj or "[]")
+            ys = json.loads(yj or "[]")
+        except Exception:
+            xs, ys = [], []
+        out.append({"serial": str(sn or "").strip(), "x": xs, "y": ys})
+    return out
 
 
 def update_test_data_trending_project_workbook(
@@ -6628,7 +6770,7 @@ def update_test_data_trending_project_workbook(
         raw_cols_sig = ""
         support_mtime_ns = 0
         with sqlite3.connect(str(path)) as conn:
-            _ensure_test_data_tables(conn)
+            _ensure_test_data_impl_tables(conn)
             rows = conn.execute(
                 """
                 SELECT key, value
@@ -6709,7 +6851,7 @@ def update_test_data_trending_project_workbook(
         return parts[0], parts[1], parts[2].lower()
 
     with sqlite3.connect(str(db_path)) as conn:
-        _ensure_test_data_tables(conn)
+        _ensure_test_data_impl_tables(conn)
         src_missing = int(
             conn.execute(
                 "SELECT COUNT(*) FROM td_sources WHERE lower(status) <> 'ok'"
@@ -11675,6 +11817,34 @@ def _load_excel_trend_config(path: Path) -> dict:
     cols = data.get("columns")
     if not isinstance(cols, list) or not cols:
         raise ValueError("Excel trend config must include a non-empty `columns` list.")
+    normalized_cols: list[dict] = []
+    for idx, raw_col in enumerate(cols):
+        if not isinstance(raw_col, dict):
+            raise ValueError(f"Excel trend config `columns[{idx}]` must be an object.")
+        name = str(raw_col.get("name") or "").strip()
+        if not name:
+            raise ValueError(f"Excel trend config `columns[{idx}].name` must be a non-empty string.")
+        aliases_raw = raw_col.get("aliases") or []
+        if aliases_raw is None:
+            aliases_raw = []
+        if not isinstance(aliases_raw, list) or not all(isinstance(v, str) for v in aliases_raw):
+            raise ValueError(f"Excel trend config `columns[{idx}].aliases` must be a list of strings.")
+        aliases: list[str] = []
+        seen_aliases: set[str] = set()
+        for value in aliases_raw:
+            alias = str(value or "").strip()
+            if not alias:
+                continue
+            key = "".join(ch.lower() for ch in alias if ch.isalnum())
+            if not key or key == "".join(ch.lower() for ch in name if ch.isalnum()) or key in seen_aliases:
+                continue
+            seen_aliases.add(key)
+            aliases.append(alias)
+        col = dict(raw_col)
+        col["name"] = name
+        col["aliases"] = aliases
+        normalized_cols.append(col)
+    data["columns"] = normalized_cols
     stats = data.get("statistics") or list(TD_DEFAULT_STATS_ORDER)
     if not isinstance(stats, list) or not all(isinstance(s, str) and s for s in stats):
         raise ValueError("Excel trend config `statistics` must be a list of strings.")
@@ -11862,6 +12032,22 @@ def _write_test_data_trending_workbook(
             if support_dir is not None
             else (docs_by_serial.get(sn, [{}])[0] if docs_by_serial.get(sn) else {})
         )
+        resolved_sqlite_rel = str(doc.get("excel_sqlite_rel") or "").strip()
+        if repo is not None:
+            resolved = _resolve_td_source_sqlite_for_node(
+                repo,
+                excel_sqlite_rel=resolved_sqlite_rel,
+                artifacts_rel=str(doc.get("artifacts_rel") or "").strip(),
+            )
+            if str(resolved.get("status") or "") == "ok" and not resolved_sqlite_rel:
+                try:
+                    resolved_path = Path(resolved.get("path")).expanduser()
+                    try:
+                        resolved_sqlite_rel = str(resolved_path.resolve().relative_to(repo.resolve()))
+                    except Exception:
+                        resolved_sqlite_rel = str(resolved_path)
+                except Exception:
+                    resolved_sqlite_rel = str(doc.get("excel_sqlite_rel") or "").strip()
         ws_src.append(
             [
                 str(sn or "").strip(),
@@ -11869,7 +12055,7 @@ def _write_test_data_trending_workbook(
                 str(doc.get("document_type") or "").strip(),
                 str(doc.get("metadata_rel") or "").strip(),
                 str(doc.get("artifacts_rel") or "").strip(),
-                str(doc.get("excel_sqlite_rel") or "").strip(),
+                resolved_sqlite_rel,
             ]
         )
 
@@ -12506,17 +12692,12 @@ def create_eidat_project(
     def _is_test_data_eligible(d: dict) -> bool:
         if not is_test_data_doc(d):
             return False
-        try:
-            sqlite_rel = str(d.get("excel_sqlite_rel") or "").strip()
-        except Exception:
-            sqlite_rel = ""
-        if sqlite_rel:
-            return True
-        try:
-            art = str(d.get("artifacts_rel") or "").strip().lower()
-        except Exception:
-            art = ""
-        return "__excel" in art
+        resolved = _resolve_td_source_sqlite_for_node(
+            repo,
+            excel_sqlite_rel=str(d.get("excel_sqlite_rel") or "").strip(),
+            artifacts_rel=str(d.get("artifacts_rel") or "").strip(),
+        )
+        return str(resolved.get("status") or "") == "ok"
 
     if project_type in (EIDAT_PROJECT_TYPE_TRENDING, EIDAT_PROJECT_TYPE_RAW_TRENDING):
         bad = [d for d in chosen_docs if isinstance(d, dict) and is_test_data_doc(d)]

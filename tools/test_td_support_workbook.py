@@ -258,7 +258,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
             payload = be.rebuild_test_data_project_cache(out_db, wb_path)
             self.assertIn("Seq1", payload.get("runs") or [])
 
-            with sqlite3.connect(str(out_db)) as conn:
+            with sqlite3.connect(str(root / "test_data_raw_cache.sqlite3")) as conn:
                 row = conn.execute(
                     "SELECT x_json, y_json FROM td_curves_raw WHERE run_name=? AND y_name=? AND x_name=? AND serial=?",
                     ("Seq1", "thrust", "Time", "SN1"),
@@ -266,7 +266,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 self.assertIsNotNone(row)
                 self.assertEqual(json.loads(row[0]), [0.0, 1.0, 2.0, 3.0, 4.0, 5.0])
                 self.assertEqual(json.loads(row[1]), [10.0, 20.0, 30.0, 40.0, 50.0, 60.0])
-
+            with sqlite3.connect(str(out_db)) as conn:
                 mean_row = conn.execute(
                     "SELECT value_num FROM td_metrics_calc WHERE run_name=? AND column_name=? AND stat=? AND serial=?",
                     ("Seq1", "thrust", "mean", "SN1"),
@@ -460,28 +460,31 @@ class TestTDSupportWorkbook(unittest.TestCase):
 
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
             root = Path(td)
-            db_path = root / "implementation_trending.sqlite3"
+            db_path = root / "test_data_raw_cache.sqlite3"
             with sqlite3.connect(str(db_path)) as conn:
-                be._ensure_test_data_tables(conn)
+                be._ensure_test_data_raw_cache_tables(conn)
                 conn.execute(
-                    "INSERT OR REPLACE INTO td_runs(run_name, default_x, display_name) VALUES (?, ?, ?)",
-                    ("RunA", "Time", ""),
+                    """
+                    INSERT OR REPLACE INTO td_raw_sequences(run_name, display_name, x_axis_kind, source_run_name, computed_epoch_ns)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    ("RunA", "", "Time", "RunA", 1),
                 )
                 conn.execute(
                     """
-                    INSERT OR REPLACE INTO td_curves_raw
-                    (run_name, y_name, x_name, serial, x_json, y_json, n_points, source_mtime_ns, computed_epoch_ns)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT OR REPLACE INTO td_raw_curve_catalog
+                    (run_name, parameter_name, units, x_axis_kind, table_name, display_name, source_kind, computed_epoch_ns)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    ("RunA", "thrust", "Time", "SN1", "[0,1,2]", "[1,2,3]", 3, 1, 1),
+                    ("RunA", "thrust", "lbf", "Time", "td_raw__runa__thrust", "", "source_sqlite", 1),
                 )
                 conn.execute(
                     """
-                    INSERT OR REPLACE INTO td_curves_raw
-                    (run_name, y_name, x_name, serial, x_json, y_json, n_points, source_mtime_ns, computed_epoch_ns)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT OR REPLACE INTO td_raw_curve_catalog
+                    (run_name, parameter_name, units, x_axis_kind, table_name, display_name, source_kind, computed_epoch_ns)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    ("RunA", "thrust", "Pulse Number", "SN1", "[1,2,3]", "[1,2,3]", 3, 1, 1),
+                    ("RunA", "thrust_pulse", "lbf", "Pulse Number", "td_raw__runa__thrust_pulse", "", "source_sqlite", 1),
                 )
                 conn.commit()
 
@@ -513,17 +516,94 @@ class TestTDSupportWorkbook(unittest.TestCase):
             )
 
             db_path = be.ensure_test_data_project_cache(root, wb_path, rebuild=True)
-            mirror_path = db_path.with_suffix(".xlsx")
-            self.assertTrue(mirror_path.exists())
+            impl_mirror_path = db_path.with_suffix(".xlsx")
+            raw_mirror_path = (root / "test_data_raw_cache.sqlite3").with_suffix(".xlsx")
+            self.assertTrue(impl_mirror_path.exists())
+            self.assertTrue(raw_mirror_path.exists())
 
-            wb = load_workbook(str(mirror_path), read_only=True, data_only=True)
+            wb = load_workbook(str(impl_mirror_path), read_only=True, data_only=True)
             try:
-                self.assertIn("td_curves_raw", wb.sheetnames)
                 self.assertIn("td_metrics_calc", wb.sheetnames)
             finally:
                 wb.close()
+            wb = load_workbook(str(raw_mirror_path), read_only=True, data_only=True)
+            try:
+                self.assertIn("td_curves_raw", wb.sheetnames)
+            finally:
+                wb.close()
 
-    def test_calc_cache_can_be_rebuilt_from_raw_without_source_sqlite(self) -> None:
+    def test_calc_cache_can_be_rebuilt_from_raw_db_without_source_sqlite(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            wb_path = root / "project.xlsx"
+            be._write_test_data_trending_workbook(
+                wb_path,
+                global_repo=root,
+                serials=["SN1"],
+                docs=[{"serial_number": "SN1", "excel_sqlite_rel": "missing.sqlite3"}],
+                config=self._make_config(),
+            )
+            support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+            be._write_td_support_workbook(
+                support_path,
+                sequence_names=["RunA"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+            )
+
+            db_path = root / "implementation_trending.sqlite3"
+            raw_db_path = root / "test_data_raw_cache.sqlite3"
+            with sqlite3.connect(str(db_path)) as conn:
+                be._ensure_test_data_impl_tables(conn)
+                conn.commit()
+            with sqlite3.connect(str(raw_db_path)) as conn:
+                be._ensure_test_data_raw_cache_tables(conn)
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO td_raw_sequences(run_name, display_name, x_axis_kind, source_run_name, computed_epoch_ns)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    ("RunA", "", "Time", "RunA", 123),
+                )
+                conn.execute(
+                    "INSERT OR REPLACE INTO td_columns_raw(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
+                    ("RunA", "Time", "", "x"),
+                )
+                conn.execute(
+                    "INSERT OR REPLACE INTO td_columns_raw(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
+                    ("RunA", "thrust", "lbf", "y"),
+                )
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO td_curves_raw
+                    (run_name, y_name, x_name, serial, x_json, y_json, n_points, source_mtime_ns, computed_epoch_ns)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    ("RunA", "thrust", "Time", "SN1", "[0,1,2,3]", "[10,20,30,40]", 4, 123, 123),
+                )
+                conn.commit()
+
+            with mock.patch.object(
+                be,
+                "_load_runtime_td_trend_config",
+                return_value={"config": {}, "columns": [{"name": "thrust", "units": "lbf"}], "statistics": ["mean", "max"]},
+            ):
+                payload = be._rebuild_test_data_project_calc_cache_from_raw(db_path, wb_path)
+
+            self.assertEqual(payload.get("mode"), "calc_from_raw")
+            with sqlite3.connect(str(db_path)) as conn:
+                rows = conn.execute(
+                    """
+                    SELECT stat, value_num
+                    FROM td_metrics_calc
+                    WHERE serial='SN1' AND run_name='RunA' AND column_name='thrust'
+                    ORDER BY stat
+                    """
+                ).fetchall()
+            self.assertEqual(rows, [("max", 40.0), ("mean", 25.0)])
+
+    def test_calc_cache_hard_fails_when_raw_only_exists_in_implementation_db(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
 
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
@@ -568,24 +648,8 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 )
                 conn.commit()
 
-            with mock.patch.object(
-                be,
-                "_load_runtime_td_trend_config",
-                return_value={"config": {}, "columns": [{"name": "thrust", "units": "lbf"}], "statistics": ["mean", "max"]},
-            ):
-                payload = be._rebuild_test_data_project_calc_cache_from_raw(db_path, wb_path)
-
-            self.assertEqual(payload.get("mode"), "calc_from_raw")
-            with sqlite3.connect(str(db_path)) as conn:
-                rows = conn.execute(
-                    """
-                    SELECT stat, value_num
-                    FROM td_metrics_calc
-                    WHERE serial='SN1' AND run_name='RunA' AND column_name='thrust'
-                    ORDER BY stat
-                    """
-                ).fetchall()
-            self.assertEqual(rows, [("max", 40.0), ("mean", 25.0)])
+            with self.assertRaisesRegex(RuntimeError, "Project raw cache DB not found"):
+                be._rebuild_test_data_project_calc_cache_from_raw(db_path, wb_path)
 
 
     def test_cache_rebuild_tracks_source_metadata_updates(self) -> None:
@@ -665,6 +729,111 @@ class TestTDSupportWorkbook(unittest.TestCase):
             with sqlite3.connect(str(out_db)) as conn:
                 row = conn.execute("SELECT vendor FROM td_source_metadata WHERE serial=?", ("SN1",)).fetchone()
                 self.assertEqual(row[0], "Vendor B")
+
+    def test_rebuild_purges_legacy_raw_tables_from_implementation_db(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            src_db = root / "src.sqlite3"
+            self._make_source_sqlite(src_db)
+
+            wb_path = root / "project.xlsx"
+            be._write_test_data_trending_workbook(
+                wb_path,
+                global_repo=root,
+                serials=["SN1"],
+                docs=[{"serial_number": "SN1", "excel_sqlite_rel": str(src_db)}],
+                config=self._make_config(),
+            )
+            support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+            be._write_td_support_workbook(
+                support_path,
+                sequence_names=["RunA"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+            )
+
+            impl_db = root / "implementation_trending.sqlite3"
+            with sqlite3.connect(str(impl_db)) as conn:
+                be._ensure_test_data_tables(conn)
+                conn.execute(
+                    "INSERT OR REPLACE INTO td_columns_raw(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
+                    ("LegacyRun", "thrust", "lbf", "y"),
+                )
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO td_curves_raw
+                    (run_name, y_name, x_name, serial, x_json, y_json, n_points, source_mtime_ns, computed_epoch_ns)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    ("LegacyRun", "thrust", "Time", "SN1", "[0,1]", "[2,3]", 2, 1, 1),
+                )
+                conn.commit()
+
+            be.rebuild_test_data_project_cache(impl_db, wb_path)
+
+            with sqlite3.connect(str(impl_db)) as conn:
+                tables = {
+                    str(r[0] or "").strip()
+                    for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+                }
+                self.assertNotIn("td_columns_raw", tables)
+                self.assertNotIn("td_curves_raw", tables)
+                self.assertIn("td_metrics_calc", tables)
+
+    def test_rebuild_matches_y_columns_via_aliases(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            src_db = root / "src_alias.sqlite3"
+            with sqlite3.connect(str(src_db)) as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE "sheet__RunA" (
+                        excel_row INTEGER NOT NULL,
+                        "Time" REAL,
+                        "Thrust_lbf" REAL
+                    )
+                    """
+                )
+                rows = [(i + 1, float(i), float(i + 1) * 10.0) for i in range(6)]
+                conn.executemany(
+                    'INSERT INTO "sheet__RunA"(excel_row,"Time","Thrust_lbf") VALUES(?,?,?)',
+                    rows,
+                )
+                conn.commit()
+
+            cfg = self._make_config()
+            cfg["columns"] = [
+                {"name": "thrust", "units": "lbf", "range_min": None, "range_max": None, "aliases": ["Thrust lbf"]}
+            ]
+
+            wb_path = root / "project.xlsx"
+            be._write_test_data_trending_workbook(
+                wb_path,
+                global_repo=root,
+                serials=["SN1"],
+                docs=[{"serial_number": "SN1", "excel_sqlite_rel": str(src_db)}],
+                config=cfg,
+            )
+            support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+            be._write_td_support_workbook(
+                support_path,
+                sequence_names=["RunA"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+            )
+
+            impl_db = root / "implementation_trending.sqlite3"
+            payload = be.rebuild_test_data_project_cache(impl_db, wb_path)
+            self.assertEqual(int(payload.get("curves_written") or 0), 1)
+
+            with sqlite3.connect(str(root / "test_data_raw_cache.sqlite3")) as conn:
+                row = conn.execute(
+                    "SELECT y_name, x_name FROM td_curves_raw WHERE run_name=? AND serial=?",
+                    ("RunA", "SN1"),
+                ).fetchone()
+                self.assertEqual(row, ("thrust", "Time"))
 
     def test_perf_candidate_discovery_clusters_near_equal_x_by_default(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
