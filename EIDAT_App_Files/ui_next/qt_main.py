@@ -3007,6 +3007,11 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 break
         metrics_layout.addWidget(self.list_stats)
 
+        self.cb_plot_metric_bounds = QtWidgets.QCheckBox("Plot parameter bounds from support workbook")
+        self.cb_plot_metric_bounds.setChecked(False)
+        self.cb_plot_metric_bounds.setToolTip("Draw min/max bounds entered in the support spreadsheet for the selected run/parameter.")
+        metrics_layout.addWidget(self.cb_plot_metric_bounds)
+
         # Curves tab
         tab_curves = QtWidgets.QWidget()
         curves_layout = QtWidgets.QVBoxLayout(tab_curves)
@@ -3037,47 +3042,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         lbl_perf.setStyleSheet("font-size: 12px; font-weight: 800; color: #0f172a;")
         perf_layout.addWidget(lbl_perf)
 
-        self.tabs_perf_sections = QtWidgets.QTabWidget()
-        perf_layout.addWidget(self.tabs_perf_sections, 1)
-
-        tab_perf_candidates = QtWidgets.QWidget()
-        perf_candidates_layout = QtWidgets.QVBoxLayout(tab_perf_candidates)
-        perf_candidates_layout.setContentsMargins(8, 8, 8, 8)
-        perf_candidates_layout.setSpacing(8)
-
-        self.ed_perf_candidate_filter = QtWidgets.QLineEdit()
-        self.ed_perf_candidate_filter.setPlaceholderText("Filter candidates by parameter, units, or serial...")
-        perf_candidates_layout.addWidget(self.ed_perf_candidate_filter)
-
-        self.tbl_perf_candidates = QtWidgets.QTableWidget(0, 6)
-        self.tbl_perf_candidates.setHorizontalHeaderLabels(
-            ["candidate", "x", "y", "serials", "points", "views"]
-        )
-        self.tbl_perf_candidates.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.tbl_perf_candidates.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
-        self.tbl_perf_candidates.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
-        self.tbl_perf_candidates.setAlternatingRowColors(True)
-        try:
-            self.tbl_perf_candidates.horizontalHeader().setStretchLastSection(True)
-        except Exception:
-            pass
-        perf_candidates_layout.addWidget(self.tbl_perf_candidates, 1)
-
-        self.lbl_perf_candidate_summary = QtWidgets.QLabel("Viable candidates: -")
-        self.lbl_perf_candidate_summary.setStyleSheet("color: #64748b; font-size: 11px;")
-        self.lbl_perf_candidate_summary.setWordWrap(True)
-        perf_candidates_layout.addWidget(self.lbl_perf_candidate_summary)
-
-        perf_candidate_btn_row = QtWidgets.QHBoxLayout()
-        self.btn_use_perf_candidate = QtWidgets.QPushButton("Use Selected Candidate")
-        perf_candidate_btn_row.addWidget(self.btn_use_perf_candidate)
-        perf_candidate_btn_row.addStretch(1)
-        perf_candidates_layout.addLayout(perf_candidate_btn_row)
-
-        tab_perf_plot = QtWidgets.QWidget()
-        perf_plot_layout = QtWidgets.QVBoxLayout(tab_perf_plot)
-        perf_plot_layout.setContentsMargins(8, 8, 8, 8)
+        perf_panel = QtWidgets.QFrame()
+        perf_panel.setStyleSheet("QFrame { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 10px; }")
+        perf_plot_layout = QtWidgets.QVBoxLayout(perf_panel)
+        perf_plot_layout.setContentsMargins(10, 10, 10, 10)
         perf_plot_layout.setSpacing(8)
+        perf_layout.addWidget(perf_panel, 1)
 
         row_perf = QtWidgets.QHBoxLayout()
         row_perf.addWidget(QtWidgets.QLabel("Performance Candidate:"))
@@ -3114,12 +3084,14 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
         # Serials are always all serials in the cache (no selector); highlighted serial is chosen below.
 
-        lbl_stats_perf = QtWidgets.QLabel("Stats (applies to both axes)")
-        lbl_stats_perf.setStyleSheet("font-size: 12px; font-weight: 700; color: #0f172a;")
-        perf_plot_layout.addWidget(lbl_stats_perf)
+        self.lbl_stats_perf = QtWidgets.QLabel("Stats (applies to both axes)")
+        self.lbl_stats_perf.setStyleSheet("font-size: 12px; font-weight: 700; color: #0f172a;")
+        self.lbl_stats_perf.setVisible(False)
+        perf_plot_layout.addWidget(self.lbl_stats_perf)
 
         self.list_perf_stats = QtWidgets.QListWidget()
         self.list_perf_stats.setMaximumHeight(110)
+        self.list_perf_stats.setVisible(False)
         perf_plot_layout.addWidget(self.list_perf_stats)
 
         view_row = QtWidgets.QHBoxLayout()
@@ -3132,9 +3104,17 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         lbl_eq.setStyleSheet("font-size: 12px; font-weight: 700; color: #0f172a;")
         perf_plot_layout.addWidget(lbl_eq)
 
-        self.tbl_perf_equations = QtWidgets.QTableWidget(0, 5)
+        self.tbl_perf_equations = QtWidgets.QTableWidget(0, 7)
         self.tbl_perf_equations.setHorizontalHeaderLabels(
-            ["stat", "master_equation", "master_rmse", "highlighted_equation", "highlighted_rmse"]
+            [
+                "stat",
+                "master_polynomial",
+                "master_x_norm",
+                "master_rmse",
+                "highlighted_polynomial",
+                "highlighted_x_norm",
+                "highlighted_rmse",
+            ]
         )
         self.tbl_perf_equations.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
         self.tbl_perf_equations.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
@@ -3145,9 +3125,6 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             pass
         self.tbl_perf_equations.setMinimumHeight(160)
         perf_plot_layout.addWidget(self.tbl_perf_equations, 1)
-
-        self.tabs_perf_sections.addTab(tab_perf_candidates, "Candidates")
-        self.tabs_perf_sections.addTab(tab_perf_plot, "Plot")
 
         tabs.addTab(tab_metrics, "Metrics")
         tabs.addTab(tab_curves, "Curves")
@@ -3271,9 +3248,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._stats_frame.setStyleSheet(
             "QFrame { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 10px; }"
         )
-        stats_lay = QtWidgets.QHBoxLayout(self._stats_frame)
+        stats_lay = QtWidgets.QVBoxLayout(self._stats_frame)
         stats_lay.setContentsMargins(10, 8, 10, 8)
-        stats_lay.setSpacing(16)
+        stats_lay.setSpacing(8)
 
         def _stat_pair(label: str) -> tuple[QtWidgets.QLabel, QtWidgets.QLabel]:
             k = QtWidgets.QLabel(label)
@@ -3283,8 +3260,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             return k, v
 
         self._stats_values: dict[str, QtWidgets.QLabel] = {}
+        stats_top_row = QtWidgets.QHBoxLayout()
+        stats_top_row.setSpacing(16)
         for key, label in (
-            ("serial", "Serial"),
             ("count", "Count"),
             ("mean", "Mean"),
             ("std", "Std"),
@@ -3296,9 +3274,19 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             box.setSpacing(6)
             box.addWidget(k_lbl)
             box.addWidget(v_lbl)
-            stats_lay.addLayout(box)
+            stats_top_row.addLayout(box)
             self._stats_values[key] = v_lbl
-        stats_lay.addStretch(1)
+        stats_top_row.addStretch(1)
+        stats_lay.addLayout(stats_top_row)
+
+        serial_key_lbl, serial_val_lbl = _stat_pair("Highlighted SN")
+        serial_val_lbl.setWordWrap(True)
+        serial_row = QtWidgets.QHBoxLayout()
+        serial_row.setSpacing(6)
+        serial_row.addWidget(serial_key_lbl)
+        serial_row.addWidget(serial_val_lbl, 1)
+        stats_lay.addLayout(serial_row)
+        self._stats_values["serial"] = serial_val_lbl
         self._stats_frame.setVisible(False)
         right_layout.addWidget(self._stats_frame, 0)
 
@@ -5168,6 +5156,47 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         dn = str((self._run_display_by_name or {}).get(rn) or "").strip()
         return dn or rn
 
+    def _metric_bounds_for_run(self, run_name: str) -> dict[str, dict]:
+        run = str(run_name or "").strip()
+        if not run or not getattr(self, "_workbook_path", None) or not getattr(self, "_project_dir", None):
+            return {}
+        reader = getattr(be, "_read_td_support_workbook", None)
+        if not callable(reader):
+            return {}
+        try:
+            support_cfg = reader(self._workbook_path, project_dir=self._project_dir)
+        except Exception:
+            return {}
+        sequences = [
+            dict(s)
+            for s in (support_cfg.get("sequences") or [])
+            if isinstance(s, dict) and bool(s.get("enabled", True))
+        ]
+        bounds_by_sequence = {
+            str(k).strip(): dict(v)
+            for k, v in (support_cfg.get("bounds_by_sequence") or {}).items()
+            if str(k).strip() and isinstance(v, dict)
+        }
+
+        def _norm_name(value: object) -> str:
+            return "".join(ch.lower() for ch in str(value or "").strip() if ch.isalnum())
+
+        seq_name = ""
+        for seq in sequences:
+            source_match = str(seq.get("source_run_name") or "").strip()
+            if source_match and _norm_name(source_match) == _norm_name(run):
+                seq_name = str(seq.get("sequence_name") or source_match).strip() or source_match
+                break
+        if not seq_name:
+            for seq in sequences:
+                candidate = str(seq.get("sequence_name") or "").strip()
+                if candidate and _norm_name(candidate) == _norm_name(run):
+                    seq_name = candidate
+                    break
+        if not seq_name:
+            seq_name = run
+        return dict(bounds_by_sequence.get(seq_name) or {})
+
     def _select_run_by_name(self, run_name: str) -> None:
         rn = str(run_name or "").strip()
         if not rn or not hasattr(self, "cb_run"):
@@ -5207,7 +5236,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             self.list_y_metrics.clear()
             return
         try:
-            y_cols = be.td_list_y_columns(self._db_path, run)
+            y_cols = be.td_list_raw_y_columns(self._db_path, run)
             metric_y_cols = be.td_list_metric_y_columns(self._db_path, run)
             x_cols = be.td_list_x_columns(self._db_path, run)
         except Exception:
@@ -5581,6 +5610,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         run_title = self._run_display_text(run) if show else run
         stats_label = "/".join(stats)
         y_label = stats[0] if len(stats) == 1 else "Metric value"
+        plot_bounds = bool(getattr(self, "cb_plot_metric_bounds", None) and self.cb_plot_metric_bounds.isChecked())
+        metric_bounds = self._metric_bounds_for_run(run) if plot_bounds else {}
         self._axes.clear()
         self._axes.set_title(f"{run_title} — {stats_label}")
         self._axes.set_xlabel("Serial Number")
@@ -5604,6 +5635,15 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 ]
                 try:
                     line = self._axes.plot(x, y, marker="o", linewidth=1.4, label=f"{y_col}.{stat}")[0]
+                    bound = dict(metric_bounds.get(str(y_col)) or {})
+                    if bound and bool(bound.get("enabled", True)):
+                        min_value = bound.get("min_value")
+                        max_value = bound.get("max_value")
+                        color = line.get_color()
+                        if isinstance(min_value, (int, float)):
+                            self._axes.axhline(float(min_value), color=color, linestyle="--", alpha=0.35, linewidth=1.0)
+                        if isinstance(max_value, (int, float)):
+                            self._axes.axhline(float(max_value), color=color, linestyle="--", alpha=0.35, linewidth=1.0)
                     # Highlight the chosen serial with a larger marker (per series).
                     hi_set = {str(sn).strip() for sn in (self._highlight_sns or []) if str(sn).strip()}
                     for hi_sn in hi_set:
@@ -5633,7 +5673,13 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             pass
         self._capture_main_plot_base_view()
         self.btn_save_plot_pdf.setEnabled(True)
-        self._last_plot_def = {"mode": "metrics", "run": run, "stats": list(stats), "y": list(y_cols)}
+        self._last_plot_def = {
+            "mode": "metrics",
+            "run": run,
+            "stats": list(stats),
+            "y": list(y_cols),
+            "plot_bounds": bool(plot_bounds),
+        }
         self.btn_add_auto_plot.setEnabled(True)
         # Keep table compact: preview first selected Y column (and highlight).
         self._refresh_stats_preview()
@@ -5879,8 +5925,6 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             if self._perf_candidate_key(data if isinstance(data, dict) else None) == want_key:
                 if self.cb_perf_plotter.currentIndex() != i:
                     self.cb_perf_plotter.setCurrentIndex(i)
-                if switch_to_plot and hasattr(self, "tabs_perf_sections"):
-                    self.tabs_perf_sections.setCurrentIndex(1)
                 return
 
     def _sync_perf_candidate_table_selection(self) -> None:
@@ -6028,9 +6072,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         return tgt, ""
 
     @staticmethod
-    def _perf_fmt_equation(coeffs: list[float], degree: int, *, x0: float | None, sx: float | None) -> str:
+    def _perf_fmt_equation(coeffs: list[float], degree: int, *, x0: float | None, sx: float | None) -> tuple[str, str]:
         if not coeffs:
-            return ""
+            return "", ""
         deg = int(degree)
         parts: list[str] = []
         for i, c in enumerate(coeffs):
@@ -6042,13 +6086,13 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             if power == 0:
                 parts.append(f"{cf:+.4g}")
             elif power == 1:
-                parts.append(f"{cf:+.4g}*x")
+                parts.append(f"{cf:+.4g}*x'")
             else:
-                parts.append(f"{cf:+.4g}*x^{power}")
+                parts.append(f"{cf:+.4g}*x'^{power}")
         expr = " ".join(parts).lstrip("+").strip()
         if x0 is not None and sx is not None:
-            return f"y = {expr}  (x'=(x-{float(x0):.4g})/{float(sx):.4g})"
-        return f"y = {expr}"
+            return f"y = {expr}", f"x' = (x - {float(x0):.4g}) / {float(sx):.4g}"
+        return f"y = {expr}", ""
 
     def _perf_poly_fit(
         self, xs: list[float], ys: list[float], degree: int, *, normalize_x: bool
@@ -6076,8 +6120,22 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         p = np.poly1d(coeffs)
         yhat = p(xn)
         rmse = float(np.sqrt(np.mean((y_arr - yhat) ** 2)))
-        eqn = self._perf_fmt_equation([float(c) for c in coeffs], deg, x0=(x0 if normalize_x else None), sx=(sx if normalize_x else None))
-        return {"degree": deg, "coeffs": [float(c) for c in coeffs], "rmse": rmse, "x0": x0, "sx": sx, "normalize_x": bool(normalize_x), "equation": eqn}
+        poly_eqn, x_norm_eqn = self._perf_fmt_equation(
+            [float(c) for c in coeffs],
+            deg,
+            x0=(x0 if normalize_x else None),
+            sx=(sx if normalize_x else None),
+        )
+        return {
+            "degree": deg,
+            "coeffs": [float(c) for c in coeffs],
+            "rmse": rmse,
+            "x0": x0,
+            "sx": sx,
+            "normalize_x": bool(normalize_x),
+            "equation": poly_eqn,
+            "x_norm_equation": x_norm_eqn,
+        }
 
     def _fill_perf_equations_table(self) -> None:
         if not hasattr(self, "tbl_perf_equations"):
@@ -6090,8 +6148,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 (
                     str(st),
                     str(master.get("equation") or ""),
+                    str(master.get("x_norm_equation") or ""),
                     (f"{float(master.get('rmse')):.4g}" if isinstance(master.get("rmse"), (int, float)) else ""),
                     str(hi.get("equation") or ""),
+                    str(hi.get("x_norm_equation") or ""),
                     (f"{float(hi.get('rmse')):.4g}" if isinstance(hi.get("rmse"), (int, float)) else ""),
                 )
             )
@@ -7019,6 +7079,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     it = self.list_y_metrics.item(i)
                     if it.text() in want:
                         it.setSelected(True)
+            if hasattr(self, "cb_plot_metric_bounds"):
+                self.cb_plot_metric_bounds.setChecked(bool(d.get("plot_bounds")))
             self._plot_metrics()
 
     def _open_all_auto_plots_panel(self) -> None:
@@ -7372,6 +7434,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             stats_label = "/".join(stats)
             ys = d.get("y") or []
             y_cols = [str(x).strip() for x in ys] if isinstance(ys, list) else []
+            plot_bounds = bool(d.get("plot_bounds"))
+            metric_bounds = self._metric_bounds_for_run(run) if plot_bounds else {}
             ax.set_title(str(d.get("name") or "") or f"{run} — {stats_label}")
             ax.set_xlabel("Serial Number")
             ax.set_ylabel(stats[0] if len(stats) == 1 else "Metric value")
@@ -7389,7 +7453,16 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                         (float(vmap.get(sn)) if isinstance(vmap.get(sn), (int, float)) else float("nan"))
                         for sn in labels
                     ]
-                    ax.plot(x_idx, yv, marker="o", linewidth=1.2, label=f"{y_col}.{stat}")
+                    line = ax.plot(x_idx, yv, marker="o", linewidth=1.2, label=f"{y_col}.{stat}")[0]
+                    bound = dict(metric_bounds.get(str(y_col)) or {})
+                    if bound and bool(bound.get("enabled", True)):
+                        min_value = bound.get("min_value")
+                        max_value = bound.get("max_value")
+                        color = line.get_color()
+                        if isinstance(min_value, (int, float)):
+                            ax.axhline(float(min_value), color=color, linestyle="--", alpha=0.35, linewidth=1.0)
+                        if isinstance(max_value, (int, float)):
+                            ax.axhline(float(max_value), color=color, linestyle="--", alpha=0.35, linewidth=1.0)
             ax.set_xticks(x_idx)
             ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
             ax.grid(True, alpha=0.25)

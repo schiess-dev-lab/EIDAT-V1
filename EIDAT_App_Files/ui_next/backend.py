@@ -2768,6 +2768,29 @@ def _ensure_test_data_tables(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         """
+        CREATE TABLE IF NOT EXISTS td_source_metadata (
+            serial TEXT PRIMARY KEY,
+            program_title TEXT,
+            asset_type TEXT,
+            asset_specific_type TEXT,
+            vendor TEXT,
+            acceptance_test_plan_number TEXT,
+            part_number TEXT,
+            revision TEXT,
+            test_date TEXT,
+            report_date TEXT,
+            document_type TEXT,
+            document_type_acronym TEXT,
+            similarity_group TEXT,
+            metadata_rel TEXT,
+            artifacts_rel TEXT,
+            excel_sqlite_rel TEXT,
+            metadata_mtime_ns INTEGER
+        )
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS td_runs (
             run_name TEXT PRIMARY KEY,
             default_x TEXT,
@@ -2783,6 +2806,28 @@ def _ensure_test_data_tables(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS td_columns (
+            run_name TEXT NOT NULL,
+            name TEXT NOT NULL,
+            units TEXT,
+            kind TEXT NOT NULL,
+            PRIMARY KEY (run_name, name)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS td_columns_raw (
+            run_name TEXT NOT NULL,
+            name TEXT NOT NULL,
+            units TEXT,
+            kind TEXT NOT NULL,
+            PRIMARY KEY (run_name, name)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS td_columns_calc (
             run_name TEXT NOT NULL,
             name TEXT NOT NULL,
             units TEXT,
@@ -2825,6 +2870,42 @@ def _ensure_test_data_tables(conn: sqlite3.Connection) -> None:
             source_mtime_ns INTEGER,
             PRIMARY KEY (serial, run_name, column_name, stat)
         )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS td_metrics_calc (
+            serial TEXT NOT NULL,
+            run_name TEXT NOT NULL,
+            column_name TEXT NOT NULL,
+            stat TEXT NOT NULL,
+            value_num REAL,
+            computed_epoch_ns INTEGER NOT NULL,
+            source_mtime_ns INTEGER,
+            PRIMARY KEY (serial, run_name, column_name, stat)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS td_curves_raw (
+            run_name TEXT NOT NULL,
+            y_name TEXT NOT NULL,
+            x_name TEXT NOT NULL,
+            serial TEXT NOT NULL,
+            x_json TEXT NOT NULL,
+            y_json TEXT NOT NULL,
+            n_points INTEGER NOT NULL,
+            source_mtime_ns INTEGER,
+            computed_epoch_ns INTEGER NOT NULL,
+            PRIMARY KEY (run_name, y_name, x_name, serial)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS td_curves_raw_lookup
+        ON td_curves_raw (run_name, y_name, x_name, serial)
         """
     )
     conn.execute(
@@ -2911,17 +2992,102 @@ def _read_test_data_sources(workbook_path: Path) -> list[dict]:
 
         out: list[dict] = []
         for row in range(2, (ws.max_row or 0) + 1):
-            sn = str(ws.cell(row, headers["serial_number"]).value or "").strip()
-            rel = str(ws.cell(row, headers["excel_sqlite_rel"]).value or "").strip()
+            item: dict[str, str] = {}
+            for key, col in headers.items():
+                item[key] = str(ws.cell(row, col).value or "").strip()
+            sn = str(item.get("serial_number") or item.get("serial") or "").strip()
             if not sn:
                 continue
-            out.append({"serial": sn, "excel_sqlite_rel": rel})
+            item["serial"] = sn
+            item["excel_sqlite_rel"] = str(item.get("excel_sqlite_rel") or "").strip()
+            out.append(item)
         return out
     finally:
         try:
             wb.close()
         except Exception:
             pass
+
+
+TD_SOURCE_METADATA_FIELDS = (
+    "program_title",
+    "asset_type",
+    "asset_specific_type",
+    "vendor",
+    "acceptance_test_plan_number",
+    "part_number",
+    "revision",
+    "test_date",
+    "report_date",
+    "document_type",
+    "document_type_acronym",
+    "similarity_group",
+)
+
+
+def _resolve_td_source_metadata_path(workbook_path: Path, source_row: Mapping[str, object]) -> Path | None:
+    metadata_rel = str(source_row.get("metadata_rel") or "").strip()
+    artifacts_rel = str(source_row.get("artifacts_rel") or "").strip()
+    try:
+        support_dir = eidat_support_dir(_infer_node_root_from_workbook_path(workbook_path))
+        meta_path = _resolve_support_path(support_dir, metadata_rel) if metadata_rel else None
+        if meta_path and meta_path.exists() and meta_path.is_file():
+            return meta_path
+        art_dir = _resolve_support_path(support_dir, artifacts_rel) if artifacts_rel else None
+        if art_dir is not None:
+            for p in sorted(art_dir.glob("*_metadata.json")):
+                if p.exists() and p.is_file():
+                    return p
+    except Exception:
+        return None
+    return None
+
+
+def _load_td_source_metadata(workbook_path: Path, source_row: Mapping[str, object]) -> dict[str, object]:
+    serial = str(source_row.get("serial") or source_row.get("serial_number") or "").strip()
+    excel_sqlite_rel = str(source_row.get("excel_sqlite_rel") or "").strip()
+    metadata_rel = str(source_row.get("metadata_rel") or "").strip()
+    artifacts_rel = str(source_row.get("artifacts_rel") or "").strip()
+
+    fallback = {
+        "serial_number": serial,
+        "program_title": str(source_row.get("program_title") or "").strip(),
+        "document_type": str(source_row.get("document_type") or "").strip(),
+        "metadata_rel": metadata_rel,
+        "artifacts_rel": artifacts_rel,
+        "excel_sqlite_rel": excel_sqlite_rel,
+    }
+
+    meta_from_file: dict[str, object] = {}
+    metadata_mtime_ns = 0
+    try:
+        meta_path = _resolve_td_source_metadata_path(workbook_path, source_row)
+        if meta_path and meta_path.exists() and meta_path.is_file():
+            metadata_mtime_ns = int(getattr(meta_path.stat(), "st_mtime_ns", int(meta_path.stat().st_mtime * 1e9)))
+            raw = json.loads(meta_path.read_text(encoding="utf-8"))
+            if isinstance(raw, Mapping):
+                meta_from_file = dict(raw)
+    except Exception:
+        meta_from_file = {}
+        metadata_mtime_ns = 0
+
+    merged = _merge_metadata(meta_from_file, fallback)
+    out: dict[str, object] = {
+        "serial_number": serial,
+        "metadata_rel": metadata_rel,
+        "artifacts_rel": artifacts_rel,
+        "excel_sqlite_rel": excel_sqlite_rel,
+        "metadata_mtime_ns": int(metadata_mtime_ns),
+    }
+    for key in TD_SOURCE_METADATA_FIELDS:
+        out[key] = str(merged.get(key) or "").strip()
+    if not out["metadata_rel"]:
+        out["metadata_rel"] = str(merged.get("metadata_rel") or "").strip()
+    if not out["artifacts_rel"]:
+        out["artifacts_rel"] = str(merged.get("artifacts_rel") or "").strip()
+    if not out["excel_sqlite_rel"]:
+        out["excel_sqlite_rel"] = str(merged.get("excel_sqlite_rel") or "").strip()
+    return out
 
 
 def _normalize_td_stat(s: object) -> str:
@@ -3104,7 +3270,7 @@ def _write_td_support_workbook(
     ws_settings.title = "Settings"
     ws_settings.append(["key", "value"])
     ws_settings.append(["exclude_first_n_default", ""])
-    ws_settings.append(["last_n_rows_default", ""])
+    ws_settings.append(["last_n_rows_default", 10])
 
     ws_seq = wb.create_sheet("Sequences")
     ws_seq.append(
@@ -3330,6 +3496,106 @@ def _read_td_support_workbook(workbook_path: Path, *, project_dir: Path | None =
             pass
 
 
+TD_GENERATED_DATA_HEADERS = ["Term", "Header", "GroupAfter", "Table Label", "ValueType", "Data Group", "Term Label", "Units", "Min", "Max"]
+
+
+def _is_generated_td_data_sheet(ws: object) -> bool:
+    try:
+        actual = [str(ws.cell(1, idx).value or "").strip() for idx in range(1, len(TD_GENERATED_DATA_HEADERS) + 1)]
+    except Exception:
+        return False
+    return actual == list(TD_GENERATED_DATA_HEADERS)
+
+
+def _load_runtime_td_trend_config() -> dict:
+    try:
+        cfg = load_excel_trend_config(DEFAULT_EXCEL_TREND_CONFIG)
+    except Exception:
+        cfg = {}
+    if not isinstance(cfg, dict):
+        cfg = {}
+    cols = [dict(c) for c in (cfg.get("columns") or []) if isinstance(c, dict)]
+    stats = [str(s).strip().lower() for s in (cfg.get("statistics") or []) if str(s).strip()]
+    stats = [s for s in stats if s in TD_ALLOWED_STATS]
+    if not stats:
+        stats = list(TD_DEFAULT_STATS_ORDER)
+    return {"config": cfg, "columns": cols, "statistics": stats}
+
+
+def _ordered_support_param_defs(
+    *,
+    sequence_names: list[str] | tuple[str, ...] | set[str] | None = None,
+    sequence_name: str = "",
+    support_cfg: dict,
+    fallback_defs: list[dict],
+) -> list[dict]:
+    def _support_norm_name(s: object) -> str:
+        return "".join(ch.lower() for ch in str(s or "").strip() if ch.isalnum())
+
+    raw_names = list(sequence_names or [])
+    if sequence_name:
+        raw_names.insert(0, str(sequence_name or "").strip())
+    resolved_names: list[str] = []
+    seen_names: set[str] = set()
+    for raw in raw_names:
+        name = str(raw or "").strip()
+        if not name:
+            continue
+        key = _support_norm_name(name)
+        if not key or key in seen_names:
+            continue
+        seen_names.add(key)
+        resolved_names.append(name)
+
+    fallback_defs = [dict(d) for d in fallback_defs if isinstance(d, dict) and str(d.get("name") or "").strip()]
+    fallback_by_name = {str(d.get("name") or "").strip(): dict(d) for d in fallback_defs}
+    fallback_order = [str(d.get("name") or "").strip() for d in fallback_defs if str(d.get("name") or "").strip()]
+
+    if not bool((support_cfg or {}).get("exists")):
+        return fallback_defs
+
+    bounds_by_sequence = (support_cfg or {}).get("bounds_by_sequence") or {}
+    seq_bounds: dict[str, dict] = {}
+    for name in resolved_names:
+        seq_bounds = dict(bounds_by_sequence.get(name) or {})
+        if seq_bounds:
+            break
+    if not seq_bounds:
+        return []
+
+    defs_by_name: dict[str, dict] = {}
+    for raw_name, raw_bound in seq_bounds.items():
+        name = str(raw_name or "").strip()
+        bound = dict(raw_bound or {}) if isinstance(raw_bound, dict) else {}
+        if not name or not bool(bound.get("enabled", True)):
+            continue
+        fallback = dict(fallback_by_name.get(name) or {})
+        defs_by_name[name] = {
+            "name": name,
+            "units": str(bound.get("units") or fallback.get("units") or "").strip(),
+            "min_value": bound.get("min_value"),
+            "max_value": bound.get("max_value"),
+            "enabled": bool(bound.get("enabled", True)),
+        }
+
+    ordered_names = [name for name in fallback_order if name in defs_by_name]
+    ordered_names.extend(sorted([name for name in defs_by_name.keys() if name not in ordered_names], key=lambda s: str(s).lower()))
+    return [defs_by_name[name] for name in ordered_names]
+
+
+def _raw_curve_points(*, rows: list[dict], actual_x: str, y_name: str) -> tuple[list[float], list[float]]:
+    xs: list[float] = []
+    ys: list[float] = []
+    for row in rows:
+        fx = _td_finite_float(row.get(actual_x))
+        fy = _td_finite_float(row.get(y_name))
+        if fx is None or fy is None:
+            continue
+        xs.append(float(fx))
+        ys.append(float(fy))
+    return xs, ys
+
+
 def _read_test_data_run_labeling(workbook_path: Path) -> dict | None:
     """
     Read optional `td_run_labeling` JSON from the Test Data Trending workbook's Config sheet.
@@ -3425,11 +3691,7 @@ def ensure_test_data_project_cache(
     # Quick staleness check: compare workbook Sources list + mtimes against td_sources.
     try:
         sources = _read_test_data_sources(wb_path)
-        expected = {
-            str(s.get("serial") or "").strip(): str(s.get("excel_sqlite_rel") or "").strip()
-            for s in sources
-            if str(s.get("serial") or "").strip()
-        }
+        expected = {str(s.get("serial") or "").strip(): dict(s) for s in sources if str(s.get("serial") or "").strip()}
     except Exception:
         expected = {}
 
@@ -3445,26 +3707,30 @@ def ensure_test_data_project_cache(
             if str(r[0] or "").strip()
         }
         try:
-            curve_count = int(conn.execute("SELECT COUNT(*) FROM td_curves").fetchone()[0] or 0)
+            meta_rows = conn.execute(
+                "SELECT serial, metadata_rel, artifacts_rel, excel_sqlite_rel, metadata_mtime_ns FROM td_source_metadata"
+            ).fetchall()
+        except Exception:
+            meta_rows = []
+        cached_meta = {
+            str(r[0] or "").strip(): {
+                "metadata_rel": str(r[1] or "").strip(),
+                "artifacts_rel": str(r[2] or "").strip(),
+                "excel_sqlite_rel": str(r[3] or "").strip(),
+                "metadata_mtime_ns": int(r[4] or 0),
+            }
+            for r in meta_rows
+            if str(r[0] or "").strip()
+        }
+        try:
+            curve_count = int(conn.execute("SELECT COUNT(*) FROM td_curves_raw").fetchone()[0] or 0)
         except Exception:
             curve_count = 0
-        try:
-            row = conn.execute("SELECT value FROM td_meta WHERE key='statistics_ignore_first_n' LIMIT 1").fetchone()
-            cached_ignore_first_n = int(str(row[0]).strip()) if row and row[0] is not None else 0
-        except Exception:
-            cached_ignore_first_n = 0
         try:
             row = conn.execute("SELECT value FROM td_meta WHERE key='support_workbook_mtime_ns' LIMIT 1").fetchone()
             cached_support_mtime_ns = int(str(row[0]).strip()) if row and row[0] is not None else 0
         except Exception:
             cached_support_mtime_ns = 0
-
-    current_ignore_first_n = 0
-    try:
-        current_ignore_first_n = int((_load_excel_trend_config(DEFAULT_EXCEL_TREND_CONFIG) or {}).get("statistics_ignore_first_n") or 0)
-    except Exception:
-        current_ignore_first_n = 0
-    current_ignore_first_n = max(0, int(current_ignore_first_n))
 
     support_mtime_ns = 0
     try:
@@ -3498,9 +3764,24 @@ def ensure_test_data_project_cache(
     if not current_stats:
         current_stats = list(TD_DEFAULT_STATS_ORDER)
     current_stats_csv = ",".join(current_stats)
+    current_raw_cols_csv = ""
+    try:
+        runtime_cfg = _load_runtime_td_trend_config()
+        current_raw_cols_csv = ",".join(
+            [str(c.get("name") or "").strip() for c in (runtime_cfg.get("columns") or []) if str(c.get("name") or "").strip()]
+        )
+    except Exception:
+        current_raw_cols_csv = ""
+    cached_raw_cols_csv = ""
+    try:
+        with sqlite3.connect(str(db_path)) as conn:
+            row = conn.execute("SELECT value FROM td_meta WHERE key='raw_columns' LIMIT 1").fetchone()
+            cached_raw_cols_csv = str(row[0] or "").strip() if row and row[0] is not None else ""
+    except Exception:
+        cached_raw_cols_csv = ""
 
-    # If the stats selection or ignore-first config changed, rebuild so td_metrics are consistent.
-    if int(cached_ignore_first_n) != int(current_ignore_first_n) or cached_stats_csv != current_stats_csv:
+    # If the selected stats or raw column config changed, rebuild so the split cache stays consistent.
+    if cached_stats_csv != current_stats_csv or cached_raw_cols_csv != current_raw_cols_csv:
         rebuild_test_data_project_cache(db_path, wb_path)
         return db_path
     if int(cached_support_mtime_ns) != int(support_mtime_ns):
@@ -3514,7 +3795,8 @@ def ensure_test_data_project_cache(
 
     # If any path/mtime differs, rebuild.
     stale = False
-    for sn, rel in expected.items():
+    for sn, source_row in expected.items():
+        rel = str(source_row.get("excel_sqlite_rel") or "").strip()
         p = _resolve_excel_sqlite_path_from_workbook(wb_path, rel)
         c = cached.get(sn) or {}
         if str(c.get("path") or "") != str(p):
@@ -3533,8 +3815,78 @@ def ensure_test_data_project_cache(
             if int(c.get("mtime_ns") or 0) != int(mtime_ns):
                 stale = True
                 break
+        source_meta = _load_td_source_metadata(wb_path, source_row)
+        cached_meta_row = cached_meta.get(sn) or {}
+        if str(cached_meta_row.get("metadata_rel") or "") != str(source_meta.get("metadata_rel") or "").strip():
+            stale = True
+            break
+        if str(cached_meta_row.get("artifacts_rel") or "") != str(source_meta.get("artifacts_rel") or "").strip():
+            stale = True
+            break
+        if str(cached_meta_row.get("excel_sqlite_rel") or "") != rel:
+            stale = True
+            break
+        if int(cached_meta_row.get("metadata_mtime_ns") or 0) != int(source_meta.get("metadata_mtime_ns") or 0):
+            stale = True
+            break
     if stale:
         rebuild_test_data_project_cache(db_path, wb_path)
+
+    return db_path
+
+
+def _validate_test_data_project_cache_for_update(project_dir: Path, workbook_path: Path) -> Path:
+    """
+    Validate that the project-local TD cache DB is present and populated enough
+    to regenerate workbook sheets without reopening source files.
+    """
+    proj_dir = Path(project_dir).expanduser()
+    wb_path = Path(workbook_path).expanduser()
+    db_path = proj_dir / EIDAT_PROJECT_IMPLEMENTATION_DB
+    guidance = (
+        "Test Data workbook updates use the existing project cache only. "
+        "Run 'Build / Refresh Cache' first to create or refresh implementation_trending.sqlite3."
+    )
+
+    if not wb_path.exists():
+        raise FileNotFoundError(f"Workbook not found: {wb_path}")
+    if not db_path.exists() or not db_path.is_file():
+        raise RuntimeError(
+            f"Project cache DB not found: {db_path}. {guidance}"
+        )
+
+    try:
+        with sqlite3.connect(str(db_path)) as conn:
+            required_tables = ("td_runs", "td_columns_calc", "td_metrics_calc")
+            table_rows = conn.execute(
+                """
+                SELECT name
+                FROM sqlite_master
+                WHERE type='table' AND name IN (?, ?, ?)
+                """,
+                required_tables,
+            ).fetchall()
+            existing_tables = {str(r[0] or "").strip() for r in table_rows if str(r[0] or "").strip()}
+            missing_tables = [name for name in required_tables if name not in existing_tables]
+            if missing_tables:
+                raise RuntimeError(
+                    f"Project cache DB is incomplete ({', '.join(missing_tables)} missing): {db_path}. {guidance}"
+                )
+
+            runs_count = int(conn.execute("SELECT COUNT(*) FROM td_runs").fetchone()[0] or 0)
+            y_cols_count = int(
+                conn.execute("SELECT COUNT(*) FROM td_columns_calc WHERE kind='y'").fetchone()[0] or 0
+            )
+            metrics_count = int(conn.execute("SELECT COUNT(*) FROM td_metrics_calc").fetchone()[0] or 0)
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(f"Failed to validate project cache DB: {db_path}. {guidance}") from exc
+
+    if runs_count <= 0 or y_cols_count <= 0 or metrics_count <= 0:
+        raise RuntimeError(
+            f"Project cache DB is incomplete: {db_path}. {guidance}"
+        )
 
     return db_path
 
@@ -3554,7 +3906,8 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
     db_path = Path(db_path).expanduser()
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
-    cfg_cols = _read_test_data_config_columns(wb_path)
+    runtime_cfg = _load_runtime_td_trend_config()
+    cfg_cols = [dict(c) for c in (runtime_cfg.get("columns") or []) if isinstance(c, dict)]
     y_cols: list[tuple[str, str]] = []
     cfg_units: dict[str, str] = {}
     for c in cfg_cols:
@@ -3565,50 +3918,16 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
             if units:
                 cfg_units[name] = units
 
-    data_defs = _read_test_data_data_definitions(wb_path)
-    data_y_by_run: dict[str, dict[str, str]] = {}
-    for d in data_defs:
-        if not bool(d.get("active")):
-            continue
-        run = str(d.get("data_group") or "").strip()
-        name = str(d.get("header") or "").strip()
-        units = str(d.get("units") or "").strip()
-        if not run or not name:
-            continue
-        existing = data_y_by_run.setdefault(run, {})
-        if name not in existing:
-            existing[name] = units
-        elif not existing.get(name) and units:
-            existing[name] = units
-
     sources = _read_test_data_sources(wb_path)
-    entries = [
-        (str(s.get("serial") or "").strip(), str(s.get("excel_sqlite_rel") or "").strip())
-        for s in sources
-        if str(s.get("serial") or "").strip()
-    ]
+    entries = [dict(s) for s in sources if str(s.get("serial") or "").strip()]
 
     computed_epoch_ns = time.time_ns()
 
     # Stats selection is driven entirely by user_inputs/excel_trend_config.json.
-    selected_stats: list[str] = []
-    try:
-        selected_stats = list((_load_excel_trend_config(DEFAULT_EXCEL_TREND_CONFIG) or {}).get("statistics") or [])
-    except Exception:
-        selected_stats = []
-    selected_stats = [str(s).strip().lower() for s in selected_stats if str(s).strip()]
+    selected_stats = [str(s).strip().lower() for s in (runtime_cfg.get("statistics") or []) if str(s).strip()]
     selected_stats = [s for s in selected_stats if s in TD_ALLOWED_STATS]
     if not selected_stats:
         selected_stats = list(TD_DEFAULT_STATS_ORDER)
-
-    # Optional: ignore the first N ordered source rows when computing per-serial statistics.
-    # This is configured via user_inputs/excel_trend_config.json.
-    stats_ignore_first_n = 0
-    try:
-        stats_ignore_first_n = int((_load_excel_trend_config(DEFAULT_EXCEL_TREND_CONFIG) or {}).get("statistics_ignore_first_n") or 0)
-    except Exception:
-        stats_ignore_first_n = 0
-    stats_ignore_first_n = max(0, int(stats_ignore_first_n))
 
     support_cfg = _read_td_support_workbook(wb_path, project_dir=db_path.parent)
     support_settings = dict(support_cfg.get("settings") or {})
@@ -4093,7 +4412,10 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
         rows: list[dict],
     ) -> tuple[list[float], list[float]]:
         seq_name = str(run_info.get("sequence_name") or "").strip()
+        source_run_name = str(run_info.get("source_run_name") or "").strip()
         seq_bounds = dict(support_bounds_by_sequence.get(seq_name) or {})
+        if not seq_bounds and source_run_name:
+            seq_bounds = dict(support_bounds_by_sequence.get(source_run_name) or {})
         bound = dict(seq_bounds.get(str(y_name)) or {})
         min_val = bound.get("min_value") if bool(bound.get("enabled", True)) else None
         max_val = bound.get("max_value") if bool(bound.get("enabled", True)) else None
@@ -4128,7 +4450,20 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
     # Reset td_* tables (only).
     with closing(sqlite3.connect(str(db_path))) as conn:
         _ensure_test_data_tables(conn)
-        for t in ("td_meta", "td_sources", "td_runs", "td_columns", "td_curves", "td_metrics", "td_terms"):
+        for t in (
+            "td_meta",
+            "td_sources",
+            "td_source_metadata",
+            "td_runs",
+            "td_columns",
+            "td_columns_raw",
+            "td_columns_calc",
+            "td_curves",
+            "td_curves_raw",
+            "td_metrics",
+            "td_metrics_calc",
+            "td_terms",
+        ):
             try:
                 conn.execute(f"DELETE FROM {t}")
             except Exception:
@@ -4137,11 +4472,11 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
         conn.execute("INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)", ("built_epoch_ns", str(computed_epoch_ns)))
         conn.execute(
             "INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)",
-            ("statistics_ignore_first_n", str(int(stats_ignore_first_n))),
+            ("statistics", ",".join(selected_stats)),
         )
         conn.execute(
             "INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)",
-            ("statistics", ",".join(selected_stats)),
+            ("raw_columns", ",".join([str(c.get("name") or "").strip() for c in cfg_cols if str(c.get("name") or "").strip()])),
         )
         conn.execute(
             "INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)",
@@ -4167,42 +4502,18 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
         except Exception:
             pass
 
-        # Store workbook-defined term rows (Data sheet) for one-to-one comparison.
-        for d in data_defs:
-            try:
-                conn.execute(
-                    """
-                    INSERT OR REPLACE INTO td_terms
-                    (row_index, term, header, table_label, value_type, data_group, term_label, units, min_val, max_val, active, normalized_stat, computed_epoch_ns)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        int(d.get("row_index") or 0),
-                        str(d.get("term") or "").strip(),
-                        str(d.get("header") or "").strip(),
-                        str(d.get("table_label") or "").strip(),
-                        str(d.get("value_type") or "").strip(),
-                        str(d.get("data_group") or "").strip(),
-                        str(d.get("term_label") or "").strip(),
-                        str(d.get("units") or "").strip(),
-                        str(d.get("min") or "").strip(),
-                        str(d.get("max") or "").strip(),
-                        (1 if bool(d.get("active")) else 0),
-                        str(d.get("normalized_stat") or "").strip(),
-                        int(computed_epoch_ns),
-                    ),
-                )
-            except Exception:
-                continue
         conn.commit()
 
     missing_sources = 0
     invalid_sources = 0
     curves_written = 0
     metrics_written = 0
-    run_y_union: dict[str, dict[str, str]] = {}
+    run_y_raw_union: dict[str, dict[str, str]] = {}
+    run_y_calc_union: dict[str, dict[str, str]] = {}
 
-    for sn, rel in entries:
+    for entry in entries:
+        sn = str(entry.get("serial") or "").strip()
+        rel = str(entry.get("excel_sqlite_rel") or "").strip()
         sqlite_path = _resolve_excel_sqlite_path_from_workbook(wb_path, rel)
         status = "ok"
         try:
@@ -4226,6 +4537,49 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
                 VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (sn, str(sqlite_path), mtime_ns, size_bytes, status, computed_epoch_ns),
+            )
+            source_meta = _load_td_source_metadata(wb_path, entry)
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO td_source_metadata(
+                    serial,
+                    program_title,
+                    asset_type,
+                    asset_specific_type,
+                    vendor,
+                    acceptance_test_plan_number,
+                    part_number,
+                    revision,
+                    test_date,
+                    report_date,
+                    document_type,
+                    document_type_acronym,
+                    similarity_group,
+                    metadata_rel,
+                    artifacts_rel,
+                    excel_sqlite_rel,
+                    metadata_mtime_ns
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    sn,
+                    str(source_meta.get("program_title") or "").strip(),
+                    str(source_meta.get("asset_type") or "").strip(),
+                    str(source_meta.get("asset_specific_type") or "").strip(),
+                    str(source_meta.get("vendor") or "").strip(),
+                    str(source_meta.get("acceptance_test_plan_number") or "").strip(),
+                    str(source_meta.get("part_number") or "").strip(),
+                    str(source_meta.get("revision") or "").strip(),
+                    str(source_meta.get("test_date") or "").strip(),
+                    str(source_meta.get("report_date") or "").strip(),
+                    str(source_meta.get("document_type") or "").strip(),
+                    str(source_meta.get("document_type_acronym") or "").strip(),
+                    str(source_meta.get("similarity_group") or "").strip(),
+                    str(source_meta.get("metadata_rel") or "").strip(),
+                    str(source_meta.get("artifacts_rel") or "").strip(),
+                    str(source_meta.get("excel_sqlite_rel") or "").strip(),
+                    int(source_meta.get("metadata_mtime_ns") or 0),
+                ),
             )
             conn.commit()
 
@@ -4360,79 +4714,99 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
                     # Local default_x for metrics
                     default_x = avail_x[0] if avail_x else ""
 
-                    desired_y: list[str] = []
-                    for y_name, _units in y_cols:
-                        if y_name:
-                            desired_y.append(y_name)
-                    extra = data_y_by_run.get(str(effective_run), {}) or {}
-                    for y_name in extra.keys():
-                        if y_name and y_name not in desired_y:
-                            desired_y.append(y_name)
+                    raw_desired_y = [y_name for y_name, _units in y_cols if y_name]
+                    calc_param_defs = _ordered_support_param_defs(
+                        sequence_names=[str(effective_run), str(run)],
+                        support_cfg=support_cfg,
+                        fallback_defs=cfg_cols,
+                    )
+                    calc_desired_y = [str(d.get("name") or "").strip() for d in calc_param_defs if str(d.get("name") or "").strip()]
+                    calc_units_by_name = {str(d.get("name") or "").strip(): str(d.get("units") or "").strip() for d in calc_param_defs}
 
-                    run_units = run_y_union.setdefault(str(effective_run), {})
-                    for y_name in desired_y:
-                        if y_name not in run_units or not run_units.get(y_name):
-                            u = cfg_units.get(y_name) or str((data_y_by_run.get(str(effective_run), {}) or {}).get(y_name) or "").strip()
-                            run_units[y_name] = str(u or "").strip()
+                    raw_units = run_y_raw_union.setdefault(str(effective_run), {})
+                    for y_name in raw_desired_y:
+                        if y_name not in raw_units or not raw_units.get(y_name):
+                            raw_units[y_name] = str(cfg_units.get(y_name) or "").strip()
 
-                    for y_name in desired_y:
+                    calc_units = run_y_calc_union.setdefault(str(effective_run), {})
+                    for y_name in calc_desired_y:
+                        if y_name not in calc_units or not calc_units.get(y_name):
+                            calc_units[y_name] = str(calc_units_by_name.get(y_name) or cfg_units.get(y_name) or "").strip()
+
+                    for y_name in raw_desired_y:
                         if y_name not in cols:
                             continue
                         if _norm_name(y_name) in x_exclude_norms:
                             continue
-
-                        # Build curves for each available X column (supports x dropdown)
                         for x_name in avail_x:
                             actual_x = x_map.get(x_name, "")
                             if not actual_x:
                                 continue
-                            q_table = _quote_ident(table)
-                            qx = _quote_ident(actual_x)
-                            qy = _quote_ident(y_name)
-                            xs, ys = _filter_rows_for_metric(run_info, y_name=y_name, actual_x=actual_x, rows=source_rows)
-
+                            xs, ys = _raw_curve_points(rows=source_rows, actual_x=actual_x, y_name=y_name)
                             with closing(sqlite3.connect(str(db_path))) as conn:
+                                payload = (
+                                    effective_run,
+                                    y_name,
+                                    x_name,
+                                    sn,
+                                    json.dumps(xs, separators=(",", ":"), ensure_ascii=False),
+                                    json.dumps(ys, separators=(",", ":"), ensure_ascii=False),
+                                    int(len(xs)),
+                                    mtime_ns,
+                                    computed_epoch_ns,
+                                )
+                                conn.execute(
+                                    """
+                                    INSERT OR REPLACE INTO td_curves_raw
+                                    (run_name, y_name, x_name, serial, x_json, y_json, n_points, source_mtime_ns, computed_epoch_ns)
+                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                    """,
+                                    payload,
+                                )
+                                # Compatibility mirror: legacy readers still expect td_curves.
                                 conn.execute(
                                     """
                                     INSERT OR REPLACE INTO td_curves
                                     (run_name, y_name, x_name, serial, x_json, y_json, n_points, source_mtime_ns, computed_epoch_ns)
                                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                                     """,
-                                    (
-                                        effective_run,
-                                        y_name,
-                                        x_name,
-                                        sn,
-                                        json.dumps(xs, separators=(",", ":"), ensure_ascii=False),
-                                        json.dumps(ys, separators=(",", ":"), ensure_ascii=False),
-                                        int(len(xs)),
-                                        mtime_ns,
-                                        computed_epoch_ns,
-                                    ),
+                                    payload,
                                 )
                                 conn.commit()
                             curves_written += 1
 
-                        # Metrics computed from the default X curve (if any)
+                    for y_name in calc_desired_y:
+                        if y_name not in cols:
+                            continue
+                        if _norm_name(y_name) in x_exclude_norms:
+                            continue
                         y_for_stats: list[float] = []
                         if default_x:
                             actual_x = x_map.get(default_x, "")
                             if not actual_x:
                                 actual_x = default_x
                             _xs_stats, y_for_stats = _filter_rows_for_metric(run_info, y_name=y_name, actual_x=actual_x, rows=source_rows)
-                            if stats_ignore_first_n > 0 and len(y_for_stats) > 0:
-                                y_for_stats = y_for_stats[int(stats_ignore_first_n):]
                         stats_map = _compute_stats(y_for_stats)
                         with closing(sqlite3.connect(str(db_path))) as conn:
                             for stat in selected_stats:
                                 val = stats_map.get(stat)
+                                payload = (sn, effective_run, y_name, str(stat), val, computed_epoch_ns, mtime_ns)
+                                conn.execute(
+                                    """
+                                    INSERT OR REPLACE INTO td_metrics_calc
+                                    (serial, run_name, column_name, stat, value_num, computed_epoch_ns, source_mtime_ns)
+                                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                                    """,
+                                    payload,
+                                )
+                                # Compatibility mirror: legacy readers still expect td_metrics.
                                 conn.execute(
                                     """
                                     INSERT OR REPLACE INTO td_metrics
                                     (serial, run_name, column_name, stat, value_num, computed_epoch_ns, source_mtime_ns)
                                     VALUES (?, ?, ?, ?, ?, ?, ?)
                                     """,
-                                    (sn, effective_run, y_name, str(stat), val, computed_epoch_ns, mtime_ns),
+                                    payload,
                                 )
                                 metrics_written += 1
                             conn.commit()
@@ -4452,7 +4826,7 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
             invalid_sources += 1
 
     # Compute optional display labels per run (condition labeling).
-    runs_all = set(run_x_union.keys()) | set(run_y_union.keys())
+    runs_all = set(run_x_union.keys()) | set(run_y_raw_union.keys()) | set(run_y_calc_union.keys())
     display_by_run: dict[str, str] = {}
     if td_run_labeling_enabled and label_template:
         def _collapse_ws(s: object) -> str:
@@ -4509,13 +4883,33 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
                     "INSERT OR REPLACE INTO td_columns(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
                     (run, x, "", "x"),
                 )
+                conn.execute(
+                    "INSERT OR REPLACE INTO td_columns_raw(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
+                    (run, x, "", "x"),
+                )
 
-            y_map = run_y_union.get(run, {}) or {}
-            y_ordered = [n for n in cfg_order if n in y_map] + sorted([n for n in y_map.keys() if n not in cfg_order], key=lambda s: str(s).lower())
-            for y_name in y_ordered:
+            y_map_raw = run_y_raw_union.get(run, {}) or {}
+            y_ordered_raw = [n for n in cfg_order if n in y_map_raw] + sorted([n for n in y_map_raw.keys() if n not in cfg_order], key=lambda s: str(s).lower())
+            for y_name in y_ordered_raw:
                 if _norm_name(y_name) in x_exclude_norms:
                     continue
-                units = str(y_map.get(y_name) or "").strip()
+                units = str(y_map_raw.get(y_name) or "").strip()
+                conn.execute(
+                    "INSERT OR REPLACE INTO td_columns_raw(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
+                    (run, y_name, units, "y"),
+                )
+
+            y_map_calc = run_y_calc_union.get(run, {}) or {}
+            y_ordered_calc = [n for n in cfg_order if n in y_map_calc] + sorted([n for n in y_map_calc.keys() if n not in cfg_order], key=lambda s: str(s).lower())
+            for y_name in y_ordered_calc:
+                if _norm_name(y_name) in x_exclude_norms:
+                    continue
+                units = str(y_map_calc.get(y_name) or "").strip()
+                conn.execute(
+                    "INSERT OR REPLACE INTO td_columns_calc(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
+                    (run, y_name, units, "y"),
+                )
+                # Compatibility union for legacy readers.
                 conn.execute(
                     "INSERT OR REPLACE INTO td_columns(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
                     (run, y_name, units, "y"),
@@ -4530,7 +4924,7 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
         "invalid_sources": invalid_sources,
         "curves_written": curves_written,
         "metrics_written": metrics_written,
-        "runs": sorted(run_x_union.keys()),
+        "runs": sorted(runs_all),
     }
 
 
@@ -4568,8 +4962,8 @@ def td_list_curve_y_columns(db_path: Path, run_name: str, x_name: str | None = N
             rows = conn.execute(
                 """
                 SELECT DISTINCT c.y_name, COALESCE(col.units, '')
-                FROM td_curves c
-                LEFT JOIN td_columns col
+                FROM td_curves_raw c
+                LEFT JOIN td_columns_raw col
                   ON col.run_name = c.run_name AND col.name = c.y_name AND col.kind = 'y'
                 WHERE c.run_name=? AND c.x_name=?
                 ORDER BY c.y_name
@@ -4580,14 +4974,34 @@ def td_list_curve_y_columns(db_path: Path, run_name: str, x_name: str | None = N
             rows = conn.execute(
                 """
                 SELECT DISTINCT c.y_name, COALESCE(col.units, '')
-                FROM td_curves c
-                LEFT JOIN td_columns col
+                FROM td_curves_raw c
+                LEFT JOIN td_columns_raw col
                   ON col.run_name = c.run_name AND col.name = c.y_name AND col.kind = 'y'
                 WHERE c.run_name=?
                 ORDER BY c.y_name
                 """,
                 (run,),
             ).fetchall()
+    return [
+        {"name": str(r[0] or "").strip(), "units": str(r[1] or "").strip()}
+        for r in rows
+        if str(r[0] or "").strip()
+    ]
+
+
+def td_list_raw_y_columns(db_path: Path, run_name: str) -> list[dict]:
+    path = Path(db_path).expanduser()
+    if not path.exists():
+        return []
+    run = str(run_name or "").strip()
+    if not run:
+        return []
+    with sqlite3.connect(str(path)) as conn:
+        _ensure_test_data_tables(conn)
+        rows = conn.execute(
+            "SELECT name, units FROM td_columns_raw WHERE run_name=? AND kind='y' ORDER BY name",
+            (run,),
+        ).fetchall()
     return [
         {"name": str(r[0] or "").strip(), "units": str(r[1] or "").strip()}
         for r in rows
@@ -4605,7 +5019,7 @@ def td_list_y_columns(db_path: Path, run_name: str) -> list[dict]:
     with sqlite3.connect(str(path)) as conn:
         _ensure_test_data_tables(conn)
         rows = conn.execute(
-            "SELECT name, units FROM td_columns WHERE run_name=? AND kind='y' ORDER BY name",
+            "SELECT name, units FROM td_columns_calc WHERE run_name=? AND kind='y' ORDER BY name",
             (run,),
         ).fetchall()
     return [
@@ -4627,8 +5041,8 @@ def td_list_metric_y_columns(db_path: Path, run_name: str) -> list[dict]:
         rows = conn.execute(
             """
             SELECT DISTINCT m.column_name, COALESCE(c.units, '')
-            FROM td_metrics m
-            LEFT JOIN td_columns c
+            FROM td_metrics_calc m
+            LEFT JOIN td_columns_calc c
               ON c.run_name = m.run_name AND c.name = m.column_name AND c.kind = 'y'
             WHERE m.run_name=? AND m.value_num IS NOT NULL
             ORDER BY m.column_name
@@ -4654,7 +5068,7 @@ def td_list_x_columns(db_path: Path, run_name: str) -> list[str]:
         row = conn.execute("SELECT default_x FROM td_runs WHERE run_name=?", (run,)).fetchone()
         default_x = str(row[0] or "").strip() if row else ""
         rows = conn.execute(
-            "SELECT name FROM td_columns WHERE run_name=? AND kind='x' ORDER BY name",
+            "SELECT name FROM td_columns_raw WHERE run_name=? AND kind='x' ORDER BY name",
             (run,),
         ).fetchall()
     xs = [str(r[0] or "").strip() for r in rows if str(r[0] or "").strip()]
@@ -4718,7 +5132,7 @@ def td_load_metric_series(db_path: Path, run_name: str, column_name: str, stat: 
         rows = conn.execute(
             """
             SELECT serial, value_num
-            FROM td_metrics
+            FROM td_metrics_calc
             WHERE run_name=? AND column_name=? AND stat=?
             ORDER BY serial
             """,
@@ -4749,7 +5163,7 @@ def td_discover_performance_candidates(db_path: Path, config_path: Path | None =
         metric_rows = conn.execute(
             """
             SELECT serial, run_name, column_name, stat, value_num
-            FROM td_metrics
+            FROM td_metrics_calc
             WHERE lower(stat) IN ('mean', 'min', 'max')
             ORDER BY run_name, column_name, stat, serial
             """
@@ -4757,7 +5171,7 @@ def td_discover_performance_candidates(db_path: Path, config_path: Path | None =
         units_rows = conn.execute(
             """
             SELECT run_name, name, units
-            FROM td_columns
+            FROM td_columns_calc
             WHERE kind='y'
             ORDER BY run_name, name
             """
@@ -4961,7 +5375,7 @@ def td_load_curves(
             rows = conn.execute(
                 f"""
                 SELECT serial, x_json, y_json
-                FROM td_curves
+                FROM td_curves_raw
                 WHERE run_name=? AND y_name=? AND x_name=? AND serial IN ({q})
                 ORDER BY serial
                 """,
@@ -4971,7 +5385,7 @@ def td_load_curves(
             rows = conn.execute(
                 """
                 SELECT serial, x_json, y_json
-                FROM td_curves
+                FROM td_curves_raw
                 WHERE run_name=? AND y_name=? AND x_name=?
                 ORDER BY serial
                 """,
@@ -4996,8 +5410,8 @@ def update_test_data_trending_project_workbook(
     dry_run: bool = False,
 ) -> dict:
     """
-    Populate a Test Data Trending workbook's `Data_calc` (computed) and `Data` (user-defined)
-    sheets using cached `td_metrics`.
+    Populate a Test Data Trending workbook's calculated sheets from cached
+    support-driven metrics.
     """
     try:
         from openpyxl import load_workbook  # type: ignore
@@ -5013,6 +5427,7 @@ def update_test_data_trending_project_workbook(
 
     repo = Path(global_repo).expanduser()
     project_dir = wb_path.parent
+    db_path = _validate_test_data_project_cache_for_update(project_dir, wb_path)
 
     try:
         wb = load_workbook(str(wb_path))
@@ -5125,64 +5540,9 @@ def update_test_data_trending_project_workbook(
         except Exception:
             pass
 
-    def _config_snapshot() -> dict:
-        if "Config" not in wb.sheetnames:
-            return {}
-        ws_cfg = wb["Config"]
-        # Parse columns block: header row contains name/units/range_min/range_max.
-        header_row = None
-        for r in range(1, (ws_cfg.max_row or 0) + 1):
-            a = str(ws_cfg.cell(r, 1).value or "").strip().lower()
-            b = str(ws_cfg.cell(r, 2).value or "").strip().lower()
-            if a == "name" and b == "units":
-                header_row = r
-                break
-        cols: list[dict] = []
-        if header_row is not None:
-            def _clean_jsonish(v: object) -> object:
-                txt = str(v or "").strip()
-                if not txt or txt.lower() in {"null", "none"}:
-                    return ""
-                try:
-                    # Config sheet stores JSON-ish strings like "null" or numbers.
-                    return json.loads(txt)
-                except Exception:
-                    return txt
-
-            for r in range(header_row + 1, (ws_cfg.max_row or 0) + 1):
-                name = str(ws_cfg.cell(r, 1).value or "").strip()
-                if not name:
-                    break
-                units = str(ws_cfg.cell(r, 2).value or "").strip()
-                rmin = _clean_jsonish(ws_cfg.cell(r, 3).value)
-                rmax = _clean_jsonish(ws_cfg.cell(r, 4).value)
-                cols.append({"name": name, "units": units, "range_min": rmin, "range_max": rmax})
-        # Stats: row where key is "statistics"
-        stats: list[str] = []
-        for r in range(1, (ws_cfg.max_row or 0) + 1):
-            k = str(ws_cfg.cell(r, 1).value or "").strip().lower()
-            if k == "statistics":
-                raw = str(ws_cfg.cell(r, 2).value or "").strip()
-                stats = [s.strip().lower() for s in raw.split(",") if s.strip()]
-                break
-        return {"columns": cols, "statistics": stats}
-
-    cfg = _config_snapshot()
-    cfg_cols = list(cfg.get("columns") or [])
-    cfg_stats = [str(s).strip().lower() for s in (cfg.get("statistics") or []) if str(s).strip()]
-    if not cfg_stats:
-        cfg_stats = list(TD_DEFAULT_STATS_ORDER)
-
-    cfg_by_name: dict[str, dict] = {}
-    cfg_order: list[str] = []
-    for c in cfg_cols:
-        if not isinstance(c, dict):
-            continue
-        name = str(c.get("name") or "").strip()
-        if not name:
-            continue
-        cfg_order.append(name)
-        cfg_by_name[name] = c
+    runtime_cfg = _load_runtime_td_trend_config()
+    cfg_cols = [dict(c) for c in (runtime_cfg.get("columns") or []) if isinstance(c, dict)]
+    cfg_order = [str(c.get("name") or "").strip() for c in cfg_cols if str(c.get("name") or "").strip()]
 
     # Migration: legacy workbooks used `Data` as the computed metrics sheet ("Metric" in A1).
     if "Data_calc" not in wb.sheetnames and "Data" in wb.sheetnames:
@@ -5190,67 +5550,22 @@ def update_test_data_trending_project_workbook(
         if a1 == "metric":
             wb["Data"].title = "Data_calc"
 
+    # Remove the legacy generated TD Data sheet now that calculations are support-driven.
+    if "Data" in wb.sheetnames:
+        try:
+            ws_data_legacy = wb["Data"]
+            if _is_generated_td_data_sheet(ws_data_legacy):
+                wb.remove(ws_data_legacy)
+        except Exception:
+            pass
+
     # Ensure computed sheet exists.
     if "Data_calc" not in wb.sheetnames:
-        ws_data_calc = wb.create_sheet("Data_calc")
+        ws_data_calc = wb.create_sheet("Data_calc", 0)
         ws_data_calc.append(["Metric"] + [str(s) for s in serials])
     else:
         ws_data_calc = wb["Data_calc"]
 
-    # Ensure user-editable Data sheet exists (EIDP-style).
-    ws_data = None
-    if "Data" in wb.sheetnames:
-        a1 = str(wb["Data"].cell(1, 1).value or "").strip().lower()
-        if a1 != "metric":
-            ws_data = wb["Data"]
-    if ws_data is None:
-        ws_data = wb.create_sheet("Data", 0)
-        headers = ["Term", "Header", "GroupAfter", "Table Label", "ValueType", "Data Group", "Term Label", "Units", "Min", "Max"]
-        headers.extend([str(s) for s in serials])
-        ws_data.append(headers)
-        try:
-            ws_data.freeze_panes = "A2"
-        except Exception:
-            pass
-
-        # Seed definitions from Data_calc metric keys (if present).
-        seen: set[tuple[str, str, str]] = set()
-        for r in range(2, (ws_data_calc.max_row or 0) + 1):
-            key = str(ws_data_calc.cell(r, 1).value or "").strip()
-            if not key or "." not in key:
-                continue
-            parts = [p.strip() for p in key.split(".") if p.strip()]
-            if len(parts) < 3:
-                continue
-            run, col, stat = parts[0], parts[1], parts[2].lower()
-            norm = _normalize_td_stat(stat)
-            if not run or not col or not norm:
-                continue
-            t = (run, col, norm)
-            if t in seen:
-                continue
-            seen.add(t)
-            c = cfg_by_name.get(col) or {}
-            units = str(c.get("units") or "").strip()
-            rmin = str(c.get("range_min") or "").strip()
-            rmax = str(c.get("range_max") or "").strip()
-            ws_data.append(
-                [
-                    col,
-                    col,
-                    "",
-                    norm,
-                    "number",
-                    run,
-                    f"{run}.{col}.{norm}",
-                    units,
-                    rmin,
-                    rmax,
-                ]
-                + [""] * len(serials)
-            )
-
-    # Ensure serial columns exist on both sheets (by matching header cells to serial numbers).
     def _ensure_serial_headers_by_name(ws) -> dict[str, int]:
         serial_cols: dict[str, int] = {}
         for col in range(1, (ws.max_column or 0) + 1):
@@ -5264,7 +5579,6 @@ def update_test_data_trending_project_workbook(
             serial_cols[sn] = int(ws.max_column or 0)
         return serial_cols
 
-    serial_cols_data = _ensure_serial_headers_by_name(ws_data)
     serial_cols_calc = _ensure_serial_headers_by_name(ws_data_calc)
     try:
         ws_data_calc.freeze_panes = "B2"
@@ -5274,8 +5588,6 @@ def update_test_data_trending_project_workbook(
     # Save any migration/creation before rebuilding cache (cache rebuild reads workbook from disk).
     if not dry_run:
         wb.save(str(wb_path))
-
-    db_path = ensure_test_data_project_cache(project_dir, wb_path, rebuild=True)
 
     def _parse_metric(s: object) -> tuple[str, str, str] | None:
         txt = str(s or "").strip()
@@ -5297,11 +5609,11 @@ def update_test_data_trending_project_workbook(
         rows = conn.execute(
             """
             SELECT serial, run_name, column_name, stat, value_num
-            FROM td_metrics
+            FROM td_metrics_calc
             """
         ).fetchall()
         y_units_rows = conn.execute(
-            "SELECT run_name, name, units FROM td_columns WHERE kind='y'"
+            "SELECT run_name, name, units FROM td_columns_calc WHERE kind='y'"
         ).fetchall()
         runs_rows = conn.execute("SELECT run_name FROM td_runs ORDER BY run_name").fetchall()
 
@@ -5316,18 +5628,10 @@ def update_test_data_trending_project_workbook(
         if k[0] and k[1] and u:
             units_map[k] = u
 
-    # Stats list for Data_calc: config stats + any stats referenced in Data definitions.
-    stats = list(cfg_stats)
-    try:
-        defs_now = _read_test_data_data_definitions(wb_path)
-    except Exception:
-        defs_now = []
-    for d in defs_now:
-        if not bool(d.get("active")):
-            continue
-        s = str(d.get("normalized_stat") or "").strip().lower()
-        if s and s not in stats:
-            stats.append(s)
+    stats = [str(s).strip().lower() for s in (runtime_cfg.get("statistics") or []) if str(s).strip()]
+    stats = [s for s in stats if s in TD_ALLOWED_STATS]
+    if not stats:
+        stats = list(TD_DEFAULT_STATS_ORDER)
 
     # Rebuild Data_calc rows from cache runs + y columns union.
     runs = [str(r[0] or "").strip() for r in runs_rows if str(r[0] or "").strip()]
@@ -5338,60 +5642,6 @@ def update_test_data_trending_project_workbook(
         if not r or not n:
             continue
         y_by_run.setdefault(r, []).append(n)
-
-    # Ensure Data definitions include any run/column/stat combos discovered from the rebuilt cache.
-    headers_now: dict[str, int] = {}
-    for col in range(1, (ws_data.max_column or 0) + 1):
-        k = str(ws_data.cell(1, col).value or "").strip().lower()
-        if k:
-            headers_now[k] = col
-
-    def _data_col(*names: str) -> int | None:
-        for name in names:
-            got = headers_now.get(str(name).strip().lower())
-            if got:
-                return int(got)
-        return None
-
-    col_header_data = _data_col("header")
-    col_data_group_data = _data_col("data group", "data_group", "datagroup")
-    col_table_label_data = _data_col("table label", "table_label", "tablelabel")
-    existing_defs: set[tuple[str, str, str]] = set()
-    if col_header_data and col_data_group_data and col_table_label_data:
-        for r in range(2, (ws_data.max_row or 0) + 1):
-            run = str(ws_data.cell(r, int(col_data_group_data)).value or "").strip()
-            col_name = str(ws_data.cell(r, int(col_header_data)).value or "").strip()
-            stat = _normalize_td_stat(ws_data.cell(r, int(col_table_label_data)).value)
-            if run and col_name and stat:
-                existing_defs.add((run, col_name, stat))
-        for run in runs:
-            ys = y_by_run.get(run, []) or []
-            ys_ordered = [n for n in cfg_order if n in ys] + sorted([n for n in ys if n not in cfg_order], key=lambda s: str(s).lower())
-            for col_name in ys_ordered:
-                c = cfg_by_name.get(col_name) or {}
-                units = str(c.get("units") or units_map.get((run, col_name)) or "").strip()
-                rmin = str(c.get("range_min") or "").strip()
-                rmax = str(c.get("range_max") or "").strip()
-                for stat in stats:
-                    key = (run, col_name, stat)
-                    if key in existing_defs:
-                        continue
-                    ws_data.append(
-                        [
-                            col_name,
-                            col_name,
-                            "",
-                            stat,
-                            "number",
-                            run,
-                            f"{run}.{col_name}.{stat}",
-                            units,
-                            rmin,
-                            rmax,
-                        ]
-                        + [""] * len(serials)
-                    )
-                    existing_defs.add(key)
 
     # Clear and rebuild Data_calc sheet.
     try:
@@ -5448,61 +5698,6 @@ def update_test_data_trending_project_workbook(
             else:
                 ws_data_calc.cell(r, cidx).value = float(val)
             updated_cells += 1
-
-    # Populate Data values from (Data Group, Header, Table Label).
-    headers: dict[str, int] = {}
-    for col in range(1, (ws_data.max_column or 0) + 1):
-        k = str(ws_data.cell(1, col).value or "").strip().lower()
-        if k:
-            headers[k] = col
-
-    def _h(*names: str) -> int | None:
-        for n in names:
-            c = headers.get(str(n).strip().lower())
-            if c:
-                return int(c)
-        return None
-
-    col_data_group = _h("data group", "data_group", "datagroup")
-    col_header = _h("header")
-    col_table_label = _h("table label", "table_label", "tablelabel")
-    col_units = _h("units")
-
-    if col_data_group and col_header and col_table_label:
-        for r in range(2, (ws_data.max_row or 0) + 1):
-            run = str(ws_data.cell(r, int(col_data_group)).value or "").strip()
-            col = str(ws_data.cell(r, int(col_header)).value or "").strip()
-            raw_stat = str(ws_data.cell(r, int(col_table_label)).value or "").strip()
-            stat = _normalize_td_stat(raw_stat)
-            if not run or not col or not stat:
-                continue
-            # Fill Units from cache if blank (optional)
-            if col_units:
-                ucell = ws_data.cell(r, int(col_units))
-                if (ucell.value is None or str(ucell.value).strip() == ""):
-                    u = units_map.get((run, col))
-                    if u:
-                        ucell.value = u
-
-            for sn, cidx in serial_cols_data.items():
-                key = (sn, run, col, stat)
-                val = metric_map.get(key)
-                if val is None:
-                    if not overwrite and ws_data.cell(r, cidx).value not in (None, ""):
-                        continue
-                    ws_data.cell(r, cidx).value = None
-                    missing_value += 1
-                    continue
-                if not overwrite and ws_data.cell(r, cidx).value not in (None, ""):
-                    continue
-                if stat == "count":
-                    try:
-                        ws_data.cell(r, cidx).value = int(float(val))
-                    except Exception:
-                        ws_data.cell(r, cidx).value = val
-                else:
-                    ws_data.cell(r, cidx).value = float(val)
-                updated_cells += 1
 
     perf_sheet_name = "Performance_candidates"
     if perf_sheet_name in wb.sheetnames:
@@ -10480,53 +10675,9 @@ def _write_test_data_trending_workbook(
 
     sn_cols = [str(s).strip() for s in serials if str(s).strip()]
 
-    # New user-editable EIDP-style Data sheet (definitions + values).
-    ws_data = wb.active
-    ws_data.title = "Data"
-    data_headers = ["Term", "Header", "GroupAfter", "Table Label", "ValueType", "Data Group", "Term Label", "Units", "Min", "Max"]
-    data_headers.extend(sn_cols)
-    ws_data.append(data_headers)
-    try:
-        ws_data.freeze_panes = "A2"
-    except Exception:
-        pass
-
-    # Seed Data definitions from config (one row per run/column/stat).
-    cfg_by_name: dict[str, dict] = {}
-    for c in cfg_cols:
-        if not isinstance(c, dict):
-            continue
-        name = str(c.get("name") or "").strip()
-        if name:
-            cfg_by_name[name] = c
-
-    for run_name in runs:
-        for name in col_names:
-            c = cfg_by_name.get(name) or {}
-            units = str(c.get("units") or "").strip()
-            rmin = c.get("range_min")
-            rmax = c.get("range_max")
-            for stat in stats:
-                ws_data.append(
-                    [
-                        name,  # Term (display)
-                        name,  # Header (TD column)
-                        "",  # GroupAfter
-                        stat,  # Table Label (TD stat)
-                        "number",  # ValueType
-                        str(run_name),  # Data Group (TD run/sheet)
-                        f"{run_name}.{name}.{stat}",  # Term Label (stable key)
-                        units,
-                        ("" if rmin is None else rmin),
-                        ("" if rmax is None else rmax),
-                    ]
-                    + [""] * len(sn_cols)
-                )
-        # visual separator between runs
-        ws_data.append([""] * len(data_headers))
-
-    # Data_calc is computed/debug: metric keys + serial columns.
-    ws_data_calc = wb.create_sheet("Data_calc")
+    # Data_calc is the computed TD workbook view.
+    ws_data_calc = wb.active
+    ws_data_calc.title = "Data_calc"
     ws_data_calc.append(["Metric"] + sn_cols)
     try:
         ws_data_calc.freeze_panes = "B2"

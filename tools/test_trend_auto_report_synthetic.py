@@ -38,6 +38,29 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
             )
             conn.execute(
                 """
+                CREATE TABLE td_source_metadata (
+                    serial TEXT PRIMARY KEY,
+                    program_title TEXT,
+                    asset_type TEXT,
+                    asset_specific_type TEXT,
+                    vendor TEXT,
+                    acceptance_test_plan_number TEXT,
+                    part_number TEXT,
+                    revision TEXT,
+                    test_date TEXT,
+                    report_date TEXT,
+                    document_type TEXT,
+                    document_type_acronym TEXT,
+                    similarity_group TEXT,
+                    metadata_rel TEXT,
+                    artifacts_rel TEXT,
+                    excel_sqlite_rel TEXT,
+                    metadata_mtime_ns INTEGER
+                )
+                """
+            )
+            conn.execute(
+                """
                 CREATE TABLE td_runs (
                     run_name TEXT PRIMARY KEY,
                     default_x TEXT,
@@ -87,6 +110,15 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
                 """
             )
             conn.execute("INSERT INTO td_sources(serial,status) VALUES ('SN1','ok'),('SN2','ok')")
+            conn.execute(
+                """
+                INSERT INTO td_source_metadata(
+                    serial, program_title, asset_type, vendor, part_number, revision, document_type, similarity_group, metadata_mtime_ns
+                ) VALUES
+                    ('SN1','Program A','Thruster','Vendor 1','PN-1','A','TD','SG-1',1),
+                    ('SN2','Program A','Thruster','Vendor 2','PN-2','B','TD','SG-1',1)
+                """
+            )
             conn.execute("INSERT INTO td_runs(run_name,default_x,display_name) VALUES ('Run1','Time','Run 1')")
             conn.execute(
                 "INSERT INTO td_columns(run_name,name,units,kind) VALUES ('Run1','thrust','lbf','y')"
@@ -254,6 +286,19 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
             self.assertEqual(thrust.get("units"), "lbf")
             self.assertEqual(float(thrust.get("range_min")), 0.0)
             self.assertEqual(float(thrust.get("range_max")), 6.0)
+
+    def test_reads_cached_source_metadata(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            db = self._make_td_db(root)
+            with sqlite3.connect(str(db)) as conn:
+                meta_by_sn, note = tar._read_cached_source_metadata(conn)
+            self.assertEqual(note, "")
+            self.assertEqual(meta_by_sn["SN1"]["program_title"], "Program A")
+            self.assertEqual(meta_by_sn["SN1"]["part_number"], "PN-1")
+            self.assertEqual(meta_by_sn["SN2"]["vendor"], "Vendor 2")
 
     def test_options_params_limits_selected_params(self):
         from EIDAT_App_Files.ui_next import trend_auto_report as tar

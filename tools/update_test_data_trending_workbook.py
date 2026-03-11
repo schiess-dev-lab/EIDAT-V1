@@ -6,8 +6,8 @@ This is a thin CLI wrapper around:
 
 It:
   - migrates legacy workbooks (old `Data` -> `Data_calc` + new EIDP-style `Data`)
-  - rebuilds the project cache DB (`implementation_trending.sqlite3`)
-  - populates `Data_calc` and `Data` from `td_metrics`
+  - validates that the project cache DB (`implementation_trending.sqlite3`) already exists
+  - populates `Data_calc` from the cached TD tables only
 
 Usage:
   python tools/update_test_data_trending_workbook.py "C:\\path\\to\\Project.xlsx"
@@ -67,8 +67,8 @@ def main(argv: list[str] | None = None) -> int:
         default="",
         help="Folder containing `EIDAT/EIDAT Support/` (or legacy `EIDAT Support/`; auto-detected from workbook path if omitted).",
     )
-    ap.add_argument("--overwrite", action="store_true", help="Overwrite existing non-empty cells in Data/Data_calc.")
-    ap.add_argument("--dry-run", action="store_true", help="Do not save the workbook (cache DB may still rebuild).")
+    ap.add_argument("--overwrite", action="store_true", help="Overwrite existing non-empty cells in Data_calc.")
+    ap.add_argument("--dry-run", action="store_true", help="Do not save the workbook.")
     args = ap.parse_args(argv)
 
     wb_path = Path(args.workbook).expanduser()

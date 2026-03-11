@@ -2,6 +2,7 @@ import json
 import sqlite3
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -79,6 +80,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 ws_settings = wb["Settings"]
                 self.assertEqual(ws_settings.cell(2, 1).value, "exclude_first_n_default")
                 self.assertEqual(ws_settings.cell(3, 1).value, "last_n_rows_default")
+                self.assertEqual(ws_settings.cell(3, 2).value, 10)
 
                 ws_seq = wb["Sequences"]
                 self.assertEqual(ws_seq.cell(2, 1).value, "RunA")
@@ -143,15 +145,15 @@ class TestTDSupportWorkbook(unittest.TestCase):
 
             with sqlite3.connect(str(out_db)) as conn:
                 row = conn.execute(
-                    "SELECT x_json, y_json FROM td_curves WHERE run_name=? AND y_name=? AND x_name=? AND serial=?",
+                    "SELECT x_json, y_json FROM td_curves_raw WHERE run_name=? AND y_name=? AND x_name=? AND serial=?",
                     ("Seq1", "thrust", "Time", "SN1"),
                 ).fetchone()
                 self.assertIsNotNone(row)
-                self.assertEqual(json.loads(row[0]), [2.0, 3.0])
-                self.assertEqual(json.loads(row[1]), [30.0, 40.0])
+                self.assertEqual(json.loads(row[0]), [0.0, 1.0, 2.0, 3.0, 4.0, 5.0])
+                self.assertEqual(json.loads(row[1]), [10.0, 20.0, 30.0, 40.0, 50.0, 60.0])
 
                 mean_row = conn.execute(
-                    "SELECT value_num FROM td_metrics WHERE run_name=? AND column_name=? AND stat=? AND serial=?",
+                    "SELECT value_num FROM td_metrics_calc WHERE run_name=? AND column_name=? AND stat=? AND serial=?",
                     ("Seq1", "thrust", "mean", "SN1"),
                 ).fetchone()
                 self.assertIsNotNone(mean_row)
@@ -192,6 +194,8 @@ class TestTDSupportWorkbook(unittest.TestCase):
             finally:
                 wb.close()
 
+            be.rebuild_test_data_project_cache(root / "implementation_trending.sqlite3", wb_path)
+            src_db.unlink()
             result = be.update_test_data_trending_project_workbook(root, wb_path, overwrite=True)
             self.assertEqual(str(result.get("workbook") or ""), str(wb_path))
 
@@ -200,12 +204,132 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 ws_calc = wb2["Data_calc"]
                 metrics = [str(ws_calc.cell(r, 1).value or "").strip() for r in range(1, (ws_calc.max_row or 0) + 1)]
                 self.assertIn("Seq1.thrust.mean", metrics)
-
-                ws_data = wb2["Data"]
-                data_groups = [str(ws_data.cell(r, 6).value or "").strip() for r in range(2, (ws_data.max_row or 0) + 1)]
-                self.assertIn("Seq1", data_groups)
+                self.assertNotIn("Data", wb2.sheetnames)
             finally:
                 wb2.close()
+
+    def test_update_workbook_fails_when_cache_db_missing(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            src_db = root / "src.sqlite3"
+            self._make_source_sqlite(src_db)
+
+            wb_path = root / "project.xlsx"
+            be._write_test_data_trending_workbook(
+                wb_path,
+                global_repo=root,
+                serials=["SN1"],
+                docs=[{"serial_number": "SN1", "excel_sqlite_rel": str(src_db)}],
+                config=self._make_config(),
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "Build / Refresh Cache"):
+                be.update_test_data_trending_project_workbook(root, wb_path, overwrite=True)
+
+    def test_update_workbook_fails_when_cache_db_incomplete(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            src_db = root / "src.sqlite3"
+            self._make_source_sqlite(src_db)
+
+            wb_path = root / "project.xlsx"
+            be._write_test_data_trending_workbook(
+                wb_path,
+                global_repo=root,
+                serials=["SN1"],
+                docs=[{"serial_number": "SN1", "excel_sqlite_rel": str(src_db)}],
+                config=self._make_config(),
+            )
+
+            db_path = root / "implementation_trending.sqlite3"
+            with sqlite3.connect(str(db_path)) as conn:
+                be._ensure_test_data_tables(conn)
+                conn.commit()
+
+            with self.assertRaisesRegex(RuntimeError, "Project cache DB is incomplete"):
+                be.update_test_data_trending_project_workbook(root, wb_path, overwrite=True)
+
+    def test_cache_rebuild_tracks_source_metadata_updates(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            src_db = root / "src.sqlite3"
+            self._make_source_sqlite(src_db)
+
+            support_dir = root / "EIDAT Support"
+            art_dir = support_dir / "debug" / "ocr" / "SN1"
+            art_dir.mkdir(parents=True, exist_ok=True)
+            meta_path = art_dir / "sn1_metadata.json"
+
+            def _write_meta(vendor: str) -> None:
+                meta_path.write_text(
+                    json.dumps(
+                        {
+                            "serial_number": "SN1",
+                            "program_title": "Program Alpha",
+                            "asset_type": "Thruster",
+                            "vendor": vendor,
+                            "part_number": "PN-001",
+                            "revision": "B",
+                            "document_type": "TD",
+                            "document_type_acronym": "TD",
+                            "similarity_group": "SG-1",
+                        },
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+
+            _write_meta("Vendor A")
+
+            wb_path = root / "project.xlsx"
+            be._write_test_data_trending_workbook(
+                wb_path,
+                global_repo=root,
+                serials=["SN1"],
+                docs=[
+                    {
+                        "serial_number": "SN1",
+                        "excel_sqlite_rel": str(src_db),
+                        "metadata_rel": str(meta_path.relative_to(support_dir)),
+                        "artifacts_rel": str(art_dir.relative_to(support_dir)),
+                    }
+                ],
+                config=self._make_config(),
+            )
+
+            out_db = root / "implementation_trending.sqlite3"
+            be.rebuild_test_data_project_cache(out_db, wb_path)
+
+            with sqlite3.connect(str(out_db)) as conn:
+                row = conn.execute(
+                    """
+                    SELECT vendor, program_title, part_number, metadata_rel, artifacts_rel, metadata_mtime_ns
+                    FROM td_source_metadata
+                    WHERE serial=?
+                    """,
+                    ("SN1",),
+                ).fetchone()
+                self.assertIsNotNone(row)
+                self.assertEqual(row[0], "Vendor A")
+                self.assertEqual(row[1], "Program Alpha")
+                self.assertEqual(row[2], "PN-001")
+                self.assertEqual(row[3], str(meta_path.relative_to(support_dir)))
+                self.assertEqual(row[4], str(art_dir.relative_to(support_dir)))
+                self.assertGreater(int(row[5] or 0), 0)
+
+            time.sleep(0.05)
+            _write_meta("Vendor B")
+            be.ensure_test_data_project_cache(root, wb_path)
+
+            with sqlite3.connect(str(out_db)) as conn:
+                row = conn.execute("SELECT vendor FROM td_source_metadata WHERE serial=?", ("SN1",)).fetchone()
+                self.assertEqual(row[0], "Vendor B")
 
 
 if __name__ == "__main__":

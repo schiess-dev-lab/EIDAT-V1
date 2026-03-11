@@ -746,6 +746,61 @@ def _summarize_units_from_td(conn: sqlite3.Connection, *, runs: list[str], param
     return dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
 
 
+TD_SOURCE_METADATA_FIELDS = (
+    "program_title",
+    "asset_type",
+    "asset_specific_type",
+    "vendor",
+    "acceptance_test_plan_number",
+    "part_number",
+    "revision",
+    "test_date",
+    "report_date",
+    "document_type",
+    "document_type_acronym",
+    "similarity_group",
+)
+
+
+def _read_cached_source_metadata(conn: sqlite3.Connection) -> tuple[dict[str, dict[str, str]], str]:
+    try:
+        rows = conn.execute(
+            """
+            SELECT
+                serial,
+                program_title,
+                asset_type,
+                asset_specific_type,
+                vendor,
+                acceptance_test_plan_number,
+                part_number,
+                revision,
+                test_date,
+                report_date,
+                document_type,
+                document_type_acronym,
+                similarity_group
+            FROM td_source_metadata
+            ORDER BY serial
+            """
+        ).fetchall()
+    except Exception:
+        return {}, "Project cache metadata unavailable (td_source_metadata missing)."
+
+    meta_by_sn: dict[str, dict[str, str]] = {}
+    for row in rows:
+        sn = str(row[0] or "").strip()
+        if not sn:
+            continue
+        meta_by_sn[sn] = {
+            key: str(row[idx + 1] or "").strip()
+            for idx, key in enumerate(TD_SOURCE_METADATA_FIELDS)
+        }
+    if not meta_by_sn:
+        return {}, "Project cache metadata unavailable (td_source_metadata empty)."
+    return meta_by_sn, ""
+
+
 def _read_workbook_metadata(workbook_path: Path) -> tuple[dict[str, dict[str, str]], str]:
     """
     Best-effort read of the project's trending workbook metadata sheet.
@@ -1469,7 +1524,18 @@ def generate_test_data_auto_report(
                     "watch_any": any(w.get("run") == run and w.get("param") == y_name for w in watch_items),
                 }
 
-        meta_by_sn, meta_note = _read_workbook_metadata(wb)
+        cache_meta_by_sn, cache_meta_note = _read_cached_source_metadata(conn)
+        workbook_meta_by_sn, workbook_meta_note = _read_workbook_metadata(wb)
+        meta_by_sn: dict[str, dict[str, str]] = {}
+        for sn in sorted(set(cache_meta_by_sn.keys()) | set(workbook_meta_by_sn.keys())):
+            merged = dict(workbook_meta_by_sn.get(sn) or {})
+            for key, value in (cache_meta_by_sn.get(sn) or {}).items():
+                if str(value or "").strip():
+                    merged[key] = str(value).strip()
+            meta_by_sn[sn] = merged
+        meta_note = ""
+        if not meta_by_sn:
+            meta_note = cache_meta_note or workbook_meta_note
 
         def _meta(sn: str, key: str) -> str:
             try:
