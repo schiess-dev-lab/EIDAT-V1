@@ -5,6 +5,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -486,6 +487,106 @@ class TestTDSupportWorkbook(unittest.TestCase):
 
             xs = be.td_list_x_columns(db_path, "RunA")
             self.assertEqual(xs, ["Time", "Pulse Number"])
+
+    def test_rebuild_writes_excel_mirror_for_project_cache(self) -> None:
+        from openpyxl import load_workbook  # type: ignore
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            src_db = root / "src.sqlite3"
+            self._make_source_sqlite(src_db)
+
+            wb_path = root / "project.xlsx"
+            be._write_test_data_trending_workbook(
+                wb_path,
+                global_repo=root,
+                serials=["SN1"],
+                docs=[{"serial_number": "SN1", "excel_sqlite_rel": str(src_db)}],
+                config=self._make_config(),
+            )
+            support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+            be._write_td_support_workbook(
+                support_path,
+                sequence_names=["RunA"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+            )
+
+            db_path = be.ensure_test_data_project_cache(root, wb_path, rebuild=True)
+            mirror_path = db_path.with_suffix(".xlsx")
+            self.assertTrue(mirror_path.exists())
+
+            wb = load_workbook(str(mirror_path), read_only=True, data_only=True)
+            try:
+                self.assertIn("td_curves_raw", wb.sheetnames)
+                self.assertIn("td_metrics_calc", wb.sheetnames)
+            finally:
+                wb.close()
+
+    def test_calc_cache_can_be_rebuilt_from_raw_without_source_sqlite(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            wb_path = root / "project.xlsx"
+            be._write_test_data_trending_workbook(
+                wb_path,
+                global_repo=root,
+                serials=["SN1"],
+                docs=[{"serial_number": "SN1", "excel_sqlite_rel": "missing.sqlite3"}],
+                config=self._make_config(),
+            )
+            support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+            be._write_td_support_workbook(
+                support_path,
+                sequence_names=["RunA"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+            )
+
+            db_path = root / "implementation_trending.sqlite3"
+            with sqlite3.connect(str(db_path)) as conn:
+                be._ensure_test_data_tables(conn)
+                conn.execute(
+                    "INSERT OR REPLACE INTO td_runs(run_name, default_x, display_name) VALUES (?, ?, ?)",
+                    ("RunA", "Time", ""),
+                )
+                conn.execute(
+                    "INSERT OR REPLACE INTO td_columns_raw(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
+                    ("RunA", "Time", "", "x"),
+                )
+                conn.execute(
+                    "INSERT OR REPLACE INTO td_columns_raw(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
+                    ("RunA", "thrust", "lbf", "y"),
+                )
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO td_curves_raw
+                    (run_name, y_name, x_name, serial, x_json, y_json, n_points, source_mtime_ns, computed_epoch_ns)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    ("RunA", "thrust", "Time", "SN1", "[0,1,2,3]", "[10,20,30,40]", 4, 123, 123),
+                )
+                conn.commit()
+
+            with mock.patch.object(
+                be,
+                "_load_runtime_td_trend_config",
+                return_value={"config": {}, "columns": [{"name": "thrust", "units": "lbf"}], "statistics": ["mean", "max"]},
+            ):
+                payload = be._rebuild_test_data_project_calc_cache_from_raw(db_path, wb_path)
+
+            self.assertEqual(payload.get("mode"), "calc_from_raw")
+            with sqlite3.connect(str(db_path)) as conn:
+                rows = conn.execute(
+                    """
+                    SELECT stat, value_num
+                    FROM td_metrics_calc
+                    WHERE serial='SN1' AND run_name='RunA' AND column_name='thrust'
+                    ORDER BY stat
+                    """
+                ).fetchall()
+            self.assertEqual(rows, [("max", 40.0), ("mean", 25.0)])
+
 
     def test_cache_rebuild_tracks_source_metadata_updates(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore

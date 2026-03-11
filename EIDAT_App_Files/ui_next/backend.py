@@ -3710,6 +3710,7 @@ def ensure_test_data_project_cache(
 
     if rebuild:
         rebuild_test_data_project_cache(db_path, wb_path)
+        _sync_sqlite_excel_mirror(db_path, force=True)
         return db_path
 
     # Quick staleness check: compare workbook Sources list + mtimes against td_sources.
@@ -3804,12 +3805,21 @@ def ensure_test_data_project_cache(
     except Exception:
         cached_raw_cols_csv = ""
 
-    # If the selected stats or raw column config changed, rebuild so the split cache stays consistent.
-    if cached_stats_csv != current_stats_csv or cached_raw_cols_csv != current_raw_cols_csv:
+    # If the selected stats changed, refresh calc tables from cached raw curves only.
+    if cached_stats_csv != current_stats_csv:
+        _rebuild_test_data_project_calc_cache_from_raw(db_path, wb_path)
+        _sync_sqlite_excel_mirror(db_path, force=True)
+        return db_path
+
+    # Raw column changes affect td_curves_raw and require source re-ingest.
+    if cached_raw_cols_csv != current_raw_cols_csv:
         rebuild_test_data_project_cache(db_path, wb_path)
         return db_path
+
+    # Support workbook changes now refresh calc tables from cached raw curves.
     if int(cached_support_mtime_ns) != int(support_mtime_ns):
-        rebuild_test_data_project_cache(db_path, wb_path)
+        _rebuild_test_data_project_calc_cache_from_raw(db_path, wb_path)
+        _sync_sqlite_excel_mirror(db_path, force=True)
         return db_path
 
     # If serial set differs, rebuild.
@@ -3855,8 +3865,410 @@ def ensure_test_data_project_cache(
             break
     if stale:
         rebuild_test_data_project_cache(db_path, wb_path)
+        _sync_sqlite_excel_mirror(db_path, force=True)
+        return db_path
+
+    _sync_sqlite_excel_mirror(db_path)
 
     return db_path
+
+
+def _sync_sqlite_excel_mirror(db_path: Path, *, force: bool = False) -> Path | None:
+    db_path = Path(db_path).expanduser()
+    if not db_path.exists() or not db_path.is_file():
+        return None
+    out_path = db_path.with_suffix(".xlsx")
+    if not force:
+        try:
+            db_mtime_ns = int(db_path.stat().st_mtime_ns)
+            xlsx_mtime_ns = int(out_path.stat().st_mtime_ns) if out_path.exists() else 0
+            if out_path.exists() and xlsx_mtime_ns >= db_mtime_ns:
+                return out_path
+        except Exception:
+            pass
+    try:
+        from openpyxl import Workbook  # type: ignore
+        from openpyxl.styles import Alignment, Font, PatternFill  # type: ignore
+        from openpyxl.utils import get_column_letter  # type: ignore
+    except Exception:
+        return None
+
+    header_font = Font(bold=True)
+    header_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+
+    with sqlite3.connect(str(db_path)) as conn:
+        tables = [
+            str(row[0] or "").strip()
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+            ).fetchall()
+            if str(row[0] or "").strip()
+        ]
+
+        wb = Workbook()
+        wb.remove(wb.active)
+
+        for table_name in tables:
+            ws = wb.create_sheet(title=table_name[:31])
+            cols = [
+                str(col[1] or "").strip()
+                for col in conn.execute(f'PRAGMA table_info("{table_name.replace(chr(34), chr(34) * 2)}")').fetchall()
+            ]
+            rows = conn.execute(f'SELECT * FROM "{table_name.replace(chr(34), chr(34) * 2)}"').fetchall()
+
+            for col_idx, col_name in enumerate(cols, start=1):
+                cell = ws.cell(row=1, column=col_idx, value=col_name)
+                cell.font = header_font
+                cell.fill = header_fill
+                cell.alignment = Alignment(horizontal="center")
+
+            for row_idx, row in enumerate(rows, start=2):
+                for col_idx, value in enumerate(row, start=1):
+                    pretty = value
+                    if isinstance(pretty, str) and pretty and pretty[:1] in ("{", "["):
+                        try:
+                            pretty = json.dumps(json.loads(pretty), indent=2)
+                        except Exception:
+                            pretty = value
+                    ws.cell(row=row_idx, column=col_idx, value=pretty)
+
+            for col_idx in range(1, len(cols) + 1):
+                max_len = len(str(cols[col_idx - 1] or ""))
+                for row_idx in range(2, len(rows) + 2):
+                    cell_val = ws.cell(row=row_idx, column=col_idx).value
+                    if cell_val is not None:
+                        max_len = max(max_len, min(60, len(str(cell_val))))
+                ws.column_dimensions[get_column_letter(col_idx)].width = max_len + 3
+            ws.freeze_panes = "A2"
+
+        wb.save(str(out_path))
+    return out_path
+
+
+def _resolve_td_support_sequence_for_run(run_name: str, support_cfg: dict) -> dict:
+    run = str(run_name or "").strip()
+    if not run:
+        return {"sequence_name": "", "source_run_name": "", "exclude_first_n": None, "last_n_rows": None}
+
+    def _norm_name(value: object) -> str:
+        return "".join(ch.lower() for ch in str(value or "").strip() if ch.isalnum())
+
+    run_norm = _norm_name(run)
+    sequences = [
+        dict(seq)
+        for seq in ((support_cfg or {}).get("sequences") or [])
+        if isinstance(seq, dict) and bool(seq.get("enabled", True))
+    ]
+    for seq in sequences:
+        source_match = str(seq.get("source_run_name") or "").strip()
+        if source_match and _norm_name(source_match) == run_norm:
+            return {
+                "sequence_name": str(seq.get("sequence_name") or source_match).strip() or source_match,
+                "source_run_name": source_match,
+                "exclude_first_n": seq.get("exclude_first_n"),
+                "last_n_rows": seq.get("last_n_rows"),
+            }
+    for seq in sequences:
+        seq_name = str(seq.get("sequence_name") or "").strip()
+        if seq_name and _norm_name(seq_name) == run_norm:
+            return {
+                "sequence_name": seq_name,
+                "source_run_name": str(seq.get("source_run_name") or seq_name).strip() or seq_name,
+                "exclude_first_n": seq.get("exclude_first_n"),
+                "last_n_rows": seq.get("last_n_rows"),
+            }
+    return {"sequence_name": run, "source_run_name": run, "exclude_first_n": None, "last_n_rows": None}
+
+
+def _rebuild_test_data_project_calc_cache_from_raw(db_path: Path, workbook_path: Path) -> dict:
+    import time
+    import statistics
+
+    def _finite_float(v: object) -> float | None:
+        if v is None:
+            return None
+        if isinstance(v, (int, float)):
+            f = float(v)
+        else:
+            t = str(v).strip().replace(",", "")
+            if not t:
+                return None
+            try:
+                f = float(t)
+            except Exception:
+                return None
+        if math.isfinite(f):
+            return f
+        return None
+
+    def _compute_stats(values: list[float]) -> dict[str, float | int | None]:
+        n = len(values)
+        if n == 0:
+            return {"mean": None, "min": None, "max": None, "std": None, "median": None, "count": 0}
+        out: dict[str, float | int | None] = {
+            "mean": (sum(values) / n),
+            "min": min(values),
+            "max": max(values),
+            "median": statistics.median(values),
+            "count": n,
+        }
+        out["std"] = statistics.stdev(values) if n >= 2 else None
+        return out
+
+    def _filter_curve_values(
+        xs: list[object],
+        ys: list[object],
+        *,
+        min_val: float | None,
+        max_val: float | None,
+        exclude_first_n: int | None,
+        last_n_rows: int | None,
+    ) -> list[float]:
+        filtered: list[float] = []
+        for raw_x, raw_y in zip(xs, ys):
+            fx = _finite_float(raw_x)
+            fy = _finite_float(raw_y)
+            if fx is None or fy is None:
+                continue
+            if min_val is not None and float(fy) < float(min_val):
+                continue
+            if max_val is not None and float(fy) > float(max_val):
+                continue
+            filtered.append(float(fy))
+        if exclude_first_n is not None and int(exclude_first_n) > 0:
+            filtered = filtered[int(exclude_first_n):]
+        if last_n_rows is not None and int(last_n_rows) > 0 and len(filtered) > int(last_n_rows):
+            filtered = filtered[-int(last_n_rows):]
+        return filtered
+
+    wb_path = Path(workbook_path).expanduser()
+    if not wb_path.exists():
+        raise FileNotFoundError(f"Workbook not found: {wb_path}")
+    db_path = Path(db_path).expanduser()
+    if not db_path.exists():
+        raise FileNotFoundError(f"Project cache DB not found: {db_path}")
+
+    runtime_cfg = _load_runtime_td_trend_config()
+    cfg_cols = [dict(c) for c in (runtime_cfg.get("columns") or []) if isinstance(c, dict)]
+    cfg_units = {
+        str(c.get("name") or "").strip(): str(c.get("units") or "").strip()
+        for c in cfg_cols
+        if str(c.get("name") or "").strip()
+    }
+    selected_stats = [str(s).strip().lower() for s in (runtime_cfg.get("statistics") or []) if str(s).strip()]
+    selected_stats = [s for s in selected_stats if s in TD_ALLOWED_STATS]
+    if not selected_stats:
+        selected_stats = list(TD_DEFAULT_STATS_ORDER)
+
+    support_cfg = _read_td_support_workbook(wb_path, project_dir=db_path.parent)
+    support_settings = dict(support_cfg.get("settings") or {})
+    bounds_by_sequence = {
+        str(k).strip(): dict(v)
+        for k, v in (support_cfg.get("bounds_by_sequence") or {}).items()
+        if str(k).strip() and isinstance(v, dict)
+    }
+    computed_epoch_ns = time.time_ns()
+
+    with sqlite3.connect(str(db_path)) as conn:
+        _ensure_test_data_tables(conn)
+        raw_runs = conn.execute(
+            "SELECT run_name, COALESCE(default_x, '') FROM td_runs ORDER BY run_name"
+        ).fetchall()
+        raw_x_cols = conn.execute(
+            "SELECT run_name, name FROM td_columns_raw WHERE kind='x' ORDER BY run_name, name"
+        ).fetchall()
+        raw_y_cols = conn.execute(
+            "SELECT run_name, name FROM td_columns_raw WHERE kind='y' ORDER BY run_name, name"
+        ).fetchall()
+        existing_display_names = {
+            str(run_name or "").strip(): str(display_name or "").strip()
+            for run_name, display_name in conn.execute(
+                "SELECT run_name, display_name FROM td_runs"
+            ).fetchall()
+            if str(run_name or "").strip()
+        }
+
+        conn.execute("DELETE FROM td_columns")
+        conn.execute("DELETE FROM td_columns_calc")
+        conn.execute("DELETE FROM td_metrics")
+        conn.execute("DELETE FROM td_metrics_calc")
+
+        raw_x_by_run: dict[str, list[str]] = {}
+        raw_y_by_run: dict[str, set[str]] = {}
+        for run_name, x_name in raw_x_cols:
+            run = str(run_name or "").strip()
+            x = str(x_name or "").strip()
+            if run and x:
+                raw_x_by_run.setdefault(run, []).append(x)
+        for run_name, y_name in raw_y_cols:
+            run = str(run_name or "").strip()
+            y = str(y_name or "").strip()
+            if run and y:
+                raw_y_by_run.setdefault(run, set()).add(y)
+
+        metrics_written = 0
+        calc_columns_written = 0
+        for run_name, default_x_raw in raw_runs:
+            run = str(run_name or "").strip()
+            if not run:
+                continue
+            default_x = str(default_x_raw or "").strip()
+            if not default_x:
+                xs = raw_x_by_run.get(run) or []
+                default_x = xs[0] if xs else ""
+
+            seq_info = _resolve_td_support_sequence_for_run(run, support_cfg)
+            seq_name = str(seq_info.get("sequence_name") or run).strip() or run
+            source_run_name = str(seq_info.get("source_run_name") or run).strip() or run
+            seq_bounds = dict(bounds_by_sequence.get(seq_name) or {})
+            if not seq_bounds and source_run_name:
+                seq_bounds = dict(bounds_by_sequence.get(source_run_name) or {})
+
+            calc_param_defs = _ordered_support_param_defs(
+                sequence_names=[seq_name, source_run_name, run],
+                support_cfg=support_cfg,
+                fallback_defs=cfg_cols,
+            )
+            if not calc_param_defs:
+                calc_param_defs = [dict(d) for d in cfg_cols if isinstance(d, dict)]
+
+            raw_y_names = set(raw_y_by_run.get(run) or set())
+            calc_names: list[str] = []
+            for param_def in calc_param_defs:
+                y_name = str(param_def.get("name") or "").strip()
+                if not y_name:
+                    continue
+                units = str(param_def.get("units") or cfg_units.get(y_name) or "").strip()
+                conn.execute(
+                    "INSERT OR REPLACE INTO td_columns_calc(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
+                    (run, y_name, units, "y"),
+                )
+                conn.execute(
+                    "INSERT OR REPLACE INTO td_columns(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
+                    (run, y_name, units, "y"),
+                )
+                calc_columns_written += 1
+                if y_name in raw_y_names:
+                    calc_names.append(y_name)
+
+            for x_name in raw_x_by_run.get(run) or []:
+                conn.execute(
+                    "INSERT OR REPLACE INTO td_columns(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
+                    (run, x_name, "", "x"),
+                )
+
+            if not default_x or not calc_names:
+                continue
+
+            curve_rows = conn.execute(
+                """
+                SELECT serial, y_name, x_json, y_json, source_mtime_ns
+                FROM td_curves_raw
+                WHERE run_name=? AND x_name=?
+                ORDER BY serial, y_name
+                """,
+                (run, default_x),
+            ).fetchall()
+            calc_name_set = set(calc_names)
+            exclude_first_n = seq_info.get("exclude_first_n")
+            if exclude_first_n is None:
+                exclude_first_n = support_settings.get("exclude_first_n_default")
+            last_n_rows = seq_info.get("last_n_rows")
+            if last_n_rows is None:
+                last_n_rows = support_settings.get("last_n_rows_default")
+
+            for serial, y_name_raw, x_json, y_json, source_mtime_ns in curve_rows:
+                y_name = str(y_name_raw or "").strip()
+                if y_name not in calc_name_set:
+                    continue
+                bound = dict(seq_bounds.get(y_name) or {})
+                min_val = bound.get("min_value") if bool(bound.get("enabled", True)) else None
+                max_val = bound.get("max_value") if bool(bound.get("enabled", True)) else None
+                try:
+                    xs = json.loads(x_json or "[]")
+                except Exception:
+                    xs = []
+                try:
+                    ys = json.loads(y_json or "[]")
+                except Exception:
+                    ys = []
+                filtered_y = _filter_curve_values(
+                    xs,
+                    ys,
+                    min_val=min_val,
+                    max_val=max_val,
+                    exclude_first_n=_to_support_int(exclude_first_n),
+                    last_n_rows=_to_support_int(last_n_rows),
+                )
+                stats_map = _compute_stats(filtered_y)
+                payload_base = (
+                    str(serial or "").strip(),
+                    run,
+                    y_name,
+                )
+                for stat in selected_stats:
+                    payload = payload_base + (
+                        str(stat),
+                        stats_map.get(stat),
+                        computed_epoch_ns,
+                        source_mtime_ns,
+                    )
+                    conn.execute(
+                        """
+                        INSERT OR REPLACE INTO td_metrics_calc
+                        (serial, run_name, column_name, stat, value_num, computed_epoch_ns, source_mtime_ns)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        payload,
+                    )
+                    conn.execute(
+                        """
+                        INSERT OR REPLACE INTO td_metrics
+                        (serial, run_name, column_name, stat, value_num, computed_epoch_ns, source_mtime_ns)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        payload,
+                    )
+                    metrics_written += 1
+
+        support_mtime_ns = 0
+        try:
+            support_path_meta = Path(str(support_cfg.get("path") or "")).expanduser()
+            if support_path_meta.exists():
+                st = support_path_meta.stat()
+                support_mtime_ns = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)))
+        except Exception:
+            support_mtime_ns = 0
+
+        conn.execute(
+            "INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)",
+            ("workbook_path", str(wb_path)),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)",
+            ("built_epoch_ns", str(computed_epoch_ns)),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)",
+            ("statistics", ",".join(selected_stats)),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)",
+            ("support_workbook_path", str(support_cfg.get("path") or "")),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)",
+            ("support_workbook_mtime_ns", str(int(support_mtime_ns))),
+        )
+        conn.commit()
+
+    return {
+        "db_path": str(db_path),
+        "workbook": str(wb_path),
+        "metrics_written": metrics_written,
+        "calc_columns_written": calc_columns_written,
+        "mode": "calc_from_raw",
+    }
 
 
 def _validate_test_data_project_cache_for_update(project_dir: Path, workbook_path: Path) -> Path:
@@ -5797,7 +6209,8 @@ def update_test_data_trending_project_workbook(
 
     repo = Path(global_repo).expanduser()
     project_dir = wb_path.parent
-    db_path = _validate_test_data_project_cache_for_update(project_dir, wb_path)
+    db_path = ensure_test_data_project_cache(project_dir, wb_path, rebuild=False)
+    _validate_test_data_project_cache_for_update(project_dir, wb_path)
 
     try:
         wb = load_workbook(str(wb_path))
