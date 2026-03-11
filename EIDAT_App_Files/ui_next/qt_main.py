@@ -13363,7 +13363,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self,
             "Select data files",
             str(Path(self.ed_pdfs.text()).expanduser()),
-            "Data files (*.pdf *.xlsx *.xlsm *.xls);;PDF files (*.pdf);;Excel files (*.xlsx *.xlsm *.xls);;All files (*.*)",
+            "Data files (*.pdf *.xlsx *.xlsm *.xls *.mat);;PDF files (*.pdf);;Excel/MAT files (*.xlsx *.xlsm *.xls *.mat);;All files (*.*)",
         )
         if paths:
             self._ingest_paths(paths)

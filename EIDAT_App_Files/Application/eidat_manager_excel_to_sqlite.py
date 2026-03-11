@@ -21,6 +21,8 @@ except Exception:  # pragma: no cover
 
 
 EXCEL_EXTENSIONS = {".xlsx", ".xlsm", ".xls"}
+MAT_EXTENSIONS = {".mat"}
+DATA_MATRIX_EXTENSIONS = set(EXCEL_EXTENSIONS) | set(MAT_EXTENSIONS)
 
 _NUM_RE = re.compile(r"^[\s\+\-]?\d[\d,\s]*(\.\d+)?([eE][\+\-]?\d+)?\s*$")
 
@@ -397,6 +399,379 @@ def _dedupe_idents(names: Sequence[str]) -> list[str]:
 def _safe_table_name(sheet_name: str) -> str:
     base = _safe_ident(sheet_name, prefix="sheet")
     return f"sheet__{base}"
+
+
+def _load_mat_payload(mat_path: Path) -> dict[str, Any]:
+    try:
+        from scipy.io import loadmat  # type: ignore
+    except Exception as exc:
+        raise RuntimeError("scipy is required to read MATLAB `.mat` files.") from exc
+
+    try:
+        data = loadmat(str(mat_path), simplify_cells=True)
+        if isinstance(data, dict):
+            return data
+    except NotImplementedError:
+        pass
+    except ValueError:
+        pass
+    except Exception as exc:
+        raise RuntimeError(f"Failed to read MAT file {mat_path}: {exc}") from exc
+
+    try:
+        import h5py  # type: ignore
+    except Exception as exc:
+        raise RuntimeError(
+            "This MATLAB file appears to use v7.3/HDF5 storage. Install `h5py` in the runtime to read it."
+        ) from exc
+
+    def _from_h5(node: Any) -> Any:
+        import h5py  # type: ignore
+        import numpy as np  # type: ignore
+
+        if isinstance(node, h5py.Dataset):
+            data = node[()]
+            if isinstance(data, bytes):
+                try:
+                    return data.decode("utf-8", errors="ignore")
+                except Exception:
+                    return repr(data)
+            if isinstance(data, np.ndarray):
+                return data
+            return data
+        if isinstance(node, h5py.Group):
+            return {k: _from_h5(v) for k, v in node.items()}
+        return node
+
+    try:
+        with h5py.File(str(mat_path), "r") as handle:
+            return {k: _from_h5(v) for k, v in handle.items()}
+    except Exception as exc:
+        raise RuntimeError(f"Failed to read HDF5-based MAT file {mat_path}: {exc}") from exc
+
+
+def _mat_is_scalar(value: Any) -> bool:
+    try:
+        import numpy as np  # type: ignore
+    except Exception:
+        np = None  # type: ignore
+
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return True
+    if np is not None and isinstance(value, np.generic):
+        return True
+    return False
+
+
+def _mat_coerce_scalar(value: Any) -> Any:
+    try:
+        import numpy as np  # type: ignore
+    except Exception:
+        np = None  # type: ignore
+
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        try:
+            return value.decode("utf-8", errors="ignore")
+        except Exception:
+            return repr(value)
+    if np is not None and isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def _mat_flatten_record(value: Any, prefix: str = "") -> dict[str, Any]:
+    try:
+        import numpy as np  # type: ignore
+    except Exception:
+        np = None  # type: ignore
+
+    out: dict[str, Any] = {}
+    if _mat_is_scalar(value):
+        out[prefix or "value"] = _mat_coerce_scalar(value)
+        return out
+
+    if isinstance(value, dict):
+        for k, v in value.items():
+            key = f"{prefix}.{k}" if prefix else str(k)
+            if _mat_is_scalar(v):
+                out[key] = _mat_coerce_scalar(v)
+            else:
+                out.update(_mat_flatten_record(v, key))
+        return out
+
+    if isinstance(value, (list, tuple)):
+        for i, item in enumerate(value):
+            key = f"{prefix}[{i}]"
+            if _mat_is_scalar(item):
+                out[key] = _mat_coerce_scalar(item)
+            else:
+                out.update(_mat_flatten_record(item, key))
+        return out
+
+    if np is not None and isinstance(value, np.ndarray):
+        if value.ndim == 0:
+            out[prefix or "value"] = _mat_coerce_scalar(value.item())
+            return out
+        if value.dtype.names:
+            names = list(value.dtype.names)
+            for idx, item in enumerate(value.reshape(-1)):
+                row_prefix = f"{prefix}[{idx}]"
+                for name in names:
+                    out.update(_mat_flatten_record(item[name], f"{row_prefix}.{name}"))
+            return out
+        if value.dtype == object:
+            for idx, item in enumerate(value.reshape(-1).tolist()):
+                out.update(_mat_flatten_record(item, f"{prefix}[{idx}]"))
+            return out
+        if value.ndim == 1 and all(_mat_is_scalar(x) for x in value.tolist()):
+            for i, item in enumerate(value.tolist()):
+                out[f"{prefix}[{i}]"] = _mat_coerce_scalar(item)
+            return out
+        if value.ndim == 2 and value.shape[0] == 1 and all(_mat_is_scalar(x) for x in value[0].tolist()):
+            for i, item in enumerate(value[0].tolist()):
+                out[f"{prefix}[{i}]"] = _mat_coerce_scalar(item)
+            return out
+        out[prefix or "value"] = repr(tuple(int(x) for x in value.shape))
+        return out
+
+    out[prefix or "value"] = str(value)
+    return out
+
+
+def _mat_payload_to_frames(payload: dict[str, Any]) -> list[tuple[str, Any]]:
+    try:
+        import numpy as np  # type: ignore
+        import pandas as pd  # type: ignore
+    except Exception as exc:
+        raise RuntimeError("pandas and numpy are required to write MAT-derived SQLite packages.") from exc
+
+    sheets: list[tuple[str, Any]] = []
+    for raw_key, raw_value in sorted(payload.items()):
+        key = str(raw_key or "").strip()
+        if not key or key.startswith("__"):
+            continue
+        value = raw_value
+
+        if isinstance(value, dict):
+            sheets.append((key, pd.DataFrame([_mat_flatten_record(value)])))
+            continue
+
+        if isinstance(value, (list, tuple)):
+            if value and all(_mat_is_scalar(x) for x in value):
+                sheets.append((key, pd.DataFrame({key: [_mat_coerce_scalar(x) for x in value]})))
+            else:
+                sheets.append((key, pd.DataFrame([_mat_flatten_record(x) for x in value])))
+            continue
+
+        if isinstance(value, np.ndarray):
+            if value.ndim == 0:
+                sheets.append((key, pd.DataFrame([{key: _mat_coerce_scalar(value.item())}])))
+            elif value.dtype.names:
+                rows: list[dict[str, Any]] = []
+                for item in value.reshape(-1):
+                    row: dict[str, Any] = {}
+                    for name in value.dtype.names:
+                        row.update(_mat_flatten_record(item[name], str(name)))
+                    rows.append(row)
+                sheets.append((key, pd.DataFrame(rows)))
+            elif value.dtype == object:
+                rows = [_mat_flatten_record(item) for item in value.reshape(-1).tolist()]
+                sheets.append((key, pd.DataFrame(rows)))
+            elif value.ndim == 1:
+                sheets.append((key, pd.DataFrame({key: [_mat_coerce_scalar(x) for x in value.tolist()]})))
+            elif value.ndim == 2:
+                sheets.append((key, pd.DataFrame(value)))
+            else:
+                lead = int(value.shape[0]) if value.shape else 1
+                flat = value.reshape(lead, -1)
+                sheets.append((key, pd.DataFrame(flat)))
+            continue
+
+        if _mat_is_scalar(value):
+            sheets.append((key, pd.DataFrame([{key: _mat_coerce_scalar(value)}])))
+            continue
+
+        sheets.append((key, pd.DataFrame([_mat_flatten_record(value)])))
+
+    if not sheets:
+        sheets.append(("data", pd.DataFrame([{"message": "No user variables found in MAT file"}])))
+    return sheets
+
+
+def _write_mat_sqlite(*, mat_path: Path, sqlite_path: Path, overwrite: bool) -> dict[str, Any]:
+    sqlite_path.parent.mkdir(parents=True, exist_ok=True)
+    if sqlite_path.exists():
+        if not overwrite:
+            return {
+                "source_file": str(mat_path),
+                "sqlite_path": str(sqlite_path),
+                "skipped": True,
+                "reason": "exists",
+            }
+        try:
+            sqlite_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    payload = _load_mat_payload(mat_path)
+    sheets = _mat_payload_to_frames(payload)
+    _stderr(f"[MAT] {mat_path}")
+
+    conn = sqlite3.connect(str(sqlite_path))
+    try:
+        conn.execute("PRAGMA journal_mode=DELETE;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute("PRAGMA temp_store=MEMORY;")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS __workbook (
+              source_file TEXT NOT NULL,
+              imported_epoch_ns INTEGER NOT NULL,
+              excel_size_bytes INTEGER NOT NULL,
+              excel_mtime_ns INTEGER NOT NULL
+            );
+            """
+        )
+        st = mat_path.stat()
+        conn.execute(
+            "INSERT INTO __workbook(source_file, imported_epoch_ns, excel_size_bytes, excel_mtime_ns) VALUES(?, ?, ?, ?)",
+            (str(mat_path), int(_now_ns()), int(st.st_size), int(st.st_mtime_ns)),
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS __sheet_info (
+              sheet_name TEXT PRIMARY KEY,
+              table_name TEXT NOT NULL,
+              header_row INTEGER NOT NULL,
+              excel_col_indices_json TEXT NOT NULL,
+              headers_json TEXT NOT NULL,
+              columns_json TEXT NOT NULL,
+              rows_inserted INTEGER NOT NULL
+            );
+            """
+        )
+        try:
+            existing_cols = {r[1] for r in conn.execute("PRAGMA table_info(__sheet_info)").fetchall()}
+            if "mapped_headers_json" not in existing_cols:
+                conn.execute("ALTER TABLE __sheet_info ADD COLUMN mapped_headers_json TEXT;")
+        except Exception:
+            pass
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS __column_map (
+              sheet_name TEXT NOT NULL,
+              header TEXT NOT NULL,
+              mapped_header TEXT NOT NULL,
+              sqlite_column TEXT NOT NULL,
+              PRIMARY KEY(sheet_name, header)
+            );
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS __meta_cells (
+              sheet_name TEXT NOT NULL,
+              excel_row INTEGER NOT NULL,
+              excel_col INTEGER NOT NULL,
+              value TEXT NOT NULL
+            );
+            """
+        )
+
+        outputs: list[dict[str, Any]] = []
+        for sheet_name, df in sheets:
+            safe_sheet_name = str(sheet_name or "data")
+            if len(list(df.columns)) <= 0:
+                try:
+                    import pandas as pd  # type: ignore
+                    df = pd.DataFrame({"value": []})
+                except Exception:
+                    pass
+            table_name = _safe_table_name(safe_sheet_name)
+            columns = [str(c or "").strip() or f"col_{i+1}" for i, c in enumerate(list(df.columns))]
+            mapped_headers = list(columns)
+            col_idents = _dedupe_idents(columns)
+            col_defs = ", ".join([f"\"{c}\" REAL" for c in col_idents])
+            conn.execute(f"DROP TABLE IF EXISTS \"{table_name}\";")
+            conn.execute(f"CREATE TABLE \"{table_name}\" (excel_row INTEGER NOT NULL, {col_defs});")
+
+            placeholders = ", ".join(["?"] * (1 + len(col_idents)))
+            ins_sql = (
+                f"INSERT INTO \"{table_name}\" (excel_row, "
+                + ", ".join([f"\"{c}\"" for c in col_idents])
+                + f") VALUES({placeholders})"
+            )
+
+            rows_inserted = 0
+            batch: list[tuple[Any, ...]] = []
+            for pos, row in enumerate(df.itertuples(index=False, name=None), start=2):
+                vals = [_mat_coerce_scalar(v) for v in list(row)]
+                batch.append((int(pos), *vals))
+                if len(batch) >= 1000:
+                    conn.executemany(ins_sql, batch)
+                    rows_inserted += len(batch)
+                    batch.clear()
+            if batch:
+                conn.executemany(ins_sql, batch)
+                rows_inserted += len(batch)
+                batch.clear()
+
+            excel_col_indices = [i + 1 for i in range(len(columns))]
+            conn.execute(
+                """
+                INSERT INTO __sheet_info(
+                  sheet_name, table_name, header_row,
+                  excel_col_indices_json, headers_json, columns_json,
+                  mapped_headers_json,
+                  rows_inserted
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    safe_sheet_name,
+                    table_name,
+                    1,
+                    json.dumps(excel_col_indices),
+                    json.dumps(columns, ensure_ascii=False),
+                    json.dumps({h: c for h, c in zip(columns, col_idents)}, ensure_ascii=False),
+                    json.dumps(mapped_headers, ensure_ascii=False),
+                    int(rows_inserted),
+                ),
+            )
+            try:
+                conn.executemany(
+                    "INSERT OR REPLACE INTO __column_map(sheet_name, header, mapped_header, sqlite_column) VALUES(?, ?, ?, ?)",
+                    [(safe_sheet_name, h, h, ci) for h, ci in zip(columns, col_idents)],
+                )
+            except Exception:
+                pass
+            outputs.append(
+                {
+                    "sheet": safe_sheet_name,
+                    "table": table_name,
+                    "header_row": 1,
+                    "columns": list(columns),
+                    "mapped_columns": list(mapped_headers),
+                    "rows_inserted": int(rows_inserted),
+                }
+            )
+            _stderr(f"[SHEET DONE] {safe_sheet_name}: rows={rows_inserted}")
+
+        conn.commit()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    _stderr(f"[DONE] {mat_path.name} -> {sqlite_path}")
+    return {
+        "source_file": str(mat_path),
+        "sqlite_path": str(sqlite_path),
+        "skipped": False,
+        "sheets": outputs,
+    }
 
 
 @dataclass(frozen=True)
@@ -846,7 +1221,10 @@ def _write_workbook_sqlite(
     min_numeric_ratio: float,
     min_data_cols: int,
 ) -> dict[str, Any]:
-    if excel_path.suffix.lower() not in EXCEL_EXTENSIONS:
+    ext = excel_path.suffix.lower()
+    if ext in MAT_EXTENSIONS:
+        return _write_mat_sqlite(mat_path=excel_path, sqlite_path=sqlite_path, overwrite=overwrite)
+    if ext not in EXCEL_EXTENSIONS:
         raise ValueError(f"Unsupported extension: {excel_path.suffix}")
 
     if not excel_path.exists():
@@ -1205,7 +1583,7 @@ def find_excel_files(root: Path) -> list[Path]:
                         stack.append(child)
                     elif child.is_file():
                         suf = child.suffix.lower()
-                        if suf in EXCEL_EXTENSIONS and not child.name.startswith("~$"):
+                        if suf in DATA_MATRIX_EXTENSIONS and not child.name.startswith("~$"):
                             out.append(child)
                 except Exception:
                     continue
@@ -1240,7 +1618,7 @@ def excel_to_sqlite(
         targets = find_excel_files(scan_root)
 
     if not targets:
-        raise RuntimeError("No Excel files found.")
+        raise RuntimeError("No Excel or MAT files found.")
 
     if out_dir is not None:
         out_root = Path(out_dir).expanduser()

@@ -534,7 +534,7 @@ def canonicalize_metadata_for_file(
     """
     p = Path(abs_path).expanduser()
     ext = str(p.suffix or "").lower()
-    is_excel = ext in {".xlsx", ".xls", ".xlsm"}
+    is_excel = ext in {".xlsx", ".xls", ".xlsm", ".mat"}
 
     existing = existing_meta if isinstance(existing_meta, dict) else {}
     extracted = extracted_meta if isinstance(extracted_meta, dict) else {}

@@ -42,7 +42,7 @@ DEFAULT_PROPOSED_PLOTS_JSON = DATA_ROOT / "user_inputs" / "proposed_plots.json"
 DEFAULT_EXCEL_TREND_CONFIG = DATA_ROOT / "user_inputs" / "excel_trend_config.json"
 DEFAULT_TREND_AUTO_REPORT_CONFIG = DATA_ROOT / "user_inputs" / "trend_auto_report_config.json"
 DEFAULT_ACCEPTANCE_HEURISTICS = DATA_ROOT / "user_inputs" / "acceptance_heuristics.json"
-EXCEL_EXTENSIONS = {".xlsx", ".xls", ".xlsm"}
+EXCEL_EXTENSIONS = {".xlsx", ".xls", ".xlsm", ".mat"}
 EXCEL_ARTIFACT_SUFFIX = "__excel"
 TD_DEFAULT_STATS_ORDER = ["mean", "min", "max", "std"]
 TD_ALLOWED_STATS_ORDER = ["mean", "min", "max", "std", "median", "count"]
@@ -6465,6 +6465,7 @@ def update_test_data_trending_project_workbook(
     *,
     overwrite: bool = False,
     dry_run: bool = False,
+    require_existing_cache: bool = True,
 ) -> dict:
     """
     Populate a Test Data Trending workbook's calculated sheets from cached
@@ -6484,7 +6485,8 @@ def update_test_data_trending_project_workbook(
 
     repo = Path(global_repo).expanduser()
     project_dir = wb_path.parent
-    _validate_test_data_project_cache_for_update(project_dir, wb_path)
+    if require_existing_cache:
+        _validate_test_data_project_cache_for_update(project_dir, wb_path)
     db_path = ensure_test_data_project_cache(project_dir, wb_path, rebuild=False)
 
     try:
@@ -12621,7 +12623,12 @@ def create_eidat_project(
         # Create/populate the project-local cache DB at project creation time so
         # Trend/Analyze can plot immediately from `implementation_trending.sqlite3`.
         ensure_test_data_project_cache(project_dir, workbook_path, rebuild=True)
-        update_test_data_trending_project_workbook(repo, workbook_path, overwrite=True)
+        update_test_data_trending_project_workbook(
+            repo,
+            workbook_path,
+            overwrite=True,
+            require_existing_cache=False,
+        )
 
     else:
         raise RuntimeError(f"Unsupported project type: {project_type}")

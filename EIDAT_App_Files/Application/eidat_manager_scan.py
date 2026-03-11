@@ -26,7 +26,7 @@ except Exception:  # pragma: no cover
 
 
 # Supported file extensions for scanning
-SUPPORTED_EXTENSIONS = {".pdf", ".xlsx", ".xls", ".xlsm"}
+SUPPORTED_EXTENSIONS = {".pdf", ".xlsx", ".xls", ".xlsm", ".mat"}
 EXCEL_ARTIFACT_SUFFIX = "__excel"
 
 # Ignore generated artifacts and support folders anywhere in the repo tree.
@@ -320,7 +320,7 @@ def _expected_artifacts_dir(support_dir: Path, file_path: Path) -> Path:
     """
     stem = str(file_path.stem or "").strip() or "unknown"
     ext = str(file_path.suffix or "").lower()
-    name = stem + (EXCEL_ARTIFACT_SUFFIX if ext in {".xlsx", ".xls", ".xlsm"} else "")
+    name = stem + (EXCEL_ARTIFACT_SUFFIX if ext in {".xlsx", ".xls", ".xlsm", ".mat"} else "")
     return Path(support_dir) / "debug" / "ocr" / name
 
 

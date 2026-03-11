@@ -47,6 +47,8 @@ def _load_scanner_core() -> Any:
 
 
 EXCEL_EXTENSIONS = {".xlsx", ".xls", ".xlsm"}
+MAT_EXTENSIONS = {".mat"}
+DATA_MATRIX_EXTENSIONS = set(EXCEL_EXTENSIONS) | set(MAT_EXTENSIONS)
 EXCEL_ARTIFACT_SUFFIX = "__excel"
 
 _IGNORED_REPO_DIRNAMES_CASEFOLD = {
@@ -915,9 +917,12 @@ def _excel_artifacts_dir(paths: SupportPaths, excel_path: Path) -> Path:
     return paths.support_dir / "debug" / "ocr" / f"{excel_path.stem}{EXCEL_ARTIFACT_SUFFIX}"
 
 
-def _derive_excel_metadata(excel_mod: Any, excel_path: Path) -> dict:
+def _derive_data_file_metadata(excel_mod: Any | None, data_path: Path) -> dict:
     try:
-        program, vehicle, serial = excel_mod.derive_file_identity(excel_path)
+        if excel_mod is not None:
+            program, vehicle, serial = excel_mod.derive_file_identity(data_path)
+        else:
+            raise RuntimeError("no excel identity helper")
     except Exception:
         program, vehicle, serial = "", "", ""
     if program and vehicle:
@@ -925,6 +930,7 @@ def _derive_excel_metadata(excel_mod: Any, excel_path: Path) -> dict:
     else:
         program_title = (program or vehicle or "Unknown").strip()
     serial_number = (serial or "Unknown").strip() or "Unknown"
+    is_mat = data_path.suffix.lower() in MAT_EXTENSIONS
     return {
         "program_title": program_title,
         "asset_type": "Unknown",
@@ -933,11 +939,24 @@ def _derive_excel_metadata(excel_mod: Any, excel_path: Path) -> dict:
         "revision": "Unknown",
         "test_date": "Unknown",
         "report_date": "Unknown",
-        "document_type": "Data file",
-        "document_type_acronym": "DATA",
+        "document_type": "Test Data" if is_mat else "Data file",
+        "document_type_acronym": "TD" if is_mat else "DATA",
         "vendor": "Unknown",
         "acceptance_test_plan_number": "Unknown",
     }
+
+
+def _is_test_data_meta(meta: dict[str, Any] | None) -> bool:
+    src = meta if isinstance(meta, dict) else {}
+    try:
+        dt = str(src.get("document_type") or "").strip().lower()
+    except Exception:
+        dt = ""
+    try:
+        acr = str(src.get("document_type_acronym") or "").strip().lower()
+    except Exception:
+        acr = ""
+    return dt in {"test data", "testdata", "td"} or acr in {"test data", "testdata", "td"}
 
 
 def _run_excel_extraction(excel_mod: Any, excel_path: Path, output_dir: Path, config_path: Path) -> dict[str, Any]:
@@ -1096,14 +1115,16 @@ def process_candidates(
 
                     ext = abs_path.suffix.lower()
                     is_excel = ext in EXCEL_EXTENSIONS
+                    is_mat = ext in MAT_EXTENSIONS
+                    is_data_matrix = ext in DATA_MATRIX_EXTENSIONS
 
                     artifacts_dir = None
                     metadata_path = None
                     pointer_token = None
                     eidat_uuid = None
 
-                    if is_excel:
-                        excel_mod = _get_excel_mod()
+                    if is_data_matrix:
+                        excel_mod = _get_excel_mod() if is_excel else None
                         artifacts_root = _excel_artifacts_dir(paths, abs_path)
                         artifacts_dir = str(artifacts_root)
 
@@ -1114,10 +1135,13 @@ def process_candidates(
                             existing_meta = None
 
                         # Extract metadata from workbook cells + filename (like PDFs use combined/title).
-                        try:
-                            extracted_meta = extract_metadata_from_excel(abs_path)
-                        except Exception:
-                            extracted_meta = _derive_excel_metadata(excel_mod, abs_path)
+                        if is_excel:
+                            try:
+                                extracted_meta = extract_metadata_from_excel(abs_path)
+                            except Exception:
+                                extracted_meta = _derive_data_file_metadata(excel_mod, abs_path)
+                        else:
+                            extracted_meta = _derive_data_file_metadata(None, abs_path)
 
                         # Canonicalize once up front so TD detection is stable.
                         try:
@@ -1125,40 +1149,32 @@ def process_candidates(
                                 abs_path,
                                 existing_meta=existing_meta,
                                 extracted_meta=extracted_meta,
-                                default_document_type="Data file",
+                                default_document_type="Test Data" if is_mat else "Data file",
                             )
                         except Exception:
                             raw_meta = extracted_meta if isinstance(extracted_meta, dict) else {}
 
-                        def _is_test_data(meta: dict) -> bool:
-                            try:
-                                dt = str(meta.get("document_type") or "").strip().lower()
-                            except Exception:
-                                dt = ""
-                            try:
-                                acr = str(meta.get("document_type_acronym") or "").strip().lower()
-                            except Exception:
-                                acr = ""
-                            return dt in {"test data", "testdata", "td"} or acr in {"test data", "testdata", "td"}
-
-                        is_test_data = _is_test_data(raw_meta if isinstance(raw_meta, dict) else {})
+                        is_test_data = bool(is_mat) or _is_test_data_meta(raw_meta if isinstance(raw_meta, dict) else {})
 
                         # Always run config-driven extraction as part of processing.
                         # If pandas is missing, allow Test Data flows to continue (SQLite is the key output).
-                        try:
-                            res = _run_excel_extraction(
-                                excel_mod,
-                                abs_path,
-                                artifacts_root,
-                                excel_config_path,
-                            )
-                        except Exception:
-                            if not is_test_data:
-                                raise
-                            res = {"error": "excel_extraction_failed"}
+                        if is_excel:
+                            try:
+                                res = _run_excel_extraction(
+                                    excel_mod,
+                                    abs_path,
+                                    artifacts_root,
+                                    excel_config_path,
+                                )
+                            except Exception:
+                                if not is_test_data:
+                                    raise
+                                res = {"error": "excel_extraction_failed"}
+                        else:
+                            res = {"dir": str(artifacts_root), "rows_count": 0, "config": None}
 
-                        # Test Data: also create a per-workbook SQLite DB (header row unknown; detect automatically).
-                        if is_test_data:
+                        # Test Data / MAT: create a per-source SQLite DB that downstream TD flows consume.
+                        if is_test_data or is_mat:
                             try:
                                 (
                                     excel_to_sqlite,
@@ -1218,15 +1234,16 @@ def process_candidates(
                                         except Exception:
                                             pass
                             except Exception as exc:
-                                # For Test Data, SQLite creation is required (so the file remains pending if it fails).
-                                raise RuntimeError(f"Test Data Excel -> SQLite failed: {exc}") from exc
+                                # For Test Data-like matrix sources, SQLite creation is required.
+                                label = "MAT" if is_mat else "Test Data Excel"
+                                raise RuntimeError(f"{label} -> SQLite failed: {exc}") from exc
 
                         # Final canonicalization pass to preserve any existing curated fields and fill blanks.
                         clean_meta = canonicalize_metadata_for_file(
                             abs_path,
                             existing_meta=existing_meta,
                             extracted_meta=raw_meta,
-                            default_document_type="Data file",
+                            default_document_type="Test Data" if is_mat else "Data file",
                         )
                         metadata_path = write_metadata(Path(artifacts_dir), abs_path, clean_meta)
                     else:
