@@ -191,16 +191,10 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 self.assertEqual(ws_settings.cell(2, 1).value, "exclude_first_n_default")
                 self.assertEqual(ws_settings.cell(3, 1).value, "last_n_rows_default")
                 self.assertEqual(ws_settings.cell(3, 2).value, 10)
-                self.assertEqual(ws_settings.cell(4, 1).value, "perf_eq_min_distinct_x_points")
-                self.assertEqual(ws_settings.cell(4, 2).value, 3)
-                self.assertEqual(ws_settings.cell(5, 1).value, "perf_eq_x_rel_tol")
-                self.assertAlmostEqual(float(ws_settings.cell(5, 2).value or 0.0), 0.05)
-                self.assertEqual(ws_settings.cell(6, 1).value, "perf_eq_x_abs_tol")
-                self.assertAlmostEqual(float(ws_settings.cell(6, 2).value or 0.0), 0.0)
-                self.assertEqual(ws_settings.cell(7, 1).value, "perf_eq_min_x_span_rel")
-                self.assertAlmostEqual(float(ws_settings.cell(7, 2).value or 0.0), 0.10)
-                self.assertEqual(ws_settings.cell(8, 1).value, "perf_eq_min_x_span_abs")
-                self.assertAlmostEqual(float(ws_settings.cell(8, 2).value or 0.0), 0.0)
+                self.assertEqual(ws_settings.cell(4, 1).value, "perf_eq_strictness")
+                self.assertEqual(str(ws_settings.cell(4, 2).value or "").strip().lower(), "medium")
+                self.assertEqual(ws_settings.cell(5, 1).value, "perf_eq_point_count")
+                self.assertEqual(str(ws_settings.cell(5, 2).value or "").strip().lower(), "medium")
 
                 ws_seq = wb["Sequences"]
                 self.assertEqual(ws_seq.cell(2, 1).value, "RunA")
@@ -596,10 +590,8 @@ class TestTDSupportWorkbook(unittest.TestCase):
                     ("SN1", "Seq3", 3.14, 12.0),
                 ],
                 support_settings={
-                    "perf_eq_x_rel_tol": 0.0,
-                    "perf_eq_x_abs_tol": 0.0,
-                    "perf_eq_min_x_span_rel": 0.0,
-                    "perf_eq_min_x_span_abs": 0.0,
+                    "perf_eq_strictness": "loose",
+                    "perf_eq_point_count": "loose",
                 },
             )
 
@@ -614,7 +606,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
             )
             self.assertIsNotNone(match)
             self.assertEqual(int(match.get("qualifying_serial_count") or 0), 1)
-            self.assertEqual(int(match.get("distinct_x_point_count") or 0), 3)
+            self.assertEqual(int(match.get("distinct_x_point_count") or 0), 2)
 
     def test_perf_candidate_discovery_legacy_support_workbook_uses_defaults(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
@@ -632,7 +624,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
             )
 
             support_cfg = be._read_td_support_workbook(root / "project.xlsx", project_dir=root)
-            self.assertNotIn("perf_eq_x_rel_tol", support_cfg.get("settings") or {})
+            self.assertNotIn("perf_eq_strictness", support_cfg.get("settings") or {})
 
             candidates = be.td_discover_performance_candidates(db_path)
             self.assertEqual(candidates, [])

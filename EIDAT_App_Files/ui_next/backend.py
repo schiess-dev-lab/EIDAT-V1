@@ -3271,11 +3271,8 @@ def _write_td_support_workbook(
     ws_settings.append(["key", "value"])
     ws_settings.append(["exclude_first_n_default", ""])
     ws_settings.append(["last_n_rows_default", 10])
-    ws_settings.append(["perf_eq_min_distinct_x_points", 3])
-    ws_settings.append(["perf_eq_x_rel_tol", 0.05])
-    ws_settings.append(["perf_eq_x_abs_tol", 0.0])
-    ws_settings.append(["perf_eq_min_x_span_rel", 0.10])
-    ws_settings.append(["perf_eq_min_x_span_abs", 0.0])
+    ws_settings.append(["perf_eq_strictness", "medium"])
+    ws_settings.append(["perf_eq_point_count", "medium"])
 
     ws_seq = wb.create_sheet("Sequences")
     ws_seq.append(
@@ -3442,14 +3439,14 @@ def _read_td_support_workbook(workbook_path: Path, *, project_dir: Path | None =
 
     wb = load_workbook(str(support_path), read_only=True, data_only=True)
     try:
-        settings: dict[str, int | float] = {}
+        settings: dict[str, object] = {}
         if "Settings" in wb.sheetnames:
             ws = wb["Settings"]
             for row in range(2, (ws.max_row or 0) + 1):
                 key = str(ws.cell(row, 1).value or "").strip()
                 if not key:
                     continue
-                val = _to_support_number(ws.cell(row, 2).value)
+                val = _normalize_support_scalar(ws.cell(row, 2).value)
                 if val is not None:
                     settings[key] = val
 
@@ -5231,12 +5228,40 @@ def _td_perf_norm_key(value: object) -> str:
     return "".join(ch.lower() for ch in str(value or "").strip() if ch.isalnum())
 
 
+TD_PERF_EQ_STRICTNESS_PRESETS: dict[str, dict[str, float]] = {
+    "tight": {
+        "perf_eq_x_rel_tol": 0.08,
+        "perf_eq_x_abs_tol": 0.0,
+        "perf_eq_min_x_span_rel": 0.15,
+        "perf_eq_min_x_span_abs": 0.0,
+    },
+    "medium": {
+        "perf_eq_x_rel_tol": 0.05,
+        "perf_eq_x_abs_tol": 0.0,
+        "perf_eq_min_x_span_rel": 0.10,
+        "perf_eq_min_x_span_abs": 0.0,
+    },
+    "loose": {
+        "perf_eq_x_rel_tol": 0.02,
+        "perf_eq_x_abs_tol": 0.0,
+        "perf_eq_min_x_span_rel": 0.03,
+        "perf_eq_min_x_span_abs": 0.0,
+    },
+}
+
+
+TD_PERF_EQ_POINT_COUNT_PRESETS: dict[str, int] = {
+    "tight": 4,
+    "medium": 3,
+    "loose": 2,
+}
+
+
 TD_PERF_EQ_DEFAULTS = {
-    "perf_eq_min_distinct_x_points": 3,
-    "perf_eq_x_rel_tol": 0.05,
-    "perf_eq_x_abs_tol": 0.0,
-    "perf_eq_min_x_span_rel": 0.10,
-    "perf_eq_min_x_span_abs": 0.0,
+    "perf_eq_strictness": "medium",
+    "perf_eq_point_count": "medium",
+    "perf_eq_min_distinct_x_points": TD_PERF_EQ_POINT_COUNT_PRESETS["medium"],
+    **TD_PERF_EQ_STRICTNESS_PRESETS["medium"],
 }
 
 
@@ -5261,6 +5286,20 @@ def _td_perf_support_setting_int(settings: dict[str, object], key: str, default:
             return int(default)
         return max(1, val)
     return max(1, int(default))
+
+
+def _td_perf_support_setting_choice(
+    settings: dict[str, object],
+    key: str,
+    *,
+    allowed: set[str],
+    default: str,
+) -> str:
+    raw = settings.get(key)
+    txt = str(raw or "").strip().lower()
+    if txt in allowed:
+        return txt
+    return str(default).strip().lower()
 
 
 def _td_perf_load_support_settings(db_path: Path) -> dict[str, object]:
@@ -5384,30 +5423,44 @@ def td_discover_performance_candidates(db_path: Path, config_path: Path | None =
     if not isinstance(legacy_plotters, list):
         legacy_plotters = []
     support_settings = _td_perf_load_support_settings(path)
+    strictness_mode = _td_perf_support_setting_choice(
+        support_settings,
+        "perf_eq_strictness",
+        allowed=set(TD_PERF_EQ_STRICTNESS_PRESETS.keys()),
+        default=str(TD_PERF_EQ_DEFAULTS["perf_eq_strictness"]),
+    )
+    point_count_mode = _td_perf_support_setting_choice(
+        support_settings,
+        "perf_eq_point_count",
+        allowed=set(TD_PERF_EQ_POINT_COUNT_PRESETS.keys()),
+        default=str(TD_PERF_EQ_DEFAULTS["perf_eq_point_count"]),
+    )
+
+    strictness_defaults = dict(TD_PERF_EQ_STRICTNESS_PRESETS.get(strictness_mode) or TD_PERF_EQ_STRICTNESS_PRESETS["medium"])
     default_min_distinct_x_points = _td_perf_support_setting_int(
         support_settings,
         "perf_eq_min_distinct_x_points",
-        int(TD_PERF_EQ_DEFAULTS["perf_eq_min_distinct_x_points"]),
+        int(TD_PERF_EQ_POINT_COUNT_PRESETS.get(point_count_mode) or TD_PERF_EQ_POINT_COUNT_PRESETS["medium"]),
     )
     x_rel_tol = _td_perf_support_setting_float(
         support_settings,
         "perf_eq_x_rel_tol",
-        float(TD_PERF_EQ_DEFAULTS["perf_eq_x_rel_tol"]),
+        float(strictness_defaults["perf_eq_x_rel_tol"]),
     )
     x_abs_tol = _td_perf_support_setting_float(
         support_settings,
         "perf_eq_x_abs_tol",
-        float(TD_PERF_EQ_DEFAULTS["perf_eq_x_abs_tol"]),
+        float(strictness_defaults["perf_eq_x_abs_tol"]),
     )
     min_x_span_rel = _td_perf_support_setting_float(
         support_settings,
         "perf_eq_min_x_span_rel",
-        float(TD_PERF_EQ_DEFAULTS["perf_eq_min_x_span_rel"]),
+        float(strictness_defaults["perf_eq_min_x_span_rel"]),
     )
     min_x_span_abs = _td_perf_support_setting_float(
         support_settings,
         "perf_eq_min_x_span_abs",
-        float(TD_PERF_EQ_DEFAULTS["perf_eq_min_x_span_abs"]),
+        float(strictness_defaults["perf_eq_min_x_span_abs"]),
     )
 
     stat_priority = ["mean", "min", "max"]
