@@ -7,7 +7,6 @@
     { "name": "pc", "units": "psia", "range_min": null, "range_max": null }
   ],
   "statistics": ["mean", "min", "max", "std"],
-  "statistics_ignore_first_n": 0,
   "performance_plotters": [
     {
       "name": "Standard Thrust Equation",

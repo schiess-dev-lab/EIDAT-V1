@@ -61,6 +61,116 @@ class TestTDSupportWorkbook(unittest.TestCase):
             "header_row": 0,
         }
 
+    def _seed_perf_candidate_db(
+        self,
+        root: Path,
+        *,
+        rows: list[tuple[str, str, float, float]],
+        support_settings: dict[str, object] | None = None,
+        legacy_support_only: bool = False,
+    ) -> Path:
+        from openpyxl import Workbook, load_workbook  # type: ignore
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        wb_path = root / "project.xlsx"
+        Workbook().save(str(wb_path))
+        support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+
+        if legacy_support_only:
+            wb = Workbook()
+            ws_settings = wb.active
+            ws_settings.title = "Settings"
+            ws_settings.append(["key", "value"])
+            ws_settings.append(["exclude_first_n_default", ""])
+            ws_settings.append(["last_n_rows_default", 10])
+            ws_seq = wb.create_sheet("Sequences")
+            ws_seq.append(
+                [
+                    "sequence_name",
+                    "source_run_name",
+                    "feed_pressure",
+                    "pulse_width_on",
+                    "exclude_first_n",
+                    "last_n_rows",
+                    "enabled",
+                ]
+            )
+            ws_bounds = wb.create_sheet("ParameterBounds")
+            ws_bounds.append(["sequence_name", "parameter_name", "units", "min_value", "max_value", "enabled"])
+            wb.save(str(support_path))
+            wb.close()
+        else:
+            be._write_td_support_workbook(
+                support_path,
+                sequence_names=sorted({run for _sn, run, _x, _y in rows}),
+                param_defs=[
+                    {"name": "impulse bit", "units": "mN-s"},
+                    {"name": "thrust", "units": "lbf"},
+                ],
+            )
+
+        if support_settings:
+            wb = load_workbook(str(support_path))
+            try:
+                ws = wb["Settings"]
+                row_by_key = {
+                    str(ws.cell(r, 1).value or "").strip(): r
+                    for r in range(2, (ws.max_row or 0) + 1)
+                    if str(ws.cell(r, 1).value or "").strip()
+                }
+                for key, value in support_settings.items():
+                    row = row_by_key.get(str(key))
+                    if row is None:
+                        row = int((ws.max_row or 0) + 1)
+                        ws.cell(row, 1).value = str(key)
+                        row_by_key[str(key)] = row
+                    ws.cell(row, 2).value = value
+                wb.save(str(support_path))
+            finally:
+                wb.close()
+
+        db_path = root / "implementation_trending.sqlite3"
+        with sqlite3.connect(str(db_path)) as conn:
+            be._ensure_test_data_tables(conn)
+            conn.execute(
+                "INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)",
+                ("workbook_path", str(wb_path)),
+            )
+            for run in sorted({run for _sn, run, _x, _y in rows}):
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO td_columns_calc(run_name, name, units, kind)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (run, "impulse bit", "mN-s", "y"),
+                )
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO td_columns_calc(run_name, name, units, kind)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (run, "thrust", "lbf", "y"),
+                )
+            for serial, run, x_val, y_val in rows:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO td_metrics_calc
+                    (serial, run_name, column_name, stat, value_num, computed_epoch_ns, source_mtime_ns)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (serial, run, "impulse bit", "mean", float(x_val), 0, 0),
+                )
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO td_metrics_calc
+                    (serial, run_name, column_name, stat, value_num, computed_epoch_ns, source_mtime_ns)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (serial, run, "thrust", "mean", float(y_val), 0, 0),
+                )
+            conn.commit()
+        return db_path
+
     def test_write_support_workbook_seeds_expected_sheets(self) -> None:
         from openpyxl import load_workbook  # type: ignore
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
@@ -81,6 +191,16 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 self.assertEqual(ws_settings.cell(2, 1).value, "exclude_first_n_default")
                 self.assertEqual(ws_settings.cell(3, 1).value, "last_n_rows_default")
                 self.assertEqual(ws_settings.cell(3, 2).value, 10)
+                self.assertEqual(ws_settings.cell(4, 1).value, "perf_eq_min_distinct_x_points")
+                self.assertEqual(ws_settings.cell(4, 2).value, 3)
+                self.assertEqual(ws_settings.cell(5, 1).value, "perf_eq_x_rel_tol")
+                self.assertAlmostEqual(float(ws_settings.cell(5, 2).value or 0.0), 0.05)
+                self.assertEqual(ws_settings.cell(6, 1).value, "perf_eq_x_abs_tol")
+                self.assertAlmostEqual(float(ws_settings.cell(6, 2).value or 0.0), 0.0)
+                self.assertEqual(ws_settings.cell(7, 1).value, "perf_eq_min_x_span_rel")
+                self.assertAlmostEqual(float(ws_settings.cell(7, 2).value or 0.0), 0.10)
+                self.assertEqual(ws_settings.cell(8, 1).value, "perf_eq_min_x_span_abs")
+                self.assertAlmostEqual(float(ws_settings.cell(8, 2).value or 0.0), 0.0)
 
                 ws_seq = wb["Sequences"]
                 self.assertEqual(ws_seq.cell(2, 1).value, "RunA")
@@ -208,6 +328,62 @@ class TestTDSupportWorkbook(unittest.TestCase):
             finally:
                 wb2.close()
 
+    def test_update_workbook_rebuilds_cache_after_support_change(self) -> None:
+        from openpyxl import load_workbook  # type: ignore
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            src_db = root / "src.sqlite3"
+            self._make_source_sqlite(src_db)
+
+            wb_path = root / "project.xlsx"
+            be._write_test_data_trending_workbook(
+                wb_path,
+                global_repo=root,
+                serials=["SN1"],
+                docs=[{"serial_number": "SN1", "excel_sqlite_rel": str(src_db)}],
+                config=self._make_config(),
+            )
+            support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+            be._write_td_support_workbook(
+                support_path,
+                sequence_names=["RunA"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+            )
+
+            be.ensure_test_data_project_cache(root, wb_path, rebuild=True)
+
+            wb = load_workbook(str(support_path))
+            try:
+                ws_settings = wb["Settings"]
+                ws_settings.cell(3, 2).value = 2
+                wb.save(str(support_path))
+            finally:
+                wb.close()
+
+            result = be.update_test_data_trending_project_workbook(root, wb_path, overwrite=True)
+            self.assertEqual(str(result.get("workbook") or ""), str(wb_path))
+
+            with sqlite3.connect(str(root / "implementation_trending.sqlite3")) as conn:
+                mean_row = conn.execute(
+                    "SELECT value_num FROM td_metrics_calc WHERE run_name=? AND column_name=? AND stat=? AND serial=?",
+                    ("RunA", "thrust", "mean", "SN1"),
+                ).fetchone()
+            self.assertIsNotNone(mean_row)
+            self.assertAlmostEqual(float(mean_row[0]), 55.0)
+
+            wb2 = load_workbook(str(wb_path), read_only=True, data_only=True)
+            try:
+                ws_calc = wb2["Data_calc"]
+                values = {
+                    str(ws_calc.cell(r, 1).value or "").strip(): ws_calc.cell(r, 2).value
+                    for r in range(1, (ws_calc.max_row or 0) + 1)
+                }
+                self.assertEqual(values.get("RunA.thrust.mean"), 55.0)
+            finally:
+                wb2.close()
+
     def test_update_workbook_fails_when_cache_db_missing(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
 
@@ -252,6 +428,37 @@ class TestTDSupportWorkbook(unittest.TestCase):
 
             with self.assertRaisesRegex(RuntimeError, "Project cache DB is incomplete"):
                 be.update_test_data_trending_project_workbook(root, wb_path, overwrite=True)
+
+    def test_validate_existing_cache_requires_built_raw_and_calc_sections(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            src_db = root / "src.sqlite3"
+            self._make_source_sqlite(src_db)
+
+            wb_path = root / "project.xlsx"
+            be._write_test_data_trending_workbook(
+                wb_path,
+                global_repo=root,
+                serials=["SN1"],
+                docs=[{"serial_number": "SN1", "excel_sqlite_rel": str(src_db)}],
+                config=self._make_config(),
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "Build / Refresh Cache"):
+                be.validate_existing_test_data_project_cache(root, wb_path)
+
+            support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+            be._write_td_support_workbook(
+                support_path,
+                sequence_names=["RunA"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+            )
+            be.ensure_test_data_project_cache(root, wb_path, rebuild=True)
+
+            validated = be.validate_existing_test_data_project_cache(root, wb_path)
+            self.assertEqual(str(validated), str(root / "implementation_trending.sqlite3"))
 
     def test_cache_rebuild_tracks_source_metadata_updates(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
@@ -330,6 +537,105 @@ class TestTDSupportWorkbook(unittest.TestCase):
             with sqlite3.connect(str(out_db)) as conn:
                 row = conn.execute("SELECT vendor FROM td_source_metadata WHERE serial=?", ("SN1",)).fetchone()
                 self.assertEqual(row[0], "Vendor B")
+
+    def test_perf_candidate_discovery_clusters_near_equal_x_by_default(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            db_path = self._seed_perf_candidate_db(
+                root,
+                rows=[
+                    ("SN1", "Seq1", 3.0, 10.0),
+                    ("SN1", "Seq2", 3.1, 11.0),
+                    ("SN1", "Seq3", 3.14, 12.0),
+                ],
+            )
+
+            candidates = be.td_discover_performance_candidates(db_path)
+            self.assertEqual(candidates, [])
+
+    def test_perf_candidate_discovery_accepts_separated_x(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            db_path = self._seed_perf_candidate_db(
+                root,
+                rows=[
+                    ("SN1", "Seq1", 3.0, 10.0),
+                    ("SN1", "Seq2", 4.0, 11.0),
+                    ("SN1", "Seq3", 5.0, 12.0),
+                ],
+            )
+
+            candidates = be.td_discover_performance_candidates(db_path)
+            match = next(
+                (
+                    item
+                    for item in candidates
+                    if str(item.get("display_name") or "") == "thrust vs impulse bit"
+                ),
+                None,
+            )
+            self.assertIsNotNone(match)
+            self.assertEqual(int(match.get("qualifying_serial_count") or 0), 1)
+            self.assertEqual(int(match.get("distinct_x_point_count") or 0), 3)
+            self.assertEqual(int(match.get("min_distinct_x_points_per_serial") or 0), 3)
+
+    def test_perf_candidate_discovery_honors_support_setting_overrides(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            db_path = self._seed_perf_candidate_db(
+                root,
+                rows=[
+                    ("SN1", "Seq1", 3.0, 10.0),
+                    ("SN1", "Seq2", 3.1, 11.0),
+                    ("SN1", "Seq3", 3.14, 12.0),
+                ],
+                support_settings={
+                    "perf_eq_x_rel_tol": 0.0,
+                    "perf_eq_x_abs_tol": 0.0,
+                    "perf_eq_min_x_span_rel": 0.0,
+                    "perf_eq_min_x_span_abs": 0.0,
+                },
+            )
+
+            candidates = be.td_discover_performance_candidates(db_path)
+            match = next(
+                (
+                    item
+                    for item in candidates
+                    if str(item.get("display_name") or "") == "thrust vs impulse bit"
+                ),
+                None,
+            )
+            self.assertIsNotNone(match)
+            self.assertEqual(int(match.get("qualifying_serial_count") or 0), 1)
+            self.assertEqual(int(match.get("distinct_x_point_count") or 0), 3)
+
+    def test_perf_candidate_discovery_legacy_support_workbook_uses_defaults(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            db_path = self._seed_perf_candidate_db(
+                root,
+                rows=[
+                    ("SN1", "Seq1", 3.0, 10.0),
+                    ("SN1", "Seq2", 3.1, 11.0),
+                    ("SN1", "Seq3", 3.14, 12.0),
+                ],
+                legacy_support_only=True,
+            )
+
+            support_cfg = be._read_td_support_workbook(root / "project.xlsx", project_dir=root)
+            self.assertNotIn("perf_eq_x_rel_tol", support_cfg.get("settings") or {})
+
+            candidates = be.td_discover_performance_candidates(db_path)
+            self.assertEqual(candidates, [])
 
 
 if __name__ == "__main__":

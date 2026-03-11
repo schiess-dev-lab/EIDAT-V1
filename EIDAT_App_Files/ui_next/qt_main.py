@@ -3888,9 +3888,14 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
     def _load_cache(self, *, rebuild: bool) -> None:
         try:
-            self._db_path = be.ensure_test_data_project_cache(
-                self._project_dir, self._workbook_path, rebuild=bool(rebuild)
-            )
+            if rebuild:
+                self._db_path = be.ensure_test_data_project_cache(
+                    self._project_dir, self._workbook_path, rebuild=True
+                )
+            else:
+                self._db_path = be.validate_existing_test_data_project_cache(
+                    self._project_dir, self._workbook_path
+                )
             self.lbl_source.setText(str(self._db_path))
             self.lbl_cache.setText(f"Cache DB: {self._db_path}")
         except Exception as exc:
@@ -5978,7 +5983,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 str((x_spec.get("column") if isinstance(x_spec, dict) else "") or "").strip(),
                 str((y_spec.get("column") if isinstance(y_spec, dict) else "") or "").strip(),
                 str(int(candidate.get("qualifying_serial_count") or 0)),
-                str(int(candidate.get("source_point_count") or 0)),
+                str(int(candidate.get("distinct_x_point_count") or 0)),
                 ", ".join([str(v).strip() for v in (candidate.get("available_equation_views") or []) if str(v).strip()]),
             ]
             for col, value in enumerate(values):
@@ -5996,7 +6001,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             total = len(all_candidates)
             shown = len(filtered)
             self.lbl_perf_candidate_summary.setText(
-                f"Viable candidates: {total} | Showing: {shown} | Rule: exact distinct paired .mean points"
+                f"Viable candidates: {total} | Showing: {shown} | Rule: clustered X operating points with min span"
             )
         self._sync_perf_candidate_table_selection()
 
@@ -6715,9 +6720,11 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             self.lbl_perf_axes.setText(f"X: {x_target or '-'} | Y: {y_target or '-'}")
         if hasattr(self, "lbl_perf_common_runs"):
             count = int(plotter.get("qualifying_serial_count") or 0)
+            distinct_x = int(plotter.get("distinct_x_point_count") or 0)
+            min_per_serial = int(plotter.get("min_distinct_x_points_per_serial") or 0)
             views = ", ".join([str(v).strip() for v in (plotter.get("available_equation_views") or []) if str(v).strip()])
             self.lbl_perf_common_runs.setText(
-                f"Qualifying serials: {count} | Stats: {', '.join(stats)} | Views: {views or 'master, serial'}"
+                f"Qualifying serials: {count} | Distinct X clusters: {distinct_x} total, {min_per_serial}+ per serial | Stats: {', '.join(stats)} | Views: {views or 'master, serial'}"
             )
 
         if hasattr(self, "list_perf_stats"):

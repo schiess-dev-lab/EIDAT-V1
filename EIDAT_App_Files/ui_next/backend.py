@@ -3271,6 +3271,11 @@ def _write_td_support_workbook(
     ws_settings.append(["key", "value"])
     ws_settings.append(["exclude_first_n_default", ""])
     ws_settings.append(["last_n_rows_default", 10])
+    ws_settings.append(["perf_eq_min_distinct_x_points", 3])
+    ws_settings.append(["perf_eq_x_rel_tol", 0.05])
+    ws_settings.append(["perf_eq_x_abs_tol", 0.0])
+    ws_settings.append(["perf_eq_min_x_span_rel", 0.10])
+    ws_settings.append(["perf_eq_min_x_span_abs", 0.0])
 
     ws_seq = wb.create_sheet("Sequences")
     ws_seq.append(
@@ -3320,15 +3325,37 @@ def _write_td_support_workbook(
 
 
 def _to_support_int(v: object) -> int | None:
+    num = _to_support_number(v)
+    if num is None:
+        return None
+    try:
+        return max(0, int(float(num)))
+    except Exception:
+        return None
+
+
+def _to_support_number(v: object) -> int | float | None:
     if v is None or isinstance(v, bool):
         return None
-    txt = str(v).strip()
+    if isinstance(v, (int, float)):
+        f = float(v)
+        if not math.isfinite(f):
+            return None
+        if abs(f - round(f)) < 1e-9:
+            return int(round(f))
+        return float(f)
+    txt = str(v).strip().replace(",", "")
     if not txt:
         return None
     try:
-        return max(0, int(float(txt)))
+        f = float(txt)
     except Exception:
         return None
+    if not math.isfinite(f):
+        return None
+    if abs(f - round(f)) < 1e-9:
+        return int(round(f))
+    return float(f)
 
 
 def _normalize_support_scalar(v: object) -> object | None:
@@ -3415,14 +3442,14 @@ def _read_td_support_workbook(workbook_path: Path, *, project_dir: Path | None =
 
     wb = load_workbook(str(support_path), read_only=True, data_only=True)
     try:
-        settings: dict[str, int] = {}
+        settings: dict[str, int | float] = {}
         if "Settings" in wb.sheetnames:
             ws = wb["Settings"]
             for row in range(2, (ws.max_row or 0) + 1):
                 key = str(ws.cell(row, 1).value or "").strip()
                 if not key:
                     continue
-                val = _to_support_int(ws.cell(row, 2).value)
+                val = _to_support_number(ws.cell(row, 2).value)
                 if val is not None:
                     settings[key] = val
 
@@ -3887,6 +3914,65 @@ def _validate_test_data_project_cache_for_update(project_dir: Path, workbook_pat
         raise RuntimeError(
             f"Project cache DB is incomplete: {db_path}. {guidance}"
         )
+
+    return db_path
+
+
+def validate_existing_test_data_project_cache(project_dir: Path, workbook_path: Path) -> Path:
+    """
+    Validate that an existing TD project cache is present and populated enough
+    for Trend/Analyze to open without rebuilding.
+    """
+    proj_dir = Path(project_dir).expanduser()
+    wb_path = Path(workbook_path).expanduser()
+    db_path = proj_dir / EIDAT_PROJECT_IMPLEMENTATION_DB
+    guidance = (
+        "Trend/Analyze now opens the existing SQLite cache only. "
+        "Use 'Build / Refresh Cache' to create or refresh implementation_trending.sqlite3."
+    )
+
+    if not wb_path.exists():
+        raise FileNotFoundError(f"Workbook not found: {wb_path}")
+    if not db_path.exists() or not db_path.is_file():
+        raise RuntimeError(f"Project cache DB not found: {db_path}. {guidance}")
+
+    try:
+        with sqlite3.connect(str(db_path)) as conn:
+            _ensure_test_data_tables(conn)
+            required_tables = (
+                "td_runs",
+                "td_columns_raw",
+                "td_curves_raw",
+                "td_columns_calc",
+                "td_metrics_calc",
+            )
+            table_rows = conn.execute(
+                """
+                SELECT name
+                FROM sqlite_master
+                WHERE type='table' AND name IN (?, ?, ?, ?, ?)
+                """,
+                required_tables,
+            ).fetchall()
+            existing_tables = {str(r[0] or "").strip() for r in table_rows if str(r[0] or "").strip()}
+            missing_tables = [name for name in required_tables if name not in existing_tables]
+            if missing_tables:
+                raise RuntimeError(
+                    f"Project cache DB is incomplete ({', '.join(missing_tables)} missing): {db_path}. {guidance}"
+                )
+
+            runs_count = int(conn.execute("SELECT COUNT(*) FROM td_runs").fetchone()[0] or 0)
+            raw_curve_count = int(conn.execute("SELECT COUNT(*) FROM td_curves_raw").fetchone()[0] or 0)
+            raw_y_count = int(conn.execute("SELECT COUNT(*) FROM td_columns_raw WHERE kind='y'").fetchone()[0] or 0)
+            calc_y_count = int(conn.execute("SELECT COUNT(*) FROM td_columns_calc WHERE kind='y'").fetchone()[0] or 0)
+            metrics_count = int(conn.execute("SELECT COUNT(*) FROM td_metrics_calc").fetchone()[0] or 0)
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(f"Failed to validate project cache DB: {db_path}. {guidance}") from exc
+
+    if runs_count <= 0 or raw_curve_count <= 0 or raw_y_count <= 0 or calc_y_count <= 0 or metrics_count <= 0:
+        raise RuntimeError(f"Project cache DB is incomplete: {db_path}. {guidance}")
 
     return db_path
 
@@ -5145,6 +5231,147 @@ def _td_perf_norm_key(value: object) -> str:
     return "".join(ch.lower() for ch in str(value or "").strip() if ch.isalnum())
 
 
+TD_PERF_EQ_DEFAULTS = {
+    "perf_eq_min_distinct_x_points": 3,
+    "perf_eq_x_rel_tol": 0.05,
+    "perf_eq_x_abs_tol": 0.0,
+    "perf_eq_min_x_span_rel": 0.10,
+    "perf_eq_min_x_span_abs": 0.0,
+}
+
+
+def _td_perf_support_setting_float(settings: dict[str, object], key: str, default: float) -> float:
+    raw = settings.get(key)
+    if isinstance(raw, (int, float)):
+        try:
+            val = float(raw)
+        except Exception:
+            return float(default)
+        if math.isfinite(val):
+            return max(0.0, val)
+    return float(default)
+
+
+def _td_perf_support_setting_int(settings: dict[str, object], key: str, default: int) -> int:
+    raw = settings.get(key)
+    if isinstance(raw, (int, float)):
+        try:
+            val = int(float(raw))
+        except Exception:
+            return int(default)
+        return max(1, val)
+    return max(1, int(default))
+
+
+def _td_perf_load_support_settings(db_path: Path) -> dict[str, object]:
+    settings: dict[str, object] = {}
+    workbook_path_txt = ""
+    try:
+        with sqlite3.connect(str(db_path)) as conn:
+            _ensure_test_data_tables(conn)
+            row = conn.execute(
+                "SELECT value FROM td_meta WHERE key='workbook_path' LIMIT 1"
+            ).fetchone()
+            workbook_path_txt = str(row[0] or "").strip() if row else ""
+    except Exception:
+        workbook_path_txt = ""
+    if workbook_path_txt:
+        try:
+            support_cfg = _read_td_support_workbook(Path(workbook_path_txt), project_dir=db_path.parent)
+            raw = support_cfg.get("settings") or {}
+            if isinstance(raw, dict):
+                settings = dict(raw)
+        except Exception:
+            settings = {}
+    return settings
+
+
+def _td_perf_cluster_points(
+    points: list[dict],
+    *,
+    rel_tol: float,
+    abs_tol: float,
+) -> list[dict]:
+    ordered = []
+    for point in sorted(points, key=lambda item: (float(item.get("x") or 0.0), str(item.get("run_name") or "").lower())):
+        try:
+            x_val = float(point.get("x"))
+        except Exception:
+            continue
+        if not math.isfinite(x_val):
+            continue
+        point_copy = dict(point)
+        point_copy["x"] = x_val
+        ordered.append(point_copy)
+    if not ordered:
+        return []
+
+    clusters: list[dict] = []
+    for point in ordered:
+        x_val = float(point["x"])
+        if not clusters:
+            clusters.append(
+                {
+                    "x_center": x_val,
+                    "x_min": x_val,
+                    "x_max": x_val,
+                    "points": [point],
+                }
+            )
+            continue
+
+        cluster = clusters[-1]
+        ref = float(cluster.get("x_center") or x_val)
+        tol = max(float(abs_tol), float(rel_tol) * max(abs(ref), abs(x_val)))
+        if abs(x_val - ref) <= tol:
+            pts = list(cluster.get("points") or [])
+            pts.append(point)
+            x_min = min(float(cluster.get("x_min") or x_val), x_val)
+            x_max = max(float(cluster.get("x_max") or x_val), x_val)
+            cluster["points"] = pts
+            cluster["x_min"] = x_min
+            cluster["x_max"] = x_max
+            cluster["x_center"] = float(sum(float(p.get("x") or 0.0) for p in pts) / max(1, len(pts)))
+            continue
+
+        clusters.append(
+            {
+                "x_center": x_val,
+                "x_min": x_val,
+                "x_max": x_val,
+                "points": [point],
+            }
+        )
+
+    return clusters
+
+
+def _td_perf_summarize_points(
+    points: list[dict],
+    *,
+    min_distinct_x_points: int,
+    x_rel_tol: float,
+    x_abs_tol: float,
+    min_x_span_rel: float,
+    min_x_span_abs: float,
+) -> dict:
+    clusters = _td_perf_cluster_points(points, rel_tol=x_rel_tol, abs_tol=x_abs_tol)
+    centers = [float(c.get("x_center") or 0.0) for c in clusters]
+    distinct_x_points = len(centers)
+    x_span = float(max(centers) - min(centers)) if len(centers) >= 2 else 0.0
+    span_ref = max((abs(c) for c in centers), default=0.0)
+    min_required_span = max(float(min_x_span_abs), float(min_x_span_rel) * float(span_ref))
+    qualifies = bool(distinct_x_points >= max(1, int(min_distinct_x_points)) and x_span >= min_required_span)
+    return {
+        "clusters": clusters,
+        "distinct_x_points": distinct_x_points,
+        "x_span": x_span,
+        "min_required_span": min_required_span,
+        "source_point_count": len(points),
+        "qualifies": qualifies,
+    }
+
+
 def td_discover_performance_candidates(db_path: Path, config_path: Path | None = None) -> list[dict]:
     path = Path(db_path).expanduser()
     if not path.exists():
@@ -5156,6 +5383,32 @@ def td_discover_performance_candidates(db_path: Path, config_path: Path | None =
     legacy_plotters = cfg.get("performance_plotters") if isinstance(cfg, dict) else []
     if not isinstance(legacy_plotters, list):
         legacy_plotters = []
+    support_settings = _td_perf_load_support_settings(path)
+    default_min_distinct_x_points = _td_perf_support_setting_int(
+        support_settings,
+        "perf_eq_min_distinct_x_points",
+        int(TD_PERF_EQ_DEFAULTS["perf_eq_min_distinct_x_points"]),
+    )
+    x_rel_tol = _td_perf_support_setting_float(
+        support_settings,
+        "perf_eq_x_rel_tol",
+        float(TD_PERF_EQ_DEFAULTS["perf_eq_x_rel_tol"]),
+    )
+    x_abs_tol = _td_perf_support_setting_float(
+        support_settings,
+        "perf_eq_x_abs_tol",
+        float(TD_PERF_EQ_DEFAULTS["perf_eq_x_abs_tol"]),
+    )
+    min_x_span_rel = _td_perf_support_setting_float(
+        support_settings,
+        "perf_eq_min_x_span_rel",
+        float(TD_PERF_EQ_DEFAULTS["perf_eq_min_x_span_rel"]),
+    )
+    min_x_span_abs = _td_perf_support_setting_float(
+        support_settings,
+        "perf_eq_min_x_span_abs",
+        float(TD_PERF_EQ_DEFAULTS["perf_eq_min_x_span_abs"]),
+    )
 
     stat_priority = ["mean", "min", "max"]
     with sqlite3.connect(str(path)) as conn:
@@ -5226,12 +5479,20 @@ def td_discover_performance_candidates(db_path: Path, config_path: Path | None =
     for norm in sorted(display_name_by_norm.keys(), key=lambda k: str(display_name_by_norm.get(k) or k).lower()):
         qualifies = False
         for sn, runs_map in mean_values.items():
-            distinct_vals = {
-                float(run_cols[norm])
-                for run_cols in (runs_map or {}).values()
-                if isinstance(run_cols, dict) and norm in run_cols
-            }
-            if len(distinct_vals) >= 2:
+            axis_points = []
+            for run_name, run_cols in (runs_map or {}).items():
+                if not isinstance(run_cols, dict) or norm not in run_cols:
+                    continue
+                axis_points.append({"run_name": str(run_name), "x": float(run_cols[norm])})
+            summary = _td_perf_summarize_points(
+                axis_points,
+                min_distinct_x_points=default_min_distinct_x_points,
+                x_rel_tol=x_rel_tol,
+                x_abs_tol=x_abs_tol,
+                min_x_span_rel=min_x_span_rel,
+                min_x_span_abs=min_x_span_abs,
+            )
+            if bool(summary.get("qualifies")):
                 qualifies = True
                 break
         if qualifies:
@@ -5264,12 +5525,15 @@ def td_discover_performance_candidates(db_path: Path, config_path: Path | None =
                 require_min_points = max(2, int(legacy.get("require_min_points") or 2))
             except Exception:
                 require_min_points = 2
+            effective_min_points = max(require_min_points, default_min_distinct_x_points)
             qualifying_serials: list[str] = []
             point_inventory: dict[str, list[dict]] = {}
+            cluster_inventory: dict[str, list[dict]] = {}
+            distinct_x_points_by_serial: dict[str, int] = {}
+            x_span_by_serial: dict[str, float] = {}
             for sn in serial_order:
                 runs_map = mean_values.get(sn) or {}
                 points: list[dict] = []
-                unique_pairs: set[tuple[float, float]] = set()
                 for run_name in sorted(runs_map.keys(), key=lambda r: r.lower()):
                     cols = runs_map.get(run_name) or {}
                     if x_norm not in cols or y_norm not in cols:
@@ -5277,10 +5541,20 @@ def td_discover_performance_candidates(db_path: Path, config_path: Path | None =
                     x_val = float(cols[x_norm])
                     y_val = float(cols[y_norm])
                     points.append({"run_name": str(run_name), "x": x_val, "y": y_val})
-                    unique_pairs.add((x_val, y_val))
-                if len(unique_pairs) >= require_min_points:
+                summary = _td_perf_summarize_points(
+                    points,
+                    min_distinct_x_points=effective_min_points,
+                    x_rel_tol=x_rel_tol,
+                    x_abs_tol=x_abs_tol,
+                    min_x_span_rel=min_x_span_rel,
+                    min_x_span_abs=min_x_span_abs,
+                )
+                if bool(summary.get("qualifies")):
                     qualifying_serials.append(sn)
                     point_inventory[sn] = points
+                    cluster_inventory[sn] = list(summary.get("clusters") or [])
+                    distinct_x_points_by_serial[sn] = int(summary.get("distinct_x_points") or 0)
+                    x_span_by_serial[sn] = float(summary.get("x_span") or 0.0)
 
             if not qualifying_serials:
                 continue
@@ -5292,12 +5566,26 @@ def td_discover_performance_candidates(db_path: Path, config_path: Path | None =
                 qualified_for_stat: list[str] = []
                 for sn in qualifying_serials:
                     runs_map = stat_values.get(sn) or {}
-                    unique_pairs: set[tuple[float, float]] = set()
+                    points: list[dict] = []
                     for run_name, cols in runs_map.items():
                         if not isinstance(cols, dict) or x_norm not in cols or y_norm not in cols:
                             continue
-                        unique_pairs.add((float(cols[x_norm]), float(cols[y_norm])))
-                    if len(unique_pairs) >= require_min_points:
+                        points.append(
+                            {
+                                "run_name": str(run_name),
+                                "x": float(cols[x_norm]),
+                                "y": float(cols[y_norm]),
+                            }
+                        )
+                    summary = _td_perf_summarize_points(
+                        points,
+                        min_distinct_x_points=effective_min_points,
+                        x_rel_tol=x_rel_tol,
+                        x_abs_tol=x_abs_tol,
+                        min_x_span_rel=min_x_span_rel,
+                        min_x_span_abs=min_x_span_abs,
+                    )
+                    if bool(summary.get("qualifies")):
                         qualified_for_stat.append(sn)
                 if qualified_for_stat:
                     available_stats.append(st)
@@ -5314,6 +5602,11 @@ def td_discover_performance_candidates(db_path: Path, config_path: Path | None =
 
             x_name = str(display_name_by_norm.get(x_norm) or x_norm).strip()
             y_name = str(display_name_by_norm.get(y_norm) or y_norm).strip()
+            distinct_x_point_count = int(sum(distinct_x_points_by_serial.get(sn, 0) for sn in qualifying_serials))
+            min_distinct_x_points_per_serial = min(
+                [distinct_x_points_by_serial.get(sn, 0) for sn in qualifying_serials],
+                default=0,
+            )
             item = {
                 "name": str(legacy.get("name") or f"{y_name} vs {x_name}").strip() or f"{y_name} vs {x_name}",
                 "display_name": f"{y_name} vs {x_name}",
@@ -5329,12 +5622,22 @@ def td_discover_performance_candidates(db_path: Path, config_path: Path | None =
                 "qualifying_serials": list(qualifying_serials),
                 "qualifying_serials_by_stat": {k: list(v) for k, v in qualifying_by_stat.items()},
                 "points_by_serial": point_inventory,
+                "x_clusters_by_serial": cluster_inventory,
+                "distinct_x_points_by_serial": dict(distinct_x_points_by_serial),
+                "x_span_by_serial": dict(x_span_by_serial),
                 "fit": {
                     "degree": max(0, degree),
                     "normalize_x": bool(fit_cfg.get("normalize_x", True)),
                 },
-                "require_min_points": require_min_points,
+                "require_min_points": effective_min_points,
+                "legacy_require_min_points": require_min_points,
                 "source_point_count": int(sum(len(v) for v in point_inventory.values())),
+                "distinct_x_point_count": distinct_x_point_count,
+                "min_distinct_x_points_per_serial": int(min_distinct_x_points_per_serial),
+                "x_cluster_rel_tol": float(x_rel_tol),
+                "x_cluster_abs_tol": float(x_abs_tol),
+                "min_x_span_rel": float(min_x_span_rel),
+                "min_x_span_abs": float(min_x_span_abs),
                 "legacy_plotter": dict(legacy) if legacy else {},
             }
             available.append(item)
@@ -5342,6 +5645,7 @@ def td_discover_performance_candidates(db_path: Path, config_path: Path | None =
     available.sort(
         key=lambda item: (
             -int(item.get("qualifying_serial_count") or 0),
+            -int(item.get("distinct_x_point_count") or 0),
             str(item.get("display_name") or item.get("name") or "").lower(),
         )
     )
@@ -5544,6 +5848,52 @@ def update_test_data_trending_project_workbook(
     cfg_cols = [dict(c) for c in (runtime_cfg.get("columns") or []) if isinstance(c, dict)]
     cfg_order = [str(c.get("name") or "").strip() for c in cfg_cols if str(c.get("name") or "").strip()]
 
+    def _current_td_cache_signature() -> tuple[str, str, int]:
+        stats_sig = ",".join(
+            [
+                str(s).strip().lower()
+                for s in (runtime_cfg.get("statistics") or [])
+                if str(s).strip() and str(s).strip().lower() in TD_ALLOWED_STATS
+            ]
+        )
+        raw_cols_sig = ",".join([str(c.get("name") or "").strip() for c in cfg_cols if str(c.get("name") or "").strip()])
+        support_mtime_ns = 0
+        try:
+            support_path = td_support_workbook_path_for(wb_path, project_dir=project_dir)
+            if support_path.exists():
+                st = support_path.stat()
+                support_mtime_ns = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)))
+        except Exception:
+            support_mtime_ns = 0
+        return stats_sig, raw_cols_sig, int(support_mtime_ns)
+
+    def _cached_td_cache_signature(path: Path) -> tuple[str, str, int]:
+        stats_sig = ""
+        raw_cols_sig = ""
+        support_mtime_ns = 0
+        with sqlite3.connect(str(path)) as conn:
+            _ensure_test_data_tables(conn)
+            rows = conn.execute(
+                """
+                SELECT key, value
+                FROM td_meta
+                WHERE key IN ('statistics', 'raw_columns', 'support_workbook_mtime_ns')
+                """
+            ).fetchall()
+        for key, value in rows:
+            name = str(key or "").strip().lower()
+            txt = str(value or "").strip()
+            if name == "statistics":
+                stats_sig = txt
+            elif name == "raw_columns":
+                raw_cols_sig = txt
+            elif name == "support_workbook_mtime_ns":
+                try:
+                    support_mtime_ns = int(txt)
+                except Exception:
+                    support_mtime_ns = 0
+        return stats_sig, raw_cols_sig, int(support_mtime_ns)
+
     # Migration: legacy workbooks used `Data` as the computed metrics sheet ("Metric" in A1).
     if "Data_calc" not in wb.sheetnames and "Data" in wb.sheetnames:
         a1 = str(wb["Data"].cell(1, 1).value or "").strip().lower()
@@ -5588,6 +5938,10 @@ def update_test_data_trending_project_workbook(
     # Save any migration/creation before rebuilding cache (cache rebuild reads workbook from disk).
     if not dry_run:
         wb.save(str(wb_path))
+        current_sig = _current_td_cache_signature()
+        cached_sig = _cached_td_cache_signature(db_path)
+        if added_serials or cached_sig != current_sig:
+            db_path = ensure_test_data_project_cache(project_dir, wb_path, rebuild=True)
 
     def _parse_metric(s: object) -> tuple[str, str, str] | None:
         txt = str(s or "").strip()
@@ -5672,6 +6026,18 @@ def update_test_data_trending_project_workbook(
     updated_cells = 0
     missing_value = 0
 
+    def _cell_value_changed(current: object, new_value: object) -> bool:
+        if current in (None, "") and new_value in (None, ""):
+            return False
+        if isinstance(current, bool) or isinstance(new_value, bool):
+            return current != new_value
+        try:
+            if isinstance(current, (int, float)) and isinstance(new_value, (int, float)):
+                return abs(float(current) - float(new_value)) > 1e-9
+        except Exception:
+            pass
+        return current != new_value
+
     # Populate Data_calc values.
     serial_cols_calc = {str(sn): idx + 2 for idx, sn in enumerate(serials)}
     for r in range(2, (ws_data_calc.max_row or 0) + 1):
@@ -5682,22 +6048,26 @@ def update_test_data_trending_project_workbook(
         for sn, cidx in serial_cols_calc.items():
             key = (sn, run, col, stat)
             val = metric_map.get(key)
+            cell = ws_data_calc.cell(r, cidx)
             if val is None:
-                if not overwrite and ws_data_calc.cell(r, cidx).value not in (None, ""):
+                if not overwrite and cell.value not in (None, ""):
                     continue
-                ws_data_calc.cell(r, cidx).value = None
-                missing_value += 1
+                if _cell_value_changed(cell.value, None):
+                    ws_data_calc.cell(r, cidx).value = None
+                    missing_value += 1
                 continue
-            if not overwrite and ws_data_calc.cell(r, cidx).value not in (None, ""):
+            if not overwrite and cell.value not in (None, ""):
                 continue
             if stat == "count":
                 try:
-                    ws_data_calc.cell(r, cidx).value = int(float(val))
+                    new_value = int(float(val))
                 except Exception:
-                    ws_data_calc.cell(r, cidx).value = val
+                    new_value = val
             else:
-                ws_data_calc.cell(r, cidx).value = float(val)
-            updated_cells += 1
+                new_value = float(val)
+            if _cell_value_changed(cell.value, new_value):
+                ws_data_calc.cell(r, cidx).value = new_value
+                updated_cells += 1
 
     perf_sheet_name = "Performance_candidates"
     if perf_sheet_name in wb.sheetnames:
@@ -5722,6 +6092,8 @@ def update_test_data_trending_project_workbook(
             "qualifying_serial_count",
             "qualifying_serials",
             "source_point_count",
+            "distinct_x_point_count",
+            "min_distinct_x_points_per_serial",
             "available_stats",
             "equation_views",
         ]
@@ -5752,6 +6124,8 @@ def update_test_data_trending_project_workbook(
                 int(item.get("qualifying_serial_count") or 0),
                 serials_txt,
                 int(item.get("source_point_count") or 0),
+                int(item.get("distinct_x_point_count") or 0),
+                int(item.get("min_distinct_x_points_per_serial") or 0),
                 stats_txt,
                 views_txt,
             ]
@@ -10554,13 +10928,6 @@ def _load_excel_trend_config(path: Path) -> dict:
         stats_norm = list(TD_DEFAULT_STATS_ORDER)
     data["statistics"] = stats_norm
 
-    ign = data.get("statistics_ignore_first_n", 0)
-    try:
-        ign_i = int(str(ign).strip()) if not isinstance(ign, bool) else 0
-    except Exception:
-        ign_i = 0
-    data["statistics_ignore_first_n"] = max(0, int(ign_i))
-
     # Optional: performance plot definitions for Test Data Trend/Analyze.
     perf = data.get("performance_plotters")
     if perf is None:
@@ -11500,6 +11867,7 @@ def create_eidat_project(
         # Create/populate the project-local cache DB at project creation time so
         # Trend/Analyze can plot immediately from `implementation_trending.sqlite3`.
         ensure_test_data_project_cache(project_dir, workbook_path, rebuild=True)
+        update_test_data_trending_project_workbook(repo, workbook_path, overwrite=True)
 
     else:
         raise RuntimeError(f"Unsupported project type: {project_type}")
