@@ -3080,28 +3080,119 @@ def _read_test_data_config_columns(workbook_path: Path) -> list[dict]:
             return []
         ws = wb["Config"]
         header_row_idx: int | None = None
+        headers: dict[str, int] = {}
         for r in range(1, (ws.max_row or 0) + 1):
-            a = str(ws.cell(r, 1).value or "").strip().lower()
-            b = str(ws.cell(r, 2).value or "").strip().lower()
-            if a == "name" and b == "units":
+            row_headers: dict[str, int] = {}
+            for c in range(1, (ws.max_column or 0) + 1):
+                key = str(ws.cell(r, c).value or "").strip().lower()
+                if key:
+                    row_headers[key] = c
+            if row_headers.get("name") and row_headers.get("units"):
                 header_row_idx = r
+                headers = row_headers
                 break
         if header_row_idx is None:
             return []
 
         cols: list[dict] = []
         for r in range(header_row_idx + 1, (ws.max_row or 0) + 1):
-            name = str(ws.cell(r, 1).value or "").strip()
+            name = str(ws.cell(r, headers.get("name", 1)).value or "").strip()
             if not name:
                 break
-            units = str(ws.cell(r, 2).value or "").strip()
-            cols.append({"name": name, "units": units})
+            units = str(ws.cell(r, headers.get("units", 2)).value or "").strip()
+            aliases: list[str] = []
+            if headers.get("aliases"):
+                raw_aliases = ws.cell(r, headers["aliases"]).value
+                if raw_aliases is not None and str(raw_aliases).strip():
+                    try:
+                        parsed = json.loads(str(raw_aliases))
+                    except Exception:
+                        parsed = [part.strip() for part in str(raw_aliases).split(",")]
+                    if isinstance(parsed, (list, tuple)):
+                        aliases = [str(v).strip() for v in parsed if str(v).strip()]
+            cols.append({"name": name, "units": units, "aliases": aliases})
         return cols
     finally:
         try:
             wb.close()
         except Exception:
             pass
+
+
+def _read_test_data_config_statistics(workbook_path: Path) -> list[str]:
+    try:
+        from openpyxl import load_workbook  # type: ignore
+    except Exception as exc:
+        raise RuntimeError(
+            "openpyxl is required to read Test Data Trending workbooks. "
+            "Install it with `py -m pip install openpyxl` within the project environment."
+        ) from exc
+
+    wb = load_workbook(str(Path(workbook_path).expanduser()), read_only=True, data_only=True)
+    try:
+        if "Config" not in wb.sheetnames:
+            return []
+        ws = wb["Config"]
+        for r in range(2, (ws.max_row or 0) + 1):
+            key = str(ws.cell(r, 1).value or "").strip().lower()
+            if key != "statistics":
+                continue
+            raw = str(ws.cell(r, 2).value or "").strip()
+            vals = [part.strip().lower() for part in raw.split(",") if part.strip()]
+            vals = [v for v in vals if v in TD_ALLOWED_STATS]
+            return vals
+        return []
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
+
+
+def _load_project_td_trend_config(workbook_path: Path) -> dict:
+    runtime_cfg = _load_runtime_td_trend_config()
+    runtime_cols = [dict(c) for c in (runtime_cfg.get("columns") or []) if isinstance(c, dict)]
+    runtime_stats = [str(s).strip().lower() for s in (runtime_cfg.get("statistics") or []) if str(s).strip()]
+    runtime_stats = [s for s in runtime_stats if s in TD_ALLOWED_STATS]
+
+    workbook_cols = _read_test_data_config_columns(workbook_path)
+    workbook_stats = _read_test_data_config_statistics(workbook_path)
+
+    def _norm_name_local(value: object) -> str:
+        return "".join(ch.lower() for ch in str(value or "").strip() if ch.isalnum())
+
+    runtime_by_name = {
+        _norm_name_local(col.get("name")): dict(col)
+        for col in runtime_cols
+        if str(col.get("name") or "").strip()
+    }
+
+    columns: list[dict] = []
+    if workbook_cols:
+        for wb_col in workbook_cols:
+            name = str(wb_col.get("name") or "").strip()
+            if not name:
+                continue
+            merged = dict(runtime_by_name.get(_norm_name_local(name)) or {})
+            merged.update(dict(wb_col))
+            if not merged.get("aliases") and runtime_by_name.get(_norm_name_local(name), {}).get("aliases"):
+                merged["aliases"] = list(runtime_by_name[_norm_name_local(name)].get("aliases") or [])
+            columns.append(merged)
+        columns_source = "workbook_config"
+    else:
+        columns = runtime_cols
+        columns_source = "runtime_config"
+
+    statistics = workbook_stats or runtime_stats or list(TD_DEFAULT_STATS_ORDER)
+    statistics_source = "workbook_config" if workbook_stats else "runtime_config"
+
+    return {
+        "columns": columns,
+        "statistics": statistics,
+        "columns_source": columns_source,
+        "statistics_source": statistics_source,
+        "runtime_config": runtime_cfg,
+    }
 
 
 def _read_test_data_sources(workbook_path: Path) -> list[dict]:
@@ -3780,10 +3871,23 @@ def _is_generated_td_data_sheet(ws: object) -> bool:
 
 
 def _load_runtime_td_trend_config() -> dict:
-    try:
-        cfg = load_excel_trend_config(DEFAULT_EXCEL_TREND_CONFIG)
-    except Exception:
-        cfg = {}
+    cfg = {}
+    cfg_path = DEFAULT_EXCEL_TREND_CONFIG
+    fallback_used = False
+    tried: list[Path] = []
+    for candidate in (DEFAULT_EXCEL_TREND_CONFIG, CENTRAL_EXCEL_TREND_CONFIG):
+        if candidate in tried:
+            continue
+        tried.append(candidate)
+        try:
+            loaded = load_excel_trend_config(candidate)
+        except Exception:
+            loaded = {}
+        if isinstance(loaded, dict) and loaded:
+            cfg = dict(loaded)
+            cfg_path = candidate
+            fallback_used = candidate != DEFAULT_EXCEL_TREND_CONFIG
+            break
     if not isinstance(cfg, dict):
         cfg = {}
     cols = [dict(c) for c in (cfg.get("columns") or []) if isinstance(c, dict)]
@@ -3791,7 +3895,13 @@ def _load_runtime_td_trend_config() -> dict:
     stats = [s for s in stats if s in TD_ALLOWED_STATS]
     if not stats:
         stats = list(TD_DEFAULT_STATS_ORDER)
-    return {"config": cfg, "columns": cols, "statistics": stats}
+    return {
+        "config": cfg,
+        "columns": cols,
+        "statistics": stats,
+        "path": str(cfg_path),
+        "fallback_used": bool(fallback_used),
+    }
 
 
 def _ordered_support_param_defs(
@@ -4034,24 +4144,13 @@ def ensure_test_data_project_cache(
     except Exception:
         cached_stats_csv = ""
 
-    current_stats: list[str] = []
-    try:
-        current_stats = list((_load_excel_trend_config(DEFAULT_EXCEL_TREND_CONFIG) or {}).get("statistics") or [])
-    except Exception:
-        current_stats = []
-    current_stats = [str(s).strip().lower() for s in current_stats if str(s).strip()]
-    current_stats = [s for s in current_stats if s in TD_ALLOWED_STATS]
-    if not current_stats:
-        current_stats = list(TD_DEFAULT_STATS_ORDER)
+    project_cfg = _load_project_td_trend_config(wb_path)
+    current_stats = [str(s).strip().lower() for s in (project_cfg.get("statistics") or []) if str(s).strip()]
+    current_stats = [s for s in current_stats if s in TD_ALLOWED_STATS] or list(TD_DEFAULT_STATS_ORDER)
     current_stats_csv = ",".join(current_stats)
-    current_raw_cols_csv = ""
-    try:
-        runtime_cfg = _load_runtime_td_trend_config()
-        current_raw_cols_csv = ",".join(
-            [str(c.get("name") or "").strip() for c in (runtime_cfg.get("columns") or []) if str(c.get("name") or "").strip()]
-        )
-    except Exception:
-        current_raw_cols_csv = ""
+    current_raw_cols_csv = ",".join(
+        [str(c.get("name") or "").strip() for c in (project_cfg.get("columns") or []) if str(c.get("name") or "").strip()]
+    )
     cached_raw_cols_csv = ""
     try:
         with sqlite3.connect(str(db_path)) as conn:
@@ -4313,17 +4412,15 @@ def _rebuild_test_data_project_calc_cache_from_raw(db_path: Path, workbook_path:
             f"Run 'Build / Refresh Cache' first to create or refresh {EIDAT_PROJECT_TD_RAW_CACHE_DB}."
         )
 
-    runtime_cfg = _load_runtime_td_trend_config()
-    cfg_cols = [dict(c) for c in (runtime_cfg.get("columns") or []) if isinstance(c, dict)]
+    project_cfg = _load_project_td_trend_config(wb_path)
+    cfg_cols = [dict(c) for c in (project_cfg.get("columns") or []) if isinstance(c, dict)]
     cfg_units = {
         str(c.get("name") or "").strip(): str(c.get("units") or "").strip()
         for c in cfg_cols
         if str(c.get("name") or "").strip()
     }
-    selected_stats = [str(s).strip().lower() for s in (runtime_cfg.get("statistics") or []) if str(s).strip()]
-    selected_stats = [s for s in selected_stats if s in TD_ALLOWED_STATS]
-    if not selected_stats:
-        selected_stats = list(TD_DEFAULT_STATS_ORDER)
+    selected_stats = [str(s).strip().lower() for s in (project_cfg.get("statistics") or []) if str(s).strip()]
+    selected_stats = [s for s in selected_stats if s in TD_ALLOWED_STATS] or list(TD_DEFAULT_STATS_ORDER)
 
     support_cfg = _read_td_support_workbook(wb_path, project_dir=db_path.parent)
     support_settings = dict(support_cfg.get("settings") or {})
@@ -4668,8 +4765,8 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     raw_db_path.parent.mkdir(parents=True, exist_ok=True)
 
-    runtime_cfg = _load_runtime_td_trend_config()
-    cfg_cols = [dict(c) for c in (runtime_cfg.get("columns") or []) if isinstance(c, dict)]
+    project_cfg = _load_project_td_trend_config(wb_path)
+    cfg_cols = [dict(c) for c in (project_cfg.get("columns") or []) if isinstance(c, dict)]
     y_cols: list[tuple[str, str]] = []
     cfg_units: dict[str, str] = {}
     for c in cfg_cols:
@@ -4686,10 +4783,8 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
     computed_epoch_ns = time.time_ns()
 
     # Stats selection is driven entirely by user_inputs/excel_trend_config.json.
-    selected_stats = [str(s).strip().lower() for s in (runtime_cfg.get("statistics") or []) if str(s).strip()]
-    selected_stats = [s for s in selected_stats if s in TD_ALLOWED_STATS]
-    if not selected_stats:
-        selected_stats = list(TD_DEFAULT_STATS_ORDER)
+    selected_stats = [str(s).strip().lower() for s in (project_cfg.get("statistics") or []) if str(s).strip()]
+    selected_stats = [s for s in selected_stats if s in TD_ALLOWED_STATS] or list(TD_DEFAULT_STATS_ORDER)
 
     support_cfg = _read_td_support_workbook(wb_path, project_dir=db_path.parent)
     support_settings = dict(support_cfg.get("settings") or {})
@@ -5859,6 +5954,13 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
         "workbook": str(wb_path),
         "implementation_db": str(db_path),
         "raw_db": str(raw_db_path),
+        "project_config": {
+            "columns_source": str(project_cfg.get("columns_source") or ""),
+            "statistics_source": str(project_cfg.get("statistics_source") or ""),
+            "runtime_config_path": str((project_cfg.get("runtime_config") or {}).get("path") or ""),
+            "runtime_config_fallback_used": bool((project_cfg.get("runtime_config") or {}).get("fallback_used")),
+            "central_config_path": str(CENTRAL_EXCEL_TREND_CONFIG),
+        },
         "statistics": list(selected_stats),
         "configured_columns": [
             {
@@ -6937,15 +7039,15 @@ def update_test_data_trending_project_workbook(
         except Exception:
             pass
 
-    runtime_cfg = _load_runtime_td_trend_config()
-    cfg_cols = [dict(c) for c in (runtime_cfg.get("columns") or []) if isinstance(c, dict)]
+    project_cfg = _load_project_td_trend_config(wb_path)
+    cfg_cols = [dict(c) for c in (project_cfg.get("columns") or []) if isinstance(c, dict)]
     cfg_order = [str(c.get("name") or "").strip() for c in cfg_cols if str(c.get("name") or "").strip()]
 
     def _current_td_cache_signature() -> tuple[str, str, int]:
         stats_sig = ",".join(
             [
                 str(s).strip().lower()
-                for s in (runtime_cfg.get("statistics") or [])
+                for s in (project_cfg.get("statistics") or [])
                 if str(s).strip() and str(s).strip().lower() in TD_ALLOWED_STATS
             ]
         )
@@ -7075,10 +7177,8 @@ def update_test_data_trending_project_workbook(
         if k[0] and k[1] and u:
             units_map[k] = u
 
-    stats = [str(s).strip().lower() for s in (runtime_cfg.get("statistics") or []) if str(s).strip()]
-    stats = [s for s in stats if s in TD_ALLOWED_STATS]
-    if not stats:
-        stats = list(TD_DEFAULT_STATS_ORDER)
+    stats = [str(s).strip().lower() for s in (project_cfg.get("statistics") or []) if str(s).strip()]
+    stats = [s for s in stats if s in TD_ALLOWED_STATS] or list(TD_DEFAULT_STATS_ORDER)
 
     # Rebuild Data_calc rows from cache runs + y columns union.
     runs = [str(r[0] or "").strip() for r in runs_rows if str(r[0] or "").strip()]
@@ -12222,7 +12322,7 @@ def _write_test_data_trending_workbook(
     ws_cfg.append(["statistics", ", ".join(stats)])
     ws_cfg.append(["", ""])
     ws_cfg.append(["Columns", ""])
-    ws_cfg.append(["name", "units", "range_min", "range_max"])
+    ws_cfg.append(["name", "units", "aliases", "range_min", "range_max"])
     for c in cfg_cols:
         if not isinstance(c, dict):
             continue
@@ -12230,6 +12330,7 @@ def _write_test_data_trending_workbook(
             [
                 str(c.get("name") or "").strip(),
                 str(c.get("units") or "").strip(),
+                json.dumps(c.get("aliases") or [], ensure_ascii=False),
                 json.dumps(c.get("range_min"), ensure_ascii=False),
                 json.dumps(c.get("range_max"), ensure_ascii=False),
             ]

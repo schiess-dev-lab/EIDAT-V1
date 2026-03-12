@@ -274,6 +274,54 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 self.assertIsNotNone(mean_row)
                 self.assertAlmostEqual(float(mean_row[0]), 35.0)
 
+    def test_rebuild_prefers_workbook_config_columns_over_runtime_config(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            src_db = root / "src.sqlite3"
+            self._make_source_sqlite(src_db)
+
+            wb_path = root / "project.xlsx"
+            be._write_test_data_trending_workbook(
+                wb_path,
+                global_repo=root,
+                serials=["SN1"],
+                docs=[{"serial_number": "SN1", "excel_sqlite_rel": str(src_db)}],
+                config=self._make_config(),
+            )
+            support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+            be._write_td_support_workbook(
+                support_path,
+                sequence_names=["RunA"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+            )
+
+            with mock.patch.object(
+                be,
+                "_load_runtime_td_trend_config",
+                return_value={
+                    "config": {"columns": [{"name": "bogus", "units": ""}], "statistics": ["mean"]},
+                    "columns": [{"name": "bogus", "units": ""}],
+                    "statistics": ["mean"],
+                    "path": "bogus.json",
+                    "fallback_used": False,
+                },
+            ):
+                payload = be.rebuild_test_data_project_cache(root / "implementation_trending.sqlite3", wb_path)
+
+            self.assertGreater(int(payload.get("curves_written") or 0), 0)
+            with sqlite3.connect(str(root / "test_data_raw_cache.sqlite3")) as conn:
+                row = conn.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM td_curves_raw
+                    WHERE run_name=? AND y_name=? AND x_name=? AND serial=?
+                    """,
+                    ("RunA", "thrust", "Time", "SN1"),
+                ).fetchone()
+            self.assertEqual(int(row[0] or 0), 1)
+
     def test_update_workbook_adds_support_named_rows(self) -> None:
         from openpyxl import load_workbook  # type: ignore
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
@@ -533,6 +581,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 wb.close()
 
     def test_calc_cache_can_be_rebuilt_from_raw_db_without_source_sqlite(self) -> None:
+        from openpyxl import load_workbook  # type: ignore
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
 
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
@@ -545,6 +594,16 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 docs=[{"serial_number": "SN1", "excel_sqlite_rel": "missing.sqlite3"}],
                 config=self._make_config(),
             )
+            wb = load_workbook(str(wb_path))
+            try:
+                ws_cfg = wb["Config"]
+                for row in range(2, (ws_cfg.max_row or 0) + 1):
+                    if str(ws_cfg.cell(row, 1).value or "").strip().lower() == "statistics":
+                        ws_cfg.cell(row, 2).value = "mean, max"
+                        break
+                wb.save(str(wb_path))
+            finally:
+                wb.close()
             support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
             be._write_td_support_workbook(
                 support_path,
