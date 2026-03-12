@@ -539,6 +539,48 @@ class TestTDSupportWorkbook(unittest.TestCase):
             xs = be.td_list_x_columns(db_path, "RunA")
             self.assertEqual(xs, ["Time", "Pulse Number"])
 
+    def test_td_load_curves_reads_materialized_raw_curve_table(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            db_path = root / "test_data_raw_cache.sqlite3"
+            table_name = "td_raw__runa__thrust"
+            with sqlite3.connect(str(db_path)) as conn:
+                be._ensure_test_data_raw_cache_tables(conn)
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO td_raw_curve_catalog
+                    (run_name, parameter_name, units, x_axis_kind, table_name, display_name, source_kind, computed_epoch_ns)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    ("RunA", "thrust", "lbf", "Time", table_name, "", "source_sqlite", 1),
+                )
+                conn.execute(
+                    f"""
+                    CREATE TABLE {be._quote_ident(table_name)} (
+                        serial TEXT PRIMARY KEY,
+                        x_json TEXT NOT NULL,
+                        y_json TEXT NOT NULL,
+                        n_points INTEGER NOT NULL,
+                        source_mtime_ns INTEGER,
+                        computed_epoch_ns INTEGER NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    f"""
+                    INSERT OR REPLACE INTO {be._quote_ident(table_name)}
+                    (serial, x_json, y_json, n_points, source_mtime_ns, computed_epoch_ns)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    ("SN1", "[0,1,2]", "[10,20,30]", 3, 1, 1),
+                )
+                conn.commit()
+
+            curves = be.td_load_curves(db_path, "RunA", "thrust", "Time")
+            self.assertEqual(curves, [{"serial": "SN1", "x": [0, 1, 2], "y": [10, 20, 30]}])
+
     def test_rebuild_writes_excel_mirror_for_project_cache(self) -> None:
         from openpyxl import load_workbook  # type: ignore
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
@@ -566,8 +608,10 @@ class TestTDSupportWorkbook(unittest.TestCase):
             db_path = be.ensure_test_data_project_cache(root, wb_path, rebuild=True)
             impl_mirror_path = db_path.with_suffix(".xlsx")
             raw_mirror_path = (root / "test_data_raw_cache.sqlite3").with_suffix(".xlsx")
+            raw_points_path = root / "test_data_raw_points.xlsx"
             self.assertTrue(impl_mirror_path.exists())
             self.assertTrue(raw_mirror_path.exists())
+            self.assertTrue(raw_points_path.exists())
 
             wb = load_workbook(str(impl_mirror_path), read_only=True, data_only=True)
             try:
@@ -577,6 +621,16 @@ class TestTDSupportWorkbook(unittest.TestCase):
             wb = load_workbook(str(raw_mirror_path), read_only=True, data_only=True)
             try:
                 self.assertIn("td_curves_raw", wb.sheetnames)
+            finally:
+                wb.close()
+            wb = load_workbook(str(raw_points_path), read_only=True, data_only=True)
+            try:
+                self.assertIn("RunA__thrust__Time", wb.sheetnames)
+                ws = wb["RunA__thrust__Time"]
+                self.assertEqual(ws.cell(1, 1).value, "Time")
+                self.assertEqual(ws.cell(1, 2).value, "SN1")
+                self.assertEqual(ws.cell(2, 1).value, 0)
+                self.assertEqual(ws.cell(2, 2).value, 10)
             finally:
                 wb.close()
 

@@ -2303,6 +2303,7 @@ EIDAT_PROJECT_TYPE_RAW_TRENDING = "EIDP Raw File Trending"
 EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING = "Test Data Trending"
 EIDAT_PROJECT_IMPLEMENTATION_DB = "implementation_trending.sqlite3"
 EIDAT_PROJECT_TD_RAW_CACHE_DB = "test_data_raw_cache.sqlite3"
+EIDAT_PROJECT_TD_RAW_POINTS_XLSX = "test_data_raw_points.xlsx"
 TD_SUPPORT_WORKBOOK_SUFFIX = ".support.xlsx"
 GLOBAL_RUN_MIRROR_DIRNAME = "global_run_mirror"
 LOCAL_PROJECTS_MIRROR_DIRNAME = "projects"
@@ -2466,6 +2467,10 @@ def _sqlite_drop_table(conn: sqlite3.Connection, table: str) -> None:
         conn.execute(f'DROP TABLE IF EXISTS "{safe}"')
     except Exception:
         pass
+
+
+def _quote_ident(name: str) -> str:
+    return '"' + str(name or "").replace('"', '""') + '"'
 
 
 def load_trending_project_terms(db_path: Path) -> list[dict]:
@@ -4299,7 +4304,150 @@ def _sync_sqlite_excel_mirror(db_path: Path, *, force: bool = False) -> Path | N
                 ws.column_dimensions[get_column_letter(col_idx)].width = max_len + 3
             ws.freeze_panes = "A2"
 
-        wb.save(str(out_path))
+    wb.save(str(out_path))
+    if db_path.name.lower() == EIDAT_PROJECT_TD_RAW_CACHE_DB.lower():
+        try:
+            _sync_td_raw_points_workbook(db_path, force=force)
+        except Exception:
+            pass
+    return out_path
+
+
+def _sync_td_raw_points_workbook(db_path: Path, *, force: bool = False) -> Path | None:
+    db_path = Path(db_path).expanduser()
+    if not db_path.exists() or not db_path.is_file():
+        return None
+    out_path = db_path.with_name(EIDAT_PROJECT_TD_RAW_POINTS_XLSX)
+    if not force:
+        try:
+            db_mtime_ns = int(db_path.stat().st_mtime_ns)
+            xlsx_mtime_ns = int(out_path.stat().st_mtime_ns) if out_path.exists() else 0
+            if out_path.exists() and xlsx_mtime_ns >= db_mtime_ns:
+                return out_path
+        except Exception:
+            pass
+    try:
+        from openpyxl import Workbook  # type: ignore
+        from openpyxl.styles import Alignment, Font, PatternFill  # type: ignore
+        from openpyxl.utils import get_column_letter  # type: ignore
+    except Exception:
+        return None
+
+    def _safe_sheet_name(name: str, used: set[str]) -> str:
+        base = re.sub(r'[:\\/?*\\[\\]]+', "_", str(name or "").strip()) or "raw"
+        base = base[:31].rstrip() or "raw"
+        cand = base
+        idx = 2
+        while cand.lower() in {u.lower() for u in used}:
+            suffix = f"_{idx}"
+            cand = (base[: max(0, 31 - len(suffix))] + suffix).rstrip() or f"raw_{idx}"
+            idx += 1
+        used.add(cand)
+        return cand
+
+    def _x_key(value: object) -> tuple[str, object]:
+        try:
+            f = float(value)
+        except Exception:
+            return ("s", str(value))
+        if not math.isfinite(f):
+            return ("s", str(value))
+        if abs(f - round(f)) < 1e-9:
+            return ("i", int(round(f)))
+        return ("f", round(f, 12))
+
+    def _display_x(value: object) -> object:
+        try:
+            f = float(value)
+        except Exception:
+            return value
+        if not math.isfinite(f):
+            return value
+        if abs(f - round(f)) < 1e-9:
+            return int(round(f))
+        return float(f)
+
+    with sqlite3.connect(str(db_path)) as conn:
+        _ensure_test_data_raw_cache_tables(conn)
+        rows = conn.execute(
+            """
+            SELECT run_name, y_name, x_name, serial, x_json, y_json
+            FROM td_curves_raw
+            ORDER BY run_name, y_name, x_name, serial
+            """
+        ).fetchall()
+    if not rows:
+        return None
+
+    grouped: dict[tuple[str, str, str], dict[str, list[tuple[object, object]]]] = {}
+    for run_name, y_name, x_name, serial, x_json, y_json in rows:
+        run = str(run_name or "").strip()
+        y = str(y_name or "").strip()
+        x = str(x_name or "").strip()
+        sn = str(serial or "").strip()
+        if not run or not y or not x or not sn:
+            continue
+        try:
+            xs = json.loads(x_json or "[]")
+            ys = json.loads(y_json or "[]")
+        except Exception:
+            xs, ys = [], []
+        points = list(zip(list(xs), list(ys)))
+        grouped.setdefault((run, y, x), {})[sn] = points
+    if not grouped:
+        return None
+
+    header_font = Font(bold=True)
+    header_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+    wb = Workbook()
+    wb.remove(wb.active)
+    used_sheet_names: set[str] = set()
+
+    for (run, y, x_name), serial_map in sorted(grouped.items(), key=lambda item: tuple(str(v).lower() for v in item[0])):
+        sheet_name = _safe_sheet_name(f"{run}__{y}__{x_name}", used_sheet_names)
+        ws = wb.create_sheet(title=sheet_name)
+        serials = sorted(serial_map.keys(), key=lambda value: value.lower())
+        ws.append([x_name] + serials)
+        ordered_keys: list[tuple[str, object]] = []
+        display_by_key: dict[tuple[str, object], object] = {}
+        values_by_serial: dict[str, dict[tuple[str, object], object]] = {serial: {} for serial in serials}
+        seen_keys: set[tuple[str, object]] = set()
+
+        for serial in serials:
+            for x_raw, y_raw in serial_map.get(serial, []):
+                key = _x_key(x_raw)
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    ordered_keys.append(key)
+                    display_by_key[key] = _display_x(x_raw)
+                values_by_serial.setdefault(serial, {})
+                if key not in values_by_serial[serial]:
+                    values_by_serial[serial][key] = y_raw
+
+        def _sort_key(item: tuple[str, object]) -> tuple[int, object]:
+            if item[0] == "s":
+                return (1, str(item[1]))
+            return (0, item[1])
+
+        ordered_keys.sort(key=_sort_key)
+        for key in ordered_keys:
+            ws.append([display_by_key.get(key)] + [values_by_serial.get(serial, {}).get(key) for serial in serials])
+
+        for col_idx in range(1, len(serials) + 2):
+            cell = ws.cell(1, col_idx)
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal="center")
+            if col_idx == 1:
+                ws.column_dimensions[get_column_letter(col_idx)].width = max(14, len(str(x_name or "")) + 2)
+            else:
+                ws.column_dimensions[get_column_letter(col_idx)].width = max(14, len(str(ws.cell(1, col_idx).value or "")) + 2)
+        try:
+            ws.freeze_panes = "B2"
+        except Exception:
+            pass
+
+    wb.save(str(out_path))
     return out_path
 
 
