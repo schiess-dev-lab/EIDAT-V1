@@ -4036,6 +4036,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         )
         if not self._perf_available_stats:
             self._perf_available_stats = ["mean", "min", "max", "std"]
+        elif "mean" not in self._perf_available_stats:
+            self._perf_available_stats.insert(0, "mean")
 
         # Keep the Metrics tab stat selector consistent with excel_trend_config.json.
         if hasattr(self, "list_stats"):
@@ -6328,6 +6330,40 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             out[sn] = float(v)
         return out
 
+    def _perf_bounds_mode(self, plotter: dict | None) -> str:
+        normalize = getattr(be, "td_perf_normalize_bounds_mode", None)
+        if callable(normalize):
+            try:
+                return str(normalize((plotter or {}).get("bounds_mode"))).strip().lower()
+            except Exception:
+                pass
+        raw = str((plotter or {}).get("bounds_mode") or "").strip().lower()
+        return raw if raw in {"actual", "median_3sigma"} else "median_3sigma"
+
+    def _perf_bounds_mode_label(self, bounds_mode: str) -> str:
+        return "median +/- 3sigma" if str(bounds_mode or "").strip().lower() == "median_3sigma" else "actual min/max"
+
+    def _load_perf_display_metric_map(self, run_name: str, col_name: str, display_stat: str, *, bounds_mode: str) -> dict[str, float]:
+        st = str(display_stat or "").strip().lower()
+        if not st:
+            return {}
+        source_stats = {st}
+        if st in {"min", "max"}:
+            source_stats.update({"median", "std"})
+        source_maps = {src: self._load_metric_map(run_name, col_name, src) for src in source_stats}
+        resolver = getattr(be, "td_perf_display_value", None)
+        serials = sorted({sn for mapping in source_maps.values() for sn in mapping.keys()})
+        out: dict[str, float] = {}
+        for sn in serials:
+            values = {src: mapping.get(sn) for src, mapping in source_maps.items()}
+            try:
+                val = resolver(values, st, bounds_mode=bounds_mode) if callable(resolver) else None
+            except Exception:
+                val = None
+            if isinstance(val, (int, float)) and math.isfinite(float(val)):
+                out[sn] = float(val)
+        return out
+
     def _resolve_td_y_col_units(self, run_name: str, target: str) -> tuple[str, str]:
         tgt = str(target or "").strip()
         if not tgt or not self._db_path:
@@ -6530,15 +6566,17 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         y_target = str(r.get("y_target") or "").strip()
         x_units = str(r.get("x_units") or "").strip()
         y_units = str(r.get("y_units") or "").strip()
+        bounds_mode = str(r.get("bounds_mode") or "").strip().lower()
+        stat_label = f"{st} (median +/- 3sigma)" if st in {"min", "max"} and bounds_mode == "median_3sigma" else st
 
         hi_sn = str(getattr(self, "_highlight_sn", "") or "").strip()
         preset_name = str(getattr(self, "cb_perf_plotter", None).currentText() if hasattr(self, "cb_perf_plotter") else "Performance").strip()
-        title = f"Performance — {preset_name} — {st}"
+        title = f"Performance — {preset_name} — {stat_label}"
 
         self._axes.clear()
         self._axes.set_title(title)
-        self._axes.set_xlabel(f"{x_target}.{st}" + (f" ({x_units})" if x_units else ""))
-        self._axes.set_ylabel(f"{y_target}.{st}" + (f" ({y_units})" if y_units else ""))
+        self._axes.set_xlabel(f"{x_target}.{stat_label}" + (f" ({x_units})" if x_units else ""))
+        self._axes.set_ylabel(f"{y_target}.{stat_label}" + (f" ({y_units})" if y_units else ""))
 
         # Draw all serials faint.
         for sn, pts in curves.items():
@@ -6874,6 +6912,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         )
         if not self._perf_available_stats:
             self._perf_available_stats = ["mean", "min", "max", "std"]
+        elif "mean" not in self._perf_available_stats:
+            self._perf_available_stats.insert(0, "mean")
 
         if hasattr(self, "list_stats"):
             try:
@@ -6988,6 +7028,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         except Exception:
             req = 2
         self._perf_require_min_points = max(2, int(req))
+        bounds_mode = self._perf_bounds_mode(plotter)
 
         if hasattr(self, "lbl_perf_axes"):
             self.lbl_perf_axes.setText(f"X: {x_target or '-'} | Y: {y_target or '-'}")
@@ -6997,7 +7038,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             min_per_serial = int(plotter.get("min_distinct_x_points_per_serial") or 0)
             views = ", ".join([str(v).strip() for v in (plotter.get("available_equation_views") or []) if str(v).strip()])
             self.lbl_perf_common_runs.setText(
-                f"Qualifying serials: {count} | Distinct X clusters: {distinct_x} total, {min_per_serial}+ per serial | Stats: {', '.join(stats)} | Views: {views or 'master, serial'}"
+                f"Qualifying serials: {count} | Distinct X clusters: {distinct_x} total, {min_per_serial}+ per serial | Stats: {', '.join(stats)} | Bounds: {self._perf_bounds_mode_label(bounds_mode)} | Views: {views or 'master, serial'}"
             )
 
         if hasattr(self, "list_perf_stats"):
@@ -7082,6 +7123,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         except Exception:
             require_min_points = 2
         self._perf_require_min_points = require_min_points
+        bounds_mode = self._perf_bounds_mode(plotter)
 
         self._perf_results_by_stat = {}
 
@@ -7092,8 +7134,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 y_col, y_units = self._resolve_td_y_col_units(rn, y_target)
                 if not x_col or not y_col:
                     continue
-                xmap = self._load_metric_map(rn, x_col, st)
-                ymap = self._load_metric_map(rn, y_col, st)
+                xmap = self._load_perf_display_metric_map(rn, x_col, st, bounds_mode=bounds_mode)
+                ymap = self._load_perf_display_metric_map(rn, y_col, st, bounds_mode=bounds_mode)
                 if not xmap or not ymap:
                     continue
                 per_run.append((rn, self._run_display_text(rn), xmap, ymap, x_units, y_units))
@@ -7158,6 +7200,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 "y_target": y_target,
                 "x_units": x_units,
                 "y_units": y_units,
+                "bounds_mode": bounds_mode,
                 "curves": curves,
                 "master_model": master_model,
                 "highlight_serial": "",

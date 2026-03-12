@@ -88,6 +88,22 @@ MASTER_BASE_COLUMNS = {"Term Label", "Data Group", "Units", "Min", "Max"}
 REPO_NAME_FILE = DATA_ROOT / "user_inputs" / "repo_root_name.txt"
 
 
+def _td_normalize_selected_stats(stats: object) -> list[str]:
+    raw = [str(s).strip().lower() for s in (stats or []) if str(s).strip()] if isinstance(stats, list) else []
+    out: list[str] = []
+    seen: set[str] = set()
+    for stat in raw:
+        if stat not in TD_ALLOWED_STATS or stat in seen:
+            continue
+        seen.add(stat)
+        out.append(stat)
+    if not out:
+        out = list(TD_DEFAULT_STATS_ORDER)
+    if "mean" not in seen:
+        out.insert(0, "mean")
+    return out
+
+
 def _read_repo_root_name() -> str:
     try:
         if not REPO_NAME_FILE.exists():
@@ -4765,8 +4781,7 @@ def _rebuild_test_data_project_calc_cache_from_raw(db_path: Path, workbook_path:
         for c in cfg_cols
         if str(c.get("name") or "").strip()
     }
-    selected_stats = [str(s).strip().lower() for s in (project_cfg.get("statistics") or []) if str(s).strip()]
-    selected_stats = [s for s in selected_stats if s in TD_ALLOWED_STATS] or list(TD_DEFAULT_STATS_ORDER)
+    selected_stats = _td_normalize_selected_stats(project_cfg.get("statistics"))
 
     support_cfg = _read_td_support_workbook(wb_path, project_dir=db_path.parent)
     support_settings = dict(support_cfg.get("settings") or {})
@@ -5124,8 +5139,7 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
     computed_epoch_ns = time.time_ns()
 
     # Stats selection is driven entirely by user_inputs/excel_trend_config.json.
-    selected_stats = [str(s).strip().lower() for s in (project_cfg.get("statistics") or []) if str(s).strip()]
-    selected_stats = [s for s in selected_stats if s in TD_ALLOWED_STATS] or list(TD_DEFAULT_STATS_ORDER)
+    selected_stats = _td_normalize_selected_stats(project_cfg.get("statistics"))
 
     support_cfg = _read_td_support_workbook(wb_path, project_dir=db_path.parent)
     support_settings = dict(support_cfg.get("settings") or {})
@@ -5217,6 +5231,7 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
         col_list: list[str],
         aliases: list[str],
         *,
+        preferred_label: str = "",
         fuzzy_enabled: bool,
         min_ratio: float,
     ) -> list[tuple[str, float, int]]:
@@ -5227,6 +5242,7 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
         if not col_list or not aliases:
             return []
         # Precompute normalized forms for fast exact matching.
+        preferred_norm = _norm_name(preferred_label)
         alias_norms = {_norm_name(a) for a in aliases if _norm_name(a)}
         out: list[tuple[str, float, int]] = []
         for idx, col in enumerate(col_list):
@@ -5250,7 +5266,14 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
                     best = float(score)
             if best >= float(min_ratio):
                 out.append((c, float(best), int(idx)))
-        out.sort(key=lambda t: (int(t[2]), -float(t[1]), str(t[0]).lower()))
+        out.sort(
+            key=lambda t: (
+                0 if preferred_norm and _norm_name(t[0]) == preferred_norm else 1,
+                int(t[2]),
+                -float(t[1]),
+                str(t[0]).lower(),
+            )
+        )
         return out
 
     def _probe_finite_values(
@@ -5962,6 +5985,7 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
                     for c, _score, _idx in _match_by_aliases(
                         col_list,
                         time_aliases,
+                        preferred_label=X_TIME,
                         fuzzy_enabled=bool(fm_enabled),
                         min_ratio=float(fm_min_ratio),
                     ):
@@ -5982,6 +6006,7 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
                     for c, _score, _idx in _match_by_aliases(
                         col_list,
                         pulse_aliases,
+                        preferred_label=X_PULSE,
                         fuzzy_enabled=bool(fm_enabled),
                         min_ratio=float(fm_min_ratio),
                     ):
@@ -6691,6 +6716,51 @@ def _td_perf_norm_key(value: object) -> str:
     return "".join(ch.lower() for ch in str(value or "").strip() if ch.isalnum())
 
 
+TD_PERF_BOUNDS_MODE_MEDIAN_3SIGMA = "median_3sigma"
+TD_PERF_BOUNDS_MODE_ACTUAL = "actual"
+TD_PERF_BOUNDS_MODES = {
+    TD_PERF_BOUNDS_MODE_MEDIAN_3SIGMA,
+    TD_PERF_BOUNDS_MODE_ACTUAL,
+}
+
+
+def td_perf_normalize_bounds_mode(value: object) -> str:
+    raw = str(value or "").strip().lower()
+    return raw if raw in TD_PERF_BOUNDS_MODES else TD_PERF_BOUNDS_MODE_MEDIAN_3SIGMA
+
+
+def _td_perf_finite_float(value: object) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            out = float(value)
+        except Exception:
+            return None
+        return out if math.isfinite(out) else None
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        out = float(text)
+    except Exception:
+        return None
+    return out if math.isfinite(out) else None
+
+
+def td_perf_display_value(values_by_stat: Mapping[str, object], display_stat: object, *, bounds_mode: object = None) -> float | None:
+    st = str(display_stat or "").strip().lower()
+    if not st:
+        return None
+    mode = td_perf_normalize_bounds_mode(bounds_mode)
+    if st in {"min", "max"} and mode == TD_PERF_BOUNDS_MODE_MEDIAN_3SIGMA:
+        median_val = _td_perf_finite_float(values_by_stat.get("median"))
+        std_val = _td_perf_finite_float(values_by_stat.get("std"))
+        if median_val is not None and std_val is not None:
+            return float(median_val - (3.0 * std_val)) if st == "min" else float(median_val + (3.0 * std_val))
+    return _td_perf_finite_float(values_by_stat.get(st))
+
+
 TD_PERF_EQ_STRICTNESS_PRESETS: dict[str, dict[str, float]] = {
     "tight": {
         "perf_eq_x_rel_tol": 0.08,
@@ -6927,13 +6997,14 @@ def td_discover_performance_candidates(db_path: Path, config_path: Path | None =
     )
 
     stat_priority = ["mean", "min", "max"]
+    source_stats = ["mean", "min", "max", "median", "std"]
     with sqlite3.connect(str(path)) as conn:
         _ensure_test_data_impl_tables(conn)
         metric_rows = conn.execute(
             """
             SELECT serial, run_name, column_name, stat, value_num
             FROM td_metrics_calc
-            WHERE lower(stat) IN ('mean', 'min', 'max')
+            WHERE lower(stat) IN ('mean', 'min', 'max', 'median', 'std')
             ORDER BY run_name, column_name, stat, serial
             """
         ).fetchall()
@@ -6972,7 +7043,7 @@ def td_discover_performance_candidates(db_path: Path, config_path: Path | None =
         run = str(run_name or "").strip()
         col = str(col_name or "").strip()
         st = str(stat or "").strip().lower()
-        if not sn or not run or not col or st not in stat_priority:
+        if not sn or not run or not col or st not in source_stats:
             continue
         if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
             continue
@@ -7037,6 +7108,7 @@ def td_discover_performance_candidates(db_path: Path, config_path: Path | None =
             if not x_norm or not y_norm or x_norm == y_norm:
                 continue
             legacy = legacy_by_pair.get((x_norm, y_norm)) or {}
+            bounds_mode = td_perf_normalize_bounds_mode(legacy.get("bounds_mode"))
             try:
                 require_min_points = max(2, int(legacy.get("require_min_points") or 2))
             except Exception:
@@ -7078,19 +7150,30 @@ def td_discover_performance_candidates(db_path: Path, config_path: Path | None =
             available_stats: list[str] = []
             qualifying_by_stat: dict[str, list[str]] = {}
             for st in stat_priority:
-                stat_values = values_by_stat.get(st) or {}
                 qualified_for_stat: list[str] = []
                 for sn in qualifying_serials:
-                    runs_map = stat_values.get(sn) or {}
+                    run_names: set[str] = set()
+                    for source_stat in source_stats:
+                        run_names.update(((values_by_stat.get(source_stat) or {}).get(sn) or {}).keys())
                     points: list[dict] = []
-                    for run_name, cols in runs_map.items():
-                        if not isinstance(cols, dict) or x_norm not in cols or y_norm not in cols:
+                    for run_name in sorted(run_names, key=lambda r: str(r).lower()):
+                        x_values = {
+                            src: (((values_by_stat.get(src) or {}).get(sn) or {}).get(run_name) or {}).get(x_norm)
+                            for src in source_stats
+                        }
+                        y_values = {
+                            src: (((values_by_stat.get(src) or {}).get(sn) or {}).get(run_name) or {}).get(y_norm)
+                            for src in source_stats
+                        }
+                        x_val = td_perf_display_value(x_values, st, bounds_mode=bounds_mode)
+                        y_val = td_perf_display_value(y_values, st, bounds_mode=bounds_mode)
+                        if x_val is None or y_val is None:
                             continue
                         points.append(
                             {
                                 "run_name": str(run_name),
-                                "x": float(cols[x_norm]),
-                                "y": float(cols[y_norm]),
+                                "x": float(x_val),
+                                "y": float(y_val),
                             }
                         )
                     summary = _td_perf_summarize_points(
@@ -7146,6 +7229,7 @@ def td_discover_performance_candidates(db_path: Path, config_path: Path | None =
                     "normalize_x": bool(fit_cfg.get("normalize_x", True)),
                 },
                 "require_min_points": effective_min_points,
+                "bounds_mode": bounds_mode,
                 "legacy_require_min_points": require_min_points,
                 "source_point_count": int(sum(len(v) for v in point_inventory.values())),
                 "distinct_x_point_count": distinct_x_point_count,
@@ -12554,6 +12638,7 @@ def _load_excel_trend_config(path: Path) -> dict:
             except Exception:
                 require_min_points = 2
             require_min_points = max(2, int(require_min_points))
+            bounds_mode = td_perf_normalize_bounds_mode(raw.get("bounds_mode"))
 
             normalized.append(
                 {
@@ -12563,6 +12648,7 @@ def _load_excel_trend_config(path: Path) -> dict:
                     "stats": stats,
                     "fit": {"degree": degree, "normalize_x": normalize_x},
                     "require_min_points": require_min_points,
+                    "bounds_mode": bounds_mode,
                 }
             )
         data["performance_plotters"] = normalized

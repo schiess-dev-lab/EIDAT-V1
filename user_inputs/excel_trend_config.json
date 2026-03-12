@@ -13,6 +13,7 @@
       "x": { "column": "isp" },
       "y": { "column": "thrust" },
       "stats": ["mean", "min", "max"],
+      "bounds_mode": "median_3sigma",
       "fit": { "degree": 2, "normalize_x": true },
       "require_min_points": 2
     }

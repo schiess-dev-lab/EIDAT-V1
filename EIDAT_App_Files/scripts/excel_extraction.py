@@ -173,7 +173,7 @@ def _load_workbook_any(excel_path: Path):
         from openpyxl import load_workbook  # type: ignore
     except Exception as exc:
         raise RuntimeError("openpyxl is required to read .xlsx files in this runtime.") from exc
-    return load_workbook(str(p), data_only=True, read_only=True)
+    return load_workbook(str(p), data_only=True, read_only=False)
 
 
 def _read_dataframe(excel_path: Path, *, sheet_name: Optional[str], header_row: int):
@@ -194,13 +194,366 @@ def _read_dataframe(excel_path: Path, *, sheet_name: Optional[str], header_row: 
         return pd.read_excel(excel_path, sheet_name=0, header=int(header_row))
 
 
-def _normalize_col_name(name: Any) -> str:
+_TD_UNIT_SUFFIX_TOKENS = {
+    "s",
+    "sec",
+    "secs",
+    "second",
+    "seconds",
+    "msec",
+    "msecs",
+    "ms",
+    "psia",
+    "psi",
+    "lbf",
+    "lbfsec",
+    "ftsec",
+    "ft",
+    "in2",
+    "lbm",
+    "lbmsec",
+    "pct",
+    "percent",
+}
+_TD_SHORT_EXACT_KEYS = {"ti", "tr", "td", "pf", "pa", "pc", "cf", "c"}
+_TD_CANONICAL_ALIASES: dict[str, list[str]] = {
+    "Time": [
+        "Time",
+        "Time (s)",
+        "Time(s)",
+        "Time sec",
+        "Time (sec)",
+        "Seq Time",
+        "Seq Time (sec)",
+        "Seq Time (s)",
+        "Sequence Time",
+        "Sequence Time (sec)",
+        "time_s",
+        "time_sec",
+        "seq_time",
+        "seq_time_sec",
+    ],
+    "Thrust": [
+        "Thrust",
+        "Thrust Calc",
+        "Thrust-N Calc",
+        "Thrust Calc (lbf)",
+        "Thrust-N Calc (lbf)",
+    ],
+    "Isp": [
+        "Isp",
+        "Isp Calc",
+        "Isp-N Calc",
+        "Isp Calc (sec)",
+        "Isp-N Calc (sec)",
+    ],
+    "Centroid": [
+        "Centroid",
+        "C*",
+        "C star",
+        "Cstar",
+        "C* (ft/sec)",
+    ],
+    "Cum_Imp_N_Calc": [
+        "Cum Imp",
+        "Cum Imp N Calc",
+        "Cum Imp-N Calc",
+        "Cum Imp-N Calc (lbf-sec)",
+    ],
+    "Rough": [
+        "Rough",
+        "Rough +/- P-to-P",
+        "Rough +/- P-to-P (+/- %)",
+        "Rough +/ P-to-P (+/ %)",
+        "Rough P-to-P",
+    ],
+    "Rough_2_sigma": [
+        "Rough 2 sigma",
+        "Rough 2 sigma (%)",
+        "Rough 2 sigma %",
+        "Rough_2_sigma",
+    ],
+    "Ti_10_Pc_msec": [
+        "Ti",
+        "Ti 10% Pc",
+        "Ti 10 Pc",
+        "Ti 10% Pc (msec)",
+    ],
+    "Tr_90_Pc_msec": [
+        "Tr",
+        "Tr 90% Pc",
+        "Tr 90 Pc",
+        "Tr 90% Pc (msec)",
+    ],
+    "Td_10_Pc_msec": [
+        "Td",
+        "Td 10% Pc",
+        "Td 10 Pc",
+        "Td 10% Pc (msec)",
+    ],
+    "Pf": ["Pf", "Pf (psia)"],
+    "Pa": ["Pa", "Pa (psia)"],
+    "Pc": ["Pc", "Pc (psia)"],
+    "Max_Pc": ["Max Pc", "Max Pc (psia)"],
+    "Throat_Area_Hot": [
+        "Throat Area Hot",
+        "Throat Area, Hot",
+        "Throat Area Hot (in^2)",
+        "Throat Area, Hot (in^2)",
+    ],
+    "Cf_calc": ["Cf", "Cf calc", "Cf_calc"],
+    "Flowrate": ["Flowrate", "Flowrate (lbm/sec)", "Flow rate", "Flow Rate"],
+}
+
+
+def _normalize_col_tokens(name: Any, *, strip_parenthetical: bool = True, strip_unit_suffix: bool = True) -> List[str]:
     s = str(name or "").strip().lower()
-    # Remove units/parentheticals and non-alphanumerics for fuzzy matching.
-    s = re.sub(r"\(.*?\)", " ", s)
-    s = re.sub(r"[^0-9a-z]+", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+    if strip_parenthetical:
+        s = re.sub(r"\(.*?\)", " ", s)
+    tokens = re.findall(r"[0-9a-z]+", s)
+    if strip_unit_suffix and len(tokens) > 1:
+        while len(tokens) > 1 and tokens[-1] in _TD_UNIT_SUFFIX_TOKENS:
+            tokens.pop()
+    return tokens
+
+
+def _normalize_col_name(name: Any) -> str:
+    return " ".join(_normalize_col_tokens(name))
+
+
+def _normalize_col_name_loose(name: Any) -> str:
+    return " ".join(_normalize_col_tokens(name, strip_parenthetical=False, strip_unit_suffix=False))
+
+
+def _clean_header_fragment(v: Any) -> str:
+    s = str(v or "").replace("\r\n", "\n").replace("\r", "\n")
+    parts = [re.sub(r"\s+", " ", part).strip() for part in s.split("\n")]
+    return " ".join(part for part in parts if part)
+
+
+def _canonical_header_defs(config_cols: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    defs: List[Dict[str, Any]] = []
+    for canon, aliases in _TD_CANONICAL_ALIASES.items():
+        defs.append({"name": canon, "aliases": list(aliases)})
+    for raw in config_cols:
+        if not isinstance(raw, dict):
+            continue
+        name = str(raw.get("name") or "").strip()
+        if not name:
+            continue
+        aliases = [str(v or "").strip() for v in (raw.get("aliases") or []) if str(v or "").strip()]
+        defs.append({"name": name, "aliases": aliases})
+    return defs
+
+
+def _fuzzy_header_score(target: str, candidate: str) -> float:
+    t = _normalize_col_name(target)
+    c = _normalize_col_name(candidate)
+    if not t or not c:
+        return 0.0
+    if t == c:
+        return 1.0
+    if t in _TD_SHORT_EXACT_KEYS or c in _TD_SHORT_EXACT_KEYS:
+        return 0.0
+    if t in c or c in t:
+        return 0.92
+    return float(difflib.SequenceMatcher(a=t, b=c).ratio())
+
+
+def _canonicalize_header(header: str, defs: List[Dict[str, Any]], *, min_ratio: float) -> str:
+    raw = str(header or "").strip()
+    if not raw:
+        return raw
+    raw_norm = _normalize_col_name(raw)
+    if not raw_norm:
+        return raw
+    for item in defs:
+        canon = str(item.get("name") or "").strip()
+        if canon and raw_norm == _normalize_col_name(canon):
+            return canon
+    for item in defs:
+        canon = str(item.get("name") or "").strip()
+        aliases = [canon] + [str(v or "").strip() for v in (item.get("aliases") or []) if str(v or "").strip()]
+        if any(raw_norm == _normalize_col_name(alias) for alias in aliases):
+            return canon
+    best = ""
+    best_score = 0.0
+    for item in defs:
+        canon = str(item.get("name") or "").strip()
+        aliases = [canon] + [str(v or "").strip() for v in (item.get("aliases") or []) if str(v or "").strip()]
+        score = max((_fuzzy_header_score(alias, raw) for alias in aliases), default=0.0)
+        if score > best_score:
+            best_score = float(score)
+            best = canon
+    if best and best_score >= float(min_ratio):
+        return best
+    return raw
+
+
+def _sheet_cell_value(ws, row: int, col: int) -> Any:
+    try:
+        return ws.cell(row=int(row), column=int(col)).value
+    except Exception:
+        pass
+    sheet = getattr(ws, "_sheet", None)
+    if sheet is not None:
+        try:
+            return sheet.cell_value(int(row) - 1, int(col) - 1)
+        except Exception:
+            return None
+    return None
+
+
+def _sheet_merged_ranges(ws) -> List[Tuple[int, int, int, int]]:
+    try:
+        merged = getattr(getattr(ws, "merged_cells", None), "ranges", None)
+        if merged is not None:
+            return [(int(r.min_row), int(r.max_row), int(r.min_col), int(r.max_col)) for r in list(merged)]
+    except Exception:
+        pass
+    sheet = getattr(ws, "_sheet", None)
+    merged_cells = getattr(sheet, "merged_cells", None)
+    out: List[Tuple[int, int, int, int]] = []
+    for rlo, rhi, clo, chi in list(merged_cells or []):
+        out.append((int(rlo) + 1, int(rhi), int(clo) + 1, int(chi)))
+    return out
+
+
+def _sheet_header_value(ws, row: int, col: int, merged_ranges: List[Tuple[int, int, int, int]]) -> Any:
+    direct = _sheet_cell_value(ws, row, col)
+    if not _is_blank(direct):
+        return direct
+    for r0, r1, c0, c1 in merged_ranges:
+        if int(r0) <= int(row) <= int(r1) and int(c0) <= int(col) <= int(c1):
+            anchor = _sheet_cell_value(ws, int(r0), int(c0))
+            if anchor not in (None, ""):
+                return anchor
+    return direct
+
+
+def _header_block_rows(ws, *, header_row: int, excel_col_indices: List[int], max_extra_rows: int = 2) -> List[int]:
+    merged_ranges = _sheet_merged_ranges(ws)
+    rows = [int(header_row)]
+    try:
+        max_row = int(getattr(ws, "max_row", 0) or 0)
+    except Exception:
+        max_row = 0
+    for row in range(int(header_row) - 1, max(0, int(header_row) - int(max_extra_rows)) - 1, -1):
+        filled = 0
+        numeric = 0
+        headerish = 0
+        for col in excel_col_indices:
+            v = _sheet_header_value(ws, int(row), int(col), merged_ranges)
+            if _is_blank(v):
+                continue
+            filled += 1
+            if _try_float(v) is not None:
+                numeric += 1
+            if _is_header_value(v):
+                headerish += 1
+        if filled <= 0:
+            continue
+        if numeric >= max(2, int(round(filled * 0.45))):
+            break
+        if headerish <= 0:
+            break
+        rows.insert(0, int(row))
+    for row in range(int(header_row) + 1, min(max_row, int(header_row) + int(max_extra_rows)) + 1):
+        filled = 0
+        numeric = 0
+        headerish = 0
+        for col in excel_col_indices:
+            v = _sheet_header_value(ws, int(row), int(col), merged_ranges)
+            if _is_blank(v):
+                continue
+            filled += 1
+            if _try_float(v) is not None:
+                numeric += 1
+            if _is_header_value(v):
+                headerish += 1
+        if filled <= 0:
+            break
+        if numeric >= max(2, int(round(filled * 0.45))):
+            break
+        if headerish <= 0:
+            break
+        rows.append(int(row))
+    return rows
+
+
+def _reconstruct_headers(ws, *, header_row: int, excel_col_indices: List[int], fallback_headers: List[str]) -> List[str]:
+    merged_ranges = _sheet_merged_ranges(ws)
+    block_rows = _header_block_rows(ws, header_row=int(header_row), excel_col_indices=excel_col_indices)
+    out: List[str] = []
+    for idx, col in enumerate(excel_col_indices):
+        fragments: List[str] = []
+        seen: set[str] = set()
+        for row in block_rows:
+            frag = _clean_header_fragment(_sheet_header_value(ws, int(row), int(col), merged_ranges))
+            key = _normalize_col_name_loose(frag)
+            if not frag or not key or key in seen:
+                continue
+            seen.add(key)
+            fragments.append(frag)
+        header = " ".join(fragments).strip()
+        if not header:
+            header = str(fallback_headers[idx] if idx < len(fallback_headers) else "").strip() or f"col_{idx + 1}"
+        out.append(header)
+    return out
+
+
+def _reconstructed_headers_for_sheet(
+    wb,
+    *,
+    sheet_name: Optional[str],
+    header_row_0b: int,
+    max_cols: int = 200,
+    lookahead_rows: int = 60,
+    min_numeric_count: int = 8,
+    min_numeric_ratio: float = 0.60,
+    min_data_cols: int = 1,
+) -> Tuple[List[str], List[str]]:
+    sheetnames = list(getattr(wb, "sheetnames", []) or [])
+    target = str(sheet_name) if sheet_name not in ("", None) else (sheetnames[0] if sheetnames else "")
+    if not target or target not in sheetnames:
+        return [], []
+    ws = wb[target]
+    hdr_1b = max(1, int(header_row_0b) + 1)
+    detected_row, cols = _detect_header_row(
+        ws,
+        max_scan_rows=max(1, int(hdr_1b)),
+        max_cols=max_cols,
+        lookahead_rows=lookahead_rows,
+        min_numeric_count=min_numeric_count,
+        min_numeric_ratio=min_numeric_ratio,
+        min_data_cols=min_data_cols,
+    )
+    if not cols:
+        return [], []
+    excel_col_indices = [c for c, _ in cols]
+    fallback_headers = [h for _, h in cols]
+    headers = _reconstruct_headers(
+        ws,
+        header_row=int(detected_row or hdr_1b),
+        excel_col_indices=excel_col_indices,
+        fallback_headers=fallback_headers,
+    )
+    return headers, fallback_headers
+
+
+def _dedupe_display_names(names: List[str]) -> List[str]:
+    out: List[str] = []
+    seen: dict[str, int] = {}
+    for raw in names:
+        name = str(raw or "").strip() or "col"
+        key = name.lower()
+        if key not in seen:
+            seen[key] = 1
+            out.append(name)
+            continue
+        seen[key] += 1
+        out.append(f"{name}_{seen[key]}")
+    return out
 
 
 def _best_fuzzy_column_match(target: str, candidates: List[str], *, min_ratio: float) -> Tuple[Optional[str], float]:
@@ -218,7 +571,9 @@ def _best_fuzzy_column_match(target: str, candidates: List[str], *, min_ratio: f
             continue
         if c == tgt:
             return cand, 1.0
-        if tgt in c or c in tgt:
+        if tgt in _TD_SHORT_EXACT_KEYS or c in _TD_SHORT_EXACT_KEYS:
+            score = 0.0
+        elif tgt in c or c in tgt:
             score = 0.92
         else:
             score = difflib.SequenceMatcher(a=tgt, b=c).ratio()
@@ -663,123 +1018,169 @@ def extract_from_excel(excel_path: Path, config: Dict[str, Any]) -> List[Dict[st
     stats = [str(s).strip().lower() for s in (config.get("statistics") or [])]
     if not stats:
         stats = ["mean", "min", "max", "std", "median", "count"]
+    canonical_defs = _canonical_header_defs([c for c in cols_cfg if isinstance(c, dict)])
 
     program, vehicle, serial = derive_file_identity(excel_path)
 
     rows: List[Dict[str, Any]] = []
-    for sheet, hdr_for_pandas in sheet_jobs:
-        df = _read_dataframe(excel_path, sheet_name=sheet, header_row=int(hdr_for_pandas))
-        df_cols = list(df.columns)
-        col_map = {_normalize_col_name(c): c for c in df_cols}
+    wb_headers = _load_workbook_any(excel_path)
+    try:
+        for sheet, hdr_for_pandas in sheet_jobs:
+            df = _read_dataframe(excel_path, sheet_name=sheet, header_row=int(hdr_for_pandas))
+            df_cols = list(df.columns)
+            rebuilt_headers, fallback_headers = _reconstructed_headers_for_sheet(
+                wb_headers,
+                sheet_name=sheet,
+                header_row_0b=int(hdr_for_pandas),
+            )
+            if rebuilt_headers and len(rebuilt_headers) == len(df_cols):
+                mapped_headers = [
+                    _canonicalize_header(h, canonical_defs, min_ratio=float(fuzzy_min_ratio))
+                    for h in rebuilt_headers
+                ]
+                renamed_cols = _dedupe_display_names(mapped_headers)
+                df.columns = renamed_cols
+                df_cols = list(df.columns)
+                if debug_fuzzy:
+                    for raw_header, mapped_header in zip(rebuilt_headers, mapped_headers):
+                        if raw_header != mapped_header:
+                            print(
+                                f"[TEST_DATA] header map: sheet={sheet!r} raw={raw_header!r} -> {mapped_header!r}",
+                                file=os.sys.stderr,
+                            )
+            else:
+                fallback = rebuilt_headers or fallback_headers
+                if fallback and len(fallback) == len(df_cols):
+                    df.columns = _dedupe_display_names(fallback)
+                    df_cols = list(df.columns)
+            col_map = {_normalize_col_name(c): c for c in df_cols}
 
-        row_id_col, keep_mask, _start_pos = _detect_row_id_mask(df, min_run=5)
-        if keep_mask is not None and keep_mask.any():
-            df_data = df.loc[keep_mask].copy()
-            if debug_table:
-                show_cols: list[str] = []
-                if row_id_col and row_id_col in df_cols:
-                    show_cols.append(str(row_id_col))
-                # Prefer configured columns in preview (after row id).
-                for col in cols_cfg:
-                    if not isinstance(col, dict):
-                        continue
-                    target = str(col.get("name") or "").strip()
-                    if not target:
-                        continue
-                    df_col = col_map.get(_normalize_col_name(target))
-                    if df_col and df_col not in show_cols:
-                        show_cols.append(str(df_col))
-                # Fill remaining with the first few worksheet columns.
-                for c in df_cols:
-                    if c not in show_cols:
-                        show_cols.append(str(c))
-                    if len(show_cols) >= 7:
-                        break
-                _debug_print_row_table(
-                    df=df,
-                    sheet_name=str(sheet or ""),
-                    header_row_0b=int(hdr_for_pandas),
-                    keep_mask=keep_mask,
-                    show_cols=show_cols,
-                )
-        else:
-            df_data = df
+            row_id_col, keep_mask, _start_pos = _detect_row_id_mask(df, min_run=5)
+            if keep_mask is not None and keep_mask.any():
+                df_data = df.loc[keep_mask].copy()
+                if debug_table:
+                    show_cols: list[str] = []
+                    if row_id_col and row_id_col in df_cols:
+                        show_cols.append(str(row_id_col))
+                    for col in cols_cfg:
+                        if not isinstance(col, dict):
+                            continue
+                        target = str(col.get("name") or "").strip()
+                        if not target:
+                            continue
+                        df_col = col_map.get(_normalize_col_name(target))
+                        if df_col and df_col not in show_cols:
+                            show_cols.append(str(df_col))
+                    for c in df_cols:
+                        if c not in show_cols:
+                            show_cols.append(str(c))
+                        if len(show_cols) >= 7:
+                            break
+                    _debug_print_row_table(
+                        df=df,
+                        sheet_name=str(sheet or ""),
+                        header_row_0b=int(hdr_for_pandas),
+                        keep_mask=keep_mask,
+                        show_cols=show_cols,
+                    )
+            else:
+                df_data = df
 
-        for col in cols_cfg:
-            if not isinstance(col, dict):
-                continue
-            name = str(col.get("name") or "").strip()
-            if not name:
-                continue
-            units = col.get("units")
-            range_min = col.get("range_min")
-            range_max = col.get("range_max")
-            df_col = col_map.get(_normalize_col_name(name))
-            matched_col = None
-            matched_score = None
-            if df_col is None and fuzzy_enabled:
-                best, score = _best_fuzzy_column_match(
-                    name, [str(c) for c in df_cols], min_ratio=float(fuzzy_min_ratio)
-                )
-                if best is not None:
-                    df_col = best
-                    matched_col = str(best)
-                    matched_score = float(score)
-                    if debug_fuzzy:
-                        print(
-                            f"[TEST_DATA] fuzzy match: sheet={sheet!r} target={name!r} -> {matched_col!r} score={matched_score:.3f}",
-                            file=os.sys.stderr,
+            for col in cols_cfg:
+                if not isinstance(col, dict):
+                    continue
+                name = str(col.get("name") or "").strip()
+                if not name:
+                    continue
+                units = col.get("units")
+                range_min = col.get("range_min")
+                range_max = col.get("range_max")
+                df_col = col_map.get(_normalize_col_name(name))
+                matched_col = None
+                matched_score = None
+                if df_col is None and fuzzy_enabled:
+                    best, score = _best_fuzzy_column_match(
+                        name, [str(c) for c in df_cols], min_ratio=float(fuzzy_min_ratio)
+                    )
+                    if best is not None:
+                        df_col = best
+                        matched_col = str(best)
+                        matched_score = float(score)
+                        if debug_fuzzy:
+                            print(
+                                f"[TEST_DATA] fuzzy match: sheet={sheet!r} target={name!r} -> {matched_col!r} score={matched_score:.3f}",
+                                file=os.sys.stderr,
+                            )
+                if df_col is None:
+                    rows.append(
+                        {
+                            "source_file": str(excel_path),
+                            "program": program,
+                            "vehicle": vehicle,
+                            "serial": serial,
+                            "sheet_name": str(sheet or ""),
+                            "header_row": int(hdr_for_pandas),
+                            "column": name,
+                            "units": units,
+                            "stat": "error",
+                            "value": None,
+                            "error": f"Missing column: {name}",
+                            "range_min": range_min,
+                            "range_max": range_max,
+                        }
+                    )
+                    continue
+                numeric = pd.to_numeric(df_data[df_col], errors="coerce")
+                numeric = numeric.dropna()
+                ign = int(config.get("statistics_ignore_first_n") or 0)
+                if ign > 0 and not numeric.empty:
+                    try:
+                        numeric = numeric.iloc[int(ign):]
+                    except Exception:
+                        pass
+                if numeric.empty:
+                    rows.append(
+                        {
+                            "source_file": str(excel_path),
+                            "program": program,
+                            "vehicle": vehicle,
+                            "serial": serial,
+                            "sheet_name": str(sheet or ""),
+                            "header_row": int(hdr_for_pandas),
+                            "column": name,
+                            "units": units,
+                            "stat": "error",
+                            "value": None,
+                            "error": f"No numeric data in column: {name}",
+                            "range_min": range_min,
+                            "range_max": range_max,
+                        }
+                    )
+                    continue
+                for stat in stats:
+                    try:
+                        val = _stat_value(numeric, stat)
+                    except Exception as exc:
+                        rows.append(
+                            {
+                                "source_file": str(excel_path),
+                                "program": program,
+                                "vehicle": vehicle,
+                                "serial": serial,
+                                "sheet_name": str(sheet or ""),
+                                "header_row": int(hdr_for_pandas),
+                                "column": name,
+                                "units": units,
+                                "stat": stat,
+                                "value": None,
+                                "error": str(exc),
+                                "range_min": range_min,
+                                "range_max": range_max,
+                                "matched_column": matched_col,
+                                "matched_score": matched_score,
+                            }
                         )
-            if df_col is None:
-                rows.append(
-                    {
-                        "source_file": str(excel_path),
-                        "program": program,
-                        "vehicle": vehicle,
-                        "serial": serial,
-                        "sheet_name": str(sheet or ""),
-                        "header_row": int(hdr_for_pandas),
-                        "column": name,
-                        "units": units,
-                        "stat": "error",
-                        "value": None,
-                        "error": f"Missing column: {name}",
-                        "range_min": range_min,
-                        "range_max": range_max,
-                    }
-                )
-                continue
-            numeric = pd.to_numeric(df_data[df_col], errors="coerce")
-            numeric = numeric.dropna()
-            ign = int(config.get("statistics_ignore_first_n") or 0)
-            if ign > 0 and not numeric.empty:
-                try:
-                    numeric = numeric.iloc[int(ign):]
-                except Exception:
-                    pass
-            if numeric.empty:
-                rows.append(
-                    {
-                        "source_file": str(excel_path),
-                        "program": program,
-                        "vehicle": vehicle,
-                        "serial": serial,
-                        "sheet_name": str(sheet or ""),
-                        "header_row": int(hdr_for_pandas),
-                        "column": name,
-                        "units": units,
-                        "stat": "error",
-                        "value": None,
-                        "error": f"No numeric data in column: {name}",
-                        "range_min": range_min,
-                        "range_max": range_max,
-                    }
-                )
-                continue
-            for stat in stats:
-                try:
-                    val = _stat_value(numeric, stat)
-                except Exception as exc:
+                        continue
                     rows.append(
                         {
                             "source_file": str(excel_path),
@@ -791,34 +1192,19 @@ def extract_from_excel(excel_path: Path, config: Dict[str, Any]) -> List[Dict[st
                             "column": name,
                             "units": units,
                             "stat": stat,
-                            "value": None,
-                            "error": str(exc),
+                            "value": val,
+                            "error": None,
                             "range_min": range_min,
                             "range_max": range_max,
                             "matched_column": matched_col,
                             "matched_score": matched_score,
                         }
                     )
-                    continue
-                rows.append(
-                    {
-                        "source_file": str(excel_path),
-                        "program": program,
-                        "vehicle": vehicle,
-                        "serial": serial,
-                        "sheet_name": str(sheet or ""),
-                        "header_row": int(hdr_for_pandas),
-                        "column": name,
-                        "units": units,
-                        "stat": stat,
-                        "value": val,
-                        "error": None,
-                        "range_min": range_min,
-                        "range_max": range_max,
-                        "matched_column": matched_col,
-                        "matched_score": matched_score,
-                    }
-                )
+    finally:
+        try:
+            wb_headers.close()
+        except Exception:
+            pass
     return rows
 
 

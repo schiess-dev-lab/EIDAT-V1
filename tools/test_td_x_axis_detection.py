@@ -274,6 +274,65 @@ class TestTDXAxisDetection(unittest.TestCase):
             xs = self._read_single_curve_x(raw_db, run="Run1", y="thrust", x_name="Time", serial="SN0001")
             self.assertEqual(xs, [float(i) for i in range(20)])
 
+    def test_canonical_time_column_is_preferred_over_legacy_alias(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            src_db = root / "src.sqlite3"
+            out_db = root / "td_cache.sqlite3"
+            raw_db = root / "test_data_raw_cache.sqlite3"
+            wb_path = root / "td.xlsx"
+            cfg_path = root / "excel_trend_config.json"
+
+            conn = sqlite3.connect(str(src_db))
+            try:
+                conn.execute(
+                    """
+                    CREATE TABLE "sheet__Run1" (
+                        excel_row INTEGER NOT NULL,
+                        "Seq_Time_sec" REAL,
+                        "Time" REAL,
+                        thrust REAL
+                    )
+                    """
+                )
+                rows = [(i + 1, 100.0 + float(i), float(i), float(i) * 10.0) for i in range(20)]
+                conn.executemany(
+                    'INSERT INTO "sheet__Run1"(excel_row,"Seq_Time_sec","Time",thrust) VALUES(?,?,?,?)',
+                    rows,
+                )
+                conn.commit()
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+            self._write_workbook(wb_path, source_sqlite=src_db)
+            self._write_config(
+                cfg_path,
+                x_axis={
+                    "replace_defaults": True,
+                    "time_aliases": ["Time", "Seq Time (sec)"],
+                    "pulse_aliases": ["Pulse Number", "cycle"],
+                    "fuzzy_match": {"enabled": True, "min_ratio": 0.82},
+                    "sequential_validation": {"enabled": True, "max_probe_rows": 250, "min_samples": 6, "pulse_min_run": 5},
+                    "fallback_mode": "alias_only",
+                    "default_x": "Time",
+                },
+            )
+
+            old = be.DEFAULT_EXCEL_TREND_CONFIG
+            be.DEFAULT_EXCEL_TREND_CONFIG = cfg_path
+            try:
+                be.rebuild_test_data_project_cache(out_db, wb_path)
+            finally:
+                be.DEFAULT_EXCEL_TREND_CONFIG = old
+
+            xs = self._read_single_curve_x(raw_db, run="Run1", y="thrust", x_name="Time", serial="SN0001")
+            self.assertEqual(xs, [float(i) for i in range(20)])
+
 
 if __name__ == "__main__":
     unittest.main()

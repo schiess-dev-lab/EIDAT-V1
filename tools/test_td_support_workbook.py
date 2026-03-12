@@ -821,6 +821,78 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 ).fetchall()
             self.assertEqual(rows, [("max", 40.0), ("mean", 25.0)])
 
+    def test_calc_cache_still_writes_mean_when_config_omits_it(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            wb_path = root / "project.xlsx"
+            cfg = self._make_config()
+            cfg["statistics"] = ["max"]
+            be._write_test_data_trending_workbook(
+                wb_path,
+                global_repo=root,
+                serials=["SN1"],
+                docs=[{"serial_number": "SN1", "excel_sqlite_rel": ""}],
+                config=cfg,
+            )
+            support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+            be._write_td_support_workbook(
+                support_path,
+                sequence_names=["RunA"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+            )
+
+            db_path = root / "implementation_trending.sqlite3"
+            with sqlite3.connect(str(db_path)) as conn:
+                be._ensure_test_data_tables(conn)
+                conn.commit()
+            raw_db_path = root / "test_data_raw_cache.sqlite3"
+            with sqlite3.connect(str(raw_db_path)) as conn:
+                be._ensure_test_data_raw_cache_tables(conn)
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO td_raw_sequences(run_name, display_name, x_axis_kind, source_run_name, computed_epoch_ns)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    ("RunA", "", "Time", "RunA", 123),
+                )
+                conn.execute(
+                    "INSERT OR REPLACE INTO td_columns_raw(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
+                    ("RunA", "Time", "", "x"),
+                )
+                conn.execute(
+                    "INSERT OR REPLACE INTO td_columns_raw(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
+                    ("RunA", "thrust", "lbf", "y"),
+                )
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO td_curves_raw
+                    (run_name, y_name, x_name, serial, x_json, y_json, n_points, source_mtime_ns, computed_epoch_ns)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    ("RunA", "thrust", "Time", "SN1", "[0,1,2,3]", "[10,20,30,40]", 4, 123, 123),
+                )
+                conn.commit()
+
+            with mock.patch.object(
+                be,
+                "_load_runtime_td_trend_config",
+                return_value={"config": {}, "columns": [{"name": "thrust", "units": "lbf"}], "statistics": ["max"]},
+            ):
+                be._rebuild_test_data_project_calc_cache_from_raw(db_path, wb_path)
+
+            with sqlite3.connect(str(db_path)) as conn:
+                rows = conn.execute(
+                    """
+                    SELECT stat, value_num
+                    FROM td_metrics_calc
+                    WHERE serial='SN1' AND run_name='RunA' AND column_name='thrust'
+                    ORDER BY stat
+                    """
+                ).fetchall()
+            self.assertEqual(rows, [("max", 40.0), ("mean", 25.0)])
+
     def test_calc_cache_hard_fails_when_raw_only_exists_in_implementation_db(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
 
@@ -1069,6 +1141,15 @@ class TestTDSupportWorkbook(unittest.TestCase):
 
             candidates = be.td_discover_performance_candidates(db_path)
             self.assertEqual(candidates, [])
+
+    def test_perf_display_value_prefers_median_plus_minus_3sigma_by_default(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        values = {"median": 100.0, "std": 2.0, "min": 95.0, "max": 105.0}
+        self.assertEqual(be.td_perf_display_value(values, "min"), 94.0)
+        self.assertEqual(be.td_perf_display_value(values, "max"), 106.0)
+        self.assertEqual(be.td_perf_display_value(values, "min", bounds_mode="actual"), 95.0)
+        self.assertEqual(be.td_perf_display_value(values, "max", bounds_mode="actual"), 105.0)
 
     def test_perf_candidate_discovery_accepts_separated_x(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore

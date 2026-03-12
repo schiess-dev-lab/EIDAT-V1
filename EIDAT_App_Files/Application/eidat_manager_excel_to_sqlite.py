@@ -828,15 +828,144 @@ def _float(s: Any, default: float) -> float:
         return float(default)
 
 
-def _normalize_header(s: Any) -> str:
+_TD_UNIT_SUFFIX_TOKENS = {
+    "s",
+    "sec",
+    "secs",
+    "second",
+    "seconds",
+    "msec",
+    "msecs",
+    "ms",
+    "psia",
+    "psi",
+    "lbf",
+    "lbfsec",
+    "ftsec",
+    "ft",
+    "in2",
+    "lbm",
+    "lbmsec",
+    "pct",
+    "percent",
+}
+_TD_SHORT_EXACT_KEYS = {"ti", "tr", "td", "pf", "pa", "pc", "cf", "c"}
+_TD_CANONICAL_ALIASES: dict[str, list[str]] = {
+    "Time": [
+        "Time",
+        "Time (s)",
+        "Time(s)",
+        "Time sec",
+        "Time (sec)",
+        "Seq Time",
+        "Seq Time (sec)",
+        "Seq Time (s)",
+        "Sequence Time",
+        "Sequence Time (sec)",
+        "time_s",
+        "time_sec",
+        "seq_time",
+        "seq_time_sec",
+    ],
+    "Thrust": [
+        "Thrust",
+        "Thrust Calc",
+        "Thrust-N Calc",
+        "Thrust Calc (lbf)",
+        "Thrust-N Calc (lbf)",
+    ],
+    "Isp": [
+        "Isp",
+        "Isp Calc",
+        "Isp-N Calc",
+        "Isp Calc (sec)",
+        "Isp-N Calc (sec)",
+    ],
+    "Centroid": [
+        "Centroid",
+        "C*",
+        "C star",
+        "Cstar",
+        "C* (ft/sec)",
+    ],
+    "Cum_Imp_N_Calc": [
+        "Cum Imp",
+        "Cum Imp N Calc",
+        "Cum Imp-N Calc",
+        "Cum Imp-N Calc (lbf-sec)",
+    ],
+    "Rough": [
+        "Rough",
+        "Rough +/- P-to-P",
+        "Rough +/- P-to-P (+/- %)",
+        "Rough +/ P-to-P (+/ %)",
+        "Rough P-to-P",
+    ],
+    "Rough_2_sigma": [
+        "Rough 2 sigma",
+        "Rough 2 sigma (%)",
+        "Rough 2 sigma %",
+        "Rough_2_sigma",
+    ],
+    "Ti_10_Pc_msec": [
+        "Ti",
+        "Ti 10% Pc",
+        "Ti 10 Pc",
+        "Ti 10% Pc (msec)",
+    ],
+    "Tr_90_Pc_msec": [
+        "Tr",
+        "Tr 90% Pc",
+        "Tr 90 Pc",
+        "Tr 90% Pc (msec)",
+    ],
+    "Td_10_Pc_msec": [
+        "Td",
+        "Td 10% Pc",
+        "Td 10 Pc",
+        "Td 10% Pc (msec)",
+    ],
+    "Pf": ["Pf", "Pf (psia)"],
+    "Pa": ["Pa", "Pa (psia)"],
+    "Pc": ["Pc", "Pc (psia)"],
+    "Max_Pc": ["Max Pc", "Max Pc (psia)"],
+    "Throat_Area_Hot": [
+        "Throat Area Hot",
+        "Throat Area, Hot",
+        "Throat Area Hot (in^2)",
+        "Throat Area, Hot (in^2)",
+    ],
+    "Cf_calc": ["Cf", "Cf calc", "Cf_calc"],
+    "Flowrate": ["Flowrate", "Flowrate (lbm/sec)", "Flow rate", "Flow Rate"],
+}
+
+
+def _normalize_header_tokens(s: Any, *, strip_parenthetical: bool = True, strip_unit_suffix: bool = True) -> list[str]:
     v = str(s or "").strip().lower()
-    v = re.sub(r"\(.*?\)", " ", v)
-    v = re.sub(r"[^0-9a-z]+", " ", v)
-    v = re.sub(r"\s+", " ", v).strip()
-    return v
+    if strip_parenthetical:
+        v = re.sub(r"\(.*?\)", " ", v)
+    tokens = re.findall(r"[0-9a-z]+", v)
+    if strip_unit_suffix and len(tokens) > 1:
+        while len(tokens) > 1 and tokens[-1] in _TD_UNIT_SUFFIX_TOKENS:
+            tokens.pop()
+    return tokens
 
 
-def _load_trend_column_names() -> list[str]:
+def _normalize_header(s: Any) -> str:
+    return " ".join(_normalize_header_tokens(s))
+
+
+def _normalize_header_loose(s: Any) -> str:
+    return " ".join(_normalize_header_tokens(s, strip_parenthetical=False, strip_unit_suffix=False))
+
+
+def _clean_header_fragment(v: Any) -> str:
+    s = str(v or "").replace("\r\n", "\n").replace("\r", "\n")
+    parts = [re.sub(r"\s+", " ", part).strip() for part in s.split("\n")]
+    return " ".join(part for part in parts if part)
+
+
+def _load_trend_column_defs() -> list[dict[str, Any]]:
     try:
         if not _EXCEL_TREND_CONFIG_PATH.exists():
             return []
@@ -844,57 +973,195 @@ def _load_trend_column_names() -> list[str]:
         cols = cfg.get("columns") if isinstance(cfg, dict) else None
         if not isinstance(cols, list):
             return []
-        out: list[str] = []
+        out: list[dict[str, Any]] = []
         for c in cols:
             if not isinstance(c, dict):
                 continue
             name = str(c.get("name") or "").strip()
             if name:
-                out.append(name)
+                aliases = [str(v or "").strip() for v in (c.get("aliases") or []) if str(v or "").strip()]
+                out.append({"name": name, "aliases": aliases})
         return out
     except Exception:
         return []
 
 
-def _fuzzy_score(target: str, candidate: str) -> float:
+def _header_fuzzy_score(target: str, candidate: str) -> float:
     t = _normalize_header(target)
     c = _normalize_header(candidate)
     if not t or not c:
         return 0.0
     if t == c:
         return 1.0
+    if t in _TD_SHORT_EXACT_KEYS or c in _TD_SHORT_EXACT_KEYS:
+        return 0.0
     if t in c or c in t:
         return 0.92
     return float(difflib.SequenceMatcher(a=t, b=c).ratio())
 
 
-def _map_headers_to_config(headers: list[str], config_cols: list[str], *, min_ratio: float) -> list[str]:
-    """
-    Return mapped header labels (same length as headers).
-    Each config column is used at most once per sheet.
-    """
-    if not headers or not config_cols:
-        return list(headers)
+def _canonical_header_defs(config_cols: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    defs: list[dict[str, Any]] = []
+    for canon, aliases in _TD_CANONICAL_ALIASES.items():
+        defs.append({"name": canon, "aliases": list(aliases)})
+    for raw in config_cols:
+        if not isinstance(raw, dict):
+            continue
+        name = str(raw.get("name") or "").strip()
+        if not name:
+            continue
+        aliases = [str(v or "").strip() for v in (raw.get("aliases") or []) if str(v or "").strip()]
+        defs.append({"name": name, "aliases": aliases})
+    return defs
 
-    pairs: list[tuple[float, int, str]] = []
-    for hi, h in enumerate(headers):
-        for c in config_cols:
-            pairs.append((_fuzzy_score(c, h), hi, c))
-    pairs.sort(key=lambda x: (-x[0], x[1], x[2].lower()))
 
-    assigned_header: dict[int, str] = {}
-    used_config: set[str] = set()
-    for score, hi, canon in pairs:
-        if score < float(min_ratio):
+def _canonicalize_header(header: str, defs: list[dict[str, Any]], *, min_ratio: float) -> str:
+    raw = str(header or "").strip()
+    if not raw:
+        return raw
+    raw_norm = _normalize_header(raw)
+    if not raw_norm:
+        return raw
+
+    # Exact self-match before alias expansion.
+    for item in defs:
+        canon = str(item.get("name") or "").strip()
+        if canon and raw_norm == _normalize_header(canon):
+            return canon
+
+    for item in defs:
+        canon = str(item.get("name") or "").strip()
+        aliases = [canon] + [str(v or "").strip() for v in (item.get("aliases") or []) if str(v or "").strip()]
+        if any(raw_norm == _normalize_header(alias) for alias in aliases):
+            return canon
+
+    best_name = ""
+    best_score = 0.0
+    for item in defs:
+        canon = str(item.get("name") or "").strip()
+        aliases = [canon] + [str(v or "").strip() for v in (item.get("aliases") or []) if str(v or "").strip()]
+        score = max((_header_fuzzy_score(alias, raw) for alias in aliases), default=0.0)
+        if score > best_score:
+            best_score = float(score)
+            best_name = canon
+    if best_name and best_score >= float(min_ratio):
+        return best_name
+    return raw
+
+
+def _sheet_cell_value(ws, row: int, col: int) -> Any:
+    try:
+        return ws.cell(row=int(row), column=int(col)).value
+    except Exception:
+        pass
+    sheet = getattr(ws, "_sheet", None)
+    if sheet is not None:
+        try:
+            return sheet.cell_value(int(row) - 1, int(col) - 1)
+        except Exception:
+            return None
+    return None
+
+
+def _sheet_merged_ranges(ws) -> list[tuple[int, int, int, int]]:
+    try:
+        merged = getattr(getattr(ws, "merged_cells", None), "ranges", None)
+        if merged is not None:
+            return [
+                (int(rng.min_row), int(rng.max_row), int(rng.min_col), int(rng.max_col))
+                for rng in list(merged)
+            ]
+    except Exception:
+        pass
+    sheet = getattr(ws, "_sheet", None)
+    merged_cells = getattr(sheet, "merged_cells", None)
+    out: list[tuple[int, int, int, int]] = []
+    for rlo, rhi, clo, chi in list(merged_cells or []):
+        out.append((int(rlo) + 1, int(rhi), int(clo) + 1, int(chi)))
+    return out
+
+
+def _sheet_header_value(ws, row: int, col: int, merged_ranges: list[tuple[int, int, int, int]]) -> Any:
+    direct = _sheet_cell_value(ws, row, col)
+    if not _is_blank(direct):
+        return direct
+    for r0, r1, c0, c1 in merged_ranges:
+        if int(r0) <= int(row) <= int(r1) and int(c0) <= int(col) <= int(c1):
+            anchor = _sheet_cell_value(ws, int(r0), int(c0))
+            if not _is_blank(anchor):
+                return anchor
+    return direct
+
+
+def _header_block_rows(ws, *, header_row: int, excel_col_indices: Sequence[int], max_extra_rows: int = 2) -> list[int]:
+    merged_ranges = _sheet_merged_ranges(ws)
+    rows = [int(header_row)]
+    try:
+        max_row = int(getattr(ws, "max_row", 0) or 0)
+    except Exception:
+        max_row = 0
+    for row in range(int(header_row) - 1, max(0, int(header_row) - int(max_extra_rows)) - 1, -1):
+        filled = 0
+        numeric = 0
+        headerish = 0
+        for col in excel_col_indices:
+            v = _sheet_header_value(ws, int(row), int(col), merged_ranges)
+            if _is_blank(v):
+                continue
+            filled += 1
+            if _try_float(v) is not None:
+                numeric += 1
+            if _is_header_value(v):
+                headerish += 1
+        if filled <= 0:
+            continue
+        if numeric >= max(2, int(round(filled * 0.45))):
             break
-        if hi in assigned_header:
-            continue
-        if canon in used_config:
-            continue
-        assigned_header[hi] = canon
-        used_config.add(canon)
+        if headerish <= 0:
+            break
+        rows.insert(0, int(row))
+    for row in range(int(header_row) + 1, min(max_row, int(header_row) + int(max_extra_rows)) + 1):
+        filled = 0
+        numeric = 0
+        headerish = 0
+        for col in excel_col_indices:
+            v = _sheet_header_value(ws, int(row), int(col), merged_ranges)
+            if _is_blank(v):
+                continue
+            filled += 1
+            if _try_float(v) is not None:
+                numeric += 1
+            if _is_header_value(v):
+                headerish += 1
+        if filled <= 0:
+            break
+        if numeric >= max(2, int(round(filled * 0.45))):
+            break
+        if headerish <= 0:
+            break
+        rows.append(int(row))
+    return rows
 
-    return [assigned_header.get(i, h) for i, h in enumerate(headers)]
+
+def _reconstruct_headers(ws, *, header_row: int, excel_col_indices: Sequence[int], fallback_headers: Sequence[str]) -> list[str]:
+    merged_ranges = _sheet_merged_ranges(ws)
+    block_rows = _header_block_rows(ws, header_row=int(header_row), excel_col_indices=excel_col_indices)
+    out: list[str] = []
+    for idx, col in enumerate(excel_col_indices):
+        fragments: list[str] = []
+        seen: set[str] = set()
+        for row in block_rows:
+            frag = _clean_header_fragment(_sheet_header_value(ws, int(row), int(col), merged_ranges))
+            key = _normalize_header_loose(frag)
+            if not frag or not key or key in seen:
+                continue
+            seen.add(key)
+            fragments.append(frag)
+        header = " ".join(fragments).strip()
+        if not header:
+            header = str(fallback_headers[idx] if idx < len(fallback_headers) else "").strip() or f"col_{idx + 1}"
+        out.append(header)
+    return out
 
 
 def _detect_header_row(
@@ -1311,7 +1578,7 @@ def _write_workbook_sqlite(
             from openpyxl import load_workbook  # type: ignore
         except Exception as exc:
             raise RuntimeError("openpyxl is required to read Excel files in this runtime.") from exc
-        wb = load_workbook(str(excel_path), data_only=True, read_only=True)
+        wb = load_workbook(str(excel_path), data_only=True, read_only=False)
 
     _stderr(f"[EXCEL] {excel_path}")
 
@@ -1320,7 +1587,8 @@ def _write_workbook_sqlite(
     fuzzy_min_ratio = _float(env.get("EIDAT_TEST_DATA_FUZZY_HEADER_MIN_RATIO", "0.82"), 0.82)
     debug_fuzzy = _truthy(env.get("EIDAT_TEST_DATA_FUZZY_DEBUG", "0"))
     debug_table = _truthy(env.get("EIDAT_TEST_DATA_DEBUG_TABLE", "0")) or debug_fuzzy
-    trend_cols = _load_trend_column_names() if fuzzy_enabled else []
+    trend_col_defs = _load_trend_column_defs() if fuzzy_enabled else []
+    canonical_defs = _canonical_header_defs(trend_col_defs)
 
     try:
         sheetnames = list(getattr(wb, "sheetnames", []) or [])
@@ -1342,12 +1610,17 @@ def _write_workbook_sqlite(
                 _stderr(f"[SHEET] {sheet_name}: no data headers detected (skipped)")
                 continue
             excel_col_indices = [c for c, _ in cols]
-            headers = [h for _, h in cols]
-            mapped_headers = (
-                _map_headers_to_config(headers, trend_cols, min_ratio=float(fuzzy_min_ratio))
-                if trend_cols
-                else list(headers)
+            detected_headers = [h for _, h in cols]
+            headers = _reconstruct_headers(
+                ws,
+                header_row=int(header_row),
+                excel_col_indices=excel_col_indices,
+                fallback_headers=detected_headers,
             )
+            mapped_headers = [
+                _canonicalize_header(h, canonical_defs, min_ratio=float(fuzzy_min_ratio))
+                for h in headers
+            ]
             if debug_fuzzy and mapped_headers != headers:
                 for oh, mh in zip(headers, mapped_headers):
                     if oh != mh:
