@@ -3603,6 +3603,7 @@ def _write_td_support_workbook(
 ) -> None:
     try:
         from openpyxl import Workbook  # type: ignore
+        from openpyxl.comments import Comment  # type: ignore
     except Exception as exc:
         raise RuntimeError(
             "openpyxl is required to create the TD support workbook. "
@@ -3617,6 +3618,31 @@ def _write_td_support_workbook(
     ws_settings.append(["last_n_rows_default", 10])
     ws_settings.append(["perf_eq_strictness", "medium"])
     ws_settings.append(["perf_eq_point_count", "medium"])
+    ws_settings["A4"].comment = Comment(
+        (
+            "Controls how strict performance-equation candidate qualification is.\n"
+            "Allowed values: tight, medium, loose.\n"
+            "tight: requires a larger meaningful X spread.\n"
+            "medium: balanced default.\n"
+            "loose: easiest qualification."
+        ),
+        "EIDAT",
+    )
+    ws_settings["B4"].comment = Comment(
+        "Choose one of: tight, medium, loose. Default is medium.",
+        "EIDAT",
+    )
+    ws_settings["A5"].comment = Comment(
+        (
+            "Controls the minimum distinct X points required for performance-equation candidates.\n"
+            "tight = 4 points, medium = 3 points, loose = 2 points."
+        ),
+        "EIDAT",
+    )
+    ws_settings["B5"].comment = Comment(
+        "Choose one of: tight, medium, loose. Default is medium.",
+        "EIDAT",
+    )
 
     ws_seq = wb.create_sheet("Sequences")
     ws_seq.append(
@@ -3624,7 +3650,10 @@ def _write_td_support_workbook(
             "sequence_name",
             "source_run_name",
             "feed_pressure",
+            "feed_pressure_units",
+            "run_type",
             "pulse_width_on",
+            "control_period",
             "exclude_first_n",
             "last_n_rows",
             "enabled",
@@ -3636,7 +3665,7 @@ def _write_td_support_workbook(
         if not name or name.lower() in seen_seq:
             continue
         seen_seq.add(name.lower())
-        ws_seq.append([name, name, "", "", "", "", True])
+        ws_seq.append([name, name, "", "", "", "", "", "", "", True])
 
     ws_bounds = wb.create_sheet("ParameterBounds")
     ws_bounds.append(["sequence_name", "parameter_name", "units", "min_value", "max_value", "enabled"])
@@ -3807,7 +3836,7 @@ def _read_td_support_workbook(workbook_path: Path, *, project_dir: Path | None =
                 source_run = str(ws.cell(row, headers.get("source_run_name", 2)).value or "").strip()
                 if not seq_name and not source_run:
                     continue
-                enabled_raw = ws.cell(row, headers.get("enabled", 7)).value if headers.get("enabled") else True
+                enabled_raw = ws.cell(row, headers.get("enabled", 10)).value if headers.get("enabled") else True
                 enabled = True
                 if enabled_raw is not None and str(enabled_raw).strip() != "":
                     enabled = _td_bool(enabled_raw, True)
@@ -3817,9 +3846,12 @@ def _read_td_support_workbook(workbook_path: Path, *, project_dir: Path | None =
                         "sequence_name": sequence_name,
                         "source_run_name": source_run or sequence_name,
                         "feed_pressure": ws.cell(row, headers.get("feed_pressure", 3)).value if headers.get("feed_pressure") else None,
-                        "pulse_width_on": ws.cell(row, headers.get("pulse_width_on", 4)).value if headers.get("pulse_width_on") else None,
-                        "exclude_first_n": _to_support_int(ws.cell(row, headers.get("exclude_first_n", 5)).value if headers.get("exclude_first_n") else None),
-                        "last_n_rows": _to_support_int(ws.cell(row, headers.get("last_n_rows", 6)).value if headers.get("last_n_rows") else None),
+                        "feed_pressure_units": str(ws.cell(row, headers.get("feed_pressure_units", 4)).value or "").strip(),
+                        "run_type": str(ws.cell(row, headers.get("run_type", 5)).value or "").strip(),
+                        "pulse_width_on": ws.cell(row, headers.get("pulse_width_on", 6)).value if headers.get("pulse_width_on") else None,
+                        "control_period": ws.cell(row, headers.get("control_period", 7)).value if headers.get("control_period") else None,
+                        "exclude_first_n": _to_support_int(ws.cell(row, headers.get("exclude_first_n", 8)).value if headers.get("exclude_first_n") else None),
+                        "last_n_rows": _to_support_int(ws.cell(row, headers.get("last_n_rows", 9)).value if headers.get("last_n_rows") else None),
                         "enabled": bool(enabled),
                     }
                 )
@@ -4027,6 +4059,178 @@ def td_read_run_labeling_config(workbook_path: Path) -> dict | None:
         return _read_test_data_run_labeling(workbook_path)
     except Exception:
         return None
+
+
+def td_metric_bound_line_specs(bound: dict | None) -> list[dict]:
+    """Return plot-ready horizontal bound lines for a metric bound definition."""
+    if not isinstance(bound, dict) or not bool(bound.get("enabled", True)):
+        return []
+    out: list[dict] = []
+    for key in ("min_value", "max_value"):
+        value = bound.get(key)
+        if not isinstance(value, (int, float)):
+            continue
+        out.append(
+            {
+                "value": float(value),
+                "color": "red",
+                "linestyle": "--",
+                "alpha": 0.8,
+                "linewidth": 1.2,
+            }
+        )
+    return out
+
+
+def _td_norm_name(value: object) -> str:
+    return "".join(ch.lower() for ch in str(value or "").strip() if ch.isalnum())
+
+
+def _td_format_compact_value(value: object) -> str:
+    num = _to_support_number(value)
+    if num is not None:
+        if isinstance(num, int):
+            return str(num)
+        try:
+            return f"{float(num):g}"
+        except Exception:
+            pass
+    return str(value or "").strip()
+
+
+def td_normalize_run_type(value: object) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    key = _td_norm_name(raw)
+    if key in {"ss", "steadystate", "steady"}:
+        return "SS"
+    if key in {"pm", "pulsemode", "pulsedmode", "pulsed", "pulse"}:
+        return "PM"
+    return raw
+
+
+def td_build_run_condition_label(sequence_row: dict | None) -> str:
+    if not isinstance(sequence_row, dict):
+        return ""
+    parts: list[str] = []
+    pressure = _td_format_compact_value(sequence_row.get("feed_pressure"))
+    pressure_units = str(sequence_row.get("feed_pressure_units") or "").strip()
+    if pressure:
+        parts.append(" ".join(x for x in (pressure, pressure_units) if x).strip())
+    run_type = td_normalize_run_type(sequence_row.get("run_type"))
+    if run_type:
+        parts.append(run_type)
+    if run_type == "PM":
+        on_time = _td_format_compact_value(sequence_row.get("pulse_width_on"))
+        off_time = _td_format_compact_value(sequence_row.get("control_period"))
+        timing = ""
+        if on_time and off_time:
+            timing = f"{on_time} Sec ON / {off_time} Sec OFF"
+        elif on_time:
+            timing = f"{on_time} Sec ON"
+        elif off_time:
+            timing = f"{off_time} Sec OFF"
+        if timing:
+            parts.append(timing)
+    return ", ".join(part for part in parts if str(part).strip())
+
+
+def td_list_run_selection_views(db_path: Path, workbook_path: Path, *, project_dir: Path | None = None) -> dict[str, list[dict]]:
+    runs_ex = [
+        dict(item)
+        for item in (td_list_runs_ex(db_path) or [])
+        if isinstance(item, dict) and str(item.get("run_name") or "").strip()
+    ]
+    if not runs_ex:
+        return {"sequence": [], "condition": []}
+
+    try:
+        support_cfg = _read_td_support_workbook(workbook_path, project_dir=project_dir)
+    except Exception:
+        support_cfg = {"exists": False, "sequences": []}
+    support_sequences = [
+        dict(seq)
+        for seq in (support_cfg.get("sequences") or [])
+        if isinstance(seq, dict) and bool(seq.get("enabled", True))
+    ]
+
+    def _find_support_sequence(run_name: str) -> dict:
+        run = str(run_name or "").strip()
+        if not run:
+            return {}
+        run_key = _td_norm_name(run)
+        for seq in support_sequences:
+            seq_name = str(seq.get("sequence_name") or "").strip()
+            if seq_name and _td_norm_name(seq_name) == run_key:
+                return dict(seq)
+        for seq in support_sequences:
+            source_name = str(seq.get("source_run_name") or "").strip()
+            if source_name and _td_norm_name(source_name) == run_key:
+                return dict(seq)
+        return {}
+
+    sequence_items: list[dict] = []
+    condition_groups: dict[tuple[str, str, str, str, str], dict] = {}
+    for item in runs_ex:
+        run_name = str(item.get("run_name") or "").strip()
+        if not run_name:
+            continue
+        seq = _find_support_sequence(run_name)
+        sequence_name = str(seq.get("sequence_name") or run_name).strip() or run_name
+        run_condition = td_build_run_condition_label(seq)
+        seq_item = {
+            "mode": "sequence",
+            "id": f"sequence:{run_name}",
+            "run_name": run_name,
+            "sequence_name": sequence_name,
+            "source_run_name": str(seq.get("source_run_name") or run_name).strip() or run_name,
+            "display_text": sequence_name,
+            "run_condition": run_condition,
+            "member_runs": [run_name],
+            "member_sequences": [sequence_name],
+            "details_text": (f"Run Condition: {run_condition}" if run_condition else f"Sequence: {sequence_name}"),
+        }
+        sequence_items.append(seq_item)
+
+        if not seq or not run_condition:
+            continue
+        cond_key = (
+            _td_format_compact_value(seq.get("feed_pressure")).lower(),
+            str(seq.get("feed_pressure_units") or "").strip().lower(),
+            td_normalize_run_type(seq.get("run_type")).lower(),
+            _td_format_compact_value(seq.get("pulse_width_on")).lower(),
+            _td_format_compact_value(seq.get("control_period")).lower(),
+        )
+        if not any(cond_key):
+            continue
+        group = condition_groups.get(cond_key)
+        if group is None:
+            group = {
+                "mode": "condition",
+                "id": "condition:" + "|".join(cond_key),
+                "display_text": run_condition,
+                "run_condition": run_condition,
+                "member_runs": [],
+                "member_sequences": [],
+                "details_text": "",
+            }
+            condition_groups[cond_key] = group
+        if run_name not in group["member_runs"]:
+            group["member_runs"].append(run_name)
+        if sequence_name not in group["member_sequences"]:
+            group["member_sequences"].append(sequence_name)
+
+    condition_items: list[dict] = []
+    for group in condition_groups.values():
+        members = [str(x).strip() for x in (group.get("member_sequences") or []) if str(x).strip()]
+        if not members:
+            continue
+        group["details_text"] = f"Sequences: {', '.join(members)}"
+        condition_items.append(group)
+
+    condition_items.sort(key=lambda d: str(d.get("display_text") or "").lower())
+    return {"sequence": sequence_items, "condition": condition_items}
 
 
 def td_list_runs_ex(db_path: Path) -> list[dict]:
@@ -4525,8 +4729,6 @@ def _rebuild_test_data_project_calc_cache_from_raw(db_path: Path, workbook_path:
         xs: list[object],
         ys: list[object],
         *,
-        min_val: float | None,
-        max_val: float | None,
         exclude_first_n: int | None,
         last_n_rows: int | None,
     ) -> list[float]:
@@ -4535,10 +4737,6 @@ def _rebuild_test_data_project_calc_cache_from_raw(db_path: Path, workbook_path:
             fx = _finite_float(raw_x)
             fy = _finite_float(raw_y)
             if fx is None or fy is None:
-                continue
-            if min_val is not None and float(fy) < float(min_val):
-                continue
-            if max_val is not None and float(fy) > float(max_val):
                 continue
             filtered.append(float(fy))
         if exclude_first_n is not None and int(exclude_first_n) > 0:
@@ -4695,9 +4893,6 @@ def _rebuild_test_data_project_calc_cache_from_raw(db_path: Path, workbook_path:
                 y_name = str(y_name_raw or "").strip()
                 if y_name not in calc_name_set:
                     continue
-                bound = dict(seq_bounds.get(y_name) or {})
-                min_val = bound.get("min_value") if bool(bound.get("enabled", True)) else None
-                max_val = bound.get("max_value") if bool(bound.get("enabled", True)) else None
                 try:
                     xs = json.loads(x_json or "[]")
                 except Exception:
@@ -4709,8 +4904,6 @@ def _rebuild_test_data_project_calc_cache_from_raw(db_path: Path, workbook_path:
                 filtered_y = _filter_curve_values(
                     xs,
                     ys,
-                    min_val=min_val,
-                    max_val=max_val,
                     exclude_first_n=_to_support_int(exclude_first_n),
                     last_n_rows=_to_support_int(last_n_rows),
                 )
@@ -5416,24 +5609,11 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
         actual_x: str,
         rows: list[dict],
     ) -> tuple[list[float], list[float]]:
-        seq_name = str(run_info.get("sequence_name") or "").strip()
-        source_run_name = str(run_info.get("source_run_name") or "").strip()
-        seq_bounds = dict(support_bounds_by_sequence.get(seq_name) or {})
-        if not seq_bounds and source_run_name:
-            seq_bounds = dict(support_bounds_by_sequence.get(source_run_name) or {})
-        bound = dict(seq_bounds.get(str(y_name)) or {})
-        min_val = bound.get("min_value") if bool(bound.get("enabled", True)) else None
-        max_val = bound.get("max_value") if bool(bound.get("enabled", True)) else None
-
         filtered: list[tuple[float, float]] = []
         for row in rows:
             fx = _finite_float(row.get(actual_x))
             fy = _finite_float(row.get(y_name))
             if fx is None or fy is None:
-                continue
-            if min_val is not None and float(fy) < float(min_val):
-                continue
-            if max_val is not None and float(fy) > float(max_val):
                 continue
             filtered.append((float(fx), float(fy)))
 

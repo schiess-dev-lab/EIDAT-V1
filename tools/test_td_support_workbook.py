@@ -185,7 +185,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 param_defs=[{"name": "thrust", "units": "lbf"}],
             )
 
-            wb = load_workbook(str(support), read_only=True, data_only=True)
+            wb = load_workbook(str(support), read_only=False, data_only=True)
             try:
                 self.assertEqual(wb.sheetnames, ["Settings", "Sequences", "ParameterBounds"])
                 ws_settings = wb["Settings"]
@@ -196,12 +196,19 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 self.assertEqual(str(ws_settings.cell(4, 2).value or "").strip().lower(), "medium")
                 self.assertEqual(ws_settings.cell(5, 1).value, "perf_eq_point_count")
                 self.assertEqual(str(ws_settings.cell(5, 2).value or "").strip().lower(), "medium")
+                self.assertIsNotNone(ws_settings["A4"].comment)
+                self.assertIn("tight, medium, loose", str(ws_settings["A4"].comment.text or ""))
+                self.assertIsNotNone(ws_settings["A5"].comment)
+                self.assertIn("tight = 4 points", str(ws_settings["A5"].comment.text or ""))
 
                 ws_seq = wb["Sequences"]
                 self.assertEqual(ws_seq.cell(2, 1).value, "RunA")
                 self.assertEqual(ws_seq.cell(2, 2).value, "RunA")
                 self.assertIsNone(ws_seq.cell(2, 3).value)
-                self.assertTrue(bool(ws_seq.cell(2, 7).value))
+                self.assertEqual(ws_seq.cell(1, 4).value, "feed_pressure_units")
+                self.assertEqual(ws_seq.cell(1, 5).value, "run_type")
+                self.assertEqual(ws_seq.cell(1, 7).value, "control_period")
+                self.assertTrue(bool(ws_seq.cell(2, 10).value))
 
                 ws_bounds = wb["ParameterBounds"]
                 self.assertEqual(ws_bounds.cell(2, 1).value, "RunA")
@@ -211,8 +218,9 @@ class TestTDSupportWorkbook(unittest.TestCase):
             finally:
                 wb.close()
 
-    def test_rebuild_uses_support_sequence_name_and_filters(self) -> None:
+    def test_rebuild_uses_support_sequence_name_without_filtering_parameter_bounds(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+        from openpyxl import load_workbook  # type: ignore
 
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
             root = Path(td)
@@ -244,7 +252,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 ws_seq.cell(2, 1).value = "Seq1"
                 ws_seq.cell(2, 2).value = "RunA"
                 ws_seq.cell(2, 3).value = 100
-                ws_seq.cell(2, 4).value = 5
+                ws_seq.cell(2, 6).value = 5
                 ws_bounds = wb["ParameterBounds"]
                 ws_bounds.cell(2, 1).value = "Seq1"
                 ws_bounds.cell(2, 2).value = "thrust"
@@ -272,7 +280,104 @@ class TestTDSupportWorkbook(unittest.TestCase):
                     ("Seq1", "thrust", "mean", "SN1"),
                 ).fetchone()
                 self.assertIsNotNone(mean_row)
-                self.assertAlmostEqual(float(mean_row[0]), 35.0)
+                self.assertAlmostEqual(float(mean_row[0]), 55.0)
+
+            result = be.update_test_data_trending_project_workbook(root, wb_path, overwrite=True)
+            self.assertEqual(str(result.get("workbook") or ""), str(wb_path))
+
+            wb2 = load_workbook(str(wb_path), read_only=True, data_only=True)
+            try:
+                ws_calc = wb2["Data_calc"]
+                values = {
+                    str(ws_calc.cell(r, 1).value or "").strip(): ws_calc.cell(r, 2).value
+                    for r in range(1, (ws_calc.max_row or 0) + 1)
+                }
+                self.assertEqual(values.get("Seq1.thrust.mean"), 55.0)
+            finally:
+                wb2.close()
+
+    def test_metric_bound_line_specs_use_red_lines_for_enabled_bounds(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        self.assertEqual(
+            be.td_metric_bound_line_specs({"enabled": True, "min_value": 10.0, "max_value": 20.0}),
+            [
+                {"value": 10.0, "color": "red", "linestyle": "--", "alpha": 0.8, "linewidth": 1.2},
+                {"value": 20.0, "color": "red", "linestyle": "--", "alpha": 0.8, "linewidth": 1.2},
+            ],
+        )
+        self.assertEqual(
+            be.td_metric_bound_line_specs({"enabled": True, "min_value": 10.0, "max_value": None}),
+            [
+                {"value": 10.0, "color": "red", "linestyle": "--", "alpha": 0.8, "linewidth": 1.2},
+            ],
+        )
+        self.assertEqual(be.td_metric_bound_line_specs({"enabled": False, "min_value": 10.0, "max_value": 20.0}), [])
+        self.assertEqual(be.td_metric_bound_line_specs({}), [])
+
+    def test_run_selection_views_group_exact_run_conditions(self) -> None:
+        from openpyxl import load_workbook  # type: ignore
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            db_path = root / "implementation_trending.sqlite3"
+            wb_path = root / "project.xlsx"
+
+            be._write_test_data_trending_workbook(
+                wb_path,
+                global_repo=root,
+                serials=["SN1"],
+                docs=[{"serial_number": "SN1", "excel_sqlite_rel": ""}],
+                config=self._make_config(),
+            )
+            support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+            be._write_td_support_workbook(
+                support_path,
+                sequence_names=["Seq1", "Seq2", "Seq3"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+            )
+
+            wb = load_workbook(str(support_path))
+            try:
+                ws_seq = wb["Sequences"]
+                rows = {
+                    str(ws_seq.cell(r, 1).value or "").strip(): r
+                    for r in range(2, (ws_seq.max_row or 0) + 1)
+                }
+                for seq_name in ("Seq1", "Seq2"):
+                    row = rows[seq_name]
+                    ws_seq.cell(row, 3).value = 350
+                    ws_seq.cell(row, 4).value = "psia"
+                    ws_seq.cell(row, 5).value = "steady state"
+                row = rows["Seq3"]
+                ws_seq.cell(row, 3).value = 350
+                ws_seq.cell(row, 4).value = "psia"
+                ws_seq.cell(row, 5).value = "pulsed mode"
+                ws_seq.cell(row, 6).value = 60
+                ws_seq.cell(row, 7).value = 120
+                wb.save(str(support_path))
+            finally:
+                wb.close()
+
+            with sqlite3.connect(str(db_path)) as conn:
+                be._ensure_test_data_impl_tables(conn)
+                for run in ("Seq1", "Seq2", "Seq3"):
+                    conn.execute(
+                        "INSERT OR REPLACE INTO td_runs(run_name, default_x, display_name) VALUES (?, ?, ?)",
+                        (run, "Time", ""),
+                    )
+                conn.commit()
+
+            views = be.td_list_run_selection_views(db_path, wb_path, project_dir=root)
+            seq_items = views.get("sequence") or []
+            cond_items = views.get("condition") or []
+
+            self.assertEqual([item.get("display_text") for item in seq_items], ["Seq1", "Seq2", "Seq3"])
+            self.assertEqual([item.get("display_text") for item in cond_items], ["350 psia, PM, 60 Sec ON / 120 Sec OFF", "350 psia, SS"])
+            ss_group = next(item for item in cond_items if item.get("display_text") == "350 psia, SS")
+            self.assertEqual(ss_group.get("member_runs"), ["Seq1", "Seq2"])
+            self.assertEqual(ss_group.get("member_sequences"), ["Seq1", "Seq2"])
 
     def test_rebuild_prefers_workbook_config_columns_over_runtime_config(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
@@ -352,7 +457,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 ws_seq.cell(2, 1).value = "Seq1"
                 ws_seq.cell(2, 2).value = "RunA"
                 ws_seq.cell(2, 3).value = 100
-                ws_seq.cell(2, 4).value = 5
+                ws_seq.cell(2, 6).value = 5
                 wb.save(str(support_path))
             finally:
                 wb.close()

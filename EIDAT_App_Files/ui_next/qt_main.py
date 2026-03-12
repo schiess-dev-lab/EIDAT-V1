@@ -2945,12 +2945,23 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._runs_ex: list[dict] = []
         self._run_display_by_name: dict[str, str] = {}
         self._run_name_by_display: dict[str, str] = {}
+        self._run_selection_views: dict[str, list[dict]] = {"sequence": [], "condition": []}
         cfg = be.td_read_run_labeling_config(self._workbook_path)
         self._run_labeling_enabled = bool(isinstance(cfg, dict) and cfg.get("enabled"))
+
+        self.cb_run_mode = QtWidgets.QComboBox()
+        self.cb_run_mode.addItem("Sequence", "sequence")
+        self.cb_run_mode.addItem("Run Conditions", "condition")
+        self.cb_run_mode.currentIndexChanged.connect(lambda *_: self._refresh_run_dropdown())
+        form.addRow("Select By:", self.cb_run_mode)
 
         self.cb_run = QtWidgets.QComboBox()
         self.cb_run.currentIndexChanged.connect(self._refresh_columns_for_run)
         form.addRow("Run:", self.cb_run)
+        self.lbl_run_details = QtWidgets.QLabel("Sequence: -")
+        self.lbl_run_details.setStyleSheet("color: #64748b; font-size: 11px;")
+        self.lbl_run_details.setWordWrap(True)
+        form.addRow("", self.lbl_run_details)
         self.cb_show_run_labels = QtWidgets.QCheckBox("Show condition labels")
         self.cb_show_run_labels.setChecked(self._run_labeling_enabled)
         self.cb_show_run_labels.setEnabled(self._run_labeling_enabled)
@@ -3914,16 +3925,26 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         try:
             runs_ex = be.td_list_runs_ex(self._db_path)
             serials = be.td_list_serials(self._db_path)
+            run_selection_views = be.td_list_run_selection_views(
+                self._db_path,
+                self._workbook_path,
+                project_dir=self._project_dir,
+            )
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "Test Data Cache", str(exc))
             return
 
         prev_ref = self.cb_run.currentData()
-        if prev_ref is None:
+        prev_id = str(prev_ref.get("id") or "").strip() if isinstance(prev_ref, dict) else ""
+        if not prev_id and prev_ref is None:
             prev_ref = self.cb_run.currentText()
-        prev_ref = str(prev_ref or "").strip()
+            prev_id = str(prev_ref or "").strip()
 
         self._runs_ex = [d for d in (runs_ex or []) if isinstance(d, dict) and str(d.get("run_name") or "").strip()]
+        self._run_selection_views = {
+            "sequence": [dict(d) for d in ((run_selection_views or {}).get("sequence") or []) if isinstance(d, dict)],
+            "condition": [dict(d) for d in ((run_selection_views or {}).get("condition") or []) if isinstance(d, dict)],
+        }
         self._run_display_by_name = {
             str(d.get("run_name") or "").strip(): str(d.get("display_name") or "").strip()
             for d in self._runs_ex
@@ -3943,8 +3964,21 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             if not (bool(self._run_labeling_enabled) or has_any_display):
                 self.cb_show_run_labels.setChecked(False)
 
-        prev_run = self._run_name_by_display.get(prev_ref, prev_ref)
-        self._refresh_run_dropdown(prev_run_name=prev_run)
+        if hasattr(self, "cb_run_mode"):
+            has_conditions = bool(self._run_selection_views.get("condition"))
+            idx = self.cb_run_mode.findData("condition")
+            if idx >= 0:
+                self.cb_run_mode.model().item(idx).setEnabled(has_conditions)
+            if self._current_run_selector_mode() == "condition" and not has_conditions:
+                seq_idx = self.cb_run_mode.findData("sequence")
+                if seq_idx >= 0:
+                    self.cb_run_mode.setCurrentIndex(seq_idx)
+
+        prev_run = self._run_name_by_display.get(prev_id, prev_id)
+        prev_selection_id = prev_id or prev_run
+        if prev_selection_id and ":" not in prev_selection_id:
+            prev_selection_id = f"sequence:{prev_run or prev_selection_id}"
+        self._refresh_run_dropdown(prev_selection_id=prev_selection_id)
 
         try:
             source_rows = be.td_read_sources_metadata(self._workbook_path)
@@ -5143,11 +5177,45 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         worker.failed.connect(_fail)
         worker.start()
 
-    def _current_run_name(self) -> str:
+    def _current_run_selector_mode(self) -> str:
+        mode = str(self.cb_run_mode.currentData() if hasattr(self, "cb_run_mode") else "sequence" or "sequence").strip().lower()
+        return mode if mode in {"sequence", "condition"} else "sequence"
+
+    def _current_run_selection(self) -> dict:
         ref = self.cb_run.currentData() if hasattr(self, "cb_run") else None
+        if isinstance(ref, dict):
+            return dict(ref)
         run = str(ref or (self.cb_run.currentText() if hasattr(self, "cb_run") else "") or "").strip()
-        # Legacy auto-plots may have stored the display label instead of the underlying run_name.
-        return str(self._run_name_by_display.get(run, run) or "").strip()
+        run = str(self._run_name_by_display.get(run, run) or "").strip()
+        if not run:
+            return {}
+        return {
+            "mode": "sequence",
+            "id": f"sequence:{run}",
+            "run_name": run,
+            "sequence_name": run,
+            "display_text": run,
+            "member_runs": [run],
+            "member_sequences": [run],
+            "run_condition": "",
+            "details_text": f"Sequence: {run}",
+        }
+
+    def _current_member_runs(self) -> list[str]:
+        selection = self._current_run_selection()
+        runs = [str(v).strip() for v in (selection.get("member_runs") or []) if str(v).strip()]
+        if runs:
+            return runs
+        run = str(selection.get("run_name") or "").strip()
+        return [run] if run else []
+
+    def _current_run_name(self) -> str:
+        selection = self._current_run_selection()
+        runs = [str(v).strip() for v in (selection.get("member_runs") or []) if str(v).strip()]
+        if runs:
+            return runs[0]
+        run = str(selection.get("run_name") or "").strip()
+        return run
 
     def _run_display_text(self, run_name: str) -> str:
         rn = str(run_name or "").strip()
@@ -5155,6 +5223,93 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             return ""
         dn = str((self._run_display_by_name or {}).get(rn) or "").strip()
         return dn or rn
+
+    def _selection_display_text(self, selection: dict | None) -> str:
+        if not isinstance(selection, dict):
+            return ""
+        mode = str(selection.get("mode") or "sequence").strip().lower()
+        if mode == "condition":
+            return str(selection.get("display_text") or selection.get("run_condition") or "").strip()
+        run = str(selection.get("run_name") or "").strip()
+        show = bool(getattr(self, "cb_show_run_labels", None) and self.cb_show_run_labels.isChecked())
+        if show:
+            return self._run_display_text(run)
+        return str(selection.get("sequence_name") or run).strip()
+
+    def _selection_title_parts(self, selection: dict | None) -> tuple[str, str]:
+        if not isinstance(selection, dict):
+            return "", ""
+        seqs = [str(v).strip() for v in (selection.get("member_sequences") or []) if str(v).strip()]
+        run_condition = str(selection.get("run_condition") or "").strip()
+        mode = str(selection.get("mode") or "sequence").strip().lower()
+        if mode == "condition":
+            seq_text = ", ".join(seqs) if seqs else str(selection.get("display_text") or "").strip()
+        else:
+            seq_text = str(selection.get("sequence_name") or (seqs[0] if seqs else selection.get("run_name")) or "").strip()
+        return seq_text, run_condition
+
+    def _compose_run_title(self, selection: dict | None, suffix: str = "") -> str:
+        seq_text, run_condition = self._selection_title_parts(selection)
+        parts: list[str] = []
+        if seq_text:
+            label = "Sequences" if str((selection or {}).get("mode") or "").strip().lower() == "condition" else "Sequence"
+            parts.append(f"{label}: {seq_text}")
+        if run_condition:
+            parts.append(f"Run Condition: {run_condition}")
+        if suffix:
+            parts.append(str(suffix).strip())
+        return " | ".join([p for p in parts if str(p).strip()])
+
+    def _select_run_by_id(self, selection_id: str) -> None:
+        key = str(selection_id or "").strip()
+        if not key or not hasattr(self, "cb_run"):
+            return
+        for idx in range(self.cb_run.count()):
+            data = self.cb_run.itemData(idx)
+            if isinstance(data, dict) and str(data.get("id") or "").strip() == key:
+                self.cb_run.setCurrentIndex(idx)
+                return
+
+    def _selection_from_plot_def(self, d: dict | None) -> dict:
+        if not isinstance(d, dict):
+            return {}
+        want_mode = str(d.get("selector_mode") or "sequence").strip().lower()
+        want_mode = want_mode if want_mode in {"sequence", "condition"} else "sequence"
+        want_id = str(d.get("selection_id") or "").strip()
+        views = self._run_selection_views.get(want_mode) or []
+        for item in views:
+            if isinstance(item, dict) and str(item.get("id") or "").strip() == want_id:
+                return dict(item)
+        runs = [str(v).strip() for v in (d.get("member_runs") or []) if str(v).strip()] if isinstance(d.get("member_runs"), list) else []
+        run = str(d.get("run") or "").strip()
+        if not runs and run:
+            runs = [run]
+        if not runs:
+            return {}
+        if want_mode == "condition":
+            seqs = [str(v).strip() for v in runs if str(v).strip()]
+            label = str(d.get("name") or "").strip()
+            return {
+                "mode": "condition",
+                "id": want_id or f"condition:{'|'.join(runs)}",
+                "display_text": label,
+                "run_condition": label,
+                "member_runs": runs,
+                "member_sequences": seqs,
+                "details_text": f"Sequences: {', '.join(seqs)}",
+            }
+        run0 = runs[0]
+        return {
+            "mode": "sequence",
+            "id": want_id or f"sequence:{run0}",
+            "run_name": run0,
+            "sequence_name": run0,
+            "display_text": run0,
+            "member_runs": [run0],
+            "member_sequences": [run0],
+            "run_condition": "",
+            "details_text": f"Sequence: {run0}",
+        }
 
     def _metric_bounds_for_run(self, run_name: str) -> dict[str, dict]:
         run = str(run_name or "").strip()
@@ -5197,29 +5352,54 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             seq_name = run
         return dict(bounds_by_sequence.get(seq_name) or {})
 
+    def _plot_metric_bound_lines(self, axes, bound: dict | None) -> None:
+        specs_fn = getattr(be, "td_metric_bound_line_specs", None)
+        specs = specs_fn(bound) if callable(specs_fn) else []
+        for spec in specs:
+            try:
+                axes.axhline(
+                    float(spec.get("value")),
+                    color=str(spec.get("color") or "red"),
+                    linestyle=str(spec.get("linestyle") or "--"),
+                    alpha=float(spec.get("alpha") if spec.get("alpha") is not None else 0.8),
+                    linewidth=float(spec.get("linewidth") if spec.get("linewidth") is not None else 1.2),
+                )
+            except Exception:
+                continue
+
     def _select_run_by_name(self, run_name: str) -> None:
         rn = str(run_name or "").strip()
-        if not rn or not hasattr(self, "cb_run"):
+        if not rn:
             return
-        idx = self.cb_run.findData(rn)
-        if idx >= 0:
-            self.cb_run.setCurrentIndex(idx)
+        self._select_run_by_id(f"sequence:{rn}")
 
-    def _refresh_run_dropdown(self, prev_run_name: str | None = None) -> None:
+    def _refresh_run_dropdown(self, prev_selection_id: str | None = None) -> None:
         if not hasattr(self, "cb_run"):
             return
-        if prev_run_name is None:
-            prev_run_name = self._current_run_name()
+        if prev_selection_id is None:
+            current = self._current_run_selection()
+            prev_selection_id = str(current.get("id") or "").strip()
+        mode = self._current_run_selector_mode()
         show = bool(getattr(self, "cb_show_run_labels", None) and self.cb_show_run_labels.isChecked())
-        runs = [str(d.get("run_name") or "").strip() for d in (self._runs_ex or []) if str(d.get("run_name") or "").strip()]
+        items = [dict(d) for d in (self._run_selection_views.get(mode) or []) if isinstance(d, dict)]
+        if mode == "condition":
+            show = True
         self.cb_run.blockSignals(True)
         self.cb_run.clear()
-        for rn in runs:
-            text = self._run_display_text(rn) if show else rn
-            self.cb_run.addItem(text, rn)
-        if prev_run_name:
-            self._select_run_by_name(prev_run_name)
+        for item in items:
+            text = self._selection_display_text(item) if show or mode == "condition" else str(item.get("sequence_name") or item.get("run_name") or "").strip()
+            if not text:
+                continue
+            self.cb_run.addItem(text, item)
+        if prev_selection_id:
+            self._select_run_by_id(prev_selection_id)
+        if self.cb_run.currentIndex() < 0 and self.cb_run.count() > 0:
+            self.cb_run.setCurrentIndex(0)
         self.cb_run.blockSignals(False)
+        selection = self._current_run_selection()
+        if hasattr(self, "lbl_run_details"):
+            details = str(selection.get("details_text") or "").strip()
+            self.lbl_run_details.setText(details or "Sequence: -")
         try:
             self._refresh_columns_for_run()
             self._refresh_stats_preview()
@@ -5229,18 +5409,51 @@ class TestDataTrendDialog(QtWidgets.QDialog):
     def _refresh_columns_for_run(self) -> None:
         if not self._db_path:
             return
-        run = self._current_run_name()
-        if not run:
+        selection = self._current_run_selection()
+        if hasattr(self, "lbl_run_details"):
+            details = str(selection.get("details_text") or "").strip()
+            self.lbl_run_details.setText(details or "Sequence: -")
+        runs = self._current_member_runs()
+        if not runs:
             self.cb_y_curve.clear()
             self.cb_x.clear()
             self.list_y_metrics.clear()
             return
-        try:
-            y_cols = be.td_list_raw_y_columns(self._db_path, run)
-            metric_y_cols = be.td_list_metric_y_columns(self._db_path, run)
-            x_cols = be.td_list_x_columns(self._db_path, run)
-        except Exception:
-            y_cols, metric_y_cols, x_cols = [], [], []
+
+        y_cols: list[dict] = []
+        metric_y_cols: list[dict] = []
+        x_cols: list[str] = []
+        seen_y: set[str] = set()
+        seen_metric_y: set[str] = set()
+        seen_x: set[str] = set()
+        for run in runs:
+            try:
+                raw_cols = be.td_list_raw_y_columns(self._db_path, run)
+            except Exception:
+                raw_cols = []
+            try:
+                metric_cols = be.td_list_metric_y_columns(self._db_path, run)
+            except Exception:
+                metric_cols = []
+            try:
+                x_vals = be.td_list_x_columns(self._db_path, run)
+            except Exception:
+                x_vals = []
+            for col in raw_cols:
+                name = str((col or {}).get("name") or "").strip()
+                if name and name not in seen_y:
+                    seen_y.add(name)
+                    y_cols.append(dict(col))
+            for col in metric_cols:
+                name = str((col or {}).get("name") or "").strip()
+                if name and name not in seen_metric_y:
+                    seen_metric_y.add(name)
+                    metric_y_cols.append(dict(col))
+            for x_val in x_vals:
+                x_name = str(x_val or "").strip()
+                if x_name and x_name not in seen_x:
+                    seen_x.add(x_name)
+                    x_cols.append(x_name)
 
         def _norm_name(s: str) -> str:
             return "".join(ch.lower() for ch in str(s or "") if ch.isalnum())
@@ -5320,20 +5533,27 @@ class TestDataTrendDialog(QtWidgets.QDialog):
     def _refresh_curve_y_columns(self) -> None:
         if not self._db_path or not hasattr(self, "cb_y_curve") or not hasattr(self, "cb_x"):
             return
-        run = self._current_run_name()
+        runs = self._current_member_runs()
         prev_y = self.cb_y_curve.currentText()
         self.cb_y_curve.blockSignals(True)
         self.cb_y_curve.clear()
-        if not run:
+        if not runs:
             self.cb_y_curve.blockSignals(False)
             return
         x_label = (self.cb_x.currentText() or "").strip()
-        x_col = self._resolve_curve_x_key(run, x_label)
-        try:
-            y_cols = be.td_list_curve_y_columns(self._db_path, run, x_col)
-        except Exception:
-            y_cols = []
-        y_names = [str(c.get("name") or "").strip() for c in y_cols if str(c.get("name") or "").strip()]
+        seen_y: set[str] = set()
+        y_names: list[str] = []
+        for run in runs:
+            x_col = self._resolve_curve_x_key(run, x_label)
+            try:
+                y_cols = be.td_list_curve_y_columns(self._db_path, run, x_col)
+            except Exception:
+                y_cols = []
+            for col in y_cols:
+                name = str((col or {}).get("name") or "").strip()
+                if name and name not in seen_y:
+                    seen_y.add(name)
+                    y_names.append(name)
         self.cb_y_curve.addItems(y_names)
         if prev_y and prev_y in y_names:
             self.cb_y_curve.setCurrentText(prev_y)
@@ -5586,10 +5806,11 @@ class TestDataTrendDialog(QtWidgets.QDialog):
     def _plot_metrics(self) -> None:
         if not self._plot_ready or not self._db_path:
             return
-        run = self._current_run_name()
+        selection = self._current_run_selection()
+        runs = self._current_member_runs()
         stats = [it.text().strip().lower() for it in self.list_stats.selectedItems()] if hasattr(self, "list_stats") else []
         stats = [s for s in stats if s]
-        if not run or not stats:
+        if not runs or not stats:
             return
         y_cols = [it.text().strip() for it in self.list_y_metrics.selectedItems()] if hasattr(self, "list_y_metrics") else []
         y_cols = [c for c in y_cols if c]
@@ -5597,7 +5818,6 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.information(self, "Plot Metrics", "Select at least one Y column.")
             return
 
-        # Always plot all serials.
         try:
             labels = be.td_list_serials(self._db_path)
         except Exception:
@@ -5606,53 +5826,46 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.information(self, "Plot Metrics", "No serial numbers available.")
             return
 
-        show = bool(getattr(self, "cb_show_run_labels", None) and self.cb_show_run_labels.isChecked())
-        run_title = self._run_display_text(run) if show else run
         stats_label = "/".join(stats)
         y_label = stats[0] if len(stats) == 1 else "Metric value"
         plot_bounds = bool(getattr(self, "cb_plot_metric_bounds", None) and self.cb_plot_metric_bounds.isChecked())
-        metric_bounds = self._metric_bounds_for_run(run) if plot_bounds else {}
         self._axes.clear()
-        self._axes.set_title(f"{run_title} — {stats_label}")
+        self._axes.set_title(self._compose_run_title(selection, stats_label))
         self._axes.set_xlabel("Serial Number")
         self._axes.set_ylabel(y_label)
         x = list(range(len(labels)))
         any_plotted = False
-        for y_col in y_cols:
-            for stat in stats:
-                try:
-                    series = be.td_load_metric_series(self._db_path, run, y_col, stat)
-                except Exception:
-                    series = []
-                vmap = {
-                    str(r.get("serial") or "").strip(): r.get("value_num")
-                    for r in series
-                    if str(r.get("serial") or "").strip()
-                }
-                y = [
-                    (float(vmap.get(sn)) if isinstance(vmap.get(sn), (int, float)) else float("nan"))
-                    for sn in labels
-                ]
-                try:
-                    line = self._axes.plot(x, y, marker="o", linewidth=1.4, label=f"{y_col}.{stat}")[0]
-                    bound = dict(metric_bounds.get(str(y_col)) or {})
-                    if bound and bool(bound.get("enabled", True)):
-                        min_value = bound.get("min_value")
-                        max_value = bound.get("max_value")
-                        color = line.get_color()
-                        if isinstance(min_value, (int, float)):
-                            self._axes.axhline(float(min_value), color=color, linestyle="--", alpha=0.35, linewidth=1.0)
-                        if isinstance(max_value, (int, float)):
-                            self._axes.axhline(float(max_value), color=color, linestyle="--", alpha=0.35, linewidth=1.0)
-                    # Highlight the chosen serial with a larger marker (per series).
-                    hi_set = {str(sn).strip() for sn in (self._highlight_sns or []) if str(sn).strip()}
-                    for hi_sn in hi_set:
-                        if hi_sn in labels:
-                            idx = labels.index(hi_sn)
-                            self._axes.plot([x[idx]], [y[idx]], marker="o", markersize=9, color=line.get_color())
-                    any_plotted = True
-                except Exception:
-                    continue
+        multi_run = len(runs) > 1
+        for run in runs:
+            metric_bounds = self._metric_bounds_for_run(run) if plot_bounds else {}
+            for y_col in y_cols:
+                for stat in stats:
+                    try:
+                        series = be.td_load_metric_series(self._db_path, run, y_col, stat)
+                    except Exception:
+                        series = []
+                    vmap = {
+                        str(r.get("serial") or "").strip(): r.get("value_num")
+                        for r in series
+                        if str(r.get("serial") or "").strip()
+                    }
+                    y = [
+                        (float(vmap.get(sn)) if isinstance(vmap.get(sn), (int, float)) else float("nan"))
+                        for sn in labels
+                    ]
+                    label = f"{run}.{y_col}.{stat}" if multi_run else f"{y_col}.{stat}"
+                    try:
+                        line = self._axes.plot(x, y, marker="o", linewidth=1.4, label=label)[0]
+                        bound = dict(metric_bounds.get(str(y_col)) or {})
+                        self._plot_metric_bound_lines(self._axes, bound)
+                        hi_set = {str(sn).strip() for sn in (self._highlight_sns or []) if str(sn).strip()}
+                        for hi_sn in hi_set:
+                            if hi_sn in labels:
+                                idx = labels.index(hi_sn)
+                                self._axes.plot([x[idx]], [y[idx]], marker="o", markersize=9, color=line.get_color())
+                        any_plotted = True
+                    except Exception:
+                        continue
         if not any_plotted:
             QtWidgets.QMessageBox.information(self, "Plot Metrics", "No metric values found for this selection.")
             return
@@ -5675,67 +5888,75 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self.btn_save_plot_pdf.setEnabled(True)
         self._last_plot_def = {
             "mode": "metrics",
-            "run": run,
+            "run": runs[0],
+            "selector_mode": str(selection.get("mode") or "sequence"),
+            "selection_id": str(selection.get("id") or ""),
+            "member_runs": list(runs),
             "stats": list(stats),
             "y": list(y_cols),
             "plot_bounds": bool(plot_bounds),
         }
         self.btn_add_auto_plot.setEnabled(True)
-        # Keep table compact: preview first selected Y column (and highlight).
         self._refresh_stats_preview()
 
     def _plot_curves(self) -> None:
         if not self._plot_ready or not self._db_path:
             return
-        run = self._current_run_name()
+        selection = self._current_run_selection()
+        runs = self._current_member_runs()
         y_col = (self.cb_y_curve.currentText() or "").strip() if hasattr(self, "cb_y_curve") else ""
         x_label = (self.cb_x.currentText() or "").strip()
-        x_key = self.cb_x.currentData()
-        x_col = (str(x_key or "") or x_label).strip()
-        if not run or not y_col:
+        if not runs or not y_col:
             return
-        if not x_col:
+        if not x_label:
             QtWidgets.QMessageBox.information(
                 self,
                 "Plot Curves",
                 "No valid X column found.\n\nOnly Time / Pulse Number are supported for the X-axis (never excel_row).",
             )
             return
-        try:
-            # Always plot all serials.
-            curves = be.td_load_curves(self._db_path, run, y_col, x_col, serials=None)
-        except Exception as exc:
-            QtWidgets.QMessageBox.warning(self, "Plot Curves", str(exc))
-            return
-
-        if not curves:
-            QtWidgets.QMessageBox.information(self, "Plot Curves", "No curve data found for this selection.")
-            return
 
         self._axes.clear()
-        show = bool(getattr(self, "cb_show_run_labels", None) and self.cb_show_run_labels.isChecked())
-        run_title = self._run_display_text(run) if show else run
-        self._axes.set_title(f"{run_title} — {y_col} vs {x_label or x_col}")
-        self._axes.set_xlabel(x_label or x_col)
+        self._axes.set_title(self._compose_run_title(selection, f"{y_col} vs {x_label}"))
+        self._axes.set_xlabel(x_label)
         self._axes.set_ylabel(y_col)
-        for s in curves:
-            sn = str(s.get("serial") or "").strip()
-            xs = s.get("x") or []
-            ys = s.get("y") or []
-            if not isinstance(xs, list) or not isinstance(ys, list) or not xs or not ys:
+        any_plotted = False
+        multi_run = len(runs) > 1
+        x_col_title = ""
+        for run in runs:
+            x_col = self._resolve_curve_x_key(run, x_label)
+            if not x_col:
                 continue
+            if not x_col_title:
+                x_col_title = x_col
             try:
-                hi_set = {str(v).strip() for v in (self._highlight_sns or []) if str(v).strip()}
-                is_hi = bool(hi_set) and sn in hi_set
-                self._axes.plot(
-                    xs,
-                    ys,
-                    linewidth=(2.6 if is_hi else 1.1),
-                    alpha=(1.0 if is_hi else 0.75),
-                    label=sn or "SN",
-                )
-            except Exception:
-                continue
+                curves = be.td_load_curves(self._db_path, run, y_col, x_col, serials=None)
+            except Exception as exc:
+                QtWidgets.QMessageBox.warning(self, "Plot Curves", str(exc))
+                return
+            for s in curves:
+                sn = str(s.get("serial") or "").strip()
+                xs = s.get("x") or []
+                ys = s.get("y") or []
+                if not isinstance(xs, list) or not isinstance(ys, list) or not xs or not ys:
+                    continue
+                try:
+                    hi_set = {str(v).strip() for v in (self._highlight_sns or []) if str(v).strip()}
+                    is_hi = bool(hi_set) and sn in hi_set
+                    label = f"{run} | {sn}" if multi_run else (sn or "SN")
+                    self._axes.plot(
+                        xs,
+                        ys,
+                        linewidth=(2.6 if is_hi else 1.1),
+                        alpha=(1.0 if is_hi else 0.75),
+                        label=label,
+                    )
+                    any_plotted = True
+                except Exception:
+                    continue
+        if not any_plotted:
+            QtWidgets.QMessageBox.information(self, "Plot Curves", "No curve data found for this selection.")
+            return
         self._axes.grid(True, alpha=0.25)
         try:
             self._axes.legend(fontsize=8, loc="best")
@@ -5751,9 +5972,17 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             pass
         self._capture_main_plot_base_view()
         self.btn_save_plot_pdf.setEnabled(True)
-        self._last_plot_def = {"mode": "curves", "run": run, "x": (x_label or x_col), "y": [y_col]}
+        self._last_plot_def = {
+            "mode": "curves",
+            "run": runs[0],
+            "selector_mode": str(selection.get("mode") or "sequence"),
+            "selection_id": str(selection.get("id") or ""),
+            "member_runs": list(runs),
+            "x": (x_label or x_col_title),
+            "y": [y_col],
+        }
         self.btn_add_auto_plot.setEnabled(True)
-        self._populate_stats_table(run, y_col, self._highlight_sn)
+        self._populate_stats_table(runs[0], y_col, self._highlight_sn)
 
     def _selected_perf_runs(self) -> list[str]:
         if not getattr(self, "_db_path", None):
@@ -6944,9 +7173,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             name = str(d.get("name") or "").strip()
             if not name:
                 mode = str(d.get("mode") or "").strip()
-                run_ref = str(d.get("run") or "").strip()
-                run = self._run_name_by_display.get(run_ref, run_ref)
-                run_disp = self._run_display_text(run) if show else run
+                selection = self._selection_from_plot_def(d)
+                run_disp = self._selection_display_text(selection) or str(d.get("run") or "").strip()
                 if mode == "curves":
                     y = ", ".join([str(x) for x in (d.get("y") or []) if str(x).strip()])
                     x = str(d.get("x") or "").strip()
@@ -6987,16 +7215,14 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             return
         d = dict(self._last_plot_def)
         if "name" not in d:
-            show = bool(getattr(self, "cb_show_run_labels", None) and self.cb_show_run_labels.isChecked())
+            selection = self._selection_from_plot_def(d) or self._current_run_selection()
             if d.get("mode") == "curves":
-                run = str(d.get("run") or "").strip()
-                run_disp = self._run_display_text(run) if show else run
+                run_disp = self._selection_display_text(selection)
                 y = ", ".join([str(x) for x in (d.get("y") or []) if str(x).strip()])
                 x = str(d.get("x") or "").strip()
                 d["name"] = f"Curves: {run_disp} {y} vs {x}".strip()
             else:
-                run = str(d.get("run") or "").strip()
-                run_disp = self._run_display_text(run) if show else run
+                run_disp = self._selection_display_text(selection)
                 y = ", ".join([str(x) for x in (d.get("y") or []) if str(x).strip()])
                 stats_val = d.get("stats")
                 stats = (
@@ -7030,10 +7256,15 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         mode = str(d.get("mode") or "").strip().lower()
         if mode not in {"curves", "metrics"}:
             return
-        run_ref = str(d.get("run") or "").strip()
-        run = self._run_name_by_display.get(run_ref, run_ref)
-        if run:
-            self._select_run_by_name(run)
+        want_mode = str(d.get("selector_mode") or "sequence").strip().lower()
+        if hasattr(self, "cb_run_mode"):
+            idx = self.cb_run_mode.findData(want_mode)
+            if idx >= 0:
+                self.cb_run_mode.setCurrentIndex(idx)
+        selection = self._selection_from_plot_def(d)
+        sel_id = str(selection.get("id") or d.get("selection_id") or "").strip()
+        if sel_id:
+            self._select_run_by_id(sel_id)
         self._set_mode(mode)
         if mode == "curves":
             ys = d.get("y") or []
@@ -7400,24 +7631,30 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         ax = fig.add_subplot(111)
 
         mode = str(d.get("mode") or "").strip().lower()
-        run_ref = str(d.get("run") or "").strip()
-        run = self._run_name_by_display.get(run_ref, run_ref)
+        selection = self._selection_from_plot_def(d)
+        runs = [str(v).strip() for v in (selection.get("member_runs") or d.get("member_runs") or []) if str(v).strip()]
+        if not runs:
+            run_ref = str(d.get("run") or "").strip()
+            if run_ref:
+                runs = [self._run_name_by_display.get(run_ref, run_ref)]
         if mode == "curves":
             ys = d.get("y") or []
             y = str(ys[0] if isinstance(ys, list) and ys else "").strip()
             x_label = str(d.get("x") or "").strip()
-            x = self._resolve_curve_x_key(run, x_label)
-            ax.set_title(str(d.get("name") or "") or f"{run} — {y} vs {x_label or x}")
-            ax.set_xlabel(x_label or x)
+            ax.set_title(str(d.get("name") or "") or self._compose_run_title(selection, f"{y} vs {x_label}"))
+            ax.set_xlabel(x_label)
             ax.set_ylabel(y)
-            curves = be.td_load_curves(self._db_path, run, y, x, serials=None)  # type: ignore[arg-type]
-            for s in curves:
-                sn = str(s.get("serial") or "").strip()
-                xs = s.get("x") or []
-                ys2 = s.get("y") or []
-                if not isinstance(xs, list) or not isinstance(ys2, list) or not xs or not ys2:
-                    continue
-                ax.plot(xs, ys2, linewidth=1.1, alpha=0.85, label=sn or "SN")
+            multi_run = len(runs) > 1
+            for run in runs:
+                x = self._resolve_curve_x_key(run, x_label)
+                curves = be.td_load_curves(self._db_path, run, y, x, serials=None)  # type: ignore[arg-type]
+                for s in curves:
+                    sn = str(s.get("serial") or "").strip()
+                    xs = s.get("x") or []
+                    ys2 = s.get("y") or []
+                    if not isinstance(xs, list) or not isinstance(ys2, list) or not xs or not ys2:
+                        continue
+                    ax.plot(xs, ys2, linewidth=1.1, alpha=0.85, label=(f"{run} | {sn}" if multi_run else (sn or "SN")))
             ax.grid(True, alpha=0.25)
             ax.legend(fontsize=8, loc="best")
         else:
@@ -7437,34 +7674,29 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             ys = d.get("y") or []
             y_cols = [str(x).strip() for x in ys] if isinstance(ys, list) else []
             plot_bounds = bool(d.get("plot_bounds"))
-            metric_bounds = self._metric_bounds_for_run(run) if plot_bounds else {}
-            ax.set_title(str(d.get("name") or "") or f"{run} — {stats_label}")
+            ax.set_title(str(d.get("name") or "") or self._compose_run_title(selection, stats_label))
             ax.set_xlabel("Serial Number")
             ax.set_ylabel(stats[0] if len(stats) == 1 else "Metric value")
             labels = be.td_list_serials(self._db_path)  # type: ignore[arg-type]
             x_idx = list(range(len(labels)))
-            for y_col in y_cols:
-                for stat in stats:
-                    series = be.td_load_metric_series(self._db_path, run, y_col, stat)  # type: ignore[arg-type]
-                    vmap = {
-                        str(r.get("serial") or "").strip(): r.get("value_num")
-                        for r in series
-                        if str(r.get("serial") or "").strip()
-                    }
-                    yv = [
-                        (float(vmap.get(sn)) if isinstance(vmap.get(sn), (int, float)) else float("nan"))
-                        for sn in labels
-                    ]
-                    line = ax.plot(x_idx, yv, marker="o", linewidth=1.2, label=f"{y_col}.{stat}")[0]
-                    bound = dict(metric_bounds.get(str(y_col)) or {})
-                    if bound and bool(bound.get("enabled", True)):
-                        min_value = bound.get("min_value")
-                        max_value = bound.get("max_value")
-                        color = line.get_color()
-                        if isinstance(min_value, (int, float)):
-                            ax.axhline(float(min_value), color=color, linestyle="--", alpha=0.35, linewidth=1.0)
-                        if isinstance(max_value, (int, float)):
-                            ax.axhline(float(max_value), color=color, linestyle="--", alpha=0.35, linewidth=1.0)
+            multi_run = len(runs) > 1
+            for run in runs:
+                metric_bounds = self._metric_bounds_for_run(run) if plot_bounds else {}
+                for y_col in y_cols:
+                    for stat in stats:
+                        series = be.td_load_metric_series(self._db_path, run, y_col, stat)  # type: ignore[arg-type]
+                        vmap = {
+                            str(r.get("serial") or "").strip(): r.get("value_num")
+                            for r in series
+                            if str(r.get("serial") or "").strip()
+                        }
+                        yv = [
+                            (float(vmap.get(sn)) if isinstance(vmap.get(sn), (int, float)) else float("nan"))
+                            for sn in labels
+                        ]
+                        ax.plot(x_idx, yv, marker="o", linewidth=1.2, label=(f"{run}.{y_col}.{stat}" if multi_run else f"{y_col}.{stat}"))
+                        bound = dict(metric_bounds.get(str(y_col)) or {})
+                        self._plot_metric_bound_lines(ax, bound)
             ax.set_xticks(x_idx)
             ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
             ax.grid(True, alpha=0.25)
