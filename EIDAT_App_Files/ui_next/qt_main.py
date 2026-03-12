@@ -2938,36 +2938,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         left_layout.addLayout(cache_row)
         left_layout.addWidget(self.lbl_cache)
 
-        form = QtWidgets.QFormLayout()
-        form.setContentsMargins(0, 0, 0, 0)
-        form.setSpacing(8)
-
         self._runs_ex: list[dict] = []
         self._run_display_by_name: dict[str, str] = {}
         self._run_name_by_display: dict[str, str] = {}
         self._run_selection_views: dict[str, list[dict]] = {"sequence": [], "condition": []}
-        cfg = be.td_read_run_labeling_config(self._workbook_path)
-        self._run_labeling_enabled = bool(isinstance(cfg, dict) and cfg.get("enabled"))
-
-        self.cb_run_mode = QtWidgets.QComboBox()
-        self.cb_run_mode.addItem("Sequence", "sequence")
-        self.cb_run_mode.addItem("Run Conditions", "condition")
-        self.cb_run_mode.currentIndexChanged.connect(lambda *_: self._refresh_run_dropdown())
-        form.addRow("Select By:", self.cb_run_mode)
-
-        self.cb_run = QtWidgets.QComboBox()
-        self.cb_run.currentIndexChanged.connect(self._refresh_columns_for_run)
-        form.addRow("Run:", self.cb_run)
-        self.lbl_run_details = QtWidgets.QLabel("Sequence: -")
-        self.lbl_run_details.setStyleSheet("color: #64748b; font-size: 11px;")
-        self.lbl_run_details.setWordWrap(True)
-        form.addRow("", self.lbl_run_details)
-        self.cb_show_run_labels = QtWidgets.QCheckBox("Show condition labels")
-        self.cb_show_run_labels.setChecked(self._run_labeling_enabled)
-        self.cb_show_run_labels.setEnabled(self._run_labeling_enabled)
-        self.cb_show_run_labels.toggled.connect(lambda *_: self._refresh_run_dropdown())
-        form.addRow("", self.cb_show_run_labels)
-        left_layout.addLayout(form)
 
         tabs = QtWidgets.QTabWidget()
         try:
@@ -3141,6 +3115,37 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         tabs.addTab(tab_curves, "Curves")
         tabs.addTab(tab_perf, "Performance")
         left_layout.addWidget(tabs)
+
+        self.run_selector_frame = QtWidgets.QFrame()
+        self.run_selector_frame.setStyleSheet(
+            "QFrame { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 10px; }"
+        )
+        run_selector_layout = QtWidgets.QVBoxLayout(self.run_selector_frame)
+        run_selector_layout.setContentsMargins(10, 10, 10, 10)
+        run_selector_layout.setSpacing(8)
+        run_selector_title = QtWidgets.QLabel("Run Selection")
+        run_selector_title.setStyleSheet("font-size: 12px; font-weight: 700; color: #334155;")
+        run_selector_layout.addWidget(run_selector_title)
+
+        form = QtWidgets.QFormLayout()
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setSpacing(8)
+
+        self.cb_run_mode = QtWidgets.QComboBox()
+        self.cb_run_mode.addItem("Sequence", "sequence")
+        self.cb_run_mode.addItem("Run Conditions", "condition")
+        self.cb_run_mode.currentIndexChanged.connect(lambda *_: self._refresh_run_dropdown())
+        form.addRow("Select By:", self.cb_run_mode)
+
+        self.cb_run = QtWidgets.QComboBox()
+        self.cb_run.currentIndexChanged.connect(self._refresh_columns_for_run)
+        form.addRow("Run:", self.cb_run)
+        self.lbl_run_details = QtWidgets.QLabel("Sequence: -")
+        self.lbl_run_details.setStyleSheet("color: #64748b; font-size: 11px;")
+        self.lbl_run_details.setWordWrap(True)
+        form.addRow("", self.lbl_run_details)
+        run_selector_layout.addLayout(form)
+        left_layout.addWidget(self.run_selector_frame)
 
         # Serial highlight (not selection/filtering for plotting)
         lbl_serials = QtWidgets.QLabel("Highlight Serial (optional)")
@@ -3958,12 +3963,6 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             dn: rn for rn, dn in self._run_display_by_name.items() if dn and int(counts.get(dn, 0)) == 1
         }
 
-        has_any_display = any(bool(v) for v in self._run_display_by_name.values())
-        if hasattr(self, "cb_show_run_labels"):
-            self.cb_show_run_labels.setEnabled(bool(self._run_labeling_enabled) or has_any_display)
-            if not (bool(self._run_labeling_enabled) or has_any_display):
-                self.cb_show_run_labels.setChecked(False)
-
         if hasattr(self, "cb_run_mode"):
             has_conditions = bool(self._run_selection_views.get("condition"))
             idx = self.cb_run_mode.findData("condition")
@@ -4459,21 +4458,18 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         right_l.setSpacing(10)
 
         list_runs = QtWidgets.QListWidget()
-
-        runs_ex = []
-        try:
-            runs_ex = be.td_list_runs_ex(self._db_path) if self._db_path else []
-        except Exception:
-            runs_ex = []
-        run_names = [str(r.get("run_name") or "").strip() for r in (runs_ex or []) if str(r.get("run_name") or "").strip()]
-
-        list_runs.blockSignals(True)
-        for rn in run_names:
-            it = QtWidgets.QListWidgetItem(rn)
-            it.setFlags(it.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
-            it.setCheckState(QtCore.Qt.CheckState.Checked)
-            list_runs.addItem(it)
-        list_runs.blockSignals(False)
+        cb_run_scope = QtWidgets.QComboBox()
+        cb_run_scope.addItem("Sequence", "sequence")
+        run_selection_views = {
+            "sequence": [dict(d) for d in (self._run_selection_views.get("sequence") or []) if isinstance(d, dict)],
+            "condition": [dict(d) for d in (self._run_selection_views.get("condition") or []) if isinstance(d, dict)],
+        }
+        if run_selection_views.get("condition"):
+            cb_run_scope.addItem("Run Conditions", "condition")
+        cur_scope = self._current_run_selector_mode()
+        idx_scope = cb_run_scope.findData(cur_scope)
+        if idx_scope >= 0:
+            cb_run_scope.setCurrentIndex(idx_scope)
 
         ed_param_filter = QtWidgets.QLineEdit()
 
@@ -4484,6 +4480,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         lbl_runs_auto.setWordWrap(True)
         row_runs = QtWidgets.QHBoxLayout()
         row_runs.addWidget(QtWidgets.QLabel("Runs included"))
+        row_runs.addWidget(cb_run_scope)
         btn_runs_popup = QtWidgets.QPushButton("Select Runs...")
         row_runs.addWidget(btn_runs_popup)
         row_runs.addStretch(1)
@@ -4589,6 +4586,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 it = QtWidgets.QListWidgetItem(src.text())
                 it.setFlags(it.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
                 it.setCheckState(src.checkState())
+                it.setData(QtCore.Qt.ItemDataRole.UserRole, src.data(QtCore.Qt.ItemDataRole.UserRole))
                 work_list.addItem(it)
 
             ed_filter.textChanged.connect(lambda text: _set_filtered_hidden(work_list, text))
@@ -4626,8 +4624,56 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             _fit_widget_to_screen(pop)
             pop.exec()
 
+        def _selection_label(selection: dict) -> str:
+            return self._selection_display_text(selection) or str(selection.get("sequence_name") or selection.get("run_name") or "").strip()
+
+        def _populate_run_selections() -> None:
+            mode = str(cb_run_scope.currentData() or "sequence").strip().lower()
+            items = [dict(d) for d in (run_selection_views.get(mode) or []) if isinstance(d, dict)]
+            list_runs.blockSignals(True)
+            list_runs.clear()
+            for selection in items:
+                label = _selection_label(selection)
+                if not label:
+                    continue
+                it = QtWidgets.QListWidgetItem(label)
+                it.setFlags(it.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+                it.setCheckState(QtCore.Qt.CheckState.Checked)
+                it.setData(QtCore.Qt.ItemDataRole.UserRole, selection)
+                list_runs.addItem(it)
+            list_runs.blockSignals(False)
+
+        def _collect_checked_run_selections() -> list[dict]:
+            out: list[dict] = []
+            for i in range(list_runs.count()):
+                it = list_runs.item(i)
+                if not it or it.checkState() != QtCore.Qt.CheckState.Checked:
+                    continue
+                data = it.data(QtCore.Qt.ItemDataRole.UserRole)
+                if isinstance(data, dict):
+                    out.append(dict(data))
+            return out
+
+        def _selected_member_runs() -> list[str]:
+            out: list[str] = []
+            seen: set[str] = set()
+            for selection in _collect_checked_run_selections():
+                members = selection.get("member_runs") or []
+                if isinstance(members, list):
+                    for run in members:
+                        rn = str(run or "").strip()
+                        if not rn or rn in seen:
+                            continue
+                        seen.add(rn)
+                        out.append(rn)
+                rn = str(selection.get("run_name") or "").strip()
+                if rn and rn not in seen:
+                    seen.add(rn)
+                    out.append(rn)
+            return out
+
         def _update_runs_label() -> None:
-            sel = _collect_checked(list_runs)
+            sel = [_selection_label(d) for d in _collect_checked_run_selections() if _selection_label(d)]
             lbl_runs_auto.setText(f"Selected runs: {_selection_summary(sel, list_runs.count())}")
 
         def _update_params_label():
@@ -4643,7 +4689,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             )
 
         def _refresh_params_from_runs():
-            runs_sel = _collect_checked(list_runs)
+            runs_sel = _selected_member_runs()
             if not runs_sel or not self._db_path:
                 list_params.clear()
                 list_metric_params.clear()
@@ -4786,10 +4832,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         btn_params_popup.clicked.connect(_open_params_popup)
         btn_metrics_popup.clicked.connect(_open_metrics_popup)
 
+        cb_run_scope.currentIndexChanged.connect(lambda *_: (_populate_run_selections(), _refresh_params_from_runs()))
         list_runs.itemChanged.connect(lambda *_: _refresh_params_from_runs())
         list_params.itemChanged.connect(lambda *_: _update_params_label())
         list_metric_params.itemChanged.connect(lambda *_: _update_metric_params_label())
         list_metric_stats.itemChanged.connect(lambda *_: _update_metric_params_label())
+        _populate_run_selections()
         _refresh_params_from_runs()
 
         splitter.addWidget(right)
@@ -4969,7 +5017,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             if not out_path:
                 QtWidgets.QMessageBox.information(dlg, "Auto Report", "Select an output PDF path.")
                 return
-            runs_sel = _collect_checked(list_runs)
+            run_selections_sel = _collect_checked_run_selections()
+            runs_sel = _selected_member_runs()
             hi_sel = [it.text().strip() for it in list_sn.selectedItems() if it and it.text().strip()]
             if not runs_sel:
                 QtWidgets.QMessageBox.information(dlg, "Auto Report", "Select at least one run.")
@@ -5071,6 +5120,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             payload = {
                 "output_pdf": out_path,
                 "runs": runs_sel,
+                "run_selections": run_selections_sel,
+                "run_selection_labels": [_selection_label(d) for d in run_selections_sel if _selection_label(d)],
                 "highlighted_serials": hi_sel,
                 "params": params_sel,
                 "metric_params": metric_params_sel,
@@ -5110,6 +5161,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
         options = {
             "runs": runs,
+            "run_selections": payload.get("run_selections") or [],
+            "run_selection_labels": payload.get("run_selection_labels") or [],
             "params": payload.get("params") or [],
             "metric_params": payload.get("metric_params") or [],
             "metric_stats": payload.get("metric_stats") or [],
@@ -5231,10 +5284,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         if mode == "condition":
             return str(selection.get("display_text") or selection.get("run_condition") or "").strip()
         run = str(selection.get("run_name") or "").strip()
-        show = bool(getattr(self, "cb_show_run_labels", None) and self.cb_show_run_labels.isChecked())
-        if show:
-            return self._run_display_text(run)
-        return str(selection.get("sequence_name") or run).strip()
+        return self._run_display_text(run) or str(selection.get("sequence_name") or run).strip()
 
     def _selection_title_parts(self, selection: dict | None) -> tuple[str, str]:
         if not isinstance(selection, dict):
@@ -5380,14 +5430,11 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             current = self._current_run_selection()
             prev_selection_id = str(current.get("id") or "").strip()
         mode = self._current_run_selector_mode()
-        show = bool(getattr(self, "cb_show_run_labels", None) and self.cb_show_run_labels.isChecked())
         items = [dict(d) for d in (self._run_selection_views.get(mode) or []) if isinstance(d, dict)]
-        if mode == "condition":
-            show = True
         self.cb_run.blockSignals(True)
         self.cb_run.clear()
         for item in items:
-            text = self._selection_display_text(item) if show or mode == "condition" else str(item.get("sequence_name") or item.get("run_name") or "").strip()
+            text = self._selection_display_text(item) or str(item.get("sequence_name") or item.get("run_name") or "").strip()
             if not text:
                 continue
             self.cb_run.addItem(text, item)
@@ -5789,6 +5836,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self.btn_mode_metrics.setChecked(m == "metrics")
         if hasattr(self, "btn_mode_perf"):
             self.btn_mode_perf.setChecked(m == "performance")
+        if hasattr(self, "run_selector_frame"):
+            self.run_selector_frame.setVisible(m != "performance")
         self.btn_plot.setText(
             "Plot Curves" if m == "curves" else ("Plot Metrics" if m == "metrics" else "Plot Performance")
         )
@@ -7168,7 +7217,6 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         if not hasattr(self, "list_auto_plots"):
             return
         self.list_auto_plots.clear()
-        show = bool(getattr(self, "cb_show_run_labels", None) and self.cb_show_run_labels.isChecked())
         for d in self._auto_plots:
             name = str(d.get("name") or "").strip()
             if not name:
@@ -7325,7 +7373,6 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             return
 
         plots: list[tuple[str, dict]] = []
-        show = bool(getattr(self, "cb_show_run_labels", None) and self.cb_show_run_labels.isChecked())
         for d in self._auto_plots:
             if not isinstance(d, dict):
                 continue
@@ -7334,7 +7381,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 mode = str(d.get("mode") or "").strip()
                 run_ref = str(d.get("run") or "").strip()
                 run = self._run_name_by_display.get(run_ref, run_ref)
-                run_disp = self._run_display_text(run) if show else run
+                run_disp = self._run_display_text(run)
                 if mode == "curves":
                     y = ", ".join([str(x) for x in (d.get("y") or []) if str(x).strip()])
                     x = str(d.get("x") or "").strip()

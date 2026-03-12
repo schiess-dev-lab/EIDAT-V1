@@ -319,6 +319,29 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
                 self.assertIn("isp", [p.lower() for p in auto])
                 self.assertIn("thrust", [p.lower() for p in auto])
 
+    def test_run_selections_expand_member_runs(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            db = self._make_perf_db(root)
+            with sqlite3.connect(str(db)) as conn:
+                run_rows = tar._td_list_runs(conn)
+                runs = tar._resolve_selected_runs(
+                    run_rows,
+                    {
+                        "run_selections": [
+                            {
+                                "mode": "condition",
+                                "id": "condition:test",
+                                "display_text": "Condition A",
+                                "member_runs": ["Run2", "Run1", "Run2"],
+                            }
+                        ]
+                    },
+                )
+                self.assertEqual(runs, ["Run2", "Run1"])
+
     def test_overall_certification_status(self):
         from EIDAT_App_Files.ui_next import trend_auto_report as tar
 

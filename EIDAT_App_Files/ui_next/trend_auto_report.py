@@ -550,8 +550,30 @@ def _overall_cert_status(grades: list[str]) -> str:
 
 def _resolve_selected_runs(run_rows: list[dict], options: dict) -> list[str]:
     run_by_name = {str(r.get("run_name") or ""): r for r in (run_rows or []) if str(r.get("run_name") or "")}
-    selected_runs = options.get("runs") or []
-    runs = [str(r).strip() for r in selected_runs if str(r).strip()] if isinstance(selected_runs, list) else []
+    runs: list[str] = []
+
+    run_selections = options.get("run_selections") or []
+    if isinstance(run_selections, list):
+        seen: set[str] = set()
+        for selection in run_selections:
+            if not isinstance(selection, dict):
+                continue
+            members = selection.get("member_runs") or []
+            if isinstance(members, list):
+                for run in members:
+                    rn = str(run or "").strip()
+                    if not rn or rn in seen:
+                        continue
+                    seen.add(rn)
+                    runs.append(rn)
+            rn = str(selection.get("run_name") or "").strip()
+            if rn and rn not in seen:
+                seen.add(rn)
+                runs.append(rn)
+
+    if not runs:
+        selected_runs = options.get("runs") or []
+        runs = [str(r).strip() for r in selected_runs if str(r).strip()] if isinstance(selected_runs, list) else []
     if not runs:
         runs = [str(r.get("run_name") or "").strip() for r in (run_rows or []) if str(r.get("run_name") or "").strip()]
     return [r for r in runs if r in run_by_name]
