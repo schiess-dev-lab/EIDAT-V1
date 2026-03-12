@@ -2307,6 +2307,7 @@ TD_SUPPORT_WORKBOOK_SUFFIX = ".support.xlsx"
 GLOBAL_RUN_MIRROR_DIRNAME = "global_run_mirror"
 LOCAL_PROJECTS_MIRROR_DIRNAME = "projects"
 PROJECT_UPDATE_DEBUG_JSON = "update_debug.json"
+TD_CACHE_DEBUG_JSON = "td_cache_debug.json"
 
 # Central runtime config used to define Test Data trending workbooks (independent of node-local DATA_ROOT).
 CENTRAL_EXCEL_TREND_CONFIG = ROOT / "user_inputs" / "excel_trend_config.json"
@@ -3055,6 +3056,15 @@ def _purge_test_data_legacy_impl_raw_tables(conn: sqlite3.Connection) -> None:
         conn.execute(f"DROP TABLE IF EXISTS {_q(table_name)}")
 
 
+def _write_td_cache_debug_json(project_dir: Path, payload: dict) -> Path | None:
+    path = Path(project_dir).expanduser() / TD_CACHE_DEBUG_JSON
+    try:
+        path.write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+    except Exception:
+        return None
+    return path
+
+
 def _read_test_data_config_columns(workbook_path: Path) -> list[dict]:
     try:
         from openpyxl import load_workbook  # type: ignore
@@ -3304,20 +3314,22 @@ def _resolve_td_source_sqlite_for_workbook(
 ) -> dict[str, object]:
     wb_path = Path(workbook_path).expanduser()
     node_root = _infer_node_root_from_workbook_path(wb_path)
+    support_dir = eidat_support_dir(node_root)
     meta = _load_td_source_metadata(wb_path, source_row)
+    excel_sqlite_rel = str(source_row.get("excel_sqlite_rel") or meta.get("excel_sqlite_rel") or "").strip()
+    artifacts_rel = str(source_row.get("artifacts_rel") or meta.get("artifacts_rel") or "").strip()
     result = _resolve_td_source_sqlite_for_node(
         node_root,
-        excel_sqlite_rel=str(source_row.get("excel_sqlite_rel") or meta.get("excel_sqlite_rel") or "").strip(),
-        artifacts_rel=str(source_row.get("artifacts_rel") or meta.get("artifacts_rel") or "").strip(),
+        excel_sqlite_rel=excel_sqlite_rel,
+        artifacts_rel=artifacts_rel,
     )
-    if not result.get("path"):
-        return result
-    path = Path(result["path"]).expanduser()
     return {
         **result,
-        "path": path,
-        "excel_sqlite_rel": str(source_row.get("excel_sqlite_rel") or meta.get("excel_sqlite_rel") or "").strip(),
-        "artifacts_rel": str(source_row.get("artifacts_rel") or meta.get("artifacts_rel") or "").strip(),
+        "path": Path(result["path"]).expanduser() if result.get("path") else None,
+        "excel_sqlite_rel": excel_sqlite_rel,
+        "artifacts_rel": artifacts_rel,
+        "node_root": str(node_root),
+        "support_dir": str(support_dir),
     }
 
 
@@ -5330,6 +5342,8 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
     run_y_calc_union: dict[str, dict[str, str]] = {}
     raw_tables_created: set[str] = set()
     diagnostics_rows: list[tuple[str, str, str, str, str, str, int, int, str]] = []
+    debug_diagnostics: list[dict] = []
+    debug_sources: list[dict] = []
 
     for entry in entries:
         sn = str(entry.get("serial") or "").strip()
@@ -5338,6 +5352,21 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
         sqlite_path = Path(sqlite_path_raw).expanduser() if sqlite_path_raw else Path()
         status = str(source_resolution.get("status") or "missing").strip().lower() or "missing"
         source_reason = str(source_resolution.get("reason") or "").strip()
+        resolved_from = str(source_resolution.get("resolved_from") or "").strip()
+        source_info = {
+            "serial": sn,
+            "status": status,
+            "resolved_from": resolved_from,
+            "resolved_sqlite_path": str(sqlite_path) if sqlite_path else "",
+            "excel_sqlite_rel": str(source_resolution.get("excel_sqlite_rel") or entry.get("excel_sqlite_rel") or "").strip(),
+            "artifacts_rel": str(source_resolution.get("artifacts_rel") or entry.get("artifacts_rel") or "").strip(),
+            "metadata_rel": str(entry.get("metadata_rel") or "").strip(),
+            "node_root": str(source_resolution.get("node_root") or "").strip(),
+            "support_dir": str(source_resolution.get("support_dir") or "").strip(),
+            "reason": source_reason,
+        }
+        debug_sources.append(dict(source_info))
+        source_debug_source_idx = len(debug_sources) - 1
         try:
             st = sqlite_path.stat()
             mtime_ns = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)))
@@ -5411,6 +5440,17 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
                 (sn, str(sqlite_path) if sqlite_path else "", status, "", "", "[]", 0, 0, source_reason),
             )
             conn.commit()
+        debug_diagnostics.append(
+            {
+                **source_info,
+                "run_name": "",
+                "x_axis_kind": "",
+                "matched_y": [],
+                "curves_written": 0,
+                "metrics_written": 0,
+            }
+        )
+        source_debug_diag_idx = len(debug_diagnostics) - 1
 
         if status != "ok":
             continue
@@ -5418,6 +5458,10 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
         try:
             src = sqlite3.connect(str(sqlite_path))
             try:
+                source_curves_written = 0
+                discovered_runs = 0
+                schema_runs = 0
+                source_issue_notes: list[str] = []
                 # Discover runs
                 try:
                     runs_rows = src.execute("SELECT sheet_name FROM __sheet_info ORDER BY sheet_name").fetchall()
@@ -5432,6 +5476,11 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
                         runs = [str(r[0] or "")[7:] for r in tbls if str(r[0] or "").startswith("sheet__")]
                     except Exception:
                         runs = []
+                discovered_runs = len(runs)
+                if not runs:
+                    source_issue_notes.append(
+                        "No runs discovered in source SQLite. Expected __sheet_info rows or sheet__* tables."
+                    )
 
                 for run in runs:
                     # Resolve table name for the run
@@ -5458,7 +5507,9 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
                         col_list = []
                         cols = set()
                     if not cols:
+                        source_issue_notes.append(f"Run '{run}' table '{table}' has no readable columns.")
                         continue
+                    schema_runs += 1
 
                     order_by = "excel_row ASC" if "excel_row" in cols else "rowid ASC"
                     source_rows = _read_run_rows(src, table, cols=cols, order_by=order_by)
@@ -5584,9 +5635,9 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
                         if y_name not in calc_units or not calc_units.get(y_name):
                             calc_units[y_name] = str(calc_units_by_name.get(y_name) or cfg_units.get(y_name) or "").strip()
 
+                    run_curves_written = 0
                     if default_x:
                         actual_x = x_map.get(default_x, "")
-                        run_curves_written = 0
                         for y_name in matched_y_names:
                             actual_y = y_actual_by_name.get(y_name, "")
                             if not actual_x or not actual_y:
@@ -5665,33 +5716,91 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
                                 )
                                 conn.commit()
                             curves_written += 1
+                            source_curves_written += 1
                             run_curves_written += 1
-                        diagnostics_rows.append(
-                            (
-                                sn,
-                                str(sqlite_path),
-                                "ok" if run_curves_written > 0 else "invalid",
-                                effective_run,
-                                default_x,
-                                json.dumps(
-                                    [
-                                        {"name": name, "source_column": y_actual_by_name.get(name, "")}
-                                        for name in matched_y_names
-                                    ],
-                                    ensure_ascii=False,
-                                ),
-                                int(run_curves_written),
-                                0,
-                                "; ".join(match_issues),
-                            )
+                    diagnostics_rows.append(
+                        (
+                            sn,
+                            str(sqlite_path),
+                            "ok" if run_curves_written > 0 else "invalid",
+                            effective_run,
+                            default_x,
+                            json.dumps(
+                                [
+                                    {"name": name, "source_column": y_actual_by_name.get(name, "")}
+                                    for name in matched_y_names
+                                ],
+                                ensure_ascii=False,
+                            ),
+                            int(run_curves_written),
+                            0,
+                            "; ".join(match_issues),
                         )
+                    )
+                    debug_diagnostics.append(
+                        {
+                            **source_info,
+                            "status": "ok" if run_curves_written > 0 else "invalid",
+                            "run_name": effective_run,
+                            "x_axis_kind": default_x,
+                            "matched_y": [
+                                {"name": name, "source_column": y_actual_by_name.get(name, "")}
+                                for name in matched_y_names
+                            ],
+                            "curves_written": int(run_curves_written),
+                            "metrics_written": 0,
+                            "reason": "; ".join(match_issues),
+                        }
+                    )
+                if source_curves_written <= 0:
+                    if not source_issue_notes and discovered_runs > 0 and schema_runs <= 0:
+                        source_issue_notes.append("Discovered runs, but none exposed readable source columns.")
+                    summary_reason = (
+                        "; ".join(dict.fromkeys(source_issue_notes))
+                        if source_issue_notes
+                        else "No usable raw curves were written for any discovered run."
+                    )
+                    with closing(sqlite3.connect(str(db_path))) as conn:
+                        _ensure_test_data_impl_tables(conn)
+                        conn.execute(
+                            "UPDATE td_sources SET status=?, last_ingested_epoch_ns=? WHERE serial=?",
+                            ("invalid", computed_epoch_ns, sn),
+                        )
+                        conn.execute(
+                            """
+                            INSERT OR REPLACE INTO td_source_diagnostics(
+                                serial, resolved_sqlite_path, status, run_name, x_axis_kind, matched_y_json, curves_written, metrics_written, reason
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (sn, str(sqlite_path), "invalid", "", "", "[]", 0, 0, summary_reason),
+                        )
+                        conn.commit()
+                    if debug_sources:
+                        debug_sources[source_debug_source_idx]["status"] = "invalid"
+                        debug_sources[source_debug_source_idx]["reason"] = summary_reason
+                    if debug_diagnostics:
+                        debug_diagnostics[source_debug_diag_idx]["status"] = "invalid"
+                        if not str(debug_diagnostics[source_debug_diag_idx].get("reason") or "").strip():
+                            debug_diagnostics[source_debug_diag_idx]["reason"] = summary_reason
+                    debug_diagnostics.append(
+                        {
+                            **source_info,
+                            "status": "invalid",
+                            "run_name": "",
+                            "x_axis_kind": "",
+                            "matched_y": [],
+                            "curves_written": 0,
+                            "metrics_written": 0,
+                            "reason": summary_reason,
+                        }
+                    )
             finally:
                 try:
                     src.close()
                 except Exception:
                     pass
 
-        except Exception:
+        except Exception as exc:
             with closing(sqlite3.connect(str(db_path))) as conn:
                 _ensure_test_data_impl_tables(conn)
                 conn.execute(
@@ -5704,9 +5813,33 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
                         serial, resolved_sqlite_path, status, run_name, x_axis_kind, matched_y_json, curves_written, metrics_written, reason
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (sn, str(sqlite_path) if sqlite_path else "", "invalid", "", "", "[]", 0, 0, "Failed to ingest source SQLite."),
+                    (
+                        sn,
+                        str(sqlite_path) if sqlite_path else "",
+                        "invalid",
+                        "",
+                        "",
+                        "[]",
+                        0,
+                        0,
+                        f"Failed to ingest source SQLite: {type(exc).__name__}: {exc}",
+                    ),
                 )
                 conn.commit()
+            debug_diagnostics.append(
+                {
+                    **source_info,
+                    "status": "invalid",
+                    "run_name": "",
+                    "x_axis_kind": "",
+                    "matched_y": [],
+                    "curves_written": 0,
+                    "metrics_written": 0,
+                    "reason": f"Failed to ingest source SQLite: {type(exc).__name__}: {exc}",
+                }
+            )
+            debug_sources[source_debug_source_idx]["status"] = "invalid"
+            debug_sources[source_debug_source_idx]["reason"] = f"Failed to ingest source SQLite: {type(exc).__name__}: {exc}"
             invalid_sources += 1
 
     if diagnostics_rows:
@@ -5721,6 +5854,36 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
                 diagnostics_rows,
             )
             conn.commit()
+
+    debug_payload = {
+        "workbook": str(wb_path),
+        "implementation_db": str(db_path),
+        "raw_db": str(raw_db_path),
+        "statistics": list(selected_stats),
+        "configured_columns": [
+            {
+                "name": str(c.get("name") or "").strip(),
+                "units": str(c.get("units") or "").strip(),
+                "aliases": [str(v).strip() for v in (c.get("aliases") or []) if str(v).strip()],
+            }
+            for c in cfg_cols
+            if str(c.get("name") or "").strip()
+        ],
+        "sources": [
+            {
+                **item,
+            }
+            for item in debug_sources
+        ],
+        "diagnostics": list(debug_diagnostics),
+        "counts": {
+            "serials_count": len(entries),
+            "missing_sources": int(missing_sources),
+            "invalid_sources": int(invalid_sources),
+            "curves_written": int(curves_written),
+        },
+    }
+    debug_path = _write_td_cache_debug_json(db_path.parent, debug_payload)
 
     # Compute optional display labels per run (condition labeling).
     runs_all = set(run_x_union.keys()) | set(run_y_raw_union.keys()) | set(run_y_calc_union.keys())
@@ -5815,6 +5978,32 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
 
     calc_payload = _rebuild_test_data_project_calc_cache_from_raw(db_path, wb_path)
     metrics_written = int(calc_payload.get("metrics_written") or 0)
+    debug_payload["counts"]["metrics_written"] = int(metrics_written)
+    debug_payload["calc_payload"] = dict(calc_payload or {})
+    if debug_path is not None:
+        _write_td_cache_debug_json(db_path.parent, debug_payload)
+
+    reason_lines = [
+        " | ".join(
+            part
+            for part in [
+                str(item.get("serial") or "").strip(),
+                str(item.get("resolved_from") or "").strip(),
+                str(item.get("reason") or "").strip(),
+            ]
+            if part
+        )
+        for item in debug_payload.get("diagnostics") or []
+        if isinstance(item, dict) and (
+            str(item.get("reason") or "").strip()
+            or str(item.get("resolved_from") or "").strip()
+        )
+    ]
+    reason_lines = list(dict.fromkeys(reason_lines))
+    reason_txt = ""
+    if reason_lines:
+        reason_txt = " Details: " + " | ".join(reason_lines[:4])
+    debug_txt = f" Debug: {debug_path}." if debug_path is not None else ""
 
     if curves_written <= 0:
         if missing_sources or invalid_sources:
@@ -5822,15 +6011,21 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
                 "Test Data raw cache build produced no curves. "
                 f"Missing sources: {missing_sources}; invalid sources: {invalid_sources}. "
                 "Check the Sources sheet, source SQLite resolution, X-axis detection, and configured Y-column matches, then run 'Build / Refresh Cache' again."
+                + reason_txt
+                + debug_txt
             )
         raise RuntimeError(
             "Test Data raw cache build produced no curves. "
             "Check X-axis detection and configured Y-column matches, then run 'Build / Refresh Cache' again."
+            + reason_txt
+            + debug_txt
         )
     if metrics_written <= 0:
         raise RuntimeError(
             "Test Data implementation cache build produced no calculated metrics. "
             "Check the support workbook filters/bounds and run 'Build / Refresh Cache' again."
+            + reason_txt
+            + debug_txt
         )
 
     return {
@@ -8230,7 +8425,29 @@ def _resolve_support_path(support_dir: Path, maybe_rel: str | None) -> Path | No
     p = Path(str(maybe_rel)).expanduser()
     if p.is_absolute():
         return p
-    return support_dir / p
+    norm = str(maybe_rel).replace("/", "\\").lstrip("\\")
+    low = norm.lower()
+    try:
+        support = Path(support_dir).expanduser()
+        if support.name.strip().lower() == "eidat support":
+            if support.parent.name.strip().lower() == "eidat":
+                node_root = support.parent.parent
+            else:
+                node_root = support.parent
+        else:
+            node_root = support.parent
+    except Exception:
+        support = Path(support_dir).expanduser()
+        node_root = support.parent
+
+    if low.startswith("eidat support\\"):
+        rest = norm[len("EIDAT Support\\") :]
+        return support / Path(rest)
+    if low.startswith("eidat\\eidat support\\"):
+        return node_root / Path(norm)
+    if low.startswith("debug\\") or low.startswith("projects\\") or low.startswith("logs\\") or low.startswith("staging\\"):
+        return support / Path(norm)
+    return support / p
 
 
 def _best_doc_for_serial(support_dir: Path, docs: list[dict]) -> dict | None:
