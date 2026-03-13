@@ -3140,6 +3140,18 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self.lbl_perf_common_runs.setWordWrap(True)
         perf_plot_layout.addWidget(self.lbl_perf_common_runs)
 
+        filter_row = QtWidgets.QHBoxLayout()
+        filter_row.addWidget(QtWidgets.QLabel("PM data filter:"))
+        self.cb_perf_filter_mode = QtWidgets.QComboBox()
+        self.cb_perf_filter_mode.addItem("All run conditions", "all_conditions")
+        self.cb_perf_filter_mode.addItem("Match control period", "match_control_period")
+        filter_row.addWidget(self.cb_perf_filter_mode, 1)
+        filter_row.addWidget(QtWidgets.QLabel("Control period:"))
+        self.cb_perf_control_period = QtWidgets.QComboBox()
+        self.cb_perf_control_period.setEnabled(False)
+        filter_row.addWidget(self.cb_perf_control_period, 1)
+        perf_plot_layout.addLayout(filter_row)
+
         fit_row = QtWidgets.QHBoxLayout()
         self.cb_perf_fit = QtWidgets.QCheckBox("Fit equation")
         self.cb_perf_fit.setChecked(True)
@@ -5448,6 +5460,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         mode = str(selection.get("mode") or "sequence").strip().lower()
         if mode == "condition":
             return str(selection.get("display_text") or selection.get("run_condition") or "").strip()
+        display_text = str(selection.get("display_text") or "").strip()
+        if display_text:
+            return display_text
         run = str(selection.get("run_name") or "").strip()
         return self._run_display_text(run) or str(selection.get("sequence_name") or run).strip()
 
@@ -5474,6 +5489,66 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         if suffix:
             parts.append(str(suffix).strip())
         return " | ".join([p for p in parts if str(p).strip()])
+
+    @staticmethod
+    def _selection_observation_filters(selection: dict | None) -> tuple[str, str]:
+        if not isinstance(selection, dict):
+            return "", ""
+        if str(selection.get("mode") or "sequence").strip().lower() != "sequence":
+            return "", ""
+        program_title = str(selection.get("program_title") or "").strip()
+        source_run_name = str(selection.get("source_run_name") or selection.get("sequence_name") or "").strip()
+        return program_title, source_run_name
+
+    def _load_metric_series_for_selection(
+        self,
+        run_name: str,
+        column_name: str,
+        stat: str,
+        *,
+        selection: dict | None = None,
+        control_period_filter: object = None,
+    ) -> list[dict]:
+        if not getattr(self, "_db_path", None):
+            return []
+        program_title, source_run_name = self._selection_observation_filters(selection)
+        try:
+            return be.td_load_metric_series(
+                self._db_path,
+                run_name,
+                column_name,
+                stat,
+                program_title=(program_title or None),
+                source_run_name=(source_run_name or None),
+                control_period_filter=control_period_filter,
+            )
+        except Exception:
+            return []
+
+    def _load_curves_for_selection(
+        self,
+        run_name: str,
+        y_name: str,
+        x_name: str,
+        *,
+        selection: dict | None = None,
+        serials: list[str] | None = None,
+    ) -> list[dict]:
+        if not getattr(self, "_db_path", None):
+            return []
+        program_title, source_run_name = self._selection_observation_filters(selection)
+        try:
+            return be.td_load_curves(
+                self._db_path,
+                run_name,
+                y_name,
+                x_name,
+                serials=serials,
+                program_title=(program_title or None),
+                source_run_name=(source_run_name or None),
+            )
+        except Exception:
+            return []
 
     def _select_run_by_id(self, selection_id: str) -> None:
         key = str(selection_id or "").strip()
@@ -5537,6 +5612,13 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             support_cfg = reader(self._workbook_path, project_dir=self._project_dir)
         except Exception:
             return {}
+        condition_bounds = {
+            str(k).strip(): dict(v)
+            for k, v in (support_cfg.get("condition_bounds") or {}).items()
+            if str(k).strip() and isinstance(v, dict)
+        }
+        if run in condition_bounds:
+            return dict(condition_bounds.get(run) or {})
         sequences = [
             dict(s)
             for s in (support_cfg.get("sequences") or [])
@@ -5647,6 +5729,67 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 )
             except Exception:
                 continue
+
+    @staticmethod
+    def _metric_points_for_serial_labels(series_rows: list[dict], labels: list[str]) -> list[dict]:
+        index_by_serial = {
+            str(sn).strip(): idx
+            for idx, sn in enumerate(labels or [])
+            if str(sn).strip()
+        }
+        rows_by_serial: dict[str, list[dict]] = {}
+        for row in series_rows or []:
+            if not isinstance(row, dict):
+                continue
+            sn = str(row.get("serial") or "").strip()
+            val = row.get("value_num")
+            if sn not in index_by_serial or not isinstance(val, (int, float)) or not math.isfinite(float(val)):
+                continue
+            rows_by_serial.setdefault(sn, []).append(dict(row))
+        out: list[dict] = []
+        for sn, rows in rows_by_serial.items():
+            rows_sorted = sorted(
+                rows,
+                key=lambda row: (
+                    str(row.get("program_title") or "").lower(),
+                    str(row.get("source_run_name") or "").lower(),
+                    str(row.get("observation_id") or "").lower(),
+                ),
+            )
+            count = len(rows_sorted)
+            if count <= 1:
+                offsets = [0.0]
+            else:
+                step = min(0.16, 0.38 / float(max(1, count - 1)))
+                offsets = [((idx - ((count - 1) / 2.0)) * step) for idx in range(count)]
+            base_x = float(index_by_serial.get(sn, 0))
+            for offset, row in zip(offsets, rows_sorted):
+                out.append(
+                    {
+                        "x": base_x + float(offset),
+                        "y": float(row.get("value_num") or 0.0),
+                        "serial": sn,
+                        "observation_id": str(row.get("observation_id") or "").strip(),
+                        "program_title": str(row.get("program_title") or "").strip(),
+                        "source_run_name": str(row.get("source_run_name") or "").strip(),
+                    }
+                )
+        out.sort(key=lambda row: (float(row.get("x") or 0.0), str(row.get("observation_id") or "").lower()))
+        return out
+
+    def _curve_trace_label(self, run_name: str, curve_row: dict, *, multi_run: bool) -> str:
+        serial = str(curve_row.get("serial") or "").strip() or "SN"
+        program_title = str(curve_row.get("program_title") or "").strip()
+        source_run_name = str(curve_row.get("source_run_name") or "").strip()
+        parts: list[str] = []
+        if multi_run:
+            parts.append(self._run_display_text(run_name) or run_name)
+        parts.append(serial)
+        if program_title:
+            parts.append(program_title)
+        if source_run_name:
+            parts.append(source_run_name)
+        return " | ".join([part for part in parts if str(part).strip()])
 
     def _select_run_by_name(self, run_name: str) -> None:
         rn = str(run_name or "").strip()
@@ -6025,12 +6168,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             return
 
         _set_val("serial", sn)
+        selection = self._current_run_selection()
         for st in ("count", "mean", "std", "min", "max"):
             val = None
-            try:
-                series = be.td_load_metric_series(self._db_path, run, y_col, st)
-            except Exception:
-                series = []
+            series = self._load_metric_series_for_selection(run, y_col, st, selection=selection)
             for r in series:
                 if str(r.get("serial") or "").strip() == sn:
                     val = r.get("value_num")
@@ -6127,10 +6268,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             for y_col in y_cols:
                 for stat in stats:
                     source_stat = "mean" if str(stat).strip().lower() == "average" else stat
-                    try:
-                        series = be.td_load_metric_series(self._db_path, run, y_col, source_stat)
-                    except Exception:
-                        series = []
+                    series = self._load_metric_series_for_selection(run, y_col, source_stat, selection=selection)
                     try:
                         if str(stat).strip().lower() == "average":
                             y = be.td_metric_average_plot_values(series, labels)
@@ -6150,13 +6288,29 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     label = f"{run}.{y_col}.{stat_label}" if multi_run else f"{y_col}.{stat_label}"
                     try:
                         is_average = str(stat).strip().lower() == "average"
-                        line = self._axes.plot(
-                            x,
-                            y,
-                            marker=None if is_average else "o",
-                            linewidth=1.4,
-                            label=label,
-                        )[0]
+                        if is_average:
+                            line = self._axes.plot(
+                                x,
+                                y,
+                                marker=None,
+                                linewidth=1.4,
+                                label=label,
+                            )[0]
+                        else:
+                            points = self._metric_points_for_serial_labels(series, labels)
+                            if not points:
+                                continue
+                            xs = [float(p.get("x") or 0.0) for p in points]
+                            ys = [float(p.get("y") or 0.0) for p in points]
+                            line = self._axes.plot(
+                                xs,
+                                ys,
+                                linestyle="",
+                                marker="o",
+                                markersize=5.2,
+                                alpha=0.88,
+                                label=label,
+                            )[0]
                         bound = dict(metric_bounds.get(str(y_col)) or {})
                         self._plot_metric_bound_lines(self._axes, bound)
                         if is_average:
@@ -6165,10 +6319,16 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                                 average_summaries.append(f"{label} = {self._fmt_num(avg_val)}")
                         else:
                             hi_set = {str(sn).strip() for sn in (self._highlight_sns or []) if str(sn).strip()}
-                            for hi_sn in hi_set:
-                                if hi_sn in labels:
-                                    idx = labels.index(hi_sn)
-                                    self._axes.plot([x[idx]], [y[idx]], marker="o", markersize=9, color=line.get_color())
+                            for point in points:
+                                if str(point.get("serial") or "").strip() in hi_set:
+                                    self._axes.plot(
+                                        [float(point.get("x") or 0.0)],
+                                        [float(point.get("y") or 0.0)],
+                                        linestyle="",
+                                        marker="o",
+                                        markersize=9,
+                                        color=line.get_color(),
+                                    )
                         any_plotted = True
                     except Exception:
                         continue
@@ -6243,7 +6403,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             if not x_col_title:
                 x_col_title = x_col
             try:
-                curves = be.td_load_curves(self._db_path, run, y_col, x_col, serials=None)
+                curves = self._load_curves_for_selection(run, y_col, x_col, selection=selection, serials=None)
             except Exception as exc:
                 QtWidgets.QMessageBox.warning(self, "Plot Curves", str(exc))
                 return
@@ -6256,7 +6416,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 try:
                     hi_set = {str(v).strip() for v in (self._highlight_sns or []) if str(v).strip()}
                     is_hi = bool(hi_set) and sn in hi_set
-                    label = f"{run} | {sn}" if multi_run else (sn or "SN")
+                    label = self._curve_trace_label(run, s, multi_run=multi_run)
                     self._axes.plot(
                         xs,
                         ys,
@@ -6312,6 +6472,33 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             return be.td_list_serials(self._db_path)
         except Exception:
             return []
+
+    def _selected_perf_filter_mode(self) -> str:
+        if not hasattr(self, "cb_perf_filter_mode"):
+            return "all_conditions"
+        try:
+            mode = str(self.cb_perf_filter_mode.currentData() or "").strip().lower()
+        except Exception:
+            mode = ""
+        return mode if mode in {"all_conditions", "match_control_period"} else "all_conditions"
+
+    def _selected_perf_control_period(self) -> object | None:
+        if self._selected_perf_filter_mode() != "match_control_period" or not hasattr(self, "cb_perf_control_period"):
+            return None
+        try:
+            value = self.cb_perf_control_period.currentData()
+        except Exception:
+            value = None
+        if value in (None, ""):
+            txt = str(self.cb_perf_control_period.currentText() or "").strip()
+            return txt or None
+        return value
+
+    def _update_perf_control_period_state(self) -> None:
+        if not hasattr(self, "cb_perf_control_period"):
+            return
+        enabled = self._selected_perf_filter_mode() == "match_control_period" and self.cb_perf_control_period.count() > 0
+        self.cb_perf_control_period.setEnabled(enabled)
 
     @staticmethod
     def _perf_norm_name(value: object) -> str:
@@ -6740,6 +6927,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         *,
         fit_enabled: bool,
         require_min_points: int,
+        control_period_filter: object = None,
     ) -> tuple[dict[str, dict], list[str], str]:
         is_surface = bool(str(input2_name or "").strip())
         equation_stats = list(plot_stats)
@@ -6755,19 +6943,68 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             if is_surface
             else f"{output_name} vs {input1_name}"
         )
+        serial_set = {str(sn).strip() for sn in serials if str(sn).strip()}
+
+        def _series_by_observation(rows: list[dict]) -> dict[str, dict]:
+            out: dict[str, dict] = {}
+            for row in rows or []:
+                if not isinstance(row, dict):
+                    continue
+                obs_id = str(row.get("observation_id") or "").strip()
+                sn = str(row.get("serial") or "").strip()
+                val = row.get("value_num")
+                if (
+                    not obs_id
+                    or not sn
+                    or sn not in serial_set
+                    or not isinstance(val, (int, float))
+                    or not math.isfinite(float(val))
+                ):
+                    continue
+                out[obs_id] = dict(row)
+            return out
+
+        def _obs_label(run_display: str, run_name_value: str, row: dict) -> str:
+            parts: list[str] = [str(run_display or run_name_value).strip() or str(run_name_value or "").strip()]
+            for key in ("program_title", "source_run_name"):
+                value = str((row or {}).get(key) or "").strip()
+                if value and value not in parts:
+                    parts.append(value)
+            return " | ".join([part for part in parts if str(part).strip()])
 
         for st in equation_stats:
             if is_surface:
-                per_run: list[tuple[str, str, dict[str, float], dict[str, float], dict[str, float], str, str, str]] = []
+                per_run: list[tuple[str, str, dict[str, dict], dict[str, dict], dict[str, dict], str, str, str]] = []
                 for rn in runs:
                     input1_col, input1_units = self._resolve_td_y_col_units(rn, input1_name)
                     input2_col, input2_units = self._resolve_td_y_col_units(rn, input2_name)
                     output_col, output_units = self._resolve_td_y_col_units(rn, output_name)
                     if not input1_col or not input2_col or not output_col:
                         continue
-                    input1_map = self._load_perf_equation_metric_map(rn, input1_col, st)
-                    input2_map = self._load_perf_equation_metric_map(rn, input2_col, st)
-                    output_map = self._load_perf_equation_metric_map(rn, output_col, st)
+                    input1_map = _series_by_observation(
+                        self._load_perf_equation_metric_series(
+                            rn,
+                            input1_col,
+                            st,
+                            control_period_filter=control_period_filter,
+                        )
+                    )
+                    input2_map = _series_by_observation(
+                        self._load_perf_equation_metric_series(
+                            rn,
+                            input2_col,
+                            st,
+                            control_period_filter=control_period_filter,
+                        )
+                    )
+                    output_map = _series_by_observation(
+                        self._load_perf_equation_metric_series(
+                            rn,
+                            output_col,
+                            st,
+                            control_period_filter=control_period_filter,
+                        )
+                    )
                     if not input1_map or not input2_map or not output_map:
                         continue
                     per_run.append(
@@ -6790,21 +7027,22 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 min_surface_points = max(3, int(require_min_points))
                 for sn in serials:
                     pts: list[tuple[float, float, float, str]] = []
-                    seen_points: set[tuple[float, float, float]] = set()
                     for _rn, rdisp, input1_map, input2_map, output_map, _u1, _u2, _uy in per_run:
-                        if sn not in input1_map or sn not in input2_map or sn not in output_map:
-                            continue
-                        point = (
-                            float(input1_map[sn]),
-                            float(input2_map[sn]),
-                            float(output_map[sn]),
-                            str(rdisp or _rn),
-                        )
-                        point_key = (round(point[0], 12), round(point[1], 12), round(point[2], 12))
-                        if point_key in seen_points:
-                            continue
-                        seen_points.add(point_key)
-                        pts.append(point)
+                        obs_ids = sorted(set(input1_map.keys()) & set(input2_map.keys()) & set(output_map.keys()))
+                        for obs_id in obs_ids:
+                            row_input1 = input1_map.get(obs_id) or {}
+                            row_input2 = input2_map.get(obs_id) or {}
+                            row_output = output_map.get(obs_id) or {}
+                            if str(row_output.get("serial") or row_input1.get("serial") or "").strip() != sn:
+                                continue
+                            pts.append(
+                                (
+                                    float(row_input1.get("value_num") or 0.0),
+                                    float(row_input2.get("value_num") or 0.0),
+                                    float(row_output.get("value_num") or 0.0),
+                                    _obs_label(rdisp, _rn, row_output or row_input1 or row_input2),
+                                )
+                            )
                     distinct_x1 = {round(p[0], 12) for p in pts}
                     distinct_x2 = {round(p[1], 12) for p in pts}
                     if len(pts) >= min_surface_points and len(distinct_x1) >= 2 and len(distinct_x2) >= 2:
@@ -6851,14 +7089,28 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     "highlight_model": {},
                 }
             else:
-                per_run_2d: list[tuple[str, str, dict[str, float], dict[str, float], str, str]] = []
+                per_run_2d: list[tuple[str, str, dict[str, dict], dict[str, dict], str, str]] = []
                 for rn in runs:
                     input1_col, input1_units = self._resolve_td_y_col_units(rn, input1_name)
                     output_col, output_units = self._resolve_td_y_col_units(rn, output_name)
                     if not input1_col or not output_col:
                         continue
-                    input1_map = self._load_perf_equation_metric_map(rn, input1_col, st)
-                    output_map = self._load_perf_equation_metric_map(rn, output_col, st)
+                    input1_map = _series_by_observation(
+                        self._load_perf_equation_metric_series(
+                            rn,
+                            input1_col,
+                            st,
+                            control_period_filter=control_period_filter,
+                        )
+                    )
+                    output_map = _series_by_observation(
+                        self._load_perf_equation_metric_series(
+                            rn,
+                            output_col,
+                            st,
+                            control_period_filter=control_period_filter,
+                        )
+                    )
                     if not input1_map or not output_map:
                         continue
                     per_run_2d.append((rn, self._run_display_text(rn), input1_map, output_map, input1_units, output_units))
@@ -6866,16 +7118,21 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 curves: dict[str, list[tuple[float, float, str]]] = {}
                 for sn in serials:
                     pts_2d: list[tuple[float, float, str]] = []
-                    seen_pairs: set[tuple[float, float]] = set()
                     for _rn, rdisp, input1_map, output_map, _xu, _yu in per_run_2d:
-                        if sn not in input1_map or sn not in output_map:
-                            continue
-                        pair = (float(input1_map[sn]), float(output_map[sn]))
-                        if pair in seen_pairs:
-                            continue
-                        seen_pairs.add(pair)
-                        pts_2d.append((pair[0], pair[1], str(rdisp or _rn)))
-                    if len(seen_pairs) >= require_min_points:
+                        obs_ids = sorted(set(input1_map.keys()) & set(output_map.keys()))
+                        for obs_id in obs_ids:
+                            row_input1 = input1_map.get(obs_id) or {}
+                            row_output = output_map.get(obs_id) or {}
+                            if str(row_output.get("serial") or row_input1.get("serial") or "").strip() != sn:
+                                continue
+                            pts_2d.append(
+                                (
+                                    float(row_input1.get("value_num") or 0.0),
+                                    float(row_output.get("value_num") or 0.0),
+                                    _obs_label(rdisp, _rn, row_output or row_input1),
+                                )
+                            )
+                    if len(pts_2d) >= require_min_points:
                         pts_2d.sort(key=lambda t: t[0])
                         curves[sn] = pts_2d
 
@@ -7372,26 +7629,79 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         return out
 
     def _load_perf_equation_metric_map(self, run_name: str, col_name: str, stat: str) -> dict[str, float]:
+        series = self._load_perf_equation_metric_series(run_name, col_name, stat)
+        out: dict[str, float] = {}
+        for row in series:
+            sn = str(row.get("serial") or "").strip()
+            val = row.get("value_num")
+            if not sn or not isinstance(val, (int, float)) or not math.isfinite(float(val)):
+                continue
+            out[sn] = float(val)
+        return out
+
+    def _load_perf_equation_metric_series(
+        self,
+        run_name: str,
+        col_name: str,
+        stat: str,
+        *,
+        control_period_filter: object = None,
+    ) -> list[dict]:
         st = str(stat or "").strip().lower()
         if not st:
-            return {}
+            return []
         if st in {"min_3sigma", "max_3sigma"}:
             resolver = getattr(be, "td_perf_mean_3sigma_value", None)
             if not callable(resolver):
-                return {}
-            mean_map = self._load_metric_map(run_name, col_name, "mean")
-            std_map = self._load_metric_map(run_name, col_name, "std")
-            serials = sorted(set(mean_map.keys()) | set(std_map.keys()))
-            out: dict[str, float] = {}
-            for sn in serials:
+                return []
+            mean_rows = self._load_metric_series_for_selection(
+                run_name,
+                col_name,
+                "mean",
+                control_period_filter=control_period_filter,
+            )
+            std_rows = self._load_metric_series_for_selection(
+                run_name,
+                col_name,
+                "std",
+                control_period_filter=control_period_filter,
+            )
+            mean_by_obs = {
+                str(row.get("observation_id") or "").strip(): dict(row)
+                for row in mean_rows
+                if isinstance(row, dict) and str(row.get("observation_id") or "").strip()
+            }
+            std_by_obs = {
+                str(row.get("observation_id") or "").strip(): dict(row)
+                for row in std_rows
+                if isinstance(row, dict) and str(row.get("observation_id") or "").strip()
+            }
+            out: list[dict] = []
+            for obs_id in sorted(set(mean_by_obs.keys()) | set(std_by_obs.keys())):
+                mean_row = mean_by_obs.get(obs_id) or {}
+                std_row = std_by_obs.get(obs_id) or {}
                 try:
-                    val = resolver({"mean": mean_map.get(sn), "std": std_map.get(sn)}, st)
+                    val = resolver(
+                        {
+                            "mean": (mean_row or {}).get("value_num"),
+                            "std": (std_row or {}).get("value_num"),
+                        },
+                        st,
+                    )
                 except Exception:
                     val = None
-                if isinstance(val, (int, float)) and math.isfinite(float(val)):
-                    out[sn] = float(val)
+                if not isinstance(val, (int, float)) or not math.isfinite(float(val)):
+                    continue
+                base_row = dict(mean_row or std_row)
+                base_row["value_num"] = float(val)
+                out.append(base_row)
             return out
-        return self._load_metric_map(run_name, col_name, st)
+        return self._load_metric_series_for_selection(
+            run_name,
+            col_name,
+            st,
+            control_period_filter=control_period_filter,
+        )
 
     def _resolve_td_y_col_units(self, run_name: str, target: str) -> tuple[str, str]:
         tgt = str(target or "").strip()
@@ -7939,11 +8249,17 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 self.cb_metric_average.blockSignals(False)
 
         prev_output, prev_input1, prev_input2 = self._perf_var_names()
+        prev_filter_mode = self._selected_perf_filter_mode()
+        prev_control_period = self._selected_perf_control_period()
 
         try:
             runs = be.td_list_runs(self._db_path)
         except Exception:
             runs = []
+        try:
+            control_periods = be.td_list_control_periods(self._db_path)
+        except Exception:
+            control_periods = []
         union: dict[str, dict] = {}
         col_runs: dict[str, set[str]] = {}
         for rn in runs:
@@ -7972,14 +8288,36 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._set_perf_axis_combo_by_norm(self.cb_perf_x_col, self._perf_norm_name(prev_input1))
         self._set_perf_axis_combo_by_norm(self.cb_perf_y_col, self._perf_norm_name(prev_output))
         self._set_perf_axis_combo_by_norm(self.cb_perf_z_col, self._perf_norm_name(prev_input2), allow_blank=True)
+        if hasattr(self, "cb_perf_filter_mode"):
+            mode_idx = self.cb_perf_filter_mode.findData(prev_filter_mode)
+            if mode_idx < 0:
+                mode_idx = self.cb_perf_filter_mode.findData("all_conditions")
+            if mode_idx >= 0:
+                self.cb_perf_filter_mode.setCurrentIndex(mode_idx)
+        if hasattr(self, "cb_perf_control_period"):
+            self.cb_perf_control_period.blockSignals(True)
+            self.cb_perf_control_period.clear()
+            for cp in control_periods:
+                self.cb_perf_control_period.addItem(str(cp), cp)
+            if prev_control_period not in (None, ""):
+                match_idx = self.cb_perf_control_period.findData(prev_control_period)
+                if match_idx >= 0:
+                    self.cb_perf_control_period.setCurrentIndex(match_idx)
+            elif self.cb_perf_control_period.count() > 0:
+                self.cb_perf_control_period.setCurrentIndex(0)
+            self.cb_perf_control_period.blockSignals(False)
         self._filter_perf_axis_options(changed="x")
         self._filter_perf_axis_options(changed="z")
+        self._update_perf_control_period_state()
 
         if not getattr(self, "_perf_signals_connected", False):
             self.cb_perf_x_col.currentIndexChanged.connect(lambda *_: self._on_perf_axis_changed("x"))
             self.cb_perf_y_col.currentIndexChanged.connect(lambda *_: self._on_perf_axis_changed("y"))
             self.cb_perf_z_col.currentIndexChanged.connect(lambda *_: self._on_perf_axis_changed("z"))
             self.cb_perf_view_stat.currentIndexChanged.connect(self._on_perf_view_stat_changed)
+            self.cb_perf_filter_mode.currentIndexChanged.connect(lambda *_: self._update_perf_control_period_state())
+            self.cb_perf_filter_mode.currentIndexChanged.connect(lambda *_: self._clear_perf_results())
+            self.cb_perf_control_period.currentIndexChanged.connect(lambda *_: self._clear_perf_results())
             self.cb_perf_fit.toggled.connect(lambda *_: self._update_perf_fit_controls())
             self.cb_perf_fit.toggled.connect(lambda *_: self._clear_perf_results())
             self.cb_perf_fit_model.currentIndexChanged.connect(lambda *_: self._update_perf_fit_controls())
@@ -8042,6 +8380,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
         fit_enabled = bool(getattr(self, "cb_perf_fit", None) and self.cb_perf_fit.isChecked())
         require_min_points = max(2, int(getattr(self, "_perf_require_min_points", 2) or 2))
+        perf_filter_mode = self._selected_perf_filter_mode()
+        control_period_filter = self._selected_perf_control_period()
         self._perf_results_by_stat, plot_view_stats, fit_error_text = self._perf_collect_results(
             output_target,
             input1_target,
@@ -8051,6 +8391,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             serials,
             fit_enabled=fit_enabled,
             require_min_points=require_min_points,
+            control_period_filter=(control_period_filter if perf_filter_mode == "match_control_period" else None),
         )
 
         if not plot_view_stats:
@@ -8113,6 +8454,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             "fit_mode": str((master_model or {}).get("fit_mode") or self._perf_requested_fit_mode()),
             "fit_family": str((master_model or {}).get("fit_family") or ""),
             "auto_surface_families": bool(getattr(self, "cb_perf_auto_surface", None) and self.cb_perf_auto_surface.isChecked()),
+            "performance_filter_mode": perf_filter_mode,
+            "selected_control_period": control_period_filter,
             "highlight_serial": str(getattr(self, "_highlight_sn", "") or "").strip(),
         }
         self.btn_add_auto_plot.setEnabled(True)
@@ -8321,6 +8664,17 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         else:
             self._set_mode("performance")
             self._refresh_performance_ui()
+            filter_mode = str(d.get("performance_filter_mode") or "all_conditions").strip().lower()
+            if hasattr(self, "cb_perf_filter_mode"):
+                idx = self.cb_perf_filter_mode.findData(filter_mode)
+                if idx >= 0:
+                    self.cb_perf_filter_mode.setCurrentIndex(idx)
+            selected_cp = d.get("selected_control_period")
+            if selected_cp not in (None, "") and hasattr(self, "cb_perf_control_period"):
+                idx = self.cb_perf_control_period.findData(selected_cp)
+                if idx >= 0:
+                    self.cb_perf_control_period.setCurrentIndex(idx)
+            self._update_perf_control_period_state()
             self._set_combo_to_value(self.cb_perf_y_col, str(d.get("output") or ""))
             self._set_combo_to_value(self.cb_perf_x_col, str(d.get("input1") or ""))
             self._set_combo_to_value(self.cb_perf_z_col, str(d.get("input2") or ""))
@@ -8689,14 +9043,19 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             multi_run = len(runs) > 1
             for run in runs:
                 x = self._resolve_curve_x_key(run, x_label)
-                curves = be.td_load_curves(self._db_path, run, y, x, serials=None)  # type: ignore[arg-type]
+                curves = self._load_curves_for_selection(run, y, x, selection=selection, serials=None)  # type: ignore[arg-type]
                 for s in curves:
-                    sn = str(s.get("serial") or "").strip()
                     xs = s.get("x") or []
                     ys2 = s.get("y") or []
                     if not isinstance(xs, list) or not isinstance(ys2, list) or not xs or not ys2:
                         continue
-                    ax.plot(xs, ys2, linewidth=1.1, alpha=0.85, label=(f"{run} | {sn}" if multi_run else (sn or "SN")))
+                    ax.plot(
+                        xs,
+                        ys2,
+                        linewidth=1.1,
+                        alpha=0.85,
+                        label=self._curve_trace_label(run, s, multi_run=multi_run),
+                    )
             ax.grid(True, alpha=0.25)
             ax.legend(fontsize=8, loc="best")
         elif mode == "metrics":
@@ -8730,19 +9089,30 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 for y_col in y_cols:
                     for stat in stats:
                         source_stat = "mean" if str(stat).strip().lower() == "average" else stat
-                        series = be.td_load_metric_series(self._db_path, run, y_col, source_stat)  # type: ignore[arg-type]
+                        series = self._load_metric_series_for_selection(run, y_col, source_stat, selection=selection)  # type: ignore[arg-type]
                         is_average = str(stat).strip().lower() == "average"
                         if str(stat).strip().lower() == "average":
                             yv = be.td_metric_average_plot_values(series, labels)  # type: ignore[arg-type]
+                            ax.plot(
+                                x_idx,
+                                yv,
+                                marker=None,
+                                linewidth=1.2,
+                                label=(f"{run}.{y_col}.{stat}" if multi_run else f"{y_col}.{stat}"),
+                            )
                         else:
-                            yv = be.td_metric_plot_values(series, labels, stat)  # type: ignore[arg-type]
-                        ax.plot(
-                            x_idx,
-                            yv,
-                            marker=None if is_average else "o",
-                            linewidth=1.2,
-                            label=(f"{run}.{y_col}.{stat}" if multi_run else f"{y_col}.{stat}"),
-                        )
+                            points = self._metric_points_for_serial_labels(series, labels)
+                            if not points:
+                                continue
+                            ax.plot(
+                                [float(p.get("x") or 0.0) for p in points],
+                                [float(p.get("y") or 0.0) for p in points],
+                                linestyle="",
+                                marker="o",
+                                markersize=5.0,
+                                alpha=0.88,
+                                label=(f"{run}.{y_col}.{stat}" if multi_run else f"{y_col}.{stat}"),
+                            )
                         bound = dict(metric_bounds.get(str(y_col)) or {})
                         self._plot_metric_bound_lines(ax, bound)
             self._apply_metric_program_segments(ax, labels)
@@ -8769,6 +9139,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             serials = self._selected_perf_serials()
             fit_enabled = bool(d.get("fit_enabled", True))
             require_min_points = max(2, int(getattr(self, "_perf_require_min_points", 2) or 2))
+            perf_filter_mode = str(d.get("performance_filter_mode") or "all_conditions").strip().lower()
+            control_period_filter = d.get("selected_control_period")
             common_runs = self._common_runs_for_perf_vars(output, input1, input2)
             if common_runs:
                 common_set = set(common_runs)
@@ -8783,6 +9155,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 serials,
                 fit_enabled=fit_enabled,
                 require_min_points=require_min_points,
+                control_period_filter=(control_period_filter if perf_filter_mode == "match_control_period" else None),
             )
             view_stat = str(d.get("view_stat") or "").strip().lower()
             if not view_stat or view_stat not in results:

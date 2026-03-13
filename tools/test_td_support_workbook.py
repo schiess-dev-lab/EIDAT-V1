@@ -161,6 +161,16 @@ class TestTDSupportWorkbook(unittest.TestCase):
             "header_row": 0,
         }
 
+    def _default_program_sheet_name(self, be) -> str:
+        return str(be._td_support_program_sheet_name(be.TD_SUPPORT_DEFAULT_PROGRAM_TITLE, 0))
+
+    def _support_sheet_bundle(self, wb, be):
+        return (
+            wb["RunConditions"],
+            wb["RunConditionBounds"],
+            wb[self._default_program_sheet_name(be)],
+        )
+
     def _seed_perf_candidate_db(
         self,
         root: Path,
@@ -239,6 +249,13 @@ class TestTDSupportWorkbook(unittest.TestCase):
             for run in sorted({run for _sn, run, _x, _y in rows}):
                 conn.execute(
                     """
+                    INSERT OR REPLACE INTO td_runs(run_name, default_x, display_name, run_type, control_period, pulse_width)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (run, "Time", run, "", None, None),
+                )
+                conn.execute(
+                    """
                     INSERT OR REPLACE INTO td_columns_calc(run_name, name, units, kind)
                     VALUES (?, ?, ?, ?)
                     """,
@@ -252,21 +269,30 @@ class TestTDSupportWorkbook(unittest.TestCase):
                     (run, "thrust", "lbf", "y"),
                 )
             for serial, run, x_val, y_val in rows:
+                observation_id = f"{serial}__{run}"
                 conn.execute(
                     """
-                    INSERT OR REPLACE INTO td_metrics_calc
-                    (serial, run_name, column_name, stat, value_num, computed_epoch_ns, source_mtime_ns)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    INSERT OR REPLACE INTO td_condition_observations
+                    (observation_id, serial, run_name, program_title, source_run_name, run_type, pulse_width, control_period, source_mtime_ns, computed_epoch_ns)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (serial, run, "impulse bit", "mean", float(x_val), 0, 0),
+                    (observation_id, serial, run, be.TD_SUPPORT_DEFAULT_PROGRAM_TITLE, run, "", None, None, 0, 0),
                 )
                 conn.execute(
                     """
                     INSERT OR REPLACE INTO td_metrics_calc
-                    (serial, run_name, column_name, stat, value_num, computed_epoch_ns, source_mtime_ns)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (observation_id, serial, run_name, column_name, stat, value_num, computed_epoch_ns, source_mtime_ns, program_title, source_run_name)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (serial, run, "thrust", "mean", float(y_val), 0, 0),
+                    (observation_id, serial, run, "impulse bit", "mean", float(x_val), 0, 0, be.TD_SUPPORT_DEFAULT_PROGRAM_TITLE, run),
+                )
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO td_metrics_calc
+                    (observation_id, serial, run_name, column_name, stat, value_num, computed_epoch_ns, source_mtime_ns, program_title, source_run_name)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (observation_id, serial, run, "thrust", "mean", float(y_val), 0, 0, be.TD_SUPPORT_DEFAULT_PROGRAM_TITLE, run),
                 )
             conn.commit()
         return db_path
@@ -286,7 +312,16 @@ class TestTDSupportWorkbook(unittest.TestCase):
 
             wb = load_workbook(str(support), read_only=False, data_only=True)
             try:
-                self.assertEqual(wb.sheetnames, ["Settings", "Sequences", "ParameterBounds"])
+                self.assertEqual(
+                    wb.sheetnames,
+                    [
+                        "Settings",
+                        "Programs",
+                        "RunConditions",
+                        "RunConditionBounds",
+                        self._default_program_sheet_name(be),
+                    ],
+                )
                 ws_settings = wb["Settings"]
                 self.assertEqual(ws_settings.cell(2, 1).value, "exclude_first_n_default")
                 self.assertEqual(ws_settings.cell(3, 1).value, "last_n_rows_default")
@@ -300,21 +335,26 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 self.assertIsNotNone(ws_settings["A5"].comment)
                 self.assertIn("tight = 4 points", str(ws_settings["A5"].comment.text or ""))
 
-                ws_seq = wb["Sequences"]
-                self.assertEqual(ws_seq.cell(2, 1).value, "RunA")
-                self.assertEqual(ws_seq.cell(2, 2).value, "RunA")
-                self.assertIsNone(ws_seq.cell(2, 3).value)
-                self.assertEqual(ws_seq.cell(1, 4).value, "feed_pressure_units")
-                self.assertEqual(ws_seq.cell(1, 5).value, "run_type")
-                self.assertEqual(ws_seq.cell(1, 6).value, "pulse_width")
-                self.assertEqual(ws_seq.cell(1, 7).value, "control_period")
-                self.assertTrue(bool(ws_seq.cell(2, 10).value))
+                ws_programs = wb["Programs"]
+                self.assertEqual(ws_programs.cell(2, 1).value, be.TD_SUPPORT_DEFAULT_PROGRAM_TITLE)
+                self.assertEqual(ws_programs.cell(2, 2).value, self._default_program_sheet_name(be))
 
-                ws_bounds = wb["ParameterBounds"]
+                ws_cond, ws_bounds, ws_prog = self._support_sheet_bundle(wb, be)
+                self.assertEqual(ws_cond.cell(2, 1).value, "RunA")
+                self.assertEqual(ws_cond.cell(2, 2).value, "RunA")
+                self.assertIsNone(ws_cond.cell(2, 3).value)
+                self.assertEqual(ws_cond.cell(1, 6).value, "pulse_width_on")
+                self.assertEqual(ws_cond.cell(1, 7).value, "control_period")
+                self.assertTrue(bool(ws_cond.cell(2, 8).value))
+
                 self.assertEqual(ws_bounds.cell(2, 1).value, "RunA")
                 self.assertEqual(ws_bounds.cell(2, 2).value, "thrust")
                 self.assertEqual(ws_bounds.cell(2, 3).value, "lbf")
                 self.assertIsNone(ws_bounds.cell(2, 4).value)
+
+                self.assertEqual(ws_prog.cell(2, 1).value, "RunA")
+                self.assertEqual(ws_prog.cell(2, 2).value, "RunA")
+                self.assertTrue(bool(ws_prog.cell(2, 5).value))
             finally:
                 wb.close()
 
@@ -348,12 +388,13 @@ class TestTDSupportWorkbook(unittest.TestCase):
             try:
                 ws_settings = wb["Settings"]
                 ws_settings.cell(3, 2).value = 2
-                ws_seq = wb["Sequences"]
-                ws_seq.cell(2, 1).value = "Seq1"
-                ws_seq.cell(2, 2).value = "RunA"
-                ws_seq.cell(2, 3).value = 100
-                ws_seq.cell(2, 6).value = 5
-                ws_bounds = wb["ParameterBounds"]
+                ws_cond, ws_bounds, ws_prog = self._support_sheet_bundle(wb, be)
+                ws_cond.cell(2, 1).value = "Seq1"
+                ws_cond.cell(2, 2).value = "Seq1"
+                ws_cond.cell(2, 3).value = 100
+                ws_cond.cell(2, 6).value = 5
+                ws_prog.cell(2, 1).value = "RunA"
+                ws_prog.cell(2, 2).value = "Seq1"
                 ws_bounds.cell(2, 1).value = "Seq1"
                 ws_bounds.cell(2, 2).value = "thrust"
                 ws_bounds.cell(2, 4).value = 15
@@ -549,43 +590,86 @@ class TestTDSupportWorkbook(unittest.TestCase):
 
             wb = load_workbook(str(support_path))
             try:
-                ws_seq = wb["Sequences"]
+                ws_cond = wb["RunConditions"]
+                _ws_bounds = wb["RunConditionBounds"]
+                ws_prog = wb[self._default_program_sheet_name(be)]
                 rows = {
-                    str(ws_seq.cell(r, 1).value or "").strip(): r
-                    for r in range(2, (ws_seq.max_row or 0) + 1)
+                    str(ws_cond.cell(r, 1).value or "").strip(): r
+                    for r in range(2, (ws_cond.max_row or 0) + 1)
                 }
-                for seq_name in ("Seq1", "Seq2"):
-                    row = rows[seq_name]
-                    ws_seq.cell(row, 3).value = 350
-                    ws_seq.cell(row, 4).value = "psia"
-                    ws_seq.cell(row, 5).value = "steady state"
+                row = rows["Seq1"]
+                ws_cond.cell(row, 2).value = "350 psia, SS"
+                ws_cond.cell(row, 3).value = 350
+                ws_cond.cell(row, 4).value = "psia"
+                ws_cond.cell(row, 5).value = "steady state"
+                row = rows["Seq2"]
+                ws_cond.cell(row, 2).value = "350 psia, SS"
+                ws_cond.cell(row, 3).value = 350
+                ws_cond.cell(row, 4).value = "psia"
+                ws_cond.cell(row, 5).value = "steady state"
                 row = rows["Seq3"]
-                ws_seq.cell(row, 3).value = 350
-                ws_seq.cell(row, 4).value = "psia"
-                ws_seq.cell(row, 5).value = "pulsed mode"
-                ws_seq.cell(row, 6).value = 60
-                ws_seq.cell(row, 7).value = 120
+                ws_cond.cell(row, 2).value = "350 psia, PM, 60 Sec ON / 120 Sec OFF"
+                ws_cond.cell(row, 3).value = 350
+                ws_cond.cell(row, 4).value = "psia"
+                ws_cond.cell(row, 5).value = "pulsed mode"
+                ws_cond.cell(row, 6).value = 60
+                ws_cond.cell(row, 7).value = 120
+                ws_prog.cell(2, 1).value = "Seq1"
+                ws_prog.cell(2, 2).value = "Seq1"
+                ws_prog.cell(3, 1).value = "Seq2"
+                ws_prog.cell(3, 2).value = "Seq1"
+                ws_prog.append(["Seq3", "Seq3", "", "", True])
                 wb.save(str(support_path))
             finally:
                 wb.close()
 
             with sqlite3.connect(str(db_path)) as conn:
                 be._ensure_test_data_impl_tables(conn)
-                for run in ("Seq1", "Seq2", "Seq3"):
-                    conn.execute(
-                        "INSERT OR REPLACE INTO td_runs(run_name, default_x, display_name) VALUES (?, ?, ?)",
-                        (run, "Time", ""),
-                    )
+                conn.execute(
+                    "INSERT OR REPLACE INTO td_runs(run_name, default_x, display_name, run_type, control_period, pulse_width) VALUES (?, ?, ?, ?, ?, ?)",
+                    ("Seq1", "Time", "350 psia, SS", "steady state", None, None),
+                )
+                conn.execute(
+                    "INSERT OR REPLACE INTO td_runs(run_name, default_x, display_name, run_type, control_period, pulse_width) VALUES (?, ?, ?, ?, ?, ?)",
+                    ("Seq3", "Time", "350 psia, PM, 60 Sec ON / 120 Sec OFF", "pulsed mode", 120, 60),
+                )
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO td_condition_observations
+                    (observation_id, serial, run_name, program_title, source_run_name, run_type, pulse_width, control_period, source_mtime_ns, computed_epoch_ns)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    ("SN1__Seq1", "SN1", "Seq1", be.TD_SUPPORT_DEFAULT_PROGRAM_TITLE, "Seq1", "steady state", None, None, 0, 0),
+                )
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO td_condition_observations
+                    (observation_id, serial, run_name, program_title, source_run_name, run_type, pulse_width, control_period, source_mtime_ns, computed_epoch_ns)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    ("SN1__Seq2", "SN1", "Seq1", be.TD_SUPPORT_DEFAULT_PROGRAM_TITLE, "Seq2", "steady state", None, None, 0, 0),
+                )
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO td_condition_observations
+                    (observation_id, serial, run_name, program_title, source_run_name, run_type, pulse_width, control_period, source_mtime_ns, computed_epoch_ns)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    ("SN1__Seq3", "SN1", "Seq3", be.TD_SUPPORT_DEFAULT_PROGRAM_TITLE, "Seq3", "pulsed mode", 60, 120, 0, 0),
+                )
                 conn.commit()
 
             views = be.td_list_run_selection_views(db_path, wb_path, project_dir=root)
             seq_items = views.get("sequence") or []
             cond_items = views.get("condition") or []
 
-            self.assertEqual([item.get("display_text") for item in seq_items], ["Seq1", "Seq2", "Seq3"])
+            self.assertEqual(
+                [item.get("display_text") for item in seq_items],
+                ["Default Program - Seq3", "Default Program - Seq1", "Default Program - Seq2"],
+            )
             self.assertEqual([item.get("display_text") for item in cond_items], ["350 psia, PM, 60 Sec ON / 120 Sec OFF", "350 psia, SS"])
             ss_group = next(item for item in cond_items if item.get("display_text") == "350 psia, SS")
-            self.assertEqual(ss_group.get("member_runs"), ["Seq1", "Seq2"])
+            self.assertEqual(ss_group.get("member_runs"), ["Seq1"])
             self.assertEqual(ss_group.get("member_sequences"), ["Seq1", "Seq2"])
 
     def test_rebuild_prefers_workbook_config_columns_over_runtime_config(self) -> None:
@@ -662,11 +746,12 @@ class TestTDSupportWorkbook(unittest.TestCase):
 
             wb = load_workbook(str(support_path))
             try:
-                ws_seq = wb["Sequences"]
-                ws_seq.cell(2, 1).value = "Seq1"
-                ws_seq.cell(2, 2).value = "RunA"
-                ws_seq.cell(2, 3).value = 100
-                ws_seq.cell(2, 6).value = 5
+                ws_cond, _ws_bounds, ws_prog = self._support_sheet_bundle(wb, be)
+                ws_cond.cell(2, 1).value = "Seq1"
+                ws_cond.cell(2, 2).value = "Seq1"
+                ws_cond.cell(2, 3).value = 100
+                ws_cond.cell(2, 6).value = 5
+                ws_prog.cell(2, 2).value = "Seq1"
                 wb.save(str(support_path))
             finally:
                 wb.close()
@@ -711,10 +796,11 @@ class TestTDSupportWorkbook(unittest.TestCase):
 
             wb = load_workbook(str(support_path))
             try:
-                ws_seq = wb["Sequences"]
-                ws_seq.cell(2, 1).value = "Seq1"
-                ws_seq.cell(2, 2).value = "RunA"
-                ws_seq.cell(2, 6).value = 5
+                ws_cond, _ws_bounds, ws_prog = self._support_sheet_bundle(wb, be)
+                ws_cond.cell(2, 1).value = "Seq1"
+                ws_cond.cell(2, 2).value = "Seq1"
+                ws_cond.cell(2, 6).value = 5
+                ws_prog.cell(2, 2).value = "Seq1"
                 wb.save(str(support_path))
             finally:
                 wb.close()
@@ -790,9 +876,9 @@ class TestTDSupportWorkbook(unittest.TestCase):
 
             wb = load_workbook(str(support_path))
             try:
-                ws_seq = wb["Sequences"]
-                ws_seq.cell(1, 6).value = "pulse_width_on"
-                ws_seq.cell(2, 6).value = 7
+                ws_cond = wb["RunConditions"]
+                ws_cond.cell(1, 6).value = "pulse_width_on"
+                ws_cond.cell(2, 6).value = 7
                 wb.save(str(support_path))
             finally:
                 wb.close()
@@ -1068,7 +1154,11 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 conn.commit()
 
             curves = be.td_load_curves(db_path, "RunA", "thrust", "Time")
-            self.assertEqual(curves, [{"serial": "SN1", "x": [0, 1, 2], "y": [10, 20, 30]}])
+            self.assertEqual(len(curves), 1)
+            self.assertEqual(curves[0].get("serial"), "SN1")
+            self.assertEqual(curves[0].get("x"), [0, 1, 2])
+            self.assertEqual(curves[0].get("y"), [10, 20, 30])
+            self.assertTrue(str(curves[0].get("observation_id") or "").strip())
 
     def test_rebuild_writes_excel_mirror_for_project_cache(self) -> None:
         from openpyxl import load_workbook  # type: ignore
@@ -1179,10 +1269,10 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 conn.execute(
                     """
                     INSERT OR REPLACE INTO td_curves_raw
-                    (run_name, y_name, x_name, serial, x_json, y_json, n_points, source_mtime_ns, computed_epoch_ns)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (run_name, y_name, x_name, observation_id, serial, x_json, y_json, n_points, source_mtime_ns, computed_epoch_ns, program_title, source_run_name)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    ("RunA", "thrust", "Time", "SN1", "[0,1,2,3]", "[10,20,30,40]", 4, 123, 123),
+                    ("RunA", "thrust", "Time", "SN1__RunA", "SN1", "[0,1,2,3]", "[10,20,30,40]", 4, 123, 123, "", "RunA"),
                 )
                 conn.commit()
 
@@ -1252,10 +1342,10 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 conn.execute(
                     """
                     INSERT OR REPLACE INTO td_curves_raw
-                    (run_name, y_name, x_name, serial, x_json, y_json, n_points, source_mtime_ns, computed_epoch_ns)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (run_name, y_name, x_name, observation_id, serial, x_json, y_json, n_points, source_mtime_ns, computed_epoch_ns, program_title, source_run_name)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    ("RunA", "thrust", "Time", "SN1", "[0,1,2,3]", "[10,20,30,40]", 4, 123, 123),
+                    ("RunA", "thrust", "Time", "SN1__RunA", "SN1", "[0,1,2,3]", "[10,20,30,40]", 4, 123, 123, "", "RunA"),
                 )
                 conn.commit()
 
@@ -1347,10 +1437,10 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 conn.execute(
                     """
                     INSERT OR REPLACE INTO td_curves_raw
-                    (run_name, y_name, x_name, serial, x_json, y_json, n_points, source_mtime_ns, computed_epoch_ns)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (run_name, y_name, x_name, observation_id, serial, x_json, y_json, n_points, source_mtime_ns, computed_epoch_ns, program_title, source_run_name)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    ("RunA", "thrust", "Time", "SN1", "[0,1,2,3]", "[10,20,30,40]", 4, 123, 123),
+                    ("RunA", "thrust", "Time", "SN1__RunA", "SN1", "[0,1,2,3]", "[10,20,30,40]", 4, 123, 123, "", "RunA"),
                 )
                 conn.commit()
 
@@ -1469,10 +1559,10 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 conn.execute(
                     """
                     INSERT OR REPLACE INTO td_curves_raw
-                    (run_name, y_name, x_name, serial, x_json, y_json, n_points, source_mtime_ns, computed_epoch_ns)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (run_name, y_name, x_name, observation_id, serial, x_json, y_json, n_points, source_mtime_ns, computed_epoch_ns, program_title, source_run_name)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    ("LegacyRun", "thrust", "Time", "SN1", "[0,1]", "[2,3]", 2, 1, 1),
+                    ("LegacyRun", "thrust", "Time", "SN1__LegacyRun", "SN1", "[0,1]", "[2,3]", 2, 1, 1, "", "LegacyRun"),
                 )
                 conn.commit()
 
