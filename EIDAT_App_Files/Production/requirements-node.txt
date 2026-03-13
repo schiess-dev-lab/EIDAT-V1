@@ -6,4 +6,5 @@ openpyxl
 xlrd
 XlsxWriter
 matplotlib
+scipy
 opencv-python-headless

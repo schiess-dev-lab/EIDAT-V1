@@ -2377,10 +2377,15 @@ def _ensure_test_data_raw_cache_tables(conn: sqlite3.Connection) -> None:
             display_name TEXT,
             x_axis_kind TEXT NOT NULL,
             source_run_name TEXT,
+            pulse_width REAL,
             computed_epoch_ns INTEGER NOT NULL
         )
         """
     )
+    try:
+        conn.execute("ALTER TABLE td_raw_sequences ADD COLUMN pulse_width REAL")
+    except Exception:
+        pass
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS td_raw_curve_catalog (
@@ -3668,7 +3673,7 @@ def _write_td_support_workbook(
             "feed_pressure",
             "feed_pressure_units",
             "run_type",
-            "pulse_width_on",
+            "pulse_width",
             "control_period",
             "exclude_first_n",
             "last_n_rows",
@@ -3742,6 +3747,15 @@ def _to_support_number(v: object) -> int | float | None:
     if abs(f - round(f)) < 1e-9:
         return int(round(f))
     return float(f)
+
+
+def _td_support_sequence_pulse_width(sequence_row: dict | None) -> object | None:
+    if not isinstance(sequence_row, dict):
+        return None
+    value = sequence_row.get("pulse_width")
+    if value not in (None, ""):
+        return value
+    return sequence_row.get("pulse_width_on")
 
 
 def _normalize_support_scalar(v: object) -> object | None:
@@ -3857,6 +3871,7 @@ def _read_td_support_workbook(workbook_path: Path, *, project_dir: Path | None =
                 if enabled_raw is not None and str(enabled_raw).strip() != "":
                     enabled = _td_bool(enabled_raw, True)
                 sequence_name = seq_name or source_run
+                pulse_width_col = headers.get("pulse_width") or headers.get("pulse_width_on")
                 sequences.append(
                     {
                         "sequence_name": sequence_name,
@@ -3864,7 +3879,7 @@ def _read_td_support_workbook(workbook_path: Path, *, project_dir: Path | None =
                         "feed_pressure": ws.cell(row, headers.get("feed_pressure", 3)).value if headers.get("feed_pressure") else None,
                         "feed_pressure_units": str(ws.cell(row, headers.get("feed_pressure_units", 4)).value or "").strip(),
                         "run_type": str(ws.cell(row, headers.get("run_type", 5)).value or "").strip(),
-                        "pulse_width_on": ws.cell(row, headers.get("pulse_width_on", 6)).value if headers.get("pulse_width_on") else None,
+                        "pulse_width": ws.cell(row, pulse_width_col if pulse_width_col else 6).value,
                         "control_period": ws.cell(row, headers.get("control_period", 7)).value if headers.get("control_period") else None,
                         "exclude_first_n": _to_support_int(ws.cell(row, headers.get("exclude_first_n", 8)).value if headers.get("exclude_first_n") else None),
                         "last_n_rows": _to_support_int(ws.cell(row, headers.get("last_n_rows", 9)).value if headers.get("last_n_rows") else None),
@@ -4138,7 +4153,7 @@ def td_build_run_condition_label(sequence_row: dict | None) -> str:
     if run_type:
         parts.append(run_type)
     if run_type == "PM":
-        on_time = _td_format_compact_value(sequence_row.get("pulse_width_on"))
+        on_time = _td_format_compact_value(_td_support_sequence_pulse_width(sequence_row))
         off_time = _td_format_compact_value(sequence_row.get("control_period"))
         timing = ""
         if on_time and off_time:
@@ -4215,7 +4230,7 @@ def td_list_run_selection_views(db_path: Path, workbook_path: Path, *, project_d
             _td_format_compact_value(seq.get("feed_pressure")).lower(),
             str(seq.get("feed_pressure_units") or "").strip().lower(),
             td_normalize_run_type(seq.get("run_type")).lower(),
-            _td_format_compact_value(seq.get("pulse_width_on")).lower(),
+            _td_format_compact_value(_td_support_sequence_pulse_width(seq)).lower(),
             _td_format_compact_value(seq.get("control_period")).lower(),
         )
         if not any(cond_key):
@@ -4674,7 +4689,13 @@ def _sync_td_raw_points_workbook(db_path: Path, *, force: bool = False) -> Path 
 def _resolve_td_support_sequence_for_run(run_name: str, support_cfg: dict) -> dict:
     run = str(run_name or "").strip()
     if not run:
-        return {"sequence_name": "", "source_run_name": "", "exclude_first_n": None, "last_n_rows": None}
+        return {
+            "sequence_name": "",
+            "source_run_name": "",
+            "pulse_width": None,
+            "exclude_first_n": None,
+            "last_n_rows": None,
+        }
 
     def _norm_name(value: object) -> str:
         return "".join(ch.lower() for ch in str(value or "").strip() if ch.isalnum())
@@ -4691,6 +4712,7 @@ def _resolve_td_support_sequence_for_run(run_name: str, support_cfg: dict) -> di
             return {
                 "sequence_name": str(seq.get("sequence_name") or source_match).strip() or source_match,
                 "source_run_name": source_match,
+                "pulse_width": _td_support_sequence_pulse_width(seq),
                 "exclude_first_n": seq.get("exclude_first_n"),
                 "last_n_rows": seq.get("last_n_rows"),
             }
@@ -4700,10 +4722,17 @@ def _resolve_td_support_sequence_for_run(run_name: str, support_cfg: dict) -> di
             return {
                 "sequence_name": seq_name,
                 "source_run_name": str(seq.get("source_run_name") or seq_name).strip() or seq_name,
+                "pulse_width": _td_support_sequence_pulse_width(seq),
                 "exclude_first_n": seq.get("exclude_first_n"),
                 "last_n_rows": seq.get("last_n_rows"),
             }
-    return {"sequence_name": run, "source_run_name": run, "exclude_first_n": None, "last_n_rows": None}
+    return {
+        "sequence_name": run,
+        "source_run_name": run,
+        "pulse_width": None,
+        "exclude_first_n": None,
+        "last_n_rows": None,
+    }
 
 
 def _rebuild_test_data_project_calc_cache_from_raw(db_path: Path, workbook_path: Path) -> dict:
@@ -4740,6 +4769,16 @@ def _rebuild_test_data_project_calc_cache_from_raw(db_path: Path, workbook_path:
         }
         out["std"] = statistics.stdev(values) if n >= 2 else None
         return out
+
+    def _compute_constant_stats(value: float) -> dict[str, float | int | None]:
+        return {
+            "mean": float(value),
+            "min": float(value),
+            "max": float(value),
+            "median": float(value),
+            "std": 0.0,
+            "count": 1,
+        }
 
     def _filter_curve_values(
         xs: list[object],
@@ -4795,7 +4834,7 @@ def _rebuild_test_data_project_calc_cache_from_raw(db_path: Path, workbook_path:
     with sqlite3.connect(str(raw_db_path)) as raw_conn:
         _ensure_test_data_raw_cache_tables(raw_conn)
         raw_runs = raw_conn.execute(
-            "SELECT run_name, COALESCE(x_axis_kind, '') FROM td_raw_sequences ORDER BY run_name"
+            "SELECT run_name, COALESCE(x_axis_kind, ''), pulse_width FROM td_raw_sequences ORDER BY run_name"
         ).fetchall()
         raw_x_cols = raw_conn.execute(
             "SELECT run_name, name FROM td_columns_raw WHERE kind='x' ORDER BY run_name, name"
@@ -4845,7 +4884,7 @@ def _rebuild_test_data_project_calc_cache_from_raw(db_path: Path, workbook_path:
 
         metrics_written = 0
         calc_columns_written = 0
-        for run_name, default_x_raw in raw_runs:
+        for run_name, default_x_raw, raw_pulse_width in raw_runs:
             run = str(run_name or "").strip()
             if not run:
                 continue
@@ -4875,6 +4914,7 @@ def _rebuild_test_data_project_calc_cache_from_raw(db_path: Path, workbook_path:
 
             raw_y_names = set(raw_y_by_run.get(run) or set())
             calc_names: list[str] = []
+            inserted_calc_names: set[str] = set()
             for param_def in calc_param_defs:
                 y_name = str(param_def.get("name") or "").strip()
                 if not y_name:
@@ -4885,18 +4925,35 @@ def _rebuild_test_data_project_calc_cache_from_raw(db_path: Path, workbook_path:
                     (run, y_name, units, "y"),
                 )
                 calc_columns_written += 1
+                inserted_calc_names.add(y_name)
                 if y_name in raw_y_names:
                     calc_names.append(y_name)
 
-            if not default_x or not calc_names:
-                continue
+            pulse_width_value = _finite_float(seq_info.get("pulse_width"))
+            if pulse_width_value is None:
+                pulse_width_value = _finite_float(raw_pulse_width)
+            if pulse_width_value is not None and "pulse_width" not in inserted_calc_names:
+                conn.execute(
+                    "INSERT OR REPLACE INTO td_columns_calc(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
+                    (run, "pulse_width", str(cfg_units.get("pulse_width") or "").strip(), "y"),
+                )
+                calc_columns_written += 1
+                inserted_calc_names.add("pulse_width")
 
             curve_rows = [
                 (serial, y_name_raw, x_json, y_json, source_mtime_ns)
                 for run_name_raw, y_name_raw, x_name_raw, serial, x_json, y_json, source_mtime_ns in raw_curve_rows
                 if str(run_name_raw or "").strip() == run and str(x_name_raw or "").strip() == default_x
             ]
+            if not curve_rows:
+                continue
             calc_name_set = set(calc_names)
+            source_mtime_by_serial: dict[str, int | None] = {}
+            for serial, _y_name_raw, _x_json, _y_json, source_mtime_ns in curve_rows:
+                serial_key = str(serial or "").strip()
+                if not serial_key or serial_key in source_mtime_by_serial:
+                    continue
+                source_mtime_by_serial[serial_key] = source_mtime_ns
             exclude_first_n = seq_info.get("exclude_first_n")
             if exclude_first_n is None:
                 exclude_first_n = support_settings.get("exclude_first_n_default")
@@ -4904,46 +4961,72 @@ def _rebuild_test_data_project_calc_cache_from_raw(db_path: Path, workbook_path:
             if last_n_rows is None:
                 last_n_rows = support_settings.get("last_n_rows_default")
 
-            for serial, y_name_raw, x_json, y_json, source_mtime_ns in curve_rows:
-                y_name = str(y_name_raw or "").strip()
-                if y_name not in calc_name_set:
-                    continue
-                try:
-                    xs = json.loads(x_json or "[]")
-                except Exception:
-                    xs = []
-                try:
-                    ys = json.loads(y_json or "[]")
-                except Exception:
-                    ys = []
-                filtered_y = _filter_curve_values(
-                    xs,
-                    ys,
-                    exclude_first_n=_to_support_int(exclude_first_n),
-                    last_n_rows=_to_support_int(last_n_rows),
-                )
-                stats_map = _compute_stats(filtered_y)
-                payload_base = (
-                    str(serial or "").strip(),
-                    run,
-                    y_name,
-                )
-                for stat in selected_stats:
-                    payload = payload_base + (
-                        str(stat),
-                        stats_map.get(stat),
-                        computed_epoch_ns,
-                        source_mtime_ns,
+            if default_x and calc_names:
+                for serial, y_name_raw, x_json, y_json, source_mtime_ns in curve_rows:
+                    y_name = str(y_name_raw or "").strip()
+                    if y_name not in calc_name_set:
+                        continue
+                    try:
+                        xs = json.loads(x_json or "[]")
+                    except Exception:
+                        xs = []
+                    try:
+                        ys = json.loads(y_json or "[]")
+                    except Exception:
+                        ys = []
+                    filtered_y = _filter_curve_values(
+                        xs,
+                        ys,
+                        exclude_first_n=_to_support_int(exclude_first_n),
+                        last_n_rows=_to_support_int(last_n_rows),
                     )
-                    conn.execute(
-                        """
-                        INSERT OR REPLACE INTO td_metrics_calc
-                        (serial, run_name, column_name, stat, value_num, computed_epoch_ns, source_mtime_ns)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        payload,
+                    stats_map = _compute_stats(filtered_y)
+                    payload_base = (
+                        str(serial or "").strip(),
+                        run,
+                        y_name,
                     )
-                    metrics_written += 1
+                    for stat in selected_stats:
+                        payload = payload_base + (
+                            str(stat),
+                            stats_map.get(stat),
+                            computed_epoch_ns,
+                            source_mtime_ns,
+                        )
+                        conn.execute(
+                            """
+                            INSERT OR REPLACE INTO td_metrics_calc
+                            (serial, run_name, column_name, stat, value_num, computed_epoch_ns, source_mtime_ns)
+                            VALUES (?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            payload,
+                        )
+                        metrics_written += 1
+
+            if pulse_width_value is not None:
+                stats_map = _compute_constant_stats(float(pulse_width_value))
+                for serial_key, source_mtime_ns in source_mtime_by_serial.items():
+                    payload_base = (
+                        serial_key,
+                        run,
+                        "pulse_width",
+                    )
+                    for stat in selected_stats:
+                        payload = payload_base + (
+                            str(stat),
+                            stats_map.get(stat),
+                            computed_epoch_ns,
+                            source_mtime_ns,
+                        )
+                        conn.execute(
+                            """
+                            INSERT OR REPLACE INTO td_metrics_calc
+                            (serial, run_name, column_name, stat, value_num, computed_epoch_ns, source_mtime_ns)
+                            VALUES (?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            payload,
+                        )
+                        metrics_written += 1
 
         support_mtime_ns = 0
         try:
@@ -5543,6 +5626,7 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
     pulse_on_aliases = [
         "pulse width on",
         "pulse_width_on",
+        "pulse_width",
         "pulse width",
         "pulse on",
         "pulse_on",
@@ -5571,6 +5655,7 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
         effective = {
             "sequence_name": str(source_run or "").strip(),
             "source_run_name": str(source_run or "").strip(),
+            "pulse_width": None,
             "exclude_first_n": None,
             "last_n_rows": None,
             "matched_support": False,
@@ -5598,17 +5683,18 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
                 effective = {
                     "sequence_name": str(seq.get("sequence_name") or source_run).strip() or str(source_run or "").strip(),
                     "source_run_name": str(source_run or "").strip(),
+                    "pulse_width": _td_support_sequence_pulse_width(seq),
                     "exclude_first_n": seq.get("exclude_first_n"),
                     "last_n_rows": seq.get("last_n_rows"),
                     "matched_support": False,
                 }
             wants_pressure = seq.get("feed_pressure") not in (None, "")
-            wants_pulse = seq.get("pulse_width_on") not in (None, "")
+            wants_pulse = _td_support_sequence_pulse_width(seq) not in (None, "")
             if not wants_pressure and not wants_pulse:
                 continue
             if wants_pressure and not _support_values_equal(seq.get("feed_pressure"), actual_pressure):
                 continue
-            if wants_pulse and not _support_values_equal(seq.get("pulse_width_on"), actual_pulse):
+            if wants_pulse and not _support_values_equal(_td_support_sequence_pulse_width(seq), actual_pulse):
                 continue
             heur_matches.append(seq)
         if len(heur_matches) > 1:
@@ -5619,6 +5705,7 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
             effective = {
                 "sequence_name": str(seq.get("sequence_name") or source_run).strip() or str(source_run or "").strip(),
                 "source_run_name": str(source_run or "").strip(),
+                "pulse_width": _td_support_sequence_pulse_width(seq),
                 "exclude_first_n": seq.get("exclude_first_n"),
                 "last_n_rows": seq.get("last_n_rows"),
                 "matched_support": True,
@@ -5786,6 +5873,7 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
     metrics_written = 0
     run_y_raw_union: dict[str, dict[str, str]] = {}
     run_y_calc_union: dict[str, dict[str, str]] = {}
+    run_pulse_width_by_run: dict[str, object] = {}
     raw_tables_created: set[str] = set()
     diagnostics_rows: list[tuple[str, str, str, str, str, str, int, int, str]] = []
     debug_diagnostics: list[dict] = []
@@ -5961,6 +6049,9 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
                     source_rows = _read_run_rows(src, table, cols=cols, order_by=order_by)
                     run_info = _resolve_support_sequence(run, source_rows, cols)
                     effective_run = str(run_info.get("sequence_name") or run).strip() or str(run or "").strip()
+                    pulse_width_value = run_info.get("pulse_width")
+                    if pulse_width_value not in (None, "") and effective_run not in run_pulse_width_by_run:
+                        run_pulse_width_by_run[effective_run] = pulse_width_value
 
                     # Collect per-run variable values for optional user-defined condition labels.
                     if td_run_labeling_enabled and label_template and label_variables and label_value_pick == "most_common":
@@ -6396,10 +6487,17 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
             )
             raw_conn.execute(
                 """
-                INSERT OR REPLACE INTO td_raw_sequences(run_name, display_name, x_axis_kind, source_run_name, computed_epoch_ns)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT OR REPLACE INTO td_raw_sequences(run_name, display_name, x_axis_kind, source_run_name, pulse_width, computed_epoch_ns)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (run, display_name, default_x, run, computed_epoch_ns),
+                (
+                    run,
+                    display_name,
+                    default_x,
+                    run,
+                    run_pulse_width_by_run.get(run),
+                    computed_epoch_ns,
+                ),
             )
             for x in sorted(xs, key=lambda k: x_priority.index(k) if k in x_priority else 999):
                 raw_conn.execute(
@@ -6712,6 +6810,36 @@ def td_load_metric_series(db_path: Path, run_name: str, column_name: str, stat: 
     return [{"serial": str(r[0] or "").strip(), "value_num": r[1]} for r in rows if str(r[0] or "").strip()]
 
 
+def td_metric_plot_values(series_rows: list[dict], serials: list[str], stat: str) -> list[float]:
+    labels = [str(sn or "").strip() for sn in (serials or [])]
+    vmap: dict[str, float] = {}
+    for row in series_rows or []:
+        if not isinstance(row, dict):
+            continue
+        sn = str(row.get("serial") or "").strip()
+        val = row.get("value_num")
+        if not sn or not isinstance(val, (int, float)) or not math.isfinite(float(val)):
+            continue
+        vmap[sn] = float(val)
+    return [(float(vmap.get(sn)) if isinstance(vmap.get(sn), (int, float)) else float("nan")) for sn in labels]
+
+
+def td_metric_average_plot_values(series_rows: list[dict], serials: list[str]) -> list[float]:
+    labels = [str(sn or "").strip() for sn in (serials or [])]
+    values: list[float] = []
+    for row in series_rows or []:
+        if not isinstance(row, dict):
+            continue
+        val = row.get("value_num")
+        if not isinstance(val, (int, float)) or not math.isfinite(float(val)):
+            continue
+        values.append(float(val))
+    if not values:
+        return [float("nan")] * len(labels)
+    overall = float(sum(values) / float(max(1, len(values))))
+    return [overall] * len(labels)
+
+
 def _td_perf_norm_key(value: object) -> str:
     return "".join(ch.lower() for ch in str(value or "").strip() if ch.isalnum())
 
@@ -6759,6 +6887,558 @@ def td_perf_display_value(values_by_stat: Mapping[str, object], display_stat: ob
         if median_val is not None and std_val is not None:
             return float(median_val - (3.0 * std_val)) if st == "min" else float(median_val + (3.0 * std_val))
     return _td_perf_finite_float(values_by_stat.get(st))
+
+
+def td_perf_mean_3sigma_value(values_by_stat: Mapping[str, object], bound: object) -> float | None:
+    raw = str(bound or "").strip().lower()
+    if raw in {"min", "min_3sigma", "lower", "lower_3sigma"}:
+        sign = -1.0
+    elif raw in {"max", "max_3sigma", "upper", "upper_3sigma"}:
+        sign = 1.0
+    else:
+        return None
+    mean_val = _td_perf_finite_float(values_by_stat.get("mean"))
+    std_val = _td_perf_finite_float(values_by_stat.get("std"))
+    if mean_val is None or std_val is None:
+        return None
+    return float(mean_val + (sign * 3.0 * std_val))
+
+
+TD_PERF_FIT_MODE_AUTO = "auto"
+TD_PERF_FIT_MODE_POLYNOMIAL = "polynomial"
+TD_PERF_FIT_MODE_LOGARITHMIC = "logarithmic"
+TD_PERF_FIT_MODE_SATURATING_EXPONENTIAL = "saturating_exponential"
+TD_PERF_FIT_MODE_POLYNOMIAL_SURFACE = "polynomial_surface"
+TD_PERF_FIT_MODE_AUTO_SURFACE = "auto_surface"
+TD_PERF_FIT_FAMILY_PLANE = "plane"
+TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE = "quadratic_surface"
+TD_PERF_FIT_MODES = {
+    TD_PERF_FIT_MODE_AUTO,
+    TD_PERF_FIT_MODE_POLYNOMIAL,
+    TD_PERF_FIT_MODE_LOGARITHMIC,
+    TD_PERF_FIT_MODE_SATURATING_EXPONENTIAL,
+    TD_PERF_FIT_MODE_POLYNOMIAL_SURFACE,
+    TD_PERF_FIT_MODE_AUTO_SURFACE,
+    TD_PERF_FIT_FAMILY_PLANE,
+    TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE,
+}
+TD_PERF_FIT_FAMILY_PRIORITY = {
+    TD_PERF_FIT_MODE_LOGARITHMIC: 0,
+    TD_PERF_FIT_MODE_SATURATING_EXPONENTIAL: 1,
+    TD_PERF_FIT_MODE_POLYNOMIAL: 2,
+    TD_PERF_FIT_FAMILY_PLANE: 3,
+    TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE: 4,
+}
+
+
+def td_perf_normalize_fit_mode(value: object) -> str:
+    raw = str(value or "").strip().lower()
+    return raw if raw in TD_PERF_FIT_MODES else TD_PERF_FIT_MODE_AUTO
+
+
+def td_perf_fit_family_label(value: object) -> str:
+    fam = td_perf_normalize_fit_mode(value)
+    if fam == TD_PERF_FIT_MODE_POLYNOMIAL:
+        return "Polynomial"
+    if fam == TD_PERF_FIT_MODE_LOGARITHMIC:
+        return "Logarithmic"
+    if fam == TD_PERF_FIT_MODE_SATURATING_EXPONENTIAL:
+        return "Saturating Exponential"
+    if fam == TD_PERF_FIT_MODE_POLYNOMIAL_SURFACE:
+        return "Polynomial Surface"
+    if fam == TD_PERF_FIT_MODE_AUTO_SURFACE:
+        return "Auto Surface"
+    if fam == TD_PERF_FIT_FAMILY_PLANE:
+        return "Plane"
+    if fam == TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE:
+        return "Quadratic Surface"
+    return "Auto"
+
+
+def _td_perf_import_numpy():
+    try:
+        import numpy as np  # type: ignore
+    except Exception as exc:
+        raise RuntimeError("numpy is required for performance fitting.") from exc
+    return np
+
+
+def _td_perf_import_curve_fit():
+    try:
+        from scipy.optimize import curve_fit  # type: ignore
+    except Exception as exc:
+        raise RuntimeError(
+            "scipy is required for Auto, Logarithmic, and Saturating Exponential performance fitting."
+        ) from exc
+    return curve_fit
+
+
+def _td_perf_fmt_num(value: object) -> str:
+    try:
+        return f"{float(value):.4g}"
+    except Exception:
+        return "0"
+
+
+def _td_perf_fmt_poly_equation(coeffs: list[float], degree: int, *, x0: float | None, sx: float | None) -> tuple[str, str]:
+    if not coeffs:
+        return "", ""
+    deg = int(degree)
+    parts: list[str] = []
+    for i, coeff in enumerate(coeffs):
+        power = deg - i
+        try:
+            cf = float(coeff)
+        except Exception:
+            continue
+        if power == 0:
+            parts.append(f"{cf:+.4g}")
+        elif power == 1:
+            parts.append(f"{cf:+.4g}*x'")
+        else:
+            parts.append(f"{cf:+.4g}*x'^{power}")
+    expr = " ".join(parts).lstrip("+").strip()
+    if x0 is not None and sx is not None:
+        return f"y = {expr}", f"x' = (x - {_td_perf_fmt_num(x0)}) / {_td_perf_fmt_num(sx)}"
+    return f"y = {expr}", ""
+
+
+def _td_perf_aic_metrics(y_true, y_hat, *, param_count: int) -> tuple[float, float]:
+    np = _td_perf_import_numpy()
+    residuals = np.asarray(y_true, dtype=float) - np.asarray(y_hat, dtype=float)
+    n = int(len(residuals))
+    if n <= 0:
+        return float("inf"), float("inf")
+    sse = float(np.sum(residuals**2))
+    mse = max(sse / float(max(1, n)), 1e-12)
+    k = max(1, int(param_count))
+    aic = float(n * math.log(mse) + (2.0 * k))
+    if n > (k + 1):
+        aicc = float(aic + ((2.0 * k * (k + 1)) / float(n - k - 1)))
+    else:
+        aicc = float("inf")
+    return aic, aicc
+
+
+def _td_perf_monotonic_violations(x_values, y_values) -> int:
+    np = _td_perf_import_numpy()
+    xs = np.asarray(x_values, dtype=float)
+    ys = np.asarray(y_values, dtype=float)
+    if len(xs) < 3:
+        return 0
+    order = np.argsort(xs)
+    ys_sorted = ys[order]
+    diffs = np.diff(ys_sorted)
+    net = float(ys_sorted[-1] - ys_sorted[0])
+    direction = 1.0 if net >= 0 else -1.0
+    tol = max(1e-9, float(np.max(np.abs(diffs))) * 1e-6 if len(diffs) else 1e-9)
+    return int(sum(1 for diff in diffs if (float(diff) * direction) < (-tol)))
+
+
+def td_perf_predict_model(model: Mapping[str, object], xs: Iterable[float]) -> list[float]:
+    np = _td_perf_import_numpy()
+    family = td_perf_normalize_fit_mode(model.get("fit_family"))
+    x_arr = np.asarray([float(v) for v in xs], dtype=float)
+    if family == TD_PERF_FIT_MODE_POLYNOMIAL:
+        coeffs = [float(v) for v in (model.get("coeffs") or [])]
+        if not coeffs:
+            return []
+        p = np.poly1d(coeffs)
+        if bool(model.get("normalize_x")):
+            x0 = float(model.get("x0") or 0.0)
+            sx = float(model.get("sx") or 1.0) or 1.0
+            x_arr = (x_arr - x0) / sx
+        return [float(v) for v in p(x_arr).tolist()]
+    params = model.get("params") or {}
+    if family == TD_PERF_FIT_MODE_LOGARITHMIC:
+        if np.any(x_arr <= 0):
+            raise ValueError("Logarithmic model requires X > 0.")
+        a = float((params or {}).get("a") or 0.0)
+        b = float((params or {}).get("b") or 0.0)
+        return [float(v) for v in (a + (b * np.log(x_arr))).tolist()]
+    if family == TD_PERF_FIT_MODE_SATURATING_EXPONENTIAL:
+        L = float((params or {}).get("L") or 0.0)
+        A = float((params or {}).get("A") or 0.0)
+        k = float((params or {}).get("k") or 0.0)
+        return [float(v) for v in (L - (A * np.exp(-k * x_arr))).tolist()]
+    return []
+
+
+def _td_perf_surface_design_matrix(x1_values, x2_values, family: str):
+    np = _td_perf_import_numpy()
+    x1 = np.asarray(x1_values, dtype=float)
+    x2 = np.asarray(x2_values, dtype=float)
+    raw = str(family or "").strip().lower()
+    if raw == TD_PERF_FIT_FAMILY_PLANE:
+        return np.column_stack([np.ones_like(x1), x1, x2])
+    if raw == TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE:
+        return np.column_stack([np.ones_like(x1), x1, x2, x1**2, x1 * x2, x2**2])
+    raise ValueError(f"Unsupported surface family: {family}")
+
+
+def _td_perf_fmt_surface_equation(coeffs: list[float], family: str) -> str:
+    raw = str(family or "").strip().lower()
+    if raw == TD_PERF_FIT_FAMILY_PLANE:
+        labels = ["", "x1", "x2"]
+    elif raw == TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE:
+        labels = ["", "x1", "x2", "x1^2", "x1*x2", "x2^2"]
+    else:
+        return ""
+    parts: list[str] = []
+    for coeff, label in zip(coeffs, labels):
+        try:
+            cf = float(coeff)
+        except Exception:
+            continue
+        if not label:
+            parts.append(f"{cf:+.4g}")
+        else:
+            parts.append(f"{cf:+.4g}*{label}")
+    expr = " ".join(parts).lstrip("+").strip()
+    return f"y = {expr}" if expr else ""
+
+
+def td_perf_predict_surface(model: Mapping[str, object], x1_values: Iterable[float], x2_values: Iterable[float]) -> list[float]:
+    np = _td_perf_import_numpy()
+    family = td_perf_normalize_fit_mode(model.get("fit_family"))
+    coeffs = [float(v) for v in (model.get("coeffs") or [])]
+    if family not in {TD_PERF_FIT_FAMILY_PLANE, TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE} or not coeffs:
+        return []
+    design = _td_perf_surface_design_matrix(list(x1_values), list(x2_values), family)
+    y_hat = design.dot(np.asarray(coeffs, dtype=float))
+    return [float(v) for v in y_hat.tolist()]
+
+
+def td_perf_build_surface_grid(
+    model: Mapping[str, object],
+    x1_min: float,
+    x1_max: float,
+    x2_min: float,
+    x2_max: float,
+    *,
+    points: int = 24,
+) -> dict[str, list[list[float]]]:
+    np = _td_perf_import_numpy()
+    if not all(math.isfinite(float(v)) for v in (x1_min, x1_max, x2_min, x2_max)):
+        return {"x1_grid": [], "x2_grid": [], "z_grid": []}
+    xs = np.linspace(float(x1_min), float(x1_max), max(2, int(points)))
+    ys = np.linspace(float(x2_min), float(x2_max), max(2, int(points)))
+    xg, yg = np.meshgrid(xs, ys)
+    zg = td_perf_predict_surface(model, xg.ravel().tolist(), yg.ravel().tolist())
+    if not zg:
+        return {"x1_grid": [], "x2_grid": [], "z_grid": []}
+    zg_arr = np.asarray(zg, dtype=float).reshape(xg.shape)
+    return {
+        "x1_grid": [[float(v) for v in row] for row in xg.tolist()],
+        "x2_grid": [[float(v) for v in row] for row in yg.tolist()],
+        "z_grid": [[float(v) for v in row] for row in zg_arr.tolist()],
+    }
+
+
+def td_perf_build_fit_curve(model: Mapping[str, object], x_min: float, x_max: float, *, points: int = 220) -> dict[str, list[float]]:
+    np = _td_perf_import_numpy()
+    if not math.isfinite(float(x_min)) or not math.isfinite(float(x_max)):
+        return {"xfit": [], "yfit": []}
+    if float(x_min) == float(x_max):
+        xs = np.asarray([float(x_min)], dtype=float)
+    else:
+        xs = np.linspace(float(x_min), float(x_max), max(2, int(points)))
+    ys = td_perf_predict_model(model, xs.tolist())
+    return {"xfit": [float(v) for v in xs.tolist()], "yfit": [float(v) for v in ys]}
+
+
+def _td_perf_finalize_model(
+    *,
+    fit_family: str,
+    fit_mode: str,
+    equation: str,
+    x_norm_equation: str,
+    params: dict[str, float],
+    param_count: int,
+    x_values,
+    y_true,
+    y_hat,
+    extra: dict[str, object] | None = None,
+) -> dict[str, object]:
+    np = _td_perf_import_numpy()
+    y_true_arr = np.asarray(y_true, dtype=float)
+    y_hat_arr = np.asarray(y_hat, dtype=float)
+    rmse = float(np.sqrt(np.mean((y_true_arr - y_hat_arr) ** 2)))
+    aic, aicc = _td_perf_aic_metrics(y_true_arr, y_hat_arr, param_count=param_count)
+    score = float(aicc if math.isfinite(aicc) else aic)
+    model = {
+        "fit_family": fit_family,
+        "fit_mode": fit_mode,
+        "equation": equation,
+        "x_norm_equation": x_norm_equation,
+        "params": dict(params),
+        "param_count": int(param_count),
+        "rmse": rmse,
+        "aic": float(aic),
+        "aicc": float(aicc),
+        "score": score,
+        "monotonic_violations": _td_perf_monotonic_violations(x_values, y_hat_arr),
+        "warnings": [],
+    }
+    if extra:
+        model.update(extra)
+    return model
+
+
+def _td_perf_fit_polynomial_model(xs: list[float], ys: list[float], *, degree: int, normalize_x: bool, fit_mode: str) -> dict[str, object] | None:
+    np = _td_perf_import_numpy()
+    deg = int(degree)
+    if deg <= 0 or len(xs) < max(2, deg + 1):
+        return None
+    x_arr = np.asarray([float(v) for v in xs], dtype=float)
+    y_arr = np.asarray([float(v) for v in ys], dtype=float)
+    if normalize_x:
+        x0 = float(np.mean(x_arr))
+        sx = float(np.std(x_arr)) or 1.0
+        xn = (x_arr - x0) / sx
+    else:
+        x0 = 0.0
+        sx = 1.0
+        xn = x_arr
+    coeffs = [float(v) for v in np.polyfit(xn, y_arr, deg).tolist()]
+    y_hat = np.poly1d(coeffs)(xn)
+    equation, x_norm_equation = _td_perf_fmt_poly_equation(
+        coeffs,
+        deg,
+        x0=(x0 if normalize_x else None),
+        sx=(sx if normalize_x else None),
+    )
+    return _td_perf_finalize_model(
+        fit_family=TD_PERF_FIT_MODE_POLYNOMIAL,
+        fit_mode=fit_mode,
+        equation=equation,
+        x_norm_equation=x_norm_equation,
+        params={"degree": float(deg)},
+        param_count=len(coeffs),
+        x_values=x_arr,
+        y_true=y_arr,
+        y_hat=y_hat,
+        extra={
+            "degree": deg,
+            "coeffs": coeffs,
+            "x0": x0,
+            "sx": sx,
+            "normalize_x": bool(normalize_x),
+        },
+    )
+
+
+def _td_perf_fit_logarithmic_model(xs: list[float], ys: list[float], *, fit_mode: str) -> dict[str, object] | None:
+    np = _td_perf_import_numpy()
+    curve_fit = _td_perf_import_curve_fit()
+    x_arr = np.asarray([float(v) for v in xs], dtype=float)
+    y_arr = np.asarray([float(v) for v in ys], dtype=float)
+    if len(x_arr) < 2 or np.any(x_arr <= 0):
+        return None
+
+    def _fn(x, a, b):
+        return a + (b * np.log(x))
+
+    log_x = np.log(x_arr)
+    denom = float(np.max(log_x) - np.min(log_x)) or 1.0
+    a0 = float(np.mean(y_arr))
+    b0 = float((y_arr[-1] - y_arr[0]) / denom)
+    params, _cov = curve_fit(_fn, x_arr, y_arr, p0=[a0, b0], maxfev=20000)
+    a, b = [float(v) for v in params]
+    y_hat = _fn(x_arr, a, b)
+    return _td_perf_finalize_model(
+        fit_family=TD_PERF_FIT_MODE_LOGARITHMIC,
+        fit_mode=fit_mode,
+        equation=f"y = {_td_perf_fmt_num(a)} {float(b):+.4g}*ln(x)",
+        x_norm_equation="",
+        params={"a": a, "b": b},
+        param_count=2,
+        x_values=x_arr,
+        y_true=y_arr,
+        y_hat=y_hat,
+    )
+
+
+def _td_perf_fit_saturating_exponential_model(xs: list[float], ys: list[float], *, fit_mode: str) -> dict[str, object] | None:
+    np = _td_perf_import_numpy()
+    curve_fit = _td_perf_import_curve_fit()
+    x_arr = np.asarray([float(v) for v in xs], dtype=float)
+    y_arr = np.asarray([float(v) for v in ys], dtype=float)
+    if len(x_arr) < 3:
+        return None
+
+    def _fn(x, L, A, k):
+        return L - (A * np.exp(-k * x))
+
+    ymax = float(np.max(y_arr))
+    ymin = float(np.min(y_arr))
+    x_span = max(float(np.max(x_arr) - np.min(x_arr)), 1e-6)
+    L0 = max(ymax + max(abs(ymax) * 0.05, 1e-3), ymax + 1e-3)
+    A0 = max(L0 - ymin, 1e-3)
+    k0 = max(1.0 / x_span, 1e-6)
+    params, _cov = curve_fit(
+        _fn,
+        x_arr,
+        y_arr,
+        p0=[L0, A0, k0],
+        bounds=([ymax, 0.0, 0.0], [float("inf"), float("inf"), float("inf")]),
+        maxfev=40000,
+    )
+    L, A, k = [float(v) for v in params]
+    if L < ymax or A <= 0.0 or k <= 0.0:
+        return None
+    y_hat = _fn(x_arr, L, A, k)
+    model = _td_perf_finalize_model(
+        fit_family=TD_PERF_FIT_MODE_SATURATING_EXPONENTIAL,
+        fit_mode=fit_mode,
+        equation=f"y = {_td_perf_fmt_num(L)} - {_td_perf_fmt_num(A)}*exp(-{_td_perf_fmt_num(k)}*x)",
+        x_norm_equation="",
+        params={"L": L, "A": A, "k": k},
+        param_count=3,
+        x_values=x_arr,
+        y_true=y_arr,
+        y_hat=y_hat,
+    )
+    model["monotonic_violations"] = 0
+    return model
+
+
+def _td_perf_choose_best_model(models: list[dict[str, object]]) -> dict[str, object] | None:
+    viable = [m for m in models if isinstance(m, dict)]
+    if not viable:
+        return None
+    best_score = min(float(m.get("score") or float("inf")) for m in viable)
+    tied = [m for m in viable if float(m.get("score") or float("inf")) <= (best_score + 2.0)]
+    tied.sort(
+        key=lambda m: (
+            int(m.get("param_count") or 99),
+            int(m.get("monotonic_violations") or 99),
+            float(m.get("rmse") or float("inf")),
+            int(TD_PERF_FIT_FAMILY_PRIORITY.get(str(m.get("fit_family") or "").strip().lower(), 99)),
+        )
+    )
+    return tied[0] if tied else None
+
+
+def td_perf_fit_model(
+    xs: list[float],
+    ys: list[float],
+    *,
+    fit_mode: object = None,
+    polynomial_degree: int = 2,
+    normalize_x: bool = True,
+) -> dict[str, object] | None:
+    mode = td_perf_normalize_fit_mode(fit_mode)
+    if len(xs) != len(ys) or len(xs) < 2:
+        return None
+    if mode in {TD_PERF_FIT_MODE_AUTO, TD_PERF_FIT_MODE_LOGARITHMIC, TD_PERF_FIT_MODE_SATURATING_EXPONENTIAL}:
+        _td_perf_import_curve_fit()
+    if mode == TD_PERF_FIT_MODE_POLYNOMIAL:
+        return _td_perf_fit_polynomial_model(xs, ys, degree=polynomial_degree, normalize_x=normalize_x, fit_mode=mode)
+    if mode == TD_PERF_FIT_MODE_LOGARITHMIC:
+        return _td_perf_fit_logarithmic_model(xs, ys, fit_mode=mode)
+    if mode == TD_PERF_FIT_MODE_SATURATING_EXPONENTIAL:
+        return _td_perf_fit_saturating_exponential_model(xs, ys, fit_mode=mode)
+    candidates = [
+        _td_perf_fit_polynomial_model(xs, ys, degree=polynomial_degree, normalize_x=normalize_x, fit_mode=mode),
+        _td_perf_fit_logarithmic_model(xs, ys, fit_mode=mode),
+        _td_perf_fit_saturating_exponential_model(xs, ys, fit_mode=mode),
+    ]
+    return _td_perf_choose_best_model([c for c in candidates if isinstance(c, dict)])
+
+
+def _td_perf_fit_surface_family(
+    x1s: list[float],
+    x2s: list[float],
+    ys: list[float],
+    *,
+    family: str,
+    fit_mode: str,
+) -> dict[str, object] | None:
+    np = _td_perf_import_numpy()
+    if len(x1s) != len(x2s) or len(x1s) != len(ys):
+        return None
+    x1_arr = np.asarray([float(v) for v in x1s], dtype=float)
+    x2_arr = np.asarray([float(v) for v in x2s], dtype=float)
+    y_arr = np.asarray([float(v) for v in ys], dtype=float)
+    if len(x1_arr) < 3:
+        return None
+    if len({round(float(v), 12) for v in x1_arr.tolist()}) < 2:
+        return None
+    if len({round(float(v), 12) for v in x2_arr.tolist()}) < 2:
+        return None
+    design = _td_perf_surface_design_matrix(x1_arr, x2_arr, family)
+    term_count = int(design.shape[1])
+    if len(y_arr) < term_count:
+        return None
+    coeffs, _residuals, rank, _singular = np.linalg.lstsq(design, y_arr, rcond=None)
+    if int(rank) < term_count:
+        return None
+    y_hat = design.dot(coeffs)
+    coeff_list = [float(v) for v in coeffs.tolist()]
+    model = _td_perf_finalize_model(
+        fit_family=str(family).strip().lower(),
+        fit_mode=fit_mode,
+        equation=_td_perf_fmt_surface_equation(coeff_list, str(family).strip().lower()),
+        x_norm_equation="",
+        params={f"c{i}": float(v) for i, v in enumerate(coeff_list)},
+        param_count=term_count,
+        x_values=list(range(len(y_arr))),
+        y_true=y_arr,
+        y_hat=y_hat,
+        extra={
+            "coeffs": coeff_list,
+            "plot_dimension": "3d",
+        },
+    )
+    model["monotonic_violations"] = 0
+    return model
+
+
+def td_perf_fit_surface_model(
+    x1s: list[float],
+    x2s: list[float],
+    ys: list[float],
+    *,
+    auto_surface_families: bool = False,
+) -> dict[str, object] | None:
+    fit_mode = TD_PERF_FIT_MODE_AUTO_SURFACE if bool(auto_surface_families) else TD_PERF_FIT_MODE_POLYNOMIAL_SURFACE
+    if len(x1s) != len(x2s) or len(x1s) != len(ys) or len(ys) < 3:
+        return None
+    if not bool(auto_surface_families):
+        model = _td_perf_fit_surface_family(
+            x1s,
+            x2s,
+            ys,
+            family=TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE,
+            fit_mode=fit_mode,
+        )
+        if model:
+            return model
+        return _td_perf_fit_surface_family(
+            x1s,
+            x2s,
+            ys,
+            family=TD_PERF_FIT_FAMILY_PLANE,
+            fit_mode=fit_mode,
+        )
+    candidates = [
+        _td_perf_fit_surface_family(
+            x1s,
+            x2s,
+            ys,
+            family=TD_PERF_FIT_FAMILY_PLANE,
+            fit_mode=fit_mode,
+        ),
+        _td_perf_fit_surface_family(
+            x1s,
+            x2s,
+            ys,
+            family=TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE,
+            fit_mode=fit_mode,
+        ),
+    ]
+    return _td_perf_choose_best_model([c for c in candidates if isinstance(c, dict)])
 
 
 TD_PERF_EQ_STRICTNESS_PRESETS: dict[str, dict[str, float]] = {

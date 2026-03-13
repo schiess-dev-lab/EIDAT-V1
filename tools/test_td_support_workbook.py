@@ -1,4 +1,5 @@
 import json
+import math
 import sqlite3
 import sys
 import tempfile
@@ -16,6 +17,14 @@ if str(ROOT) not in sys.path:
 def _have_openpyxl() -> bool:
     try:
         import openpyxl  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+def _have_scipy() -> bool:
+    try:
+        import scipy  # noqa: F401
     except Exception:
         return False
     return True
@@ -207,6 +216,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 self.assertIsNone(ws_seq.cell(2, 3).value)
                 self.assertEqual(ws_seq.cell(1, 4).value, "feed_pressure_units")
                 self.assertEqual(ws_seq.cell(1, 5).value, "run_type")
+                self.assertEqual(ws_seq.cell(1, 6).value, "pulse_width")
                 self.assertEqual(ws_seq.cell(1, 7).value, "control_period")
                 self.assertTrue(bool(ws_seq.cell(2, 10).value))
 
@@ -475,6 +485,181 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 self.assertNotIn("Data", wb2.sheetnames)
             finally:
                 wb2.close()
+
+    def test_rebuild_surfaces_support_pulse_width_as_trend_metric(self) -> None:
+        from openpyxl import load_workbook  # type: ignore
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            src_db = root / "src.sqlite3"
+            self._make_source_sqlite(src_db)
+
+            wb_path = root / "project.xlsx"
+            be._write_test_data_trending_workbook(
+                wb_path,
+                global_repo=root,
+                serials=["SN1"],
+                docs=[{"serial_number": "SN1", "excel_sqlite_rel": str(src_db)}],
+                config=self._make_config(),
+            )
+            support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+            be._write_td_support_workbook(
+                support_path,
+                sequence_names=["RunA"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+            )
+
+            wb = load_workbook(str(support_path))
+            try:
+                ws_seq = wb["Sequences"]
+                ws_seq.cell(2, 1).value = "Seq1"
+                ws_seq.cell(2, 2).value = "RunA"
+                ws_seq.cell(2, 6).value = 5
+                wb.save(str(support_path))
+            finally:
+                wb.close()
+
+            be.rebuild_test_data_project_cache(root / "implementation_trending.sqlite3", wb_path)
+
+            with sqlite3.connect(str(root / "implementation_trending.sqlite3")) as conn:
+                cols = {
+                    str(row[0] or "").strip()
+                    for row in conn.execute(
+                        "SELECT name FROM td_columns_calc WHERE run_name=? AND kind='y' ORDER BY name",
+                        ("Seq1",),
+                    ).fetchall()
+                }
+                self.assertIn("pulse_width", cols)
+                pulse_rows = conn.execute(
+                    """
+                    SELECT stat, value_num
+                    FROM td_metrics_calc
+                    WHERE run_name=? AND column_name=?
+                    ORDER BY stat
+                    """,
+                    ("Seq1", "pulse_width"),
+                ).fetchall()
+            self.assertEqual(pulse_rows, [("max", 5.0), ("mean", 5.0), ("min", 5.0), ("std", 0.0)])
+
+            with sqlite3.connect(str(root / "test_data_raw_cache.sqlite3")) as conn:
+                raw_row = conn.execute(
+                    "SELECT pulse_width FROM td_raw_sequences WHERE run_name=?",
+                    ("Seq1",),
+                ).fetchone()
+            self.assertIsNotNone(raw_row)
+            self.assertAlmostEqual(float(raw_row[0]), 5.0)
+
+            result = be.update_test_data_trending_project_workbook(root, wb_path, overwrite=True)
+            self.assertEqual(str(result.get("workbook") or ""), str(wb_path))
+
+            wb2 = load_workbook(str(wb_path), read_only=True, data_only=True)
+            try:
+                ws_calc = wb2["Data_calc"]
+                values = {
+                    str(ws_calc.cell(r, 1).value or "").strip(): ws_calc.cell(r, 2).value
+                    for r in range(1, (ws_calc.max_row or 0) + 1)
+                }
+                self.assertEqual(values.get("Seq1.pulse_width.mean"), 5.0)
+                self.assertEqual(values.get("Seq1.pulse_width.std"), 0.0)
+            finally:
+                wb2.close()
+
+    def test_rebuild_maps_legacy_pulse_width_on_to_canonical_pulse_width(self) -> None:
+        from openpyxl import load_workbook  # type: ignore
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            src_db = root / "src.sqlite3"
+            self._make_source_sqlite(src_db)
+
+            wb_path = root / "project.xlsx"
+            be._write_test_data_trending_workbook(
+                wb_path,
+                global_repo=root,
+                serials=["SN1"],
+                docs=[{"serial_number": "SN1", "excel_sqlite_rel": str(src_db)}],
+                config=self._make_config(),
+            )
+            support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+            be._write_td_support_workbook(
+                support_path,
+                sequence_names=["RunA"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+            )
+
+            wb = load_workbook(str(support_path))
+            try:
+                ws_seq = wb["Sequences"]
+                ws_seq.cell(1, 6).value = "pulse_width_on"
+                ws_seq.cell(2, 6).value = 7
+                wb.save(str(support_path))
+            finally:
+                wb.close()
+
+            be.rebuild_test_data_project_cache(root / "implementation_trending.sqlite3", wb_path)
+
+            with sqlite3.connect(str(root / "implementation_trending.sqlite3")) as conn:
+                cols = {
+                    str(row[0] or "").strip()
+                    for row in conn.execute(
+                        "SELECT name FROM td_columns_calc WHERE run_name=? AND kind='y' ORDER BY name",
+                        ("RunA",),
+                    ).fetchall()
+                }
+                pulse_rows = conn.execute(
+                    """
+                    SELECT stat, value_num
+                    FROM td_metrics_calc
+                    WHERE run_name=? AND column_name=?
+                    ORDER BY stat
+                    """,
+                    ("RunA", "pulse_width"),
+                ).fetchall()
+            self.assertIn("pulse_width", cols)
+            self.assertNotIn("pulse_width_on", cols)
+            self.assertEqual(pulse_rows, [("max", 7.0), ("mean", 7.0), ("min", 7.0), ("std", 0.0)])
+
+    def test_rebuild_skips_synthetic_pulse_width_when_support_value_missing(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            src_db = root / "src.sqlite3"
+            self._make_source_sqlite(src_db)
+
+            wb_path = root / "project.xlsx"
+            be._write_test_data_trending_workbook(
+                wb_path,
+                global_repo=root,
+                serials=["SN1"],
+                docs=[{"serial_number": "SN1", "excel_sqlite_rel": str(src_db)}],
+                config=self._make_config(),
+            )
+            support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+            be._write_td_support_workbook(
+                support_path,
+                sequence_names=["RunA"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+            )
+
+            be.rebuild_test_data_project_cache(root / "implementation_trending.sqlite3", wb_path)
+
+            with sqlite3.connect(str(root / "implementation_trending.sqlite3")) as conn:
+                cols = {
+                    str(row[0] or "").strip()
+                    for row in conn.execute(
+                        "SELECT name FROM td_columns_calc WHERE run_name=? AND kind='y' ORDER BY name",
+                        ("RunA",),
+                    ).fetchall()
+                }
+                pulse_rows = conn.execute(
+                    "SELECT COUNT(*) FROM td_metrics_calc WHERE run_name=? AND column_name=?",
+                    ("RunA", "pulse_width"),
+                ).fetchone()
+            self.assertNotIn("pulse_width", cols)
+            self.assertEqual(int(pulse_rows[0] or 0), 0)
 
     def test_update_workbook_rebuilds_cache_after_support_change(self) -> None:
         from openpyxl import load_workbook  # type: ignore
@@ -893,6 +1078,38 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 ).fetchall()
             self.assertEqual(rows, [("max", 40.0), ("mean", 25.0)])
 
+    def test_metric_plot_values_leave_mean_as_per_serial_values(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        series_rows = [
+            {"serial": "SN1", "value_num": 10.0},
+            {"serial": "SN2", "value_num": 20.0},
+            {"serial": "SN3", "value_num": 40.0},
+        ]
+        serials = ["SN1", "SN2", "SN3", "SN4"]
+
+        values_mean = be.td_metric_plot_values(series_rows, serials, "mean")
+        self.assertEqual(values_mean[:3], [10.0, 20.0, 40.0])
+        self.assertTrue(math.isnan(values_mean[3]))
+        values_max = be.td_metric_plot_values(series_rows, serials, "max")
+        self.assertEqual(values_max[:3], [10.0, 20.0, 40.0])
+        self.assertTrue(math.isnan(values_max[3]))
+
+    def test_metric_average_plot_values_use_overall_average_of_mean_points(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        series_rows = [
+            {"serial": "SN1", "value_num": 10.0},
+            {"serial": "SN2", "value_num": 20.0},
+            {"serial": "SN3", "value_num": 40.0},
+        ]
+        serials = ["SN1", "SN2", "SN3", "SN4"]
+
+        self.assertEqual(
+            be.td_metric_average_plot_values(series_rows, serials),
+            [23.333333333333332, 23.333333333333332, 23.333333333333332, 23.333333333333332],
+        )
+
     def test_calc_cache_hard_fails_when_raw_only_exists_in_implementation_db(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
 
@@ -1150,6 +1367,103 @@ class TestTDSupportWorkbook(unittest.TestCase):
         self.assertEqual(be.td_perf_display_value(values, "max"), 106.0)
         self.assertEqual(be.td_perf_display_value(values, "min", bounds_mode="actual"), 95.0)
         self.assertEqual(be.td_perf_display_value(values, "max", bounds_mode="actual"), 105.0)
+
+    def test_perf_mean_3sigma_value_uses_mean_plus_minus_three_sigma(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        values = {"mean": 100.0, "std": 2.0, "min": 95.0, "max": 105.0}
+        self.assertEqual(be.td_perf_mean_3sigma_value(values, "min_3sigma"), 94.0)
+        self.assertEqual(be.td_perf_mean_3sigma_value(values, "max_3sigma"), 106.0)
+
+    def test_perf_mean_3sigma_value_requires_mean_and_std(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        self.assertIsNone(be.td_perf_mean_3sigma_value({"std": 2.0}, "min_3sigma"))
+        self.assertIsNone(be.td_perf_mean_3sigma_value({"mean": 100.0}, "max_3sigma"))
+
+    @unittest.skipUnless(_have_scipy(), "scipy not installed")
+    def test_perf_fit_model_selects_logarithmic_for_log_data(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        xs = [1.0, 2.0, 4.0, 8.0, 16.0]
+        ys = [5.0 + (3.0 * math.log(x)) for x in xs]
+        model = be.td_perf_fit_model(xs, ys, fit_mode="auto", polynomial_degree=2, normalize_x=True)
+        self.assertIsNotNone(model)
+        self.assertEqual(str(model.get("fit_family") or ""), be.TD_PERF_FIT_MODE_LOGARITHMIC)
+        self.assertEqual(str(model.get("fit_mode") or ""), be.TD_PERF_FIT_MODE_AUTO)
+
+    @unittest.skipUnless(_have_scipy(), "scipy not installed")
+    def test_perf_fit_model_selects_saturating_exponential_for_ceiling_data(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        xs = [0.5, 1.0, 2.0, 4.0, 8.0, 12.0]
+        ys = [100.0 - (40.0 * math.exp(-0.45 * x)) for x in xs]
+        model = be.td_perf_fit_model(xs, ys, fit_mode="auto", polynomial_degree=2, normalize_x=True)
+        self.assertIsNotNone(model)
+        self.assertEqual(str(model.get("fit_family") or ""), be.TD_PERF_FIT_MODE_SATURATING_EXPONENTIAL)
+
+    @unittest.skipUnless(_have_scipy(), "scipy not installed")
+    def test_perf_fit_model_selects_polynomial_for_quadratic_data(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        xs = [-2.0, -1.0, 0.0, 1.0, 2.0, 3.0]
+        ys = [2.0 + (3.0 * x) + (0.5 * x * x) for x in xs]
+        model = be.td_perf_fit_model(xs, ys, fit_mode="auto", polynomial_degree=2, normalize_x=True)
+        self.assertIsNotNone(model)
+        self.assertEqual(str(model.get("fit_family") or ""), be.TD_PERF_FIT_MODE_POLYNOMIAL)
+
+    @unittest.skipUnless(_have_scipy(), "scipy not installed")
+    def test_perf_fit_model_manual_logarithmic_rejects_nonpositive_x(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        model = be.td_perf_fit_model([0.0, 1.0, 2.0], [1.0, 2.0, 3.0], fit_mode="logarithmic")
+        self.assertIsNone(model)
+
+    def test_perf_fit_surface_model_prefers_quadratic_surface_for_quadratic_data(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        x1s: list[float] = []
+        x2s: list[float] = []
+        ys: list[float] = []
+        for x1 in (1.0, 2.0, 3.0):
+            for x2 in (4.0, 6.0, 8.0):
+                x1s.append(x1)
+                x2s.append(x2)
+                ys.append(10.0 + (2.0 * x1) - (1.5 * x2) + (0.25 * x1 * x2) + (0.5 * x1 * x1) - (0.2 * x2 * x2))
+
+        model = be.td_perf_fit_surface_model(x1s, x2s, ys, auto_surface_families=False)
+        self.assertIsNotNone(model)
+        self.assertEqual(str(model.get("fit_family") or ""), be.TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE)
+        preds = be.td_perf_predict_surface(model, x1s, x2s)
+        for actual, pred in zip(ys, preds):
+            self.assertAlmostEqual(actual, pred, places=6)
+
+    def test_perf_fit_surface_model_auto_prefers_plane_for_planar_data(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        x1s: list[float] = []
+        x2s: list[float] = []
+        ys: list[float] = []
+        for x1 in (1.0, 2.0, 3.0):
+            for x2 in (5.0, 7.0, 9.0):
+                x1s.append(x1)
+                x2s.append(x2)
+                ys.append(3.0 + (2.0 * x1) - (0.75 * x2))
+
+        model = be.td_perf_fit_surface_model(x1s, x2s, ys, auto_surface_families=True)
+        self.assertIsNotNone(model)
+        self.assertEqual(str(model.get("fit_family") or ""), be.TD_PERF_FIT_FAMILY_PLANE)
+
+    def test_perf_fit_surface_model_rejects_degenerate_input_coverage(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        model = be.td_perf_fit_surface_model(
+            [1.0, 2.0, 3.0, 4.0],
+            [5.0, 5.0, 5.0, 5.0],
+            [10.0, 12.0, 14.0, 16.0],
+            auto_surface_families=False,
+        )
+        self.assertIsNone(model)
 
     def test_perf_candidate_discovery_accepts_separated_x(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
