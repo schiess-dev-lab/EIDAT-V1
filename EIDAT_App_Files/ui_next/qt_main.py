@@ -6111,7 +6111,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.information(self, "Plot Metrics", "No serial numbers available.")
             return
 
-        stats_label = self._metric_title_suffix(stats)
+        stats_label = _metric_title_suffix(stats)
         y_label = stats[0] if len(stats) == 1 else "Metric value"
         plot_bounds = bool(getattr(self, "cb_plot_metric_bounds", None) and self.cb_plot_metric_bounds.isChecked())
         self._axes.clear()
@@ -6503,7 +6503,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
     ) -> None:
         prev = self._perf_current_col_name(cb)
         prev_norm = self._perf_norm_name(prev)
-        cb.blockSignals(True)
+        blocker = QtCore.QSignalBlocker(cb)
         cb.clear()
         if allow_blank:
             cb.addItem("None", "")
@@ -6517,12 +6517,45 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             units = str((col or {}).get("units") or "").strip()
             label = f"{nm} ({units})" if units else nm
             cb.addItem(label, nm)
-        cb.blockSignals(False)
         if prev_norm:
             for i in range(cb.count()):
                 if self._perf_norm_name(cb.itemData(i)) == prev_norm:
                     cb.setCurrentIndex(i)
                     break
+        del blocker
+
+    def _set_perf_axis_combo_by_norm(
+        self,
+        cb: QtWidgets.QComboBox,
+        want_norm: str,
+        *,
+        allow_blank: bool = False,
+        disallow_norms: set[str] | None = None,
+    ) -> bool:
+        blocked = {norm for norm in (disallow_norms or set()) if norm}
+        blocker = QtCore.QSignalBlocker(cb)
+        try:
+            if want_norm:
+                for i in range(cb.count()):
+                    item_norm = self._perf_norm_name(cb.itemData(i))
+                    if item_norm and item_norm == want_norm and item_norm not in blocked:
+                        cb.setCurrentIndex(i)
+                        return True
+            if allow_blank and cb.count() > 0:
+                cb.setCurrentIndex(0)
+                return True
+            for i in range(cb.count()):
+                item_norm = self._perf_norm_name(cb.itemData(i))
+                if not item_norm or item_norm in blocked:
+                    continue
+                cb.setCurrentIndex(i)
+                return True
+            if cb.count() > 0:
+                cb.setCurrentIndex(0)
+                return True
+            return False
+        finally:
+            del blocker
 
     def _common_runs_for_perf_pair(self, x_name: str, y_name: str) -> list[str]:
         x_norm = self._perf_norm_name(x_name)
@@ -6603,35 +6636,50 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             combos["z"] = self.cb_perf_z_col
         if changed not in combos:
             return
-        pivot_cb = combos[changed]
-        pivot = self._perf_current_col_name(pivot_cb)
-        pivot_norm = self._perf_norm_name(pivot)
-        pivot_runs = set((getattr(self, "_perf_col_runs", {}) or {}).get(pivot_norm) or set())
-        selected_norms = {
-            key: self._perf_norm_name(self._perf_current_col_name(cb))
-            for key, cb in combos.items()
-        }
-        for key, cb in combos.items():
-            if key == changed:
-                continue
-            disallow = {v for k2, v in selected_norms.items() if k2 != key and v}
-            allowed_norms = {
-                norm_name
-                for norm_name, runs in (getattr(self, "_perf_col_runs", {}) or {}).items()
-                if norm_name not in disallow and (not pivot_runs or (set(runs or set()) & pivot_runs))
+        if getattr(self, "_perf_axis_update_in_progress", False):
+            return
+        self._perf_axis_update_in_progress = True
+        try:
+            pivot_cb = combos[changed]
+            pivot = self._perf_current_col_name(pivot_cb)
+            pivot_norm = self._perf_norm_name(pivot)
+            pivot_runs = set((getattr(self, "_perf_col_runs", {}) or {}).get(pivot_norm) or set())
+            selected_norms = {
+                key: self._perf_norm_name(self._perf_current_col_name(cb))
+                for key, cb in combos.items()
             }
-            if not allowed_norms and getattr(self, "_perf_available_columns", None):
+            for key, cb in combos.items():
+                if key == changed:
+                    continue
+                desired_norm = selected_norms.get(key, "")
+                disallow = {v for k2, v in selected_norms.items() if k2 != key and v}
                 allowed_norms = {
-                    self._perf_norm_name(str((col or {}).get("name") or "").strip())
-                    for col in (self._perf_available_columns or [])
-                    if self._perf_norm_name(str((col or {}).get("name") or "").strip()) not in disallow
+                    norm_name
+                    for norm_name, runs in (getattr(self, "_perf_col_runs", {}) or {}).items()
+                    if norm_name not in disallow and (not pivot_runs or (set(runs or set()) & pivot_runs))
                 }
-            self._fill_perf_axis_combo(cb, allowed_norms=allowed_norms, allow_blank=(key == "z"))
-            if key != "z" and cb.count() > 0 and not self._perf_current_col_name(cb):
-                cb.setCurrentIndex(0)
+                if not allowed_norms and getattr(self, "_perf_available_columns", None):
+                    allowed_norms = {
+                        self._perf_norm_name(str((col or {}).get("name") or "").strip())
+                        for col in (self._perf_available_columns or [])
+                        if self._perf_norm_name(str((col or {}).get("name") or "").strip()) not in disallow
+                    }
+                self._fill_perf_axis_combo(cb, allowed_norms=allowed_norms, allow_blank=(key == "z"))
+                self._set_perf_axis_combo_by_norm(
+                    cb,
+                    desired_norm,
+                    allow_blank=(key == "z"),
+                    disallow_norms=disallow,
+                )
+                selected_norms[key] = self._perf_norm_name(self._perf_current_col_name(cb))
+        finally:
+            self._perf_axis_update_in_progress = False
 
     def _on_perf_axis_changed(self, changed: str | None = None) -> None:
-        self._filter_perf_axis_options(changed=changed)
+        if changed in {"x", "y", "z"}:
+            if getattr(self, "_perf_axis_update_in_progress", False):
+                return
+            self._filter_perf_axis_options(changed=changed)
         self._update_perf_fit_controls()
         self._update_perf_pair_summary()
         self._clear_perf_results()
@@ -6667,6 +6715,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
     def _set_combo_to_value(self, cb: QtWidgets.QComboBox, value: str) -> bool:
         want = str(value or "").strip()
+        blocker = QtCore.QSignalBlocker(cb)
         if not want:
             if cb.count() > 0:
                 cb.setCurrentIndex(0)
@@ -7920,32 +7969,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._fill_perf_axis_combo(self.cb_perf_x_col)
         self._fill_perf_axis_combo(self.cb_perf_y_col)
         self._fill_perf_axis_combo(self.cb_perf_z_col, allow_blank=True)
-        if prev_input1:
-            for i in range(self.cb_perf_x_col.count()):
-                if self._perf_norm_name(self.cb_perf_x_col.itemData(i)) == self._perf_norm_name(prev_input1):
-                    self.cb_perf_x_col.setCurrentIndex(i)
-                    break
-        elif self.cb_perf_x_col.count() > 0:
-            self.cb_perf_x_col.setCurrentIndex(0)
+        self._set_perf_axis_combo_by_norm(self.cb_perf_x_col, self._perf_norm_name(prev_input1))
+        self._set_perf_axis_combo_by_norm(self.cb_perf_y_col, self._perf_norm_name(prev_output))
+        self._set_perf_axis_combo_by_norm(self.cb_perf_z_col, self._perf_norm_name(prev_input2), allow_blank=True)
         self._filter_perf_axis_options(changed="x")
-        if prev_output:
-            for i in range(self.cb_perf_y_col.count()):
-                if self._perf_norm_name(self.cb_perf_y_col.itemData(i)) == self._perf_norm_name(prev_output):
-                    self.cb_perf_y_col.setCurrentIndex(i)
-                    break
-        elif self.cb_perf_y_col.count() > 0:
-            self.cb_perf_y_col.setCurrentIndex(0)
-        if prev_input2:
-            for i in range(self.cb_perf_z_col.count()):
-                if self._perf_norm_name(self.cb_perf_z_col.itemData(i)) == self._perf_norm_name(prev_input2):
-                    self.cb_perf_z_col.setCurrentIndex(i)
-                    break
-        else:
-            self.cb_perf_z_col.setCurrentIndex(0)
-        if self._perf_norm_name(self._perf_current_col_name(self.cb_perf_x_col)) == self._perf_norm_name(self._perf_current_col_name(self.cb_perf_y_col)):
-            self._filter_perf_axis_options(changed="x")
-            if self.cb_perf_y_col.count() > 0:
-                self.cb_perf_y_col.setCurrentIndex(0)
         self._filter_perf_axis_options(changed="z")
 
         if not getattr(self, "_perf_signals_connected", False):
@@ -7976,7 +8003,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             self._clear_perf_results()
             return
 
-        self._update_perf_pair_summary()
+        self._on_perf_axis_changed()
 
     def _on_perf_preset_changed(self) -> None:
         self._on_perf_axis_changed()
@@ -8151,7 +8178,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                         st = str(d.get("stat") or "").strip()
                         if st:
                             stats = [st]
-                    stats_label = self._metric_title_suffix(stats) or "metrics"
+                    stats_label = _metric_title_suffix(stats) or "metrics"
                     name = f"Metrics: {run_disp} {stats_label} ({y})".strip()
             item = QtWidgets.QListWidgetItem(name or "Auto-Plot")
             item.setData(QtCore.Qt.ItemDataRole.UserRole, d)
@@ -8204,7 +8231,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     st = str(d.get("stat") or "").strip()
                     if st:
                         stats = [st]
-                stats_label = self._metric_title_suffix(stats) or "metrics"
+                stats_label = _metric_title_suffix(stats) or "metrics"
                 d["name"] = f"Metrics: {run_disp} {stats_label} ({y})".strip()
         self._auto_plots.append(d)
         try:
@@ -8297,6 +8324,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             self._set_combo_to_value(self.cb_perf_y_col, str(d.get("output") or ""))
             self._set_combo_to_value(self.cb_perf_x_col, str(d.get("input1") or ""))
             self._set_combo_to_value(self.cb_perf_z_col, str(d.get("input2") or ""))
+            self._on_perf_axis_changed("z" if str(d.get("input2") or "").strip() else "x")
             if hasattr(self, "cb_perf_fit"):
                 self.cb_perf_fit.setChecked(bool(d.get("fit_enabled", True)))
             fit_mode = str(d.get("fit_mode") or "").strip().lower()
@@ -8362,7 +8390,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                         st = str(d.get("stat") or "").strip()
                         if st:
                             stats = [st]
-                    stats_label = self._metric_title_suffix(stats) or "metrics"
+                    stats_label = _metric_title_suffix(stats) or "metrics"
                     name = f"Metrics: {run_disp} {stats_label} ({y})".strip()
             plots.append((name or "Auto Plot", d))
 
@@ -8684,7 +8712,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     stats = [st]
             if not stats:
                 stats = ["mean"]
-            stats_label = self._metric_title_suffix(stats)
+            stats_label = _metric_title_suffix(stats)
             ys = d.get("y") or []
             y_cols = [str(x).strip() for x in ys] if isinstance(ys, list) else []
             plot_bounds = bool(d.get("plot_bounds"))

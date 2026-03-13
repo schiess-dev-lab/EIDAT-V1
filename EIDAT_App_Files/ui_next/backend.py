@@ -12,11 +12,12 @@ import re
 from functools import lru_cache
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Dict, Iterable, Mapping, Optional, Sequence
+from typing import Dict, Iterable, Mapping, Optional, Sequence, TypeVar
 
 
 APP_ROOT = Path(__file__).resolve().parents[1]
 ROOT = APP_ROOT.parent  # repository root that holds user data folders
+T = TypeVar("T")
 
 
 def _get_data_root() -> Path:
@@ -4739,6 +4740,23 @@ def _rebuild_test_data_project_calc_cache_from_raw(db_path: Path, workbook_path:
     import time
     import statistics
 
+    def _apply_last_n_rows_limit(values: list[T], last_n_rows: int | None) -> list[T]:
+        if last_n_rows is None:
+            return values
+        try:
+            limit = int(last_n_rows)
+        except Exception:
+            return values
+        if limit <= 0:
+            return values
+        prior_rows = values[:-1]
+        effective_limit = max(0, limit - 1)
+        if effective_limit == 0:
+            return []
+        if len(prior_rows) <= effective_limit:
+            return prior_rows
+        return prior_rows[-effective_limit:]
+
     def _finite_float(v: object) -> float | None:
         if v is None:
             return None
@@ -4796,9 +4814,7 @@ def _rebuild_test_data_project_calc_cache_from_raw(db_path: Path, workbook_path:
             filtered.append(float(fy))
         if exclude_first_n is not None and int(exclude_first_n) > 0:
             filtered = filtered[int(exclude_first_n):]
-        if last_n_rows is not None and int(last_n_rows) > 0 and len(filtered) > int(last_n_rows):
-            filtered = filtered[-int(last_n_rows):]
-        return filtered
+        return _apply_last_n_rows_limit(filtered, last_n_rows)
 
     wb_path = Path(workbook_path).expanduser()
     if not wb_path.exists():
@@ -5736,8 +5752,7 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
 
         if exclude_first_n is not None and int(exclude_first_n) > 0:
             filtered = filtered[int(exclude_first_n):]
-        if last_n_rows is not None and int(last_n_rows) > 0 and len(filtered) > int(last_n_rows):
-            filtered = filtered[-int(last_n_rows):]
+        filtered = _apply_last_n_rows_limit(filtered, last_n_rows)
         xs = [x for x, _y in filtered]
         ys = [y for _x, y in filtered]
         return xs, ys

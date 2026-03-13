@@ -1,5 +1,6 @@
 import json
 import math
+import os
 import sqlite3
 import sys
 import tempfile
@@ -30,9 +31,106 @@ def _have_scipy() -> bool:
     return True
 
 
+def _have_pyside6() -> bool:
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6 import QtWidgets  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+def _qt_app():
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6 import QtWidgets
+
+    app = QtWidgets.QApplication.instance()
+    if app is None:
+        app = QtWidgets.QApplication([])
+    return app
+
+
+class _PerfAxisHarness:
+    def __init__(self) -> None:
+        _qt_app()
+        from PySide6 import QtWidgets
+        from EIDAT_App_Files.ui_next.qt_main import TestDataTrendDialog  # type: ignore
+
+        self.cb_perf_x_col = QtWidgets.QComboBox()
+        self.cb_perf_y_col = QtWidgets.QComboBox()
+        self.cb_perf_z_col = QtWidgets.QComboBox()
+        self.lbl_perf_axes = QtWidgets.QLabel()
+        self.lbl_perf_common_runs = QtWidgets.QLabel()
+        self.clear_calls = 0
+
+        self._perf_available_columns = [
+            {"name": "A", "units": "ua"},
+            {"name": "B", "units": "ub"},
+            {"name": "C", "units": "uc"},
+            {"name": "D", "units": "ud"},
+        ]
+        self._perf_col_runs = {
+            "a": {"r1", "r2", "r3"},
+            "b": {"r1", "r2", "r3"},
+            "c": {"r1", "r2", "r3"},
+            "d": {"r2"},
+        }
+        self._perf_all_runs = ["r1", "r2", "r3"]
+        self._perf_axis_update_in_progress = False
+
+        self._perf_norm_name = TestDataTrendDialog._perf_norm_name
+
+        for name in (
+            "_perf_current_col_name",
+            "_fill_perf_axis_combo",
+            "_set_perf_axis_combo_by_norm",
+            "_common_runs_for_perf_vars",
+            "_perf_var_names",
+            "_update_perf_axes_label",
+            "_update_perf_pair_summary",
+            "_filter_perf_axis_options",
+            "_on_perf_axis_changed",
+            "_set_combo_to_value",
+        ):
+            setattr(self, name, getattr(TestDataTrendDialog, name).__get__(self, _PerfAxisHarness))
+
+        self._update_perf_fit_controls = lambda: None
+        self._clear_perf_results = lambda: setattr(self, "clear_calls", self.clear_calls + 1)
+
+        self._fill_perf_axis_combo(self.cb_perf_x_col)
+        self._fill_perf_axis_combo(self.cb_perf_y_col)
+        self._fill_perf_axis_combo(self.cb_perf_z_col, allow_blank=True)
+        self._set_perf_axis_combo_by_norm(self.cb_perf_x_col, "a")
+        self._set_perf_axis_combo_by_norm(self.cb_perf_y_col, "b")
+        self._set_perf_axis_combo_by_norm(self.cb_perf_z_col, "", allow_blank=True)
+
+        self.cb_perf_x_col.currentIndexChanged.connect(lambda *_: self._on_perf_axis_changed("x"))
+        self.cb_perf_y_col.currentIndexChanged.connect(lambda *_: self._on_perf_axis_changed("y"))
+        self.cb_perf_z_col.currentIndexChanged.connect(lambda *_: self._on_perf_axis_changed("z"))
+
+    def set_user_value(self, cb, value: str) -> None:
+        want_norm = self._perf_norm_name(value)
+        for i in range(cb.count()):
+            if self._perf_norm_name(cb.itemData(i)) == want_norm:
+                cb.setCurrentIndex(i)
+                return
+        raise AssertionError(f"missing combo value {value!r}")
+
+
 @unittest.skipUnless(_have_openpyxl(), "openpyxl not installed")
 class TestTDSupportWorkbook(unittest.TestCase):
     def _make_source_sqlite(self, path: Path) -> None:
+        rows = [
+            (1, 0.0, 100.0, 5.0, 10.0),
+            (2, 1.0, 100.0, 5.0, 20.0),
+            (3, 2.0, 100.0, 5.0, 30.0),
+            (4, 3.0, 100.0, 5.0, 40.0),
+            (5, 4.0, 100.0, 5.0, 50.0),
+            (6, 5.0, 100.0, 5.0, 60.0),
+        ]
+        self._make_source_sqlite_with_rows(path, rows)
+
+    def _make_source_sqlite_with_rows(self, path: Path, rows: list[tuple[int, float, float, float, float]]) -> None:
         with sqlite3.connect(str(path)) as conn:
             conn.execute(
                 """
@@ -45,14 +143,6 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 )
                 """
             )
-            rows = [
-                (1, 0.0, 100.0, 5.0, 10.0),
-                (2, 1.0, 100.0, 5.0, 20.0),
-                (3, 2.0, 100.0, 5.0, 30.0),
-                (4, 3.0, 100.0, 5.0, 40.0),
-                (5, 4.0, 100.0, 5.0, 50.0),
-                (6, 5.0, 100.0, 5.0, 60.0),
-            ]
             conn.executemany(
                 'INSERT INTO "sheet__RunA"(excel_row,"Time","feed pressure","pulse width on",thrust) VALUES(?,?,?,?,?)',
                 rows,
@@ -290,7 +380,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
                     ("Seq1", "thrust", "mean", "SN1"),
                 ).fetchone()
                 self.assertIsNotNone(mean_row)
-                self.assertAlmostEqual(float(mean_row[0]), 55.0)
+                self.assertAlmostEqual(float(mean_row[0]), 50.0)
 
             result = be.update_test_data_trending_project_workbook(root, wb_path, overwrite=True)
             self.assertEqual(str(result.get("workbook") or ""), str(wb_path))
@@ -302,9 +392,118 @@ class TestTDSupportWorkbook(unittest.TestCase):
                     str(ws_calc.cell(r, 1).value or "").strip(): ws_calc.cell(r, 2).value
                     for r in range(1, (ws_calc.max_row or 0) + 1)
                 }
-                self.assertEqual(values.get("Seq1.thrust.mean"), 55.0)
+                self.assertEqual(values.get("Seq1.thrust.mean"), 50.0)
             finally:
                 wb2.close()
+
+    def test_last_n_rows_excludes_final_row_and_stays_consistent_between_rebuild_and_refresh(self) -> None:
+        from openpyxl import load_workbook  # type: ignore
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            src_db = root / "src.sqlite3"
+            rows = [(idx + 1, float(idx), 100.0, 5.0, float((idx + 1) * 10)) for idx in range(12)]
+            self._make_source_sqlite_with_rows(src_db, rows)
+
+            wb_path = root / "project.xlsx"
+            be._write_test_data_trending_workbook(
+                wb_path,
+                global_repo=root,
+                serials=["SN1"],
+                docs=[{"serial_number": "SN1", "excel_sqlite_rel": str(src_db)}],
+                config=self._make_config(),
+            )
+            support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+            be._write_td_support_workbook(
+                support_path,
+                sequence_names=["RunA"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+            )
+
+            wb = load_workbook(str(support_path))
+            try:
+                ws_settings = wb["Settings"]
+                ws_settings.cell(3, 2).value = 10
+                wb.save(str(support_path))
+            finally:
+                wb.close()
+
+            out_db = root / "implementation_trending.sqlite3"
+            be.rebuild_test_data_project_cache(out_db, wb_path)
+
+            with sqlite3.connect(str(out_db)) as conn:
+                mean_row = conn.execute(
+                    "SELECT value_num FROM td_metrics_calc WHERE run_name=? AND column_name=? AND stat=? AND serial=?",
+                    ("RunA", "thrust", "mean", "SN1"),
+                ).fetchone()
+            self.assertIsNotNone(mean_row)
+            self.assertAlmostEqual(float(mean_row[0]), 70.0)
+
+            result = be.update_test_data_trending_project_workbook(root, wb_path, overwrite=True)
+            self.assertEqual(str(result.get("workbook") or ""), str(wb_path))
+
+            with sqlite3.connect(str(out_db)) as conn:
+                mean_row = conn.execute(
+                    "SELECT value_num FROM td_metrics_calc WHERE run_name=? AND column_name=? AND stat=? AND serial=?",
+                    ("RunA", "thrust", "mean", "SN1"),
+                ).fetchone()
+            self.assertIsNotNone(mean_row)
+            self.assertAlmostEqual(float(mean_row[0]), 70.0)
+
+            wb2 = load_workbook(str(wb_path), read_only=True, data_only=True)
+            try:
+                ws_calc = wb2["Data_calc"]
+                values = {
+                    str(ws_calc.cell(r, 1).value or "").strip(): ws_calc.cell(r, 2).value
+                    for r in range(1, (ws_calc.max_row or 0) + 1)
+                }
+                self.assertEqual(values.get("RunA.thrust.mean"), 70.0)
+            finally:
+                wb2.close()
+
+    def test_last_n_rows_of_one_yields_empty_stats(self) -> None:
+        from openpyxl import load_workbook  # type: ignore
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            src_db = root / "src.sqlite3"
+            self._make_source_sqlite(src_db)
+
+            wb_path = root / "project.xlsx"
+            be._write_test_data_trending_workbook(
+                wb_path,
+                global_repo=root,
+                serials=["SN1"],
+                docs=[{"serial_number": "SN1", "excel_sqlite_rel": str(src_db)}],
+                config=self._make_config(),
+            )
+            support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+            be._write_td_support_workbook(
+                support_path,
+                sequence_names=["RunA"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+            )
+
+            wb = load_workbook(str(support_path))
+            try:
+                ws_settings = wb["Settings"]
+                ws_settings.cell(3, 2).value = 1
+                wb.save(str(support_path))
+            finally:
+                wb.close()
+
+            out_db = root / "implementation_trending.sqlite3"
+            be.rebuild_test_data_project_cache(out_db, wb_path)
+
+            with sqlite3.connect(str(out_db)) as conn:
+                mean_row = conn.execute(
+                    "SELECT value_num FROM td_metrics_calc WHERE run_name=? AND column_name=? AND stat=? AND serial=?",
+                    ("RunA", "thrust", "mean", "SN1"),
+                ).fetchone()
+            self.assertIsNotNone(mean_row)
+            self.assertIsNone(mean_row[0])
 
     def test_metric_bound_line_specs_use_red_lines_for_enabled_bounds(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
@@ -704,7 +903,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
                     ("RunA", "thrust", "mean", "SN1"),
                 ).fetchone()
             self.assertIsNotNone(mean_row)
-            self.assertAlmostEqual(float(mean_row[0]), 55.0)
+            self.assertAlmostEqual(float(mean_row[0]), 50.0)
 
             wb2 = load_workbook(str(wb_path), read_only=True, data_only=True)
             try:
@@ -713,7 +912,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
                     str(ws_calc.cell(r, 1).value or "").strip(): ws_calc.cell(r, 2).value
                     for r in range(1, (ws_calc.max_row or 0) + 1)
                 }
-                self.assertEqual(values.get("RunA.thrust.mean"), 55.0)
+                self.assertEqual(values.get("RunA.thrust.mean"), 50.0)
             finally:
                 wb2.close()
 
@@ -1004,7 +1203,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
                     ORDER BY stat
                     """
                 ).fetchall()
-            self.assertEqual(rows, [("max", 40.0), ("mean", 25.0)])
+            self.assertEqual(rows, [("max", 30.0), ("mean", 20.0)])
 
     def test_calc_cache_still_writes_mean_when_config_omits_it(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
@@ -1076,7 +1275,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
                     ORDER BY stat
                     """
                 ).fetchall()
-            self.assertEqual(rows, [("max", 40.0), ("mean", 25.0)])
+            self.assertEqual(rows, [("max", 30.0), ("mean", 20.0)])
 
     def test_metric_plot_values_leave_mean_as_per_serial_values(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
@@ -1367,6 +1566,57 @@ class TestTDSupportWorkbook(unittest.TestCase):
         self.assertEqual(be.td_perf_display_value(values, "max"), 106.0)
         self.assertEqual(be.td_perf_display_value(values, "min", bounds_mode="actual"), 95.0)
         self.assertEqual(be.td_perf_display_value(values, "max", bounds_mode="actual"), 105.0)
+
+    @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
+    def test_perf_axis_selecting_third_parameter_does_not_recurse(self) -> None:
+        harness = _PerfAxisHarness()
+
+        harness.clear_calls = 0
+        harness.set_user_value(harness.cb_perf_z_col, "C")
+
+        self.assertEqual(harness._perf_var_names(), ("B", "A", "C"))
+        self.assertEqual(harness.clear_calls, 1)
+        self.assertIn("Mode: surface", harness.lbl_perf_common_runs.text())
+
+    @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
+    def test_perf_axis_blank_z_remains_optional(self) -> None:
+        harness = _PerfAxisHarness()
+
+        harness.clear_calls = 0
+        harness.cb_perf_z_col.setCurrentIndex(0)
+
+        self.assertEqual(harness._perf_current_col_name(harness.cb_perf_z_col), "")
+        self.assertEqual(harness._perf_var_names(), ("B", "A", ""))
+        self.assertEqual(harness.clear_calls, 0)
+
+    @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
+    def test_perf_axis_invalidated_peer_falls_back_once(self) -> None:
+        harness = _PerfAxisHarness()
+        harness.clear_calls = 0
+        self.assertTrue(harness._set_combo_to_value(harness.cb_perf_x_col, "B"))
+        self.assertTrue(harness._set_combo_to_value(harness.cb_perf_y_col, "B"))
+        self.assertTrue(harness._set_combo_to_value(harness.cb_perf_z_col, "C"))
+        harness._on_perf_axis_changed("x")
+
+        output_name, input1_name, input2_name = harness._perf_var_names()
+        self.assertEqual(input1_name, "B")
+        self.assertEqual(input2_name, "C")
+        self.assertEqual(output_name, "A")
+        self.assertEqual(len({output_name, input1_name, input2_name}), 3)
+        self.assertEqual(harness.clear_calls, 1)
+
+    @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
+    def test_perf_axis_preset_restore_with_three_parameters_is_safe(self) -> None:
+        harness = _PerfAxisHarness()
+
+        harness.clear_calls = 0
+        self.assertTrue(harness._set_combo_to_value(harness.cb_perf_y_col, "C"))
+        self.assertTrue(harness._set_combo_to_value(harness.cb_perf_x_col, "A"))
+        self.assertTrue(harness._set_combo_to_value(harness.cb_perf_z_col, "B"))
+        harness._on_perf_axis_changed("z")
+
+        self.assertEqual(harness._perf_var_names(), ("C", "A", "B"))
+        self.assertEqual(harness.clear_calls, 1)
 
     def test_perf_mean_3sigma_value_uses_mean_plus_minus_three_sigma(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
