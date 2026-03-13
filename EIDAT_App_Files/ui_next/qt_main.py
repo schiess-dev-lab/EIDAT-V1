@@ -80,6 +80,29 @@ def _td_metric_program_segments(labels: list[str], serial_rows: list[dict]) -> l
     return segments
 
 
+def _td_order_metric_serials(labels: list[str], serial_rows: list[dict]) -> list[str]:
+    meta_by_sn = _td_serial_metadata_by_serial(serial_rows)
+    serials: list[str] = []
+    seen: set[str] = set()
+    for raw_sn in labels or []:
+        sn = str(raw_sn or "").strip()
+        if not sn or sn in seen:
+            continue
+        seen.add(sn)
+        serials.append(sn)
+
+    def _sort_key(sn: str) -> tuple[int, str, str]:
+        row = meta_by_sn.get(sn) or {}
+        program = str(row.get("program_title") or "").strip() or "Unknown Program"
+        return (
+            1 if program == "Unknown Program" else 0,
+            program.casefold(),
+            sn.casefold(),
+        )
+
+    return sorted(serials, key=_sort_key)
+
+
 class ProcWorker(QtCore.QThread):
     line = QtCore.Signal(str)
     finished = QtCore.Signal(int)
@@ -3510,6 +3533,13 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             label.setStyleSheet("color: #b91c1c; font-size: 12px;")
             layout.addWidget(label)
 
+    def _set_plot_note(self, text: str = "") -> None:
+        if not hasattr(self, "lbl_plot_note"):
+            return
+        note = str(text or "").strip()
+        self.lbl_plot_note.setText(note)
+        self.lbl_plot_note.setVisible(bool(note))
+
     def _ensure_main_axes(self, plot_dimension: str = "2d") -> None:
         if not getattr(self, "_figure", None):
             return
@@ -6056,7 +6086,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             return
 
         try:
-            labels = be.td_list_serials(self._db_path)
+            labels = _td_order_metric_serials(be.td_list_serials(self._db_path), self._serial_source_rows)
         except Exception:
             labels = []
         if not labels:
@@ -8598,7 +8628,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             ax.set_title(str(d.get("name") or "") or self._compose_run_title(selection, stats_label))
             ax.set_xlabel("Serial Number")
             ax.set_ylabel(stats[0] if len(stats) == 1 else "Metric value")
-            labels = be.td_list_serials(self._db_path)  # type: ignore[arg-type]
+            labels = _td_order_metric_serials(
+                be.td_list_serials(self._db_path),  # type: ignore[arg-type]
+                self._serial_source_rows,
+            )
             x_idx = list(range(len(labels)))
             multi_run = len(runs) > 1
             for run in runs:
