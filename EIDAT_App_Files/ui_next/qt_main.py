@@ -2542,6 +2542,12 @@ class ImplementationTrendDialog(QtWidgets.QDialog):
         self.lbl_plot_note.setText(note)
         self.lbl_plot_note.setVisible(bool(note))
 
+    @staticmethod
+    def _metric_title_suffix(stats: list[str] | tuple[str, ...] | None) -> str:
+        items = [str(s).strip().lower() for s in (stats or []) if str(s).strip()]
+        title_items = [s for s in items if s != "average"]
+        return "/".join(title_items)
+
     def _default_plot_name(self, term_payloads: list[dict]) -> str:
         labels: list[str] = []
         for payload in term_payloads:
@@ -3142,6 +3148,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self.cb_perf_fit_model.addItem("Polynomial", "polynomial")
         self.cb_perf_fit_model.addItem("Logarithmic", "logarithmic")
         self.cb_perf_fit_model.addItem("Saturating Exponential", "saturating_exponential")
+        self.cb_perf_fit_model.addItem("Piecewise Auto", "piecewise_auto")
+        self.cb_perf_fit_model.addItem("Piecewise 2-Segment", "piecewise_2")
+        self.cb_perf_fit_model.addItem("Piecewise 3-Segment", "piecewise_3")
         self.sp_perf_degree = QtWidgets.QSpinBox()
         self.sp_perf_degree.setRange(1, 6)
         self.sp_perf_degree.setValue(2)
@@ -3327,6 +3336,14 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._axes = None
         self._init_plot_area(plot_layout)
         right_layout.addWidget(self.plot_container, 6)
+
+        self.lbl_plot_note = QtWidgets.QLabel("")
+        self.lbl_plot_note.setVisible(False)
+        self.lbl_plot_note.setWordWrap(True)
+        self.lbl_plot_note.setStyleSheet(
+            "color: #0f172a; font-size: 12px; font-weight: 800; padding: 2px 2px 0 2px;"
+        )
+        right_layout.addWidget(self.lbl_plot_note)
 
         # Highlighted stats: centered dropdown button + single-row summary (keeps the plot area larger).
         self.btn_stats_toggle = QtWidgets.QPushButton("Highlighted Serial Stats ▸")
@@ -3517,11 +3534,6 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             except Exception:
                 pass
             layout.addWidget(self._canvas)
-            self.lbl_plot_note = QtWidgets.QLabel("")
-            self.lbl_plot_note.setVisible(False)
-            self.lbl_plot_note.setWordWrap(True)
-            self.lbl_plot_note.setStyleSheet("color: #334155; font-size: 11px; font-weight: 700; padding-top: 2px;")
-            layout.addWidget(self.lbl_plot_note)
             self._plot_ready = True
         except Exception as exc:
             self._plot_ready = False
@@ -6093,7 +6105,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.information(self, "Plot Metrics", "No serial numbers available.")
             return
 
-        stats_label = "/".join(stats)
+        stats_label = self._metric_title_suffix(stats)
         y_label = stats[0] if len(stats) == 1 else "Metric value"
         plot_bounds = bool(getattr(self, "cb_plot_metric_bounds", None) and self.cb_plot_metric_bounds.isChecked())
         self._axes.clear()
@@ -6167,7 +6179,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         except Exception:
             pass
         if average_summaries:
-            self._set_plot_note("Average value: " + " | ".join(average_summaries))
+            prefix = "Average value: " if len(average_summaries) == 1 else "Average values: "
+            self._set_plot_note(prefix + " | ".join(average_summaries))
         try:
             self._figure.tight_layout()
         except Exception:
@@ -6371,6 +6384,28 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             self.sp_perf_degree.setEnabled(allow_poly_controls)
         if hasattr(self, "cb_perf_norm_x"):
             self.cb_perf_norm_x.setEnabled(allow_poly_controls)
+
+    def _perf_build_master_aggregate_curve(self, curves: dict[str, list[tuple[float, float, str]]]) -> tuple[list[float], list[float]]:
+        aggregator = getattr(be, "td_perf_build_aggregate_curve", None)
+        if callable(aggregator):
+            try:
+                aggregate = aggregator(curves, max_bins=24, min_serials_per_bin=1)
+            except Exception:
+                aggregate = {}
+            if isinstance(aggregate, dict):
+                xs = [float(v) for v in (aggregate.get("x") or [])]
+                ys = [float(v) for v in (aggregate.get("y") or [])]
+                if len(xs) == len(ys) and xs:
+                    return xs, ys
+        pooled_x: list[float] = []
+        pooled_y: list[float] = []
+        for pts in (curves or {}).values():
+            for point in pts or []:
+                if len(point) < 2:
+                    continue
+                pooled_x.append(float(point[0]))
+                pooled_y.append(float(point[1]))
+        return pooled_x, pooled_y
 
     def _perf_fit_model_for_points(self, xs: list[float], ys: list[float]) -> dict | None:
         fitter = getattr(be, "td_perf_fit_model", None)
@@ -6774,8 +6809,6 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     per_run_2d.append((rn, self._run_display_text(rn), input1_map, output_map, input1_units, output_units))
 
                 curves: dict[str, list[tuple[float, float, str]]] = {}
-                pooled_x: list[float] = []
-                pooled_y: list[float] = []
                 for sn in serials:
                     pts_2d: list[tuple[float, float, str]] = []
                     seen_pairs: set[tuple[float, float]] = set()
@@ -6790,8 +6823,6 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     if len(seen_pairs) >= require_min_points:
                         pts_2d.sort(key=lambda t: t[0])
                         curves[sn] = pts_2d
-                        pooled_x.extend([p[0] for p in pts_2d])
-                        pooled_y.extend([p[1] for p in pts_2d])
 
                 if not curves:
                     continue
@@ -6800,9 +6831,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 output_units = next((u for *_rest, _, u in per_run_2d if str(u).strip()), "")
 
                 master_model = {}
-                if fit_enabled and pooled_x:
+                aggregate_x, aggregate_y = self._perf_build_master_aggregate_curve(curves)
+                if fit_enabled and aggregate_x:
                     try:
-                        model = self._perf_fit_model_for_points(pooled_x, pooled_y)
+                        model = self._perf_fit_model_for_points(aggregate_x, aggregate_y)
                     except Exception as exc:
                         if not fit_error_text:
                             fit_error_text = str(exc)
@@ -7396,7 +7428,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
     def _fill_perf_equations_table(self) -> None:
         if not hasattr(self, "tbl_perf_equations"):
             return
-        rows = []
+        rows_by_stat: dict[str, tuple[str, str, str, str, str, str, str, str, str]] = {}
         order = {
             "mean": 0,
             "min": 1,
@@ -7408,19 +7440,44 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         for st, r in (getattr(self, "_perf_results_by_stat", {}) or {}).items():
             master = (r or {}).get("master_model") or {}
             hi = (r or {}).get("highlight_model") or {}
-            rows.append(
-                (
-                    str(st),
-                    self._perf_fit_family_label(master.get("fit_family") or ""),
-                    str(master.get("equation") or ""),
-                    str(master.get("x_norm_equation") or ""),
-                    (f"{float(master.get('rmse')):.4g}" if isinstance(master.get("rmse"), (int, float)) else ""),
-                    self._perf_fit_family_label(hi.get("fit_family") or ""),
-                    str(hi.get("equation") or ""),
-                    str(hi.get("x_norm_equation") or ""),
-                    (f"{float(hi.get('rmse')):.4g}" if isinstance(hi.get("rmse"), (int, float)) else ""),
-                )
+            rows_by_stat[str(st).strip().lower()] = (
+                str(st),
+                self._perf_fit_family_label(master.get("fit_family") or ""),
+                str(master.get("equation") or ""),
+                str(master.get("x_norm_equation") or ""),
+                (f"{float(master.get('rmse')):.4g}" if isinstance(master.get("rmse"), (int, float)) else ""),
+                self._perf_fit_family_label(hi.get("fit_family") or ""),
+                str(hi.get("equation") or ""),
+                str(hi.get("x_norm_equation") or ""),
+                (f"{float(hi.get('rmse')):.4g}" if isinstance(hi.get("rmse"), (int, float)) else ""),
             )
+        mean_row = rows_by_stat.get("mean")
+        if mean_row:
+            mean_master_eqn = str(mean_row[2] or "").strip()
+            mean_hi_eqn = str(mean_row[6] or "").strip()
+            rows_by_stat["min_3sigma"] = (
+                "min_3sigma",
+                str(mean_row[1] or ""),
+                (f"{mean_master_eqn} - 3sigma" if mean_master_eqn else ""),
+                str(mean_row[3] or ""),
+                "",
+                str(mean_row[5] or ""),
+                (f"{mean_hi_eqn} - 3sigma" if mean_hi_eqn else ""),
+                str(mean_row[7] or ""),
+                "",
+            )
+            rows_by_stat["max_3sigma"] = (
+                "max_3sigma",
+                str(mean_row[1] or ""),
+                (f"{mean_master_eqn} + 3sigma" if mean_master_eqn else ""),
+                str(mean_row[3] or ""),
+                "",
+                str(mean_row[5] or ""),
+                (f"{mean_hi_eqn} + 3sigma" if mean_hi_eqn else ""),
+                str(mean_row[7] or ""),
+                "",
+            )
+        rows = list(rows_by_stat.values())
         rows.sort(key=lambda t: (order.get(str(t[0]).strip().lower(), 100), str(t[0]).lower()))
         self.tbl_perf_equations.setRowCount(len(rows))
         for r_i, row in enumerate(rows):
@@ -8088,7 +8145,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                         st = str(d.get("stat") or "").strip()
                         if st:
                             stats = [st]
-                    stats_label = "/".join(stats) if stats else "mean"
+                    stats_label = self._metric_title_suffix(stats) or "metrics"
                     name = f"Metrics: {run_disp} {stats_label} ({y})".strip()
             item = QtWidgets.QListWidgetItem(name or "Auto-Plot")
             item.setData(QtCore.Qt.ItemDataRole.UserRole, d)
@@ -8141,7 +8198,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     st = str(d.get("stat") or "").strip()
                     if st:
                         stats = [st]
-                stats_label = "/".join(stats) if stats else "mean"
+                stats_label = self._metric_title_suffix(stats) or "metrics"
                 d["name"] = f"Metrics: {run_disp} {stats_label} ({y})".strip()
         self._auto_plots.append(d)
         try:
@@ -8299,7 +8356,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                         st = str(d.get("stat") or "").strip()
                         if st:
                             stats = [st]
-                    stats_label = "/".join(stats) if stats else "mean"
+                    stats_label = self._metric_title_suffix(stats) or "metrics"
                     name = f"Metrics: {run_disp} {stats_label} ({y})".strip()
             plots.append((name or "Auto Plot", d))
 
@@ -8621,7 +8678,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     stats = [st]
             if not stats:
                 stats = ["mean"]
-            stats_label = "/".join(stats)
+            stats_label = self._metric_title_suffix(stats)
             ys = d.get("y") or []
             y_cols = [str(x).strip() for x in ys] if isinstance(ys, list) else []
             plot_bounds = bool(d.get("plot_bounds"))

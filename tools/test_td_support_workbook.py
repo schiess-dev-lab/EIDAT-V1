@@ -1419,6 +1419,107 @@ class TestTDSupportWorkbook(unittest.TestCase):
         model = be.td_perf_fit_model([0.0, 1.0, 2.0], [1.0, 2.0, 3.0], fit_mode="logarithmic")
         self.assertIsNone(model)
 
+    def test_perf_fit_model_manual_piecewise_2_recovers_late_rise(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        xs = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]
+        ys = [1.0, 1.2, 1.4, 1.6, 1.8, 4.8, 7.8, 10.8]
+        model = be.td_perf_fit_model(xs, ys, fit_mode="piecewise_2", polynomial_degree=2, normalize_x=True)
+        self.assertIsNotNone(model)
+        self.assertEqual(str(model.get("fit_family") or ""), be.TD_PERF_FIT_MODE_PIECEWISE_2)
+        params = model.get("params") or {}
+        self.assertEqual(int(params.get("segment_count") or 0), 2)
+        self.assertEqual(len(params.get("breakpoints") or []), 1)
+        preds = be.td_perf_predict_model(model, xs)
+        for actual, pred in zip(ys, preds):
+            self.assertAlmostEqual(actual, pred, places=6)
+
+    @unittest.skipUnless(_have_scipy(), "scipy not installed")
+    def test_perf_fit_model_auto_selects_piecewise_2_for_late_rise(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        xs = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]
+        ys = [1.0, 1.2, 1.4, 1.6, 1.8, 4.8, 7.8, 10.8]
+        model = be.td_perf_fit_model(xs, ys, fit_mode="auto", polynomial_degree=2, normalize_x=True)
+        self.assertIsNotNone(model)
+        self.assertEqual(str(model.get("fit_family") or ""), be.TD_PERF_FIT_MODE_PIECEWISE_2)
+
+    @unittest.skipUnless(_have_scipy(), "scipy not installed")
+    def test_perf_fit_model_auto_selects_piecewise_for_reversed_drop(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        xs = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]
+        ys = [9.0, 8.5, 8.0, 7.5, 7.0, 3.0, -1.0, -5.0]
+        model = be.td_perf_fit_model(xs, ys, fit_mode="auto", polynomial_degree=2, normalize_x=True)
+        self.assertIsNotNone(model)
+        self.assertIn(
+            str(model.get("fit_family") or ""),
+            {be.TD_PERF_FIT_MODE_PIECEWISE_2, be.TD_PERF_FIT_MODE_PIECEWISE_3},
+        )
+
+    def test_perf_fit_model_piecewise_auto_prefers_three_segments_when_needed(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        xs = list(range(10))
+        ys = [1.0, 1.4, 1.8, 5.0, 8.2, 11.4, 10.8, 10.2, 9.6, 9.0]
+        model = be.td_perf_fit_model(xs, ys, fit_mode="piecewise_auto", polynomial_degree=2, normalize_x=True)
+        self.assertIsNotNone(model)
+        self.assertEqual(str(model.get("fit_family") or ""), be.TD_PERF_FIT_MODE_PIECEWISE_3)
+
+    def test_perf_fit_model_manual_piecewise_requires_enough_points(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        model = be.td_perf_fit_model([0.0, 1.0, 2.0], [1.0, 2.0, 3.0], fit_mode="piecewise_2")
+        self.assertIsNone(model)
+
+    def test_perf_fit_model_manual_piecewise_rejects_degenerate_splits(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        xs = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
+        ys = [2.0 + (1.5 * x) for x in xs]
+        model = be.td_perf_fit_model(xs, ys, fit_mode="piecewise_2")
+        self.assertIsNone(model)
+
+    def test_perf_fit_model_manual_piecewise_3_rejects_breakpoints_too_close(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        xs = [0.0, 0.001, 0.002, 0.003, 1.0, 2.0, 3.0]
+        ys = [1.0, 1.1, 1.2, 1.3, 4.0, 5.0, 6.0]
+        model = be.td_perf_fit_model(xs, ys, fit_mode="piecewise_3")
+        self.assertIsNone(model)
+
+    def test_perf_predict_model_piecewise_hits_breakpoint_exactly(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        xs = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
+        ys = [1.0, 2.0, 3.0, 4.0, 7.0, 10.0]
+        model = be.td_perf_fit_model(xs, ys, fit_mode="piecewise_2")
+        self.assertIsNotNone(model)
+        params = model.get("params") or {}
+        breakpoint = float((params.get("breakpoints") or [0.0])[0])
+        pred_at_break = be.td_perf_predict_model(model, [breakpoint])[0]
+        self.assertAlmostEqual(pred_at_break, 4.0, places=6)
+
+    def test_perf_build_aggregate_curve_uses_serial_medians_not_raw_density(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        curves = {
+            "dense_high": [(0.0, 100.0, "r1"), (0.1, 100.0, "r2"), (0.2, 100.0, "r3"), (0.3, 100.0, "r4")],
+            "sparse_low": [(0.2, 0.0, "r5")],
+        }
+        agg = be.td_perf_build_aggregate_curve(curves, max_bins=4, min_serials_per_bin=1)
+        self.assertTrue(agg.get("x"))
+        self.assertTrue(agg.get("y"))
+        self.assertLess(float(min(agg.get("y") or [0.0])), 100.0)
+        self.assertGreater(float(max(agg.get("y") or [0.0])), 0.0)
+
+    def test_perf_fit_family_label_includes_piecewise_modes(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        self.assertEqual(be.td_perf_fit_family_label("piecewise_auto"), "Piecewise Auto")
+        self.assertEqual(be.td_perf_fit_family_label("piecewise_2"), "Piecewise 2-Segment")
+        self.assertEqual(be.td_perf_fit_family_label("piecewise_3"), "Piecewise 3-Segment")
+
     def test_perf_fit_surface_model_prefers_quadratic_surface_for_quadratic_data(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
 

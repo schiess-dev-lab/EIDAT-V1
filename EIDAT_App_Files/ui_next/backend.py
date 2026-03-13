@@ -12,7 +12,7 @@ import re
 from functools import lru_cache
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Dict, Iterable, Mapping, Optional
+from typing import Dict, Iterable, Mapping, Optional, Sequence
 
 
 APP_ROOT = Path(__file__).resolve().parents[1]
@@ -6908,6 +6908,9 @@ TD_PERF_FIT_MODE_AUTO = "auto"
 TD_PERF_FIT_MODE_POLYNOMIAL = "polynomial"
 TD_PERF_FIT_MODE_LOGARITHMIC = "logarithmic"
 TD_PERF_FIT_MODE_SATURATING_EXPONENTIAL = "saturating_exponential"
+TD_PERF_FIT_MODE_PIECEWISE_AUTO = "piecewise_auto"
+TD_PERF_FIT_MODE_PIECEWISE_2 = "piecewise_2"
+TD_PERF_FIT_MODE_PIECEWISE_3 = "piecewise_3"
 TD_PERF_FIT_MODE_POLYNOMIAL_SURFACE = "polynomial_surface"
 TD_PERF_FIT_MODE_AUTO_SURFACE = "auto_surface"
 TD_PERF_FIT_FAMILY_PLANE = "plane"
@@ -6917,6 +6920,9 @@ TD_PERF_FIT_MODES = {
     TD_PERF_FIT_MODE_POLYNOMIAL,
     TD_PERF_FIT_MODE_LOGARITHMIC,
     TD_PERF_FIT_MODE_SATURATING_EXPONENTIAL,
+    TD_PERF_FIT_MODE_PIECEWISE_AUTO,
+    TD_PERF_FIT_MODE_PIECEWISE_2,
+    TD_PERF_FIT_MODE_PIECEWISE_3,
     TD_PERF_FIT_MODE_POLYNOMIAL_SURFACE,
     TD_PERF_FIT_MODE_AUTO_SURFACE,
     TD_PERF_FIT_FAMILY_PLANE,
@@ -6925,9 +6931,11 @@ TD_PERF_FIT_MODES = {
 TD_PERF_FIT_FAMILY_PRIORITY = {
     TD_PERF_FIT_MODE_LOGARITHMIC: 0,
     TD_PERF_FIT_MODE_SATURATING_EXPONENTIAL: 1,
-    TD_PERF_FIT_MODE_POLYNOMIAL: 2,
-    TD_PERF_FIT_FAMILY_PLANE: 3,
-    TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE: 4,
+    TD_PERF_FIT_MODE_PIECEWISE_2: 2,
+    TD_PERF_FIT_MODE_PIECEWISE_3: 3,
+    TD_PERF_FIT_MODE_POLYNOMIAL: 4,
+    TD_PERF_FIT_FAMILY_PLANE: 5,
+    TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE: 6,
 }
 
 
@@ -6944,6 +6952,12 @@ def td_perf_fit_family_label(value: object) -> str:
         return "Logarithmic"
     if fam == TD_PERF_FIT_MODE_SATURATING_EXPONENTIAL:
         return "Saturating Exponential"
+    if fam == TD_PERF_FIT_MODE_PIECEWISE_AUTO:
+        return "Piecewise Auto"
+    if fam == TD_PERF_FIT_MODE_PIECEWISE_2:
+        return "Piecewise 2-Segment"
+    if fam == TD_PERF_FIT_MODE_PIECEWISE_3:
+        return "Piecewise 3-Segment"
     if fam == TD_PERF_FIT_MODE_POLYNOMIAL_SURFACE:
         return "Polynomial Surface"
     if fam == TD_PERF_FIT_MODE_AUTO_SURFACE:
@@ -7001,6 +7015,228 @@ def _td_perf_fmt_poly_equation(coeffs: list[float], degree: int, *, x0: float | 
     if x0 is not None and sx is not None:
         return f"y = {expr}", f"x' = (x - {_td_perf_fmt_num(x0)}) / {_td_perf_fmt_num(sx)}"
     return f"y = {expr}", ""
+
+
+def _td_perf_piecewise_basis(xs, breakpoints: Sequence[float]):
+    np = _td_perf_import_numpy()
+    x_arr = np.asarray(xs, dtype=float)
+    cols = [np.ones_like(x_arr), x_arr]
+    for bp in breakpoints:
+        cols.append(np.maximum(0.0, x_arr - float(bp)))
+    return np.column_stack(cols)
+
+
+def _td_perf_piecewise_segment_params(coeffs: Sequence[float], breakpoints: Sequence[float]) -> list[dict[str, float]]:
+    intercept = float(coeffs[0])
+    slope = float(coeffs[1])
+    segments: list[dict[str, float]] = []
+    running_intercept = intercept
+    running_slope = slope
+    prev_bp: float | None = None
+    for idx, bp in enumerate(breakpoints):
+        seg: dict[str, float] = {
+            "x_min": float("-inf") if prev_bp is None else float(prev_bp),
+            "x_max": float(bp),
+            "intercept": float(running_intercept),
+            "slope": float(running_slope),
+        }
+        segments.append(seg)
+        delta = float(coeffs[idx + 2])
+        running_intercept = float(running_intercept - (delta * float(bp)))
+        running_slope = float(running_slope + delta)
+        prev_bp = float(bp)
+    segments.append(
+        {
+            "x_min": float(prev_bp if prev_bp is not None else float("-inf")),
+            "x_max": float("inf"),
+            "intercept": float(running_intercept),
+            "slope": float(running_slope),
+        }
+    )
+    return segments
+
+
+def _td_perf_piecewise_param_count(segment_count: int) -> int:
+    return 2 + (2 * max(0, int(segment_count) - 1))
+
+
+def _td_perf_fmt_piecewise_equation(segments: Sequence[Mapping[str, object]], breakpoints: Sequence[float]) -> str:
+    if not segments:
+        return ""
+    pieces: list[str] = []
+    for idx, seg in enumerate(segments):
+        intercept = _td_perf_fmt_num(seg.get("intercept"))
+        slope = _td_perf_fmt_num(seg.get("slope"))
+        expr = f"{intercept} {float(seg.get('slope') or 0.0):+.4g}*x"
+        if idx == 0:
+            cond = f"x <= {_td_perf_fmt_num(breakpoints[0])}" if breakpoints else "all x"
+        elif idx == (len(segments) - 1):
+            cond = f"x > {_td_perf_fmt_num(breakpoints[-1])}"
+        else:
+            cond = f"{_td_perf_fmt_num(breakpoints[idx - 1])} < x <= {_td_perf_fmt_num(breakpoints[idx])}"
+        pieces.append(f"{cond}: y = {expr}")
+    bp_text = ", ".join(_td_perf_fmt_num(bp) for bp in breakpoints)
+    if bp_text:
+        return f"breaks: [{bp_text}] | " + " ; ".join(pieces)
+    return " ; ".join(pieces)
+
+
+def _td_perf_piecewise_candidate_breaks(
+    unique_x: Sequence[float],
+    *,
+    segment_count: int,
+    min_points_per_segment: int,
+    min_span: float,
+) -> list[tuple[float, ...]]:
+    values = [float(v) for v in unique_x]
+    if len(values) < max(2, int(segment_count)):
+        return []
+
+    def _valid_spans(boundaries: Sequence[float]) -> bool:
+        parts = [values[0], *[float(v) for v in boundaries], values[-1]]
+        return all((parts[i + 1] - parts[i]) >= float(min_span) for i in range(len(parts) - 1))
+
+    candidates: list[tuple[float, ...]] = []
+    if int(segment_count) == 2:
+        for idx in range(min_points_per_segment - 1, len(values) - min_points_per_segment):
+            bp = float(values[idx])
+            if _valid_spans([bp]):
+                candidates.append((bp,))
+        return candidates
+    if int(segment_count) == 3:
+        for idx1 in range(min_points_per_segment - 1, len(values) - ((2 * min_points_per_segment) - 1)):
+            bp1 = float(values[idx1])
+            for idx2 in range(idx1 + min_points_per_segment, len(values) - min_points_per_segment):
+                bp2 = float(values[idx2])
+                if _valid_spans([bp1, bp2]):
+                    candidates.append((bp1, bp2))
+        return candidates
+    return []
+
+
+def _td_perf_fit_piecewise_model(
+    xs: list[float],
+    ys: list[float],
+    *,
+    segment_count: int,
+    fit_mode: str,
+) -> dict[str, object] | None:
+    np = _td_perf_import_numpy()
+    seg_count = int(segment_count)
+    if seg_count not in {2, 3} or len(xs) != len(ys):
+        return None
+    min_points_per_segment = 2
+    if len(xs) < (seg_count * min_points_per_segment):
+        return None
+    x_arr = np.asarray([float(v) for v in xs], dtype=float)
+    y_arr = np.asarray([float(v) for v in ys], dtype=float)
+    if len(x_arr) < (seg_count * min_points_per_segment):
+        return None
+    finite_mask = np.isfinite(x_arr) & np.isfinite(y_arr)
+    if not bool(np.all(finite_mask)):
+        return None
+    order = np.argsort(x_arr, kind="mergesort")
+    x_sorted = x_arr[order]
+    y_sorted = y_arr[order]
+    unique_x = sorted({round(float(v), 12) for v in x_sorted.tolist()})
+    min_unique = seg_count + 1
+    if len(unique_x) < min_unique:
+        return None
+    x_span = float(x_sorted[-1] - x_sorted[0])
+    min_span = max(1e-9, x_span * 0.05)
+    best_model: dict[str, object] | None = None
+    best_score = float("inf")
+    candidates = _td_perf_piecewise_candidate_breaks(
+        unique_x,
+        segment_count=seg_count,
+        min_points_per_segment=min_points_per_segment,
+        min_span=min_span,
+    )
+    if not candidates:
+        return None
+
+    slope_scale = max(abs(float(y_sorted[-1] - y_sorted[0])) / max(x_span, 1e-9), 1e-9)
+    slope_delta_tol = max(1e-6, slope_scale * 0.08)
+    split_penalty = 0.75 * float(seg_count - 1)
+
+    for breakpoints in candidates:
+        edges = [x_sorted[0], *[float(v) for v in breakpoints], x_sorted[-1]]
+        counts: list[int] = []
+        for idx in range(seg_count):
+            if idx == 0:
+                mask = x_sorted <= float(edges[idx + 1])
+            elif idx == (seg_count - 1):
+                mask = x_sorted > float(edges[idx])
+            else:
+                mask = (x_sorted > float(edges[idx])) & (x_sorted <= float(edges[idx + 1]))
+            count = int(np.count_nonzero(mask))
+            if count < min_points_per_segment:
+                counts = []
+                break
+            span = float(np.max(x_sorted[mask]) - np.min(x_sorted[mask]))
+            if span < min_span:
+                counts = []
+                break
+            counts.append(count)
+        if len(counts) != seg_count:
+            continue
+
+        design = _td_perf_piecewise_basis(x_sorted, breakpoints)
+        coeffs, _residuals, rank, _singular = np.linalg.lstsq(design, y_sorted, rcond=None)
+        if int(rank) < int(design.shape[1]):
+            continue
+        coeff_list = [float(v) for v in coeffs.tolist()]
+        segments = _td_perf_piecewise_segment_params(coeff_list, breakpoints)
+        if len(segments) != seg_count:
+            continue
+        slope_deltas = [abs(float(segments[i + 1]["slope"]) - float(segments[i]["slope"])) for i in range(seg_count - 1)]
+        if any(delta < slope_delta_tol for delta in slope_deltas):
+            continue
+        y_hat = design.dot(coeffs)
+        family = TD_PERF_FIT_MODE_PIECEWISE_2 if seg_count == 2 else TD_PERF_FIT_MODE_PIECEWISE_3
+        model = _td_perf_finalize_model(
+            fit_family=family,
+            fit_mode=fit_mode,
+            equation=_td_perf_fmt_piecewise_equation(segments, breakpoints),
+            x_norm_equation="",
+            params={
+                "segment_count": seg_count,
+                "breakpoints": [float(v) for v in breakpoints],
+                "coeffs": coeff_list,
+                "segments": [
+                    {
+                        "x_min": float(seg["x_min"]),
+                        "x_max": float(seg["x_max"]),
+                        "intercept": float(seg["intercept"]),
+                        "slope": float(seg["slope"]),
+                    }
+                    for seg in segments
+                ],
+            },
+            param_count=_td_perf_piecewise_param_count(seg_count),
+            x_values=x_sorted,
+            y_true=y_sorted,
+            y_hat=y_hat,
+            extra={
+                "breakpoints": [float(v) for v in breakpoints],
+                "segments": [
+                    {
+                        "x_min": float(seg["x_min"]),
+                        "x_max": float(seg["x_max"]),
+                        "intercept": float(seg["intercept"]),
+                        "slope": float(seg["slope"]),
+                    }
+                    for seg in segments
+                ],
+                "segment_count": seg_count,
+            },
+        )
+        model["monotonic_violations"] = 0
+        model["score"] = float(model.get("score") or float("inf")) + split_penalty
+        if float(model.get("score") or float("inf")) < best_score:
+            best_model = model
+            best_score = float(model.get("score") or float("inf"))
+    return best_model
 
 
 def _td_perf_aic_metrics(y_true, y_hat, *, param_count: int) -> tuple[float, float]:
@@ -7061,7 +7297,79 @@ def td_perf_predict_model(model: Mapping[str, object], xs: Iterable[float]) -> l
         A = float((params or {}).get("A") or 0.0)
         k = float((params or {}).get("k") or 0.0)
         return [float(v) for v in (L - (A * np.exp(-k * x_arr))).tolist()]
+    if family in {TD_PERF_FIT_MODE_PIECEWISE_2, TD_PERF_FIT_MODE_PIECEWISE_3}:
+        coeffs = [float(v) for v in ((params or {}).get("coeffs") or [])]
+        breakpoints = [float(v) for v in ((params or {}).get("breakpoints") or [])]
+        if len(coeffs) != (2 + len(breakpoints)):
+            return []
+        design = _td_perf_piecewise_basis(x_arr, breakpoints)
+        y_hat = design.dot(np.asarray(coeffs, dtype=float))
+        return [float(v) for v in y_hat.tolist()]
     return []
+
+
+def td_perf_build_aggregate_curve(
+    curves: Mapping[str, Sequence[Sequence[object]]],
+    *,
+    max_bins: int = 24,
+    min_serials_per_bin: int = 1,
+) -> dict[str, list[float]]:
+    np = _td_perf_import_numpy()
+    serial_points: dict[str, list[tuple[float, float]]] = {}
+    pooled_x: list[float] = []
+    for serial, rows in (curves or {}).items():
+        pts: list[tuple[float, float]] = []
+        for row in rows or []:
+            if len(row) < 2:
+                continue
+            try:
+                x_val = float(row[0])
+                y_val = float(row[1])
+            except Exception:
+                continue
+            if not (math.isfinite(x_val) and math.isfinite(y_val)):
+                continue
+            pts.append((x_val, y_val))
+            pooled_x.append(x_val)
+        if pts:
+            serial_points[str(serial)] = pts
+    if not pooled_x:
+        return {"x": [], "y": []}
+    x_min = float(min(pooled_x))
+    x_max = float(max(pooled_x))
+    if not math.isfinite(x_min) or not math.isfinite(x_max):
+        return {"x": [], "y": []}
+    unique_x = sorted({round(float(v), 12) for v in pooled_x})
+    if len(unique_x) <= 1 or float(x_min) == float(x_max):
+        y_vals = [y for pts in serial_points.values() for _x, y in pts]
+        y_med = float(np.median(np.asarray(y_vals, dtype=float))) if y_vals else 0.0
+        return {"x": [float(x_min)], "y": [y_med]}
+
+    bin_count = max(2, min(int(max_bins), len(unique_x)))
+    edges = np.linspace(float(x_min), float(x_max), bin_count + 1)
+    bins: list[tuple[float, float]] = list(zip(edges[:-1].tolist(), edges[1:].tolist()))
+    agg_x: list[float] = []
+    agg_y: list[float] = []
+    for idx, (left, right) in enumerate(bins):
+        serial_bin_points: list[tuple[float, float]] = []
+        for pts in serial_points.values():
+            if idx == (len(bins) - 1):
+                in_bin = [(x, y) for x, y in pts if x >= left and x <= right]
+            else:
+                in_bin = [(x, y) for x, y in pts if x >= left and x < right]
+            if not in_bin:
+                continue
+            x_med = float(np.median(np.asarray([x for x, _y in in_bin], dtype=float)))
+            y_med = float(np.median(np.asarray([y for _x, y in in_bin], dtype=float)))
+            serial_bin_points.append((x_med, y_med))
+        if len(serial_bin_points) < max(1, int(min_serials_per_bin)):
+            continue
+        agg_x.append(float(np.median(np.asarray([x for x, _y in serial_bin_points], dtype=float))))
+        agg_y.append(float(np.median(np.asarray([y for _x, y in serial_bin_points], dtype=float))))
+    if not agg_x:
+        return {"x": [], "y": []}
+    pairs = sorted(zip(agg_x, agg_y), key=lambda item: item[0])
+    return {"x": [float(x) for x, _y in pairs], "y": [float(y) for _x, y in pairs]}
 
 
 def _td_perf_surface_design_matrix(x1_values, x2_values, family: str):
@@ -7339,10 +7647,27 @@ def td_perf_fit_model(
         return _td_perf_fit_logarithmic_model(xs, ys, fit_mode=mode)
     if mode == TD_PERF_FIT_MODE_SATURATING_EXPONENTIAL:
         return _td_perf_fit_saturating_exponential_model(xs, ys, fit_mode=mode)
+    if mode == TD_PERF_FIT_MODE_PIECEWISE_2:
+        return _td_perf_fit_piecewise_model(xs, ys, segment_count=2, fit_mode=mode)
+    if mode == TD_PERF_FIT_MODE_PIECEWISE_3:
+        return _td_perf_fit_piecewise_model(xs, ys, segment_count=3, fit_mode=mode)
+    if mode == TD_PERF_FIT_MODE_PIECEWISE_AUTO:
+        return _td_perf_choose_best_model(
+            [
+                c
+                for c in (
+                    _td_perf_fit_piecewise_model(xs, ys, segment_count=2, fit_mode=mode),
+                    _td_perf_fit_piecewise_model(xs, ys, segment_count=3, fit_mode=mode),
+                )
+                if isinstance(c, dict)
+            ]
+        )
     candidates = [
         _td_perf_fit_polynomial_model(xs, ys, degree=polynomial_degree, normalize_x=normalize_x, fit_mode=mode),
         _td_perf_fit_logarithmic_model(xs, ys, fit_mode=mode),
         _td_perf_fit_saturating_exponential_model(xs, ys, fit_mode=mode),
+        _td_perf_fit_piecewise_model(xs, ys, segment_count=2, fit_mode=mode),
+        _td_perf_fit_piecewise_model(xs, ys, segment_count=3, fit_mode=mode),
     ]
     return _td_perf_choose_best_model([c for c in candidates if isinstance(c, dict)])
 
