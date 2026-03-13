@@ -45,6 +45,41 @@ def _fit_widget_to_screen(widget: QtWidgets.QWidget, margin: int = 40) -> None:
         pass
 
 
+def _td_serial_metadata_by_serial(rows: list[dict]) -> dict[str, dict]:
+    by_sn: dict[str, dict] = {}
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        sn = str(row.get("serial") or row.get("serial_number") or "").strip()
+        if sn and sn not in by_sn:
+            by_sn[sn] = row
+    return by_sn
+
+
+def _td_metric_program_segments(labels: list[str], serial_rows: list[dict]) -> list[dict]:
+    meta_by_sn = _td_serial_metadata_by_serial(serial_rows)
+    segments: list[dict] = []
+    for idx, raw_sn in enumerate(labels or []):
+        sn = str(raw_sn or "").strip()
+        if not sn:
+            continue
+        row = meta_by_sn.get(sn) or {}
+        program = str(row.get("program_title") or "").strip() or "Unknown Program"
+        if segments and str(segments[-1].get("program") or "") == program:
+            segments[-1]["end"] = idx
+            serials = segments[-1].setdefault("serials", [])
+            if isinstance(serials, list):
+                serials.append(sn)
+        else:
+            segments.append({
+                "program": program,
+                "start": idx,
+                "end": idx,
+                "serials": [sn],
+            })
+    return segments
+
+
 class ProcWorker(QtCore.QThread):
     line = QtCore.Signal(str)
     finished = QtCore.Signal(int)
@@ -2982,7 +3017,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self.list_stats = QtWidgets.QListWidget()
         self.list_stats.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
         self.list_stats.setMaximumHeight(92)
-        for st in ["mean", "average", "min", "max", "std"]:
+        for st in ["mean", "min", "max", "std"]:
             self.list_stats.addItem(QtWidgets.QListWidgetItem(st))
         # Default selection: mean (matches prior single-select default behavior).
         for i in range(self.list_stats.count()):
@@ -2991,6 +3026,13 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 it.setSelected(True)
                 break
         metrics_layout.addWidget(self.list_stats)
+
+        self.cb_metric_average = QtWidgets.QCheckBox("Average")
+        self.cb_metric_average.setChecked(False)
+        self.cb_metric_average.setToolTip(
+            "Plot the aggregate average of the per-SN mean points as a separate flat series."
+        )
+        metrics_layout.addWidget(self.cb_metric_average)
 
         self.cb_plot_metric_bounds = QtWidgets.QCheckBox("Plot parameter bounds from support workbook")
         self.cb_plot_metric_bounds.setChecked(False)
@@ -4041,13 +4083,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             source_rows = be.td_read_sources_metadata(self._workbook_path)
         except Exception:
             source_rows = []
-        by_sn: dict[str, dict] = {}
-        for row in source_rows:
-            if not isinstance(row, dict):
-                continue
-            sn = str(row.get("serial") or row.get("serial_number") or "").strip()
-            if sn and sn not in by_sn:
-                by_sn[sn] = row
+        by_sn = _td_serial_metadata_by_serial(source_rows)
         self._serial_source_rows = [by_sn.get(sn, {"serial": sn, "serial_number": sn}) for sn in serials if str(sn).strip()]
 
         keep = [sn for sn in (self._highlight_sns or []) if sn in set(serials)]
@@ -4103,13 +4139,14 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 prev = {it.text().strip().lower() for it in self.list_stats.selectedItems() if it and it.text().strip()}
             except Exception:
                 prev = set()
+            prev_average = bool(
+                "average" in prev
+                or (hasattr(self, "cb_metric_average") and self.cb_metric_average.isChecked())
+            )
             self.list_stats.blockSignals(True)
             try:
                 self.list_stats.clear()
-                metric_stats = list(self._perf_available_stats)
-                if "average" not in metric_stats:
-                    insert_at = metric_stats.index("mean") + 1 if "mean" in metric_stats else 0
-                    metric_stats.insert(insert_at, "average")
+                metric_stats = [st for st in self._perf_available_stats if str(st).strip().lower() != "average"]
                 for st in metric_stats:
                     self.list_stats.addItem(QtWidgets.QListWidgetItem(st))
 
@@ -4125,6 +4162,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     self.list_stats.item(0).setSelected(True)
             finally:
                 self.list_stats.blockSignals(False)
+            if hasattr(self, "cb_metric_average"):
+                self.cb_metric_average.blockSignals(True)
+                self.cb_metric_average.setChecked(prev_average)
+                self.cb_metric_average.blockSignals(False)
 
         self.cb_perf_plotter.blockSignals(True)
         self.cb_perf_plotter.clear()
@@ -5481,6 +5522,72 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             except Exception:
                 continue
 
+    def _apply_metric_program_segments(self, axes, labels: list[str]) -> None:
+        if axes is None or not labels:
+            return
+        try:
+            from matplotlib.patches import Rectangle
+            from matplotlib.transforms import blended_transform_factory
+        except Exception:
+            return
+        segments = _td_metric_program_segments(labels, self._serial_source_rows)
+        if not segments:
+            return
+        palette = ["#1d4ed8", "#0f766e", "#b45309", "#7c3aed", "#be123c", "#334155"]
+        transform = blended_transform_factory(axes.transData, axes.transAxes)
+        for idx, segment in enumerate(segments):
+            try:
+                start = int(segment.get("start"))
+                end = int(segment.get("end"))
+            except Exception:
+                continue
+            color = palette[idx % len(palette)]
+            x0 = float(start) - 0.5
+            width = float(end - start + 1)
+            try:
+                axes.add_patch(
+                    Rectangle(
+                        (x0, 0.0),
+                        width,
+                        1.0,
+                        transform=transform,
+                        fill=False,
+                        linewidth=1.4,
+                        linestyle="-",
+                        edgecolor=color,
+                        alpha=0.95,
+                        zorder=0.2,
+                    )
+                )
+            except Exception:
+                continue
+            label = str(segment.get("program") or "Unknown Program")
+            span = end - start + 1
+            try:
+                axes.text(
+                    (float(start) + float(end)) / 2.0,
+                    0.985,
+                    label,
+                    transform=transform,
+                    ha="center",
+                    va="top",
+                    fontsize=(8 if span >= 2 else 7),
+                    fontweight="bold",
+                    rotation=(90 if span == 1 and len(label) > 14 else 0),
+                    color=color,
+                    bbox={
+                        "boxstyle": "round,pad=0.22",
+                        "facecolor": "#ffffff",
+                        "edgecolor": color,
+                        "linewidth": 1.0,
+                        "alpha": 0.92,
+                    },
+                    clip_on=True,
+                    zorder=4.0,
+                )
+            except Exception:
+                continue
+
     def _select_run_by_name(self, run_name: str) -> None:
         rn = str(run_name or "").strip()
         if not rn:
@@ -5924,6 +6031,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         runs = self._current_member_runs()
         stats = [it.text().strip().lower() for it in self.list_stats.selectedItems()] if hasattr(self, "list_stats") else []
         stats = [s for s in stats if s]
+        if hasattr(self, "cb_metric_average") and self.cb_metric_average.isChecked() and "average" not in stats:
+            stats.append("average")
         if not runs or not stats:
             return
         y_cols = [it.text().strip() for it in self.list_y_metrics.selectedItems()] if hasattr(self, "list_y_metrics") else []
@@ -5991,6 +6100,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         if not any_plotted:
             QtWidgets.QMessageBox.information(self, "Plot Metrics", "No metric values found for this selection.")
             return
+        self._apply_metric_program_segments(self._axes, labels)
+        self._axes.set_xlim(-0.5, max(len(labels) - 0.5, 0.5))
         self._axes.set_xticks(x)
         self._axes.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
         self._axes.grid(True, alpha=0.25)
@@ -6244,9 +6355,13 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             d = cb.currentData()
         except Exception:
             d = None
-        if isinstance(d, str) and d.strip():
+        if isinstance(d, str):
+            if not d.strip():
+                return ""
             return d.strip()
         txt = str(cb.currentText() or "").strip()
+        if not txt or txt.strip().lower() in {"none", "(none)"}:
+            return ""
         if txt.endswith(")") and " (" in txt:
             txt = txt.split(" (", 1)[0].strip()
         return txt
@@ -7624,10 +7739,16 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 prev = {it.text().strip().lower() for it in self.list_stats.selectedItems() if it and it.text().strip()}
             except Exception:
                 prev = set()
+            prev_average = bool(
+                "average" in prev
+                or (hasattr(self, "cb_metric_average") and self.cb_metric_average.isChecked())
+            )
             self.list_stats.blockSignals(True)
             try:
                 self.list_stats.clear()
                 for st in self._perf_available_stats:
+                    if str(st).strip().lower() == "average":
+                        continue
                     self.list_stats.addItem(QtWidgets.QListWidgetItem(st))
                 restored = False
                 if prev:
@@ -7640,6 +7761,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     self.list_stats.item(0).setSelected(True)
             finally:
                 self.list_stats.blockSignals(False)
+            if hasattr(self, "cb_metric_average"):
+                self.cb_metric_average.blockSignals(True)
+                self.cb_metric_average.setChecked(prev_average)
+                self.cb_metric_average.blockSignals(False)
 
         prev_output, prev_input1, prev_input2 = self._perf_var_names()
 
@@ -8019,12 +8144,18 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             if not stats:
                 stats = ["mean"]
             want_stats = {s for s in stats if s}
+            want_average = "average" in want_stats
+            want_stats.discard("average")
+            if hasattr(self, "cb_metric_average"):
+                self.cb_metric_average.setChecked(want_average)
             if want_stats and hasattr(self, "list_stats"):
                 self.list_stats.clearSelection()
                 for i in range(self.list_stats.count()):
                     it = self.list_stats.item(i)
                     if it.text().strip().lower() in want_stats:
                         it.setSelected(True)
+            elif hasattr(self, "list_stats"):
+                self.list_stats.clearSelection()
             ys = d.get("y") or []
             want = {str(x).strip() for x in ys if str(x).strip()} if isinstance(ys, list) else set()
             if want and hasattr(self, "list_y_metrics"):
@@ -8458,6 +8589,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                         )
                         bound = dict(metric_bounds.get(str(y_col)) or {})
                         self._plot_metric_bound_lines(ax, bound)
+            self._apply_metric_program_segments(ax, labels)
+            ax.set_xlim(-0.5, max(len(labels) - 0.5, 0.5))
             ax.set_xticks(x_idx)
             ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
             ax.grid(True, alpha=0.25)
