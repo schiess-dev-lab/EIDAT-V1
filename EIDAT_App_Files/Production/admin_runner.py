@@ -308,10 +308,11 @@ def run_update_processor(
     on_log: Callable[[str], None] | None = None,
 ) -> PipelineResult:
     """
-    Update the node-local backend processor environment without deleting node caches/artifacts.
+    Update the node-local processor environments without deleting node caches/artifacts.
 
-    Today this means ensuring/updating the node runtime venv packages under:
+    This ensures/updates:
       <node_root>\\EIDAT\\Runtime\\.venv
+      <node_root>\\EIDAT\\ExtractionNode\\node-ui\\.venv
     """
     node = _as_abs(node_root)
     runtime = _as_abs(runtime_root)
@@ -327,24 +328,31 @@ def run_update_processor(
         if not (runtime / "EIDAT_App_Files").exists():
             raise RuntimeError(f"Runtime root does not contain EIDAT_App_Files: {runtime}")
 
-        # Prefer the requirements file from the central runtime to keep updates consistent.
-        req = runtime / "EIDAT_App_Files" / "Production" / "requirements-node.txt"
-        if not req.exists():
-            req = Path(__file__).resolve().parent / "requirements-node.txt"
+        # Prefer requirement files from the central runtime to keep updates consistent.
+        req_full = runtime / "EIDAT_App_Files" / "Production" / "requirements-node.txt"
+        if not req_full.exists():
+            req_full = Path(__file__).resolve().parent / "requirements-node.txt"
+        req_ui = runtime / "EIDAT_App_Files" / "Production" / "requirements-node-ui.txt"
+        if not req_ui.exists():
+            req_ui = Path(__file__).resolve().parent / "requirements-node-ui.txt"
 
         if on_log is not None:
             on_log(f"[NODE] {node}")
-            on_log("[ACTION] update_processor (bootstrap node runtime venv; keep caches)")
-            on_log(f"[REQ] {req}")
+            on_log("[ACTION] update_processor (bootstrap node runtime + node-ui venvs; keep caches)")
+            on_log(f"[REQ full] {req_full}")
+            on_log(f"[REQ ui] {req_ui}")
 
         from .bootstrap_env import main as bootstrap_main
         from .node_layout import node_layout
 
         layout = node_layout(node)
-        log_path = layout.runtime_dir / "last_install_log.txt"
-        pre_mtime = log_path.stat().st_mtime_ns if log_path.exists() else None
+        runtime_log_path = layout.runtime_dir / "last_install_log.txt"
+        ui_venv_dir = layout.extraction_node_dir / "node-ui" / ".venv"
+        ui_log_path = ui_venv_dir / "eidat_last_install_log.txt"
+        pre_runtime_mtime = runtime_log_path.stat().st_mtime_ns if runtime_log_path.exists() else None
+        pre_ui_mtime = ui_log_path.stat().st_mtime_ns if ui_log_path.exists() else None
 
-        rc = int(
+        rc_runtime = int(
             bootstrap_main(
                 [
                     "--yes",
@@ -353,34 +361,62 @@ def run_update_processor(
                     "--node-root",
                     str(node),
                     "--requirements",
-                    str(req),
+                    str(req_full),
+                    "--sys-python",
+                    str(python_exe),
+                ]
+            )
+        )
+        rc_ui = int(
+            bootstrap_main(
+                [
+                    "--yes",
+                    "--profile",
+                    "ui",
+                    "--node-root",
+                    str(node),
+                    "--venv-dir",
+                    str(ui_venv_dir),
+                    "--requirements",
+                    str(req_ui),
                     "--sys-python",
                     str(python_exe),
                 ]
             )
         )
 
-        post_mtime = log_path.stat().st_mtime_ns if log_path.exists() else None
-        updated = bool(pre_mtime != post_mtime)
+        post_runtime_mtime = runtime_log_path.stat().st_mtime_ns if runtime_log_path.exists() else None
+        post_ui_mtime = ui_log_path.stat().st_mtime_ns if ui_log_path.exists() else None
+        runtime_updated = bool(pre_runtime_mtime != post_runtime_mtime)
+        ui_updated = bool(pre_ui_mtime != post_ui_mtime)
+        updated = bool(runtime_updated or ui_updated)
 
         outputs["update_processor"] = {
-            "rc": rc,
+            "rc": max(rc_runtime, rc_ui),
             "python": python_exe,
-            "requirements": str(req),
-            "install_log": str(log_path),
+            "runtime_requirements": str(req_full),
+            "ui_requirements": str(req_ui),
+            "runtime_install_log": str(runtime_log_path),
+            "ui_install_log": str(ui_log_path),
+            "runtime_updated": runtime_updated,
+            "ui_updated": ui_updated,
             "updated": updated,
         }
 
-        if rc != 0:
-            raise RuntimeError(f"bootstrap_env failed (rc={rc})")
+        if rc_runtime != 0:
+            raise RuntimeError(f"runtime bootstrap_env failed (rc={rc_runtime})")
+        if rc_ui != 0:
+            raise RuntimeError(f"node-ui bootstrap_env failed (rc={rc_ui})")
 
         if on_log is not None:
             if updated:
-                on_log("[OK] Backend processor updated.")
+                on_log("[OK] Processor environments updated.")
             else:
-                on_log("[OK] Backend processor already up to date.")
-            if log_path.exists():
-                on_log(f"[LOG] {log_path}")
+                on_log("[OK] Processor environments already up to date.")
+            if runtime_log_path.exists():
+                on_log(f"[LOG runtime] {runtime_log_path}")
+            if ui_log_path.exists():
+                on_log(f"[LOG ui] {ui_log_path}")
 
         return PipelineResult(ok=True, node_root=node, outputs=outputs)
     except Exception as exc:

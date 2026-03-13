@@ -432,7 +432,7 @@ class AdminWindow(QtWidgets.QMainWindow):
                 b_reset = QtWidgets.QPushButton("Reset")
                 b_proc = QtWidgets.QPushButton("Process")
                 b_update = QtWidgets.QPushButton("Update Proc")
-                b_update.setToolTip("Update backend processor (node runtime venv) without deleting node caches/artifacts.")
+                b_update.setToolTip("Update node runtime and node UI venv packages without deleting node caches/artifacts.")
                 for b in (b_open, b_deploy, b_reset, b_proc, b_update):
                     b.setMaximumWidth(120)
                 b_open.clicked.connect(lambda _=False, root=n.node_root: self._open_folder(root))
@@ -594,7 +594,7 @@ class AdminWindow(QtWidgets.QMainWindow):
         # Ensure the node env file exists (even though update currently doesn't read it).
         self._ensure_node_env_file(n.node_root)
         self.worker.set_tasks([(n.node_id, n.node_root, n.runtime_root, True, "update_processor")])
-        self._run_status.begin(f"Update Processor: {Path(n.node_root).name}")
+        self._run_status.begin(f"Update Processor Envs: {Path(n.node_root).name}")
         self.worker.start()
 
     def _act_scan_force_candidates(self, node_id: str) -> None:

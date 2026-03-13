@@ -2512,6 +2512,13 @@ class ImplementationTrendDialog(QtWidgets.QDialog):
         except Exception:
             return str(value)
 
+    def _set_plot_note(self, text: str = "") -> None:
+        if not hasattr(self, "lbl_plot_note"):
+            return
+        note = str(text or "").strip()
+        self.lbl_plot_note.setText(note)
+        self.lbl_plot_note.setVisible(bool(note))
+
     def _default_plot_name(self, term_payloads: list[dict]) -> str:
         labels: list[str] = []
         for payload in term_payloads:
@@ -3487,6 +3494,11 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             except Exception:
                 pass
             layout.addWidget(self._canvas)
+            self.lbl_plot_note = QtWidgets.QLabel("")
+            self.lbl_plot_note.setVisible(False)
+            self.lbl_plot_note.setWordWrap(True)
+            self.lbl_plot_note.setStyleSheet("color: #334155; font-size: 11px; font-weight: 700; padding-top: 2px;")
+            layout.addWidget(self.lbl_plot_note)
             self._plot_ready = True
         except Exception as exc:
             self._plot_ready = False
@@ -6016,6 +6028,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             self._refresh_stats_preview()
 
     def _plot_current_mode(self) -> None:
+        self._set_plot_note("")
         if self._mode == "performance":
             self._plot_performance()
         elif self._mode == "metrics":
@@ -6026,6 +6039,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
     def _plot_metrics(self) -> None:
         if not self._plot_ready or not self._db_path:
             return
+        self._set_plot_note("")
         self._ensure_main_axes("2d")
         selection = self._current_run_selection()
         runs = self._current_member_runs()
@@ -6058,6 +6072,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._axes.set_ylabel(y_label)
         x = list(range(len(labels)))
         any_plotted = False
+        average_summaries: list[str] = []
         multi_run = len(runs) > 1
         for run in runs:
             metric_bounds = self._metric_bounds_for_run(run) if plot_bounds else {}
@@ -6086,14 +6101,26 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     stat_label = str(stat)
                     label = f"{run}.{y_col}.{stat_label}" if multi_run else f"{y_col}.{stat_label}"
                     try:
-                        line = self._axes.plot(x, y, marker="o", linewidth=1.4, label=label)[0]
+                        is_average = str(stat).strip().lower() == "average"
+                        line = self._axes.plot(
+                            x,
+                            y,
+                            marker=None if is_average else "o",
+                            linewidth=1.4,
+                            label=label,
+                        )[0]
                         bound = dict(metric_bounds.get(str(y_col)) or {})
                         self._plot_metric_bound_lines(self._axes, bound)
-                        hi_set = {str(sn).strip() for sn in (self._highlight_sns or []) if str(sn).strip()}
-                        for hi_sn in hi_set:
-                            if hi_sn in labels:
-                                idx = labels.index(hi_sn)
-                                self._axes.plot([x[idx]], [y[idx]], marker="o", markersize=9, color=line.get_color())
+                        if is_average:
+                            avg_val = next((float(v) for v in y if isinstance(v, (int, float)) and math.isfinite(float(v))), None)
+                            if avg_val is not None:
+                                average_summaries.append(f"{label} = {self._fmt_num(avg_val)}")
+                        else:
+                            hi_set = {str(sn).strip() for sn in (self._highlight_sns or []) if str(sn).strip()}
+                            for hi_sn in hi_set:
+                                if hi_sn in labels:
+                                    idx = labels.index(hi_sn)
+                                    self._axes.plot([x[idx]], [y[idx]], marker="o", markersize=9, color=line.get_color())
                         any_plotted = True
                     except Exception:
                         continue
@@ -6109,6 +6136,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             self._axes.legend(fontsize=8, loc="best")
         except Exception:
             pass
+        if average_summaries:
+            self._set_plot_note("Average value: " + " | ".join(average_summaries))
         try:
             self._figure.tight_layout()
         except Exception:
@@ -6135,6 +6164,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
     def _plot_curves(self) -> None:
         if not self._plot_ready or not self._db_path:
             return
+        self._set_plot_note("")
         self._ensure_main_axes("2d")
         selection = self._current_run_selection()
         runs = self._current_member_runs()
@@ -7861,6 +7891,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
     def _plot_performance(self) -> None:
         if not self._plot_ready or not self._db_path:
             return
+        self._set_plot_note("")
         output_target, input1_target, input2_target = self._perf_var_names()
         if not output_target or not input1_target:
             QtWidgets.QMessageBox.information(self, "Performance", "Select Output and Input 1 columns.")
@@ -8576,6 +8607,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     for stat in stats:
                         source_stat = "mean" if str(stat).strip().lower() == "average" else stat
                         series = be.td_load_metric_series(self._db_path, run, y_col, source_stat)  # type: ignore[arg-type]
+                        is_average = str(stat).strip().lower() == "average"
                         if str(stat).strip().lower() == "average":
                             yv = be.td_metric_average_plot_values(series, labels)  # type: ignore[arg-type]
                         else:
@@ -8583,7 +8615,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                         ax.plot(
                             x_idx,
                             yv,
-                            marker="o",
+                            marker=None if is_average else "o",
                             linewidth=1.2,
                             label=(f"{run}.{y_col}.{stat}" if multi_run else f"{y_col}.{stat}"),
                         )
