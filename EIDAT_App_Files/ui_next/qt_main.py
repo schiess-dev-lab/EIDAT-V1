@@ -3509,6 +3509,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         except Exception:
             pass
 
+    @staticmethod
+    def _metric_title_suffix(stats: list[str] | tuple[str, ...] | None) -> str:
+        items = [str(s).strip().lower() for s in (stats or []) if str(s).strip()]
+        title_items = [s for s in items if s != "average"]
+        return "/".join(title_items)
+
     def _init_plot_area(self, layout: QtWidgets.QVBoxLayout) -> None:
         try:
             from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
