@@ -358,6 +358,156 @@ class TestTDSupportWorkbook(unittest.TestCase):
             finally:
                 wb.close()
 
+    def test_write_support_workbook_new_schema_seeds_program_and_condition_tabs(self) -> None:
+        from openpyxl import load_workbook  # type: ignore
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            support = root / "proj.support.xlsx"
+            be._write_td_support_workbook(
+                support,
+                sequence_names=["Seq1", "Seq2", "Seq3"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+                program_titles=["Program A", "Program B"],
+                sequences_by_program={"Program A": ["Seq1", "Seq2"], "Program B": ["Seq3"]},
+            )
+
+            wb = load_workbook(str(support), read_only=False, data_only=True)
+            try:
+                self.assertIn("Settings", wb.sheetnames)
+                self.assertIn("Programs", wb.sheetnames)
+                self.assertIn("RunConditions", wb.sheetnames)
+                self.assertNotIn("RunConditionBounds", wb.sheetnames)
+                ws_programs = wb["Programs"]
+                sheet_a = str(ws_programs.cell(2, 2).value or "").strip()
+                sheet_b = str(ws_programs.cell(3, 2).value or "").strip()
+                self.assertTrue(sheet_a.startswith("Program_"))
+                self.assertTrue(sheet_b.startswith("Program_"))
+                ws_a = wb[sheet_a]
+                ws_b = wb[sheet_b]
+                self.assertEqual([ws_a.cell(r, 1).value for r in range(2, 4)], ["Seq1", "Seq2"])
+                self.assertEqual([ws_b.cell(r, 1).value for r in range(2, 3)], ["Seq3"])
+                cond_sheet_names = [name for name in wb.sheetnames if str(name).startswith(be.TD_SUPPORT_CONDITION_SHEET_PREFIX)]
+                self.assertEqual(len(cond_sheet_names), 3)
+            finally:
+                wb.close()
+
+    def test_read_support_workbook_new_schema_groups_by_condition_and_splits_control_period(self) -> None:
+        from openpyxl import Workbook, load_workbook  # type: ignore
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            wb_path = root / "project.xlsx"
+            Workbook().save(str(wb_path))
+            support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+            be._write_td_support_workbook(
+                support_path,
+                sequence_names=["Seq1", "Seq2", "Seq3"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+                program_titles=["Program A", "Program B"],
+                sequences_by_program={"Program A": ["Seq1", "Seq2"], "Program B": ["Seq3"]},
+            )
+
+            wb = load_workbook(str(support_path))
+            try:
+                ws_programs = wb["Programs"]
+                sheet_a = str(ws_programs.cell(2, 2).value or "").strip()
+                sheet_b = str(ws_programs.cell(3, 2).value or "").strip()
+                ws_a = wb[sheet_a]
+                ws_b = wb[sheet_b]
+                for ws, row in ((ws_a, 2), (ws_b, 2)):
+                    ws.cell(row, 2).value = "CondA"
+                    ws.cell(row, 3).value = "350 psia, PM, 60 ON / 120 OFF"
+                    ws.cell(row, 4).value = 350
+                    ws.cell(row, 5).value = "psia"
+                    ws.cell(row, 6).value = "PM"
+                    ws.cell(row, 7).value = 60
+                    ws.cell(row, 8).value = 120
+                ws_a.cell(3, 2).value = "CondA"
+                ws_a.cell(3, 3).value = "350 psia, PM, 60 ON / 240 OFF"
+                ws_a.cell(3, 4).value = 350
+                ws_a.cell(3, 5).value = "psia"
+                ws_a.cell(3, 6).value = "PM"
+                ws_a.cell(3, 7).value = 60
+                ws_a.cell(3, 8).value = 240
+                wb.save(str(support_path))
+            finally:
+                wb.close()
+
+            support_cfg = be._read_td_support_workbook(wb_path, project_dir=root)
+            conds = support_cfg.get("run_conditions") or []
+            self.assertEqual(len(conds), 2)
+            sequences = support_cfg.get("sequences") or []
+            cond_keys = {str(row.get("condition_key") or "") for row in sequences}
+            self.assertEqual(len(cond_keys), 2)
+
+    def test_rebuild_new_schema_aggregates_across_programs_and_skips_disabled_rows(self) -> None:
+        from openpyxl import load_workbook  # type: ignore
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            src_db_a = root / "src_a.sqlite3"
+            src_db_b = root / "src_b.sqlite3"
+            self._make_source_sqlite(src_db_a)
+            self._make_source_sqlite(src_db_b)
+
+            wb_path = root / "project.xlsx"
+            be._write_test_data_trending_workbook(
+                wb_path,
+                global_repo=root,
+                serials=["SN1"],
+                docs=[
+                    {"serial_number": "SN1", "excel_sqlite_rel": str(src_db_b), "program_title": "Program B"},
+                    {"serial_number": "SN1", "excel_sqlite_rel": str(src_db_a), "program_title": "Program A"},
+                ],
+                config=self._make_config(),
+            )
+            support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+            be._write_td_support_workbook(
+                support_path,
+                sequence_names=["RunA"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+                program_titles=["Program A", "Program B"],
+                sequences_by_program={"Program A": ["RunA"], "Program B": ["RunA"]},
+            )
+
+            wb = load_workbook(str(support_path))
+            try:
+                ws_programs = wb["Programs"]
+                sheet_a = str(ws_programs.cell(2, 2).value or "").strip()
+                sheet_b = str(ws_programs.cell(3, 2).value or "").strip()
+                ws_a = wb[sheet_a]
+                ws_b = wb[sheet_b]
+                for ws in (ws_a, ws_b):
+                    ws.cell(2, 2).value = "CondMerged"
+                    ws.cell(2, 3).value = "100 psia, PM, 5 ON / 20 OFF"
+                    ws.cell(2, 4).value = 100
+                    ws.cell(2, 5).value = "psia"
+                    ws.cell(2, 6).value = "PM"
+                    ws.cell(2, 7).value = 5
+                    ws.cell(2, 8).value = 20
+                ws_b.cell(2, 11).value = False
+                wb.save(str(support_path))
+            finally:
+                wb.close()
+
+            out_db = root / "implementation_trending.sqlite3"
+            payload = be.rebuild_test_data_project_cache(out_db, wb_path)
+            self.assertGreater(int(payload.get("metrics_written") or 0), 0)
+            with sqlite3.connect(str(out_db)) as conn:
+                run_names = [str(row[0] or "").strip() for row in conn.execute("SELECT run_name FROM td_runs ORDER BY run_name").fetchall()]
+                self.assertEqual(run_names, ["CondMerged"])
+                obs = conn.execute(
+                    "SELECT program_title, source_run_name FROM td_condition_observations WHERE run_name=? AND serial=?",
+                    ("CondMerged", "SN1"),
+                ).fetchone()
+                self.assertIsNotNone(obs)
+                self.assertIn("Program A", str(obs[0] or ""))
+                self.assertNotIn("Program B", str(obs[0] or ""))
+
     def test_rebuild_uses_support_sequence_name_without_filtering_parameter_bounds(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
         from openpyxl import load_workbook  # type: ignore

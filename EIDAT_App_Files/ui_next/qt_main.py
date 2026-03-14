@@ -1375,7 +1375,7 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
                 self.rb_all.setText("All indexed TD reports")
                 for w in (self.rb_program, self.rb_asset, self.rb_asset_specific, self.rb_group):
                     w.setEnabled(True)
-                for w in (self.cb_program, self.cb_asset, self.cb_asset_specific, self.cb_group):
+                for w in (self.cb_program, self.btn_program_multi, self.cb_asset, self.cb_asset_specific, self.cb_group):
                     w.setEnabled(True)
                 if hasattr(self, "lbl_select_hint"):
                     self.lbl_select_hint.setText(
@@ -1409,7 +1409,7 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
                 self.rb_all.setText("All indexed EIDPs")
                 for w in (self.rb_program, self.rb_asset, self.rb_asset_specific, self.rb_group):
                     w.setEnabled(True)
-                for w in (self.cb_program, self.cb_asset, self.cb_asset_specific, self.cb_group):
+                for w in (self.cb_program, self.btn_program_multi, self.cb_asset, self.cb_asset_specific, self.cb_group):
                     w.setEnabled(True)
                 if hasattr(self, "lbl_select_hint"):
                     self.lbl_select_hint.setText(
@@ -1517,7 +1517,15 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
         self.cb_asset = QtWidgets.QComboBox()
         self.cb_asset_specific = QtWidgets.QComboBox()
         self.cb_group = QtWidgets.QComboBox()
-        self.cb_program.currentIndexChanged.connect(lambda *_: self._apply_filter_and_refresh_table(select_all=True))
+        self._selected_program_filters: list[str] = []
+        self.cb_program.setEditable(True)
+        try:
+            self.cb_program.lineEdit().setReadOnly(True)
+        except Exception:
+            pass
+        self.btn_program_multi = QtWidgets.QPushButton("Select...")
+        self.btn_program_multi.clicked.connect(self._open_program_multi_select)
+        self.cb_program.currentIndexChanged.connect(self._on_program_filter_changed)
         self.cb_asset.currentIndexChanged.connect(lambda *_: self._apply_filter_and_refresh_table(select_all=True))
         self.cb_asset_specific.currentIndexChanged.connect(lambda *_: self._apply_filter_and_refresh_table(select_all=True))
         self.cb_group.currentIndexChanged.connect(lambda *_: self._apply_filter_and_refresh_table(select_all=True))
@@ -1525,6 +1533,7 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
         top.addWidget(self.rb_all)
         top.addWidget(self.rb_program)
         top.addWidget(self.cb_program, 1)
+        top.addWidget(self.btn_program_multi)
         top.addWidget(self.rb_asset)
         top.addWidget(self.cb_asset, 1)
         top.addWidget(self.rb_asset_specific)
@@ -1755,12 +1764,22 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
         parts = _merge_values(parts, _candidate_names("part_numbers"))
         test_plans = _merge_values(test_plans, _candidate_names("acceptance_test_plan_numbers"))
 
+        self.cb_program.blockSignals(True)
         self.cb_program.clear()
         self.cb_asset.clear()
         self.cb_asset_specific.clear()
         self.cb_group.clear()
 
         self.cb_program.addItems(programs or ["(none)"])
+        self._selected_program_filters = [
+            value for value in (self._selected_program_filters or []) if value in set(programs)
+        ]
+        if self._selected_program_filters:
+            idx = self.cb_program.findText(self._selected_program_filters[0])
+            if idx >= 0:
+                self.cb_program.setCurrentIndex(idx)
+        self._update_program_filter_summary()
+        self.cb_program.blockSignals(False)
         self.cb_asset.addItems(assets or ["(none)"])
         self.cb_asset_specific.addItems(asset_specifics or ["(none)"])
 
@@ -1799,6 +1818,96 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
                 self.cb_group.addItem(label, gid)
         else:
             self.cb_group.addItem("(none)", "")
+
+    def _program_filter_values(self) -> list[str]:
+        values: list[str] = []
+        for idx in range(self.cb_program.count() if hasattr(self, "cb_program") else 0):
+            txt = str(self.cb_program.itemText(idx) or "").strip()
+            if txt and txt != "(none)":
+                values.append(txt)
+        return values
+
+    def _update_program_filter_summary(self) -> None:
+        if not hasattr(self, "cb_program"):
+            return
+        selected = [value for value in (self._selected_program_filters or []) if str(value).strip()]
+        if not selected:
+            text = str(self.cb_program.currentText() or "").strip()
+        elif len(selected) == 1:
+            text = selected[0]
+        else:
+            text = f"{len(selected)} programs selected"
+        try:
+            self.cb_program.setEditText(text or "(none)")
+            self.cb_program.setToolTip(", ".join(selected) if selected else "")
+        except Exception:
+            pass
+
+    def _selected_program_filter_values(self) -> list[str]:
+        selected = [value for value in (self._selected_program_filters or []) if str(value).strip()]
+        if selected:
+            return selected
+        current = str(self.cb_program.currentText() or "").strip() if hasattr(self, "cb_program") else ""
+        return [current] if current and current != "(none)" else []
+
+    def _on_program_filter_changed(self, *_args) -> None:
+        current = str(self.cb_program.currentText() or "").strip() if hasattr(self, "cb_program") else ""
+        if current and current != "(none)" and current not in set(self._selected_program_filters or []):
+            self._selected_program_filters = [current]
+        self._update_program_filter_summary()
+        self._apply_filter_and_refresh_table(select_all=True)
+
+    def _open_program_multi_select(self) -> None:
+        values = self._program_filter_values()
+        if not values:
+            return
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Select Programs")
+        dlg.resize(420, 420)
+        root = QtWidgets.QVBoxLayout(dlg)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(8)
+
+        listw = QtWidgets.QListWidget()
+        selected = set(self._selected_program_filter_values())
+        for value in values:
+            item = QtWidgets.QListWidgetItem(value)
+            item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(QtCore.Qt.CheckState.Checked if value in selected else QtCore.Qt.CheckState.Unchecked)
+            listw.addItem(item)
+        root.addWidget(listw, 1)
+
+        btns = QtWidgets.QHBoxLayout()
+        btns.addStretch(1)
+        btn_apply = QtWidgets.QPushButton("Apply")
+        btn_cancel = QtWidgets.QPushButton("Cancel")
+        btns.addWidget(btn_apply)
+        btns.addWidget(btn_cancel)
+        root.addLayout(btns)
+
+        def _apply() -> None:
+            chosen = [
+                str(listw.item(i).text() or "").strip()
+                for i in range(listw.count())
+                if listw.item(i) and listw.item(i).checkState() == QtCore.Qt.CheckState.Checked
+            ]
+            self._selected_program_filters = [value for value in chosen if value]
+            if self._selected_program_filters:
+                blocker = QtCore.QSignalBlocker(self.cb_program)
+                try:
+                    idx = self.cb_program.findText(self._selected_program_filters[0])
+                    if idx >= 0:
+                        self.cb_program.setCurrentIndex(idx)
+                finally:
+                    del blocker
+            self._update_program_filter_summary()
+            dlg.accept()
+            self._apply_filter_and_refresh_table(select_all=True)
+
+        btn_apply.clicked.connect(_apply)
+        btn_cancel.clicked.connect(dlg.reject)
+        _fit_widget_to_screen(dlg)
+        dlg.exec()
 
     def _filtered_docs(self, docs: list[dict]) -> list[dict]:
         ptype = str(self.cb_type.currentText() or "").strip()
@@ -1840,8 +1949,10 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
             # EIDP projects must not be created from TD reports.
             docs = [d for d in docs if isinstance(d, dict) and not _is_td(d)]
         if self.rb_program.isChecked():
-            wanted = str(self.cb_program.currentText() or "").strip()
-            return [d for d in docs if str(d.get("program_title") or "").strip() == wanted]
+            wanted_values = set(self._selected_program_filter_values())
+            if not wanted_values:
+                return []
+            return [d for d in docs if str(d.get("program_title") or "").strip() in wanted_values]
         if self.rb_asset.isChecked():
             wanted = str(self.cb_asset.currentText() or "").strip()
             return [d for d in docs if str(d.get("asset_type") or "").strip() == wanted]

@@ -3698,11 +3698,57 @@ def _discover_td_runs_for_docs(global_repo: Path | None, docs: list[dict] | None
     return runs
 
 
+def _discover_td_runs_by_program_for_docs(global_repo: Path | None, docs: list[dict] | None) -> dict[str, list[str]]:
+    repo = Path(global_repo).expanduser() if global_repo is not None else None
+    runs_by_program: dict[str, list[str]] = {}
+    seen: dict[str, set[str]] = {}
+    for d in (docs or []):
+        if repo is None or not isinstance(d, dict):
+            continue
+        program_title = str(d.get("program_title") or "").strip() or TD_SUPPORT_DEFAULT_PROGRAM_TITLE
+        resolved = _resolve_td_source_sqlite_for_node(
+            repo,
+            excel_sqlite_rel=str((d or {}).get("excel_sqlite_rel") or "").strip(),
+            artifacts_rel=str((d or {}).get("artifacts_rel") or "").strip(),
+        )
+        p = resolved.get("path")
+        if not p:
+            continue
+        p = Path(p).expanduser()
+        if not p.exists() or not p.is_file():
+            continue
+        try:
+            with sqlite3.connect(str(p)) as conn:
+                rows = conn.execute("SELECT sheet_name FROM __sheet_info ORDER BY sheet_name").fetchall()
+        except Exception:
+            try:
+                with sqlite3.connect(str(p)) as conn:
+                    rows = conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'sheet__%' ORDER BY name"
+                    ).fetchall()
+                rows = [(str(r[0] or "")[7:],) for r in rows if str(r[0] or "").startswith("sheet__")]
+            except Exception:
+                rows = []
+        for row in rows:
+            run_name = str(row[0] or "").strip()
+            if not run_name:
+                continue
+            seen.setdefault(program_title, set())
+            if run_name.lower() in seen[program_title]:
+                continue
+            seen[program_title].add(run_name.lower())
+            runs_by_program.setdefault(program_title, []).append(run_name)
+    for runs in runs_by_program.values():
+        runs.sort(key=str.lower)
+    return runs_by_program
+
+
 TD_SUPPORT_PROGRAMS_SHEET = "Programs"
 TD_SUPPORT_RUN_CONDITIONS_SHEET = "RunConditions"
 TD_SUPPORT_RUN_CONDITION_BOUNDS_SHEET = "RunConditionBounds"
 TD_SUPPORT_DEFAULT_PROGRAM_TITLE = "Default Program"
 TD_SUPPORT_PROGRAM_SHEET_PREFIX = "Program_"
+TD_SUPPORT_CONDITION_SHEET_PREFIX = "Condition_"
 
 
 def _td_support_norm_name(value: object) -> str:
@@ -3715,6 +3761,99 @@ def _td_support_program_sheet_name(program_title: str, index: int) -> str:
     prefix = f"{TD_SUPPORT_PROGRAM_SHEET_PREFIX}{index + 1:02d}_"
     room = max(0, 31 - len(prefix))
     return (prefix + slug[:room])[:31]
+
+
+def _td_support_condition_sheet_name(condition_key: str, index: int) -> str:
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", str(condition_key or "").strip()).strip("_")
+    slug = slug or f"{index + 1:02d}"
+    prefix = f"{TD_SUPPORT_CONDITION_SHEET_PREFIX}{index + 1:02d}_"
+    room = max(0, 31 - len(prefix))
+    return (prefix + slug[:room])[:31]
+
+
+def _td_support_program_row_defaults(source_run_name: object, *, program_title: object = "") -> dict[str, object]:
+    source = str(source_run_name or "").strip()
+    return {
+        "program_title": str(program_title or "").strip(),
+        "source_run_name": source,
+        "condition_key": source,
+        "display_name": source,
+        "feed_pressure": None,
+        "feed_pressure_units": "",
+        "run_type": "",
+        "pulse_width": None,
+        "pulse_width_on": None,
+        "control_period": None,
+        "exclude_first_n": None,
+        "last_n_rows": None,
+        "enabled": True,
+    }
+
+
+def _td_support_condition_group_identity(row: Mapping[str, object]) -> tuple[str, str, str, str, str, str]:
+    return (
+        str(row.get("condition_key") or row.get("source_run_name") or "").strip(),
+        _td_format_compact_value(row.get("feed_pressure")).lower(),
+        str(row.get("feed_pressure_units") or "").strip().lower(),
+        td_normalize_run_type(row.get("run_type")).lower(),
+        _td_format_compact_value(row.get("pulse_width_on", row.get("pulse_width"))).lower(),
+        _td_format_compact_value(row.get("control_period")).lower(),
+    )
+
+
+def _td_group_program_rows_into_conditions(rows: Sequence[Mapping[str, object]]) -> list[dict]:
+    grouped: dict[tuple[str, str, str, str, str, str], dict] = {}
+    for raw_row in rows or []:
+        if not isinstance(raw_row, Mapping):
+            continue
+        if not bool(raw_row.get("enabled", True)):
+            continue
+        source_run_name = str(raw_row.get("source_run_name") or "").strip()
+        condition_key = str(raw_row.get("condition_key") or source_run_name).strip() or source_run_name
+        if not condition_key or not source_run_name:
+            continue
+        identity = _td_support_condition_group_identity(raw_row)
+        group = grouped.get(identity)
+        if group is None:
+            group = {
+                "condition_key": condition_key,
+                "display_name": str(raw_row.get("display_name") or condition_key).strip() or condition_key,
+                "feed_pressure": raw_row.get("feed_pressure"),
+                "feed_pressure_units": str(raw_row.get("feed_pressure_units") or "").strip(),
+                "run_type": str(raw_row.get("run_type") or "").strip(),
+                "pulse_width": raw_row.get("pulse_width_on", raw_row.get("pulse_width")),
+                "pulse_width_on": raw_row.get("pulse_width_on", raw_row.get("pulse_width")),
+                "control_period": raw_row.get("control_period"),
+                "member_rows": [],
+                "member_sequences": [],
+                "member_programs": [],
+            }
+            grouped[identity] = group
+        group["member_rows"].append(dict(raw_row))
+        program_title = str(raw_row.get("program_title") or "").strip()
+        if source_run_name not in group["member_sequences"]:
+            group["member_sequences"].append(source_run_name)
+        if program_title and program_title not in group["member_programs"]:
+            group["member_programs"].append(program_title)
+    out = list(grouped.values())
+    out.sort(key=lambda d: (str(d.get("display_name") or "").lower(), str(d.get("condition_key") or "").lower()))
+    used_keys: dict[str, int] = {}
+    for idx, group in enumerate(out):
+        base_key = str(group.get("condition_key") or "").strip() or f"condition_{idx + 1}"
+        dup_count = used_keys.get(base_key.lower(), 0)
+        used_keys[base_key.lower()] = dup_count + 1
+        if dup_count > 0:
+            suffix_parts = [
+                _td_format_compact_value(group.get("feed_pressure")),
+                str(group.get("feed_pressure_units") or "").strip(),
+                td_normalize_run_type(group.get("run_type")),
+                _td_format_compact_value(group.get("pulse_width_on")),
+                _td_format_compact_value(group.get("control_period")),
+            ]
+            suffix = re.sub(r"[^A-Za-z0-9]+", "_", "_".join([p for p in suffix_parts if str(p).strip()])).strip("_")
+            group["condition_key"] = f"{base_key}_{suffix or str(dup_count + 1)}"
+        group["sheet_name"] = _td_support_condition_sheet_name(str(group.get("condition_key") or ""), idx)
+    return out
 
 
 def td_build_run_condition_key(sequence_row: dict | None) -> str:
@@ -3746,6 +3885,7 @@ def _write_td_support_workbook(
     sequence_names: list[str],
     param_defs: list[dict],
     program_titles: list[str] | None = None,
+    sequences_by_program: Mapping[str, Sequence[str]] | None = None,
 ) -> None:
     try:
         from openpyxl import Workbook  # type: ignore
@@ -3812,51 +3952,188 @@ def _write_td_support_workbook(
         seen_programs.add(key)
         programs.append(title)
 
+    program_sequence_map: dict[str, list[str]] = {}
+    if isinstance(sequences_by_program, Mapping) and sequences_by_program:
+        for title, seqs in sequences_by_program.items():
+            clean_title = str(title or "").strip() or TD_SUPPORT_DEFAULT_PROGRAM_TITLE
+            ordered: list[str] = []
+            seen_local: set[str] = set()
+            for seq in seqs or []:
+                seq_name = str(seq or "").strip()
+                if not seq_name or seq_name.lower() in seen_local:
+                    continue
+                seen_local.add(seq_name.lower())
+                ordered.append(seq_name)
+            if ordered:
+                program_sequence_map[clean_title] = ordered
+        if program_sequence_map:
+            programs = [p for p in programs if p in program_sequence_map] or sorted(program_sequence_map.keys())
+    if not program_sequence_map:
+        for title in programs:
+            program_sequence_map[str(title)] = list(all_sequences)
+
+    use_new_schema = bool(sequences_by_program)
     ws_programs = wb.create_sheet(TD_SUPPORT_PROGRAMS_SHEET)
     ws_programs.append(["program_title", "sheet_name", "enabled"])
     for idx, title in enumerate(programs):
         ws_programs.append([title, _td_support_program_sheet_name(title, idx), True])
 
-    ws_cond = wb.create_sheet(TD_SUPPORT_RUN_CONDITIONS_SHEET)
-    ws_cond.append(
-        [
-            "condition_key",
-            "display_name",
-            "feed_pressure",
-            "feed_pressure_units",
-            "run_type",
-            "pulse_width_on",
-            "control_period",
-            "enabled",
-        ]
-    )
-    for seq_name in all_sequences:
-        ws_cond.append([seq_name, seq_name, "", "", "", "", "", True])
-
-    ws_bounds = wb.create_sheet(TD_SUPPORT_RUN_CONDITION_BOUNDS_SHEET)
-    ws_bounds.append(["condition_key", "parameter_name", "units", "min_value", "max_value", "enabled"])
-    rows_seen: set[tuple[str, str]] = set()
-    for seq_name in all_sequences:
-        sname = str(seq_name or "").strip()
-        if not sname:
-            continue
-        for param in param_defs:
-            if not isinstance(param, dict):
-                continue
-            pname = str(param.get("name") or "").strip()
-            if not pname:
-                continue
-            key = (sname.lower(), pname.lower())
-            if key in rows_seen:
-                continue
-            rows_seen.add(key)
-            ws_bounds.append([sname, pname, str(param.get("units") or "").strip(), "", "", True])
-
-    for idx, title in enumerate(programs):
-        ws_prog = wb.create_sheet(_td_support_program_sheet_name(title, idx))
-        ws_prog.append(["source_run_name", "condition_key", "exclude_first_n", "last_n_rows", "enabled"])
+    if not use_new_schema:
+        ws_cond = wb.create_sheet(TD_SUPPORT_RUN_CONDITIONS_SHEET)
+        ws_cond.append(
+            [
+                "condition_key",
+                "display_name",
+                "feed_pressure",
+                "feed_pressure_units",
+                "run_type",
+                "pulse_width_on",
+                "control_period",
+                "enabled",
+            ]
+        )
         for seq_name in all_sequences:
-            ws_prog.append([seq_name, seq_name, "", "", True])
+            ws_cond.append([seq_name, seq_name, "", "", "", "", "", True])
+
+        ws_bounds = wb.create_sheet(TD_SUPPORT_RUN_CONDITION_BOUNDS_SHEET)
+        ws_bounds.append(["condition_key", "parameter_name", "units", "min_value", "max_value", "enabled"])
+        rows_seen: set[tuple[str, str]] = set()
+        for seq_name in all_sequences:
+            sname = str(seq_name or "").strip()
+            if not sname:
+                continue
+            for param in param_defs:
+                if not isinstance(param, dict):
+                    continue
+                pname = str(param.get("name") or "").strip()
+                if not pname:
+                    continue
+                key = (sname.lower(), pname.lower())
+                if key in rows_seen:
+                    continue
+                rows_seen.add(key)
+                ws_bounds.append([sname, pname, str(param.get("units") or "").strip(), "", "", True])
+
+        for idx, title in enumerate(programs):
+            ws_prog = wb.create_sheet(_td_support_program_sheet_name(title, idx))
+            ws_prog.append(["source_run_name", "condition_key", "exclude_first_n", "last_n_rows", "enabled"])
+            for seq_name in all_sequences:
+                ws_prog.append([seq_name, seq_name, "", "", True])
+    else:
+        program_rows: list[dict] = []
+        for idx, title in enumerate(programs):
+            ws_prog = wb.create_sheet(_td_support_program_sheet_name(title, idx))
+            ws_prog.append(
+                [
+                    "source_run_name",
+                    "condition_key",
+                    "display_name",
+                    "feed_pressure",
+                    "feed_pressure_units",
+                    "run_type",
+                    "pulse_width_on",
+                    "control_period",
+                    "exclude_first_n",
+                    "last_n_rows",
+                    "enabled",
+                ]
+            )
+            for seq_name in (program_sequence_map.get(title) or []):
+                row = _td_support_program_row_defaults(seq_name, program_title=title)
+                ws_prog.append(
+                    [
+                        row["source_run_name"],
+                        row["condition_key"],
+                        row["display_name"],
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        True,
+                    ]
+                )
+                program_rows.append(row)
+
+        condition_groups = _td_group_program_rows_into_conditions(program_rows)
+        ws_cond = wb.create_sheet(TD_SUPPORT_RUN_CONDITIONS_SHEET)
+        ws_cond.append(
+            [
+                "condition_key",
+                "display_name",
+                "feed_pressure",
+                "feed_pressure_units",
+                "run_type",
+                "pulse_width_on",
+                "control_period",
+                "sheet_name",
+                "member_sequences",
+                "member_programs",
+                "enabled",
+            ]
+        )
+        for group in condition_groups:
+            ws_cond.append(
+                [
+                    group.get("condition_key"),
+                    group.get("display_name"),
+                    group.get("feed_pressure"),
+                    group.get("feed_pressure_units"),
+                    group.get("run_type"),
+                    group.get("pulse_width_on"),
+                    group.get("control_period"),
+                    group.get("sheet_name"),
+                    ", ".join([str(v).strip() for v in (group.get("member_sequences") or []) if str(v).strip()]),
+                    ", ".join([str(v).strip() for v in (group.get("member_programs") or []) if str(v).strip()]),
+                    True,
+                ]
+            )
+        for idx, group in enumerate(condition_groups):
+            ws_c = wb.create_sheet(str(group.get("sheet_name") or _td_support_condition_sheet_name(str(group.get("condition_key") or ""), idx)))
+            ws_c.append(
+                [
+                    "condition_key",
+                    "display_name",
+                    "feed_pressure",
+                    "feed_pressure_units",
+                    "run_type",
+                    "pulse_width_on",
+                    "control_period",
+                    "member_sequences",
+                    "member_programs",
+                    "parameter_name",
+                    "units",
+                    "min_value",
+                    "max_value",
+                    "enabled",
+                ]
+            )
+            member_sequences = ", ".join([str(v).strip() for v in (group.get("member_sequences") or []) if str(v).strip()])
+            member_programs = ", ".join([str(v).strip() for v in (group.get("member_programs") or []) if str(v).strip()])
+            for param in param_defs:
+                pname = str((param or {}).get("name") or "").strip()
+                if not pname:
+                    continue
+                ws_c.append(
+                    [
+                        group.get("condition_key"),
+                        group.get("display_name"),
+                        group.get("feed_pressure"),
+                        group.get("feed_pressure_units"),
+                        group.get("run_type"),
+                        group.get("pulse_width_on"),
+                        group.get("control_period"),
+                        member_sequences,
+                        member_programs,
+                        pname,
+                        str((param or {}).get("units") or "").strip(),
+                        "",
+                        "",
+                        True,
+                    ]
+                )
 
     path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(str(path))
@@ -3996,6 +4273,7 @@ def _read_td_support_workbook(workbook_path: Path, *, project_dir: Path | None =
             "programs": [],
             "program_mappings": {},
             "run_conditions": [],
+            "condition_groups": [],
             "condition_bounds": {},
             "sequences": [],
             "bounds_by_sequence": {},
@@ -4059,6 +4337,9 @@ def _read_td_support_workbook(workbook_path: Path, *, project_dir: Path | None =
                         "pulse_width": ws.cell(row, headers.get("pulse_width_on", 6)).value if headers.get("pulse_width_on") else None,
                         "pulse_width_on": ws.cell(row, headers.get("pulse_width_on", 6)).value if headers.get("pulse_width_on") else None,
                         "control_period": ws.cell(row, headers.get("control_period", 7)).value if headers.get("control_period") else None,
+                        "sheet_name": str(ws.cell(row, headers.get("sheet_name", 8)).value or "").strip() if headers.get("sheet_name") else "",
+                        "member_sequences_text": str(ws.cell(row, headers.get("member_sequences", 9)).value or "").strip() if headers.get("member_sequences") else "",
+                        "member_programs_text": str(ws.cell(row, headers.get("member_programs", 10)).value or "").strip() if headers.get("member_programs") else "",
                         "enabled": bool(enabled),
                     }
                 )
@@ -4108,6 +4389,7 @@ def _read_td_support_workbook(workbook_path: Path, *, project_dir: Path | None =
                 if key:
                     headers[key] = col
             rows_out: list[dict] = []
+            has_full_condition_columns = any(k in headers for k in ("display_name", "feed_pressure", "pulse_width_on", "control_period"))
             for row in range(2, (ws.max_row or 0) + 1):
                 source_run = str(ws.cell(row, headers.get("source_run_name", 1)).value or "").strip()
                 condition_key = str(ws.cell(row, headers.get("condition_key", 2)).value or "").strip()
@@ -4115,18 +4397,56 @@ def _read_td_support_workbook(workbook_path: Path, *, project_dir: Path | None =
                     continue
                 enabled_raw = ws.cell(row, headers.get("enabled", 5)).value if headers.get("enabled") else True
                 enabled = _td_bool(enabled_raw, True)
-                rows_out.append(
-                    {
-                        "program_title": title,
-                        "sheet_name": sheet_name,
-                        "source_run_name": source_run,
-                        "condition_key": condition_key or source_run,
-                        "exclude_first_n": _to_support_int(ws.cell(row, headers.get("exclude_first_n", 3)).value if headers.get("exclude_first_n") else None),
-                        "last_n_rows": _to_support_int(ws.cell(row, headers.get("last_n_rows", 4)).value if headers.get("last_n_rows") else None),
-                        "enabled": bool(enabled),
-                    }
-                )
+                row_out = {
+                    "program_title": title,
+                    "sheet_name": sheet_name,
+                    "source_run_name": source_run,
+                    "condition_key": condition_key or source_run,
+                    "exclude_first_n": _to_support_int(ws.cell(row, headers.get("exclude_first_n", 3)).value if headers.get("exclude_first_n") else None),
+                    "last_n_rows": _to_support_int(ws.cell(row, headers.get("last_n_rows", 4)).value if headers.get("last_n_rows") else None),
+                    "enabled": bool(enabled),
+                }
+                if has_full_condition_columns:
+                    row_out.update(
+                        {
+                            "display_name": str(ws.cell(row, headers.get("display_name", 3)).value or "").strip() or (condition_key or source_run),
+                            "feed_pressure": ws.cell(row, headers.get("feed_pressure")).value if headers.get("feed_pressure") else None,
+                            "feed_pressure_units": str(ws.cell(row, headers.get("feed_pressure_units")).value or "").strip() if headers.get("feed_pressure_units") else "",
+                            "run_type": str(ws.cell(row, headers.get("run_type")).value or "").strip() if headers.get("run_type") else "",
+                            "pulse_width": ws.cell(row, headers.get("pulse_width_on")).value if headers.get("pulse_width_on") else None,
+                            "pulse_width_on": ws.cell(row, headers.get("pulse_width_on")).value if headers.get("pulse_width_on") else None,
+                            "control_period": ws.cell(row, headers.get("control_period")).value if headers.get("control_period") else None,
+                        }
+                    )
+                rows_out.append(row_out)
             program_mappings[title] = rows_out
+
+        for sheet_name in wb.sheetnames:
+            if not str(sheet_name).startswith(TD_SUPPORT_CONDITION_SHEET_PREFIX):
+                continue
+            ws = wb[sheet_name]
+            headers: dict[str, int] = {}
+            for col in range(1, (ws.max_column or 0) + 1):
+                key = str(ws.cell(1, col).value or "").strip().lower()
+                if key:
+                    headers[key] = col
+            if "condition_key" not in headers or "parameter_name" not in headers:
+                continue
+            for row in range(2, (ws.max_row or 0) + 1):
+                condition_key = str(ws.cell(row, headers.get("condition_key", 1)).value or "").strip()
+                pname = str(ws.cell(row, headers.get("parameter_name", 10)).value or "").strip()
+                if not condition_key or not pname:
+                    continue
+                enabled_raw = ws.cell(row, headers.get("enabled", 14)).value if headers.get("enabled") else True
+                enabled = _td_bool(enabled_raw, True)
+                condition_bounds.setdefault(condition_key, {})[pname] = {
+                    "condition_key": condition_key,
+                    "parameter_name": pname,
+                    "units": str(ws.cell(row, headers.get("units", 11)).value or "").strip(),
+                    "min_value": _td_finite_float(ws.cell(row, headers.get("min_value", 12)).value if headers.get("min_value") else None),
+                    "max_value": _td_finite_float(ws.cell(row, headers.get("max_value", 13)).value if headers.get("max_value") else None),
+                    "enabled": bool(enabled),
+                }
 
         if not run_conditions and "Sequences" in wb.sheetnames:
             ws = wb["Sequences"]
@@ -4223,31 +4543,88 @@ def _read_td_support_workbook(workbook_path: Path, *, project_dir: Path | None =
             if key and key not in run_conditions_by_key:
                 run_conditions_by_key[key] = dict(row)
 
+        full_program_rows = [
+            dict(row)
+            for rows in program_mappings.values()
+            for row in (rows or [])
+            if isinstance(row, dict)
+        ]
+        has_new_program_schema = any(
+            str(row.get("display_name") or "").strip()
+            or row.get("feed_pressure") not in (None, "")
+            or row.get("control_period") not in (None, "")
+            for row in full_program_rows
+        )
+
         sequences: list[dict] = []
-        for program_title, rows in program_mappings.items():
-            for row in rows:
-                if not isinstance(row, dict):
-                    continue
-                condition_key = str(row.get("condition_key") or "").strip()
-                condition = dict(run_conditions_by_key.get(condition_key) or {})
-                sequences.append(
-                    {
-                        "sequence_name": condition_key,
-                        "condition_key": condition_key,
-                        "display_name": str(condition.get("display_name") or condition_key).strip() or condition_key,
-                        "source_run_name": str(row.get("source_run_name") or condition_key).strip() or condition_key,
-                        "program_title": str(program_title or "").strip(),
-                        "feed_pressure": condition.get("feed_pressure"),
-                        "feed_pressure_units": str(condition.get("feed_pressure_units") or "").strip(),
-                        "run_type": str(condition.get("run_type") or "").strip(),
-                        "pulse_width": condition.get("pulse_width"),
-                        "pulse_width_on": condition.get("pulse_width_on"),
-                        "control_period": condition.get("control_period"),
-                        "exclude_first_n": row.get("exclude_first_n"),
-                        "last_n_rows": row.get("last_n_rows"),
-                        "enabled": bool(row.get("enabled", True) and condition.get("enabled", True)),
-                    }
-                )
+        if has_new_program_schema:
+            grouped_conditions = _td_group_program_rows_into_conditions(full_program_rows)
+            run_conditions = [
+                {
+                    "condition_key": str(group.get("condition_key") or "").strip(),
+                    "display_name": str(group.get("display_name") or "").strip(),
+                    "feed_pressure": group.get("feed_pressure"),
+                    "feed_pressure_units": str(group.get("feed_pressure_units") or "").strip(),
+                    "run_type": str(group.get("run_type") or "").strip(),
+                    "pulse_width": group.get("pulse_width_on"),
+                    "pulse_width_on": group.get("pulse_width_on"),
+                    "control_period": group.get("control_period"),
+                    "sheet_name": str(group.get("sheet_name") or "").strip(),
+                    "member_sequences_text": ", ".join([str(v).strip() for v in (group.get("member_sequences") or []) if str(v).strip()]),
+                    "member_programs_text": ", ".join([str(v).strip() for v in (group.get("member_programs") or []) if str(v).strip()]),
+                    "enabled": True,
+                }
+                for group in grouped_conditions
+            ]
+            for group in grouped_conditions:
+                condition_key = str(group.get("condition_key") or "").strip()
+                display_name = str(group.get("display_name") or condition_key).strip() or condition_key
+                for member in (group.get("member_rows") or []):
+                    if not isinstance(member, dict):
+                        continue
+                    sequences.append(
+                        {
+                            "sequence_name": condition_key,
+                            "condition_key": condition_key,
+                            "display_name": display_name,
+                            "source_run_name": str(member.get("source_run_name") or "").strip(),
+                            "program_title": str(member.get("program_title") or "").strip(),
+                            "feed_pressure": group.get("feed_pressure"),
+                            "feed_pressure_units": str(group.get("feed_pressure_units") or "").strip(),
+                            "run_type": str(group.get("run_type") or "").strip(),
+                            "pulse_width": group.get("pulse_width_on"),
+                            "pulse_width_on": group.get("pulse_width_on"),
+                            "control_period": group.get("control_period"),
+                            "exclude_first_n": member.get("exclude_first_n"),
+                            "last_n_rows": member.get("last_n_rows"),
+                            "enabled": bool(member.get("enabled", True)),
+                        }
+                    )
+        else:
+            for program_title, rows in program_mappings.items():
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    condition_key = str(row.get("condition_key") or "").strip()
+                    condition = dict(run_conditions_by_key.get(condition_key) or {})
+                    sequences.append(
+                        {
+                            "sequence_name": condition_key,
+                            "condition_key": condition_key,
+                            "display_name": str(condition.get("display_name") or condition_key).strip() or condition_key,
+                            "source_run_name": str(row.get("source_run_name") or condition_key).strip() or condition_key,
+                            "program_title": str(program_title or "").strip(),
+                            "feed_pressure": condition.get("feed_pressure"),
+                            "feed_pressure_units": str(condition.get("feed_pressure_units") or "").strip(),
+                            "run_type": str(condition.get("run_type") or "").strip(),
+                            "pulse_width": condition.get("pulse_width"),
+                            "pulse_width_on": condition.get("pulse_width_on"),
+                            "control_period": condition.get("control_period"),
+                            "exclude_first_n": row.get("exclude_first_n"),
+                            "last_n_rows": row.get("last_n_rows"),
+                            "enabled": bool(row.get("enabled", True) and condition.get("enabled", True)),
+                        }
+                    )
 
         return {
             "path": str(support_path),
@@ -4256,6 +4633,7 @@ def _read_td_support_workbook(workbook_path: Path, *, project_dir: Path | None =
             "programs": program_rows if program_rows else programs,
             "program_mappings": program_mappings,
             "run_conditions": run_conditions,
+            "condition_groups": run_conditions,
             "condition_bounds": condition_bounds,
             "sequences": sequences,
             "bounds_by_sequence": condition_bounds,
@@ -4563,19 +4941,24 @@ def _td_resolved_support_condition_payload(
 ) -> dict:
     conditions_by_key = _td_support_run_conditions_by_key(support_cfg)
     condition = dict(conditions_by_key.get(condition_key) or {})
-    display_name = str(condition.get("display_name") or condition_key or source_run_name).strip() or source_run_name
+    display_name = str(
+        condition.get("display_name")
+        or (mapping or {}).get("display_name")
+        or condition_key
+        or source_run_name
+    ).strip() or source_run_name
     payload = {
         "program_title": str(program_title or "").strip(),
         "condition_key": str(condition_key or "").strip() or str(source_run_name or "").strip(),
         "sequence_name": str(condition_key or "").strip() or str(source_run_name or "").strip(),
         "display_name": display_name,
         "source_run_name": str(source_run_name or "").strip() or display_name,
-        "feed_pressure": condition.get("feed_pressure"),
-        "feed_pressure_units": str(condition.get("feed_pressure_units") or "").strip(),
-        "run_type": str(condition.get("run_type") or "").strip(),
-        "pulse_width": condition.get("pulse_width"),
-        "pulse_width_on": condition.get("pulse_width_on", condition.get("pulse_width")),
-        "control_period": condition.get("control_period"),
+        "feed_pressure": condition.get("feed_pressure", (mapping or {}).get("feed_pressure")),
+        "feed_pressure_units": str(condition.get("feed_pressure_units") or (mapping or {}).get("feed_pressure_units") or "").strip(),
+        "run_type": str(condition.get("run_type") or (mapping or {}).get("run_type") or "").strip(),
+        "pulse_width": condition.get("pulse_width", (mapping or {}).get("pulse_width")),
+        "pulse_width_on": condition.get("pulse_width_on", condition.get("pulse_width", (mapping or {}).get("pulse_width_on", (mapping or {}).get("pulse_width")))),
+        "control_period": condition.get("control_period", (mapping or {}).get("control_period")),
         "exclude_first_n": (mapping or {}).get("exclude_first_n"),
         "last_n_rows": (mapping or {}).get("last_n_rows"),
         "matched_support": bool(mapping or condition),
@@ -4663,30 +5046,18 @@ def td_list_run_selection_views(db_path: Path, workbook_path: Path, *, project_d
         support_cfg = {"exists": False}
 
     observations_by_run: dict[str, list[dict]] = {}
-    path = Path(db_path).expanduser()
-    if path.exists():
-        with sqlite3.connect(str(path)) as conn:
-            _ensure_test_data_impl_tables(conn)
-            obs_rows = conn.execute(
-                """
-                SELECT DISTINCT
-                    run_name,
-                    COALESCE(program_title, ''),
-                    COALESCE(source_run_name, '')
-                FROM td_condition_observations
-                ORDER BY run_name, program_title, source_run_name
-                """
-            ).fetchall()
-        for run_name, program_title, source_run_name in obs_rows:
-            run = str(run_name or "").strip()
-            if not run:
-                continue
-            observations_by_run.setdefault(run, []).append(
-                {
-                    "program_title": str(program_title or "").strip(),
-                    "source_run_name": str(source_run_name or "").strip(),
-                }
-            )
+    for row in ((support_cfg.get("sequences") or [])):
+        if not isinstance(row, dict) or not bool(row.get("enabled", True)):
+            continue
+        run = str(row.get("condition_key") or row.get("sequence_name") or "").strip()
+        if not run:
+            continue
+        observations_by_run.setdefault(run, []).append(
+            {
+                "program_title": str(row.get("program_title") or "").strip(),
+                "source_run_name": str(row.get("source_run_name") or "").strip(),
+            }
+        )
 
     sequence_items: list[dict] = []
     condition_items: list[dict] = []
@@ -4764,6 +5135,21 @@ def td_list_run_selection_views(db_path: Path, workbook_path: Path, *, project_d
             str(d.get("sequence_name") or "").lower(),
         )
     )
+    deduped_sequence_items: list[dict] = []
+    seen_sequence_ids: set[str] = set()
+    for item in sequence_items:
+        key = "|".join(
+            [
+                str(item.get("run_name") or "").strip().lower(),
+                str(item.get("program_title") or "").strip().lower(),
+                str(item.get("sequence_name") or "").strip().lower(),
+            ]
+        )
+        if key in seen_sequence_ids:
+            continue
+        seen_sequence_ids.add(key)
+        deduped_sequence_items.append(item)
+    sequence_items = deduped_sequence_items
     condition_items.sort(key=lambda d: str(d.get("display_text") or "").lower())
     return {"sequence": sequence_items, "condition": condition_items}
 
@@ -5396,6 +5782,7 @@ def _rebuild_test_data_project_calc_cache_from_raw(db_path: Path, workbook_path:
 
         raw_x_by_run: dict[str, list[str]] = {}
         raw_y_by_run: dict[str, set[str]] = {}
+        raw_run_defaults: dict[str, dict[str, object]] = {}
         for run_name, x_name in raw_x_cols:
             run = str(run_name or "").strip()
             x = str(x_name or "").strip()
@@ -5406,6 +5793,17 @@ def _rebuild_test_data_project_calc_cache_from_raw(db_path: Path, workbook_path:
             y = str(y_name or "").strip()
             if run and y:
                 raw_y_by_run.setdefault(run, set()).add(y)
+        for run_name, display_name_raw, default_x_raw, raw_pulse_width, raw_run_type, raw_control_period in raw_runs:
+            run = str(run_name or "").strip()
+            if not run:
+                continue
+            raw_run_defaults[run] = {
+                "display_name": str(display_name_raw or "").strip(),
+                "default_x": str(default_x_raw or "").strip(),
+                "pulse_width": raw_pulse_width,
+                "run_type": str(raw_run_type or "").strip(),
+                "control_period": raw_control_period,
+            }
 
         raw_obs_by_id: dict[str, dict[str, object]] = {}
         for observation_id, run_name, serial, program_title, source_run_name, run_type, pulse_width, control_period, source_mtime_ns in raw_obs_rows:
@@ -5437,7 +5835,144 @@ def _rebuild_test_data_project_calc_cache_from_raw(db_path: Path, workbook_path:
                     "control_period": None,
                     "source_mtime_ns": source_mtime_ns,
                 }
-        for obs in raw_obs_by_id.values():
+        support_rows = [
+            dict(row)
+            for row in ((support_cfg.get("sequences") or []))
+            if isinstance(row, dict) and bool(row.get("enabled", True))
+        ]
+        if not support_rows:
+            support_rows = [_td_support_program_row_defaults(run_name) for run_name in raw_run_defaults.keys() if str(run_name or "").strip()]
+        support_by_program_source: dict[tuple[str, str], dict] = {}
+        support_by_source: dict[str, list[dict]] = {}
+        for row in support_rows:
+            program_key = _td_support_norm_name(row.get("program_title"))
+            source_key = _td_support_norm_name(row.get("source_run_name"))
+            if source_key:
+                support_by_program_source[(program_key, source_key)] = dict(row)
+                support_by_source.setdefault(source_key, []).append(dict(row))
+
+        condition_meta_by_key = {
+            str(row.get("condition_key") or "").strip(): dict(row)
+            for row in ((support_cfg.get("condition_groups") or support_cfg.get("run_conditions") or []))
+            if isinstance(row, dict) and str(row.get("condition_key") or "").strip()
+        }
+
+        aggregated_curve_values: dict[tuple[str, str, str], list[float]] = {}
+        aggregated_obs_meta: dict[tuple[str, str], dict[str, object]] = {}
+        condition_y_names: dict[str, set[str]] = {}
+        for run_name_raw, y_name_raw, x_name_raw, observation_id, serial, program_title, source_run_name_raw, x_json, y_json, source_mtime_ns in raw_curve_rows:
+            raw_run = str(run_name_raw or "").strip()
+            y_name = str(y_name_raw or "").strip()
+            serial_txt = str(serial or "").strip()
+            if not raw_run or not y_name or not serial_txt:
+                continue
+            source_run_name = str(source_run_name_raw or raw_run).strip() or raw_run
+            program_norm = _td_support_norm_name(program_title)
+            source_norm = _td_support_norm_name(source_run_name)
+            support_row = dict(support_by_program_source.get((program_norm, source_norm)) or {})
+            if not support_row:
+                source_candidates = [dict(row) for row in (support_by_source.get(source_norm) or []) if isinstance(row, dict)]
+                if not program_norm and source_candidates:
+                    support_row = source_candidates[0]
+                elif program_norm:
+                    blank_program_candidates = [row for row in source_candidates if not str(row.get("program_title") or "").strip()]
+                    if len(blank_program_candidates) == 1:
+                        support_row = blank_program_candidates[0]
+            if not support_row or not bool(support_row.get("enabled", True)):
+                continue
+            condition_key = str(support_row.get("condition_key") or source_run_name).strip() or source_run_name
+            try:
+                xs = json.loads(x_json or "[]")
+            except Exception:
+                xs = []
+            try:
+                ys = json.loads(y_json or "[]")
+            except Exception:
+                ys = []
+            exclude_first_n = support_row.get("exclude_first_n")
+            if exclude_first_n is None:
+                exclude_first_n = support_settings.get("exclude_first_n_default")
+            last_n_rows = support_row.get("last_n_rows")
+            if last_n_rows is None:
+                last_n_rows = support_settings.get("last_n_rows_default")
+            filtered_y = _filter_curve_values(
+                xs,
+                ys,
+                exclude_first_n=_to_support_int(exclude_first_n),
+                last_n_rows=_to_support_int(last_n_rows),
+            )
+            condition_y_names.setdefault(condition_key, set()).add(y_name)
+            aggregated_curve_values.setdefault((condition_key, serial_txt, y_name), []).extend(filtered_y)
+            obs_meta = aggregated_obs_meta.setdefault(
+                (condition_key, serial_txt),
+                {
+                    "program_titles": set(),
+                    "source_run_names": set(),
+                    "source_mtime_ns": [],
+                },
+            )
+            prog_txt = str(program_title or "").strip()
+            if prog_txt:
+                obs_meta["program_titles"].add(prog_txt)
+            obs_meta["source_run_names"].add(source_run_name)
+            if isinstance(source_mtime_ns, int):
+                obs_meta["source_mtime_ns"].append(int(source_mtime_ns))
+
+        metrics_written = 0
+        calc_columns_written = 0
+        inserted_columns: set[tuple[str, str]] = set()
+        inserted_runs: set[str] = set()
+        for (condition_key, serial_txt), meta in aggregated_obs_meta.items():
+            condition_meta = dict(condition_meta_by_key.get(condition_key) or {})
+            run_display_name = str(condition_meta.get("display_name") or condition_key).strip() or condition_key
+            default_x = "Time"
+            member_source_runs = sorted({str(v).strip() for v in (meta.get("source_run_names") or set()) if str(v).strip()})
+            for source_run in member_source_runs:
+                raw_default = str((raw_run_defaults.get(source_run) or {}).get("default_x") or "").strip()
+                if raw_default:
+                    default_x = raw_default
+                    break
+            if condition_key not in inserted_runs:
+                inserted_runs.add(condition_key)
+                conn.execute(
+                    "INSERT OR REPLACE INTO td_runs(run_name, default_x, display_name, run_type, control_period, pulse_width) VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        condition_key,
+                        default_x,
+                        run_display_name,
+                        str(condition_meta.get("run_type") or "").strip(),
+                        _finite_float(condition_meta.get("control_period")),
+                        _finite_float(condition_meta.get("pulse_width_on", condition_meta.get("pulse_width"))),
+                    ),
+                )
+                calc_param_defs = _ordered_support_param_defs(
+                    sequence_names=[condition_key],
+                    support_cfg={"bounds_by_sequence": {condition_key: bounds_by_sequence.get(condition_key) or {}}, "settings": support_settings},
+                    fallback_defs=cfg_cols,
+                )
+                if not calc_param_defs:
+                    calc_param_defs = [dict(d) for d in cfg_cols if isinstance(d, dict)]
+                for param_def in calc_param_defs:
+                    col_name = str(param_def.get("name") or "").strip()
+                    if not col_name:
+                        continue
+                    if (condition_key, col_name) in inserted_columns:
+                        continue
+                    inserted_columns.add((condition_key, col_name))
+                    conn.execute(
+                        "INSERT OR REPLACE INTO td_columns_calc(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
+                        (condition_key, col_name, str(param_def.get("units") or cfg_units.get(col_name) or "").strip(), "y"),
+                    )
+                    calc_columns_written += 1
+                if _finite_float(condition_meta.get("pulse_width_on", condition_meta.get("pulse_width"))) is not None and (condition_key, "pulse_width") not in inserted_columns:
+                    inserted_columns.add((condition_key, "pulse_width"))
+                    conn.execute(
+                        "INSERT OR REPLACE INTO td_columns_calc(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
+                        (condition_key, "pulse_width", str(cfg_units.get("pulse_width") or "").strip(), "y"),
+                    )
+                    calc_columns_written += 1
+
+            observation_id_calc = f"{_td_norm_ident_token(serial_txt)}__{_td_norm_ident_token(condition_key)}"
             conn.execute(
                 """
                 INSERT OR REPLACE INTO td_condition_observations(
@@ -5445,184 +5980,66 @@ def _rebuild_test_data_project_calc_cache_from_raw(db_path: Path, workbook_path:
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    str(obs.get("observation_id") or "").strip(),
-                    str(obs.get("serial") or "").strip(),
-                    str(obs.get("run_name") or "").strip(),
-                    str(obs.get("program_title") or "").strip(),
-                    str(obs.get("source_run_name") or "").strip(),
-                    str(obs.get("run_type") or "").strip(),
-                    _finite_float(obs.get("pulse_width")),
-                    _finite_float(obs.get("control_period")),
-                    obs.get("source_mtime_ns"),
+                    observation_id_calc,
+                    serial_txt,
+                    condition_key,
+                    ", ".join(sorted({str(v).strip() for v in (meta.get("program_titles") or set()) if str(v).strip()})),
+                    ", ".join(member_source_runs),
+                    str(condition_meta.get("run_type") or "").strip(),
+                    _finite_float(condition_meta.get("pulse_width_on", condition_meta.get("pulse_width"))),
+                    _finite_float(condition_meta.get("control_period")),
+                    max([int(v) for v in (meta.get("source_mtime_ns") or [])], default=0),
                     computed_epoch_ns,
                 ),
             )
-
-        metrics_written = 0
-        calc_columns_written = 0
-        for run_name, display_name_raw, default_x_raw, raw_pulse_width, raw_run_type, raw_control_period in raw_runs:
-            run = str(run_name or "").strip()
-            if not run:
-                continue
-            default_x = str(default_x_raw or "").strip()
-            if not default_x:
-                xs = raw_x_by_run.get(run) or []
-                default_x = xs[0] if xs else ""
-
-            existing = dict(existing_display_names.get(run) or {})
-            run_display_name = str(display_name_raw or existing.get("display_name") or run).strip() or run
-            conn.execute(
-                "INSERT OR REPLACE INTO td_runs(run_name, default_x, display_name, run_type, control_period, pulse_width) VALUES (?, ?, ?, ?, ?, ?)",
-                (
-                    run,
-                    default_x,
-                    run_display_name,
-                    str(raw_run_type or existing.get("run_type") or "").strip(),
-                    _finite_float(raw_control_period if raw_control_period is not None else existing.get("control_period")),
-                    _finite_float(raw_pulse_width if raw_pulse_width is not None else existing.get("pulse_width")),
-                ),
-            )
-            seq_info = _resolve_td_support_sequence_for_run(run, support_cfg)
-            seq_name = str(seq_info.get("sequence_name") or run).strip() or run
-            source_run_name = str(seq_info.get("source_run_name") or run).strip() or run
-            seq_bounds = dict(bounds_by_sequence.get(seq_name) or {})
-            if not seq_bounds and source_run_name:
-                seq_bounds = dict(bounds_by_sequence.get(source_run_name) or {})
-
-            calc_param_defs = _ordered_support_param_defs(
-                sequence_names=[seq_name, source_run_name, run],
-                support_cfg=support_cfg,
-                fallback_defs=cfg_cols,
-            )
-            if not calc_param_defs:
-                calc_param_defs = [dict(d) for d in cfg_cols if isinstance(d, dict)]
-
-            raw_y_names = set(raw_y_by_run.get(run) or set())
-            calc_names: list[str] = []
-            inserted_calc_names: set[str] = set()
-            for param_def in calc_param_defs:
-                y_name = str(param_def.get("name") or "").strip()
-                if not y_name:
-                    continue
-                units = str(param_def.get("units") or cfg_units.get(y_name) or "").strip()
-                conn.execute(
-                    "INSERT OR REPLACE INTO td_columns_calc(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
-                    (run, y_name, units, "y"),
-                )
-                calc_columns_written += 1
-                inserted_calc_names.add(y_name)
-                if y_name in raw_y_names:
-                    calc_names.append(y_name)
-
-            pulse_width_value = _finite_float(seq_info.get("pulse_width"))
-            if pulse_width_value is None:
-                pulse_width_value = _finite_float(raw_pulse_width)
-            if pulse_width_value is not None and "pulse_width" not in inserted_calc_names:
-                conn.execute(
-                    "INSERT OR REPLACE INTO td_columns_calc(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
-                    (run, "pulse_width", str(cfg_units.get("pulse_width") or "").strip(), "y"),
-                )
-                calc_columns_written += 1
-                inserted_calc_names.add("pulse_width")
-
-            curve_rows = [
-                (observation_id, serial, program_title, source_run_name_raw, y_name_raw, x_json, y_json, source_mtime_ns)
-                for run_name_raw, y_name_raw, x_name_raw, observation_id, serial, program_title, source_run_name_raw, x_json, y_json, source_mtime_ns in raw_curve_rows
-                if str(run_name_raw or "").strip() == run and str(x_name_raw or "").strip() == default_x
-            ]
-            if not curve_rows:
-                continue
-            calc_name_set = set(calc_names)
-            source_mtime_by_obs: dict[str, dict[str, object]] = {}
-            for observation_id, serial, program_title, source_run_name_raw, _y_name_raw, _x_json, _y_json, source_mtime_ns in curve_rows:
-                obs_key = str(observation_id or "").strip()
-                if not obs_key or obs_key in source_mtime_by_obs:
-                    continue
-                source_mtime_by_obs[obs_key] = {
-                    "serial": str(serial or "").strip(),
-                    "program_title": str(program_title or "").strip(),
-                    "source_run_name": str(source_run_name_raw or "").strip(),
-                    "source_mtime_ns": source_mtime_ns,
-                }
-            exclude_first_n = seq_info.get("exclude_first_n")
-            if exclude_first_n is None:
-                exclude_first_n = support_settings.get("exclude_first_n_default")
-            last_n_rows = seq_info.get("last_n_rows")
-            if last_n_rows is None:
-                last_n_rows = support_settings.get("last_n_rows_default")
-
-            if default_x and calc_names:
-                for observation_id, serial, program_title, source_run_name_raw, y_name_raw, x_json, y_json, source_mtime_ns in curve_rows:
-                    y_name = str(y_name_raw or "").strip()
-                    if y_name not in calc_name_set:
-                        continue
-                    try:
-                        xs = json.loads(x_json or "[]")
-                    except Exception:
-                        xs = []
-                    try:
-                        ys = json.loads(y_json or "[]")
-                    except Exception:
-                        ys = []
-                    filtered_y = _filter_curve_values(
-                        xs,
-                        ys,
-                        exclude_first_n=_to_support_int(exclude_first_n),
-                        last_n_rows=_to_support_int(last_n_rows),
-                    )
-                    stats_map = _compute_stats(filtered_y)
-                    payload_base = (
-                        str(observation_id or "").strip(),
-                        str(serial or "").strip(),
-                        run,
-                        y_name,
-                    )
-                    for stat in selected_stats:
-                        payload = payload_base + (
+            for y_name in sorted(condition_y_names.get(condition_key) or set()):
+                values = list(aggregated_curve_values.get((condition_key, serial_txt, y_name)) or [])
+                stats_map = _compute_stats(values)
+                for stat in selected_stats:
+                    conn.execute(
+                        """
+                        INSERT OR REPLACE INTO td_metrics_calc
+                        (observation_id, serial, run_name, column_name, stat, value_num, computed_epoch_ns, source_mtime_ns, program_title, source_run_name)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            observation_id_calc,
+                            serial_txt,
+                            condition_key,
+                            y_name,
                             str(stat),
                             stats_map.get(stat),
                             computed_epoch_ns,
-                            source_mtime_ns,
-                            str(program_title or "").strip(),
-                            str(source_run_name_raw or "").strip(),
-                        )
-                        conn.execute(
-                            """
-                            INSERT OR REPLACE INTO td_metrics_calc
-                            (observation_id, serial, run_name, column_name, stat, value_num, computed_epoch_ns, source_mtime_ns, program_title, source_run_name)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                            """,
-                            payload,
-                        )
-                        metrics_written += 1
-
+                            max([int(v) for v in (meta.get("source_mtime_ns") or [])], default=0),
+                            ", ".join(sorted({str(v).strip() for v in (meta.get("program_titles") or set()) if str(v).strip()})),
+                            ", ".join(member_source_runs),
+                        ),
+                    )
+                    metrics_written += 1
+            pulse_width_value = _finite_float(condition_meta.get("pulse_width_on", condition_meta.get("pulse_width")))
             if pulse_width_value is not None:
                 stats_map = _compute_constant_stats(float(pulse_width_value))
-                for observation_id, obs in source_mtime_by_obs.items():
-                    payload_base = (
-                        str(observation_id or "").strip(),
-                        str(obs.get("serial") or "").strip(),
-                        run,
-                        "pulse_width",
-                    )
-                    for stat in selected_stats:
-                        payload = payload_base + (
+                for stat in selected_stats:
+                    conn.execute(
+                        """
+                        INSERT OR REPLACE INTO td_metrics_calc
+                        (observation_id, serial, run_name, column_name, stat, value_num, computed_epoch_ns, source_mtime_ns, program_title, source_run_name)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            observation_id_calc,
+                            serial_txt,
+                            condition_key,
+                            "pulse_width",
                             str(stat),
                             stats_map.get(stat),
                             computed_epoch_ns,
-                            obs.get("source_mtime_ns"),
-                            str(obs.get("program_title") or "").strip(),
-                            str(obs.get("source_run_name") or "").strip(),
-                        )
-                        conn.execute(
-                            """
-                            INSERT OR REPLACE INTO td_metrics_calc
-                            (observation_id, serial, run_name, column_name, stat, value_num, computed_epoch_ns, source_mtime_ns, program_title, source_run_name)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                            """,
-                            payload,
-                        )
-                        metrics_written += 1
+                            max([int(v) for v in (meta.get("source_mtime_ns") or [])], default=0),
+                            ", ".join(sorted({str(v).strip() for v in (meta.get("program_titles") or set()) if str(v).strip()})),
+                            ", ".join(member_source_runs),
+                        ),
+                    )
+                    metrics_written += 1
 
         support_mtime_ns = 0
         try:
@@ -15441,6 +15858,7 @@ def create_eidat_project(
             ),
         )
         support_workbook_path = td_support_workbook_path_for(workbook_path, project_dir=project_dir)
+        sequences_by_program = _discover_td_runs_by_program_for_docs(repo, chosen_docs)
         _ensure_file_written(
             support_workbook_path,
             create_fn=lambda: _write_td_support_workbook(
@@ -15454,16 +15872,8 @@ def create_eidat_project(
                         if isinstance(doc, dict) and str(doc.get("program_title") or "").strip()
                     }
                 ),
+                sequences_by_program=sequences_by_program,
             ),
-        )
-        # Create/populate the project-local cache DB at project creation time so
-        # Trend/Analyze can plot immediately from `implementation_trending.sqlite3`.
-        ensure_test_data_project_cache(project_dir, workbook_path, rebuild=True)
-        update_test_data_trending_project_workbook(
-            repo,
-            workbook_path,
-            overwrite=True,
-            require_existing_cache=False,
         )
 
     else:
