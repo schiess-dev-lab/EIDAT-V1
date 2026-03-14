@@ -9552,9 +9552,21 @@ def update_test_data_trending_project_workbook(
 
     repo = Path(global_repo).expanduser()
     project_dir = wb_path.parent
+    cache_missing = False
     if require_existing_cache:
-        _validate_test_data_project_cache_for_update(project_dir, wb_path)
-    db_path = ensure_test_data_project_cache(project_dir, wb_path, rebuild=False)
+        try:
+            _validate_test_data_project_cache_for_update(project_dir, wb_path)
+        except RuntimeError as exc:
+            message = str(exc or "")
+            if "Project cache DB not found" in message:
+                cache_missing = True
+            else:
+                raise
+    db_path = ensure_test_data_project_cache(
+        project_dir,
+        wb_path,
+        rebuild=bool(cache_missing or not require_existing_cache),
+    )
 
     try:
         wb = load_workbook(str(wb_path))

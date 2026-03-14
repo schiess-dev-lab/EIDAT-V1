@@ -1152,7 +1152,8 @@ class TestTDSupportWorkbook(unittest.TestCase):
             finally:
                 wb2.close()
 
-    def test_update_workbook_fails_when_cache_db_missing(self) -> None:
+    def test_update_workbook_builds_missing_cache_db(self) -> None:
+        from openpyxl import load_workbook  # type: ignore
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
 
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
@@ -1168,9 +1169,27 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 docs=[{"serial_number": "SN1", "excel_sqlite_rel": str(src_db)}],
                 config=self._make_config(),
             )
+            support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+            be._write_td_support_workbook(
+                support_path,
+                sequence_names=["RunA"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+            )
 
-            with self.assertRaisesRegex(RuntimeError, "Build / Refresh Cache"):
-                be.update_test_data_trending_project_workbook(root, wb_path, overwrite=True)
+            result = be.update_test_data_trending_project_workbook(root, wb_path, overwrite=True)
+            self.assertEqual(str(result.get("workbook") or ""), str(wb_path))
+            self.assertTrue((root / "implementation_trending.sqlite3").exists())
+
+            wb = load_workbook(str(wb_path), read_only=True, data_only=True)
+            try:
+                ws_calc = wb["Data_calc"]
+                values = {
+                    str(ws_calc.cell(r, 1).value or "").strip(): ws_calc.cell(r, 2).value
+                    for r in range(1, (ws_calc.max_row or 0) + 1)
+                }
+                self.assertIn("RunA.thrust.mean", values)
+            finally:
+                wb.close()
 
     def test_update_workbook_fails_when_cache_db_incomplete(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
