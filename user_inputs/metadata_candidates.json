@@ -43,14 +43,9 @@
       "aliases": ["EIDP", "End Item Data Package", "End-Item Data Package", "Valve End Item Data Package (EIDP)"]
     },
     {
-      "name": "Data file",
-      "acronym": "DATA",
-      "aliases": ["Data file", "Data File", "Excel", "Spreadsheet", "Excel file data"]
-    },
-    {
       "name": "Test Data",
       "acronym": "TD",
-      "aliases": ["Test Data", "Test-Data", "TestData", "TD"]
+      "aliases": ["Test Data", "Test-Data", "TestData", "TD", "Hot Fire Test", "Hot Fire Test Data", "Hotfire Test Data"]
     }
   ],
   "label_aliases": {

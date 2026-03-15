@@ -931,7 +931,7 @@ def _derive_data_file_metadata(excel_mod: Any | None, data_path: Path) -> dict:
         program_title = (program or vehicle or "Unknown").strip()
     serial_number = (serial or "Unknown").strip() or "Unknown"
     is_mat = data_path.suffix.lower() in MAT_EXTENSIONS
-    return {
+    out = {
         "program_title": program_title,
         "asset_type": "Unknown",
         "serial_number": serial_number,
@@ -939,11 +939,22 @@ def _derive_data_file_metadata(excel_mod: Any | None, data_path: Path) -> dict:
         "revision": "Unknown",
         "test_date": "Unknown",
         "report_date": "Unknown",
-        "document_type": "Test Data" if is_mat else "Data file",
-        "document_type_acronym": "TD" if is_mat else "DATA",
         "vendor": "Unknown",
         "acceptance_test_plan_number": "Unknown",
     }
+    if is_mat:
+        out.update(
+            {
+                "document_type": "TD",
+                "document_type_acronym": "TD",
+                "document_type_status": "confirmed",
+                "document_type_source": "ranker",
+                "document_type_reason": "mat_extension_match",
+                "document_type_evidence": [{"kind": "extension", "doc_type": "TD", "value": ".mat"}],
+                "document_type_review_required": False,
+            }
+        )
+    return out
 
 
 def _is_test_data_meta(meta: dict[str, Any] | None) -> bool:
@@ -1149,7 +1160,7 @@ def process_candidates(
                                 abs_path,
                                 existing_meta=existing_meta,
                                 extracted_meta=extracted_meta,
-                                default_document_type="Test Data" if is_mat else "Data file",
+                                default_document_type="TD" if is_mat else "Unknown",
                             )
                         except Exception:
                             raw_meta = extracted_meta if isinstance(extracted_meta, dict) else {}
@@ -1243,7 +1254,7 @@ def process_candidates(
                             abs_path,
                             existing_meta=existing_meta,
                             extracted_meta=raw_meta,
-                            default_document_type="Test Data" if is_mat else "Data file",
+                            default_document_type="TD" if is_mat else "Unknown",
                         )
                         metadata_path = write_metadata(Path(artifacts_dir), abs_path, clean_meta)
                     else:
@@ -1348,7 +1359,7 @@ def process_candidates(
                             abs_path,
                             existing_meta=existing_meta,
                             extracted_meta=(extracted_meta if extracted_meta is not None else embedded_meta),
-                            default_document_type="EIDP",
+                            default_document_type="Unknown",
                         )
                         if artifacts_dir:
                             metadata_path = write_metadata(Path(artifacts_dir), abs_path, clean_meta)

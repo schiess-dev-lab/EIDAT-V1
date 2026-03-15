@@ -37,6 +37,11 @@ CREATE TABLE IF NOT EXISTS documents (
   report_date TEXT,
   document_type TEXT,
   document_type_acronym TEXT,
+  document_type_status TEXT,
+  document_type_source TEXT,
+  document_type_reason TEXT,
+  document_type_evidence_json TEXT,
+  document_type_review_required INTEGER,
   vendor TEXT,
   acceptance_test_plan_number TEXT,
   excel_sqlite_rel TEXT,
@@ -323,7 +328,7 @@ def build_index(paths: SupportPaths, *, similarity: float = 0.86) -> IndexSummar
         except Exception:
             continue
         is_excel_artifacts = str(meta_path.parent.name).endswith("__excel")
-        default_doc_type = "Data file" if is_excel_artifacts else "EIDP"
+        default_doc_type = "Unknown"
         meta = sanitize_metadata(raw, default_document_type=default_doc_type)
         title = str(meta.get("program_title") or "")
 
@@ -363,6 +368,11 @@ def build_index(paths: SupportPaths, *, similarity: float = 0.86) -> IndexSummar
                 "report_date": meta.get("report_date"),
                 "document_type": meta.get("document_type"),
                 "document_type_acronym": meta.get("document_type_acronym"),
+                "document_type_status": meta.get("document_type_status"),
+                "document_type_source": meta.get("document_type_source"),
+                "document_type_reason": meta.get("document_type_reason"),
+                "document_type_evidence_json": json.dumps(meta.get("document_type_evidence") or [], ensure_ascii=True),
+                "document_type_review_required": 1 if meta.get("document_type_review_required") else 0,
                 "vendor": meta.get("vendor"),
                 "acceptance_test_plan_number": meta.get("acceptance_test_plan_number"),
                 "excel_sqlite_rel": meta.get("excel_sqlite_rel"),
@@ -386,6 +396,11 @@ def build_index(paths: SupportPaths, *, similarity: float = 0.86) -> IndexSummar
             ("certification_status", "TEXT"),
             ("certification_pass_rate", "TEXT"),
             ("document_type_acronym", "TEXT"),
+            ("document_type_status", "TEXT"),
+            ("document_type_source", "TEXT"),
+            ("document_type_reason", "TEXT"),
+            ("document_type_evidence_json", "TEXT"),
+            ("document_type_review_required", "INTEGER"),
             ("vendor", "TEXT"),
             ("acceptance_test_plan_number", "TEXT"),
             ("asset_specific_type", "TEXT"),
@@ -406,10 +421,11 @@ def build_index(paths: SupportPaths, *, similarity: float = 0.86) -> IndexSummar
                 INSERT INTO documents(
                   metadata_rel, artifacts_rel, program_title, asset_type, asset_specific_type,
                   serial_number, part_number, revision, test_date, report_date, document_type,
-                  document_type_acronym, vendor, acceptance_test_plan_number,
+                  document_type_acronym, document_type_status, document_type_source, document_type_reason,
+                  document_type_evidence_json, document_type_review_required, vendor, acceptance_test_plan_number,
                   excel_sqlite_rel, tables_sqlite_rel, file_extension, title_norm, similarity_group, indexed_epoch_ns,
                   certification_status, certification_pass_rate
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     d["metadata_rel"],
@@ -424,6 +440,11 @@ def build_index(paths: SupportPaths, *, similarity: float = 0.86) -> IndexSummar
                     d["report_date"],
                     d["document_type"],
                     d.get("document_type_acronym"),
+                    d.get("document_type_status"),
+                    d.get("document_type_source"),
+                    d.get("document_type_reason"),
+                    d.get("document_type_evidence_json"),
+                    d.get("document_type_review_required"),
                     d.get("vendor"),
                     d.get("acceptance_test_plan_number"),
                     d.get("excel_sqlite_rel"),

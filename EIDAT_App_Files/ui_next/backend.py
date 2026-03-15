@@ -608,7 +608,7 @@ def refresh_metadata_only(global_repo: Path, rel_paths: list[str]) -> Dict[str, 
                     except Exception:
                         extracted_meta = None
 
-            default_doc_type = "Data file" if is_excel else "EIDP"
+            default_doc_type = "Unknown"
             clean_meta = emd.canonicalize_metadata_for_file(
                 abs_path,
                 existing_meta=existing_meta,
@@ -3335,6 +3335,7 @@ def _read_test_data_sources(workbook_path: Path) -> list[dict]:
                 continue
             item["serial"] = sn
             item["excel_sqlite_rel"] = str(item.get("excel_sqlite_rel") or "").strip()
+            item["_sheet_row"] = str(row)
             out.append(item)
         return out
     finally:
@@ -3358,6 +3359,92 @@ TD_SOURCE_METADATA_FIELDS = (
     "document_type_acronym",
     "similarity_group",
 )
+
+
+def _td_canonical_source_link_for_node(node_root: Path, path: Path) -> str:
+    p = Path(path).expanduser()
+    support_dir = eidat_support_dir(node_root)
+    try:
+        if _path_is_within_root(p, support_dir):
+            try:
+                rel = p.resolve().relative_to(support_dir.resolve())
+            except Exception:
+                rel = p.relative_to(support_dir)
+            if support_dir.parent.name.strip().lower() == "eidat":
+                out = Path("EIDAT") / "EIDAT Support" / rel
+            else:
+                out = Path("EIDAT Support") / rel
+            return str(out).replace("/", "\\")
+    except Exception:
+        pass
+
+    try:
+        if _path_is_within_root(p, node_root):
+            try:
+                rel = p.resolve().relative_to(Path(node_root).expanduser().resolve())
+            except Exception:
+                rel = p.relative_to(Path(node_root).expanduser())
+            return str(rel).replace("/", "\\")
+    except Exception:
+        pass
+
+    return str(p)
+
+
+def _write_test_data_source_link_updates(workbook_path: Path, updates_by_serial: Mapping[str, str]) -> dict[str, str]:
+    updates = {
+        str(sn).strip(): str(val).strip()
+        for sn, val in (updates_by_serial or {}).items()
+        if str(sn).strip() and str(val).strip()
+    }
+    if not updates:
+        return {}
+    try:
+        from openpyxl import load_workbook  # type: ignore
+    except Exception as exc:
+        raise RuntimeError(
+            "openpyxl is required to heal Test Data source links in project workbooks. "
+            "Install it with `py -m pip install openpyxl` within the project environment."
+        ) from exc
+
+    wb_path = Path(workbook_path).expanduser()
+    wb = load_workbook(str(wb_path))
+    changed: dict[str, str] = {}
+    try:
+        if "Sources" not in wb.sheetnames:
+            return {}
+        ws = wb["Sources"]
+        headers: dict[str, int] = {}
+        for col in range(1, (ws.max_column or 0) + 1):
+            key = str(ws.cell(1, col).value or "").strip().lower()
+            if key:
+                headers[key] = col
+        serial_col = headers.get("serial_number") or headers.get("serial")
+        sqlite_col = headers.get("excel_sqlite_rel")
+        if not serial_col or not sqlite_col:
+            return {}
+
+        dirty = False
+        for row in range(2, (ws.max_row or 0) + 1):
+            serial = str(ws.cell(row, serial_col).value or "").strip()
+            if not serial or serial not in updates:
+                continue
+            new_value = str(updates[serial]).strip()
+            cur_value = str(ws.cell(row, sqlite_col).value or "").strip()
+            if cur_value == new_value:
+                continue
+            ws.cell(row, sqlite_col).value = new_value
+            changed[serial] = new_value
+            dirty = True
+
+        if dirty:
+            wb.save(str(wb_path))
+        return changed
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
 
 
 def _resolve_td_source_metadata_path(workbook_path: Path, source_row: Mapping[str, object]) -> Path | None:
@@ -3457,31 +3544,33 @@ def _resolve_td_source_sqlite_for_node(
     excel_sqlite_rel: str,
     artifacts_rel: str,
 ) -> dict[str, object]:
+    node_root = Path(node_root).expanduser()
     raw = str(excel_sqlite_rel or "").strip()
-    if raw:
-        candidate = _resolve_excel_sqlite_path_from_workbook(node_root / "dummy.xlsx", raw)
-        if candidate.exists() and candidate.is_file():
-            return {
-                "status": "ok",
-                "path": candidate,
-                "resolved_from": "excel_sqlite_rel",
-                "reason": "",
-            }
-        if candidate.exists() and not candidate.is_file():
-            return {
-                "status": "invalid",
-                "path": candidate,
-                "resolved_from": "excel_sqlite_rel",
-                "reason": f"Resolved source path is not a file: {candidate}",
-            }
+    candidate = _resolve_excel_sqlite_path_from_workbook(node_root / "dummy.xlsx", raw) if raw else Path()
+    candidate_exists = bool(candidate) and candidate.exists()
+    candidate_is_file = bool(candidate_exists and candidate.is_file())
+    candidate_in_node = bool(candidate and candidate_is_file and _path_is_within_root(candidate, node_root))
 
     candidates = _td_source_sqlite_artifact_candidates(node_root=node_root, artifacts_rel=artifacts_rel)
+    if candidate_in_node:
+        healed_rel = _td_canonical_source_link_for_node(node_root, candidate)
+        return {
+            "status": "ok",
+            "path": candidate,
+            "resolved_from": "excel_sqlite_rel",
+            "reason": "",
+            "healed_excel_sqlite_rel": healed_rel,
+            "workbook_excel_sqlite_rel": raw,
+        }
     if len(candidates) == 1:
+        healed_rel = _td_canonical_source_link_for_node(node_root, candidates[0])
         return {
             "status": "ok",
             "path": candidates[0],
             "resolved_from": "artifacts_rel",
             "reason": "",
+            "healed_excel_sqlite_rel": healed_rel,
+            "workbook_excel_sqlite_rel": raw,
         }
     if len(candidates) > 1:
         names = ", ".join(p.name for p in candidates[:6])
@@ -3490,20 +3579,43 @@ def _resolve_td_source_sqlite_for_node(
             "path": None,
             "resolved_from": "artifacts_rel",
             "reason": f"Multiple source SQLite files found in TD artifacts folder: {names}",
+            "healed_excel_sqlite_rel": "",
+            "workbook_excel_sqlite_rel": raw,
         }
     if raw:
-        candidate = _resolve_excel_sqlite_path_from_workbook(node_root / "dummy.xlsx", raw)
+        if candidate_exists and not candidate_is_file:
+            return {
+                "status": "invalid",
+                "path": candidate,
+                "resolved_from": "excel_sqlite_rel",
+                "reason": f"Resolved source path is not a file: {candidate}",
+                "healed_excel_sqlite_rel": "",
+                "workbook_excel_sqlite_rel": raw,
+            }
+        if candidate_is_file and not candidate_in_node:
+            return {
+                "status": "invalid",
+                "path": candidate,
+                "resolved_from": "excel_sqlite_rel",
+                "reason": f"Resolved source SQLite is outside the active node root ({node_root}): {candidate}",
+                "healed_excel_sqlite_rel": "",
+                "workbook_excel_sqlite_rel": raw,
+            }
         return {
             "status": "missing",
             "path": candidate,
             "resolved_from": "excel_sqlite_rel",
             "reason": f"Source SQLite not found: {candidate}",
+            "healed_excel_sqlite_rel": "",
+            "workbook_excel_sqlite_rel": raw,
         }
     return {
         "status": "missing",
         "path": None,
         "resolved_from": "",
         "reason": "No source SQLite could be resolved from excel_sqlite_rel or artifacts_rel.",
+        "healed_excel_sqlite_rel": "",
+        "workbook_excel_sqlite_rel": raw,
     }
 
 
@@ -3529,6 +3641,8 @@ def _resolve_td_source_sqlite_for_workbook(
         "artifacts_rel": artifacts_rel,
         "node_root": str(node_root),
         "support_dir": str(support_dir),
+        "healed_excel_sqlite_rel": str(result.get("healed_excel_sqlite_rel") or "").strip(),
+        "workbook_excel_sqlite_rel": str(result.get("workbook_excel_sqlite_rel") or excel_sqlite_rel).strip(),
     }
 
 
@@ -3790,15 +3904,50 @@ def _td_support_program_row_defaults(source_run_name: object, *, program_title: 
     }
 
 
-def _td_support_condition_group_identity(row: Mapping[str, object]) -> tuple[str, str, str, str, str, str]:
+def _td_condition_identity_parts(row: Mapping[str, object]) -> tuple[str, str, str, str, str]:
     return (
-        str(row.get("condition_key") or row.get("source_run_name") or "").strip(),
         _td_format_compact_value(row.get("feed_pressure")).lower(),
         str(row.get("feed_pressure_units") or "").strip().lower(),
         td_normalize_run_type(row.get("run_type")).lower(),
         _td_format_compact_value(row.get("pulse_width_on", row.get("pulse_width"))).lower(),
         _td_format_compact_value(row.get("control_period")).lower(),
     )
+
+
+def _td_condition_base_key(row: Mapping[str, object]) -> str:
+    source_run_name = str(row.get("source_run_name") or "").strip()
+    explicit = str(
+        row.get("condition_key")
+        or row.get("run_name")
+        or row.get("sequence_name")
+        or ""
+    ).strip()
+    has_condition_fields = any(bool(part) for part in _td_condition_identity_parts(row))
+    if explicit:
+        if not source_run_name:
+            return explicit
+        if _td_support_norm_name(explicit) != _td_support_norm_name(source_run_name):
+            return explicit
+    if has_condition_fields:
+        parts = [
+            _td_format_compact_value(row.get("feed_pressure")),
+            str(row.get("feed_pressure_units") or "").strip(),
+            td_normalize_run_type(row.get("run_type")),
+            _td_format_compact_value(_td_support_sequence_pulse_width(row)),
+            _td_format_compact_value(row.get("control_period")),
+        ]
+        joined = "_".join([p for p in parts if str(p).strip()])
+        slug = re.sub(r"[^A-Za-z0-9]+", "_", joined).strip("_")
+        if slug:
+            return slug
+    return explicit or source_run_name
+
+
+def _td_support_condition_group_identity(row: Mapping[str, object]) -> tuple[str, str, str, str, str, str]:
+    condition_parts = _td_condition_identity_parts(row)
+    if any(bool(part) for part in condition_parts):
+        return ("",) + condition_parts
+    return (_td_condition_base_key(row),) + condition_parts
 
 
 def _td_group_program_rows_into_conditions(rows: Sequence[Mapping[str, object]]) -> list[dict]:
@@ -3809,7 +3958,7 @@ def _td_group_program_rows_into_conditions(rows: Sequence[Mapping[str, object]])
         if not bool(raw_row.get("enabled", True)):
             continue
         source_run_name = str(raw_row.get("source_run_name") or "").strip()
-        condition_key = str(raw_row.get("condition_key") or source_run_name).strip() or source_run_name
+        condition_key = _td_condition_base_key(raw_row)
         if not condition_key or not source_run_name:
             continue
         identity = _td_support_condition_group_identity(raw_row)
@@ -3859,24 +4008,7 @@ def _td_group_program_rows_into_conditions(rows: Sequence[Mapping[str, object]])
 def td_build_run_condition_key(sequence_row: dict | None) -> str:
     if not isinstance(sequence_row, dict):
         return ""
-    explicit = str(
-        sequence_row.get("condition_key")
-        or sequence_row.get("run_name")
-        or sequence_row.get("sequence_name")
-        or ""
-    ).strip()
-    if explicit:
-        return explicit
-    parts = [
-        _td_format_compact_value(sequence_row.get("feed_pressure")),
-        str(sequence_row.get("feed_pressure_units") or "").strip(),
-        td_normalize_run_type(sequence_row.get("run_type")),
-        _td_format_compact_value(_td_support_sequence_pulse_width(sequence_row)),
-        _td_format_compact_value(sequence_row.get("control_period")),
-    ]
-    joined = "_".join([p for p in parts if str(p).strip()])
-    slug = re.sub(r"[^A-Za-z0-9]+", "_", joined).strip("_")
-    return slug or ""
+    return _td_condition_base_key(sequence_row)
 
 
 def _write_td_support_workbook(
@@ -5192,6 +5324,7 @@ def ensure_test_data_project_cache(
     db_path = proj_dir / EIDAT_PROJECT_IMPLEMENTATION_DB
     raw_db_path = td_raw_cache_db_path_for(proj_dir)
     db_path.parent.mkdir(parents=True, exist_ok=True)
+    current_node_root = str(_infer_node_root_from_workbook_path(wb_path))
 
     with sqlite3.connect(str(db_path)) as conn:
         _ensure_test_data_impl_tables(conn)
@@ -5245,12 +5378,37 @@ def ensure_test_data_project_cache(
             cached_support_mtime_ns = int(str(row[0]).strip()) if row and row[0] is not None else 0
         except Exception:
             cached_support_mtime_ns = 0
+        try:
+            row = conn.execute("SELECT value FROM td_meta WHERE key='workbook_path' LIMIT 1").fetchone()
+            cached_workbook_path = str(row[0] or "").strip() if row and row[0] is not None else ""
+        except Exception:
+            cached_workbook_path = ""
+        try:
+            row = conn.execute("SELECT value FROM td_meta WHERE key='node_root' LIMIT 1").fetchone()
+            cached_node_root = str(row[0] or "").strip() if row and row[0] is not None else ""
+        except Exception:
+            cached_node_root = ""
     with sqlite3.connect(str(raw_db_path)) as conn:
         _ensure_test_data_raw_cache_tables(conn)
         try:
             curve_count = int(conn.execute("SELECT COUNT(*) FROM td_curves_raw").fetchone()[0] or 0)
         except Exception:
             curve_count = 0
+
+    stale_context = False
+    try:
+        stale_context = str(Path(cached_workbook_path).expanduser()) != str(wb_path)
+    except Exception:
+        stale_context = bool(cached_workbook_path) and cached_workbook_path != str(wb_path)
+    if not stale_context and cached_node_root != current_node_root:
+        stale_context = True
+    if not stale_context and expected and cached and (not cached_workbook_path or not cached_node_root):
+        stale_context = True
+    if stale_context:
+        rebuild_test_data_project_cache(db_path, wb_path)
+        _sync_sqlite_excel_mirror(db_path, force=True)
+        _sync_sqlite_excel_mirror(raw_db_path, force=True)
+        return db_path
 
     support_mtime_ns = 0
     try:
@@ -5316,12 +5474,26 @@ def ensure_test_data_project_cache(
     # If any path/mtime differs, rebuild.
     stale = False
     for sn, source_row in expected.items():
-        rel = str(source_row.get("excel_sqlite_rel") or "").strip()
-        p = _resolve_excel_sqlite_path_from_workbook(wb_path, rel)
+        source_resolution = _resolve_td_source_sqlite_for_workbook(wb_path, source_row)
+        p_raw = source_resolution.get("path")
+        p = Path(p_raw).expanduser() if p_raw else Path()
+        status = str(source_resolution.get("status") or "").strip().lower()
+        healed_rel = str(source_resolution.get("healed_excel_sqlite_rel") or "").strip()
+        expected_excel_rel = healed_rel or str(source_resolution.get("workbook_excel_sqlite_rel") or source_row.get("excel_sqlite_rel") or "").strip()
         c = cached.get(sn) or {}
+        cached_status = str(c.get("status") or "").strip().lower()
+        if cached_status != status:
+            if curve_count > 0 and cached_status == "ok" and status == "missing":
+                pass
+            else:
+                stale = True
+                break
         if str(c.get("path") or "") != str(p):
-            stale = True
-            break
+            if curve_count > 0 and cached_status == "ok" and status == "missing":
+                pass
+            else:
+                stale = True
+                break
         try:
             st = p.stat()
             mtime_ns = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)))
@@ -5343,7 +5515,7 @@ def ensure_test_data_project_cache(
         if str(cached_meta_row.get("artifacts_rel") or "") != str(source_meta.get("artifacts_rel") or "").strip():
             stale = True
             break
-        if str(cached_meta_row.get("excel_sqlite_rel") or "") != rel:
+        if str(cached_meta_row.get("excel_sqlite_rel") or "") != expected_excel_rel:
             stale = True
             break
         if int(cached_meta_row.get("metadata_mtime_ns") or 0) != int(source_meta.get("metadata_mtime_ns") or 0):
@@ -6899,6 +7071,9 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
     diagnostics_rows: list[tuple[str, str, str, str, str, str, int, int, str]] = []
     debug_diagnostics: list[dict] = []
     debug_sources: list[dict] = []
+    valid_sources = 0
+    source_link_updates: dict[str, str] = {}
+    source_link_update_errors: list[str] = []
 
     for entry in entries:
         sn = str(entry.get("serial") or "").strip()
@@ -6908,12 +7083,16 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
         status = str(source_resolution.get("status") or "missing").strip().lower() or "missing"
         source_reason = str(source_resolution.get("reason") or "").strip()
         resolved_from = str(source_resolution.get("resolved_from") or "").strip()
+        workbook_excel_sqlite_rel = str(source_resolution.get("workbook_excel_sqlite_rel") or entry.get("excel_sqlite_rel") or "").strip()
+        healed_excel_sqlite_rel = str(source_resolution.get("healed_excel_sqlite_rel") or "").strip()
         source_info = {
             "serial": sn,
             "status": status,
             "resolved_from": resolved_from,
             "resolved_sqlite_path": str(sqlite_path) if sqlite_path else "",
-            "excel_sqlite_rel": str(source_resolution.get("excel_sqlite_rel") or entry.get("excel_sqlite_rel") or "").strip(),
+            "workbook_excel_sqlite_rel": workbook_excel_sqlite_rel,
+            "excel_sqlite_rel": healed_excel_sqlite_rel or workbook_excel_sqlite_rel,
+            "healed_excel_sqlite_rel": healed_excel_sqlite_rel,
             "artifacts_rel": str(source_resolution.get("artifacts_rel") or entry.get("artifacts_rel") or "").strip(),
             "metadata_rel": str(entry.get("metadata_rel") or "").strip(),
             "node_root": str(source_resolution.get("node_root") or "").strip(),
@@ -6933,6 +7112,13 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
             missing_sources += 1
         elif status != "ok":
             invalid_sources += 1
+        elif healed_excel_sqlite_rel and healed_excel_sqlite_rel != workbook_excel_sqlite_rel:
+            entry["excel_sqlite_rel"] = healed_excel_sqlite_rel
+            source_link_updates[sn] = healed_excel_sqlite_rel
+            source_info["excel_sqlite_rel"] = healed_excel_sqlite_rel
+            source_info["link_healed"] = True
+            debug_sources[source_debug_source_idx]["excel_sqlite_rel"] = healed_excel_sqlite_rel
+            debug_sources[source_debug_source_idx]["link_healed"] = True
 
         with closing(sqlite3.connect(str(db_path))) as conn:
             _ensure_test_data_impl_tables(conn)
@@ -7011,6 +7197,7 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
 
         if status != "ok":
             continue
+        valid_sources += 1
 
         try:
             src = sqlite3.connect(str(sqlite_path))
@@ -7456,6 +7643,22 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
             debug_sources[source_debug_source_idx]["reason"] = f"Failed to ingest source SQLite: {type(exc).__name__}: {exc}"
             invalid_sources += 1
 
+    if source_link_updates:
+        try:
+            changed_links = _write_test_data_source_link_updates(wb_path, source_link_updates)
+            for item in debug_sources:
+                sn = str(item.get("serial") or "").strip()
+                if sn in changed_links:
+                    item["excel_sqlite_rel"] = changed_links[sn]
+                    item["healed_excel_sqlite_rel"] = changed_links[sn]
+            for item in debug_diagnostics:
+                sn = str(item.get("serial") or "").strip()
+                if sn in changed_links:
+                    item["excel_sqlite_rel"] = changed_links[sn]
+                    item["healed_excel_sqlite_rel"] = changed_links[sn]
+        except Exception as exc:
+            source_link_update_errors.append(str(exc))
+
     if diagnostics_rows:
         with closing(sqlite3.connect(str(db_path))) as conn:
             _ensure_test_data_impl_tables(conn)
@@ -7473,6 +7676,7 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
         "workbook": str(wb_path),
         "implementation_db": str(db_path),
         "raw_db": str(raw_db_path),
+        "active_node_root": str(_infer_node_root_from_workbook_path(wb_path)),
         "project_config": {
             "columns_source": str(project_cfg.get("columns_source") or ""),
             "statistics_source": str(project_cfg.get("statistics_source") or ""),
@@ -7499,12 +7703,43 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
         "diagnostics": list(debug_diagnostics),
         "counts": {
             "serials_count": len(entries),
+            "valid_sources": int(valid_sources),
             "missing_sources": int(missing_sources),
             "invalid_sources": int(invalid_sources),
             "curves_written": int(curves_written),
         },
+        "link_healing": {
+            "requested_updates": dict(source_link_updates),
+            "errors": list(source_link_update_errors),
+        },
     }
     debug_path = _write_td_cache_debug_json(db_path.parent, debug_payload)
+
+    if valid_sources <= 0 and entries:
+        reason_lines = [
+            " | ".join(
+                part
+                for part in [
+                    str(item.get("serial") or "").strip(),
+                    str(item.get("workbook_excel_sqlite_rel") or "").strip(),
+                    str(item.get("reason") or "").strip(),
+                ]
+                if part
+            )
+            for item in debug_sources
+            if isinstance(item, dict) and str(item.get("reason") or "").strip()
+        ]
+        reason_lines = list(dict.fromkeys(reason_lines))
+        reason_txt = ""
+        if reason_lines:
+            reason_txt = " Details: " + " | ".join(reason_lines[:4])
+        debug_txt = f" Debug: {debug_path}." if debug_path is not None else ""
+        raise RuntimeError(
+            "No valid Test Data source SQLite files could be resolved for the active project node. "
+            "Check the workbook Sources sheet, current node/global repo path, and TD artifact folders, then run 'Build / Refresh Cache' again."
+            + reason_txt
+            + debug_txt
+        )
 
     # Compute optional display labels per run (condition labeling).
     runs_all = set(run_x_union.keys()) | set(run_y_raw_union.keys()) | set(run_y_calc_union.keys())
@@ -10237,6 +10472,11 @@ def read_eidat_index_documents(global_repo: Path) -> list[dict]:
         ]
         for opt in (
             "document_type_acronym",
+            "document_type_status",
+            "document_type_source",
+            "document_type_reason",
+            "document_type_evidence_json",
+            "document_type_review_required",
             "vendor",
             "acceptance_test_plan_number",
             "excel_sqlite_rel",
@@ -10257,6 +10497,11 @@ def read_eidat_index_documents(global_repo: Path) -> list[dict]:
     for r in rows:
         d = {k: r[k] for k in r.keys()}
         d.setdefault("document_type_acronym", None)
+        d.setdefault("document_type_status", None)
+        d.setdefault("document_type_source", None)
+        d.setdefault("document_type_reason", None)
+        d.setdefault("document_type_evidence_json", None)
+        d.setdefault("document_type_review_required", None)
         d.setdefault("vendor", None)
         d.setdefault("acceptance_test_plan_number", None)
         d.setdefault("excel_sqlite_rel", None)
@@ -11783,6 +12028,21 @@ def is_test_data_doc(doc: Mapping[str, object]) -> bool:
         acr = str(doc.get("document_type_acronym") or "").strip()
     except Exception:
         acr = ""
+    try:
+        status = str(doc.get("document_type_status") or "").strip().lower()
+    except Exception:
+        status = ""
+    try:
+        review_required = bool(doc.get("document_type_review_required"))
+    except Exception:
+        review_required = False
+
+    if status == "confirmed" and not review_required:
+        dt_norm0 = _norm_alnum_spaces(dt)
+        acr_norm0 = _norm_alnum_spaces(acr)
+        return dt_norm0 == "td" or acr_norm0 == "td"
+    if review_required and status in {"ambiguous", "unknown"}:
+        return False
 
     short_tokens, long_aliases = _td_alias_norms()
     dt_norm = _norm_alnum_spaces(dt)
@@ -11803,6 +12063,29 @@ def is_test_data_doc(doc: Mapping[str, object]) -> bool:
         return True
     if short_tokens and any(t in blob_tokens for t in short_tokens):
         return True
+    return False
+
+
+def _is_confirmed_doc_type(doc: Mapping[str, object], expected: str) -> bool:
+    want = _norm_alnum_spaces(expected)
+    try:
+        status = str(doc.get("document_type_status") or "").strip().lower()
+    except Exception:
+        status = ""
+    try:
+        review_required = bool(doc.get("document_type_review_required"))
+    except Exception:
+        review_required = False
+    try:
+        dt = _norm_alnum_spaces(str(doc.get("document_type") or ""))
+    except Exception:
+        dt = ""
+    try:
+        acr = _norm_alnum_spaces(str(doc.get("document_type_acronym") or ""))
+    except Exception:
+        acr = ""
+    if status == "confirmed" and not review_required:
+        return dt == want or acr == want
     return False
 
 
@@ -15116,15 +15399,12 @@ def _write_test_data_trending_workbook(
                 excel_sqlite_rel=resolved_sqlite_rel,
                 artifacts_rel=str(doc.get("artifacts_rel") or "").strip(),
             )
-            if str(resolved.get("status") or "") == "ok" and not resolved_sqlite_rel:
-                try:
-                    resolved_path = Path(resolved.get("path")).expanduser()
-                    try:
-                        resolved_sqlite_rel = str(resolved_path.resolve().relative_to(repo.resolve()))
-                    except Exception:
-                        resolved_sqlite_rel = str(resolved_path)
-                except Exception:
-                    resolved_sqlite_rel = str(doc.get("excel_sqlite_rel") or "").strip()
+            if str(resolved.get("status") or "") == "ok":
+                resolved_sqlite_rel = str(
+                    resolved.get("healed_excel_sqlite_rel")
+                    or resolved.get("workbook_excel_sqlite_rel")
+                    or resolved_sqlite_rel
+                ).strip()
         ws_src.append(
             [
                 str(sn or "").strip(),
@@ -15767,7 +16047,7 @@ def create_eidat_project(
     continued_population_clean = _sanitize_continued_population(continued_population)
 
     def _is_test_data_eligible(d: dict) -> bool:
-        if not is_test_data_doc(d):
+        if not _is_confirmed_doc_type(d, "TD"):
             return False
         resolved = _resolve_td_source_sqlite_for_node(
             repo,
@@ -15777,20 +16057,20 @@ def create_eidat_project(
         return str(resolved.get("status") or "") == "ok"
 
     if project_type in (EIDAT_PROJECT_TYPE_TRENDING, EIDAT_PROJECT_TYPE_RAW_TRENDING):
-        bad = [d for d in chosen_docs if isinstance(d, dict) and is_test_data_doc(d)]
+        bad = [d for d in chosen_docs if isinstance(d, dict) and not _is_confirmed_doc_type(d, "EIDP")]
         if bad:
             bad_sn = sorted({str(d.get("serial_number") or "").strip() for d in bad if str(d.get("serial_number") or "").strip()})
             raise RuntimeError(
-                "TD reports cannot be used to create an EIDP Trending project. "
-                "Create a Test Data Trending project instead. "
-                + (f"(TD serials selected: {', '.join(bad_sn[:12])})" if bad_sn else "")
+                "EIDP Trending projects require documents with confirmed EIDP document type. "
+                "Review ambiguous or TD documents before using them in EIDP workflows. "
+                + (f"(Affected serials: {', '.join(bad_sn[:12])})" if bad_sn else "")
             )
     if project_type == EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING:
         bad = [d for d in chosen_docs if isinstance(d, dict) and not _is_test_data_eligible(d)]
         if bad:
             bad_sn = sorted({str(d.get("serial_number") or "").strip() for d in bad if str(d.get("serial_number") or "").strip()})
             raise RuntimeError(
-                "Test Data Trending projects must be created from TD reports with extracted Excel data. "
+                "Test Data Trending projects must be created from confirmed TD reports with extracted Excel data. "
                 + (f"(Invalid serials selected: {', '.join(bad_sn[:12])})" if bad_sn else "")
             )
 

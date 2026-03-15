@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import sqlite3
 
@@ -15,6 +16,14 @@ if str(ROOT) not in sys.path:
 def _have_numpy() -> bool:
     try:
         import numpy as _np  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+def _have_matplotlib() -> bool:
+    try:
+        from matplotlib.backends.backend_pdf import PdfPages  # noqa: F401
     except Exception:
         return False
     return True
@@ -436,6 +445,47 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         self.assertEqual(plan["charts_sel"], [])  # popped to make room for omitted-items page
         self.assertTrue(any("Appendix: full deviations table omitted" in x for x in plan["omitted_items"]))
         self.assertTrue(any("Metrics: PASS-only" in x for x in plan["omitted_items"]))
+
+    @unittest.skipUnless(_have_matplotlib(), "matplotlib not installed")
+    def test_generate_auto_report_fails_clearly_for_empty_cache(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            db = root / "empty.sqlite3"
+            with sqlite3.connect(str(db)) as conn:
+                conn.execute("CREATE TABLE td_sources(serial TEXT PRIMARY KEY)")
+                conn.execute("CREATE TABLE td_runs(run_name TEXT PRIMARY KEY, default_x TEXT, display_name TEXT)")
+                conn.commit()
+
+            with mock.patch.object(
+                tar,
+                "default_trend_auto_report_config",
+                return_value=tar.default_trend_auto_report_config(),
+            ), mock.patch(
+                "EIDAT_App_Files.ui_next.backend.ensure_test_data_project_cache",
+                return_value=db,
+            ), mock.patch(
+                "EIDAT_App_Files.ui_next.backend.load_excel_trend_config",
+                return_value={
+                    "description": "x",
+                    "data_group": "Excel Data",
+                    "columns": [{"name": "thrust", "units": "lbf"}],
+                    "statistics": ["mean"],
+                    "header_row": 0,
+                },
+            ), mock.patch(
+                "EIDAT_App_Files.ui_next.backend.load_trend_auto_report_config",
+                return_value=tar.default_trend_auto_report_config(),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "no usable Test Data sources"):
+                    tar.generate_test_data_auto_report(
+                        root,
+                        root / "project.xlsx",
+                        root / "report.pdf",
+                        highlighted_serials=[],
+                        options={"update_excel_trend_config": False},
+                    )
 
     @unittest.skipUnless(_have_numpy(), "numpy not installed")
     def test_master_curve_and_poly_fit(self):

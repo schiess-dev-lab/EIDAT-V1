@@ -18,11 +18,74 @@ def _write_candidates(data_root: Path, payload: dict) -> None:
     (ui / "metadata_candidates.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
+def _write_doc_type_strategies(data_root: Path, payload: dict) -> None:
+    ui = data_root / "user_inputs"
+    ui.mkdir(parents=True, exist_ok=True)
+    (ui / "document_type_strategies.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def _strategy_payload() -> dict:
+    return {
+        "version": 1,
+        "document_types": [
+            {"name": "End Item Data Package", "acronym": "EIDP"},
+            {"name": "Test Data", "acronym": "TD"},
+        ],
+        "filename_aliases": {
+            "EIDP": ["EIDP", "End Item Data Package"],
+            "TD": ["TD", "Test Data", "Hot Fire Test Data", "Hot Fire Test"],
+        },
+        "content_aliases": {
+            "EIDP": ["EIDP", "End Item Data Package"],
+            "TD": ["TD", "Test Data", "Hot Fire Test Data", "Hot Fire Test"],
+        },
+        "extension_rules": {
+            "EIDP": [".pdf"],
+            "TD": [".xlsx", ".xls", ".xlsm", ".mat"],
+        },
+        "folder_rules": {
+            "levels": 3,
+            "aliases": {
+                "EIDP": ["EIDP", "End Item Data Package"],
+                "TD": ["TD", "Test Data", "Hot Fire Test Data", "Hot Fire Test"],
+            },
+        },
+        "serial_patterns": ["(?i)\\bSN[-_ ]?[A-Z0-9]+(?:[-_][A-Z0-9]+)*\\b"],
+        "ranker": {
+            "weights": {
+                "content": 5,
+                "folder": 3,
+                "extension_compatible": 1,
+                "serial_bonus": 2,
+            },
+            "min_score": 4,
+            "conflict_gap": 2,
+        },
+        "special_cases": {
+            "td_folder_serial_rule": {
+                "enabled": True,
+                "compatible_extensions": [".xlsx", ".xls", ".xlsm", ".mat"],
+                "require_serial_in_filename": True,
+            }
+        },
+    }
+
+
 class TestStrictMetadataAllowlists(unittest.TestCase):
+    def setUp(self) -> None:
+        self._old_data_root = os.environ.get("EIDAT_DATA_ROOT")
+
+    def tearDown(self) -> None:
+        if self._old_data_root is None:
+            os.environ.pop("EIDAT_DATA_ROOT", None)
+        else:
+            os.environ["EIDAT_DATA_ROOT"] = self._old_data_root
+
     def test_program_title_strict_unknown_when_not_allowlisted(self):
         with tempfile.TemporaryDirectory() as td:
             data_root = Path(td)
             _write_candidates(data_root, {"program_titles": ["Starlink"]})
+            _write_doc_type_strategies(data_root, _strategy_payload())
             os.environ["EIDAT_DATA_ROOT"] = str(data_root)
 
             text = "\n".join(
@@ -38,6 +101,7 @@ class TestStrictMetadataAllowlists(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as repo_td:
             data_root = Path(td)
             _write_candidates(data_root, {"program_titles": ["Starlink"]})
+            _write_doc_type_strategies(data_root, _strategy_payload())
             os.environ["EIDAT_DATA_ROOT"] = str(data_root)
 
             p = Path(repo_td) / "Starlink" / "sub" / "file.pdf"
@@ -51,6 +115,7 @@ class TestStrictMetadataAllowlists(unittest.TestCase):
                 data_root,
                 {"program_titles": [{"name": "Starlink", "aliases": ["Star Link", "STAR-LINK"]}]},
             )
+            _write_doc_type_strategies(data_root, _strategy_payload())
             os.environ["EIDAT_DATA_ROOT"] = str(data_root)
 
             text = "\n".join(["=== Page 1 ===", "Program: Star Link"])
@@ -61,6 +126,7 @@ class TestStrictMetadataAllowlists(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             data_root = Path(td)
             _write_candidates(data_root, {"program_titles": ["Starlink"], "part_numbers": ["VLV-42A"]})
+            _write_doc_type_strategies(data_root, _strategy_payload())
             os.environ["EIDAT_DATA_ROOT"] = str(data_root)
 
             text = "\n".join(["=== Page 1 ===", "Valve model: VLV 42A"])
@@ -71,6 +137,7 @@ class TestStrictMetadataAllowlists(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             data_root = Path(td)
             _write_candidates(data_root, {"program_titles": ["Starlink"]})
+            _write_doc_type_strategies(data_root, _strategy_payload())
             os.environ["EIDAT_DATA_ROOT"] = str(data_root)
 
             text = "\n".join(["=== Page 1 ===", "Valve model: VLV-42A"])
@@ -87,6 +154,7 @@ class TestStrictMetadataAllowlists(unittest.TestCase):
                     "acceptance_test_plan_numbers": ["ATP-1234"],
                 },
             )
+            _write_doc_type_strategies(data_root, _strategy_payload())
             os.environ["EIDAT_DATA_ROOT"] = str(data_root)
 
             text = "\n".join(["=== Page 1 ===", "Acceptance Test Plan: ATP 1234"])
@@ -103,6 +171,7 @@ class TestStrictMetadataAllowlists(unittest.TestCase):
                     "vendors": [{"name": "MOOG", "aliases": ["MOOG INC", "MOOG, INC."]}],
                 },
             )
+            _write_doc_type_strategies(data_root, _strategy_payload())
             os.environ["EIDAT_DATA_ROOT"] = str(data_root)
 
             text = "\n".join(["=== Page 1 ===", "Manufacturer: MOOG INC"])
@@ -119,6 +188,7 @@ class TestStrictMetadataAllowlists(unittest.TestCase):
                     "asset_specific_types": [{"name": "VLV-42A", "aliases": ["VLV 42A", "VLV_42A"]}],
                 },
             )
+            _write_doc_type_strategies(data_root, _strategy_payload())
             os.environ["EIDAT_DATA_ROOT"] = str(data_root)
 
             text = "\n".join(["=== Page 1 ===", "Valve model: VLV 42A"])
@@ -129,6 +199,7 @@ class TestStrictMetadataAllowlists(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             data_root = Path(td)
             _write_candidates(data_root, {"program_titles": ["Starlink"]})
+            _write_doc_type_strategies(data_root, _strategy_payload())
             os.environ["EIDAT_DATA_ROOT"] = str(data_root)
 
             text = "\n".join(
@@ -148,6 +219,7 @@ class TestStrictMetadataAllowlists(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             data_root = Path(td)
             _write_candidates(data_root, {"program_titles": ["Starlink"]})
+            _write_doc_type_strategies(data_root, _strategy_payload())
             os.environ["EIDAT_DATA_ROOT"] = str(data_root)
 
             text = "\n".join(
@@ -162,63 +234,104 @@ class TestStrictMetadataAllowlists(unittest.TestCase):
             meta = emd.extract_metadata_from_text(text, pdf_path=Path(td) / "Starlink" / "x.pdf")
             self.assertEqual(meta.get("report_date"), "2026-01-16")
 
-    def test_document_type_directory_fallback_td(self):
+    def test_document_type_folder_only_td_is_review_required_unknown(self):
         with tempfile.TemporaryDirectory() as td:
             data_root = Path(td)
-            _write_candidates(
-                data_root,
-                {
-                    "program_titles": ["Starlink"],
-                    "document_types": [
-                        {"name": "Test Data", "acronym": "TD", "aliases": ["Test Data", "TD"]},
-                        {"name": "End Item Data Package", "acronym": "EIDP", "aliases": ["EIDP"]},
-                    ],
-                },
-            )
+            _write_candidates(data_root, {"program_titles": ["Starlink"]})
+            _write_doc_type_strategies(data_root, _strategy_payload())
             os.environ["EIDAT_DATA_ROOT"] = str(data_root)
 
             p = Path(td) / "Starlink" / "Test Data" / "x.pdf"
             meta = emd.extract_metadata_from_text("=== Page 1 ===\n(no doc type)\n", pdf_path=p)
-            self.assertEqual(meta.get("document_type"), "TD")
-            self.assertEqual(meta.get("document_type_acronym"), "TD")
+            self.assertEqual(meta.get("document_type"), "Unknown")
+            self.assertTrue(bool(meta.get("document_type_review_required")))
 
-    def test_document_type_directory_fallback_eidp(self):
+    def test_document_type_filename_pdf_confirms_eidp(self):
         with tempfile.TemporaryDirectory() as td:
             data_root = Path(td)
-            _write_candidates(
-                data_root,
-                {
-                    "program_titles": ["Starlink"],
-                    "document_types": [
-                        {"name": "End Item Data Package", "acronym": "EIDP", "aliases": ["EIDP"]},
-                    ],
-                },
-            )
+            _write_candidates(data_root, {"program_titles": ["Starlink"]})
+            _write_doc_type_strategies(data_root, _strategy_payload())
             os.environ["EIDAT_DATA_ROOT"] = str(data_root)
 
-            p = Path(td) / "Starlink" / "EIDP" / "x.pdf"
+            p = Path(td) / "Starlink" / "SN4001_EIDP.pdf"
             meta = emd.extract_metadata_from_text("=== Page 1 ===\n(no doc type)\n", pdf_path=p)
             self.assertEqual(meta.get("document_type"), "EIDP")
+            self.assertEqual(meta.get("document_type_status"), "confirmed")
 
-    def test_canonicalize_document_type_from_path(self):
+    def test_document_type_content_confirms_eidp(self):
         with tempfile.TemporaryDirectory() as td:
             data_root = Path(td)
-            _write_candidates(
-                data_root,
-                {
-                    "program_titles": ["Starlink"],
-                    "document_types": [
-                        {"name": "Test Data", "acronym": "TD", "aliases": ["TD"]},
-                        {"name": "End Item Data Package", "acronym": "EIDP", "aliases": ["EIDP"]},
-                    ],
-                },
-            )
+            _write_candidates(data_root, {"program_titles": ["Starlink"]})
+            _write_doc_type_strategies(data_root, _strategy_payload())
             os.environ["EIDAT_DATA_ROOT"] = str(data_root)
 
-            p = Path(td) / "Starlink" / "TD" / "x.pdf"
-            meta = emd.canonicalize_metadata_for_file(p, existing_meta=None, extracted_meta={}, default_document_type="EIDP")
+            p = Path(td) / "Starlink" / "SN4001_unknown.pdf"
+            text = "\n".join(["=== Page 1 ===", "Valve End Item Data Package (EIDP)"])
+            meta = emd.extract_metadata_from_text(text, pdf_path=p)
+            self.assertEqual(meta.get("document_type"), "EIDP")
+            self.assertEqual(meta.get("document_type_source"), "ranker")
+
+    def test_document_type_conflict_requires_review(self):
+        with tempfile.TemporaryDirectory() as td:
+            data_root = Path(td)
+            _write_candidates(data_root, {"program_titles": ["Starlink"]})
+            _write_doc_type_strategies(data_root, _strategy_payload())
+            os.environ["EIDAT_DATA_ROOT"] = str(data_root)
+
+            p = Path(td) / "Starlink" / "SN4001_EIDP.pdf"
+            text = "\n".join(["=== Page 1 ===", "Hot Fire Test Data"])
+            meta = emd.extract_metadata_from_text(text, pdf_path=p)
+            self.assertEqual(meta.get("document_type"), "Unknown")
+            self.assertEqual(meta.get("document_type_status"), "ambiguous")
+            self.assertTrue(bool(meta.get("document_type_review_required")))
+
+    def test_document_type_excel_folder_and_serial_confirms_td(self):
+        with tempfile.TemporaryDirectory() as td:
+            data_root = Path(td)
+            _write_candidates(data_root, {"program_titles": ["Starlink"]})
+            _write_doc_type_strategies(data_root, _strategy_payload())
+            os.environ["EIDAT_DATA_ROOT"] = str(data_root)
+
+            p = Path(td) / "Starlink" / "Hot Fire Test Data" / "SN4001_results.xlsx"
+            meta = emd.canonicalize_metadata_for_file(p, existing_meta=None, extracted_meta={}, default_document_type="Unknown")
             self.assertEqual(meta.get("document_type"), "TD")
-            self.assertEqual(meta.get("document_type_acronym"), "TD")
+            self.assertEqual(meta.get("document_type_reason"), "folder_serial_rule")
+
+    def test_document_type_excel_folder_without_serial_stays_unknown(self):
+        with tempfile.TemporaryDirectory() as td:
+            data_root = Path(td)
+            _write_candidates(data_root, {"program_titles": ["Starlink"]})
+            _write_doc_type_strategies(data_root, _strategy_payload())
+            os.environ["EIDAT_DATA_ROOT"] = str(data_root)
+
+            p = Path(td) / "Starlink" / "Hot Fire Test Data" / "results.xlsx"
+            meta = emd.canonicalize_metadata_for_file(p, existing_meta=None, extracted_meta={}, default_document_type="Unknown")
+            self.assertEqual(meta.get("document_type"), "Unknown")
+            self.assertTrue(bool(meta.get("document_type_review_required")))
+
+    def test_document_type_extension_only_pdf_is_unknown(self):
+        with tempfile.TemporaryDirectory() as td:
+            data_root = Path(td)
+            _write_candidates(data_root, {"program_titles": ["Starlink"]})
+            _write_doc_type_strategies(data_root, _strategy_payload())
+            os.environ["EIDAT_DATA_ROOT"] = str(data_root)
+
+            p = Path(td) / "Starlink" / "SN4001_report.pdf"
+            meta = emd.canonicalize_metadata_for_file(p, existing_meta=None, extracted_meta={}, default_document_type="Unknown")
+            self.assertEqual(meta.get("document_type"), "Unknown")
+            self.assertEqual(meta.get("document_type_reason"), "extension_only_insufficient")
+
+    def test_document_type_mat_is_confirmed_td(self):
+        with tempfile.TemporaryDirectory() as td:
+            data_root = Path(td)
+            _write_candidates(data_root, {"program_titles": ["Starlink"]})
+            _write_doc_type_strategies(data_root, _strategy_payload())
+            os.environ["EIDAT_DATA_ROOT"] = str(data_root)
+
+            p = Path(td) / "Starlink" / "capture.mat"
+            meta = emd.canonicalize_metadata_for_file(p, existing_meta=None, extracted_meta={}, default_document_type="Unknown")
+            self.assertEqual(meta.get("document_type"), "TD")
+            self.assertEqual(meta.get("document_type_reason"), "mat_extension_match")
 
     def test_asset_type_directory_fallback(self):
         with tempfile.TemporaryDirectory() as td:
@@ -230,6 +343,7 @@ class TestStrictMetadataAllowlists(unittest.TestCase):
                     "asset_types": ["Valve", "Pump"],
                 },
             )
+            _write_doc_type_strategies(data_root, _strategy_payload())
             os.environ["EIDAT_DATA_ROOT"] = str(data_root)
 
             p = Path(td) / "Starlink" / "Valve" / "x.pdf"
@@ -246,6 +360,7 @@ class TestStrictMetadataAllowlists(unittest.TestCase):
                     "asset_types": ["Valve", "Pump"],
                 },
             )
+            _write_doc_type_strategies(data_root, _strategy_payload())
             os.environ["EIDAT_DATA_ROOT"] = str(data_root)
 
             p = Path(td) / "Starlink" / "Pump" / "x.pdf"

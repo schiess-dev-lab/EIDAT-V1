@@ -443,6 +443,76 @@ class TestTDSupportWorkbook(unittest.TestCase):
             cond_keys = {str(row.get("condition_key") or "") for row in sequences}
             self.assertEqual(len(cond_keys), 2)
 
+    def test_run_condition_views_group_default_program_rows_by_condition_tuple(self) -> None:
+        from openpyxl import Workbook, load_workbook  # type: ignore
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            wb_path = root / "project.xlsx"
+            Workbook().save(str(wb_path))
+            support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+            be._write_td_support_workbook(
+                support_path,
+                sequence_names=["Seq1", "Seq2"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+                program_titles=["Program A"],
+                sequences_by_program={"Program A": ["Seq1", "Seq2"]},
+            )
+
+            wb = load_workbook(str(support_path))
+            try:
+                ws_programs = wb["Programs"]
+                sheet_a = str(ws_programs.cell(2, 2).value or "").strip()
+                ws_a = wb[sheet_a]
+                for row in (2, 3):
+                    ws_a.cell(row, 3).value = "350 psia, PM, 60 ON / 120 OFF"
+                    ws_a.cell(row, 4).value = 350
+                    ws_a.cell(row, 5).value = "psia"
+                    ws_a.cell(row, 6).value = "PM"
+                    ws_a.cell(row, 7).value = 60
+                    ws_a.cell(row, 8).value = 120
+                wb.save(str(support_path))
+            finally:
+                wb.close()
+
+            support_cfg = be._read_td_support_workbook(wb_path, project_dir=root)
+            run_conditions = support_cfg.get("run_conditions") or []
+            self.assertEqual(len(run_conditions), 1)
+            condition_key = str(run_conditions[0].get("condition_key") or "").strip()
+            self.assertTrue(condition_key)
+
+            db_path = root / "implementation_trending.sqlite3"
+            with sqlite3.connect(str(db_path)) as conn:
+                be._ensure_test_data_impl_tables(conn)
+                conn.execute(
+                    "INSERT OR REPLACE INTO td_runs(run_name, default_x, display_name, run_type, control_period, pulse_width) VALUES (?, ?, ?, ?, ?, ?)",
+                    (condition_key, "Time", "350 psia, PM, 60 ON / 120 OFF", "PM", 120, 60),
+                )
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO td_condition_observations
+                    (observation_id, serial, run_name, program_title, source_run_name, run_type, pulse_width, control_period, source_mtime_ns, computed_epoch_ns)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    ("SN1__Seq1", "SN1", condition_key, "Program A", "Seq1", "PM", 60, 120, 0, 0),
+                )
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO td_condition_observations
+                    (observation_id, serial, run_name, program_title, source_run_name, run_type, pulse_width, control_period, source_mtime_ns, computed_epoch_ns)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    ("SN2__Seq2", "SN2", condition_key, "Program A", "Seq2", "PM", 60, 120, 0, 0),
+                )
+                conn.commit()
+
+            views = be.td_list_run_selection_views(db_path, wb_path, project_dir=root)
+            cond_items = views.get("condition") or []
+            self.assertEqual(len(cond_items), 1)
+            self.assertEqual(cond_items[0].get("run_name"), condition_key)
+            self.assertEqual(cond_items[0].get("member_sequences"), ["Seq1", "Seq2"])
+
     def test_rebuild_new_schema_aggregates_across_programs_and_skips_disabled_rows(self) -> None:
         from openpyxl import load_workbook  # type: ignore
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
@@ -1694,6 +1764,246 @@ class TestTDSupportWorkbook(unittest.TestCase):
             with sqlite3.connect(str(out_db)) as conn:
                 row = conn.execute("SELECT vendor FROM td_source_metadata WHERE serial=?", ("SN1",)).fetchone()
                 self.assertEqual(row[0], "Vendor B")
+
+    def test_cache_rebuild_prefers_active_node_sources_and_heals_stale_links(self) -> None:
+        from openpyxl import load_workbook  # type: ignore
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            current_support = root / "EIDAT" / "EIDAT Support"
+            art_dir = current_support / "debug" / "ocr" / "SN1"
+            art_dir.mkdir(parents=True, exist_ok=True)
+            current_src = art_dir / "source_current.sqlite3"
+            self._make_source_sqlite(current_src)
+            with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as old_td:
+                old_root = Path(old_td)
+                old_art_dir = old_root / "EIDAT Support" / "debug" / "ocr" / "SN1"
+                old_art_dir.mkdir(parents=True, exist_ok=True)
+                old_src = old_art_dir / "source_old.sqlite3"
+                self._make_source_sqlite(old_src)
+
+                wb_path = root / "project.xlsx"
+                be._write_test_data_trending_workbook(
+                    wb_path,
+                    global_repo=root,
+                    serials=["SN1"],
+                    docs=[
+                        {
+                            "serial_number": "SN1",
+                            "excel_sqlite_rel": "",
+                            "artifacts_rel": str(art_dir.relative_to(current_support)),
+                            "document_type": "TD",
+                        }
+                    ],
+                    config=self._make_config(),
+                )
+                wb = load_workbook(str(wb_path))
+                try:
+                    ws = wb["Sources"]
+                    headers = {
+                        str(ws.cell(1, c).value or "").strip().lower(): c
+                        for c in range(1, (ws.max_column or 0) + 1)
+                    }
+                    ws.cell(2, headers["excel_sqlite_rel"]).value = str(old_src)
+                    wb.save(str(wb_path))
+                finally:
+                    wb.close()
+
+                support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+                be._write_td_support_workbook(
+                    support_path,
+                    sequence_names=["RunA"],
+                    param_defs=[{"name": "thrust", "units": "lbf"}],
+                )
+
+                db_path = be.ensure_test_data_project_cache(root, wb_path, rebuild=True)
+                expected_rel = "EIDAT\\EIDAT Support\\debug\\ocr\\SN1\\source_current.sqlite3"
+
+                with sqlite3.connect(str(db_path)) as conn:
+                    row = conn.execute("SELECT sqlite_path FROM td_sources WHERE serial=?", ("SN1",)).fetchone()
+                    self.assertEqual(str(row[0] or ""), str(current_src))
+                    meta = conn.execute(
+                        "SELECT excel_sqlite_rel FROM td_source_metadata WHERE serial=?",
+                        ("SN1",),
+                    ).fetchone()
+                    self.assertEqual(str(meta[0] or ""), expected_rel)
+
+                wb = load_workbook(str(wb_path), read_only=True, data_only=True)
+                try:
+                    ws = wb["Sources"]
+                    headers = {
+                        str(ws.cell(1, c).value or "").strip().lower(): c
+                        for c in range(1, (ws.max_column or 0) + 1)
+                    }
+                    self.assertEqual(str(ws.cell(2, headers["excel_sqlite_rel"]).value or ""), expected_rel)
+                finally:
+                    wb.close()
+
+    def test_cache_rebuild_forces_refresh_when_cached_workbook_context_mismatches(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            old_src = root / "old_source.sqlite3"
+            new_src = root / "new_source.sqlite3"
+            self._make_source_sqlite(old_src)
+            self._make_source_sqlite(new_src)
+
+            old_wb = root / "old_project.xlsx"
+            be._write_test_data_trending_workbook(
+                old_wb,
+                global_repo=root,
+                serials=["SN1"],
+                docs=[{"serial_number": "SN1", "excel_sqlite_rel": str(old_src)}],
+                config=self._make_config(),
+            )
+            old_support = be.td_support_workbook_path_for(old_wb, project_dir=root)
+            be._write_td_support_workbook(
+                old_support,
+                sequence_names=["RunA"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+            )
+            be.ensure_test_data_project_cache(root, old_wb, rebuild=True)
+
+            new_wb = root / "new_project.xlsx"
+            be._write_test_data_trending_workbook(
+                new_wb,
+                global_repo=root,
+                serials=["SN1"],
+                docs=[{"serial_number": "SN1", "excel_sqlite_rel": str(new_src)}],
+                config=self._make_config(),
+            )
+            new_support = be.td_support_workbook_path_for(new_wb, project_dir=root)
+            be._write_td_support_workbook(
+                new_support,
+                sequence_names=["RunA"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+            )
+
+            db_path = be.ensure_test_data_project_cache(root, new_wb)
+            with sqlite3.connect(str(db_path)) as conn:
+                meta = {
+                    str(k or ""): str(v or "")
+                    for k, v in conn.execute(
+                        "SELECT key, value FROM td_meta WHERE key IN ('workbook_path', 'node_root')"
+                    ).fetchall()
+                }
+                self.assertEqual(meta.get("workbook_path"), str(new_wb))
+                self.assertEqual(meta.get("node_root"), str(root))
+                row = conn.execute("SELECT sqlite_path FROM td_sources WHERE serial=?", ("SN1",)).fetchone()
+                self.assertEqual(str(row[0] or ""), str(new_src))
+
+    def test_cache_rebuild_recovers_blank_source_link_from_artifacts_and_stays_stable(self) -> None:
+        from openpyxl import load_workbook  # type: ignore
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            current_support = root / "EIDAT" / "EIDAT Support"
+            art_dir = current_support / "debug" / "ocr" / "SN1"
+            art_dir.mkdir(parents=True, exist_ok=True)
+            current_src = art_dir / "source_current.sqlite3"
+            self._make_source_sqlite(current_src)
+
+            wb_path = root / "project.xlsx"
+            be._write_test_data_trending_workbook(
+                wb_path,
+                global_repo=root,
+                serials=["SN1"],
+                docs=[
+                    {
+                        "serial_number": "SN1",
+                        "excel_sqlite_rel": "",
+                        "artifacts_rel": str(art_dir.relative_to(current_support)),
+                        "document_type": "TD",
+                    }
+                ],
+                config=self._make_config(),
+            )
+            wb = load_workbook(str(wb_path))
+            try:
+                ws = wb["Sources"]
+                headers = {
+                    str(ws.cell(1, c).value or "").strip().lower(): c
+                    for c in range(1, (ws.max_column or 0) + 1)
+                }
+                ws.cell(2, headers["excel_sqlite_rel"]).value = ""
+                wb.save(str(wb_path))
+            finally:
+                wb.close()
+
+            support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+            be._write_td_support_workbook(
+                support_path,
+                sequence_names=["RunA"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+            )
+
+            db_path = be.ensure_test_data_project_cache(root, wb_path, rebuild=True)
+            db_path_2 = be.ensure_test_data_project_cache(root, wb_path)
+            self.assertEqual(str(db_path), str(db_path_2))
+
+            with sqlite3.connect(str(db_path)) as conn:
+                row = conn.execute("SELECT sqlite_path FROM td_sources WHERE serial=?", ("SN1",)).fetchone()
+                self.assertEqual(str(row[0] or ""), str(current_src))
+
+            wb = load_workbook(str(wb_path), read_only=True, data_only=True)
+            try:
+                ws = wb["Sources"]
+                headers = {
+                    str(ws.cell(1, c).value or "").strip().lower(): c
+                    for c in range(1, (ws.max_column or 0) + 1)
+                }
+                healed = str(ws.cell(2, headers["excel_sqlite_rel"]).value or "")
+                self.assertEqual(healed, "EIDAT\\EIDAT Support\\debug\\ocr\\SN1\\source_current.sqlite3")
+            finally:
+                wb.close()
+
+    def test_cache_rebuild_fails_clearly_when_no_valid_sources_resolve(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as old_td:
+                old_root = Path(old_td)
+                old_src = old_root / "source_old.sqlite3"
+                self._make_source_sqlite(old_src)
+
+                current_support = root / "EIDAT" / "EIDAT Support"
+                current_support.mkdir(parents=True, exist_ok=True)
+
+                wb_path = root / "project.xlsx"
+                be._write_test_data_trending_workbook(
+                    wb_path,
+                    global_repo=root,
+                    serials=["SN1"],
+                    docs=[
+                        {
+                            "serial_number": "SN1",
+                            "excel_sqlite_rel": str(old_src),
+                            "artifacts_rel": "debug/ocr/SN1",
+                            "document_type": "TD",
+                        }
+                    ],
+                    config=self._make_config(),
+                )
+                support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+                be._write_td_support_workbook(
+                    support_path,
+                    sequence_names=["RunA"],
+                    param_defs=[{"name": "thrust", "units": "lbf"}],
+                )
+
+                with self.assertRaisesRegex(RuntimeError, "Sources sheet"):
+                    be.ensure_test_data_project_cache(root, wb_path, rebuild=True)
+
+                debug_path = root / be.TD_CACHE_DEBUG_JSON
+                self.assertTrue(debug_path.exists())
+                payload = json.loads(debug_path.read_text(encoding="utf-8"))
+                self.assertEqual(int((payload.get("counts") or {}).get("valid_sources") or 0), 0)
+                reason = str(((payload.get("sources") or [{}])[0]).get("reason") or "")
+                self.assertIn("outside the active node root", reason)
 
     def test_rebuild_purges_legacy_raw_tables_from_implementation_db(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore

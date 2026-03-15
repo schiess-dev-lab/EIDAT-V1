@@ -1379,7 +1379,18 @@ def generate_test_data_auto_report(
         run_rows = _td_list_runs(conn)
         run_by_name = {str(r.get("run_name") or "").strip(): r for r in (run_rows or []) if str(r.get("run_name") or "").strip()}
 
+        if not all_serials:
+            raise RuntimeError(
+                "Auto Report found no usable Test Data sources in the current project cache. "
+                "Build / Refresh Cache again and verify the workbook Sources sheet points at the active node path."
+            )
+
         runs = _resolve_selected_runs(run_rows, options)
+        if not runs:
+            raise RuntimeError(
+                "Auto Report found no usable Test Data runs in the current project cache. "
+                "Build / Refresh Cache again and verify TD source resolution for this project."
+            )
 
         excel_cols = excel_cfg.get("columns") or []
         excel_names = {
@@ -1389,6 +1400,11 @@ def generate_test_data_auto_report(
         }
 
         params = _resolve_selected_params(conn, runs=runs, options=options)
+        if not params:
+            raise RuntimeError(
+                "Auto Report found no reportable Test Data parameters in the current project cache. "
+                "Check the workbook Sources sheet, cache diagnostics, and configured TD columns."
+            )
 
         params_norm = {_norm_key(p) for p in params if p}
         hi = [s for s in highlighted_serials if s in all_serials]

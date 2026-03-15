@@ -23,6 +23,11 @@ ALLOWED_KEYS = {
     "acceptance_test_plan_number",
     "excel_sqlite_rel",
     "file_extension",
+    "document_type_status",
+    "document_type_source",
+    "document_type_reason",
+    "document_type_evidence",
+    "document_type_review_required",
 }
 
 DEFAULT_CANDIDATES = {
@@ -56,9 +61,55 @@ DEFAULT_CANDIDATES = {
     # Back-compat: this can be a list[str] or list[{"name","acronym","aliases"}]
     "document_types": [
         {"name": "End Item Data Package", "acronym": "EIDP", "aliases": ["EIDP", "End Item Data Package", "End-Item Data Package"]},
-        {"name": "Data file", "acronym": "DATA", "aliases": ["DATA", "Data file", "Excel file data", "Spreadsheet", "Excel"]},
-        {"name": "Test Data", "acronym": "TD", "aliases": ["TD", "Test Data", "Test-Data", "TestData"]},
+        {"name": "Test Data", "acronym": "TD", "aliases": ["TD", "Test Data", "Test-Data", "TestData", "Hot Fire Test", "Hot Fire Test Data", "Hotfire Test Data"]},
     ],
+}
+
+DEFAULT_DOCUMENT_TYPE_STRATEGIES = {
+    "version": 1,
+    "document_types": [
+        {"name": "End Item Data Package", "acronym": "EIDP"},
+        {"name": "Test Data", "acronym": "TD"},
+    ],
+    "filename_aliases": {
+        "EIDP": ["EIDP", "End Item Data Package", "End-Item Data Package"],
+        "TD": ["TD", "Test Data", "Test-Data", "TestData", "Hot Fire Test", "Hot Fire Test Data", "Hotfire Test Data"],
+    },
+    "content_aliases": {
+        "EIDP": ["EIDP", "End Item Data Package", "End-Item Data Package"],
+        "TD": ["TD", "Test Data", "Test-Data", "TestData", "Hot Fire Test", "Hot Fire Test Data", "Hotfire Test Data"],
+    },
+    "extension_rules": {
+        "EIDP": [".pdf"],
+        "TD": [".xlsx", ".xls", ".xlsm", ".mat"],
+    },
+    "folder_rules": {
+        "levels": 3,
+        "aliases": {
+            "EIDP": ["EIDP", "End Item Data Package", "End-Item Data Package"],
+            "TD": ["TD", "Test Data", "Test-Data", "TestData", "Hot Fire Test", "Hot Fire Test Data", "Hotfire Test Data"],
+        },
+    },
+    "serial_patterns": [
+        "(?i)\\bSN[-_ ]?[A-Z0-9]+(?:[-_][A-Z0-9]+)*\\b",
+    ],
+    "ranker": {
+        "weights": {
+            "content": 5,
+            "folder": 3,
+            "extension_compatible": 1,
+            "serial_bonus": 2,
+        },
+        "min_score": 4,
+        "conflict_gap": 2,
+    },
+    "special_cases": {
+        "td_folder_serial_rule": {
+            "enabled": True,
+            "compatible_extensions": [".xlsx", ".xls", ".xlsm", ".mat"],
+            "require_serial_in_filename": True,
+        },
+    },
 }
 
 LABEL_ALIASES = {
@@ -497,26 +548,6 @@ def _infer_doc_type_from_path_strict(path: Optional[Path], entries: list[dict], 
     return doc_type, acr
 
 
-def _doc_type_default_if_allowlisted(entries: list[dict], *, is_excel: bool) -> tuple[str | None, str | None]:
-    """
-    Default doc types:
-      - PDFs -> EIDP
-      - Excel -> DATA
-    Only if a matching entry exists in allowlisted document_types.
-    """
-    want = "DATA" if is_excel else "EIDP"
-    for e in entries:
-        name = str(e.get("name") or "").strip() or ""
-        acr = str(e.get("acronym") or "").strip() or ""
-        doc_type = (acr or name).strip()
-        if not doc_type:
-            continue
-        if doc_type.strip().upper() == want:
-            return doc_type, (acr or doc_type)
-    # Also allow matching by name normalization (e.g., "Data file" name w/ acronym DATA should have been caught above).
-    return None, None
-
-
 def canonicalize_metadata_for_file(
     abs_path: Path,
     *,
@@ -540,7 +571,7 @@ def canonicalize_metadata_for_file(
     extracted = extracted_meta if isinstance(extracted_meta, dict) else {}
 
     if default_document_type is None:
-        default_document_type = "Data file" if is_excel else "EIDP"
+        default_document_type = "Unknown"
 
     candidates = _load_candidates()
     cand = candidates if isinstance(candidates, dict) else {}
@@ -550,7 +581,7 @@ def canonicalize_metadata_for_file(
     vendor_entries = _iter_named_alias_entries(cand.get("vendors") or [])
     asset_type_entries = _iter_named_alias_entries(cand.get("asset_types") or [])
     asset_specific_entries = _iter_named_alias_entries(cand.get("asset_specific_types") or [])
-    doc_type_entries = _iter_doc_type_entries(cand.get("document_types") or [])
+    strategy = _load_document_type_strategies()
 
     derived: dict[str, object] = {}
     derived["file_extension"] = ext or "Unknown"
@@ -654,26 +685,16 @@ def canonicalize_metadata_for_file(
     merged["part_number"] = _strict(pn_entries, "part_number")
     merged["acceptance_test_plan_number"] = _strict(atp_entries, "acceptance_test_plan_number")
 
-    # Document type: existing -> extracted -> filename -> folders -> extension default (if allowlisted) -> Unknown
-    dt: str | None = None
-    acr: str | None = None
+    doc_type_meta = None
     for src in (existing, extracted):
-        blob = "\n".join([_as_clean_str(src.get("document_type")), _as_clean_str(src.get("document_type_acronym"))]).strip()
-        if not blob:
-            continue
-        dt, acr = _best_doc_type_match_in_blob(blob, doc_type_entries)
-        if dt:
+        doc_type_meta = _doc_type_payload_from_meta(src, strategy)
+        if doc_type_meta is not None:
             break
-    if not dt:
-        dt, acr = _best_doc_type_match_in_blob(filename_blob, doc_type_entries)
-    if not dt:
-        dt, acr = _infer_doc_type_from_path_strict(p, doc_type_entries, max_levels=5)
-    if not dt:
-        dt, acr = _doc_type_default_if_allowlisted(doc_type_entries, is_excel=is_excel)
-    merged["document_type"] = dt or "Unknown"
-    merged["document_type_acronym"] = (acr or dt) if dt else "Unknown"
+    if doc_type_meta is None:
+        doc_type_meta = identify_document_type(p)
+    merged.update(doc_type_meta)
 
-    # Fill common keys with Unknown so JSON and index consumers are stable.
+    # Fill string keys with Unknown so JSON and index consumers are stable.
     for k in [
         "program_title",
         "asset_type",
@@ -699,12 +720,12 @@ def canonicalize_metadata_for_file(
             merged["excel_sqlite_rel"] = v
             break
 
-    return sanitize_metadata(merged, default_document_type=str(default_document_type or "").strip() or ("Data file" if is_excel else "EIDP"))
+    return sanitize_metadata(merged, default_document_type=str(default_document_type or "").strip() or "Unknown")
 
 
-def sanitize_metadata(raw: Any, *, default_document_type: str = "EIDP") -> dict:
+def sanitize_metadata(raw: Any, *, default_document_type: str = "Unknown") -> dict:
     if not isinstance(raw, dict):
-        return {"document_type": default_document_type}
+        return _doc_type_payload(_coerce_doc_type_code(default_document_type, _load_document_type_strategies()), status="unknown", source="sanitize", reason="no_match")
     cleaned = {}
     for k, v in raw.items():
         key = str(k)
@@ -727,7 +748,7 @@ def sanitize_metadata(raw: Any, *, default_document_type: str = "EIDP") -> dict:
     vendor_entries = _iter_named_alias_entries(cand.get("vendors") or [])
     asset_type_entries = _iter_named_alias_entries(cand.get("asset_types") or [])
     asset_specific_entries = _iter_named_alias_entries(cand.get("asset_specific_types") or [])
-    doc_type_entries = _iter_doc_type_entries(cand.get("document_types") or [])
+    strategy = _load_document_type_strategies()
 
     def _enforce(field: str, entries: list[dict]) -> None:
         if field not in cleaned:
@@ -745,13 +766,11 @@ def sanitize_metadata(raw: Any, *, default_document_type: str = "EIDP") -> dict:
     _enforce("part_number", pn_entries)
     _enforce("acceptance_test_plan_number", atp_entries)
 
-    # Document type enforcement.
-    dt_blob = "\n".join([_as_clean_str(cleaned.get("document_type")), _as_clean_str(cleaned.get("document_type_acronym"))]).strip()
-    dt, acr = _best_doc_type_match_in_blob(dt_blob, doc_type_entries) if dt_blob else (None, None)
-    if not dt and default_document_type:
-        dt, acr = _best_doc_type_match_in_blob(str(default_document_type), doc_type_entries)
-    cleaned["document_type"] = dt or "Unknown"
-    cleaned["document_type_acronym"] = (acr or dt) if dt else "Unknown"
+    carried = _doc_type_payload_from_meta(cleaned, strategy)
+    if carried is None:
+        dt = _coerce_doc_type_code(default_document_type, strategy)
+        carried = _doc_type_payload(dt, status="unknown", source="sanitize", reason="no_match")
+    cleaned.update(carried)
     return cleaned
 
 
@@ -819,6 +838,298 @@ def _iter_doc_type_entries(raw: Any) -> list[dict]:
         if name:
             out.append({"name": name, "acronym": acronym, "aliases": alias_list})
     return out
+
+
+def _doc_type_aliases_for(strategy: dict, doc_type: str, *, key: str) -> list[str]:
+    raw = strategy.get(key) if isinstance(strategy, dict) else None
+    if isinstance(raw, dict):
+        vals = raw.get(doc_type)
+        if isinstance(vals, list):
+            out = [str(v).strip() for v in vals if str(v).strip()]
+            if out:
+                return out
+    for entry in _iter_doc_type_entries(strategy.get("document_types") if isinstance(strategy, dict) else []):
+        acr = str(entry.get("acronym") or "").strip().upper()
+        if acr != str(doc_type or "").strip().upper():
+            continue
+        vals = [str(v).strip() for v in (entry.get("aliases") or []) if str(v).strip()]
+        name = str(entry.get("name") or "").strip()
+        if name:
+            vals.append(name)
+        if acr:
+            vals.append(acr)
+        return _dedupe_strings(vals)
+    return []
+
+
+def _doc_type_exts_for(strategy: dict, doc_type: str) -> set[str]:
+    raw = strategy.get("extension_rules") if isinstance(strategy, dict) else None
+    if not isinstance(raw, dict):
+        return set()
+    vals = raw.get(doc_type)
+    if not isinstance(vals, list):
+        return set()
+    return {str(v or "").strip().lower() for v in vals if str(v or "").strip()}
+
+
+def _match_alias_in_blob(blob: str, aliases: list[str]) -> str | None:
+    if not blob or not aliases:
+        return None
+    blob_norm = _norm_alnum_spaces(blob)
+    if not blob_norm:
+        return None
+    blob_pad = f" {blob_norm} "
+    best: tuple[int, str] | None = None
+    for alias in aliases:
+        alias_norm = _norm_alnum_spaces(alias)
+        if not alias_norm:
+            continue
+        if f" {alias_norm} " not in blob_pad:
+            continue
+        score = len(alias_norm)
+        if best is None or score > best[0]:
+            best = (score, str(alias).strip())
+    return best[1] if best else None
+
+
+def _top_blob(text: str, *, max_lines: int = 120) -> str:
+    if not text:
+        return ""
+    lines = [str(ln or "").strip() for ln in str(text).splitlines()]
+    out: list[str] = []
+    for line in lines:
+        if not line:
+            continue
+        out.append(line)
+        if len(out) >= int(max_lines):
+            break
+    return "\n".join(out)
+
+
+def _folder_blob(path: Path, *, levels: int) -> str:
+    parts: list[str] = []
+    cur = Path(path).expanduser().parent
+    for _ in range(max(0, int(levels))):
+        try:
+            name = str(cur.name or "").strip()
+        except Exception:
+            name = ""
+        if name:
+            parts.append(name)
+        try:
+            if cur.parent == cur:
+                break
+            cur = cur.parent
+        except Exception:
+            break
+    return "\n".join(parts)
+
+
+def _filename_matches_serial_patterns(filename: str, strategy: dict) -> str | None:
+    pats = strategy.get("serial_patterns") if isinstance(strategy, dict) else None
+    if not isinstance(pats, list):
+        return None
+    for pat in pats:
+        ptxt = str(pat or "").strip()
+        if not ptxt:
+            continue
+        try:
+            m = re.search(ptxt, filename or "")
+        except Exception:
+            continue
+        if m:
+            return str(m.group(0) or "").strip()
+    return None
+
+
+def _coerce_doc_type_code(value: object, strategy: dict) -> str | None:
+    text = str(value or "").strip()
+    if not text or text.casefold() == "unknown":
+        return None
+    for entry in _iter_doc_type_entries(strategy.get("document_types") if isinstance(strategy, dict) else []):
+        acr = str(entry.get("acronym") or "").strip()
+        name = str(entry.get("name") or "").strip()
+        aliases = [str(v).strip() for v in (entry.get("aliases") or []) if str(v).strip()]
+        aliases.extend([name, acr])
+        hit = _match_alias_in_blob(text, aliases)
+        if hit:
+            return (acr or name or "").strip() or None
+    return None
+
+
+def _doc_type_payload(
+    doc_type: str | None,
+    *,
+    status: str,
+    source: str,
+    reason: str,
+    evidence: list[dict[str, Any]] | None = None,
+    review_required: bool | None = None,
+) -> dict[str, Any]:
+    code = str(doc_type or "").strip().upper()
+    if code not in {"EIDP", "TD"}:
+        code = "Unknown"
+    if review_required is None:
+        review_required = status != "confirmed"
+    return {
+        "document_type": code,
+        "document_type_acronym": code,
+        "document_type_status": str(status or "").strip() or "unknown",
+        "document_type_source": str(source or "").strip() or "unknown",
+        "document_type_reason": str(reason or "").strip() or "no_match",
+        "document_type_evidence": list(evidence or []),
+        "document_type_review_required": bool(review_required),
+    }
+
+
+def _doc_type_payload_from_meta(meta: Any, strategy: dict) -> dict[str, Any] | None:
+    if not isinstance(meta, dict):
+        return None
+    code = _coerce_doc_type_code(meta.get("document_type_acronym") or meta.get("document_type"), strategy)
+    status = str(meta.get("document_type_status") or "").strip().lower()
+    source = str(meta.get("document_type_source") or "").strip()
+    reason = str(meta.get("document_type_reason") or "").strip()
+    evidence = meta.get("document_type_evidence")
+    review_required = meta.get("document_type_review_required")
+    if status in {"confirmed", "ambiguous", "unknown"}:
+        if not isinstance(evidence, list):
+            evidence = []
+        return _doc_type_payload(
+            code,
+            status=status,
+            source=source or "metadata",
+            reason=reason or "metadata_carried",
+            evidence=[e for e in evidence if isinstance(e, dict)],
+            review_required=bool(review_required) if isinstance(review_required, bool) else (status != "confirmed"),
+        )
+    if code:
+        return _doc_type_payload(
+            code,
+            status="confirmed",
+            source="metadata",
+            reason="metadata_carried",
+            evidence=[],
+            review_required=False,
+        )
+    return None
+
+
+def identify_document_type(
+    abs_path: Path,
+    *,
+    text_blob: str | None = None,
+    workbook_blob: str | None = None,
+) -> dict[str, Any]:
+    p = Path(abs_path).expanduser()
+    ext = str(p.suffix or "").lower()
+    strategy = _load_document_type_strategies()
+    types = [str(e.get("acronym") or e.get("name") or "").strip().upper() for e in _iter_doc_type_entries(strategy.get("document_types") or [])]
+    types = [t for t in types if t in {"EIDP", "TD"}]
+    if not types:
+        types = ["EIDP", "TD"]
+
+    filename_blob = "\n".join([str(p.stem or ""), str(p.name or ""), re.sub(r"[_\\-]+", " ", str(p.stem or ""))]).strip()
+    content_blob = _top_blob(workbook_blob or text_blob or "")
+    folder_cfg = strategy.get("folder_rules") if isinstance(strategy, dict) else {}
+    folder_levels = int(folder_cfg.get("levels") or 3) if isinstance(folder_cfg, dict) else 3
+    folder_blob = _folder_blob(p, levels=folder_levels)
+    serial_match = _filename_matches_serial_patterns(str(p.name or ""), strategy)
+
+    evidence: list[dict[str, Any]] = []
+    filename_hits: dict[str, str] = {}
+    content_hits: dict[str, str] = {}
+    folder_hits: dict[str, str] = {}
+    compatible: dict[str, bool] = {}
+    scores: dict[str, int] = {}
+
+    ranker = strategy.get("ranker") if isinstance(strategy, dict) else {}
+    weights = ranker.get("weights") if isinstance(ranker, dict) else {}
+    weight_content = int(weights.get("content") or 5)
+    weight_folder = int(weights.get("folder") or 3)
+    weight_ext = int(weights.get("extension_compatible") or 1)
+    weight_serial = int(weights.get("serial_bonus") or 2)
+    min_score = int(ranker.get("min_score") or 4)
+    conflict_gap = int(ranker.get("conflict_gap") or 2)
+
+    for doc_type in types:
+        compatible[doc_type] = ext in _doc_type_exts_for(strategy, doc_type)
+        scores[doc_type] = weight_ext if compatible[doc_type] else 0
+
+        fn_alias = _match_alias_in_blob(filename_blob, _doc_type_aliases_for(strategy, doc_type, key="filename_aliases"))
+        if fn_alias:
+            filename_hits[doc_type] = fn_alias
+            evidence.append({"kind": "filename", "doc_type": doc_type, "value": fn_alias})
+
+        content_alias = _match_alias_in_blob(content_blob, _doc_type_aliases_for(strategy, doc_type, key="content_aliases"))
+        if content_alias:
+            content_hits[doc_type] = content_alias
+            scores[doc_type] += weight_content
+            evidence.append({"kind": "content", "doc_type": doc_type, "value": content_alias})
+
+        folder_alias = _match_alias_in_blob(folder_blob, _doc_type_aliases_for(strategy, doc_type, key="content_aliases"))
+        if not folder_alias:
+            folder_raw = folder_cfg.get("aliases") if isinstance(folder_cfg, dict) else {}
+            if isinstance(folder_raw, dict):
+                folder_alias = _match_alias_in_blob(folder_blob, [str(v).strip() for v in (folder_raw.get(doc_type) or []) if str(v).strip()])
+        if folder_alias:
+            folder_hits[doc_type] = folder_alias
+            scores[doc_type] += weight_folder
+            evidence.append({"kind": "folder", "doc_type": doc_type, "value": folder_alias})
+
+    td_special = False
+    special_cases = strategy.get("special_cases") if isinstance(strategy, dict) else {}
+    td_rule = special_cases.get("td_folder_serial_rule") if isinstance(special_cases, dict) else {}
+    if isinstance(td_rule, dict) and str(td_rule.get("enabled") or "1").strip().lower() not in {"0", "false", "no"}:
+        td_exts = {str(v or "").strip().lower() for v in (td_rule.get("compatible_extensions") or []) if str(v or "").strip()}
+        require_serial = bool(td_rule.get("require_serial_in_filename", True))
+        if ext in td_exts and "TD" in folder_hits and (serial_match or not require_serial):
+            td_special = True
+            scores["TD"] = max(scores.get("TD", 0), min_score + weight_serial)
+            evidence.append({"kind": "special_case", "doc_type": "TD", "value": "folder_serial_rule", "serial": serial_match or ""})
+
+    if ext == ".mat":
+        if "EIDP" in filename_hits or "EIDP" in content_hits or "EIDP" in folder_hits:
+            return _doc_type_payload(None, status="ambiguous", source="ranker", reason="signal_conflict", evidence=evidence, review_required=True)
+        evidence.append({"kind": "extension", "doc_type": "TD", "value": ".mat"})
+        return _doc_type_payload("TD", status="confirmed", source="ranker", reason="mat_extension_match", evidence=evidence, review_required=False)
+
+    filename_types = [doc_type for doc_type in types if doc_type in filename_hits]
+    if len(filename_types) > 1:
+        return _doc_type_payload(None, status="ambiguous", source="filename", reason="signal_conflict", evidence=evidence, review_required=True)
+    if len(filename_types) == 1:
+        chosen = filename_types[0]
+        conflicts = [t for t in types if t != chosen and (t in content_hits or t in folder_hits or (t == "TD" and td_special))]
+        if not compatible.get(chosen, False) or conflicts:
+            return _doc_type_payload(None, status="ambiguous", source="filename", reason="signal_conflict", evidence=evidence, review_required=True)
+        return _doc_type_payload(chosen, status="confirmed", source="filename", reason="filename_match", evidence=evidence, review_required=False)
+
+    ranked = sorted(((score, doc_type) for doc_type, score in scores.items()), reverse=True)
+    best_score, best_type = ranked[0] if ranked else (0, "")
+    second_score = ranked[1][0] if len(ranked) > 1 else 0
+
+    strong_types = {doc_type for doc_type in types if doc_type in content_hits}
+    if td_special:
+        strong_types.add("TD")
+    if len(strong_types) > 1:
+        return _doc_type_payload(None, status="ambiguous", source="ranker", reason="signal_conflict", evidence=evidence, review_required=True)
+
+    td_exts_all = _doc_type_exts_for(strategy, "TD")
+    if best_type == "TD" and ext in td_exts_all and "TD" in folder_hits and not td_special and "TD" not in content_hits:
+        return _doc_type_payload(None, status="unknown", source="ranker", reason="no_match", evidence=evidence, review_required=True)
+
+    if best_type and best_score >= min_score:
+        if second_score and (best_score - second_score) < conflict_gap:
+            return _doc_type_payload(None, status="ambiguous", source="ranker", reason="signal_conflict", evidence=evidence, review_required=True)
+        if best_type == "TD" and td_special:
+            return _doc_type_payload("TD", status="confirmed", source="ranker", reason="folder_serial_rule", evidence=evidence, review_required=False)
+        if best_type in content_hits:
+            return _doc_type_payload(best_type, status="confirmed", source="ranker", reason="content_match", evidence=evidence, review_required=False)
+        if best_type in folder_hits:
+            return _doc_type_payload(best_type, status="confirmed", source="ranker", reason="folder_match", evidence=evidence, review_required=False)
+
+    if any(compatible.values()):
+        return _doc_type_payload(None, status="unknown", source="ranker", reason="extension_only_insufficient", evidence=evidence, review_required=True)
+    return _doc_type_payload(None, status="unknown", source="ranker", reason="no_match", evidence=evidence, review_required=True)
 
 
 def _pick_document_type(text: str, entries: list[dict]) -> tuple[Optional[str], Optional[str]]:
@@ -913,11 +1224,10 @@ def derive_minimal_metadata(core: Any, pdf_path: Path) -> dict:
         "revision": "Unknown",
         "test_date": "Unknown",
         "report_date": "Unknown",
-        "document_type": "EIDP",
-        "document_type_acronym": "EIDP",
         "vendor": "Unknown",
         "acceptance_test_plan_number": "Unknown",
     }
+    meta.update(identify_document_type(pdf_path))
     return meta
 
 
@@ -1085,6 +1395,46 @@ def _load_candidates() -> dict:
     return DEFAULT_CANDIDATES
 
 
+def _resolve_user_inputs_path(name: str) -> Path:
+    repo_root = Path(__file__).resolve().parents[2]
+    cand_paths: list[Path] = []
+    raw_data_root = (os.environ.get("EIDAT_DATA_ROOT") or "").strip()
+    if raw_data_root:
+        try:
+            data_root = Path(raw_data_root).expanduser()
+            if not data_root.is_absolute():
+                data_root = (repo_root / data_root).resolve()
+            cand_paths.append(data_root / "user_inputs" / str(name))
+        except Exception:
+            pass
+    cand_paths.append(repo_root / "user_inputs" / str(name))
+    for path in cand_paths:
+        try:
+            if path.exists():
+                return path
+        except Exception:
+            continue
+    return cand_paths[-1]
+
+
+def _load_document_type_strategies() -> dict:
+    path = _resolve_user_inputs_path("document_type_strategies.json")
+    try:
+        if path.exists():
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                merged = dict(DEFAULT_DOCUMENT_TYPE_STRATEGIES)
+                for key, value in raw.items():
+                    if key in {"filename_aliases", "content_aliases", "extension_rules", "serial_patterns", "document_types", "special_cases", "ranker", "folder_rules"}:
+                        merged[key] = value
+                    else:
+                        merged[key] = value
+                return merged
+    except Exception:
+        pass
+    return dict(DEFAULT_DOCUMENT_TYPE_STRATEGIES)
+
+
 def _match_from_list(value: str, candidates: list[str]) -> Optional[str]:
     if not value or not candidates:
         return None
@@ -1213,8 +1563,6 @@ def extract_metadata_from_text(text: str, *, asset_types: Optional[list[str]] = 
     vendor_entries = _iter_named_alias_entries(cand.get("vendors") or [])
     asset_type_entries = _iter_named_alias_entries(asset_types if asset_types is not None else (cand.get("asset_types") or []))
     asset_specific_entries = _iter_named_alias_entries(cand.get("asset_specific_types") or [])
-    doc_type_entries = _iter_doc_type_entries(cand.get("document_types") or [])
-
     meta: dict[str, Optional[str]] = {
         "program_title": None,
         "asset_type": None,
@@ -1226,6 +1574,10 @@ def extract_metadata_from_text(text: str, *, asset_types: Optional[list[str]] = 
         "report_date": None,
         "document_type": None,
         "document_type_acronym": None,
+        "document_type_status": None,
+        "document_type_source": None,
+        "document_type_reason": None,
+        "document_type_review_required": None,
         "vendor": None,
         "acceptance_test_plan_number": None,
     }
@@ -1281,32 +1633,18 @@ def extract_metadata_from_text(text: str, *, asset_types: Optional[list[str]] = 
         "acceptance_test_plan_number", lines=lines, pdf_path=pdf_path, entries=atp_entries, label_aliases=label_aliases, pages=3, max_folder_levels=5
     ) or "Unknown"
 
-    # Document type (strict): document text -> filename -> folders -> extension default (if allowlisted) -> Unknown
-    if doc_type_entries:
-        first_pages = _first_pages_blob(lines, pages=3)
-        doc_text_blob = f"{title_blob}\n{first_pages}".strip()
-        dt, acr = _best_doc_type_match_in_blob(doc_text_blob, doc_type_entries)
-        if not dt and pdf_path is not None:
-            try:
-                fn_blob = f"{pdf_path.stem}\n{pdf_path.name}"
-            except Exception:
-                fn_blob = str(pdf_path)
-            dt, acr = _best_doc_type_match_in_blob(fn_blob, doc_type_entries)
-        if not dt:
-            dt, acr = _infer_doc_type_from_path_strict(pdf_path, doc_type_entries, max_levels=5)
-        if not dt:
-            ext = ""
-            try:
-                ext = str(getattr(pdf_path, "suffix", "") or "").lower()
-            except Exception:
-                ext = ""
-            is_excel = ext in {".xlsx", ".xls", ".xlsm"}
-            dt, acr = _doc_type_default_if_allowlisted(doc_type_entries, is_excel=is_excel)
-        meta["document_type"] = dt or "Unknown"
-        meta["document_type_acronym"] = (acr or dt) if dt else "Unknown"
-    else:
-        meta["document_type"] = "Unknown"
-        meta["document_type_acronym"] = "Unknown"
+    classifier_path = pdf_path if pdf_path is not None else Path("document.unknown")
+    doc_type_meta = identify_document_type(classifier_path, text_blob=text)
+    for key in (
+        "document_type",
+        "document_type_acronym",
+        "document_type_status",
+        "document_type_source",
+        "document_type_reason",
+        "document_type_evidence",
+        "document_type_review_required",
+    ):
+        meta[key] = doc_type_meta.get(key)
 
     if meta.get("revision"):
         meta["revision"] = _normalize_revision(meta["revision"] or "") or "Unknown"

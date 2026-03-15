@@ -1,0 +1,52 @@
+{
+  "version": 1,
+  "document_types": [
+    {
+      "name": "End Item Data Package",
+      "acronym": "EIDP"
+    },
+    {
+      "name": "Test Data",
+      "acronym": "TD"
+    }
+  ],
+  "filename_aliases": {
+    "EIDP": ["EIDP", "End Item Data Package", "End-Item Data Package"],
+    "TD": ["TD", "Test Data", "Test-Data", "TestData", "Hot Fire Test", "Hot Fire Test Data", "Hotfire Test Data"]
+  },
+  "content_aliases": {
+    "EIDP": ["EIDP", "End Item Data Package", "End-Item Data Package"],
+    "TD": ["TD", "Test Data", "Test-Data", "TestData", "Hot Fire Test", "Hot Fire Test Data", "Hotfire Test Data"]
+  },
+  "extension_rules": {
+    "EIDP": [".pdf"],
+    "TD": [".xlsx", ".xls", ".xlsm", ".mat"]
+  },
+  "folder_rules": {
+    "levels": 3,
+    "aliases": {
+      "EIDP": ["EIDP", "End Item Data Package", "End-Item Data Package"],
+      "TD": ["TD", "Test Data", "Test-Data", "TestData", "Hot Fire Test", "Hot Fire Test Data", "Hotfire Test Data"]
+    }
+  },
+  "serial_patterns": [
+    "(?i)\\bSN[-_ ]?[A-Z0-9]+(?:[-_][A-Z0-9]+)*\\b"
+  ],
+  "ranker": {
+    "weights": {
+      "content": 5,
+      "folder": 3,
+      "extension_compatible": 1,
+      "serial_bonus": 2
+    },
+    "min_score": 4,
+    "conflict_gap": 2
+  },
+  "special_cases": {
+    "td_folder_serial_rule": {
+      "enabled": true,
+      "compatible_extensions": [".xlsx", ".xls", ".xlsm", ".mat"],
+      "require_serial_in_filename": true
+    }
+  }
+}
