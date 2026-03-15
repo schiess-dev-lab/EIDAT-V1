@@ -5702,9 +5702,11 @@ def _sync_sqlite_excel_mirror(db_path: Path, *, force: bool = False) -> Path | N
 
         wb = Workbook()
         wb.remove(wb.active)
+        used_sheet_titles: set[str] = set()
 
         for table_name in tables:
-            ws = wb.create_sheet(title=table_name[:31])
+            safe_title = _td_safe_excel_sheet_title(table_name, used_sheet_titles, fallback="table")
+            ws = wb.create_sheet(title=safe_title)
             cols = [
                 str(col[1] or "").strip()
                 for col in conn.execute(f'PRAGMA table_info("{table_name.replace(chr(34), chr(34) * 2)}")').fetchall()

@@ -612,6 +612,33 @@ class TestTDSupportWorkbook(unittest.TestCase):
             finally:
                 wb.close()
 
+    def test_sync_sqlite_excel_mirror_uses_unique_sheet_titles_for_long_table_names(self) -> None:
+        from openpyxl import load_workbook  # type: ignore
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            db_path = root / "mirror.sqlite3"
+            table_a = "table_name_that_is_definitely_longer_than_thirty_one_chars_A"
+            table_b = "table_name_that_is_definitely_longer_than_thirty_one_chars_B"
+            with sqlite3.connect(str(db_path)) as conn:
+                conn.execute(f'CREATE TABLE "{table_a}" (id INTEGER, value TEXT)')
+                conn.execute(f'CREATE TABLE "{table_b}" (id INTEGER, value TEXT)')
+                conn.execute(f'INSERT INTO "{table_a}"(id, value) VALUES (1, "a")')
+                conn.execute(f'INSERT INTO "{table_b}"(id, value) VALUES (2, "b")')
+                conn.commit()
+
+            out_path = be._sync_sqlite_excel_mirror(db_path, force=True)
+            self.assertIsNotNone(out_path)
+
+            wb = load_workbook(str(out_path), read_only=True, data_only=True)
+            try:
+                self.assertEqual(len(wb.sheetnames), 2)
+                self.assertEqual(len(set(wb.sheetnames)), 2)
+                self.assertTrue(all(len(str(name or "")) <= 31 for name in wb.sheetnames))
+            finally:
+                wb.close()
+
     @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
     def test_metric_bounds_for_run_reads_deferred_run_conditions_sheet(self) -> None:
         from openpyxl import load_workbook  # type: ignore
