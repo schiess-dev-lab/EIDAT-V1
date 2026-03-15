@@ -117,6 +117,60 @@ class _PerfAxisHarness:
         raise AssertionError(f"missing combo value {value!r}")
 
 
+class _RunSelectionHarness:
+    def __init__(self) -> None:
+        _qt_app()
+        from PySide6 import QtWidgets
+        from EIDAT_App_Files.ui_next.qt_main import TestDataTrendDialog  # type: ignore
+
+        self.cb_run_mode = QtWidgets.QComboBox()
+        self.cb_run_mode.addItem("Sequence", "sequence")
+        self.cb_run_mode.addItem("Run Conditions", "condition")
+        self.cb_run = QtWidgets.QComboBox()
+        self.lbl_run_details = QtWidgets.QLabel()
+        self.list_auto_plots = QtWidgets.QListWidget()
+        self.btn_open_auto = QtWidgets.QPushButton()
+        self.btn_open_all_auto = QtWidgets.QPushButton()
+        self.btn_delete_auto = QtWidgets.QPushButton()
+        self.btn_save_all_auto = QtWidgets.QPushButton()
+        self._plot_ready = True
+        self._db_path = "db.sqlite3"
+        self._auto_plots = []
+        self._run_selection_views = {"sequence": [], "condition": []}
+        self._run_display_by_name = {}
+        self._run_name_by_display = {}
+        self._is_internal_run_label = TestDataTrendDialog._is_internal_run_label
+        self._metric_title_suffix = TestDataTrendDialog._metric_title_suffix
+
+        for name in (
+            "_current_run_selector_mode",
+            "_current_run_selection",
+            "_run_display_text",
+            "_selection_condition_label",
+            "_selection_display_text",
+            "_selection_title_parts",
+            "_compose_run_title",
+            "_select_run_by_id",
+            "_selection_from_plot_def",
+            "_refresh_run_dropdown",
+            "_refresh_auto_plots_list",
+            "_update_auto_actions",
+        ):
+            setattr(self, name, getattr(TestDataTrendDialog, name).__get__(self, _RunSelectionHarness))
+
+        self._refresh_columns_for_run = lambda: None
+        self._refresh_stats_preview = lambda: None
+
+
+class _MetricBoundsHarness:
+    def __init__(self, project_dir: Path, workbook_path: Path) -> None:
+        from EIDAT_App_Files.ui_next.qt_main import TestDataTrendDialog  # type: ignore
+
+        self._project_dir = Path(project_dir)
+        self._workbook_path = Path(workbook_path)
+        self._metric_bounds_for_run = TestDataTrendDialog._metric_bounds_for_run.__get__(self, _MetricBoundsHarness)
+
+
 @unittest.skipUnless(_have_openpyxl(), "openpyxl not installed")
 class TestTDSupportWorkbook(unittest.TestCase):
     def _make_source_sqlite(self, path: Path) -> None:
@@ -164,11 +218,11 @@ class TestTDSupportWorkbook(unittest.TestCase):
     def _default_program_sheet_name(self, be) -> str:
         return str(be._td_support_program_sheet_name(be.TD_SUPPORT_DEFAULT_PROGRAM_TITLE, 0))
 
-    def _support_sheet_bundle(self, wb, be):
-        return (
-            wb["RunConditions"],
-            wb["RunConditionBounds"],
-            wb[self._default_program_sheet_name(be)],
+    def _refresh_support_conditions(self, be, wb_path: Path, root: Path) -> None:
+        be._refresh_td_support_run_conditions_sheet(
+            wb_path,
+            project_dir=root,
+            param_defs=[{"name": "thrust", "units": "lbf"}],
         )
 
     def _seed_perf_candidate_db(
@@ -317,8 +371,6 @@ class TestTDSupportWorkbook(unittest.TestCase):
                     [
                         "Settings",
                         "Programs",
-                        "RunConditions",
-                        "RunConditionBounds",
                         self._default_program_sheet_name(be),
                     ],
                 )
@@ -338,27 +390,18 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 ws_programs = wb["Programs"]
                 self.assertEqual(ws_programs.cell(2, 1).value, be.TD_SUPPORT_DEFAULT_PROGRAM_TITLE)
                 self.assertEqual(ws_programs.cell(2, 2).value, self._default_program_sheet_name(be))
+                ws_prog = wb[self._default_program_sheet_name(be)]
 
-                ws_cond, ws_bounds, ws_prog = self._support_sheet_bundle(wb, be)
-                self.assertEqual(ws_cond.cell(2, 1).value, "RunA")
-                self.assertEqual(ws_cond.cell(2, 2).value, "RunA")
-                self.assertIsNone(ws_cond.cell(2, 3).value)
-                self.assertEqual(ws_cond.cell(1, 6).value, "pulse_width_on")
-                self.assertEqual(ws_cond.cell(1, 7).value, "control_period")
-                self.assertTrue(bool(ws_cond.cell(2, 8).value))
-
-                self.assertEqual(ws_bounds.cell(2, 1).value, "RunA")
-                self.assertEqual(ws_bounds.cell(2, 2).value, "thrust")
-                self.assertEqual(ws_bounds.cell(2, 3).value, "lbf")
-                self.assertIsNone(ws_bounds.cell(2, 4).value)
-
+                self.assertNotIn("RunConditions", wb.sheetnames)
+                self.assertNotIn("RunConditionBounds", wb.sheetnames)
                 self.assertEqual(ws_prog.cell(2, 1).value, "RunA")
                 self.assertEqual(ws_prog.cell(2, 2).value, "RunA")
-                self.assertTrue(bool(ws_prog.cell(2, 5).value))
+                self.assertEqual(ws_prog.cell(1, 8).value, "control_period")
+                self.assertTrue(bool(ws_prog.cell(2, 11).value))
             finally:
                 wb.close()
 
-    def test_write_support_workbook_new_schema_seeds_program_and_condition_tabs(self) -> None:
+    def test_write_support_workbook_new_schema_seeds_program_tabs_only(self) -> None:
         from openpyxl import load_workbook  # type: ignore
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
 
@@ -377,8 +420,8 @@ class TestTDSupportWorkbook(unittest.TestCase):
             try:
                 self.assertIn("Settings", wb.sheetnames)
                 self.assertIn("Programs", wb.sheetnames)
-                self.assertIn("RunConditions", wb.sheetnames)
                 self.assertNotIn("RunConditionBounds", wb.sheetnames)
+                self.assertNotIn("RunConditions", wb.sheetnames)
                 ws_programs = wb["Programs"]
                 sheet_a = str(ws_programs.cell(2, 2).value or "").strip()
                 sheet_b = str(ws_programs.cell(3, 2).value or "").strip()
@@ -389,9 +432,193 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 self.assertEqual([ws_a.cell(r, 1).value for r in range(2, 4)], ["Seq1", "Seq2"])
                 self.assertEqual([ws_b.cell(r, 1).value for r in range(2, 3)], ["Seq3"])
                 cond_sheet_names = [name for name in wb.sheetnames if str(name).startswith(be.TD_SUPPORT_CONDITION_SHEET_PREFIX)]
-                self.assertEqual(len(cond_sheet_names), 3)
+                self.assertEqual(cond_sheet_names, [])
             finally:
                 wb.close()
+
+    def test_update_project_generates_deferred_run_conditions_sheet(self) -> None:
+        from openpyxl import load_workbook  # type: ignore
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            src_db = root / "src.sqlite3"
+            self._make_source_sqlite(src_db)
+            wb_path = root / "project.xlsx"
+            be._write_test_data_trending_workbook(
+                wb_path,
+                global_repo=root,
+                serials=["SN1"],
+                docs=[{"serial_number": "SN1", "excel_sqlite_rel": str(src_db), "program_title": be.TD_SUPPORT_DEFAULT_PROGRAM_TITLE}],
+                config=self._make_config(),
+            )
+            support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+            be._write_td_support_workbook(
+                support_path,
+                sequence_names=["RunA"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+            )
+
+            wb = load_workbook(str(support_path))
+            try:
+                self.assertNotIn("RunConditions", wb.sheetnames)
+                ws_prog = wb[self._default_program_sheet_name(be)]
+                ws_prog.cell(2, 2).value = "Seq1"
+                ws_prog.cell(2, 3).value = "100 psia, PM, 5 Sec ON / 20 Sec OFF"
+                ws_prog.cell(2, 4).value = 100
+                ws_prog.cell(2, 5).value = "psia"
+                ws_prog.cell(2, 6).value = "PM"
+                ws_prog.cell(2, 7).value = 5
+                ws_prog.cell(2, 8).value = 20
+                wb.save(str(support_path))
+            finally:
+                wb.close()
+
+            be.update_test_data_trending_project_workbook(root, wb_path, overwrite=True, require_existing_cache=False)
+
+            wb = load_workbook(str(support_path), read_only=True, data_only=True)
+            try:
+                self.assertEqual(wb.sheetnames[-1], "RunConditions")
+                ws_cond = wb["RunConditions"]
+                self.assertEqual(
+                    [ws_cond.cell(1, c).value for c in range(1, 15)],
+                    [
+                        "condition_key",
+                        "display_name",
+                        "feed_pressure",
+                        "feed_pressure_units",
+                        "run_type",
+                        "pulse_width_on",
+                        "control_period",
+                        "member_sequences",
+                        "member_programs",
+                        "parameter_name",
+                        "units",
+                        "min_value",
+                        "max_value",
+                        "enabled",
+                    ],
+                )
+                self.assertEqual(str(ws_cond.cell(2, 1).value or "").strip(), "Seq1")
+                self.assertEqual(str(ws_cond.cell(2, 10).value or "").strip(), "thrust")
+            finally:
+                wb.close()
+
+    def test_update_project_preserves_existing_run_condition_bounds(self) -> None:
+        from openpyxl import load_workbook  # type: ignore
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            src_db = root / "src.sqlite3"
+            self._make_source_sqlite(src_db)
+            wb_path = root / "project.xlsx"
+            be._write_test_data_trending_workbook(
+                wb_path,
+                global_repo=root,
+                serials=["SN1"],
+                docs=[{"serial_number": "SN1", "excel_sqlite_rel": str(src_db), "program_title": be.TD_SUPPORT_DEFAULT_PROGRAM_TITLE}],
+                config=self._make_config(),
+            )
+            support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+            be._write_td_support_workbook(
+                support_path,
+                sequence_names=["RunA"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+            )
+
+            wb = load_workbook(str(support_path))
+            try:
+                ws_prog = wb[self._default_program_sheet_name(be)]
+                ws_prog.cell(2, 2).value = "Seq1"
+                ws_prog.cell(2, 3).value = "100 psia, PM, 5 Sec ON / 20 Sec OFF"
+                ws_prog.cell(2, 4).value = 100
+                ws_prog.cell(2, 5).value = "psia"
+                ws_prog.cell(2, 6).value = "PM"
+                ws_prog.cell(2, 7).value = 5
+                ws_prog.cell(2, 8).value = 20
+                wb.save(str(support_path))
+            finally:
+                wb.close()
+
+            be.update_test_data_trending_project_workbook(root, wb_path, overwrite=True, require_existing_cache=False)
+
+            wb = load_workbook(str(support_path))
+            try:
+                ws_cond = wb["RunConditions"]
+                ws_cond.cell(2, 12).value = 15
+                ws_cond.cell(2, 13).value = 45
+                wb.save(str(support_path))
+            finally:
+                wb.close()
+
+            be.update_test_data_trending_project_workbook(root, wb_path, overwrite=True, require_existing_cache=False)
+
+            wb = load_workbook(str(support_path), read_only=True, data_only=True)
+            try:
+                ws_cond = wb["RunConditions"]
+                self.assertEqual(ws_cond.cell(2, 12).value, 15)
+                self.assertEqual(ws_cond.cell(2, 13).value, 45)
+            finally:
+                wb.close()
+
+    @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
+    def test_metric_bounds_for_run_reads_deferred_run_conditions_sheet(self) -> None:
+        from openpyxl import load_workbook  # type: ignore
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            src_db = root / "src.sqlite3"
+            self._make_source_sqlite(src_db)
+            wb_path = root / "project.xlsx"
+            be._write_test_data_trending_workbook(
+                wb_path,
+                global_repo=root,
+                serials=["SN1"],
+                docs=[{"serial_number": "SN1", "excel_sqlite_rel": str(src_db), "program_title": be.TD_SUPPORT_DEFAULT_PROGRAM_TITLE}],
+                config=self._make_config(),
+            )
+            support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+            be._write_td_support_workbook(
+                support_path,
+                sequence_names=["RunA"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+            )
+
+            wb = load_workbook(str(support_path))
+            try:
+                ws_prog = wb[self._default_program_sheet_name(be)]
+                ws_prog.cell(2, 1).value = "RunA"
+                ws_prog.cell(2, 2).value = "Seq1"
+                ws_prog.cell(2, 3).value = "100 psia, PM, 5 Sec ON / 20 Sec OFF"
+                ws_prog.cell(2, 4).value = 100
+                ws_prog.cell(2, 5).value = "psia"
+                ws_prog.cell(2, 6).value = "PM"
+                ws_prog.cell(2, 7).value = 5
+                ws_prog.cell(2, 8).value = 20
+                wb.save(str(support_path))
+            finally:
+                wb.close()
+
+            be.update_test_data_trending_project_workbook(root, wb_path, overwrite=True, require_existing_cache=False)
+
+            wb = load_workbook(str(support_path))
+            try:
+                ws_cond = wb["RunConditions"]
+                ws_cond.cell(2, 12).value = 15
+                ws_cond.cell(2, 13).value = 45
+                wb.save(str(support_path))
+            finally:
+                wb.close()
+
+            harness = _MetricBoundsHarness(root, wb_path)
+            seq_bounds = harness._metric_bounds_for_run("Seq1")
+            source_bounds = harness._metric_bounds_for_run("RunA")
+            self.assertEqual((seq_bounds.get("thrust") or {}).get("min_value"), 15.0)
+            self.assertEqual((seq_bounds.get("thrust") or {}).get("max_value"), 45.0)
+            self.assertEqual((source_bounds.get("thrust") or {}).get("min_value"), 15.0)
+            self.assertEqual((source_bounds.get("thrust") or {}).get("max_value"), 45.0)
 
     def test_read_support_workbook_new_schema_groups_by_condition_and_splits_control_period(self) -> None:
         from openpyxl import Workbook, load_workbook  # type: ignore
@@ -513,6 +740,96 @@ class TestTDSupportWorkbook(unittest.TestCase):
             self.assertEqual(cond_items[0].get("run_name"), condition_key)
             self.assertEqual(cond_items[0].get("member_sequences"), ["Seq1", "Seq2"])
 
+    def test_run_condition_label_prefers_derived_pm_fields_over_display_name(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        row = {
+            "display_name": "sequence",
+            "feed_pressure": 350,
+            "feed_pressure_units": "psia",
+            "run_type": "pulsed mode",
+            "pulse_width_on": 60,
+            "control_period": 120,
+            "condition_key": "cond_a",
+        }
+        self.assertEqual(
+            be._td_effective_run_condition_label(row),
+            "350 psia, PM, 60 Sec ON / 120 Sec OFF",
+        )
+
+    def test_run_condition_label_prefers_derived_non_pm_fields_over_display_name(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        row = {
+            "display_name": "sequence",
+            "feed_pressure": 410,
+            "feed_pressure_units": "psia",
+            "run_type": "steady state",
+            "condition_key": "cond_b",
+        }
+        self.assertEqual(be._td_effective_run_condition_label(row), "410 psia, SS")
+
+    def test_run_selection_views_use_derived_condition_display_name(self) -> None:
+        from openpyxl import load_workbook  # type: ignore
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            db_path = root / "implementation_trending.sqlite3"
+            wb_path = root / "project.xlsx"
+
+            be._write_test_data_trending_workbook(
+                wb_path,
+                global_repo=root,
+                serials=["SN1"],
+                docs=[{"serial_number": "SN1", "excel_sqlite_rel": ""}],
+                config=self._make_config(),
+            )
+            support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+            be._write_td_support_workbook(
+                support_path,
+                sequence_names=["Seq1"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+            )
+
+            wb = load_workbook(str(support_path))
+            try:
+                ws_prog = wb[self._default_program_sheet_name(be)]
+                ws_prog.cell(2, 3).value = "sequence"
+                ws_prog.cell(2, 4).value = 350
+                ws_prog.cell(2, 5).value = "psia"
+                ws_prog.cell(2, 6).value = "pulsed mode"
+                ws_prog.cell(2, 7).value = 60
+                ws_prog.cell(2, 8).value = 120
+                wb.save(str(support_path))
+            finally:
+                wb.close()
+
+            with sqlite3.connect(str(db_path)) as conn:
+                be._ensure_test_data_impl_tables(conn)
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO td_runs(run_name, default_x, display_name, run_type, control_period, pulse_width)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    ("Seq1", "Time", "sequence", "pulsed mode", 120, 60),
+                )
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO td_condition_observations
+                    (observation_id, serial, run_name, program_title, source_run_name, run_type, pulse_width, control_period, source_mtime_ns, computed_epoch_ns)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    ("SN1__Seq1", "SN1", "Seq1", be.TD_SUPPORT_DEFAULT_PROGRAM_TITLE, "Seq1", "pulsed mode", 60, 120, 0, 0),
+                )
+                conn.commit()
+
+            views = be.td_list_run_selection_views(db_path, wb_path, project_dir=root)
+            cond_items = views.get("condition") or []
+            self.assertEqual(len(cond_items), 1)
+            self.assertEqual(cond_items[0].get("display_text"), "350 psia, PM, 60 Sec ON / 120 Sec OFF")
+            self.assertEqual(cond_items[0].get("run_condition"), "350 psia, PM, 60 Sec ON / 120 Sec OFF")
+
     def test_rebuild_new_schema_aggregates_across_programs_and_skips_disabled_rows(self) -> None:
         from openpyxl import load_workbook  # type: ignore
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
@@ -608,17 +925,20 @@ class TestTDSupportWorkbook(unittest.TestCase):
             try:
                 ws_settings = wb["Settings"]
                 ws_settings.cell(3, 2).value = 2
-                ws_cond, ws_bounds, ws_prog = self._support_sheet_bundle(wb, be)
-                ws_cond.cell(2, 1).value = "Seq1"
-                ws_cond.cell(2, 2).value = "Seq1"
-                ws_cond.cell(2, 3).value = 100
-                ws_cond.cell(2, 6).value = 5
+                ws_prog = wb[self._default_program_sheet_name(be)]
                 ws_prog.cell(2, 1).value = "RunA"
                 ws_prog.cell(2, 2).value = "Seq1"
-                ws_bounds.cell(2, 1).value = "Seq1"
-                ws_bounds.cell(2, 2).value = "thrust"
-                ws_bounds.cell(2, 4).value = 15
-                ws_bounds.cell(2, 5).value = 45
+                ws_prog.cell(2, 4).value = 100
+                ws_prog.cell(2, 7).value = 5
+                wb.save(str(support_path))
+            finally:
+                wb.close()
+            self._refresh_support_conditions(be, wb_path, root)
+            wb = load_workbook(str(support_path))
+            try:
+                ws_cond = wb["RunConditions"]
+                ws_cond.cell(2, 12).value = 15
+                ws_cond.cell(2, 13).value = 45
                 wb.save(str(support_path))
             finally:
                 wb.close()
@@ -810,35 +1130,27 @@ class TestTDSupportWorkbook(unittest.TestCase):
 
             wb = load_workbook(str(support_path))
             try:
-                ws_cond = wb["RunConditions"]
-                _ws_bounds = wb["RunConditionBounds"]
                 ws_prog = wb[self._default_program_sheet_name(be)]
-                rows = {
-                    str(ws_cond.cell(r, 1).value or "").strip(): r
-                    for r in range(2, (ws_cond.max_row or 0) + 1)
-                }
-                row = rows["Seq1"]
-                ws_cond.cell(row, 2).value = "350 psia, SS"
-                ws_cond.cell(row, 3).value = 350
-                ws_cond.cell(row, 4).value = "psia"
-                ws_cond.cell(row, 5).value = "steady state"
-                row = rows["Seq2"]
-                ws_cond.cell(row, 2).value = "350 psia, SS"
-                ws_cond.cell(row, 3).value = 350
-                ws_cond.cell(row, 4).value = "psia"
-                ws_cond.cell(row, 5).value = "steady state"
-                row = rows["Seq3"]
-                ws_cond.cell(row, 2).value = "350 psia, PM, 60 Sec ON / 120 Sec OFF"
-                ws_cond.cell(row, 3).value = 350
-                ws_cond.cell(row, 4).value = "psia"
-                ws_cond.cell(row, 5).value = "pulsed mode"
-                ws_cond.cell(row, 6).value = 60
-                ws_cond.cell(row, 7).value = 120
                 ws_prog.cell(2, 1).value = "Seq1"
                 ws_prog.cell(2, 2).value = "Seq1"
+                ws_prog.cell(2, 3).value = "350 psia, SS"
+                ws_prog.cell(2, 4).value = 350
+                ws_prog.cell(2, 5).value = "psia"
+                ws_prog.cell(2, 6).value = "steady state"
                 ws_prog.cell(3, 1).value = "Seq2"
                 ws_prog.cell(3, 2).value = "Seq1"
-                ws_prog.append(["Seq3", "Seq3", "", "", True])
+                ws_prog.cell(3, 3).value = "350 psia, SS"
+                ws_prog.cell(3, 4).value = 350
+                ws_prog.cell(3, 5).value = "psia"
+                ws_prog.cell(3, 6).value = "steady state"
+                ws_prog.cell(4, 1).value = "Seq3"
+                ws_prog.cell(4, 2).value = "Seq3"
+                ws_prog.cell(4, 3).value = "350 psia, PM, 60 Sec ON / 120 Sec OFF"
+                ws_prog.cell(4, 4).value = 350
+                ws_prog.cell(4, 5).value = "psia"
+                ws_prog.cell(4, 6).value = "pulsed mode"
+                ws_prog.cell(4, 7).value = 60
+                ws_prog.cell(4, 8).value = 120
                 wb.save(str(support_path))
             finally:
                 wb.close()
@@ -966,12 +1278,10 @@ class TestTDSupportWorkbook(unittest.TestCase):
 
             wb = load_workbook(str(support_path))
             try:
-                ws_cond, _ws_bounds, ws_prog = self._support_sheet_bundle(wb, be)
-                ws_cond.cell(2, 1).value = "Seq1"
-                ws_cond.cell(2, 2).value = "Seq1"
-                ws_cond.cell(2, 3).value = 100
-                ws_cond.cell(2, 6).value = 5
+                ws_prog = wb[self._default_program_sheet_name(be)]
                 ws_prog.cell(2, 2).value = "Seq1"
+                ws_prog.cell(2, 4).value = 100
+                ws_prog.cell(2, 7).value = 5
                 wb.save(str(support_path))
             finally:
                 wb.close()
@@ -1016,11 +1326,9 @@ class TestTDSupportWorkbook(unittest.TestCase):
 
             wb = load_workbook(str(support_path))
             try:
-                ws_cond, _ws_bounds, ws_prog = self._support_sheet_bundle(wb, be)
-                ws_cond.cell(2, 1).value = "Seq1"
-                ws_cond.cell(2, 2).value = "Seq1"
-                ws_cond.cell(2, 6).value = 5
+                ws_prog = wb[self._default_program_sheet_name(be)]
                 ws_prog.cell(2, 2).value = "Seq1"
+                ws_prog.cell(2, 7).value = 5
                 wb.save(str(support_path))
             finally:
                 wb.close()
@@ -1096,9 +1404,8 @@ class TestTDSupportWorkbook(unittest.TestCase):
 
             wb = load_workbook(str(support_path))
             try:
-                ws_cond = wb["RunConditions"]
-                ws_cond.cell(1, 6).value = "pulse_width_on"
-                ws_cond.cell(2, 6).value = 7
+                ws_prog = wb[self._default_program_sheet_name(be)]
+                ws_prog.cell(2, 7).value = 7
                 wb.save(str(support_path))
             finally:
                 wb.close()
@@ -2137,6 +2444,84 @@ class TestTDSupportWorkbook(unittest.TestCase):
         self.assertEqual(be.td_perf_display_value(values, "max", bounds_mode="actual"), 105.0)
 
     @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
+    def test_condition_dropdown_prefers_run_condition_label(self) -> None:
+        harness = _RunSelectionHarness()
+        harness._run_selection_views["condition"] = [
+            {
+                "mode": "condition",
+                "id": "condition:seq1",
+                "run_name": "Seq1",
+                "display_text": "sequence",
+                "run_condition": "350 psia, PM, 60 Sec ON / 120 Sec OFF",
+                "member_runs": ["Seq1"],
+                "member_sequences": ["Seq1", "Seq2"],
+                "details_text": "Source Sequences: Seq1, Seq2",
+            }
+        ]
+        harness.cb_run_mode.setCurrentIndex(harness.cb_run_mode.findData("condition"))
+
+        harness._refresh_run_dropdown()
+
+        self.assertEqual(harness.cb_run.itemText(0), "350 psia, PM, 60 Sec ON / 120 Sec OFF")
+
+    @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
+    def test_condition_title_is_condition_first_and_not_sequence(self) -> None:
+        harness = _RunSelectionHarness()
+        selection = {
+            "mode": "condition",
+            "id": "condition:seq1",
+            "run_name": "Seq1",
+            "display_text": "sequence",
+            "run_condition": "350 psia, PM, 60 Sec ON / 120 Sec OFF",
+            "member_runs": ["Seq1"],
+            "member_sequences": ["Seq1", "Seq2"],
+        }
+
+        title = harness._compose_run_title(selection, "mean")
+
+        self.assertEqual(
+            title,
+            "Run Condition: 350 psia, PM, 60 Sec ON / 120 Sec OFF | Sequences: Seq1, Seq2 | mean",
+        )
+
+    @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
+    def test_condition_auto_plot_name_uses_run_condition_label(self) -> None:
+        harness = _RunSelectionHarness()
+        harness._run_selection_views["condition"] = [
+            {
+                "mode": "condition",
+                "id": "condition:seq1",
+                "run_name": "Seq1",
+                "display_text": "sequence",
+                "run_condition": "350 psia, PM, 60 Sec ON / 120 Sec OFF",
+                "member_runs": ["Seq1"],
+                "member_sequences": ["Seq1", "Seq2"],
+                "details_text": "Source Sequences: Seq1, Seq2",
+            }
+        ]
+        harness._auto_plots = [
+            {
+                "mode": "metrics",
+                "selector_mode": "condition",
+                "selection_id": "condition:seq1",
+                "run": "Seq1",
+                "run_condition": "350 psia, PM, 60 Sec ON / 120 Sec OFF",
+                "display_text": "sequence",
+                "member_runs": ["Seq1"],
+                "member_sequences": ["Seq1", "Seq2"],
+                "stats": ["mean"],
+                "y": ["thrust"],
+            }
+        ]
+
+        harness._refresh_auto_plots_list()
+
+        self.assertEqual(
+            harness.list_auto_plots.item(0).text(),
+            "Metrics: 350 psia, PM, 60 Sec ON / 120 Sec OFF mean (thrust)",
+        )
+
+    @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
     def test_perf_axis_selecting_third_parameter_does_not_recurse(self) -> None:
         harness = _PerfAxisHarness()
 
@@ -2279,8 +2664,8 @@ class TestTDSupportWorkbook(unittest.TestCase):
     def test_perf_fit_model_piecewise_auto_prefers_three_segments_when_needed(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
 
-        xs = list(range(10))
-        ys = [1.0, 1.4, 1.8, 5.0, 8.2, 11.4, 10.8, 10.2, 9.6, 9.0]
+        xs = list(range(12))
+        ys = [1.0, 1.0, 1.0, 3.0, 5.0, 7.0, 9.0, 9.0, 9.0, 9.0, 9.0, 9.0]
         model = be.td_perf_fit_model(xs, ys, fit_mode="piecewise_auto", polynomial_degree=2, normalize_x=True)
         self.assertIsNotNone(model)
         self.assertEqual(str(model.get("fit_family") or ""), be.TD_PERF_FIT_MODE_PIECEWISE_3)
@@ -2317,7 +2702,10 @@ class TestTDSupportWorkbook(unittest.TestCase):
         params = model.get("params") or {}
         breakpoint = float((params.get("breakpoints") or [0.0])[0])
         pred_at_break = be.td_perf_predict_model(model, [breakpoint])[0]
-        self.assertAlmostEqual(pred_at_break, 4.0, places=6)
+        pred_left = be.td_perf_predict_model(model, [breakpoint - 1e-6])[0]
+        pred_right = be.td_perf_predict_model(model, [breakpoint + 1e-6])[0]
+        self.assertAlmostEqual(pred_at_break, pred_left, places=4)
+        self.assertAlmostEqual(pred_at_break, pred_right, places=4)
 
     def test_perf_build_aggregate_curve_uses_serial_medians_not_raw_density(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
@@ -2332,12 +2720,103 @@ class TestTDSupportWorkbook(unittest.TestCase):
         self.assertLess(float(min(agg.get("y") or [0.0])), 100.0)
         self.assertGreater(float(max(agg.get("y") or [0.0])), 0.0)
 
+    def test_perf_build_aggregate_curve_returns_weighting_meta(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        curves = {
+            "a": [(0.0, 10.0, "r1"), (1.0, 11.0, "r2"), (2.0, 12.0, "r3")],
+            "b": [(0.0, 20.0, "r4"), (2.0, 24.0, "r5")],
+        }
+        agg = be.td_perf_build_aggregate_curve(curves, max_bins=3, min_serials_per_bin=1, return_meta=True)
+        xs = agg.get("x") or []
+        ys = agg.get("y") or []
+        support = agg.get("serial_support") or []
+        edge_weight = agg.get("edge_weight") or []
+        self.assertEqual(len(xs), len(ys))
+        self.assertEqual(len(xs), len(support))
+        self.assertEqual(len(xs), len(edge_weight))
+        self.assertTrue(all(float(v) >= 1.0 for v in edge_weight))
+
+    @unittest.skipUnless(_have_scipy(), "scipy not installed")
+    def test_perf_weighted_polynomial_improves_sparse_endpoint_residual(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        xs = [0.0002, 0.00035, 0.0005, 0.0007, 0.0010, 0.0015, 0.0030, 0.0060, 0.0120]
+        ys = [170.0, 208.0, 220.0, 223.0, 224.0, 224.2, 224.8, 228.5, 233.5]
+        weighted = be.td_perf_fit_model(xs, ys, fit_mode="polynomial", polynomial_degree=2, sample_weights=None)
+        unweighted = be.td_perf_fit_model(xs, ys, fit_mode="polynomial", polynomial_degree=2, sample_weights=[1.0] * len(xs))
+        self.assertIsNotNone(weighted)
+        self.assertIsNotNone(unweighted)
+        weighted_preds = be.td_perf_predict_model(weighted, [xs[0], xs[-1]])
+        unweighted_preds = be.td_perf_predict_model(unweighted, [xs[0], xs[-1]])
+        weighted_edge_error = abs(float(weighted_preds[0]) - ys[0]) + abs(float(weighted_preds[1]) - ys[-1])
+        unweighted_edge_error = abs(float(unweighted_preds[0]) - ys[0]) + abs(float(unweighted_preds[1]) - ys[-1])
+        self.assertLess(weighted_edge_error, unweighted_edge_error)
+
+    @unittest.skipUnless(_have_scipy(), "scipy not installed")
+    def test_perf_fit_model_auto_prefers_new_family_for_sharp_left_knee_and_tail_drift(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        xs = [0.0002, 0.00035, 0.0005, 0.0007, 0.0010, 0.0015, 0.0030, 0.0060, 0.0120]
+        ys = [165.0, 205.0, 220.0, 223.0, 224.0, 224.5, 226.0, 229.5, 234.0]
+        model = be.td_perf_fit_model(xs, ys, fit_mode="auto", polynomial_degree=2, normalize_x=True)
+        sat = be.td_perf_fit_model(xs, ys, fit_mode="saturating_exponential")
+        self.assertIsNotNone(model)
+        self.assertIsNotNone(sat)
+        self.assertIn(
+            str(model.get("fit_family") or ""),
+            {be.TD_PERF_FIT_MODE_MONOTONE_PCHIP, be.TD_PERF_FIT_MODE_HYBRID_SATURATING_LINEAR},
+        )
+        self.assertLess(float(model.get("edge_rmse_norm") or 0.0), float(sat.get("edge_rmse_norm") or float("inf")))
+
+    @unittest.skipUnless(_have_scipy(), "scipy not installed")
+    def test_perf_predict_model_monotone_pchip_hits_knots_and_clamps_outside_domain(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        xs = [0.5, 1.0, 2.0, 4.0, 8.0]
+        ys = [10.0, 12.0, 15.0, 17.0, 18.0]
+        model = be.td_perf_fit_model(xs, ys, fit_mode="monotone_pchip")
+        self.assertIsNotNone(model)
+        preds = be.td_perf_predict_model(model, xs)
+        for actual, pred in zip(ys, preds):
+            self.assertAlmostEqual(actual, pred, places=6)
+        clamped = be.td_perf_predict_model(model, [0.1, 10.0])
+        self.assertAlmostEqual(clamped[0], ys[0], places=6)
+        self.assertAlmostEqual(clamped[1], ys[-1], places=6)
+
+    @unittest.skipUnless(_have_scipy(), "scipy not installed")
+    def test_perf_fit_model_hybrid_saturating_linear_is_monotone_and_bounded(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        xs = [0.0002, 0.00035, 0.0005, 0.0007, 0.0010, 0.0015, 0.0030, 0.0060, 0.0120]
+        ys = [165.0, 205.0, 220.0, 223.0, 224.0, 224.5, 226.0, 229.5, 234.0]
+        model = be.td_perf_fit_model(xs, ys, fit_mode="hybrid_saturating_linear")
+        self.assertIsNotNone(model)
+        params = model.get("params") or {}
+        self.assertGreaterEqual(float(params.get("m") or 0.0), 0.0)
+        self.assertGreaterEqual(float(params.get("A") or 0.0), 0.0)
+        self.assertGreaterEqual(float(params.get("k") or 0.0), 0.0)
+        preds = be.td_perf_predict_model(model, xs)
+        self.assertEqual(preds, sorted(preds))
+
+    def test_perf_fit_model_piecewise_allows_breakpoint_near_left_edge_when_supported(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        xs = [0.0, 0.001, 0.002, 0.003, 0.02, 0.04, 0.06, 1.0, 2.0, 3.0]
+        ys = [1.0, 1.3, 1.6, 1.9, 2.2, 2.5, 2.8, 4.0, 5.0, 6.0]
+        model = be.td_perf_fit_model(xs, ys, fit_mode="piecewise_2")
+        self.assertIsNotNone(model)
+        breakpoint = float(((model.get("params") or {}).get("breakpoints") or [999.0])[0])
+        self.assertLess(breakpoint, 0.1)
+
     def test_perf_fit_family_label_includes_piecewise_modes(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
 
         self.assertEqual(be.td_perf_fit_family_label("piecewise_auto"), "Piecewise Auto")
         self.assertEqual(be.td_perf_fit_family_label("piecewise_2"), "Piecewise 2-Segment")
         self.assertEqual(be.td_perf_fit_family_label("piecewise_3"), "Piecewise 3-Segment")
+        self.assertEqual(be.td_perf_fit_family_label("hybrid_saturating_linear"), "Hybrid Saturating + Linear")
+        self.assertEqual(be.td_perf_fit_family_label("monotone_pchip"), "Monotone PCHIP")
 
     def test_perf_fit_surface_model_prefers_quadratic_surface_for_quadratic_data(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
@@ -2357,6 +2836,9 @@ class TestTDSupportWorkbook(unittest.TestCase):
         preds = be.td_perf_predict_surface(model, x1s, x2s)
         for actual, pred in zip(ys, preds):
             self.assertAlmostEqual(actual, pred, places=6)
+        self.assertTrue(str(model.get("x_norm_equation") or "").strip())
+        self.assertIsInstance(model.get("x1_center"), float)
+        self.assertIsInstance(model.get("x2_scale"), float)
 
     def test_perf_fit_surface_model_auto_prefers_plane_for_planar_data(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
@@ -2384,6 +2866,41 @@ class TestTDSupportWorkbook(unittest.TestCase):
             auto_surface_families=False,
         )
         self.assertIsNone(model)
+
+    def test_perf_fit_surface_model_uses_normalized_solver_for_disparate_scales(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        x1s: list[float] = []
+        x2s: list[float] = []
+        ys: list[float] = []
+        for x1 in (0.0003, 0.0006, 0.0010, 0.0020, 0.0040, 0.0080):
+            for x2 in (50.0, 100.0, 150.0, 200.0):
+                x1s.append(x1)
+                x2s.append(x2)
+                ys.append(220.0 + (5000.0 * x1) - (0.05 * x2) + (100000.0 * x1 * x1) + (0.002 * x1 * x2) + (0.0002 * x2 * x2))
+
+        model = be.td_perf_fit_surface_model(x1s, x2s, ys, auto_surface_families=False)
+        self.assertIsNotNone(model)
+        self.assertEqual(str(model.get("fit_family") or ""), be.TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE)
+        self.assertEqual(str(model.get("solver") or ""), "lstsq")
+        self.assertLess(float(model.get("condition_number") or 999.0), 100.0)
+        preds = be.td_perf_predict_surface(model, x1s, x2s)
+        for actual, pred in zip(ys, preds):
+            self.assertAlmostEqual(actual, pred, places=5)
+
+    def test_perf_fit_surface_model_switches_to_ridge_when_normalized_design_is_ill_conditioned(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        x1s = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+        x2s = [2.0, 4.000001, 6.000001, 8.000002, 10.000002, 12.000003]
+        ys = [10.0 + (3.0 * x1) - (2.0 * x2) + (0.5 * x1 * x1) for x1, x2 in zip(x1s, x2s)]
+        model = be.td_perf_fit_surface_model(x1s, x2s, ys, auto_surface_families=False)
+        self.assertIsNotNone(model)
+        self.assertEqual(str(model.get("solver") or ""), "ridge")
+        self.assertGreater(float(model.get("condition_number") or 0.0), 1e5)
+        preds = be.td_perf_predict_surface(model, x1s, x2s)
+        self.assertEqual(len(preds), len(ys))
+        self.assertTrue(all(math.isfinite(float(v)) for v in preds))
 
     def test_perf_candidate_discovery_accepts_separated_x(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore

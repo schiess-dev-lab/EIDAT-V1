@@ -3964,9 +3964,13 @@ def _td_group_program_rows_into_conditions(rows: Sequence[Mapping[str, object]])
         identity = _td_support_condition_group_identity(raw_row)
         group = grouped.get(identity)
         if group is None:
+            display_name = _td_effective_run_condition_label(
+                raw_row,
+                fallback_display_name=(raw_row.get("display_name") or condition_key),
+            )
             group = {
                 "condition_key": condition_key,
-                "display_name": str(raw_row.get("display_name") or condition_key).strip() or condition_key,
+                "display_name": display_name,
                 "feed_pressure": raw_row.get("feed_pressure"),
                 "feed_pressure_units": str(raw_row.get("feed_pressure_units") or "").strip(),
                 "run_type": str(raw_row.get("run_type") or "").strip(),
@@ -4104,16 +4108,16 @@ def _write_td_support_workbook(
         for title in programs:
             program_sequence_map[str(title)] = list(all_sequences)
 
-    use_new_schema = bool(sequences_by_program)
     ws_programs = wb.create_sheet(TD_SUPPORT_PROGRAMS_SHEET)
     ws_programs.append(["program_title", "sheet_name", "enabled"])
     for idx, title in enumerate(programs):
         ws_programs.append([title, _td_support_program_sheet_name(title, idx), True])
 
-    if not use_new_schema:
-        ws_cond = wb.create_sheet(TD_SUPPORT_RUN_CONDITIONS_SHEET)
-        ws_cond.append(
+    for idx, title in enumerate(programs):
+        ws_prog = wb.create_sheet(_td_support_program_sheet_name(title, idx))
+        ws_prog.append(
             [
+                "source_run_name",
                 "condition_key",
                 "display_name",
                 "feed_pressure",
@@ -4121,151 +4125,28 @@ def _write_td_support_workbook(
                 "run_type",
                 "pulse_width_on",
                 "control_period",
+                "exclude_first_n",
+                "last_n_rows",
                 "enabled",
             ]
         )
-        for seq_name in all_sequences:
-            ws_cond.append([seq_name, seq_name, "", "", "", "", "", True])
-
-        ws_bounds = wb.create_sheet(TD_SUPPORT_RUN_CONDITION_BOUNDS_SHEET)
-        ws_bounds.append(["condition_key", "parameter_name", "units", "min_value", "max_value", "enabled"])
-        rows_seen: set[tuple[str, str]] = set()
-        for seq_name in all_sequences:
-            sname = str(seq_name or "").strip()
-            if not sname:
-                continue
-            for param in param_defs:
-                if not isinstance(param, dict):
-                    continue
-                pname = str(param.get("name") or "").strip()
-                if not pname:
-                    continue
-                key = (sname.lower(), pname.lower())
-                if key in rows_seen:
-                    continue
-                rows_seen.add(key)
-                ws_bounds.append([sname, pname, str(param.get("units") or "").strip(), "", "", True])
-
-        for idx, title in enumerate(programs):
-            ws_prog = wb.create_sheet(_td_support_program_sheet_name(title, idx))
-            ws_prog.append(["source_run_name", "condition_key", "exclude_first_n", "last_n_rows", "enabled"])
-            for seq_name in all_sequences:
-                ws_prog.append([seq_name, seq_name, "", "", True])
-    else:
-        program_rows: list[dict] = []
-        for idx, title in enumerate(programs):
-            ws_prog = wb.create_sheet(_td_support_program_sheet_name(title, idx))
+        for seq_name in (program_sequence_map.get(title) or []):
+            row = _td_support_program_row_defaults(seq_name, program_title=title)
             ws_prog.append(
                 [
-                    "source_run_name",
-                    "condition_key",
-                    "display_name",
-                    "feed_pressure",
-                    "feed_pressure_units",
-                    "run_type",
-                    "pulse_width_on",
-                    "control_period",
-                    "exclude_first_n",
-                    "last_n_rows",
-                    "enabled",
-                ]
-            )
-            for seq_name in (program_sequence_map.get(title) or []):
-                row = _td_support_program_row_defaults(seq_name, program_title=title)
-                ws_prog.append(
-                    [
-                        row["source_run_name"],
-                        row["condition_key"],
-                        row["display_name"],
-                        "",
-                        "",
-                        "",
-                        "",
-                        "",
-                        "",
-                        "",
-                        True,
-                    ]
-                )
-                program_rows.append(row)
-
-        condition_groups = _td_group_program_rows_into_conditions(program_rows)
-        ws_cond = wb.create_sheet(TD_SUPPORT_RUN_CONDITIONS_SHEET)
-        ws_cond.append(
-            [
-                "condition_key",
-                "display_name",
-                "feed_pressure",
-                "feed_pressure_units",
-                "run_type",
-                "pulse_width_on",
-                "control_period",
-                "sheet_name",
-                "member_sequences",
-                "member_programs",
-                "enabled",
-            ]
-        )
-        for group in condition_groups:
-            ws_cond.append(
-                [
-                    group.get("condition_key"),
-                    group.get("display_name"),
-                    group.get("feed_pressure"),
-                    group.get("feed_pressure_units"),
-                    group.get("run_type"),
-                    group.get("pulse_width_on"),
-                    group.get("control_period"),
-                    group.get("sheet_name"),
-                    ", ".join([str(v).strip() for v in (group.get("member_sequences") or []) if str(v).strip()]),
-                    ", ".join([str(v).strip() for v in (group.get("member_programs") or []) if str(v).strip()]),
+                    row["source_run_name"],
+                    row["condition_key"],
+                    row["display_name"],
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
                     True,
                 ]
             )
-        for idx, group in enumerate(condition_groups):
-            ws_c = wb.create_sheet(str(group.get("sheet_name") or _td_support_condition_sheet_name(str(group.get("condition_key") or ""), idx)))
-            ws_c.append(
-                [
-                    "condition_key",
-                    "display_name",
-                    "feed_pressure",
-                    "feed_pressure_units",
-                    "run_type",
-                    "pulse_width_on",
-                    "control_period",
-                    "member_sequences",
-                    "member_programs",
-                    "parameter_name",
-                    "units",
-                    "min_value",
-                    "max_value",
-                    "enabled",
-                ]
-            )
-            member_sequences = ", ".join([str(v).strip() for v in (group.get("member_sequences") or []) if str(v).strip()])
-            member_programs = ", ".join([str(v).strip() for v in (group.get("member_programs") or []) if str(v).strip()])
-            for param in param_defs:
-                pname = str((param or {}).get("name") or "").strip()
-                if not pname:
-                    continue
-                ws_c.append(
-                    [
-                        group.get("condition_key"),
-                        group.get("display_name"),
-                        group.get("feed_pressure"),
-                        group.get("feed_pressure_units"),
-                        group.get("run_type"),
-                        group.get("pulse_width_on"),
-                        group.get("control_period"),
-                        member_sequences,
-                        member_programs,
-                        pname,
-                        str((param or {}).get("units") or "").strip(),
-                        "",
-                        "",
-                        True,
-                    ]
-                )
 
     path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(str(path))
@@ -4273,6 +4154,128 @@ def _write_td_support_workbook(
         wb.close()
     except Exception:
         pass
+
+
+def _refresh_td_support_run_conditions_sheet(
+    workbook_path: Path,
+    *,
+    project_dir: Path | None = None,
+    param_defs: list[dict] | None = None,
+) -> dict:
+    try:
+        from openpyxl import load_workbook  # type: ignore
+    except Exception as exc:
+        raise RuntimeError(
+            "openpyxl is required to update the TD support workbook. "
+            "Install it with `py -m pip install openpyxl` within the project environment."
+        ) from exc
+
+    wb_path = Path(workbook_path).expanduser()
+    support_path = td_support_workbook_path_for(wb_path, project_dir=project_dir)
+    if not support_path.exists():
+        return {"path": str(support_path), "updated": False, "condition_count": 0, "rows_written": 0}
+
+    support_cfg = _read_td_support_workbook(wb_path, project_dir=project_dir)
+    run_conditions = [
+        dict(row)
+        for row in ((support_cfg.get("run_conditions") or []))
+        if isinstance(row, dict) and str(row.get("condition_key") or "").strip()
+    ]
+    condition_bounds = {
+        str(k).strip(): dict(v)
+        for k, v in (support_cfg.get("condition_bounds") or {}).items()
+        if str(k).strip() and isinstance(v, dict)
+    }
+    param_defs = [
+        dict(d)
+        for d in (param_defs or [])
+        if isinstance(d, dict) and str(d.get("name") or "").strip()
+    ]
+    param_order = [str(d.get("name") or "").strip() for d in param_defs if str(d.get("name") or "").strip()]
+    param_units = {
+        str(d.get("name") or "").strip(): str(d.get("units") or "").strip()
+        for d in param_defs
+        if str(d.get("name") or "").strip()
+    }
+
+    wb = load_workbook(str(support_path))
+    try:
+        for sheet_name in list(wb.sheetnames):
+            if sheet_name == TD_SUPPORT_RUN_CONDITIONS_SHEET or sheet_name == TD_SUPPORT_RUN_CONDITION_BOUNDS_SHEET:
+                wb.remove(wb[sheet_name])
+                continue
+            if str(sheet_name).startswith(TD_SUPPORT_CONDITION_SHEET_PREFIX):
+                wb.remove(wb[sheet_name])
+
+        ws_cond = wb.create_sheet(TD_SUPPORT_RUN_CONDITIONS_SHEET)
+        ws_cond.append(
+            [
+                "condition_key",
+                "display_name",
+                "feed_pressure",
+                "feed_pressure_units",
+                "run_type",
+                "pulse_width_on",
+                "control_period",
+                "member_sequences",
+                "member_programs",
+                "parameter_name",
+                "units",
+                "min_value",
+                "max_value",
+                "enabled",
+            ]
+        )
+
+        rows_written = 0
+        for row in run_conditions:
+            condition_key = str(row.get("condition_key") or "").strip()
+            if not condition_key:
+                continue
+            bounds = dict(condition_bounds.get(condition_key) or {})
+            ordered_names = [name for name in param_order if name]
+            ordered_names.extend(
+                sorted(
+                    [name for name in bounds.keys() if str(name).strip() and str(name).strip() not in ordered_names],
+                    key=lambda s: str(s).lower(),
+                )
+            )
+            if not ordered_names:
+                ordered_names = [""]
+            for param_name in ordered_names:
+                bound = dict(bounds.get(param_name) or {}) if param_name else {}
+                ws_cond.append(
+                    [
+                        condition_key,
+                        str(row.get("display_name") or condition_key).strip() or condition_key,
+                        row.get("feed_pressure"),
+                        str(row.get("feed_pressure_units") or "").strip(),
+                        str(row.get("run_type") or "").strip(),
+                        row.get("pulse_width_on", row.get("pulse_width")),
+                        row.get("control_period"),
+                        str(row.get("member_sequences_text") or "").strip(),
+                        str(row.get("member_programs_text") or "").strip(),
+                        param_name,
+                        str(bound.get("units") or param_units.get(param_name) or "").strip(),
+                        bound.get("min_value"),
+                        bound.get("max_value"),
+                        bool(bound.get("enabled", row.get("enabled", True))),
+                    ]
+                )
+                rows_written += 1
+        wb.save(str(support_path))
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
+
+    return {
+        "path": str(support_path),
+        "updated": True,
+        "condition_count": len(run_conditions),
+        "rows_written": rows_written,
+    }
 
 
 def _to_support_int(v: object) -> int | None:
@@ -4445,6 +4448,7 @@ def _read_td_support_workbook(workbook_path: Path, *, project_dir: Path | None =
                 enabled = _td_bool(enabled_raw, True)
                 programs.append({"program_title": title, "sheet_name": sheet_name, "enabled": bool(enabled)})
 
+        combined_run_conditions_sheet = False
         if TD_SUPPORT_RUN_CONDITIONS_SHEET in wb.sheetnames:
             ws = wb[TD_SUPPORT_RUN_CONDITIONS_SHEET]
             headers: dict[str, int] = {}
@@ -4452,31 +4456,51 @@ def _read_td_support_workbook(workbook_path: Path, *, project_dir: Path | None =
                 key = str(ws.cell(1, col).value or "").strip().lower()
                 if key:
                     headers[key] = col
+            combined_run_conditions_sheet = "parameter_name" in headers
+            run_conditions_by_key: dict[str, dict] = {}
             for row in range(2, (ws.max_row or 0) + 1):
                 condition_key = str(ws.cell(row, headers.get("condition_key", 1)).value or "").strip()
-                display_name = str(ws.cell(row, headers.get("display_name", 2)).value or "").strip()
-                if not condition_key and not display_name:
+                raw_display_name = str(ws.cell(row, headers.get("display_name", 2)).value or "").strip()
+                if not condition_key and not raw_display_name:
                     continue
-                enabled_raw = ws.cell(row, headers.get("enabled", 8)).value if headers.get("enabled") else True
+                enabled_raw = ws.cell(row, headers.get("enabled", 14 if combined_run_conditions_sheet else 8)).value if headers.get("enabled") else True
                 enabled = _td_bool(enabled_raw, True)
-                run_conditions.append(
-                    {
-                        "condition_key": condition_key or display_name,
-                        "display_name": display_name or condition_key,
-                        "feed_pressure": ws.cell(row, headers.get("feed_pressure", 3)).value if headers.get("feed_pressure") else None,
-                        "feed_pressure_units": str(ws.cell(row, headers.get("feed_pressure_units", 4)).value or "").strip(),
-                        "run_type": str(ws.cell(row, headers.get("run_type", 5)).value or "").strip(),
-                        "pulse_width": ws.cell(row, headers.get("pulse_width_on", 6)).value if headers.get("pulse_width_on") else None,
-                        "pulse_width_on": ws.cell(row, headers.get("pulse_width_on", 6)).value if headers.get("pulse_width_on") else None,
-                        "control_period": ws.cell(row, headers.get("control_period", 7)).value if headers.get("control_period") else None,
-                        "sheet_name": str(ws.cell(row, headers.get("sheet_name", 8)).value or "").strip() if headers.get("sheet_name") else "",
-                        "member_sequences_text": str(ws.cell(row, headers.get("member_sequences", 9)).value or "").strip() if headers.get("member_sequences") else "",
-                        "member_programs_text": str(ws.cell(row, headers.get("member_programs", 10)).value or "").strip() if headers.get("member_programs") else "",
-                        "enabled": bool(enabled),
-                    }
+                row_payload = {
+                    "condition_key": condition_key or raw_display_name,
+                    "display_name": raw_display_name or condition_key,
+                    "feed_pressure": ws.cell(row, headers.get("feed_pressure", 3)).value if headers.get("feed_pressure") else None,
+                    "feed_pressure_units": str(ws.cell(row, headers.get("feed_pressure_units", 4)).value or "").strip(),
+                    "run_type": str(ws.cell(row, headers.get("run_type", 5)).value or "").strip(),
+                    "pulse_width": ws.cell(row, headers.get("pulse_width_on", 6)).value if headers.get("pulse_width_on") else None,
+                    "pulse_width_on": ws.cell(row, headers.get("pulse_width_on", 6)).value if headers.get("pulse_width_on") else None,
+                    "control_period": ws.cell(row, headers.get("control_period", 7)).value if headers.get("control_period") else None,
+                    "sheet_name": str(ws.cell(row, headers.get("sheet_name", 8)).value or "").strip() if headers.get("sheet_name") else "",
+                    "member_sequences_text": str(ws.cell(row, headers.get("member_sequences", 9)).value or "").strip() if headers.get("member_sequences") else "",
+                    "member_programs_text": str(ws.cell(row, headers.get("member_programs", 10)).value or "").strip() if headers.get("member_programs") else "",
+                    "enabled": bool(enabled),
+                }
+                display_name = _td_effective_run_condition_label(
+                    row_payload,
+                    fallback_display_name=(raw_display_name or condition_key),
                 )
+                row_payload["display_name"] = display_name
+                key = str(row_payload.get("condition_key") or "").strip()
+                if key and key not in run_conditions_by_key:
+                    run_conditions_by_key[key] = dict(row_payload)
+                if combined_run_conditions_sheet:
+                    pname = str(ws.cell(row, headers.get("parameter_name", 10)).value or "").strip()
+                    if pname:
+                        condition_bounds.setdefault(key, {})[pname] = {
+                            "condition_key": key,
+                            "parameter_name": pname,
+                            "units": str(ws.cell(row, headers.get("units", 11)).value or "").strip(),
+                            "min_value": _td_finite_float(ws.cell(row, headers.get("min_value", 12)).value if headers.get("min_value") else None),
+                            "max_value": _td_finite_float(ws.cell(row, headers.get("max_value", 13)).value if headers.get("max_value") else None),
+                            "enabled": bool(enabled),
+                        }
+            run_conditions = list(run_conditions_by_key.values())
 
-        if TD_SUPPORT_RUN_CONDITION_BOUNDS_SHEET in wb.sheetnames:
+        if not combined_run_conditions_sheet and TD_SUPPORT_RUN_CONDITION_BOUNDS_SHEET in wb.sheetnames:
             ws = wb[TD_SUPPORT_RUN_CONDITION_BOUNDS_SHEET]
             headers: dict[str, int] = {}
             for col in range(1, (ws.max_column or 0) + 1):
@@ -4539,9 +4563,10 @@ def _read_td_support_workbook(workbook_path: Path, *, project_dir: Path | None =
                     "enabled": bool(enabled),
                 }
                 if has_full_condition_columns:
+                    raw_display_name = str(ws.cell(row, headers.get("display_name", 3)).value or "").strip()
                     row_out.update(
                         {
-                            "display_name": str(ws.cell(row, headers.get("display_name", 3)).value or "").strip() or (condition_key or source_run),
+                            "display_name": raw_display_name or (condition_key or source_run),
                             "feed_pressure": ws.cell(row, headers.get("feed_pressure")).value if headers.get("feed_pressure") else None,
                             "feed_pressure_units": str(ws.cell(row, headers.get("feed_pressure_units")).value or "").strip() if headers.get("feed_pressure_units") else "",
                             "run_type": str(ws.cell(row, headers.get("run_type")).value or "").strip() if headers.get("run_type") else "",
@@ -4550,35 +4575,40 @@ def _read_td_support_workbook(workbook_path: Path, *, project_dir: Path | None =
                             "control_period": ws.cell(row, headers.get("control_period")).value if headers.get("control_period") else None,
                         }
                     )
+                    row_out["display_name"] = _td_effective_run_condition_label(
+                        row_out,
+                        fallback_display_name=(raw_display_name or condition_key or source_run),
+                    )
                 rows_out.append(row_out)
             program_mappings[title] = rows_out
 
-        for sheet_name in wb.sheetnames:
-            if not str(sheet_name).startswith(TD_SUPPORT_CONDITION_SHEET_PREFIX):
-                continue
-            ws = wb[sheet_name]
-            headers: dict[str, int] = {}
-            for col in range(1, (ws.max_column or 0) + 1):
-                key = str(ws.cell(1, col).value or "").strip().lower()
-                if key:
-                    headers[key] = col
-            if "condition_key" not in headers or "parameter_name" not in headers:
-                continue
-            for row in range(2, (ws.max_row or 0) + 1):
-                condition_key = str(ws.cell(row, headers.get("condition_key", 1)).value or "").strip()
-                pname = str(ws.cell(row, headers.get("parameter_name", 10)).value or "").strip()
-                if not condition_key or not pname:
+        if not combined_run_conditions_sheet and not condition_bounds:
+            for sheet_name in wb.sheetnames:
+                if not str(sheet_name).startswith(TD_SUPPORT_CONDITION_SHEET_PREFIX):
                     continue
-                enabled_raw = ws.cell(row, headers.get("enabled", 14)).value if headers.get("enabled") else True
-                enabled = _td_bool(enabled_raw, True)
-                condition_bounds.setdefault(condition_key, {})[pname] = {
-                    "condition_key": condition_key,
-                    "parameter_name": pname,
-                    "units": str(ws.cell(row, headers.get("units", 11)).value or "").strip(),
-                    "min_value": _td_finite_float(ws.cell(row, headers.get("min_value", 12)).value if headers.get("min_value") else None),
-                    "max_value": _td_finite_float(ws.cell(row, headers.get("max_value", 13)).value if headers.get("max_value") else None),
-                    "enabled": bool(enabled),
-                }
+                ws = wb[sheet_name]
+                headers: dict[str, int] = {}
+                for col in range(1, (ws.max_column or 0) + 1):
+                    key = str(ws.cell(1, col).value or "").strip().lower()
+                    if key:
+                        headers[key] = col
+                if "condition_key" not in headers or "parameter_name" not in headers:
+                    continue
+                for row in range(2, (ws.max_row or 0) + 1):
+                    condition_key = str(ws.cell(row, headers.get("condition_key", 1)).value or "").strip()
+                    pname = str(ws.cell(row, headers.get("parameter_name", 10)).value or "").strip()
+                    if not condition_key or not pname:
+                        continue
+                    enabled_raw = ws.cell(row, headers.get("enabled", 14)).value if headers.get("enabled") else True
+                    enabled = _td_bool(enabled_raw, True)
+                    condition_bounds.setdefault(condition_key, {})[pname] = {
+                        "condition_key": condition_key,
+                        "parameter_name": pname,
+                        "units": str(ws.cell(row, headers.get("units", 11)).value or "").strip(),
+                        "min_value": _td_finite_float(ws.cell(row, headers.get("min_value", 12)).value if headers.get("min_value") else None),
+                        "max_value": _td_finite_float(ws.cell(row, headers.get("max_value", 13)).value if headers.get("max_value") else None),
+                        "enabled": bool(enabled),
+                    }
 
         if not run_conditions and "Sequences" in wb.sheetnames:
             ws = wb["Sequences"]
@@ -5017,6 +5047,30 @@ def td_build_run_condition_label(sequence_row: dict | None) -> str:
     return ", ".join(part for part in parts if str(part).strip())
 
 
+def _td_effective_run_condition_label(
+    row: Mapping[str, object] | None,
+    *,
+    fallback_display_name: object = "",
+) -> str:
+    if not isinstance(row, Mapping):
+        return str(fallback_display_name or "").strip()
+    derived = td_build_run_condition_label(dict(row))
+    if derived:
+        return derived
+    for candidate in (
+        fallback_display_name,
+        row.get("display_name"),
+        row.get("condition_key"),
+        row.get("run_name"),
+        row.get("sequence_name"),
+        row.get("source_run_name"),
+    ):
+        text = str(candidate or "").strip()
+        if text:
+            return text
+    return ""
+
+
 def _td_support_enabled_programs(support_cfg: dict) -> list[dict]:
     return [
         dict(row)
@@ -5072,19 +5126,18 @@ def _td_resolved_support_condition_payload(
     mapping: dict | None = None,
 ) -> dict:
     conditions_by_key = _td_support_run_conditions_by_key(support_cfg)
-    condition = dict(conditions_by_key.get(condition_key) or {})
-    display_name = str(
-        condition.get("display_name")
-        or (mapping or {}).get("display_name")
-        or condition_key
-        or source_run_name
-    ).strip() or source_run_name
+    resolved_condition_key = str(condition_key or "").strip() or str(source_run_name or "").strip()
+    condition = dict(conditions_by_key.get(resolved_condition_key) or {})
+    if not condition and isinstance(mapping, dict):
+        derived_condition_key = td_build_run_condition_key(dict(mapping))
+        if derived_condition_key:
+            resolved_condition_key = derived_condition_key
+            condition = dict(conditions_by_key.get(resolved_condition_key) or {})
     payload = {
         "program_title": str(program_title or "").strip(),
-        "condition_key": str(condition_key or "").strip() or str(source_run_name or "").strip(),
-        "sequence_name": str(condition_key or "").strip() or str(source_run_name or "").strip(),
-        "display_name": display_name,
-        "source_run_name": str(source_run_name or "").strip() or display_name,
+        "condition_key": resolved_condition_key,
+        "sequence_name": resolved_condition_key,
+        "source_run_name": str(source_run_name or "").strip(),
         "feed_pressure": condition.get("feed_pressure", (mapping or {}).get("feed_pressure")),
         "feed_pressure_units": str(condition.get("feed_pressure_units") or (mapping or {}).get("feed_pressure_units") or "").strip(),
         "run_type": str(condition.get("run_type") or (mapping or {}).get("run_type") or "").strip(),
@@ -5095,6 +5148,17 @@ def _td_resolved_support_condition_payload(
         "last_n_rows": (mapping or {}).get("last_n_rows"),
         "matched_support": bool(mapping or condition),
     }
+    display_name = _td_effective_run_condition_label(
+        payload,
+        fallback_display_name=(
+            condition.get("display_name")
+            or (mapping or {}).get("display_name")
+            or resolved_condition_key
+            or source_run_name
+        ),
+    )
+    payload["display_name"] = display_name
+    payload["source_run_name"] = str(source_run_name or "").strip() or display_name
     return payload
 
 
@@ -5177,19 +5241,23 @@ def td_list_run_selection_views(db_path: Path, workbook_path: Path, *, project_d
     except Exception:
         support_cfg = {"exists": False}
 
-    observations_by_run: dict[str, list[dict]] = {}
+    observations_by_condition: dict[str, list[dict]] = {}
+    observations_by_source_run: dict[str, list[dict]] = {}
     for row in ((support_cfg.get("sequences") or [])):
         if not isinstance(row, dict) or not bool(row.get("enabled", True)):
             continue
-        run = str(row.get("condition_key") or row.get("sequence_name") or "").strip()
-        if not run:
+        condition_key = str(row.get("condition_key") or row.get("sequence_name") or "").strip()
+        source_run_name = str(row.get("source_run_name") or "").strip()
+        if not condition_key and not source_run_name:
             continue
-        observations_by_run.setdefault(run, []).append(
-            {
-                "program_title": str(row.get("program_title") or "").strip(),
-                "source_run_name": str(row.get("source_run_name") or "").strip(),
-            }
-        )
+        obs = {
+            "program_title": str(row.get("program_title") or "").strip(),
+            "source_run_name": source_run_name,
+        }
+        if condition_key:
+            observations_by_condition.setdefault(condition_key, []).append(obs)
+        if source_run_name:
+            observations_by_source_run.setdefault(source_run_name, []).append(obs)
 
     sequence_items: list[dict] = []
     condition_items: list[dict] = []
@@ -5198,8 +5266,11 @@ def td_list_run_selection_views(db_path: Path, workbook_path: Path, *, project_d
         if not run_name:
             continue
         support_payload = _td_resolve_support_condition_for_source("", run_name, support_cfg)
-        run_display_name = str(item.get("display_name") or support_payload.get("display_name") or run_name).strip() or run_name
-        source_rows = list(observations_by_run.get(run_name) or [])
+        run_display_name = str(support_payload.get("display_name") or item.get("display_name") or run_name).strip() or run_name
+        resolved_condition_key = str(support_payload.get("condition_key") or "").strip()
+        source_rows = list(observations_by_condition.get(resolved_condition_key) or [])
+        if not source_rows:
+            source_rows = list(observations_by_source_run.get(run_name) or [])
         member_sequences: list[str] = []
         detail_rows: list[str] = []
         seen_sequence_labels: set[str] = set()
@@ -8290,6 +8361,8 @@ TD_PERF_FIT_MODE_AUTO = "auto"
 TD_PERF_FIT_MODE_POLYNOMIAL = "polynomial"
 TD_PERF_FIT_MODE_LOGARITHMIC = "logarithmic"
 TD_PERF_FIT_MODE_SATURATING_EXPONENTIAL = "saturating_exponential"
+TD_PERF_FIT_MODE_HYBRID_SATURATING_LINEAR = "hybrid_saturating_linear"
+TD_PERF_FIT_MODE_MONOTONE_PCHIP = "monotone_pchip"
 TD_PERF_FIT_MODE_PIECEWISE_AUTO = "piecewise_auto"
 TD_PERF_FIT_MODE_PIECEWISE_2 = "piecewise_2"
 TD_PERF_FIT_MODE_PIECEWISE_3 = "piecewise_3"
@@ -8302,6 +8375,8 @@ TD_PERF_FIT_MODES = {
     TD_PERF_FIT_MODE_POLYNOMIAL,
     TD_PERF_FIT_MODE_LOGARITHMIC,
     TD_PERF_FIT_MODE_SATURATING_EXPONENTIAL,
+    TD_PERF_FIT_MODE_HYBRID_SATURATING_LINEAR,
+    TD_PERF_FIT_MODE_MONOTONE_PCHIP,
     TD_PERF_FIT_MODE_PIECEWISE_AUTO,
     TD_PERF_FIT_MODE_PIECEWISE_2,
     TD_PERF_FIT_MODE_PIECEWISE_3,
@@ -8310,14 +8385,25 @@ TD_PERF_FIT_MODES = {
     TD_PERF_FIT_FAMILY_PLANE,
     TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE,
 }
+TD_PERF_FIT_COMPLEXITY_PENALTIES = {
+    TD_PERF_FIT_MODE_POLYNOMIAL: 0.0,
+    TD_PERF_FIT_MODE_LOGARITHMIC: 0.0,
+    TD_PERF_FIT_MODE_SATURATING_EXPONENTIAL: 0.0,
+    TD_PERF_FIT_MODE_HYBRID_SATURATING_LINEAR: 0.10,
+    TD_PERF_FIT_MODE_PIECEWISE_2: 0.15,
+    TD_PERF_FIT_MODE_PIECEWISE_3: 0.30,
+    TD_PERF_FIT_MODE_MONOTONE_PCHIP: 0.35,
+}
 TD_PERF_FIT_FAMILY_PRIORITY = {
     TD_PERF_FIT_MODE_LOGARITHMIC: 0,
     TD_PERF_FIT_MODE_SATURATING_EXPONENTIAL: 1,
-    TD_PERF_FIT_MODE_PIECEWISE_2: 2,
-    TD_PERF_FIT_MODE_PIECEWISE_3: 3,
-    TD_PERF_FIT_MODE_POLYNOMIAL: 4,
-    TD_PERF_FIT_FAMILY_PLANE: 5,
-    TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE: 6,
+    TD_PERF_FIT_MODE_HYBRID_SATURATING_LINEAR: 2,
+    TD_PERF_FIT_MODE_PIECEWISE_2: 3,
+    TD_PERF_FIT_MODE_PIECEWISE_3: 4,
+    TD_PERF_FIT_MODE_MONOTONE_PCHIP: 5,
+    TD_PERF_FIT_MODE_POLYNOMIAL: 6,
+    TD_PERF_FIT_FAMILY_PLANE: 7,
+    TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE: 8,
 }
 
 
@@ -8334,6 +8420,10 @@ def td_perf_fit_family_label(value: object) -> str:
         return "Logarithmic"
     if fam == TD_PERF_FIT_MODE_SATURATING_EXPONENTIAL:
         return "Saturating Exponential"
+    if fam == TD_PERF_FIT_MODE_HYBRID_SATURATING_LINEAR:
+        return "Hybrid Saturating + Linear"
+    if fam == TD_PERF_FIT_MODE_MONOTONE_PCHIP:
+        return "Monotone PCHIP"
     if fam == TD_PERF_FIT_MODE_PIECEWISE_AUTO:
         return "Piecewise Auto"
     if fam == TD_PERF_FIT_MODE_PIECEWISE_2:
@@ -8364,9 +8454,17 @@ def _td_perf_import_curve_fit():
         from scipy.optimize import curve_fit  # type: ignore
     except Exception as exc:
         raise RuntimeError(
-            "scipy is required for Auto, Logarithmic, and Saturating Exponential performance fitting."
+            "scipy is required for Auto, Logarithmic, Saturating Exponential, Hybrid Saturating + Linear, and Monotone PCHIP performance fitting."
         ) from exc
     return curve_fit
+
+
+def _td_perf_import_pchip():
+    try:
+        from scipy.interpolate import PchipInterpolator  # type: ignore
+    except Exception as exc:
+        raise RuntimeError("scipy is required for Monotone PCHIP performance fitting.") from exc
+    return PchipInterpolator
 
 
 def _td_perf_fmt_num(value: object) -> str:
@@ -8397,6 +8495,94 @@ def _td_perf_fmt_poly_equation(coeffs: list[float], degree: int, *, x0: float | 
     if x0 is not None and sx is not None:
         return f"y = {expr}", f"x' = (x - {_td_perf_fmt_num(x0)}) / {_td_perf_fmt_num(sx)}"
     return f"y = {expr}", ""
+
+
+def _td_perf_fmt_surface_equation(coeffs: list[float], family: str) -> str:
+    raw = str(family or "").strip().lower()
+    if raw == TD_PERF_FIT_FAMILY_PLANE:
+        labels = ["", "x1'", "x2'"]
+    elif raw == TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE:
+        labels = ["", "x1'", "x2'", "x1'^2", "x1'*x2'", "x2'^2"]
+    else:
+        return ""
+    parts: list[str] = []
+    for coeff, label in zip(coeffs, labels):
+        try:
+            cf = float(coeff)
+        except Exception:
+            continue
+        if not label:
+            parts.append(f"{cf:+.4g}")
+        else:
+            parts.append(f"{cf:+.4g}*{label}")
+    expr = " ".join(parts).lstrip("+").strip()
+    return f"y = {expr}" if expr else ""
+
+
+def _td_perf_fmt_surface_normalization(x1_center: float, x1_scale: float, x2_center: float, x2_scale: float) -> str:
+    return (
+        f"x1' = (x1 - {_td_perf_fmt_num(x1_center)}) / {_td_perf_fmt_num(x1_scale)} ; "
+        f"x2' = (x2 - {_td_perf_fmt_num(x2_center)}) / {_td_perf_fmt_num(x2_scale)}"
+    )
+
+
+def _td_perf_prepare_xy(xs: Sequence[float], ys: Sequence[float]):
+    np = _td_perf_import_numpy()
+    if len(xs) != len(ys):
+        return None, None, None
+    x_arr = np.asarray([float(v) for v in xs], dtype=float)
+    y_arr = np.asarray([float(v) for v in ys], dtype=float)
+    finite_mask = np.isfinite(x_arr) & np.isfinite(y_arr)
+    if not bool(np.all(finite_mask)):
+        return None, None, None
+    order = np.argsort(x_arr, kind="mergesort")
+    return x_arr[order], y_arr[order], order
+
+
+def _td_perf_edge_weights(xs: Sequence[float]) -> list[float]:
+    values = [float(v) for v in xs]
+    if not values:
+        return []
+    x_min = float(min(values))
+    x_max = float(max(values))
+    x_span = float(x_max - x_min)
+    if not math.isfinite(x_span) or x_span <= 0.0:
+        return [1.0 for _ in values]
+    edge_lo = x_min + (0.20 * x_span)
+    edge_hi = x_max - (0.20 * x_span)
+    return [1.75 if (float(x) <= edge_lo or float(x) >= edge_hi) else 1.0 for x in values]
+
+
+def _td_perf_prepare_sample_weights(xs: Sequence[float], sample_weights: Sequence[float] | None):
+    np = _td_perf_import_numpy()
+    if sample_weights is None:
+        return _td_perf_edge_weights(xs)
+    if len(sample_weights) != len(xs):
+        return None
+    try:
+        arr = np.asarray([float(v) for v in sample_weights], dtype=float)
+    except Exception:
+        return None
+    if not bool(np.all(np.isfinite(arr))):
+        return None
+    arr = np.clip(arr, 1e-6, None)
+    return [float(v) for v in arr.tolist()]
+
+
+def _td_perf_curve_fit_sigma(sample_weights: Sequence[float] | None):
+    if sample_weights is None:
+        return None
+    return [float(1.0 / max(float(v), 1e-6)) for v in sample_weights]
+
+
+def _td_perf_weighted_lstsq(design, y_values, sample_weights: Sequence[float] | None):
+    np = _td_perf_import_numpy()
+    if sample_weights is None:
+        return np.linalg.lstsq(design, y_values, rcond=None)
+    w = np.sqrt(np.asarray([float(v) for v in sample_weights], dtype=float)).reshape(-1, 1)
+    weighted_design = design * w
+    weighted_y = np.asarray(y_values, dtype=float) * w[:, 0]
+    return np.linalg.lstsq(weighted_design, weighted_y, rcond=None)
 
 
 def _td_perf_piecewise_basis(xs, breakpoints: Sequence[float]):
@@ -8502,6 +8688,7 @@ def _td_perf_fit_piecewise_model(
     *,
     segment_count: int,
     fit_mode: str,
+    sample_weights: Sequence[float] | None = None,
 ) -> dict[str, object] | None:
     np = _td_perf_import_numpy()
     seg_count = int(segment_count)
@@ -8510,22 +8697,24 @@ def _td_perf_fit_piecewise_model(
     min_points_per_segment = 2
     if len(xs) < (seg_count * min_points_per_segment):
         return None
-    x_arr = np.asarray([float(v) for v in xs], dtype=float)
-    y_arr = np.asarray([float(v) for v in ys], dtype=float)
-    if len(x_arr) < (seg_count * min_points_per_segment):
+    prepared = _td_perf_prepare_xy(xs, ys)
+    if prepared[0] is None:
         return None
-    finite_mask = np.isfinite(x_arr) & np.isfinite(y_arr)
-    if not bool(np.all(finite_mask)):
+    x_sorted, y_sorted, order = prepared
+    assert order is not None
+    weights_in = _td_perf_prepare_sample_weights(xs, sample_weights)
+    if weights_in is None:
         return None
-    order = np.argsort(x_arr, kind="mergesort")
-    x_sorted = x_arr[order]
-    y_sorted = y_arr[order]
+    weights_sorted = [float(weights_in[idx]) for idx in order.tolist()]
     unique_x = sorted({round(float(v), 12) for v in x_sorted.tolist()})
     min_unique = seg_count + 1
     if len(unique_x) < min_unique:
         return None
     x_span = float(x_sorted[-1] - x_sorted[0])
-    min_span = max(1e-9, x_span * 0.05)
+    diffs = np.diff(np.asarray(unique_x, dtype=float))
+    positive_diffs = [float(v) for v in diffs.tolist() if float(v) > 0.0]
+    median_dx = float(np.median(np.asarray(positive_diffs, dtype=float))) if positive_diffs else 0.0
+    min_span = max(1e-9, 2.0 * median_dx)
     best_model: dict[str, object] | None = None
     best_score = float("inf")
     candidates = _td_perf_piecewise_candidate_breaks(
@@ -8539,7 +8728,9 @@ def _td_perf_fit_piecewise_model(
 
     slope_scale = max(abs(float(y_sorted[-1] - y_sorted[0])) / max(x_span, 1e-9), 1e-9)
     slope_delta_tol = max(1e-6, slope_scale * 0.08)
-    split_penalty = 0.75 * float(seg_count - 1)
+    split_penalty = TD_PERF_FIT_COMPLEXITY_PENALTIES[
+        TD_PERF_FIT_MODE_PIECEWISE_2 if seg_count == 2 else TD_PERF_FIT_MODE_PIECEWISE_3
+    ]
 
     for breakpoints in candidates:
         edges = [x_sorted[0], *[float(v) for v in breakpoints], x_sorted[-1]]
@@ -8564,7 +8755,7 @@ def _td_perf_fit_piecewise_model(
             continue
 
         design = _td_perf_piecewise_basis(x_sorted, breakpoints)
-        coeffs, _residuals, rank, _singular = np.linalg.lstsq(design, y_sorted, rcond=None)
+        coeffs, _residuals, rank, _singular = _td_perf_weighted_lstsq(design, y_sorted, weights_sorted)
         if int(rank) < int(design.shape[1]):
             continue
         coeff_list = [float(v) for v in coeffs.tolist()]
@@ -8599,6 +8790,7 @@ def _td_perf_fit_piecewise_model(
             x_values=x_sorted,
             y_true=y_sorted,
             y_hat=y_hat,
+            complexity_penalty=split_penalty,
             extra={
                 "breakpoints": [float(v) for v in breakpoints],
                 "segments": [
@@ -8611,13 +8803,15 @@ def _td_perf_fit_piecewise_model(
                     for seg in segments
                 ],
                 "segment_count": seg_count,
+                "fit_domain": [float(x_sorted[0]), float(x_sorted[-1])],
+                "sample_weights_used": [float(v) for v in weights_sorted],
             },
         )
         model["monotonic_violations"] = 0
-        model["score"] = float(model.get("score") or float("inf")) + split_penalty
-        if float(model.get("score") or float("inf")) < best_score:
+        model["monotonicity_penalty"] = 0.0
+        if _td_perf_model_score_value(model) < best_score:
             best_model = model
-            best_score = float(model.get("score") or float("inf"))
+            best_score = _td_perf_model_score_value(model)
     return best_model
 
 
@@ -8653,6 +8847,74 @@ def _td_perf_monotonic_violations(x_values, y_values) -> int:
     return int(sum(1 for diff in diffs if (float(diff) * direction) < (-tol)))
 
 
+def _td_perf_normalized_rmse(y_true, y_hat) -> float:
+    np = _td_perf_import_numpy()
+    y_true_arr = np.asarray(y_true, dtype=float)
+    y_hat_arr = np.asarray(y_hat, dtype=float)
+    if len(y_true_arr) <= 0:
+        return float("inf")
+    y_span = max(float(np.max(y_true_arr) - np.min(y_true_arr)), 1e-9)
+    rmse = float(np.sqrt(np.mean((y_true_arr - y_hat_arr) ** 2)))
+    return rmse / y_span
+
+
+def _td_perf_edge_rmse_norm(x_values, y_true, y_hat) -> float:
+    np = _td_perf_import_numpy()
+    xs = np.asarray(x_values, dtype=float)
+    y_true_arr = np.asarray(y_true, dtype=float)
+    y_hat_arr = np.asarray(y_hat, dtype=float)
+    if len(xs) <= 1:
+        return _td_perf_normalized_rmse(y_true_arr, y_hat_arr)
+    x_min = float(np.min(xs))
+    x_max = float(np.max(xs))
+    x_span = float(x_max - x_min)
+    if x_span <= 0.0:
+        return _td_perf_normalized_rmse(y_true_arr, y_hat_arr)
+    edge_lo = x_min + (0.20 * x_span)
+    edge_hi = x_max - (0.20 * x_span)
+    mask = (xs <= edge_lo) | (xs >= edge_hi)
+    if int(np.count_nonzero(mask)) <= 0:
+        return _td_perf_normalized_rmse(y_true_arr, y_hat_arr)
+    return _td_perf_normalized_rmse(y_true_arr[mask], y_hat_arr[mask])
+
+
+def _td_perf_group_duplicate_xy(xs, ys):
+    np = _td_perf_import_numpy()
+    grouped: dict[float, list[float]] = {}
+    for x_val, y_val in zip(xs, ys):
+        grouped.setdefault(round(float(x_val), 12), []).append(float(y_val))
+    pairs = sorted((float(x_key), float(np.median(np.asarray(vals, dtype=float)))) for x_key, vals in grouped.items())
+    return [float(x) for x, _ in pairs], [float(y) for _x, y in pairs]
+
+
+def _td_perf_tail_slope_seed(xs, ys) -> float:
+    np = _td_perf_import_numpy()
+    if len(xs) < 2:
+        return 0.0
+    tail_count = max(2, int(math.ceil(len(xs) * 0.25)))
+    tail_x = np.asarray(xs[-tail_count:], dtype=float)
+    tail_y = np.asarray(ys[-tail_count:], dtype=float)
+    if len(tail_x) < 2 or float(np.max(tail_x) - np.min(tail_x)) <= 0.0:
+        return 0.0
+    coeffs = np.polyfit(tail_x, tail_y, 1)
+    return max(float(coeffs[0]), 0.0)
+
+
+def _td_perf_parametric_aic_key(model: Mapping[str, object]) -> tuple[float, float]:
+    family = str(model.get("fit_family") or "").strip().lower()
+    if family == TD_PERF_FIT_MODE_MONOTONE_PCHIP:
+        return float("inf"), float("inf")
+    return float(model.get("aicc") or float("inf")), float(model.get("aic") or float("inf"))
+
+
+def _td_perf_model_score_value(model: Mapping[str, object]) -> float:
+    try:
+        score = float(model.get("score"))
+    except Exception:
+        return float("inf")
+    return score if math.isfinite(score) else float("inf")
+
+
 def td_perf_predict_model(model: Mapping[str, object], xs: Iterable[float]) -> list[float]:
     np = _td_perf_import_numpy()
     family = td_perf_normalize_fit_mode(model.get("fit_family"))
@@ -8679,6 +8941,25 @@ def td_perf_predict_model(model: Mapping[str, object], xs: Iterable[float]) -> l
         A = float((params or {}).get("A") or 0.0)
         k = float((params or {}).get("k") or 0.0)
         return [float(v) for v in (L - (A * np.exp(-k * x_arr))).tolist()]
+    if family == TD_PERF_FIT_MODE_HYBRID_SATURATING_LINEAR:
+        b = float((params or {}).get("b") or 0.0)
+        m = float((params or {}).get("m") or 0.0)
+        A = float((params or {}).get("A") or 0.0)
+        k = float((params or {}).get("k") or 0.0)
+        return [float(v) for v in (b + (m * x_arr) + (A * (1.0 - np.exp(-k * x_arr)))).tolist()]
+    if family == TD_PERF_FIT_MODE_MONOTONE_PCHIP:
+        PchipInterpolator = _td_perf_import_pchip()
+        knots = [float(v) for v in ((params or {}).get("knots") or [])]
+        knot_values = [float(v) for v in ((params or {}).get("knot_values") or [])]
+        if len(knots) < 2 or len(knots) != len(knot_values):
+            return []
+        interpolator = PchipInterpolator(knots, knot_values, extrapolate=False)
+        y_hat = interpolator(x_arr)
+        left_y = float((params or {}).get("left_y") or knot_values[0])
+        right_y = float((params or {}).get("right_y") or knot_values[-1])
+        y_hat = np.where(x_arr < float(knots[0]), left_y, y_hat)
+        y_hat = np.where(x_arr > float(knots[-1]), right_y, y_hat)
+        return [float(v) for v in y_hat.tolist()]
     if family in {TD_PERF_FIT_MODE_PIECEWISE_2, TD_PERF_FIT_MODE_PIECEWISE_3}:
         coeffs = [float(v) for v in ((params or {}).get("coeffs") or [])]
         breakpoints = [float(v) for v in ((params or {}).get("breakpoints") or [])]
@@ -8695,7 +8976,8 @@ def td_perf_build_aggregate_curve(
     *,
     max_bins: int = 24,
     min_serials_per_bin: int = 1,
-) -> dict[str, list[float]]:
+    return_meta: bool = False,
+) -> dict[str, list[float] | list[int]]:
     np = _td_perf_import_numpy()
     serial_points: dict[str, list[tuple[float, float]]] = {}
     pooled_x: list[float] = []
@@ -8715,23 +8997,31 @@ def td_perf_build_aggregate_curve(
             pooled_x.append(x_val)
         if pts:
             serial_points[str(serial)] = pts
+    empty: dict[str, list[float] | list[int]] = {"x": [], "y": []}
+    if return_meta:
+        empty.update({"serial_support": [], "edge_weight": []})
     if not pooled_x:
-        return {"x": [], "y": []}
+        return empty
     x_min = float(min(pooled_x))
     x_max = float(max(pooled_x))
     if not math.isfinite(x_min) or not math.isfinite(x_max):
-        return {"x": [], "y": []}
+        return empty
     unique_x = sorted({round(float(v), 12) for v in pooled_x})
     if len(unique_x) <= 1 or float(x_min) == float(x_max):
         y_vals = [y for pts in serial_points.values() for _x, y in pts]
         y_med = float(np.median(np.asarray(y_vals, dtype=float))) if y_vals else 0.0
-        return {"x": [float(x_min)], "y": [y_med]}
+        out: dict[str, list[float] | list[int]] = {"x": [float(x_min)], "y": [y_med]}
+        if return_meta:
+            out["serial_support"] = [len(serial_points)]
+            out["edge_weight"] = [1.0]
+        return out
 
     bin_count = max(2, min(int(max_bins), len(unique_x)))
     edges = np.linspace(float(x_min), float(x_max), bin_count + 1)
     bins: list[tuple[float, float]] = list(zip(edges[:-1].tolist(), edges[1:].tolist()))
     agg_x: list[float] = []
     agg_y: list[float] = []
+    serial_support: list[int] = []
     for idx, (left, right) in enumerate(bins):
         serial_bin_points: list[tuple[float, float]] = []
         for pts in serial_points.values():
@@ -8748,10 +9038,37 @@ def td_perf_build_aggregate_curve(
             continue
         agg_x.append(float(np.median(np.asarray([x for x, _y in serial_bin_points], dtype=float))))
         agg_y.append(float(np.median(np.asarray([y for _x, y in serial_bin_points], dtype=float))))
+        serial_support.append(int(len(serial_bin_points)))
     if not agg_x:
-        return {"x": [], "y": []}
-    pairs = sorted(zip(agg_x, agg_y), key=lambda item: item[0])
-    return {"x": [float(x) for x, _y in pairs], "y": [float(y) for _x, y in pairs]}
+        return empty
+    edge_weight = _td_perf_edge_weights(agg_x)
+    pairs = sorted(zip(agg_x, agg_y, serial_support, edge_weight), key=lambda item: item[0])
+    out = {
+        "x": [float(x) for x, _y, _support, _edge in pairs],
+        "y": [float(y) for _x, y, _support, _edge in pairs],
+    }
+    if return_meta:
+        out["serial_support"] = [int(support) for _x, _y, support, _edge in pairs]
+        out["edge_weight"] = [float(edge) for _x, _y, _support, edge in pairs]
+    return out
+
+
+def _td_perf_surface_normalize_axes(x1_values, x2_values, *, centers: tuple[float, float] | None = None, scales: tuple[float, float] | None = None):
+    np = _td_perf_import_numpy()
+    x1 = np.asarray(x1_values, dtype=float)
+    x2 = np.asarray(x2_values, dtype=float)
+    if centers is None:
+        x1_center = float(np.mean(x1))
+        x2_center = float(np.mean(x2))
+    else:
+        x1_center, x2_center = float(centers[0]), float(centers[1])
+    if scales is None:
+        x1_scale = float(np.std(x1)) or 1.0
+        x2_scale = float(np.std(x2)) or 1.0
+    else:
+        x1_scale = float(scales[0]) or 1.0
+        x2_scale = float(scales[1]) or 1.0
+    return (x1 - x1_center) / x1_scale, (x2 - x2_center) / x2_scale, x1_center, x1_scale, x2_center, x2_scale
 
 
 def _td_perf_surface_design_matrix(x1_values, x2_values, family: str):
@@ -8766,35 +9083,19 @@ def _td_perf_surface_design_matrix(x1_values, x2_values, family: str):
     raise ValueError(f"Unsupported surface family: {family}")
 
 
-def _td_perf_fmt_surface_equation(coeffs: list[float], family: str) -> str:
-    raw = str(family or "").strip().lower()
-    if raw == TD_PERF_FIT_FAMILY_PLANE:
-        labels = ["", "x1", "x2"]
-    elif raw == TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE:
-        labels = ["", "x1", "x2", "x1^2", "x1*x2", "x2^2"]
-    else:
-        return ""
-    parts: list[str] = []
-    for coeff, label in zip(coeffs, labels):
-        try:
-            cf = float(coeff)
-        except Exception:
-            continue
-        if not label:
-            parts.append(f"{cf:+.4g}")
-        else:
-            parts.append(f"{cf:+.4g}*{label}")
-    expr = " ".join(parts).lstrip("+").strip()
-    return f"y = {expr}" if expr else ""
-
-
 def td_perf_predict_surface(model: Mapping[str, object], x1_values: Iterable[float], x2_values: Iterable[float]) -> list[float]:
     np = _td_perf_import_numpy()
     family = td_perf_normalize_fit_mode(model.get("fit_family"))
     coeffs = [float(v) for v in (model.get("coeffs") or [])]
     if family not in {TD_PERF_FIT_FAMILY_PLANE, TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE} or not coeffs:
         return []
-    design = _td_perf_surface_design_matrix(list(x1_values), list(x2_values), family)
+    x1n, x2n, _x1_center, _x1_scale, _x2_center, _x2_scale = _td_perf_surface_normalize_axes(
+        list(x1_values),
+        list(x2_values),
+        centers=(float(model.get("x1_center") or 0.0), float(model.get("x2_center") or 0.0)),
+        scales=(float(model.get("x1_scale") or 1.0), float(model.get("x2_scale") or 1.0)),
+    )
+    design = _td_perf_surface_design_matrix(x1n, x2n, family)
     y_hat = design.dot(np.asarray(coeffs, dtype=float))
     return [float(v) for v in y_hat.tolist()]
 
@@ -8843,19 +9144,30 @@ def _td_perf_finalize_model(
     fit_mode: str,
     equation: str,
     x_norm_equation: str,
-    params: dict[str, float],
+    params: dict[str, object],
     param_count: int,
     x_values,
     y_true,
     y_hat,
+    complexity_penalty: float = 0.0,
+    composite_score: bool = True,
     extra: dict[str, object] | None = None,
 ) -> dict[str, object]:
     np = _td_perf_import_numpy()
+    x_arr = np.asarray(x_values, dtype=float)
     y_true_arr = np.asarray(y_true, dtype=float)
     y_hat_arr = np.asarray(y_hat, dtype=float)
     rmse = float(np.sqrt(np.mean((y_true_arr - y_hat_arr) ** 2)))
     aic, aicc = _td_perf_aic_metrics(y_true_arr, y_hat_arr, param_count=param_count)
-    score = float(aicc if math.isfinite(aicc) else aic)
+    global_rmse_norm = _td_perf_normalized_rmse(y_true_arr, y_hat_arr)
+    edge_rmse_norm = _td_perf_edge_rmse_norm(x_arr, y_true_arr, y_hat_arr) if composite_score else global_rmse_norm
+    monotonic_violations = _td_perf_monotonic_violations(x_arr, y_hat_arr)
+    monotonicity_penalty = 0.5 * float(monotonic_violations) if composite_score else 0.0
+    score = (
+        float(global_rmse_norm + (1.5 * edge_rmse_norm) + monotonicity_penalty + float(complexity_penalty))
+        if composite_score
+        else float(aicc if math.isfinite(aicc) else aic)
+    )
     model = {
         "fit_family": fit_family,
         "fit_mode": fit_mode,
@@ -8867,7 +9179,11 @@ def _td_perf_finalize_model(
         "aic": float(aic),
         "aicc": float(aicc),
         "score": score,
-        "monotonic_violations": _td_perf_monotonic_violations(x_values, y_hat_arr),
+        "global_rmse_norm": float(global_rmse_norm),
+        "edge_rmse_norm": float(edge_rmse_norm),
+        "complexity_penalty": float(complexity_penalty),
+        "monotonicity_penalty": float(monotonicity_penalty),
+        "monotonic_violations": monotonic_violations,
         "warnings": [],
     }
     if extra:
@@ -8875,13 +9191,28 @@ def _td_perf_finalize_model(
     return model
 
 
-def _td_perf_fit_polynomial_model(xs: list[float], ys: list[float], *, degree: int, normalize_x: bool, fit_mode: str) -> dict[str, object] | None:
+def _td_perf_fit_polynomial_model(
+    xs: list[float],
+    ys: list[float],
+    *,
+    degree: int,
+    normalize_x: bool,
+    fit_mode: str,
+    sample_weights: Sequence[float] | None = None,
+) -> dict[str, object] | None:
     np = _td_perf_import_numpy()
     deg = int(degree)
     if deg <= 0 or len(xs) < max(2, deg + 1):
         return None
-    x_arr = np.asarray([float(v) for v in xs], dtype=float)
-    y_arr = np.asarray([float(v) for v in ys], dtype=float)
+    prepared = _td_perf_prepare_xy(xs, ys)
+    if prepared[0] is None:
+        return None
+    x_arr, y_arr, order = prepared
+    assert order is not None
+    weights_in = _td_perf_prepare_sample_weights(xs, sample_weights)
+    if weights_in is None:
+        return None
+    weights = [float(weights_in[idx]) for idx in order.tolist()]
     if normalize_x:
         x0 = float(np.mean(x_arr))
         sx = float(np.std(x_arr)) or 1.0
@@ -8890,8 +9221,12 @@ def _td_perf_fit_polynomial_model(xs: list[float], ys: list[float], *, degree: i
         x0 = 0.0
         sx = 1.0
         xn = x_arr
-    coeffs = [float(v) for v in np.polyfit(xn, y_arr, deg).tolist()]
-    y_hat = np.poly1d(coeffs)(xn)
+    design = np.vander(xn, deg + 1, increasing=False)
+    coeffs, _residuals, rank, _singular = _td_perf_weighted_lstsq(design, y_arr, weights)
+    if int(rank) < int(design.shape[1]):
+        return None
+    coeffs = [float(v) for v in coeffs.tolist()]
+    y_hat = design.dot(np.asarray(coeffs, dtype=float))
     equation, x_norm_equation = _td_perf_fmt_poly_equation(
         coeffs,
         deg,
@@ -8908,23 +9243,39 @@ def _td_perf_fit_polynomial_model(xs: list[float], ys: list[float], *, degree: i
         x_values=x_arr,
         y_true=y_arr,
         y_hat=y_hat,
+        complexity_penalty=TD_PERF_FIT_COMPLEXITY_PENALTIES[TD_PERF_FIT_MODE_POLYNOMIAL],
         extra={
             "degree": deg,
             "coeffs": coeffs,
             "x0": x0,
             "sx": sx,
             "normalize_x": bool(normalize_x),
+            "fit_domain": [float(x_arr[0]), float(x_arr[-1])],
+            "sample_weights_used": [float(v) for v in weights],
         },
     )
 
 
-def _td_perf_fit_logarithmic_model(xs: list[float], ys: list[float], *, fit_mode: str) -> dict[str, object] | None:
+def _td_perf_fit_logarithmic_model(
+    xs: list[float],
+    ys: list[float],
+    *,
+    fit_mode: str,
+    sample_weights: Sequence[float] | None = None,
+) -> dict[str, object] | None:
     np = _td_perf_import_numpy()
     curve_fit = _td_perf_import_curve_fit()
-    x_arr = np.asarray([float(v) for v in xs], dtype=float)
-    y_arr = np.asarray([float(v) for v in ys], dtype=float)
+    prepared = _td_perf_prepare_xy(xs, ys)
+    if prepared[0] is None:
+        return None
+    x_arr, y_arr, order = prepared
+    assert order is not None
     if len(x_arr) < 2 or np.any(x_arr <= 0):
         return None
+    weights_in = _td_perf_prepare_sample_weights(xs, sample_weights)
+    if weights_in is None:
+        return None
+    ordered_weights = [float(weights_in[idx]) for idx in order.tolist()]
 
     def _fn(x, a, b):
         return a + (b * np.log(x))
@@ -8933,7 +9284,15 @@ def _td_perf_fit_logarithmic_model(xs: list[float], ys: list[float], *, fit_mode
     denom = float(np.max(log_x) - np.min(log_x)) or 1.0
     a0 = float(np.mean(y_arr))
     b0 = float((y_arr[-1] - y_arr[0]) / denom)
-    params, _cov = curve_fit(_fn, x_arr, y_arr, p0=[a0, b0], maxfev=20000)
+    params, _cov = curve_fit(
+        _fn,
+        x_arr,
+        y_arr,
+        p0=[a0, b0],
+        sigma=_td_perf_curve_fit_sigma(ordered_weights),
+        absolute_sigma=False,
+        maxfev=20000,
+    )
     a, b = [float(v) for v in params]
     y_hat = _fn(x_arr, a, b)
     return _td_perf_finalize_model(
@@ -8946,16 +9305,34 @@ def _td_perf_fit_logarithmic_model(xs: list[float], ys: list[float], *, fit_mode
         x_values=x_arr,
         y_true=y_arr,
         y_hat=y_hat,
+        complexity_penalty=TD_PERF_FIT_COMPLEXITY_PENALTIES[TD_PERF_FIT_MODE_LOGARITHMIC],
+        extra={
+            "fit_domain": [float(x_arr[0]), float(x_arr[-1])],
+            "sample_weights_used": [float(v) for v in ordered_weights],
+        },
     )
 
 
-def _td_perf_fit_saturating_exponential_model(xs: list[float], ys: list[float], *, fit_mode: str) -> dict[str, object] | None:
+def _td_perf_fit_saturating_exponential_model(
+    xs: list[float],
+    ys: list[float],
+    *,
+    fit_mode: str,
+    sample_weights: Sequence[float] | None = None,
+) -> dict[str, object] | None:
     np = _td_perf_import_numpy()
     curve_fit = _td_perf_import_curve_fit()
-    x_arr = np.asarray([float(v) for v in xs], dtype=float)
-    y_arr = np.asarray([float(v) for v in ys], dtype=float)
+    prepared = _td_perf_prepare_xy(xs, ys)
+    if prepared[0] is None:
+        return None
+    x_arr, y_arr, order = prepared
+    assert order is not None
     if len(x_arr) < 3:
         return None
+    weights_in = _td_perf_prepare_sample_weights(xs, sample_weights)
+    if weights_in is None:
+        return None
+    ordered_weights = [float(weights_in[idx]) for idx in order.tolist()]
 
     def _fn(x, L, A, k):
         return L - (A * np.exp(-k * x))
@@ -8972,6 +9349,8 @@ def _td_perf_fit_saturating_exponential_model(xs: list[float], ys: list[float], 
         y_arr,
         p0=[L0, A0, k0],
         bounds=([ymax, 0.0, 0.0], [float("inf"), float("inf"), float("inf")]),
+        sigma=_td_perf_curve_fit_sigma(ordered_weights),
+        absolute_sigma=False,
         maxfev=40000,
     )
     L, A, k = [float(v) for v in params]
@@ -8988,21 +9367,145 @@ def _td_perf_fit_saturating_exponential_model(xs: list[float], ys: list[float], 
         x_values=x_arr,
         y_true=y_arr,
         y_hat=y_hat,
+        complexity_penalty=TD_PERF_FIT_COMPLEXITY_PENALTIES[TD_PERF_FIT_MODE_SATURATING_EXPONENTIAL],
+        extra={
+            "fit_domain": [float(x_arr[0]), float(x_arr[-1])],
+            "sample_weights_used": [float(v) for v in ordered_weights],
+        },
     )
     model["monotonic_violations"] = 0
+    model["monotonicity_penalty"] = 0.0
     return model
+
+
+def _td_perf_fit_hybrid_saturating_linear_model(
+    xs: list[float],
+    ys: list[float],
+    *,
+    fit_mode: str,
+    sample_weights: Sequence[float] | None = None,
+) -> dict[str, object] | None:
+    np = _td_perf_import_numpy()
+    curve_fit = _td_perf_import_curve_fit()
+    prepared = _td_perf_prepare_xy(xs, ys)
+    if prepared[0] is None:
+        return None
+    x_arr, y_arr, order = prepared
+    assert order is not None
+    if len(x_arr) < 4:
+        return None
+    weights_in = _td_perf_prepare_sample_weights(xs, sample_weights)
+    if weights_in is None:
+        return None
+    ordered_weights = [float(weights_in[idx]) for idx in order.tolist()]
+
+    def _fn(x, b, m, A, k):
+        return b + (m * x) + (A * (1.0 - np.exp(-k * x)))
+
+    x_span = max(float(np.max(x_arr) - np.min(x_arr)), 1e-6)
+    ymin = float(np.min(y_arr))
+    ymax = float(np.max(y_arr))
+    m0 = _td_perf_tail_slope_seed(x_arr, y_arr)
+    b0 = float(y_arr[0] - (m0 * x_arr[0]))
+    A0 = max((ymax - ymin) - (m0 * x_span), 1e-3)
+    k0 = max(1.0 / x_span, 1e-6)
+    params, _cov = curve_fit(
+        _fn,
+        x_arr,
+        y_arr,
+        p0=[b0, m0, A0, k0],
+        bounds=([-float("inf"), 0.0, 0.0, 0.0], [float("inf"), float("inf"), float("inf"), float("inf")]),
+        sigma=_td_perf_curve_fit_sigma(ordered_weights),
+        absolute_sigma=False,
+        maxfev=50000,
+    )
+    b, m, A, k = [float(v) for v in params]
+    if m < 0.0 or A < 0.0 or k < 0.0:
+        return None
+    y_hat = _fn(x_arr, b, m, A, k)
+    model = _td_perf_finalize_model(
+        fit_family=TD_PERF_FIT_MODE_HYBRID_SATURATING_LINEAR,
+        fit_mode=fit_mode,
+        equation=(
+            f"y = {_td_perf_fmt_num(b)} + {_td_perf_fmt_num(m)}*x + "
+            f"{_td_perf_fmt_num(A)}*(1 - exp(-{_td_perf_fmt_num(k)}*x))"
+        ),
+        x_norm_equation="",
+        params={"b": b, "m": m, "A": A, "k": k},
+        param_count=4,
+        x_values=x_arr,
+        y_true=y_arr,
+        y_hat=y_hat,
+        complexity_penalty=TD_PERF_FIT_COMPLEXITY_PENALTIES[TD_PERF_FIT_MODE_HYBRID_SATURATING_LINEAR],
+        extra={
+            "fit_domain": [float(x_arr[0]), float(x_arr[-1])],
+            "sample_weights_used": [float(v) for v in ordered_weights],
+        },
+    )
+    model["monotonic_violations"] = 0
+    model["monotonicity_penalty"] = 0.0
+    return model
+
+
+def _td_perf_fit_monotone_pchip_model(
+    xs: list[float],
+    ys: list[float],
+    *,
+    fit_mode: str,
+    sample_weights: Sequence[float] | None = None,
+) -> dict[str, object] | None:
+    np = _td_perf_import_numpy()
+    PchipInterpolator = _td_perf_import_pchip()
+    prepared = _td_perf_prepare_xy(xs, ys)
+    if prepared[0] is None:
+        return None
+    x_arr, y_arr, order = prepared
+    assert order is not None
+    unique_x, unique_y = _td_perf_group_duplicate_xy(x_arr.tolist(), y_arr.tolist())
+    if len(unique_x) < 2:
+        return None
+    weights_in = _td_perf_prepare_sample_weights(xs, sample_weights)
+    if weights_in is None:
+        return None
+    ordered_weights = [float(weights_in[idx]) for idx in order.tolist()]
+    interpolator = PchipInterpolator(unique_x, unique_y, extrapolate=False)
+    y_hat = interpolator(x_arr)
+    if np.any(~np.isfinite(y_hat)):
+        return None
+    return _td_perf_finalize_model(
+        fit_family=TD_PERF_FIT_MODE_MONOTONE_PCHIP,
+        fit_mode=fit_mode,
+        equation=f"PCHIP knot fit ({len(unique_x)} knots, clamped outside observed domain)",
+        x_norm_equation="",
+        params={
+            "knots": [float(v) for v in unique_x],
+            "knot_values": [float(v) for v in unique_y],
+            "left_y": float(unique_y[0]),
+            "right_y": float(unique_y[-1]),
+        },
+        param_count=len(unique_x),
+        x_values=x_arr,
+        y_true=y_arr,
+        y_hat=y_hat,
+        complexity_penalty=TD_PERF_FIT_COMPLEXITY_PENALTIES[TD_PERF_FIT_MODE_MONOTONE_PCHIP],
+        extra={
+            "fit_domain": [float(unique_x[0]), float(unique_x[-1])],
+            "sample_weights_used": [float(v) for v in ordered_weights],
+        },
+    )
 
 
 def _td_perf_choose_best_model(models: list[dict[str, object]]) -> dict[str, object] | None:
     viable = [m for m in models if isinstance(m, dict)]
     if not viable:
         return None
-    best_score = min(float(m.get("score") or float("inf")) for m in viable)
-    tied = [m for m in viable if float(m.get("score") or float("inf")) <= (best_score + 2.0)]
+    best_score = min(_td_perf_model_score_value(m) for m in viable)
+    tied = [m for m in viable if _td_perf_model_score_value(m) <= (best_score + 0.05)]
     tied.sort(
         key=lambda m: (
-            int(m.get("param_count") or 99),
+            _td_perf_model_score_value(m),
             int(m.get("monotonic_violations") or 99),
+            *_td_perf_parametric_aic_key(m),
             float(m.get("rmse") or float("inf")),
             int(TD_PERF_FIT_FAMILY_PRIORITY.get(str(m.get("fit_family") or "").strip().lower(), 99)),
         )
@@ -9017,39 +9520,66 @@ def td_perf_fit_model(
     fit_mode: object = None,
     polynomial_degree: int = 2,
     normalize_x: bool = True,
+    sample_weights: list[float] | None = None,
 ) -> dict[str, object] | None:
     mode = td_perf_normalize_fit_mode(fit_mode)
     if len(xs) != len(ys) or len(xs) < 2:
         return None
-    if mode in {TD_PERF_FIT_MODE_AUTO, TD_PERF_FIT_MODE_LOGARITHMIC, TD_PERF_FIT_MODE_SATURATING_EXPONENTIAL}:
+    if mode in {
+        TD_PERF_FIT_MODE_AUTO,
+        TD_PERF_FIT_MODE_LOGARITHMIC,
+        TD_PERF_FIT_MODE_SATURATING_EXPONENTIAL,
+        TD_PERF_FIT_MODE_HYBRID_SATURATING_LINEAR,
+        TD_PERF_FIT_MODE_MONOTONE_PCHIP,
+    }:
         _td_perf_import_curve_fit()
     if mode == TD_PERF_FIT_MODE_POLYNOMIAL:
-        return _td_perf_fit_polynomial_model(xs, ys, degree=polynomial_degree, normalize_x=normalize_x, fit_mode=mode)
+        return _td_perf_fit_polynomial_model(
+            xs,
+            ys,
+            degree=polynomial_degree,
+            normalize_x=normalize_x,
+            fit_mode=mode,
+            sample_weights=sample_weights,
+        )
     if mode == TD_PERF_FIT_MODE_LOGARITHMIC:
-        return _td_perf_fit_logarithmic_model(xs, ys, fit_mode=mode)
+        return _td_perf_fit_logarithmic_model(xs, ys, fit_mode=mode, sample_weights=sample_weights)
     if mode == TD_PERF_FIT_MODE_SATURATING_EXPONENTIAL:
-        return _td_perf_fit_saturating_exponential_model(xs, ys, fit_mode=mode)
+        return _td_perf_fit_saturating_exponential_model(xs, ys, fit_mode=mode, sample_weights=sample_weights)
+    if mode == TD_PERF_FIT_MODE_HYBRID_SATURATING_LINEAR:
+        return _td_perf_fit_hybrid_saturating_linear_model(xs, ys, fit_mode=mode, sample_weights=sample_weights)
+    if mode == TD_PERF_FIT_MODE_MONOTONE_PCHIP:
+        return _td_perf_fit_monotone_pchip_model(xs, ys, fit_mode=mode, sample_weights=sample_weights)
     if mode == TD_PERF_FIT_MODE_PIECEWISE_2:
-        return _td_perf_fit_piecewise_model(xs, ys, segment_count=2, fit_mode=mode)
+        return _td_perf_fit_piecewise_model(xs, ys, segment_count=2, fit_mode=mode, sample_weights=sample_weights)
     if mode == TD_PERF_FIT_MODE_PIECEWISE_3:
-        return _td_perf_fit_piecewise_model(xs, ys, segment_count=3, fit_mode=mode)
+        return _td_perf_fit_piecewise_model(xs, ys, segment_count=3, fit_mode=mode, sample_weights=sample_weights)
     if mode == TD_PERF_FIT_MODE_PIECEWISE_AUTO:
         return _td_perf_choose_best_model(
             [
                 c
                 for c in (
-                    _td_perf_fit_piecewise_model(xs, ys, segment_count=2, fit_mode=mode),
-                    _td_perf_fit_piecewise_model(xs, ys, segment_count=3, fit_mode=mode),
+                    _td_perf_fit_piecewise_model(xs, ys, segment_count=2, fit_mode=mode, sample_weights=sample_weights),
+                    _td_perf_fit_piecewise_model(xs, ys, segment_count=3, fit_mode=mode, sample_weights=sample_weights),
                 )
                 if isinstance(c, dict)
             ]
         )
     candidates = [
-        _td_perf_fit_polynomial_model(xs, ys, degree=polynomial_degree, normalize_x=normalize_x, fit_mode=mode),
-        _td_perf_fit_logarithmic_model(xs, ys, fit_mode=mode),
-        _td_perf_fit_saturating_exponential_model(xs, ys, fit_mode=mode),
-        _td_perf_fit_piecewise_model(xs, ys, segment_count=2, fit_mode=mode),
-        _td_perf_fit_piecewise_model(xs, ys, segment_count=3, fit_mode=mode),
+        _td_perf_fit_polynomial_model(
+            xs,
+            ys,
+            degree=polynomial_degree,
+            normalize_x=normalize_x,
+            fit_mode=mode,
+            sample_weights=sample_weights,
+        ),
+        _td_perf_fit_logarithmic_model(xs, ys, fit_mode=mode, sample_weights=sample_weights),
+        _td_perf_fit_saturating_exponential_model(xs, ys, fit_mode=mode, sample_weights=sample_weights),
+        _td_perf_fit_hybrid_saturating_linear_model(xs, ys, fit_mode=mode, sample_weights=sample_weights),
+        _td_perf_fit_monotone_pchip_model(xs, ys, fit_mode=mode, sample_weights=sample_weights),
+        _td_perf_fit_piecewise_model(xs, ys, segment_count=2, fit_mode=mode, sample_weights=sample_weights),
+        _td_perf_fit_piecewise_model(xs, ys, segment_count=3, fit_mode=mode, sample_weights=sample_weights),
     ]
     return _td_perf_choose_best_model([c for c in candidates if isinstance(c, dict)])
 
@@ -9074,31 +9604,49 @@ def _td_perf_fit_surface_family(
         return None
     if len({round(float(v), 12) for v in x2_arr.tolist()}) < 2:
         return None
-    design = _td_perf_surface_design_matrix(x1_arr, x2_arr, family)
+    x1n, x2n, x1_center, x1_scale, x2_center, x2_scale = _td_perf_surface_normalize_axes(x1_arr, x2_arr)
+    design = _td_perf_surface_design_matrix(x1n, x2n, family)
     term_count = int(design.shape[1])
     if len(y_arr) < term_count:
         return None
-    coeffs, _residuals, rank, _singular = np.linalg.lstsq(design, y_arr, rcond=None)
-    if int(rank) < term_count:
-        return None
+    cond_number = float(np.linalg.cond(design))
+    solver = "lstsq"
+    if cond_number <= 1e5:
+        coeffs, _residuals, rank, _singular = np.linalg.lstsq(design, y_arr, rcond=None)
+        if int(rank) < term_count:
+            return None
+    else:
+        solver = "ridge"
+        ridge_alpha = 1e-6
+        xtx = design.T.dot(design) + (ridge_alpha * np.eye(term_count, dtype=float))
+        xty = design.T.dot(y_arr)
+        coeffs = np.linalg.solve(xtx, xty)
     y_hat = design.dot(coeffs)
     coeff_list = [float(v) for v in coeffs.tolist()]
     model = _td_perf_finalize_model(
         fit_family=str(family).strip().lower(),
         fit_mode=fit_mode,
         equation=_td_perf_fmt_surface_equation(coeff_list, str(family).strip().lower()),
-        x_norm_equation="",
+        x_norm_equation=_td_perf_fmt_surface_normalization(x1_center, x1_scale, x2_center, x2_scale),
         params={f"c{i}": float(v) for i, v in enumerate(coeff_list)},
         param_count=term_count,
         x_values=list(range(len(y_arr))),
         y_true=y_arr,
         y_hat=y_hat,
+        composite_score=False,
         extra={
             "coeffs": coeff_list,
             "plot_dimension": "3d",
+            "x1_center": float(x1_center),
+            "x1_scale": float(x1_scale),
+            "x2_center": float(x2_center),
+            "x2_scale": float(x2_scale),
+            "solver": solver,
+            "condition_number": float(cond_number),
         },
     )
     model["monotonic_violations"] = 0
+    model["monotonicity_penalty"] = 0.0
     return model
 
 
@@ -9917,6 +10465,12 @@ def update_test_data_trending_project_workbook(
     project_cfg = _load_project_td_trend_config(wb_path)
     cfg_cols = [dict(c) for c in (project_cfg.get("columns") or []) if isinstance(c, dict)]
     cfg_order = [str(c.get("name") or "").strip() for c in cfg_cols if str(c.get("name") or "").strip()]
+    if not dry_run:
+        _refresh_td_support_run_conditions_sheet(
+            wb_path,
+            project_dir=project_dir,
+            param_defs=cfg_cols,
+        )
 
     def _current_td_cache_signature() -> tuple[str, str, int]:
         stats_sig = ",".join(
