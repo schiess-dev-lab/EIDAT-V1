@@ -562,6 +562,56 @@ class TestTDSupportWorkbook(unittest.TestCase):
             finally:
                 wb.close()
 
+    def test_refresh_support_conditions_normalizes_overlong_program_sheet_names(self) -> None:
+        import warnings
+
+        from openpyxl import load_workbook  # type: ignore
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            wb_path = root / "project.xlsx"
+            be._write_test_data_trending_workbook(
+                wb_path,
+                global_repo=root,
+                serials=["SN1"],
+                docs=[{"serial_number": "SN1", "excel_sqlite_rel": ""}],
+                config=self._make_config(),
+            )
+            support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+            be._write_td_support_workbook(
+                support_path,
+                sequence_names=["RunA"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+            )
+
+            long_title = "Program_01_This_is_a_very_long_program_sheet_name_that_exceeds_excel_limits"
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                wb = load_workbook(str(support_path))
+                try:
+                    ws_programs = wb["Programs"]
+                    program_sheet = wb[self._default_program_sheet_name(be)]
+                    program_sheet.title = long_title
+                    ws_programs.cell(2, 2).value = long_title
+                    wb.save(str(support_path))
+                finally:
+                    wb.close()
+
+            self._refresh_support_conditions(be, wb_path, root)
+
+            wb = load_workbook(str(support_path), read_only=True, data_only=True)
+            try:
+                self.assertIn("RunConditions", wb.sheetnames)
+                self.assertTrue(all(len(str(name or "")) <= 31 for name in wb.sheetnames))
+                ws_programs = wb["Programs"]
+                normalized_name = str(ws_programs.cell(2, 2).value or "").strip()
+                self.assertTrue(normalized_name)
+                self.assertLessEqual(len(normalized_name), 31)
+                self.assertIn(normalized_name, wb.sheetnames)
+            finally:
+                wb.close()
+
     @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
     def test_metric_bounds_for_run_reads_deferred_run_conditions_sheet(self) -> None:
         from openpyxl import load_workbook  # type: ignore

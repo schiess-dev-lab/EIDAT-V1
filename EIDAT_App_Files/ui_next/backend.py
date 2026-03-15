@@ -3885,6 +3885,68 @@ def _td_support_condition_sheet_name(condition_key: str, index: int) -> str:
     return (prefix + slug[:room])[:31]
 
 
+def _td_load_workbook_ignore_long_title_warning(*args, **kwargs):
+    import warnings
+
+    from openpyxl import load_workbook  # type: ignore
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=r"Title is more than 31 characters.*",
+            category=UserWarning,
+        )
+        return load_workbook(*args, **kwargs)
+
+
+def _td_safe_excel_sheet_title(title: object, used: set[str], *, fallback: str = "Sheet") -> str:
+    raw = re.sub(r"[\[\]\*:/\\?]+", "_", str(title or "").strip()).strip("'")
+    raw = raw or fallback
+    candidate = raw[:31] or fallback[:31] or "Sheet"
+    suffix_idx = 2
+    while candidate.lower() in used:
+        suffix = f"_{suffix_idx}"
+        candidate = (raw[: max(0, 31 - len(suffix))] + suffix)[:31]
+        suffix_idx += 1
+    used.add(candidate.lower())
+    return candidate
+
+
+def _td_normalize_support_workbook_sheet_names(wb) -> bool:
+    changed = False
+    used_titles: set[str] = set()
+    rename_map: dict[str, str] = {}
+
+    for ws in list(getattr(wb, "worksheets", []) or []):
+        old_title = str(getattr(ws, "title", "") or "")
+        preferred = old_title
+        if len(old_title) > 31:
+            preferred = old_title[:31]
+        new_title = _td_safe_excel_sheet_title(preferred, used_titles, fallback="Sheet")
+        if new_title != old_title:
+            ws.title = new_title
+            rename_map[old_title] = new_title
+            changed = True
+
+    if rename_map and TD_SUPPORT_PROGRAMS_SHEET in wb.sheetnames:
+        ws_programs = wb[TD_SUPPORT_PROGRAMS_SHEET]
+        headers: dict[str, int] = {}
+        for col in range(1, (ws_programs.max_column or 0) + 1):
+            key = str(ws_programs.cell(1, col).value or "").strip().lower()
+            if key:
+                headers[key] = col
+        sheet_col = headers.get("sheet_name", 2)
+        for row in range(2, (ws_programs.max_row or 0) + 1):
+            old_value = str(ws_programs.cell(row, sheet_col).value or "").strip()
+            new_value = rename_map.get(old_value)
+            if not new_value:
+                continue
+            ws_programs.cell(row, sheet_col).value = new_value
+            changed = True
+
+    return changed
+
+
 def _td_support_program_row_defaults(source_run_name: object, *, program_title: object = "") -> dict[str, object]:
     source = str(source_run_name or "").strip()
     return {
@@ -4198,8 +4260,10 @@ def _refresh_td_support_run_conditions_sheet(
         if str(d.get("name") or "").strip()
     }
 
-    wb = load_workbook(str(support_path))
+    wb = _td_load_workbook_ignore_long_title_warning(str(support_path))
     try:
+        if _td_normalize_support_workbook_sheet_names(wb):
+            wb.save(str(support_path))
         for sheet_name in list(wb.sheetnames):
             if sheet_name == TD_SUPPORT_RUN_CONDITIONS_SHEET or sheet_name == TD_SUPPORT_RUN_CONDITION_BOUNDS_SHEET:
                 wb.remove(wb[sheet_name])
@@ -4414,7 +4478,7 @@ def _read_td_support_workbook(workbook_path: Path, *, project_dir: Path | None =
             "bounds_by_sequence": {},
         }
 
-    wb = load_workbook(str(support_path), read_only=True, data_only=True)
+    wb = _td_load_workbook_ignore_long_title_warning(str(support_path), read_only=True, data_only=True)
     try:
         settings: dict[str, object] = {}
         if "Settings" in wb.sheetnames:
