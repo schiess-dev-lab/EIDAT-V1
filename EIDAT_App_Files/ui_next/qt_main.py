@@ -11765,6 +11765,10 @@ class MainWindow(QtWidgets.QMainWindow):
             wb_path = Path(str(record.get("workbook") or "")).expanduser()
             ptype = str(record.get("type") or "").strip()
             overwrite = bool(getattr(self, "cb_project_overwrite", None) and self.cb_project_overwrite.isChecked())
+            project_name = str(record.get("name") or wb_path.stem or "").strip() or wb_path.stem
+            started = time.perf_counter()
+            self._append_log(f"[PROJECT UPDATE] Starting: {project_name}")
+            self._append_log(f"[PROJECT UPDATE] Workbook: {wb_path}")
             if ptype == getattr(be, "EIDAT_PROJECT_TYPE_TRENDING", "EIDP Trending"):
                 payload = be.update_eidp_trending_project_workbook(repo, wb_path, overwrite=overwrite)
             elif ptype == getattr(be, "EIDAT_PROJECT_TYPE_RAW_TRENDING", "EIDP Raw File Trending"):
@@ -11781,9 +11785,36 @@ class MainWindow(QtWidgets.QMainWindow):
             serials_added = int(payload.get("serials_added") or 0)
             added_serials = payload.get("added_serials") or []
             dbg = str(payload.get("debug_json") or "").strip()
+            elapsed_s = round(time.perf_counter() - started, 3)
             self._append_log(
-                f"[PROJECT UPDATE] updated={updated}, serials={serials}, added={serials_added}, sources={have_src}, missing_source={missing_src}, missing_value={missing_val}"
+                f"[PROJECT UPDATE] Finished in {elapsed_s:.3f}s: updated={updated}, serials={serials}, added={serials_added}, sources={have_src}, missing_source={missing_src}, missing_value={missing_val}"
             )
+            if ptype == getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending"):
+                timings = payload.get("timings")
+                if not isinstance(timings, dict) and dbg:
+                    try:
+                        dbg_payload = json.loads(dbg)
+                        if isinstance(dbg_payload, dict):
+                            timings = dbg_payload.get("timings_s")
+                    except Exception:
+                        timings = None
+                if isinstance(timings, dict):
+                    ordered_keys = [
+                        "support_refresh_s",
+                        "pre_cache_workbook_save_s",
+                        "cache_ensure_s",
+                        "cache_read_s",
+                        "final_workbook_save_s",
+                        "total_s",
+                    ]
+                    shown = set()
+                    for key in ordered_keys:
+                        if key not in timings:
+                            continue
+                        shown.add(key)
+                        self._append_log(f"[TD UPDATE TIMING] {key}={timings.get(key)}")
+                    for key in sorted(str(k) for k in timings.keys() if str(k) not in shown):
+                        self._append_log(f"[TD UPDATE TIMING] {key}={timings.get(key)}")
             lines = [
                 f"Updated cells: {updated}",
                 f"Serials in workbook: {serials}",

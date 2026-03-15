@@ -10399,8 +10399,13 @@ def update_test_data_trending_project_workbook(
     if not wb_path.exists():
         raise FileNotFoundError(f"Project workbook not found: {wb_path}")
 
+    import time
+
+    timings: dict[str, float] = {}
+    total_started = time.perf_counter()
     repo = Path(global_repo).expanduser()
     project_dir = wb_path.parent
+    db_path = project_dir / EIDAT_PROJECT_IMPLEMENTATION_DB
     cache_missing = False
     if require_existing_cache:
         try:
@@ -10411,11 +10416,6 @@ def update_test_data_trending_project_workbook(
                 cache_missing = True
             else:
                 raise
-    db_path = ensure_test_data_project_cache(
-        project_dir,
-        wb_path,
-        rebuild=bool(cache_missing or not require_existing_cache),
-    )
 
     try:
         wb = load_workbook(str(wb_path))
@@ -10532,57 +10532,13 @@ def update_test_data_trending_project_workbook(
     cfg_cols = [dict(c) for c in (project_cfg.get("columns") or []) if isinstance(c, dict)]
     cfg_order = [str(c.get("name") or "").strip() for c in cfg_cols if str(c.get("name") or "").strip()]
     if not dry_run:
+        t0 = time.perf_counter()
         _refresh_td_support_run_conditions_sheet(
             wb_path,
             project_dir=project_dir,
             param_defs=cfg_cols,
         )
-
-    def _current_td_cache_signature() -> tuple[str, str, int]:
-        stats_sig = ",".join(
-            [
-                str(s).strip().lower()
-                for s in (project_cfg.get("statistics") or [])
-                if str(s).strip() and str(s).strip().lower() in TD_ALLOWED_STATS
-            ]
-        )
-        raw_cols_sig = ",".join([str(c.get("name") or "").strip() for c in cfg_cols if str(c.get("name") or "").strip()])
-        support_mtime_ns = 0
-        try:
-            support_path = td_support_workbook_path_for(wb_path, project_dir=project_dir)
-            if support_path.exists():
-                st = support_path.stat()
-                support_mtime_ns = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)))
-        except Exception:
-            support_mtime_ns = 0
-        return stats_sig, raw_cols_sig, int(support_mtime_ns)
-
-    def _cached_td_cache_signature(path: Path) -> tuple[str, str, int]:
-        stats_sig = ""
-        raw_cols_sig = ""
-        support_mtime_ns = 0
-        with sqlite3.connect(str(path)) as conn:
-            _ensure_test_data_impl_tables(conn)
-            rows = conn.execute(
-                """
-                SELECT key, value
-                FROM td_meta
-                WHERE key IN ('statistics', 'raw_columns', 'support_workbook_mtime_ns')
-                """
-            ).fetchall()
-        for key, value in rows:
-            name = str(key or "").strip().lower()
-            txt = str(value or "").strip()
-            if name == "statistics":
-                stats_sig = txt
-            elif name == "raw_columns":
-                raw_cols_sig = txt
-            elif name == "support_workbook_mtime_ns":
-                try:
-                    support_mtime_ns = int(txt)
-                except Exception:
-                    support_mtime_ns = 0
-        return stats_sig, raw_cols_sig, int(support_mtime_ns)
+        timings["support_refresh_s"] = round(time.perf_counter() - t0, 3)
 
     # Migration: legacy workbooks used `Data` as the computed metrics sheet ("Metric" in A1).
     if "Data_calc" not in wb.sheetnames and "Data" in wb.sheetnames:
@@ -10627,11 +10583,16 @@ def update_test_data_trending_project_workbook(
 
     # Save any migration/creation before rebuilding cache (cache rebuild reads workbook from disk).
     if not dry_run:
+        t0 = time.perf_counter()
         wb.save(str(wb_path))
-        current_sig = _current_td_cache_signature()
-        cached_sig = _cached_td_cache_signature(db_path)
-        if added_serials or cached_sig != current_sig:
-            db_path = ensure_test_data_project_cache(project_dir, wb_path, rebuild=True)
+        timings["pre_cache_workbook_save_s"] = round(time.perf_counter() - t0, 3)
+        t0 = time.perf_counter()
+        db_path = ensure_test_data_project_cache(
+            project_dir,
+            wb_path,
+            rebuild=bool(cache_missing or not require_existing_cache),
+        )
+        timings["cache_ensure_s"] = round(time.perf_counter() - t0, 3)
 
     def _parse_metric(s: object) -> tuple[str, str, str] | None:
         txt = str(s or "").strip()
@@ -10642,6 +10603,7 @@ def update_test_data_trending_project_workbook(
             return None
         return parts[0], parts[1], parts[2].lower()
 
+    t0 = time.perf_counter()
     with sqlite3.connect(str(db_path)) as conn:
         _ensure_test_data_impl_tables(conn)
         src_missing = int(
@@ -10687,6 +10649,7 @@ def update_test_data_trending_project_workbook(
             ORDER BY control_period
             """
         ).fetchall()
+    timings["cache_read_s"] = round(time.perf_counter() - t0, 3)
 
     with sqlite3.connect(str(_td_resolve_raw_cache_db_path(db_path))) as raw_conn:
         _ensure_test_data_raw_cache_tables(raw_conn)
@@ -10953,7 +10916,9 @@ def update_test_data_trending_project_workbook(
 
     try:
         if not dry_run:
+            t0 = time.perf_counter()
             wb.save(str(wb_path))
+            timings["final_workbook_save_s"] = round(time.perf_counter() - t0, 3)
     finally:
         try:
             wb.close()
@@ -10985,6 +10950,8 @@ def update_test_data_trending_project_workbook(
         except Exception:
             pass
 
+    timings["total_s"] = round(time.perf_counter() - total_started, 3)
+
     return {
         "workbook": str(wb_path),
         "db_path": str(db_path),
@@ -10995,6 +10962,8 @@ def update_test_data_trending_project_workbook(
         "serials_added": int(len(added_serials)),
         "added_serials": list(added_serials),
         "dry_run": bool(dry_run),
+        "timings": dict(timings),
+        "debug_json": json.dumps({"timings_s": timings}, separators=(",", ":")),
     }
 
 

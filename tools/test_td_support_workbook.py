@@ -504,6 +504,32 @@ class TestTDSupportWorkbook(unittest.TestCase):
             finally:
                 wb.close()
 
+    def test_update_project_only_ensures_cache_once(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            src_db = root / "src.sqlite3"
+            self._make_source_sqlite(src_db)
+            wb_path = root / "project.xlsx"
+            be._write_test_data_trending_workbook(
+                wb_path,
+                global_repo=root,
+                serials=["SN1"],
+                docs=[{"serial_number": "SN1", "excel_sqlite_rel": str(src_db), "program_title": be.TD_SUPPORT_DEFAULT_PROGRAM_TITLE}],
+                config=self._make_config(),
+            )
+            support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+            be._write_td_support_workbook(
+                support_path,
+                sequence_names=["RunA"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+            )
+
+            with mock.patch.object(be, "ensure_test_data_project_cache", wraps=be.ensure_test_data_project_cache) as mocked_ensure:
+                be.update_test_data_trending_project_workbook(root, wb_path, overwrite=True, require_existing_cache=False)
+            self.assertEqual(mocked_ensure.call_count, 1)
+
     def test_update_project_preserves_existing_run_condition_bounds(self) -> None:
         from openpyxl import load_workbook  # type: ignore
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
