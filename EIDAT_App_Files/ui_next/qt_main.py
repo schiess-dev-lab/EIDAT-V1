@@ -3092,6 +3092,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self.btn_open_support = QtWidgets.QPushButton("Open Support Workbook")
         self.btn_open_support.setMinimumHeight(40)
         self.btn_open_support.clicked.connect(self._open_support_workbook)
+        self.btn_export_debug_excels = QtWidgets.QPushButton("Generate Debug Excel Files")
+        self.btn_export_debug_excels.setMinimumHeight(40)
+        self.btn_export_debug_excels.clicked.connect(self._generate_debug_excel_files)
         self.btn_plot = QtWidgets.QPushButton("Plot Curves")
         self.btn_plot.setMinimumHeight(40)
         self.btn_plot.setStyleSheet(
@@ -3116,6 +3119,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self.lbl_cache.setWordWrap(True)
         cache_row.addWidget(self.btn_refresh_cache)
         cache_row.addWidget(self.btn_open_support)
+        cache_row.addWidget(self.btn_export_debug_excels)
         cache_row.addWidget(self.btn_plot)
         cache_row.addStretch(1)
         left_layout.addLayout(cache_row)
@@ -4235,6 +4239,37 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             be.open_path(path)
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "Open Support Workbook", str(exc))
+
+    def _generate_debug_excel_files(self) -> None:
+        try:
+            generated = be.export_test_data_project_debug_excels(
+                self._project_dir,
+                self._workbook_path,
+                force=True,
+            )
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Debug Excel Files", str(exc))
+            return
+
+        if not generated:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Debug Excel Files",
+                "No debug Excel files were generated from the current cache.",
+            )
+            return
+
+        ordered_keys = (
+            "implementation_excel",
+            "raw_cache_excel",
+            "raw_points_excel",
+        )
+        lines = [str(generated[key]) for key in ordered_keys if key in generated]
+        QtWidgets.QMessageBox.information(
+            self,
+            "Debug Excel Files",
+            "Generated debug Excel files:\n\n" + "\n".join(lines),
+        )
 
     def _refresh_from_cache(self) -> None:
         if not self._db_path:

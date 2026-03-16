@@ -208,6 +208,38 @@ class TestTDTrendDialogCacheLoading(unittest.TestCase):
         self.assertEqual(harness._refresh_from_cache_calls, 1)
         self.assertEqual(harness._update_plot_zoom_actions_calls, 1)
 
+    def test_generate_debug_excel_files_uses_manual_export_only(self) -> None:
+        _qt_app()
+        from pathlib import Path
+        from PySide6 import QtWidgets
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+        from EIDAT_App_Files.ui_next.qt_main import TestDataTrendDialog  # type: ignore
+
+        class _Harness:
+            pass
+
+        harness = _Harness()
+        harness._project_dir = Path("C:/tmp/project")
+        harness._workbook_path = Path("C:/tmp/project/project.xlsx")
+        generate_debug = TestDataTrendDialog._generate_debug_excel_files.__get__(harness, _Harness)
+        exported = {
+            "implementation_excel": Path("C:/tmp/project/implementation_trending.xlsx"),
+            "raw_cache_excel": Path("C:/tmp/project/test_data_raw_cache.xlsx"),
+            "raw_points_excel": Path("C:/tmp/project/test_data_raw_points.xlsx"),
+        }
+
+        with mock.patch.object(be, "export_test_data_project_debug_excels", return_value=exported) as export_mock:
+            with mock.patch.object(QtWidgets.QMessageBox, "information") as info_mock:
+                generate_debug()
+
+        export_mock.assert_called_once_with(harness._project_dir, harness._workbook_path, force=True)
+        info_mock.assert_called_once()
+        info_args = info_mock.call_args.args
+        self.assertEqual(info_args[1], "Debug Excel Files")
+        self.assertIn("implementation_trending.xlsx", info_args[2])
+        self.assertIn("test_data_raw_cache.xlsx", info_args[2])
+        self.assertIn("test_data_raw_points.xlsx", info_args[2])
+
 
 @unittest.skipUnless(_have_openpyxl(), "openpyxl not installed")
 class TestTDSupportWorkbook(unittest.TestCase):
@@ -2038,7 +2070,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
             self.assertEqual(curves[0].get("y"), [10, 20, 30])
             self.assertTrue(str(curves[0].get("observation_id") or "").strip())
 
-    def test_rebuild_writes_excel_mirror_for_project_cache(self) -> None:
+    def test_debug_export_writes_excel_mirror_for_project_cache(self) -> None:
         from openpyxl import load_workbook  # type: ignore
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
 
@@ -2066,9 +2098,17 @@ class TestTDSupportWorkbook(unittest.TestCase):
             impl_mirror_path = db_path.with_suffix(".xlsx")
             raw_mirror_path = (root / "test_data_raw_cache.sqlite3").with_suffix(".xlsx")
             raw_points_path = root / "test_data_raw_points.xlsx"
+            self.assertFalse(impl_mirror_path.exists())
+            self.assertFalse(raw_mirror_path.exists())
+            self.assertFalse(raw_points_path.exists())
+
+            generated = be.export_test_data_project_debug_excels(root, wb_path, force=True)
             self.assertTrue(impl_mirror_path.exists())
             self.assertTrue(raw_mirror_path.exists())
             self.assertTrue(raw_points_path.exists())
+            self.assertEqual(generated["implementation_excel"], impl_mirror_path)
+            self.assertEqual(generated["raw_cache_excel"], raw_mirror_path)
+            self.assertEqual(generated["raw_points_excel"], raw_points_path)
 
             wb = load_workbook(str(impl_mirror_path), read_only=True, data_only=True)
             try:

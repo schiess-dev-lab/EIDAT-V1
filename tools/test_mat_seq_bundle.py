@@ -69,7 +69,7 @@ class TestMatSeqBundle(unittest.TestCase):
     def test_processes_bundle_into_single_indexed_td_source(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
             repo = Path(td)
-            src_dir = repo / "Data" / "Starlink"
+            src_dir = repo / "Valve" / "ModelX"
             src_dir.mkdir(parents=True, exist_ok=True)
             seq1 = src_dir / "SN123_seq1.mat"
             seq2 = src_dir / "SN123_seq2.mat"
@@ -99,6 +99,12 @@ class TestMatSeqBundle(unittest.TestCase):
             self.assertTrue(metadata_path.exists())
             self.assertTrue(manifest_path.exists())
             self.assertFalse((paths.support_dir / "debug" / "ocr" / "SN123_seq1__excel").exists())
+            meta = __import__("json").loads(metadata_path.read_text(encoding="utf-8"))
+            manifest = __import__("json").loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(str(meta.get("asset_type") or "").strip(), "Valve")
+            self.assertEqual(str(meta.get("asset_specific_type") or "").strip(), "ModelX")
+            self.assertEqual(str(manifest.get("asset_type") or "").strip(), "Valve")
+            self.assertEqual(str(manifest.get("asset_specific_type") or "").strip(), "ModelX")
 
             with sqlite3.connect(str(sqlite_path)) as conn:
                 runs = [str(row[0] or "") for row in conn.execute("SELECT sheet_name FROM __sheet_info ORDER BY sheet_name").fetchall()]
@@ -112,7 +118,7 @@ class TestMatSeqBundle(unittest.TestCase):
             self.assertEqual(len(td_docs), 1)
             self.assertIn(bundle.bundle_stem, str(td_docs[0].get("excel_sqlite_rel") or ""))
 
-            resolved_artifacts = get_file_artifacts_path(repo, "Data/Starlink/SN123_seq2.mat")
+            resolved_artifacts = get_file_artifacts_path(repo, "Valve/ModelX/SN123_seq2.mat")
             self.assertIsNotNone(resolved_artifacts)
             self.assertEqual(resolved_artifacts, artifacts_dir)
 

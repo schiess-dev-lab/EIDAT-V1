@@ -5538,8 +5538,6 @@ def ensure_test_data_project_cache(
 
     if rebuild:
         rebuild_test_data_project_cache(db_path, wb_path)
-        _sync_sqlite_excel_mirror(db_path, force=True)
-        _sync_sqlite_excel_mirror(raw_db_path, force=True)
         return db_path
 
     # Quick staleness check: compare workbook Sources list + mtimes against td_sources.
@@ -5609,8 +5607,6 @@ def ensure_test_data_project_cache(
         stale_context = True
     if stale_context:
         rebuild_test_data_project_cache(db_path, wb_path)
-        _sync_sqlite_excel_mirror(db_path, force=True)
-        _sync_sqlite_excel_mirror(raw_db_path, force=True)
         return db_path
 
     support_mtime_ns = 0
@@ -5653,8 +5649,6 @@ def ensure_test_data_project_cache(
     # If the selected stats changed, refresh calc tables from cached raw curves only.
     if cached_stats_csv != current_stats_csv:
         _rebuild_test_data_project_calc_cache_from_raw(db_path, wb_path)
-        _sync_sqlite_excel_mirror(db_path, force=True)
-        _sync_sqlite_excel_mirror(raw_db_path)
         return db_path
 
     # Raw column changes affect td_curves_raw and require source re-ingest.
@@ -5665,8 +5659,6 @@ def ensure_test_data_project_cache(
     # Support workbook changes now refresh calc tables from cached raw curves.
     if int(cached_support_mtime_ns) != int(support_mtime_ns):
         rebuild_test_data_project_cache(db_path, wb_path)
-        _sync_sqlite_excel_mirror(db_path, force=True)
-        _sync_sqlite_excel_mirror(raw_db_path, force=True)
         return db_path
 
     # If serial set differs, rebuild.
@@ -5726,14 +5718,39 @@ def ensure_test_data_project_cache(
             break
     if stale:
         rebuild_test_data_project_cache(db_path, wb_path)
-        _sync_sqlite_excel_mirror(db_path, force=True)
-        _sync_sqlite_excel_mirror(raw_db_path, force=True)
         return db_path
 
-    _sync_sqlite_excel_mirror(db_path)
-    _sync_sqlite_excel_mirror(raw_db_path)
-
     return db_path
+
+
+def export_test_data_project_debug_excels(
+    project_dir: Path,
+    workbook_path: Path,
+    *,
+    force: bool = True,
+) -> dict[str, Path]:
+    """
+    Export optional Excel debug files for an already-built TD project cache.
+    """
+    proj_dir = Path(project_dir).expanduser()
+    db_path = validate_existing_test_data_project_cache(proj_dir, workbook_path)
+    raw_db_path = td_raw_cache_db_path_for(proj_dir)
+
+    generated: dict[str, Path] = {}
+
+    impl_xlsx_path = _sync_sqlite_excel_mirror(db_path, force=force)
+    if impl_xlsx_path is not None:
+        generated["implementation_excel"] = impl_xlsx_path
+
+    raw_xlsx_path = _sync_sqlite_excel_mirror(raw_db_path, force=force)
+    if raw_xlsx_path is not None:
+        generated["raw_cache_excel"] = raw_xlsx_path
+
+    raw_points_path = raw_db_path.with_name(EIDAT_PROJECT_TD_RAW_POINTS_XLSX)
+    if raw_points_path.exists():
+        generated["raw_points_excel"] = raw_points_path
+
+    return generated
 
 
 def _sync_sqlite_excel_mirror(db_path: Path, *, force: bool = False) -> Path | None:

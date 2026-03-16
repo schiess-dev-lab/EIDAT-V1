@@ -951,6 +951,16 @@ def _bundle_identity_path(member: MatBundleMember) -> Path:
     return member.file_path.with_name(f"{member.bundle_stem}.mat")
 
 
+def _bundle_folder_asset_hints(member: MatBundleMember) -> dict[str, str]:
+    parent = member.file_path.parent
+    asset_specific_type = str(parent.name or "").strip()
+    asset_type = str(parent.parent.name or "").strip() if parent.parent != parent else ""
+    return {
+        "asset_type": asset_type or "Unknown",
+        "asset_specific_type": asset_specific_type or "Unknown",
+    }
+
+
 def _merge_bundle_metadata(items: list[dict[str, Any]]) -> dict[str, Any]:
     merged: dict[str, Any] = {}
     for item in items:
@@ -993,11 +1003,16 @@ def _write_mat_bundle_manifest(
     members: list[MatBundleMember],
     sqlite_path: Path,
     metadata_path: Path | None,
+    metadata: dict[str, Any] | None = None,
 ) -> Path:
+    meta = metadata if isinstance(metadata, dict) else {}
     payload = {
         "bundle_key": bundle.group_key,
         "bundle_stem": bundle.bundle_stem,
         "serial_number": bundle.serial_number,
+        "asset_type": str(meta.get("asset_type") or "").strip(),
+        "asset_specific_type": str(meta.get("asset_specific_type") or "").strip(),
+        "program_title": str(meta.get("program_title") or "").strip(),
         "source_dir_rel": _safe_repo_rel(global_repo, bundle.file_path.parent),
         "sqlite_rel": _safe_repo_rel(global_repo, sqlite_path),
         "metadata_rel": _safe_repo_rel(global_repo, metadata_path) if metadata_path is not None else "",
@@ -1333,9 +1348,14 @@ def process_candidates(
                         except Exception:
                             raw_meta = extracted_meta if isinstance(extracted_meta, dict) else {}
                         if is_mat_bundle and bundle_seed is not None and isinstance(raw_meta, dict):
+                            folder_hints = _bundle_folder_asset_hints(bundle_seed)
                             raw_meta["serial_number"] = bundle_seed.serial_number
                             raw_meta["document_type"] = "TD"
                             raw_meta["document_type_acronym"] = "TD"
+                            if str(raw_meta.get("asset_type") or "").strip() in {"", "Unknown", "unknown"}:
+                                raw_meta["asset_type"] = folder_hints.get("asset_type") or "Unknown"
+                            if str(raw_meta.get("asset_specific_type") or "").strip() in {"", "Unknown", "unknown"}:
+                                raw_meta["asset_specific_type"] = folder_hints.get("asset_specific_type") or "Unknown"
 
                         is_test_data = bool(is_mat) or _is_test_data_meta(raw_meta if isinstance(raw_meta, dict) else {})
 
@@ -1469,9 +1489,14 @@ def process_candidates(
                             default_document_type="TD" if is_mat else "Unknown",
                         )
                         if is_mat_bundle and bundle_seed is not None:
+                            folder_hints = _bundle_folder_asset_hints(bundle_seed)
                             clean_meta["serial_number"] = bundle_seed.serial_number
                             clean_meta["document_type"] = "TD"
                             clean_meta["document_type_acronym"] = "TD"
+                            if str(clean_meta.get("asset_type") or "").strip() in {"", "Unknown", "unknown"}:
+                                clean_meta["asset_type"] = folder_hints.get("asset_type") or "Unknown"
+                            if str(clean_meta.get("asset_specific_type") or "").strip() in {"", "Unknown", "unknown"}:
+                                clean_meta["asset_specific_type"] = folder_hints.get("asset_specific_type") or "Unknown"
                         metadata_path = write_metadata(Path(artifacts_dir), metadata_identity_path, clean_meta)
                         if is_mat_bundle and bundle_seed is not None:
                             _write_mat_bundle_manifest(
@@ -1481,6 +1506,7 @@ def process_candidates(
                                 members=bundle_members,
                                 sqlite_path=mat_bundle_sqlite_path(paths.support_dir, bundle_seed),
                                 metadata_path=metadata_path,
+                                metadata=clean_meta,
                             )
                     else:
                         core = _get_core()
