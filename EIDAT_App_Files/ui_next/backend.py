@@ -9,6 +9,7 @@ import sys
 import shutil
 import subprocess
 import re
+from datetime import datetime
 from functools import lru_cache
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -875,10 +876,6 @@ def compile_master_from_state() -> None:
 
     # Write the master workbook
     write_master(serials, rows, program_by_sn=prog_map, sv_by_sn=sv_map, data_by_sn=data_map)
-
-
-def generate_plot_terms() -> subprocess.Popen:
-    return run_script("scripts/generate_plot_terms.py")
 
 
 def generate_plots() -> subprocess.Popen:
@@ -4259,11 +4256,109 @@ def _refresh_td_support_run_conditions_sheet(
         for d in param_defs
         if str(d.get("name") or "").strip()
     }
+    headers = [
+        "condition_key",
+        "display_name",
+        "feed_pressure",
+        "feed_pressure_units",
+        "run_type",
+        "pulse_width_on",
+        "control_period",
+        "member_sequences",
+        "member_programs",
+        "parameter_name",
+        "units",
+        "min_value",
+        "max_value",
+        "enabled",
+    ]
+    desired_rows: list[list[object]] = []
+    rows_written = 0
+    for row in run_conditions:
+        condition_key = str(row.get("condition_key") or "").strip()
+        if not condition_key:
+            continue
+        bounds = dict(condition_bounds.get(condition_key) or {})
+        ordered_names = [name for name in param_order if name]
+        ordered_names.extend(
+            sorted(
+                [name for name in bounds.keys() if str(name).strip() and str(name).strip() not in ordered_names],
+                key=lambda s: str(s).lower(),
+            )
+        )
+        if not ordered_names:
+            ordered_names = [""]
+        for param_name in ordered_names:
+            bound = dict(bounds.get(param_name) or {}) if param_name else {}
+            desired_rows.append(
+                [
+                    condition_key,
+                    str(row.get("display_name") or condition_key).strip() or condition_key,
+                    row.get("feed_pressure"),
+                    str(row.get("feed_pressure_units") or "").strip(),
+                    str(row.get("run_type") or "").strip(),
+                    row.get("pulse_width_on", row.get("pulse_width")),
+                    row.get("control_period"),
+                    str(row.get("member_sequences_text") or "").strip(),
+                    str(row.get("member_programs_text") or "").strip(),
+                    param_name,
+                    str(bound.get("units") or param_units.get(param_name) or "").strip(),
+                    bound.get("min_value"),
+                    bound.get("max_value"),
+                    bool(bound.get("enabled", row.get("enabled", True))),
+                ]
+            )
+            rows_written += 1
+
+    def _canon_support_cell(value: object) -> object:
+        if value is None:
+            return ""
+        if isinstance(value, bool):
+            return bool(value)
+        if isinstance(value, (int, float)):
+            f = float(value)
+            if not math.isfinite(f):
+                return ""
+            if abs(f - round(f)) < 1e-9:
+                return int(round(f))
+            return round(f, 12)
+        return str(value).strip()
 
     wb = _td_load_workbook_ignore_long_title_warning(str(support_path))
     try:
-        if _td_normalize_support_workbook_sheet_names(wb):
-            wb.save(str(support_path))
+        normalized_changed = _td_normalize_support_workbook_sheet_names(wb)
+        legacy_sheet_names = [
+            sheet_name
+            for sheet_name in wb.sheetnames
+            if sheet_name == TD_SUPPORT_RUN_CONDITION_BOUNDS_SHEET
+            or str(sheet_name).startswith(TD_SUPPORT_CONDITION_SHEET_PREFIX)
+        ]
+        existing_headers: list[object] = []
+        existing_rows: list[list[object]] = []
+        if TD_SUPPORT_RUN_CONDITIONS_SHEET in wb.sheetnames:
+            ws_existing = wb[TD_SUPPORT_RUN_CONDITIONS_SHEET]
+            existing_headers = [
+                _canon_support_cell(ws_existing.cell(1, col).value)
+                for col in range(1, len(headers) + 1)
+            ]
+            for row in ws_existing.iter_rows(min_row=2, max_col=len(headers), values_only=True):
+                canon_row = [_canon_support_cell(value) for value in row]
+                if any(value != "" for value in canon_row):
+                    existing_rows.append(canon_row)
+        desired_rows_canon = [[_canon_support_cell(value) for value in row] for row in desired_rows]
+        if (
+            not normalized_changed
+            and not legacy_sheet_names
+            and existing_headers == headers
+            and existing_rows == desired_rows_canon
+        ):
+            return {
+                "path": str(support_path),
+                "updated": False,
+                "condition_count": len(run_conditions),
+                "rows_written": rows_written,
+            }
+
         for sheet_name in list(wb.sheetnames):
             if sheet_name == TD_SUPPORT_RUN_CONDITIONS_SHEET or sheet_name == TD_SUPPORT_RUN_CONDITION_BOUNDS_SHEET:
                 wb.remove(wb[sheet_name])
@@ -4272,61 +4367,9 @@ def _refresh_td_support_run_conditions_sheet(
                 wb.remove(wb[sheet_name])
 
         ws_cond = wb.create_sheet(TD_SUPPORT_RUN_CONDITIONS_SHEET)
-        ws_cond.append(
-            [
-                "condition_key",
-                "display_name",
-                "feed_pressure",
-                "feed_pressure_units",
-                "run_type",
-                "pulse_width_on",
-                "control_period",
-                "member_sequences",
-                "member_programs",
-                "parameter_name",
-                "units",
-                "min_value",
-                "max_value",
-                "enabled",
-            ]
-        )
-
-        rows_written = 0
-        for row in run_conditions:
-            condition_key = str(row.get("condition_key") or "").strip()
-            if not condition_key:
-                continue
-            bounds = dict(condition_bounds.get(condition_key) or {})
-            ordered_names = [name for name in param_order if name]
-            ordered_names.extend(
-                sorted(
-                    [name for name in bounds.keys() if str(name).strip() and str(name).strip() not in ordered_names],
-                    key=lambda s: str(s).lower(),
-                )
-            )
-            if not ordered_names:
-                ordered_names = [""]
-            for param_name in ordered_names:
-                bound = dict(bounds.get(param_name) or {}) if param_name else {}
-                ws_cond.append(
-                    [
-                        condition_key,
-                        str(row.get("display_name") or condition_key).strip() or condition_key,
-                        row.get("feed_pressure"),
-                        str(row.get("feed_pressure_units") or "").strip(),
-                        str(row.get("run_type") or "").strip(),
-                        row.get("pulse_width_on", row.get("pulse_width")),
-                        row.get("control_period"),
-                        str(row.get("member_sequences_text") or "").strip(),
-                        str(row.get("member_programs_text") or "").strip(),
-                        param_name,
-                        str(bound.get("units") or param_units.get(param_name) or "").strip(),
-                        bound.get("min_value"),
-                        bound.get("max_value"),
-                        bool(bound.get("enabled", row.get("enabled", True))),
-                    ]
-                )
-                rows_written += 1
+        ws_cond.append(headers)
+        for row in desired_rows:
+            ws_cond.append(list(row))
         wb.save(str(support_path))
     finally:
         try:
@@ -8428,6 +8471,7 @@ TD_PERF_FIT_MODE_POLYNOMIAL = "polynomial"
 TD_PERF_FIT_MODE_LOGARITHMIC = "logarithmic"
 TD_PERF_FIT_MODE_SATURATING_EXPONENTIAL = "saturating_exponential"
 TD_PERF_FIT_MODE_HYBRID_SATURATING_LINEAR = "hybrid_saturating_linear"
+TD_PERF_FIT_MODE_HYBRID_QUADRATIC_RESIDUAL = "hybrid_quadratic_residual"
 TD_PERF_FIT_MODE_MONOTONE_PCHIP = "monotone_pchip"
 TD_PERF_FIT_MODE_PIECEWISE_AUTO = "piecewise_auto"
 TD_PERF_FIT_MODE_PIECEWISE_2 = "piecewise_2"
@@ -8442,6 +8486,7 @@ TD_PERF_FIT_MODES = {
     TD_PERF_FIT_MODE_LOGARITHMIC,
     TD_PERF_FIT_MODE_SATURATING_EXPONENTIAL,
     TD_PERF_FIT_MODE_HYBRID_SATURATING_LINEAR,
+    TD_PERF_FIT_MODE_HYBRID_QUADRATIC_RESIDUAL,
     TD_PERF_FIT_MODE_MONOTONE_PCHIP,
     TD_PERF_FIT_MODE_PIECEWISE_AUTO,
     TD_PERF_FIT_MODE_PIECEWISE_2,
@@ -8456,6 +8501,7 @@ TD_PERF_FIT_COMPLEXITY_PENALTIES = {
     TD_PERF_FIT_MODE_LOGARITHMIC: 0.0,
     TD_PERF_FIT_MODE_SATURATING_EXPONENTIAL: 0.0,
     TD_PERF_FIT_MODE_HYBRID_SATURATING_LINEAR: 0.10,
+    TD_PERF_FIT_MODE_HYBRID_QUADRATIC_RESIDUAL: 0.20,
     TD_PERF_FIT_MODE_PIECEWISE_2: 0.15,
     TD_PERF_FIT_MODE_PIECEWISE_3: 0.30,
     TD_PERF_FIT_MODE_MONOTONE_PCHIP: 0.35,
@@ -8464,13 +8510,15 @@ TD_PERF_FIT_FAMILY_PRIORITY = {
     TD_PERF_FIT_MODE_LOGARITHMIC: 0,
     TD_PERF_FIT_MODE_SATURATING_EXPONENTIAL: 1,
     TD_PERF_FIT_MODE_HYBRID_SATURATING_LINEAR: 2,
-    TD_PERF_FIT_MODE_PIECEWISE_2: 3,
-    TD_PERF_FIT_MODE_PIECEWISE_3: 4,
-    TD_PERF_FIT_MODE_MONOTONE_PCHIP: 5,
-    TD_PERF_FIT_MODE_POLYNOMIAL: 6,
-    TD_PERF_FIT_FAMILY_PLANE: 7,
-    TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE: 8,
+    TD_PERF_FIT_MODE_HYBRID_QUADRATIC_RESIDUAL: 3,
+    TD_PERF_FIT_MODE_PIECEWISE_2: 4,
+    TD_PERF_FIT_MODE_PIECEWISE_3: 5,
+    TD_PERF_FIT_MODE_MONOTONE_PCHIP: 6,
+    TD_PERF_FIT_MODE_POLYNOMIAL: 7,
+    TD_PERF_FIT_FAMILY_PLANE: 8,
+    TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE: 9,
 }
+TD_PERF_EXPORT_STATS_ORDER = ["mean", "min", "max", "std", "min_3sigma", "max_3sigma"]
 
 
 def td_perf_normalize_fit_mode(value: object) -> str:
@@ -8488,6 +8536,8 @@ def td_perf_fit_family_label(value: object) -> str:
         return "Saturating Exponential"
     if fam == TD_PERF_FIT_MODE_HYBRID_SATURATING_LINEAR:
         return "Hybrid Saturating + Linear"
+    if fam == TD_PERF_FIT_MODE_HYBRID_QUADRATIC_RESIDUAL:
+        return "Hybrid + Quadratic Residual"
     if fam == TD_PERF_FIT_MODE_MONOTONE_PCHIP:
         return "Monotone PCHIP"
     if fam == TD_PERF_FIT_MODE_PIECEWISE_AUTO:
@@ -8981,6 +9031,17 @@ def _td_perf_model_score_value(model: Mapping[str, object]) -> float:
     return score if math.isfinite(score) else float("inf")
 
 
+def td_perf_normalize_surface_family(value: object) -> str:
+    raw = str(value or "").strip().lower()
+    if raw in {TD_PERF_FIT_MODE_AUTO_SURFACE, TD_PERF_FIT_FAMILY_PLANE, TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE}:
+        return raw
+    if raw in {"auto", TD_PERF_FIT_MODE_POLYNOMIAL_SURFACE}:
+        return TD_PERF_FIT_MODE_AUTO_SURFACE
+    if raw in {"quadratic", "quadratic_surface"}:
+        return TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE
+    return TD_PERF_FIT_MODE_AUTO_SURFACE
+
+
 def td_perf_predict_model(model: Mapping[str, object], xs: Iterable[float]) -> list[float]:
     np = _td_perf_import_numpy()
     family = td_perf_normalize_fit_mode(model.get("fit_family"))
@@ -9013,6 +9074,24 @@ def td_perf_predict_model(model: Mapping[str, object], xs: Iterable[float]) -> l
         A = float((params or {}).get("A") or 0.0)
         k = float((params or {}).get("k") or 0.0)
         return [float(v) for v in (b + (m * x_arr) + (A * (1.0 - np.exp(-k * x_arr)))).tolist()]
+    if family == TD_PERF_FIT_MODE_HYBRID_QUADRATIC_RESIDUAL:
+        base_params = dict((params or {}).get("base_params") or {})
+        b = float(base_params.get("b") or 0.0)
+        m = float(base_params.get("m") or 0.0)
+        A = float(base_params.get("A") or 0.0)
+        k = float(base_params.get("k") or 0.0)
+        base = b + (m * x_arr) + (A * (1.0 - np.exp(-k * x_arr)))
+        coeffs = [float(v) for v in ((params or {}).get("residual_coeffs") or [])]
+        if len(coeffs) != 3:
+            return [float(v) for v in base.tolist()]
+        if bool((params or {}).get("normalize_x")):
+            x0 = float((params or {}).get("x0") or 0.0)
+            sx = float((params or {}).get("sx") or 1.0) or 1.0
+            xn = (x_arr - x0) / sx
+        else:
+            xn = x_arr
+        residual = np.poly1d(coeffs)(xn)
+        return [float(v) for v in (base + residual).tolist()]
     if family == TD_PERF_FIT_MODE_MONOTONE_PCHIP:
         PchipInterpolator = _td_perf_import_pchip()
         knots = [float(v) for v in ((params or {}).get("knots") or [])]
@@ -9513,6 +9592,88 @@ def _td_perf_fit_hybrid_saturating_linear_model(
     return model
 
 
+def _td_perf_fit_hybrid_quadratic_residual_model(
+    xs: list[float],
+    ys: list[float],
+    *,
+    fit_mode: str,
+    normalize_x: bool,
+    sample_weights: Sequence[float] | None = None,
+) -> dict[str, object] | None:
+    np = _td_perf_import_numpy()
+    base_model = _td_perf_fit_hybrid_saturating_linear_model(xs, ys, fit_mode=fit_mode, sample_weights=sample_weights)
+    if not isinstance(base_model, dict):
+        return None
+    prepared = _td_perf_prepare_xy(xs, ys)
+    if prepared[0] is None:
+        return None
+    x_arr, y_arr, order = prepared
+    assert order is not None
+    weights_in = _td_perf_prepare_sample_weights(xs, sample_weights)
+    if weights_in is None:
+        return None
+    weights = [float(weights_in[idx]) for idx in order.tolist()]
+    base_pred = np.asarray(td_perf_predict_model(base_model, x_arr.tolist()), dtype=float)
+    residuals = y_arr - base_pred
+    if normalize_x:
+        x0 = float(np.mean(x_arr))
+        sx = float(np.std(x_arr)) or 1.0
+        xn = (x_arr - x0) / sx
+    else:
+        x0 = 0.0
+        sx = 1.0
+        xn = x_arr
+    design = np.vander(xn, 3, increasing=False)
+    coeffs, _residuals, rank, _singular = _td_perf_weighted_lstsq(design, residuals, weights)
+    if int(rank) < int(design.shape[1]):
+        return None
+    residual_coeffs = [float(v) for v in coeffs.tolist()]
+    residual_hat = design.dot(np.asarray(residual_coeffs, dtype=float))
+    y_hat = base_pred + residual_hat
+    residual_eq, residual_norm_eq = _td_perf_fmt_poly_equation(
+        residual_coeffs,
+        2,
+        x0=(x0 if normalize_x else None),
+        sx=(sx if normalize_x else None),
+    )
+    base_params = dict(base_model.get("params") or {})
+    return _td_perf_finalize_model(
+        fit_family=TD_PERF_FIT_MODE_HYBRID_QUADRATIC_RESIDUAL,
+        fit_mode=fit_mode,
+        equation=(
+            f"{str(base_model.get('equation') or '').strip()} ; residual: {residual_eq or 'y = 0'}"
+        ),
+        x_norm_equation=residual_norm_eq or str(base_model.get("x_norm_equation") or ""),
+        params={
+            "base_model_family": TD_PERF_FIT_MODE_HYBRID_SATURATING_LINEAR,
+            "base_params": base_params,
+            "residual_coeffs": residual_coeffs,
+            "normalize_x": bool(normalize_x),
+            "x0": float(x0),
+            "sx": float(sx),
+        },
+        param_count=7,
+        x_values=x_arr,
+        y_true=y_arr,
+        y_hat=y_hat,
+        complexity_penalty=TD_PERF_FIT_COMPLEXITY_PENALTIES[TD_PERF_FIT_MODE_HYBRID_QUADRATIC_RESIDUAL],
+        extra={
+            "base_model": {
+                "fit_family": TD_PERF_FIT_MODE_HYBRID_SATURATING_LINEAR,
+                "fit_mode": fit_mode,
+                "params": base_params,
+                "equation": str(base_model.get("equation") or ""),
+            },
+            "residual_coeffs": residual_coeffs,
+            "x0": float(x0),
+            "sx": float(sx),
+            "normalize_x": bool(normalize_x),
+            "fit_domain": [float(x_arr[0]), float(x_arr[-1])],
+            "sample_weights_used": [float(v) for v in weights],
+        },
+    )
+
+
 def _td_perf_fit_monotone_pchip_model(
     xs: list[float],
     ys: list[float],
@@ -9596,6 +9757,7 @@ def td_perf_fit_model(
         TD_PERF_FIT_MODE_LOGARITHMIC,
         TD_PERF_FIT_MODE_SATURATING_EXPONENTIAL,
         TD_PERF_FIT_MODE_HYBRID_SATURATING_LINEAR,
+        TD_PERF_FIT_MODE_HYBRID_QUADRATIC_RESIDUAL,
         TD_PERF_FIT_MODE_MONOTONE_PCHIP,
     }:
         _td_perf_import_curve_fit()
@@ -9614,6 +9776,14 @@ def td_perf_fit_model(
         return _td_perf_fit_saturating_exponential_model(xs, ys, fit_mode=mode, sample_weights=sample_weights)
     if mode == TD_PERF_FIT_MODE_HYBRID_SATURATING_LINEAR:
         return _td_perf_fit_hybrid_saturating_linear_model(xs, ys, fit_mode=mode, sample_weights=sample_weights)
+    if mode == TD_PERF_FIT_MODE_HYBRID_QUADRATIC_RESIDUAL:
+        return _td_perf_fit_hybrid_quadratic_residual_model(
+            xs,
+            ys,
+            fit_mode=mode,
+            normalize_x=normalize_x,
+            sample_weights=sample_weights,
+        )
     if mode == TD_PERF_FIT_MODE_MONOTONE_PCHIP:
         return _td_perf_fit_monotone_pchip_model(xs, ys, fit_mode=mode, sample_weights=sample_weights)
     if mode == TD_PERF_FIT_MODE_PIECEWISE_2:
@@ -9643,12 +9813,195 @@ def td_perf_fit_model(
         _td_perf_fit_logarithmic_model(xs, ys, fit_mode=mode, sample_weights=sample_weights),
         _td_perf_fit_saturating_exponential_model(xs, ys, fit_mode=mode, sample_weights=sample_weights),
         _td_perf_fit_hybrid_saturating_linear_model(xs, ys, fit_mode=mode, sample_weights=sample_weights),
+        _td_perf_fit_hybrid_quadratic_residual_model(
+            xs,
+            ys,
+            fit_mode=mode,
+            normalize_x=normalize_x,
+            sample_weights=sample_weights,
+        ),
         _td_perf_fit_monotone_pchip_model(xs, ys, fit_mode=mode, sample_weights=sample_weights),
         _td_perf_fit_piecewise_model(xs, ys, segment_count=2, fit_mode=mode, sample_weights=sample_weights),
         _td_perf_fit_piecewise_model(xs, ys, segment_count=3, fit_mode=mode, sample_weights=sample_weights),
     ]
     return _td_perf_choose_best_model([c for c in candidates if isinstance(c, dict)])
 
+
+def _td_perf_excel_num(value: object) -> str:
+    try:
+        out = float(value)
+    except Exception:
+        return "0"
+    if not math.isfinite(out):
+        return "0"
+    return format(out, ".15g")
+
+
+def _td_perf_excel_ref(column_index: int, row_index: int, *, absolute: bool = False) -> str:
+    try:
+        from openpyxl.utils import get_column_letter  # type: ignore
+    except Exception as exc:  # pragma: no cover - optional dep guard
+        raise RuntimeError(
+            "openpyxl is required to export performance equations to Excel. "
+            "Install it with `py -m pip install openpyxl` within the project environment."
+        ) from exc
+    col = get_column_letter(int(column_index))
+    if absolute:
+        return f"${col}${int(row_index)}"
+    return f"{col}{int(row_index)}"
+
+
+def _td_perf_export_series_for_stat(
+    db_path: Path,
+    run_name: str,
+    column_name: str,
+    stat: str,
+    *,
+    control_period_filter: object = None,
+) -> list[dict]:
+    st = str(stat or "").strip().lower()
+    if not st:
+        return []
+    if st in {"min_3sigma", "max_3sigma"}:
+        mean_rows = td_load_metric_series(
+            db_path,
+            run_name,
+            column_name,
+            "mean",
+            control_period_filter=control_period_filter,
+        )
+        std_rows = td_load_metric_series(
+            db_path,
+            run_name,
+            column_name,
+            "std",
+            control_period_filter=control_period_filter,
+        )
+        mean_by_obs = {
+            str(row.get("observation_id") or "").strip(): dict(row)
+            for row in mean_rows
+            if isinstance(row, dict) and str(row.get("observation_id") or "").strip()
+        }
+        std_by_obs = {
+            str(row.get("observation_id") or "").strip(): dict(row)
+            for row in std_rows
+            if isinstance(row, dict) and str(row.get("observation_id") or "").strip()
+        }
+        out: list[dict] = []
+        for obs_id in sorted(set(mean_by_obs.keys()) | set(std_by_obs.keys())):
+            mean_row = mean_by_obs.get(obs_id) or {}
+            std_row = std_by_obs.get(obs_id) or {}
+            value = td_perf_mean_3sigma_value(
+                {
+                    "mean": mean_row.get("value_num"),
+                    "std": std_row.get("value_num"),
+                },
+                st,
+            )
+            if value is None:
+                continue
+            base_row = dict(mean_row or std_row)
+            base_row["value_num"] = float(value)
+            out.append(base_row)
+        return out
+    return td_load_metric_series(
+        db_path,
+        run_name,
+        column_name,
+        st,
+        control_period_filter=control_period_filter,
+    )
+
+
+def _td_perf_export_condition_label(row: Mapping[str, object], *, display_name: str = "") -> str:
+    parts: list[str] = []
+    for candidate in (display_name, row.get("program_title"), row.get("source_run_name")):
+        text = str(candidate or "").strip()
+        if text and text not in parts:
+            parts.append(text)
+    if parts:
+        return " | ".join(parts)
+    return str(row.get("run_name") or "").strip()
+
+
+def _td_perf_join_unique_text(values: Sequence[object]) -> str:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(text)
+    return ", ".join(out)
+
+
+def _td_perf_cluster_points_3d(
+    points: list[dict[str, object]],
+    *,
+    rel_tol: float,
+    abs_tol: float,
+) -> list[dict[str, object]]:
+    ordered: list[dict[str, object]] = []
+    for point in sorted(
+        points,
+        key=lambda item: (
+            float(item.get("x1") or 0.0),
+            float(item.get("x2") or 0.0),
+            str(item.get("source_run_name") or "").lower(),
+            str(item.get("observation_id") or "").lower(),
+        ),
+    ):
+        try:
+            x1 = float(point.get("x1"))
+            x2 = float(point.get("x2"))
+        except Exception:
+            continue
+        if not (math.isfinite(x1) and math.isfinite(x2)):
+            continue
+        copy = dict(point)
+        copy["x1"] = x1
+        copy["x2"] = x2
+        ordered.append(copy)
+    if not ordered:
+        return []
+
+    clusters: list[dict[str, object]] = []
+    for point in ordered:
+        x1 = float(point["x1"])
+        x2 = float(point["x2"])
+        if not clusters:
+            clusters.append(
+                {
+                    "x1_center": x1,
+                    "x2_center": x2,
+                    "points": [point],
+                }
+            )
+            continue
+        cluster = clusters[-1]
+        ref_x1 = float(cluster.get("x1_center") or x1)
+        ref_x2 = float(cluster.get("x2_center") or x2)
+        tol_x1 = max(float(abs_tol), float(rel_tol) * max(abs(ref_x1), abs(x1)))
+        tol_x2 = max(float(abs_tol), float(rel_tol) * max(abs(ref_x2), abs(x2)))
+        if abs(x1 - ref_x1) <= tol_x1 and abs(x2 - ref_x2) <= tol_x2:
+            pts = list(cluster.get("points") or [])
+            pts.append(point)
+            cluster["points"] = pts
+            cluster["x1_center"] = float(sum(float(p.get("x1") or 0.0) for p in pts) / max(1, len(pts)))
+            cluster["x2_center"] = float(sum(float(p.get("x2") or 0.0) for p in pts) / max(1, len(pts)))
+            continue
+        clusters.append(
+            {
+                "x1_center": x1,
+                "x2_center": x2,
+                "points": [point],
+            }
+        )
+    return clusters
 
 def _td_perf_fit_surface_family(
     x1s: list[float],
@@ -9722,11 +10075,28 @@ def td_perf_fit_surface_model(
     ys: list[float],
     *,
     auto_surface_families: bool = False,
+    surface_family: object = None,
 ) -> dict[str, object] | None:
-    fit_mode = TD_PERF_FIT_MODE_AUTO_SURFACE if bool(auto_surface_families) else TD_PERF_FIT_MODE_POLYNOMIAL_SURFACE
+    explicit_family = surface_family not in (None, "")
+    selected_family = td_perf_normalize_surface_family(
+        surface_family if explicit_family else (TD_PERF_FIT_MODE_AUTO_SURFACE if bool(auto_surface_families) else TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE)
+    )
+    fit_mode = (
+        TD_PERF_FIT_MODE_AUTO_SURFACE
+        if selected_family == TD_PERF_FIT_MODE_AUTO_SURFACE
+        else TD_PERF_FIT_MODE_POLYNOMIAL_SURFACE
+    )
     if len(x1s) != len(x2s) or len(x1s) != len(ys) or len(ys) < 3:
         return None
-    if not bool(auto_surface_families):
+    if selected_family == TD_PERF_FIT_FAMILY_PLANE:
+        return _td_perf_fit_surface_family(
+            x1s,
+            x2s,
+            ys,
+            family=TD_PERF_FIT_FAMILY_PLANE,
+            fit_mode=fit_mode,
+        )
+    if selected_family == TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE:
         model = _td_perf_fit_surface_family(
             x1s,
             x2s,
@@ -9734,7 +10104,7 @@ def td_perf_fit_surface_model(
             family=TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE,
             fit_mode=fit_mode,
         )
-        if model:
+        if model or explicit_family:
             return model
         return _td_perf_fit_surface_family(
             x1s,
@@ -9760,6 +10130,184 @@ def td_perf_fit_surface_model(
         ),
     ]
     return _td_perf_choose_best_model([c for c in candidates if isinstance(c, dict)])
+
+
+def td_perf_collect_equation_export_rows(
+    db_path: Path,
+    *,
+    run_specs: Sequence[Mapping[str, object]],
+    control_period_filter: object = None,
+) -> list[dict[str, object]]:
+    path = Path(db_path).expanduser()
+    if not path.exists():
+        return []
+    support_settings = _td_perf_load_support_settings(path)
+    strictness_mode = _td_perf_support_setting_choice(
+        support_settings,
+        "perf_eq_strictness",
+        allowed=set(TD_PERF_EQ_STRICTNESS_PRESETS.keys()),
+        default=str(TD_PERF_EQ_DEFAULTS["perf_eq_strictness"]),
+    )
+    strictness_defaults = dict(TD_PERF_EQ_STRICTNESS_PRESETS.get(strictness_mode) or TD_PERF_EQ_STRICTNESS_PRESETS["medium"])
+    x_rel_tol = _td_perf_support_setting_float(
+        support_settings,
+        "perf_eq_x_rel_tol",
+        float(strictness_defaults["perf_eq_x_rel_tol"]),
+    )
+    x_abs_tol = _td_perf_support_setting_float(
+        support_settings,
+        "perf_eq_x_abs_tol",
+        float(strictness_defaults["perf_eq_x_abs_tol"]),
+    )
+
+    out: list[dict[str, object]] = []
+    for spec in run_specs or []:
+        run_name = str((spec or {}).get("run_name") or "").strip()
+        if not run_name:
+            continue
+        display_name = str((spec or {}).get("display_name") or run_name).strip()
+        input1_column = str((spec or {}).get("input1_column") or "").strip()
+        input2_column = str((spec or {}).get("input2_column") or "").strip()
+        output_column = str((spec or {}).get("output_column") or "").strip()
+        if not input1_column or not output_column:
+            continue
+        x1_rows = _td_perf_export_series_for_stat(
+            path,
+            run_name,
+            input1_column,
+            "mean",
+            control_period_filter=control_period_filter,
+        )
+        y_rows = _td_perf_export_series_for_stat(
+            path,
+            run_name,
+            output_column,
+            "mean",
+            control_period_filter=control_period_filter,
+        )
+        if not x1_rows or not y_rows:
+            continue
+        x1_map = {
+            str(row.get("observation_id") or "").strip(): dict(row)
+            for row in x1_rows
+            if isinstance(row, dict) and str(row.get("observation_id") or "").strip()
+        }
+        y_map = {
+            str(row.get("observation_id") or "").strip(): dict(row)
+            for row in y_rows
+            if isinstance(row, dict) and str(row.get("observation_id") or "").strip()
+        }
+        if input2_column:
+            x2_rows = _td_perf_export_series_for_stat(
+                path,
+                run_name,
+                input2_column,
+                "mean",
+                control_period_filter=control_period_filter,
+            )
+            x2_map = {
+                str(row.get("observation_id") or "").strip(): dict(row)
+                for row in x2_rows
+                if isinstance(row, dict) and str(row.get("observation_id") or "").strip()
+            }
+            points_3d: list[dict[str, object]] = []
+            for obs_id in sorted(set(x1_map.keys()) & set(x2_map.keys()) & set(y_map.keys())):
+                row_x1 = x1_map.get(obs_id) or {}
+                row_x2 = x2_map.get(obs_id) or {}
+                row_y = y_map.get(obs_id) or {}
+                try:
+                    x1 = float(row_x1.get("value_num"))
+                    x2 = float(row_x2.get("value_num"))
+                    y = float(row_y.get("value_num"))
+                except Exception:
+                    continue
+                if not (math.isfinite(x1) and math.isfinite(x2) and math.isfinite(y)):
+                    continue
+                points_3d.append(
+                    {
+                        "observation_id": obs_id,
+                        "run_name": run_name,
+                        "display_name": display_name,
+                        "program_title": str(row_y.get("program_title") or row_x1.get("program_title") or row_x2.get("program_title") or "").strip(),
+                        "source_run_name": str(row_y.get("source_run_name") or row_x1.get("source_run_name") or row_x2.get("source_run_name") or "").strip(),
+                        "control_period": row_y.get("control_period", row_x1.get("control_period", row_x2.get("control_period"))),
+                        "x1": x1,
+                        "x2": x2,
+                        "actual_mean": y,
+                    }
+                )
+            for cluster in _td_perf_cluster_points_3d(points_3d, rel_tol=x_rel_tol, abs_tol=x_abs_tol):
+                points = list(cluster.get("points") or [])
+                if not points:
+                    continue
+                first = dict(points[0])
+                out.append(
+                    {
+                        "run_name": run_name,
+                        "display_name": display_name,
+                        "program_title": _td_perf_join_unique_text([p.get("program_title") for p in points]),
+                        "source_run_name": _td_perf_join_unique_text([p.get("source_run_name") for p in points]),
+                        "control_period": first.get("control_period"),
+                        "condition_label": _td_perf_export_condition_label(first, display_name=display_name),
+                        "input_1": float(cluster.get("x1_center") or 0.0),
+                        "input_2": float(cluster.get("x2_center") or 0.0),
+                        "actual_mean": float(sum(float(p.get("actual_mean") or 0.0) for p in points) / max(1, len(points))),
+                        "sample_count": int(len(points)),
+                    }
+                )
+            continue
+
+        points_2d: list[dict[str, object]] = []
+        for obs_id in sorted(set(x1_map.keys()) & set(y_map.keys())):
+            row_x1 = x1_map.get(obs_id) or {}
+            row_y = y_map.get(obs_id) or {}
+            try:
+                x1 = float(row_x1.get("value_num"))
+                y = float(row_y.get("value_num"))
+            except Exception:
+                continue
+            if not (math.isfinite(x1) and math.isfinite(y)):
+                continue
+            points_2d.append(
+                {
+                    "observation_id": obs_id,
+                    "run_name": run_name,
+                    "display_name": display_name,
+                    "program_title": str(row_y.get("program_title") or row_x1.get("program_title") or "").strip(),
+                    "source_run_name": str(row_y.get("source_run_name") or row_x1.get("source_run_name") or "").strip(),
+                    "control_period": row_y.get("control_period", row_x1.get("control_period")),
+                    "x": x1,
+                    "actual_mean": y,
+                }
+            )
+        for cluster in _td_perf_cluster_points(points_2d, rel_tol=x_rel_tol, abs_tol=x_abs_tol):
+            points = list(cluster.get("points") or [])
+            if not points:
+                continue
+            first = dict(points[0])
+            out.append(
+                {
+                    "run_name": run_name,
+                    "display_name": display_name,
+                    "program_title": _td_perf_join_unique_text([p.get("program_title") for p in points]),
+                    "source_run_name": _td_perf_join_unique_text([p.get("source_run_name") for p in points]),
+                    "control_period": first.get("control_period"),
+                    "condition_label": _td_perf_export_condition_label(first, display_name=display_name),
+                    "input_1": float(cluster.get("x_center") or 0.0),
+                    "input_2": None,
+                    "actual_mean": float(sum(float(p.get("actual_mean") or 0.0) for p in points) / max(1, len(points))),
+                    "sample_count": int(len(points)),
+                }
+            )
+    out.sort(
+        key=lambda row: (
+            str(row.get("run_name") or "").lower(),
+            float(row.get("input_1") or 0.0),
+            float(row.get("input_2") or 0.0) if row.get("input_2") not in (None, "") else float("-inf"),
+            str(row.get("condition_label") or "").lower(),
+        )
+    )
+    return out
 
 
 TD_PERF_EQ_STRICTNESS_PRESETS: dict[str, dict[str, float]] = {
@@ -9943,6 +10491,419 @@ def _td_perf_summarize_points(
         "source_point_count": len(points),
         "qualifies": qualifies,
     }
+
+
+def _td_perf_excel_polynomial_expr(coeffs: Sequence[object], x_ref: str) -> str:
+    terms: list[str] = []
+    coeff_list = [float(v) for v in coeffs]
+    degree = len(coeff_list) - 1
+    for idx, coeff in enumerate(coeff_list):
+        power = degree - idx
+        c_txt = _td_perf_excel_num(coeff)
+        if power <= 0:
+            terms.append(c_txt)
+        elif power == 1:
+            terms.append(f"({c_txt}*{x_ref})")
+        else:
+            terms.append(f"({c_txt}*({x_ref}^{power}))")
+    return "(" + "+".join(terms) + ")"
+
+
+def _td_perf_excel_norm_expr(raw_ref: str, center: object, scale: object) -> str:
+    return f"(({raw_ref}-{_td_perf_excel_num(center)})/{_td_perf_excel_num(scale)})"
+
+
+def _td_perf_exportable_model(result: Mapping[str, object]) -> dict[str, object] | None:
+    model = (result or {}).get("master_model") if isinstance(result, Mapping) else None
+    if not isinstance(model, dict):
+        return None
+    family = td_perf_normalize_fit_mode(model.get("fit_family"))
+    if not family:
+        return None
+    return model
+
+
+def _td_perf_pchip_segment_rows(model: Mapping[str, object], stat: str) -> list[dict[str, float | int | str]]:
+    PchipInterpolator = _td_perf_import_pchip()
+    knots = [float(v) for v in ((model.get("params") or {}).get("knots") or [])]
+    knot_values = [float(v) for v in ((model.get("params") or {}).get("knot_values") or [])]
+    if len(knots) < 2 or len(knots) != len(knot_values):
+        return []
+    interp = PchipInterpolator(knots, knot_values, extrapolate=False)
+    coeffs = interp.c
+    rows: list[dict[str, float | int | str]] = []
+    for idx in range(len(knots) - 1):
+        rows.append(
+            {
+                "stat": str(stat),
+                "segment_index": int(idx),
+                "x0": float(knots[idx]),
+                "x1": float(knots[idx + 1]),
+                "a": float(coeffs[0, idx]),
+                "b": float(coeffs[1, idx]),
+                "c": float(coeffs[2, idx]),
+                "d": float(coeffs[3, idx]),
+                "left_y": float((model.get("params") or {}).get("left_y") or knot_values[0]),
+                "right_y": float((model.get("params") or {}).get("right_y") or knot_values[-1]),
+            }
+        )
+    return rows
+
+
+def _td_perf_excel_formula_for_model(
+    model: Mapping[str, object],
+    *,
+    raw_x_ref: str,
+    norm_x_ref: str,
+    raw_x1_ref: str,
+    raw_x2_ref: str,
+    norm_x1_ref: str,
+    norm_x2_ref: str,
+    pchip_segments: Sequence[Mapping[str, object]] | None = None,
+) -> str:
+    family = td_perf_normalize_fit_mode(model.get("fit_family"))
+    params = model.get("params") or {}
+    if family == TD_PERF_FIT_MODE_POLYNOMIAL:
+        coeffs = [float(v) for v in (model.get("coeffs") or [])]
+        x_ref = norm_x_ref if bool(model.get("normalize_x")) else raw_x_ref
+        return "=" + _td_perf_excel_polynomial_expr(coeffs, x_ref)
+    if family == TD_PERF_FIT_MODE_LOGARITHMIC:
+        return f"={_td_perf_excel_num(params.get('a'))}+({_td_perf_excel_num(params.get('b'))}*LN({raw_x_ref}))"
+    if family == TD_PERF_FIT_MODE_SATURATING_EXPONENTIAL:
+        return (
+            f"={_td_perf_excel_num(params.get('L'))}"
+            f"-({_td_perf_excel_num(params.get('A'))}*EXP(-{_td_perf_excel_num(params.get('k'))}*{raw_x_ref}))"
+        )
+    if family == TD_PERF_FIT_MODE_HYBRID_SATURATING_LINEAR:
+        return (
+            f"={_td_perf_excel_num(params.get('b'))}"
+            f"+({_td_perf_excel_num(params.get('m'))}*{raw_x_ref})"
+            f"+({_td_perf_excel_num(params.get('A'))}*(1-EXP(-{_td_perf_excel_num(params.get('k'))}*{raw_x_ref})))"
+        )
+    if family == TD_PERF_FIT_MODE_HYBRID_QUADRATIC_RESIDUAL:
+        base_params = dict(params.get("base_params") or {})
+        residual_coeffs = [float(v) for v in (params.get("residual_coeffs") or [])]
+        residual_x_ref = norm_x_ref if bool(params.get("normalize_x")) else raw_x_ref
+        base_expr = (
+            f"{_td_perf_excel_num(base_params.get('b'))}"
+            f"+({_td_perf_excel_num(base_params.get('m'))}*{raw_x_ref})"
+            f"+({_td_perf_excel_num(base_params.get('A'))}*(1-EXP(-{_td_perf_excel_num(base_params.get('k'))}*{raw_x_ref})))"
+        )
+        residual_expr = _td_perf_excel_polynomial_expr(residual_coeffs, residual_x_ref) if residual_coeffs else "0"
+        return f"=({base_expr})+({residual_expr})"
+    if family == TD_PERF_FIT_MODE_MONOTONE_PCHIP:
+        segments = list(pchip_segments or [])
+        if not segments:
+            return ""
+        first_x = float(segments[0].get("x0") or 0.0)
+        last_x = float(segments[-1].get("x1") or 0.0)
+        left_y = float(segments[0].get("left_y") or 0.0)
+        right_y = float(segments[-1].get("right_y") or 0.0)
+        nested = _td_perf_excel_num(right_y)
+        for segment in reversed(segments):
+            x0 = float(segment.get("x0") or 0.0)
+            x1 = float(segment.get("x1") or 0.0)
+            dx = f"({raw_x_ref}-{_td_perf_excel_num(x0)})"
+            poly = (
+                f"({_td_perf_excel_num(segment.get('a'))}*({dx}^3))"
+                f"+({_td_perf_excel_num(segment.get('b'))}*({dx}^2))"
+                f"+({_td_perf_excel_num(segment.get('c'))}*{dx})"
+                f"+{_td_perf_excel_num(segment.get('d'))}"
+            )
+            nested = f"IF({raw_x_ref}<={_td_perf_excel_num(x1)},{poly},{nested})"
+        return (
+            f"=IF({raw_x_ref}<{_td_perf_excel_num(first_x)},{_td_perf_excel_num(left_y)},"
+            f"IF({raw_x_ref}>{_td_perf_excel_num(last_x)},{_td_perf_excel_num(right_y)},{nested}))"
+        )
+    if family in {TD_PERF_FIT_MODE_PIECEWISE_2, TD_PERF_FIT_MODE_PIECEWISE_3}:
+        coeffs = [float(v) for v in ((params or {}).get("coeffs") or [])]
+        breakpoints = [float(v) for v in ((params or {}).get("breakpoints") or [])]
+        if len(coeffs) < 2:
+            return ""
+        expr = f"{_td_perf_excel_num(coeffs[0])}+({_td_perf_excel_num(coeffs[1])}*{raw_x_ref})"
+        for coeff, bp in zip(coeffs[2:], breakpoints):
+            expr += f"+({_td_perf_excel_num(coeff)}*MAX(0,{raw_x_ref}-{_td_perf_excel_num(bp)}))"
+        return "=" + expr
+    if family == TD_PERF_FIT_FAMILY_PLANE:
+        coeffs = [float(v) for v in (model.get("coeffs") or [])]
+        if len(coeffs) != 3:
+            return ""
+        return (
+            f"={_td_perf_excel_num(coeffs[0])}"
+            f"+({_td_perf_excel_num(coeffs[1])}*{norm_x1_ref})"
+            f"+({_td_perf_excel_num(coeffs[2])}*{norm_x2_ref})"
+        )
+    if family == TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE:
+        coeffs = [float(v) for v in (model.get("coeffs") or [])]
+        if len(coeffs) != 6:
+            return ""
+        return (
+            f"={_td_perf_excel_num(coeffs[0])}"
+            f"+({_td_perf_excel_num(coeffs[1])}*{norm_x1_ref})"
+            f"+({_td_perf_excel_num(coeffs[2])}*{norm_x2_ref})"
+            f"+({_td_perf_excel_num(coeffs[3])}*({norm_x1_ref}^2))"
+            f"+({_td_perf_excel_num(coeffs[4])}*{norm_x1_ref}*{norm_x2_ref})"
+            f"+({_td_perf_excel_num(coeffs[5])}*({norm_x2_ref}^2))"
+        )
+    return ""
+
+
+def td_perf_export_equation_workbook(
+    db_path: Path,
+    output_path: Path,
+    *,
+    plot_metadata: Mapping[str, object],
+    results_by_stat: Mapping[str, Mapping[str, object]],
+    run_specs: Sequence[Mapping[str, object]],
+    control_period_filter: object = None,
+) -> Path:
+    try:
+        from openpyxl import Workbook  # type: ignore
+        from openpyxl.styles import Alignment, Font, PatternFill  # type: ignore
+        from openpyxl.utils import get_column_letter  # type: ignore
+    except Exception as exc:  # pragma: no cover - depends on optional dep
+        raise RuntimeError(
+            "openpyxl is required to export performance equations to Excel. "
+            "Install it with `py -m pip install openpyxl` within the project environment."
+        ) from exc
+
+    path = Path(output_path).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    export_rows = td_perf_collect_equation_export_rows(
+        db_path,
+        run_specs=run_specs,
+        control_period_filter=control_period_filter,
+    )
+
+    models_by_stat: dict[str, dict[str, object]] = {}
+    for stat in TD_PERF_EXPORT_STATS_ORDER:
+        result = dict((results_by_stat or {}).get(stat) or {})
+        model = _td_perf_exportable_model(result)
+        if model is not None:
+            models_by_stat[stat] = dict(model)
+    if not models_by_stat:
+        raise RuntimeError("No exportable master performance equations are available for the current plot.")
+
+    plot_dimension = str(plot_metadata.get("plot_dimension") or "2d").strip().lower()
+    is_surface = plot_dimension == "3d" or bool(str(plot_metadata.get("input2_target") or "").strip())
+    output_target = str(plot_metadata.get("output_target") or "").strip()
+    input1_target = str(plot_metadata.get("input1_target") or "").strip()
+    input2_target = str(plot_metadata.get("input2_target") or "").strip()
+    output_units = str(plot_metadata.get("output_units") or plot_metadata.get("y_units") or "").strip()
+    input1_units = str(plot_metadata.get("input1_units") or plot_metadata.get("x_units") or "").strip()
+    input2_units = str(plot_metadata.get("input2_units") or "").strip()
+
+    helper_source_stat = "mean" if "mean" in models_by_stat else next(iter(models_by_stat.keys()))
+    helper_model = models_by_stat[helper_source_stat]
+    helper_family = td_perf_normalize_fit_mode(helper_model.get("fit_family"))
+
+    wb = Workbook()
+    ws = wb.active
+    if ws is None:
+        ws = wb.create_sheet("Equation Export")
+    ws.title = "Equation Export"
+    ws_params = wb.create_sheet("Model Parameters")
+    ws_support = wb.create_sheet("Model Support")
+    ws_params.sheet_state = "hidden"
+    ws_support.sheet_state = "hidden"
+
+    header_font = Font(bold=True)
+    header_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+    section_fill = PatternFill(start_color="E2F0D9", end_color="E2F0D9", fill_type="solid")
+
+    metadata_rows: list[tuple[object, object]] = [
+        ("Export Timestamp", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+        ("Plot Dimension", "3D" if is_surface else "2D"),
+        ("Output Target", output_target),
+        ("Output Units", output_units),
+        ("Input 1 Target", input1_target),
+        ("Input 1 Units", input1_units),
+        ("Input 2 Target", input2_target if is_surface else ""),
+        ("Input 2 Units", input2_units if is_surface else ""),
+        ("Run Selection", str(plot_metadata.get("run_selection_label") or plot_metadata.get("display_text") or plot_metadata.get("run_condition") or "").strip()),
+        ("Member Runs", ", ".join(str(v).strip() for v in (plot_metadata.get("member_runs") or []) if str(v).strip())),
+        ("PM Filter Mode", str(plot_metadata.get("performance_filter_mode") or "all_conditions").strip()),
+        ("Selected Control Period", "" if control_period_filter in (None, "") else str(control_period_filter)),
+        ("Helper Normalization Source", helper_source_stat),
+    ]
+    for row_idx, (label, value) in enumerate(metadata_rows, start=1):
+        ws.cell(row_idx, 1).value = label
+        ws.cell(row_idx, 2).value = value
+        ws.cell(row_idx, 1).font = header_font
+
+    stat_meta_header_row = len(metadata_rows) + 2
+    for col_idx, value in enumerate(["Stat", "Fit Family", "Equation", "Normalization"], start=1):
+        cell = ws.cell(stat_meta_header_row, col_idx)
+        cell.value = value
+        cell.font = header_font
+        cell.fill = section_fill
+    stat_meta_row = stat_meta_header_row + 1
+    unavailable_stats: list[str] = []
+    for stat in TD_PERF_EXPORT_STATS_ORDER:
+        model = models_by_stat.get(stat)
+        if model is None:
+            unavailable_stats.append(stat)
+            continue
+        ws.cell(stat_meta_row, 1).value = stat
+        ws.cell(stat_meta_row, 2).value = td_perf_fit_family_label(model.get("fit_family"))
+        ws.cell(stat_meta_row, 3).value = str(model.get("equation") or "")
+        ws.cell(stat_meta_row, 4).value = str(model.get("x_norm_equation") or "")
+        stat_meta_row += 1
+    if unavailable_stats:
+        ws.cell(stat_meta_row, 1).value = "Unavailable Stats"
+        ws.cell(stat_meta_row, 2).value = ", ".join(unavailable_stats)
+        ws.cell(stat_meta_row, 1).font = header_font
+        stat_meta_row += 1
+
+    data_header_row = stat_meta_row + 2
+    headers = ["run_name", "program_title", "source_run_name", "control_period", "condition_label", "input_1"]
+    if is_surface:
+        headers.append("input_2")
+    headers.append("input_1_norm")
+    if is_surface:
+        headers.append("input_2_norm")
+    headers.extend([f"pred_{stat}" for stat in TD_PERF_EXPORT_STATS_ORDER])
+    headers.extend(["actual_mean", "pct_delta_mean"])
+    col_by_name = {name: idx for idx, name in enumerate(headers, start=1)}
+    for col_idx, name in enumerate(headers, start=1):
+        cell = ws.cell(data_header_row, col_idx)
+        cell.value = name
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center")
+    ws.freeze_panes = ws.cell(data_header_row + 1, 1)
+
+    for col_idx, value in enumerate(["stat", "fit_family", "field", "value"], start=1):
+        cell = ws_params.cell(1, col_idx)
+        cell.value = value
+        cell.font = header_font
+        cell.fill = header_fill
+    for col_idx, value in enumerate(["stat", "family", "segment_index", "x0", "x1", "a", "b", "c", "d", "left_y", "right_y"], start=1):
+        cell = ws_support.cell(1, col_idx)
+        cell.value = value
+        cell.font = header_font
+        cell.fill = header_fill
+
+    param_row = 2
+    support_row = 2
+    pchip_support_by_stat: dict[str, list[dict[str, object]]] = {}
+    for stat in TD_PERF_EXPORT_STATS_ORDER:
+        model = models_by_stat.get(stat)
+        if model is None:
+            continue
+        family = td_perf_normalize_fit_mode(model.get("fit_family"))
+        for field, value in (
+            ("equation", model.get("equation")),
+            ("x_norm_equation", model.get("x_norm_equation")),
+            ("rmse", model.get("rmse")),
+            ("fit_domain", json.dumps(model.get("fit_domain") or [])),
+            ("sample_weights_used", json.dumps(model.get("sample_weights_used") or [])),
+        ):
+            ws_params.cell(param_row, 1).value = stat
+            ws_params.cell(param_row, 2).value = family
+            ws_params.cell(param_row, 3).value = field
+            ws_params.cell(param_row, 4).value = value
+            param_row += 1
+        for field, value in sorted((model.get("params") or {}).items(), key=lambda item: str(item[0])):
+            ws_params.cell(param_row, 1).value = stat
+            ws_params.cell(param_row, 2).value = family
+            ws_params.cell(param_row, 3).value = str(field)
+            ws_params.cell(param_row, 4).value = json.dumps(value) if isinstance(value, (dict, list, tuple)) else value
+            param_row += 1
+        if family == TD_PERF_FIT_MODE_MONOTONE_PCHIP:
+            segments = _td_perf_pchip_segment_rows(model, stat)
+            pchip_support_by_stat[stat] = [dict(seg) for seg in segments]
+            for seg in segments:
+                for col_idx, key in enumerate(["stat", "stat", "segment_index", "x0", "x1", "a", "b", "c", "d", "left_y", "right_y"], start=1):
+                    if col_idx == 2:
+                        ws_support.cell(support_row, col_idx).value = family
+                    else:
+                        ws_support.cell(support_row, col_idx).value = seg.get(key)
+                support_row += 1
+
+    helper_x_template = ""
+    helper_x2_template = ""
+    if helper_family == TD_PERF_FIT_MODE_POLYNOMIAL and bool(helper_model.get("normalize_x")):
+        helper_x_template = _td_perf_excel_norm_expr("{X}", helper_model.get("x0"), helper_model.get("sx"))
+    elif helper_family == TD_PERF_FIT_MODE_HYBRID_QUADRATIC_RESIDUAL and bool((helper_model.get("params") or {}).get("normalize_x")):
+        helper_x_template = _td_perf_excel_norm_expr(
+            "{X}",
+            (helper_model.get("params") or {}).get("x0"),
+            (helper_model.get("params") or {}).get("sx"),
+        )
+    elif helper_family in {TD_PERF_FIT_FAMILY_PLANE, TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE}:
+        helper_x_template = _td_perf_excel_norm_expr("{X}", helper_model.get("x1_center"), helper_model.get("x1_scale"))
+        if is_surface:
+            helper_x2_template = _td_perf_excel_norm_expr("{X2}", helper_model.get("x2_center"), helper_model.get("x2_scale"))
+
+    for idx, row in enumerate(export_rows, start=data_header_row + 1):
+        ws.cell(idx, col_by_name["run_name"]).value = str(row.get("run_name") or "")
+        ws.cell(idx, col_by_name["program_title"]).value = str(row.get("program_title") or "")
+        ws.cell(idx, col_by_name["source_run_name"]).value = str(row.get("source_run_name") or "")
+        ws.cell(idx, col_by_name["control_period"]).value = row.get("control_period")
+        ws.cell(idx, col_by_name["condition_label"]).value = str(row.get("condition_label") or "")
+        ws.cell(idx, col_by_name["input_1"]).value = row.get("input_1")
+        if is_surface:
+            ws.cell(idx, col_by_name["input_2"]).value = row.get("input_2")
+
+        raw_x_ref = _td_perf_excel_ref(col_by_name["input_1"], idx)
+        raw_x2_ref = _td_perf_excel_ref(col_by_name["input_2"], idx) if is_surface else ""
+        norm_x_ref = _td_perf_excel_ref(col_by_name["input_1_norm"], idx)
+        norm_x2_ref = _td_perf_excel_ref(col_by_name["input_2_norm"], idx) if is_surface else ""
+        if helper_x_template:
+            ws.cell(idx, col_by_name["input_1_norm"]).value = "=" + helper_x_template.replace("{X}", raw_x_ref)
+        if is_surface and helper_x2_template:
+            ws.cell(idx, col_by_name["input_2_norm"]).value = "=" + helper_x2_template.replace("{X2}", raw_x2_ref)
+
+        for stat in TD_PERF_EXPORT_STATS_ORDER:
+            model = models_by_stat.get(stat)
+            if model is None:
+                continue
+            family = td_perf_normalize_fit_mode(model.get("fit_family"))
+            stat_norm_x_ref = norm_x_ref
+            stat_norm_x1_ref = norm_x_ref
+            stat_norm_x2_ref = norm_x2_ref
+            if family == TD_PERF_FIT_MODE_POLYNOMIAL and bool(model.get("normalize_x")):
+                stat_norm_x_ref = _td_perf_excel_norm_expr(raw_x_ref, model.get("x0"), model.get("sx"))
+            elif family == TD_PERF_FIT_MODE_HYBRID_QUADRATIC_RESIDUAL and bool((model.get("params") or {}).get("normalize_x")):
+                stat_norm_x_ref = _td_perf_excel_norm_expr(
+                    raw_x_ref,
+                    (model.get("params") or {}).get("x0"),
+                    (model.get("params") or {}).get("sx"),
+                )
+            elif family in {TD_PERF_FIT_FAMILY_PLANE, TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE}:
+                stat_norm_x1_ref = _td_perf_excel_norm_expr(raw_x_ref, model.get("x1_center"), model.get("x1_scale"))
+                stat_norm_x2_ref = _td_perf_excel_norm_expr(raw_x2_ref, model.get("x2_center"), model.get("x2_scale"))
+            formula = _td_perf_excel_formula_for_model(
+                model,
+                raw_x_ref=raw_x_ref,
+                norm_x_ref=stat_norm_x_ref,
+                raw_x1_ref=raw_x_ref,
+                raw_x2_ref=raw_x2_ref,
+                norm_x1_ref=stat_norm_x1_ref,
+                norm_x2_ref=stat_norm_x2_ref,
+                pchip_segments=pchip_support_by_stat.get(stat),
+            )
+            if formula:
+                ws.cell(idx, col_by_name[f"pred_{stat}"]).value = formula
+
+        ws.cell(idx, col_by_name["actual_mean"]).value = row.get("actual_mean")
+        pred_mean_ref = _td_perf_excel_ref(col_by_name["pred_mean"], idx)
+        actual_mean_ref = _td_perf_excel_ref(col_by_name["actual_mean"], idx)
+        ws.cell(idx, col_by_name["pct_delta_mean"]).value = f'=IF(OR({actual_mean_ref}="",{actual_mean_ref}=0),"",({pred_mean_ref}-{actual_mean_ref})/{actual_mean_ref})'
+
+    for ws_cur in (ws, ws_params, ws_support):
+        for col_idx in range(1, (ws_cur.max_column or 0) + 1):
+            max_len = 0
+            for row_idx in range(1, (ws_cur.max_row or 0) + 1):
+                value = ws_cur.cell(row_idx, col_idx).value
+                text = str(value) if value not in (None, "") else ""
+                max_len = max(max_len, len(text))
+            ws_cur.column_dimensions[get_column_letter(col_idx)].width = min(max(12, max_len + 2), 64)
+
+    wb.save(str(path))
+    wb.close()
+    return path
 
 
 def td_discover_performance_candidates(

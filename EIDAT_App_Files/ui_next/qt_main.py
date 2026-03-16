@@ -3252,7 +3252,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         perf_plot_layout.addWidget(self.lbl_perf_common_runs)
 
         filter_row = QtWidgets.QHBoxLayout()
-        filter_row.addWidget(QtWidgets.QLabel("PM data filter:"))
+        filter_row.addWidget(QtWidgets.QLabel("PM data filter (2D/3D):"))
         self.cb_perf_filter_mode = QtWidgets.QComboBox()
         self.cb_perf_filter_mode.addItem("All run conditions", "all_conditions")
         self.cb_perf_filter_mode.addItem("Match control period", "match_control_period")
@@ -3272,6 +3272,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self.cb_perf_fit_model.addItem("Logarithmic", "logarithmic")
         self.cb_perf_fit_model.addItem("Saturating Exponential", "saturating_exponential")
         self.cb_perf_fit_model.addItem("Hybrid Saturating + Linear", "hybrid_saturating_linear")
+        self.cb_perf_fit_model.addItem("Hybrid + Quadratic Residual", "hybrid_quadratic_residual")
         self.cb_perf_fit_model.addItem("Monotone PCHIP", "monotone_pchip")
         self.cb_perf_fit_model.addItem("Piecewise Auto", "piecewise_auto")
         self.cb_perf_fit_model.addItem("Piecewise 2-Segment", "piecewise_2")
@@ -3281,15 +3282,18 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self.sp_perf_degree.setValue(2)
         self.cb_perf_norm_x = QtWidgets.QCheckBox("Normalize X")
         self.cb_perf_norm_x.setChecked(True)
-        self.cb_perf_auto_surface = QtWidgets.QCheckBox("Enable Auto Surface Families")
-        self.cb_perf_auto_surface.setChecked(False)
+        self.cb_perf_surface_model = QtWidgets.QComboBox()
+        self.cb_perf_surface_model.addItem("Auto Surface", "auto_surface")
+        self.cb_perf_surface_model.addItem("Quadratic Surface", "quadratic_surface")
+        self.cb_perf_surface_model.addItem("Plane", "plane")
         fit_row.addWidget(self.cb_perf_fit)
         fit_row.addWidget(QtWidgets.QLabel("Model:"))
         fit_row.addWidget(self.cb_perf_fit_model)
+        fit_row.addWidget(QtWidgets.QLabel("3D Model:"))
+        fit_row.addWidget(self.cb_perf_surface_model)
         fit_row.addWidget(QtWidgets.QLabel("Degree:"))
         fit_row.addWidget(self.sp_perf_degree)
         fit_row.addWidget(self.cb_perf_norm_x)
-        fit_row.addWidget(self.cb_perf_auto_surface)
         fit_row.addStretch(1)
         perf_plot_layout.addLayout(fit_row)
 
@@ -3313,9 +3317,15 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         view_row.addWidget(self.cb_perf_view_stat, 1)
         perf_plot_layout.addLayout(view_row)
 
+        eq_row = QtWidgets.QHBoxLayout()
         lbl_eq = QtWidgets.QLabel("Equations (per stat)")
         lbl_eq.setStyleSheet("font-size: 12px; font-weight: 700; color: #0f172a;")
-        perf_plot_layout.addWidget(lbl_eq)
+        eq_row.addWidget(lbl_eq)
+        eq_row.addStretch(1)
+        self.btn_perf_export_equations = QtWidgets.QPushButton("Export Equation to Excel")
+        self.btn_perf_export_equations.setEnabled(False)
+        eq_row.addWidget(self.btn_perf_export_equations)
+        perf_plot_layout.addLayout(eq_row)
 
         self.tbl_perf_equations = QtWidgets.QTableWidget(0, 9)
         self.tbl_perf_equations.setHorizontalHeaderLabels(
@@ -6697,6 +6707,22 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         raw = str(data if data is not None else self.cb_perf_fit_model.currentText()).strip().lower()
         return raw or "auto"
 
+    def _perf_requested_surface_family(self) -> str:
+        if not hasattr(self, "cb_perf_surface_model"):
+            return "auto_surface"
+        try:
+            data = self.cb_perf_surface_model.currentData()
+        except Exception:
+            data = None
+        normalize = getattr(be, "td_perf_normalize_surface_family", None)
+        if callable(normalize):
+            try:
+                return str(normalize(data if data is not None else self.cb_perf_surface_model.currentText())).strip().lower()
+            except Exception:
+                pass
+        raw = str(data if data is not None else self.cb_perf_surface_model.currentText()).strip().lower()
+        return raw or "auto_surface"
+
     def _perf_fit_family_label(self, family: object) -> str:
         labeler = getattr(be, "td_perf_fit_family_label", None)
         if callable(labeler):
@@ -6717,12 +6743,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 self.cb_perf_fit_model.setToolTip("2-variable fit family selector. 3-variable mode uses surface fitting.")
             else:
                 self.cb_perf_fit_model.setToolTip("")
-        if hasattr(self, "cb_perf_auto_surface"):
-            self.cb_perf_auto_surface.setEnabled(fit_enabled and is_surface)
+        if hasattr(self, "cb_perf_surface_model"):
+            self.cb_perf_surface_model.setEnabled(fit_enabled and is_surface)
             if is_surface:
-                self.cb_perf_auto_surface.setToolTip("Compare polynomial surface families when fitting 1 output with 2 inputs.")
+                self.cb_perf_surface_model.setToolTip("Surface family override for 3D performance plots. Control-period filtering applies here too.")
             else:
-                self.cb_perf_auto_surface.setToolTip("Enable Input 2 to use 3-variable surface fitting.")
+                self.cb_perf_surface_model.setToolTip("Enable Input 2 to use 3-variable surface fitting.")
         allow_poly_controls = fit_enabled and (not is_surface) and fit_mode == "polynomial"
         if hasattr(self, "sp_perf_degree"):
             self.sp_perf_degree.setEnabled(allow_poly_controls)
@@ -6782,8 +6808,14 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         grid_builder = getattr(be, "td_perf_build_surface_grid", None)
         if not callable(fitter):
             return None
-        auto_surface = bool(getattr(self, "cb_perf_auto_surface", None) and self.cb_perf_auto_surface.isChecked())
-        model = fitter(x1s, x2s, ys, auto_surface_families=auto_surface)
+        surface_family = self._perf_requested_surface_family()
+        model = fitter(
+            x1s,
+            x2s,
+            ys,
+            auto_surface_families=(surface_family == "auto_surface"),
+            surface_family=surface_family,
+        )
         if not isinstance(model, dict):
             return None
         if callable(grid_builder) and x1s and x2s:
@@ -7056,6 +7088,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 self.cb_perf_view_stat.blockSignals(False)
             except Exception:
                 pass
+        self._update_perf_export_button_state()
 
     def _set_combo_to_value(self, cb: QtWidgets.QComboBox, value: str) -> bool:
         want = str(value or "").strip()
@@ -8011,6 +8044,132 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             self.tbl_perf_equations.resizeColumnsToContents()
         except Exception:
             pass
+        self._update_perf_export_button_state()
+
+    def _perf_has_exportable_models(self) -> bool:
+        for result in (getattr(self, "_perf_results_by_stat", {}) or {}).values():
+            master = (result or {}).get("master_model") or {}
+            if isinstance(master, dict) and str(master.get("fit_family") or "").strip():
+                return True
+        return False
+
+    def _update_perf_export_button_state(self) -> None:
+        if hasattr(self, "btn_perf_export_equations"):
+            try:
+                self.btn_perf_export_equations.setEnabled(self._perf_has_exportable_models())
+            except Exception:
+                pass
+
+    @staticmethod
+    def _perf_export_slug(value: object) -> str:
+        text = re.sub(r"[^A-Za-z0-9]+", "_", str(value or "").strip()).strip("_")
+        return text or "value"
+
+    def _perf_export_run_specs(self, runs: list[str], output_target: str, input1_target: str, input2_target: str) -> list[dict]:
+        specs: list[dict] = []
+        for run_name in runs or []:
+            output_col, output_units = self._resolve_td_y_col_units(run_name, output_target)
+            input1_col, input1_units = self._resolve_td_y_col_units(run_name, input1_target)
+            input2_col = ""
+            input2_units = ""
+            if str(input2_target or "").strip():
+                input2_col, input2_units = self._resolve_td_y_col_units(run_name, input2_target)
+            if not output_col or not input1_col:
+                continue
+            if str(input2_target or "").strip() and not input2_col:
+                continue
+            specs.append(
+                {
+                    "run_name": str(run_name or "").strip(),
+                    "display_name": self._run_display_text(run_name),
+                    "output_column": output_col,
+                    "output_units": output_units,
+                    "input1_column": input1_col,
+                    "input1_units": input1_units,
+                    "input2_column": input2_col,
+                    "input2_units": input2_units,
+                }
+            )
+        return specs
+
+    def _open_spreadsheet_path(self, file_path: Path) -> None:
+        import platform
+        import subprocess
+
+        resolved = str(Path(file_path).expanduser().resolve())
+        if platform.system() == "Windows":
+            subprocess.Popen(["start", "excel", resolved], shell=True)
+        elif platform.system() == "Darwin":
+            subprocess.Popen(["open", resolved])
+        else:
+            subprocess.Popen(["xdg-open", resolved])
+
+    def _export_perf_equations_to_excel(self) -> None:
+        if not self._perf_has_exportable_models():
+            QtWidgets.QMessageBox.information(self, "Performance", "No exportable master equations are available.")
+            return
+        if not getattr(self, "_db_path", None):
+            QtWidgets.QMessageBox.information(self, "Performance", "Build/refresh cache first.")
+            return
+        results = getattr(self, "_perf_results_by_stat", {}) or {}
+        first_result = next((r for r in results.values() if isinstance(r, dict)), {}) or {}
+        output_target = str(first_result.get("output_target") or "").strip()
+        input1_target = str(first_result.get("input1_target") or "").strip()
+        input2_target = str(first_result.get("input2_target") or "").strip()
+        if not output_target or not input1_target:
+            QtWidgets.QMessageBox.information(self, "Performance", "Plot a performance fit before exporting equations.")
+            return
+
+        plot_def = dict(getattr(self, "_last_plot_def", {}) or {})
+        current_selection = self._current_run_selection()
+        runs = [str(v).strip() for v in (plot_def.get("member_runs") or current_selection.get("member_runs") or []) if str(v).strip()]
+        run_specs = self._perf_export_run_specs(runs, output_target, input1_target, input2_target)
+        perf_filter_mode = str(plot_def.get("performance_filter_mode") or self._selected_perf_filter_mode()).strip().lower()
+        control_period_filter = plot_def.get("selected_control_period")
+        if perf_filter_mode != "match_control_period":
+            control_period_filter = None
+
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_name = (
+            f"performance_equation_export_{self._perf_export_slug(output_target)}_vs_"
+            f"{self._perf_export_slug(input1_target)}"
+        )
+        if str(input2_target or "").strip():
+            default_name += f"_{self._perf_export_slug(input2_target)}"
+        default_name += f"_{timestamp}.xlsx"
+        out_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Export Equation to Excel",
+            str(self._project_dir / default_name),
+            "Excel Files (*.xlsx)",
+        )
+        if not out_path:
+            return
+
+        plot_metadata = {
+            "plot_dimension": str(first_result.get("plot_dimension") or plot_def.get("plot_dimension") or "2d"),
+            "output_target": output_target,
+            "output_units": str(first_result.get("output_units") or first_result.get("y_units") or "").strip(),
+            "input1_target": input1_target,
+            "input1_units": str(first_result.get("input1_units") or first_result.get("x_units") or "").strip(),
+            "input2_target": input2_target,
+            "input2_units": str(first_result.get("input2_units") or "").strip(),
+            "run_selection_label": str(plot_def.get("run_condition") or plot_def.get("display_text") or self._selection_condition_label(current_selection)).strip(),
+            "member_runs": list(runs),
+            "performance_filter_mode": perf_filter_mode or "all_conditions",
+        }
+        try:
+            exported = be.td_perf_export_equation_workbook(
+                self._db_path,
+                Path(out_path),
+                plot_metadata=plot_metadata,
+                results_by_stat=results,
+                run_specs=run_specs,
+                control_period_filter=control_period_filter,
+            )
+            self._open_spreadsheet_path(Path(exported))
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Export Equation to Excel", str(exc))
 
     def _select_perf_equation_row(self, stat: str) -> None:
         st = str(stat or "").strip().lower()
@@ -8479,9 +8638,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             self.cb_perf_fit.toggled.connect(lambda *_: self._clear_perf_results())
             self.cb_perf_fit_model.currentIndexChanged.connect(lambda *_: self._update_perf_fit_controls())
             self.cb_perf_fit_model.currentIndexChanged.connect(lambda *_: self._clear_perf_results())
-            self.cb_perf_auto_surface.toggled.connect(lambda *_: self._clear_perf_results())
+            self.cb_perf_surface_model.currentIndexChanged.connect(lambda *_: self._clear_perf_results())
             self.sp_perf_degree.valueChanged.connect(lambda *_: self._clear_perf_results())
             self.cb_perf_norm_x.toggled.connect(lambda *_: self._clear_perf_results())
+            self.btn_perf_export_equations.clicked.connect(self._export_perf_equations_to_excel)
             self._perf_signals_connected = True
 
         self.cb_perf_fit.setEnabled(True)
@@ -8613,7 +8773,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             "fit_enabled": bool(fit_enabled),
             "fit_mode": str((master_model or {}).get("fit_mode") or self._perf_requested_fit_mode()),
             "fit_family": str((master_model or {}).get("fit_family") or ""),
-            "auto_surface_families": bool(getattr(self, "cb_perf_auto_surface", None) and self.cb_perf_auto_surface.isChecked()),
+            "surface_fit_family": self._perf_requested_surface_family(),
+            "auto_surface_families": bool(self._perf_requested_surface_family() == "auto_surface"),
             "performance_filter_mode": perf_filter_mode,
             "selected_control_period": control_period_filter,
             "highlight_serial": str(getattr(self, "_highlight_sn", "") or "").strip(),
@@ -8846,8 +9007,14 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 idx = self.cb_perf_fit_model.findData(fit_mode)
                 if idx >= 0:
                     self.cb_perf_fit_model.setCurrentIndex(idx)
-            if hasattr(self, "cb_perf_auto_surface"):
-                self.cb_perf_auto_surface.setChecked(bool(d.get("auto_surface_families")))
+            surface_fit_family = str(
+                d.get("surface_fit_family")
+                or ("auto_surface" if bool(d.get("auto_surface_families")) else "quadratic_surface")
+            ).strip().lower()
+            if hasattr(self, "cb_perf_surface_model"):
+                idx = self.cb_perf_surface_model.findData(surface_fit_family)
+                if idx >= 0:
+                    self.cb_perf_surface_model.setCurrentIndex(idx)
             self._plot_performance()
             view_stat = str(d.get("view_stat") or "").strip().lower()
             if view_stat and hasattr(self, "cb_perf_view_stat"):
@@ -9556,11 +9723,6 @@ class MainWindow(QtWidgets.QMainWindow):
                     be.save_scanner_env(env)
         except Exception:
             pass
-        self._refresh_plot_series_after_worker = False
-        self._auto_update_plot_terms_on_success = False
-        self._plot_terms_pending = False
-        self._plot_terms_pending_reason = ""
-
         # Global styling - polished modern design with rounded corners
         self.setStyleSheet(
             """
@@ -13072,31 +13234,16 @@ class MainWindow(QtWidgets.QMainWindow):
         finally:
             self._last_run_dir = None
 
-    def _schedule_plot_terms_update(self, reason: str):
-        label = "Refreshing available plot terms"
-        if reason:
-            label += f" ({reason})"
-        if self._worker is not None and self._worker.isRunning():
-            self._plot_terms_pending = True
-            self._plot_terms_pending_reason = reason
-            return
-        self._plot_terms_pending = False
-        self._plot_terms_pending_reason = ""
-        self._refresh_plot_series_after_worker = True
-        self._start_worker(be.generate_plot_terms, status_msg=label)
-
     def _start_worker(
         self,
         popen_factory,
         *,
         status_msg: str,
         show_run_progress: bool = False,
-        refresh_plot_terms_after: bool = False,
         total_files: int | None = None,
     ):
         if self._worker is not None and self._worker.isRunning():
             return
-        self._auto_update_plot_terms_on_success = bool(refresh_plot_terms_after)
         self._append_log(f"[GUI] {status_msg}")
         self.status_bar.showMessage(status_msg)
         self._progress_total = 0
@@ -13200,17 +13347,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._refresh_run_registry()
             except Exception as exc:
                 self._append_log(f"[WARN] Registry refresh failed: {exc}")
-        if getattr(self, "_refresh_plot_series_after_worker", False):
-            self._refresh_plot_series_after_worker = False
-            try:
-                self._refresh_series_catalog()
-            except Exception:
-                pass
-        auto_refresh = self._auto_update_plot_terms_on_success and not was_canceled and rc == 0
-        self._auto_update_plot_terms_on_success = False
-        if auto_refresh:
-            self._schedule_plot_terms_update("latest scan")
-
         # Update master database after successful extraction run
         if is_extraction and rc == 0 and not was_canceled:
             try:
@@ -13221,12 +13357,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._append_log(f"[ERROR] Failed to compile master database: {e}")
 
         self._scan_refresh()
-        if self._plot_terms_pending and (self._worker is None or not self._worker.isRunning()):
-            reason = self._plot_terms_pending_reason or "refresh"
-            self._plot_terms_pending = False
-            self._plot_terms_pending_reason = ""
-            self._schedule_plot_terms_update(reason)
-
     def _act_install(self):
         self._start_worker(be.run_install_full, status_msg="Installing environment...")
 
@@ -13517,7 +13647,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 lambda entries=entries, terms=terms: be.run_missing_terms_for_selected_pdfs(entries, terms),
                 status_msg=missing_status,
                 show_run_progress=True,
-                refresh_plot_terms_after=True,
                 total_files=total_eidps,
             )
             result["run"] = True
@@ -13534,7 +13663,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 lambda paths=paths, terms=terms: be.run_selected_pdfs(paths, terms),
                 status_msg=full_status,
                 show_run_progress=True,
-                refresh_plot_terms_after=True,
                 total_files=total_eidps,
             )
             result["run"] = True
@@ -13575,7 +13703,6 @@ class MainWindow(QtWidgets.QMainWindow):
             lambda: be.run_scanner(terms, pdfs),
             status_msg="Running simple extraction...",
             show_run_progress=True,
-            refresh_plot_terms_after=True,
             total_files=total_files,
         )
 
@@ -13614,7 +13741,6 @@ class MainWindow(QtWidgets.QMainWindow):
             lambda: be.run_excel_scanner(data_dir),
             status_msg="Extracting Excel data...",
             show_run_progress=True,
-            refresh_plot_terms_after=True,
             total_files=total_files,
         )
 
@@ -14303,8 +14429,6 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 self._show_toast("Workspace synced - all up-to-date")
             self.status_bar.showMessage("Workspace sync complete", 3000)
-        self._schedule_plot_terms_update("workspace sync")
-
     def _apply_sync_error(self, message: str, *, auto: bool):
         self.lbl_sync_banner.setText(f"Sync failed: {message}")
         if not auto:
@@ -14383,9 +14507,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self._append_log("[GUI] Master workbook compiled successfully!")
             self.status_bar.showMessage("Master workbook compiled successfully!", 5000)
             self._show_toast("Master workbook compiled successfully!")
-
-            # Refresh plot terms if needed
-            self._schedule_plot_terms_update("master compilation")
 
         except Exception as e:
             self._append_log(f"[ERROR] Failed to compile master workbook: {e}")
@@ -15274,7 +15395,7 @@ class MainWindow(QtWidgets.QMainWindow):
             options = []
         self._plot_series_options = options
         if not options and hasattr(self, "status_bar"):
-            self.status_bar.showMessage("No plot series found. Generate the term list first.", 4000)
+            self.status_bar.showMessage("No plot series found. Add or restore user_inputs/plot_terms.xlsx.", 4000)
 
 
     # NOTE: _load_proposed_plots, _refresh_proposed_summary, _open_proposed_plots_dialog were removed

@@ -351,6 +351,142 @@ class TestTDSupportWorkbook(unittest.TestCase):
             conn.commit()
         return db_path
 
+    def _seed_perf_export_db_2d(
+        self,
+        root: Path,
+        *,
+        rows: list[tuple[str, str, float, float, float | None]],
+    ) -> Path:
+        from openpyxl import Workbook  # type: ignore
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        wb_path = root / "project.xlsx"
+        Workbook().save(str(wb_path))
+        support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+        be._write_td_support_workbook(
+            support_path,
+            sequence_names=sorted({run for _sn, run, _x, _y, _cp in rows}),
+            param_defs=[
+                {"name": "impulse bit", "units": "mN-s"},
+                {"name": "thrust", "units": "lbf"},
+            ],
+        )
+        db_path = root / "perf_export_2d.sqlite3"
+        with sqlite3.connect(str(db_path)) as conn:
+            be._ensure_test_data_tables(conn)
+            conn.execute("INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)", ("workbook_path", str(wb_path)))
+            for run in sorted({run for _sn, run, _x, _y, _cp in rows}):
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO td_runs(run_name, default_x, display_name, run_type, control_period, pulse_width)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (run, "Time", run, "pm", None, None),
+                )
+                for name, units in (("impulse bit", "mN-s"), ("thrust", "lbf")):
+                    conn.execute(
+                        """
+                        INSERT OR REPLACE INTO td_columns_calc(run_name, name, units, kind)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (run, name, units, "y"),
+                    )
+            for serial, run, x_val, y_val, cp in rows:
+                observation_id = f"{serial}__{run}__{x_val:.6f}"
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO td_condition_observations
+                    (observation_id, serial, run_name, program_title, source_run_name, run_type, pulse_width, control_period, source_mtime_ns, computed_epoch_ns)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (observation_id, serial, run, be.TD_SUPPORT_DEFAULT_PROGRAM_TITLE, run, "pm", None, cp, 0, 0),
+                )
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO td_metrics_calc
+                    (observation_id, serial, run_name, column_name, stat, value_num, computed_epoch_ns, source_mtime_ns, program_title, source_run_name)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (observation_id, serial, run, "impulse bit", "mean", float(x_val), 0, 0, be.TD_SUPPORT_DEFAULT_PROGRAM_TITLE, run),
+                )
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO td_metrics_calc
+                    (observation_id, serial, run_name, column_name, stat, value_num, computed_epoch_ns, source_mtime_ns, program_title, source_run_name)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (observation_id, serial, run, "thrust", "mean", float(y_val), 0, 0, be.TD_SUPPORT_DEFAULT_PROGRAM_TITLE, run),
+                )
+            conn.commit()
+        return db_path
+
+    def _seed_perf_export_db_3d(
+        self,
+        root: Path,
+        *,
+        rows: list[tuple[str, str, float, float, float, float | None]],
+    ) -> Path:
+        from openpyxl import Workbook  # type: ignore
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        wb_path = root / "project.xlsx"
+        Workbook().save(str(wb_path))
+        support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+        be._write_td_support_workbook(
+            support_path,
+            sequence_names=sorted({run for _sn, run, _x1, _x2, _y, _cp in rows}),
+            param_defs=[
+                {"name": "impulse bit", "units": "mN-s"},
+                {"name": "feed pressure", "units": "psia"},
+                {"name": "thrust", "units": "lbf"},
+            ],
+        )
+        db_path = root / "perf_export_3d.sqlite3"
+        with sqlite3.connect(str(db_path)) as conn:
+            be._ensure_test_data_tables(conn)
+            conn.execute("INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)", ("workbook_path", str(wb_path)))
+            for run in sorted({run for _sn, run, _x1, _x2, _y, _cp in rows}):
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO td_runs(run_name, default_x, display_name, run_type, control_period, pulse_width)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (run, "Time", run, "pm", None, None),
+                )
+                for name, units in (("impulse bit", "mN-s"), ("feed pressure", "psia"), ("thrust", "lbf")):
+                    conn.execute(
+                        """
+                        INSERT OR REPLACE INTO td_columns_calc(run_name, name, units, kind)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (run, name, units, "y"),
+                    )
+            for serial, run, x1_val, x2_val, y_val, cp in rows:
+                observation_id = f"{serial}__{run}__{x1_val:.6f}__{x2_val:.6f}"
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO td_condition_observations
+                    (observation_id, serial, run_name, program_title, source_run_name, run_type, pulse_width, control_period, source_mtime_ns, computed_epoch_ns)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (observation_id, serial, run, be.TD_SUPPORT_DEFAULT_PROGRAM_TITLE, run, "pm", None, cp, 0, 0),
+                )
+                for column_name, value_num in (
+                    ("impulse bit", float(x1_val)),
+                    ("feed pressure", float(x2_val)),
+                    ("thrust", float(y_val)),
+                ):
+                    conn.execute(
+                        """
+                        INSERT OR REPLACE INTO td_metrics_calc
+                        (observation_id, serial, run_name, column_name, stat, value_num, computed_epoch_ns, source_mtime_ns, program_title, source_run_name)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (observation_id, serial, run, column_name, "mean", value_num, 0, 0, be.TD_SUPPORT_DEFAULT_PROGRAM_TITLE, run),
+                    )
+            conn.commit()
+        return db_path
+
     def test_write_support_workbook_seeds_expected_sheets(self) -> None:
         from openpyxl import load_workbook  # type: ignore
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
@@ -587,6 +723,61 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 self.assertEqual(ws_cond.cell(2, 13).value, 45)
             finally:
                 wb.close()
+
+    def test_refresh_support_conditions_is_noop_when_generated_sheet_is_unchanged(self) -> None:
+        from openpyxl import load_workbook  # type: ignore
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            src_db = root / "src.sqlite3"
+            self._make_source_sqlite(src_db)
+            wb_path = root / "project.xlsx"
+            be._write_test_data_trending_workbook(
+                wb_path,
+                global_repo=root,
+                serials=["SN1"],
+                docs=[{"serial_number": "SN1", "excel_sqlite_rel": str(src_db), "program_title": be.TD_SUPPORT_DEFAULT_PROGRAM_TITLE}],
+                config=self._make_config(),
+            )
+            support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+            be._write_td_support_workbook(
+                support_path,
+                sequence_names=["RunA"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+            )
+
+            wb = load_workbook(str(support_path))
+            try:
+                ws_prog = wb[self._default_program_sheet_name(be)]
+                ws_prog.cell(2, 1).value = "RunA"
+                ws_prog.cell(2, 2).value = "Seq1"
+                ws_prog.cell(2, 3).value = "100 psia, PM, 5 Sec ON / 20 Sec OFF"
+                ws_prog.cell(2, 4).value = 100
+                ws_prog.cell(2, 5).value = "psia"
+                ws_prog.cell(2, 6).value = "PM"
+                ws_prog.cell(2, 7).value = 5
+                ws_prog.cell(2, 8).value = 20
+                wb.save(str(support_path))
+            finally:
+                wb.close()
+
+            first = be._refresh_td_support_run_conditions_sheet(
+                wb_path,
+                project_dir=root,
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+            )
+            mtime_before = support_path.stat().st_mtime_ns
+            second = be._refresh_td_support_run_conditions_sheet(
+                wb_path,
+                project_dir=root,
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+            )
+            mtime_after = support_path.stat().st_mtime_ns
+
+            self.assertTrue(first.get("updated"))
+            self.assertFalse(second.get("updated"))
+            self.assertEqual(mtime_before, mtime_after)
 
     def test_refresh_support_conditions_normalizes_overlong_program_sheet_names(self) -> None:
         import warnings
@@ -2919,7 +3110,53 @@ class TestTDSupportWorkbook(unittest.TestCase):
         self.assertEqual(be.td_perf_fit_family_label("piecewise_2"), "Piecewise 2-Segment")
         self.assertEqual(be.td_perf_fit_family_label("piecewise_3"), "Piecewise 3-Segment")
         self.assertEqual(be.td_perf_fit_family_label("hybrid_saturating_linear"), "Hybrid Saturating + Linear")
+        self.assertEqual(be.td_perf_fit_family_label("hybrid_quadratic_residual"), "Hybrid + Quadratic Residual")
         self.assertEqual(be.td_perf_fit_family_label("monotone_pchip"), "Monotone PCHIP")
+
+    @unittest.skipUnless(_have_scipy(), "scipy not installed")
+    def test_perf_fit_model_hybrid_quadratic_residual_competes_and_predicts(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        xs = [0.0002, 0.00035, 0.0005, 0.0007, 0.0010, 0.0015, 0.0030, 0.0060, 0.0120]
+        ys = [165.0, 205.0, 220.0, 223.0, 224.0, 224.5, 226.2, 230.2, 235.8]
+        model = be.td_perf_fit_model(xs, ys, fit_mode="hybrid_quadratic_residual", normalize_x=True)
+        self.assertIsNotNone(model)
+        self.assertEqual(str(model.get("fit_family") or ""), be.TD_PERF_FIT_MODE_HYBRID_QUADRATIC_RESIDUAL)
+        preds = be.td_perf_predict_model(model, xs)
+        self.assertEqual(len(preds), len(xs))
+        self.assertTrue(all(math.isfinite(float(v)) for v in preds))
+
+    def test_perf_fit_surface_model_manual_plane_override(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        x1s: list[float] = []
+        x2s: list[float] = []
+        ys: list[float] = []
+        for x1 in (1.0, 2.0, 3.0):
+            for x2 in (5.0, 7.0, 9.0):
+                x1s.append(x1)
+                x2s.append(x2)
+                ys.append(3.0 + (2.0 * x1) - (0.75 * x2))
+
+        model = be.td_perf_fit_surface_model(x1s, x2s, ys, surface_family="plane")
+        self.assertIsNotNone(model)
+        self.assertEqual(str(model.get("fit_family") or ""), be.TD_PERF_FIT_FAMILY_PLANE)
+
+    def test_perf_fit_surface_model_manual_quadratic_override(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        x1s: list[float] = []
+        x2s: list[float] = []
+        ys: list[float] = []
+        for x1 in (1.0, 2.0, 3.0):
+            for x2 in (4.0, 6.0, 8.0):
+                x1s.append(x1)
+                x2s.append(x2)
+                ys.append(10.0 + (2.0 * x1) - (1.5 * x2) + (0.25 * x1 * x2) + (0.5 * x1 * x1) - (0.2 * x2 * x2))
+
+        model = be.td_perf_fit_surface_model(x1s, x2s, ys, surface_family="quadratic_surface")
+        self.assertIsNotNone(model)
+        self.assertEqual(str(model.get("fit_family") or ""), be.TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE)
 
     def test_perf_fit_surface_model_prefers_quadratic_surface_for_quadratic_data(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
@@ -3004,6 +3241,180 @@ class TestTDSupportWorkbook(unittest.TestCase):
         preds = be.td_perf_predict_surface(model, x1s, x2s)
         self.assertEqual(len(preds), len(ys))
         self.assertTrue(all(math.isfinite(float(v)) for v in preds))
+
+    @unittest.skipUnless(_have_openpyxl(), "openpyxl not installed")
+    @unittest.skipUnless(_have_scipy(), "scipy not installed")
+    def test_perf_export_equation_workbook_writes_2d_formulas_actual_mean_and_support(self) -> None:
+        from openpyxl import load_workbook  # type: ignore
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            db_path = self._seed_perf_export_db_2d(
+                root,
+                rows=[
+                    ("SN1", "RunA", 1.000, 10.0, 1.5),
+                    ("SN2", "RunA", 1.020, 14.0, 1.5),
+                    ("SN1", "RunA", 2.000, 18.0, 1.5),
+                    ("SN2", "RunA", 2.010, 22.0, 1.5),
+                ],
+            )
+            xs = [1.0, 1.5, 2.0, 2.5, 3.0]
+            ys = [10.0, 13.0, 18.0, 23.0, 28.0]
+            piecewise_xs = [0.0, 0.001, 0.002, 0.003, 0.02, 0.04, 0.06, 1.0, 2.0, 3.0]
+            piecewise_ys = [1.0, 1.3, 1.6, 1.9, 2.2, 2.5, 2.8, 4.0, 5.0, 6.0]
+            results = {
+                "mean": {"master_model": be.td_perf_fit_model(xs, ys, fit_mode="hybrid_quadratic_residual", normalize_x=True)},
+                "min": {"master_model": be.td_perf_fit_model(piecewise_xs, piecewise_ys, fit_mode="piecewise_2")},
+                "max": {"master_model": be.td_perf_fit_model(xs, ys, fit_mode="monotone_pchip")},
+                "std": {"master_model": be.td_perf_fit_model(xs, [1.0, 1.1, 1.3, 1.6, 2.0], fit_mode="polynomial", polynomial_degree=2)},
+            }
+            out_path = root / "perf_export.xlsx"
+            exported = be.td_perf_export_equation_workbook(
+                db_path,
+                out_path,
+                plot_metadata={
+                    "plot_dimension": "2d",
+                    "output_target": "thrust",
+                    "output_units": "lbf",
+                    "input1_target": "impulse bit",
+                    "input1_units": "mN-s",
+                    "run_selection_label": "RunA",
+                    "member_runs": ["RunA"],
+                    "performance_filter_mode": "match_control_period",
+                },
+                results_by_stat=results,
+                run_specs=[
+                    {
+                        "run_name": "RunA",
+                        "display_name": "RunA",
+                        "output_column": "thrust",
+                        "output_units": "lbf",
+                        "input1_column": "impulse bit",
+                        "input1_units": "mN-s",
+                        "input2_column": "",
+                        "input2_units": "",
+                    }
+                ],
+                control_period_filter=1.5,
+            )
+            self.assertEqual(Path(exported), out_path)
+
+            wb = load_workbook(str(out_path), read_only=False, data_only=False)
+            try:
+                ws = wb["Equation Export"]
+                labels = {
+                    str(ws.cell(r, 1).value or "").strip(): ws.cell(r, 2).value
+                    for r in range(1, (ws.max_row or 0) + 1)
+                    if str(ws.cell(r, 1).value or "").strip()
+                }
+                self.assertEqual(labels.get("PM Filter Mode"), "match_control_period")
+                self.assertEqual(str(labels.get("Selected Control Period")), "1.5")
+
+                header_row = next(
+                    r for r in range(1, (ws.max_row or 0) + 1) if str(ws.cell(r, 1).value or "").strip() == "run_name"
+                )
+                headers = [str(ws.cell(header_row, c).value or "").strip() for c in range(1, (ws.max_column or 0) + 1)]
+                self.assertIn("input_1_norm", headers)
+                self.assertIn("pred_mean", headers)
+                self.assertIn("pred_min", headers)
+                self.assertIn("pred_max", headers)
+                self.assertIn("actual_mean", headers)
+                self.assertIn("pct_delta_mean", headers)
+
+                row1 = header_row + 1
+                mean_formula = str(ws.cell(row1, headers.index("pred_mean") + 1).value or "")
+                min_formula = str(ws.cell(row1, headers.index("pred_min") + 1).value or "")
+                max_formula = str(ws.cell(row1, headers.index("pred_max") + 1).value or "")
+                pct_formula = str(ws.cell(row1, headers.index("pct_delta_mean") + 1).value or "")
+                actual_mean = float(ws.cell(row1, headers.index("actual_mean") + 1).value or 0.0)
+                self.assertIn("EXP(", mean_formula)
+                self.assertIn("^2", mean_formula)
+                self.assertIn("MAX(0", min_formula)
+                self.assertIn("IF(", max_formula)
+                self.assertIn("^3", max_formula)
+                self.assertIn("/", pct_formula)
+                self.assertAlmostEqual(actual_mean, 12.0, places=6)
+
+                self.assertIn("Model Support", wb.sheetnames)
+                self.assertEqual(wb["Model Support"].sheet_state, "hidden")
+                self.assertGreater(wb["Model Support"].max_row, 1)
+            finally:
+                wb.close()
+
+    @unittest.skipUnless(_have_openpyxl(), "openpyxl not installed")
+    def test_perf_export_equation_workbook_writes_3d_surface_formulas_and_norm_columns(self) -> None:
+        from openpyxl import load_workbook  # type: ignore
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            db_path = self._seed_perf_export_db_3d(
+                root,
+                rows=[
+                    ("SN1", "Run3D", 1.0, 10.0, 33.0, 2.0),
+                    ("SN2", "Run3D", 1.02, 10.01, 35.0, 2.0),
+                    ("SN1", "Run3D", 2.0, 20.0, 55.0, 2.0),
+                    ("SN2", "Run3D", 2.01, 20.02, 57.0, 2.0),
+                    ("SN1", "Run3D", 3.0, 30.0, 81.0, 2.0),
+                    ("SN2", "Run3D", 3.01, 30.03, 83.0, 2.0),
+                ],
+            )
+            x1s = [1.0, 1.0, 2.0, 2.0, 3.0, 3.0]
+            x2s = [10.0, 20.0, 10.0, 20.0, 20.0, 30.0]
+            ys = [33.0, 43.0, 45.0, 55.0, 69.0, 83.0]
+            surface = be.td_perf_fit_surface_model(x1s, x2s, ys, surface_family="quadratic_surface")
+            self.assertIsNotNone(surface)
+            out_path = root / "perf_export_3d.xlsx"
+            be.td_perf_export_equation_workbook(
+                db_path,
+                out_path,
+                plot_metadata={
+                    "plot_dimension": "3d",
+                    "output_target": "thrust",
+                    "output_units": "lbf",
+                    "input1_target": "impulse bit",
+                    "input1_units": "mN-s",
+                    "input2_target": "feed pressure",
+                    "input2_units": "psia",
+                    "run_selection_label": "Run3D",
+                    "member_runs": ["Run3D"],
+                    "performance_filter_mode": "match_control_period",
+                },
+                results_by_stat={"mean": {"master_model": surface}},
+                run_specs=[
+                    {
+                        "run_name": "Run3D",
+                        "display_name": "Run3D",
+                        "output_column": "thrust",
+                        "output_units": "lbf",
+                        "input1_column": "impulse bit",
+                        "input1_units": "mN-s",
+                        "input2_column": "feed pressure",
+                        "input2_units": "psia",
+                    }
+                ],
+                control_period_filter=2.0,
+            )
+
+            wb = load_workbook(str(out_path), read_only=False, data_only=False)
+            try:
+                ws = wb["Equation Export"]
+                header_row = next(
+                    r for r in range(1, (ws.max_row or 0) + 1) if str(ws.cell(r, 1).value or "").strip() == "run_name"
+                )
+                headers = [str(ws.cell(header_row, c).value or "").strip() for c in range(1, (ws.max_column or 0) + 1)]
+                self.assertIn("input_2", headers)
+                self.assertIn("input_2_norm", headers)
+                formula = str(ws.cell(header_row + 1, headers.index("pred_mean") + 1).value or "")
+                self.assertIn("^2", formula)
+                self.assertIn("*", formula)
+                self.assertTrue(str(ws.cell(header_row + 1, headers.index("input_1_norm") + 1).value or "").startswith("="))
+                self.assertTrue(str(ws.cell(header_row + 1, headers.index("input_2_norm") + 1).value or "").startswith("="))
+                actual_mean = float(ws.cell(header_row + 1, headers.index("actual_mean") + 1).value or 0.0)
+                self.assertAlmostEqual(actual_mean, 34.0, places=6)
+            finally:
+                wb.close()
 
     def test_perf_candidate_discovery_accepts_separated_x(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
