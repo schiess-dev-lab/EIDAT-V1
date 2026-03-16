@@ -187,6 +187,65 @@ class ManagerTaskWorker(QtCore.QThread):
         self.completed.emit(payload)
 
 
+class ProjectTaskWorker(QtCore.QThread):
+    progress = QtCore.Signal(str)
+    completed = QtCore.Signal(object)
+    failed = QtCore.Signal(str)
+
+    def __init__(self, task_factory, *, log_path: Path | None = None, parent=None):
+        super().__init__(parent)
+        self._task_factory = task_factory
+        self._log_path = Path(log_path).expanduser() if log_path else None
+
+    def _write_log_line(self, handle, text: str) -> None:
+        if handle is None:
+            return
+        try:
+            stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            handle.write(f"[{stamp}] {text}\n")
+            handle.flush()
+        except Exception:
+            pass
+
+    def run(self):
+        handle = None
+        try:
+            if self._log_path is not None:
+                self._log_path.parent.mkdir(parents=True, exist_ok=True)
+                handle = self._log_path.open("a", encoding="utf-8")
+
+            def _report(message: str) -> None:
+                txt = str(message or "").strip()
+                if not txt:
+                    return
+                self._write_log_line(handle, txt)
+                self.progress.emit(txt)
+
+            if self._log_path is not None:
+                _report(f"Log file: {self._log_path}")
+
+            payload = self._task_factory(_report)
+            if isinstance(payload, dict) and self._log_path is not None:
+                payload = dict(payload)
+                payload["log_path"] = str(self._log_path)
+                timings = payload.get("timings")
+                if isinstance(timings, dict):
+                    self._write_log_line(handle, f"Timings JSON: {json.dumps(timings, sort_keys=True)}")
+            self.completed.emit(payload)
+        except Exception as e:
+            if self._log_path is not None:
+                self._write_log_line(handle, f"ERROR: {e}")
+                self.failed.emit(f"{e}\n\nLog: {self._log_path}")
+            else:
+                self.failed.emit(str(e))
+        finally:
+            if handle is not None:
+                try:
+                    handle.close()
+                except Exception:
+                    pass
+
+
 class RunProgressDialog(QtWidgets.QDialog):
     """Large popup that visualizes term progress with a simple spinner animation."""
 
@@ -445,6 +504,11 @@ class RepoScanDialog(QtWidgets.QDialog):
         self.lbl_status.setWordWrap(True)
         self.lbl_status.setStyleSheet("font-size: 12px;")
 
+        self.lbl_detail = QtWidgets.QLabel("")
+        self.lbl_detail.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.lbl_detail.setWordWrap(True)
+        self.lbl_detail.setStyleSheet("color: #dbeafe; font-size: 11px;")
+
         self.progress_bar = QtWidgets.QProgressBar()
         self.progress_bar.setRange(0, 0)
         self.progress_bar.setTextVisible(True)
@@ -460,6 +524,7 @@ class RepoScanDialog(QtWidgets.QDialog):
 
         layout.addWidget(self.lbl_heading)
         layout.addWidget(self.lbl_status)
+        layout.addWidget(self.lbl_detail)
         layout.addWidget(self.progress_bar)
         layout.addWidget(self.lbl_hint)
         layout.addWidget(self.btn_close)
@@ -480,6 +545,7 @@ class RepoScanDialog(QtWidgets.QDialog):
             self.lbl_heading.setText(heading)
         self._base_status = status_text
         self.lbl_status.setText(status_text)
+        self.lbl_detail.setText("")
         self.progress_bar.setRange(0, 0)
         self.progress_bar.setFormat("Scanning...")
         self.btn_close.setEnabled(False)
@@ -494,9 +560,17 @@ class RepoScanDialog(QtWidgets.QDialog):
         except Exception:
             pass
 
+    def set_status_text(self, status_text: str) -> None:
+        self._base_status = str(status_text or "").strip()
+        self.lbl_status.setText(self._base_status)
+
+    def set_detail_text(self, detail_text: str) -> None:
+        self.lbl_detail.setText(str(detail_text or "").strip())
+
     def finish(self, message: str, success: bool = True):
         self._dot_timer.stop()
         self.lbl_status.setText(message)
+        self.lbl_detail.setText("")
         if self.progress_bar.maximum() == 0:
             self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(100 if success else self.progress_bar.value())
@@ -3256,8 +3330,22 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self.lbl_perf_common_runs.setWordWrap(True)
         perf_plot_layout.addWidget(self.lbl_perf_common_runs)
 
+        mode_row = QtWidgets.QHBoxLayout()
+        mode_row.addWidget(QtWidgets.QLabel("Condition family:"))
+        self.rb_perf_steady_state = QtWidgets.QRadioButton("Steady-state")
+        self.rb_perf_pulsed_mode = QtWidgets.QRadioButton("Pulsed mode")
+        self.rb_perf_steady_state.setChecked(True)
+        self._perf_run_type_group = QtWidgets.QButtonGroup(self)
+        self._perf_run_type_group.setExclusive(True)
+        self._perf_run_type_group.addButton(self.rb_perf_steady_state)
+        self._perf_run_type_group.addButton(self.rb_perf_pulsed_mode)
+        mode_row.addWidget(self.rb_perf_steady_state)
+        mode_row.addWidget(self.rb_perf_pulsed_mode)
+        mode_row.addStretch(1)
+        perf_plot_layout.addLayout(mode_row)
+
         filter_row = QtWidgets.QHBoxLayout()
-        filter_row.addWidget(QtWidgets.QLabel("PM data filter (2D/3D):"))
+        filter_row.addWidget(QtWidgets.QLabel("PM control-period filter:"))
         self.cb_perf_filter_mode = QtWidgets.QComboBox()
         self.cb_perf_filter_mode.addItem("All run conditions", "all_conditions")
         self.cb_perf_filter_mode.addItem("Match control period", "match_control_period")
@@ -3382,14 +3470,38 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self.cb_run_mode.currentIndexChanged.connect(lambda *_: self._refresh_run_dropdown())
         form.addRow("Select By:", self.cb_run_mode)
 
+        self.lbl_run_combo = QtWidgets.QLabel("Run:")
         self.cb_run = QtWidgets.QComboBox()
         self.cb_run.currentIndexChanged.connect(self._refresh_columns_for_run)
-        form.addRow("Run:", self.cb_run)
+        form.addRow(self.lbl_run_combo, self.cb_run)
+
+        self.metrics_condition_frame = QtWidgets.QFrame()
+        metrics_condition_layout = QtWidgets.QVBoxLayout(self.metrics_condition_frame)
+        metrics_condition_layout.setContentsMargins(0, 0, 0, 0)
+        metrics_condition_layout.setSpacing(6)
+        self.lbl_metrics_condition_picker = QtWidgets.QLabel("Run Conditions:")
+        self.lbl_metrics_condition_picker.setStyleSheet("font-size: 12px; font-weight: 700; color: #334155;")
+        metrics_condition_layout.addWidget(self.lbl_metrics_condition_picker)
+        self.list_metric_run_conditions = QtWidgets.QListWidget()
+        self.list_metric_run_conditions.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
+        self.list_metric_run_conditions.itemChanged.connect(self._on_metric_condition_selection_changed)
+        metrics_condition_layout.addWidget(self.list_metric_run_conditions, 1)
+        metrics_condition_actions = QtWidgets.QHBoxLayout()
+        self.btn_metric_run_conditions_all = QtWidgets.QPushButton("Select All")
+        self.btn_metric_run_conditions_all.clicked.connect(lambda: self._set_metric_condition_selection_ids(None))
+        self.btn_metric_run_conditions_clear = QtWidgets.QPushButton("Clear")
+        self.btn_metric_run_conditions_clear.clicked.connect(lambda: self._set_metric_condition_selection_ids([]))
+        metrics_condition_actions.addWidget(self.btn_metric_run_conditions_all)
+        metrics_condition_actions.addWidget(self.btn_metric_run_conditions_clear)
+        metrics_condition_actions.addStretch(1)
+        metrics_condition_layout.addLayout(metrics_condition_actions)
+
         self.lbl_run_details = QtWidgets.QLabel("Sequence: -")
         self.lbl_run_details.setStyleSheet("color: #64748b; font-size: 11px;")
         self.lbl_run_details.setWordWrap(True)
         form.addRow("", self.lbl_run_details)
         run_selector_layout.addLayout(form)
+        run_selector_layout.addWidget(self.metrics_condition_frame)
         left_layout.addWidget(self.run_selector_frame)
 
         # Serial highlight (not selection/filtering for plotting)
@@ -5586,41 +5698,170 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         mode = str(self.cb_run_mode.currentData() if hasattr(self, "cb_run_mode") else "sequence" or "sequence").strip().lower()
         return mode if mode in {"sequence", "condition"} else "sequence"
 
-    def _current_run_selection(self) -> dict:
+    @staticmethod
+    def _selection_summary_text(items: list[str] | tuple[str, ...] | None) -> str:
+        return ", ".join([str(item).strip() for item in (items or []) if str(item).strip()])
+
+    def _metrics_condition_multiselect_active(self) -> bool:
+        return (
+            str(getattr(self, "_mode", "") or "").strip().lower() == "metrics"
+            and self._current_run_selector_mode() == "condition"
+            and hasattr(self, "list_metric_run_conditions")
+        )
+
+    def _checked_metric_condition_selections(self) -> list[dict]:
+        if not hasattr(self, "list_metric_run_conditions"):
+            return []
+        out: list[dict] = []
+        for i in range(self.list_metric_run_conditions.count()):
+            it = self.list_metric_run_conditions.item(i)
+            if not it or it.checkState() != QtCore.Qt.CheckState.Checked:
+                continue
+            data = it.data(QtCore.Qt.ItemDataRole.UserRole)
+            if isinstance(data, dict):
+                out.append(dict(data))
+        return out
+
+    def _set_metric_condition_selection_ids(self, selection_ids: list[str] | tuple[str, ...] | set[str] | None) -> None:
+        if not hasattr(self, "list_metric_run_conditions"):
+            return
+        ids = (
+            {str(v).strip() for v in selection_ids if str(v).strip()}
+            if selection_ids is not None
+            else None
+        )
+        self.list_metric_run_conditions.blockSignals(True)
+        try:
+            for i in range(self.list_metric_run_conditions.count()):
+                it = self.list_metric_run_conditions.item(i)
+                if not it:
+                    continue
+                data = it.data(QtCore.Qt.ItemDataRole.UserRole)
+                sel_id = str(data.get("id") or "").strip() if isinstance(data, dict) else ""
+                checked = True if ids is None else sel_id in ids
+                it.setCheckState(QtCore.Qt.CheckState.Checked if checked else QtCore.Qt.CheckState.Unchecked)
+        finally:
+            self.list_metric_run_conditions.blockSignals(False)
+        self._on_metric_condition_selection_changed()
+
+    def _combine_run_selections(self, selections: list[dict] | tuple[dict, ...] | None) -> dict:
+        items = [dict(item) for item in (selections or []) if isinstance(item, dict)]
+        if not items:
+            return {}
+        if len(items) == 1:
+            return dict(items[0])
+
+        first = dict(items[0])
+        mode = str(first.get("mode") or "condition").strip().lower() or "condition"
+        selection_ids: list[str] = []
+        selection_labels: list[str] = []
+        run_conditions: list[str] = []
+        member_runs: list[str] = []
+        member_sequences: list[str] = []
+        detail_rows: list[str] = []
+        seen_runs: set[str] = set()
+        seen_sequences: set[str] = set()
+        seen_labels: set[str] = set()
+        seen_conditions: set[str] = set()
+
+        for item in items:
+            selection_id = str(item.get("id") or "").strip()
+            if selection_id:
+                selection_ids.append(selection_id)
+            label = self._selection_display_text(item)
+            if label and label.lower() not in seen_labels:
+                seen_labels.add(label.lower())
+                selection_labels.append(label)
+            condition_label = self._selection_condition_label(item)
+            if condition_label and condition_label.lower() not in seen_conditions:
+                seen_conditions.add(condition_label.lower())
+                run_conditions.append(condition_label)
+            for run_name in (item.get("member_runs") or []):
+                rn = str(run_name or "").strip()
+                if rn and rn.lower() not in seen_runs:
+                    seen_runs.add(rn.lower())
+                    member_runs.append(rn)
+            for sequence_name in (item.get("member_sequences") or []):
+                seq = str(sequence_name or "").strip()
+                if seq and seq.lower() not in seen_sequences:
+                    seen_sequences.add(seq.lower())
+                    member_sequences.append(seq)
+            details = str(item.get("details_text") or "").strip()
+            if details:
+                detail_rows.append(details)
+
+        label_text = self._selection_summary_text(selection_labels)
+        detail_text = self._selection_summary_text(detail_rows)
+        combined: dict = {
+            "mode": mode,
+            "id": f"{mode}:multi:{'|'.join(selection_ids)}" if selection_ids else f"{mode}:multi",
+            "run_name": str(first.get("run_name") or "").strip(),
+            "display_text": label_text,
+            "run_condition": label_text,
+            "run_conditions": list(run_conditions or selection_labels),
+            "selection_ids": list(selection_ids),
+            "selection_labels": list(selection_labels),
+            "member_runs": list(member_runs),
+            "member_sequences": list(member_sequences),
+            "details_text": detail_text,
+        }
+        return combined
+
+    def _current_run_selections(self) -> list[dict]:
+        if self._metrics_condition_multiselect_active():
+            return self._checked_metric_condition_selections()
         ref = self.cb_run.currentData() if hasattr(self, "cb_run") else None
         if isinstance(ref, dict):
-            return dict(ref)
+            return [dict(ref)]
         run = str(ref or (self.cb_run.currentText() if hasattr(self, "cb_run") else "") or "").strip()
         run = str(self._run_name_by_display.get(run, run) or "").strip()
         if not run:
+            return []
+        return [
+            {
+                "mode": "sequence",
+                "id": f"sequence:{run}",
+                "run_name": run,
+                "sequence_name": run,
+                "display_text": run,
+                "member_runs": [run],
+                "member_sequences": [run],
+                "run_condition": "",
+                "details_text": f"Sequence: {run}",
+            }
+        ]
+
+    def _current_run_selection(self) -> dict:
+        selections = self._current_run_selections()
+        if not selections:
             return {}
-        return {
-            "mode": "sequence",
-            "id": f"sequence:{run}",
-            "run_name": run,
-            "sequence_name": run,
-            "display_text": run,
-            "member_runs": [run],
-            "member_sequences": [run],
-            "run_condition": "",
-            "details_text": f"Sequence: {run}",
-        }
+        if len(selections) == 1:
+            return dict(selections[0])
+        return self._combine_run_selections(selections)
 
     def _current_member_runs(self) -> list[str]:
-        selection = self._current_run_selection()
-        runs = [str(v).strip() for v in (selection.get("member_runs") or []) if str(v).strip()]
-        if runs:
-            return runs
-        run = str(selection.get("run_name") or "").strip()
-        return [run] if run else []
+        runs: list[str] = []
+        seen: set[str] = set()
+        for selection in self._current_run_selections():
+            members = selection.get("member_runs") or []
+            if isinstance(members, list):
+                for run_name in members:
+                    rn = str(run_name or "").strip()
+                    if rn and rn.lower() not in seen:
+                        seen.add(rn.lower())
+                        runs.append(rn)
+            run_name = str(selection.get("run_name") or "").strip()
+            if run_name and run_name.lower() not in seen:
+                seen.add(run_name.lower())
+                runs.append(run_name)
+        return runs
 
     def _current_run_name(self) -> str:
-        selection = self._current_run_selection()
-        runs = [str(v).strip() for v in (selection.get("member_runs") or []) if str(v).strip()]
+        runs = self._current_member_runs()
         if runs:
             return runs[0]
-        run = str(selection.get("run_name") or "").strip()
-        return run
+        selection = self._current_run_selection()
+        return str(selection.get("run_name") or "").strip()
 
     def _run_display_text(self, run_name: str) -> str:
         rn = str(run_name or "").strip()
@@ -5636,6 +5877,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
     def _selection_condition_label(self, selection: dict | None) -> str:
         if not isinstance(selection, dict):
             return ""
+        labels = [str(v).strip() for v in (selection.get("selection_labels") or selection.get("run_conditions") or []) if str(v).strip()]
+        if len(labels) > 1:
+            return self._selection_summary_text(labels)
         fallback = ""
         for candidate in (selection.get("run_condition"), selection.get("display_text")):
             text = str(candidate or "").strip()
@@ -5677,10 +5921,11 @@ class TestDataTrendDialog(QtWidgets.QDialog):
     def _compose_run_title(self, selection: dict | None, suffix: str = "") -> str:
         seq_text, run_condition = self._selection_title_parts(selection)
         mode = str((selection or {}).get("mode") or "").strip().lower()
+        multi_condition = len([str(v).strip() for v in ((selection or {}).get("selection_labels") or (selection or {}).get("run_conditions") or []) if str(v).strip()]) > 1
         parts: list[str] = []
         if mode == "condition":
             if run_condition:
-                parts.append(f"Run Condition: {run_condition}")
+                parts.append(f"{'Run Conditions' if multi_condition else 'Run Condition'}: {run_condition}")
             if seq_text:
                 parts.append(f"Sequences: {seq_text}")
         else:
@@ -5710,6 +5955,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         *,
         selection: dict | None = None,
         control_period_filter: object = None,
+        run_type_filter: object = None,
     ) -> list[dict]:
         if not getattr(self, "_db_path", None):
             return []
@@ -5723,6 +5969,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 program_title=(program_title or None),
                 source_run_name=(source_run_name or None),
                 control_period_filter=control_period_filter,
+                run_type_filter=run_type_filter,
             )
         except Exception:
             return []
@@ -5767,8 +6014,47 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             return {}
         want_mode = str(d.get("selector_mode") or "sequence").strip().lower()
         want_mode = want_mode if want_mode in {"sequence", "condition"} else "sequence"
+        want_ids = (
+            [str(v).strip() for v in (d.get("selection_ids") or []) if str(v).strip()]
+            if isinstance(d.get("selection_ids"), list)
+            else []
+        )
         want_id = str(d.get("selection_id") or "").strip()
         views = self._run_selection_views.get(want_mode) or []
+        if want_mode == "condition" and len(want_ids) > 1:
+            items: list[dict] = []
+            by_id = {
+                str(item.get("id") or "").strip(): dict(item)
+                for item in views
+                if isinstance(item, dict) and str(item.get("id") or "").strip()
+            }
+            for selection_id in want_ids:
+                item = by_id.get(selection_id)
+                if item:
+                    items.append(dict(item))
+            if items:
+                combined = self._combine_run_selections(items)
+                if combined:
+                    return combined
+            labels = (
+                [str(v).strip() for v in (d.get("selection_labels") or d.get("run_conditions") or []) if str(v).strip()]
+                if isinstance(d.get("selection_labels") or d.get("run_conditions"), list)
+                else []
+            )
+            runs = [str(v).strip() for v in (d.get("member_runs") or []) if str(v).strip()] if isinstance(d.get("member_runs"), list) else []
+            seqs = [str(v).strip() for v in (d.get("member_sequences") or []) if str(v).strip()] if isinstance(d.get("member_sequences"), list) else []
+            return {
+                "mode": "condition",
+                "id": want_id or f"condition:multi:{'|'.join(want_ids)}",
+                "display_text": self._selection_summary_text(labels),
+                "run_condition": self._selection_summary_text(labels),
+                "run_conditions": list(labels),
+                "selection_ids": list(want_ids),
+                "selection_labels": list(labels),
+                "member_runs": runs,
+                "member_sequences": seqs,
+                "details_text": f"Source Sequences: {', '.join(seqs)}" if seqs else "",
+            }
         for item in views:
             if isinstance(item, dict) and str(item.get("id") or "").strip() == want_id:
                 return dict(item)
@@ -5807,6 +6093,55 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             "run_condition": "",
             "details_text": f"Sequence: {run0}",
         }
+
+    def _populate_metric_condition_list(self) -> None:
+        if not hasattr(self, "list_metric_run_conditions"):
+            return
+        prev_checked_ids = {
+            str(data.get("id") or "").strip()
+            for data in self._checked_metric_condition_selections()
+            if isinstance(data, dict) and str(data.get("id") or "").strip()
+        }
+        had_items = self.list_metric_run_conditions.count() > 0
+        items = [dict(d) for d in (self._run_selection_views.get("condition") or []) if isinstance(d, dict)]
+        self.list_metric_run_conditions.blockSignals(True)
+        self.list_metric_run_conditions.clear()
+        try:
+            for item in items:
+                label = self._selection_display_text(item)
+                if not label:
+                    continue
+                it = QtWidgets.QListWidgetItem(label)
+                it.setFlags(it.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+                sel_id = str(item.get("id") or "").strip()
+                checked = (sel_id in prev_checked_ids) if had_items else True
+                it.setCheckState(QtCore.Qt.CheckState.Checked if checked else QtCore.Qt.CheckState.Unchecked)
+                it.setData(QtCore.Qt.ItemDataRole.UserRole, item)
+                self.list_metric_run_conditions.addItem(it)
+        finally:
+            self.list_metric_run_conditions.blockSignals(False)
+
+    def _refresh_run_selection_visibility(self) -> None:
+        multi_active = self._metrics_condition_multiselect_active()
+        if hasattr(self, "lbl_run_combo"):
+            self.lbl_run_combo.setVisible(not multi_active)
+        if hasattr(self, "cb_run"):
+            self.cb_run.setVisible(not multi_active)
+        if hasattr(self, "metrics_condition_frame"):
+            self.metrics_condition_frame.setVisible(multi_active)
+
+    def _on_metric_condition_selection_changed(self) -> None:
+        selection = self._current_run_selection()
+        if hasattr(self, "lbl_run_details"):
+            details = str(selection.get("details_text") or "").strip()
+            if not details and self._metrics_condition_multiselect_active():
+                details = "Run Conditions: -"
+            self.lbl_run_details.setText(details or "Sequence: -")
+        try:
+            self._refresh_columns_for_run()
+            self._refresh_stats_preview()
+        except Exception:
+            pass
 
     def _metric_bounds_for_run(self, run_name: str) -> dict[str, dict]:
         run = str(run_name or "").strip()
@@ -6012,6 +6347,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             prev_selection_id = str(current.get("id") or "").strip()
         mode = self._current_run_selector_mode()
         items = [dict(d) for d in (self._run_selection_views.get(mode) or []) if isinstance(d, dict)]
+        self._populate_metric_condition_list()
         self.cb_run.blockSignals(True)
         self.cb_run.clear()
         for item in items:
@@ -6024,9 +6360,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         if self.cb_run.currentIndex() < 0 and self.cb_run.count() > 0:
             self.cb_run.setCurrentIndex(0)
         self.cb_run.blockSignals(False)
+        self._refresh_run_selection_visibility()
         selection = self._current_run_selection()
         if hasattr(self, "lbl_run_details"):
             details = str(selection.get("details_text") or "").strip()
+            if not details and self._metrics_condition_multiselect_active():
+                details = "Run Conditions: -"
             self.lbl_run_details.setText(details or "Sequence: -")
         try:
             self._refresh_columns_for_run()
@@ -6417,6 +6756,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             self.btn_mode_perf.setChecked(m == "performance")
         if hasattr(self, "run_selector_frame"):
             self.run_selector_frame.setVisible(m != "performance")
+        self._refresh_run_selection_visibility()
         self.btn_plot.setText(
             "Plot Curves" if m == "curves" else ("Plot Metrics" if m == "metrics" else "Plot Performance")
         )
@@ -6439,6 +6779,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._set_plot_note("")
         self._ensure_main_axes("2d")
         selection = self._current_run_selection()
+        selections = self._current_run_selections()
         runs = self._current_member_runs()
         stats = [it.text().strip().lower() for it in self.list_stats.selectedItems()] if hasattr(self, "list_stats") else []
         stats = [s for s in stats if s]
@@ -6471,12 +6812,29 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         any_plotted = False
         average_summaries: list[str] = []
         multi_run = len(runs) > 1
-        for run in runs:
+        run_selection_pairs: list[tuple[str, dict | None]] = []
+        if selections:
+            seen_pairs: set[tuple[str, str]] = set()
+            for selected in selections:
+                selected_runs = [str(v).strip() for v in (selected.get("member_runs") or []) if str(v).strip()]
+                if not selected_runs:
+                    selected_run = str(selected.get("run_name") or "").strip()
+                    if selected_run:
+                        selected_runs = [selected_run]
+                for run_name in selected_runs:
+                    pair_key = (run_name.lower(), str(selected.get("id") or "").strip().lower())
+                    if pair_key in seen_pairs:
+                        continue
+                    seen_pairs.add(pair_key)
+                    run_selection_pairs.append((run_name, dict(selected)))
+        else:
+            run_selection_pairs = [(run_name, selection) for run_name in runs]
+        for run, run_selection in run_selection_pairs:
             metric_bounds = self._metric_bounds_for_run(run) if plot_bounds else {}
             for y_col in y_cols:
                 for stat in stats:
                     source_stat = "mean" if str(stat).strip().lower() == "average" else stat
-                    series = self._load_metric_series_for_selection(run, y_col, source_stat, selection=selection)
+                    series = self._load_metric_series_for_selection(run, y_col, source_stat, selection=run_selection)
                     try:
                         if str(stat).strip().lower() == "average":
                             y = be.td_metric_average_plot_values(series, labels)
@@ -6566,13 +6924,19 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._capture_main_plot_base_view()
         self._update_perf_primary_equation_banner()
         self.btn_save_plot_pdf.setEnabled(True)
+        selection_ids = [str(item.get("id") or "").strip() for item in selections if isinstance(item, dict) and str(item.get("id") or "").strip()]
+        selection_labels = [self._selection_display_text(item) for item in selections if isinstance(item, dict) and self._selection_display_text(item)]
+        run_conditions = [self._selection_condition_label(item) for item in selections if isinstance(item, dict) and self._selection_condition_label(item)]
         self._last_plot_def = {
             "mode": "metrics",
             "run": runs[0],
             "selector_mode": str(selection.get("mode") or "sequence"),
             "selection_id": str(selection.get("id") or ""),
+            "selection_ids": list(selection_ids),
+            "selection_labels": list(selection_labels),
             "display_text": self._selection_display_text(selection),
             "run_condition": self._selection_condition_label(selection),
+            "run_conditions": list(run_conditions),
             "member_sequences": list(selection.get("member_sequences") or []),
             "member_runs": list(runs),
             "stats": list(stats),
@@ -6697,8 +7061,25 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             mode = ""
         return mode if mode in {"all_conditions", "match_control_period"} else "all_conditions"
 
+    def _selected_perf_run_type_mode(self) -> str:
+        if hasattr(self, "rb_perf_pulsed_mode") and self.rb_perf_pulsed_mode.isChecked():
+            return "pulsed_mode"
+        return "steady_state"
+
+    def _set_perf_run_type_mode(self, mode: object) -> None:
+        normalized = be.td_perf_normalize_run_type_mode(mode)
+        target = self.rb_perf_pulsed_mode if normalized == "pulsed_mode" else self.rb_perf_steady_state
+        try:
+            target.setChecked(True)
+        except Exception:
+            pass
+
     def _selected_perf_control_period(self) -> object | None:
-        if self._selected_perf_filter_mode() != "match_control_period" or not hasattr(self, "cb_perf_control_period"):
+        if (
+            self._selected_perf_run_type_mode() != "pulsed_mode"
+            or self._selected_perf_filter_mode() != "match_control_period"
+            or not hasattr(self, "cb_perf_control_period")
+        ):
             return None
         try:
             value = self.cb_perf_control_period.currentData()
@@ -6712,7 +7093,11 @@ class TestDataTrendDialog(QtWidgets.QDialog):
     def _update_perf_control_period_state(self) -> None:
         if not hasattr(self, "cb_perf_control_period"):
             return
-        enabled = self._selected_perf_filter_mode() == "match_control_period" and self.cb_perf_control_period.count() > 0
+        enabled = (
+            self._selected_perf_run_type_mode() == "pulsed_mode"
+            and self._selected_perf_filter_mode() == "match_control_period"
+            and self.cb_perf_control_period.count() > 0
+        )
         self.cb_perf_control_period.setEnabled(enabled)
 
     @staticmethod
@@ -7173,6 +7558,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         fit_enabled: bool,
         require_min_points: int,
         control_period_filter: object = None,
+        run_type_filter: object = None,
     ) -> tuple[dict[str, dict], list[str], str]:
         is_surface = bool(str(input2_name or "").strip())
         equation_stats = list(plot_stats)
@@ -7232,6 +7618,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                             input1_col,
                             st,
                             control_period_filter=control_period_filter,
+                            run_type_filter=run_type_filter,
                         )
                     )
                     input2_map = _series_by_observation(
@@ -7240,6 +7627,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                             input2_col,
                             st,
                             control_period_filter=control_period_filter,
+                            run_type_filter=run_type_filter,
                         )
                     )
                     output_map = _series_by_observation(
@@ -7248,6 +7636,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                             output_col,
                             st,
                             control_period_filter=control_period_filter,
+                            run_type_filter=run_type_filter,
                         )
                     )
                     if not input1_map or not input2_map or not output_map:
@@ -7346,6 +7735,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                             input1_col,
                             st,
                             control_period_filter=control_period_filter,
+                            run_type_filter=run_type_filter,
                         )
                     )
                     output_map = _series_by_observation(
@@ -7354,6 +7744,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                             output_col,
                             st,
                             control_period_filter=control_period_filter,
+                            run_type_filter=run_type_filter,
                         )
                     )
                     if not input1_map or not output_map:
@@ -7891,6 +8282,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         stat: str,
         *,
         control_period_filter: object = None,
+        run_type_filter: object = None,
     ) -> list[dict]:
         st = str(stat or "").strip().lower()
         if not st:
@@ -7904,12 +8296,14 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 col_name,
                 "mean",
                 control_period_filter=control_period_filter,
+                run_type_filter=run_type_filter,
             )
             std_rows = self._load_metric_series_for_selection(
                 run_name,
                 col_name,
                 "std",
                 control_period_filter=control_period_filter,
+                run_type_filter=run_type_filter,
             )
             mean_by_obs = {
                 str(row.get("observation_id") or "").strip(): dict(row)
@@ -7946,6 +8340,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             col_name,
             st,
             control_period_filter=control_period_filter,
+            run_type_filter=run_type_filter,
         )
 
     def _resolve_td_y_col_units(self, run_name: str, target: str) -> tuple[str, str]:
@@ -8230,9 +8625,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         current_selection = self._current_run_selection()
         runs = [str(v).strip() for v in (plot_def.get("member_runs") or current_selection.get("member_runs") or []) if str(v).strip()]
         run_specs = self._perf_export_run_specs(runs, output_target, input1_target, input2_target)
+        run_type_mode = str(
+            plot_def.get("performance_run_type_mode") or self._selected_perf_run_type_mode()
+        ).strip().lower()
         perf_filter_mode = str(plot_def.get("performance_filter_mode") or self._selected_perf_filter_mode()).strip().lower()
         control_period_filter = plot_def.get("selected_control_period")
-        if perf_filter_mode != "match_control_period":
+        if run_type_mode != "pulsed_mode" or perf_filter_mode != "match_control_period":
             control_period_filter = None
 
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -8262,6 +8660,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             "input2_units": str(first_result.get("input2_units") or "").strip(),
             "run_selection_label": str(plot_def.get("run_condition") or plot_def.get("display_text") or self._selection_condition_label(current_selection)).strip(),
             "member_runs": list(runs),
+            "performance_run_type_mode": run_type_mode,
             "performance_filter_mode": perf_filter_mode or "all_conditions",
         }
         try:
@@ -8272,6 +8671,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 results_by_stat=results,
                 run_specs=run_specs,
                 control_period_filter=control_period_filter,
+                run_type_filter=run_type_mode,
             )
             self._open_spreadsheet_path(Path(exported))
         except Exception as exc:
@@ -8671,6 +9071,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 self.cb_metric_average.blockSignals(False)
 
         prev_output, prev_input1, prev_input2 = self._perf_var_names()
+        prev_run_type_mode = self._selected_perf_run_type_mode()
         prev_filter_mode = self._selected_perf_filter_mode()
         prev_control_period = self._selected_perf_control_period()
 
@@ -8682,6 +9083,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             control_periods = be.td_list_control_periods(self._db_path)
         except Exception:
             control_periods = []
+        try:
+            available_run_type_modes = be.td_list_performance_run_type_modes(self._db_path)
+        except Exception:
+            available_run_type_modes = ["steady_state", "pulsed_mode"]
         union: dict[str, dict] = {}
         col_runs: dict[str, set[str]] = {}
         for rn in runs:
@@ -8710,6 +9115,26 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._set_perf_axis_combo_by_norm(self.cb_perf_x_col, self._perf_norm_name(prev_input1))
         self._set_perf_axis_combo_by_norm(self.cb_perf_y_col, self._perf_norm_name(prev_output))
         self._set_perf_axis_combo_by_norm(self.cb_perf_z_col, self._perf_norm_name(prev_input2), allow_blank=True)
+        available_run_type_set = {
+            be.td_perf_normalize_run_type_mode(mode)
+            for mode in (available_run_type_modes or [])
+            if str(mode).strip()
+        }
+        if not available_run_type_set:
+            available_run_type_set = {"steady_state", "pulsed_mode"}
+        if hasattr(self, "rb_perf_steady_state") and hasattr(self, "rb_perf_pulsed_mode"):
+            self.rb_perf_steady_state.blockSignals(True)
+            self.rb_perf_pulsed_mode.blockSignals(True)
+            self.rb_perf_steady_state.setEnabled("steady_state" in available_run_type_set)
+            self.rb_perf_pulsed_mode.setEnabled("pulsed_mode" in available_run_type_set)
+            desired_run_type_mode = (
+                prev_run_type_mode
+                if prev_run_type_mode in available_run_type_set
+                else ("steady_state" if "steady_state" in available_run_type_set else "pulsed_mode")
+            )
+            self._set_perf_run_type_mode(desired_run_type_mode)
+            self.rb_perf_steady_state.blockSignals(False)
+            self.rb_perf_pulsed_mode.blockSignals(False)
         if hasattr(self, "cb_perf_filter_mode"):
             mode_idx = self.cb_perf_filter_mode.findData(prev_filter_mode)
             if mode_idx < 0:
@@ -8737,6 +9162,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             self.cb_perf_y_col.currentIndexChanged.connect(lambda *_: self._on_perf_axis_changed("y"))
             self.cb_perf_z_col.currentIndexChanged.connect(lambda *_: self._on_perf_axis_changed("z"))
             self.cb_perf_view_stat.currentIndexChanged.connect(self._on_perf_view_stat_changed)
+            self.rb_perf_steady_state.toggled.connect(lambda *_: self._update_perf_control_period_state())
+            self.rb_perf_steady_state.toggled.connect(lambda *_: self._clear_perf_results())
+            self.rb_perf_pulsed_mode.toggled.connect(lambda *_: self._update_perf_control_period_state())
+            self.rb_perf_pulsed_mode.toggled.connect(lambda *_: self._clear_perf_results())
             self.cb_perf_filter_mode.currentIndexChanged.connect(lambda *_: self._update_perf_control_period_state())
             self.cb_perf_filter_mode.currentIndexChanged.connect(lambda *_: self._clear_perf_results())
             self.cb_perf_control_period.currentIndexChanged.connect(lambda *_: self._clear_perf_results())
@@ -8803,6 +9232,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
         fit_enabled = bool(getattr(self, "cb_perf_fit", None) and self.cb_perf_fit.isChecked())
         require_min_points = max(2, int(getattr(self, "_perf_require_min_points", 2) or 2))
+        run_type_mode = self._selected_perf_run_type_mode()
         perf_filter_mode = self._selected_perf_filter_mode()
         control_period_filter = self._selected_perf_control_period()
         self._perf_results_by_stat, plot_view_stats, fit_error_text = self._perf_collect_results(
@@ -8814,6 +9244,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             serials,
             fit_enabled=fit_enabled,
             require_min_points=require_min_points,
+            run_type_filter=run_type_mode,
             control_period_filter=(control_period_filter if perf_filter_mode == "match_control_period" else None),
         )
 
@@ -8881,6 +9312,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             "fit_family": str((master_model or {}).get("fit_family") or ""),
             "surface_fit_family": self._perf_requested_surface_family(),
             "auto_surface_families": bool(self._perf_requested_surface_family() == "auto_surface"),
+            "performance_run_type_mode": run_type_mode,
             "performance_filter_mode": perf_filter_mode,
             "selected_control_period": control_period_filter,
             "highlight_serial": str(getattr(self, "_highlight_sn", "") or "").strip(),
@@ -9029,8 +9461,15 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             if idx >= 0:
                 self.cb_run_mode.setCurrentIndex(idx)
         selection = self._selection_from_plot_def(d)
+        selection_ids = [str(v).strip() for v in (d.get("selection_ids") or []) if str(v).strip()] if isinstance(d.get("selection_ids"), list) else []
         sel_id = str(selection.get("id") or d.get("selection_id") or "").strip()
-        if sel_id:
+        if mode == "metrics" and want_mode == "condition":
+            self._set_mode("metrics")
+            restore_ids = list(selection_ids)
+            if not restore_ids and sel_id:
+                restore_ids = [sel_id]
+            self._set_metric_condition_selection_ids(restore_ids if restore_ids else None)
+        if sel_id and not (mode == "metrics" and want_mode == "condition"):
             self._select_run_by_id(sel_id)
         self._set_mode(mode)
         if mode == "curves":
@@ -9091,6 +9530,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         else:
             self._set_mode("performance")
             self._refresh_performance_ui()
+            run_type_mode = str(d.get("performance_run_type_mode") or "").strip().lower()
+            if run_type_mode:
+                self._set_perf_run_type_mode(run_type_mode)
             filter_mode = str(d.get("performance_filter_mode") or "all_conditions").strip().lower()
             if hasattr(self, "cb_perf_filter_mode"):
                 idx = self.cb_perf_filter_mode.findData(filter_mode)
@@ -9572,6 +10014,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             serials = self._selected_perf_serials()
             fit_enabled = bool(d.get("fit_enabled", True))
             require_min_points = max(2, int(getattr(self, "_perf_require_min_points", 2) or 2))
+            run_type_mode = str(d.get("performance_run_type_mode") or self._selected_perf_run_type_mode()).strip().lower()
             perf_filter_mode = str(d.get("performance_filter_mode") or "all_conditions").strip().lower()
             control_period_filter = d.get("selected_control_period")
             common_runs = self._common_runs_for_perf_vars(output, input1, input2)
@@ -9588,7 +10031,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 serials,
                 fit_enabled=fit_enabled,
                 require_min_points=require_min_points,
-                control_period_filter=(control_period_filter if perf_filter_mode == "match_control_period" else None),
+                run_type_filter=run_type_mode,
+                control_period_filter=(
+                    control_period_filter
+                    if run_type_mode == "pulsed_mode" and perf_filter_mode == "match_control_period"
+                    else None
+                ),
             )
             view_stat = str(d.get("view_stat") or "").strip().lower()
             if not view_stat or view_stat not in results:
@@ -10235,8 +10683,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._worker: ProcWorker | None = None
         self._sync_worker: WorkspaceSyncWorker | None = None
         self._manager_worker: ManagerTaskWorker | None = None
+        self._project_worker: ProjectTaskWorker | None = None
         self._sync_popup_active = False
         self._manager_popup_active = False
+        self._project_popup_active = False
         self._enrich_after_run: bool = False
         self._registry_cache: tuple[list[str], list[list[str]]] | None = None
         self._scan_refresh()
@@ -11775,6 +12225,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cb_project_overwrite.setChecked(False)
         self.cb_project_overwrite.setStyleSheet("color:#0f172a; font-size: 12px;")
         self.btn_project_update = QtWidgets.QPushButton("Update Project")
+        self.btn_project_perf_sheets = QtWidgets.QPushButton("Generate Performance Sheets")
         self.btn_project_env = QtWidgets.QPushButton("Project Env")
         self.btn_project_delete = QtWidgets.QPushButton("Delete Project")
         self.btn_project_open_folder = QtWidgets.QPushButton("Open Folder")
@@ -11782,6 +12233,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_project_open_support = QtWidgets.QPushButton("Open Support Workbook")
         for b in (
             self.btn_project_update,
+            self.btn_project_perf_sheets,
             self.btn_project_env,
             self.btn_project_delete,
             self.btn_project_open_folder,
@@ -11801,8 +12253,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 }
                 QPushButton:hover { background: #f9fafb; }
                 """
-            )
+        )
         self.btn_project_update.clicked.connect(self._act_update_project)
+        self.btn_project_perf_sheets.clicked.connect(self._act_generate_project_performance_sheets)
         self.btn_project_env.clicked.connect(self._act_project_env)
         self.btn_project_delete.clicked.connect(self._act_delete_project)
         self.btn_project_open_folder.clicked.connect(self._act_open_project_folder)
@@ -11810,6 +12263,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_project_open_support.clicked.connect(self._act_open_project_support_workbook)
         actions.addWidget(self.cb_project_overwrite)
         actions.addWidget(self.btn_project_update)
+        actions.addWidget(self.btn_project_perf_sheets)
         actions.addWidget(self.btn_project_env)
         actions.addWidget(self.btn_project_delete)
         actions.addWidget(self.btn_project_open_folder)
@@ -11919,8 +12373,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _update_project_actions(self) -> None:
         record = self._selected_project_record()
+        project_busy = bool(getattr(self, "_project_worker", None) and self._project_worker.isRunning())
         is_impl_supported = False
         is_update_supported = False
+        is_td = False
         if record:
             ptype = str(record.get("type") or "").strip()
             is_impl_supported = ptype in (
@@ -11929,15 +12385,189 @@ class MainWindow(QtWidgets.QMainWindow):
                 getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending"),
             )
             is_update_supported = is_impl_supported
+            is_td = ptype == getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending")
         if hasattr(self, "btn_project_implementation"):
             self.btn_project_implementation.setEnabled(bool(record) and is_impl_supported)
         if hasattr(self, "btn_project_update"):
-            self.btn_project_update.setEnabled(bool(record) and is_update_supported)
+            self.btn_project_update.setEnabled(bool(record) and is_update_supported and not project_busy)
+        if hasattr(self, "btn_project_perf_sheets"):
+            self.btn_project_perf_sheets.setEnabled(bool(record) and is_td and not project_busy)
         if hasattr(self, "btn_project_env"):
-            self.btn_project_env.setEnabled(bool(record))
+            self.btn_project_env.setEnabled(bool(record) and not project_busy)
         if hasattr(self, "btn_project_open_support"):
-            is_td = bool(record) and str(record.get("type") or "").strip() == getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending")
             self.btn_project_open_support.setEnabled(bool(is_td))
+
+    def _project_task_log_path(self, project_dir: Path, prefix: str) -> Path:
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_prefix = re.sub(r"[^A-Za-z0-9_]+", "_", str(prefix or "project_task")).strip("_") or "project_task"
+        return Path(project_dir).expanduser() / "logs" / f"{safe_prefix}_{stamp}.log"
+
+    def _start_project_task(
+        self,
+        *,
+        heading: str,
+        status_text: str,
+        project_dir: Path,
+        log_prefix: str,
+        task_factory,
+        on_success,
+    ) -> None:
+        if self._project_worker is not None and self._project_worker.isRunning():
+            self._show_toast("Project task already running")
+            return
+        if self._manager_popup_active or self._sync_popup_active:
+            self._show_toast("Another background task is already using the progress popup")
+            return
+
+        log_path = self._project_task_log_path(project_dir, log_prefix)
+        self._project_popup_active = True
+        self._repo_scan_dialog.begin(status_text, heading=heading)
+        self._repo_scan_dialog.set_detail_text(f"Logging to {log_path.name}")
+        self._append_log(f"[GUI] {heading} started")
+        self._append_log(f"[PROJECT TASK] Log: {log_path}")
+
+        self._project_worker = ProjectTaskWorker(task_factory, log_path=log_path, parent=self)
+        self._update_project_actions()
+        self._project_worker.progress.connect(self._on_project_task_progress)
+        self._project_worker.completed.connect(lambda payload: self._on_project_task_done(payload, on_success, heading))
+        self._project_worker.failed.connect(lambda message: self._on_project_task_error(message, heading))
+        self._project_worker.start()
+
+    def _on_project_task_progress(self, text: str) -> None:
+        msg = str(text or "").strip()
+        if not msg:
+            return
+        self._append_log(f"[PROJECT TASK] {msg}")
+        if self._project_popup_active:
+            self._repo_scan_dialog.set_detail_text(msg)
+
+    def _on_project_task_done(self, payload: object, on_success, heading: str) -> None:
+        self._project_worker = None
+        self._update_project_actions()
+        msg = None
+        try:
+            msg = on_success(payload)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, heading, str(exc))
+            if self._project_popup_active:
+                self._repo_scan_dialog.finish(f"{heading} failed: {exc}", success=False)
+                self._project_popup_active = False
+            return
+        if self._project_popup_active:
+            self._repo_scan_dialog.finish(msg or f"{heading} complete", success=True)
+            self._project_popup_active = False
+
+    def _on_project_task_error(self, message: str, heading: str) -> None:
+        self._project_worker = None
+        self._update_project_actions()
+        QtWidgets.QMessageBox.warning(self, heading, message)
+        if self._project_popup_active:
+            self._repo_scan_dialog.finish(f"{heading} failed: {message}", success=False)
+            self._project_popup_active = False
+
+    def _handle_project_update_success(self, payload: object, *, wb_path: Path, ptype: str, started: float) -> str:
+        if not isinstance(payload, dict):
+            raise RuntimeError("Project update returned an invalid payload.")
+        updated = int(payload.get("updated_cells") or 0)
+        missing_src = int(payload.get("missing_source") or 0)
+        missing_val = int(payload.get("missing_value") or 0)
+        serials = int(payload.get("serials_in_workbook") or 0)
+        have_src = int(payload.get("serials_with_source") or 0)
+        serials_added = int(payload.get("serials_added") or 0)
+        added_serials = payload.get("added_serials") or []
+        dbg = str(payload.get("debug_json") or "").strip()
+        log_path = str(payload.get("log_path") or "").strip()
+        elapsed_s = round(time.perf_counter() - started, 3)
+        self._append_log(
+            f"[PROJECT UPDATE] Finished in {elapsed_s:.3f}s: updated={updated}, serials={serials}, added={serials_added}, sources={have_src}, missing_source={missing_src}, missing_value={missing_val}"
+        )
+        if ptype == getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending"):
+            timings = payload.get("timings")
+            if not isinstance(timings, dict) and dbg:
+                try:
+                    dbg_payload = json.loads(dbg)
+                    if isinstance(dbg_payload, dict):
+                        timings = dbg_payload.get("timings_s")
+                except Exception:
+                    timings = None
+            if isinstance(timings, dict):
+                ordered_keys = [
+                    "support_refresh_s",
+                    "pre_cache_workbook_save_s",
+                    "cache_ensure_s",
+                    "cache_read_s",
+                    "data_calc_build_s",
+                    "metrics_long_sheet_s",
+                    "raw_cache_long_sheet_s",
+                    "perf_candidates_main_s",
+                    "perf_candidates_cp_total_s",
+                    "perf_candidates_cp_count",
+                    "metadata_sync_s",
+                    "post_cache_workbook_build_s",
+                    "final_workbook_save_s",
+                    "total_s",
+                ]
+                shown = set()
+                for key in ordered_keys:
+                    if key not in timings:
+                        continue
+                    shown.add(key)
+                    self._append_log(f"[TD UPDATE TIMING] {key}={timings.get(key)}")
+                for key in sorted(str(k) for k in timings.keys() if str(k) not in shown):
+                    self._append_log(f"[TD UPDATE TIMING] {key}={timings.get(key)}")
+
+        lines = [
+            f"Updated cells: {updated}",
+            f"Serials in workbook: {serials}",
+        ]
+        if serials_added:
+            lines.append(f"Serials auto-added: {serials_added}")
+        lines.extend(
+            [
+                f"Serials with debug source: {have_src}",
+                f"Missing debug source: {missing_src}",
+                f"No value found: {missing_val}",
+                "",
+                f"Workbook: {payload.get('workbook') or wb_path}",
+            ]
+        )
+        if ptype == getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending"):
+            lines.append("Recalculation includes support-workbook heuristics when present.")
+            lines.append("Performance candidate sheets are now generated only on demand.")
+        if log_path:
+            lines.append(f"Log: {log_path}")
+        msg = "\n".join(lines)
+        if serials_added and isinstance(added_serials, list) and added_serials:
+            shown = ", ".join(str(s).strip() for s in added_serials[:20] if str(s).strip())
+            if shown:
+                msg += f"\nAdded serials: {shown}" + (" ..." if len(added_serials) > 20 else "")
+        if dbg:
+            self._append_log(f"[PROJECT UPDATE] Debug JSON: {dbg}")
+        QtWidgets.QMessageBox.information(self, "Project Updated", msg)
+        self._show_toast(f"Project updated: {updated} cell(s)")
+        return f"Project updated in {elapsed_s:.1f}s"
+
+    def _handle_project_performance_sheet_success(self, payload: object, *, wb_path: Path) -> str:
+        if not isinstance(payload, dict):
+            raise RuntimeError("Performance-sheet generation returned an invalid payload.")
+        timings = payload.get("timings") if isinstance(payload.get("timings"), dict) else {}
+        log_path = str(payload.get("log_path") or "").strip()
+        perf_count = int(payload.get("performance_candidate_count") or 0)
+        cp_count = int(payload.get("performance_cp_sheet_count") or 0)
+        if isinstance(timings, dict):
+            for key in ("perf_candidates_main_s", "perf_candidates_cp_total_s", "perf_candidates_cp_count", "final_workbook_save_s", "total_s"):
+                if key in timings:
+                    self._append_log(f"[TD PERFORMANCE TIMING] {key}={timings.get(key)}")
+        lines = [
+            f"Workbook: {payload.get('workbook') or wb_path}",
+            f"Performance candidate rows: {perf_count}",
+            f"Control-period sheets: {cp_count}",
+        ]
+        if log_path:
+            lines.append(f"Log: {log_path}")
+        QtWidgets.QMessageBox.information(self, "Performance Sheets Generated", "\n".join(lines))
+        self._show_toast("Performance sheets generated")
+        return "Performance sheets generated"
 
     def _act_open_project_folder(self) -> None:
         item = self._selected_project_item(2)
@@ -12037,84 +12667,66 @@ class MainWindow(QtWidgets.QMainWindow):
             started = time.perf_counter()
             self._append_log(f"[PROJECT UPDATE] Starting: {project_name}")
             self._append_log(f"[PROJECT UPDATE] Workbook: {wb_path}")
-            if ptype == getattr(be, "EIDAT_PROJECT_TYPE_TRENDING", "EIDP Trending"):
-                payload = be.update_eidp_trending_project_workbook(repo, wb_path, overwrite=overwrite)
-            elif ptype == getattr(be, "EIDAT_PROJECT_TYPE_RAW_TRENDING", "EIDP Raw File Trending"):
-                payload = be.update_eidp_raw_trending_project_workbook(repo, wb_path, overwrite=overwrite)
-            elif ptype == getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending"):
-                payload = be.update_test_data_trending_project_workbook(repo, wb_path, overwrite=overwrite)
-            else:
+
+            def _task(report):
+                if ptype == getattr(be, "EIDAT_PROJECT_TYPE_TRENDING", "EIDP Trending"):
+                    report("Updating EIDP trending workbook")
+                    return be.update_eidp_trending_project_workbook(repo, wb_path, overwrite=overwrite)
+                if ptype == getattr(be, "EIDAT_PROJECT_TYPE_RAW_TRENDING", "EIDP Raw File Trending"):
+                    report("Updating raw-file trending workbook")
+                    return be.update_eidp_raw_trending_project_workbook(repo, wb_path, overwrite=overwrite)
+                if ptype == getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending"):
+                    return be.update_test_data_trending_project_workbook(
+                        repo,
+                        wb_path,
+                        overwrite=overwrite,
+                        include_performance_sheets=False,
+                        progress_cb=report,
+                    )
                 raise RuntimeError(f"Unsupported project type: {ptype}")
-            updated = int(payload.get("updated_cells") or 0)
-            missing_src = int(payload.get("missing_source") or 0)
-            missing_val = int(payload.get("missing_value") or 0)
-            serials = int(payload.get("serials_in_workbook") or 0)
-            have_src = int(payload.get("serials_with_source") or 0)
-            serials_added = int(payload.get("serials_added") or 0)
-            added_serials = payload.get("added_serials") or []
-            dbg = str(payload.get("debug_json") or "").strip()
-            elapsed_s = round(time.perf_counter() - started, 3)
-            self._append_log(
-                f"[PROJECT UPDATE] Finished in {elapsed_s:.3f}s: updated={updated}, serials={serials}, added={serials_added}, sources={have_src}, missing_source={missing_src}, missing_value={missing_val}"
+
+            self._start_project_task(
+                heading="Update Project",
+                status_text=f"Updating {project_name}",
+                project_dir=wb_path.parent,
+                log_prefix="project_update",
+                task_factory=_task,
+                on_success=lambda payload: self._handle_project_update_success(payload, wb_path=wb_path, ptype=ptype, started=started),
             )
-            if ptype == getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending"):
-                timings = payload.get("timings")
-                if not isinstance(timings, dict) and dbg:
-                    try:
-                        dbg_payload = json.loads(dbg)
-                        if isinstance(dbg_payload, dict):
-                            timings = dbg_payload.get("timings_s")
-                    except Exception:
-                        timings = None
-                if isinstance(timings, dict):
-                    ordered_keys = [
-                        "support_refresh_s",
-                        "pre_cache_workbook_save_s",
-                        "cache_ensure_s",
-                        "cache_read_s",
-                        "final_workbook_save_s",
-                        "total_s",
-                    ]
-                    shown = set()
-                    for key in ordered_keys:
-                        if key not in timings:
-                            continue
-                        shown.add(key)
-                        self._append_log(f"[TD UPDATE TIMING] {key}={timings.get(key)}")
-                    for key in sorted(str(k) for k in timings.keys() if str(k) not in shown):
-                        self._append_log(f"[TD UPDATE TIMING] {key}={timings.get(key)}")
-            lines = [
-                f"Updated cells: {updated}",
-                f"Serials in workbook: {serials}",
-            ]
-            if serials_added:
-                lines.append(f"Serials auto-added: {serials_added}")
-            lines.extend(
-                [
-                    f"Serials with debug source: {have_src}",
-                    f"Missing debug source: {missing_src}",
-                    f"No value found: {missing_val}",
-                    "",
-                    f"Workbook: {payload.get('workbook') or wb_path}",
-                ]
-            )
-            if ptype == getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending"):
-                lines.append("Recalculation includes support-workbook heuristics when present.")
-            msg = "\n".join(lines)
-            if serials_added and isinstance(added_serials, list) and added_serials:
-                shown = ", ".join(str(s).strip() for s in added_serials[:20] if str(s).strip())
-                if shown:
-                    msg += f"\nAdded serials: {shown}" + (" ..." if len(added_serials) > 20 else "")
-            if dbg:
-                msg += f"\nDebug JSON: {dbg}"
-            QtWidgets.QMessageBox.information(
-                self,
-                "Project Updated",
-                msg,
-            )
-            self._show_toast(f"Project updated: {updated} cell(s)")
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "Update Project", str(exc))
+
+    def _act_generate_project_performance_sheets(self) -> None:
+        try:
+            record = self._selected_project_record()
+            if not record:
+                raise RuntimeError("Select a project in the list first.")
+            ptype = str(record.get("type") or "").strip()
+            if ptype != getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending"):
+                raise RuntimeError("Performance sheets are available only for Test Data Trending projects.")
+            project_dir = Path(str(record.get("folder") or "")).expanduser()
+            wb_path = Path(str(record.get("workbook") or "")).expanduser()
+            project_name = str(record.get("name") or wb_path.stem or "").strip() or wb_path.stem
+
+            def _task(report):
+                return be.generate_test_data_project_performance_sheets(
+                    project_dir,
+                    wb_path,
+                    progress_cb=report,
+                )
+
+            self._append_log(f"[PROJECT PERFORMANCE] Starting: {project_name}")
+            self._append_log(f"[PROJECT PERFORMANCE] Workbook: {wb_path}")
+            self._start_project_task(
+                heading="Generate Performance Sheets",
+                status_text=f"Generating performance sheets for {project_name}",
+                project_dir=project_dir,
+                log_prefix="project_performance_sheets",
+                task_factory=_task,
+                on_success=lambda payload: self._handle_project_performance_sheet_success(payload, wb_path=wb_path),
+            )
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Generate Performance Sheets", str(exc))
 
     def _act_delete_project(self) -> None:
         try:
@@ -13897,6 +14509,14 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
         self._manager_worker = None
+        project_worker = getattr(self, "_project_worker", None)
+        if project_worker and project_worker.isRunning():
+            try:
+                project_worker.terminate()
+                project_worker.wait(1000)
+            except Exception:
+                pass
+        self._project_worker = None
         try:
             self._progress_dialog.abort()
         except Exception:

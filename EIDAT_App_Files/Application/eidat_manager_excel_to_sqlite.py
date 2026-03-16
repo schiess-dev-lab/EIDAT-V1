@@ -868,6 +868,7 @@ def _mat_extract_run_table(
     *,
     canonical_defs: list[dict[str, Any]],
     fuzzy_min_ratio: float,
+    allowed_header_norms: set[str] | None = None,
 ) -> dict[str, Any]:
     payload = _load_mat_payload(mat_path)
     series_by_name: dict[str, list[float | int | None]] = {}
@@ -901,11 +902,22 @@ def _mat_extract_run_table(
     if not selected:
         raise RuntimeError(f"{mat_path.name} had no aligned series for the dominant sample length.")
 
-    headers = list(selected.keys())
-    mapped_headers = [
+    headers_all = list(selected.keys())
+    mapped_all = [
         _canonicalize_header(header, canonical_defs, min_ratio=float(fuzzy_min_ratio))
-        for header in headers
+        for header in headers_all
     ]
+    keep_pairs: list[tuple[str, str]] = []
+    allowed_norms = {str(v).strip() for v in (allowed_header_norms or set()) if str(v).strip()}
+    for header, mapped in zip(headers_all, mapped_all):
+        norm = _normalize_header(mapped or header)
+        if allowed_norms and norm not in allowed_norms:
+            continue
+        keep_pairs.append((header, mapped))
+    if not keep_pairs:
+        raise RuntimeError(f"{mat_path.name} did not contain any TD-relevant aligned series.")
+    headers = [header for header, _mapped in keep_pairs]
+    mapped_headers = [mapped for _header, mapped in keep_pairs]
     col_idents = _dedupe_idents(mapped_headers)
     rows: list[tuple[Any, ...]] = []
     for idx in range(int(dominant_len)):
@@ -947,6 +959,7 @@ def write_mat_bundle_sqlite(
     fuzzy_min_ratio = _float(env.get("EIDAT_TEST_DATA_FUZZY_HEADER_MIN_RATIO", "0.82"), 0.82)
     trend_col_defs = _load_trend_column_defs() if fuzzy_enabled else []
     canonical_defs = _canonical_header_defs(trend_col_defs)
+    allowed_header_norms = _mat_relevant_header_targets(canonical_defs, fuzzy_min_ratio=float(fuzzy_min_ratio))
 
     conn = sqlite3.connect(str(sqlite_path))
     try:
@@ -1034,6 +1047,7 @@ def write_mat_bundle_sqlite(
                 mat_path,
                 canonical_defs=canonical_defs,
                 fuzzy_min_ratio=float(fuzzy_min_ratio),
+                allowed_header_norms=allowed_header_norms,
             )
             table_name = _safe_table_name(seq_name)
             col_defs = ", ".join([f"\"{c}\" REAL" for c in run["col_idents"]])
@@ -1331,6 +1345,54 @@ def _load_trend_column_defs() -> list[dict[str, Any]]:
         return out
     except Exception:
         return []
+
+
+def _load_excel_trend_runtime_config() -> dict[str, Any]:
+    try:
+        if not _EXCEL_TREND_CONFIG_PATH.exists():
+            return {}
+        raw = json.loads(_EXCEL_TREND_CONFIG_PATH.read_text(encoding="utf-8"))
+        return raw if isinstance(raw, dict) else {}
+    except Exception:
+        return {}
+
+
+def _mat_relevant_header_targets(canonical_defs: list[dict[str, Any]], *, fuzzy_min_ratio: float) -> set[str]:
+    cfg = _load_excel_trend_runtime_config()
+    allow_norms: set[str] = set()
+
+    def _add(value: Any) -> None:
+        raw = str(value or "").strip()
+        if not raw:
+            return
+        canon = _canonicalize_header(raw, canonical_defs, min_ratio=float(fuzzy_min_ratio))
+        norm = _normalize_header(canon or raw)
+        if norm:
+            allow_norms.add(norm)
+
+    for col in (cfg.get("columns") or []):
+        if not isinstance(col, dict):
+            continue
+        _add(col.get("name"))
+        for alias in (col.get("aliases") or []):
+            _add(alias)
+
+    x_axis = cfg.get("x_axis") if isinstance(cfg.get("x_axis"), dict) else {}
+    _add("Time")
+    _add("Pulse Number")
+    for alias in (x_axis.get("time_aliases") or []):
+        _add(alias)
+    for alias in (x_axis.get("pulse_aliases") or []):
+        _add(alias)
+
+    td_label = cfg.get("td_run_labeling") if isinstance(cfg.get("td_run_labeling"), dict) else {}
+    variables = td_label.get("variables") if isinstance(td_label.get("variables"), dict) else {}
+    for spec in variables.values():
+        if not isinstance(spec, dict):
+            continue
+        _add(spec.get("column"))
+
+    return allow_norms
 
 
 def _header_fuzzy_score(target: str, candidate: str) -> float:

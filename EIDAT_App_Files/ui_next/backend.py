@@ -13,7 +13,7 @@ from datetime import datetime
 from functools import lru_cache
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Dict, Iterable, Mapping, Optional, Sequence, TypeVar
+from typing import Callable, Dict, Iterable, Mapping, Optional, Sequence, TypeVar
 
 
 APP_ROOT = Path(__file__).resolve().parents[1]
@@ -112,6 +112,13 @@ def _td_normalize_selected_stats(stats: object) -> list[str]:
         out = list(TD_DEFAULT_STATS_ORDER)
     if "mean" not in seen:
         out.insert(0, "mean")
+    return out
+
+
+def _td_cache_selected_stats(stats: object) -> list[str]:
+    out = list(_td_normalize_selected_stats(stats))
+    if "std" not in out:
+        out.append("std")
     return out
 
 
@@ -5153,6 +5160,46 @@ def td_normalize_run_type(value: object) -> str:
     return raw
 
 
+def td_perf_normalize_run_type_mode(value: object) -> str:
+    raw = str(value or "").strip().lower()
+    if raw in {"steady_state", "steady-state", "steadystate", "steady state", "ss", "steady_state_only"}:
+        return "steady_state"
+    if raw in {"pulsed_mode", "pulsed-mode", "pulsedmode", "pulsed mode", "pm", "pulse", "pm_only"}:
+        return "pulsed_mode"
+    return "all_conditions"
+
+
+def td_perf_run_type_mode_label(value: object) -> str:
+    mode = td_perf_normalize_run_type_mode(value)
+    if mode == "steady_state":
+        return "Steady-state"
+    if mode == "pulsed_mode":
+        return "Pulsed mode"
+    return "All run conditions"
+
+
+def _td_perf_run_type_sql_key(column_expr: str) -> str:
+    return (
+        f"lower(replace(replace(replace(replace(trim(COALESCE({column_expr}, '')), '-', ''), ' ', ''), '/', ''), '_', ''))"
+    )
+
+
+def _td_perf_run_type_sql_clause(mode: object, column_expr: str) -> tuple[str, list[object]]:
+    normalized = td_perf_normalize_run_type_mode(mode)
+    key_expr = _td_perf_run_type_sql_key(column_expr)
+    if normalized == "pulsed_mode":
+        return (
+            f" AND {key_expr} IN ('pm', 'pulsemode', 'pulsedmode', 'pulsed', 'pulse')",
+            [],
+        )
+    if normalized == "steady_state":
+        return (
+            f" AND {key_expr} NOT IN ('pm', 'pulsemode', 'pulsedmode', 'pulsed', 'pulse')",
+            [],
+        )
+    return "", []
+
+
 def td_build_run_condition_label(sequence_row: dict | None) -> str:
     if not isinstance(sequence_row, dict):
         return ""
@@ -6086,7 +6133,7 @@ def _rebuild_test_data_project_calc_cache_from_raw(db_path: Path, workbook_path:
         for c in cfg_cols
         if str(c.get("name") or "").strip()
     }
-    selected_stats = _td_normalize_selected_stats(project_cfg.get("statistics"))
+    selected_stats = _td_cache_selected_stats(project_cfg.get("statistics"))
 
     support_cfg = _read_td_support_workbook(wb_path, project_dir=db_path.parent)
     support_settings = dict(support_cfg.get("settings") or {})
@@ -6629,7 +6676,7 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
     computed_epoch_ns = time.time_ns()
 
     # Stats selection is driven entirely by user_inputs/excel_trend_config.json.
-    selected_stats = _td_normalize_selected_stats(project_cfg.get("statistics"))
+    selected_stats = _td_cache_selected_stats(project_cfg.get("statistics"))
 
     support_cfg = _read_td_support_workbook(wb_path, project_dir=db_path.parent)
     support_settings = dict(support_cfg.get("settings") or {})
@@ -8324,6 +8371,7 @@ def td_load_metric_series(
     program_title: str | None = None,
     source_run_name: str | None = None,
     control_period_filter: object = None,
+    run_type_filter: object = None,
 ) -> list[dict]:
     path = Path(db_path).expanduser()
     if not path.exists():
@@ -8358,14 +8406,21 @@ def td_load_metric_series(
     if src_run:
         metric_sql.append(" AND lower(COALESCE(m.source_run_name, '')) = lower(?)")
         metric_params.append(src_run)
+    run_type_sql, run_type_params = _td_perf_run_type_sql_clause(run_type_filter, "o.run_type")
+    if run_type_sql:
+        metric_sql.append(run_type_sql)
+        metric_params.extend(run_type_params)
     if control_period_filter not in (None, ""):
         cp_filter_num = _to_support_number(control_period_filter)
+        run_type_key = _td_perf_run_type_sql_key("o.run_type")
         if cp_filter_num is not None:
-            metric_sql.append(" AND (lower(COALESCE(o.run_type, '')) <> 'pm' OR ABS(COALESCE(o.control_period, 0) - ?) <= 1e-9)")
+            metric_sql.append(
+                f" AND ({run_type_key} NOT IN ('pm', 'pulsemode', 'pulsedmode', 'pulsed', 'pulse') OR ABS(COALESCE(o.control_period, 0) - ?) <= 1e-9)"
+            )
             metric_params.append(cp_filter_num)
         else:
             metric_sql.append(
-                " AND (lower(COALESCE(o.run_type, '')) <> 'pm' OR lower(TRIM(CAST(o.control_period AS TEXT))) = lower(TRIM(CAST(? AS TEXT))))"
+                f" AND ({run_type_key} NOT IN ('pm', 'pulsemode', 'pulsedmode', 'pulsed', 'pulse') OR lower(TRIM(CAST(o.control_period AS TEXT))) = lower(TRIM(CAST(? AS TEXT))))"
             )
             metric_params.append(str(control_period_filter))
     metric_sql.append(" ORDER BY m.serial, m.observation_id")
@@ -8427,11 +8482,36 @@ def td_list_control_periods(db_path: Path) -> list[object]:
             """
             SELECT DISTINCT control_period
             FROM td_condition_observations
-            WHERE lower(COALESCE(run_type, ''))='pm' AND control_period IS NOT NULL
+            WHERE """
+            + _td_perf_run_type_sql_key("run_type")
+            + """ IN ('pm', 'pulsemode', 'pulsedmode', 'pulsed', 'pulse') AND control_period IS NOT NULL
             ORDER BY control_period
             """
         ).fetchall()
     return [row[0] for row in rows if row and row[0] is not None]
+
+
+def td_list_performance_run_type_modes(db_path: Path) -> list[str]:
+    path = Path(db_path).expanduser()
+    if not path.exists():
+        return []
+    modes: set[str] = set()
+    with sqlite3.connect(str(path)) as conn:
+        _ensure_test_data_impl_tables(conn)
+        rows = conn.execute(
+            """
+            SELECT DISTINCT COALESCE(run_type, '')
+            FROM td_condition_observations
+            """
+        ).fetchall()
+    for row in rows:
+        run_type = td_normalize_run_type((row[0] if row else "") or "")
+        if run_type == "PM":
+            modes.add("pulsed_mode")
+        else:
+            modes.add("steady_state")
+    ordered = [mode for mode in ("steady_state", "pulsed_mode") if mode in modes]
+    return ordered or ["steady_state"]
 
 
 def _td_perf_norm_key(value: object) -> str:
@@ -9890,6 +9970,7 @@ def _td_perf_export_series_for_stat(
     stat: str,
     *,
     control_period_filter: object = None,
+    run_type_filter: object = None,
 ) -> list[dict]:
     st = str(stat or "").strip().lower()
     if not st:
@@ -9901,6 +9982,7 @@ def _td_perf_export_series_for_stat(
             column_name,
             "mean",
             control_period_filter=control_period_filter,
+            run_type_filter=run_type_filter,
         )
         std_rows = td_load_metric_series(
             db_path,
@@ -9908,6 +9990,7 @@ def _td_perf_export_series_for_stat(
             column_name,
             "std",
             control_period_filter=control_period_filter,
+            run_type_filter=run_type_filter,
         )
         mean_by_obs = {
             str(row.get("observation_id") or "").strip(): dict(row)
@@ -9942,6 +10025,7 @@ def _td_perf_export_series_for_stat(
         column_name,
         st,
         control_period_filter=control_period_filter,
+        run_type_filter=run_type_filter,
     )
 
 
@@ -10169,6 +10253,7 @@ def td_perf_collect_equation_export_rows(
     *,
     run_specs: Sequence[Mapping[str, object]],
     control_period_filter: object = None,
+    run_type_filter: object = None,
 ) -> list[dict[str, object]]:
     path = Path(db_path).expanduser()
     if not path.exists():
@@ -10209,6 +10294,7 @@ def td_perf_collect_equation_export_rows(
             input1_column,
             "mean",
             control_period_filter=control_period_filter,
+            run_type_filter=run_type_filter,
         )
         y_rows = _td_perf_export_series_for_stat(
             path,
@@ -10216,6 +10302,7 @@ def td_perf_collect_equation_export_rows(
             output_column,
             "mean",
             control_period_filter=control_period_filter,
+            run_type_filter=run_type_filter,
         )
         if not x1_rows or not y_rows:
             continue
@@ -10236,6 +10323,7 @@ def td_perf_collect_equation_export_rows(
                 input2_column,
                 "mean",
                 control_period_filter=control_period_filter,
+                run_type_filter=run_type_filter,
             )
             x2_map = {
                 str(row.get("observation_id") or "").strip(): dict(row)
@@ -10706,6 +10794,7 @@ def td_perf_export_equation_workbook(
     results_by_stat: Mapping[str, Mapping[str, object]],
     run_specs: Sequence[Mapping[str, object]],
     control_period_filter: object = None,
+    run_type_filter: object = None,
 ) -> Path:
     try:
         from openpyxl import Workbook  # type: ignore
@@ -10723,6 +10812,7 @@ def td_perf_export_equation_workbook(
         db_path,
         run_specs=run_specs,
         control_period_filter=control_period_filter,
+        run_type_filter=run_type_filter,
     )
 
     models_by_stat: dict[str, dict[str, object]] = {}
@@ -10772,6 +10862,7 @@ def td_perf_export_equation_workbook(
         ("Input 2 Units", input2_units if is_surface else ""),
         ("Run Selection", str(plot_metadata.get("run_selection_label") or plot_metadata.get("display_text") or plot_metadata.get("run_condition") or "").strip()),
         ("Member Runs", ", ".join(str(v).strip() for v in (plot_metadata.get("member_runs") or []) if str(v).strip())),
+        ("Condition Family", td_perf_run_type_mode_label(plot_metadata.get("performance_run_type_mode") or run_type_filter)),
         ("PM Filter Mode", str(plot_metadata.get("performance_filter_mode") or "all_conditions").strip()),
         ("Selected Control Period", "" if control_period_filter in (None, "") else str(control_period_filter)),
         ("Helper Normalization Source", helper_source_stat),
@@ -10971,6 +11062,7 @@ def td_discover_performance_candidates(
     config_path: Path | None = None,
     *,
     control_period_filter: object = None,
+    run_type_filter: object = None,
 ) -> list[dict]:
     path = Path(db_path).expanduser()
     if not path.exists():
@@ -11036,12 +11128,23 @@ def td_discover_performance_candidates(
             WHERE lower(m.stat) IN ('mean', 'min', 'max', 'median', 'std')
         """
         metric_params: list[object] = []
+        run_type_sql, run_type_params = _td_perf_run_type_sql_clause(run_type_filter, "o.run_type")
+        if run_type_sql:
+            metric_sql += run_type_sql
+            metric_params.extend(run_type_params)
         if control_period_filter not in (None, ""):
+            run_type_key = _td_perf_run_type_sql_key("o.run_type")
             if isinstance(cp_filter_num, (int, float)):
-                metric_sql += " AND (lower(COALESCE(o.run_type, '')) <> 'pm' OR ABS(COALESCE(o.control_period, 0) - ?) <= 1e-9)"
+                metric_sql += (
+                    f" AND ({run_type_key} NOT IN ('pm', 'pulsemode', 'pulsedmode', 'pulsed', 'pulse')"
+                    " OR ABS(COALESCE(o.control_period, 0) - ?) <= 1e-9)"
+                )
                 metric_params.append(float(cp_filter_num))
             else:
-                metric_sql += " AND (lower(COALESCE(o.run_type, '')) <> 'pm' OR lower(TRIM(CAST(o.control_period AS TEXT))) = lower(TRIM(CAST(? AS TEXT))))"
+                metric_sql += (
+                    f" AND ({run_type_key} NOT IN ('pm', 'pulsemode', 'pulsedmode', 'pulsed', 'pulse')"
+                    " OR lower(TRIM(CAST(o.control_period AS TEXT))) = lower(TRIM(CAST(? AS TEXT))))"
+                )
                 metric_params.append(str(control_period_filter))
         metric_sql += " ORDER BY m.run_name, m.column_name, m.stat, m.serial, m.observation_id"
         metric_rows = conn.execute(metric_sql, tuple(metric_params)).fetchall()
@@ -11396,6 +11499,212 @@ def td_load_curves(
     return out
 
 
+def _td_emit_progress(progress_cb: Callable[[str], None] | None, message: str) -> None:
+    if progress_cb is None:
+        return
+    try:
+        progress_cb(str(message or "").strip())
+    except Exception:
+        pass
+
+
+def _td_reset_workbook_sheet(wb, sheet_name: str, headers: list[str]):
+    if sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        try:
+            ws.delete_rows(1, ws.max_row or 1)
+        except Exception:
+            try:
+                wb.remove(ws)
+            except Exception:
+                pass
+            ws = wb.create_sheet(sheet_name)
+    else:
+        ws = wb.create_sheet(sheet_name)
+    ws.append(headers)
+    try:
+        ws.freeze_panes = "A2"
+    except Exception:
+        pass
+    return ws
+
+
+def _td_append_performance_candidate_rows(ws_target, items: list[dict]) -> None:
+    for item in items:
+        x_spec = item.get("x") or {}
+        y_spec = item.get("y") or {}
+        x_col = str((x_spec.get("column") if isinstance(x_spec, dict) else "") or "").strip()
+        y_col = str((y_spec.get("column") if isinstance(y_spec, dict) else "") or "").strip()
+        serials_txt = ", ".join([str(sn).strip() for sn in (item.get("qualifying_serials") or []) if str(sn).strip()])
+        stats_txt = ", ".join([str(st).strip() for st in (item.get("available_stats") or []) if str(st).strip()])
+        views_txt = ", ".join([str(v).strip() for v in (item.get("available_equation_views") or []) if str(v).strip()])
+        ws_target.append(
+            [
+                str(item.get("display_name") or item.get("name") or "").strip(),
+                x_col,
+                str(item.get("x_units") or "").strip(),
+                y_col,
+                str(item.get("y_units") or "").strip(),
+                int(item.get("qualifying_serial_count") or 0),
+                serials_txt,
+                int(item.get("source_point_count") or 0),
+                int(item.get("distinct_x_point_count") or 0),
+                int(item.get("min_distinct_x_points_per_serial") or 0),
+                stats_txt,
+                views_txt,
+            ]
+        )
+
+
+def _td_perf_cp_sheet_name(value: object) -> str:
+    txt = _td_format_compact_value(value).replace(".", "_")
+    txt = re.sub(r"[^A-Za-z0-9_]+", "_", txt).strip("_") or "value"
+    return f"Performance_candidates_CP_{txt}"[:31]
+
+
+def _td_write_performance_candidate_sheets(
+    wb,
+    db_path: Path,
+    *,
+    progress_cb: Callable[[str], None] | None = None,
+    timings: dict[str, float | int] | None = None,
+) -> dict[str, int]:
+    import time
+
+    perf_headers = [
+        "candidate",
+        "x_column",
+        "x_units",
+        "y_column",
+        "y_units",
+        "qualifying_serial_count",
+        "qualifying_serials",
+        "source_point_count",
+        "distinct_x_point_count",
+        "min_distinct_x_points_per_serial",
+        "available_stats",
+        "equation_views",
+    ]
+
+    _td_emit_progress(progress_cb, "Generating performance candidate sheets")
+    t0 = time.perf_counter()
+    ws_perf = _td_reset_workbook_sheet(wb, "Performance_candidates", perf_headers)
+    try:
+        perf_candidates = td_discover_performance_candidates(db_path, DEFAULT_EXCEL_TREND_CONFIG)
+    except Exception:
+        perf_candidates = []
+    _td_append_performance_candidate_rows(ws_perf, perf_candidates)
+    if timings is not None:
+        timings["perf_candidates_main_s"] = round(time.perf_counter() - t0, 3)
+
+    with sqlite3.connect(str(Path(db_path).expanduser())) as conn:
+        control_period_rows = conn.execute(
+            """
+            SELECT DISTINCT control_period
+            FROM td_condition_observations
+            WHERE """
+            + _td_perf_run_type_sql_key("run_type")
+            + """ IN ('pm', 'pulsemode', 'pulsedmode', 'pulsed', 'pulse') AND control_period IS NOT NULL
+            ORDER BY control_period
+            """
+        ).fetchall()
+    cp_count = len(control_period_rows)
+    if timings is not None:
+        timings["perf_candidates_cp_count"] = int(cp_count)
+
+    for sheet_name in list(wb.sheetnames):
+        if sheet_name.startswith("Performance_candidates_CP_"):
+            try:
+                wb.remove(wb[sheet_name])
+            except Exception:
+                pass
+
+    t0 = time.perf_counter()
+    for idx, (cp_value,) in enumerate(control_period_rows, start=1):
+        _td_emit_progress(progress_cb, f"Generating control-period performance sheets ({idx}/{cp_count})")
+        try:
+            cp_candidates = td_discover_performance_candidates(
+                db_path,
+                DEFAULT_EXCEL_TREND_CONFIG,
+                control_period_filter=cp_value,
+            )
+        except Exception:
+            cp_candidates = []
+        ws_cp = _td_reset_workbook_sheet(wb, _td_perf_cp_sheet_name(cp_value), perf_headers)
+        _td_append_performance_candidate_rows(ws_cp, cp_candidates)
+    if timings is not None:
+        timings["perf_candidates_cp_total_s"] = round(time.perf_counter() - t0, 3)
+
+    return {
+        "performance_candidate_count": int(len(perf_candidates)),
+        "performance_cp_sheet_count": int(cp_count),
+    }
+
+
+def generate_test_data_project_performance_sheets(
+    project_dir: Path,
+    workbook_path: Path,
+    *,
+    progress_cb: Callable[[str], None] | None = None,
+) -> dict:
+    try:
+        from openpyxl import load_workbook  # type: ignore
+    except Exception as exc:
+        raise RuntimeError(
+            "openpyxl is required to generate Test Data performance sheets. "
+            "Install it with `py -m pip install openpyxl` within the project environment."
+        ) from exc
+
+    import time
+
+    proj_dir = Path(project_dir).expanduser()
+    wb_path = Path(workbook_path).expanduser()
+    if not wb_path.exists():
+        raise FileNotFoundError(f"Project workbook not found: {wb_path}")
+    db_path = _validate_test_data_project_cache_for_update(proj_dir, wb_path)
+
+    timings: dict[str, float | int] = {
+        "perf_candidates_main_s": 0.0,
+        "perf_candidates_cp_total_s": 0.0,
+        "perf_candidates_cp_count": 0,
+        "final_workbook_save_s": 0.0,
+    }
+    total_started = time.perf_counter()
+
+    _td_emit_progress(progress_cb, "Loading workbook for performance sheet generation")
+    try:
+        wb = load_workbook(str(wb_path))
+    except PermissionError as exc:
+        raise RuntimeError(f"Workbook is not writable (close it in Excel first): {wb_path}") from exc
+
+    try:
+        counts = _td_write_performance_candidate_sheets(
+            wb,
+            db_path,
+            progress_cb=progress_cb,
+            timings=timings,
+        )
+        _td_emit_progress(progress_cb, "Saving workbook with performance sheets")
+        t0 = time.perf_counter()
+        wb.save(str(wb_path))
+        timings["final_workbook_save_s"] = round(time.perf_counter() - t0, 3)
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
+
+    timings["total_s"] = round(time.perf_counter() - total_started, 3)
+
+    return {
+        "workbook": str(wb_path),
+        "db_path": str(db_path),
+        "timings": dict(timings),
+        "debug_json": json.dumps({"timings_s": timings}, separators=(",", ":")),
+        **counts,
+    }
+
+
 def update_test_data_trending_project_workbook(
     global_repo: Path,
     workbook_path: Path,
@@ -11403,6 +11712,8 @@ def update_test_data_trending_project_workbook(
     overwrite: bool = False,
     dry_run: bool = False,
     require_existing_cache: bool = True,
+    include_performance_sheets: bool = False,
+    progress_cb: Callable[[str], None] | None = None,
 ) -> dict:
     """
     Populate a Test Data Trending workbook's calculated sheets from cached
@@ -11422,7 +11733,16 @@ def update_test_data_trending_project_workbook(
 
     import time
 
-    timings: dict[str, float] = {}
+    timings: dict[str, float | int] = {
+        "data_calc_build_s": 0.0,
+        "metrics_long_sheet_s": 0.0,
+        "raw_cache_long_sheet_s": 0.0,
+        "perf_candidates_main_s": 0.0,
+        "perf_candidates_cp_total_s": 0.0,
+        "perf_candidates_cp_count": 0,
+        "metadata_sync_s": 0.0,
+        "post_cache_workbook_build_s": 0.0,
+    }
     total_started = time.perf_counter()
     repo = Path(global_repo).expanduser()
     project_dir = wb_path.parent
@@ -11553,6 +11873,7 @@ def update_test_data_trending_project_workbook(
     cfg_cols = [dict(c) for c in (project_cfg.get("columns") or []) if isinstance(c, dict)]
     cfg_order = [str(c.get("name") or "").strip() for c in cfg_cols if str(c.get("name") or "").strip()]
     if not dry_run:
+        _td_emit_progress(progress_cb, "Refreshing support workbook")
         t0 = time.perf_counter()
         _refresh_td_support_run_conditions_sheet(
             wb_path,
@@ -11604,9 +11925,11 @@ def update_test_data_trending_project_workbook(
 
     # Save any migration/creation before rebuilding cache (cache rebuild reads workbook from disk).
     if not dry_run:
+        _td_emit_progress(progress_cb, "Saving workbook before cache validation")
         t0 = time.perf_counter()
         wb.save(str(wb_path))
         timings["pre_cache_workbook_save_s"] = round(time.perf_counter() - t0, 3)
+        _td_emit_progress(progress_cb, "Ensuring project cache")
         t0 = time.perf_counter()
         if require_existing_cache and not cache_missing:
             db_path = validate_existing_test_data_project_cache(project_dir, wb_path)
@@ -11665,6 +11988,7 @@ def update_test_data_trending_project_workbook(
             return None
         return parts[0], parts[1], parts[2].lower()
 
+    _td_emit_progress(progress_cb, "Reading project cache")
     t0 = time.perf_counter()
     with sqlite3.connect(str(db_path)) as conn:
         _ensure_test_data_impl_tables(conn)
@@ -11703,16 +12027,6 @@ def update_test_data_trending_project_workbook(
             "SELECT run_name, name, units FROM td_columns_calc WHERE kind='y'"
         ).fetchall()
         runs_rows = conn.execute("SELECT run_name FROM td_runs ORDER BY run_name").fetchall()
-        control_period_rows = conn.execute(
-            """
-            SELECT DISTINCT control_period
-            FROM td_condition_observations
-            WHERE lower(COALESCE(run_type, ''))='pm' AND control_period IS NOT NULL
-            ORDER BY control_period
-            """
-        ).fetchall()
-    timings["cache_read_s"] = round(time.perf_counter() - t0, 3)
-
     with sqlite3.connect(str(_td_resolve_raw_cache_db_path(db_path))) as raw_conn:
         _ensure_test_data_raw_cache_tables(raw_conn)
         raw_cache_long_rows = raw_conn.execute(
@@ -11735,6 +12049,8 @@ def update_test_data_trending_project_workbook(
             ORDER BY o.run_name, o.serial, o.observation_id
             """
         ).fetchall()
+    timings["cache_read_s"] = round(time.perf_counter() - t0, 3)
+    post_cache_started = time.perf_counter()
 
     metric_map: dict[tuple[str, str, str, str], float | int | None] = {}
     for sn, run, col, stat, val in rows:
@@ -11760,6 +12076,8 @@ def update_test_data_trending_project_workbook(
             continue
         y_by_run.setdefault(r, []).append(n)
 
+    _td_emit_progress(progress_cb, "Rebuilding Data_calc")
+    t0 = time.perf_counter()
     # Clear and rebuild Data_calc sheet.
     try:
         ws_data_calc.delete_rows(1, ws_data_calc.max_row or 1)
@@ -11831,28 +12149,12 @@ def update_test_data_trending_project_workbook(
             if _cell_value_changed(cell.value, new_value):
                 ws_data_calc.cell(r, cidx).value = new_value
                 updated_cells += 1
+    timings["data_calc_build_s"] = round(time.perf_counter() - t0, 3)
 
-    def _reset_sheet(sheet_name: str, headers: list[str]):
-        if sheet_name in wb.sheetnames:
-            ws = wb[sheet_name]
-            try:
-                ws.delete_rows(1, ws.max_row or 1)
-            except Exception:
-                try:
-                    wb.remove(ws)
-                except Exception:
-                    pass
-                ws = wb.create_sheet(sheet_name)
-        else:
-            ws = wb.create_sheet(sheet_name)
-        ws.append(headers)
-        try:
-            ws.freeze_panes = "A2"
-        except Exception:
-            pass
-        return ws
-
-    ws_metrics_long = _reset_sheet(
+    _td_emit_progress(progress_cb, "Writing Metrics_long")
+    t0 = time.perf_counter()
+    ws_metrics_long = _td_reset_workbook_sheet(
+        wb,
         "Metrics_long",
         [
             "observation_id",
@@ -11869,8 +12171,12 @@ def update_test_data_trending_project_workbook(
     )
     for row in metric_rows_long:
         ws_metrics_long.append(list(row))
+    timings["metrics_long_sheet_s"] = round(time.perf_counter() - t0, 3)
 
-    ws_raw_long = _reset_sheet(
+    _td_emit_progress(progress_cb, "Writing RawCache_long")
+    t0 = time.perf_counter()
+    ws_raw_long = _td_reset_workbook_sheet(
+        wb,
         "RawCache_long",
         [
             "observation_id",
@@ -11888,80 +12194,19 @@ def update_test_data_trending_project_workbook(
     )
     for row in raw_cache_long_rows:
         ws_raw_long.append(list(row))
+    timings["raw_cache_long_sheet_s"] = round(time.perf_counter() - t0, 3)
 
-    perf_sheet_name = "Performance_candidates"
-    perf_headers = [
-        "candidate",
-        "x_column",
-        "x_units",
-        "y_column",
-        "y_units",
-        "qualifying_serial_count",
-        "qualifying_serials",
-        "source_point_count",
-        "distinct_x_point_count",
-        "min_distinct_x_points_per_serial",
-        "available_stats",
-        "equation_views",
-    ]
-    ws_perf = _reset_sheet(perf_sheet_name, perf_headers)
-    try:
-        perf_candidates = td_discover_performance_candidates(db_path, DEFAULT_EXCEL_TREND_CONFIG)
-    except Exception:
-        perf_candidates = []
-    def _append_perf_rows(ws_perf_target, items: list[dict]) -> None:
-        for item in items:
-            x_spec = item.get("x") or {}
-            y_spec = item.get("y") or {}
-            x_col = str((x_spec.get("column") if isinstance(x_spec, dict) else "") or "").strip()
-            y_col = str((y_spec.get("column") if isinstance(y_spec, dict) else "") or "").strip()
-            serials_txt = ", ".join([str(sn).strip() for sn in (item.get("qualifying_serials") or []) if str(sn).strip()])
-            stats_txt = ", ".join([str(st).strip() for st in (item.get("available_stats") or []) if str(st).strip()])
-            views_txt = ", ".join([str(v).strip() for v in (item.get("available_equation_views") or []) if str(v).strip()])
-            ws_perf_target.append(
-                [
-                    str(item.get("display_name") or item.get("name") or "").strip(),
-                    x_col,
-                    str(item.get("x_units") or "").strip(),
-                    y_col,
-                    str(item.get("y_units") or "").strip(),
-                    int(item.get("qualifying_serial_count") or 0),
-                    serials_txt,
-                    int(item.get("source_point_count") or 0),
-                    int(item.get("distinct_x_point_count") or 0),
-                    int(item.get("min_distinct_x_points_per_serial") or 0),
-                    stats_txt,
-                    views_txt,
-                ]
-            )
-
-    _append_perf_rows(ws_perf, perf_candidates)
-
-    for sheet_name in list(wb.sheetnames):
-        if sheet_name.startswith("Performance_candidates_CP_"):
-            try:
-                wb.remove(wb[sheet_name])
-            except Exception:
-                pass
-
-    def _cp_sheet_name(value: object) -> str:
-        txt = _td_format_compact_value(value).replace(".", "_")
-        txt = re.sub(r"[^A-Za-z0-9_]+", "_", txt).strip("_") or "value"
-        return f"Performance_candidates_CP_{txt}"[:31]
-
-    for (cp_value,) in control_period_rows:
-        try:
-            cp_candidates = td_discover_performance_candidates(
-                db_path,
-                DEFAULT_EXCEL_TREND_CONFIG,
-                control_period_filter=cp_value,
-            )
-        except Exception:
-            cp_candidates = []
-        ws_cp = _reset_sheet(_cp_sheet_name(cp_value), perf_headers)
-        _append_perf_rows(ws_cp, cp_candidates)
+    if include_performance_sheets:
+        _td_write_performance_candidate_sheets(
+            wb,
+            db_path,
+            progress_cb=progress_cb,
+            timings=timings,
+        )
 
     # Sync workbook metadata sheets/rows to the canonical index (best-effort).
+    _td_emit_progress(progress_cb, "Syncing workbook metadata")
+    t0 = time.perf_counter()
     try:
         support_dir = eidat_support_dir(repo)
         docs = read_eidat_index_documents(repo)
@@ -11975,9 +12220,12 @@ def update_test_data_trending_project_workbook(
         )
     except Exception:
         pass
+    timings["metadata_sync_s"] = round(time.perf_counter() - t0, 3)
+    timings["post_cache_workbook_build_s"] = round(time.perf_counter() - post_cache_started, 3)
 
     try:
         if not dry_run:
+            _td_emit_progress(progress_cb, "Saving updated workbook")
             t0 = time.perf_counter()
             wb.save(str(wb_path))
             timings["final_workbook_save_s"] = round(time.perf_counter() - t0, 3)

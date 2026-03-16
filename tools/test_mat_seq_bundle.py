@@ -37,6 +37,7 @@ class TestMatSeqBundle(unittest.TestCase):
                 "time": np.array([0.0, 1.0, 2.0], dtype=float),
                 "thrust": np.array([10.0 + offset, 11.0 + offset, 12.0 + offset], dtype=float),
                 "pressure": np.array([[100.0 + offset], [101.0 + offset], [102.0 + offset]], dtype=float),
+                "junkTelemetry": np.array([5000.0 + offset, 5001.0 + offset, 5002.0 + offset], dtype=float),
                 "ignored_matrix": np.array([[1.0, 2.0], [3.0, 4.0]], dtype=float),
             },
         )
@@ -109,8 +110,13 @@ class TestMatSeqBundle(unittest.TestCase):
             with sqlite3.connect(str(sqlite_path)) as conn:
                 runs = [str(row[0] or "") for row in conn.execute("SELECT sheet_name FROM __sheet_info ORDER BY sheet_name").fetchall()]
                 member_count = int(conn.execute("SELECT COUNT(*) FROM __mat_bundle_members").fetchone()[0] or 0)
+                seq1_cols = [str(row[1] or "") for row in conn.execute('PRAGMA table_info("sheet__seq1")').fetchall()]
             self.assertEqual(runs, ["seq1", "seq2", "seq3"])
             self.assertEqual(member_count, 3)
+            self.assertIn("Time", seq1_cols)
+            self.assertIn("Thrust", seq1_cols)
+            self.assertIn("pressure", seq1_cols)
+            self.assertNotIn("junkTelemetry", seq1_cols)
 
             build_index(paths)
             docs = read_eidat_index_documents(repo)

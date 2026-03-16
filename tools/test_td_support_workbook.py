@@ -123,11 +123,23 @@ class _RunSelectionHarness:
         from PySide6 import QtWidgets
         from EIDAT_App_Files.ui_next.qt_main import TestDataTrendDialog  # type: ignore
 
+        self._mode = "curves"
         self.cb_run_mode = QtWidgets.QComboBox()
         self.cb_run_mode.addItem("Sequence", "sequence")
         self.cb_run_mode.addItem("Run Conditions", "condition")
+        self.lbl_run_combo = QtWidgets.QLabel()
         self.cb_run = QtWidgets.QComboBox()
+        self.metrics_condition_frame = QtWidgets.QFrame()
+        self.list_metric_run_conditions = QtWidgets.QListWidget()
         self.lbl_run_details = QtWidgets.QLabel()
+        self.cb_metric_average = QtWidgets.QCheckBox()
+        self.cb_plot_metric_bounds = QtWidgets.QCheckBox()
+        self.list_stats = QtWidgets.QListWidget()
+        for st in ("mean", "min", "max", "std"):
+            self.list_stats.addItem(QtWidgets.QListWidgetItem(st))
+        self.list_y_metrics = QtWidgets.QListWidget()
+        for name in ("thrust", "current"):
+            self.list_y_metrics.addItem(QtWidgets.QListWidgetItem(name))
         self.list_auto_plots = QtWidgets.QListWidget()
         self.btn_open_auto = QtWidgets.QPushButton()
         self.btn_open_all_auto = QtWidgets.QPushButton()
@@ -141,10 +153,18 @@ class _RunSelectionHarness:
         self._run_name_by_display = {}
         self._is_internal_run_label = TestDataTrendDialog._is_internal_run_label
         self._metric_title_suffix = TestDataTrendDialog._metric_title_suffix
+        self._selection_summary_text = TestDataTrendDialog._selection_summary_text
+        self._plot_metrics_called = False
 
         for name in (
             "_current_run_selector_mode",
+            "_metrics_condition_multiselect_active",
+            "_checked_metric_condition_selections",
+            "_set_metric_condition_selection_ids",
+            "_combine_run_selections",
+            "_current_run_selections",
             "_current_run_selection",
+            "_current_member_runs",
             "_run_display_text",
             "_selection_condition_label",
             "_selection_display_text",
@@ -152,14 +172,38 @@ class _RunSelectionHarness:
             "_compose_run_title",
             "_select_run_by_id",
             "_selection_from_plot_def",
+            "_populate_metric_condition_list",
+            "_refresh_run_selection_visibility",
+            "_on_metric_condition_selection_changed",
             "_refresh_run_dropdown",
             "_refresh_auto_plots_list",
             "_update_auto_actions",
+            "_open_selected_auto_plot",
         ):
             setattr(self, name, getattr(TestDataTrendDialog, name).__get__(self, _RunSelectionHarness))
 
         self._refresh_columns_for_run = lambda: None
         self._refresh_stats_preview = lambda: None
+        self._set_mode = lambda mode: setattr(self, "_mode", str(mode or "").strip().lower())
+        self._plot_metrics = lambda: setattr(self, "_plot_metrics_called", True)
+        self._plot_curves = lambda: None
+        self._refresh_performance_ui = lambda: None
+        self._set_combo_to_value = lambda *args, **kwargs: None
+        self._on_perf_axis_changed = lambda *args, **kwargs: None
+        self.cb_run_mode.currentIndexChanged.connect(lambda *_: self._refresh_run_dropdown())
+
+    def checked_condition_ids(self) -> list[str]:
+        from PySide6 import QtCore
+
+        out: list[str] = []
+        for i in range(self.list_metric_run_conditions.count()):
+            it = self.list_metric_run_conditions.item(i)
+            if not it:
+                continue
+            data = it.data(QtCore.Qt.ItemDataRole.UserRole)
+            if it.checkState() == QtCore.Qt.CheckState.Checked and isinstance(data, dict):
+                out.append(str(data.get("id") or "").strip())
+        return out
 
 
 class _MetricBoundsHarness:
@@ -239,6 +283,81 @@ class TestTDTrendDialogCacheLoading(unittest.TestCase):
         self.assertIn("implementation_trending.xlsx", info_args[2])
         self.assertIn("test_data_raw_cache.xlsx", info_args[2])
         self.assertIn("test_data_raw_points.xlsx", info_args[2])
+
+
+@unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
+class TestProjectUpdateUI(unittest.TestCase):
+    def test_project_update_uses_background_task_for_td_projects(self) -> None:
+        _qt_app()
+        from PySide6 import QtWidgets
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+        from EIDAT_App_Files.ui_next.qt_main import MainWindow  # type: ignore
+
+        class _Harness:
+            pass
+
+        harness = _Harness()
+        harness.ed_global_repo = QtWidgets.QLineEdit("C:/tmp/repo")
+        harness.cb_project_overwrite = QtWidgets.QCheckBox()
+        harness.cb_project_overwrite.setChecked(True)
+        harness._selected_project_record = lambda: {
+            "name": "Proj",
+            "type": getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending"),
+            "folder": "C:/tmp/repo/projects/Proj",
+            "workbook": "C:/tmp/repo/projects/Proj/project.xlsx",
+        }
+        harness._append_log = lambda *_args, **_kwargs: None
+        captured: dict[str, object] = {}
+        harness._start_project_task = lambda **kwargs: captured.update(kwargs)
+        act = MainWindow._act_update_project.__get__(harness, _Harness)
+
+        with mock.patch.object(be, "update_test_data_trending_project_workbook", return_value={"workbook": "x"}) as update_mock:
+            act()
+            self.assertEqual(captured.get("heading"), "Update Project")
+            self.assertEqual(captured.get("log_prefix"), "project_update")
+            task_factory = captured.get("task_factory")
+            self.assertTrue(callable(task_factory))
+            progress_lines: list[str] = []
+            result = task_factory(progress_lines.append)  # type: ignore[misc]
+
+        self.assertEqual(result.get("workbook"), "x")
+        update_mock.assert_called_once()
+        args, kwargs = update_mock.call_args
+        self.assertEqual(Path(args[1]), Path("C:/tmp/repo/projects/Proj/project.xlsx"))
+        self.assertTrue(bool(kwargs.get("overwrite")))
+        self.assertFalse(bool(kwargs.get("include_performance_sheets")))
+        self.assertTrue(callable(kwargs.get("progress_cb")))
+
+    def test_generate_performance_sheets_uses_background_task_for_td_projects(self) -> None:
+        _qt_app()
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+        from EIDAT_App_Files.ui_next.qt_main import MainWindow  # type: ignore
+
+        class _Harness:
+            pass
+
+        harness = _Harness()
+        harness._selected_project_record = lambda: {
+            "name": "Proj",
+            "type": getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending"),
+            "folder": "C:/tmp/repo/projects/Proj",
+            "workbook": "C:/tmp/repo/projects/Proj/project.xlsx",
+        }
+        harness._append_log = lambda *_args, **_kwargs: None
+        captured: dict[str, object] = {}
+        harness._start_project_task = lambda **kwargs: captured.update(kwargs)
+        act = MainWindow._act_generate_project_performance_sheets.__get__(harness, _Harness)
+
+        with mock.patch.object(be, "generate_test_data_project_performance_sheets", return_value={"workbook": "x"}) as perf_mock:
+            act()
+            self.assertEqual(captured.get("heading"), "Generate Performance Sheets")
+            self.assertEqual(captured.get("log_prefix"), "project_performance_sheets")
+            task_factory = captured.get("task_factory")
+            self.assertTrue(callable(task_factory))
+            result = task_factory(lambda *_args: None)  # type: ignore[misc]
+
+        self.assertEqual(result.get("workbook"), "x")
+        perf_mock.assert_called_once()
 
 
 @unittest.skipUnless(_have_openpyxl(), "openpyxl not installed")
@@ -1932,6 +2051,122 @@ class TestTDSupportWorkbook(unittest.TestCase):
             finally:
                 wb.close()
 
+    def test_update_workbook_skips_performance_sheets_by_default_and_reports_stage_timings(self) -> None:
+        from openpyxl import load_workbook  # type: ignore
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            src_db = root / "src.sqlite3"
+            self._make_source_sqlite(src_db)
+
+            wb_path = root / "project.xlsx"
+            be._write_test_data_trending_workbook(
+                wb_path,
+                global_repo=root,
+                serials=["SN1"],
+                docs=[{"serial_number": "SN1", "excel_sqlite_rel": str(src_db)}],
+                config=self._make_config(),
+            )
+            support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+            be._write_td_support_workbook(
+                support_path,
+                sequence_names=["RunA"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+            )
+
+            progress: list[str] = []
+            result = be.update_test_data_trending_project_workbook(
+                root,
+                wb_path,
+                overwrite=True,
+                progress_cb=progress.append,
+            )
+
+            timings = result.get("timings") or {}
+            for key in (
+                "data_calc_build_s",
+                "metrics_long_sheet_s",
+                "raw_cache_long_sheet_s",
+                "perf_candidates_main_s",
+                "perf_candidates_cp_total_s",
+                "perf_candidates_cp_count",
+                "metadata_sync_s",
+                "post_cache_workbook_build_s",
+            ):
+                self.assertIn(key, timings)
+            self.assertEqual(timings.get("perf_candidates_main_s"), 0.0)
+            self.assertEqual(timings.get("perf_candidates_cp_total_s"), 0.0)
+            self.assertEqual(timings.get("perf_candidates_cp_count"), 0)
+
+            wb = load_workbook(str(wb_path), read_only=True, data_only=True)
+            try:
+                self.assertNotIn("Performance_candidates", wb.sheetnames)
+                self.assertFalse(any(str(name).startswith("Performance_candidates_CP_") for name in wb.sheetnames))
+            finally:
+                wb.close()
+
+            expected_stages = [
+                "Refreshing support workbook",
+                "Saving workbook before cache validation",
+                "Ensuring project cache",
+                "Reading project cache",
+                "Rebuilding Data_calc",
+                "Writing Metrics_long",
+                "Writing RawCache_long",
+                "Syncing workbook metadata",
+                "Saving updated workbook",
+            ]
+            indices = [next(i for i, msg in enumerate(progress) if stage in msg) for stage in expected_stages]
+            self.assertEqual(indices, sorted(indices))
+
+    def test_generate_performance_sheets_writes_main_and_cp_sheets(self) -> None:
+        from openpyxl import load_workbook  # type: ignore
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            db_path = self._seed_perf_candidate_db(
+                root,
+                rows=[
+                    ("SN1", "Seq1", 3.0, 10.0),
+                    ("SN1", "Seq2", 4.0, 11.0),
+                    ("SN1", "Seq3", 5.0, 12.0),
+                ],
+            )
+            wb_path = root / "project.xlsx"
+
+            with sqlite3.connect(str(db_path)) as conn:
+                conn.execute(
+                    "UPDATE td_condition_observations SET run_type=?, control_period=?",
+                    ("pm", 120.0),
+                )
+                conn.commit()
+
+            progress: list[str] = []
+            result = be.generate_test_data_project_performance_sheets(
+                root,
+                wb_path,
+                progress_cb=progress.append,
+            )
+
+            self.assertEqual(str(result.get("workbook") or ""), str(wb_path))
+            timings = result.get("timings") or {}
+            self.assertGreaterEqual(int(timings.get("perf_candidates_cp_count") or 0), 1)
+
+            wb = load_workbook(str(wb_path), read_only=True, data_only=True)
+            try:
+                self.assertIn("Performance_candidates", wb.sheetnames)
+                self.assertTrue(any(str(name).startswith("Performance_candidates_CP_120") for name in wb.sheetnames))
+                ws = wb["Performance_candidates"]
+                self.assertGreater(int(ws.max_row or 0), 1)
+            finally:
+                wb.close()
+
+            self.assertTrue(any("Generating performance candidate sheets" in msg for msg in progress))
+            self.assertTrue(any("Generating control-period performance sheets" in msg for msg in progress))
+            self.assertTrue(any("Saving workbook with performance sheets" in msg for msg in progress))
+
     def test_update_workbook_fails_when_cache_db_incomplete(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
 
@@ -2203,6 +2438,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
 
             self.assertEqual(payload.get("mode"), "calc_from_raw")
             with sqlite3.connect(str(db_path)) as conn:
+                stats_meta = conn.execute("SELECT value FROM td_meta WHERE key='statistics' LIMIT 1").fetchone()
                 rows = conn.execute(
                     """
                     SELECT stat, value_num
@@ -2211,7 +2447,12 @@ class TestTDSupportWorkbook(unittest.TestCase):
                     ORDER BY stat
                     """
                 ).fetchall()
-            self.assertEqual(rows, [("max", 30.0), ("mean", 20.0)])
+            self.assertIn("std", str((stats_meta[0] if stats_meta else "") or ""))
+            self.assertEqual([str(r[0] or "") for r in rows], ["max", "mean", "std"])
+            self.assertEqual(float(rows[0][1]), 30.0)
+            self.assertEqual(float(rows[1][1]), 20.0)
+            self.assertTrue(isinstance(rows[2][1], (int, float)))
+            self.assertGreater(float(rows[2][1]), 0.0)
 
     def test_calc_cache_still_writes_mean_when_config_omits_it(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
@@ -2283,7 +2524,11 @@ class TestTDSupportWorkbook(unittest.TestCase):
                     ORDER BY stat
                     """
                 ).fetchall()
-            self.assertEqual(rows, [("max", 30.0), ("mean", 20.0)])
+            self.assertEqual([str(r[0] or "") for r in rows], ["max", "mean", "std"])
+            self.assertEqual(float(rows[0][1]), 30.0)
+            self.assertEqual(float(rows[1][1]), 20.0)
+            self.assertTrue(isinstance(rows[2][1], (int, float)))
+            self.assertGreater(float(rows[2][1]), 0.0)
 
     def test_metric_plot_values_leave_mean_as_per_serial_values(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
@@ -2894,6 +3139,249 @@ class TestTDSupportWorkbook(unittest.TestCase):
         )
 
     @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
+    def test_metrics_condition_checklist_populates_and_defaults_all_checked(self) -> None:
+        harness = _RunSelectionHarness()
+        harness._run_selection_views["condition"] = [
+            {
+                "mode": "condition",
+                "id": "condition:seq1",
+                "run_name": "Seq1",
+                "display_text": "350 psia, SS",
+                "run_condition": "350 psia, SS",
+                "member_runs": ["Seq1"],
+                "member_sequences": ["Seq1", "Seq2"],
+                "details_text": "Source Sequences: Seq1, Seq2",
+            },
+            {
+                "mode": "condition",
+                "id": "condition:seq3",
+                "run_name": "Seq3",
+                "display_text": "410 psia, PM",
+                "run_condition": "410 psia, PM",
+                "member_runs": ["Seq3"],
+                "member_sequences": ["Seq3"],
+                "details_text": "Source Sequences: Seq3",
+            },
+        ]
+        harness._set_mode("metrics")
+        harness.cb_run_mode.setCurrentIndex(harness.cb_run_mode.findData("condition"))
+
+        self.assertEqual(harness.list_metric_run_conditions.count(), 2)
+        self.assertEqual(harness.checked_condition_ids(), ["condition:seq1", "condition:seq3"])
+
+    @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
+    def test_current_run_selections_and_member_runs_follow_checked_conditions(self) -> None:
+        harness = _RunSelectionHarness()
+        harness._run_selection_views["condition"] = [
+            {
+                "mode": "condition",
+                "id": "condition:a",
+                "run_name": "RunA",
+                "display_text": "350 psia, SS",
+                "run_condition": "350 psia, SS",
+                "member_runs": ["RunA"],
+                "member_sequences": ["Seq1", "Seq2"],
+                "details_text": "Source Sequences: Seq1, Seq2",
+            },
+            {
+                "mode": "condition",
+                "id": "condition:b",
+                "run_name": "RunB",
+                "display_text": "410 psia, PM",
+                "run_condition": "410 psia, PM",
+                "member_runs": ["RunA", "RunB"],
+                "member_sequences": ["Seq3"],
+                "details_text": "Source Sequences: Seq3",
+            },
+        ]
+        harness._set_mode("metrics")
+        harness.cb_run_mode.setCurrentIndex(harness.cb_run_mode.findData("condition"))
+        harness._set_metric_condition_selection_ids(["condition:b", "condition:a"])
+
+        self.assertEqual(
+            [item.get("id") for item in harness._current_run_selections()],
+            ["condition:a", "condition:b"],
+        )
+        self.assertEqual(harness._current_member_runs(), ["RunA", "RunB"])
+
+    @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
+    def test_multi_condition_title_uses_pluralized_condition_label(self) -> None:
+        harness = _RunSelectionHarness()
+        selection = harness._combine_run_selections(
+            [
+                {
+                    "mode": "condition",
+                    "id": "condition:seq1",
+                    "run_name": "Seq1",
+                    "display_text": "350 psia, SS",
+                    "run_condition": "350 psia, SS",
+                    "member_runs": ["Seq1"],
+                    "member_sequences": ["Seq1", "Seq2"],
+                    "details_text": "Source Sequences: Seq1, Seq2",
+                },
+                {
+                    "mode": "condition",
+                    "id": "condition:seq3",
+                    "run_name": "Seq3",
+                    "display_text": "410 psia, PM",
+                    "run_condition": "410 psia, PM",
+                    "member_runs": ["Seq3"],
+                    "member_sequences": ["Seq3"],
+                    "details_text": "Source Sequences: Seq3",
+                },
+            ]
+        )
+
+        title = harness._compose_run_title(selection, "mean")
+
+        self.assertEqual(
+            title,
+            "Run Conditions: 350 psia, SS, 410 psia, PM | Sequences: Seq1, Seq2, Seq3 | mean",
+        )
+
+    @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
+    def test_multi_condition_auto_plot_name_uses_combined_labels(self) -> None:
+        harness = _RunSelectionHarness()
+        harness._run_selection_views["condition"] = [
+            {
+                "mode": "condition",
+                "id": "condition:seq1",
+                "run_name": "Seq1",
+                "display_text": "350 psia, SS",
+                "run_condition": "350 psia, SS",
+                "member_runs": ["Seq1"],
+                "member_sequences": ["Seq1", "Seq2"],
+                "details_text": "Source Sequences: Seq1, Seq2",
+            },
+            {
+                "mode": "condition",
+                "id": "condition:seq3",
+                "run_name": "Seq3",
+                "display_text": "410 psia, PM",
+                "run_condition": "410 psia, PM",
+                "member_runs": ["Seq3"],
+                "member_sequences": ["Seq3"],
+                "details_text": "Source Sequences: Seq3",
+            },
+        ]
+        harness._auto_plots = [
+            {
+                "mode": "metrics",
+                "selector_mode": "condition",
+                "selection_id": "condition:multi:condition:seq1|condition:seq3",
+                "selection_ids": ["condition:seq1", "condition:seq3"],
+                "selection_labels": ["350 psia, SS", "410 psia, PM"],
+                "run_conditions": ["350 psia, SS", "410 psia, PM"],
+                "run_condition": "350 psia, SS, 410 psia, PM",
+                "member_runs": ["Seq1", "Seq3"],
+                "member_sequences": ["Seq1", "Seq2", "Seq3"],
+                "stats": ["mean"],
+                "y": ["thrust"],
+            }
+        ]
+
+        harness._refresh_auto_plots_list()
+
+        self.assertEqual(
+            harness.list_auto_plots.item(0).text(),
+            "Metrics: 350 psia, SS, 410 psia, PM mean (thrust)",
+        )
+
+    @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
+    def test_open_selected_auto_plot_restores_multi_condition_checks(self) -> None:
+        harness = _RunSelectionHarness()
+        harness._run_selection_views["condition"] = [
+            {
+                "mode": "condition",
+                "id": "condition:seq1",
+                "run_name": "Seq1",
+                "display_text": "350 psia, SS",
+                "run_condition": "350 psia, SS",
+                "member_runs": ["Seq1"],
+                "member_sequences": ["Seq1", "Seq2"],
+                "details_text": "Source Sequences: Seq1, Seq2",
+            },
+            {
+                "mode": "condition",
+                "id": "condition:seq3",
+                "run_name": "Seq3",
+                "display_text": "410 psia, PM",
+                "run_condition": "410 psia, PM",
+                "member_runs": ["Seq3"],
+                "member_sequences": ["Seq3"],
+                "details_text": "Source Sequences: Seq3",
+            },
+        ]
+        harness._auto_plots = [
+            {
+                "mode": "metrics",
+                "selector_mode": "condition",
+                "selection_id": "condition:multi:condition:seq1|condition:seq3",
+                "selection_ids": ["condition:seq1", "condition:seq3"],
+                "selection_labels": ["350 psia, SS", "410 psia, PM"],
+                "run_conditions": ["350 psia, SS", "410 psia, PM"],
+                "member_runs": ["Seq1", "Seq3"],
+                "member_sequences": ["Seq1", "Seq2", "Seq3"],
+                "stats": ["mean"],
+                "y": ["thrust"],
+            }
+        ]
+        harness._refresh_auto_plots_list()
+        harness.list_auto_plots.item(0).setSelected(True)
+
+        harness._open_selected_auto_plot()
+
+        self.assertEqual(harness.checked_condition_ids(), ["condition:seq1", "condition:seq3"])
+        self.assertTrue(harness._plot_metrics_called)
+
+    @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
+    def test_open_selected_auto_plot_keeps_single_condition_for_legacy_payload(self) -> None:
+        harness = _RunSelectionHarness()
+        harness._run_selection_views["condition"] = [
+            {
+                "mode": "condition",
+                "id": "condition:seq1",
+                "run_name": "Seq1",
+                "display_text": "350 psia, SS",
+                "run_condition": "350 psia, SS",
+                "member_runs": ["Seq1"],
+                "member_sequences": ["Seq1", "Seq2"],
+                "details_text": "Source Sequences: Seq1, Seq2",
+            },
+            {
+                "mode": "condition",
+                "id": "condition:seq3",
+                "run_name": "Seq3",
+                "display_text": "410 psia, PM",
+                "run_condition": "410 psia, PM",
+                "member_runs": ["Seq3"],
+                "member_sequences": ["Seq3"],
+                "details_text": "Source Sequences: Seq3",
+            },
+        ]
+        harness._auto_plots = [
+            {
+                "mode": "metrics",
+                "selector_mode": "condition",
+                "selection_id": "condition:seq3",
+                "run": "Seq3",
+                "run_condition": "410 psia, PM",
+                "display_text": "410 psia, PM",
+                "member_runs": ["Seq3"],
+                "member_sequences": ["Seq3"],
+                "stats": ["mean"],
+                "y": ["thrust"],
+            }
+        ]
+        harness._refresh_auto_plots_list()
+        harness.list_auto_plots.item(0).setSelected(True)
+
+        harness._open_selected_auto_plot()
+
+        self.assertEqual(harness.checked_condition_ids(), ["condition:seq3"])
+        self.assertTrue(harness._plot_metrics_called)
+
+    @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
     def test_perf_axis_selecting_third_parameter_does_not_recurse(self) -> None:
         harness = _PerfAxisHarness()
 
@@ -3359,6 +3847,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
                     "input1_units": "mN-s",
                     "run_selection_label": "RunA",
                     "member_runs": ["RunA"],
+                    "performance_run_type_mode": "pulsed_mode",
                     "performance_filter_mode": "match_control_period",
                 },
                 results_by_stat=results,
@@ -3375,6 +3864,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
                     }
                 ],
                 control_period_filter=1.5,
+                run_type_filter="pulsed_mode",
             )
             self.assertEqual(Path(exported), out_path)
 
@@ -3386,6 +3876,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
                     for r in range(1, (ws.max_row or 0) + 1)
                     if str(ws.cell(r, 1).value or "").strip()
                 }
+                self.assertEqual(labels.get("Condition Family"), "Pulsed mode")
                 self.assertEqual(labels.get("PM Filter Mode"), "match_control_period")
                 self.assertEqual(str(labels.get("Selected Control Period")), "1.5")
 
@@ -3558,6 +4049,116 @@ class TestTDSupportWorkbook(unittest.TestCase):
             self.assertIsNotNone(match)
             self.assertEqual(int(match.get("qualifying_serial_count") or 0), 1)
             self.assertEqual(int(match.get("distinct_x_point_count") or 0), 2)
+
+    def test_perf_candidate_discovery_run_type_filter_separates_steady_state_and_pm(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            db_path = self._seed_perf_candidate_db(
+                root,
+                rows=[
+                    ("SN1", "SS1", 1.0, 10.0),
+                    ("SN1", "SS2", 2.0, 20.0),
+                    ("SN1", "PM1", 3.0, 30.0),
+                    ("SN1", "PM2", 4.0, 40.0),
+                ],
+                support_settings={
+                    "perf_eq_strictness": "loose",
+                    "perf_eq_point_count": "loose",
+                },
+            )
+
+            with sqlite3.connect(str(db_path)) as conn:
+                conn.execute("UPDATE td_runs SET run_type=?, control_period=? WHERE run_name IN (?, ?)", ("steady state", None, "SS1", "SS2"))
+                conn.execute("UPDATE td_runs SET run_type=?, control_period=? WHERE run_name IN (?, ?)", ("pulsed mode", 120.0, "PM1", "PM2"))
+                conn.execute(
+                    "UPDATE td_condition_observations SET run_type=?, control_period=? WHERE run_name IN (?, ?)",
+                    ("steady state", None, "SS1", "SS2"),
+                )
+                conn.execute(
+                    "UPDATE td_condition_observations SET run_type=?, control_period=? WHERE run_name IN (?, ?)",
+                    ("pulsed mode", 120.0, "PM1", "PM2"),
+                )
+                conn.commit()
+
+            all_candidates = be.td_discover_performance_candidates(db_path)
+            ss_candidates = be.td_discover_performance_candidates(db_path, run_type_filter="steady_state")
+            pm_candidates = be.td_discover_performance_candidates(db_path, run_type_filter="pulsed_mode")
+
+            def _match(items: list[dict]) -> dict | None:
+                return next(
+                    (
+                        item
+                        for item in items
+                        if str(item.get("display_name") or "") == "thrust vs impulse bit"
+                    ),
+                    None,
+                )
+
+            all_match = _match(all_candidates)
+            ss_match = _match(ss_candidates)
+            pm_match = _match(pm_candidates)
+            self.assertIsNotNone(all_match)
+            self.assertIsNotNone(ss_match)
+            self.assertIsNotNone(pm_match)
+            self.assertEqual(int((all_match or {}).get("source_point_count") or 0), 4)
+            self.assertEqual(int((ss_match or {}).get("source_point_count") or 0), 2)
+            self.assertEqual(int((pm_match or {}).get("source_point_count") or 0), 2)
+
+    def test_perf_collect_equation_export_rows_honor_run_type_filter(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            db_path = self._seed_perf_candidate_db(
+                root,
+                rows=[
+                    ("SN1", "SS1", 1.0, 10.0),
+                    ("SN1", "SS2", 2.0, 20.0),
+                    ("SN1", "PM1", 3.0, 30.0),
+                    ("SN1", "PM2", 4.0, 40.0),
+                ],
+            )
+
+            with sqlite3.connect(str(db_path)) as conn:
+                conn.execute(
+                    "UPDATE td_condition_observations SET run_type=?, control_period=? WHERE run_name IN (?, ?)",
+                    ("steady state", None, "SS1", "SS2"),
+                )
+                conn.execute(
+                    "UPDATE td_condition_observations SET run_type=?, control_period=? WHERE run_name IN (?, ?)",
+                    ("pulsed mode", 120.0, "PM1", "PM2"),
+                )
+                conn.commit()
+
+            run_specs = [
+                {
+                    "run_name": run_name,
+                    "display_name": run_name,
+                    "output_column": "thrust",
+                    "output_units": "lbf",
+                    "input1_column": "impulse bit",
+                    "input1_units": "mN-s",
+                    "input2_column": "",
+                    "input2_units": "",
+                }
+                for run_name in ("SS1", "SS2", "PM1", "PM2")
+            ]
+
+            ss_rows = be.td_perf_collect_equation_export_rows(
+                db_path,
+                run_specs=run_specs,
+                run_type_filter="steady_state",
+            )
+            pm_rows = be.td_perf_collect_equation_export_rows(
+                db_path,
+                run_specs=run_specs,
+                run_type_filter="pulsed_mode",
+            )
+
+            self.assertEqual({str(row.get("run_name") or "") for row in ss_rows}, {"SS1", "SS2"})
+            self.assertEqual({str(row.get("run_name") or "") for row in pm_rows}, {"PM1", "PM2"})
 
     def test_perf_candidate_discovery_legacy_support_workbook_uses_defaults(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
