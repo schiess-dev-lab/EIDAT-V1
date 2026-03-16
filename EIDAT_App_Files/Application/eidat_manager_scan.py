@@ -20,6 +20,15 @@ except Exception:  # pragma: no cover
         extract_pointer_token = None  # type: ignore[assignment]
 
 try:
+    from eidat_manager_mat_bundle import detect_mat_bundle_member, mat_bundle_artifacts_dir  # type: ignore
+except Exception:  # pragma: no cover
+    try:
+        from .eidat_manager_mat_bundle import detect_mat_bundle_member, mat_bundle_artifacts_dir  # type: ignore
+    except Exception:  # pragma: no cover
+        detect_mat_bundle_member = None  # type: ignore[assignment]
+        mat_bundle_artifacts_dir = None  # type: ignore[assignment]
+
+try:
     import fitz  # PyMuPDF
 except Exception:  # pragma: no cover
     fitz = None
@@ -318,8 +327,16 @@ def _expected_artifacts_dir(support_dir: Path, file_path: Path) -> Path:
     PDFs:  EIDAT Support/debug/ocr/<stem>/
     Excel: EIDAT Support/debug/ocr/<stem>__excel/
     """
-    stem = str(file_path.stem or "").strip() or "unknown"
     ext = str(file_path.suffix or "").lower()
+    if ext == ".mat" and detect_mat_bundle_member is not None and mat_bundle_artifacts_dir is not None:
+        repo_root = support_dir.parent.parent if support_dir.parent.name == "EIDAT" else support_dir.parent
+        try:
+            bundle = detect_mat_bundle_member(file_path, repo_root=repo_root)
+        except Exception:
+            bundle = None
+        if bundle is not None:
+            return mat_bundle_artifacts_dir(support_dir, bundle)
+    stem = str(file_path.stem or "").strip() or "unknown"
     name = stem + (EXCEL_ARTIFACT_SUFFIX if ext in {".xlsx", ".xls", ".xlsm", ".mat"} else "")
     return Path(support_dir) / "debug" / "ocr" / name
 

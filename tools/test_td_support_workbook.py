@@ -171,6 +171,44 @@ class _MetricBoundsHarness:
         self._metric_bounds_for_run = TestDataTrendDialog._metric_bounds_for_run.__get__(self, _MetricBoundsHarness)
 
 
+@unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
+class TestTDTrendDialogCacheLoading(unittest.TestCase):
+    def test_open_uses_existing_cache_validation(self) -> None:
+        _qt_app()
+        from PySide6 import QtWidgets
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+        from EIDAT_App_Files.ui_next.qt_main import TestDataTrendDialog  # type: ignore
+
+        class _Harness:
+            pass
+
+        harness = _Harness()
+        harness._project_dir = Path("C:/tmp/project")
+        harness._workbook_path = Path("C:/tmp/project/project.xlsx")
+        harness.lbl_source = QtWidgets.QLabel()
+        harness.lbl_cache = QtWidgets.QLabel()
+        harness._refresh_from_cache_calls = 0
+        harness._update_plot_zoom_actions_calls = 0
+        harness._refresh_from_cache = lambda: setattr(harness, "_refresh_from_cache_calls", harness._refresh_from_cache_calls + 1)
+        harness._update_plot_zoom_actions = lambda: setattr(
+            harness,
+            "_update_plot_zoom_actions_calls",
+            harness._update_plot_zoom_actions_calls + 1,
+        )
+        load_cache = TestDataTrendDialog._load_cache.__get__(harness, _Harness)
+        fake_db = harness._project_dir / "implementation_trending.sqlite3"
+
+        with mock.patch.object(be, "validate_existing_test_data_project_cache", return_value=fake_db) as validate_mock:
+            with mock.patch.object(be, "ensure_test_data_project_cache") as ensure_mock:
+                load_cache(rebuild=False)
+
+        validate_mock.assert_called_once_with(harness._project_dir, harness._workbook_path)
+        ensure_mock.assert_not_called()
+        self.assertEqual(harness._db_path, fake_db)
+        self.assertEqual(harness._refresh_from_cache_calls, 1)
+        self.assertEqual(harness._update_plot_zoom_actions_calls, 1)
+
+
 @unittest.skipUnless(_have_openpyxl(), "openpyxl not installed")
 class TestTDSupportWorkbook(unittest.TestCase):
     def _make_source_sqlite(self, path: Path) -> None:
@@ -3326,6 +3364,8 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 mean_formula = str(ws.cell(row1, headers.index("pred_mean") + 1).value or "")
                 min_formula = str(ws.cell(row1, headers.index("pred_min") + 1).value or "")
                 max_formula = str(ws.cell(row1, headers.index("pred_max") + 1).value or "")
+                min_3sigma_formula = str(ws.cell(row1, headers.index("pred_min_3sigma") + 1).value or "")
+                max_3sigma_formula = str(ws.cell(row1, headers.index("pred_max_3sigma") + 1).value or "")
                 pct_formula = str(ws.cell(row1, headers.index("pct_delta_mean") + 1).value or "")
                 actual_mean = float(ws.cell(row1, headers.index("actual_mean") + 1).value or 0.0)
                 self.assertIn("EXP(", mean_formula)
@@ -3333,6 +3373,10 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 self.assertIn("MAX(0", min_formula)
                 self.assertIn("IF(", max_formula)
                 self.assertIn("^3", max_formula)
+                self.assertIn("-(", min_3sigma_formula)
+                self.assertIn("3*", min_3sigma_formula)
+                self.assertIn("+(", max_3sigma_formula)
+                self.assertIn("3*", max_3sigma_formula)
                 self.assertIn("/", pct_formula)
                 self.assertAlmostEqual(actual_mean, 12.0, places=6)
 

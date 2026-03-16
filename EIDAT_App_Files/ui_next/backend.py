@@ -20,6 +20,15 @@ APP_ROOT = Path(__file__).resolve().parents[1]
 ROOT = APP_ROOT.parent  # repository root that holds user data folders
 T = TypeVar("T")
 
+_APP_APPLICATION_ROOT = APP_ROOT / "Application"
+if str(_APP_APPLICATION_ROOT) not in sys.path:
+    sys.path.insert(0, str(_APP_APPLICATION_ROOT))
+try:
+    from eidat_manager_mat_bundle import detect_mat_bundle_member, mat_bundle_artifacts_dir  # type: ignore
+except Exception:
+    detect_mat_bundle_member = None  # type: ignore[assignment]
+    mat_bundle_artifacts_dir = None  # type: ignore[assignment]
+
 
 def _get_data_root() -> Path:
     raw = (os.environ.get("EIDAT_DATA_ROOT") or "").strip()
@@ -4051,6 +4060,22 @@ def _td_group_program_rows_into_conditions(rows: Sequence[Mapping[str, object]])
     out.sort(key=lambda d: (str(d.get("display_name") or "").lower(), str(d.get("condition_key") or "").lower()))
     used_keys: dict[str, int] = {}
     for idx, group in enumerate(out):
+        member_rows = [dict(row) for row in (group.get("member_rows") or []) if isinstance(row, Mapping)]
+        if len(member_rows) == 1:
+            member = member_rows[0]
+            source_run_name = str(member.get("source_run_name") or "").strip()
+            explicit_key = str(
+                member.get("condition_key")
+                or member.get("run_name")
+                or member.get("sequence_name")
+                or ""
+            ).strip()
+            if (
+                source_run_name
+                and explicit_key
+                and _td_support_norm_name(explicit_key) == _td_support_norm_name(source_run_name)
+            ):
+                group["condition_key"] = source_run_name
         base_key = str(group.get("condition_key") or "").strip() or f"condition_{idx + 1}"
         dup_count = used_keys.get(base_key.lower(), 0)
         used_keys[base_key.lower()] = dup_count + 1
@@ -7254,6 +7279,10 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
     valid_sources = 0
     source_link_updates: dict[str, str] = {}
     source_link_update_errors: list[str] = []
+    impl_conn = sqlite3.connect(str(db_path))
+    raw_conn = sqlite3.connect(str(raw_db_path))
+    _ensure_test_data_impl_tables(impl_conn)
+    _ensure_test_data_raw_cache_tables(raw_conn)
 
     for entry in entries:
         sn = str(entry.get("serial") or "").strip()
@@ -7300,69 +7329,66 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
             debug_sources[source_debug_source_idx]["excel_sqlite_rel"] = healed_excel_sqlite_rel
             debug_sources[source_debug_source_idx]["link_healed"] = True
 
-        with closing(sqlite3.connect(str(db_path))) as conn:
-            _ensure_test_data_impl_tables(conn)
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO td_sources(serial, sqlite_path, mtime_ns, size_bytes, status, last_ingested_epoch_ns)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (sn, str(sqlite_path), mtime_ns, size_bytes, status, computed_epoch_ns),
-            )
-            source_meta = _load_td_source_metadata(wb_path, entry)
-            source_program_title = str(source_meta.get("program_title") or "").strip()
-            source_info["program_title"] = source_program_title
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO td_source_metadata(
-                    serial,
-                    program_title,
-                    asset_type,
-                    asset_specific_type,
-                    vendor,
-                    acceptance_test_plan_number,
-                    part_number,
-                    revision,
-                    test_date,
-                    report_date,
-                    document_type,
-                    document_type_acronym,
-                    similarity_group,
-                    metadata_rel,
-                    artifacts_rel,
-                    excel_sqlite_rel,
-                    metadata_mtime_ns
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    sn,
-                    str(source_meta.get("program_title") or "").strip(),
-                    str(source_meta.get("asset_type") or "").strip(),
-                    str(source_meta.get("asset_specific_type") or "").strip(),
-                    str(source_meta.get("vendor") or "").strip(),
-                    str(source_meta.get("acceptance_test_plan_number") or "").strip(),
-                    str(source_meta.get("part_number") or "").strip(),
-                    str(source_meta.get("revision") or "").strip(),
-                    str(source_meta.get("test_date") or "").strip(),
-                    str(source_meta.get("report_date") or "").strip(),
-                    str(source_meta.get("document_type") or "").strip(),
-                    str(source_meta.get("document_type_acronym") or "").strip(),
-                    str(source_meta.get("similarity_group") or "").strip(),
-                    str(source_meta.get("metadata_rel") or "").strip(),
-                    str(source_meta.get("artifacts_rel") or "").strip(),
-                    str(source_meta.get("excel_sqlite_rel") or "").strip(),
-                    int(source_meta.get("metadata_mtime_ns") or 0),
-                ),
-            )
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO td_source_diagnostics(
-                    serial, resolved_sqlite_path, status, run_name, x_axis_kind, matched_y_json, curves_written, metrics_written, reason
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (sn, str(sqlite_path) if sqlite_path else "", status, "", "", "[]", 0, 0, source_reason),
-            )
-            conn.commit()
+        impl_conn.execute(
+            """
+            INSERT OR REPLACE INTO td_sources(serial, sqlite_path, mtime_ns, size_bytes, status, last_ingested_epoch_ns)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (sn, str(sqlite_path), mtime_ns, size_bytes, status, computed_epoch_ns),
+        )
+        source_meta = _load_td_source_metadata(wb_path, entry)
+        source_program_title = str(source_meta.get("program_title") or "").strip()
+        source_info["program_title"] = source_program_title
+        impl_conn.execute(
+            """
+            INSERT OR REPLACE INTO td_source_metadata(
+                serial,
+                program_title,
+                asset_type,
+                asset_specific_type,
+                vendor,
+                acceptance_test_plan_number,
+                part_number,
+                revision,
+                test_date,
+                report_date,
+                document_type,
+                document_type_acronym,
+                similarity_group,
+                metadata_rel,
+                artifacts_rel,
+                excel_sqlite_rel,
+                metadata_mtime_ns
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                sn,
+                str(source_meta.get("program_title") or "").strip(),
+                str(source_meta.get("asset_type") or "").strip(),
+                str(source_meta.get("asset_specific_type") or "").strip(),
+                str(source_meta.get("vendor") or "").strip(),
+                str(source_meta.get("acceptance_test_plan_number") or "").strip(),
+                str(source_meta.get("part_number") or "").strip(),
+                str(source_meta.get("revision") or "").strip(),
+                str(source_meta.get("test_date") or "").strip(),
+                str(source_meta.get("report_date") or "").strip(),
+                str(source_meta.get("document_type") or "").strip(),
+                str(source_meta.get("document_type_acronym") or "").strip(),
+                str(source_meta.get("similarity_group") or "").strip(),
+                str(source_meta.get("metadata_rel") or "").strip(),
+                str(source_meta.get("artifacts_rel") or "").strip(),
+                str(source_meta.get("excel_sqlite_rel") or "").strip(),
+                int(source_meta.get("metadata_mtime_ns") or 0),
+            ),
+        )
+        impl_conn.execute(
+            """
+            INSERT OR REPLACE INTO td_source_diagnostics(
+                serial, resolved_sqlite_path, status, run_name, x_axis_kind, matched_y_json, curves_written, metrics_written, reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (sn, str(sqlite_path) if sqlite_path else "", status, "", "", "[]", 0, 0, source_reason),
+        )
         debug_diagnostics.append(
             {
                 **source_info,
@@ -7592,110 +7618,107 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
                             x_json_txt = json.dumps(xs, separators=(",", ":"), ensure_ascii=False)
                             y_json_txt = json.dumps(ys, separators=(",", ":"), ensure_ascii=False)
                             table_name = _td_raw_curve_table_name(effective_run, y_name)
-                            with closing(sqlite3.connect(str(raw_db_path))) as conn:
-                                _ensure_test_data_raw_cache_tables(conn)
-                                conn.execute(
-                                    """
-                                    INSERT OR REPLACE INTO td_raw_condition_observations(
-                                        observation_id, run_name, serial, program_title, source_run_name, run_type, pulse_width, control_period, source_mtime_ns, computed_epoch_ns
-                                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                                    """,
-                                    (
-                                        observation_id,
-                                        effective_run,
-                                        sn,
-                                        source_program_title,
-                                        str(run_info.get("source_run_name") or run).strip(),
-                                        str(run_info.get("run_type") or "").strip(),
-                                        _finite_float(pulse_width_value),
-                                        _finite_float(run_info.get("control_period")),
-                                        mtime_ns,
-                                        computed_epoch_ns,
-                                    ),
-                                )
-                                if table_name not in raw_tables_created:
-                                    conn.execute(
-                                        f"""
-                                        CREATE TABLE IF NOT EXISTS {_quote_ident(table_name)} (
-                                            observation_id TEXT PRIMARY KEY,
-                                            serial TEXT NOT NULL,
-                                            program_title TEXT,
-                                            source_run_name TEXT,
-                                            x_json TEXT NOT NULL,
-                                            y_json TEXT NOT NULL,
-                                            n_points INTEGER NOT NULL,
-                                            source_mtime_ns INTEGER,
-                                            computed_epoch_ns INTEGER NOT NULL
-                                        )
-                                        """
-                                    )
-                                    raw_tables_created.add(table_name)
-                                payload = (
+                            raw_conn.execute(
+                                """
+                                INSERT OR REPLACE INTO td_raw_condition_observations(
+                                    observation_id, run_name, serial, program_title, source_run_name, run_type, pulse_width, control_period, source_mtime_ns, computed_epoch_ns
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                """,
+                                (
+                                    observation_id,
                                     effective_run,
-                                    y_name,
-                                    default_x,
+                                    sn,
+                                    source_program_title,
+                                    str(run_info.get("source_run_name") or run).strip(),
+                                    str(run_info.get("run_type") or "").strip(),
+                                    _finite_float(pulse_width_value),
+                                    _finite_float(run_info.get("control_period")),
+                                    mtime_ns,
+                                    computed_epoch_ns,
+                                ),
+                            )
+                            if table_name not in raw_tables_created:
+                                raw_conn.execute(
+                                    f"""
+                                    CREATE TABLE IF NOT EXISTS {_quote_ident(table_name)} (
+                                        observation_id TEXT PRIMARY KEY,
+                                        serial TEXT NOT NULL,
+                                        program_title TEXT,
+                                        source_run_name TEXT,
+                                        x_json TEXT NOT NULL,
+                                        y_json TEXT NOT NULL,
+                                        n_points INTEGER NOT NULL,
+                                        source_mtime_ns INTEGER,
+                                        computed_epoch_ns INTEGER NOT NULL
+                                    )
+                                    """
+                                )
+                                raw_tables_created.add(table_name)
+                            payload = (
+                                effective_run,
+                                y_name,
+                                default_x,
+                                observation_id,
+                                sn,
+                                x_json_txt,
+                                y_json_txt,
+                                int(len(xs)),
+                                mtime_ns,
+                                computed_epoch_ns,
+                                source_program_title,
+                                str(run_info.get("source_run_name") or run).strip(),
+                            )
+                            raw_conn.execute(
+                                """
+                                INSERT OR REPLACE INTO td_curves_raw
+                                (run_name, y_name, x_name, observation_id, serial, x_json, y_json, n_points, source_mtime_ns, computed_epoch_ns, program_title, source_run_name)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                """,
+                                payload,
+                            )
+                            raw_conn.execute(
+                                """
+                                INSERT OR REPLACE INTO td_curves
+                                (run_name, y_name, x_name, observation_id, serial, x_json, y_json, n_points, source_mtime_ns, computed_epoch_ns, program_title, source_run_name)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                """,
+                                payload,
+                            )
+                            raw_conn.execute(
+                                f"""
+                                INSERT OR REPLACE INTO {_quote_ident(table_name)}
+                                (observation_id, serial, program_title, source_run_name, x_json, y_json, n_points, source_mtime_ns, computed_epoch_ns)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                """,
+                                (
                                     observation_id,
                                     sn,
+                                    source_program_title,
+                                    str(run_info.get("source_run_name") or run).strip(),
                                     x_json_txt,
                                     y_json_txt,
                                     int(len(xs)),
                                     mtime_ns,
                                     computed_epoch_ns,
-                                    source_program_title,
-                                    str(run_info.get("source_run_name") or run).strip(),
-                                )
-                                conn.execute(
-                                    """
-                                    INSERT OR REPLACE INTO td_curves_raw
-                                    (run_name, y_name, x_name, observation_id, serial, x_json, y_json, n_points, source_mtime_ns, computed_epoch_ns, program_title, source_run_name)
-                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                                    """,
-                                    payload,
-                                )
-                                conn.execute(
-                                    """
-                                    INSERT OR REPLACE INTO td_curves
-                                    (run_name, y_name, x_name, observation_id, serial, x_json, y_json, n_points, source_mtime_ns, computed_epoch_ns, program_title, source_run_name)
-                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                                    """,
-                                    payload,
-                                )
-                                conn.execute(
-                                    f"""
-                                    INSERT OR REPLACE INTO {_quote_ident(table_name)}
-                                    (observation_id, serial, program_title, source_run_name, x_json, y_json, n_points, source_mtime_ns, computed_epoch_ns)
-                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                                    """,
-                                    (
-                                        observation_id,
-                                        sn,
-                                        source_program_title,
-                                        str(run_info.get("source_run_name") or run).strip(),
-                                        x_json_txt,
-                                        y_json_txt,
-                                        int(len(xs)),
-                                        mtime_ns,
-                                        computed_epoch_ns,
-                                    ),
-                                )
-                                conn.execute(
-                                    """
-                                    INSERT OR REPLACE INTO td_raw_curve_catalog
-                                    (run_name, parameter_name, units, x_axis_kind, table_name, display_name, source_kind, computed_epoch_ns)
-                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                                    """,
-                                    (
-                                        effective_run,
-                                        y_name,
-                                        str(cfg_units.get(y_name) or "").strip(),
-                                        default_x,
-                                        table_name,
-                                        run_display_name,
-                                        "source_sqlite",
-                                        computed_epoch_ns,
-                                    ),
-                                )
-                                conn.commit()
+                                ),
+                            )
+                            raw_conn.execute(
+                                """
+                                INSERT OR REPLACE INTO td_raw_curve_catalog
+                                (run_name, parameter_name, units, x_axis_kind, table_name, display_name, source_kind, computed_epoch_ns)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                                """,
+                                (
+                                    effective_run,
+                                    y_name,
+                                    str(cfg_units.get(y_name) or "").strip(),
+                                    default_x,
+                                    table_name,
+                                    run_display_name,
+                                    "source_sqlite",
+                                    computed_epoch_ns,
+                                ),
+                            )
                             curves_written += 1
                             source_curves_written += 1
                             run_curves_written += 1
@@ -7741,21 +7764,18 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
                         if source_issue_notes
                         else "No usable raw curves were written for any discovered run."
                     )
-                    with closing(sqlite3.connect(str(db_path))) as conn:
-                        _ensure_test_data_impl_tables(conn)
-                        conn.execute(
-                            "UPDATE td_sources SET status=?, last_ingested_epoch_ns=? WHERE serial=?",
-                            ("invalid", computed_epoch_ns, sn),
-                        )
-                        conn.execute(
-                            """
-                            INSERT OR REPLACE INTO td_source_diagnostics(
-                                serial, resolved_sqlite_path, status, run_name, x_axis_kind, matched_y_json, curves_written, metrics_written, reason
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                            """,
-                            (sn, str(sqlite_path), "invalid", "", "", "[]", 0, 0, summary_reason),
-                        )
-                        conn.commit()
+                    impl_conn.execute(
+                        "UPDATE td_sources SET status=?, last_ingested_epoch_ns=? WHERE serial=?",
+                        ("invalid", computed_epoch_ns, sn),
+                    )
+                    impl_conn.execute(
+                        """
+                        INSERT OR REPLACE INTO td_source_diagnostics(
+                            serial, resolved_sqlite_path, status, run_name, x_axis_kind, matched_y_json, curves_written, metrics_written, reason
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (sn, str(sqlite_path), "invalid", "", "", "[]", 0, 0, summary_reason),
+                    )
                     if debug_sources:
                         debug_sources[source_debug_source_idx]["status"] = "invalid"
                         debug_sources[source_debug_source_idx]["reason"] = summary_reason
@@ -7782,31 +7802,28 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
                     pass
 
         except Exception as exc:
-            with closing(sqlite3.connect(str(db_path))) as conn:
-                _ensure_test_data_impl_tables(conn)
-                conn.execute(
-                    "UPDATE td_sources SET status=?, last_ingested_epoch_ns=? WHERE serial=?",
-                    ("invalid", computed_epoch_ns, sn),
-                )
-                conn.execute(
-                    """
-                    INSERT OR REPLACE INTO td_source_diagnostics(
-                        serial, resolved_sqlite_path, status, run_name, x_axis_kind, matched_y_json, curves_written, metrics_written, reason
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        sn,
-                        str(sqlite_path) if sqlite_path else "",
-                        "invalid",
-                        "",
-                        "",
-                        "[]",
-                        0,
-                        0,
-                        f"Failed to ingest source SQLite: {type(exc).__name__}: {exc}",
-                    ),
-                )
-                conn.commit()
+            impl_conn.execute(
+                "UPDATE td_sources SET status=?, last_ingested_epoch_ns=? WHERE serial=?",
+                ("invalid", computed_epoch_ns, sn),
+            )
+            impl_conn.execute(
+                """
+                INSERT OR REPLACE INTO td_source_diagnostics(
+                    serial, resolved_sqlite_path, status, run_name, x_axis_kind, matched_y_json, curves_written, metrics_written, reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    sn,
+                    str(sqlite_path) if sqlite_path else "",
+                    "invalid",
+                    "",
+                    "",
+                    "[]",
+                    0,
+                    0,
+                    f"Failed to ingest source SQLite: {type(exc).__name__}: {exc}",
+                ),
+            )
             debug_diagnostics.append(
                 {
                     **source_info,
@@ -7840,17 +7857,14 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
             source_link_update_errors.append(str(exc))
 
     if diagnostics_rows:
-        with closing(sqlite3.connect(str(db_path))) as conn:
-            _ensure_test_data_impl_tables(conn)
-            conn.executemany(
-                """
-                INSERT OR REPLACE INTO td_source_diagnostics(
-                    serial, resolved_sqlite_path, status, run_name, x_axis_kind, matched_y_json, curves_written, metrics_written, reason
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                diagnostics_rows,
-            )
-            conn.commit()
+        impl_conn.executemany(
+            """
+            INSERT OR REPLACE INTO td_source_diagnostics(
+                serial, resolved_sqlite_path, status, run_name, x_axis_kind, matched_y_json, curves_written, metrics_written, reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            diagnostics_rows,
+        )
 
     debug_payload = {
         "workbook": str(wb_path),
@@ -7959,71 +7973,72 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
             display_by_run[run] = _collapse_ws(disp) or base
 
     # Write raw-cache runs + columns tables only.
-    with closing(sqlite3.connect(str(raw_db_path))) as raw_conn:
-        _ensure_test_data_raw_cache_tables(raw_conn)
-        cfg_order = [n for n, _u in y_cols if n]
-        for run in sorted(runs_all, key=lambda s: str(s).lower()):
-            xs = run_x_union.get(run, set())
-            default_x = run_default_x.get(run, "")
-            if not default_x:
-                for x in x_priority:
-                    if x in xs:
-                        default_x = x
-                        break
-            run_meta = dict(run_meta_by_run.get(run) or {})
-            display_name = str(display_by_run.get(run) or run_meta.get("display_name") or run).strip() or str(run)
-            run_type = str(run_meta.get("run_type") or "").strip()
-            control_period = _finite_float(run_meta.get("control_period"))
-            pulse_width = _finite_float(run_meta.get("pulse_width"))
+    cfg_order = [n for n, _u in y_cols if n]
+    for run in sorted(runs_all, key=lambda s: str(s).lower()):
+        xs = run_x_union.get(run, set())
+        default_x = run_default_x.get(run, "")
+        if not default_x:
+            for x in x_priority:
+                if x in xs:
+                    default_x = x
+                    break
+        run_meta = dict(run_meta_by_run.get(run) or {})
+        display_name = str(display_by_run.get(run) or run_meta.get("display_name") or run).strip() or str(run)
+        run_type = str(run_meta.get("run_type") or "").strip()
+        control_period = _finite_float(run_meta.get("control_period"))
+        pulse_width = _finite_float(run_meta.get("pulse_width"))
+        raw_conn.execute(
+            "INSERT OR REPLACE INTO td_runs(run_name, default_x, display_name, run_type, control_period, pulse_width) VALUES (?, ?, ?, ?, ?, ?)",
+            (run, default_x, display_name, run_type, control_period, pulse_width),
+        )
+        raw_conn.execute(
+            """
+            INSERT OR REPLACE INTO td_raw_sequences(run_name, display_name, x_axis_kind, source_run_name, pulse_width, run_type, control_period, computed_epoch_ns)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run,
+                display_name,
+                default_x,
+                run,
+                pulse_width if pulse_width is not None else _finite_float(run_pulse_width_by_run.get(run)),
+                run_type,
+                control_period,
+                computed_epoch_ns,
+            ),
+        )
+        for x in sorted(xs, key=lambda k: x_priority.index(k) if k in x_priority else 999):
             raw_conn.execute(
-                "INSERT OR REPLACE INTO td_runs(run_name, default_x, display_name, run_type, control_period, pulse_width) VALUES (?, ?, ?, ?, ?, ?)",
-                (run, default_x, display_name, run_type, control_period, pulse_width),
+                "INSERT OR REPLACE INTO td_columns(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
+                (run, x, "", "x"),
+            )
+            raw_conn.execute(
+                "INSERT OR REPLACE INTO td_columns_raw(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
+                (run, x, "", "x"),
+            )
+
+        y_map_raw = run_y_raw_union.get(run, {}) or {}
+        y_ordered_raw = [n for n in cfg_order if n in y_map_raw] + sorted([n for n in y_map_raw.keys() if n not in cfg_order], key=lambda s: str(s).lower())
+        for y_name in y_ordered_raw:
+            if _norm_name(y_name) in x_exclude_norms:
+                continue
+            units = str(y_map_raw.get(y_name) or "").strip()
+            raw_conn.execute(
+                "INSERT OR REPLACE INTO td_columns_raw(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
+                (run, y_name, units, "y"),
             )
             raw_conn.execute(
                 """
-                INSERT OR REPLACE INTO td_raw_sequences(run_name, display_name, x_axis_kind, source_run_name, pulse_width, run_type, control_period, computed_epoch_ns)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                UPDATE td_raw_curve_catalog
+                SET units=?, x_axis_kind=?, display_name=?
+                WHERE run_name=? AND parameter_name=?
                 """,
-                (
-                    run,
-                    display_name,
-                    default_x,
-                    run,
-                    pulse_width if pulse_width is not None else _finite_float(run_pulse_width_by_run.get(run)),
-                    run_type,
-                    control_period,
-                    computed_epoch_ns,
-                ),
+                (units, default_x, display_name, run, y_name),
             )
-            for x in sorted(xs, key=lambda k: x_priority.index(k) if k in x_priority else 999):
-                raw_conn.execute(
-                    "INSERT OR REPLACE INTO td_columns(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
-                    (run, x, "", "x"),
-                )
-                raw_conn.execute(
-                    "INSERT OR REPLACE INTO td_columns_raw(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
-                    (run, x, "", "x"),
-                )
-
-            y_map_raw = run_y_raw_union.get(run, {}) or {}
-            y_ordered_raw = [n for n in cfg_order if n in y_map_raw] + sorted([n for n in y_map_raw.keys() if n not in cfg_order], key=lambda s: str(s).lower())
-            for y_name in y_ordered_raw:
-                if _norm_name(y_name) in x_exclude_norms:
-                    continue
-                units = str(y_map_raw.get(y_name) or "").strip()
-                raw_conn.execute(
-                    "INSERT OR REPLACE INTO td_columns_raw(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
-                    (run, y_name, units, "y"),
-                )
-                raw_conn.execute(
-                    """
-                    UPDATE td_raw_curve_catalog
-                    SET units=?, x_axis_kind=?, display_name=?
-                    WHERE run_name=? AND parameter_name=?
-                    """,
-                    (units, default_x, display_name, run, y_name),
-                )
-        raw_conn.commit()
+    impl_conn.commit()
+    raw_conn.commit()
+    impl_conn.close()
+    raw_conn.close()
 
     calc_payload = _rebuild_test_data_project_calc_cache_from_raw(db_path, wb_path)
     metrics_written = int(calc_payload.get("metrics_written") or 0)
@@ -10648,6 +10663,24 @@ def _td_perf_excel_formula_for_model(
     return ""
 
 
+def _td_perf_derived_3sigma_equation_text(
+    stat: str,
+    models_by_stat: Mapping[str, Mapping[str, object]],
+) -> tuple[str, str]:
+    raw = str(stat or "").strip().lower()
+    if raw not in {"min_3sigma", "max_3sigma"}:
+        return "", ""
+    mean_model = models_by_stat.get("mean") or {}
+    std_model = models_by_stat.get("std") or {}
+    mean_eq = str((mean_model or {}).get("equation") or "").strip()
+    std_eq = str((std_model or {}).get("equation") or "").strip()
+    if not mean_eq or not std_eq:
+        return "", ""
+    sign = "-" if raw == "min_3sigma" else "+"
+    norm_text = str((mean_model or {}).get("x_norm_equation") or (std_model or {}).get("x_norm_equation") or "").strip()
+    return f"({mean_eq}) {sign} 3*({std_eq})", norm_text
+
+
 def td_perf_export_equation_workbook(
     db_path: Path,
     output_path: Path,
@@ -10741,13 +10774,18 @@ def td_perf_export_equation_workbook(
     unavailable_stats: list[str] = []
     for stat in TD_PERF_EXPORT_STATS_ORDER:
         model = models_by_stat.get(stat)
-        if model is None:
+        derived_eq, derived_norm = _td_perf_derived_3sigma_equation_text(stat, models_by_stat)
+        if model is None and not derived_eq:
             unavailable_stats.append(stat)
             continue
         ws.cell(stat_meta_row, 1).value = stat
-        ws.cell(stat_meta_row, 2).value = td_perf_fit_family_label(model.get("fit_family"))
-        ws.cell(stat_meta_row, 3).value = str(model.get("equation") or "")
-        ws.cell(stat_meta_row, 4).value = str(model.get("x_norm_equation") or "")
+        ws.cell(stat_meta_row, 2).value = (
+            td_perf_fit_family_label(model.get("fit_family"))
+            if model is not None
+            else "Derived from Mean and Std"
+        )
+        ws.cell(stat_meta_row, 3).value = derived_eq or str((model or {}).get("equation") or "")
+        ws.cell(stat_meta_row, 4).value = derived_norm or str((model or {}).get("x_norm_equation") or "")
         stat_meta_row += 1
     if unavailable_stats:
         ws.cell(stat_meta_row, 1).value = "Unavailable Stats"
@@ -10857,33 +10895,38 @@ def td_perf_export_equation_workbook(
 
         for stat in TD_PERF_EXPORT_STATS_ORDER:
             model = models_by_stat.get(stat)
-            if model is None:
-                continue
-            family = td_perf_normalize_fit_mode(model.get("fit_family"))
-            stat_norm_x_ref = norm_x_ref
-            stat_norm_x1_ref = norm_x_ref
-            stat_norm_x2_ref = norm_x2_ref
-            if family == TD_PERF_FIT_MODE_POLYNOMIAL and bool(model.get("normalize_x")):
-                stat_norm_x_ref = _td_perf_excel_norm_expr(raw_x_ref, model.get("x0"), model.get("sx"))
-            elif family == TD_PERF_FIT_MODE_HYBRID_QUADRATIC_RESIDUAL and bool((model.get("params") or {}).get("normalize_x")):
-                stat_norm_x_ref = _td_perf_excel_norm_expr(
-                    raw_x_ref,
-                    (model.get("params") or {}).get("x0"),
-                    (model.get("params") or {}).get("sx"),
+            formula = ""
+            if stat in {"min_3sigma", "max_3sigma"} and {"mean", "std"} <= set(models_by_stat.keys()):
+                mean_ref = _td_perf_excel_ref(col_by_name["pred_mean"], idx)
+                std_ref = _td_perf_excel_ref(col_by_name["pred_std"], idx)
+                sign = "-" if stat == "min_3sigma" else "+"
+                formula = f"={mean_ref}{sign}(3*{std_ref})"
+            elif model is not None:
+                family = td_perf_normalize_fit_mode(model.get("fit_family"))
+                stat_norm_x_ref = norm_x_ref
+                stat_norm_x1_ref = norm_x_ref
+                stat_norm_x2_ref = norm_x2_ref
+                if family == TD_PERF_FIT_MODE_POLYNOMIAL and bool(model.get("normalize_x")):
+                    stat_norm_x_ref = _td_perf_excel_norm_expr(raw_x_ref, model.get("x0"), model.get("sx"))
+                elif family == TD_PERF_FIT_MODE_HYBRID_QUADRATIC_RESIDUAL and bool((model.get("params") or {}).get("normalize_x")):
+                    stat_norm_x_ref = _td_perf_excel_norm_expr(
+                        raw_x_ref,
+                        (model.get("params") or {}).get("x0"),
+                        (model.get("params") or {}).get("sx"),
+                    )
+                elif family in {TD_PERF_FIT_FAMILY_PLANE, TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE}:
+                    stat_norm_x1_ref = _td_perf_excel_norm_expr(raw_x_ref, model.get("x1_center"), model.get("x1_scale"))
+                    stat_norm_x2_ref = _td_perf_excel_norm_expr(raw_x2_ref, model.get("x2_center"), model.get("x2_scale"))
+                formula = _td_perf_excel_formula_for_model(
+                    model,
+                    raw_x_ref=raw_x_ref,
+                    norm_x_ref=stat_norm_x_ref,
+                    raw_x1_ref=raw_x_ref,
+                    raw_x2_ref=raw_x2_ref,
+                    norm_x1_ref=stat_norm_x1_ref,
+                    norm_x2_ref=stat_norm_x2_ref,
+                    pchip_segments=pchip_support_by_stat.get(stat),
                 )
-            elif family in {TD_PERF_FIT_FAMILY_PLANE, TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE}:
-                stat_norm_x1_ref = _td_perf_excel_norm_expr(raw_x_ref, model.get("x1_center"), model.get("x1_scale"))
-                stat_norm_x2_ref = _td_perf_excel_norm_expr(raw_x2_ref, model.get("x2_center"), model.get("x2_scale"))
-            formula = _td_perf_excel_formula_for_model(
-                model,
-                raw_x_ref=raw_x_ref,
-                norm_x_ref=stat_norm_x_ref,
-                raw_x1_ref=raw_x_ref,
-                raw_x2_ref=raw_x2_ref,
-                norm_x1_ref=stat_norm_x1_ref,
-                norm_x2_ref=stat_norm_x2_ref,
-                pchip_segments=pchip_support_by_stat.get(stat),
-            )
             if formula:
                 ws.cell(idx, col_by_name[f"pred_{stat}"]).value = formula
 
@@ -11548,11 +11591,52 @@ def update_test_data_trending_project_workbook(
         wb.save(str(wb_path))
         timings["pre_cache_workbook_save_s"] = round(time.perf_counter() - t0, 3)
         t0 = time.perf_counter()
-        db_path = ensure_test_data_project_cache(
-            project_dir,
-            wb_path,
-            rebuild=bool(cache_missing or not require_existing_cache),
-        )
+        if require_existing_cache and not cache_missing:
+            db_path = validate_existing_test_data_project_cache(project_dir, wb_path)
+            cached_support_mtime_ns = 0
+            cached_stats_csv = ""
+            cached_raw_cols_csv = ""
+            cached_serials: set[str] = set()
+            try:
+                with sqlite3.connect(str(db_path)) as cache_conn:
+                    row = cache_conn.execute("SELECT value FROM td_meta WHERE key='support_workbook_mtime_ns' LIMIT 1").fetchone()
+                    cached_support_mtime_ns = int(str(row[0]).strip()) if row and row[0] is not None else 0
+                    row = cache_conn.execute("SELECT value FROM td_meta WHERE key='statistics' LIMIT 1").fetchone()
+                    cached_stats_csv = str(row[0] or "").strip() if row and row[0] is not None else ""
+                    row = cache_conn.execute("SELECT value FROM td_meta WHERE key='raw_columns' LIMIT 1").fetchone()
+                    cached_raw_cols_csv = str(row[0] or "").strip() if row and row[0] is not None else ""
+                    cached_serials = {
+                        str(row[0] or "").strip()
+                        for row in cache_conn.execute("SELECT serial FROM td_sources").fetchall()
+                        if str(row[0] or "").strip()
+                    }
+            except Exception:
+                cached_support_mtime_ns = 0
+                cached_stats_csv = ""
+                cached_raw_cols_csv = ""
+                cached_serials = set()
+
+            current_stats_csv = ",".join(_td_normalize_selected_stats(project_cfg.get("statistics")))
+            current_raw_cols_csv = ",".join(cfg_order)
+            support_mtime_ns = 0
+            try:
+                support_path = td_support_workbook_path_for(wb_path, project_dir=project_dir)
+                if support_path.exists():
+                    st = support_path.stat()
+                    support_mtime_ns = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)))
+            except Exception:
+                support_mtime_ns = 0
+
+            if set(serials) != cached_serials or bool(added_serials) or cached_raw_cols_csv != current_raw_cols_csv:
+                db_path = ensure_test_data_project_cache(project_dir, wb_path, rebuild=False)
+            elif cached_stats_csv != current_stats_csv or int(cached_support_mtime_ns) != int(support_mtime_ns):
+                _rebuild_test_data_project_calc_cache_from_raw(db_path, wb_path)
+        else:
+            db_path = ensure_test_data_project_cache(
+                project_dir,
+                wb_path,
+                rebuild=bool(cache_missing or not require_existing_cache),
+            )
         timings["cache_ensure_s"] = round(time.perf_counter() - t0, 3)
 
     def _parse_metric(s: object) -> tuple[str, str, str] | None:
@@ -12190,6 +12274,13 @@ def get_file_artifacts_path(global_repo: Path, rel_path: str) -> Path | None:
     ext = path_obj.suffix.lower()
     root = eidat_debug_ocr_root(repo)
     candidates: list[Path] = []
+    if ext == ".mat" and detect_mat_bundle_member is not None and mat_bundle_artifacts_dir is not None:
+        try:
+            bundle = detect_mat_bundle_member(repo / path_obj, repo_root=repo)
+        except Exception:
+            bundle = None
+        if bundle is not None:
+            candidates.append(mat_bundle_artifacts_dir(eidat_support_dir(repo), bundle))
     if ext in EXCEL_EXTENSIONS:
         candidates.append(root / f"{stem}{EXCEL_ARTIFACT_SUFFIX}")
     candidates.append(root / stem)

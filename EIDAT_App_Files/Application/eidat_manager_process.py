@@ -24,6 +24,22 @@ from eidat_manager_metadata import (
     load_metadata_from_artifacts,
     write_metadata,
 )
+try:
+    from eidat_manager_mat_bundle import (  # type: ignore
+        MatBundleMember,
+        detect_mat_bundle_member,
+        list_mat_bundle_members,
+        mat_bundle_artifacts_dir,
+        mat_bundle_sqlite_path,
+    )
+except Exception:
+    from .eidat_manager_mat_bundle import (  # type: ignore
+        MatBundleMember,
+        detect_mat_bundle_member,
+        list_mat_bundle_members,
+        mat_bundle_artifacts_dir,
+        mat_bundle_sqlite_path,
+    )
 
 
 @dataclass(frozen=True)
@@ -914,7 +930,121 @@ def _resolve_user_inputs_file(name: str) -> Path:
 
 
 def _excel_artifacts_dir(paths: SupportPaths, excel_path: Path) -> Path:
+    if excel_path.suffix.lower() in MAT_EXTENSIONS:
+        bundle = detect_mat_bundle_member(excel_path, repo_root=paths.global_repo)
+        if bundle is not None:
+            return mat_bundle_artifacts_dir(paths.support_dir, bundle)
     return paths.support_dir / "debug" / "ocr" / f"{excel_path.stem}{EXCEL_ARTIFACT_SUFFIX}"
+
+
+def _safe_repo_rel(repo_root: Path, path: Path) -> str:
+    try:
+        return path.resolve().relative_to(repo_root.resolve()).as_posix()
+    except Exception:
+        try:
+            return path.relative_to(repo_root).as_posix()
+        except Exception:
+            return str(path)
+
+
+def _bundle_identity_path(member: MatBundleMember) -> Path:
+    return member.file_path.with_name(f"{member.bundle_stem}.mat")
+
+
+def _merge_bundle_metadata(items: list[dict[str, Any]]) -> dict[str, Any]:
+    merged: dict[str, Any] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        for key, value in item.items():
+            if key not in merged:
+                merged[key] = value
+                continue
+            cur = merged.get(key)
+            cur_text = str(cur or "").strip()
+            new_text = str(value or "").strip()
+            if key == "document_type_evidence":
+                if cur in (None, [], "") and value not in (None, [], ""):
+                    merged[key] = value
+                continue
+            if cur_text in {"", "Unknown", "unknown"} and new_text not in {"", "Unknown", "unknown"}:
+                merged[key] = value
+    return merged
+
+
+def _cleanup_stale_mat_member_artifacts(paths: SupportPaths, members: list[MatBundleMember], keep_dir: Path) -> None:
+    for member in members:
+        old_dir = paths.support_dir / "debug" / "ocr" / f"{member.file_path.stem}{EXCEL_ARTIFACT_SUFFIX}"
+        try:
+            if old_dir.resolve() == keep_dir.resolve():
+                continue
+        except Exception:
+            if str(old_dir) == str(keep_dir):
+                continue
+        if old_dir.exists():
+            shutil.rmtree(old_dir, ignore_errors=True)
+
+
+def _write_mat_bundle_manifest(
+    *,
+    global_repo: Path,
+    artifacts_dir: Path,
+    bundle: MatBundleMember,
+    members: list[MatBundleMember],
+    sqlite_path: Path,
+    metadata_path: Path | None,
+) -> Path:
+    payload = {
+        "bundle_key": bundle.group_key,
+        "bundle_stem": bundle.bundle_stem,
+        "serial_number": bundle.serial_number,
+        "source_dir_rel": _safe_repo_rel(global_repo, bundle.file_path.parent),
+        "sqlite_rel": _safe_repo_rel(global_repo, sqlite_path),
+        "metadata_rel": _safe_repo_rel(global_repo, metadata_path) if metadata_path is not None else "",
+        "members": [
+            {
+                "rel_path": _safe_repo_rel(global_repo, member.file_path),
+                "file_name": member.file_path.name,
+                "sequence_name": member.sequence_name,
+                "sequence_number": int(member.sequence_number),
+            }
+            for member in members
+        ],
+    }
+    out = artifacts_dir / "mat_seq_bundle.json"
+    out.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
+    return out
+
+
+def _mark_files_processed(
+    conn: Any,
+    *,
+    global_repo: Path,
+    rel_paths: list[str],
+    now_ns: int,
+) -> None:
+    for rel_path in rel_paths:
+        abs_path = (global_repo / Path(rel_path)).expanduser()
+        try:
+            content_sha1 = _sha1_file(abs_path)
+        except Exception:
+            content_sha1 = ""
+        try:
+            st = abs_path.stat()
+            mtime_ns = int(getattr(st, "st_mtime_ns", 0) or 0)
+        except Exception:
+            mtime_ns = 0
+        conn.execute(
+            """
+            UPDATE files
+            SET last_processed_epoch_ns = ?,
+                last_processed_mtime_ns = ?,
+                content_sha1 = ?,
+                needs_processing = 0
+            WHERE rel_path = ?
+            """,
+            (now_ns, mtime_ns, content_sha1, rel_path),
+        )
 
 
 def _derive_data_file_metadata(excel_mod: Any | None, data_path: Path) -> dict:
@@ -1044,7 +1174,7 @@ def process_candidates(
             excel_mod = _load_excel_extractor()
         return excel_mod
 
-    def _get_excel_sqlite_helpers() -> tuple[Any, Any, Any, Any, Any]:
+    def _get_excel_sqlite_helpers() -> tuple[Any, Any, Any, Any, Any, Any]:
         nonlocal excel_sqlite_helpers
         if excel_sqlite_helpers is None:
             try:
@@ -1054,6 +1184,7 @@ def process_candidates(
                     excel_to_sqlite,
                     export_sqlite_excel_mirror,
                     export_sqlite_text_mirror,
+                    write_mat_bundle_sqlite,
                 )
             except Exception:
                 from .eidat_manager_excel_to_sqlite import (  # type: ignore
@@ -1062,6 +1193,7 @@ def process_candidates(
                     excel_to_sqlite,
                     export_sqlite_excel_mirror,
                     export_sqlite_text_mirror,
+                    write_mat_bundle_sqlite,
                 )
             excel_sqlite_helpers = (
                 excel_to_sqlite,
@@ -1069,6 +1201,7 @@ def process_candidates(
                 export_sqlite_excel_mirror,
                 _load_test_data_env,
                 _truthy,
+                write_mat_bundle_sqlite,
             )
         return excel_sqlite_helpers
 
@@ -1102,6 +1235,7 @@ def process_candidates(
             ).fetchall()
 
         results: list[ProcessResult] = []
+        bundle_outcomes: dict[str, ProcessResult] = {}
         prev_env = _set_env_for_support(paths)
         try:
             processed = 0
@@ -1119,6 +1253,16 @@ def process_candidates(
                 except Exception:
                     pass
                 abs_path = (paths.global_repo / Path(rel_path)).expanduser()
+                if rel_path in bundle_outcomes:
+                    cached = bundle_outcomes[rel_path]
+                    results.append(cached)
+                    if cached.ok:
+                        processed += 1
+                    try:
+                        print(f"[PROCESS] {attempted}/{total} done: {rel_path}", file=sys.stderr, flush=True)
+                    except Exception:
+                        pass
+                    continue
                 try:
                     if not abs_path.exists():
                         raise FileNotFoundError(f"Missing file: {abs_path}")
@@ -1136,17 +1280,41 @@ def process_candidates(
 
                     if is_data_matrix:
                         excel_mod = _get_excel_mod() if is_excel else None
-                        artifacts_root = _excel_artifacts_dir(paths, abs_path)
+                        bundle_seed = detect_mat_bundle_member(abs_path, repo_root=paths.global_repo) if is_mat else None
+                        bundle_members = list_mat_bundle_members(abs_path, repo_root=paths.global_repo) if bundle_seed is not None else []
+                        is_mat_bundle = bool(bundle_seed is not None and bundle_members)
+                        artifacts_root = (
+                            mat_bundle_artifacts_dir(paths.support_dir, bundle_seed)
+                            if is_mat_bundle and bundle_seed is not None
+                            else _excel_artifacts_dir(paths, abs_path)
+                        )
                         artifacts_dir = str(artifacts_root)
+                        metadata_identity_path = _bundle_identity_path(bundle_seed) if is_mat_bundle and bundle_seed is not None else abs_path
 
                         # Load any existing artifacts metadata first (treated as curated when present).
                         try:
-                            existing_meta = load_metadata_from_artifacts(artifacts_root, abs_path)
+                            existing_meta = load_metadata_from_artifacts(artifacts_root, metadata_identity_path)
                         except Exception:
                             existing_meta = None
 
                         # Extract metadata from workbook cells + filename (like PDFs use combined/title).
-                        if is_excel:
+                        if is_mat_bundle and bundle_seed is not None:
+                            per_member_meta: list[dict[str, Any]] = []
+                            for member in bundle_members:
+                                base_meta = _derive_data_file_metadata(None, member.file_path)
+                                try:
+                                    resolved_meta = canonicalize_metadata_for_file(
+                                        member.file_path,
+                                        existing_meta=None,
+                                        extracted_meta=base_meta,
+                                        default_document_type="TD",
+                                    )
+                                except Exception:
+                                    resolved_meta = base_meta if isinstance(base_meta, dict) else {}
+                                if isinstance(resolved_meta, dict):
+                                    per_member_meta.append(dict(resolved_meta))
+                            extracted_meta = _merge_bundle_metadata(per_member_meta)
+                        elif is_excel:
                             try:
                                 extracted_meta = extract_metadata_from_excel(abs_path)
                             except Exception:
@@ -1157,13 +1325,17 @@ def process_candidates(
                         # Canonicalize once up front so TD detection is stable.
                         try:
                             raw_meta = canonicalize_metadata_for_file(
-                                abs_path,
+                                bundle_seed.file_path if is_mat_bundle and bundle_seed is not None else abs_path,
                                 existing_meta=existing_meta,
                                 extracted_meta=extracted_meta,
                                 default_document_type="TD" if is_mat else "Unknown",
                             )
                         except Exception:
                             raw_meta = extracted_meta if isinstance(extracted_meta, dict) else {}
+                        if is_mat_bundle and bundle_seed is not None and isinstance(raw_meta, dict):
+                            raw_meta["serial_number"] = bundle_seed.serial_number
+                            raw_meta["document_type"] = "TD"
+                            raw_meta["document_type_acronym"] = "TD"
 
                         is_test_data = bool(is_mat) or _is_test_data_meta(raw_meta if isinstance(raw_meta, dict) else {})
 
@@ -1193,35 +1365,47 @@ def process_candidates(
                                     export_sqlite_excel_mirror,
                                     _load_test_data_env,
                                     _truthy,
+                                    write_mat_bundle_sqlite,
                                 ) = _get_excel_sqlite_helpers()
-                                payload = excel_to_sqlite(
-                                    global_repo=paths.global_repo,
-                                    excel_files=[abs_path],
-                                    data_dir=None,
-                                    out_dir=Path(artifacts_root),
-                                    overwrite=True,
-                                )
                                 sqlite_rel = ""
                                 sqlite_abs: Path | None = None
-                                try:
-                                    results_list = list((payload or {}).get("results") or [])
-                                except Exception:
-                                    results_list = []
-                                for r0 in results_list:
+                                if is_mat_bundle and bundle_seed is not None:
+                                    artifacts_root.mkdir(parents=True, exist_ok=True)
+                                    _cleanup_stale_mat_member_artifacts(paths, bundle_members, artifacts_root)
+                                    sqlite_abs = mat_bundle_sqlite_path(paths.support_dir, bundle_seed)
+                                    write_mat_bundle_sqlite(
+                                        mat_paths=[member.file_path for member in bundle_members],
+                                        sqlite_path=sqlite_abs,
+                                        overwrite=True,
+                                    )
+                                    sqlite_rel = _safe_repo_rel(paths.global_repo, sqlite_abs)
+                                else:
+                                    payload = excel_to_sqlite(
+                                        global_repo=paths.global_repo,
+                                        excel_files=[abs_path],
+                                        data_dir=None,
+                                        out_dir=Path(artifacts_root),
+                                        overwrite=True,
+                                    )
                                     try:
-                                        sp = str((r0 or {}).get("sqlite_path") or "").strip()
+                                        results_list = list((payload or {}).get("results") or [])
                                     except Exception:
-                                        sp = ""
-                                    if sp:
+                                        results_list = []
+                                    for r0 in results_list:
                                         try:
-                                            sqlite_abs = Path(sp).expanduser()
+                                            sp = str((r0 or {}).get("sqlite_path") or "").strip()
                                         except Exception:
-                                            sqlite_abs = None
-                                        try:
-                                            sqlite_rel = str(Path(sp).resolve().relative_to(paths.global_repo.resolve()))
-                                        except Exception:
-                                            sqlite_rel = sp
-                                        break
+                                            sp = ""
+                                        if sp:
+                                            try:
+                                                sqlite_abs = Path(sp).expanduser()
+                                            except Exception:
+                                                sqlite_abs = None
+                                            try:
+                                                sqlite_rel = str(Path(sp).resolve().relative_to(paths.global_repo.resolve()))
+                                            except Exception:
+                                                sqlite_rel = sp
+                                            break
                                 if not sqlite_rel:
                                     raise RuntimeError("excel_to_sqlite did not report an output sqlite_path")
                                 if isinstance(raw_meta, dict):
@@ -1244,19 +1428,60 @@ def process_candidates(
                                             export_sqlite_excel_mirror(sqlite_abs)
                                         except Exception:
                                             pass
+                                if is_mat_bundle and bundle_seed is not None:
+                                    member_rels = [_safe_repo_rel(paths.global_repo, member.file_path) for member in bundle_members]
+                                    _mark_files_processed(
+                                        conn,
+                                        global_repo=paths.global_repo,
+                                        rel_paths=member_rels,
+                                        now_ns=now_ns,
+                                    )
+                                    for member_rel, member in zip(member_rels, bundle_members):
+                                        if member_rel == rel_path:
+                                            continue
+                                        bundle_outcomes[member_rel] = ProcessResult(
+                                            rel_path=member_rel,
+                                            abs_path=str(member.file_path),
+                                            ok=True,
+                                            artifacts_dir=str(artifacts_root),
+                                        )
                             except Exception as exc:
+                                if is_mat_bundle and bundle_seed is not None:
+                                    for member in bundle_members:
+                                        member_rel = _safe_repo_rel(paths.global_repo, member.file_path)
+                                        if member_rel == rel_path:
+                                            continue
+                                        bundle_outcomes[member_rel] = ProcessResult(
+                                            rel_path=member_rel,
+                                            abs_path=str(member.file_path),
+                                            ok=False,
+                                            error=f"MAT -> SQLite failed: {exc}",
+                                        )
                                 # For Test Data-like matrix sources, SQLite creation is required.
                                 label = "MAT" if is_mat else "Test Data Excel"
                                 raise RuntimeError(f"{label} -> SQLite failed: {exc}") from exc
 
                         # Final canonicalization pass to preserve any existing curated fields and fill blanks.
                         clean_meta = canonicalize_metadata_for_file(
-                            abs_path,
+                            bundle_seed.file_path if is_mat_bundle and bundle_seed is not None else abs_path,
                             existing_meta=existing_meta,
                             extracted_meta=raw_meta,
                             default_document_type="TD" if is_mat else "Unknown",
                         )
-                        metadata_path = write_metadata(Path(artifacts_dir), abs_path, clean_meta)
+                        if is_mat_bundle and bundle_seed is not None:
+                            clean_meta["serial_number"] = bundle_seed.serial_number
+                            clean_meta["document_type"] = "TD"
+                            clean_meta["document_type_acronym"] = "TD"
+                        metadata_path = write_metadata(Path(artifacts_dir), metadata_identity_path, clean_meta)
+                        if is_mat_bundle and bundle_seed is not None:
+                            _write_mat_bundle_manifest(
+                                global_repo=paths.global_repo,
+                                artifacts_dir=artifacts_root,
+                                bundle=bundle_seed,
+                                members=bundle_members,
+                                sqlite_path=mat_bundle_sqlite_path(paths.support_dir, bundle_seed),
+                                metadata_path=metadata_path,
+                            )
                     else:
                         core = _get_core()
                         # Use default debug-method pipeline (fused tables)

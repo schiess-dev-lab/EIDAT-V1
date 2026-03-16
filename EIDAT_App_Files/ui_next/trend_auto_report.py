@@ -245,6 +245,483 @@ def _td_metric_map(conn: sqlite3.Connection, run_name: str, column_name: str, st
     return out
 
 
+def _selection_observation_filters(selection: dict | None) -> tuple[str, str]:
+    if not isinstance(selection, dict):
+        return "", ""
+    if str(selection.get("mode") or "sequence").strip().lower() != "sequence":
+        return "", ""
+    program_title = str(selection.get("program_title") or "").strip()
+    source_run_name = str(selection.get("source_run_name") or selection.get("sequence_name") or "").strip()
+    return program_title, source_run_name
+
+
+def _selection_for_run(run_name: str, options: dict) -> dict:
+    run = str(run_name or "").strip()
+    if not run:
+        return {}
+    run_selections = options.get("run_selections") or []
+    if not isinstance(run_selections, list):
+        return {}
+
+    best: dict = {}
+    for selection in run_selections:
+        if not isinstance(selection, dict):
+            continue
+        members = [str(v).strip() for v in (selection.get("member_runs") or []) if str(v).strip()]
+        sel_run = str(selection.get("run_name") or "").strip()
+        if run not in members and run != sel_run:
+            continue
+        if str(selection.get("mode") or "sequence").strip().lower() == "sequence":
+            return dict(selection)
+        if not best:
+            best = dict(selection)
+    return best
+
+
+def _td_serial_metadata_by_serial(rows: list[dict]) -> dict[str, dict]:
+    by_sn: dict[str, dict] = {}
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        sn = str(row.get("serial") or row.get("serial_number") or "").strip()
+        if sn and sn not in by_sn:
+            by_sn[sn] = dict(row)
+    return by_sn
+
+
+def _td_order_metric_serials(labels: list[str], serial_rows: list[dict]) -> list[str]:
+    meta_by_sn = _td_serial_metadata_by_serial(serial_rows)
+    serials: list[str] = []
+    seen: set[str] = set()
+    for raw_sn in labels or []:
+        sn = str(raw_sn or "").strip()
+        if not sn or sn in seen:
+            continue
+        seen.add(sn)
+        serials.append(sn)
+
+    def _sort_key(sn: str) -> tuple[int, str, str]:
+        row = meta_by_sn.get(sn) or {}
+        program = str(row.get("program_title") or "").strip() or "Unknown Program"
+        return (
+            1 if program == "Unknown Program" else 0,
+            program.casefold(),
+            sn.casefold(),
+        )
+
+    return sorted(serials, key=_sort_key)
+
+
+def _series_rows_to_metric_map(rows: list[dict]) -> dict[str, float]:
+    out: dict[str, float] = {}
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        sn = str(row.get("serial") or "").strip()
+        val = row.get("value_num")
+        if not sn or not isinstance(val, (int, float)) or not math.isfinite(float(val)):
+            continue
+        out[sn] = float(val)
+    return out
+
+
+def _resolve_td_y_col_from_rows(rows: list[dict], target: str) -> tuple[str, str]:
+    tgt = str(target or "").strip()
+    if not tgt:
+        return "", ""
+    want = _norm_key(tgt)
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        name = str(row.get("name") or "").strip()
+        if name and _norm_key(name) == want:
+            return name, str(row.get("units") or "").strip()
+    return tgt, ""
+
+
+def _resolve_curve_x_key(be: Any, db_path: Path, run_name: str, x_label: str) -> str:
+    run = str(run_name or "").strip()
+    label = str(x_label or "").strip()
+    if not run or not label:
+        return label
+
+    def _norm_name(value: object) -> str:
+        return "".join(ch.lower() for ch in str(value or "").strip() if ch.isalnum())
+
+    time_norms = {_norm_name(x) for x in ("time", "time_s", "time(sec)", "time(s)", "time (s)", "time_sec", "times")}
+    pulse_norms = {_norm_name(x) for x in ("pulse number", "pulse#", "pulse #", "pulse_number", "pulsenumber", "cycle")}
+
+    try:
+        xs = be.td_list_x_columns(db_path, run)
+    except Exception:
+        xs = []
+    xs = [str(x or "").strip() for x in (xs or []) if str(x or "").strip()]
+    if label in xs:
+        return label
+
+    by_norm: dict[str, str] = {}
+    for x in xs:
+        nk = _norm_name(x)
+        if nk and nk not in by_norm:
+            by_norm[nk] = x
+
+    want = _norm_name(label)
+    if want == _norm_name("excel_row"):
+        for pref in ("Time", "Time (s)", "Time(s)", "time_s", "time"):
+            resolved = by_norm.get(_norm_name(pref))
+            if resolved:
+                return resolved
+        for pref in ("Pulse Number", "Pulse #", "cycle", "Cycle", "pulse_number", "pulsenumber"):
+            resolved = by_norm.get(_norm_name(pref))
+            if resolved:
+                return resolved
+    if want in time_norms:
+        for pref in ("Time", "Time (s)", "Time(s)", "time_s", "time"):
+            resolved = by_norm.get(_norm_name(pref))
+            if resolved:
+                return resolved
+    if want in pulse_norms:
+        for pref in ("Pulse Number", "Pulse #", "cycle", "Cycle", "pulse_number", "pulsenumber"):
+            resolved = by_norm.get(_norm_name(pref))
+            if resolved:
+                return resolved
+    return label
+
+
+def _load_metric_series_for_selection(
+    be: Any,
+    db_path: Path,
+    run_name: str,
+    column_name: str,
+    stat: str,
+    *,
+    selection: dict | None = None,
+    control_period_filter: object = None,
+) -> list[dict]:
+    program_title, source_run_name = _selection_observation_filters(selection)
+    try:
+        return be.td_load_metric_series(
+            db_path,
+            run_name,
+            column_name,
+            stat,
+            program_title=(program_title or None),
+            source_run_name=(source_run_name or None),
+            control_period_filter=control_period_filter,
+        )
+    except Exception:
+        return []
+
+
+def _load_metric_map_for_selection(
+    be: Any,
+    db_path: Path,
+    run_name: str,
+    column_name: str,
+    stat: str,
+    *,
+    selection: dict | None = None,
+    control_period_filter: object = None,
+) -> dict[str, float]:
+    rows = _load_metric_series_for_selection(
+        be,
+        db_path,
+        run_name,
+        column_name,
+        stat,
+        selection=selection,
+        control_period_filter=control_period_filter,
+    )
+    return _series_rows_to_metric_map(rows)
+
+
+def _load_perf_equation_metric_series(
+    be: Any,
+    db_path: Path,
+    run_name: str,
+    column_name: str,
+    stat: str,
+    *,
+    selection: dict | None = None,
+    control_period_filter: object = None,
+) -> list[dict]:
+    st = str(stat or "").strip().lower()
+    if not st:
+        return []
+    if st in {"min_3sigma", "max_3sigma"}:
+        resolver = getattr(be, "td_perf_mean_3sigma_value", None)
+        if not callable(resolver):
+            return []
+        mean_rows = _load_metric_series_for_selection(
+            be,
+            db_path,
+            run_name,
+            column_name,
+            "mean",
+            selection=selection,
+            control_period_filter=control_period_filter,
+        )
+        std_rows = _load_metric_series_for_selection(
+            be,
+            db_path,
+            run_name,
+            column_name,
+            "std",
+            selection=selection,
+            control_period_filter=control_period_filter,
+        )
+        mean_by_obs = {
+            str(row.get("observation_id") or "").strip(): dict(row)
+            for row in mean_rows
+            if isinstance(row, dict) and str(row.get("observation_id") or "").strip()
+        }
+        std_by_obs = {
+            str(row.get("observation_id") or "").strip(): dict(row)
+            for row in std_rows
+            if isinstance(row, dict) and str(row.get("observation_id") or "").strip()
+        }
+        out: list[dict] = []
+        for obs_id in sorted(set(mean_by_obs.keys()) | set(std_by_obs.keys())):
+            mean_row = mean_by_obs.get(obs_id) or {}
+            std_row = std_by_obs.get(obs_id) or {}
+            try:
+                val = resolver(
+                    {
+                        "mean": (mean_row or {}).get("value_num"),
+                        "std": (std_row or {}).get("value_num"),
+                    },
+                    st,
+                )
+            except Exception:
+                val = None
+            if not isinstance(val, (int, float)) or not math.isfinite(float(val)):
+                continue
+            base_row = dict(mean_row or std_row)
+            base_row["value_num"] = float(val)
+            out.append(base_row)
+        return out
+    return _load_metric_series_for_selection(
+        be,
+        db_path,
+        run_name,
+        column_name,
+        st,
+        selection=selection,
+        control_period_filter=control_period_filter,
+    )
+
+
+def _curve_rows_to_series(rows: list[dict]) -> list[CurveSeries]:
+    out: list[CurveSeries] = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        sn = str(row.get("serial") or "").strip()
+        xs = row.get("x")
+        ys = row.get("y")
+        if not sn or not isinstance(xs, list) or not isinstance(ys, list) or not xs or not ys:
+            continue
+        pts = min(len(xs), len(ys))
+        x_vals: list[float] = []
+        y_vals: list[float] = []
+        for idx in range(pts):
+            xf = _safe_float(xs[idx])
+            yf = _safe_float(ys[idx])
+            if xf is None or yf is None:
+                continue
+            x_vals.append(float(xf))
+            y_vals.append(float(yf))
+        if len(x_vals) < 2 or len(y_vals) < 2:
+            continue
+        out.append(CurveSeries(serial=sn, x=x_vals, y=y_vals))
+    return out
+
+
+def _load_curves_for_selection(
+    be: Any,
+    db_path: Path,
+    run_name: str,
+    y_name: str,
+    x_name: str,
+    *,
+    selection: dict | None = None,
+    serials: list[str] | None = None,
+) -> list[CurveSeries]:
+    program_title, source_run_name = _selection_observation_filters(selection)
+    try:
+        rows = be.td_load_curves(
+            db_path,
+            run_name,
+            y_name,
+            x_name,
+            serials=serials,
+            program_title=(program_title or None),
+            source_run_name=(source_run_name or None),
+        )
+    except Exception:
+        rows = []
+    return _curve_rows_to_series(rows)
+
+
+def _read_gui_source_metadata(be: Any, workbook_path: Path) -> tuple[dict[str, dict[str, str]], str]:
+    reader = getattr(be, "td_read_sources_metadata", None)
+    loader = getattr(be, "_load_td_source_metadata", None)
+    if not callable(reader):
+        return {}, "GUI source metadata unavailable (td_read_sources_metadata missing)."
+    wb_path = Path(workbook_path).expanduser()
+    try:
+        source_rows = reader(wb_path)
+    except Exception as exc:
+        return {}, f"GUI source metadata unavailable ({exc})."
+    if not isinstance(source_rows, list) or not source_rows:
+        return {}, "GUI source metadata unavailable (Sources sheet empty)."
+
+    meta_by_sn: dict[str, dict[str, str]] = {}
+    for row in source_rows:
+        if not isinstance(row, dict):
+            continue
+        sn = str(row.get("serial") or row.get("serial_number") or "").strip()
+        if not sn:
+            continue
+        payload = dict(row)
+        if callable(loader):
+            try:
+                loaded = loader(wb_path, row)
+                if isinstance(loaded, dict):
+                    payload = dict(loaded)
+            except Exception:
+                payload = dict(row)
+        meta_by_sn[sn] = {
+            "program_title": str(payload.get("program_title") or "").strip(),
+            "asset_type": str(payload.get("asset_type") or "").strip(),
+            "asset_specific_type": str(payload.get("asset_specific_type") or "").strip(),
+            "vendor": str(payload.get("vendor") or "").strip(),
+            "acceptance_test_plan_number": str(payload.get("acceptance_test_plan_number") or "").strip(),
+            "part_number": str(payload.get("part_number") or "").strip(),
+            "revision": str(payload.get("revision") or "").strip(),
+            "test_date": str(payload.get("test_date") or "").strip(),
+            "report_date": str(payload.get("report_date") or "").strip(),
+            "document_type": str(payload.get("document_type") or "").strip(),
+            "document_type_acronym": str(payload.get("document_type_acronym") or "").strip(),
+            "similarity_group": str(payload.get("similarity_group") or "").strip(),
+        }
+    if not meta_by_sn:
+        return {}, "GUI source metadata unavailable (resolved metadata empty)."
+    return meta_by_sn, ""
+
+
+def _series_by_observation(rows: list[dict], serial_set: set[str] | None = None) -> dict[str, dict]:
+    out: dict[str, dict] = {}
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        obs_id = str(row.get("observation_id") or "").strip()
+        sn = str(row.get("serial") or "").strip()
+        val = row.get("value_num")
+        if not obs_id or not sn:
+            continue
+        if serial_set is not None and sn not in serial_set:
+            continue
+        if not isinstance(val, (int, float)) or not math.isfinite(float(val)):
+            continue
+        out[obs_id] = dict(row)
+    return out
+
+
+def _perf_observation_label(run_display: str, run_name: str, row: dict) -> str:
+    parts: list[str] = [str(run_display or run_name).strip() or str(run_name or "").strip()]
+    for key in ("program_title", "source_run_name"):
+        value = str((row or {}).get(key) or "").strip()
+        if value and value not in parts:
+            parts.append(value)
+    return " | ".join([part for part in parts if str(part).strip()])
+
+
+def _collect_performance_curves_for_stat(
+    *,
+    be: Any,
+    db_path: Path,
+    conn: sqlite3.Connection,
+    run_by_name: dict[str, dict],
+    runs: list[str],
+    serials: list[str],
+    x_target: str,
+    y_target: str,
+    stat: str,
+    options: dict,
+    require_min_points: int,
+    control_period_filter: object = None,
+) -> tuple[dict[str, list[tuple[float, float, str]]], list[float], list[float], str, str]:
+    serial_set = {str(sn).strip() for sn in serials if str(sn).strip()}
+    per_run: list[tuple[str, str, dict[str, dict], dict[str, dict], str, str]] = []
+    for rn in runs:
+        run_selection = _selection_for_run(rn, options)
+        metric_cols = []
+        try:
+            metric_cols = be.td_list_metric_y_columns(db_path, rn)
+        except Exception:
+            metric_cols = []
+        if not metric_cols:
+            metric_cols = _td_list_y_columns(conn, rn)
+        x_col, x_units = _resolve_td_y_col_from_rows(metric_cols, x_target)
+        y_col, y_units = _resolve_td_y_col_from_rows(metric_cols, y_target)
+        if not x_col or not y_col:
+            continue
+        x_rows = _load_perf_equation_metric_series(
+            be,
+            db_path,
+            rn,
+            x_col,
+            stat,
+            selection=run_selection,
+            control_period_filter=control_period_filter,
+        )
+        y_rows = _load_perf_equation_metric_series(
+            be,
+            db_path,
+            rn,
+            y_col,
+            stat,
+            selection=run_selection,
+            control_period_filter=control_period_filter,
+        )
+        x_map = _series_by_observation(x_rows, serial_set)
+        y_map = _series_by_observation(y_rows, serial_set)
+        if not x_map or not y_map:
+            continue
+        run_display = str((run_by_name.get(rn) or {}).get("display_name") or "").strip() or rn
+        per_run.append((rn, run_display, x_map, y_map, x_units, y_units))
+
+    curves: dict[str, list[tuple[float, float, str]]] = {}
+    pooled_x: list[float] = []
+    pooled_y: list[float] = []
+    for sn in serials:
+        pts: list[tuple[float, float, str]] = []
+        for rn, run_display, x_map, y_map, _xu, _yu in per_run:
+            obs_ids = sorted(set(x_map.keys()) & set(y_map.keys()))
+            for obs_id in obs_ids:
+                row_x = x_map.get(obs_id) or {}
+                row_y = y_map.get(obs_id) or {}
+                if str(row_y.get("serial") or row_x.get("serial") or "").strip() != sn:
+                    continue
+                pts.append(
+                    (
+                        float(row_x.get("value_num") or 0.0),
+                        float(row_y.get("value_num") or 0.0),
+                        _perf_observation_label(run_display, rn, row_y or row_x),
+                    )
+                )
+        if len(pts) >= require_min_points:
+            pts.sort(key=lambda t: t[0])
+            curves[sn] = pts
+            pooled_x.extend([p[0] for p in pts])
+            pooled_y.extend([p[1] for p in pts])
+
+    x_units = next((str(xu).strip() for *_rest, xu, _yu in per_run if str(xu).strip()), "")
+    y_units = next((str(yu).strip() for *_rest, _xu, yu in per_run if str(yu).strip()), "")
+    return curves, pooled_x, pooled_y, x_units, y_units
+
+
 def _td_units_for_y(conn: sqlite3.Connection) -> dict[str, list[str]]:
     try:
         rows = conn.execute("SELECT name, units FROM td_columns WHERE kind='y'").fetchall()
@@ -579,21 +1056,70 @@ def _resolve_selected_runs(run_rows: list[dict], options: dict) -> list[str]:
     return [r for r in runs if r in run_by_name]
 
 
-def _resolve_selected_params(conn: sqlite3.Connection, *, runs: list[str], options: dict) -> list[str]:
+def _resolve_selected_params(
+    be_or_conn: Any,
+    db_path: Path | None = None,
+    conn: sqlite3.Connection | None = None,
+    *,
+    runs: list[str],
+    options: dict,
+) -> list[str]:
     selected_params = options.get("params") or []
     params = [str(p).strip() for p in selected_params if str(p).strip()] if isinstance(selected_params, list) else []
     if params:
         return params
 
-    # Auto-detect from cache/workbook (td_columns).
+    be = be_or_conn
+    if conn is None and isinstance(be_or_conn, sqlite3.Connection):
+        conn = be_or_conn
+        be = None
+
+    # Auto-detect from the same raw-curve dataset that backs the GUI Curves tab.
+    def _norm_name(value: object) -> str:
+        return "".join(ch.lower() for ch in str(value or "") if ch.isalnum())
+
+    x_exclude_norms = {
+        _norm_name(x)
+        for x in (
+            "time",
+            "time_s",
+            "time(sec)",
+            "time(s)",
+            "time (s)",
+            "time_sec",
+            "times",
+            "pulse number",
+            "pulse#",
+            "pulse #",
+            "pulse_number",
+            "pulsenumber",
+            "cycle",
+            "excel_row",
+        )
+    }
     seen: set[str] = set()
     auto: list[str] = []
     for run in runs:
-        for c in _td_list_y_columns(conn, run):
+        cols: list[dict] = []
+        if be is not None and db_path is not None:
+            try:
+                cols = be.td_list_raw_y_columns(db_path, run)
+            except Exception:
+                cols = []
+            if not cols:
+                try:
+                    cols = be.td_list_curve_y_columns(db_path, run)
+                except Exception:
+                    cols = []
+        if not cols and conn is not None:
+            cols = _td_list_y_columns(conn, run)
+        for c in cols:
             name = str(c.get("name") or "").strip()
             if not name:
                 continue
             nk = _norm_key(name)
+            if _norm_name(name) in x_exclude_norms:
+                continue
             if nk in seen:
                 continue
             seen.add(nk)
@@ -1375,7 +1901,12 @@ def generate_test_data_auto_report(
             change_summary = "excel_trend_config.json update disabled."
 
         conn = sqlite3.connect(str(Path(db_path).expanduser()))
-        all_serials = _td_list_serials(conn)
+        source_rows = []
+        try:
+            source_rows = be.td_read_sources_metadata(wb)
+        except Exception:
+            source_rows = []
+        all_serials = _td_order_metric_serials(be.td_list_serials(db_path), source_rows) or _td_list_serials(conn)
         run_rows = _td_list_runs(conn)
         run_by_name = {str(r.get("run_name") or "").strip(): r for r in (run_rows or []) if str(r.get("run_name") or "").strip()}
 
@@ -1399,7 +1930,7 @@ def generate_test_data_auto_report(
             if isinstance(c, dict) and str(c.get("name") or "").strip()
         }
 
-        params = _resolve_selected_params(conn, runs=runs, options=options)
+        params = _resolve_selected_params(be, db_path, conn, runs=runs, options=options)
         if not params:
             raise RuntimeError(
                 "Auto Report found no reportable Test Data parameters in the current project cache. "
@@ -1435,8 +1966,20 @@ def generate_test_data_auto_report(
 
         for run in runs:
             run_meta = run_by_name.get(run) or {}
-            x_name = str(run_meta.get("default_x") or "").strip() or "Time"
-            y_cols = _td_list_y_columns(conn, run)
+            run_selection = _selection_for_run(run, options)
+            x_name = _resolve_curve_x_key(be, db_path, run, str(run_meta.get("default_x") or "").strip() or "Time")
+            y_cols = []
+            try:
+                y_cols = be.td_list_curve_y_columns(db_path, run, x_name)
+            except Exception:
+                y_cols = []
+            if not y_cols:
+                try:
+                    y_cols = be.td_list_raw_y_columns(db_path, run)
+                except Exception:
+                    y_cols = []
+            if not y_cols:
+                y_cols = _td_list_y_columns(conn, run)
             y_by_norm = {_norm_key(str(c.get("name") or "")): c for c in y_cols if str(c.get("name") or "").strip()}
 
             for p in params:
@@ -1446,7 +1989,14 @@ def generate_test_data_auto_report(
                 y_name = str(y_by_norm[nk].get("name") or "").strip()
                 units = str(y_by_norm[nk].get("units") or "").strip()
 
-                series = _load_curves(conn, run, y_name, x_name)
+                series = _load_curves_for_selection(
+                    be,
+                    db_path,
+                    run,
+                    y_name,
+                    x_name,
+                    selection=run_selection,
+                )
                 if not series:
                     continue
 
@@ -1564,16 +2114,20 @@ def generate_test_data_auto_report(
 
         cache_meta_by_sn, cache_meta_note = _read_cached_source_metadata(conn)
         workbook_meta_by_sn, workbook_meta_note = _read_workbook_metadata(wb)
+        gui_meta_by_sn, gui_meta_note = _read_gui_source_metadata(be, wb)
         meta_by_sn: dict[str, dict[str, str]] = {}
-        for sn in sorted(set(cache_meta_by_sn.keys()) | set(workbook_meta_by_sn.keys())):
+        for sn in sorted(set(cache_meta_by_sn.keys()) | set(workbook_meta_by_sn.keys()) | set(gui_meta_by_sn.keys())):
             merged = dict(workbook_meta_by_sn.get(sn) or {})
             for key, value in (cache_meta_by_sn.get(sn) or {}).items():
+                if str(value or "").strip():
+                    merged[key] = str(value).strip()
+            for key, value in (gui_meta_by_sn.get(sn) or {}).items():
                 if str(value or "").strip():
                     merged[key] = str(value).strip()
             meta_by_sn[sn] = merged
         meta_note = ""
         if not meta_by_sn:
-            meta_note = cache_meta_note or workbook_meta_note
+            meta_note = gui_meta_note or cache_meta_note or workbook_meta_note
 
         def _meta(sn: str, key: str) -> str:
             try:
@@ -1586,6 +2140,18 @@ def generate_test_data_auto_report(
             if program:
                 return f"{program}\n{sn}"
             return sn
+
+        def _metric_map_for_run(run_name: str, column_name: str, stat: str, *, control_period_filter: object = None) -> dict[str, float]:
+            selection = _selection_for_run(run_name, options)
+            return _load_metric_map_for_selection(
+                be,
+                db_path,
+                run_name,
+                column_name,
+                stat,
+                selection=selection,
+                control_period_filter=control_period_filter,
+            )
 
         grade_map: dict[tuple[str, str, str], str] = {}
         for r in grading_rows:
@@ -1938,7 +2504,14 @@ def generate_test_data_auto_report(
             for run in runs:
                 for p in params:
                     nk = _norm_key(p)
-                    col, units = _resolve_td_y_col(conn, run, p)
+                    metric_cols = []
+                    try:
+                        metric_cols = be.td_list_metric_y_columns(db_path, run)
+                    except Exception:
+                        metric_cols = []
+                    if not metric_cols:
+                        metric_cols = _td_list_y_columns(conn, run)
+                    col, units = _resolve_td_y_col_from_rows(metric_cols, p)
                     if not col:
                         continue
                     col_by_run_param_norm[(run, nk)] = col
@@ -1946,7 +2519,7 @@ def generate_test_data_auto_report(
                         units_by_param_norm[nk] = units
                     key = (run, col)
                     if key not in metric_map_cache:
-                        metric_map_cache[key] = _td_metric_map(conn, run, col, summary_metric_stat)
+                        metric_map_cache[key] = _metric_map_for_run(run, col, summary_metric_stat)
 
             def _pooled_median(sn: str, p: str) -> float | None:
                 nk = _norm_key(p)
@@ -2019,34 +2592,21 @@ def generate_test_data_auto_report(
                     fit_degree = max(0, fit_degree)
                     fit_norm = bool((fit_cfg.get("normalize_x") if isinstance(fit_cfg, dict) else True))
 
-                    per_run: list[tuple[str, str, dict[str, float], dict[str, float], str, str]] = []
-                    for rn in runs:
-                        x_col, x_units = _resolve_td_y_col(conn, rn, x_target)
-                        y_col, y_units = _resolve_td_y_col(conn, rn, y_target)
-                        xmap = _td_metric_map(conn, rn, x_col, st)
-                        ymap = _td_metric_map(conn, rn, y_col, st)
-                        dn = str((run_by_name.get(rn) or {}).get("display_name") or "").strip()
-                        per_run.append((rn, dn or rn, xmap, ymap, x_units, y_units))
-
-                    curves: dict[str, list[tuple[float, float, str]]] = {}
-                    pooled_x: list[float] = []
-                    pooled_y: list[float] = []
-                    for sn in all_serials:
-                        pts: list[tuple[float, float, str]] = []
-                        for _rn, rdisp, xmap, ymap, _xu, _yu in per_run:
-                            if sn not in xmap or sn not in ymap:
-                                continue
-                            pts.append((float(xmap[sn]), float(ymap[sn]), rdisp))
-                        if len(pts) >= require_min_points:
-                            pts.sort(key=lambda t: t[0])
-                            curves[sn] = pts
-                            pooled_x.extend([p[0] for p in pts])
-                            pooled_y.extend([p[1] for p in pts])
+                    curves, pooled_x, pooled_y, x_units, y_units = _collect_performance_curves_for_stat(
+                        be=be,
+                        db_path=db_path,
+                        conn=conn,
+                        run_by_name=run_by_name,
+                        runs=runs,
+                        serials=all_serials,
+                        x_target=x_target,
+                        y_target=y_target,
+                        stat=st,
+                        options=options,
+                        require_min_points=require_min_points,
+                    )
                     if not curves:
                         continue
-
-                    x_units = next((str(xu).strip() for *_rest, xu, _yu in per_run if str(xu).strip()), "")
-                    y_units = next((str(yu).strip() for *_rest, _xu, yu in per_run if str(yu).strip()), "")
 
                     # Fits (master + investigated)
                     master_poly: dict = {"degree": int(fit_degree), "coeffs": [], "rmse": None, "x0": None, "sx": None}
@@ -2180,7 +2740,7 @@ def generate_test_data_auto_report(
                     run_meta = run_by_name.get(run) or {}
                     run_title = str(run_meta.get("display_name") or "").strip() or run
                     units = str(((curves_summary.get(run, {}) or {}).get(param_name) or {}).get("units") or "").strip()
-                    vmap = _td_metric_map(conn, run, param_name, metric_stat)
+                    vmap = _metric_map_for_run(run, param_name, metric_stat)
                     yv = [(float(vmap.get(sn)) if isinstance(vmap.get(sn), (int, float)) else float("nan")) for sn in serials]
                     if not any(isinstance(v, (int, float)) and not math.isnan(float(v)) for v in yv):
                         continue
@@ -2230,9 +2790,17 @@ def generate_test_data_auto_report(
             for run, param_name in charts_sel:
                 run_meta = run_by_name.get(run) or {}
                 run_title = str(run_meta.get("display_name") or "").strip() or run
-                x_name = str(run_meta.get("default_x") or "").strip() or "Time"
+                run_selection = _selection_for_run(run, options)
+                x_name = _resolve_curve_x_key(be, db_path, run, str(run_meta.get("default_x") or "").strip() or "Time")
                 model = (curves_summary.get(run, {}) or {}).get(param_name) or {}
-                series = _load_curves(conn, run, param_name, x_name)
+                series = _load_curves_for_selection(
+                    be,
+                    db_path,
+                    run,
+                    param_name,
+                    x_name,
+                    selection=run_selection,
+                )
                 if not series:
                     continue
                 dom = model.get("domain") or []
@@ -2295,7 +2863,7 @@ def generate_test_data_auto_report(
                     run_meta = run_by_name.get(run) or {}
                     run_title = str(run_meta.get("display_name") or "").strip() or run
                     units = str(((curves_summary.get(run, {}) or {}).get(param_name) or {}).get("units") or "").strip()
-                    vmap = _td_metric_map(conn, run, param_name, metric_stat)
+                    vmap = _metric_map_for_run(run, param_name, metric_stat)
                     serials = all_serials
                     x_idx = list(range(len(serials)))
                     yv = [(float(vmap.get(sn)) if isinstance(vmap.get(sn), (int, float)) else float("nan")) for sn in serials]
@@ -2304,7 +2872,7 @@ def generate_test_data_auto_report(
 
                     fig = plt.figure(figsize=(11.0, 8.5), dpi=120)
                     ax = fig.add_subplot(111)
-                    ax.set_title(f"Metrics — {run_title} — {param_name} ({metrics_stat})")
+                    ax.set_title(f"Metrics — {run_title} — {param_name} ({metric_stat})")
                     ax.set_xlabel("Serial Number")
                     ax.set_ylabel(f"{param_name} ({units})" if units else param_name)
 
@@ -2420,37 +2988,21 @@ def generate_test_data_auto_report(
                     fit_norm = bool((fit_cfg.get("normalize_x") if isinstance(fit_cfg, dict) else True))
 
                     for st in stats_list:
-                        # Build per-run metric maps once for this stat.
-                        per_run: list[tuple[str, str, dict[str, float], dict[str, float], str, str]] = []
-                        for rn in runs:
-                            x_col, x_units = _resolve_td_y_col(conn, rn, x_target)
-                            y_col, y_units = _resolve_td_y_col(conn, rn, y_target)
-                            xmap = _td_metric_map(conn, rn, x_col, st)
-                            ymap = _td_metric_map(conn, rn, y_col, st)
-                            dn = str((run_by_name.get(rn) or {}).get("display_name") or "").strip()
-                            per_run.append((rn, dn or rn, xmap, ymap, x_units, y_units))
-
-                        # Assemble per-serial points across runs + pooled points for master fit.
-                        curves: dict[str, list[tuple[float, float, str]]] = {}
-                        pooled_x: list[float] = []
-                        pooled_y: list[float] = []
-                        for sn in all_serials:
-                            pts: list[tuple[float, float, str]] = []
-                            for _rn, rdisp, xmap, ymap, _xu, _yu in per_run:
-                                if sn not in xmap or sn not in ymap:
-                                    continue
-                                pts.append((float(xmap[sn]), float(ymap[sn]), rdisp))
-                            if len(pts) >= require_min_points:
-                                pts.sort(key=lambda t: t[0])
-                                curves[sn] = pts
-                                pooled_x.extend([p[0] for p in pts])
-                                pooled_y.extend([p[1] for p in pts])
+                        curves, pooled_x, pooled_y, x_units, y_units = _collect_performance_curves_for_stat(
+                            be=be,
+                            db_path=db_path,
+                            conn=conn,
+                            run_by_name=run_by_name,
+                            runs=runs,
+                            serials=all_serials,
+                            x_target=x_target,
+                            y_target=y_target,
+                            stat=st,
+                            options=options,
+                            require_min_points=require_min_points,
+                        )
                         if not curves:
                             continue
-
-                        # Units: prefer first non-empty
-                        x_units = next((u for *_rest, u, _ in per_run if str(u).strip()), "")
-                        y_units = next((u for *_rest, _, u in per_run if str(u).strip()), "")
 
                         # Fits (master + highlighted)
                         master_poly: dict = {"degree": int(fit_degree), "coeffs": [], "rmse": None, "x0": None, "sx": None}

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import difflib
 import json
+import math
 import os
 import re
 import sqlite3
@@ -768,6 +769,352 @@ def _write_mat_sqlite(*, mat_path: Path, sqlite_path: Path, overwrite: bool) -> 
     _stderr(f"[DONE] {mat_path.name} -> {sqlite_path}")
     return {
         "source_file": str(mat_path),
+        "sqlite_path": str(sqlite_path),
+        "skipped": False,
+        "sheets": outputs,
+    }
+
+
+def _mat_is_numeric_scalar(value: Any) -> bool:
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, (int, float)):
+        return True
+    try:
+        import numpy as np  # type: ignore
+    except Exception:
+        np = None  # type: ignore
+    return bool(np is not None and isinstance(value, np.generic) and getattr(value, "dtype", None) is not None and getattr(value.dtype, "kind", "") in {"i", "u", "f"})
+
+
+def _mat_series_value(value: Any) -> float | int | None:
+    scalar = _mat_coerce_scalar(value)
+    if scalar is None or isinstance(scalar, bool):
+        return None
+    if isinstance(scalar, int):
+        return scalar
+    try:
+        num = float(scalar)
+    except Exception:
+        return None
+    if not math.isfinite(num):
+        return None
+    if float(num).is_integer():
+        try:
+            return int(num)
+        except Exception:
+            return num
+    return num
+
+
+def _mat_collect_numeric_series(value: Any, prefix: str = "") -> dict[str, list[float | int | None]]:
+    try:
+        import numpy as np  # type: ignore
+    except Exception:
+        np = None  # type: ignore
+
+    out: dict[str, list[float | int | None]] = {}
+
+    def _store(name: str, values: list[Any]) -> None:
+        clean_name = str(name or "value").strip() or "value"
+        seq = [_mat_series_value(v) for v in values]
+        if seq:
+            out[clean_name] = seq
+
+    if isinstance(value, dict):
+        for key, item in value.items():
+            child = f"{prefix}.{key}" if prefix else str(key)
+            out.update(_mat_collect_numeric_series(item, child))
+        return out
+
+    if isinstance(value, (list, tuple)):
+        if value and all(_mat_is_numeric_scalar(item) for item in value):
+            _store(prefix or "value", list(value))
+            return out
+        for idx, item in enumerate(value):
+            child = f"{prefix}[{idx}]"
+            out.update(_mat_collect_numeric_series(item, child))
+        return out
+
+    if np is not None and isinstance(value, np.ndarray):
+        kind = getattr(getattr(value, "dtype", None), "kind", "")
+        if kind in {"i", "u", "f"}:
+            if value.ndim == 1 and int(value.size) > 0:
+                _store(prefix or "value", value.tolist())
+                return out
+            if value.ndim == 2 and int(min(value.shape)) == 1 and int(max(value.shape)) > 0:
+                _store(prefix or "value", value.reshape(-1).tolist())
+                return out
+            return out
+        if kind == "O":
+            for idx, item in enumerate(value.reshape(-1).tolist()):
+                child = f"{prefix}[{idx}]"
+                out.update(_mat_collect_numeric_series(item, child))
+            return out
+        if value.dtype.names:
+            for name in value.dtype.names:
+                child = f"{prefix}.{name}" if prefix else str(name)
+                try:
+                    out.update(_mat_collect_numeric_series(value[name], child))
+                except Exception:
+                    continue
+        return out
+
+    return out
+
+
+def _mat_extract_run_table(
+    mat_path: Path,
+    *,
+    canonical_defs: list[dict[str, Any]],
+    fuzzy_min_ratio: float,
+) -> dict[str, Any]:
+    payload = _load_mat_payload(mat_path)
+    series_by_name: dict[str, list[float | int | None]] = {}
+    for raw_key, raw_value in sorted(payload.items()):
+        key = str(raw_key or "").strip()
+        if not key or key.startswith("__"):
+            continue
+        nested = _mat_collect_numeric_series(raw_value, key)
+        for name, values in nested.items():
+            clean = str(name or "").strip()
+            if clean and values:
+                series_by_name[clean] = values
+
+    if not series_by_name:
+        raise RuntimeError(f"{mat_path.name} did not contain any numeric 1-D series.")
+
+    lengths: dict[int, int] = {}
+    for values in series_by_name.values():
+        n = int(len(values))
+        if n <= 0:
+            continue
+        lengths[n] = lengths.get(n, 0) + 1
+    if not lengths:
+        raise RuntimeError(f"{mat_path.name} did not contain any usable series lengths.")
+    dominant_len = sorted(lengths.items(), key=lambda item: (-int(item[1]), -int(item[0])))[0][0]
+    selected = {
+        name: values
+        for name, values in series_by_name.items()
+        if int(len(values)) == int(dominant_len)
+    }
+    if not selected:
+        raise RuntimeError(f"{mat_path.name} had no aligned series for the dominant sample length.")
+
+    headers = list(selected.keys())
+    mapped_headers = [
+        _canonicalize_header(header, canonical_defs, min_ratio=float(fuzzy_min_ratio))
+        for header in headers
+    ]
+    col_idents = _dedupe_idents(mapped_headers)
+    rows: list[tuple[Any, ...]] = []
+    for idx in range(int(dominant_len)):
+        rows.append(tuple(selected[name][idx] for name in headers))
+    return {
+        "headers": headers,
+        "mapped_headers": mapped_headers,
+        "col_idents": col_idents,
+        "rows": rows,
+        "row_count": int(dominant_len),
+    }
+
+
+def write_mat_bundle_sqlite(
+    *,
+    mat_paths: Sequence[Path],
+    sqlite_path: Path,
+    overwrite: bool,
+) -> dict[str, Any]:
+    members = [Path(p).expanduser() for p in mat_paths if str(p)]
+    if not members:
+        raise RuntimeError("No MAT files were provided for bundle aggregation.")
+
+    sqlite_path.parent.mkdir(parents=True, exist_ok=True)
+    if sqlite_path.exists():
+        if not overwrite:
+            return {
+                "sqlite_path": str(sqlite_path),
+                "skipped": True,
+                "reason": "exists",
+            }
+        try:
+            sqlite_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    env = _load_test_data_env()
+    fuzzy_enabled = _truthy(env.get("EIDAT_TEST_DATA_FUZZY_HEADER_STICK", "1"))
+    fuzzy_min_ratio = _float(env.get("EIDAT_TEST_DATA_FUZZY_HEADER_MIN_RATIO", "0.82"), 0.82)
+    trend_col_defs = _load_trend_column_defs() if fuzzy_enabled else []
+    canonical_defs = _canonical_header_defs(trend_col_defs)
+
+    conn = sqlite3.connect(str(sqlite_path))
+    try:
+        conn.execute("PRAGMA journal_mode=DELETE;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute("PRAGMA temp_store=MEMORY;")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS __workbook (
+              source_file TEXT NOT NULL,
+              imported_epoch_ns INTEGER NOT NULL,
+              excel_size_bytes INTEGER NOT NULL,
+              excel_mtime_ns INTEGER NOT NULL
+            );
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS __sheet_info (
+              sheet_name TEXT PRIMARY KEY,
+              table_name TEXT NOT NULL,
+              header_row INTEGER NOT NULL,
+              excel_col_indices_json TEXT NOT NULL,
+              headers_json TEXT NOT NULL,
+              columns_json TEXT NOT NULL,
+              rows_inserted INTEGER NOT NULL
+            );
+            """
+        )
+        try:
+            existing_cols = {r[1] for r in conn.execute("PRAGMA table_info(__sheet_info)").fetchall()}
+            if "mapped_headers_json" not in existing_cols:
+                conn.execute("ALTER TABLE __sheet_info ADD COLUMN mapped_headers_json TEXT;")
+        except Exception:
+            pass
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS __column_map (
+              sheet_name TEXT NOT NULL,
+              header TEXT NOT NULL,
+              mapped_header TEXT NOT NULL,
+              sqlite_column TEXT NOT NULL,
+              PRIMARY KEY(sheet_name, header)
+            );
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS __meta_cells (
+              sheet_name TEXT NOT NULL,
+              excel_row INTEGER NOT NULL,
+              excel_col INTEGER NOT NULL,
+              value TEXT NOT NULL
+            );
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS __mat_bundle_members (
+              seq_name TEXT PRIMARY KEY,
+              source_file TEXT NOT NULL,
+              source_rel TEXT,
+              mtime_ns INTEGER,
+              size_bytes INTEGER,
+              rows_inserted INTEGER NOT NULL,
+              status TEXT NOT NULL,
+              error TEXT
+            );
+            """
+        )
+
+        outputs: list[dict[str, Any]] = []
+        for mat_path in members:
+            st = mat_path.stat()
+            conn.execute(
+                "INSERT INTO __workbook(source_file, imported_epoch_ns, excel_size_bytes, excel_mtime_ns) VALUES(?, ?, ?, ?)",
+                (str(mat_path), int(_now_ns()), int(st.st_size), int(st.st_mtime_ns)),
+            )
+
+            seq_name = str(mat_path.stem or "").strip()
+            m = re.search(r"(seq\d+)$", seq_name, flags=re.IGNORECASE)
+            if m:
+                seq_name = str(m.group(1) or "").lower() or seq_name
+            run = _mat_extract_run_table(
+                mat_path,
+                canonical_defs=canonical_defs,
+                fuzzy_min_ratio=float(fuzzy_min_ratio),
+            )
+            table_name = _safe_table_name(seq_name)
+            col_defs = ", ".join([f"\"{c}\" REAL" for c in run["col_idents"]])
+            conn.execute(f"DROP TABLE IF EXISTS \"{table_name}\";")
+            conn.execute(f"CREATE TABLE \"{table_name}\" (excel_row INTEGER NOT NULL, {col_defs});")
+
+            placeholders = ", ".join(["?"] * (1 + len(run["col_idents"])))
+            ins_sql = (
+                f"INSERT INTO \"{table_name}\" (excel_row, "
+                + ", ".join([f"\"{c}\"" for c in run["col_idents"]])
+                + f") VALUES({placeholders})"
+            )
+            batch = [(idx + 2, *row) for idx, row in enumerate(run["rows"])]
+            if batch:
+                conn.executemany(ins_sql, batch)
+            excel_col_indices = [i + 1 for i in range(len(run["headers"]))]
+            conn.execute(
+                """
+                INSERT INTO __sheet_info(
+                  sheet_name, table_name, header_row,
+                  excel_col_indices_json, headers_json, columns_json,
+                  mapped_headers_json,
+                  rows_inserted
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    seq_name,
+                    table_name,
+                    1,
+                    json.dumps(excel_col_indices),
+                    json.dumps(run["headers"], ensure_ascii=False),
+                    json.dumps({h: c for h, c in zip(run["headers"], run["col_idents"])}, ensure_ascii=False),
+                    json.dumps(run["mapped_headers"], ensure_ascii=False),
+                    int(run["row_count"]),
+                ),
+            )
+            conn.executemany(
+                "INSERT OR REPLACE INTO __column_map(sheet_name, header, mapped_header, sqlite_column) VALUES(?, ?, ?, ?)",
+                [
+                    (seq_name, h, mh, ci)
+                    for h, mh, ci in zip(run["headers"], run["mapped_headers"], run["col_idents"])
+                ],
+            )
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO __mat_bundle_members(
+                  seq_name, source_file, source_rel, mtime_ns, size_bytes, rows_inserted, status, error
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    seq_name,
+                    str(mat_path),
+                    str(mat_path),
+                    int(st.st_mtime_ns),
+                    int(st.st_size),
+                    int(run["row_count"]),
+                    "ok",
+                    "",
+                ),
+            )
+            outputs.append(
+                {
+                    "sheet": seq_name,
+                    "table": table_name,
+                    "header_row": 1,
+                    "columns": list(run["headers"]),
+                    "mapped_columns": list(run["mapped_headers"]),
+                    "rows_inserted": int(run["row_count"]),
+                    "source_file": str(mat_path),
+                }
+            )
+            _stderr(f"[MAT BUNDLE] {mat_path.name} -> {seq_name}: rows={run['row_count']}")
+
+        conn.commit()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    return {
         "sqlite_path": str(sqlite_path),
         "skipped": False,
         "sheets": outputs,

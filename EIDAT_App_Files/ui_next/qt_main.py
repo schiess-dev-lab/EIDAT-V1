@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import html
 import json
 import time
 import shutil
@@ -3655,6 +3656,16 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
             from matplotlib.figure import Figure
 
+            self.lbl_perf_primary_equation = QtWidgets.QLabel("")
+            self.lbl_perf_primary_equation.setVisible(False)
+            self.lbl_perf_primary_equation.setWordWrap(True)
+            self.lbl_perf_primary_equation.setTextFormat(QtCore.Qt.TextFormat.RichText)
+            self.lbl_perf_primary_equation.setStyleSheet(
+                "QLabel { background: #fef3c7; border: 1px solid #f59e0b; border-radius: 8px; "
+                "padding: 8px 10px; color: #78350f; font-size: 11px; font-weight: 700; }"
+            )
+            layout.addWidget(self.lbl_perf_primary_equation)
+
             self._figure = Figure(figsize=(8, 4), dpi=100)
             self._axes = self._figure.add_subplot(111)
             self._axes.set_facecolor("#ffffff")
@@ -4199,9 +4210,15 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
     def _load_cache(self, *, rebuild: bool) -> None:
         try:
-            self._db_path = be.ensure_test_data_project_cache(
-                self._project_dir, self._workbook_path, rebuild=bool(rebuild)
-            )
+            if rebuild:
+                self._db_path = be.ensure_test_data_project_cache(
+                    self._project_dir, self._workbook_path, rebuild=True
+                )
+            else:
+                self._db_path = be.validate_existing_test_data_project_cache(
+                    self._project_dir,
+                    self._workbook_path,
+                )
             self.lbl_source.setText(str(self._db_path))
             self.lbl_cache.setText(f"Cache DB: {self._db_path}")
         except Exception as exc:
@@ -6370,6 +6387,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         )
         if m != "performance":
             self._refresh_stats_preview()
+        self._update_perf_primary_equation_banner()
 
     def _plot_current_mode(self) -> None:
         self._set_plot_note("")
@@ -6511,6 +6529,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         except Exception:
             pass
         self._capture_main_plot_base_view()
+        self._update_perf_primary_equation_banner()
         self.btn_save_plot_pdf.setEnabled(True)
         self._last_plot_def = {
             "mode": "metrics",
@@ -7089,6 +7108,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             except Exception:
                 pass
         self._update_perf_export_button_state()
+        self._update_perf_primary_equation_banner()
 
     def _set_combo_to_value(self, cb: QtWidgets.QComboBox, value: str) -> bool:
         want = str(value or "").strip()
@@ -8007,29 +8027,36 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 (f"{float(hi.get('rmse')):.4g}" if isinstance(hi.get("rmse"), (int, float)) else ""),
             )
         mean_row = rows_by_stat.get("mean")
+        std_row = rows_by_stat.get("std")
         if mean_row:
             mean_master_eqn = str(mean_row[2] or "").strip()
             mean_hi_eqn = str(mean_row[6] or "").strip()
+            std_master_eqn = str((std_row[2] if std_row else "") or "").strip()
+            std_hi_eqn = str((std_row[6] if std_row else "") or "").strip()
+            derived_master_min = f"({mean_master_eqn}) - 3*({std_master_eqn})" if mean_master_eqn and std_master_eqn else (f"{mean_master_eqn} - 3sigma" if mean_master_eqn else "")
+            derived_master_max = f"({mean_master_eqn}) + 3*({std_master_eqn})" if mean_master_eqn and std_master_eqn else (f"{mean_master_eqn} + 3sigma" if mean_master_eqn else "")
+            derived_hi_min = f"({mean_hi_eqn}) - 3*({std_hi_eqn})" if mean_hi_eqn and std_hi_eqn else (f"{mean_hi_eqn} - 3sigma" if mean_hi_eqn else "")
+            derived_hi_max = f"({mean_hi_eqn}) + 3*({std_hi_eqn})" if mean_hi_eqn and std_hi_eqn else (f"{mean_hi_eqn} + 3sigma" if mean_hi_eqn else "")
             rows_by_stat["min_3sigma"] = (
                 "min_3sigma",
-                str(mean_row[1] or ""),
-                (f"{mean_master_eqn} - 3sigma" if mean_master_eqn else ""),
-                str(mean_row[3] or ""),
+                ("Derived from Mean and Std" if std_master_eqn else str(mean_row[1] or "")),
+                derived_master_min,
+                str(mean_row[3] or (std_row[3] if std_row else "") or ""),
                 "",
-                str(mean_row[5] or ""),
-                (f"{mean_hi_eqn} - 3sigma" if mean_hi_eqn else ""),
-                str(mean_row[7] or ""),
+                ("Derived from Mean and Std" if std_hi_eqn else str(mean_row[5] or "")),
+                derived_hi_min,
+                str(mean_row[7] or (std_row[7] if std_row else "") or ""),
                 "",
             )
             rows_by_stat["max_3sigma"] = (
                 "max_3sigma",
-                str(mean_row[1] or ""),
-                (f"{mean_master_eqn} + 3sigma" if mean_master_eqn else ""),
-                str(mean_row[3] or ""),
+                ("Derived from Mean and Std" if std_master_eqn else str(mean_row[1] or "")),
+                derived_master_max,
+                str(mean_row[3] or (std_row[3] if std_row else "") or ""),
                 "",
-                str(mean_row[5] or ""),
-                (f"{mean_hi_eqn} + 3sigma" if mean_hi_eqn else ""),
-                str(mean_row[7] or ""),
+                ("Derived from Mean and Std" if std_hi_eqn else str(mean_row[5] or "")),
+                derived_hi_max,
+                str(mean_row[7] or (std_row[7] if std_row else "") or ""),
                 "",
             )
         rows = list(rows_by_stat.values())
@@ -8059,6 +8086,50 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 self.btn_perf_export_equations.setEnabled(self._perf_has_exportable_models())
             except Exception:
                 pass
+
+    def _perf_exact_equation_text(self, stat: str) -> str:
+        results = getattr(self, "_perf_results_by_stat", {}) or {}
+        raw = str(stat or "").strip().lower()
+        if raw in {"min_3sigma", "max_3sigma"}:
+            mean_model = ((results.get("mean") or {}).get("master_model") or {}) if isinstance(results, dict) else {}
+            std_model = ((results.get("std") or {}).get("master_model") or {}) if isinstance(results, dict) else {}
+            mean_eq = str((mean_model or {}).get("equation") or "").strip()
+            std_eq = str((std_model or {}).get("equation") or "").strip()
+            if mean_eq and std_eq:
+                sign = "-" if raw == "min_3sigma" else "+"
+                return f"({mean_eq}) {sign} 3*({std_eq})"
+        model = ((results.get(raw) or {}).get("master_model") or {}) if isinstance(results, dict) else {}
+        return str((model or {}).get("equation") or "").strip()
+
+    def _update_perf_primary_equation_banner(self) -> None:
+        if not hasattr(self, "lbl_perf_primary_equation"):
+            return
+        if str(getattr(self, "_mode", "") or "").strip().lower() != "performance":
+            self.lbl_perf_primary_equation.clear()
+            self.lbl_perf_primary_equation.setVisible(False)
+            return
+        results = getattr(self, "_perf_results_by_stat", {}) or {}
+        first_result = next((r for r in results.values() if isinstance(r, dict)), {}) or {}
+        if str(first_result.get("plot_dimension") or "2d").strip().lower() == "3d":
+            self.lbl_perf_primary_equation.clear()
+            self.lbl_perf_primary_equation.setVisible(False)
+            return
+        lines: list[str] = []
+        for stat in ("mean", "min", "max", "min_3sigma", "max_3sigma"):
+            eq = self._perf_exact_equation_text(stat)
+            if not eq:
+                continue
+            lines.append(f"<b>{html.escape(stat)}</b>: <span style='font-family: Consolas, monospace;'>{html.escape(eq)}</span>")
+        if not lines:
+            self.lbl_perf_primary_equation.clear()
+            self.lbl_perf_primary_equation.setVisible(False)
+            return
+        output_target = html.escape(str(first_result.get("output_target") or first_result.get("y_target") or "").strip())
+        input1_target = html.escape(str(first_result.get("input1_target") or first_result.get("x_target") or "").strip())
+        subtitle = f"<div style='margin-top:2px; margin-bottom:6px;'>{output_target} vs {input1_target}</div>" if output_target and input1_target else ""
+        body = "<br>".join(lines)
+        self.lbl_perf_primary_equation.setText(f"<div><b>Performance Equation</b>{subtitle}{body}</div>")
+        self.lbl_perf_primary_equation.setVisible(True)
 
     @staticmethod
     def _perf_export_slug(value: object) -> str:
