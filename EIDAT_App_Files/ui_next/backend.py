@@ -5556,11 +5556,43 @@ def td_list_runs_ex(db_path: Path) -> list[dict]:
     return out
 
 
+def _td_project_cache_refresh_mode(
+    *,
+    stale_context: bool,
+    curve_count: int,
+    expected_serials: set[str],
+    cached_serials: set[str],
+    cached_stats_csv: str,
+    current_stats_csv: str,
+    cached_raw_cols_csv: str,
+    current_raw_cols_csv: str,
+    cached_support_mtime_ns: int,
+    support_mtime_ns: int,
+    source_state_stale: bool,
+) -> tuple[str, str]:
+    if stale_context:
+        return "full", "context changed"
+    if curve_count <= 0 and expected_serials:
+        return "full", "raw cache is empty"
+    if cached_raw_cols_csv != current_raw_cols_csv:
+        return "full", "configured raw columns changed"
+    if expected_serials and expected_serials != cached_serials:
+        return "full", "source serial set changed"
+    if source_state_stale:
+        return "full", "source SQLite inputs changed"
+    if cached_stats_csv != current_stats_csv:
+        return "calc", "selected statistics changed"
+    if int(cached_support_mtime_ns) != int(support_mtime_ns):
+        return "calc", "support workbook changed"
+    return "none", ""
+
+
 def ensure_test_data_project_cache(
     project_dir: Path,
     workbook_path: Path,
     *,
     rebuild: bool = False,
+    progress_cb: Callable[[str], None] | None = None,
 ) -> Path:
     """
     Ensure `td_*` cache tables exist and are up-to-date inside the project's
@@ -5584,8 +5616,11 @@ def ensure_test_data_project_cache(
         conn.commit()
 
     if rebuild:
-        rebuild_test_data_project_cache(db_path, wb_path)
+        _td_emit_progress(progress_cb, "Rebuilding raw Test Data cache")
+        rebuild_test_data_project_cache(db_path, wb_path, progress_cb=progress_cb)
         return db_path
+
+    _td_emit_progress(progress_cb, "Checking project cache inputs")
 
     # Quick staleness check: compare workbook Sources list + mtimes against td_sources.
     try:
@@ -5652,9 +5687,6 @@ def ensure_test_data_project_cache(
         stale_context = True
     if not stale_context and expected and cached and (not cached_workbook_path or not cached_node_root):
         stale_context = True
-    if stale_context:
-        rebuild_test_data_project_cache(db_path, wb_path)
-        return db_path
 
     support_mtime_ns = 0
     try:
@@ -5664,11 +5696,6 @@ def ensure_test_data_project_cache(
             support_mtime_ns = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)))
     except Exception:
         support_mtime_ns = 0
-
-    # If we have no curves at all, treat as stale.
-    if curve_count == 0 and expected:
-        rebuild_test_data_project_cache(db_path, wb_path)
-        return db_path
 
     cached_stats_csv = ""
     try:
@@ -5692,26 +5719,6 @@ def ensure_test_data_project_cache(
             cached_raw_cols_csv = str(row[0] or "").strip() if row and row[0] is not None else ""
     except Exception:
         cached_raw_cols_csv = ""
-
-    # If the selected stats changed, refresh calc tables from cached raw curves only.
-    if cached_stats_csv != current_stats_csv:
-        _rebuild_test_data_project_calc_cache_from_raw(db_path, wb_path)
-        return db_path
-
-    # Raw column changes affect td_curves_raw and require source re-ingest.
-    if cached_raw_cols_csv != current_raw_cols_csv:
-        rebuild_test_data_project_cache(db_path, wb_path)
-        return db_path
-
-    # Support workbook changes now refresh calc tables from cached raw curves.
-    if int(cached_support_mtime_ns) != int(support_mtime_ns):
-        rebuild_test_data_project_cache(db_path, wb_path)
-        return db_path
-
-    # If serial set differs, rebuild.
-    if expected and set(expected.keys()) != set(cached.keys()):
-        rebuild_test_data_project_cache(db_path, wb_path)
-        return db_path
 
     # If any path/mtime differs, rebuild.
     stale = False
@@ -5763,8 +5770,27 @@ def ensure_test_data_project_cache(
         if int(cached_meta_row.get("metadata_mtime_ns") or 0) != int(source_meta.get("metadata_mtime_ns") or 0):
             stale = True
             break
-    if stale:
-        rebuild_test_data_project_cache(db_path, wb_path)
+
+    refresh_mode, refresh_reason = _td_project_cache_refresh_mode(
+        stale_context=bool(stale_context),
+        curve_count=int(curve_count),
+        expected_serials=set(expected.keys()),
+        cached_serials=set(cached.keys()),
+        cached_stats_csv=str(cached_stats_csv),
+        current_stats_csv=str(current_stats_csv),
+        cached_raw_cols_csv=str(cached_raw_cols_csv),
+        current_raw_cols_csv=str(current_raw_cols_csv),
+        cached_support_mtime_ns=int(cached_support_mtime_ns),
+        support_mtime_ns=int(support_mtime_ns),
+        source_state_stale=bool(stale),
+    )
+    if refresh_mode == "full":
+        _td_emit_progress(progress_cb, f"Refreshing raw Test Data cache ({refresh_reason})")
+        rebuild_test_data_project_cache(db_path, wb_path, progress_cb=progress_cb)
+        return db_path
+    if refresh_mode == "calc":
+        _td_emit_progress(progress_cb, f"Refreshing calculated Test Data cache ({refresh_reason})")
+        _rebuild_test_data_project_calc_cache_from_raw(db_path, wb_path, progress_cb=progress_cb)
         return db_path
 
     return db_path
@@ -6033,7 +6059,12 @@ def _resolve_td_support_sequence_for_run(run_name: str, support_cfg: dict) -> di
     return _td_resolve_support_condition_for_source("", run, support_cfg)
 
 
-def _rebuild_test_data_project_calc_cache_from_raw(db_path: Path, workbook_path: Path) -> dict:
+def _rebuild_test_data_project_calc_cache_from_raw(
+    db_path: Path,
+    workbook_path: Path,
+    *,
+    progress_cb: Callable[[str], None] | None = None,
+) -> dict:
     import time
     import statistics
 
@@ -6143,7 +6174,16 @@ def _rebuild_test_data_project_calc_cache_from_raw(db_path: Path, workbook_path:
         if str(k).strip() and isinstance(v, dict)
     }
     computed_epoch_ns = time.time_ns()
+    total_started = time.perf_counter()
+    timings: dict[str, float] = {
+        "raw_cache_read_s": 0.0,
+        "calc_aggregate_s": 0.0,
+        "calc_write_s": 0.0,
+        "total_s": 0.0,
+    }
 
+    _td_emit_progress(progress_cb, "Reading raw Test Data cache")
+    t0 = time.perf_counter()
     with sqlite3.connect(str(raw_db_path)) as raw_conn:
         _ensure_test_data_raw_cache_tables(raw_conn)
         raw_runs = raw_conn.execute(
@@ -6195,11 +6235,13 @@ def _rebuild_test_data_project_calc_cache_from_raw(db_path: Path, workbook_path:
             ).fetchall()
         except Exception:
             raw_obs_rows = []
+    timings["raw_cache_read_s"] = round(time.perf_counter() - t0, 3)
     if not raw_runs or not raw_y_cols or not raw_curve_rows:
         raise RuntimeError(
             f"Project raw cache DB is incomplete: {raw_db_path}. "
             f"Run 'Build / Refresh Cache' first to create or refresh {EIDAT_PROJECT_TD_RAW_CACHE_DB}."
         )
+    _td_emit_progress(progress_cb, "Aggregating calculated metrics from raw cache")
     with sqlite3.connect(str(db_path)) as conn:
         _ensure_test_data_impl_tables(conn)
         _purge_test_data_legacy_impl_raw_tables(conn)
@@ -6301,6 +6343,7 @@ def _rebuild_test_data_project_calc_cache_from_raw(db_path: Path, workbook_path:
         aggregated_curve_values: dict[tuple[str, str, str], list[float]] = {}
         aggregated_obs_meta: dict[tuple[str, str], dict[str, object]] = {}
         condition_y_names: dict[str, set[str]] = {}
+        t0 = time.perf_counter()
         for run_name_raw, y_name_raw, x_name_raw, observation_id, serial, program_title, source_run_name_raw, x_json, y_json, source_mtime_ns in raw_curve_rows:
             raw_run = str(run_name_raw or "").strip()
             y_name = str(y_name_raw or "").strip()
@@ -6363,6 +6406,10 @@ def _rebuild_test_data_project_calc_cache_from_raw(db_path: Path, workbook_path:
         calc_columns_written = 0
         inserted_columns: set[tuple[str, str]] = set()
         inserted_runs: set[str] = set()
+        run_rows_to_write: list[tuple[object, ...]] = []
+        column_rows_to_write: list[tuple[object, ...]] = []
+        obs_rows_to_write: list[tuple[object, ...]] = []
+        metric_rows_to_write: list[tuple[object, ...]] = []
         for (condition_key, serial_txt), meta in aggregated_obs_meta.items():
             condition_meta = dict(condition_meta_by_key.get(condition_key) or {})
             run_display_name = str(condition_meta.get("display_name") or condition_key).strip() or condition_key
@@ -6375,8 +6422,7 @@ def _rebuild_test_data_project_calc_cache_from_raw(db_path: Path, workbook_path:
                     break
             if condition_key not in inserted_runs:
                 inserted_runs.add(condition_key)
-                conn.execute(
-                    "INSERT OR REPLACE INTO td_runs(run_name, default_x, display_name, run_type, control_period, pulse_width) VALUES (?, ?, ?, ?, ?, ?)",
+                run_rows_to_write.append(
                     (
                         condition_key,
                         default_x,
@@ -6384,7 +6430,7 @@ def _rebuild_test_data_project_calc_cache_from_raw(db_path: Path, workbook_path:
                         str(condition_meta.get("run_type") or "").strip(),
                         _finite_float(condition_meta.get("control_period")),
                         _finite_float(condition_meta.get("pulse_width_on", condition_meta.get("pulse_width"))),
-                    ),
+                    )
                 )
                 calc_param_defs = _ordered_support_param_defs(
                     sequence_names=[condition_key],
@@ -6400,49 +6446,41 @@ def _rebuild_test_data_project_calc_cache_from_raw(db_path: Path, workbook_path:
                     if (condition_key, col_name) in inserted_columns:
                         continue
                     inserted_columns.add((condition_key, col_name))
-                    conn.execute(
-                        "INSERT OR REPLACE INTO td_columns_calc(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
-                        (condition_key, col_name, str(param_def.get("units") or cfg_units.get(col_name) or "").strip(), "y"),
+                    column_rows_to_write.append(
+                        (condition_key, col_name, str(param_def.get("units") or cfg_units.get(col_name) or "").strip(), "y")
                     )
                     calc_columns_written += 1
                 if _finite_float(condition_meta.get("pulse_width_on", condition_meta.get("pulse_width"))) is not None and (condition_key, "pulse_width") not in inserted_columns:
                     inserted_columns.add((condition_key, "pulse_width"))
-                    conn.execute(
-                        "INSERT OR REPLACE INTO td_columns_calc(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
-                        (condition_key, "pulse_width", str(cfg_units.get("pulse_width") or "").strip(), "y"),
+                    column_rows_to_write.append(
+                        (condition_key, "pulse_width", str(cfg_units.get("pulse_width") or "").strip(), "y")
                     )
                     calc_columns_written += 1
 
             observation_id_calc = f"{_td_norm_ident_token(serial_txt)}__{_td_norm_ident_token(condition_key)}"
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO td_condition_observations(
-                    observation_id, serial, run_name, program_title, source_run_name, run_type, pulse_width, control_period, source_mtime_ns, computed_epoch_ns
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
+            program_titles_txt = ", ".join(sorted({str(v).strip() for v in (meta.get("program_titles") or set()) if str(v).strip()}))
+            member_source_runs_txt = ", ".join(member_source_runs)
+            source_mtime_max = max([int(v) for v in (meta.get("source_mtime_ns") or [])], default=0)
+            pulse_width_value = _finite_float(condition_meta.get("pulse_width_on", condition_meta.get("pulse_width")))
+            obs_rows_to_write.append(
                 (
                     observation_id_calc,
                     serial_txt,
                     condition_key,
-                    ", ".join(sorted({str(v).strip() for v in (meta.get("program_titles") or set()) if str(v).strip()})),
-                    ", ".join(member_source_runs),
+                    program_titles_txt,
+                    member_source_runs_txt,
                     str(condition_meta.get("run_type") or "").strip(),
-                    _finite_float(condition_meta.get("pulse_width_on", condition_meta.get("pulse_width"))),
+                    pulse_width_value,
                     _finite_float(condition_meta.get("control_period")),
-                    max([int(v) for v in (meta.get("source_mtime_ns") or [])], default=0),
+                    source_mtime_max,
                     computed_epoch_ns,
-                ),
+                )
             )
             for y_name in sorted(condition_y_names.get(condition_key) or set()):
                 values = list(aggregated_curve_values.get((condition_key, serial_txt, y_name)) or [])
                 stats_map = _compute_stats(values)
                 for stat in selected_stats:
-                    conn.execute(
-                        """
-                        INSERT OR REPLACE INTO td_metrics_calc
-                        (observation_id, serial, run_name, column_name, stat, value_num, computed_epoch_ns, source_mtime_ns, program_title, source_run_name)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
+                    metric_rows_to_write.append(
                         (
                             observation_id_calc,
                             serial_txt,
@@ -6451,22 +6489,16 @@ def _rebuild_test_data_project_calc_cache_from_raw(db_path: Path, workbook_path:
                             str(stat),
                             stats_map.get(stat),
                             computed_epoch_ns,
-                            max([int(v) for v in (meta.get("source_mtime_ns") or [])], default=0),
-                            ", ".join(sorted({str(v).strip() for v in (meta.get("program_titles") or set()) if str(v).strip()})),
-                            ", ".join(member_source_runs),
-                        ),
+                            source_mtime_max,
+                            program_titles_txt,
+                            member_source_runs_txt,
+                        )
                     )
                     metrics_written += 1
-            pulse_width_value = _finite_float(condition_meta.get("pulse_width_on", condition_meta.get("pulse_width")))
             if pulse_width_value is not None:
                 stats_map = _compute_constant_stats(float(pulse_width_value))
                 for stat in selected_stats:
-                    conn.execute(
-                        """
-                        INSERT OR REPLACE INTO td_metrics_calc
-                        (observation_id, serial, run_name, column_name, stat, value_num, computed_epoch_ns, source_mtime_ns, program_title, source_run_name)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
+                    metric_rows_to_write.append(
                         (
                             observation_id_calc,
                             serial_txt,
@@ -6475,12 +6507,13 @@ def _rebuild_test_data_project_calc_cache_from_raw(db_path: Path, workbook_path:
                             str(stat),
                             stats_map.get(stat),
                             computed_epoch_ns,
-                            max([int(v) for v in (meta.get("source_mtime_ns") or [])], default=0),
-                            ", ".join(sorted({str(v).strip() for v in (meta.get("program_titles") or set()) if str(v).strip()})),
-                            ", ".join(member_source_runs),
-                        ),
+                            source_mtime_max,
+                            program_titles_txt,
+                            member_source_runs_txt,
+                        )
                     )
                     metrics_written += 1
+        timings["calc_aggregate_s"] = round(time.perf_counter() - t0, 3)
 
         support_mtime_ns = 0
         try:
@@ -6491,6 +6524,36 @@ def _rebuild_test_data_project_calc_cache_from_raw(db_path: Path, workbook_path:
         except Exception:
             support_mtime_ns = 0
 
+        _td_emit_progress(progress_cb, "Writing calculated Test Data cache")
+        t0 = time.perf_counter()
+        if run_rows_to_write:
+            conn.executemany(
+                "INSERT OR REPLACE INTO td_runs(run_name, default_x, display_name, run_type, control_period, pulse_width) VALUES (?, ?, ?, ?, ?, ?)",
+                run_rows_to_write,
+            )
+        if column_rows_to_write:
+            conn.executemany(
+                "INSERT OR REPLACE INTO td_columns_calc(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
+                column_rows_to_write,
+            )
+        if obs_rows_to_write:
+            conn.executemany(
+                """
+                INSERT OR REPLACE INTO td_condition_observations(
+                    observation_id, serial, run_name, program_title, source_run_name, run_type, pulse_width, control_period, source_mtime_ns, computed_epoch_ns
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                obs_rows_to_write,
+            )
+        if metric_rows_to_write:
+            conn.executemany(
+                """
+                INSERT OR REPLACE INTO td_metrics_calc
+                (observation_id, serial, run_name, column_name, stat, value_num, computed_epoch_ns, source_mtime_ns, program_title, source_run_name)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                metric_rows_to_write,
+            )
         conn.execute(
             "INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)",
             ("workbook_path", str(wb_path)),
@@ -6512,6 +6575,9 @@ def _rebuild_test_data_project_calc_cache_from_raw(db_path: Path, workbook_path:
             ("support_workbook_mtime_ns", str(int(support_mtime_ns))),
         )
         conn.commit()
+        timings["calc_write_s"] = round(time.perf_counter() - t0, 3)
+
+    timings["total_s"] = round(time.perf_counter() - total_started, 3)
 
     return {
         "db_path": str(db_path),
@@ -6519,6 +6585,7 @@ def _rebuild_test_data_project_calc_cache_from_raw(db_path: Path, workbook_path:
         "metrics_written": metrics_written,
         "calc_columns_written": calc_columns_written,
         "mode": "calc_from_raw",
+        "timings": dict(timings),
     }
 
 
@@ -6641,7 +6708,12 @@ def validate_existing_test_data_project_cache(project_dir: Path, workbook_path: 
     return db_path
 
 
-def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
+def rebuild_test_data_project_cache(
+    db_path: Path,
+    workbook_path: Path,
+    *,
+    progress_cb: Callable[[str], None] | None = None,
+) -> dict:
     """
     Rebuild `td_*` cache tables inside `implementation_trending.sqlite3` from the
     workbook's `Sources` + `Config` sheets.
@@ -6674,6 +6746,16 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
     entries = [dict(s) for s in sources if str(s.get("serial") or "").strip()]
 
     computed_epoch_ns = time.time_ns()
+    total_started = time.perf_counter()
+    timings: dict[str, float] = {
+        "source_resolution_s": 0.0,
+        "source_sqlite_read_s": 0.0,
+        "run_discovery_and_matching_s": 0.0,
+        "raw_curve_extraction_s": 0.0,
+        "raw_db_write_s": 0.0,
+        "calc_rebuild_s": 0.0,
+        "total_s": 0.0,
+    }
 
     # Stats selection is driven entirely by user_inputs/excel_trend_config.json.
     selected_stats = _td_cache_selected_stats(project_cfg.get("statistics"))
@@ -7348,8 +7430,10 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
     _ensure_test_data_impl_tables(impl_conn)
     _ensure_test_data_raw_cache_tables(raw_conn)
 
-    for entry in entries:
+    for idx, entry in enumerate(entries, start=1):
         sn = str(entry.get("serial") or "").strip()
+        _td_emit_progress(progress_cb, f"Ingesting source {idx}/{max(1, len(entries))}: {sn or 'unknown serial'}")
+        t_source_resolution = time.perf_counter()
         source_resolution = _resolve_td_source_sqlite_for_workbook(wb_path, entry)
         sqlite_path_raw = source_resolution.get("path")
         sqlite_path = Path(sqlite_path_raw).expanduser() if sqlite_path_raw else Path()
@@ -7401,6 +7485,7 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
             (sn, str(sqlite_path), mtime_ns, size_bytes, status, computed_epoch_ns),
         )
         source_meta = _load_td_source_metadata(wb_path, entry)
+        timings["source_resolution_s"] += time.perf_counter() - t_source_resolution
         source_program_title = str(source_meta.get("program_title") or "").strip()
         source_info["program_title"] = source_program_title
         impl_conn.execute(
@@ -7512,6 +7597,7 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
                         table = f"sheet__{run}"
 
                     # Columns present
+                    t_source_read = time.perf_counter()
                     try:
                         q_table = _quote_ident(table)
                         info = src.execute(f"PRAGMA table_info({q_table})").fetchall()
@@ -7527,6 +7613,8 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
 
                     order_by = "excel_row ASC" if "excel_row" in cols else "rowid ASC"
                     source_rows = _read_run_rows(src, table, cols=cols, order_by=order_by)
+                    timings["source_sqlite_read_s"] += time.perf_counter() - t_source_read
+                    t_match = time.perf_counter()
                     run_info = _resolve_support_sequence(source_program_title, run, source_rows, cols)
                     effective_run = str(run_info.get("condition_key") or run_info.get("sequence_name") or run).strip() or str(run or "").strip()
                     run_display_name = str(run_info.get("display_name") or effective_run).strip() or effective_run
@@ -7670,6 +7758,7 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
                     for y_name in calc_desired_y:
                         if y_name not in calc_units or not calc_units.get(y_name):
                             calc_units[y_name] = str(calc_units_by_name.get(y_name) or cfg_units.get(y_name) or "").strip()
+                    timings["run_discovery_and_matching_s"] += time.perf_counter() - t_match
 
                     run_curves_written = 0
                     if default_x:
@@ -7678,10 +7767,13 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
                             actual_y = y_actual_by_name.get(y_name, "")
                             if not actual_x or not actual_y:
                                 continue
+                            t_extract = time.perf_counter()
                             xs, ys = _raw_curve_points(rows=source_rows, actual_x=actual_x, y_name=actual_y)
                             x_json_txt = json.dumps(xs, separators=(",", ":"), ensure_ascii=False)
                             y_json_txt = json.dumps(ys, separators=(",", ":"), ensure_ascii=False)
+                            timings["raw_curve_extraction_s"] += time.perf_counter() - t_extract
                             table_name = _td_raw_curve_table_name(effective_run, y_name)
+                            t_raw_write = time.perf_counter()
                             raw_conn.execute(
                                 """
                                 INSERT OR REPLACE INTO td_raw_condition_observations(
@@ -7741,14 +7833,6 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
                                 payload,
                             )
                             raw_conn.execute(
-                                """
-                                INSERT OR REPLACE INTO td_curves
-                                (run_name, y_name, x_name, observation_id, serial, x_json, y_json, n_points, source_mtime_ns, computed_epoch_ns, program_title, source_run_name)
-                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                                """,
-                                payload,
-                            )
-                            raw_conn.execute(
                                 f"""
                                 INSERT OR REPLACE INTO {_quote_ident(table_name)}
                                 (observation_id, serial, program_title, source_run_name, x_json, y_json, n_points, source_mtime_ns, computed_epoch_ns)
@@ -7783,6 +7867,7 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
                                     computed_epoch_ns,
                                 ),
                             )
+                            timings["raw_db_write_s"] += time.perf_counter() - t_raw_write
                             curves_written += 1
                             source_curves_written += 1
                             run_curves_written += 1
@@ -7970,7 +8055,10 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
             "requested_updates": dict(source_link_updates),
             "errors": list(source_link_update_errors),
         },
+        "timings": dict(timings),
     }
+    timings["total_s"] = round(time.perf_counter() - total_started, 3)
+    debug_payload["timings"] = dict(timings)
     debug_path = _write_td_cache_debug_json(db_path.parent, debug_payload)
 
     if valid_sources <= 0 and entries:
@@ -8037,6 +8125,8 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
             display_by_run[run] = _collapse_ws(disp) or base
 
     # Write raw-cache runs + columns tables only.
+    _td_emit_progress(progress_cb, "Writing raw Test Data cache tables")
+    t0 = time.perf_counter()
     cfg_order = [n for n, _u in y_cols if n]
     for run in sorted(runs_all, key=lambda s: str(s).lower()):
         xs = run_x_union.get(run, set())
@@ -8101,13 +8191,19 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
             )
     impl_conn.commit()
     raw_conn.commit()
+    timings["raw_db_write_s"] += time.perf_counter() - t0
     impl_conn.close()
     raw_conn.close()
 
-    calc_payload = _rebuild_test_data_project_calc_cache_from_raw(db_path, wb_path)
+    _td_emit_progress(progress_cb, "Rebuilding calculated Test Data cache")
+    t0 = time.perf_counter()
+    calc_payload = _rebuild_test_data_project_calc_cache_from_raw(db_path, wb_path, progress_cb=progress_cb)
+    timings["calc_rebuild_s"] = round(time.perf_counter() - t0, 3)
+    timings["total_s"] = round(time.perf_counter() - total_started, 3)
     metrics_written = int(calc_payload.get("metrics_written") or 0)
     debug_payload["counts"]["metrics_written"] = int(metrics_written)
     debug_payload["calc_payload"] = dict(calc_payload or {})
+    debug_payload["timings"] = dict(timings)
     if debug_path is not None:
         _write_td_cache_debug_json(db_path.parent, debug_payload)
 
@@ -8166,6 +8262,7 @@ def rebuild_test_data_project_cache(db_path: Path, workbook_path: Path) -> dict:
         "curves_written": curves_written,
         "metrics_written": metrics_written,
         "runs": sorted(runs_all),
+        "timings": dict(timings),
     }
 
 
@@ -12483,14 +12580,15 @@ def update_test_data_trending_project_workbook(
                 support_mtime_ns = 0
 
             if set(serials) != cached_serials or bool(added_serials) or cached_raw_cols_csv != current_raw_cols_csv:
-                db_path = ensure_test_data_project_cache(project_dir, wb_path, rebuild=False)
+                db_path = ensure_test_data_project_cache(project_dir, wb_path, rebuild=False, progress_cb=progress_cb)
             elif cached_stats_csv != current_stats_csv or int(cached_support_mtime_ns) != int(support_mtime_ns):
-                _rebuild_test_data_project_calc_cache_from_raw(db_path, wb_path)
+                _rebuild_test_data_project_calc_cache_from_raw(db_path, wb_path, progress_cb=progress_cb)
         else:
             db_path = ensure_test_data_project_cache(
                 project_dir,
                 wb_path,
                 rebuild=bool(cache_missing or not require_existing_cache),
+                progress_cb=progress_cb,
             )
         timings["cache_ensure_s"] = round(time.perf_counter() - t0, 3)
 

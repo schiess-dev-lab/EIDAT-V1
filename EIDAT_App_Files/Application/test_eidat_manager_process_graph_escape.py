@@ -161,6 +161,47 @@ class TestEidatManagerProcessGraphEscape(unittest.TestCase):
         self.assertFalse(bool(page_data.get("timeout")))
         self.assertIsNone(page_data.get("error"))
 
+    def test_graph_page_skip_bypasses_tables_ocr_and_charts(self) -> None:
+        try:
+            import numpy as np
+        except Exception:
+            self.skipTest("numpy not available")
+
+        import eidat_manager_process as proc
+
+        with tempfile.TemporaryDirectory() as tmp:
+            page_dir = Path(tmp) / "page_1"
+            self._write_page_png(page_dir / "page_1.png")
+            settings = self._base_settings()
+            settings["graph_page_bypass"] = True
+
+            with (
+                mock.patch(
+                    "extraction.graph_page_guard.inspect_page_for_graph_item_skip",
+                    return_value={
+                        "skip_page": True,
+                        "reason": "dense_raster_graph_page",
+                        "stats": {"dominant_raster_gate": True, "microgrid_gate": True, "no_useful_text_gate": True},
+                    },
+                ),
+                mock.patch("extraction.graph_page_guard.find_chart_like_regions", side_effect=AssertionError("region guard called")),
+                mock.patch("debug_method.run_table_variants._run_for_input", side_effect=AssertionError("table variants called")),
+                mock.patch("extraction.ocr_engine.get_tesseract_lang", return_value="eng"),
+                mock.patch("extraction.ocr_engine.ocr_page", side_effect=AssertionError("page OCR called")),
+                mock.patch("extraction.chart_detection.detect_charts", side_effect=AssertionError("chart detection called")),
+                mock.patch("extraction.debug_exporter.export_page_debug"),
+            ):
+                page_data = proc._process_debug_method_page(Path("dummy.pdf"), 1, page_dir, settings)
+
+        self.assertEqual(page_data.get("tokens"), [])
+        self.assertEqual(page_data.get("tables"), [])
+        self.assertEqual(page_data.get("charts"), [])
+        self.assertEqual(page_data.get("flow"), {})
+        self.assertEqual(page_data.get("skip_reason"), "dense_raster_graph_page")
+        self.assertEqual(page_data.get("skip_marker"), "{ITEM SKIPPED}")
+        self.assertIn("graph_page_item_skipped", page_data.get("warnings", []))
+        self.assertTrue(page_data.get("graph_page_skip_stats"))
+
     def test_bordered_table_timeout_preserves_ocr_flow(self) -> None:
         try:
             import numpy as np

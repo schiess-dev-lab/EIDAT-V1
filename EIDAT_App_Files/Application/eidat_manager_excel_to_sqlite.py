@@ -644,6 +644,7 @@ def _write_mat_sqlite(*, mat_path: Path, sqlite_path: Path, overwrite: bool) -> 
             """
             CREATE TABLE IF NOT EXISTS __sheet_info (
               sheet_name TEXT PRIMARY KEY,
+              source_sheet_name TEXT,
               table_name TEXT NOT NULL,
               header_row INTEGER NOT NULL,
               excel_col_indices_json TEXT NOT NULL,
@@ -655,6 +656,8 @@ def _write_mat_sqlite(*, mat_path: Path, sqlite_path: Path, overwrite: bool) -> 
         )
         try:
             existing_cols = {r[1] for r in conn.execute("PRAGMA table_info(__sheet_info)").fetchall()}
+            if "source_sheet_name" not in existing_cols:
+                conn.execute("ALTER TABLE __sheet_info ADD COLUMN source_sheet_name TEXT;")
             if "mapped_headers_json" not in existing_cols:
                 conn.execute("ALTER TABLE __sheet_info ADD COLUMN mapped_headers_json TEXT;")
         except Exception:
@@ -723,13 +726,14 @@ def _write_mat_sqlite(*, mat_path: Path, sqlite_path: Path, overwrite: bool) -> 
             conn.execute(
                 """
                 INSERT INTO __sheet_info(
-                  sheet_name, table_name, header_row,
+                  sheet_name, source_sheet_name, table_name, header_row,
                   excel_col_indices_json, headers_json, columns_json,
                   mapped_headers_json,
                   rows_inserted
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
+                    safe_sheet_name,
                     safe_sheet_name,
                     table_name,
                     1,
@@ -980,6 +984,7 @@ def write_mat_bundle_sqlite(
             """
             CREATE TABLE IF NOT EXISTS __sheet_info (
               sheet_name TEXT PRIMARY KEY,
+              source_sheet_name TEXT,
               table_name TEXT NOT NULL,
               header_row INTEGER NOT NULL,
               excel_col_indices_json TEXT NOT NULL,
@@ -991,6 +996,8 @@ def write_mat_bundle_sqlite(
         )
         try:
             existing_cols = {r[1] for r in conn.execute("PRAGMA table_info(__sheet_info)").fetchall()}
+            if "source_sheet_name" not in existing_cols:
+                conn.execute("ALTER TABLE __sheet_info ADD COLUMN source_sheet_name TEXT;")
             if "mapped_headers_json" not in existing_cols:
                 conn.execute("ALTER TABLE __sheet_info ADD COLUMN mapped_headers_json TEXT;")
         except Exception:
@@ -1067,13 +1074,14 @@ def write_mat_bundle_sqlite(
             conn.execute(
                 """
                 INSERT INTO __sheet_info(
-                  sheet_name, table_name, header_row,
+                  sheet_name, source_sheet_name, table_name, header_row,
                   excel_col_indices_json, headers_json, columns_json,
                   mapped_headers_json,
                   rows_inserted
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
+                    seq_name,
                     seq_name,
                     table_name,
                     1,
@@ -1138,12 +1146,20 @@ def write_mat_bundle_sqlite(
 @dataclass(frozen=True)
 class DetectedSheet:
     sheet_name: str
+    source_sheet_name: str
     table_name: str
     header_row: int
     excel_col_indices: list[int]
     headers: list[str]
     mapped_headers: list[str]
     col_idents: list[str]
+
+
+_SEQ_SHEET_RE = re.compile(r"^\s*seq(?:uence)?[\s_-]*\d+\s*$", flags=re.IGNORECASE)
+
+
+def _looks_like_sequence_sheet_name(name: object) -> bool:
+    return bool(_SEQ_SHEET_RE.match(str(name or "").strip()))
 
 
 def _parse_env_file(path: Path) -> dict[str, str]:
@@ -1896,6 +1912,7 @@ def _write_workbook_sqlite(
     min_numeric_count: int,
     min_numeric_ratio: float,
     min_data_cols: int,
+    synthesize_td_seq_aliases: bool = False,
 ) -> dict[str, Any]:
     ext = excel_path.suffix.lower()
     if ext in MAT_EXTENSIONS:
@@ -2003,7 +2020,9 @@ def _write_workbook_sqlite(
         sheetnames = list(getattr(wb, "sheetnames", []) or [])
         if not sheetnames:
             raise RuntimeError("Workbook has no sheets.")
+        has_real_sequence_tabs = any(_looks_like_sequence_sheet_name(name) for name in sheetnames)
         sheets: list[DetectedSheet] = []
+        synthetic_seq_count = 0
         for sheet_name in sheetnames:
             ws = wb[sheet_name]
             header_row, cols = _detect_header_row(
@@ -2034,11 +2053,17 @@ def _write_workbook_sqlite(
                 for oh, mh in zip(headers, mapped_headers):
                     if oh != mh:
                         _stderr(f"[TEST_DATA] header map: {sheet_name}: {oh!r} -> {mh!r}")
+            effective_sheet_name = str(sheet_name)
+            if synthesize_td_seq_aliases and not has_real_sequence_tabs:
+                synthetic_seq_count += 1
+                effective_sheet_name = f"seq_{synthetic_seq_count}"
+                _stderr(f"[TD SYNTHETIC SEQ] {sheet_name} -> {effective_sheet_name}")
             col_idents = _dedupe_idents(mapped_headers)
             sheets.append(
                 DetectedSheet(
-                    sheet_name=str(sheet_name),
-                    table_name=_safe_table_name(str(sheet_name)),
+                    sheet_name=effective_sheet_name,
+                    source_sheet_name=str(sheet_name),
+                    table_name=_safe_table_name(effective_sheet_name),
                     header_row=int(header_row),
                     excel_col_indices=excel_col_indices,
                     headers=headers,
@@ -2046,7 +2071,7 @@ def _write_workbook_sqlite(
                     col_idents=col_idents,
                 )
             )
-            _stderr(f"[SHEET] {sheet_name}: header_row={header_row} cols={len(cols)}")
+            _stderr(f"[SHEET] {sheet_name}: header_row={header_row} cols={len(cols)} as {effective_sheet_name}")
 
         if not sheets:
             raise RuntimeError("No sheets contained detectable numeric columns.")
@@ -2077,6 +2102,7 @@ def _write_workbook_sqlite(
                 """
                 CREATE TABLE IF NOT EXISTS __sheet_info (
                   sheet_name TEXT PRIMARY KEY,
+                  source_sheet_name TEXT,
                   table_name TEXT NOT NULL,
                   header_row INTEGER NOT NULL,
                   excel_col_indices_json TEXT NOT NULL,
@@ -2089,6 +2115,8 @@ def _write_workbook_sqlite(
             # Back/forward compat: add mapped headers column if missing.
             try:
                 existing_cols = {r[1] for r in conn.execute("PRAGMA table_info(__sheet_info)").fetchall()}
+                if "source_sheet_name" not in existing_cols:
+                    conn.execute("ALTER TABLE __sheet_info ADD COLUMN source_sheet_name TEXT;")
                 if "mapped_headers_json" not in existing_cols:
                     conn.execute("ALTER TABLE __sheet_info ADD COLUMN mapped_headers_json TEXT;")
             except Exception:
@@ -2117,7 +2145,7 @@ def _write_workbook_sqlite(
 
             outputs: list[dict[str, Any]] = []
             for s in sheets:
-                ws = wb[s.sheet_name]
+                ws = wb[s.source_sheet_name]
 
                 # Store metadata cells above the detected header row for later parsing/trending.
                 try:
@@ -2170,14 +2198,15 @@ def _write_workbook_sqlite(
                 conn.execute(
                     """
                     INSERT INTO __sheet_info(
-                      sheet_name, table_name, header_row,
+                      sheet_name, source_sheet_name, table_name, header_row,
                       excel_col_indices_json, headers_json, columns_json,
                       mapped_headers_json,
                       rows_inserted
-                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         s.sheet_name,
+                        s.source_sheet_name,
                         s.table_name,
                         int(s.header_row),
                         json.dumps(list(s.excel_col_indices)),
@@ -2202,6 +2231,7 @@ def _write_workbook_sqlite(
                 outputs.append(
                     {
                         "sheet": s.sheet_name,
+                        "source_sheet_name": s.source_sheet_name,
                         "table": s.table_name,
                         "header_row": int(s.header_row),
                         "columns": list(s.headers),
@@ -2282,6 +2312,7 @@ def excel_to_sqlite(
     data_dir: Path | None = None,
     out_dir: Path | None = None,
     overwrite: bool = True,
+    synthesize_td_seq_aliases: bool = False,
     max_scan_rows: int = 200,
     max_cols: int = 200,
     lookahead_rows: int = 60,
@@ -2318,6 +2349,7 @@ def excel_to_sqlite(
                 excel_path=fp,
                 sqlite_path=db,
                 overwrite=bool(overwrite),
+                synthesize_td_seq_aliases=bool(synthesize_td_seq_aliases),
                 max_scan_rows=int(max_scan_rows),
                 max_cols=int(max_cols),
                 lookahead_rows=int(lookahead_rows),

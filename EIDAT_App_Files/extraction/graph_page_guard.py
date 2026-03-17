@@ -8,7 +8,7 @@ bordered-table work while preserving OCR on the original page.
 
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import Any, Callable, Dict, List
 
 try:
     import cv2
@@ -133,6 +133,257 @@ def _build_masks_and_components(img_gray: object) -> Dict[str, object]:
             "vert_comps": _line_components(vert, "v", img_w, img_h),
         }
     )
+    return result
+
+
+def _downscale_for_probe(img_gray: "np.ndarray", max_dim: int = 1056) -> "np.ndarray":
+    if not HAVE_CV2:
+        return img_gray
+    h, w = img_gray.shape[:2]
+    max_side = max(int(h), int(w))
+    target = max(64, int(max_dim))
+    if max_side <= target:
+        return img_gray
+    scale = float(target) / float(max_side)
+    out_w = max(1, int(round(float(w) * scale)))
+    out_h = max(1, int(round(float(h) * scale)))
+    try:
+        return cv2.resize(img_gray, (out_w, out_h), interpolation=cv2.INTER_AREA)
+    except Exception:
+        return img_gray
+
+
+def _threshold_binary_inv(img_gray: "np.ndarray") -> "np.ndarray | None":
+    try:
+        _thr, bin_inv = cv2.threshold(img_gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        return bin_inv
+    except Exception:
+        return None
+
+
+def _connected_component_summary(bin_inv: "np.ndarray") -> Dict[str, object]:
+    summary: Dict[str, object] = {
+        "component_count": 0,
+        "ink_ratio": 0.0,
+        "largest_component_ratio": 0.0,
+        "largest_component_bbox": [],
+        "largest_component_crop_ink_ratio": 0.0,
+    }
+    if not HAVE_CV2 or not isinstance(bin_inv, np.ndarray) or bin_inv.ndim != 2 or bin_inv.size == 0:
+        return summary
+
+    img_h, img_w = bin_inv.shape[:2]
+    img_area = float(max(1, img_h * img_w))
+    summary["ink_ratio"] = float(float(np.count_nonzero(bin_inv)) / img_area)
+
+    try:
+        num, _labels, stats, _centroids = cv2.connectedComponentsWithStats(bin_inv, connectivity=8)
+    except Exception:
+        return summary
+
+    largest_area = 0
+    largest_bbox: List[int] = []
+    comp_count = 0
+    for i in range(1, int(num)):
+        area = int(stats[i, cv2.CC_STAT_AREA])
+        if area <= 0:
+            continue
+        comp_count += 1
+        if area > largest_area:
+            x = int(stats[i, cv2.CC_STAT_LEFT])
+            y = int(stats[i, cv2.CC_STAT_TOP])
+            w = int(stats[i, cv2.CC_STAT_WIDTH])
+            h = int(stats[i, cv2.CC_STAT_HEIGHT])
+            largest_area = int(area)
+            largest_bbox = [x, y, x + w, y + h]
+
+    summary["component_count"] = int(comp_count)
+    if largest_area > 0:
+        summary["largest_component_ratio"] = float(float(largest_area) / img_area)
+        summary["largest_component_bbox"] = list(largest_bbox)
+        if len(largest_bbox) == 4:
+            x0, y0, x1, y1 = largest_bbox
+            crop = bin_inv[y0:y1, x0:x1]
+            if crop.size > 0:
+                summary["largest_component_crop_ink_ratio"] = float(
+                    float(np.count_nonzero(crop)) / float(max(1, crop.shape[0] * crop.shape[1]))
+                )
+    return summary
+
+
+def _estimate_microgrid_stats(bin_inv: "np.ndarray", bbox: List[int]) -> Dict[str, float]:
+    stats_out: Dict[str, float] = {
+        "crop_w": 0.0,
+        "crop_h": 0.0,
+        "crop_ink_ratio": 0.0,
+        "h_line_count": 0.0,
+        "v_line_count": 0.0,
+        "h_gap_med": 0.0,
+        "v_gap_med": 0.0,
+        "h_gap_cv": 0.0,
+        "v_gap_cv": 0.0,
+    }
+    if not HAVE_CV2 or not isinstance(bin_inv, np.ndarray) or bin_inv.ndim != 2 or len(bbox) != 4:
+        return stats_out
+
+    x0, y0, x1, y1 = (int(v) for v in bbox)
+    x0 = max(0, min(int(bin_inv.shape[1]), x0))
+    x1 = max(0, min(int(bin_inv.shape[1]), x1))
+    y0 = max(0, min(int(bin_inv.shape[0]), y0))
+    y1 = max(0, min(int(bin_inv.shape[0]), y1))
+    if x1 <= x0 or y1 <= y0:
+        return stats_out
+    crop = bin_inv[y0:y1, x0:x1]
+    crop_h, crop_w = crop.shape[:2]
+    if crop_h < 30 or crop_w < 30:
+        return stats_out
+    stats_out["crop_w"] = float(crop_w)
+    stats_out["crop_h"] = float(crop_h)
+    stats_out["crop_ink_ratio"] = float(float(np.count_nonzero(crop)) / float(max(1, crop_h * crop_w)))
+
+    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(5, int(round(float(crop_w) * 0.05))), 1))
+    v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(5, int(round(float(crop_h) * 0.05)))))
+    try:
+        horiz = cv2.morphologyEx(crop, cv2.MORPH_OPEN, h_kernel)
+        vert = cv2.morphologyEx(crop, cv2.MORPH_OPEN, v_kernel)
+    except Exception:
+        return stats_out
+
+    h_comps = _line_components(horiz, "h", crop_w, crop_h)
+    v_comps = _line_components(vert, "v", crop_w, crop_h)
+    h_positions = _cluster_positions([float(comp["pos"]) for comp in h_comps], tol=max(2.0, float(crop_h) * 0.01))
+    v_positions = _cluster_positions([float(comp["pos"]) for comp in v_comps], tol=max(2.0, float(crop_w) * 0.01))
+    h_gap_med, h_gap_cv = _gap_stats(h_positions)
+    v_gap_med, v_gap_cv = _gap_stats(v_positions)
+
+    stats_out["h_line_count"] = float(len(h_positions))
+    stats_out["v_line_count"] = float(len(v_positions))
+    stats_out["h_gap_med"] = float(h_gap_med)
+    stats_out["v_gap_med"] = float(v_gap_med)
+    stats_out["h_gap_cv"] = float(h_gap_cv)
+    stats_out["v_gap_cv"] = float(v_gap_cv)
+    return stats_out
+
+
+def _summarize_probe_tokens(tokens: List[Dict[str, Any]]) -> Dict[str, float]:
+    stats_out: Dict[str, float] = {
+        "token_count": 0.0,
+        "nonempty_tokens": 0.0,
+        "alnum_tokens": 0.0,
+        "text_chars": 0.0,
+    }
+    if not isinstance(tokens, list):
+        return stats_out
+
+    nonempty = 0
+    alnum = 0
+    text_chars = 0
+    for tok in tokens:
+        txt = str((tok or {}).get("text", "") or "").strip()
+        if not txt:
+            continue
+        nonempty += 1
+        text_chars += len(txt)
+        if any(ch.isalnum() for ch in txt):
+            alnum += 1
+
+    stats_out["token_count"] = float(len(tokens))
+    stats_out["nonempty_tokens"] = float(nonempty)
+    stats_out["alnum_tokens"] = float(alnum)
+    stats_out["text_chars"] = float(text_chars)
+    return stats_out
+
+
+def inspect_page_for_graph_item_skip(
+    img_gray: object,
+    *,
+    ocr_probe: Callable[[], object] | None = None,
+) -> Dict[str, object]:
+    """
+    Return a conservative page-level skip classification for dense raster graph items.
+
+    This is intentionally stricter than the region-masking guard. It requires:
+    - a dominant low-resolution raster component
+    - no useful text from a cheap OCR probe
+    - evidence that tiny dense cells collapsed into graph-like structure
+    """
+    result: Dict[str, object] = {"skip_page": False, "reason": "", "stats": {}}
+    if not HAVE_CV2:
+        return result
+    if not isinstance(img_gray, np.ndarray) or img_gray.ndim != 2 or img_gray.size == 0:
+        return result
+
+    img_probe = _downscale_for_probe(img_gray)
+    bin_inv = _threshold_binary_inv(img_probe)
+    if bin_inv is None:
+        return result
+
+    cc_stats = _connected_component_summary(bin_inv)
+    bbox = list(cc_stats.get("largest_component_bbox") or [])
+    microgrid_stats = _estimate_microgrid_stats(bin_inv, bbox)
+
+    dominant_raster_gate = (
+        float(cc_stats.get("ink_ratio") or 0.0) >= 0.20
+        and float(cc_stats.get("largest_component_ratio") or 0.0) >= 0.15
+        and int(cc_stats.get("component_count") or 0) <= 6
+    )
+
+    probe_tokens: List[Dict[str, Any]] = []
+    probe_error = ""
+    if callable(ocr_probe):
+        try:
+            probe_result = ocr_probe()
+            if isinstance(probe_result, dict):
+                maybe_tokens = probe_result.get("tokens")
+                if isinstance(maybe_tokens, list):
+                    probe_tokens = maybe_tokens
+            elif isinstance(probe_result, list):
+                probe_tokens = probe_result
+        except Exception as exc:
+            probe_error = f"{type(exc).__name__}: {exc}"
+    probe_stats = _summarize_probe_tokens(probe_tokens)
+    no_useful_text_gate = bool(
+        callable(ocr_probe)
+        and int(probe_stats.get("alnum_tokens") or 0) <= 1
+        and int(probe_stats.get("text_chars") or 0) <= 4
+    )
+
+    crop_ink_ratio = float(microgrid_stats.get("crop_ink_ratio") or 0.0)
+    h_line_count = int(round(float(microgrid_stats.get("h_line_count") or 0.0)))
+    v_line_count = int(round(float(microgrid_stats.get("v_line_count") or 0.0)))
+    h_gap_med = float(microgrid_stats.get("h_gap_med") or 0.0)
+    v_gap_med = float(microgrid_stats.get("v_gap_med") or 0.0)
+    h_gap_cv = float(microgrid_stats.get("h_gap_cv") or 0.0)
+    v_gap_cv = float(microgrid_stats.get("v_gap_cv") or 0.0)
+
+    collapsed_microcells = crop_ink_ratio >= 0.60
+    ruled_microgrid = (
+        h_line_count >= 8
+        and v_line_count >= 8
+        and h_gap_med > 0
+        and v_gap_med > 0
+        and h_gap_med <= 18.0
+        and v_gap_med <= 18.0
+        and h_gap_cv <= 0.55
+        and v_gap_cv <= 0.55
+    )
+    microgrid_gate = bool(collapsed_microcells or ruled_microgrid)
+
+    result["stats"] = {
+        "probe_size": [int(img_probe.shape[1]), int(img_probe.shape[0])],
+        "dominant_component": cc_stats,
+        "microgrid": microgrid_stats,
+        "ocr_probe": probe_stats,
+        "probe_error": probe_error,
+        "dominant_raster_gate": bool(dominant_raster_gate),
+        "no_useful_text_gate": bool(no_useful_text_gate),
+        "microgrid_gate": bool(microgrid_gate),
+    }
+
+    if dominant_raster_gate and no_useful_text_gate and microgrid_gate:
+        result["skip_page"] = True
+        result["reason"] = "dense_raster_graph_page"
+
     return result
 
 

@@ -95,6 +95,7 @@ class _PerfAxisHarness:
             setattr(self, name, getattr(TestDataTrendDialog, name).__get__(self, _PerfAxisHarness))
 
         self._update_perf_fit_controls = lambda: None
+        self._update_perf_control_period_state = lambda: None
         self._clear_perf_results = lambda: setattr(self, "clear_calls", self.clear_calls + 1)
 
         self._fill_perf_axis_combo(self.cb_perf_x_col)
@@ -260,7 +261,7 @@ class _MetricBoundsHarness:
 
 @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
 class TestTDTrendDialogCacheLoading(unittest.TestCase):
-    def test_open_uses_existing_cache_validation(self) -> None:
+    def test_load_cache_sync_fallback_uses_smart_ensure(self) -> None:
         _qt_app()
         from PySide6 import QtWidgets
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
@@ -285,17 +286,21 @@ class TestTDTrendDialogCacheLoading(unittest.TestCase):
         load_cache = TestDataTrendDialog._load_cache.__get__(harness, _Harness)
         fake_db = harness._project_dir / "implementation_trending.sqlite3"
 
-        with mock.patch.object(be, "validate_existing_test_data_project_cache", return_value=fake_db) as validate_mock:
-            with mock.patch.object(be, "ensure_test_data_project_cache") as ensure_mock:
+        with mock.patch.object(be, "ensure_test_data_project_cache", return_value=fake_db) as ensure_mock:
+            with mock.patch.object(QtWidgets.QMessageBox, "warning") as warning_mock:
                 load_cache(rebuild=False)
 
-        validate_mock.assert_called_once_with(harness._project_dir, harness._workbook_path)
-        ensure_mock.assert_not_called()
+        warning_mock.assert_not_called()
+        ensure_mock.assert_called_once_with(
+            harness._project_dir,
+            harness._workbook_path,
+            rebuild=False,
+        )
         self.assertEqual(harness._db_path, fake_db)
         self.assertEqual(harness._refresh_from_cache_calls, 1)
         self.assertEqual(harness._update_plot_zoom_actions_calls, 1)
 
-    def test_open_auto_builds_cache_when_validation_fails(self) -> None:
+    def test_load_cache_sync_fallback_warns_on_error(self) -> None:
         _qt_app()
         from PySide6 import QtWidgets
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
@@ -318,21 +323,220 @@ class TestTDTrendDialogCacheLoading(unittest.TestCase):
             harness._update_plot_zoom_actions_calls + 1,
         )
         load_cache = TestDataTrendDialog._load_cache.__get__(harness, _Harness)
-        fake_db = harness._project_dir / "implementation_trending.sqlite3"
 
-        with mock.patch.object(
-            be,
-            "validate_existing_test_data_project_cache",
-            side_effect=RuntimeError("Project cache DB not found"),
-        ) as validate_mock:
+        with mock.patch.object(be, "ensure_test_data_project_cache", side_effect=RuntimeError("boom")) as ensure_mock:
+            with mock.patch.object(QtWidgets.QMessageBox, "warning") as warning_mock:
+                load_cache(rebuild=False)
+
+        ensure_mock.assert_called_once_with(
+            harness._project_dir,
+            harness._workbook_path,
+            rebuild=False,
+        )
+        warning_mock.assert_called_once()
+        self.assertEqual(harness._refresh_from_cache_calls, 0)
+        self.assertEqual(harness._update_plot_zoom_actions_calls, 0)
+
+    def test_load_cache_progress_path_auto_builds_on_first_open(self) -> None:
+        _qt_app()
+        from PySide6 import QtCore, QtWidgets
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+        from EIDAT_App_Files.ui_next import qt_main as qm  # type: ignore
+        from EIDAT_App_Files.ui_next.qt_main import TestDataTrendDialog  # type: ignore
+
+        class _Signal:
+            def __init__(self) -> None:
+                self._callbacks: list = []
+
+            def connect(self, callback) -> None:
+                self._callbacks.append(callback)
+
+            def emit(self, *args) -> None:
+                for callback in list(self._callbacks):
+                    callback(*args)
+
+        class _ImmediateWorker:
+            def __init__(self, task_factory, parent=None):
+                self._task_factory = task_factory
+                self._running = False
+                self.progress = _Signal()
+                self.completed = _Signal()
+                self.failed = _Signal()
+
+            def isRunning(self) -> bool:
+                return self._running
+
+            def start(self) -> None:
+                self._running = True
+                try:
+                    payload = self._task_factory(lambda message: self.progress.emit(message))
+                except Exception as exc:
+                    self.failed.emit(str(exc))
+                else:
+                    self.completed.emit(payload)
+                finally:
+                    self._running = False
+
+        class _ProgressStub:
+            def __init__(self) -> None:
+                self.lbl_heading = QtWidgets.QLabel()
+                self.detail_label = QtWidgets.QLabel()
+                self.btn_cancel = QtWidgets.QPushButton()
+                self.begin_calls: list[str] = []
+                self.finish_calls: list[tuple[str, bool]] = []
+
+            def begin(self, status_text: str) -> None:
+                self.begin_calls.append(status_text)
+
+            def finish(self, message: str, success: bool = True) -> None:
+                self.finish_calls.append((message, success))
+
+        class _Harness:
+            pass
+
+        harness = _Harness()
+        harness._project_dir = Path("C:/tmp/project")
+        harness._workbook_path = Path("C:/tmp/project/project.xlsx")
+        harness.lbl_source = QtWidgets.QLabel()
+        harness.lbl_cache = QtWidgets.QLabel()
+        harness.btn_refresh_cache = QtWidgets.QPushButton()
+        harness.btn_open_support = QtWidgets.QPushButton()
+        harness.btn_export_debug_excels = QtWidgets.QPushButton()
+        harness.btn_plot = QtWidgets.QPushButton()
+        harness._cache_worker = None
+        harness._cache_progress_visible = False
+        harness._cache_progress_heading = ""
+        harness._cache_progress_status = ""
+        harness._cache_progress_detail = ""
+        harness._cache_progress_timer = QtCore.QTimer()
+        harness._report_progress = _ProgressStub()
+        harness._refresh_from_cache_calls = 0
+        harness._update_plot_zoom_actions_calls = 0
+        harness._refresh_from_cache = lambda: setattr(harness, "_refresh_from_cache_calls", harness._refresh_from_cache_calls + 1)
+        harness._update_plot_zoom_actions = lambda: setattr(
+            harness,
+            "_update_plot_zoom_actions_calls",
+            harness._update_plot_zoom_actions_calls + 1,
+        )
+
+        for name in (
+            "_load_cache",
+            "_set_cache_controls_enabled",
+            "_show_cache_progress_dialog",
+            "_on_cache_task_progress",
+            "_on_cache_task_done",
+            "_on_cache_task_error",
+        ):
+            setattr(harness, name, getattr(TestDataTrendDialog, name).__get__(harness, _Harness))
+        harness._cache_progress_timer.timeout.connect(harness._show_cache_progress_dialog)
+
+        fake_db = harness._project_dir / "implementation_trending.sqlite3"
+        with mock.patch.object(qm, "ProjectTaskWorker", _ImmediateWorker):
             with mock.patch.object(be, "ensure_test_data_project_cache", return_value=fake_db) as ensure_mock:
-                load_cache(rebuild=False)
+                with mock.patch.object(QtWidgets.QMessageBox, "warning") as warning_mock:
+                    harness._load_cache(rebuild=False)
 
-        validate_mock.assert_called_once_with(harness._project_dir, harness._workbook_path)
-        ensure_mock.assert_called_once_with(harness._project_dir, harness._workbook_path, rebuild=True)
+        warning_mock.assert_not_called()
+        ensure_mock.assert_called_once()
+        self.assertEqual(ensure_mock.call_args.kwargs.get("rebuild"), False)
+        self.assertTrue(callable(ensure_mock.call_args.kwargs.get("progress_cb")))
         self.assertEqual(harness._db_path, fake_db)
         self.assertEqual(harness._refresh_from_cache_calls, 1)
         self.assertEqual(harness._update_plot_zoom_actions_calls, 1)
+
+    def test_load_cache_progress_path_warns_only_when_build_fails(self) -> None:
+        _qt_app()
+        from PySide6 import QtCore, QtWidgets
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+        from EIDAT_App_Files.ui_next import qt_main as qm  # type: ignore
+        from EIDAT_App_Files.ui_next.qt_main import TestDataTrendDialog  # type: ignore
+
+        class _Signal:
+            def __init__(self) -> None:
+                self._callbacks: list = []
+
+            def connect(self, callback) -> None:
+                self._callbacks.append(callback)
+
+            def emit(self, *args) -> None:
+                for callback in list(self._callbacks):
+                    callback(*args)
+
+        class _ImmediateWorker:
+            def __init__(self, task_factory, parent=None):
+                self._task_factory = task_factory
+                self._running = False
+                self.progress = _Signal()
+                self.completed = _Signal()
+                self.failed = _Signal()
+
+            def isRunning(self) -> bool:
+                return self._running
+
+            def start(self) -> None:
+                self._running = True
+                try:
+                    _ = self._task_factory(lambda message: self.progress.emit(message))
+                except Exception as exc:
+                    self.failed.emit(str(exc))
+                else:
+                    self.completed.emit(None)
+                finally:
+                    self._running = False
+
+        class _ProgressStub:
+            def __init__(self) -> None:
+                self.lbl_heading = QtWidgets.QLabel()
+                self.detail_label = QtWidgets.QLabel()
+                self.btn_cancel = QtWidgets.QPushButton()
+
+            def begin(self, status_text: str) -> None:
+                return None
+
+            def finish(self, message: str, success: bool = True) -> None:
+                return None
+
+        class _Harness:
+            pass
+
+        harness = _Harness()
+        harness._project_dir = Path("C:/tmp/project")
+        harness._workbook_path = Path("C:/tmp/project/project.xlsx")
+        harness.lbl_source = QtWidgets.QLabel()
+        harness.lbl_cache = QtWidgets.QLabel()
+        harness.btn_refresh_cache = QtWidgets.QPushButton()
+        harness.btn_open_support = QtWidgets.QPushButton()
+        harness.btn_export_debug_excels = QtWidgets.QPushButton()
+        harness.btn_plot = QtWidgets.QPushButton()
+        harness._cache_worker = None
+        harness._cache_progress_visible = False
+        harness._cache_progress_heading = ""
+        harness._cache_progress_status = ""
+        harness._cache_progress_detail = ""
+        harness._cache_progress_timer = QtCore.QTimer()
+        harness._report_progress = _ProgressStub()
+        harness._refresh_from_cache = lambda: None
+        harness._update_plot_zoom_actions = lambda: None
+
+        for name in (
+            "_load_cache",
+            "_set_cache_controls_enabled",
+            "_show_cache_progress_dialog",
+            "_on_cache_task_progress",
+            "_on_cache_task_done",
+            "_on_cache_task_error",
+        ):
+            setattr(harness, name, getattr(TestDataTrendDialog, name).__get__(harness, _Harness))
+        harness._cache_progress_timer.timeout.connect(harness._show_cache_progress_dialog)
+
+        with mock.patch.object(qm, "ProjectTaskWorker", _ImmediateWorker):
+            with mock.patch.object(be, "ensure_test_data_project_cache", side_effect=RuntimeError("build failed")):
+                with mock.patch.object(QtWidgets.QMessageBox, "warning") as warning_mock:
+                    harness._load_cache(rebuild=False)
+
+        warning_mock.assert_called_once()
+        self.assertIn("build failed", str(warning_mock.call_args.args[2]))
+        self.assertEqual(harness.lbl_cache.text(), "Cache DB: unavailable")
 
     def test_generate_debug_excel_files_uses_manual_export_only(self) -> None:
         _qt_app()
@@ -2094,6 +2298,120 @@ class TestTDSupportWorkbook(unittest.TestCase):
             finally:
                 wb2.close()
 
+    def test_ensure_cache_uses_calc_only_refresh_after_support_change(self) -> None:
+        from openpyxl import load_workbook  # type: ignore
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            src_db = root / "src.sqlite3"
+            self._make_source_sqlite(src_db)
+
+            wb_path = root / "project.xlsx"
+            be._write_test_data_trending_workbook(
+                wb_path,
+                global_repo=root,
+                serials=["SN1"],
+                docs=[{"serial_number": "SN1", "excel_sqlite_rel": str(src_db)}],
+                config=self._make_config(),
+            )
+            support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+            be._write_td_support_workbook(
+                support_path,
+                sequence_names=["RunA"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+            )
+            be.ensure_test_data_project_cache(root, wb_path, rebuild=True)
+
+            wb = load_workbook(str(support_path))
+            try:
+                ws_settings = wb["Settings"]
+                ws_settings.cell(3, 2).value = 3
+                wb.save(str(support_path))
+            finally:
+                wb.close()
+
+            with mock.patch.object(be, "rebuild_test_data_project_cache") as rebuild_mock:
+                with mock.patch.object(be, "_rebuild_test_data_project_calc_cache_from_raw", return_value={}) as calc_mock:
+                    db_path = be.ensure_test_data_project_cache(root, wb_path, rebuild=False)
+
+            self.assertEqual(db_path, root / "implementation_trending.sqlite3")
+            rebuild_mock.assert_not_called()
+            calc_mock.assert_called_once_with(root / "implementation_trending.sqlite3", wb_path, progress_cb=None)
+
+    def test_ensure_cache_uses_calc_only_refresh_after_statistics_change(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            src_db = root / "src.sqlite3"
+            self._make_source_sqlite(src_db)
+
+            wb_path = root / "project.xlsx"
+            be._write_test_data_trending_workbook(
+                wb_path,
+                global_repo=root,
+                serials=["SN1"],
+                docs=[{"serial_number": "SN1", "excel_sqlite_rel": str(src_db)}],
+                config=self._make_config(),
+            )
+            support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+            be._write_td_support_workbook(
+                support_path,
+                sequence_names=["RunA"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+            )
+            be.ensure_test_data_project_cache(root, wb_path, rebuild=True)
+
+            cfg = self._make_config()
+            cfg["statistics"] = ["mean", "max"]
+            with mock.patch.object(be, "_load_project_td_trend_config", return_value=cfg):
+                with mock.patch.object(be, "rebuild_test_data_project_cache") as rebuild_mock:
+                    with mock.patch.object(be, "_rebuild_test_data_project_calc_cache_from_raw", return_value={}) as calc_mock:
+                        db_path = be.ensure_test_data_project_cache(root, wb_path, rebuild=False)
+
+            self.assertEqual(db_path, root / "implementation_trending.sqlite3")
+            rebuild_mock.assert_not_called()
+            calc_mock.assert_called_once_with(root / "implementation_trending.sqlite3", wb_path, progress_cb=None)
+
+    def test_ensure_cache_rebuilds_raw_cache_after_raw_column_change(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            src_db = root / "src.sqlite3"
+            self._make_source_sqlite(src_db)
+
+            wb_path = root / "project.xlsx"
+            be._write_test_data_trending_workbook(
+                wb_path,
+                global_repo=root,
+                serials=["SN1"],
+                docs=[{"serial_number": "SN1", "excel_sqlite_rel": str(src_db)}],
+                config=self._make_config(),
+            )
+            support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+            be._write_td_support_workbook(
+                support_path,
+                sequence_names=["RunA"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+            )
+            be.ensure_test_data_project_cache(root, wb_path, rebuild=True)
+
+            cfg = self._make_config()
+            cfg["columns"] = [
+                {"name": "thrust", "units": "lbf", "range_min": None, "range_max": None},
+                {"name": "feed pressure", "units": "psi", "range_min": None, "range_max": None},
+            ]
+            with mock.patch.object(be, "_load_project_td_trend_config", return_value=cfg):
+                with mock.patch.object(be, "rebuild_test_data_project_cache", return_value={}) as rebuild_mock:
+                    with mock.patch.object(be, "_rebuild_test_data_project_calc_cache_from_raw") as calc_mock:
+                        db_path = be.ensure_test_data_project_cache(root, wb_path, rebuild=False)
+
+            self.assertEqual(db_path, root / "implementation_trending.sqlite3")
+            rebuild_mock.assert_called_once_with(root / "implementation_trending.sqlite3", wb_path, progress_cb=None)
+            calc_mock.assert_not_called()
+
     def test_update_workbook_builds_missing_cache_db(self) -> None:
         from openpyxl import load_workbook  # type: ignore
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
@@ -3108,6 +3426,17 @@ class TestTDSupportWorkbook(unittest.TestCase):
             impl_db = root / "implementation_trending.sqlite3"
             payload = be.rebuild_test_data_project_cache(impl_db, wb_path)
             self.assertEqual(int(payload.get("curves_written") or 0), 1)
+            timings = payload.get("timings") or {}
+            for key in (
+                "source_resolution_s",
+                "source_sqlite_read_s",
+                "run_discovery_and_matching_s",
+                "raw_curve_extraction_s",
+                "raw_db_write_s",
+                "calc_rebuild_s",
+                "total_s",
+            ):
+                self.assertIn(key, timings)
 
             with sqlite3.connect(str(root / "test_data_raw_cache.sqlite3")) as conn:
                 row = conn.execute(
@@ -3115,6 +3444,23 @@ class TestTDSupportWorkbook(unittest.TestCase):
                     ("RunA", "SN1"),
                 ).fetchone()
                 self.assertEqual(row, ("thrust", "Time"))
+                raw_curve_count = int(conn.execute("SELECT COUNT(*) FROM td_curves_raw").fetchone()[0] or 0)
+                legacy_curve_count = int(conn.execute("SELECT COUNT(*) FROM td_curves").fetchone()[0] or 0)
+                self.assertGreater(raw_curve_count, 0)
+                self.assertEqual(legacy_curve_count, 0)
+
+            debug_payload = json.loads((root / be.TD_CACHE_DEBUG_JSON).read_text(encoding="utf-8"))
+            debug_timings = debug_payload.get("timings") or {}
+            for key in (
+                "source_resolution_s",
+                "source_sqlite_read_s",
+                "run_discovery_and_matching_s",
+                "raw_curve_extraction_s",
+                "raw_db_write_s",
+                "calc_rebuild_s",
+                "total_s",
+            ):
+                self.assertIn(key, debug_timings)
 
     def test_perf_candidate_discovery_clusters_near_equal_x_by_default(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore

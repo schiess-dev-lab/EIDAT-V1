@@ -392,6 +392,7 @@ def _build_debug_method_settings(dpi: int | None) -> dict[str, Any]:
         "tg_draw_overlay_lines": bool(tg_draw_overlay_lines),
         "tg_apply_borders_to_page": bool(tg_apply_borders_to_page),
         "tg_border_thickness": int(tg_border_thickness),
+        "graph_page_bypass": _parse_bool_env("EIDAT_GRAPH_PAGE_BYPASS", True),
         "enable_borderless": _parse_bool_env("EIDAT_TABLE_ENABLE_BORDERLESS", False)
         or _parse_bool_env("EIDAT_ENABLE_BORDERLESS_TABLES", False),
         "page_timeout_sec": max(0, _parse_int_env("EIDAT_PAGE_TIMEOUT_SEC", 0)),
@@ -441,12 +442,70 @@ def _process_debug_method_page(
 
     warnings: list[str] = []
     graph_guard: dict[str, Any] = {"regions": [], "stats": {}}
+    graph_page_skip: dict[str, Any] = {"skip_page": False, "reason": "", "stats": {}}
     masked_table_page_path = page_path
+    page_img_gray = None
     try:
         import cv2  # type: ignore
 
         page_img_gray = cv2.imread(str(page_path), cv2.IMREAD_GRAYSCALE)
         if page_img_gray is not None:
+            if bool(settings.get("graph_page_bypass", True)):
+                probe_lang: str | None = None
+
+                def _probe_page_tokens() -> list[dict[str, Any]]:
+                    nonlocal probe_lang
+                    if probe_lang is None:
+                        probe_lang = ocr_engine.get_tesseract_lang()
+                    tokens_probe, _probe_w, _probe_h, _probe_img = ocr_engine.ocr_page(
+                        pdf_path,
+                        page_num - 1,
+                        96,
+                        probe_lang,
+                        3,
+                        debug_dir=None,
+                    )
+                    return list(tokens_probe or [])
+
+                graph_page_skip = graph_page_guard.inspect_page_for_graph_item_skip(
+                    page_img_gray,
+                    ocr_probe=_probe_page_tokens,
+                )
+                if bool(graph_page_skip.get("skip_page")):
+                    warnings.append("graph_page_item_skipped")
+                    page_h, page_w = page_img_gray.shape[:2]
+                    page_data = {
+                        "page": int(page_num),
+                        "tokens": [],
+                        "tables": [],
+                        "charts": [],
+                        "img_w": int(page_w),
+                        "img_h": int(page_h),
+                        "dpi": int(settings.get("detection_dpi") or 900),
+                        "ocr_dpi": int(settings.get("ocr_dpi") or 450),
+                        "flow": {},
+                        "skip_reason": str(graph_page_skip.get("reason") or "graph_page_item_skipped"),
+                        "skip_marker": "{ITEM SKIPPED}",
+                        "graph_page_skip_stats": graph_page_skip.get("stats") or {},
+                    }
+                    if warnings:
+                        page_data["warnings"] = warnings
+                    debug_exporter.export_page_debug(
+                        pdf_path,
+                        page_num - 1,
+                        [],
+                        [],
+                        int(page_w),
+                        int(page_h),
+                        int(settings.get("detection_dpi") or 900),
+                        page_dir,
+                        charts=[],
+                        flow_data={},
+                        ocr_dpi=int(settings.get("ocr_dpi") or 450),
+                        ocr_img_w=int(page_w),
+                        ocr_img_h=int(page_h),
+                    )
+                    return page_data
             graph_guard = graph_page_guard.find_chart_like_regions(page_img_gray)
             chart_regions = list(graph_guard.get("regions") or [])
             if chart_regions:
@@ -1115,6 +1174,21 @@ def _is_test_data_meta(meta: dict[str, Any] | None) -> bool:
     return dt in {"test data", "testdata", "td"} or acr in {"test data", "testdata", "td"}
 
 
+def _is_confirmed_test_data_meta(meta: dict[str, Any] | None) -> bool:
+    src = meta if isinstance(meta, dict) else {}
+    if not _is_test_data_meta(src):
+        return False
+    try:
+        status = str(src.get("document_type_status") or "").strip().lower()
+    except Exception:
+        status = ""
+    try:
+        review_required = bool(src.get("document_type_review_required"))
+    except Exception:
+        review_required = False
+    return status == "confirmed" and not review_required
+
+
 def _run_excel_extraction(excel_mod: Any, excel_path: Path, output_dir: Path, config_path: Path) -> dict[str, Any]:
     if not config_path.exists():
         raise RuntimeError(f"Excel trend config not found: {config_path}")
@@ -1358,6 +1432,9 @@ def process_candidates(
                                 raw_meta["asset_specific_type"] = folder_hints.get("asset_specific_type") or "Unknown"
 
                         is_test_data = bool(is_mat) or _is_test_data_meta(raw_meta if isinstance(raw_meta, dict) else {})
+                        is_confirmed_test_data = bool(is_mat) or _is_confirmed_test_data_meta(
+                            raw_meta if isinstance(raw_meta, dict) else {}
+                        )
 
                         # Always run config-driven extraction as part of processing.
                         # If pandas is missing, allow Test Data flows to continue (SQLite is the key output).
@@ -1406,6 +1483,7 @@ def process_candidates(
                                         data_dir=None,
                                         out_dir=Path(artifacts_root),
                                         overwrite=True,
+                                        synthesize_td_seq_aliases=bool(is_confirmed_test_data),
                                     )
                                     try:
                                         results_list = list((payload or {}).get("results") or [])

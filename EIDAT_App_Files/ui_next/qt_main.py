@@ -3066,6 +3066,14 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._zone_zoom_press_xy: tuple[float, float] | None = None
         self._zone_zoom_rect = None
         self._perf_plotters: list[dict] = []
+        self._cache_worker: ProjectTaskWorker | None = None
+        self._cache_progress_visible = False
+        self._cache_progress_heading = "Test Data Cache"
+        self._cache_progress_status = "Preparing cache"
+        self._cache_progress_detail = ""
+        self._cache_progress_timer = QtCore.QTimer(self)
+        self._cache_progress_timer.setSingleShot(True)
+        self._cache_progress_timer.timeout.connect(self._show_cache_progress_dialog)
 
         self.setWindowTitle("Test Data - Trend / Analyze")
         self.resize(1180, 760)
@@ -3752,15 +3760,15 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 3)
 
-        self._load_cache(rebuild=False)
-        self._load_auto_plots()
-        self._set_mode("curves")
-
         self._report_progress = RunProgressDialog(self)
         try:
             self._report_progress.btn_cancel.hide()
         except Exception:
             pass
+
+        self._load_cache(rebuild=False)
+        self._load_auto_plots()
+        self._set_mode("curves")
 
     @staticmethod
     def _metric_title_suffix(stats: list[str] | tuple[str, ...] | None) -> str:
@@ -4326,30 +4334,120 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         dlg.exec()
 
     def _load_cache(self, *, rebuild: bool) -> None:
-        try:
-            if rebuild:
+        if not hasattr(self, "_report_progress"):
+            try:
                 self._db_path = be.ensure_test_data_project_cache(
-                    self._project_dir, self._workbook_path, rebuild=True
+                    self._project_dir,
+                    self._workbook_path,
+                    rebuild=bool(rebuild),
                 )
-            else:
-                try:
-                    self._db_path = be.validate_existing_test_data_project_cache(
-                        self._project_dir,
-                        self._workbook_path,
-                    )
-                except RuntimeError:
-                    self._db_path = be.ensure_test_data_project_cache(
-                        self._project_dir,
-                        self._workbook_path,
-                        rebuild=True,
-                    )
-            self.lbl_source.setText(str(self._db_path))
-            self.lbl_cache.setText(f"Cache DB: {self._db_path}")
-        except Exception as exc:
-            QtWidgets.QMessageBox.warning(self, "Test Data Cache", str(exc))
+                self.lbl_source.setText(str(self._db_path))
+                self.lbl_cache.setText(f"Cache DB: {self._db_path}")
+            except Exception as exc:
+                QtWidgets.QMessageBox.warning(self, "Test Data Cache", str(exc))
+                return
+            self._refresh_from_cache()
+            self._update_plot_zoom_actions()
             return
+        if self._cache_worker is not None and self._cache_worker.isRunning():
+            return
+        self._set_cache_controls_enabled(False)
+        self._cache_progress_visible = False
+        self._cache_progress_heading = "Rebuilding Test Data Cache" if rebuild else "Loading Test Data Cache"
+        self._cache_progress_status = "Rebuilding raw cache" if rebuild else "Checking project cache"
+        self._cache_progress_detail = ""
+        self.lbl_cache.setText("Cache DB: loading...")
+        self._cache_progress_timer.start(150)
+
+        def _task(report):
+            report(self._cache_progress_status)
+            return be.ensure_test_data_project_cache(
+                self._project_dir,
+                self._workbook_path,
+                rebuild=bool(rebuild),
+                progress_cb=report,
+            )
+
+        self._cache_worker = ProjectTaskWorker(_task, parent=self)
+        self._cache_worker.progress.connect(self._on_cache_task_progress)
+        self._cache_worker.completed.connect(self._on_cache_task_done)
+        self._cache_worker.failed.connect(self._on_cache_task_error)
+        self._cache_worker.start()
+
+    def _set_cache_controls_enabled(self, enabled: bool) -> None:
+        for widget in (
+            getattr(self, "btn_refresh_cache", None),
+            getattr(self, "btn_open_support", None),
+            getattr(self, "btn_export_debug_excels", None),
+            getattr(self, "btn_plot", None),
+        ):
+            try:
+                if widget is not None:
+                    widget.setEnabled(bool(enabled))
+            except Exception:
+                pass
+
+    def _show_cache_progress_dialog(self) -> None:
+        worker = self._cache_worker
+        if worker is None or not worker.isRunning() or self._cache_progress_visible:
+            return
+        self._cache_progress_visible = True
+        try:
+            self._report_progress.lbl_heading.setText(self._cache_progress_heading)
+            self._report_progress.begin(self._cache_progress_status)
+            if self._cache_progress_detail:
+                self._report_progress.detail_label.setText(self._cache_progress_detail)
+        except Exception:
+            self._cache_progress_visible = False
+
+    def _on_cache_task_progress(self, text: str) -> None:
+        msg = str(text or "").strip()
+        if not msg:
+            return
+        self._cache_progress_detail = msg
+        if not self._cache_progress_visible:
+            self._show_cache_progress_dialog()
+        if self._cache_progress_visible:
+            try:
+                self._report_progress.detail_label.setText(msg)
+            except Exception:
+                pass
+
+    def _on_cache_task_done(self, payload: object) -> None:
+        self._cache_progress_timer.stop()
+        self._cache_worker = None
+        self._set_cache_controls_enabled(True)
+        db_path = Path(str(payload)).expanduser() if payload is not None else None
+        if db_path is None:
+            QtWidgets.QMessageBox.warning(self, "Test Data Cache", "Cache build returned no database path.")
+            return
+        self._db_path = db_path
+        self.lbl_source.setText(str(self._db_path))
+        self.lbl_cache.setText(f"Cache DB: {self._db_path}")
+        if self._cache_progress_visible:
+            try:
+                self._report_progress.finish("Cache ready", success=True)
+            except Exception:
+                pass
+            self._cache_progress_visible = False
         self._refresh_from_cache()
         self._update_plot_zoom_actions()
+
+    def _on_cache_task_error(self, message: str) -> None:
+        self._cache_progress_timer.stop()
+        self._cache_worker = None
+        self._set_cache_controls_enabled(True)
+        self.lbl_cache.setText("Cache DB: unavailable")
+        if self._cache_progress_visible:
+            try:
+                self._report_progress.finish(f"Cache failed: {message}", success=False)
+            except Exception:
+                pass
+            self._cache_progress_visible = False
+        try:
+            QtWidgets.QMessageBox.warning(self, "Test Data Cache", str(message))
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Test Data Cache", str(exc))
 
     def _open_support_workbook(self) -> None:
         try:

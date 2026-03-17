@@ -129,6 +129,59 @@ class TestDebugExporterDefaultAscii(unittest.TestCase):
         self.assertIn("[Table 1]", combined)
         self.assertIn("| A |", combined)
 
+    def test_combined_text_emits_skip_marker_for_graph_item_page(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp)
+            output_path = debug_exporter.export_combined_text(
+                Path("dummy.pdf"),
+                [
+                    {
+                        "page": 1,
+                        "tokens": [],
+                        "tables": [],
+                        "charts": [],
+                        "flow": {},
+                        "dpi": 900,
+                        "ocr_dpi": 450,
+                        "skip_reason": "dense_raster_graph_page",
+                        "skip_marker": "{ITEM SKIPPED}",
+                    }
+                ],
+                out_dir,
+            )
+
+            combined = output_path.read_text(encoding="utf-8")
+
+        self.assertIn("=== Page 1 ===", combined)
+        self.assertIn("{ITEM SKIPPED}", combined)
+        self.assertNotIn("--- PAGE 1 SKIPPED:", combined)
+
+    def test_summary_report_includes_graph_item_skip_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp)
+            output_path = debug_exporter.create_summary_report(
+                Path("dummy.pdf"),
+                [
+                    {
+                        "page": 1,
+                        "tokens": [],
+                        "tables": [],
+                        "charts": [],
+                        "flow": {},
+                        "warnings": ["graph_page_item_skipped"],
+                        "skip_reason": "dense_raster_graph_page",
+                        "skip_marker": "{ITEM SKIPPED}",
+                    }
+                ],
+                out_dir,
+            )
+
+            summary = output_path.read_text(encoding="utf-8")
+
+        self.assertIn("dense_raster_graph_page", summary)
+        self.assertIn("graph_page_item_skipped", summary)
+        self.assertIn("{ITEM SKIPPED}", summary)
+
     def test_combined_text_uses_default_ascii_after_vline_split(self) -> None:
         old_env = {
             "EIDAT_TABLE_SPLIT_MODE": os.environ.get("EIDAT_TABLE_SPLIT_MODE"),

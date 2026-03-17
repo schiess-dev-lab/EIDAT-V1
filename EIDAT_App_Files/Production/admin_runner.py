@@ -308,11 +308,14 @@ def run_update_processor(
     on_log: Callable[[str], None] | None = None,
 ) -> PipelineResult:
     """
-    Update the node-local processor environments without deleting node caches/artifacts.
+    Refresh the node-local processor environments against the current central runtime
+    without deleting node caches/artifacts.
 
     This ensures/updates:
       <node_root>\\EIDAT\\Runtime\\.venv
       <node_root>\\EIDAT\\ExtractionNode\\node-ui\\.venv
+    Processing still executes directly from:
+      <runtime_root>\\EIDAT_App_Files
     """
     node = _as_abs(node_root)
     runtime = _as_abs(runtime_root)
@@ -325,7 +328,8 @@ def run_update_processor(
             raise RuntimeError(f"Node root does not exist: {node}")
         if not node.is_dir():
             raise RuntimeError(f"Node root is not a directory: {node}")
-        if not (runtime / "EIDAT_App_Files").exists():
+        app_root = runtime / "EIDAT_App_Files"
+        if not app_root.exists():
             raise RuntimeError(f"Runtime root does not contain EIDAT_App_Files: {runtime}")
 
         # Prefer requirement files from the central runtime to keep updates consistent.
@@ -338,7 +342,8 @@ def run_update_processor(
 
         if on_log is not None:
             on_log(f"[NODE] {node}")
-            on_log("[ACTION] update_processor (bootstrap node runtime + node-ui venvs; keep caches)")
+            on_log("[ACTION] update_processor (refresh node runtime + node-ui venvs; keep caches)")
+            on_log(f"[APP ROOT] {app_root}")
             on_log(f"[REQ full] {req_full}")
             on_log(f"[REQ ui] {req_ui}")
 
@@ -394,6 +399,7 @@ def run_update_processor(
         outputs["update_processor"] = {
             "rc": max(rc_runtime, rc_ui),
             "python": python_exe,
+            "app_root": str(app_root),
             "runtime_requirements": str(req_full),
             "ui_requirements": str(req_ui),
             "runtime_install_log": str(runtime_log_path),
@@ -410,9 +416,9 @@ def run_update_processor(
 
         if on_log is not None:
             if updated:
-                on_log("[OK] Processor environments updated.")
+                on_log("[OK] Processor environments updated against current runtime code.")
             else:
-                on_log("[OK] Processor environments already up to date.")
+                on_log("[OK] Processor environments already match the current runtime code.")
             if runtime_log_path.exists():
                 on_log(f"[LOG runtime] {runtime_log_path}")
             if ui_log_path.exists():

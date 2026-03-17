@@ -1494,6 +1494,7 @@ def export_combined_text(pdf_path: Path, pages_data: List[Dict],
         tables = page_data.get('tables', [])
         flow = page_data.get('flow') or {}
         charts = page_data.get('charts', []) or []
+        skip_marker = str(page_data.get("skip_marker") or "").strip()
         chart_bboxes = [c.get("bbox_px") for c in charts if c.get("bbox_px")]
         confirmed_footers: List[List[Dict]] = []
 
@@ -1530,6 +1531,10 @@ def export_combined_text(pdf_path: Path, pages_data: List[Dict],
                     combined_text.append("[Timed-Out Table Salvage]\n")
                     combined_text.append(salvage_text)
                     combined_text.append("\n\n")
+
+        if skip_marker:
+            combined_text.append(f"{skip_marker}\n\n")
+            continue
 
         if flow:
             header_entries = header_page_entries[page_idx] if page_idx < len(header_page_entries) else []
@@ -1763,13 +1768,23 @@ def create_summary_report(pdf_path: Path, pages_data: List[Dict],
     pages = []
     for p in pages_data:
         page_tables = p.get('tables', [])
-        pages.append({
+        page_summary = {
             'page': p.get('page'),
             'tokens': len(p.get('tokens', [])),
             'tables': len(page_tables),
             'cells': sum(t.get('num_cells', 0) for t in page_tables),
             'ocr_method_summary': _build_ocr_method_summary(page_tables)
-        })
+        }
+        warnings = list(p.get("warnings") or [])
+        if warnings:
+            page_summary["warnings"] = warnings
+        skip_reason = str(p.get("skip_reason") or "").strip()
+        if skip_reason:
+            page_summary["skip_reason"] = skip_reason
+        skip_marker = str(p.get("skip_marker") or "").strip()
+        if skip_marker:
+            page_summary["skip_marker"] = skip_marker
+        pages.append(page_summary)
 
     summary = {
         'pdf_file': str(pdf_path),

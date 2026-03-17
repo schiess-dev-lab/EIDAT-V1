@@ -9,6 +9,31 @@ if str(APP_ROOT) not in sys.path:
 
 
 class TestGraphPageGuard(unittest.TestCase):
+    def test_dense_raster_graph_page_is_skipped_when_probe_finds_no_text(self) -> None:
+        try:
+            import cv2  # type: ignore
+            import numpy as np
+        except Exception:
+            self.skipTest("cv2/numpy not available")
+
+        from extraction.graph_page_guard import inspect_page_for_graph_item_skip
+
+        img = np.full((2200, 1700), 255, dtype=np.uint8)
+        x0, y0, x1, y1 = 180, 120, 1520, 2060
+        for x in range(x0, x1 + 1, 8):
+            cv2.line(img, (x, y0), (x, y1), 0, 2)
+        for y in range(y0, y1 + 1, 8):
+            cv2.line(img, (x0, y), (x1, y), 0, 2)
+
+        result = inspect_page_for_graph_item_skip(img, ocr_probe=lambda: [])
+
+        self.assertTrue(result.get("skip_page"))
+        self.assertEqual(result.get("reason"), "dense_raster_graph_page")
+        stats = result.get("stats") or {}
+        self.assertTrue(stats.get("dominant_raster_gate"))
+        self.assertTrue(stats.get("no_useful_text_gate"))
+        self.assertTrue(stats.get("microgrid_gate"))
+
     def test_dense_regular_grid_region_is_detected(self) -> None:
         try:
             import cv2  # type: ignore
@@ -70,6 +95,51 @@ class TestGraphPageGuard(unittest.TestCase):
 
         result = find_chart_like_regions(img)
         self.assertFalse(result.get("regions"))
+
+    def test_full_page_table_is_not_skipped(self) -> None:
+        try:
+            import cv2  # type: ignore
+            import numpy as np
+        except Exception:
+            self.skipTest("cv2/numpy not available")
+
+        from extraction.graph_page_guard import inspect_page_for_graph_item_skip
+
+        img = np.full((2200, 1700), 255, dtype=np.uint8)
+        x0, y0, x1, y1 = 120, 140, 1560, 2040
+        for x in range(x0, x1 + 1, 180):
+            cv2.line(img, (x, y0), (x, y1), 0, 3)
+        for y in range(y0, y1 + 1, 140):
+            cv2.line(img, (x0, y), (x1, y), 0, 3)
+
+        result = inspect_page_for_graph_item_skip(img, ocr_probe=lambda: [])
+
+        self.assertFalse(result.get("skip_page"))
+
+    def test_dense_page_with_meaningful_probe_text_is_not_skipped(self) -> None:
+        try:
+            import cv2  # type: ignore
+            import numpy as np
+        except Exception:
+            self.skipTest("cv2/numpy not available")
+
+        from extraction.graph_page_guard import inspect_page_for_graph_item_skip
+
+        img = np.full((2200, 1700), 255, dtype=np.uint8)
+        x0, y0, x1, y1 = 180, 120, 1520, 2060
+        for x in range(x0, x1 + 1, 8):
+            cv2.line(img, (x, y0), (x, y1), 0, 2)
+        for y in range(y0, y1 + 1, 8):
+            cv2.line(img, (x0, y), (x1, y), 0, 2)
+
+        result = inspect_page_for_graph_item_skip(
+            img,
+            ocr_probe=lambda: [{"text": "Voltage"}, {"text": "Current"}],
+        )
+
+        self.assertFalse(result.get("skip_page"))
+        stats = result.get("stats") or {}
+        self.assertFalse(stats.get("no_useful_text_gate"))
 
 
 if __name__ == "__main__":
