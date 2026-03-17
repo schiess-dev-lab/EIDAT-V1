@@ -8592,6 +8592,7 @@ TD_PERF_FIT_MODE_POLYNOMIAL_SURFACE = "polynomial_surface"
 TD_PERF_FIT_MODE_AUTO_SURFACE = "auto_surface"
 TD_PERF_FIT_FAMILY_PLANE = "plane"
 TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE = "quadratic_surface"
+TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD = "quadratic_surface_control_period"
 TD_PERF_FIT_MODES = {
     TD_PERF_FIT_MODE_AUTO,
     TD_PERF_FIT_MODE_POLYNOMIAL,
@@ -8607,6 +8608,7 @@ TD_PERF_FIT_MODES = {
     TD_PERF_FIT_MODE_AUTO_SURFACE,
     TD_PERF_FIT_FAMILY_PLANE,
     TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE,
+    TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD,
 }
 TD_PERF_FIT_COMPLEXITY_PENALTIES = {
     TD_PERF_FIT_MODE_POLYNOMIAL: 0.0,
@@ -8629,6 +8631,7 @@ TD_PERF_FIT_FAMILY_PRIORITY = {
     TD_PERF_FIT_MODE_POLYNOMIAL: 7,
     TD_PERF_FIT_FAMILY_PLANE: 8,
     TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE: 9,
+    TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD: 10,
 }
 TD_PERF_EXPORT_STATS_ORDER = ["mean", "min", "max", "std", "min_3sigma", "max_3sigma"]
 
@@ -8666,6 +8669,8 @@ def td_perf_fit_family_label(value: object) -> str:
         return "Plane"
     if fam == TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE:
         return "Quadratic Surface"
+    if fam == TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD:
+        return "Quadratic Surface + Control Period"
     return "Auto"
 
 
@@ -8751,6 +8756,49 @@ def _td_perf_fmt_surface_normalization(x1_center: float, x1_scale: float, x2_cen
     return (
         f"x1' = (x1 - {_td_perf_fmt_num(x1_center)}) / {_td_perf_fmt_num(x1_scale)} ; "
         f"x2' = (x2 - {_td_perf_fmt_num(x2_center)}) / {_td_perf_fmt_num(x2_scale)}"
+    )
+
+
+def _td_perf_fmt_variable_poly_expr(coeffs: Sequence[object], variable_name: str) -> str:
+    terms: list[str] = []
+    coeff_list = [float(v) for v in coeffs]
+    degree = len(coeff_list) - 1
+    for idx, coeff in enumerate(coeff_list):
+        power = degree - idx
+        if power <= 0:
+            terms.append(f"{float(coeff):+.4g}")
+        elif power == 1:
+            terms.append(f"{float(coeff):+.4g}*{variable_name}")
+        else:
+            terms.append(f"{float(coeff):+.4g}*{variable_name}^{power}")
+    expr = " ".join(terms).lstrip("+").strip()
+    return expr or "0"
+
+
+def _td_perf_fmt_surface_control_period_equation(coeff_cp_models: Sequence[Sequence[object]]) -> str:
+    labels = ["", "x1'", "x2'", "x1'^2", "x1'*x2'", "x2'^2"]
+    parts: list[str] = []
+    for coeffs, label in zip(coeff_cp_models, labels):
+        coeff_expr = _td_perf_fmt_variable_poly_expr(coeffs, "cp'")
+        if not label:
+            parts.append(f"({coeff_expr})")
+        else:
+            parts.append(f"({coeff_expr})*{label}")
+    expr = " + ".join(part for part in parts if part.strip())
+    return f"y = {expr}" if expr else ""
+
+
+def _td_perf_fmt_surface_control_period_normalization(
+    x1_center: float,
+    x1_scale: float,
+    x2_center: float,
+    x2_scale: float,
+    cp_center: float,
+    cp_scale: float,
+) -> str:
+    return (
+        f"{_td_perf_fmt_surface_normalization(x1_center, x1_scale, x2_center, x2_scale)} ; "
+        f"cp' = (control_period - {_td_perf_fmt_num(cp_center)}) / {_td_perf_fmt_num(cp_scale)}"
     )
 
 
@@ -9145,12 +9193,19 @@ def _td_perf_model_score_value(model: Mapping[str, object]) -> float:
 
 def td_perf_normalize_surface_family(value: object) -> str:
     raw = str(value or "").strip().lower()
-    if raw in {TD_PERF_FIT_MODE_AUTO_SURFACE, TD_PERF_FIT_FAMILY_PLANE, TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE}:
+    if raw in {
+        TD_PERF_FIT_MODE_AUTO_SURFACE,
+        TD_PERF_FIT_FAMILY_PLANE,
+        TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE,
+        TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD,
+    }:
         return raw
     if raw in {"auto", TD_PERF_FIT_MODE_POLYNOMIAL_SURFACE}:
         return TD_PERF_FIT_MODE_AUTO_SURFACE
     if raw in {"quadratic", "quadratic_surface"}:
         return TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE
+    if raw in {"quadratic_surface_control_period", "quadratic_surface_cp", "quadratic_control_period"}:
+        return TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD
     return TD_PERF_FIT_MODE_AUTO_SURFACE
 
 
@@ -9340,10 +9395,67 @@ def _td_perf_surface_design_matrix(x1_values, x2_values, family: str):
     raise ValueError(f"Unsupported surface family: {family}")
 
 
-def td_perf_predict_surface(model: Mapping[str, object], x1_values: Iterable[float], x2_values: Iterable[float]) -> list[float]:
+def _td_perf_surface_normalize_control_period(values, *, center: float | None = None, scale: float | None = None):
+    np = _td_perf_import_numpy()
+    arr = np.asarray([float(v) for v in values], dtype=float)
+    cp_center = float(np.mean(arr)) if center is None else float(center)
+    cp_scale = (float(np.std(arr)) or 1.0) if scale is None else (float(scale) or 1.0)
+    return (arr - cp_center) / cp_scale, cp_center, cp_scale
+
+
+def _td_perf_surface_control_period_coeffs(model: Mapping[str, object], control_period, count: int):
+    np = _td_perf_import_numpy()
+    if count <= 0:
+        return np.asarray([], dtype=float).reshape(0, 0)
+    if control_period is None:
+        raise ValueError("Control-period-aware surface prediction requires control_period.")
+    if isinstance(control_period, Iterable) and not isinstance(control_period, (str, bytes)):
+        cp_values = [float(v) for v in control_period]
+        if len(cp_values) != count:
+            raise ValueError("control_period iterable length must match x1/x2 inputs.")
+    else:
+        cp_values = [float(control_period)] * count
+    cp_norm, _cp_center, _cp_scale = _td_perf_surface_normalize_control_period(
+        cp_values,
+        center=float(model.get("cp_center") or 0.0),
+        scale=float(model.get("cp_scale") or 1.0),
+    )
+    coeff_cp_models = [np.asarray([float(v) for v in coeffs], dtype=float) for coeffs in (model.get("coeff_cp_models") or [])]
+    if not coeff_cp_models:
+        return np.asarray([], dtype=float).reshape(0, 0)
+    coeff_matrix = []
+    for coeffs in coeff_cp_models:
+        coeff_matrix.append(np.poly1d(coeffs)(cp_norm))
+    return np.vstack(coeff_matrix).T
+
+
+def td_perf_predict_surface(
+    model: Mapping[str, object],
+    x1_values: Iterable[float],
+    x2_values: Iterable[float],
+    *,
+    control_period: object = None,
+) -> list[float]:
     np = _td_perf_import_numpy()
     family = td_perf_normalize_fit_mode(model.get("fit_family"))
     coeffs = [float(v) for v in (model.get("coeffs") or [])]
+    if family == TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD:
+        x1_list = [float(v) for v in x1_values]
+        x2_list = [float(v) for v in x2_values]
+        if len(x1_list) != len(x2_list) or not x1_list:
+            return []
+        x1n, x2n, _x1_center, _x1_scale, _x2_center, _x2_scale = _td_perf_surface_normalize_axes(
+            x1_list,
+            x2_list,
+            centers=(float(model.get("x1_center") or 0.0), float(model.get("x2_center") or 0.0)),
+            scales=(float(model.get("x1_scale") or 1.0), float(model.get("x2_scale") or 1.0)),
+        )
+        design = _td_perf_surface_design_matrix(x1n, x2n, TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE)
+        coeff_matrix = _td_perf_surface_control_period_coeffs(model, control_period, len(x1_list))
+        if coeff_matrix.size <= 0:
+            return []
+        y_hat = np.sum(design * coeff_matrix, axis=1)
+        return [float(v) for v in y_hat.tolist()]
     if family not in {TD_PERF_FIT_FAMILY_PLANE, TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE} or not coeffs:
         return []
     x1n, x2n, _x1_center, _x1_scale, _x2_center, _x2_scale = _td_perf_surface_normalize_axes(
@@ -9365,6 +9477,7 @@ def td_perf_build_surface_grid(
     x2_max: float,
     *,
     points: int = 24,
+    control_period: object = None,
 ) -> dict[str, list[list[float]]]:
     np = _td_perf_import_numpy()
     if not all(math.isfinite(float(v)) for v in (x1_min, x1_max, x2_min, x2_max)):
@@ -9372,7 +9485,7 @@ def td_perf_build_surface_grid(
     xs = np.linspace(float(x1_min), float(x1_max), max(2, int(points)))
     ys = np.linspace(float(x2_min), float(x2_max), max(2, int(points)))
     xg, yg = np.meshgrid(xs, ys)
-    zg = td_perf_predict_surface(model, xg.ravel().tolist(), yg.ravel().tolist())
+    zg = td_perf_predict_surface(model, xg.ravel().tolist(), yg.ravel().tolist(), control_period=control_period)
     if not zg:
         return {"x1_grid": [], "x2_grid": [], "z_grid": []}
     zg_arr = np.asarray(zg, dtype=float).reshape(xg.shape)
@@ -10055,6 +10168,16 @@ def _td_perf_join_unique_text(values: Sequence[object]) -> str:
     return ", ".join(out)
 
 
+def _td_perf_control_period_cluster_key(value: object) -> tuple[str, object]:
+    try:
+        num = float(value)
+    except Exception:
+        return ("text", str(value or "").strip().lower())
+    if not math.isfinite(num):
+        return ("text", str(value or "").strip().lower())
+    return ("num", round(float(num), 9))
+
+
 def _td_perf_cluster_points_3d(
     points: list[dict[str, object]],
     *,
@@ -10067,6 +10190,7 @@ def _td_perf_cluster_points_3d(
         key=lambda item: (
             float(item.get("x1") or 0.0),
             float(item.get("x2") or 0.0),
+            _td_perf_control_period_cluster_key(item.get("control_period")),
             str(item.get("source_run_name") or "").lower(),
             str(item.get("observation_id") or "").lower(),
         ),
@@ -10081,6 +10205,7 @@ def _td_perf_cluster_points_3d(
         copy = dict(point)
         copy["x1"] = x1
         copy["x2"] = x2
+        copy["_cp_key"] = _td_perf_control_period_cluster_key(point.get("control_period"))
         ordered.append(copy)
     if not ordered:
         return []
@@ -10095,10 +10220,21 @@ def _td_perf_cluster_points_3d(
                     "x1_center": x1,
                     "x2_center": x2,
                     "points": [point],
+                    "_cp_key": point.get("_cp_key"),
                 }
             )
             continue
         cluster = clusters[-1]
+        if cluster.get("_cp_key") != point.get("_cp_key"):
+            clusters.append(
+                {
+                    "x1_center": x1,
+                    "x2_center": x2,
+                    "points": [point],
+                    "_cp_key": point.get("_cp_key"),
+                }
+            )
+            continue
         ref_x1 = float(cluster.get("x1_center") or x1)
         ref_x2 = float(cluster.get("x2_center") or x2)
         tol_x1 = max(float(abs_tol), float(rel_tol) * max(abs(ref_x1), abs(x1)))
@@ -10115,6 +10251,7 @@ def _td_perf_cluster_points_3d(
                 "x1_center": x1,
                 "x2_center": x2,
                 "points": [point],
+                "_cp_key": point.get("_cp_key"),
             }
         )
     return clusters
@@ -10144,18 +10281,24 @@ def _td_perf_fit_surface_family(
     term_count = int(design.shape[1])
     if len(y_arr) < term_count:
         return None
+    if str(family).strip().lower() == TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE:
+        return _td_perf_fit_quadratic_surface_iterative(
+            x1_arr,
+            x2_arr,
+            y_arr,
+            fit_mode=fit_mode,
+            x1n=x1n,
+            x2n=x2n,
+            x1_center=x1_center,
+            x1_scale=x1_scale,
+            x2_center=x2_center,
+            x2_scale=x2_scale,
+            design=design,
+        )
     cond_number = float(np.linalg.cond(design))
-    solver = "lstsq"
-    if cond_number <= 1e5:
-        coeffs, _residuals, rank, _singular = np.linalg.lstsq(design, y_arr, rcond=None)
-        if int(rank) < term_count:
-            return None
-    else:
-        solver = "ridge"
-        ridge_alpha = 1e-6
-        xtx = design.T.dot(design) + (ridge_alpha * np.eye(term_count, dtype=float))
-        xty = design.T.dot(y_arr)
-        coeffs = np.linalg.solve(xtx, xty)
+    coeffs, _residuals, rank, _singular = np.linalg.lstsq(design, y_arr, rcond=None)
+    if int(rank) < term_count:
+        return None
     y_hat = design.dot(coeffs)
     coeff_list = [float(v) for v in coeffs.tolist()]
     model = _td_perf_finalize_model(
@@ -10176,8 +10319,303 @@ def _td_perf_fit_surface_family(
             "x1_scale": float(x1_scale),
             "x2_center": float(x2_center),
             "x2_scale": float(x2_scale),
-            "solver": solver,
+            "solver": "lstsq",
             "condition_number": float(cond_number),
+            "ridge_alpha": 0.0,
+            "iterations": 1,
+            "converged": True,
+            "y_center": 0.0,
+            "y_scale": 1.0,
+        },
+    )
+    model["monotonic_violations"] = 0
+    model["monotonicity_penalty"] = 0.0
+    return model
+
+
+def _td_perf_surface_low_score(x1n, x2n, y_norm):
+    np = _td_perf_import_numpy()
+    point_count = int(len(y_norm))
+    if point_count <= 0:
+        return np.asarray([], dtype=float)
+    k = min(6, max(3, int(math.ceil(math.sqrt(point_count)))))
+    coords = np.column_stack([np.asarray(x1n, dtype=float), np.asarray(x2n, dtype=float)])
+    dist_sq = np.sum((coords[:, None, :] - coords[None, :, :]) ** 2, axis=2)
+    low_score = np.zeros(point_count, dtype=float)
+    for idx in range(point_count):
+        order = np.argsort(dist_sq[idx], kind="mergesort")[:k]
+        local = np.asarray(y_norm[order], dtype=float)
+        local_min = float(np.min(local))
+        local_med = float(np.median(local))
+        denom = max(local_med - local_min, 1e-9)
+        low_score[idx] = float(np.clip((local_med - float(y_norm[idx])) / denom, 0.0, 1.0))
+    return low_score
+
+
+def _td_perf_surface_solve_linear_system(design, y_values):
+    np = _td_perf_import_numpy()
+    term_count = int(design.shape[1])
+    cond_number = float(np.linalg.cond(design))
+    ridge_alpha = 0.0
+    solver = "lstsq"
+    if cond_number <= 1e5:
+        coeffs, _residuals, rank, _singular = np.linalg.lstsq(design, y_values, rcond=None)
+        if int(rank) < term_count:
+            cond_number = float("inf")
+        else:
+            return coeffs, solver, cond_number, ridge_alpha
+    solver = "ridge"
+    ridge_alpha = 1e-6 if cond_number <= 1e8 else 1e-4
+    xtx = design.T.dot(design) + (ridge_alpha * np.eye(term_count, dtype=float))
+    xty = design.T.dot(np.asarray(y_values, dtype=float))
+    coeffs = np.linalg.solve(xtx, xty)
+    return coeffs, solver, cond_number, ridge_alpha
+
+
+def _td_perf_fit_quadratic_surface_control_period_model(
+    x1s: list[float],
+    x2s: list[float],
+    ys: list[float],
+    control_periods: Sequence[float],
+    *,
+    fit_mode: str,
+) -> dict[str, object] | None:
+    np = _td_perf_import_numpy()
+    if len(x1s) != len(x2s) or len(x1s) != len(ys) or len(x1s) != len(control_periods):
+        return None
+    x1_arr = np.asarray([float(v) for v in x1s], dtype=float)
+    x2_arr = np.asarray([float(v) for v in x2s], dtype=float)
+    y_arr = np.asarray([float(v) for v in ys], dtype=float)
+    cp_arr = np.asarray([float(v) for v in control_periods], dtype=float)
+    if not bool(np.all(np.isfinite(x1_arr) & np.isfinite(x2_arr) & np.isfinite(y_arr) & np.isfinite(cp_arr))):
+        return None
+    if len(x1_arr) < 6:
+        return None
+
+    cp_groups: dict[float, list[int]] = {}
+    for idx, cp_value in enumerate(cp_arr.tolist()):
+        cp_groups.setdefault(round(float(cp_value), 12), []).append(idx)
+    cp_values = sorted(float(v) for v in cp_groups.keys())
+    if len(cp_values) < 2:
+        return None
+
+    x1n_all, x2n_all, x1_center, x1_scale, x2_center, x2_scale = _td_perf_surface_normalize_axes(x1_arr, x2_arr)
+    slice_models: list[dict[str, object]] = []
+    coeff_rows: list[list[float]] = []
+    for cp_value in cp_values:
+        idxs = cp_groups.get(round(float(cp_value), 12), [])
+        if len(idxs) < 6:
+            return None
+        slice_x1 = x1_arr[idxs]
+        slice_x2 = x2_arr[idxs]
+        slice_y = y_arr[idxs]
+        if len({round(float(v), 12) for v in slice_x1.tolist()}) < 2:
+            return None
+        if len({round(float(v), 12) for v in slice_x2.tolist()}) < 2:
+            return None
+        slice_x1n = np.asarray([float(x1n_all[idx]) for idx in idxs], dtype=float)
+        slice_x2n = np.asarray([float(x2n_all[idx]) for idx in idxs], dtype=float)
+        slice_design = _td_perf_surface_design_matrix(slice_x1n, slice_x2n, TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE)
+        slice_model = _td_perf_fit_quadratic_surface_iterative(
+            slice_x1,
+            slice_x2,
+            slice_y,
+            fit_mode=fit_mode,
+            x1n=slice_x1n,
+            x2n=slice_x2n,
+            x1_center=x1_center,
+            x1_scale=x1_scale,
+            x2_center=x2_center,
+            x2_scale=x2_scale,
+            design=slice_design,
+        )
+        if not isinstance(slice_model, dict):
+            return None
+        coeff_list = [float(v) for v in (slice_model.get("coeffs") or [])]
+        if len(coeff_list) != 6:
+            return None
+        coeff_rows.append(coeff_list)
+        slice_models.append(
+            {
+                "control_period": float(cp_value),
+                "coeffs": coeff_list,
+                "solver": str(slice_model.get("solver") or ""),
+                "condition_number": float(slice_model.get("condition_number") or 0.0),
+            }
+        )
+
+    cp_norm, cp_center, cp_scale = _td_perf_surface_normalize_control_period(cp_values)
+    cp_degree = 1 if len(cp_values) == 2 else 2
+    coeff_matrix_arr = np.asarray(coeff_rows, dtype=float)
+    coeff_cp_models: list[list[float]] = []
+    coeffs_at_center: list[float] = []
+    for basis_idx in range(coeff_matrix_arr.shape[1]):
+        coeff_values = coeff_matrix_arr[:, basis_idx]
+        cp_coeffs = np.polyfit(cp_norm, coeff_values, cp_degree)
+        coeff_cp_models.append([float(v) for v in cp_coeffs.tolist()])
+        coeffs_at_center.append(float(np.poly1d(cp_coeffs)(0.0)))
+
+    y_hat = np.asarray(
+        td_perf_predict_surface(
+            {
+                "fit_family": TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD,
+                "x1_center": float(x1_center),
+                "x1_scale": float(x1_scale),
+                "x2_center": float(x2_center),
+                "x2_scale": float(x2_scale),
+                "cp_center": float(cp_center),
+                "cp_scale": float(cp_scale),
+                "coeff_cp_models": coeff_cp_models,
+            },
+            x1_arr.tolist(),
+            x2_arr.tolist(),
+            control_period=cp_arr.tolist(),
+        ),
+        dtype=float,
+    )
+    params: dict[str, object] = {
+        "cp_center": float(cp_center),
+        "cp_scale": float(cp_scale),
+        "control_period_degree": int(cp_degree),
+        "control_period_values": [float(v) for v in cp_values],
+        "fit_domain_control_period": [float(min(cp_values)), float(max(cp_values))],
+        "coeff_cp_models": [[float(v) for v in coeffs] for coeffs in coeff_cp_models],
+    }
+    for basis_idx, coeffs in enumerate(coeff_cp_models):
+        params[f"basis_{basis_idx}_cp_coeffs"] = [float(v) for v in coeffs]
+    return _td_perf_finalize_model(
+        fit_family=TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD,
+        fit_mode=fit_mode,
+        equation=_td_perf_fmt_surface_control_period_equation(coeff_cp_models),
+        x_norm_equation=_td_perf_fmt_surface_control_period_normalization(
+            x1_center,
+            x1_scale,
+            x2_center,
+            x2_scale,
+            cp_center,
+            cp_scale,
+        ),
+        params=params,
+        param_count=(len(coeff_cp_models) * (cp_degree + 1)),
+        x_values=list(range(len(y_arr))),
+        y_true=y_arr,
+        y_hat=y_hat,
+        composite_score=False,
+        extra={
+            "coeffs": [float(v) for v in coeffs_at_center],
+            "coeff_cp_models": [[float(v) for v in coeffs] for coeffs in coeff_cp_models],
+            "plot_dimension": "3d",
+            "x1_center": float(x1_center),
+            "x1_scale": float(x1_scale),
+            "x2_center": float(x2_center),
+            "x2_scale": float(x2_scale),
+            "cp_center": float(cp_center),
+            "cp_scale": float(cp_scale),
+            "control_period_values": [float(v) for v in cp_values],
+            "control_period_degree": int(cp_degree),
+            "fit_domain_control_period": [float(min(cp_values)), float(max(cp_values))],
+            "slice_models": slice_models,
+            "solver": "slice_polyfit",
+        },
+    )
+
+
+def _td_perf_fit_quadratic_surface_iterative(
+    x1_arr,
+    x2_arr,
+    y_arr,
+    *,
+    fit_mode: str,
+    x1n,
+    x2n,
+    x1_center: float,
+    x1_scale: float,
+    x2_center: float,
+    x2_scale: float,
+    design,
+) -> dict[str, object] | None:
+    np = _td_perf_import_numpy()
+    term_count = int(design.shape[1])
+    if len(y_arr) < term_count:
+        return None
+    y_center = float(np.median(y_arr))
+    y_std = float(np.std(y_arr))
+    y_span = float(np.max(y_arr) - np.min(y_arr))
+    y_scale = max(y_std, y_span / 4.0, 1e-9)
+    y_norm = (np.asarray(y_arr, dtype=float) - y_center) / y_scale
+    low_score = _td_perf_surface_low_score(x1n, x2n, y_norm)
+    weights = np.ones(len(y_arr), dtype=float)
+    prev_coeffs = None
+    coeffs_norm = None
+    final_solver = "lstsq"
+    final_cond = float(np.linalg.cond(design))
+    final_ridge_alpha = 0.0
+    iterations = 0
+    converged = False
+
+    for iteration in range(1, 13):
+        sqrt_w = np.sqrt(np.asarray(weights, dtype=float)).reshape(-1, 1)
+        weighted_design = np.asarray(design, dtype=float) * sqrt_w
+        weighted_y = np.asarray(y_norm, dtype=float) * sqrt_w[:, 0]
+        coeffs_iter, solver, cond_number, ridge_alpha = _td_perf_surface_solve_linear_system(weighted_design, weighted_y)
+        y_hat_norm = np.asarray(design, dtype=float).dot(np.asarray(coeffs_iter, dtype=float))
+        residual_norm = y_hat_norm - y_norm
+        robust = 1.0 / np.maximum(1.0, np.abs(residual_norm) / 1.5)
+        asym = 1.0 + (2.5 * low_score * np.maximum(residual_norm, 0.0))
+        new_weights = np.clip(robust * asym, 0.2, 8.0)
+
+        coeff_delta = float("inf")
+        if prev_coeffs is not None:
+            denom = max(float(np.linalg.norm(prev_coeffs)), 1e-12)
+            coeff_delta = float(np.linalg.norm(np.asarray(coeffs_iter, dtype=float) - np.asarray(prev_coeffs, dtype=float)) / denom)
+        weight_delta = float(np.sqrt(np.mean((new_weights - np.asarray(weights, dtype=float)) ** 2)))
+
+        coeffs_norm = np.asarray(coeffs_iter, dtype=float)
+        final_solver = solver
+        final_cond = float(cond_number)
+        final_ridge_alpha = float(ridge_alpha)
+        iterations = iteration
+
+        if prev_coeffs is not None and (coeff_delta < 1e-6 or weight_delta < 1e-4):
+            converged = True
+            weights = new_weights
+            break
+
+        prev_coeffs = np.asarray(coeffs_iter, dtype=float)
+        weights = new_weights
+
+    if coeffs_norm is None:
+        return None
+
+    coeffs_raw = np.asarray(coeffs_norm, dtype=float) * float(y_scale)
+    coeffs_raw[0] = float(coeffs_raw[0] + y_center)
+    y_hat = np.asarray(design, dtype=float).dot(coeffs_raw)
+    coeff_list = [float(v) for v in coeffs_raw.tolist()]
+    model = _td_perf_finalize_model(
+        fit_family=TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE,
+        fit_mode=fit_mode,
+        equation=_td_perf_fmt_surface_equation(coeff_list, TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE),
+        x_norm_equation=_td_perf_fmt_surface_normalization(x1_center, x1_scale, x2_center, x2_scale),
+        params={f"c{i}": float(v) for i, v in enumerate(coeff_list)},
+        param_count=term_count,
+        x_values=list(range(len(y_arr))),
+        y_true=y_arr,
+        y_hat=y_hat,
+        composite_score=False,
+        extra={
+            "coeffs": coeff_list,
+            "plot_dimension": "3d",
+            "x1_center": float(x1_center),
+            "x1_scale": float(x1_scale),
+            "x2_center": float(x2_center),
+            "x2_scale": float(x2_scale),
+            "solver": f"irls_{final_solver}",
+            "condition_number": float(final_cond),
+            "ridge_alpha": float(final_ridge_alpha),
+            "iterations": int(iterations),
+            "converged": bool(converged),
+            "y_center": float(y_center),
+            "y_scale": float(y_scale),
         },
     )
     model["monotonic_violations"] = 0
@@ -10192,6 +10630,7 @@ def td_perf_fit_surface_model(
     *,
     auto_surface_families: bool = False,
     surface_family: object = None,
+    control_periods: Sequence[float] | None = None,
 ) -> dict[str, object] | None:
     explicit_family = surface_family not in (None, "")
     selected_family = td_perf_normalize_surface_family(
@@ -10227,6 +10666,16 @@ def td_perf_fit_surface_model(
             x2s,
             ys,
             family=TD_PERF_FIT_FAMILY_PLANE,
+            fit_mode=fit_mode,
+        )
+    if selected_family == TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD:
+        if control_periods is None:
+            return None
+        return _td_perf_fit_quadratic_surface_control_period_model(
+            x1s,
+            x2s,
+            ys,
+            control_periods,
             fit_mode=fit_mode,
         )
     candidates = [
@@ -10679,6 +11128,8 @@ def _td_perf_excel_formula_for_model(
     raw_x2_ref: str,
     norm_x1_ref: str,
     norm_x2_ref: str,
+    raw_cp_ref: str,
+    norm_cp_ref: str,
     pchip_segments: Sequence[Mapping[str, object]] | None = None,
 ) -> str:
     family = td_perf_normalize_fit_mode(model.get("fit_family"))
@@ -10765,6 +11216,26 @@ def _td_perf_excel_formula_for_model(
             f"+({_td_perf_excel_num(coeffs[4])}*{norm_x1_ref}*{norm_x2_ref})"
             f"+({_td_perf_excel_num(coeffs[5])}*({norm_x2_ref}^2))"
         )
+    if family == TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD:
+        coeff_cp_models = [[float(v) for v in coeffs] for coeffs in (model.get("coeff_cp_models") or [])]
+        if len(coeff_cp_models) != 6 or not norm_cp_ref:
+            return ""
+        basis_terms = [
+            "",
+            norm_x1_ref,
+            norm_x2_ref,
+            f"({norm_x1_ref}^2)",
+            f"({norm_x1_ref}*{norm_x2_ref})",
+            f"({norm_x2_ref}^2)",
+        ]
+        expr_terms: list[str] = []
+        for coeffs, basis in zip(coeff_cp_models, basis_terms):
+            cp_expr = _td_perf_excel_polynomial_expr(coeffs, norm_cp_ref)
+            if not basis:
+                expr_terms.append(cp_expr)
+            else:
+                expr_terms.append(f"({cp_expr}*{basis})")
+        return "=" + "+".join(expr_terms)
     return ""
 
 
@@ -10836,6 +11307,11 @@ def td_perf_export_equation_workbook(
     helper_source_stat = "mean" if "mean" in models_by_stat else next(iter(models_by_stat.keys()))
     helper_model = models_by_stat[helper_source_stat]
     helper_family = td_perf_normalize_fit_mode(helper_model.get("fit_family"))
+    uses_control_period_norm = any(
+        td_perf_normalize_fit_mode((model or {}).get("fit_family")) == TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD
+        for model in models_by_stat.values()
+        if isinstance(model, Mapping)
+    )
 
     wb = Workbook()
     ws = wb.active
@@ -10902,7 +11378,10 @@ def td_perf_export_equation_workbook(
         stat_meta_row += 1
 
     data_header_row = stat_meta_row + 2
-    headers = ["run_name", "program_title", "source_run_name", "control_period", "condition_label", "input_1"]
+    headers = ["run_name", "program_title", "source_run_name", "control_period"]
+    if uses_control_period_norm:
+        headers.append("control_period_norm")
+    headers.extend(["condition_label", "input_1"])
     if is_surface:
         headers.append("input_2")
     headers.append("input_1_norm")
@@ -10966,9 +11445,27 @@ def td_perf_export_equation_workbook(
                     else:
                         ws_support.cell(support_row, col_idx).value = seg.get(key)
                 support_row += 1
+        elif family == TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD:
+            cp_values = [float(v) for v in (model.get("control_period_values") or [])]
+            cp_min = float(min(cp_values)) if cp_values else 0.0
+            cp_max = float(max(cp_values)) if cp_values else 0.0
+            for basis_idx, coeffs in enumerate(model.get("coeff_cp_models") or []):
+                coeff_list = [float(v) for v in coeffs]
+                padded = coeff_list + [""] * max(0, 4 - len(coeff_list))
+                ws_support.cell(support_row, 1).value = stat
+                ws_support.cell(support_row, 2).value = family
+                ws_support.cell(support_row, 3).value = basis_idx
+                ws_support.cell(support_row, 4).value = cp_min
+                ws_support.cell(support_row, 5).value = cp_max
+                ws_support.cell(support_row, 6).value = padded[0] if len(padded) > 0 else ""
+                ws_support.cell(support_row, 7).value = padded[1] if len(padded) > 1 else ""
+                ws_support.cell(support_row, 8).value = padded[2] if len(padded) > 2 else ""
+                ws_support.cell(support_row, 9).value = padded[3] if len(padded) > 3 else ""
+                support_row += 1
 
     helper_x_template = ""
     helper_x2_template = ""
+    helper_cp_template = ""
     if helper_family == TD_PERF_FIT_MODE_POLYNOMIAL and bool(helper_model.get("normalize_x")):
         helper_x_template = _td_perf_excel_norm_expr("{X}", helper_model.get("x0"), helper_model.get("sx"))
     elif helper_family == TD_PERF_FIT_MODE_HYBRID_QUADRATIC_RESIDUAL and bool((helper_model.get("params") or {}).get("normalize_x")):
@@ -10981,12 +11478,21 @@ def td_perf_export_equation_workbook(
         helper_x_template = _td_perf_excel_norm_expr("{X}", helper_model.get("x1_center"), helper_model.get("x1_scale"))
         if is_surface:
             helper_x2_template = _td_perf_excel_norm_expr("{X2}", helper_model.get("x2_center"), helper_model.get("x2_scale"))
+    elif helper_family == TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD:
+        helper_x_template = _td_perf_excel_norm_expr("{X}", helper_model.get("x1_center"), helper_model.get("x1_scale"))
+        if is_surface:
+            helper_x2_template = _td_perf_excel_norm_expr("{X2}", helper_model.get("x2_center"), helper_model.get("x2_scale"))
+        helper_cp_template = _td_perf_excel_norm_expr("{CP}", helper_model.get("cp_center"), helper_model.get("cp_scale"))
 
     for idx, row in enumerate(export_rows, start=data_header_row + 1):
         ws.cell(idx, col_by_name["run_name"]).value = str(row.get("run_name") or "")
         ws.cell(idx, col_by_name["program_title"]).value = str(row.get("program_title") or "")
         ws.cell(idx, col_by_name["source_run_name"]).value = str(row.get("source_run_name") or "")
         ws.cell(idx, col_by_name["control_period"]).value = row.get("control_period")
+        if uses_control_period_norm:
+            raw_cp_ref = _td_perf_excel_ref(col_by_name["control_period"], idx)
+            if helper_cp_template:
+                ws.cell(idx, col_by_name["control_period_norm"]).value = "=" + helper_cp_template.replace("{CP}", raw_cp_ref)
         ws.cell(idx, col_by_name["condition_label"]).value = str(row.get("condition_label") or "")
         ws.cell(idx, col_by_name["input_1"]).value = row.get("input_1")
         if is_surface:
@@ -10994,8 +11500,10 @@ def td_perf_export_equation_workbook(
 
         raw_x_ref = _td_perf_excel_ref(col_by_name["input_1"], idx)
         raw_x2_ref = _td_perf_excel_ref(col_by_name["input_2"], idx) if is_surface else ""
+        raw_cp_ref = _td_perf_excel_ref(col_by_name["control_period"], idx)
         norm_x_ref = _td_perf_excel_ref(col_by_name["input_1_norm"], idx)
         norm_x2_ref = _td_perf_excel_ref(col_by_name["input_2_norm"], idx) if is_surface else ""
+        norm_cp_ref = _td_perf_excel_ref(col_by_name["control_period_norm"], idx) if uses_control_period_norm else ""
         if helper_x_template:
             ws.cell(idx, col_by_name["input_1_norm"]).value = "=" + helper_x_template.replace("{X}", raw_x_ref)
         if is_surface and helper_x2_template:
@@ -11014,6 +11522,7 @@ def td_perf_export_equation_workbook(
                 stat_norm_x_ref = norm_x_ref
                 stat_norm_x1_ref = norm_x_ref
                 stat_norm_x2_ref = norm_x2_ref
+                stat_norm_cp_ref = norm_cp_ref
                 if family == TD_PERF_FIT_MODE_POLYNOMIAL and bool(model.get("normalize_x")):
                     stat_norm_x_ref = _td_perf_excel_norm_expr(raw_x_ref, model.get("x0"), model.get("sx"))
                 elif family == TD_PERF_FIT_MODE_HYBRID_QUADRATIC_RESIDUAL and bool((model.get("params") or {}).get("normalize_x")):
@@ -11025,6 +11534,10 @@ def td_perf_export_equation_workbook(
                 elif family in {TD_PERF_FIT_FAMILY_PLANE, TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE}:
                     stat_norm_x1_ref = _td_perf_excel_norm_expr(raw_x_ref, model.get("x1_center"), model.get("x1_scale"))
                     stat_norm_x2_ref = _td_perf_excel_norm_expr(raw_x2_ref, model.get("x2_center"), model.get("x2_scale"))
+                elif family == TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD:
+                    stat_norm_x1_ref = _td_perf_excel_norm_expr(raw_x_ref, model.get("x1_center"), model.get("x1_scale"))
+                    stat_norm_x2_ref = _td_perf_excel_norm_expr(raw_x2_ref, model.get("x2_center"), model.get("x2_scale"))
+                    stat_norm_cp_ref = _td_perf_excel_norm_expr(raw_cp_ref, model.get("cp_center"), model.get("cp_scale"))
                 formula = _td_perf_excel_formula_for_model(
                     model,
                     raw_x_ref=raw_x_ref,
@@ -11033,6 +11546,8 @@ def td_perf_export_equation_workbook(
                     raw_x2_ref=raw_x2_ref,
                     norm_x1_ref=stat_norm_x1_ref,
                     norm_x2_ref=stat_norm_x2_ref,
+                    raw_cp_ref=raw_cp_ref,
+                    norm_cp_ref=stat_norm_cp_ref,
                     pchip_segments=pchip_support_by_stat.get(stat),
                 )
             if formula:

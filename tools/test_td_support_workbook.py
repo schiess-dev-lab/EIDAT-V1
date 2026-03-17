@@ -117,6 +117,49 @@ class _PerfAxisHarness:
         raise AssertionError(f"missing combo value {value!r}")
 
 
+class _PerfControlPeriodHarness:
+    def __init__(self) -> None:
+        _qt_app()
+        from PySide6 import QtWidgets
+        from EIDAT_App_Files.ui_next.qt_main import TestDataTrendDialog  # type: ignore
+
+        self.rb_perf_steady_state = QtWidgets.QRadioButton()
+        self.rb_perf_pulsed_mode = QtWidgets.QRadioButton()
+        self.rb_perf_pulsed_mode.setChecked(True)
+        self.cb_perf_filter_mode = QtWidgets.QComboBox()
+        self.cb_perf_filter_mode.addItem("All run conditions", "all_conditions")
+        self.cb_perf_filter_mode.addItem("Match control period", "match_control_period")
+        self.cb_perf_control_period = QtWidgets.QComboBox()
+        self.cb_perf_control_period.addItem("60", 60.0)
+        self.cb_perf_control_period.addItem("120", 120.0)
+        self.cb_perf_surface_model = QtWidgets.QComboBox()
+        self.cb_perf_surface_model.addItem("Auto Surface", "auto_surface")
+        self.cb_perf_surface_model.addItem("Quadratic Surface", "quadratic_surface")
+        self.cb_perf_surface_model.addItem("Quadratic Surface + Control Period", "quadratic_surface_control_period")
+        self.cb_perf_x_col = QtWidgets.QComboBox()
+        self.cb_perf_y_col = QtWidgets.QComboBox()
+        self.cb_perf_z_col = QtWidgets.QComboBox()
+        for cb, values in (
+            (self.cb_perf_x_col, [("Input1", "input1")]),
+            (self.cb_perf_y_col, [("Output", "output")]),
+            (self.cb_perf_z_col, [("None", ""), ("Input2", "input2")]),
+        ):
+            for text, data in values:
+                cb.addItem(text, data)
+        self.cb_perf_z_col.setCurrentIndex(1)
+
+        for name in (
+            "_selected_perf_run_type_mode",
+            "_selected_perf_filter_mode",
+            "_perf_current_col_name",
+            "_perf_var_names",
+            "_perf_requested_surface_family",
+            "_selected_perf_control_period",
+            "_update_perf_control_period_state",
+        ):
+            setattr(self, name, getattr(TestDataTrendDialog, name).__get__(self, _PerfControlPeriodHarness))
+
+
 class _RunSelectionHarness:
     def __init__(self) -> None:
         _qt_app()
@@ -248,6 +291,45 @@ class TestTDTrendDialogCacheLoading(unittest.TestCase):
 
         validate_mock.assert_called_once_with(harness._project_dir, harness._workbook_path)
         ensure_mock.assert_not_called()
+        self.assertEqual(harness._db_path, fake_db)
+        self.assertEqual(harness._refresh_from_cache_calls, 1)
+        self.assertEqual(harness._update_plot_zoom_actions_calls, 1)
+
+    def test_open_auto_builds_cache_when_validation_fails(self) -> None:
+        _qt_app()
+        from PySide6 import QtWidgets
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+        from EIDAT_App_Files.ui_next.qt_main import TestDataTrendDialog  # type: ignore
+
+        class _Harness:
+            pass
+
+        harness = _Harness()
+        harness._project_dir = Path("C:/tmp/project")
+        harness._workbook_path = Path("C:/tmp/project/project.xlsx")
+        harness.lbl_source = QtWidgets.QLabel()
+        harness.lbl_cache = QtWidgets.QLabel()
+        harness._refresh_from_cache_calls = 0
+        harness._update_plot_zoom_actions_calls = 0
+        harness._refresh_from_cache = lambda: setattr(harness, "_refresh_from_cache_calls", harness._refresh_from_cache_calls + 1)
+        harness._update_plot_zoom_actions = lambda: setattr(
+            harness,
+            "_update_plot_zoom_actions_calls",
+            harness._update_plot_zoom_actions_calls + 1,
+        )
+        load_cache = TestDataTrendDialog._load_cache.__get__(harness, _Harness)
+        fake_db = harness._project_dir / "implementation_trending.sqlite3"
+
+        with mock.patch.object(
+            be,
+            "validate_existing_test_data_project_cache",
+            side_effect=RuntimeError("Project cache DB not found"),
+        ) as validate_mock:
+            with mock.patch.object(be, "ensure_test_data_project_cache", return_value=fake_db) as ensure_mock:
+                load_cache(rebuild=False)
+
+        validate_mock.assert_called_once_with(harness._project_dir, harness._workbook_path)
+        ensure_mock.assert_called_once_with(harness._project_dir, harness._workbook_path, rebuild=True)
         self.assertEqual(harness._db_path, fake_db)
         self.assertEqual(harness._refresh_from_cache_calls, 1)
         self.assertEqual(harness._update_plot_zoom_actions_calls, 1)
@@ -3678,6 +3760,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
         self.assertEqual(be.td_perf_fit_family_label("hybrid_saturating_linear"), "Hybrid Saturating + Linear")
         self.assertEqual(be.td_perf_fit_family_label("hybrid_quadratic_residual"), "Hybrid + Quadratic Residual")
         self.assertEqual(be.td_perf_fit_family_label("monotone_pchip"), "Monotone PCHIP")
+        self.assertEqual(be.td_perf_fit_family_label("quadratic_surface_control_period"), "Quadratic Surface + Control Period")
 
     @unittest.skipUnless(_have_scipy(), "scipy not installed")
     def test_perf_fit_model_hybrid_quadratic_residual_competes_and_predicts(self) -> None:
@@ -3788,8 +3871,13 @@ class TestTDSupportWorkbook(unittest.TestCase):
         model = be.td_perf_fit_surface_model(x1s, x2s, ys, auto_surface_families=False)
         self.assertIsNotNone(model)
         self.assertEqual(str(model.get("fit_family") or ""), be.TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE)
-        self.assertEqual(str(model.get("solver") or ""), "lstsq")
+        self.assertEqual(str(model.get("solver") or ""), "irls_lstsq")
         self.assertLess(float(model.get("condition_number") or 999.0), 100.0)
+        self.assertEqual(float(model.get("ridge_alpha") or 0.0), 0.0)
+        self.assertGreaterEqual(int(model.get("iterations") or 0), 2)
+        self.assertIs(bool(model.get("converged")), True)
+        self.assertTrue(math.isfinite(float(model.get("y_center") or 0.0)))
+        self.assertGreater(float(model.get("y_scale") or 0.0), 0.0)
         preds = be.td_perf_predict_surface(model, x1s, x2s)
         for actual, pred in zip(ys, preds):
             self.assertAlmostEqual(actual, pred, places=5)
@@ -3802,11 +3890,216 @@ class TestTDSupportWorkbook(unittest.TestCase):
         ys = [10.0 + (3.0 * x1) - (2.0 * x2) + (0.5 * x1 * x1) for x1, x2 in zip(x1s, x2s)]
         model = be.td_perf_fit_surface_model(x1s, x2s, ys, auto_surface_families=False)
         self.assertIsNotNone(model)
-        self.assertEqual(str(model.get("solver") or ""), "ridge")
+        self.assertEqual(str(model.get("solver") or ""), "irls_ridge")
         self.assertGreater(float(model.get("condition_number") or 0.0), 1e5)
+        self.assertIn(float(model.get("ridge_alpha") or 0.0), {1e-6, 1e-4})
+        self.assertGreaterEqual(int(model.get("iterations") or 0), 1)
+        self.assertIsInstance(model.get("converged"), bool)
+        self.assertGreater(float(model.get("y_scale") or 0.0), 0.0)
         preds = be.td_perf_predict_surface(model, x1s, x2s)
         self.assertEqual(len(preds), len(ys))
         self.assertTrue(all(math.isfinite(float(v)) for v in preds))
+
+    def test_perf_fit_surface_model_reduces_low_end_overshoot_with_iterative_weights(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        np = be._td_perf_import_numpy()
+        x1s: list[float] = []
+        x2s: list[float] = []
+        ys: list[float] = []
+        for x1 in (0.0, 1.0, 2.0, 3.0, 4.0):
+            for x2 in (0.0, 1.0, 2.0, 3.0, 4.0):
+                y_val = 42.0 + (2.5 * x1) + (1.75 * x2) + (0.35 * x1 * x1) + (0.2 * x1 * x2) + (0.28 * x2 * x2)
+                if x1 <= 1.0 and x2 <= 1.0:
+                    y_val -= 6.0
+                x1s.append(x1)
+                x2s.append(x2)
+                ys.append(y_val)
+
+        model = be.td_perf_fit_surface_model(x1s, x2s, ys, auto_surface_families=False)
+        self.assertIsNotNone(model)
+        self.assertEqual(str(model.get("solver") or ""), "irls_lstsq")
+
+        x1n, x2n, _x1_center, _x1_scale, _x2_center, _x2_scale = be._td_perf_surface_normalize_axes(x1s, x2s)
+        design = be._td_perf_surface_design_matrix(x1n, x2n, be.TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE)
+        y_arr = np.asarray(ys, dtype=float)
+        baseline_coeffs, _residuals, rank, _singular = np.linalg.lstsq(design, y_arr, rcond=None)
+        self.assertEqual(int(rank), 6)
+        baseline_preds = design.dot(np.asarray(baseline_coeffs, dtype=float))
+        iterative_preds = np.asarray(be.td_perf_predict_surface(model, x1s, x2s), dtype=float)
+
+        low_mask = np.asarray([(x1 <= 1.0 and x2 <= 1.0) for x1, x2 in zip(x1s, x2s)], dtype=bool)
+        baseline_low_overshoot = float(np.mean(np.maximum(baseline_preds[low_mask] - y_arr[low_mask], 0.0)))
+        iterative_low_overshoot = float(np.mean(np.maximum(iterative_preds[low_mask] - y_arr[low_mask], 0.0)))
+        baseline_rmse = float(np.sqrt(np.mean((baseline_preds - y_arr) ** 2)))
+        iterative_rmse = float(np.sqrt(np.mean((iterative_preds - y_arr) ** 2)))
+
+        self.assertGreater(baseline_low_overshoot, 0.0)
+        self.assertLess(iterative_low_overshoot, baseline_low_overshoot)
+        self.assertLessEqual(iterative_rmse, (baseline_rmse * 1.10) + 1e-9)
+
+    def test_perf_fit_surface_model_control_period_matches_three_trained_slices(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        cps = [60.0, 120.0, 180.0]
+        x1_axis = [1.0, 2.0, 3.0]
+        x2_axis = [10.0, 20.0, 30.0]
+        x1s: list[float] = []
+        x2s: list[float] = []
+        ys: list[float] = []
+        control_periods: list[float] = []
+        expected_by_cp: dict[float, tuple[list[float], list[float], list[float]]] = {}
+        for cp in cps:
+            cp_x1: list[float] = []
+            cp_x2: list[float] = []
+            cp_y: list[float] = []
+            c0 = 15.0 + (0.2 * cp) + (0.0015 * cp * cp)
+            c1 = 0.8 + (0.006 * cp) + (0.00003 * cp * cp)
+            c2 = -0.12 + (0.001 * cp) + (0.000004 * cp * cp)
+            c3 = 0.08 + (0.00025 * cp)
+            c4 = 0.01 + (0.00006 * cp)
+            c5 = 0.002 + (0.000015 * cp)
+            for x1 in x1_axis:
+                for x2 in x2_axis:
+                    y_val = c0 + (c1 * x1) + (c2 * x2) + (c3 * x1 * x1) + (c4 * x1 * x2) + (c5 * x2 * x2)
+                    x1s.append(x1)
+                    x2s.append(x2)
+                    ys.append(y_val)
+                    control_periods.append(cp)
+                    cp_x1.append(x1)
+                    cp_x2.append(x2)
+                    cp_y.append(y_val)
+            expected_by_cp[cp] = (cp_x1, cp_x2, cp_y)
+
+        model = be.td_perf_fit_surface_model(
+            x1s,
+            x2s,
+            ys,
+            surface_family="quadratic_surface_control_period",
+            control_periods=control_periods,
+        )
+        self.assertIsNotNone(model)
+        self.assertEqual(str(model.get("fit_family") or ""), be.TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD)
+        self.assertEqual(int(model.get("control_period_degree") or -1), 2)
+        self.assertEqual([float(v) for v in (model.get("control_period_values") or [])], cps)
+        for cp in cps:
+            cp_x1, cp_x2, cp_y = expected_by_cp[cp]
+            preds = be.td_perf_predict_surface(model, cp_x1, cp_x2, control_period=cp)
+            for actual, pred in zip(cp_y, preds):
+                self.assertAlmostEqual(actual, pred, places=5)
+
+    def test_perf_fit_surface_model_control_period_uses_linear_interpolation_for_two_slices(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        cps = [50.0, 150.0]
+        x1_axis = [1.0, 2.0, 3.0]
+        x2_axis = [5.0, 10.0, 15.0]
+        x1s: list[float] = []
+        x2s: list[float] = []
+        ys: list[float] = []
+        control_periods: list[float] = []
+        expected_by_cp: dict[float, tuple[list[float], list[float], list[float]]] = {}
+        for cp in cps:
+            cp_x1: list[float] = []
+            cp_x2: list[float] = []
+            cp_y: list[float] = []
+            for x1 in x1_axis:
+                for x2 in x2_axis:
+                    y_val = (
+                        (12.0 + (0.08 * cp))
+                        + ((1.2 + (0.004 * cp)) * x1)
+                        + ((-0.05 + (0.0008 * cp)) * x2)
+                        + (0.12 * x1 * x1)
+                        + ((0.015 + (0.00004 * cp)) * x1 * x2)
+                        + (0.003 * x2 * x2)
+                    )
+                    x1s.append(x1)
+                    x2s.append(x2)
+                    ys.append(y_val)
+                    control_periods.append(cp)
+                    cp_x1.append(x1)
+                    cp_x2.append(x2)
+                    cp_y.append(y_val)
+            expected_by_cp[cp] = (cp_x1, cp_x2, cp_y)
+
+        model = be.td_perf_fit_surface_model(
+            x1s,
+            x2s,
+            ys,
+            surface_family="quadratic_surface_control_period",
+            control_periods=control_periods,
+        )
+        self.assertIsNotNone(model)
+        self.assertEqual(int(model.get("control_period_degree") or -1), 1)
+        for cp in cps:
+            cp_x1, cp_x2, cp_y = expected_by_cp[cp]
+            preds = be.td_perf_predict_surface(model, cp_x1, cp_x2, control_period=cp)
+            for actual, pred in zip(cp_y, preds):
+                self.assertAlmostEqual(actual, pred, places=5)
+
+    def test_perf_fit_surface_model_control_period_interpolates_new_slice_stably(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        cps = [40.0, 80.0, 120.0, 160.0]
+        x1_axis = [1.0, 2.0, 3.0]
+        x2_axis = [8.0, 16.0, 24.0]
+        x1s: list[float] = []
+        x2s: list[float] = []
+        ys: list[float] = []
+        control_periods: list[float] = []
+        for cp in cps:
+            c0 = 25.0 + (0.18 * cp) + (0.0008 * cp * cp)
+            c1 = 0.6 + (0.004 * cp) + (0.00002 * cp * cp)
+            c2 = -0.08 + (0.0006 * cp) + (0.000002 * cp * cp)
+            c3 = 0.05 + (0.00015 * cp)
+            c4 = 0.02 + (0.00003 * cp)
+            c5 = 0.0015 + (0.00001 * cp)
+            for x1 in x1_axis:
+                for x2 in x2_axis:
+                    y_val = c0 + (c1 * x1) + (c2 * x2) + (c3 * x1 * x1) + (c4 * x1 * x2) + (c5 * x2 * x2)
+                    x1s.append(x1)
+                    x2s.append(x2)
+                    ys.append(y_val)
+                    control_periods.append(cp)
+
+        model = be.td_perf_fit_surface_model(
+            x1s,
+            x2s,
+            ys,
+            surface_family="quadratic_surface_control_period",
+            control_periods=control_periods,
+        )
+        self.assertIsNotNone(model)
+        self.assertEqual(int(model.get("control_period_degree") or -1), 2)
+        interp_x1 = [1.0, 2.0, 3.0]
+        interp_x2 = [8.0, 16.0, 24.0]
+        preds = be.td_perf_predict_surface(model, interp_x1, interp_x2, control_period=100.0)
+        self.assertEqual(len(preds), 3)
+        self.assertTrue(all(math.isfinite(float(v)) for v in preds))
+        expected = []
+        cp = 100.0
+        c0 = 25.0 + (0.18 * cp) + (0.0008 * cp * cp)
+        c1 = 0.6 + (0.004 * cp) + (0.00002 * cp * cp)
+        c2 = -0.08 + (0.0006 * cp) + (0.000002 * cp * cp)
+        c3 = 0.05 + (0.00015 * cp)
+        c4 = 0.02 + (0.00003 * cp)
+        c5 = 0.0015 + (0.00001 * cp)
+        for x1, x2 in zip(interp_x1, interp_x2):
+            expected.append(c0 + (c1 * x1) + (c2 * x2) + (c3 * x1 * x1) + (c4 * x1 * x2) + (c5 * x2 * x2))
+        for actual, pred in zip(expected, preds):
+            self.assertAlmostEqual(actual, pred, places=5)
+
+    def test_perf_fit_surface_model_control_period_requires_multiple_distinct_periods(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        model = be.td_perf_fit_surface_model(
+            [1.0, 1.0, 2.0, 2.0, 3.0, 3.0],
+            [10.0, 20.0, 10.0, 20.0, 10.0, 20.0],
+            [30.0, 35.0, 40.0, 45.0, 50.0, 55.0],
+            surface_family="quadratic_surface_control_period",
+            control_periods=[120.0] * 6,
+        )
+        self.assertIsNone(model)
 
     @unittest.skipUnless(_have_openpyxl(), "openpyxl not installed")
     @unittest.skipUnless(_have_scipy(), "scipy not installed")
@@ -3981,15 +4274,138 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 headers = [str(ws.cell(header_row, c).value or "").strip() for c in range(1, (ws.max_column or 0) + 1)]
                 self.assertIn("input_2", headers)
                 self.assertIn("input_2_norm", headers)
+                self.assertIn("pred_mean", headers)
+                self.assertIn("pct_delta_mean", headers)
                 formula = str(ws.cell(header_row + 1, headers.index("pred_mean") + 1).value or "")
+                pct_formula = str(ws.cell(header_row + 1, headers.index("pct_delta_mean") + 1).value or "")
                 self.assertIn("^2", formula)
                 self.assertIn("*", formula)
+                self.assertTrue(formula.startswith("="))
+                self.assertTrue(pct_formula.startswith("="))
+                self.assertIn("/", pct_formula)
                 self.assertTrue(str(ws.cell(header_row + 1, headers.index("input_1_norm") + 1).value or "").startswith("="))
                 self.assertTrue(str(ws.cell(header_row + 1, headers.index("input_2_norm") + 1).value or "").startswith("="))
                 actual_mean = float(ws.cell(header_row + 1, headers.index("actual_mean") + 1).value or 0.0)
                 self.assertAlmostEqual(actual_mean, 34.0, places=6)
             finally:
                 wb.close()
+
+    @unittest.skipUnless(_have_openpyxl(), "openpyxl not installed")
+    def test_perf_export_equation_workbook_writes_control_period_aware_surface_formulas(self) -> None:
+        from openpyxl import load_workbook  # type: ignore
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            rows: list[tuple[str, str, float, float, float, float | None]] = []
+            x1s: list[float] = []
+            x2s: list[float] = []
+            ys: list[float] = []
+            cps: list[float] = []
+            for cp in (60.0, 120.0, 180.0):
+                c0 = 20.0 + (0.16 * cp) + (0.001 * cp * cp)
+                c1 = 0.9 + (0.003 * cp)
+                c2 = -0.04 + (0.0004 * cp)
+                c3 = 0.08
+                c4 = 0.012 + (0.00002 * cp)
+                c5 = 0.0025
+                for serial, x1, x2 in (
+                    ("SN1", 1.0, 10.0),
+                    ("SN2", 1.0, 20.0),
+                    ("SN1", 2.0, 10.0),
+                    ("SN2", 2.0, 20.0),
+                    ("SN1", 3.0, 20.0),
+                    ("SN2", 3.0, 30.0),
+                ):
+                    y_val = c0 + (c1 * x1) + (c2 * x2) + (c3 * x1 * x1) + (c4 * x1 * x2) + (c5 * x2 * x2)
+                    rows.append((serial, "RunCP", x1, x2, y_val, cp))
+                    x1s.append(x1)
+                    x2s.append(x2)
+                    ys.append(y_val)
+                    cps.append(cp)
+
+            db_path = self._seed_perf_export_db_3d(root, rows=rows)
+            surface = be.td_perf_fit_surface_model(
+                x1s,
+                x2s,
+                ys,
+                surface_family="quadratic_surface_control_period",
+                control_periods=cps,
+            )
+            self.assertIsNotNone(surface)
+            out_path = root / "perf_export_cp_3d.xlsx"
+            be.td_perf_export_equation_workbook(
+                db_path,
+                out_path,
+                plot_metadata={
+                    "plot_dimension": "3d",
+                    "output_target": "thrust",
+                    "output_units": "lbf",
+                    "input1_target": "impulse bit",
+                    "input1_units": "mN-s",
+                    "input2_target": "feed pressure",
+                    "input2_units": "psia",
+                    "run_selection_label": "RunCP",
+                    "member_runs": ["RunCP"],
+                    "performance_filter_mode": "all_conditions",
+                },
+                results_by_stat={"mean": {"master_model": surface}},
+                run_specs=[
+                    {
+                        "run_name": "RunCP",
+                        "display_name": "RunCP",
+                        "output_column": "thrust",
+                        "output_units": "lbf",
+                        "input1_column": "impulse bit",
+                        "input1_units": "mN-s",
+                        "input2_column": "feed pressure",
+                        "input2_units": "psia",
+                    }
+                ],
+                run_type_filter="pulsed_mode",
+            )
+
+            wb = load_workbook(str(out_path), read_only=False, data_only=False)
+            try:
+                ws = wb["Equation Export"]
+                header_row = next(
+                    r for r in range(1, (ws.max_row or 0) + 1) if str(ws.cell(r, 1).value or "").strip() == "run_name"
+                )
+                headers = [str(ws.cell(header_row, c).value or "").strip() for c in range(1, (ws.max_column or 0) + 1)]
+                self.assertIn("control_period", headers)
+                self.assertIn("control_period_norm", headers)
+                self.assertIn("pred_mean", headers)
+                self.assertIn("pct_delta_mean", headers)
+                row1 = header_row + 1
+                cp_norm_formula = str(ws.cell(row1, headers.index("control_period_norm") + 1).value or "")
+                pred_formula = str(ws.cell(row1, headers.index("pred_mean") + 1).value or "")
+                pct_formula = str(ws.cell(row1, headers.index("pct_delta_mean") + 1).value or "")
+                self.assertTrue(cp_norm_formula.startswith("="))
+                self.assertTrue(pred_formula.startswith("="))
+                self.assertIn("^2", pred_formula)
+                self.assertIn("/", pct_formula)
+                self.assertIn("Model Parameters", wb.sheetnames)
+                self.assertIn("Model Support", wb.sheetnames)
+                params_ws = wb["Model Parameters"]
+                support_ws = wb["Model Support"]
+                params_values = [str(params_ws.cell(r, 3).value or "").strip() for r in range(2, (params_ws.max_row or 0) + 1)]
+                self.assertIn("cp_center", params_values)
+                self.assertIn("coeff_cp_models", params_values)
+                self.assertGreater(support_ws.max_row, 1)
+            finally:
+                wb.close()
+
+    @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
+    def test_perf_control_period_combo_enables_for_control_period_surface_slice(self) -> None:
+        harness = _PerfControlPeriodHarness()
+        harness.cb_perf_filter_mode.setCurrentIndex(harness.cb_perf_filter_mode.findData("all_conditions"))
+        harness.cb_perf_surface_model.setCurrentIndex(harness.cb_perf_surface_model.findData("quadratic_surface_control_period"))
+        harness._update_perf_control_period_state()
+        self.assertTrue(harness.cb_perf_control_period.isEnabled())
+        self.assertEqual(harness._selected_perf_control_period(), 60.0)
+        harness.cb_perf_surface_model.setCurrentIndex(harness.cb_perf_surface_model.findData("quadratic_surface"))
+        harness._update_perf_control_period_state()
+        self.assertFalse(harness.cb_perf_control_period.isEnabled())
 
     def test_perf_candidate_discovery_accepts_separated_x(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore

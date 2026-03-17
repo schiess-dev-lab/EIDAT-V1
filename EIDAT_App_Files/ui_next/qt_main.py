@@ -3378,6 +3378,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self.cb_perf_surface_model = QtWidgets.QComboBox()
         self.cb_perf_surface_model.addItem("Auto Surface", "auto_surface")
         self.cb_perf_surface_model.addItem("Quadratic Surface", "quadratic_surface")
+        self.cb_perf_surface_model.addItem("Quadratic Surface + Control Period", "quadratic_surface_control_period")
         self.cb_perf_surface_model.addItem("Plane", "plane")
         fit_row.addWidget(self.cb_perf_fit)
         fit_row.addWidget(QtWidgets.QLabel("Model:"))
@@ -4331,10 +4332,17 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     self._project_dir, self._workbook_path, rebuild=True
                 )
             else:
-                self._db_path = be.validate_existing_test_data_project_cache(
-                    self._project_dir,
-                    self._workbook_path,
-                )
+                try:
+                    self._db_path = be.validate_existing_test_data_project_cache(
+                        self._project_dir,
+                        self._workbook_path,
+                    )
+                except RuntimeError:
+                    self._db_path = be.ensure_test_data_project_cache(
+                        self._project_dir,
+                        self._workbook_path,
+                        rebuild=True,
+                    )
             self.lbl_source.setText(str(self._db_path))
             self.lbl_cache.setText(f"Cache DB: {self._db_path}")
         except Exception as exc:
@@ -7077,7 +7085,6 @@ class TestDataTrendDialog(QtWidgets.QDialog):
     def _selected_perf_control_period(self) -> object | None:
         if (
             self._selected_perf_run_type_mode() != "pulsed_mode"
-            or self._selected_perf_filter_mode() != "match_control_period"
             or not hasattr(self, "cb_perf_control_period")
         ):
             return None
@@ -7093,12 +7100,26 @@ class TestDataTrendDialog(QtWidgets.QDialog):
     def _update_perf_control_period_state(self) -> None:
         if not hasattr(self, "cb_perf_control_period"):
             return
+        _output_name, _input1_name, input2_name = self._perf_var_names()
+        is_surface = bool(str(input2_name or "").strip())
+        cp_surface_family = str(getattr(be, "TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD", "quadratic_surface_control_period"))
+        use_as_slice = (
+            self._selected_perf_run_type_mode() == "pulsed_mode"
+            and is_surface
+            and self._perf_requested_surface_family() == cp_surface_family
+        )
         enabled = (
             self._selected_perf_run_type_mode() == "pulsed_mode"
-            and self._selected_perf_filter_mode() == "match_control_period"
+            and (self._selected_perf_filter_mode() == "match_control_period" or use_as_slice)
             and self.cb_perf_control_period.count() > 0
         )
         self.cb_perf_control_period.setEnabled(enabled)
+        if use_as_slice and self._selected_perf_filter_mode() != "match_control_period":
+            self.cb_perf_control_period.setToolTip("Select the displayed control-period slice for the control-period-aware surface.")
+        elif enabled:
+            self.cb_perf_control_period.setToolTip("Select the control period used to filter pulsed-mode data.")
+        else:
+            self.cb_perf_control_period.setToolTip("")
 
     @staticmethod
     def _perf_norm_name(value: object) -> str:
@@ -7185,7 +7206,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         if hasattr(self, "cb_perf_surface_model"):
             self.cb_perf_surface_model.setEnabled(fit_enabled and is_surface)
             if is_surface:
-                self.cb_perf_surface_model.setToolTip("Surface family override for 3D performance plots. Control-period filtering applies here too.")
+                self.cb_perf_surface_model.setToolTip("Surface family override for 3D performance plots, including the control-period-aware surface slice model.")
             else:
                 self.cb_perf_surface_model.setToolTip("Enable Input 2 to use 3-variable surface fitting.")
         allow_poly_controls = fit_enabled and (not is_surface) and fit_mode == "polynomial"
@@ -7242,7 +7263,15 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 model.update(curve)
         return model
 
-    def _perf_fit_surface_for_points(self, x1s: list[float], x2s: list[float], ys: list[float]) -> dict | None:
+    def _perf_fit_surface_for_points(
+        self,
+        x1s: list[float],
+        x2s: list[float],
+        ys: list[float],
+        *,
+        control_periods: list[float] | None = None,
+        display_control_period: object = None,
+    ) -> dict | None:
         fitter = getattr(be, "td_perf_fit_surface_model", None)
         grid_builder = getattr(be, "td_perf_build_surface_grid", None)
         if not callable(fitter):
@@ -7254,12 +7283,21 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             ys,
             auto_surface_families=(surface_family == "auto_surface"),
             surface_family=surface_family,
+            control_periods=control_periods,
         )
         if not isinstance(model, dict):
             return None
         if callable(grid_builder) and x1s and x2s:
             try:
-                grid = grid_builder(model, min(x1s), max(x1s), min(x2s), max(x2s), points=22)
+                grid = grid_builder(
+                    model,
+                    min(x1s),
+                    max(x1s),
+                    min(x2s),
+                    max(x2s),
+                    points=22,
+                    control_period=display_control_period,
+                )
             except Exception:
                 grid = {}
             if isinstance(grid, dict):
@@ -7496,6 +7534,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 return
             self._filter_perf_axis_options(changed=changed)
         self._update_perf_fit_controls()
+        self._update_perf_control_period_state()
         self._update_perf_pair_summary()
         self._clear_perf_results()
 
@@ -7558,9 +7597,13 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         fit_enabled: bool,
         require_min_points: int,
         control_period_filter: object = None,
+        display_control_period: object = None,
         run_type_filter: object = None,
     ) -> tuple[dict[str, dict], list[str], str]:
         is_surface = bool(str(input2_name or "").strip())
+        surface_family = self._perf_requested_surface_family() if is_surface else ""
+        cp_surface_family = str(getattr(be, "TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD", "quadratic_surface_control_period"))
+        use_cp_surface = bool(is_surface and surface_family == cp_surface_family)
         equation_stats = list(plot_stats)
         for st in ("min_3sigma", "max_3sigma"):
             if st not in equation_stats:
@@ -7602,6 +7645,14 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 if value and value not in parts:
                     parts.append(value)
             return " | ".join([part for part in parts if str(part).strip()])
+
+        def _cp_matches(value: object, target: object) -> bool:
+            if target in (None, ""):
+                return True
+            try:
+                return abs(float(value) - float(target)) <= 1e-9
+            except Exception:
+                return str(value or "").strip().lower() == str(target or "").strip().lower()
 
         for st in equation_stats:
             if is_surface:
@@ -7658,9 +7709,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 pooled_x1: list[float] = []
                 pooled_x2: list[float] = []
                 pooled_y: list[float] = []
+                pooled_cp: list[float] = []
+                invalid_control_period_seen = False
                 min_surface_points = max(3, int(require_min_points))
                 for sn in serials:
-                    pts: list[tuple[float, float, float, str]] = []
+                    pts_all: list[tuple[float, float, float, str, object]] = []
+                    pts_slice: list[tuple[float, float, float, str]] = []
                     for _rn, rdisp, input1_map, input2_map, output_map, _u1, _u2, _uy in per_run:
                         obs_ids = sorted(set(input1_map.keys()) & set(input2_map.keys()) & set(output_map.keys()))
                         for obs_id in obs_ids:
@@ -7669,22 +7723,38 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                             row_output = output_map.get(obs_id) or {}
                             if str(row_output.get("serial") or row_input1.get("serial") or "").strip() != sn:
                                 continue
-                            pts.append(
-                                (
-                                    float(row_input1.get("value_num") or 0.0),
-                                    float(row_input2.get("value_num") or 0.0),
-                                    float(row_output.get("value_num") or 0.0),
-                                    _obs_label(rdisp, _rn, row_output or row_input1 or row_input2),
-                                )
+                            cp_value = row_output.get("control_period", row_input1.get("control_period", row_input2.get("control_period")))
+                            cp_numeric = None
+                            if use_cp_surface:
+                                try:
+                                    cp_numeric = float(cp_value)
+                                    if not math.isfinite(cp_numeric):
+                                        raise ValueError
+                                except Exception:
+                                    invalid_control_period_seen = True
+                            point = (
+                                float(row_input1.get("value_num") or 0.0),
+                                float(row_input2.get("value_num") or 0.0),
+                                float(row_output.get("value_num") or 0.0),
+                                _obs_label(rdisp, _rn, row_output or row_input1 or row_input2),
+                                cp_numeric if cp_numeric is not None else cp_value,
                             )
-                    distinct_x1 = {round(p[0], 12) for p in pts}
-                    distinct_x2 = {round(p[1], 12) for p in pts}
-                    if len(pts) >= min_surface_points and len(distinct_x1) >= 2 and len(distinct_x2) >= 2:
-                        pts.sort(key=lambda t: (t[0], t[1], t[3]))
-                        points_3d[sn] = pts
-                        pooled_x1.extend([p[0] for p in pts])
-                        pooled_x2.extend([p[1] for p in pts])
-                        pooled_y.extend([p[2] for p in pts])
+                            pts_all.append(point)
+                            if not use_cp_surface or _cp_matches(cp_value, display_control_period):
+                                pts_slice.append((point[0], point[1], point[2], point[3]))
+                    distinct_x1 = {round(p[0], 12) for p in pts_all}
+                    distinct_x2 = {round(p[1], 12) for p in pts_all}
+                    if len(pts_all) >= min_surface_points and len(distinct_x1) >= 2 and len(distinct_x2) >= 2:
+                        pts_slice.sort(key=lambda t: (t[0], t[1], t[3]))
+                        if pts_slice:
+                            points_3d[sn] = pts_slice
+                        pooled_x1.extend([p[0] for p in pts_all])
+                        pooled_x2.extend([p[1] for p in pts_all])
+                        pooled_y.extend([p[2] for p in pts_all])
+                        if use_cp_surface:
+                            for point in pts_all:
+                                if isinstance(point[4], (int, float)):
+                                    pooled_cp.append(float(point[4]))
 
                 if not points_3d:
                     continue
@@ -7696,7 +7766,19 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 master_model: dict = {}
                 if fit_enabled and len(pooled_y) >= 3:
                     try:
-                        model = self._perf_fit_surface_for_points(pooled_x1, pooled_x2, pooled_y)
+                        if use_cp_surface and run_type_filter != "pulsed_mode":
+                            raise RuntimeError("Quadratic Surface + Control Period requires pulsed-mode data.")
+                        if use_cp_surface and invalid_control_period_seen:
+                            raise RuntimeError("Quadratic Surface + Control Period requires usable control-period values for all fitted pulsed-mode points.")
+                        model = self._perf_fit_surface_for_points(
+                            pooled_x1,
+                            pooled_x2,
+                            pooled_y,
+                            control_periods=(pooled_cp if use_cp_surface else None),
+                            display_control_period=display_control_period,
+                        )
+                        if use_cp_surface and not isinstance(model, dict):
+                            raise RuntimeError("Quadratic Surface + Control Period requires at least two distinct control periods with valid surface coverage.")
                     except Exception as exc:
                         if not fit_error_text:
                             fit_error_text = str(exc)
@@ -7717,6 +7799,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     "stat_label": st,
                     "fit_mode": self._perf_requested_fit_mode(),
                     "plot_dimension": "3d",
+                    "surface_fit_family": surface_family,
+                    "selected_control_period": display_control_period,
                     "points_3d": points_3d,
                     "master_model": master_model,
                     "highlight_serial": "",
@@ -8719,10 +8803,15 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 continue
             try:
                 if plot_dimension == "3d":
-                    x1s = [float(p[0]) for p in pts]
-                    x2s = [float(p[1]) for p in pts]
-                    ys = [float(p[2]) for p in pts]
-                    model = self._perf_fit_surface_for_points(x1s, x2s, ys) if fit_enabled else None
+                    if str(((r.get("master_model") or {}).get("fit_family") or "")).strip().lower() == str(
+                        getattr(be, "TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD", "quadratic_surface_control_period")
+                    ):
+                        model = None
+                    else:
+                        x1s = [float(p[0]) for p in pts]
+                        x2s = [float(p[1]) for p in pts]
+                        ys = [float(p[2]) for p in pts]
+                        model = self._perf_fit_surface_for_points(x1s, x2s, ys) if fit_enabled else None
                 else:
                     xs = [float(p[0]) for p in pts]
                     ys = [float(p[1]) for p in pts]
@@ -9173,6 +9262,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             self.cb_perf_fit.toggled.connect(lambda *_: self._clear_perf_results())
             self.cb_perf_fit_model.currentIndexChanged.connect(lambda *_: self._update_perf_fit_controls())
             self.cb_perf_fit_model.currentIndexChanged.connect(lambda *_: self._clear_perf_results())
+            self.cb_perf_surface_model.currentIndexChanged.connect(lambda *_: self._update_perf_control_period_state())
             self.cb_perf_surface_model.currentIndexChanged.connect(lambda *_: self._clear_perf_results())
             self.sp_perf_degree.valueChanged.connect(lambda *_: self._clear_perf_results())
             self.cb_perf_norm_x.toggled.connect(lambda *_: self._clear_perf_results())
@@ -9246,6 +9336,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             require_min_points=require_min_points,
             run_type_filter=run_type_mode,
             control_period_filter=(control_period_filter if perf_filter_mode == "match_control_period" else None),
+            display_control_period=control_period_filter,
         )
 
         if not plot_view_stats:
