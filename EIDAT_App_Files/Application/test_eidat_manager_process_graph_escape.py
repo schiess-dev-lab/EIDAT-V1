@@ -100,6 +100,25 @@ class TestEidatManagerProcessGraphEscape(unittest.TestCase):
             else:
                 sys.modules.pop("eidat_manager_embed", None)
 
+    def test_import_uses_noop_pointer_helpers_when_embed_module_has_no_symbols(self) -> None:
+        saved_proc = sys.modules.pop("eidat_manager_process", None)
+        saved_embed = sys.modules.get("eidat_manager_embed")
+        sys.modules["eidat_manager_embed"] = types.ModuleType("eidat_manager_embed")
+        try:
+            proc = importlib.import_module("eidat_manager_process")
+            token = proc.build_pointer_token({"rel_path": "Programs/test.pdf"})
+            self.assertTrue(token.startswith("EIDAT_PTR:"))
+            self.assertFalse(proc.has_pointer_token(Path("Programs/test.pdf")))
+            self.assertFalse(proc.embed_pointer_token(Path("Programs/test.pdf"), token))
+        finally:
+            sys.modules.pop("eidat_manager_process", None)
+            if saved_proc is not None:
+                sys.modules["eidat_manager_process"] = saved_proc
+            if saved_embed is not None:
+                sys.modules["eidat_manager_embed"] = saved_embed
+            else:
+                sys.modules.pop("eidat_manager_embed", None)
+
     def _write_page_png(self, path: Path) -> None:
         try:
             import cv2  # type: ignore

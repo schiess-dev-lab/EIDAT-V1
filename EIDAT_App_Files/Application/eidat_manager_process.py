@@ -15,16 +15,38 @@ import hashlib
 import uuid
 
 from eidat_manager_db import SupportPaths, connect_db, ensure_schema
-try:
-    from eidat_manager_embed import build_pointer_token, embed_pointer_token, has_pointer_token
-except ImportError:
-    from eidat_manager_embed import embed_pointer_token, has_pointer_token
 
-    # Backward-compatible fallback for stale node mirrors that predate build_pointer_token.
-    def build_pointer_token(payload: dict) -> str:
-        raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
-        enc = base64.urlsafe_b64encode(raw).decode("ascii")
-        return f"EIDAT_PTR:{enc}"
+
+def _fallback_build_pointer_token(payload: dict) -> str:
+    raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    enc = base64.urlsafe_b64encode(raw).decode("ascii")
+    return f"EIDAT_PTR:{enc}"
+
+
+def _fallback_embed_pointer_token(pdf_path: Path, token: str, *, overwrite: bool = False) -> bool:
+    return False
+
+
+def _fallback_has_pointer_token(pdf_path: Path) -> bool:
+    return False
+
+
+try:
+    import eidat_manager_embed as _eidat_manager_embed
+except Exception:
+    try:
+        from . import eidat_manager_embed as _eidat_manager_embed  # type: ignore
+    except Exception:
+        _eidat_manager_embed = None  # type: ignore[assignment]
+
+if _eidat_manager_embed is not None:
+    build_pointer_token = getattr(_eidat_manager_embed, "build_pointer_token", _fallback_build_pointer_token)
+    embed_pointer_token = getattr(_eidat_manager_embed, "embed_pointer_token", _fallback_embed_pointer_token)
+    has_pointer_token = getattr(_eidat_manager_embed, "has_pointer_token", _fallback_has_pointer_token)
+else:
+    build_pointer_token = _fallback_build_pointer_token
+    embed_pointer_token = _fallback_embed_pointer_token
+    has_pointer_token = _fallback_has_pointer_token
 
 from eidat_manager_metadata import (
     canonicalize_metadata_for_file,
