@@ -3,6 +3,8 @@ import sys
 import tempfile
 import unittest
 import json
+import importlib
+import types
 from contextlib import ExitStack
 from pathlib import Path
 from unittest import mock
@@ -77,6 +79,26 @@ class TestEidatManagerProcessGraphEscape(unittest.TestCase):
     def tearDown(self) -> None:
         os.environ.clear()
         os.environ.update(self._saved_env)
+
+    def test_import_uses_pointer_token_fallback_when_embed_module_is_stale(self) -> None:
+        saved_proc = sys.modules.pop("eidat_manager_process", None)
+        saved_embed = sys.modules.get("eidat_manager_embed")
+        fake_embed = types.ModuleType("eidat_manager_embed")
+        fake_embed.embed_pointer_token = lambda *_args, **_kwargs: True
+        fake_embed.has_pointer_token = lambda *_args, **_kwargs: False
+        sys.modules["eidat_manager_embed"] = fake_embed
+        try:
+            proc = importlib.import_module("eidat_manager_process")
+            token = proc.build_pointer_token({"rel_path": "Programs/test.pdf"})
+            self.assertTrue(token.startswith("EIDAT_PTR:"))
+        finally:
+            sys.modules.pop("eidat_manager_process", None)
+            if saved_proc is not None:
+                sys.modules["eidat_manager_process"] = saved_proc
+            if saved_embed is not None:
+                sys.modules["eidat_manager_embed"] = saved_embed
+            else:
+                sys.modules.pop("eidat_manager_embed", None)
 
     def _write_page_png(self, path: Path) -> None:
         try:

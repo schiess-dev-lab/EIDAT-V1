@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import importlib.util
 import json
 import multiprocessing
@@ -14,7 +15,17 @@ import hashlib
 import uuid
 
 from eidat_manager_db import SupportPaths, connect_db, ensure_schema
-from eidat_manager_embed import build_pointer_token, embed_pointer_token, has_pointer_token
+try:
+    from eidat_manager_embed import build_pointer_token, embed_pointer_token, has_pointer_token
+except ImportError:
+    from eidat_manager_embed import embed_pointer_token, has_pointer_token
+
+    # Backward-compatible fallback for stale node mirrors that predate build_pointer_token.
+    def build_pointer_token(payload: dict) -> str:
+        raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+        enc = base64.urlsafe_b64encode(raw).decode("ascii")
+        return f"EIDAT_PTR:{enc}"
+
 from eidat_manager_metadata import (
     canonicalize_metadata_for_file,
     derive_minimal_metadata,
