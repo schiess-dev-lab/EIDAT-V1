@@ -3364,6 +3364,32 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         filter_row.addWidget(self.cb_perf_control_period, 1)
         perf_plot_layout.addLayout(filter_row)
 
+        band_x_row = QtWidgets.QHBoxLayout()
+        band_x_row.addWidget(QtWidgets.QLabel("X band filter:"))
+        self.ed_perf_x_band_min = QtWidgets.QLineEdit()
+        self.ed_perf_x_band_min.setPlaceholderText("min")
+        self.ed_perf_x_band_min.setToolTip("Optional lower bound for the plotted X-axis data band. Blank leaves it unbounded.")
+        band_x_row.addWidget(self.ed_perf_x_band_min, 1)
+        band_x_row.addWidget(QtWidgets.QLabel("to"))
+        self.ed_perf_x_band_max = QtWidgets.QLineEdit()
+        self.ed_perf_x_band_max.setPlaceholderText("max")
+        self.ed_perf_x_band_max.setToolTip("Optional upper bound for the plotted X-axis data band. Blank leaves it unbounded.")
+        band_x_row.addWidget(self.ed_perf_x_band_max, 1)
+        perf_plot_layout.addLayout(band_x_row)
+
+        band_y_row = QtWidgets.QHBoxLayout()
+        band_y_row.addWidget(QtWidgets.QLabel("Y band filter:"))
+        self.ed_perf_y_band_min = QtWidgets.QLineEdit()
+        self.ed_perf_y_band_min.setPlaceholderText("min")
+        self.ed_perf_y_band_min.setToolTip("Optional lower bound for the plotted Y-axis data band. Blank leaves it unbounded.")
+        band_y_row.addWidget(self.ed_perf_y_band_min, 1)
+        band_y_row.addWidget(QtWidgets.QLabel("to"))
+        self.ed_perf_y_band_max = QtWidgets.QLineEdit()
+        self.ed_perf_y_band_max.setPlaceholderText("max")
+        self.ed_perf_y_band_max.setToolTip("Optional upper bound for the plotted Y-axis data band. Blank leaves it unbounded.")
+        band_y_row.addWidget(self.ed_perf_y_band_max, 1)
+        perf_plot_layout.addLayout(band_y_row)
+
         fit_row = QtWidgets.QHBoxLayout()
         self.cb_perf_fit = QtWidgets.QCheckBox("Fit equation")
         self.cb_perf_fit.setChecked(True)
@@ -3424,6 +3450,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         lbl_eq.setStyleSheet("font-size: 12px; font-weight: 700; color: #0f172a;")
         eq_row.addWidget(lbl_eq)
         eq_row.addStretch(1)
+        self.btn_perf_save_equation = QtWidgets.QPushButton("Save Performance Equation")
+        self.btn_perf_save_equation.setEnabled(False)
+        eq_row.addWidget(self.btn_perf_save_equation)
+        self.btn_perf_saved_equations = QtWidgets.QPushButton("Saved Performance Equations")
+        self.btn_perf_saved_equations.setEnabled(True)
+        eq_row.addWidget(self.btn_perf_saved_equations)
         self.btn_perf_export_equations = QtWidgets.QPushButton("Export Equation to Excel")
         self.btn_perf_export_equations.setEnabled(False)
         eq_row.addWidget(self.btn_perf_export_equations)
@@ -7249,6 +7281,98 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         y_name = self._perf_current_col_name(self.cb_perf_y_col) if hasattr(self, "cb_perf_y_col") else ""
         return x_name, y_name
 
+    @staticmethod
+    def _perf_parse_band_value(raw_value: object, axis_label: str, edge_label: str) -> float | None:
+        text = str(raw_value or "").strip()
+        if not text:
+            return None
+        try:
+            value = float(text)
+        except Exception as exc:
+            raise ValueError(f"{axis_label} band {edge_label} must be a number.") from exc
+        if not math.isfinite(value):
+            raise ValueError(f"{axis_label} band {edge_label} must be finite.")
+        return float(value)
+
+    @classmethod
+    def _perf_normalize_axis_band(
+        cls,
+        axis_label: str,
+        lower_raw: object,
+        upper_raw: object,
+    ) -> tuple[float | None, float | None]:
+        lower = cls._perf_parse_band_value(lower_raw, axis_label, "min")
+        upper = cls._perf_parse_band_value(upper_raw, axis_label, "max")
+        if lower is not None and upper is not None and lower > upper:
+            raise ValueError(f"{axis_label} band min cannot be greater than max.")
+        return lower, upper
+
+    def _current_perf_axis_band_filters(self) -> dict[str, tuple[float | None, float | None]]:
+        x_min = getattr(getattr(self, "ed_perf_x_band_min", None), "text", lambda: "")()
+        x_max = getattr(getattr(self, "ed_perf_x_band_max", None), "text", lambda: "")()
+        y_min = getattr(getattr(self, "ed_perf_y_band_min", None), "text", lambda: "")()
+        y_max = getattr(getattr(self, "ed_perf_y_band_max", None), "text", lambda: "")()
+        return {
+            "x": self._perf_normalize_axis_band("X", x_min, x_max),
+            "y": self._perf_normalize_axis_band("Y", y_min, y_max),
+        }
+
+    @staticmethod
+    def _perf_axis_band_active(bounds: tuple[float | None, float | None]) -> bool:
+        return bool(bounds[0] is not None or bounds[1] is not None)
+
+    @staticmethod
+    def _perf_axis_band_contains(value: object, bounds: tuple[float | None, float | None]) -> bool:
+        lower, upper = bounds
+        try:
+            numeric = float(value)
+        except Exception:
+            return False
+        if not math.isfinite(numeric):
+            return False
+        if lower is not None and numeric < lower:
+            return False
+        if upper is not None and numeric > upper:
+            return False
+        return True
+
+    @classmethod
+    def _perf_filter_points_by_axis_bands(
+        cls,
+        points: list[tuple],
+        axis_band_filters: dict[str, tuple[float | None, float | None]] | None,
+    ) -> list[tuple]:
+        filters = axis_band_filters or {}
+        x_bounds = filters.get("x", (None, None))
+        y_bounds = filters.get("y", (None, None))
+        if not cls._perf_axis_band_active(x_bounds) and not cls._perf_axis_band_active(y_bounds):
+            return list(points or [])
+        out: list[tuple] = []
+        for point in points or []:
+            if len(point) < 2:
+                continue
+            if not cls._perf_axis_band_contains(point[0], x_bounds):
+                continue
+            if not cls._perf_axis_band_contains(point[1], y_bounds):
+                continue
+            out.append(point)
+        return out
+
+    @staticmethod
+    def _perf_axis_band_note(axis_band_filters: dict[str, tuple[float | None, float | None]] | None) -> str:
+        filters = axis_band_filters or {}
+        parts: list[str] = []
+        for axis in ("x", "y"):
+            lower, upper = filters.get(axis, (None, None))
+            if lower is None and upper is None:
+                continue
+            lo_txt = "-inf" if lower is None else f"{float(lower):.6g}"
+            hi_txt = "inf" if upper is None else f"{float(upper):.6g}"
+            parts.append(f"{axis.upper()} [{lo_txt}, {hi_txt}]")
+        if not parts:
+            return ""
+        return "Data band filter active: " + " | ".join(parts) + " | Zoom still only changes the view."
+
     def _perf_requested_fit_mode(self) -> str:
         if not hasattr(self, "cb_perf_fit_model"):
             return "auto"
@@ -7694,6 +7818,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         *,
         fit_enabled: bool,
         require_min_points: int,
+        axis_band_filters: dict[str, tuple[float | None, float | None]] | None = None,
         control_period_filter: object = None,
         display_control_period: object = None,
         run_type_filter: object = None,
@@ -7812,7 +7937,6 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 min_surface_points = max(3, int(require_min_points))
                 for sn in serials:
                     pts_all: list[tuple[float, float, float, str, object]] = []
-                    pts_slice: list[tuple[float, float, float, str]] = []
                     for _rn, rdisp, input1_map, input2_map, output_map, _u1, _u2, _uy in per_run:
                         obs_ids = sorted(set(input1_map.keys()) & set(input2_map.keys()) & set(output_map.keys()))
                         for obs_id in obs_ids:
@@ -7838,8 +7962,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                                 cp_numeric if cp_numeric is not None else cp_value,
                             )
                             pts_all.append(point)
-                            if not use_cp_surface or _cp_matches(cp_value, display_control_period):
-                                pts_slice.append((point[0], point[1], point[2], point[3]))
+                    pts_all = self._perf_filter_points_by_axis_bands(pts_all, axis_band_filters)
+                    pts_slice = [
+                        (point[0], point[1], point[2], point[3])
+                        for point in pts_all
+                        if not use_cp_surface or _cp_matches(point[4], display_control_period)
+                    ]
                     distinct_x1 = {round(p[0], 12) for p in pts_all}
                     distinct_x2 = {round(p[1], 12) for p in pts_all}
                     if len(pts_all) >= min_surface_points and len(distinct_x1) >= 2 and len(distinct_x2) >= 2:
@@ -7950,6 +8078,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                                     _obs_label(rdisp, _rn, row_output or row_input1),
                                 )
                             )
+                    pts_2d = self._perf_filter_points_by_axis_bands(pts_2d, axis_band_filters)
                     if len(pts_2d) >= require_min_points:
                         pts_2d.sort(key=lambda t: t[0])
                         curves[sn] = pts_2d
@@ -8693,9 +8822,16 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         return False
 
     def _update_perf_export_button_state(self) -> None:
-        if hasattr(self, "btn_perf_export_equations"):
+        enabled = self._perf_has_exportable_models()
+        for widget_name in ("btn_perf_export_equations", "btn_perf_save_equation"):
+            if hasattr(self, widget_name):
+                try:
+                    getattr(self, widget_name).setEnabled(enabled)
+                except Exception:
+                    pass
+        if hasattr(self, "btn_perf_saved_equations"):
             try:
-                self.btn_perf_export_equations.setEnabled(self._perf_has_exportable_models())
+                self.btn_perf_saved_equations.setEnabled(bool(getattr(self, "_project_dir", None)))
             except Exception:
                 pass
 
@@ -8846,6 +8982,13 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             "performance_filter_mode": perf_filter_mode or "all_conditions",
         }
         try:
+            asset_metadata = be.td_perf_collect_asset_metadata(self._db_path, be._td_perf_entry_serials(results))
+        except Exception:
+            asset_metadata = {}
+        if isinstance(asset_metadata, dict):
+            plot_metadata["asset_type"] = str(asset_metadata.get("primary_asset_type") or "").strip()
+            plot_metadata["asset_specific_type"] = str(asset_metadata.get("primary_asset_specific_type") or "").strip()
+        try:
             exported = be.td_perf_export_equation_workbook(
                 self._db_path,
                 Path(out_path),
@@ -8858,6 +9001,327 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             self._open_spreadsheet_path(Path(exported))
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "Export Equation to Excel", str(exc))
+
+    def _perf_default_saved_name(self) -> str:
+        results = getattr(self, "_perf_results_by_stat", {}) or {}
+        first_result = next((r for r in results.values() if isinstance(r, dict)), {}) or {}
+        output_target = str(first_result.get("output_target") or "").strip()
+        input1_target = str(first_result.get("input1_target") or "").strip()
+        input2_target = str(first_result.get("input2_target") or "").strip()
+        if input2_target:
+            return f"Performance: {output_target} vs {input1_target},{input2_target}".strip()
+        return f"Performance: {output_target} vs {input1_target}".strip()
+
+    def _build_current_saved_performance_entry(self, name: str, existing_entry: dict | None = None) -> dict:
+        if not getattr(self, "_db_path", None):
+            raise RuntimeError("Build/refresh cache first.")
+        results = getattr(self, "_perf_results_by_stat", {}) or {}
+        first_result = next((r for r in results.values() if isinstance(r, dict)), {}) or {}
+        output_target = str(first_result.get("output_target") or "").strip()
+        input1_target = str(first_result.get("input1_target") or "").strip()
+        input2_target = str(first_result.get("input2_target") or "").strip()
+        if not output_target or not input1_target:
+            raise RuntimeError("Plot a performance fit before saving equations.")
+
+        plot_def = dict(getattr(self, "_last_plot_def", {}) or {})
+        current_selection = self._current_run_selection()
+        runs = [
+            str(value).strip()
+            for value in (plot_def.get("member_runs") or current_selection.get("member_runs") or [])
+            if str(value).strip()
+        ]
+        plot_def["member_runs"] = list(runs)
+        plot_def["polynomial_degree"] = int(self.sp_perf_degree.value()) if hasattr(self, "sp_perf_degree") else 2
+        plot_def["normalize_x"] = bool(getattr(self, "cb_perf_norm_x", None) and self.cb_perf_norm_x.isChecked())
+        plot_def["require_min_points"] = int(getattr(self, "_perf_require_min_points", 2) or 2)
+        plot_def["fit_mode"] = str(plot_def.get("fit_mode") or self._perf_requested_fit_mode()).strip().lower()
+        plot_def["surface_fit_family"] = str(self._perf_requested_surface_family()).strip().lower()
+        plot_def["output"] = output_target
+        plot_def["input1"] = input1_target
+        plot_def["input2"] = input2_target
+        run_specs = self._perf_export_run_specs(runs, output_target, input1_target, input2_target)
+        plot_metadata = {
+            "plot_dimension": str(first_result.get("plot_dimension") or plot_def.get("plot_dimension") or "2d"),
+            "output_target": output_target,
+            "output_units": str(first_result.get("output_units") or first_result.get("y_units") or "").strip(),
+            "input1_target": input1_target,
+            "input1_units": str(first_result.get("input1_units") or first_result.get("x_units") or "").strip(),
+            "input2_target": input2_target,
+            "input2_units": str(first_result.get("input2_units") or "").strip(),
+            "run_selection_label": str(plot_def.get("run_condition") or plot_def.get("display_text") or self._selection_condition_label(current_selection)).strip(),
+            "display_text": str(plot_def.get("display_text") or self._selection_display_text(current_selection)).strip(),
+            "run_condition": str(plot_def.get("run_condition") or self._selection_condition_label(current_selection)).strip(),
+            "member_runs": list(runs),
+            "performance_run_type_mode": str(plot_def.get("performance_run_type_mode") or self._selected_perf_run_type_mode()).strip().lower(),
+            "performance_filter_mode": str(plot_def.get("performance_filter_mode") or self._selected_perf_filter_mode()).strip().lower() or "all_conditions",
+            "selected_control_period": plot_def.get("selected_control_period"),
+        }
+        return be.td_perf_build_saved_equation_entry(
+            self._db_path,
+            name=name,
+            plot_definition=plot_def,
+            plot_metadata=plot_metadata,
+            results_by_stat=results,
+            run_specs=run_specs,
+            existing_id=((existing_entry or {}).get("id") if isinstance(existing_entry, dict) else None),
+            existing_saved_at=((existing_entry or {}).get("saved_at") if isinstance(existing_entry, dict) else None),
+        )
+
+    def _format_saved_performance_entry_detail(self, entry: dict) -> str:
+        lines: list[str] = []
+        lines.append(f"Name: {str(entry.get('name') or '').strip()}")
+        asset_metadata = dict(entry.get("asset_metadata") or {}) if isinstance(entry.get("asset_metadata"), dict) else {}
+        primary_asset = str(asset_metadata.get("primary_asset_type") or "").strip() or "(Unspecified)"
+        primary_specific = str(asset_metadata.get("primary_asset_specific_type") or "").strip() or "(Unspecified)"
+        lines.append(f"Asset Type: {primary_asset}")
+        lines.append(f"Asset Specific Type: {primary_specific}")
+        plot_metadata = dict(entry.get("plot_metadata") or {}) if isinstance(entry.get("plot_metadata"), dict) else {}
+        lines.append(f"Dimension: {str(plot_metadata.get('plot_dimension') or '').strip().upper()}")
+        lines.append(f"Output: {str(plot_metadata.get('output_target') or '').strip()}")
+        lines.append(f"Input 1: {str(plot_metadata.get('input1_target') or '').strip()}")
+        input2_target = str(plot_metadata.get("input2_target") or "").strip()
+        if input2_target:
+            lines.append(f"Input 2: {input2_target}")
+        lines.append(f"Updated: {str(entry.get('updated_at') or '').strip()}")
+        refresh_error = str(entry.get("refresh_error") or "").strip()
+        if refresh_error:
+            lines.append(f"Refresh Error: {refresh_error}")
+        group_map = asset_metadata.get("serials_by_asset_group") or {}
+        if isinstance(group_map, dict) and group_map:
+            lines.append("")
+            lines.append("Asset Groups:")
+            for key, serials in sorted(group_map.items(), key=lambda item: str(item[0]).lower()):
+                serial_list = ", ".join(str(v).strip() for v in (serials or []) if str(v).strip())
+                lines.append(f"  {key}: {serial_list}")
+        rows = entry.get("equation_rows") or []
+        if isinstance(rows, list) and rows:
+            lines.append("")
+            lines.append("Equations:")
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                lines.append(f"  [{str(row.get('stat') or '').strip()}] {str(row.get('fit_family') or '').strip()}")
+                lines.append(f"    {str(row.get('equation') or '').strip()}")
+                norm_text = str(row.get("x_norm_equation") or "").strip()
+                if norm_text:
+                    lines.append(f"    norm: {norm_text}")
+        return "\n".join(lines)
+
+    def _save_current_performance_equation(self) -> None:
+        if not self._perf_has_exportable_models():
+            QtWidgets.QMessageBox.information(self, "Performance", "No exportable master equations are available.")
+            return
+        store = be.load_td_saved_performance_equations(self._project_dir)
+        entries = [dict(item) for item in (store.get("entries") or []) if isinstance(item, dict)]
+        default_name = self._perf_default_saved_name()
+        name, ok = QtWidgets.QInputDialog.getText(self, "Save Performance Equation", "Saved equation name:", text=default_name)
+        if not ok:
+            return
+        clean_name = str(name or "").strip()
+        if not clean_name:
+            QtWidgets.QMessageBox.information(self, "Save Performance Equation", "Enter a saved equation name.")
+            return
+        existing = next((item for item in entries if str(item.get("name") or "").strip().casefold() == clean_name.casefold()), None)
+        if existing:
+            answer = QtWidgets.QMessageBox.question(
+                self,
+                "Overwrite Saved Equation",
+                f"A saved performance equation named '{clean_name}' already exists.\n\nOverwrite it?",
+            )
+            if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+                return
+        try:
+            entry = self._build_current_saved_performance_entry(clean_name, existing_entry=existing if isinstance(existing, dict) else None)
+            be.td_perf_upsert_saved_equation(self._project_dir, entry)
+            self._show_toast("Saved performance equation")
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Save Performance Equation", str(exc))
+
+    def _open_saved_performance_equations_popup(self) -> None:
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Saved Performance Equations")
+        dlg.resize(1080, 640)
+        layout = QtWidgets.QVBoxLayout(dlg)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        tbl = QtWidgets.QTableWidget(0, 10)
+        tbl.setHorizontalHeaderLabels(
+            [
+                "name",
+                "asset_type",
+                "asset_specific_type",
+                "dimension",
+                "output",
+                "input_1",
+                "input_2",
+                "stats",
+                "fit_family",
+                "updated_at",
+            ]
+        )
+        tbl.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        tbl.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        tbl.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        layout.addWidget(tbl, 2)
+
+        detail = QtWidgets.QPlainTextEdit()
+        detail.setReadOnly(True)
+        detail.setMinimumHeight(180)
+        layout.addWidget(detail, 1)
+
+        button_row = QtWidgets.QHBoxLayout()
+        button_row.addStretch(1)
+        btn_export_excel = QtWidgets.QPushButton("Export All to Excel")
+        btn_export_matlab = QtWidgets.QPushButton("Export All to MATLAB")
+        btn_delete = QtWidgets.QPushButton("Delete Selected")
+        btn_close = QtWidgets.QPushButton("Close")
+        for button in (btn_export_excel, btn_export_matlab, btn_delete, btn_close):
+            button_row.addWidget(button)
+        layout.addLayout(button_row)
+
+        def _load_entries() -> list[dict]:
+            store = be.load_td_saved_performance_equations(self._project_dir)
+            return [dict(item) for item in (store.get("entries") or []) if isinstance(item, dict)]
+
+        def _selected_entry() -> dict | None:
+            row = tbl.currentRow()
+            if row < 0:
+                return None
+            item = tbl.item(row, 0)
+            data = item.data(QtCore.Qt.ItemDataRole.UserRole) if item is not None else None
+            return dict(data) if isinstance(data, dict) else None
+
+        def _refresh_table() -> None:
+            entries = _load_entries()
+            tbl.setRowCount(len(entries))
+            for row_idx, entry in enumerate(entries):
+                plot_metadata = dict(entry.get("plot_metadata") or {}) if isinstance(entry.get("plot_metadata"), dict) else {}
+                asset_metadata = dict(entry.get("asset_metadata") or {}) if isinstance(entry.get("asset_metadata"), dict) else {}
+                equation_rows = entry.get("equation_rows") or []
+                stats_text = ", ".join(
+                    str(row.get("stat") or "").strip()
+                    for row in equation_rows
+                    if isinstance(row, dict) and str(row.get("stat") or "").strip()
+                )
+                family_text = next(
+                    (
+                        str(row.get("fit_family") or "").strip()
+                        for row in equation_rows
+                        if isinstance(row, dict) and str(row.get("fit_family") or "").strip()
+                    ),
+                    "",
+                )
+                values = [
+                    str(entry.get("name") or "").strip(),
+                    str(asset_metadata.get("primary_asset_type") or "").strip(),
+                    str(asset_metadata.get("primary_asset_specific_type") or "").strip(),
+                    str(plot_metadata.get("plot_dimension") or "").strip().upper(),
+                    str(plot_metadata.get("output_target") or "").strip(),
+                    str(plot_metadata.get("input1_target") or "").strip(),
+                    str(plot_metadata.get("input2_target") or "").strip(),
+                    stats_text,
+                    family_text,
+                    str(entry.get("updated_at") or "").strip(),
+                ]
+                for col_idx, value in enumerate(values):
+                    item = QtWidgets.QTableWidgetItem(value)
+                    item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+                    if col_idx == 0:
+                        item.setData(QtCore.Qt.ItemDataRole.UserRole, entry)
+                    tbl.setItem(row_idx, col_idx, item)
+            try:
+                tbl.resizeColumnsToContents()
+            except Exception:
+                pass
+            if entries:
+                tbl.selectRow(0)
+            else:
+                detail.clear()
+            enabled = bool(entries)
+            btn_export_excel.setEnabled(enabled)
+            btn_export_matlab.setEnabled(enabled)
+            btn_delete.setEnabled(enabled and tbl.currentRow() >= 0)
+
+        def _sync_detail() -> None:
+            entry = _selected_entry()
+            if entry is None:
+                detail.clear()
+                btn_delete.setEnabled(False)
+                return
+            detail.setPlainText(self._format_saved_performance_entry_detail(entry))
+            btn_delete.setEnabled(True)
+
+        def _export_all_to_excel() -> None:
+            if not getattr(self, "_db_path", None):
+                QtWidgets.QMessageBox.information(dlg, "Saved Performance Equations", "Build/refresh cache first.")
+                return
+            entries = _load_entries()
+            if not entries:
+                QtWidgets.QMessageBox.information(dlg, "Saved Performance Equations", "No saved equations are available.")
+                return
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            out_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+                dlg,
+                "Export All Saved Equations to Excel",
+                str(self._project_dir / f"saved_performance_equations_{timestamp}.xlsx"),
+                "Excel Files (*.xlsx)",
+            )
+            if not out_path:
+                return
+            try:
+                exported = be.td_perf_export_saved_equations_workbook(self._db_path, Path(out_path), entries=entries)
+                self._open_spreadsheet_path(Path(exported))
+            except Exception as exc:
+                QtWidgets.QMessageBox.warning(dlg, "Saved Performance Equations", str(exc))
+
+        def _export_all_to_matlab() -> None:
+            entries = _load_entries()
+            if not entries:
+                QtWidgets.QMessageBox.information(dlg, "Saved Performance Equations", "No saved equations are available.")
+                return
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            out_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+                dlg,
+                "Export All Saved Equations to MATLAB",
+                str(self._project_dir / f"saved_performance_equations_{timestamp}.m"),
+                "MATLAB Files (*.m)",
+            )
+            if not out_path:
+                return
+            try:
+                exported = be.td_perf_export_saved_equations_matlab(Path(out_path), entries=entries)
+                try:
+                    be.open_path(Path(exported))
+                except Exception:
+                    pass
+            except Exception as exc:
+                QtWidgets.QMessageBox.warning(dlg, "Saved Performance Equations", str(exc))
+
+        def _delete_selected() -> None:
+            entry = _selected_entry()
+            if entry is None:
+                return
+            answer = QtWidgets.QMessageBox.question(
+                dlg,
+                "Delete Saved Equation",
+                f"Delete saved performance equation '{str(entry.get('name') or '').strip()}'?",
+            )
+            if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+                return
+            try:
+                be.td_perf_delete_saved_equation(self._project_dir, entry.get("id"))
+                _refresh_table()
+            except Exception as exc:
+                QtWidgets.QMessageBox.warning(dlg, "Delete Saved Equation", str(exc))
+
+        tbl.itemSelectionChanged.connect(_sync_detail)
+        btn_export_excel.clicked.connect(_export_all_to_excel)
+        btn_export_matlab.clicked.connect(_export_all_to_matlab)
+        btn_delete.clicked.connect(_delete_selected)
+        btn_close.clicked.connect(dlg.accept)
+        _refresh_table()
+        dlg.exec()
 
     def _select_perf_equation_row(self, stat: str) -> None:
         st = str(stat or "").strip().lower()
@@ -9364,6 +9828,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             self.cb_perf_surface_model.currentIndexChanged.connect(lambda *_: self._clear_perf_results())
             self.sp_perf_degree.valueChanged.connect(lambda *_: self._clear_perf_results())
             self.cb_perf_norm_x.toggled.connect(lambda *_: self._clear_perf_results())
+            self.ed_perf_x_band_min.textChanged.connect(lambda *_: self._clear_perf_results())
+            self.ed_perf_x_band_max.textChanged.connect(lambda *_: self._clear_perf_results())
+            self.ed_perf_y_band_min.textChanged.connect(lambda *_: self._clear_perf_results())
+            self.ed_perf_y_band_max.textChanged.connect(lambda *_: self._clear_perf_results())
+            self.btn_perf_save_equation.clicked.connect(self._save_current_performance_equation)
+            self.btn_perf_saved_equations.clicked.connect(self._open_saved_performance_equations_popup)
             self.btn_perf_export_equations.clicked.connect(self._export_perf_equations_to_excel)
             self._perf_signals_connected = True
 
@@ -9423,6 +9893,11 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         run_type_mode = self._selected_perf_run_type_mode()
         perf_filter_mode = self._selected_perf_filter_mode()
         control_period_filter = self._selected_perf_control_period()
+        try:
+            axis_band_filters = self._current_perf_axis_band_filters()
+        except ValueError as exc:
+            QtWidgets.QMessageBox.warning(self, "Performance", str(exc))
+            return
         self._perf_results_by_stat, plot_view_stats, fit_error_text = self._perf_collect_results(
             output_target,
             input1_target,
@@ -9432,15 +9907,18 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             serials,
             fit_enabled=fit_enabled,
             require_min_points=require_min_points,
+            axis_band_filters=axis_band_filters,
             run_type_filter=run_type_mode,
             control_period_filter=(control_period_filter if perf_filter_mode == "match_control_period" else None),
             display_control_period=control_period_filter,
         )
 
         if not plot_view_stats:
-            QtWidgets.QMessageBox.information(
-                self, "Performance", "No qualifying performance data found for the selected Output/Input pairing."
-            )
+            detail = self._perf_axis_band_note(axis_band_filters)
+            message = "No qualifying performance data found for the selected Output/Input pairing."
+            if detail:
+                message += "\n\n" + detail
+            QtWidgets.QMessageBox.information(self, "Performance", message)
             return
 
         self._perf_plot_view_stats = list(plot_view_stats)
@@ -9474,6 +9952,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         )
         if fit_error_text:
             QtWidgets.QMessageBox.warning(self, "Performance", fit_error_text)
+        self._set_plot_note(self._perf_axis_band_note(axis_band_filters))
         self._update_perf_highlight_models()
         self._fill_perf_equations_table()
         self._redraw_performance_view()
@@ -9504,6 +9983,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             "performance_run_type_mode": run_type_mode,
             "performance_filter_mode": perf_filter_mode,
             "selected_control_period": control_period_filter,
+            "x_band_min": axis_band_filters.get("x", (None, None))[0],
+            "x_band_max": axis_band_filters.get("x", (None, None))[1],
+            "y_band_min": axis_band_filters.get("y", (None, None))[0],
+            "y_band_max": axis_band_filters.get("y", (None, None))[1],
             "highlight_serial": str(getattr(self, "_highlight_sn", "") or "").strip(),
         }
         self.btn_add_auto_plot.setEnabled(True)
@@ -9736,6 +10219,14 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             self._set_combo_to_value(self.cb_perf_y_col, str(d.get("output") or ""))
             self._set_combo_to_value(self.cb_perf_x_col, str(d.get("input1") or ""))
             self._set_combo_to_value(self.cb_perf_z_col, str(d.get("input2") or ""))
+            if hasattr(self, "ed_perf_x_band_min"):
+                self.ed_perf_x_band_min.setText("" if d.get("x_band_min") in (None, "") else str(d.get("x_band_min")))
+            if hasattr(self, "ed_perf_x_band_max"):
+                self.ed_perf_x_band_max.setText("" if d.get("x_band_max") in (None, "") else str(d.get("x_band_max")))
+            if hasattr(self, "ed_perf_y_band_min"):
+                self.ed_perf_y_band_min.setText("" if d.get("y_band_min") in (None, "") else str(d.get("y_band_min")))
+            if hasattr(self, "ed_perf_y_band_max"):
+                self.ed_perf_y_band_max.setText("" if d.get("y_band_max") in (None, "") else str(d.get("y_band_max")))
             self._on_perf_axis_changed("z" if str(d.get("input2") or "").strip() else "x")
             if hasattr(self, "cb_perf_fit"):
                 self.cb_perf_fit.setChecked(bool(d.get("fit_enabled", True)))
@@ -10206,6 +10697,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             run_type_mode = str(d.get("performance_run_type_mode") or self._selected_perf_run_type_mode()).strip().lower()
             perf_filter_mode = str(d.get("performance_filter_mode") or "all_conditions").strip().lower()
             control_period_filter = d.get("selected_control_period")
+            axis_band_filters = {
+                "x": self._perf_normalize_axis_band("X", d.get("x_band_min"), d.get("x_band_max")),
+                "y": self._perf_normalize_axis_band("Y", d.get("y_band_min"), d.get("y_band_max")),
+            }
             common_runs = self._common_runs_for_perf_vars(output, input1, input2)
             if common_runs:
                 common_set = set(common_runs)
@@ -10220,6 +10715,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 serials,
                 fit_enabled=fit_enabled,
                 require_min_points=require_min_points,
+                axis_band_filters=axis_band_filters,
                 run_type_filter=run_type_mode,
                 control_period_filter=(
                     control_period_filter
@@ -12704,6 +13200,15 @@ class MainWindow(QtWidgets.QMainWindow):
                     self._append_log(f"[TD UPDATE TIMING] {key}={timings.get(key)}")
                 for key in sorted(str(k) for k in timings.keys() if str(k) not in shown):
                     self._append_log(f"[TD UPDATE TIMING] {key}={timings.get(key)}")
+            saved_refresh = payload.get("saved_equation_refresh")
+            if isinstance(saved_refresh, dict):
+                self._append_log(
+                    "[PROJECT UPDATE] Saved equations refreshed="
+                    f"{int(saved_refresh.get('refreshed_count') or 0)}, failed={int(saved_refresh.get('failed_count') or 0)}"
+                )
+                for err in (saved_refresh.get("errors") or []):
+                    if str(err).strip():
+                        self._append_log(f"[PROJECT UPDATE] Saved equation refresh error: {err}")
 
         lines = [
             f"Updated cells: {updated}",
@@ -12723,6 +13228,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if ptype == getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending"):
             lines.append("Recalculation includes support-workbook heuristics when present.")
             lines.append("Performance candidate sheets are now generated only on demand.")
+            saved_refresh = payload.get("saved_equation_refresh")
+            if isinstance(saved_refresh, dict):
+                lines.append(
+                    "Saved equations refreshed: "
+                    f"{int(saved_refresh.get('refreshed_count') or 0)}"
+                    f" (failed: {int(saved_refresh.get('failed_count') or 0)})"
+                )
         if log_path:
             lines.append(f"Log: {log_path}")
         msg = "\n".join(lines)

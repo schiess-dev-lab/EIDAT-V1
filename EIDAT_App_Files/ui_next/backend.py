@@ -11427,6 +11427,8 @@ def td_perf_export_equation_workbook(
     metadata_rows: list[tuple[object, object]] = [
         ("Export Timestamp", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
         ("Plot Dimension", "3D" if is_surface else "2D"),
+        ("Asset Type", str(plot_metadata.get("asset_type") or "").strip()),
+        ("Asset Specific Type", str(plot_metadata.get("asset_specific_type") or "").strip()),
         ("Output Target", output_target),
         ("Output Units", output_units),
         ("Input 1 Target", input1_target),
@@ -11668,6 +11670,1205 @@ def td_perf_export_equation_workbook(
     wb.close()
     return path
 
+
+TD_SAVED_PERFORMANCE_EQUATIONS_JSON = "saved_performance_equations.json"
+TD_SAVED_PERFORMANCE_EQUATIONS_VERSION = 1
+
+
+def td_saved_performance_equations_path(project_dir: Path) -> Path:
+    return Path(project_dir).expanduser() / TD_SAVED_PERFORMANCE_EQUATIONS_JSON
+
+
+def _td_perf_json_safe(value: object) -> object:
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        return float(value) if math.isfinite(float(value)) else None
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, Mapping):
+        return {str(k): _td_perf_json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_td_perf_json_safe(v) for v in value]
+    try:
+        item = value.item()  # type: ignore[attr-defined]
+    except Exception:
+        item = None
+    if item is not None and item is not value:
+        return _td_perf_json_safe(item)
+    return str(value)
+
+
+def _td_perf_saved_slug(value: object, *, fallback: str = "equation") -> str:
+    txt = re.sub(r"[^A-Za-z0-9]+", "_", str(value or "").strip().lower()).strip("_")
+    return txt or fallback
+
+
+def _td_perf_serializable_model(model: Mapping[str, object] | None) -> dict[str, object]:
+    if not isinstance(model, Mapping):
+        return {}
+    out = {
+        str(k): _td_perf_json_safe(v)
+        for k, v in model.items()
+        if str(k) not in {"xfit", "yfit", "x1_grid", "x2_grid", "z_grid"}
+    }
+    return out if isinstance(out, dict) else {}
+
+
+def _td_perf_serializable_results(results_by_stat: Mapping[str, Mapping[str, object]]) -> dict[str, dict[str, object]]:
+    out: dict[str, dict[str, object]] = {}
+    for raw_stat, raw_result in (results_by_stat or {}).items():
+        stat = str(raw_stat or "").strip().lower()
+        if not stat or not isinstance(raw_result, Mapping):
+            continue
+        result = dict(raw_result)
+        out[stat] = {
+            "stat_label": stat,
+            "plot_dimension": str(result.get("plot_dimension") or "").strip().lower(),
+            "output_target": str(result.get("output_target") or "").strip(),
+            "input1_target": str(result.get("input1_target") or "").strip(),
+            "input2_target": str(result.get("input2_target") or "").strip(),
+            "output_units": str(result.get("output_units") or result.get("y_units") or "").strip(),
+            "input1_units": str(result.get("input1_units") or result.get("x_units") or "").strip(),
+            "input2_units": str(result.get("input2_units") or "").strip(),
+            "selected_control_period": result.get("selected_control_period"),
+            "master_model": _td_perf_serializable_model((result.get("master_model") or {}) if isinstance(result, Mapping) else {}),
+        }
+    return out
+
+
+def td_perf_saved_equation_rows(results_by_stat: Mapping[str, Mapping[str, object]]) -> list[dict[str, object]]:
+    models_by_stat: dict[str, dict[str, object]] = {}
+    for stat in TD_PERF_EXPORT_STATS_ORDER:
+        model = _td_perf_exportable_model((results_by_stat or {}).get(stat) or {})
+        if model is not None:
+            models_by_stat[stat] = dict(model)
+    rows: list[dict[str, object]] = []
+    for stat in TD_PERF_EXPORT_STATS_ORDER:
+        model = models_by_stat.get(stat)
+        derived_eq, derived_norm = _td_perf_derived_3sigma_equation_text(stat, models_by_stat)
+        if model is None and not derived_eq:
+            continue
+        rows.append(
+            {
+                "stat": stat,
+                "fit_family": (
+                    td_perf_fit_family_label(model.get("fit_family"))
+                    if model is not None
+                    else "Derived from Mean and Std"
+                ),
+                "equation": derived_eq or str((model or {}).get("equation") or ""),
+                "x_norm_equation": derived_norm or str((model or {}).get("x_norm_equation") or ""),
+                "rmse": (float(model.get("rmse")) if isinstance((model or {}).get("rmse"), (int, float)) else None),
+            }
+        )
+    return rows
+
+
+def _td_perf_entry_serials(results_by_stat: Mapping[str, Mapping[str, object]]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for result in (results_by_stat or {}).values():
+        if not isinstance(result, Mapping):
+            continue
+        plot_dimension = str(result.get("plot_dimension") or "2d").strip().lower()
+        if plot_dimension == "3d":
+            serials = ((result.get("points_3d") or {}) if isinstance(result.get("points_3d"), Mapping) else {}).keys()
+        else:
+            serials = ((result.get("curves") or {}) if isinstance(result.get("curves"), Mapping) else {}).keys()
+        for raw_serial in serials:
+            serial = str(raw_serial or "").strip()
+            if serial and serial not in seen:
+                seen.add(serial)
+                out.append(serial)
+    out.sort()
+    return out
+
+
+def td_perf_collect_asset_metadata(db_path: Path, serials: Sequence[object]) -> dict[str, object]:
+    serial_list = sorted({str(v).strip() for v in (serials or []) if str(v).strip()})
+    serial_meta: dict[str, dict[str, str]] = {}
+    if serial_list and Path(db_path).expanduser().exists():
+        placeholders = ",".join("?" for _ in serial_list)
+        try:
+            with sqlite3.connect(str(Path(db_path).expanduser())) as conn:
+                _ensure_test_data_impl_tables(conn)
+                rows = conn.execute(
+                    f"""
+                    SELECT serial, asset_type, asset_specific_type
+                    FROM td_source_metadata
+                    WHERE serial IN ({placeholders})
+                    """,
+                    tuple(serial_list),
+                ).fetchall()
+            for raw_serial, raw_asset, raw_specific in rows:
+                serial = str(raw_serial or "").strip()
+                if not serial:
+                    continue
+                serial_meta[serial] = {
+                    "asset_type": str(raw_asset or "").strip(),
+                    "asset_specific_type": str(raw_specific or "").strip(),
+                }
+        except Exception:
+            serial_meta = {}
+
+    asset_types = sorted(
+        {
+            str((serial_meta.get(serial) or {}).get("asset_type") or "").strip()
+            for serial in serial_list
+            if str((serial_meta.get(serial) or {}).get("asset_type") or "").strip()
+        }
+    )
+    asset_specific_types = sorted(
+        {
+            str((serial_meta.get(serial) or {}).get("asset_specific_type") or "").strip()
+            for serial in serial_list
+            if str((serial_meta.get(serial) or {}).get("asset_specific_type") or "").strip()
+        }
+    )
+    serials_by_asset_group: dict[str, list[str]] = {}
+    for serial in serial_list:
+        meta = serial_meta.get(serial) or {}
+        asset_type = str(meta.get("asset_type") or "").strip() or "(Unspecified)"
+        asset_specific = str(meta.get("asset_specific_type") or "").strip() or "(Unspecified)"
+        serials_by_asset_group.setdefault(f"{asset_type} | {asset_specific}", []).append(serial)
+
+    primary_asset_type = ""
+    primary_asset_specific_type = ""
+    if len(asset_types) > 1:
+        primary_asset_type = "mixed_asset_type"
+        primary_asset_specific_type = "mixed_asset_specific"
+    elif len(asset_types) == 1:
+        primary_asset_type = asset_types[0]
+        if len(asset_specific_types) > 1:
+            primary_asset_specific_type = "mixed_asset_specific"
+        elif len(asset_specific_types) == 1:
+            primary_asset_specific_type = asset_specific_types[0]
+
+    return {
+        "contributing_serials": serial_list,
+        "asset_types": asset_types,
+        "asset_specific_types": asset_specific_types,
+        "primary_asset_type": primary_asset_type,
+        "primary_asset_specific_type": primary_asset_specific_type,
+        "serials_by_asset_group": serials_by_asset_group,
+    }
+
+
+def _td_perf_resolve_y_col_units(db_path: Path, run_name: str, target: str) -> tuple[str, str]:
+    want = "".join(ch.lower() for ch in str(target or "").strip() if ch.isalnum())
+    if not want:
+        return "", ""
+    try:
+        cols = td_list_y_columns(db_path, run_name)
+    except Exception:
+        cols = []
+    for col in cols:
+        name = str((col or {}).get("name") or "").strip()
+        if not name:
+            continue
+        if "".join(ch.lower() for ch in name if ch.isalnum()) == want:
+            return name, str((col or {}).get("units") or "").strip()
+    return str(target or "").strip(), ""
+
+
+def td_perf_resolve_run_specs(
+    db_path: Path,
+    runs: Sequence[object],
+    *,
+    output_target: str,
+    input1_target: str,
+    input2_target: str = "",
+) -> list[dict[str, object]]:
+    run_display: dict[str, str] = {}
+    try:
+        with sqlite3.connect(str(Path(db_path).expanduser())) as conn:
+            _ensure_test_data_impl_tables(conn)
+            rows = conn.execute("SELECT run_name, display_name FROM td_runs").fetchall()
+        run_display = {
+            str(run_name or "").strip(): str(display_name or run_name or "").strip()
+            for run_name, display_name in rows
+            if str(run_name or "").strip()
+        }
+    except Exception:
+        run_display = {}
+
+    specs: list[dict[str, object]] = []
+    for raw_run in runs or []:
+        run_name = str(raw_run or "").strip()
+        if not run_name:
+            continue
+        output_col, output_units = _td_perf_resolve_y_col_units(db_path, run_name, output_target)
+        input1_col, input1_units = _td_perf_resolve_y_col_units(db_path, run_name, input1_target)
+        input2_col = ""
+        input2_units = ""
+        if str(input2_target or "").strip():
+            input2_col, input2_units = _td_perf_resolve_y_col_units(db_path, run_name, input2_target)
+        if not output_col or not input1_col:
+            continue
+        if str(input2_target or "").strip() and not input2_col:
+            continue
+        specs.append(
+            {
+                "run_name": run_name,
+                "display_name": str(run_display.get(run_name) or run_name),
+                "output_column": output_col,
+                "output_units": output_units,
+                "input1_column": input1_col,
+                "input1_units": input1_units,
+                "input2_column": input2_col,
+                "input2_units": input2_units,
+            }
+        )
+    return specs
+
+
+def td_perf_collect_saved_equation_snapshot(
+    db_path: Path,
+    plot_definition: Mapping[str, object],
+) -> dict[str, object]:
+    path = Path(db_path).expanduser()
+    if not path.exists():
+        raise FileNotFoundError(f"Project cache DB not found: {path}")
+
+    output_target = str(plot_definition.get("output") or plot_definition.get("output_target") or "").strip()
+    input1_target = str(plot_definition.get("input1") or plot_definition.get("input1_target") or "").strip()
+    input2_target = str(plot_definition.get("input2") or plot_definition.get("input2_target") or "").strip()
+    if not output_target or not input1_target:
+        raise RuntimeError("Saved performance equation is missing output/input targets.")
+
+    stats_raw = plot_definition.get("stats") or []
+    plot_stats = [
+        str(value).strip().lower()
+        for value in (stats_raw if isinstance(stats_raw, list) else [stats_raw])
+        if str(value).strip()
+    ]
+    plot_stats = [stat for stat in plot_stats if stat in TD_ALLOWED_STATS or stat in {"min_3sigma", "max_3sigma"}]
+    if not plot_stats:
+        plot_stats = ["mean"]
+
+    member_runs = [str(value).strip() for value in (plot_definition.get("member_runs") or []) if str(value).strip()]
+    if not member_runs:
+        member_runs = [str(value).strip() for value in td_list_runs(path) if str(value).strip()]
+    serials = [str(value).strip() for value in td_list_serials(path) if str(value).strip()]
+    if not serials:
+        raise RuntimeError("No serial numbers found in the project cache.")
+
+    fit_enabled = bool(plot_definition.get("fit_enabled", True))
+    require_min_points = max(2, int(plot_definition.get("require_min_points") or 2))
+    fit_mode = td_perf_normalize_fit_mode(plot_definition.get("fit_mode") or TD_PERF_FIT_MODE_AUTO)
+    surface_family = td_perf_normalize_surface_family(
+        plot_definition.get("surface_fit_family") or plot_definition.get("surface_family") or TD_PERF_FIT_MODE_AUTO_SURFACE
+    )
+    polynomial_degree = max(1, int(plot_definition.get("polynomial_degree") or plot_definition.get("degree") or 2))
+    normalize_x = bool(plot_definition.get("normalize_x", True))
+    run_type_filter = td_perf_normalize_run_type_mode(
+        plot_definition.get("performance_run_type_mode") or plot_definition.get("run_type_filter")
+    )
+    filter_mode = str(plot_definition.get("performance_filter_mode") or "all_conditions").strip().lower() or "all_conditions"
+    selected_control_period = plot_definition.get("selected_control_period")
+    control_period_filter = (
+        selected_control_period
+        if (run_type_filter == "pulsed_mode" and filter_mode == "match_control_period")
+        else None
+    )
+    is_surface = bool(input2_target)
+    use_cp_surface = bool(is_surface and surface_family == TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD)
+
+    def _series_by_observation(rows: list[dict]) -> dict[str, dict]:
+        out: dict[str, dict] = {}
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            observation_id = str(row.get("observation_id") or "").strip()
+            serial = str(row.get("serial") or "").strip()
+            value = row.get("value_num")
+            if not observation_id or not serial or serial not in serials or not isinstance(value, (int, float)):
+                continue
+            if not math.isfinite(float(value)):
+                continue
+            out[observation_id] = dict(row)
+        return out
+
+    def _obs_label(display_name: str, run_name: str, row: Mapping[str, object]) -> str:
+        parts: list[str] = [str(display_name or run_name).strip() or str(run_name or "").strip()]
+        for key in ("program_title", "source_run_name"):
+            value = str((row or {}).get(key) or "").strip()
+            if value and value not in parts:
+                parts.append(value)
+        return " | ".join([part for part in parts if str(part).strip()])
+
+    def _aggregate_curve(curves: Mapping[str, Sequence[Sequence[object]]]) -> tuple[list[float], list[float], list[float]]:
+        aggregate = td_perf_build_aggregate_curve(curves, max_bins=24, min_serials_per_bin=1, return_meta=True)
+        xs = [float(value) for value in (aggregate.get("x") or [])]
+        ys = [float(value) for value in (aggregate.get("y") or [])]
+        support = [float(value) for value in (aggregate.get("serial_support") or [])]
+        edge_weight = [float(value) for value in (aggregate.get("edge_weight") or [])]
+        if len(xs) == len(ys) == len(support) == len(edge_weight) and xs:
+            weights = [
+                float(max(1.0, math.sqrt(max(0.0, support[idx])))) * float(edge_weight[idx])
+                for idx in range(len(xs))
+            ]
+            return xs, ys, weights
+        pooled_x: list[float] = []
+        pooled_y: list[float] = []
+        for points in (curves or {}).values():
+            for point in points or []:
+                if len(point) >= 2:
+                    pooled_x.append(float(point[0]))
+                    pooled_y.append(float(point[1]))
+        return pooled_x, pooled_y, []
+
+    run_specs = td_perf_resolve_run_specs(
+        path,
+        member_runs,
+        output_target=output_target,
+        input1_target=input1_target,
+        input2_target=input2_target,
+    )
+    if not run_specs:
+        raise RuntimeError("No qualifying runs are available for the saved performance equation.")
+
+    equation_stats = list(plot_stats)
+    for extra_stat in ("min_3sigma", "max_3sigma"):
+        if extra_stat not in equation_stats:
+            equation_stats.append(extra_stat)
+
+    results: dict[str, dict[str, object]] = {}
+    contributing_serials: set[str] = set()
+    fit_error_text = ""
+    pair_label = f"{output_target} vs {input1_target},{input2_target}" if is_surface else f"{output_target} vs {input1_target}"
+    for stat in equation_stats:
+        if is_surface:
+            per_run: list[tuple[str, str, dict[str, dict], dict[str, dict], dict[str, dict], str, str, str]] = []
+            for spec in run_specs:
+                run_name = str(spec.get("run_name") or "").strip()
+                display_name = str(spec.get("display_name") or run_name).strip() or run_name
+                input1_rows = _series_by_observation(
+                    _td_perf_export_series_for_stat(
+                        path,
+                        run_name,
+                        str(spec.get("input1_column") or ""),
+                        stat,
+                        control_period_filter=control_period_filter,
+                        run_type_filter=run_type_filter,
+                    )
+                )
+                input2_rows = _series_by_observation(
+                    _td_perf_export_series_for_stat(
+                        path,
+                        run_name,
+                        str(spec.get("input2_column") or ""),
+                        stat,
+                        control_period_filter=control_period_filter,
+                        run_type_filter=run_type_filter,
+                    )
+                )
+                output_rows = _series_by_observation(
+                    _td_perf_export_series_for_stat(
+                        path,
+                        run_name,
+                        str(spec.get("output_column") or ""),
+                        stat,
+                        control_period_filter=control_period_filter,
+                        run_type_filter=run_type_filter,
+                    )
+                )
+                if input1_rows and input2_rows and output_rows:
+                    per_run.append(
+                        (
+                            run_name,
+                            display_name,
+                            input1_rows,
+                            input2_rows,
+                            output_rows,
+                            str(spec.get("input1_units") or ""),
+                            str(spec.get("input2_units") or ""),
+                            str(spec.get("output_units") or ""),
+                        )
+                    )
+            points_3d: dict[str, list[tuple[float, float, float, str]]] = {}
+            pooled_x1: list[float] = []
+            pooled_x2: list[float] = []
+            pooled_y: list[float] = []
+            pooled_cp: list[float] = []
+            invalid_control_period_seen = False
+            for serial in serials:
+                pts_all: list[tuple[float, float, float, str, object]] = []
+                pts_slice: list[tuple[float, float, float, str]] = []
+                for run_name, display_name, input1_map, input2_map, output_map, _u1, _u2, _uy in per_run:
+                    obs_ids = sorted(set(input1_map.keys()) & set(input2_map.keys()) & set(output_map.keys()))
+                    for observation_id in obs_ids:
+                        row_input1 = input1_map.get(observation_id) or {}
+                        row_input2 = input2_map.get(observation_id) or {}
+                        row_output = output_map.get(observation_id) or {}
+                        if str(row_output.get("serial") or row_input1.get("serial") or "").strip() != serial:
+                            continue
+                        cp_value = row_output.get("control_period", row_input1.get("control_period", row_input2.get("control_period")))
+                        cp_numeric = None
+                        if use_cp_surface:
+                            try:
+                                cp_numeric = float(cp_value)
+                                if not math.isfinite(cp_numeric):
+                                    raise ValueError
+                            except Exception:
+                                invalid_control_period_seen = True
+                        point = (
+                            float(row_input1.get("value_num") or 0.0),
+                            float(row_input2.get("value_num") or 0.0),
+                            float(row_output.get("value_num") or 0.0),
+                            _obs_label(display_name, run_name, row_output or row_input1 or row_input2),
+                            cp_numeric if cp_numeric is not None else cp_value,
+                        )
+                        pts_all.append(point)
+                        if not use_cp_surface or selected_control_period in (None, "") or cp_value == selected_control_period:
+                            pts_slice.append((point[0], point[1], point[2], point[3]))
+                distinct_x1 = {round(point[0], 12) for point in pts_all}
+                distinct_x2 = {round(point[1], 12) for point in pts_all}
+                if len(pts_all) >= max(3, require_min_points) and len(distinct_x1) >= 2 and len(distinct_x2) >= 2:
+                    if pts_slice:
+                        pts_slice.sort(key=lambda row: (row[0], row[1], row[3]))
+                        points_3d[serial] = pts_slice
+                    contributing_serials.add(serial)
+                    pooled_x1.extend([point[0] for point in pts_all])
+                    pooled_x2.extend([point[1] for point in pts_all])
+                    pooled_y.extend([point[2] for point in pts_all])
+                    if use_cp_surface:
+                        pooled_cp.extend([float(point[4]) for point in pts_all if isinstance(point[4], (int, float))])
+            if not points_3d:
+                continue
+
+            master_model: dict[str, object] = {}
+            if fit_enabled and len(pooled_y) >= 3:
+                try:
+                    if use_cp_surface and run_type_filter != "pulsed_mode":
+                        raise RuntimeError("Quadratic Surface + Control Period requires pulsed-mode data.")
+                    if use_cp_surface and invalid_control_period_seen:
+                        raise RuntimeError("Quadratic Surface + Control Period requires usable control-period values for all fitted pulsed-mode points.")
+                    fitted = td_perf_fit_surface_model(
+                        pooled_x1,
+                        pooled_x2,
+                        pooled_y,
+                        auto_surface_families=(surface_family == TD_PERF_FIT_MODE_AUTO_SURFACE),
+                        surface_family=surface_family,
+                        control_periods=(pooled_cp if use_cp_surface else None),
+                    )
+                    if isinstance(fitted, dict):
+                        if pooled_x1 and pooled_x2:
+                            fitted.update(
+                                td_perf_build_surface_grid(
+                                    fitted,
+                                    min(pooled_x1),
+                                    max(pooled_x1),
+                                    min(pooled_x2),
+                                    max(pooled_x2),
+                                    points=22,
+                                    control_period=selected_control_period,
+                                )
+                            )
+                        master_model = fitted
+                    elif use_cp_surface:
+                        raise RuntimeError("Quadratic Surface + Control Period requires at least two distinct control periods with valid surface coverage.")
+                except Exception as exc:
+                    if not fit_error_text:
+                        fit_error_text = str(exc)
+            results[stat] = {
+                "pair_label": pair_label,
+                "output_target": output_target,
+                "input1_target": input1_target,
+                "input2_target": input2_target,
+                "input1_units": next((u1 for *_rest, u1, _u2, _uy in per_run if str(u1).strip()), ""),
+                "input2_units": next((u2 for *_rest, u2, _uy in per_run if str(u2).strip()), ""),
+                "output_units": next((uy for *_rest, uy in per_run if str(uy).strip()), ""),
+                "stat_label": stat,
+                "fit_mode": fit_mode,
+                "plot_dimension": "3d",
+                "surface_fit_family": surface_family,
+                "selected_control_period": selected_control_period,
+                "points_3d": points_3d,
+                "master_model": master_model,
+            }
+        else:
+            per_run_2d: list[tuple[str, str, dict[str, dict], dict[str, dict], str, str]] = []
+            for spec in run_specs:
+                run_name = str(spec.get("run_name") or "").strip()
+                display_name = str(spec.get("display_name") or run_name).strip() or run_name
+                input1_rows = _series_by_observation(
+                    _td_perf_export_series_for_stat(
+                        path,
+                        run_name,
+                        str(spec.get("input1_column") or ""),
+                        stat,
+                        control_period_filter=control_period_filter,
+                        run_type_filter=run_type_filter,
+                    )
+                )
+                output_rows = _series_by_observation(
+                    _td_perf_export_series_for_stat(
+                        path,
+                        run_name,
+                        str(spec.get("output_column") or ""),
+                        stat,
+                        control_period_filter=control_period_filter,
+                        run_type_filter=run_type_filter,
+                    )
+                )
+                if input1_rows and output_rows:
+                    per_run_2d.append(
+                        (
+                            run_name,
+                            display_name,
+                            input1_rows,
+                            output_rows,
+                            str(spec.get("input1_units") or ""),
+                            str(spec.get("output_units") or ""),
+                        )
+                    )
+            curves: dict[str, list[tuple[float, float, str]]] = {}
+            for serial in serials:
+                points_2d: list[tuple[float, float, str]] = []
+                for run_name, display_name, input1_map, output_map, _u1, _uy in per_run_2d:
+                    obs_ids = sorted(set(input1_map.keys()) & set(output_map.keys()))
+                    for observation_id in obs_ids:
+                        row_input1 = input1_map.get(observation_id) or {}
+                        row_output = output_map.get(observation_id) or {}
+                        if str(row_output.get("serial") or row_input1.get("serial") or "").strip() != serial:
+                            continue
+                        points_2d.append(
+                            (
+                                float(row_input1.get("value_num") or 0.0),
+                                float(row_output.get("value_num") or 0.0),
+                                _obs_label(display_name, run_name, row_output or row_input1),
+                            )
+                        )
+                if len(points_2d) >= require_min_points:
+                    points_2d.sort(key=lambda row: row[0])
+                    curves[serial] = points_2d
+                    contributing_serials.add(serial)
+            if not curves:
+                continue
+
+            master_model: dict[str, object] = {}
+            aggregate_x, aggregate_y, aggregate_weights = _aggregate_curve(curves)
+            if fit_enabled and aggregate_x:
+                try:
+                    fitted = td_perf_fit_model(
+                        aggregate_x,
+                        aggregate_y,
+                        fit_mode=fit_mode,
+                        polynomial_degree=polynomial_degree,
+                        normalize_x=normalize_x,
+                        sample_weights=(aggregate_weights or None),
+                    )
+                    if isinstance(fitted, dict):
+                        fitted.update(td_perf_build_fit_curve(fitted, min(aggregate_x), max(aggregate_x), points=220))
+                        master_model = fitted
+                except Exception as exc:
+                    if not fit_error_text:
+                        fit_error_text = str(exc)
+
+            results[stat] = {
+                "pair_label": pair_label,
+                "output_target": output_target,
+                "input1_target": input1_target,
+                "input2_target": "",
+                "x_units": next((u1 for *_rest, u1, _uy in per_run_2d if str(u1).strip()), ""),
+                "y_units": next((uy for *_rest, uy in per_run_2d if str(uy).strip()), ""),
+                "input1_units": next((u1 for *_rest, u1, _uy in per_run_2d if str(u1).strip()), ""),
+                "output_units": next((uy for *_rest, uy in per_run_2d if str(uy).strip()), ""),
+                "stat_label": stat,
+                "fit_mode": fit_mode,
+                "plot_dimension": "2d",
+                "curves": curves,
+                "master_model": master_model,
+            }
+
+    if not results:
+        raise RuntimeError("No qualifying performance data found for the saved equation.")
+
+    first_result = next((result for result in results.values() if isinstance(result, Mapping)), {}) or {}
+    asset_metadata = td_perf_collect_asset_metadata(path, sorted(contributing_serials))
+    plot_metadata = {
+        "plot_dimension": str(first_result.get("plot_dimension") or ("3d" if is_surface else "2d")).strip().lower(),
+        "output_target": output_target,
+        "output_units": str(first_result.get("output_units") or first_result.get("y_units") or "").strip(),
+        "input1_target": input1_target,
+        "input1_units": str(first_result.get("input1_units") or first_result.get("x_units") or "").strip(),
+        "input2_target": input2_target,
+        "input2_units": str(first_result.get("input2_units") or "").strip(),
+        "run_selection_label": str(plot_definition.get("run_condition") or plot_definition.get("display_text") or "").strip(),
+        "display_text": str(plot_definition.get("display_text") or "").strip(),
+        "run_condition": str(plot_definition.get("run_condition") or "").strip(),
+        "member_runs": list(member_runs),
+        "performance_run_type_mode": run_type_filter,
+        "performance_filter_mode": filter_mode,
+        "selected_control_period": selected_control_period,
+        "asset_type": str(asset_metadata.get("primary_asset_type") or "").strip(),
+        "asset_specific_type": str(asset_metadata.get("primary_asset_specific_type") or "").strip(),
+    }
+    if fit_error_text:
+        plot_metadata["fit_error_text"] = fit_error_text
+
+    return {
+        "plot_metadata": plot_metadata,
+        "results_by_stat": _td_perf_serializable_results(results),
+        "run_specs": _td_perf_json_safe(run_specs),
+        "equation_rows": td_perf_saved_equation_rows(results),
+        "asset_metadata": asset_metadata,
+    }
+
+
+def td_perf_build_saved_equation_entry(
+    db_path: Path,
+    *,
+    name: str,
+    plot_definition: Mapping[str, object],
+    plot_metadata: Mapping[str, object],
+    results_by_stat: Mapping[str, Mapping[str, object]],
+    run_specs: Sequence[Mapping[str, object]],
+    existing_id: object = None,
+    existing_saved_at: object = None,
+) -> dict[str, object]:
+    now_txt = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    clean_name = str(name or "").strip() or "Saved Performance Equation"
+    asset_metadata = td_perf_collect_asset_metadata(db_path, _td_perf_entry_serials(results_by_stat))
+    plot_meta = dict(_td_perf_json_safe(plot_metadata) if isinstance(plot_metadata, Mapping) else {})
+    plot_meta["asset_type"] = str(asset_metadata.get("primary_asset_type") or "").strip()
+    plot_meta["asset_specific_type"] = str(asset_metadata.get("primary_asset_specific_type") or "").strip()
+    return {
+        "id": str(existing_id or f"{_td_perf_saved_slug(clean_name)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"),
+        "name": clean_name,
+        "slug": _td_perf_saved_slug(clean_name),
+        "saved_at": str(existing_saved_at or now_txt),
+        "updated_at": now_txt,
+        "plot_definition": _td_perf_json_safe(plot_definition),
+        "plot_metadata": plot_meta,
+        "run_specs": _td_perf_json_safe(run_specs),
+        "results_by_stat": _td_perf_serializable_results(results_by_stat),
+        "equation_rows": td_perf_saved_equation_rows(results_by_stat),
+        "asset_metadata": asset_metadata,
+        "refresh_error": "",
+    }
+
+
+def _td_perf_normalize_saved_entry(raw: object) -> dict[str, object] | None:
+    if not isinstance(raw, Mapping):
+        return None
+    name = str(raw.get("name") or "").strip()
+    if not name:
+        return None
+    entry_id = str(raw.get("id") or "").strip() or f"{_td_perf_saved_slug(name)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    saved_at = str(raw.get("saved_at") or "").strip()
+    updated_at = str(raw.get("updated_at") or saved_at or "").strip()
+    plot_definition = dict(raw.get("plot_definition") or {}) if isinstance(raw.get("plot_definition"), Mapping) else {}
+    plot_metadata = dict(raw.get("plot_metadata") or {}) if isinstance(raw.get("plot_metadata"), Mapping) else {}
+    results_by_stat = raw.get("results_by_stat") or {}
+    if not isinstance(results_by_stat, Mapping):
+        results_by_stat = {}
+    normalized_results = _td_perf_serializable_results(results_by_stat)
+    equation_rows = raw.get("equation_rows")
+    if not isinstance(equation_rows, list):
+        equation_rows = td_perf_saved_equation_rows(normalized_results)
+    asset_metadata = raw.get("asset_metadata")
+    if not isinstance(asset_metadata, Mapping):
+        asset_metadata = td_perf_collect_asset_metadata(Path("."), [])
+    return {
+        "id": entry_id,
+        "name": name,
+        "slug": str(raw.get("slug") or _td_perf_saved_slug(name)).strip() or _td_perf_saved_slug(name),
+        "saved_at": saved_at,
+        "updated_at": updated_at,
+        "plot_definition": _td_perf_json_safe(plot_definition),
+        "plot_metadata": _td_perf_json_safe(plot_metadata),
+        "run_specs": _td_perf_json_safe(raw.get("run_specs") or []),
+        "results_by_stat": normalized_results,
+        "equation_rows": _td_perf_json_safe(equation_rows),
+        "asset_metadata": _td_perf_json_safe(asset_metadata),
+        "refresh_error": str(raw.get("refresh_error") or "").strip(),
+    }
+
+
+def load_td_saved_performance_equations(project_dir: Path) -> dict[str, object]:
+    path = td_saved_performance_equations_path(project_dir)
+    if not path.exists():
+        return {"version": TD_SAVED_PERFORMANCE_EQUATIONS_VERSION, "entries": []}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        raw = {}
+    entries_raw = raw.get("entries") if isinstance(raw, Mapping) else []
+    entries: list[dict[str, object]] = []
+    for item in entries_raw if isinstance(entries_raw, list) else []:
+        normalized = _td_perf_normalize_saved_entry(item)
+        if normalized is not None:
+            entries.append(normalized)
+    return {"version": TD_SAVED_PERFORMANCE_EQUATIONS_VERSION, "entries": entries}
+
+
+def save_td_saved_performance_equations(project_dir: Path, store: Mapping[str, object]) -> Path:
+    path = td_saved_performance_equations_path(project_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    entries_raw = store.get("entries") if isinstance(store, Mapping) else []
+    entries: list[dict[str, object]] = []
+    for item in entries_raw if isinstance(entries_raw, list) else []:
+        normalized = _td_perf_normalize_saved_entry(item)
+        if normalized is not None:
+            entries.append(normalized)
+    payload = {"version": TD_SAVED_PERFORMANCE_EQUATIONS_VERSION, "entries": entries}
+    path.write_text(json.dumps(_td_perf_json_safe(payload), indent=2), encoding="utf-8")
+    return path
+
+
+def td_perf_upsert_saved_equation(project_dir: Path, entry: Mapping[str, object]) -> dict[str, object]:
+    normalized = _td_perf_normalize_saved_entry(entry)
+    if normalized is None:
+        raise RuntimeError("Saved performance equation entry is invalid.")
+    store = load_td_saved_performance_equations(project_dir)
+    entries = [dict(item) for item in (store.get("entries") or []) if isinstance(item, Mapping)]
+    replaced = False
+    for idx, existing in enumerate(entries):
+        if str(existing.get("id") or "").strip() == str(normalized.get("id") or "").strip():
+            entries[idx] = normalized
+            replaced = True
+            break
+        if str(existing.get("name") or "").strip().casefold() == str(normalized.get("name") or "").strip().casefold():
+            normalized["id"] = str(existing.get("id") or normalized.get("id") or "").strip() or str(normalized.get("id") or "")
+            normalized["saved_at"] = str(existing.get("saved_at") or normalized.get("saved_at") or "").strip()
+            entries[idx] = normalized
+            replaced = True
+            break
+    if not replaced:
+        entries.append(normalized)
+    entries.sort(key=lambda item: str(item.get("name") or "").lower())
+    store["entries"] = entries
+    save_td_saved_performance_equations(project_dir, store)
+    return normalized
+
+
+def td_perf_delete_saved_equation(project_dir: Path, entry_id: object) -> bool:
+    wanted = str(entry_id or "").strip()
+    if not wanted:
+        return False
+    store = load_td_saved_performance_equations(project_dir)
+    entries = [dict(item) for item in (store.get("entries") or []) if isinstance(item, Mapping)]
+    kept = [item for item in entries if str(item.get("id") or "").strip() != wanted]
+    if len(kept) == len(entries):
+        return False
+    store["entries"] = kept
+    save_td_saved_performance_equations(project_dir, store)
+    return True
+
+
+def td_perf_refresh_saved_equation_entry(db_path: Path, entry: Mapping[str, object]) -> dict[str, object]:
+    normalized = _td_perf_normalize_saved_entry(entry)
+    if normalized is None:
+        raise RuntimeError("Saved performance equation entry is invalid.")
+    snapshot = td_perf_collect_saved_equation_snapshot(db_path, dict(normalized.get("plot_definition") or {}))
+    refreshed = dict(normalized)
+    refreshed["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    refreshed["plot_metadata"] = dict(snapshot.get("plot_metadata") or {})
+    refreshed["run_specs"] = list(snapshot.get("run_specs") or [])
+    refreshed["results_by_stat"] = dict(snapshot.get("results_by_stat") or {})
+    refreshed["equation_rows"] = list(snapshot.get("equation_rows") or [])
+    refreshed["asset_metadata"] = dict(snapshot.get("asset_metadata") or {})
+    refreshed["refresh_error"] = ""
+    return refreshed
+
+
+def td_perf_refresh_saved_equation_store(project_dir: Path, db_path: Path) -> dict[str, object]:
+    store = load_td_saved_performance_equations(project_dir)
+    entries = [dict(item) for item in (store.get("entries") or []) if isinstance(item, Mapping)]
+    if not entries:
+        return {"refreshed_count": 0, "failed_count": 0, "errors": [], "path": str(td_saved_performance_equations_path(project_dir))}
+    refreshed_entries: list[dict[str, object]] = []
+    errors: list[str] = []
+    refreshed_count = 0
+    failed_count = 0
+    for entry in entries:
+        try:
+            refreshed_entries.append(td_perf_refresh_saved_equation_entry(db_path, entry))
+            refreshed_count += 1
+        except Exception as exc:
+            failed_count += 1
+            preserved = dict(entry)
+            preserved["refresh_error"] = str(exc)
+            refreshed_entries.append(preserved)
+            errors.append(f"{str(entry.get('name') or '').strip()}: {exc}")
+    store["entries"] = refreshed_entries
+    path = save_td_saved_performance_equations(project_dir, store)
+    return {
+        "refreshed_count": refreshed_count,
+        "failed_count": failed_count,
+        "errors": errors,
+        "path": str(path),
+    }
+
+
+def _td_perf_saved_entry_plot_metadata(entry: Mapping[str, object]) -> dict[str, object]:
+    plot_metadata = dict(entry.get("plot_metadata") or {}) if isinstance(entry.get("plot_metadata"), Mapping) else {}
+    asset_metadata = dict(entry.get("asset_metadata") or {}) if isinstance(entry.get("asset_metadata"), Mapping) else {}
+    plot_metadata["asset_type"] = str(asset_metadata.get("primary_asset_type") or plot_metadata.get("asset_type") or "").strip()
+    plot_metadata["asset_specific_type"] = str(asset_metadata.get("primary_asset_specific_type") or plot_metadata.get("asset_specific_type") or "").strip()
+    return plot_metadata
+
+
+def _td_perf_saved_entry_control_period_filter(entry: Mapping[str, object]) -> object:
+    plot_definition = dict(entry.get("plot_definition") or {}) if isinstance(entry.get("plot_definition"), Mapping) else {}
+    run_type_filter = td_perf_normalize_run_type_mode(
+        plot_definition.get("performance_run_type_mode") or plot_definition.get("run_type_filter")
+    )
+    filter_mode = str(plot_definition.get("performance_filter_mode") or "all_conditions").strip().lower()
+    selected_control_period = plot_definition.get("selected_control_period")
+    if run_type_filter == "pulsed_mode" and filter_mode == "match_control_period":
+        return selected_control_period
+    return None
+
+
+def _td_perf_saved_entry_run_type_filter(entry: Mapping[str, object]) -> object:
+    plot_definition = dict(entry.get("plot_definition") or {}) if isinstance(entry.get("plot_definition"), Mapping) else {}
+    return td_perf_normalize_run_type_mode(
+        plot_definition.get("performance_run_type_mode") or plot_definition.get("run_type_filter")
+    )
+
+
+def _td_perf_unique_sheet_name(base: str, used: set[str]) -> str:
+    clean = re.sub(r"[\[\]\:\*\?\/\\]", "_", str(base or "").strip()) or "Sheet"
+    clean = clean[:31]
+    candidate = clean
+    idx = 1
+    while candidate.lower() in used or not candidate:
+        suffix = f"_{idx}"
+        candidate = f"{clean[: max(1, 31 - len(suffix))]}{suffix}"
+        idx += 1
+    used.add(candidate.lower())
+    return candidate
+
+
+def _td_perf_copy_sheet_between_workbooks(source_ws, target_ws) -> None:
+    from copy import copy
+
+    for row in source_ws.iter_rows():
+        for cell in row:
+            new_cell = target_ws.cell(row=cell.row, column=cell.column, value=cell.value)
+            if cell.has_style:
+                new_cell._style = copy(cell._style)
+            if cell.number_format:
+                new_cell.number_format = cell.number_format
+            if cell.font:
+                new_cell.font = copy(cell.font)
+            if cell.fill:
+                new_cell.fill = copy(cell.fill)
+            if cell.border:
+                new_cell.border = copy(cell.border)
+            if cell.alignment:
+                new_cell.alignment = copy(cell.alignment)
+            if cell.protection:
+                new_cell.protection = copy(cell.protection)
+    for key, dim in source_ws.column_dimensions.items():
+        target_ws.column_dimensions[key].width = dim.width
+        target_ws.column_dimensions[key].hidden = dim.hidden
+    for idx, dim in source_ws.row_dimensions.items():
+        target_ws.row_dimensions[idx].height = dim.height
+        target_ws.row_dimensions[idx].hidden = dim.hidden
+    target_ws.freeze_panes = source_ws.freeze_panes
+    target_ws.sheet_state = source_ws.sheet_state
+
+
+def td_perf_export_saved_equations_workbook(
+    db_path: Path,
+    output_path: Path,
+    *,
+    entries: Sequence[Mapping[str, object]],
+) -> Path:
+    try:
+        from openpyxl import Workbook, load_workbook  # type: ignore
+    except Exception as exc:
+        raise RuntimeError(
+            "openpyxl is required to export saved performance equations to Excel. "
+            "Install it with `py -m pip install openpyxl` within the project environment."
+        ) from exc
+    import tempfile
+
+    usable_entries = [_td_perf_normalize_saved_entry(entry) for entry in (entries or [])]
+    usable_entries = [entry for entry in usable_entries if entry is not None]
+    if not usable_entries:
+        raise RuntimeError("No saved performance equations are available to export.")
+
+    path = Path(output_path).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    wb = Workbook()
+    try:
+        default_ws = wb.active
+        if default_ws is not None:
+            wb.remove(default_ws)
+    except Exception:
+        pass
+    used_sheet_names: set[str] = set()
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_root = Path(temp_dir)
+        for index, entry in enumerate(usable_entries, start=1):
+            temp_path = temp_root / f"saved_perf_export_{index}.xlsx"
+            td_perf_export_equation_workbook(
+                db_path,
+                temp_path,
+                plot_metadata=_td_perf_saved_entry_plot_metadata(entry),
+                results_by_stat=dict(entry.get("results_by_stat") or {}),
+                run_specs=list(entry.get("run_specs") or []),
+                control_period_filter=_td_perf_saved_entry_control_period_filter(entry),
+                run_type_filter=_td_perf_saved_entry_run_type_filter(entry),
+            )
+            temp_wb = load_workbook(str(temp_path), read_only=False, data_only=False)
+            try:
+                base_slug = _td_perf_saved_slug(entry.get("name") or f"equation_{index}")
+                for ws in temp_wb.worksheets:
+                    suffix = ""
+                    raw_title = str(ws.title or "").strip().lower()
+                    if raw_title == "model parameters":
+                        suffix = "_params"
+                    elif raw_title == "model support":
+                        suffix = "_support"
+                    target_name = _td_perf_unique_sheet_name(f"{base_slug}{suffix}" if suffix else base_slug, used_sheet_names)
+                    target_ws = wb.create_sheet(title=target_name)
+                    _td_perf_copy_sheet_between_workbooks(ws, target_ws)
+            finally:
+                temp_wb.close()
+    wb.save(str(path))
+    wb.close()
+    return path
+
+
+def _td_perf_matlab_identifier(value: object, *, prefix: str) -> str:
+    raw = re.sub(r"[^A-Za-z0-9_]", "_", str(value or "").strip())
+    raw = re.sub(r"_+", "_", raw).strip("_")
+    if not raw:
+        raw = prefix
+    if raw[0].isdigit():
+        raw = f"{prefix}_{raw}"
+    return raw
+
+
+def _td_perf_matlab_quote(value: object) -> str:
+    return "'" + str(value or "").replace("'", "''") + "'"
+
+
+def _td_perf_matlab_num(value: object) -> str:
+    if value in (None, ""):
+        return "0"
+    try:
+        num = float(value)
+    except Exception:
+        return "0"
+    if not math.isfinite(num):
+        return "0"
+    return f"{num:.15g}"
+
+
+def _td_perf_matlab_vector(values: Sequence[object]) -> str:
+    return "[" + " ".join(_td_perf_matlab_num(value) for value in (values or [])) + "]"
+
+
+def _td_perf_matlab_cellstr(values: Sequence[object]) -> str:
+    return "{" + ", ".join(_td_perf_matlab_quote(value) for value in (values or [])) + "}"
+
+
+def _td_perf_matlab_primary_group(asset_metadata: Mapping[str, object]) -> tuple[str, str]:
+    asset_type = str(asset_metadata.get("primary_asset_type") or "").strip()
+    asset_specific = str(asset_metadata.get("primary_asset_specific_type") or "").strip()
+    if not asset_type:
+        asset_type = "unspecified_asset_type"
+    if not asset_specific:
+        asset_specific = "unspecified_asset_specific"
+    return asset_type, asset_specific
+
+
+def _td_perf_matlab_function_expr(
+    model: Mapping[str, object],
+    *,
+    x_var: str,
+    x1_var: str,
+    x2_var: str,
+    cp_var: str,
+) -> str:
+    family = td_perf_normalize_fit_mode(model.get("fit_family"))
+    params = model.get("params") or {}
+    if family == TD_PERF_FIT_MODE_POLYNOMIAL:
+        coeffs = [float(v) for v in (model.get("coeffs") or [])]
+        ref = x_var
+        if bool(model.get("normalize_x")):
+            ref = f"(({x_var}-{_td_perf_matlab_num(model.get('x0'))})./{_td_perf_matlab_num(model.get('sx') or 1.0)})"
+        degree = len(coeffs) - 1
+        terms: list[str] = []
+        for idx, coeff in enumerate(coeffs):
+            power = degree - idx
+            if power <= 0:
+                terms.append(_td_perf_matlab_num(coeff))
+            elif power == 1:
+                terms.append(f"({_td_perf_matlab_num(coeff)}.*{ref})")
+            else:
+                terms.append(f"({_td_perf_matlab_num(coeff)}.*({ref}.^{power}))")
+        return "(" + " + ".join(terms) + ")"
+    if family == TD_PERF_FIT_MODE_LOGARITHMIC:
+        return f"({_td_perf_matlab_num(params.get('a'))} + ({_td_perf_matlab_num(params.get('b'))}.*log({x_var})))"
+    if family == TD_PERF_FIT_MODE_SATURATING_EXPONENTIAL:
+        return f"({_td_perf_matlab_num(params.get('L'))} - ({_td_perf_matlab_num(params.get('A'))}.*exp(-{_td_perf_matlab_num(params.get('k'))}.*{x_var})))"
+    if family == TD_PERF_FIT_MODE_HYBRID_SATURATING_LINEAR:
+        return f"({_td_perf_matlab_num(params.get('b'))} + ({_td_perf_matlab_num(params.get('m'))}.*{x_var}) + ({_td_perf_matlab_num(params.get('A'))}.*(1 - exp(-{_td_perf_matlab_num(params.get('k'))}.*{x_var}))))"
+    if family == TD_PERF_FIT_MODE_HYBRID_QUADRATIC_RESIDUAL:
+        base_params = dict(params.get("base_params") or {})
+        residual_coeffs = [float(v) for v in (params.get("residual_coeffs") or [])]
+        ref = x_var
+        if bool(params.get("normalize_x")):
+            ref = f"(({x_var}-{_td_perf_matlab_num(params.get('x0'))})./{_td_perf_matlab_num(params.get('sx') or 1.0)})"
+        residual_expr = "0"
+        if len(residual_coeffs) == 3:
+            residual_expr = (
+                f"({_td_perf_matlab_num(residual_coeffs[0])}.*({ref}.^2) + "
+                f"{_td_perf_matlab_num(residual_coeffs[1])}.*{ref} + "
+                f"{_td_perf_matlab_num(residual_coeffs[2])})"
+            )
+        base_expr = (
+            f"({_td_perf_matlab_num(base_params.get('b'))} + "
+            f"({_td_perf_matlab_num(base_params.get('m'))}.*{x_var}) + "
+            f"({_td_perf_matlab_num(base_params.get('A'))}.*(1 - exp(-{_td_perf_matlab_num(base_params.get('k'))}.*{x_var}))))"
+        )
+        return f"({base_expr} + {residual_expr})"
+    if family == TD_PERF_FIT_MODE_MONOTONE_PCHIP:
+        return (
+            f"eidat_perf_pchip_predict({x_var}, "
+            f"{_td_perf_matlab_vector((params or {}).get('knots') or [])}, "
+            f"{_td_perf_matlab_vector((params or {}).get('knot_values') or [])}, "
+            f"{_td_perf_matlab_num((params or {}).get('left_y'))}, "
+            f"{_td_perf_matlab_num((params or {}).get('right_y'))})"
+        )
+    if family in {TD_PERF_FIT_MODE_PIECEWISE_2, TD_PERF_FIT_MODE_PIECEWISE_3}:
+        return (
+            f"eidat_perf_piecewise_predict({x_var}, "
+            f"{_td_perf_matlab_vector((params or {}).get('coeffs') or [])}, "
+            f"{_td_perf_matlab_vector((params or {}).get('breakpoints') or [])})"
+        )
+    if family in {TD_PERF_FIT_FAMILY_PLANE, TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE}:
+        coeffs = [float(v) for v in (model.get("coeffs") or [])]
+        x1n = f"(({x1_var}-{_td_perf_matlab_num(model.get('x1_center'))})./{_td_perf_matlab_num(model.get('x1_scale') or 1.0)})"
+        x2n = f"(({x2_var}-{_td_perf_matlab_num(model.get('x2_center'))})./{_td_perf_matlab_num(model.get('x2_scale') or 1.0)})"
+        if family == TD_PERF_FIT_FAMILY_PLANE and len(coeffs) >= 3:
+            return f"({_td_perf_matlab_num(coeffs[0])} + {_td_perf_matlab_num(coeffs[1])}.*{x1n} + {_td_perf_matlab_num(coeffs[2])}.*{x2n})"
+        if family == TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE and len(coeffs) >= 6:
+            return (
+                f"({_td_perf_matlab_num(coeffs[0])} + {_td_perf_matlab_num(coeffs[1])}.*{x1n} + {_td_perf_matlab_num(coeffs[2])}.*{x2n} + "
+                f"{_td_perf_matlab_num(coeffs[3])}.*({x1n}.^2) + {_td_perf_matlab_num(coeffs[4])}.*({x1n}.*{x2n}) + {_td_perf_matlab_num(coeffs[5])}.*({x2n}.^2))"
+            )
+    if family == TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD:
+        coeff_cp_models = [_td_perf_matlab_vector(coeffs) for coeffs in (model.get("coeff_cp_models") or [])]
+        coeff_matrix = "{" + ", ".join(coeff_cp_models) + "}"
+        return (
+            f"eidat_perf_surface_cp_predict({x1_var}, {x2_var}, {cp_var}, {coeff_matrix}, "
+            f"{_td_perf_matlab_num(model.get('x1_center'))}, {_td_perf_matlab_num(model.get('x1_scale') or 1.0)}, "
+            f"{_td_perf_matlab_num(model.get('x2_center'))}, {_td_perf_matlab_num(model.get('x2_scale') or 1.0)}, "
+            f"{_td_perf_matlab_num(model.get('cp_center'))}, {_td_perf_matlab_num(model.get('cp_scale') or 1.0)})"
+        )
+    return "[]"
+
+
+def td_perf_export_saved_equations_matlab(
+    output_path: Path,
+    *,
+    entries: Sequence[Mapping[str, object]],
+) -> Path:
+    usable_entries = [_td_perf_normalize_saved_entry(entry) for entry in (entries or [])]
+    usable_entries = [entry for entry in usable_entries if entry is not None]
+    if not usable_entries:
+        raise RuntimeError("No saved performance equations are available to export.")
+
+    path = Path(output_path).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    func_name = _td_perf_matlab_identifier(path.stem, prefix="eidat_perf")
+    lines: list[str] = [
+        f"function out = {func_name}()",
+        "% Auto-generated by EIDAT saved performance equation export.",
+        "% The returned struct is grouped by asset type and asset-specific type.",
+        "out = struct();",
+        "",
+    ]
+    for entry in usable_entries:
+        asset_metadata = dict(entry.get("asset_metadata") or {}) if isinstance(entry.get("asset_metadata"), Mapping) else {}
+        asset_type_group, asset_specific_group = _td_perf_matlab_primary_group(asset_metadata)
+        asset_key = _td_perf_matlab_identifier(asset_type_group, prefix="asset")
+        asset_specific_key = _td_perf_matlab_identifier(asset_specific_group, prefix="asset_specific")
+        equation_key = _td_perf_matlab_identifier(entry.get("slug") or entry.get("name") or "equation", prefix="equation")
+        prefix = f"out.{asset_key}.{asset_specific_key}.{equation_key}"
+        plot_metadata = _td_perf_saved_entry_plot_metadata(entry)
+        results_by_stat = dict(entry.get("results_by_stat") or {})
+        lines.extend(
+            [
+                f"% {str(entry.get('name') or '').strip()}",
+                f"{prefix}.name = {_td_perf_matlab_quote(entry.get('name') or '')};",
+                f"{prefix}.asset_type = {_td_perf_matlab_quote(asset_type_group)};",
+                f"{prefix}.asset_specific_type = {_td_perf_matlab_quote(asset_specific_group)};",
+                f"{prefix}.asset_types = {_td_perf_matlab_cellstr(asset_metadata.get('asset_types') or [])};",
+                f"{prefix}.asset_specific_types = {_td_perf_matlab_cellstr(asset_metadata.get('asset_specific_types') or [])};",
+                f"{prefix}.output_target = {_td_perf_matlab_quote(plot_metadata.get('output_target') or '')};",
+                f"{prefix}.input1_target = {_td_perf_matlab_quote(plot_metadata.get('input1_target') or '')};",
+                f"{prefix}.input2_target = {_td_perf_matlab_quote(plot_metadata.get('input2_target') or '')};",
+                f"{prefix}.stats = {_td_perf_matlab_cellstr([row.get('stat') for row in (entry.get('equation_rows') or []) if isinstance(row, Mapping)])};",
+            ]
+        )
+        x_var = _td_perf_matlab_identifier(plot_metadata.get("input1_target") or "input1", prefix="input1")
+        x1_var = x_var
+        x2_var = _td_perf_matlab_identifier(plot_metadata.get("input2_target") or "input2", prefix="input2")
+        cp_var = "control_period"
+        for stat in TD_PERF_EXPORT_STATS_ORDER:
+            result = dict(results_by_stat.get(stat) or {})
+            model = _td_perf_exportable_model(result)
+            if model is None:
+                continue
+            field_key = _td_perf_matlab_identifier(stat, prefix="stat")
+            family = td_perf_normalize_fit_mode(model.get("fit_family"))
+            if family == TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD:
+                handle = f"@({x1_var}, {x2_var}, {cp_var}) {_td_perf_matlab_function_expr(model, x_var=x_var, x1_var=x1_var, x2_var=x2_var, cp_var=cp_var)}"
+            elif str(plot_metadata.get("plot_dimension") or "").strip().lower() == "3d" or str(plot_metadata.get("input2_target") or "").strip():
+                handle = f"@({x1_var}, {x2_var}) {_td_perf_matlab_function_expr(model, x_var=x_var, x1_var=x1_var, x2_var=x2_var, cp_var=cp_var)}"
+            else:
+                handle = f"@({x_var}) {_td_perf_matlab_function_expr(model, x_var=x_var, x1_var=x1_var, x2_var=x2_var, cp_var=cp_var)}"
+            lines.append(f"{prefix}.{field_key} = {handle};")
+            lines.append(f"{prefix}.equation_text_{field_key} = {_td_perf_matlab_quote(model.get('equation') or '')};")
+        lines.append("")
+
+    lines.extend(
+        [
+            "end",
+            "",
+            "function y = eidat_perf_piecewise_predict(x, coeffs, breakpoints)",
+            "x = double(x);",
+            "y = coeffs(1) + coeffs(2).*x;",
+            "for idx = 1:numel(breakpoints)",
+            "    y = y + coeffs(idx + 2).*max(0, x - breakpoints(idx));",
+            "end",
+            "end",
+            "",
+            "function y = eidat_perf_pchip_predict(x, knots, knot_values, left_y, right_y)",
+            "x = double(x);",
+            "y = interp1(knots, knot_values, x, 'pchip');",
+            "y(x < knots(1)) = left_y;",
+            "y(x > knots(end)) = right_y;",
+            "end",
+            "",
+            "function y = eidat_perf_surface_cp_predict(x1, x2, control_period, coeff_cp_models, x1_center, x1_scale, x2_center, x2_scale, cp_center, cp_scale)",
+            "x1n = (double(x1) - x1_center) ./ x1_scale;",
+            "x2n = (double(x2) - x2_center) ./ x2_scale;",
+            "cpn = (double(control_period) - cp_center) ./ cp_scale;",
+            "basis = {ones(size(x1n)), x1n, x2n, x1n.^2, x1n.*x2n, x2n.^2};",
+            "y = zeros(size(x1n));",
+            "for idx = 1:min(numel(coeff_cp_models), numel(basis))",
+            "    coeffs = coeff_cp_models{idx};",
+            "    y = y + polyval(coeffs, cpn) .* basis{idx};",
+            "end",
+            "end",
+            "",
+        ]
+    )
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return path
 
 def td_discover_performance_candidates(
     db_path: Path,
@@ -12873,6 +14074,23 @@ def update_test_data_trending_project_workbook(
         except Exception:
             pass
 
+    saved_equation_refresh: dict[str, object] = {
+        "refreshed_count": 0,
+        "failed_count": 0,
+        "errors": [],
+        "path": str(td_saved_performance_equations_path(project_dir)),
+    }
+    if not dry_run:
+        try:
+            saved_equation_refresh = td_perf_refresh_saved_equation_store(project_dir, db_path)
+        except Exception as exc:
+            saved_equation_refresh = {
+                "refreshed_count": 0,
+                "failed_count": 0,
+                "errors": [str(exc)],
+                "path": str(td_saved_performance_equations_path(project_dir)),
+            }
+
     timings["total_s"] = round(time.perf_counter() - total_started, 3)
 
     return {
@@ -12885,6 +14103,7 @@ def update_test_data_trending_project_workbook(
         "serials_added": int(len(added_serials)),
         "added_serials": list(added_serials),
         "dry_run": bool(dry_run),
+        "saved_equation_refresh": saved_equation_refresh,
         "timings": dict(timings),
         "debug_json": json.dumps({"timings_s": timings}, separators=(",", ":")),
     }

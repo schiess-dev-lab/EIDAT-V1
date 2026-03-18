@@ -161,6 +161,33 @@ class _PerfControlPeriodHarness:
             setattr(self, name, getattr(TestDataTrendDialog, name).__get__(self, _PerfControlPeriodHarness))
 
 
+class _PerfBandFilterHarness:
+    def __init__(self, db_path: Path) -> None:
+        from EIDAT_App_Files.ui_next.qt_main import TestDataTrendDialog  # type: ignore
+
+        self._db_path = Path(db_path)
+
+        type(self)._perf_parse_band_value = staticmethod(TestDataTrendDialog._perf_parse_band_value)
+        type(self)._perf_axis_band_active = staticmethod(TestDataTrendDialog._perf_axis_band_active)
+        type(self)._perf_axis_band_contains = staticmethod(TestDataTrendDialog._perf_axis_band_contains)
+        type(self)._selection_observation_filters = staticmethod(TestDataTrendDialog._selection_observation_filters)
+        type(self)._perf_normalize_axis_band = classmethod(TestDataTrendDialog._perf_normalize_axis_band.__func__)
+        type(self)._perf_filter_points_by_axis_bands = classmethod(TestDataTrendDialog._perf_filter_points_by_axis_bands.__func__)
+
+        for name in (
+            "_load_metric_series_for_selection",
+            "_load_perf_equation_metric_series",
+            "_resolve_td_y_col_units",
+            "_perf_build_master_aggregate_curve",
+            "_perf_collect_results",
+        ):
+            setattr(self, name, getattr(TestDataTrendDialog, name).__get__(self, _PerfBandFilterHarness))
+
+        self._run_display_text = lambda run_name: str(run_name)
+        self._perf_requested_surface_family = lambda: "auto_surface"
+        self._perf_requested_fit_mode = lambda: "auto"
+
+
 class _RunSelectionHarness:
     def __init__(self) -> None:
         _qt_app()
@@ -248,6 +275,37 @@ class _RunSelectionHarness:
             if it.checkState() == QtCore.Qt.CheckState.Checked and isinstance(data, dict):
                 out.append(str(data.get("id") or "").strip())
         return out
+
+
+class _SavedPerfActionHarness:
+    def __init__(self, project_dir: Path) -> None:
+        _qt_app()
+        from EIDAT_App_Files.ui_next.qt_main import TestDataTrendDialog  # type: ignore
+
+        self._project_dir = Path(project_dir)
+        self._db_path = self._project_dir / "cache.sqlite3"
+        self._toast_message = ""
+        self._perf_results_by_stat = {"mean": {"master_model": {"fit_family": "polynomial"}}}
+
+        for name in ("_save_current_performance_equation", "_format_saved_performance_entry_detail"):
+            setattr(self, name, getattr(TestDataTrendDialog, name).__get__(self, _SavedPerfActionHarness))
+
+        self._perf_has_exportable_models = lambda: True
+        self._perf_default_saved_name = lambda: "Performance: thrust vs impulse bit"
+        self._build_current_saved_performance_entry = lambda name, existing_entry=None: {
+            "id": "entry1",
+            "name": name,
+            "slug": "entry1",
+            "saved_at": "2026-01-01 00:00:00",
+            "updated_at": "2026-01-01 00:00:00",
+            "plot_definition": {},
+            "plot_metadata": {},
+            "run_specs": [],
+            "results_by_stat": {},
+            "equation_rows": [],
+            "asset_metadata": {},
+        }
+        self._show_toast = lambda message: setattr(self, "_toast_message", str(message))
 
 
 class _MetricBoundsHarness:
@@ -961,6 +1019,67 @@ class TestTDSupportWorkbook(unittest.TestCase):
                     )
             conn.commit()
         return db_path
+
+    def _seed_perf_source_metadata(
+        self,
+        db_path: Path,
+        rows: list[tuple[str, str, str]],
+    ) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with sqlite3.connect(str(db_path)) as conn:
+            be._ensure_test_data_impl_tables(conn)
+            for serial, asset_type, asset_specific_type in rows:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO td_sources(serial, sqlite_path, mtime_ns, size_bytes, status, last_ingested_epoch_ns)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (serial, "", 0, 0, "ok", 0),
+                )
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO td_source_metadata(
+                        serial,
+                        program_title,
+                        asset_type,
+                        asset_specific_type,
+                        vendor,
+                        acceptance_test_plan_number,
+                        part_number,
+                        revision,
+                        test_date,
+                        report_date,
+                        document_type,
+                        document_type_acronym,
+                        similarity_group,
+                        metadata_rel,
+                        artifacts_rel,
+                        excel_sqlite_rel,
+                        metadata_mtime_ns
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        serial,
+                        be.TD_SUPPORT_DEFAULT_PROGRAM_TITLE,
+                        asset_type,
+                        asset_specific_type,
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "TD",
+                        "TD",
+                        "",
+                        "",
+                        "",
+                        "",
+                        0,
+                    ),
+                )
+            conn.commit()
 
     def test_write_support_workbook_seeds_expected_sheets(self) -> None:
         from openpyxl import load_workbook  # type: ignore
@@ -4741,6 +4860,302 @@ class TestTDSupportWorkbook(unittest.TestCase):
             finally:
                 wb.close()
 
+    def test_saved_perf_equation_store_round_trip_preserves_asset_metadata(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            db_path = self._seed_perf_export_db_2d(
+                root,
+                rows=[
+                    ("SN1", "RunA", 1.0, 10.0, 1.5),
+                    ("SN2", "RunA", 2.0, 20.0, 1.5),
+                ],
+            )
+            self._seed_perf_source_metadata(
+                db_path,
+                [
+                    ("SN1", "Thruster", "Hall_A"),
+                    ("SN2", "Thruster", "Hall_A"),
+                ],
+            )
+            model = be.td_perf_fit_model([1.0, 2.0, 3.0], [10.0, 20.0, 30.0], fit_mode="polynomial", polynomial_degree=2)
+            self.assertIsNotNone(model)
+            entry = be.td_perf_build_saved_equation_entry(
+                db_path,
+                name="Thrust vs Impulse",
+                plot_definition={"output": "thrust", "input1": "impulse bit", "member_runs": ["RunA"], "stats": ["mean"]},
+                plot_metadata={"plot_dimension": "2d", "output_target": "thrust", "input1_target": "impulse bit"},
+                results_by_stat={
+                    "mean": {
+                        "plot_dimension": "2d",
+                        "curves": {"SN1": [(1.0, 10.0, "RunA")], "SN2": [(2.0, 20.0, "RunA")]},
+                        "master_model": model,
+                    }
+                },
+                run_specs=[
+                    {
+                        "run_name": "RunA",
+                        "display_name": "RunA",
+                        "output_column": "thrust",
+                        "output_units": "lbf",
+                        "input1_column": "impulse bit",
+                        "input1_units": "mN-s",
+                        "input2_column": "",
+                        "input2_units": "",
+                    }
+                ],
+            )
+            be.td_perf_upsert_saved_equation(root, entry)
+            store = be.load_td_saved_performance_equations(root)
+            entries = store.get("entries") or []
+            self.assertEqual(len(entries), 1)
+            loaded = dict(entries[0])
+            asset_metadata = dict(loaded.get("asset_metadata") or {})
+            self.assertEqual(asset_metadata.get("primary_asset_type"), "Thruster")
+            self.assertEqual(asset_metadata.get("primary_asset_specific_type"), "Hall_A")
+
+    def test_saved_perf_snapshot_derives_mixed_asset_metadata(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            db_path = self._seed_perf_export_db_2d(
+                root,
+                rows=[
+                    ("SN1", "RunA", 1.0, 10.0, 1.5),
+                    ("SN2", "RunA", 2.0, 20.0, 1.5),
+                    ("SN1", "RunA", 3.0, 30.0, 1.5),
+                    ("SN2", "RunA", 4.0, 40.0, 1.5),
+                ],
+            )
+            self._seed_perf_source_metadata(
+                db_path,
+                [
+                    ("SN1", "Thruster", "Hall_A"),
+                    ("SN2", "Valve", "Cathode_B"),
+                ],
+            )
+            snapshot = be.td_perf_collect_saved_equation_snapshot(
+                db_path,
+                {
+                    "output": "thrust",
+                    "input1": "impulse bit",
+                    "member_runs": ["RunA"],
+                    "stats": ["mean"],
+                    "fit_enabled": True,
+                    "fit_mode": "polynomial",
+                    "polynomial_degree": 2,
+                    "normalize_x": True,
+                    "require_min_points": 2,
+                    "performance_run_type_mode": "pulsed_mode",
+                    "performance_filter_mode": "match_control_period",
+                    "selected_control_period": 1.5,
+                },
+            )
+            asset_metadata = dict(snapshot.get("asset_metadata") or {})
+            self.assertEqual(asset_metadata.get("primary_asset_type"), "mixed_asset_type")
+            self.assertEqual(asset_metadata.get("primary_asset_specific_type"), "mixed_asset_specific")
+
+    @unittest.skipUnless(_have_openpyxl(), "openpyxl not installed")
+    def test_saved_perf_export_workbook_includes_asset_metadata_rows(self) -> None:
+        from openpyxl import load_workbook  # type: ignore
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            db_path = self._seed_perf_export_db_2d(
+                root,
+                rows=[
+                    ("SN1", "RunA", 1.0, 10.0, 1.5),
+                    ("SN2", "RunA", 2.0, 20.0, 1.5),
+                    ("SN1", "RunA", 3.0, 30.0, 1.5),
+                    ("SN2", "RunA", 4.0, 40.0, 1.5),
+                ],
+            )
+            self._seed_perf_source_metadata(
+                db_path,
+                [
+                    ("SN1", "Thruster", "Hall_A"),
+                    ("SN2", "Thruster", "Hall_A"),
+                ],
+            )
+            snapshot = be.td_perf_collect_saved_equation_snapshot(
+                db_path,
+                {
+                    "output": "thrust",
+                    "input1": "impulse bit",
+                    "member_runs": ["RunA"],
+                    "stats": ["mean"],
+                    "fit_enabled": True,
+                    "fit_mode": "polynomial",
+                    "polynomial_degree": 2,
+                    "normalize_x": True,
+                    "require_min_points": 2,
+                    "performance_run_type_mode": "pulsed_mode",
+                    "performance_filter_mode": "match_control_period",
+                    "selected_control_period": 1.5,
+                },
+            )
+            entry = {
+                "id": "entry1",
+                "name": "Thrust vs Impulse",
+                "slug": "thrust_vs_impulse",
+                "saved_at": "2026-01-01 00:00:00",
+                "updated_at": "2026-01-01 00:00:00",
+                "plot_definition": {
+                    "output": "thrust",
+                    "input1": "impulse bit",
+                    "member_runs": ["RunA"],
+                    "stats": ["mean"],
+                    "performance_run_type_mode": "pulsed_mode",
+                    "performance_filter_mode": "match_control_period",
+                    "selected_control_period": 1.5,
+                },
+                **snapshot,
+            }
+            out_path = root / "saved_perf.xlsx"
+            be.td_perf_export_saved_equations_workbook(db_path, out_path, entries=[entry])
+            wb = load_workbook(str(out_path), read_only=False, data_only=False)
+            try:
+                ws = wb[wb.sheetnames[0]]
+                labels = {
+                    str(ws.cell(r, 1).value or "").strip(): ws.cell(r, 2).value
+                    for r in range(1, min(20, (ws.max_row or 0) + 1))
+                    if str(ws.cell(r, 1).value or "").strip()
+                }
+                self.assertEqual(labels.get("Asset Type"), "Thruster")
+                self.assertEqual(labels.get("Asset Specific Type"), "Hall_A")
+            finally:
+                wb.close()
+
+    def test_saved_perf_export_matlab_groups_by_asset_type_and_subtype(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            model = be.td_perf_fit_model([1.0, 2.0, 3.0], [10.0, 20.0, 30.0], fit_mode="polynomial", polynomial_degree=2)
+            self.assertIsNotNone(model)
+            out_path = root / "saved_perf_equations.m"
+            be.td_perf_export_saved_equations_matlab(
+                out_path,
+                entries=[
+                    {
+                        "id": "entry1",
+                        "name": "Thrust vs Impulse",
+                        "slug": "thrust_vs_impulse",
+                        "plot_metadata": {"plot_dimension": "2d", "output_target": "thrust", "input1_target": "impulse bit"},
+                        "results_by_stat": {"mean": {"master_model": model}},
+                        "equation_rows": [{"stat": "mean"}],
+                        "asset_metadata": {
+                            "primary_asset_type": "Thruster",
+                            "primary_asset_specific_type": "Hall_A",
+                            "asset_types": ["Thruster"],
+                            "asset_specific_types": ["Hall_A"],
+                        },
+                    }
+                ],
+            )
+            text = out_path.read_text(encoding="utf-8")
+            self.assertIn("out.Thruster.Hall_A.thrust_vs_impulse", text)
+            self.assertIn("equation_text_mean", text)
+            self.assertIn("asset_specific_types", text)
+
+    def test_saved_perf_refresh_store_recomputes_asset_metadata_from_cache(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            db_path = self._seed_perf_export_db_2d(
+                root,
+                rows=[
+                    ("SN1", "RunA", 1.0, 10.0, 1.5),
+                    ("SN2", "RunA", 2.0, 20.0, 1.5),
+                    ("SN1", "RunA", 3.0, 30.0, 1.5),
+                    ("SN2", "RunA", 4.0, 40.0, 1.5),
+                ],
+            )
+            self._seed_perf_source_metadata(
+                db_path,
+                [
+                    ("SN1", "Thruster", "Hall_A"),
+                    ("SN2", "Thruster", "Hall_A"),
+                ],
+            )
+            snapshot = be.td_perf_collect_saved_equation_snapshot(
+                db_path,
+                {
+                    "output": "thrust",
+                    "input1": "impulse bit",
+                    "member_runs": ["RunA"],
+                    "stats": ["mean"],
+                    "fit_enabled": True,
+                    "fit_mode": "polynomial",
+                    "polynomial_degree": 2,
+                    "normalize_x": True,
+                    "require_min_points": 2,
+                    "performance_run_type_mode": "pulsed_mode",
+                    "performance_filter_mode": "match_control_period",
+                    "selected_control_period": 1.5,
+                },
+            )
+            be.save_td_saved_performance_equations(
+                root,
+                {
+                    "entries": [
+                        {
+                            "id": "entry1",
+                            "name": "Thrust vs Impulse",
+                            "slug": "thrust_vs_impulse",
+                            "saved_at": "2026-01-01 00:00:00",
+                            "updated_at": "2026-01-01 00:00:00",
+                            "plot_definition": {
+                                "output": "thrust",
+                                "input1": "impulse bit",
+                                "member_runs": ["RunA"],
+                                "stats": ["mean"],
+                                "fit_enabled": True,
+                                "fit_mode": "polynomial",
+                                "polynomial_degree": 2,
+                                "normalize_x": True,
+                                "require_min_points": 2,
+                                "performance_run_type_mode": "pulsed_mode",
+                                "performance_filter_mode": "match_control_period",
+                                "selected_control_period": 1.5,
+                            },
+                            **snapshot,
+                        }
+                    ]
+                },
+            )
+            self._seed_perf_source_metadata(
+                db_path,
+                [
+                    ("SN1", "Valve", "Cathode_B"),
+                    ("SN2", "Valve", "Cathode_B"),
+                ],
+            )
+            refresh = be.td_perf_refresh_saved_equation_store(root, db_path)
+            self.assertEqual(int(refresh.get("refreshed_count") or 0), 1)
+            store = be.load_td_saved_performance_equations(root)
+            entry = dict((store.get("entries") or [])[0])
+            asset_metadata = dict(entry.get("asset_metadata") or {})
+            self.assertEqual(asset_metadata.get("primary_asset_type"), "Valve")
+            self.assertEqual(asset_metadata.get("primary_asset_specific_type"), "Cathode_B")
+
+    @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
+    def test_saved_perf_save_action_upserts_entry_and_toasts(self) -> None:
+        harness = _SavedPerfActionHarness(Path(tempfile.mkdtemp()))
+        with mock.patch("PySide6.QtWidgets.QInputDialog.getText", return_value=("Saved Equation", True)):
+            with mock.patch("PySide6.QtWidgets.QMessageBox.question", return_value=0):
+                with mock.patch("EIDAT_App_Files.ui_next.backend.load_td_saved_performance_equations", return_value={"entries": []}):
+                    with mock.patch("EIDAT_App_Files.ui_next.backend.td_perf_upsert_saved_equation") as mocked_upsert:
+                        harness._save_current_performance_equation()
+        mocked_upsert.assert_called_once()
+        saved_entry = mocked_upsert.call_args.args[1]
+        self.assertEqual(saved_entry.get("name"), "Saved Equation")
+        self.assertEqual(harness._toast_message, "Saved performance equation")
+
     @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
     def test_perf_control_period_combo_enables_for_control_period_surface_slice(self) -> None:
         harness = _PerfControlPeriodHarness()
@@ -4752,6 +5167,62 @@ class TestTDSupportWorkbook(unittest.TestCase):
         harness.cb_perf_surface_model.setCurrentIndex(harness.cb_perf_surface_model.findData("quadratic_surface"))
         harness._update_perf_control_period_state()
         self.assertFalse(harness.cb_perf_control_period.isEnabled())
+
+    @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
+    def test_perf_axis_band_filter_helper_respects_open_ranges(self) -> None:
+        harness = _PerfBandFilterHarness(Path("C:/tmp/fake.sqlite3"))
+        points = [
+            (0.5, 10.0, "a"),
+            (1.5, 20.0, "b"),
+            (2.5, 30.0, "c"),
+            (3.5, 40.0, "d"),
+        ]
+        filtered = harness._perf_filter_points_by_axis_bands(
+            points,
+            {
+                "x": harness._perf_normalize_axis_band("X", 1.0, 3.0),
+                "y": harness._perf_normalize_axis_band("Y", "", 30.0),
+            },
+        )
+        self.assertEqual(filtered, [(1.5, 20.0, "b"), (2.5, 30.0, "c")])
+
+    @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
+    def test_perf_collect_results_applies_x_and_y_band_filters_before_serial_qualification(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            db_path = self._seed_perf_export_db_2d(
+                root,
+                rows=[
+                    ("SN1", "RunA", 1.0, 10.0, None),
+                    ("SN1", "RunA", 2.0, 20.0, None),
+                    ("SN1", "RunA", 3.0, 30.0, None),
+                    ("SN2", "RunA", 1.0, 100.0, None),
+                    ("SN2", "RunA", 2.0, 200.0, None),
+                ],
+            )
+            harness = _PerfBandFilterHarness(db_path)
+            results, plot_view_stats, fit_error_text = harness._perf_collect_results(
+                "thrust",
+                "impulse bit",
+                "",
+                ["mean"],
+                ["RunA"],
+                ["SN1", "SN2"],
+                fit_enabled=False,
+                require_min_points=2,
+                axis_band_filters={
+                    "x": harness._perf_normalize_axis_band("X", 1.5, None),
+                    "y": harness._perf_normalize_axis_band("Y", None, 40.0),
+                },
+            )
+
+            self.assertEqual(fit_error_text, "")
+            self.assertEqual(plot_view_stats, ["mean"])
+            mean_result = results.get("mean") or {}
+            curves = mean_result.get("curves") or {}
+            self.assertEqual(set(curves.keys()), {"SN1"})
+            self.assertEqual([tuple(point[:2]) for point in curves["SN1"]], [(2.0, 20.0), (3.0, 30.0)])
+            self.assertTrue(all("RunA" in str(point[2]) for point in curves["SN1"]))
 
     def test_perf_candidate_discovery_accepts_separated_x(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
