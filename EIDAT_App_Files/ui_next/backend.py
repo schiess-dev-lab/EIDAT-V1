@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import importlib.util
 import math
 import os
@@ -2339,6 +2340,7 @@ GLOBAL_RUN_MIRROR_DIRNAME = "global_run_mirror"
 LOCAL_PROJECTS_MIRROR_DIRNAME = "projects"
 PROJECT_UPDATE_DEBUG_JSON = "update_debug.json"
 TD_CACHE_DEBUG_JSON = "td_cache_debug.json"
+TD_PROJECT_CACHE_SCHEMA_VERSION = "2"
 
 # Central runtime config used to define Test Data trending workbooks (independent of node-local DATA_ROOT).
 CENTRAL_EXCEL_TREND_CONFIG = ROOT / "user_inputs" / "excel_trend_config.json"
@@ -2353,6 +2355,17 @@ def _td_resolve_raw_cache_db_path(db_path: Path) -> Path:
     if path.name.lower() == EIDAT_PROJECT_TD_RAW_CACHE_DB.lower():
         return path
     return td_raw_cache_db_path_for(path.parent)
+
+
+def _td_stable_json(value: object) -> str:
+    try:
+        return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
+    except Exception:
+        return json.dumps(str(value), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _td_hash_payload(value: object) -> str:
+    return hashlib.sha1(_td_stable_json(value).encode("utf-8")).hexdigest()
 
 
 def _td_raw_cache_candidate_paths(db_path: Path) -> list[Path]:
@@ -2857,6 +2870,23 @@ def _infer_node_root_from_workbook_path(workbook_path: Path) -> Path:
     return p.parent
 
 
+def _read_project_meta(project_dir: Path) -> dict:
+    pj = Path(project_dir).expanduser() / EIDAT_PROJECT_META
+    try:
+        raw = json.loads(pj.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return dict(raw) if isinstance(raw, dict) else {}
+
+
+def resolve_test_data_project_global_repo(project_dir: Path, workbook_path: Path) -> Path:
+    project_meta = _read_project_meta(project_dir)
+    raw = str(project_meta.get("global_repo") or "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    return _infer_node_root_from_workbook_path(workbook_path)
+
+
 def _resolve_excel_sqlite_path_from_workbook(workbook_path: Path, excel_sqlite_rel: str) -> Path:
     """
     Resolve workbook-relative excel_sqlite_rel values into absolute paths.
@@ -2908,10 +2938,15 @@ def _ensure_test_data_impl_tables(conn: sqlite3.Connection) -> None:
             mtime_ns INTEGER,
             size_bytes INTEGER,
             status TEXT,
-            last_ingested_epoch_ns INTEGER
+            last_ingested_epoch_ns INTEGER,
+            raw_fingerprint TEXT
         )
         """
     )
+    try:
+        conn.execute("ALTER TABLE td_sources ADD COLUMN raw_fingerprint TEXT")
+    except Exception:
+        pass
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS td_source_metadata (
@@ -3523,6 +3558,81 @@ def _load_td_source_metadata(workbook_path: Path, source_row: Mapping[str, objec
     if not out["excel_sqlite_rel"]:
         out["excel_sqlite_rel"] = str(merged.get("excel_sqlite_rel") or "").strip()
     return out
+
+
+def _td_source_runtime_state(
+    workbook_path: Path,
+    source_row: Mapping[str, object],
+    *,
+    project_raw_signature: str,
+) -> dict[str, object]:
+    source_resolution = _resolve_td_source_sqlite_for_workbook(workbook_path, source_row)
+    sqlite_path_raw = source_resolution.get("path")
+    sqlite_path = Path(sqlite_path_raw).expanduser() if sqlite_path_raw else Path()
+    status = str(source_resolution.get("status") or "missing").strip().lower() or "missing"
+    source_meta = _load_td_source_metadata(workbook_path, source_row)
+    mtime_ns = 0
+    size_bytes = 0
+    if status == "ok":
+        try:
+            st = sqlite_path.stat()
+            mtime_ns = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)))
+            size_bytes = int(st.st_size)
+        except Exception:
+            status = "missing"
+            mtime_ns = 0
+            size_bytes = 0
+    healed_excel_sqlite_rel = str(source_resolution.get("healed_excel_sqlite_rel") or "").strip()
+    workbook_excel_sqlite_rel = str(
+        source_resolution.get("workbook_excel_sqlite_rel")
+        or source_row.get("excel_sqlite_rel")
+        or ""
+    ).strip()
+    effective_excel_sqlite_rel = healed_excel_sqlite_rel or workbook_excel_sqlite_rel
+    fingerprint_payload = {
+        "serial": str(source_row.get("serial") or source_row.get("serial_number") or "").strip(),
+        "status": status,
+        "sqlite_path": str(sqlite_path) if sqlite_path else "",
+        "mtime_ns": int(mtime_ns),
+        "size_bytes": int(size_bytes),
+        "metadata_rel": str(source_meta.get("metadata_rel") or "").strip(),
+        "artifacts_rel": str(source_meta.get("artifacts_rel") or "").strip(),
+        "excel_sqlite_rel": effective_excel_sqlite_rel,
+        "metadata_mtime_ns": int(source_meta.get("metadata_mtime_ns") or 0),
+        "project_raw_signature": str(project_raw_signature),
+    }
+    return {
+        "serial": str(source_row.get("serial") or source_row.get("serial_number") or "").strip(),
+        "source_row": dict(source_row),
+        "source_resolution": dict(source_resolution),
+        "source_meta": dict(source_meta),
+        "status": status,
+        "sqlite_path": str(sqlite_path) if sqlite_path else "",
+        "mtime_ns": int(mtime_ns),
+        "size_bytes": int(size_bytes),
+        "excel_sqlite_rel": effective_excel_sqlite_rel,
+        "fingerprint": _td_hash_payload(fingerprint_payload),
+    }
+
+
+def _td_build_project_raw_signature(
+    workbook_path: Path,
+    *,
+    raw_columns_csv: str,
+) -> str:
+    x_axis_cfg: dict = {}
+    try:
+        x_axis_cfg = dict((_load_excel_trend_config(DEFAULT_EXCEL_TREND_CONFIG) or {}).get("x_axis") or {})
+    except Exception:
+        x_axis_cfg = {}
+    payload = {
+        "schema_version": TD_PROJECT_CACHE_SCHEMA_VERSION,
+        "node_root": str(_infer_node_root_from_workbook_path(workbook_path)),
+        "workbook_path": str(Path(workbook_path).expanduser()),
+        "raw_columns": str(raw_columns_csv),
+        "x_axis": x_axis_cfg,
+    }
+    return _td_hash_payload(payload)
 
 
 def _td_source_sqlite_artifact_candidates(
@@ -5825,15 +5935,187 @@ def _td_project_cache_refresh_mode(
         return "full", "raw cache is empty"
     if cached_raw_cols_csv != current_raw_cols_csv:
         return "full", "configured raw columns changed"
-    if expected_serials and expected_serials != cached_serials:
-        return "full", "source serial set changed"
     if source_state_stale:
-        return "full", "source SQLite inputs changed"
+        return "incremental_raw", "source SQLite inputs changed"
+    if expected_serials and expected_serials != cached_serials:
+        return "incremental_raw", "source serial set changed"
     if cached_stats_csv != current_stats_csv:
         return "calc", "selected statistics changed"
     if int(cached_support_mtime_ns) != int(support_mtime_ns):
         return "calc", "support workbook changed"
     return "none", ""
+
+
+def _td_meta_value(conn: sqlite3.Connection, key: str) -> str:
+    try:
+        row = conn.execute("SELECT value FROM td_meta WHERE key=? LIMIT 1", (str(key),)).fetchone()
+    except Exception:
+        return ""
+    return str(row[0] or "").strip() if row and row[0] is not None else ""
+
+
+def inspect_test_data_project_cache_state(project_dir: Path, workbook_path: Path) -> dict[str, object]:
+    proj_dir = Path(project_dir).expanduser()
+    wb_path = Path(workbook_path).expanduser()
+    if not wb_path.exists():
+        raise FileNotFoundError(f"Workbook not found: {wb_path}")
+
+    db_path = proj_dir / EIDAT_PROJECT_IMPLEMENTATION_DB
+    raw_db_path = td_raw_cache_db_path_for(proj_dir)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with sqlite3.connect(str(db_path)) as conn:
+        _ensure_test_data_impl_tables(conn)
+        conn.commit()
+    with sqlite3.connect(str(raw_db_path)) as conn:
+        _ensure_test_data_raw_cache_tables(conn)
+        conn.commit()
+
+    project_cfg = _load_project_td_trend_config(wb_path)
+    current_stats_csv = ",".join(_td_normalize_selected_stats(project_cfg.get("statistics")))
+    current_raw_cols_csv = ",".join(
+        [str(c.get("name") or "").strip() for c in (project_cfg.get("columns") or []) if str(c.get("name") or "").strip()]
+    )
+    project_raw_signature = _td_build_project_raw_signature(
+        wb_path,
+        raw_columns_csv=current_raw_cols_csv,
+    )
+
+    try:
+        sources = _read_test_data_sources(wb_path)
+    except Exception:
+        sources = []
+    source_states = [
+        _td_source_runtime_state(
+            wb_path,
+            dict(source_row),
+            project_raw_signature=project_raw_signature,
+        )
+        for source_row in sources
+        if str(source_row.get("serial") or "").strip()
+    ]
+    expected_serials = {str(item.get("serial") or "").strip() for item in source_states if str(item.get("serial") or "").strip()}
+
+    with sqlite3.connect(str(db_path)) as conn:
+        _ensure_test_data_impl_tables(conn)
+        cached_sources_rows = conn.execute(
+            "SELECT serial, sqlite_path, mtime_ns, size_bytes, status, last_ingested_epoch_ns, COALESCE(raw_fingerprint, '') FROM td_sources"
+        ).fetchall()
+        cached_sources = {
+            str(row[0] or "").strip(): {
+                "sqlite_path": str(row[1] or "").strip(),
+                "mtime_ns": int(row[2] or 0),
+                "size_bytes": int(row[3] or 0),
+                "status": str(row[4] or "").strip().lower(),
+                "last_ingested_epoch_ns": int(row[5] or 0),
+                "raw_fingerprint": str(row[6] or "").strip(),
+            }
+            for row in cached_sources_rows
+            if str(row[0] or "").strip()
+        }
+        cached_stats_csv = _td_meta_value(conn, "statistics")
+        cached_raw_cols_csv = _td_meta_value(conn, "raw_columns")
+        cached_support_mtime_ns = int(_td_meta_value(conn, "support_workbook_mtime_ns") or 0)
+        cached_workbook_path = _td_meta_value(conn, "workbook_path")
+        cached_node_root = _td_meta_value(conn, "node_root")
+        cached_project_raw_signature = _td_meta_value(conn, "project_raw_signature")
+        cached_schema_version = _td_meta_value(conn, "cache_schema_version")
+    with sqlite3.connect(str(raw_db_path)) as conn:
+        _ensure_test_data_raw_cache_tables(conn)
+        try:
+            curve_count = int(conn.execute("SELECT COUNT(*) FROM td_curves_raw").fetchone()[0] or 0)
+        except Exception:
+            curve_count = 0
+
+    current_node_root = str(_infer_node_root_from_workbook_path(wb_path))
+    stale_context = False
+    try:
+        stale_context = str(Path(cached_workbook_path).expanduser()) != str(wb_path)
+    except Exception:
+        stale_context = bool(cached_workbook_path) and cached_workbook_path != str(wb_path)
+    if not stale_context and cached_node_root and cached_node_root != current_node_root:
+        stale_context = True
+
+    support_mtime_ns = 0
+    try:
+        support_path = td_support_workbook_path_for(wb_path, project_dir=proj_dir)
+        if support_path.exists():
+            st = support_path.stat()
+            support_mtime_ns = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)))
+    except Exception:
+        support_mtime_ns = 0
+
+    added_serials: list[str] = []
+    changed_serials: list[str] = []
+    unchanged_serials: list[str] = []
+    invalid_serials: list[str] = []
+    fingerprints_by_serial: dict[str, str] = {}
+    source_state_by_serial: dict[str, dict[str, object]] = {}
+    for item in source_states:
+        serial = str(item.get("serial") or "").strip()
+        if not serial:
+            continue
+        source_state_by_serial[serial] = dict(item)
+        fingerprint = str(item.get("fingerprint") or "").strip()
+        fingerprints_by_serial[serial] = fingerprint
+        cached = cached_sources.get(serial) or {}
+        if str(item.get("status") or "").strip().lower() != "ok":
+            invalid_serials.append(serial)
+        if not cached:
+            added_serials.append(serial)
+            continue
+        if str(cached.get("raw_fingerprint") or "").strip() != fingerprint:
+            changed_serials.append(serial)
+            continue
+        unchanged_serials.append(serial)
+
+    removed_serials = sorted(set(cached_sources.keys()) - expected_serials)
+    source_state_stale = bool(added_serials or changed_serials or removed_serials)
+    if cached_schema_version != TD_PROJECT_CACHE_SCHEMA_VERSION:
+        source_state_stale = True
+        stale_context = True
+    if cached_project_raw_signature and cached_project_raw_signature != project_raw_signature:
+        stale_context = True
+
+    refresh_mode, refresh_reason = _td_project_cache_refresh_mode(
+        stale_context=bool(stale_context),
+        curve_count=int(curve_count),
+        expected_serials=set(expected_serials),
+        cached_serials=set(cached_sources.keys()),
+        cached_stats_csv=str(cached_stats_csv),
+        current_stats_csv=str(current_stats_csv),
+        cached_raw_cols_csv=str(cached_raw_cols_csv),
+        current_raw_cols_csv=str(current_raw_cols_csv),
+        cached_support_mtime_ns=int(cached_support_mtime_ns),
+        support_mtime_ns=int(support_mtime_ns),
+        source_state_stale=bool(source_state_stale),
+    )
+    return {
+        "db_path": db_path,
+        "raw_db_path": raw_db_path,
+        "mode": refresh_mode,
+        "reason": refresh_reason,
+        "project_raw_signature": project_raw_signature,
+        "current_stats_csv": current_stats_csv,
+        "current_raw_cols_csv": current_raw_cols_csv,
+        "support_mtime_ns": int(support_mtime_ns),
+        "source_states": source_states,
+        "source_state_by_serial": source_state_by_serial,
+        "fingerprints_by_serial": fingerprints_by_serial,
+        "counts": {
+            "added": len(added_serials),
+            "changed": len(changed_serials),
+            "removed": len(removed_serials),
+            "unchanged": len(unchanged_serials),
+            "invalid": len(invalid_serials),
+            "reingested": len(added_serials) + len(changed_serials),
+        },
+        "added_serials": list(added_serials),
+        "changed_serials": list(changed_serials),
+        "removed_serials": list(removed_serials),
+        "unchanged_serials": list(unchanged_serials),
+        "invalid_serials": list(invalid_serials),
+    }
 
 
 def ensure_test_data_project_cache(
@@ -5847,202 +6129,13 @@ def ensure_test_data_project_cache(
     Ensure `td_*` cache tables exist and are up-to-date inside the project's
     `implementation_trending.sqlite3`.
     """
-    proj_dir = Path(project_dir).expanduser()
-    wb_path = Path(workbook_path).expanduser()
-    if not wb_path.exists():
-        raise FileNotFoundError(f"Workbook not found: {wb_path}")
-
-    db_path = proj_dir / EIDAT_PROJECT_IMPLEMENTATION_DB
-    raw_db_path = td_raw_cache_db_path_for(proj_dir)
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    current_node_root = str(_infer_node_root_from_workbook_path(wb_path))
-
-    with sqlite3.connect(str(db_path)) as conn:
-        _ensure_test_data_impl_tables(conn)
-        conn.commit()
-    with sqlite3.connect(str(raw_db_path)) as conn:
-        _ensure_test_data_raw_cache_tables(conn)
-        conn.commit()
-
-    if rebuild:
-        _td_emit_progress(progress_cb, "Rebuilding raw Test Data cache")
-        rebuild_test_data_project_cache(db_path, wb_path, progress_cb=progress_cb)
-        return db_path
-
-    _td_emit_progress(progress_cb, "Checking project cache inputs")
-
-    # Quick staleness check: compare workbook Sources list + mtimes against td_sources.
-    try:
-        sources = _read_test_data_sources(wb_path)
-        expected = {str(s.get("serial") or "").strip(): dict(s) for s in sources if str(s.get("serial") or "").strip()}
-    except Exception:
-        expected = {}
-
-    with sqlite3.connect(str(db_path)) as conn:
-        _ensure_test_data_impl_tables(conn)
-        try:
-            rows = conn.execute("SELECT serial, sqlite_path, mtime_ns, status FROM td_sources").fetchall()
-        except Exception:
-            rows = []
-        cached = {
-            str(r[0] or "").strip(): {"path": str(r[1] or "").strip(), "mtime_ns": r[2], "status": str(r[3] or "").strip()}
-            for r in rows
-            if str(r[0] or "").strip()
-        }
-        try:
-            meta_rows = conn.execute(
-                "SELECT serial, metadata_rel, artifacts_rel, excel_sqlite_rel, metadata_mtime_ns FROM td_source_metadata"
-            ).fetchall()
-        except Exception:
-            meta_rows = []
-        cached_meta = {
-            str(r[0] or "").strip(): {
-                "metadata_rel": str(r[1] or "").strip(),
-                "artifacts_rel": str(r[2] or "").strip(),
-                "excel_sqlite_rel": str(r[3] or "").strip(),
-                "metadata_mtime_ns": int(r[4] or 0),
-            }
-            for r in meta_rows
-            if str(r[0] or "").strip()
-        }
-        try:
-            row = conn.execute("SELECT value FROM td_meta WHERE key='support_workbook_mtime_ns' LIMIT 1").fetchone()
-            cached_support_mtime_ns = int(str(row[0]).strip()) if row and row[0] is not None else 0
-        except Exception:
-            cached_support_mtime_ns = 0
-        try:
-            row = conn.execute("SELECT value FROM td_meta WHERE key='workbook_path' LIMIT 1").fetchone()
-            cached_workbook_path = str(row[0] or "").strip() if row and row[0] is not None else ""
-        except Exception:
-            cached_workbook_path = ""
-        try:
-            row = conn.execute("SELECT value FROM td_meta WHERE key='node_root' LIMIT 1").fetchone()
-            cached_node_root = str(row[0] or "").strip() if row and row[0] is not None else ""
-        except Exception:
-            cached_node_root = ""
-    with sqlite3.connect(str(raw_db_path)) as conn:
-        _ensure_test_data_raw_cache_tables(conn)
-        try:
-            curve_count = int(conn.execute("SELECT COUNT(*) FROM td_curves_raw").fetchone()[0] or 0)
-        except Exception:
-            curve_count = 0
-
-    stale_context = False
-    try:
-        stale_context = str(Path(cached_workbook_path).expanduser()) != str(wb_path)
-    except Exception:
-        stale_context = bool(cached_workbook_path) and cached_workbook_path != str(wb_path)
-    if not stale_context and cached_node_root != current_node_root:
-        stale_context = True
-    if not stale_context and expected and cached and (not cached_workbook_path or not cached_node_root):
-        stale_context = True
-
-    support_mtime_ns = 0
-    try:
-        support_path = td_support_workbook_path_for(wb_path, project_dir=proj_dir)
-        if support_path.exists():
-            st = support_path.stat()
-            support_mtime_ns = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)))
-    except Exception:
-        support_mtime_ns = 0
-
-    cached_stats_csv = ""
-    try:
-        with sqlite3.connect(str(db_path)) as conn:
-            row = conn.execute("SELECT value FROM td_meta WHERE key='statistics' LIMIT 1").fetchone()
-            cached_stats_csv = str(row[0] or "").strip() if row and row[0] is not None else ""
-    except Exception:
-        cached_stats_csv = ""
-
-    project_cfg = _load_project_td_trend_config(wb_path)
-    current_stats = [str(s).strip().lower() for s in (project_cfg.get("statistics") or []) if str(s).strip()]
-    current_stats = [s for s in current_stats if s in TD_ALLOWED_STATS] or list(TD_DEFAULT_STATS_ORDER)
-    current_stats_csv = ",".join(current_stats)
-    current_raw_cols_csv = ",".join(
-        [str(c.get("name") or "").strip() for c in (project_cfg.get("columns") or []) if str(c.get("name") or "").strip()]
+    payload = sync_test_data_project_cache(
+        project_dir,
+        workbook_path,
+        rebuild=rebuild,
+        progress_cb=progress_cb,
     )
-    cached_raw_cols_csv = ""
-    try:
-        with sqlite3.connect(str(db_path)) as conn:
-            row = conn.execute("SELECT value FROM td_meta WHERE key='raw_columns' LIMIT 1").fetchone()
-            cached_raw_cols_csv = str(row[0] or "").strip() if row and row[0] is not None else ""
-    except Exception:
-        cached_raw_cols_csv = ""
-
-    # If any path/mtime differs, rebuild.
-    stale = False
-    for sn, source_row in expected.items():
-        source_resolution = _resolve_td_source_sqlite_for_workbook(wb_path, source_row)
-        p_raw = source_resolution.get("path")
-        p = Path(p_raw).expanduser() if p_raw else Path()
-        status = str(source_resolution.get("status") or "").strip().lower()
-        healed_rel = str(source_resolution.get("healed_excel_sqlite_rel") or "").strip()
-        expected_excel_rel = healed_rel or str(source_resolution.get("workbook_excel_sqlite_rel") or source_row.get("excel_sqlite_rel") or "").strip()
-        c = cached.get(sn) or {}
-        cached_status = str(c.get("status") or "").strip().lower()
-        if cached_status != status:
-            if curve_count > 0 and cached_status == "ok" and status == "missing":
-                pass
-            else:
-                stale = True
-                break
-        if str(c.get("path") or "") != str(p):
-            if curve_count > 0 and cached_status == "ok" and status == "missing":
-                pass
-            else:
-                stale = True
-                break
-        try:
-            st = p.stat()
-            mtime_ns = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)))
-        except Exception:
-            mtime_ns = None
-        if mtime_ns is None:
-            if curve_count <= 0 and str(c.get("status") or "").lower() == "ok":
-                stale = True
-                break
-        else:
-            if int(c.get("mtime_ns") or 0) != int(mtime_ns):
-                stale = True
-                break
-        source_meta = _load_td_source_metadata(wb_path, source_row)
-        cached_meta_row = cached_meta.get(sn) or {}
-        if str(cached_meta_row.get("metadata_rel") or "") != str(source_meta.get("metadata_rel") or "").strip():
-            stale = True
-            break
-        if str(cached_meta_row.get("artifacts_rel") or "") != str(source_meta.get("artifacts_rel") or "").strip():
-            stale = True
-            break
-        if str(cached_meta_row.get("excel_sqlite_rel") or "") != expected_excel_rel:
-            stale = True
-            break
-        if int(cached_meta_row.get("metadata_mtime_ns") or 0) != int(source_meta.get("metadata_mtime_ns") or 0):
-            stale = True
-            break
-
-    refresh_mode, refresh_reason = _td_project_cache_refresh_mode(
-        stale_context=bool(stale_context),
-        curve_count=int(curve_count),
-        expected_serials=set(expected.keys()),
-        cached_serials=set(cached.keys()),
-        cached_stats_csv=str(cached_stats_csv),
-        current_stats_csv=str(current_stats_csv),
-        cached_raw_cols_csv=str(cached_raw_cols_csv),
-        current_raw_cols_csv=str(current_raw_cols_csv),
-        cached_support_mtime_ns=int(cached_support_mtime_ns),
-        support_mtime_ns=int(support_mtime_ns),
-        source_state_stale=bool(stale),
-    )
-    if refresh_mode == "full":
-        _td_emit_progress(progress_cb, f"Refreshing raw Test Data cache ({refresh_reason})")
-        rebuild_test_data_project_cache(db_path, wb_path, progress_cb=progress_cb)
-        return db_path
-    if refresh_mode == "calc":
-        _td_emit_progress(progress_cb, f"Refreshing calculated Test Data cache ({refresh_reason})")
-        _rebuild_test_data_project_calc_cache_from_raw(db_path, wb_path, progress_cb=progress_cb)
-        return db_path
-
-    return db_path
+    return Path(str(payload.get("db_path") or (Path(project_dir).expanduser() / EIDAT_PROJECT_IMPLEMENTATION_DB))).expanduser()
 
 
 def export_test_data_project_debug_excels(
@@ -6954,7 +7047,287 @@ def validate_existing_test_data_project_cache(project_dir: Path, workbook_path: 
     if runs_count <= 0 or raw_runs_count <= 0 or raw_curve_count <= 0 or raw_y_count <= 0 or calc_y_count <= 0 or metrics_count <= 0:
         raise RuntimeError(f"Project cache DB is incomplete: {db_path}. {guidance}")
 
+    state = inspect_test_data_project_cache_state(proj_dir, wb_path)
+    refresh_mode = str(state.get("mode") or "").strip().lower()
+    if refresh_mode and refresh_mode != "none":
+        reason = str(state.get("reason") or "project cache is stale").strip() or "project cache is stale"
+        raise RuntimeError(
+            f"Project cache is stale: {reason}. "
+            "Run 'Update Project' to refresh the implementation before opening Trend / Analyze."
+        )
+
     return db_path
+
+
+def _td_delete_serial_rows_from_cache(
+    impl_conn: sqlite3.Connection,
+    raw_conn: sqlite3.Connection,
+    serials: Sequence[object],
+) -> None:
+    serial_list = sorted({str(value).strip() for value in (serials or []) if str(value).strip()})
+    if not serial_list:
+        return
+    placeholders = ",".join("?" for _ in serial_list)
+    for table_name in ("td_sources", "td_source_metadata", "td_source_diagnostics"):
+        try:
+            impl_conn.execute(f"DELETE FROM {table_name} WHERE serial IN ({placeholders})", tuple(serial_list))
+        except Exception:
+            pass
+    for table_name in ("td_raw_condition_observations", "td_curves_raw", "td_curves", "td_metrics"):
+        try:
+            raw_conn.execute(f"DELETE FROM {table_name} WHERE serial IN ({placeholders})", tuple(serial_list))
+        except Exception:
+            pass
+    try:
+        raw_tables = [
+            str(row[0] or "").strip()
+            for row in raw_conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name GLOB 'td_raw__*' ORDER BY name"
+            ).fetchall()
+            if str(row[0] or "").strip()
+        ]
+    except Exception:
+        raw_tables = []
+    for table_name in raw_tables:
+        try:
+            safe = table_name.replace('"', '""')
+            raw_conn.execute(f'DELETE FROM "{safe}" WHERE serial IN ({placeholders})', tuple(serial_list))
+        except Exception:
+            pass
+
+
+def _td_rebuild_raw_summary_tables(
+    raw_conn: sqlite3.Connection,
+    *,
+    cfg_units: Mapping[str, str],
+    computed_epoch_ns: int,
+) -> None:
+    try:
+        existing_runs_rows = raw_conn.execute(
+            "SELECT run_name, COALESCE(display_name, '') FROM td_runs"
+        ).fetchall()
+    except Exception:
+        existing_runs_rows = []
+    display_by_run = {
+        str(run_name or "").strip(): str(display_name or "").strip()
+        for run_name, display_name in existing_runs_rows
+        if str(run_name or "").strip()
+    }
+    try:
+        catalog_rows_existing = raw_conn.execute(
+            """
+            SELECT run_name, parameter_name, COALESCE(units, ''), COALESCE(display_name, '')
+            FROM td_raw_curve_catalog
+            """
+        ).fetchall()
+    except Exception:
+        catalog_rows_existing = []
+    units_by_run_param = {
+        (str(run_name or "").strip(), str(param_name or "").strip()): str(units or "").strip()
+        for run_name, param_name, units, _display_name in catalog_rows_existing
+        if str(run_name or "").strip() and str(param_name or "").strip()
+    }
+    for run_name, _param_name, _units, display_name in catalog_rows_existing:
+        run = str(run_name or "").strip()
+        if run and str(display_name or "").strip() and not display_by_run.get(run):
+            display_by_run[run] = str(display_name or "").strip()
+
+    curve_rows = raw_conn.execute(
+        """
+        SELECT run_name, y_name, x_name, COALESCE(program_title, ''), COALESCE(source_run_name, '')
+        FROM td_curves_raw
+        ORDER BY run_name, y_name, x_name
+        """
+    ).fetchall()
+    obs_rows = raw_conn.execute(
+        """
+        SELECT run_name, COALESCE(run_type, ''), pulse_width, control_period
+        FROM td_raw_condition_observations
+        ORDER BY run_name, observation_id
+        """
+    ).fetchall()
+
+    raw_conn.execute("DELETE FROM td_runs")
+    raw_conn.execute("DELETE FROM td_raw_sequences")
+    raw_conn.execute("DELETE FROM td_columns")
+    raw_conn.execute("DELETE FROM td_columns_raw")
+    raw_conn.execute("DELETE FROM td_raw_curve_catalog")
+
+    run_meta_by_run: dict[str, dict[str, object]] = {}
+    for run_name, run_type, pulse_width, control_period in obs_rows:
+        run = str(run_name or "").strip()
+        if not run or run in run_meta_by_run:
+            continue
+        run_meta_by_run[run] = {
+            "run_type": str(run_type or "").strip(),
+            "pulse_width": pulse_width,
+            "control_period": control_period,
+        }
+
+    x_priority = ["Time", "Pulse Number"]
+    x_by_run: dict[str, set[str]] = {}
+    y_by_run: dict[str, set[str]] = {}
+    for run_name, y_name, x_name, _program_title, _source_run_name in curve_rows:
+        run = str(run_name or "").strip()
+        y_name_clean = str(y_name or "").strip()
+        x_name_clean = str(x_name or "").strip()
+        if not run or not y_name_clean:
+            continue
+        if x_name_clean:
+            x_by_run.setdefault(run, set()).add(x_name_clean)
+        y_by_run.setdefault(run, set()).add(y_name_clean)
+
+    for run in sorted(set(x_by_run.keys()) | set(y_by_run.keys()), key=lambda value: str(value).lower()):
+        xs = sorted(
+            list(x_by_run.get(run) or set()),
+            key=lambda value: x_priority.index(value) if value in x_priority else 999,
+        )
+        default_x = xs[0] if xs else ""
+        run_meta = dict(run_meta_by_run.get(run) or {})
+        display_name = str(display_by_run.get(run) or run).strip() or run
+        raw_conn.execute(
+            "INSERT OR REPLACE INTO td_runs(run_name, default_x, display_name, run_type, control_period, pulse_width) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                run,
+                default_x,
+                display_name,
+                str(run_meta.get('run_type') or "").strip(),
+                run_meta.get("control_period"),
+                run_meta.get("pulse_width"),
+            ),
+        )
+        raw_conn.execute(
+            """
+            INSERT OR REPLACE INTO td_raw_sequences(run_name, display_name, x_axis_kind, source_run_name, pulse_width, run_type, control_period, computed_epoch_ns)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run,
+                display_name,
+                default_x,
+                run,
+                run_meta.get("pulse_width"),
+                str(run_meta.get("run_type") or "").strip(),
+                run_meta.get("control_period"),
+                int(computed_epoch_ns),
+            ),
+        )
+        for x_name in xs:
+            raw_conn.execute(
+                "INSERT OR REPLACE INTO td_columns(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
+                (run, x_name, "", "x"),
+            )
+            raw_conn.execute(
+                "INSERT OR REPLACE INTO td_columns_raw(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
+                (run, x_name, "", "x"),
+            )
+        ys = sorted(list(y_by_run.get(run) or set()), key=lambda value: str(value).lower())
+        for y_name in ys:
+            units = str(units_by_run_param.get((run, y_name)) or cfg_units.get(y_name) or "").strip()
+            raw_conn.execute(
+                "INSERT OR REPLACE INTO td_columns_raw(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
+                (run, y_name, units, "y"),
+            )
+            raw_conn.execute(
+                """
+                INSERT OR REPLACE INTO td_raw_curve_catalog
+                (run_name, parameter_name, units, x_axis_kind, table_name, display_name, source_kind, computed_epoch_ns)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run,
+                    y_name,
+                    units,
+                    default_x,
+                    _td_raw_curve_table_name(run, y_name),
+                    display_name,
+                    "source_sqlite",
+                    int(computed_epoch_ns),
+                ),
+            )
+
+    expected_tables = {
+        _td_raw_curve_table_name(str(run_name or "").strip(), str(y_name or "").strip())
+        for run_name, y_name, _x_name, _program_title, _source_run_name in curve_rows
+        if str(run_name or "").strip() and str(y_name or "").strip()
+    }
+    raw_tables = [
+        str(row[0] or "").strip()
+        for row in raw_conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name GLOB 'td_raw__*' ORDER BY name"
+        ).fetchall()
+        if str(row[0] or "").strip()
+    ]
+    for table_name in raw_tables:
+        if table_name in expected_tables:
+            continue
+        _sqlite_drop_table(raw_conn, table_name)
+
+
+def sync_test_data_project_cache(
+    project_dir: Path,
+    workbook_path: Path,
+    *,
+    rebuild: bool = False,
+    progress_cb: Callable[[str], None] | None = None,
+) -> dict[str, object]:
+    proj_dir = Path(project_dir).expanduser()
+    wb_path = Path(workbook_path).expanduser()
+    if not wb_path.exists():
+        raise FileNotFoundError(f"Workbook not found: {wb_path}")
+    db_path = proj_dir / EIDAT_PROJECT_IMPLEMENTATION_DB
+
+    if rebuild:
+        _td_emit_progress(progress_cb, "Refreshing raw Test Data cache (forced full rebuild)")
+        payload = rebuild_test_data_project_cache(db_path, wb_path, progress_cb=progress_cb)
+        payload["mode"] = "full_rebuild"
+        payload.setdefault("counts", {})
+        return payload
+
+    state = inspect_test_data_project_cache_state(proj_dir, wb_path)
+    refresh_mode = str(state.get("mode") or "").strip().lower() or "none"
+    refresh_reason = str(state.get("reason") or "").strip()
+    if refresh_mode == "full":
+        _td_emit_progress(progress_cb, f"Refreshing raw Test Data cache ({refresh_reason})")
+        payload = rebuild_test_data_project_cache(db_path, wb_path, progress_cb=progress_cb)
+        payload["mode"] = "full_rebuild"
+    elif refresh_mode == "incremental_raw":
+        _td_emit_progress(progress_cb, f"Refreshing raw Test Data cache ({refresh_reason})")
+        payload = rebuild_test_data_project_cache(
+            db_path,
+            wb_path,
+            progress_cb=progress_cb,
+            _entries_override=[
+                dict((state.get("source_state_by_serial") or {}).get(serial) or {}).get("source_row")
+                for serial in list(state.get("added_serials") or []) + list(state.get("changed_serials") or [])
+                if dict((state.get("source_state_by_serial") or {}).get(serial) or {}).get("source_row")
+            ],
+            _full_reset=False,
+            _removed_serials=list(state.get("removed_serials") or []),
+            _source_fingerprints=dict(state.get("fingerprints_by_serial") or {}),
+            _preclassified_counts=dict(state.get("counts") or {}),
+        )
+        payload["mode"] = "incremental_raw"
+    elif refresh_mode == "calc":
+        _td_emit_progress(progress_cb, f"Refreshing calculated Test Data cache ({refresh_reason})")
+        payload = _rebuild_test_data_project_calc_cache_from_raw(db_path, wb_path, progress_cb=progress_cb)
+        payload["mode"] = "calc_only"
+        payload["counts"] = dict(state.get("counts") or {})
+    else:
+        payload = {
+            "db_path": str(db_path),
+            "raw_db_path": str(td_raw_cache_db_path_for(proj_dir)),
+            "workbook": str(wb_path),
+            "mode": "noop",
+            "counts": dict(state.get("counts") or {}),
+            "reason": refresh_reason,
+        }
+    payload["db_path"] = str(payload.get("db_path") or db_path)
+    payload["raw_db_path"] = str(payload.get("raw_db_path") or td_raw_cache_db_path_for(proj_dir))
+    payload["workbook"] = str(payload.get("workbook") or wb_path)
+    payload["counts"] = dict(payload.get("counts") or state.get("counts") or {})
+    payload["reason"] = str(payload.get("reason") or refresh_reason).strip()
+    return payload
 
 
 def rebuild_test_data_project_cache(
@@ -6962,6 +7335,11 @@ def rebuild_test_data_project_cache(
     workbook_path: Path,
     *,
     progress_cb: Callable[[str], None] | None = None,
+    _entries_override: list[dict] | None = None,
+    _full_reset: bool = True,
+    _removed_serials: Sequence[object] | None = None,
+    _source_fingerprints: Mapping[str, str] | None = None,
+    _preclassified_counts: Mapping[str, object] | None = None,
 ) -> dict:
     """
     Rebuild `td_*` cache tables inside `implementation_trending.sqlite3` from the
@@ -6992,7 +7370,23 @@ def rebuild_test_data_project_cache(
                 cfg_units[name] = units
 
     sources = _read_test_data_sources(wb_path)
-    entries = [dict(s) for s in sources if str(s.get("serial") or "").strip()]
+    entries = (
+        [dict(s) for s in (_entries_override or []) if isinstance(s, dict) and str(s.get("serial") or "").strip()]
+        if _entries_override is not None
+        else [dict(s) for s in sources if str(s.get("serial") or "").strip()]
+    )
+    full_reset = bool(_full_reset)
+    removed_serials = sorted({str(value).strip() for value in (_removed_serials or []) if str(value).strip()})
+    source_fingerprints = {
+        str(serial).strip(): str(value).strip()
+        for serial, value in (_source_fingerprints or {}).items()
+        if str(serial).strip()
+    }
+    preclassified_counts = {
+        str(key): int(value or 0)
+        for key, value in (_preclassified_counts or {}).items()
+        if str(key).strip()
+    }
 
     computed_epoch_ns = time.time_ns()
     total_started = time.perf_counter()
@@ -7575,24 +7969,26 @@ def rebuild_test_data_project_cache(
                 issues.append(f"Ambiguous fuzzy matches for '{cfg_name}': {', '.join(sorted(best_actuals))}")
         return matched, issues
 
-    # Reset implementation cache tables.
+    # Reset or prepare implementation cache tables.
     with closing(sqlite3.connect(str(db_path))) as conn:
-        for t in (
-            "td_runs",
-            "td_columns_calc",
-            "td_metrics_calc",
-            "td_condition_observations",
-            "td_terms",
-            "td_source_diagnostics",
-        ):
-            _sqlite_drop_table(conn, t)
+        if full_reset:
+            for t in (
+                "td_runs",
+                "td_columns_calc",
+                "td_metrics_calc",
+                "td_condition_observations",
+                "td_terms",
+                "td_source_diagnostics",
+            ):
+                _sqlite_drop_table(conn, t)
         _ensure_test_data_impl_tables(conn)
         _purge_test_data_legacy_impl_raw_tables(conn)
-        for t in ("td_meta", "td_sources", "td_source_metadata"):
-            try:
-                conn.execute(f"DELETE FROM {t}")
-            except Exception:
-                pass
+        if full_reset:
+            for t in ("td_meta", "td_sources", "td_source_metadata"):
+                try:
+                    conn.execute(f"DELETE FROM {t}")
+                except Exception:
+                    pass
         conn.execute("INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)", ("workbook_path", str(wb_path)))
         conn.execute("INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)", ("built_epoch_ns", str(computed_epoch_ns)))
         conn.execute(
@@ -7619,6 +8015,14 @@ def rebuild_test_data_project_cache(
             "INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)",
             ("support_workbook_mtime_ns", str(int(support_mtime_ns))),
         )
+        conn.execute(
+            "INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)",
+            ("project_raw_signature", _td_build_project_raw_signature(wb_path, raw_columns_csv=",".join([str(c.get("name") or "").strip() for c in cfg_cols if str(c.get("name") or "").strip()]))),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)",
+            ("cache_schema_version", TD_PROJECT_CACHE_SCHEMA_VERSION),
+        )
         try:
             conn.execute(
                 "INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)",
@@ -7629,33 +8033,42 @@ def rebuild_test_data_project_cache(
 
         conn.commit()
 
-    # Reset raw-cache tables.
+    # Reset or prepare raw-cache tables.
     with closing(sqlite3.connect(str(raw_db_path))) as conn:
-        rows = conn.execute(
-            """
-            SELECT name
-            FROM sqlite_master
-            WHERE type='table' AND (name IN (
-                'td_raw_meta',
-                'td_raw_sequences',
-                'td_raw_condition_observations',
-                'td_raw_curve_catalog',
-                'td_runs',
-                'td_columns',
-                'td_columns_raw',
-                'td_curves',
-                'td_curves_raw'
-            ) OR name LIKE 'td_raw__%')
-            """
-        ).fetchall()
-        for (table_name,) in rows:
-            _sqlite_drop_table(conn, str(table_name or "").strip())
+        if full_reset:
+            rows = conn.execute(
+                """
+                SELECT name
+                FROM sqlite_master
+                WHERE type='table' AND (name IN (
+                    'td_raw_meta',
+                    'td_raw_sequences',
+                    'td_raw_condition_observations',
+                    'td_raw_curve_catalog',
+                    'td_runs',
+                    'td_columns',
+                    'td_columns_raw',
+                    'td_curves',
+                    'td_curves_raw'
+                ) OR name LIKE 'td_raw__%')
+                """
+            ).fetchall()
+            for (table_name,) in rows:
+                _sqlite_drop_table(conn, str(table_name or "").strip())
         _ensure_test_data_raw_cache_tables(conn)
         conn.execute("INSERT OR REPLACE INTO td_raw_meta(key, value) VALUES (?, ?)", ("workbook_path", str(wb_path)))
         conn.execute("INSERT OR REPLACE INTO td_raw_meta(key, value) VALUES (?, ?)", ("built_epoch_ns", str(computed_epoch_ns)))
         conn.execute(
             "INSERT OR REPLACE INTO td_raw_meta(key, value) VALUES (?, ?)",
             ("support_workbook_path", str(support_cfg.get("path") or "")),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO td_raw_meta(key, value) VALUES (?, ?)",
+            ("project_raw_signature", _td_build_project_raw_signature(wb_path, raw_columns_csv=",".join([str(c.get("name") or "").strip() for c in cfg_cols if str(c.get("name") or "").strip()]))),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO td_raw_meta(key, value) VALUES (?, ?)",
+            ("cache_schema_version", TD_PROJECT_CACHE_SCHEMA_VERSION),
         )
         conn.commit()
 
@@ -7678,6 +8091,11 @@ def rebuild_test_data_project_cache(
     raw_conn = sqlite3.connect(str(raw_db_path))
     _ensure_test_data_impl_tables(impl_conn)
     _ensure_test_data_raw_cache_tables(raw_conn)
+    if not full_reset and (removed_serials or entries):
+        serials_to_delete = sorted({*removed_serials, *[str(entry.get("serial") or "").strip() for entry in entries if str(entry.get("serial") or "").strip()]})
+        _td_delete_serial_rows_from_cache(impl_conn, raw_conn, serials_to_delete)
+        impl_conn.commit()
+        raw_conn.commit()
 
     for idx, entry in enumerate(entries, start=1):
         sn = str(entry.get("serial") or "").strip()
@@ -7728,12 +8146,43 @@ def rebuild_test_data_project_cache(
 
         impl_conn.execute(
             """
-            INSERT OR REPLACE INTO td_sources(serial, sqlite_path, mtime_ns, size_bytes, status, last_ingested_epoch_ns)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT OR REPLACE INTO td_sources(serial, sqlite_path, mtime_ns, size_bytes, status, last_ingested_epoch_ns, raw_fingerprint)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (sn, str(sqlite_path), mtime_ns, size_bytes, status, computed_epoch_ns),
+            (
+                sn,
+                str(sqlite_path),
+                mtime_ns,
+                size_bytes,
+                status,
+                computed_epoch_ns,
+                str(source_fingerprints.get(sn) or ""),
+            ),
         )
         source_meta = _load_td_source_metadata(wb_path, entry)
+        raw_fingerprint = str(source_fingerprints.get(sn) or "").strip()
+        if not raw_fingerprint:
+            raw_fingerprint = _td_hash_payload(
+                {
+                    "serial": sn,
+                    "status": status,
+                    "sqlite_path": str(sqlite_path) if sqlite_path else "",
+                    "mtime_ns": int(mtime_ns or 0),
+                    "size_bytes": int(size_bytes or 0),
+                    "metadata_rel": str(source_meta.get("metadata_rel") or "").strip(),
+                    "artifacts_rel": str(source_meta.get("artifacts_rel") or "").strip(),
+                    "excel_sqlite_rel": str(source_meta.get("excel_sqlite_rel") or "").strip(),
+                    "metadata_mtime_ns": int(source_meta.get("metadata_mtime_ns") or 0),
+                    "project_raw_signature": _td_build_project_raw_signature(
+                        wb_path,
+                        raw_columns_csv=",".join([str(c.get("name") or "").strip() for c in cfg_cols if str(c.get("name") or "").strip()]),
+                    ),
+                }
+            )
+            impl_conn.execute(
+                "UPDATE td_sources SET raw_fingerprint=? WHERE serial=?",
+                (raw_fingerprint, sn),
+            )
         timings["source_resolution_s"] += time.perf_counter() - t_source_resolution
         source_program_title = str(source_meta.get("program_title") or "").strip()
         source_info["program_title"] = source_program_title
@@ -8299,6 +8748,11 @@ def rebuild_test_data_project_cache(
             "missing_sources": int(missing_sources),
             "invalid_sources": int(invalid_sources),
             "curves_written": int(curves_written),
+            "added": int(preclassified_counts.get("added") or 0),
+            "changed": int(preclassified_counts.get("changed") or 0),
+            "removed": int(preclassified_counts.get("removed") or 0),
+            "unchanged": int(preclassified_counts.get("unchanged") or 0),
+            "reingested": int(preclassified_counts.get("reingested") or len(entries)),
         },
         "link_healing": {
             "requested_updates": dict(source_link_updates),
@@ -8309,8 +8763,7 @@ def rebuild_test_data_project_cache(
     timings["total_s"] = round(time.perf_counter() - total_started, 3)
     debug_payload["timings"] = dict(timings)
     debug_path = _write_td_cache_debug_json(db_path.parent, debug_payload)
-
-    if valid_sources <= 0 and entries:
+    if full_reset and valid_sources <= 0 and entries:
         reason_lines = [
             " | ".join(
                 part
@@ -8334,7 +8787,7 @@ def rebuild_test_data_project_cache(
             "Check the workbook Sources sheet, current node/global repo path, and TD artifact folders, then run 'Build / Refresh Cache' again."
             + reason_txt
             + debug_txt
-        )
+            )
 
     # Compute optional display labels per run (condition labeling).
     runs_all = set(run_x_union.keys()) | set(run_y_raw_union.keys()) | set(run_y_calc_union.keys())
@@ -8373,71 +8826,82 @@ def rebuild_test_data_project_cache(
                     disp = f"{base} — {run}"
             display_by_run[run] = _collapse_ws(disp) or base
 
-    # Write raw-cache runs + columns tables only.
+    # Write raw-cache runs + columns tables.
     _td_emit_progress(progress_cb, "Writing raw Test Data cache tables")
     t0 = time.perf_counter()
-    cfg_order = [n for n, _u in y_cols if n]
-    for run in sorted(runs_all, key=lambda s: str(s).lower()):
-        xs = run_x_union.get(run, set())
-        default_x = run_default_x.get(run, "")
-        if not default_x:
-            for x in x_priority:
-                if x in xs:
-                    default_x = x
-                    break
-        run_meta = dict(run_meta_by_run.get(run) or {})
-        display_name = str(display_by_run.get(run) or run_meta.get("display_name") or run).strip() or str(run)
-        run_type = str(run_meta.get("run_type") or "").strip()
-        control_period = _finite_float(run_meta.get("control_period"))
-        pulse_width = _finite_float(run_meta.get("pulse_width"))
-        raw_conn.execute(
-            "INSERT OR REPLACE INTO td_runs(run_name, default_x, display_name, run_type, control_period, pulse_width) VALUES (?, ?, ?, ?, ?, ?)",
-            (run, default_x, display_name, run_type, control_period, pulse_width),
-        )
-        raw_conn.execute(
-            """
-            INSERT OR REPLACE INTO td_raw_sequences(run_name, display_name, x_axis_kind, source_run_name, pulse_width, run_type, control_period, computed_epoch_ns)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                run,
-                display_name,
-                default_x,
-                run,
-                pulse_width if pulse_width is not None else _finite_float(run_pulse_width_by_run.get(run)),
-                run_type,
-                control_period,
-                computed_epoch_ns,
-            ),
-        )
-        for x in sorted(xs, key=lambda k: x_priority.index(k) if k in x_priority else 999):
+    if full_reset:
+        cfg_order = [n for n, _u in y_cols if n]
+        for run in sorted(runs_all, key=lambda s: str(s).lower()):
+            xs = run_x_union.get(run, set())
+            default_x = run_default_x.get(run, "")
+            if not default_x:
+                for x in x_priority:
+                    if x in xs:
+                        default_x = x
+                        break
+            run_meta = dict(run_meta_by_run.get(run) or {})
+            display_name = str(display_by_run.get(run) or run_meta.get("display_name") or run).strip() or str(run)
+            run_type = str(run_meta.get("run_type") or "").strip()
+            control_period = _finite_float(run_meta.get("control_period"))
+            pulse_width = _finite_float(run_meta.get("pulse_width"))
             raw_conn.execute(
-                "INSERT OR REPLACE INTO td_columns(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
-                (run, x, "", "x"),
-            )
-            raw_conn.execute(
-                "INSERT OR REPLACE INTO td_columns_raw(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
-                (run, x, "", "x"),
-            )
-
-        y_map_raw = run_y_raw_union.get(run, {}) or {}
-        y_ordered_raw = [n for n in cfg_order if n in y_map_raw] + sorted([n for n in y_map_raw.keys() if n not in cfg_order], key=lambda s: str(s).lower())
-        for y_name in y_ordered_raw:
-            if _norm_name(y_name) in x_exclude_norms:
-                continue
-            units = str(y_map_raw.get(y_name) or "").strip()
-            raw_conn.execute(
-                "INSERT OR REPLACE INTO td_columns_raw(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
-                (run, y_name, units, "y"),
+                "INSERT OR REPLACE INTO td_runs(run_name, default_x, display_name, run_type, control_period, pulse_width) VALUES (?, ?, ?, ?, ?, ?)",
+                (run, default_x, display_name, run_type, control_period, pulse_width),
             )
             raw_conn.execute(
                 """
-                UPDATE td_raw_curve_catalog
-                SET units=?, x_axis_kind=?, display_name=?
-                WHERE run_name=? AND parameter_name=?
+                INSERT OR REPLACE INTO td_raw_sequences(run_name, display_name, x_axis_kind, source_run_name, pulse_width, run_type, control_period, computed_epoch_ns)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (units, default_x, display_name, run, y_name),
+                (
+                    run,
+                    display_name,
+                    default_x,
+                    run,
+                    pulse_width if pulse_width is not None else _finite_float(run_pulse_width_by_run.get(run)),
+                    run_type,
+                    control_period,
+                    computed_epoch_ns,
+                ),
             )
+            for x in sorted(xs, key=lambda k: x_priority.index(k) if k in x_priority else 999):
+                raw_conn.execute(
+                    "INSERT OR REPLACE INTO td_columns(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
+                    (run, x, "", "x"),
+                )
+                raw_conn.execute(
+                    "INSERT OR REPLACE INTO td_columns_raw(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
+                    (run, x, "", "x"),
+                )
+
+            y_map_raw = run_y_raw_union.get(run, {}) or {}
+            y_ordered_raw = [n for n in cfg_order if n in y_map_raw] + sorted([n for n in y_map_raw.keys() if n not in cfg_order], key=lambda s: str(s).lower())
+            for y_name in y_ordered_raw:
+                if _norm_name(y_name) in x_exclude_norms:
+                    continue
+                units = str(y_map_raw.get(y_name) or "").strip()
+                raw_conn.execute(
+                    "INSERT OR REPLACE INTO td_columns_raw(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
+                    (run, y_name, units, "y"),
+                )
+                raw_conn.execute(
+                    """
+                    UPDATE td_raw_curve_catalog
+                    SET units=?, x_axis_kind=?, display_name=?
+                    WHERE run_name=? AND parameter_name=?
+                    """,
+                    (units, default_x, display_name, run, y_name),
+                )
+    else:
+        _td_rebuild_raw_summary_tables(
+            raw_conn,
+            cfg_units=cfg_units,
+            computed_epoch_ns=computed_epoch_ns,
+        )
+    try:
+        total_curve_count = int(raw_conn.execute("SELECT COUNT(*) FROM td_curves_raw").fetchone()[0] or 0)
+    except Exception:
+        total_curve_count = 0
     impl_conn.commit()
     raw_conn.commit()
     timings["raw_db_write_s"] += time.perf_counter() - t0
@@ -8478,7 +8942,7 @@ def rebuild_test_data_project_cache(
         reason_txt = " Details: " + " | ".join(reason_lines[:4])
     debug_txt = f" Debug: {debug_path}." if debug_path is not None else ""
 
-    if curves_written <= 0:
+    if total_curve_count <= 0:
         if missing_sources or invalid_sources:
             raise RuntimeError(
                 "Test Data raw cache build produced no curves. "
@@ -8511,6 +8975,14 @@ def rebuild_test_data_project_cache(
         "curves_written": curves_written,
         "metrics_written": metrics_written,
         "runs": sorted(runs_all),
+        "counts": {
+            "added": int(preclassified_counts.get("added") or 0),
+            "changed": int(preclassified_counts.get("changed") or 0),
+            "removed": int(preclassified_counts.get("removed") or 0),
+            "unchanged": int(preclassified_counts.get("unchanged") or 0),
+            "invalid": int(preclassified_counts.get("invalid") or invalid_sources),
+            "reingested": int(preclassified_counts.get("reingested") or len(entries)),
+        },
         "timings": dict(timings),
     }
 
@@ -9944,6 +10416,12 @@ def td_perf_build_surface_grid(
     np = _td_perf_import_numpy()
     if not all(math.isfinite(float(v)) for v in (x1_min, x1_max, x2_min, x2_max)):
         return {"x1_grid": [], "x2_grid": [], "z_grid": []}
+    if (
+        td_perf_normalize_fit_mode(model.get("fit_family")) == TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD
+        and control_period not in (None, "")
+        and not _td_perf_surface_control_period_in_domain(model, control_period)
+    ):
+        return {"x1_grid": [], "x2_grid": [], "z_grid": []}
     xs = np.linspace(float(x1_min), float(x1_max), max(2, int(points)))
     ys = np.linspace(float(x2_min), float(x2_max), max(2, int(points)))
     xg, yg = np.meshgrid(xs, ys)
@@ -10834,6 +11312,134 @@ def _td_perf_surface_solve_linear_system(design, y_values):
     return coeffs, solver, cond_number, ridge_alpha
 
 
+def _td_perf_analyze_quadratic_surface_control_period_fit_support(
+    x1s: list[float],
+    x2s: list[float],
+    ys: list[float],
+    control_periods: Sequence[float],
+    *,
+    fit_mode: str,
+) -> dict[str, object]:
+    np = _td_perf_import_numpy()
+    diagnostics: dict[str, object] = {
+        "eligible_control_period_values": [],
+        "ignored_control_periods": [],
+        "slice_models": [],
+        "slice_rows": [],
+        "x1_center": 0.0,
+        "x1_scale": 1.0,
+        "x2_center": 0.0,
+        "x2_scale": 1.0,
+    }
+    if len(x1s) != len(x2s) or len(x1s) != len(ys) or len(x1s) != len(control_periods):
+        return diagnostics
+    x1_arr = np.asarray([float(v) for v in x1s], dtype=float)
+    x2_arr = np.asarray([float(v) for v in x2s], dtype=float)
+    y_arr = np.asarray([float(v) for v in ys], dtype=float)
+    cp_arr = np.asarray([float(v) for v in control_periods], dtype=float)
+    if not bool(np.all(np.isfinite(x1_arr) & np.isfinite(x2_arr) & np.isfinite(y_arr) & np.isfinite(cp_arr))):
+        return diagnostics
+    if len(x1_arr) < 6:
+        return diagnostics
+
+    cp_groups: dict[float, list[int]] = {}
+    for idx, cp_value in enumerate(cp_arr.tolist()):
+        cp_groups.setdefault(round(float(cp_value), 12), []).append(idx)
+
+    x1n_all, x2n_all, x1_center, x1_scale, x2_center, x2_scale = _td_perf_surface_normalize_axes(x1_arr, x2_arr)
+    diagnostics.update(
+        {
+            "x1_center": float(x1_center),
+            "x1_scale": float(x1_scale),
+            "x2_center": float(x2_center),
+            "x2_scale": float(x2_scale),
+        }
+    )
+
+    slice_rows: list[dict[str, object]] = []
+    slice_models: list[dict[str, object]] = []
+    eligible_control_period_values: list[float] = []
+    ignored_control_periods: list[dict[str, object]] = []
+    for cp_value in sorted(float(v) for v in cp_groups.keys()):
+        idxs = cp_groups.get(round(float(cp_value), 12), [])
+        slice_x1 = x1_arr[idxs]
+        slice_x2 = x2_arr[idxs]
+        slice_y = y_arr[idxs]
+        point_count = int(len(idxs))
+        distinct_x1 = len({round(float(v), 12) for v in slice_x1.tolist()})
+        distinct_x2 = len({round(float(v), 12) for v in slice_x2.tolist()})
+        reason = _td_perf_surface_control_period_reason(
+            point_count=point_count,
+            distinct_x1=distinct_x1,
+            distinct_x2=distinct_x2,
+        )
+        row = {
+            "control_period": float(cp_value),
+            "point_count": point_count,
+            "distinct_x1": int(distinct_x1),
+            "distinct_x2": int(distinct_x2),
+            "eligible": not bool(reason),
+            "reason": reason,
+        }
+        if reason:
+            ignored_control_periods.append(dict(row))
+            slice_rows.append(dict(row))
+            continue
+        slice_x1n = np.asarray([float(x1n_all[idx]) for idx in idxs], dtype=float)
+        slice_x2n = np.asarray([float(x2n_all[idx]) for idx in idxs], dtype=float)
+        slice_design = _td_perf_surface_design_matrix(slice_x1n, slice_x2n, TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE)
+        slice_model = _td_perf_fit_quadratic_surface_iterative(
+            slice_x1,
+            slice_x2,
+            slice_y,
+            fit_mode=fit_mode,
+            x1n=slice_x1n,
+            x2n=slice_x2n,
+            x1_center=x1_center,
+            x1_scale=x1_scale,
+            x2_center=x2_center,
+            x2_scale=x2_scale,
+            design=slice_design,
+        )
+        coeff_list = [float(v) for v in (slice_model.get("coeffs") or [])] if isinstance(slice_model, dict) else []
+        if not isinstance(slice_model, dict) or len(coeff_list) != 6:
+            row["eligible"] = False
+            row["reason"] = _td_perf_surface_control_period_reason(
+                point_count=point_count,
+                distinct_x1=distinct_x1,
+                distinct_x2=distinct_x2,
+                fit_failed=True,
+            )
+            ignored_control_periods.append(dict(row))
+            slice_rows.append(dict(row))
+            continue
+        eligible_control_period_values.append(float(cp_value))
+        row["eligible"] = True
+        row["reason"] = ""
+        slice_rows.append(dict(row))
+        slice_models.append(
+            {
+                "control_period": float(cp_value),
+                "coeffs": coeff_list,
+                "solver": str(slice_model.get("solver") or ""),
+                "condition_number": float(slice_model.get("condition_number") or 0.0),
+                "point_count": point_count,
+                "distinct_x1": int(distinct_x1),
+                "distinct_x2": int(distinct_x2),
+            }
+        )
+
+    diagnostics.update(
+        {
+            "eligible_control_period_values": [float(v) for v in eligible_control_period_values],
+            "ignored_control_periods": ignored_control_periods,
+            "slice_models": slice_models,
+            "slice_rows": slice_rows,
+        }
+    )
+    return diagnostics
+
+
 def _td_perf_fit_quadratic_surface_control_period_model(
     x1s: list[float],
     x2s: list[float],
@@ -10854,57 +11460,24 @@ def _td_perf_fit_quadratic_surface_control_period_model(
     if len(x1_arr) < 6:
         return None
 
-    cp_groups: dict[float, list[int]] = {}
-    for idx, cp_value in enumerate(cp_arr.tolist()):
-        cp_groups.setdefault(round(float(cp_value), 12), []).append(idx)
-    cp_values = sorted(float(v) for v in cp_groups.keys())
-    if len(cp_values) < 2:
+    support = _td_perf_analyze_quadratic_surface_control_period_fit_support(
+        x1s,
+        x2s,
+        ys,
+        control_periods,
+        fit_mode=fit_mode,
+    )
+    cp_values = [float(v) for v in (support.get("eligible_control_period_values") or [])]
+    slice_models = [dict(item) for item in (support.get("slice_models") or []) if isinstance(item, Mapping)]
+    ignored_control_periods = [dict(item) for item in (support.get("ignored_control_periods") or []) if isinstance(item, Mapping)]
+    x1_center = float(support.get("x1_center") or 0.0)
+    x1_scale = float(support.get("x1_scale") or 1.0)
+    x2_center = float(support.get("x2_center") or 0.0)
+    x2_scale = float(support.get("x2_scale") or 1.0)
+    if len(cp_values) < 2 or len(slice_models) < 2:
         return None
 
-    x1n_all, x2n_all, x1_center, x1_scale, x2_center, x2_scale = _td_perf_surface_normalize_axes(x1_arr, x2_arr)
-    slice_models: list[dict[str, object]] = []
-    coeff_rows: list[list[float]] = []
-    for cp_value in cp_values:
-        idxs = cp_groups.get(round(float(cp_value), 12), [])
-        if len(idxs) < 6:
-            return None
-        slice_x1 = x1_arr[idxs]
-        slice_x2 = x2_arr[idxs]
-        slice_y = y_arr[idxs]
-        if len({round(float(v), 12) for v in slice_x1.tolist()}) < 2:
-            return None
-        if len({round(float(v), 12) for v in slice_x2.tolist()}) < 2:
-            return None
-        slice_x1n = np.asarray([float(x1n_all[idx]) for idx in idxs], dtype=float)
-        slice_x2n = np.asarray([float(x2n_all[idx]) for idx in idxs], dtype=float)
-        slice_design = _td_perf_surface_design_matrix(slice_x1n, slice_x2n, TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE)
-        slice_model = _td_perf_fit_quadratic_surface_iterative(
-            slice_x1,
-            slice_x2,
-            slice_y,
-            fit_mode=fit_mode,
-            x1n=slice_x1n,
-            x2n=slice_x2n,
-            x1_center=x1_center,
-            x1_scale=x1_scale,
-            x2_center=x2_center,
-            x2_scale=x2_scale,
-            design=slice_design,
-        )
-        if not isinstance(slice_model, dict):
-            return None
-        coeff_list = [float(v) for v in (slice_model.get("coeffs") or [])]
-        if len(coeff_list) != 6:
-            return None
-        coeff_rows.append(coeff_list)
-        slice_models.append(
-            {
-                "control_period": float(cp_value),
-                "coeffs": coeff_list,
-                "solver": str(slice_model.get("solver") or ""),
-                "condition_number": float(slice_model.get("condition_number") or 0.0),
-            }
-        )
+    coeff_rows = [[float(v) for v in (slice_model.get("coeffs") or [])] for slice_model in slice_models]
 
     cp_norm, cp_center, cp_scale = _td_perf_surface_normalize_control_period(cp_values)
     cp_degree = 1 if len(cp_values) == 2 else 2
@@ -10940,12 +11513,14 @@ def _td_perf_fit_quadratic_surface_control_period_model(
         "cp_scale": float(cp_scale),
         "control_period_degree": int(cp_degree),
         "control_period_values": [float(v) for v in cp_values],
+        "eligible_control_period_values": [float(v) for v in cp_values],
+        "ignored_control_periods": [dict(entry) for entry in ignored_control_periods],
         "fit_domain_control_period": [float(min(cp_values)), float(max(cp_values))],
         "coeff_cp_models": [[float(v) for v in coeffs] for coeffs in coeff_cp_models],
     }
     for basis_idx, coeffs in enumerate(coeff_cp_models):
         params[f"basis_{basis_idx}_cp_coeffs"] = [float(v) for v in coeffs]
-    return _td_perf_finalize_model(
+    model = _td_perf_finalize_model(
         fit_family=TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD,
         fit_mode=fit_mode,
         equation=_td_perf_fmt_surface_control_period_equation(coeff_cp_models),
@@ -10974,12 +11549,18 @@ def _td_perf_fit_quadratic_surface_control_period_model(
             "cp_center": float(cp_center),
             "cp_scale": float(cp_scale),
             "control_period_values": [float(v) for v in cp_values],
+            "eligible_control_period_values": [float(v) for v in cp_values],
+            "ignored_control_periods": [dict(entry) for entry in ignored_control_periods],
             "control_period_degree": int(cp_degree),
             "fit_domain_control_period": [float(min(cp_values)), float(max(cp_values))],
             "slice_models": slice_models,
             "solver": "slice_polyfit",
         },
     )
+    warning_text = _td_perf_format_surface_control_period_warning(ignored_control_periods)
+    if warning_text:
+        _td_perf_append_fit_warning(model, warning_text)
+    return model
 
 
 def _td_perf_fit_quadratic_surface_iterative(
@@ -12097,6 +12678,7 @@ def _td_perf_serializable_results(results_by_stat: Mapping[str, Mapping[str, obj
             "input1_units": str(result.get("input1_units") or result.get("x_units") or "").strip(),
             "input2_units": str(result.get("input2_units") or "").strip(),
             "selected_control_period": result.get("selected_control_period"),
+            "fit_warning_text": str(result.get("fit_warning_text") or "").strip(),
             "master_model": _td_perf_serializable_model((result.get("master_model") or {}) if isinstance(result, Mapping) else {}),
         }
     return out
@@ -12402,6 +12984,7 @@ def td_perf_collect_saved_equation_snapshot(
     results: dict[str, dict[str, object]] = {}
     contributing_serials: set[str] = set()
     fit_error_text = ""
+    fit_warning_text = ""
     pair_label = f"{output_target} vs {input1_target},{input2_target}" if is_surface else f"{output_target} vs {input1_target}"
     for stat in equation_stats:
         if is_surface:
@@ -12510,6 +13093,21 @@ def td_perf_collect_saved_equation_snapshot(
                         raise RuntimeError("Quadratic Surface + Control Period requires pulsed-mode data.")
                     if use_cp_surface and invalid_control_period_seen:
                         raise RuntimeError("Quadratic Surface + Control Period requires usable control-period values for all fitted pulsed-mode points.")
+                    cp_support = (
+                        _td_perf_analyze_quadratic_surface_control_period_fit_support(
+                            pooled_x1,
+                            pooled_x2,
+                            pooled_y,
+                            pooled_cp,
+                            fit_mode=(
+                                TD_PERF_FIT_MODE_AUTO_SURFACE
+                                if surface_family == TD_PERF_FIT_MODE_AUTO_SURFACE
+                                else TD_PERF_FIT_MODE_POLYNOMIAL_SURFACE
+                            ),
+                        )
+                        if use_cp_surface
+                        else {}
+                    )
                     fitted = td_perf_fit_surface_model(
                         pooled_x1,
                         pooled_x2,
@@ -12531,9 +13129,21 @@ def td_perf_collect_saved_equation_snapshot(
                                     control_period=selected_control_period,
                                 )
                             )
+                        if use_cp_surface:
+                            domain_warning = _td_perf_surface_control_period_out_of_domain_warning(fitted, selected_control_period)
+                            if domain_warning:
+                                _td_perf_append_fit_warning(fitted, domain_warning)
+                            warning_text = str(fitted.get("fit_warning_text") or "").strip()
+                            if warning_text and not fit_warning_text:
+                                fit_warning_text = warning_text
                         master_model = fitted
                     elif use_cp_surface:
-                        raise RuntimeError("Quadratic Surface + Control Period requires at least two distinct control periods with valid surface coverage.")
+                        raise RuntimeError(
+                            _td_perf_format_surface_control_period_failure(
+                                cp_support.get("ignored_control_periods") or [],
+                                eligible_count=len(cp_support.get("eligible_control_period_values") or []),
+                            )
+                        )
                 except Exception as exc:
                     if not fit_error_text:
                         fit_error_text = str(exc)
@@ -12552,6 +13162,7 @@ def td_perf_collect_saved_equation_snapshot(
                 "selected_control_period": selected_control_period,
                 "points_3d": points_3d,
                 "master_model": master_model,
+                "fit_warning_text": str(master_model.get("fit_warning_text") or "").strip(),
             }
         else:
             per_run_2d: list[tuple[str, str, dict[str, dict], dict[str, dict], str, str]] = []
@@ -12673,6 +13284,8 @@ def td_perf_collect_saved_equation_snapshot(
     }
     if fit_error_text:
         plot_metadata["fit_error_text"] = fit_error_text
+    if fit_warning_text:
+        plot_metadata["fit_warning_text"] = fit_warning_text
 
     return {
         "plot_metadata": plot_metadata,
@@ -14192,6 +14805,11 @@ def update_test_data_trending_project_workbook(
         pass
 
     # Save any migration/creation before rebuilding cache (cache rebuild reads workbook from disk).
+    cache_sync_payload: dict[str, object] = {
+        "mode": "noop",
+        "counts": {},
+        "reason": "",
+    }
     if not dry_run:
         _td_emit_progress(progress_cb, "Saving workbook before cache validation")
         t0 = time.perf_counter()
@@ -14199,53 +14817,13 @@ def update_test_data_trending_project_workbook(
         timings["pre_cache_workbook_save_s"] = round(time.perf_counter() - t0, 3)
         _td_emit_progress(progress_cb, "Ensuring project cache")
         t0 = time.perf_counter()
-        if require_existing_cache and not cache_missing:
-            db_path = validate_existing_test_data_project_cache(project_dir, wb_path)
-            cached_support_mtime_ns = 0
-            cached_stats_csv = ""
-            cached_raw_cols_csv = ""
-            cached_serials: set[str] = set()
-            try:
-                with sqlite3.connect(str(db_path)) as cache_conn:
-                    row = cache_conn.execute("SELECT value FROM td_meta WHERE key='support_workbook_mtime_ns' LIMIT 1").fetchone()
-                    cached_support_mtime_ns = int(str(row[0]).strip()) if row and row[0] is not None else 0
-                    row = cache_conn.execute("SELECT value FROM td_meta WHERE key='statistics' LIMIT 1").fetchone()
-                    cached_stats_csv = str(row[0] or "").strip() if row and row[0] is not None else ""
-                    row = cache_conn.execute("SELECT value FROM td_meta WHERE key='raw_columns' LIMIT 1").fetchone()
-                    cached_raw_cols_csv = str(row[0] or "").strip() if row and row[0] is not None else ""
-                    cached_serials = {
-                        str(row[0] or "").strip()
-                        for row in cache_conn.execute("SELECT serial FROM td_sources").fetchall()
-                        if str(row[0] or "").strip()
-                    }
-            except Exception:
-                cached_support_mtime_ns = 0
-                cached_stats_csv = ""
-                cached_raw_cols_csv = ""
-                cached_serials = set()
-
-            current_stats_csv = ",".join(_td_normalize_selected_stats(project_cfg.get("statistics")))
-            current_raw_cols_csv = ",".join(cfg_order)
-            support_mtime_ns = 0
-            try:
-                support_path = td_support_workbook_path_for(wb_path, project_dir=project_dir)
-                if support_path.exists():
-                    st = support_path.stat()
-                    support_mtime_ns = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)))
-            except Exception:
-                support_mtime_ns = 0
-
-            if set(serials) != cached_serials or bool(added_serials) or cached_raw_cols_csv != current_raw_cols_csv:
-                db_path = ensure_test_data_project_cache(project_dir, wb_path, rebuild=False, progress_cb=progress_cb)
-            elif cached_stats_csv != current_stats_csv or int(cached_support_mtime_ns) != int(support_mtime_ns):
-                _rebuild_test_data_project_calc_cache_from_raw(db_path, wb_path, progress_cb=progress_cb)
-        else:
-            db_path = ensure_test_data_project_cache(
-                project_dir,
-                wb_path,
-                rebuild=bool(cache_missing or not require_existing_cache),
-                progress_cb=progress_cb,
-            )
+        cache_sync_payload = sync_test_data_project_cache(
+            project_dir,
+            wb_path,
+            rebuild=False,
+            progress_cb=progress_cb,
+        )
+        db_path = Path(str(cache_sync_payload.get("db_path") or db_path)).expanduser()
         timings["cache_ensure_s"] = round(time.perf_counter() - t0, 3)
 
     def _parse_metric(s: object) -> tuple[str, str, str] | None:
@@ -14558,6 +15136,9 @@ def update_test_data_trending_project_workbook(
         "serials_added": int(len(added_serials)),
         "added_serials": list(added_serials),
         "dry_run": bool(dry_run),
+        "cache_sync_mode": str(cache_sync_payload.get("mode") or ""),
+        "cache_sync_counts": dict(cache_sync_payload.get("counts") or {}),
+        "cache_sync_reason": str(cache_sync_payload.get("reason") or ""),
         "saved_equation_refresh": saved_equation_refresh,
         "timings": dict(timings),
         "debug_json": json.dumps({"timings_s": timings}, separators=(",", ":")),

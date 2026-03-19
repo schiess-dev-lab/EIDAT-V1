@@ -775,7 +775,7 @@ class TestTDTrendDialogCacheLoading(unittest.TestCase):
         self.assertIn("build failed", str(warning_mock.call_args.args[2]))
         self.assertEqual(harness.lbl_cache.text(), "Cache DB: unavailable")
 
-    def test_load_cache_rebuild_path_still_uses_smart_ensure(self) -> None:
+    def test_load_cache_rebuild_path_uses_project_update_pipeline(self) -> None:
         _qt_app()
         from PySide6 import QtWidgets
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
@@ -799,16 +799,23 @@ class TestTDTrendDialogCacheLoading(unittest.TestCase):
         )
         load_cache = TestDataTrendDialog._load_cache.__get__(harness, _Harness)
         fake_db = harness._project_dir / "implementation_trending.sqlite3"
+        fake_repo = Path("C:/tmp/repo")
+        fake_payload = {"db_path": str(fake_db)}
 
-        with mock.patch.object(be, "ensure_test_data_project_cache", return_value=fake_db) as ensure_mock:
-            with mock.patch.object(QtWidgets.QMessageBox, "warning") as warning_mock:
-                load_cache(rebuild=True)
+        with mock.patch.object(be, "resolve_test_data_project_global_repo", return_value=fake_repo) as repo_mock:
+            with mock.patch.object(be, "update_test_data_trending_project_workbook", return_value=fake_payload) as update_mock:
+                with mock.patch.object(QtWidgets.QMessageBox, "warning") as warning_mock:
+                    load_cache(rebuild=True)
 
         warning_mock.assert_not_called()
-        ensure_mock.assert_called_once_with(
+        repo_mock.assert_called_once_with(
             harness._project_dir,
             harness._workbook_path,
-            rebuild=True,
+        )
+        update_mock.assert_called_once_with(
+            fake_repo,
+            harness._workbook_path,
+            overwrite=False,
         )
         self.assertEqual(harness._db_path, fake_db)
         self.assertEqual(harness._refresh_from_cache_calls, 1)
@@ -2820,6 +2827,250 @@ class TestTDSupportWorkbook(unittest.TestCase):
             self.assertEqual(db_path, root / "implementation_trending.sqlite3")
             rebuild_mock.assert_called_once_with(root / "implementation_trending.sqlite3", wb_path, progress_cb=None)
             calc_mock.assert_not_called()
+
+    def test_sync_cache_noops_when_inputs_are_unchanged(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            src_db = root / "src.sqlite3"
+            self._make_source_sqlite(src_db)
+
+            wb_path = root / "project.xlsx"
+            be._write_test_data_trending_workbook(
+                wb_path,
+                global_repo=root,
+                serials=["SN1"],
+                docs=[{"serial_number": "SN1", "excel_sqlite_rel": str(src_db)}],
+                config=self._make_config(),
+            )
+            support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+            be._write_td_support_workbook(
+                support_path,
+                sequence_names=["RunA"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+            )
+            be.ensure_test_data_project_cache(root, wb_path, rebuild=True)
+
+            with mock.patch.object(be, "rebuild_test_data_project_cache") as rebuild_mock:
+                with mock.patch.object(be, "_rebuild_test_data_project_calc_cache_from_raw") as calc_mock:
+                    payload = be.sync_test_data_project_cache(root, wb_path)
+
+            self.assertEqual(str(payload.get("mode") or ""), "noop")
+            rebuild_mock.assert_not_called()
+            calc_mock.assert_not_called()
+
+    def test_sync_cache_incremental_reingests_only_changed_serial(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            src_db_1 = root / "src1.sqlite3"
+            src_db_2 = root / "src2.sqlite3"
+            self._make_source_sqlite(src_db_1)
+            self._make_source_sqlite(src_db_2)
+
+            wb_path = root / "project.xlsx"
+            be._write_test_data_trending_workbook(
+                wb_path,
+                global_repo=root,
+                serials=["SN1", "SN2"],
+                docs=[
+                    {"serial_number": "SN1", "excel_sqlite_rel": str(src_db_1)},
+                    {"serial_number": "SN2", "excel_sqlite_rel": str(src_db_2)},
+                ],
+                config=self._make_config(),
+            )
+            support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+            be._write_td_support_workbook(
+                support_path,
+                sequence_names=["RunA"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+            )
+            be.ensure_test_data_project_cache(root, wb_path, rebuild=True)
+
+            with sqlite3.connect(str(root / "implementation_trending.sqlite3")) as conn:
+                before = {
+                    str(serial or ""): int(epoch or 0)
+                    for serial, epoch in conn.execute(
+                        "SELECT serial, last_ingested_epoch_ns FROM td_sources ORDER BY serial"
+                    ).fetchall()
+                }
+
+            time.sleep(0.05)
+            src_db_1.unlink()
+            self._make_source_sqlite_with_rows(
+                src_db_1,
+                [
+                    (1, 0.0, 100.0, 5.0, 11.0),
+                    (2, 1.0, 100.0, 5.0, 22.0),
+                    (3, 2.0, 100.0, 5.0, 33.0),
+                    (4, 3.0, 100.0, 5.0, 44.0),
+                    (5, 4.0, 100.0, 5.0, 55.0),
+                    (6, 5.0, 100.0, 5.0, 66.0),
+                ],
+            )
+
+            payload = be.sync_test_data_project_cache(root, wb_path)
+            self.assertEqual(str(payload.get("mode") or ""), "incremental_raw")
+            counts = payload.get("counts") or {}
+            self.assertEqual(int(counts.get("changed") or 0), 1)
+            self.assertEqual(int(counts.get("reingested") or 0), 1)
+
+            with sqlite3.connect(str(root / "implementation_trending.sqlite3")) as conn:
+                after = {
+                    str(serial or ""): int(epoch or 0)
+                    for serial, epoch in conn.execute(
+                        "SELECT serial, last_ingested_epoch_ns FROM td_sources ORDER BY serial"
+                    ).fetchall()
+                }
+            self.assertGreater(after["SN1"], before["SN1"])
+            self.assertEqual(after["SN2"], before["SN2"])
+
+    def test_sync_cache_routes_added_serials_through_incremental_rebuild(self) -> None:
+        from openpyxl import load_workbook  # type: ignore
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            src_db_1 = root / "src1.sqlite3"
+            src_db_2 = root / "src2.sqlite3"
+            self._make_source_sqlite(src_db_1)
+            self._make_source_sqlite(src_db_2)
+
+            wb_path = root / "project.xlsx"
+            be._write_test_data_trending_workbook(
+                wb_path,
+                global_repo=root,
+                serials=["SN1"],
+                docs=[{"serial_number": "SN1", "excel_sqlite_rel": str(src_db_1)}],
+                config=self._make_config(),
+            )
+            support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+            be._write_td_support_workbook(
+                support_path,
+                sequence_names=["RunA"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+            )
+            be.ensure_test_data_project_cache(root, wb_path, rebuild=True)
+
+            wb = load_workbook(str(wb_path))
+            try:
+                ws = wb["Sources"]
+                ws.append(["SN2", "", "", "", "", str(src_db_2)])
+                wb.save(str(wb_path))
+            finally:
+                wb.close()
+
+            with mock.patch.object(be, "rebuild_test_data_project_cache", return_value={"db_path": str(root / "implementation_trending.sqlite3")}) as rebuild_mock:
+                payload = be.sync_test_data_project_cache(root, wb_path)
+
+            self.assertEqual(str(payload.get("mode") or ""), "incremental_raw")
+            self.assertEqual(int((payload.get("counts") or {}).get("added") or 0), 1)
+            kwargs = rebuild_mock.call_args.kwargs
+            self.assertEqual(kwargs.get("_full_reset"), False)
+            entries_override = kwargs.get("_entries_override") or []
+            self.assertEqual([str(item.get("serial") or "") for item in entries_override], ["SN2"])
+
+    def test_sync_cache_prunes_removed_serial_from_raw_and_impl(self) -> None:
+        from openpyxl import load_workbook  # type: ignore
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            src_db_1 = root / "src1.sqlite3"
+            src_db_2 = root / "src2.sqlite3"
+            self._make_source_sqlite(src_db_1)
+            self._make_source_sqlite(src_db_2)
+
+            wb_path = root / "project.xlsx"
+            be._write_test_data_trending_workbook(
+                wb_path,
+                global_repo=root,
+                serials=["SN1", "SN2"],
+                docs=[
+                    {"serial_number": "SN1", "excel_sqlite_rel": str(src_db_1)},
+                    {"serial_number": "SN2", "excel_sqlite_rel": str(src_db_2)},
+                ],
+                config=self._make_config(),
+            )
+            support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+            be._write_td_support_workbook(
+                support_path,
+                sequence_names=["RunA"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+            )
+            be.ensure_test_data_project_cache(root, wb_path, rebuild=True)
+
+            wb = load_workbook(str(wb_path))
+            try:
+                ws = wb["Sources"]
+                ws.delete_rows(3, 1)
+                wb.save(str(wb_path))
+            finally:
+                wb.close()
+
+            payload = be.sync_test_data_project_cache(root, wb_path)
+            self.assertEqual(str(payload.get("mode") or ""), "incremental_raw")
+            counts = payload.get("counts") or {}
+            self.assertEqual(int(counts.get("removed") or 0), 1)
+
+            with sqlite3.connect(str(root / "implementation_trending.sqlite3")) as conn:
+                serials = [
+                    str(row[0] or "")
+                    for row in conn.execute("SELECT serial FROM td_sources ORDER BY serial").fetchall()
+                ]
+            self.assertEqual(serials, ["SN1"])
+
+            with sqlite3.connect(str(root / "test_data_raw_cache.sqlite3")) as conn:
+                raw_serials = [
+                    str(row[0] or "")
+                    for row in conn.execute(
+                        "SELECT DISTINCT serial FROM td_curves_raw ORDER BY serial"
+                    ).fetchall()
+                ]
+            self.assertEqual(raw_serials, ["SN1"])
+
+    def test_validate_existing_cache_hard_fails_when_source_changes(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            src_db = root / "src.sqlite3"
+            self._make_source_sqlite(src_db)
+
+            wb_path = root / "project.xlsx"
+            be._write_test_data_trending_workbook(
+                wb_path,
+                global_repo=root,
+                serials=["SN1"],
+                docs=[{"serial_number": "SN1", "excel_sqlite_rel": str(src_db)}],
+                config=self._make_config(),
+            )
+            support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+            be._write_td_support_workbook(
+                support_path,
+                sequence_names=["RunA"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+            )
+            be.ensure_test_data_project_cache(root, wb_path, rebuild=True)
+
+            time.sleep(0.05)
+            src_db.unlink()
+            self._make_source_sqlite_with_rows(
+                src_db,
+                [
+                    (1, 0.0, 100.0, 5.0, 9.0),
+                    (2, 1.0, 100.0, 5.0, 19.0),
+                    (3, 2.0, 100.0, 5.0, 29.0),
+                    (4, 3.0, 100.0, 5.0, 39.0),
+                    (5, 4.0, 100.0, 5.0, 49.0),
+                    (6, 5.0, 100.0, 5.0, 59.0),
+                ],
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "Project cache is stale"):
+                be.validate_existing_test_data_project_cache(root, wb_path)
 
     def test_update_workbook_builds_missing_cache_db(self) -> None:
         from openpyxl import load_workbook  # type: ignore
@@ -4856,6 +5107,200 @@ class TestTDSupportWorkbook(unittest.TestCase):
         )
         self.assertIsNone(model)
 
+    def test_perf_fit_surface_model_control_period_skips_sparse_slices_and_records_ignored_periods(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        x1s: list[float] = []
+        x2s: list[float] = []
+        ys: list[float] = []
+        control_periods: list[float] = []
+        for cp in (60.0, 120.0):
+            c0 = 10.0 + (0.05 * cp)
+            c1 = 0.8 + (0.002 * cp)
+            c2 = -0.08 + (0.0005 * cp)
+            c3 = 0.04
+            c4 = 0.01 + (0.00002 * cp)
+            c5 = 0.002
+            for x1 in (1.0, 2.0, 3.0):
+                for x2 in (10.0, 20.0, 30.0):
+                    x1s.append(x1)
+                    x2s.append(x2)
+                    ys.append(c0 + (c1 * x1) + (c2 * x2) + (c3 * x1 * x1) + (c4 * x1 * x2) + (c5 * x2 * x2))
+                    control_periods.append(cp)
+        for x1, x2 in ((1.0, 10.0), (1.0, 20.0), (2.0, 10.0), (2.0, 20.0)):
+            cp = 180.0
+            x1s.append(x1)
+            x2s.append(x2)
+            ys.append(12.0 + (0.05 * cp) + (0.9 * x1) - (0.02 * x2) + (0.03 * x1 * x1) + (0.01 * x1 * x2))
+            control_periods.append(cp)
+
+        model = be.td_perf_fit_surface_model(
+            x1s,
+            x2s,
+            ys,
+            surface_family="quadratic_surface_control_period",
+            control_periods=control_periods,
+        )
+        self.assertIsNotNone(model)
+        self.assertEqual([float(v) for v in (model.get("eligible_control_period_values") or [])], [60.0, 120.0])
+        self.assertEqual([float(v) for v in (model.get("fit_domain_control_period") or [])], [60.0, 120.0])
+        ignored = list(model.get("ignored_control_periods") or [])
+        self.assertEqual(len(ignored), 1)
+        self.assertEqual(float(ignored[0].get("control_period") or 0.0), 180.0)
+        self.assertIn("points (<6)", str(ignored[0].get("reason") or ""))
+        self.assertIn("180", str(model.get("fit_warning_text") or ""))
+
+    def test_perf_fit_surface_model_control_period_interpolates_inside_domain_when_middle_slice_is_ignored(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        x1s: list[float] = []
+        x2s: list[float] = []
+        ys: list[float] = []
+        control_periods: list[float] = []
+        for cp in (60.0, 180.0):
+            c0 = 18.0 + (0.04 * cp)
+            c1 = 0.7 + (0.003 * cp)
+            c2 = -0.03 + (0.0004 * cp)
+            c3 = 0.05
+            c4 = 0.012 + (0.000015 * cp)
+            c5 = 0.0022
+            for x1 in (1.0, 2.0, 3.0):
+                for x2 in (8.0, 16.0, 24.0):
+                    x1s.append(x1)
+                    x2s.append(x2)
+                    ys.append(c0 + (c1 * x1) + (c2 * x2) + (c3 * x1 * x1) + (c4 * x1 * x2) + (c5 * x2 * x2))
+                    control_periods.append(cp)
+        for x1, x2 in ((1.0, 8.0), (1.0, 16.0), (2.0, 8.0), (2.0, 16.0)):
+            cp = 120.0
+            x1s.append(x1)
+            x2s.append(x2)
+            ys.append(14.0 + (0.04 * cp) + (0.8 * x1) - (0.01 * x2) + (0.04 * x1 * x1) + (0.008 * x1 * x2))
+            control_periods.append(cp)
+
+        model = be.td_perf_fit_surface_model(
+            x1s,
+            x2s,
+            ys,
+            surface_family="quadratic_surface_control_period",
+            control_periods=control_periods,
+        )
+        self.assertIsNotNone(model)
+        preds = be.td_perf_predict_surface(model, [1.0, 2.0, 3.0], [8.0, 16.0, 24.0], control_period=120.0)
+        self.assertEqual(len(preds), 3)
+        self.assertTrue(all(math.isfinite(float(v)) for v in preds))
+        grid = be.td_perf_build_surface_grid(model, 1.0, 3.0, 8.0, 24.0, points=4, control_period=120.0)
+        self.assertTrue(grid.get("z_grid"))
+
+    def test_perf_build_surface_grid_control_period_outside_fit_domain_returns_empty_grid(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        x1s: list[float] = []
+        x2s: list[float] = []
+        ys: list[float] = []
+        control_periods: list[float] = []
+        for cp in (60.0, 120.0):
+            for x1 in (1.0, 2.0, 3.0):
+                for x2 in (10.0, 20.0, 30.0):
+                    x1s.append(x1)
+                    x2s.append(x2)
+                    ys.append(20.0 + (0.06 * cp) + x1 - (0.03 * x2) + (0.02 * x1 * x2))
+                    control_periods.append(cp)
+        for x1, x2 in ((1.0, 10.0), (1.0, 20.0), (2.0, 10.0), (2.0, 20.0)):
+            cp = 180.0
+            x1s.append(x1)
+            x2s.append(x2)
+            ys.append(15.0 + (0.03 * cp) + x1 - (0.01 * x2))
+            control_periods.append(cp)
+
+        model = be.td_perf_fit_surface_model(
+            x1s,
+            x2s,
+            ys,
+            surface_family="quadratic_surface_control_period",
+            control_periods=control_periods,
+        )
+        self.assertIsNotNone(model)
+        grid = be.td_perf_build_surface_grid(model, 1.0, 3.0, 10.0, 30.0, points=4, control_period=180.0)
+        self.assertEqual(grid.get("x1_grid"), [])
+        self.assertEqual(grid.get("x2_grid"), [])
+        self.assertEqual(grid.get("z_grid"), [])
+
+    @unittest.skipUnless(_have_openpyxl(), "openpyxl not installed")
+    def test_perf_collect_saved_equation_snapshot_reports_descriptive_cp_coverage_failure(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            rows: list[tuple[str, str, float, float, float, float | None]] = []
+            cp = 60.0
+            for x1 in (1.0, 2.0, 3.0):
+                for x2 in (10.0, 20.0, 30.0):
+                    rows.append(("SN1", "RunCP", x1, x2, 18.0 + (0.04 * cp) + x1 - (0.03 * x2) + (0.01 * x1 * x2), cp))
+            cp = 120.0
+            for x1, x2 in ((1.0, 10.0), (1.0, 20.0), (2.0, 10.0), (2.0, 20.0)):
+                rows.append(("SN1", "RunCP", x1, x2, 18.0 + (0.04 * cp) + x1 - (0.03 * x2), cp))
+            db_path = self._seed_perf_export_db_3d(root, rows=rows)
+            self._seed_perf_source_metadata(db_path, [("SN1", "Thruster", "Hall_A")])
+
+            snapshot = be.td_perf_collect_saved_equation_snapshot(
+                db_path,
+                {
+                    "output": "thrust",
+                    "input1": "impulse bit",
+                    "input2": "feed pressure",
+                    "member_runs": ["RunCP"],
+                    "stats": ["mean"],
+                    "fit_enabled": True,
+                    "surface_fit_family": "quadratic_surface_control_period",
+                    "performance_run_type_mode": "pulsed_mode",
+                    "performance_filter_mode": "all_conditions",
+                    "require_min_points": 2,
+                },
+            )
+            fit_error_text = str(((snapshot.get("plot_metadata") or {}).get("fit_error_text") or "")).strip()
+            self.assertIn("Eligible periods: 0", fit_error_text)
+            self.assertIn("CP 60", fit_error_text)
+            self.assertIn("CP 120", fit_error_text)
+            self.assertIn("points (<6)", fit_error_text)
+
+    @unittest.skipUnless(_have_openpyxl(), "openpyxl not installed")
+    def test_perf_collect_saved_equation_snapshot_keeps_invalid_control_period_error(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            rows = [
+                ("SN1", "RunCP", 1.0, 10.0, 20.0, 60.0),
+                ("SN2", "RunCP", 1.0, 20.0, 21.0, 60.0),
+                ("SN1", "RunCP", 2.0, 10.0, 22.0, 60.0),
+                ("SN2", "RunCP", 2.0, 20.0, 23.0, 60.0),
+                ("SN1", "RunCP", 3.0, 20.0, 24.0, None),
+                ("SN2", "RunCP", 3.0, 30.0, 25.0, 120.0),
+            ]
+            db_path = self._seed_perf_export_db_3d(root, rows=rows)
+            self._seed_perf_source_metadata(db_path, [("SN1", "Thruster", "Hall_A"), ("SN2", "Thruster", "Hall_A")])
+
+            snapshot = be.td_perf_collect_saved_equation_snapshot(
+                db_path,
+                {
+                    "output": "thrust",
+                    "input1": "impulse bit",
+                    "input2": "feed pressure",
+                    "member_runs": ["RunCP"],
+                    "stats": ["mean"],
+                    "fit_enabled": True,
+                    "surface_fit_family": "quadratic_surface_control_period",
+                    "performance_run_type_mode": "pulsed_mode",
+                    "performance_filter_mode": "all_conditions",
+                    "require_min_points": 2,
+                },
+            )
+            fit_error_text = str(((snapshot.get("plot_metadata") or {}).get("fit_error_text") or "")).strip()
+            self.assertEqual(
+                fit_error_text,
+                "Quadratic Surface + Control Period requires usable control-period values for all fitted pulsed-mode points.",
+            )
+
     @unittest.skipUnless(_have_openpyxl(), "openpyxl not installed")
     @unittest.skipUnless(_have_scipy(), "scipy not installed")
     def test_perf_export_equation_workbook_writes_2d_formulas_actual_mean_and_support(self) -> None:
@@ -5613,6 +6058,50 @@ class TestTDSupportWorkbook(unittest.TestCase):
         self.assertIsInstance(harness._last_plot_def, dict)
         for key in ("x_band_min", "x_band_max", "y_band_min", "y_band_max"):
             self.assertNotIn(key, harness._last_plot_def)
+
+    @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
+    def test_plot_performance_surfaces_cp_fit_warning_as_plot_note(self) -> None:
+        harness = _PlotPerformanceHarness()
+        harness._perf_collect_results = lambda *args, **kwargs: (
+            {
+                "mean": {
+                    "plot_dimension": "2d",
+                    "master_model": {"fit_warning_text": "Ignored control periods for CP-surface fit: CP 180: 4 points, 2 distinct x1, 2 distinct x2 (4 points (<6))"},
+                    "curves": {"SN1": [(1.0, 2.0, "RunA"), (2.0, 3.0, "RunA")]},
+                    "fit_warning_text": "Ignored control periods for CP-surface fit: CP 180: 4 points, 2 distinct x1, 2 distinct x2 (4 points (<6))",
+                }
+            },
+            ["mean"],
+            "",
+        )
+        from PySide6 import QtWidgets
+
+        with mock.patch.object(QtWidgets.QMessageBox, "warning") as warning_mock:
+            harness._plot_performance()
+        warning_mock.assert_not_called()
+        self.assertIn("Ignored control periods", harness._plot_note)
+
+    @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
+    def test_plot_performance_blocks_fit_error_only_when_no_master_model(self) -> None:
+        harness = _PlotPerformanceHarness()
+        message = "Quadratic Surface + Control Period requires at least two distinct control periods with valid surface coverage. Eligible periods: 1. CP 120: 4 points, 2 distinct x1, 2 distinct x2 (4 points (<6))"
+        harness._perf_collect_results = lambda *args, **kwargs: (
+            {
+                "mean": {
+                    "plot_dimension": "2d",
+                    "master_model": {},
+                    "curves": {"SN1": [(1.0, 2.0, "RunA"), (2.0, 3.0, "RunA")]},
+                }
+            },
+            ["mean"],
+            message,
+        )
+        from PySide6 import QtWidgets
+
+        with mock.patch.object(QtWidgets.QMessageBox, "warning") as warning_mock:
+            harness._plot_performance()
+        warning_mock.assert_called_once()
+        self.assertIn("Eligible periods: 1", str(warning_mock.call_args.args[2]))
 
     @unittest.skipUnless(_have_matplotlib(), "matplotlib not installed")
     def test_render_plot_def_ignores_legacy_band_keys(self) -> None:

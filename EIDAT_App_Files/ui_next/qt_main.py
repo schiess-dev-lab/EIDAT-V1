@@ -4555,11 +4555,13 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         if not hasattr(self, "_report_progress"):
             try:
                 if rebuild:
-                    self._db_path = be.ensure_test_data_project_cache(
-                        self._project_dir,
+                    repo = be.resolve_test_data_project_global_repo(self._project_dir, self._workbook_path)
+                    payload = be.update_test_data_trending_project_workbook(
+                        repo,
                         self._workbook_path,
-                        rebuild=True,
+                        overwrite=False,
                     )
+                    self._db_path = Path(str(payload.get("db_path") or "")).expanduser()
                 else:
                     self._db_path = be.validate_existing_test_data_project_cache(
                         self._project_dir,
@@ -4586,12 +4588,14 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         def _task(report):
             report(self._cache_progress_status)
             if rebuild:
-                return be.ensure_test_data_project_cache(
-                    self._project_dir,
+                repo = be.resolve_test_data_project_global_repo(self._project_dir, self._workbook_path)
+                payload = be.update_test_data_trending_project_workbook(
+                    repo,
                     self._workbook_path,
-                    rebuild=True,
+                    overwrite=False,
                     progress_cb=report,
                 )
+                return Path(str(payload.get("db_path") or "")).expanduser()
             return be.validate_existing_test_data_project_cache(
                 self._project_dir,
                 self._workbook_path,
@@ -7632,6 +7636,18 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 grid = {}
             if isinstance(grid, dict):
                 model.update(grid)
+        cp_surface_family = str(getattr(be, "TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD", "quadratic_surface_control_period"))
+        if str(model.get("fit_family") or "").strip().lower() == cp_surface_family:
+            domain_warning_fn = getattr(be, "_td_perf_surface_control_period_out_of_domain_warning", None)
+            append_warning_fn = getattr(be, "_td_perf_append_fit_warning", None)
+            if callable(domain_warning_fn):
+                domain_warning = str(domain_warning_fn(model, display_control_period) or "").strip()
+                if domain_warning:
+                    if callable(append_warning_fn):
+                        append_warning_fn(model, domain_warning)
+                    else:
+                        existing = str(model.get("fit_warning_text") or "").strip()
+                        model["fit_warning_text"] = "\n".join([part for part in [existing, domain_warning] if part])
         return model
 
     def _perf_current_col_name(self, cb: QtWidgets.QComboBox) -> str:
@@ -8102,6 +8118,21 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                             raise RuntimeError("Quadratic Surface + Control Period requires pulsed-mode data.")
                         if use_cp_surface and invalid_control_period_seen:
                             raise RuntimeError("Quadratic Surface + Control Period requires usable control-period values for all fitted pulsed-mode points.")
+                        cp_support = {}
+                        if use_cp_surface:
+                            support_fn = getattr(be, "_td_perf_analyze_quadratic_surface_control_period_fit_support", None)
+                            if callable(support_fn):
+                                cp_support = support_fn(
+                                    pooled_x1,
+                                    pooled_x2,
+                                    pooled_y,
+                                    pooled_cp,
+                                    fit_mode=(
+                                        str(getattr(be, "TD_PERF_FIT_MODE_AUTO_SURFACE", "auto_surface"))
+                                        if surface_family == str(getattr(be, "TD_PERF_FIT_MODE_AUTO_SURFACE", "auto_surface"))
+                                        else str(getattr(be, "TD_PERF_FIT_MODE_POLYNOMIAL_SURFACE", "polynomial_surface"))
+                                    ),
+                                )
                         model = self._perf_fit_surface_for_points(
                             pooled_x1,
                             pooled_x2,
@@ -8110,6 +8141,14 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                             display_control_period=display_control_period,
                         )
                         if use_cp_surface and not isinstance(model, dict):
+                            failure_fn = getattr(be, "_td_perf_format_surface_control_period_failure", None)
+                            if callable(failure_fn):
+                                raise RuntimeError(
+                                    failure_fn(
+                                        cp_support.get("ignored_control_periods") or [],
+                                        eligible_count=len(cp_support.get("eligible_control_period_values") or []),
+                                    )
+                                )
                             raise RuntimeError("Quadratic Surface + Control Period requires at least two distinct control periods with valid surface coverage.")
                     except Exception as exc:
                         if not fit_error_text:
@@ -8135,6 +8174,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     "selected_control_period": display_control_period,
                     "points_3d": points_3d,
                     "master_model": master_model,
+                    "fit_warning_text": str(master_model.get("fit_warning_text") or "").strip(),
                     "highlight_serial": "",
                     "highlight_model": {},
                 }
@@ -10044,9 +10084,20 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             require_min_points=require_min_points,
             plot_dimension=("3d" if str(input2_target or "").strip() else "2d"),
         )
-        if fit_error_text:
+        fit_warning_notes: list[str] = []
+        for stat in plot_view_stats:
+            result = (self._perf_results_by_stat or {}).get(stat) or {}
+            warning_text = str(result.get("fit_warning_text") or ((result.get("master_model") or {}).get("fit_warning_text") if isinstance(result.get("master_model"), dict) else "") or "").strip()
+            if warning_text and warning_text not in fit_warning_notes:
+                fit_warning_notes.append(warning_text)
+        has_master_model = any(
+            isinstance(((self._perf_results_by_stat or {}).get(stat) or {}).get("master_model"), dict)
+            and bool((((self._perf_results_by_stat or {}).get(stat) or {}).get("master_model") or {}))
+            for stat in plot_view_stats
+        )
+        if fit_error_text and not has_master_model:
             QtWidgets.QMessageBox.warning(self, "Performance", fit_error_text)
-        self._set_plot_note("")
+        self._set_plot_note("\n".join(fit_warning_notes))
         self._update_perf_highlight_models()
         self._fill_perf_equations_table()
         self._redraw_performance_view()
@@ -13237,12 +13288,25 @@ class MainWindow(QtWidgets.QMainWindow):
         have_src = int(payload.get("serials_with_source") or 0)
         serials_added = int(payload.get("serials_added") or 0)
         added_serials = payload.get("added_serials") or []
+        cache_sync_mode = str(payload.get("cache_sync_mode") or "").strip()
+        cache_sync_reason = str(payload.get("cache_sync_reason") or "").strip()
+        cache_sync_counts = payload.get("cache_sync_counts") if isinstance(payload.get("cache_sync_counts"), dict) else {}
         dbg = str(payload.get("debug_json") or "").strip()
         log_path = str(payload.get("log_path") or "").strip()
         elapsed_s = round(time.perf_counter() - started, 3)
         self._append_log(
             f"[PROJECT UPDATE] Finished in {elapsed_s:.3f}s: updated={updated}, serials={serials}, added={serials_added}, sources={have_src}, missing_source={missing_src}, missing_value={missing_val}"
         )
+        if cache_sync_mode:
+            self._append_log(
+                "[PROJECT UPDATE] Cache sync mode="
+                f"{cache_sync_mode}, reason={cache_sync_reason or 'n/a'}, "
+                f"added={int(cache_sync_counts.get('added') or 0)}, "
+                f"changed={int(cache_sync_counts.get('changed') or 0)}, "
+                f"removed={int(cache_sync_counts.get('removed') or 0)}, "
+                f"unchanged={int(cache_sync_counts.get('unchanged') or 0)}, "
+                f"reingested={int(cache_sync_counts.get('reingested') or 0)}"
+            )
         if ptype == getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending"):
             timings = payload.get("timings")
             if not isinstance(timings, dict) and dbg:
@@ -13303,6 +13367,8 @@ class MainWindow(QtWidgets.QMainWindow):
             ]
         )
         if ptype == getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending"):
+            if cache_sync_mode:
+                lines.append(f"Cache sync mode: {cache_sync_mode}")
             lines.append("Recalculation includes support-workbook heuristics when present.")
             lines.append("Performance candidate sheets are now generated only on demand.")
             saved_refresh = payload.get("saved_equation_refresh")
