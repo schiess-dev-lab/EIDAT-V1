@@ -849,6 +849,29 @@ class TestTDTrendDialogCacheLoading(unittest.TestCase):
 
 @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
 class TestProjectUpdateUI(unittest.TestCase):
+    def test_prepare_dialog_keeps_explicit_launch_size_when_adjust_size_grows(self) -> None:
+        _qt_app()
+        from PySide6 import QtCore, QtWidgets
+        from EIDAT_App_Files.ui_next.qt_main import MainWindow  # type: ignore
+
+        class _Harness:
+            pass
+
+        class _LargeHintDialog(QtWidgets.QDialog):
+            def sizeHint(self) -> QtCore.QSize:
+                return QtCore.QSize(1600, 1200)
+
+        harness = _Harness()
+        dlg = _LargeHintDialog()
+        dlg.resize(960, 640)
+
+        with mock.patch("EIDAT_App_Files.ui_next.qt_main._fit_widget_to_screen") as fit_mock:
+            MainWindow._prepare_dialog(harness, dlg)
+
+        self.assertEqual(dlg.size().width(), 960)
+        self.assertEqual(dlg.size().height(), 640)
+        fit_mock.assert_called_once_with(dlg)
+
     def test_project_update_uses_background_task_for_td_projects(self) -> None:
         _qt_app()
         from PySide6 import QtWidgets
@@ -2634,6 +2657,55 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 self.assertEqual(values.get("RunA.thrust.mean"), 50.0)
             finally:
                 wb2.close()
+
+    def test_update_sync_support_workbook_adds_new_program_sheet(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            wb_path = root / "project.xlsx"
+            support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+            be._write_td_support_workbook(
+                support_path,
+                sequence_names=["RunA"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+                program_titles=["Program Alpha"],
+                sequences_by_program={"Program Alpha": ["RunA"]},
+            )
+
+            docs = [
+                {"metadata_rel": "alpha.json", "program_title": "Program Alpha"},
+                {"metadata_rel": "beta.json", "program_title": "Program Beta"},
+            ]
+            with mock.patch.object(be, "read_eidat_index_documents", return_value=docs):
+                with mock.patch.object(be, "_project_selected_metadata_rels", return_value={"alpha.json", "beta.json"}):
+                    with mock.patch.object(be, "_discover_td_runs_for_docs", return_value=["RunA", "RunB"]):
+                        with mock.patch.object(
+                            be,
+                            "_discover_td_runs_by_program_for_docs",
+                            return_value={"Program Alpha": ["RunA"], "Program Beta": ["RunB"]},
+                        ):
+                            result = be._sync_td_support_workbook_program_sheets(
+                                wb_path,
+                                global_repo=root,
+                                project_dir=root,
+                                param_defs=[{"name": "thrust", "units": "lbf"}],
+                            )
+
+            self.assertTrue(bool(result.get("updated")))
+            support_cfg = be._read_td_support_workbook(wb_path, project_dir=root)
+            program_titles = {
+                str(row.get("program_title") or "").strip()
+                for row in (support_cfg.get("programs") or [])
+                if isinstance(row, dict)
+            }
+            self.assertIn("Program Alpha", program_titles)
+            self.assertIn("Program Beta", program_titles)
+            beta_rows = support_cfg.get("program_mappings", {}).get("Program Beta") or []
+            self.assertEqual(
+                [str(row.get("source_run_name") or "").strip() for row in beta_rows],
+                ["RunB"],
+            )
 
     def test_ensure_cache_uses_calc_only_refresh_after_support_change(self) -> None:
         from openpyxl import load_workbook  # type: ignore
@@ -5275,9 +5347,87 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 ],
             )
             text = out_path.read_text(encoding="utf-8")
+            self.assertIn("% Usage: out = saved_perf_equations();", text)
             self.assertIn("out.Thruster.Hall_A.thrust_vs_impulse", text)
+            self.assertIn("% Usage: y = out.Thruster.Hall_A.thrust_vs_impulse.mean(impulse_bit)", text)
+            self.assertIn("% Inputs: impulse bit (impulse_bit)", text)
+            self.assertIn("% Output: y is predicted thrust; scalar and array inputs are evaluated element-wise.", text)
             self.assertIn("equation_text_mean", text)
             self.assertIn("asset_specific_types", text)
+
+    def test_saved_perf_export_matlab_documents_control_period_surface_signature(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            x1s: list[float] = []
+            x2s: list[float] = []
+            ys: list[float] = []
+            cps: list[float] = []
+            for cp in (60.0, 120.0, 180.0):
+                c0 = 20.0 + (0.16 * cp) + (0.001 * cp * cp)
+                c1 = 0.9 + (0.003 * cp)
+                c2 = -0.04 + (0.0004 * cp)
+                c3 = 0.08
+                c4 = 0.012 + (0.00002 * cp)
+                c5 = 0.0025
+                for x1, x2 in (
+                    (1.0, 10.0),
+                    (1.0, 20.0),
+                    (2.0, 10.0),
+                    (2.0, 20.0),
+                    (3.0, 20.0),
+                    (3.0, 30.0),
+                ):
+                    x1s.append(x1)
+                    x2s.append(x2)
+                    ys.append(c0 + (c1 * x1) + (c2 * x2) + (c3 * x1 * x1) + (c4 * x1 * x2) + (c5 * x2 * x2))
+                    cps.append(cp)
+            model = be.td_perf_fit_surface_model(
+                x1s,
+                x2s,
+                ys,
+                surface_family="quadratic_surface_control_period",
+                control_periods=cps,
+            )
+            self.assertIsNotNone(model)
+            out_path = root / "saved_perf_equations_cp.m"
+            be.td_perf_export_saved_equations_matlab(
+                out_path,
+                entries=[
+                    {
+                        "id": "entry1",
+                        "name": "Thrust vs Inputs",
+                        "slug": "thrust_vs_inputs",
+                        "plot_metadata": {
+                            "plot_dimension": "3d",
+                            "output_target": "thrust",
+                            "input1_target": "impulse bit",
+                            "input2_target": "feed pressure",
+                        },
+                        "results_by_stat": {"mean": {"master_model": model}},
+                        "equation_rows": [{"stat": "mean"}],
+                        "asset_metadata": {
+                            "primary_asset_type": "Thruster",
+                            "primary_asset_specific_type": "Hall_A",
+                            "asset_types": ["Thruster"],
+                            "asset_specific_types": ["Hall_A"],
+                        },
+                    }
+                ],
+            )
+            text = out_path.read_text(encoding="utf-8")
+            self.assertIn(
+                "% Usage: y = out.Thruster.Hall_A.thrust_vs_inputs.mean(impulse_bit, feed_pressure, control_period)",
+                text,
+            )
+            self.assertIn(
+                "% Inputs: impulse bit (impulse_bit), feed pressure (feed_pressure), control period (control_period)",
+                text,
+            )
+            self.assertIn("% Output: y is predicted thrust; scalar and array inputs are evaluated element-wise.", text)
+            self.assertIn("% Control-period-aware quadratic surface predictor for exported 3D equations.", text)
+            self.assertIn("equation_text_mean", text)
 
     def test_saved_perf_refresh_store_recomputes_asset_metadata_from_cache(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore

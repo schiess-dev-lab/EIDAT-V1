@@ -2217,7 +2217,7 @@ class ImplementationTrendDialog(QtWidgets.QDialog):
         self._last_plot_source_label = ""
 
         self.setWindowTitle("Implementation - Trend / Analyze Data")
-        self.resize(1080, 720)
+        self.resize(960, 640)
         self.setStyleSheet(
             """
             QDialog {
@@ -3077,7 +3077,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._cache_progress_timer.timeout.connect(self._show_cache_progress_dialog)
 
         self.setWindowTitle("Test Data - Trend / Analyze")
-        self.resize(1180, 760)
+        self.resize(1020, 680)
         self.setStyleSheet(
             """
             QDialog { background: #f8fafc; color: #0f172a; }
@@ -14791,7 +14791,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _prepare_dialog(self, dlg: QtWidgets.QDialog) -> None:
         try:
+            explicit_size = dlg.size()
             dlg.adjustSize()
+            if explicit_size.isValid() and explicit_size.width() > 0 and explicit_size.height() > 0:
+                dlg.resize(explicit_size)
         except Exception:
             pass
         _fit_widget_to_screen(dlg)

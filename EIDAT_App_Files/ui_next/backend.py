@@ -4424,6 +4424,248 @@ def _refresh_td_support_run_conditions_sheet(
     }
 
 
+def _sync_td_support_workbook_program_sheets(
+    workbook_path: Path,
+    *,
+    global_repo: Path | None,
+    project_dir: Path | None = None,
+    param_defs: list[dict] | None = None,
+) -> dict:
+    wb_path = Path(workbook_path).expanduser()
+    proj_dir = Path(project_dir).expanduser() if project_dir is not None else wb_path.parent
+    repo = Path(global_repo).expanduser() if global_repo is not None else None
+    support_path = td_support_workbook_path_for(wb_path, project_dir=proj_dir)
+
+    docs: list[dict] = []
+    selected: set[str] = set()
+    if repo is not None:
+        try:
+            docs = read_eidat_index_documents(repo)
+        except Exception:
+            docs = []
+        try:
+            selected = _project_selected_metadata_rels(proj_dir)
+        except Exception:
+            selected = set()
+    chosen_docs = (
+        [d for d in docs if isinstance(d, dict) and str(d.get("metadata_rel") or "").strip() in selected]
+        if selected
+        else []
+    )
+    discovered_program_titles = sorted(
+        {
+            str(doc.get("program_title") or "").strip()
+            for doc in chosen_docs
+            if isinstance(doc, dict) and str(doc.get("program_title") or "").strip()
+        }
+    )
+    discovered_runs_by_program = _discover_td_runs_by_program_for_docs(repo, chosen_docs) if chosen_docs else {}
+    discovered_sequence_names = _discover_td_runs_for_docs(repo, chosen_docs) if chosen_docs else []
+    clean_param_defs = [
+        dict(d)
+        for d in (param_defs or [])
+        if isinstance(d, dict) and str(d.get("name") or "").strip()
+    ]
+
+    if not support_path.exists():
+        _write_td_support_workbook(
+            support_path,
+            sequence_names=(discovered_sequence_names or ["Run1"]),
+            param_defs=clean_param_defs,
+            program_titles=discovered_program_titles,
+            sequences_by_program=discovered_runs_by_program,
+        )
+        return {
+            "path": str(support_path),
+            "updated": True,
+            "created": True,
+            "program_count": len(discovered_program_titles) or 1,
+        }
+
+    if not discovered_program_titles and not discovered_runs_by_program:
+        return {
+            "path": str(support_path),
+            "updated": False,
+            "created": False,
+            "program_count": 0,
+        }
+
+    support_cfg = _read_td_support_workbook(wb_path, project_dir=proj_dir)
+    existing_programs = [
+        dict(row)
+        for row in (support_cfg.get("programs") or [])
+        if isinstance(row, dict) and str(row.get("program_title") or "").strip()
+    ]
+    existing_rows_by_program = {
+        str(title).strip(): [dict(row) for row in rows if isinstance(row, dict)]
+        for title, rows in (support_cfg.get("program_mappings") or {}).items()
+        if str(title).strip() and isinstance(rows, list)
+    }
+
+    desired_program_titles: list[str] = []
+    seen_titles: set[str] = set()
+    for row in existing_programs:
+        title = str(row.get("program_title") or "").strip()
+        key = _td_support_norm_name(title)
+        if not title or not key or key in seen_titles:
+            continue
+        seen_titles.add(key)
+        desired_program_titles.append(title)
+    for title in discovered_program_titles:
+        key = _td_support_norm_name(title)
+        if not title or not key or key in seen_titles:
+            continue
+        seen_titles.add(key)
+        desired_program_titles.append(title)
+    if not desired_program_titles:
+        desired_program_titles = [TD_SUPPORT_DEFAULT_PROGRAM_TITLE]
+
+    desired_sequences_by_program: dict[str, list[str]] = {}
+    for title in desired_program_titles:
+        ordered: list[str] = []
+        seen_sequences: set[str] = set()
+        for row in existing_rows_by_program.get(title) or []:
+            source_run = str(row.get("source_run_name") or "").strip()
+            key = source_run.lower()
+            if not source_run or key in seen_sequences:
+                continue
+            seen_sequences.add(key)
+            ordered.append(source_run)
+        for seq_name in discovered_runs_by_program.get(title) or []:
+            clean = str(seq_name or "").strip()
+            key = clean.lower()
+            if not clean or key in seen_sequences:
+                continue
+            seen_sequences.add(key)
+            ordered.append(clean)
+        if not ordered and title == TD_SUPPORT_DEFAULT_PROGRAM_TITLE:
+            for seq_name in discovered_sequence_names:
+                clean = str(seq_name or "").strip()
+                key = clean.lower()
+                if not clean or key in seen_sequences:
+                    continue
+                seen_sequences.add(key)
+                ordered.append(clean)
+        desired_sequences_by_program[title] = ordered
+
+    wb = _td_load_workbook_ignore_long_title_warning(str(support_path))
+    try:
+        changed = _td_normalize_support_workbook_sheet_names(wb)
+
+        existing_sheet_by_title: dict[str, str] = {}
+        for row in existing_programs:
+            title = str(row.get("program_title") or "").strip()
+            sheet_name = str(row.get("sheet_name") or "").strip()
+            if title and sheet_name and sheet_name in wb.sheetnames:
+                existing_sheet_by_title[title] = sheet_name
+
+        protected_sheet_names = {
+            TD_SUPPORT_PROGRAMS_SHEET.lower(),
+            TD_SUPPORT_RUN_CONDITIONS_SHEET.lower(),
+            TD_SUPPORT_RUN_CONDITION_BOUNDS_SHEET.lower(),
+            "settings",
+        }
+        used_sheet_names = {
+            str(sheet_name).strip().lower()
+            for sheet_name in wb.sheetnames
+            if str(sheet_name).strip() and str(sheet_name).strip().lower() in protected_sheet_names
+        }
+        desired_sheet_by_title: dict[str, str] = {}
+        for idx, title in enumerate(desired_program_titles):
+            existing_sheet = existing_sheet_by_title.get(title, "")
+            if existing_sheet and existing_sheet in wb.sheetnames and existing_sheet.lower() not in used_sheet_names:
+                desired_sheet_by_title[title] = existing_sheet
+                used_sheet_names.add(existing_sheet.lower())
+                continue
+            preferred = _td_support_program_sheet_name(title, idx)
+            sheet_name = _td_safe_excel_sheet_title(preferred, used_sheet_names, fallback="Program")
+            desired_sheet_by_title[title] = sheet_name
+
+        ws_programs = _td_reset_workbook_sheet(
+            wb,
+            TD_SUPPORT_PROGRAMS_SHEET,
+            ["program_title", "sheet_name", "enabled"],
+        )
+        try:
+            ws_programs.freeze_panes = "A2"
+        except Exception:
+            pass
+
+        row_headers = [
+            "source_run_name",
+            "condition_key",
+            "display_name",
+            "feed_pressure",
+            "feed_pressure_units",
+            "run_type",
+            "pulse_width_on",
+            "control_period",
+            "exclude_first_n",
+            "last_n_rows",
+            "enabled",
+        ]
+        for title in desired_program_titles:
+            sheet_name = desired_sheet_by_title[title]
+            existing_enabled = next(
+                (
+                    bool(row.get("enabled", True))
+                    for row in existing_programs
+                    if str(row.get("program_title") or "").strip() == title
+                ),
+                True,
+            )
+            ws_programs.append([title, sheet_name, existing_enabled])
+
+            existing_rows = {
+                str(row.get("source_run_name") or "").strip().lower(): dict(row)
+                for row in (existing_rows_by_program.get(title) or [])
+                if str(row.get("source_run_name") or "").strip()
+            }
+            ws_program = _td_reset_workbook_sheet(wb, sheet_name, row_headers)
+            desired_rows: list[list[object]] = []
+            for seq_name in desired_sequences_by_program.get(title) or []:
+                seq_key = str(seq_name or "").strip().lower()
+                if not seq_key:
+                    continue
+                row_data = dict(existing_rows.get(seq_key) or _td_support_program_row_defaults(seq_name, program_title=title))
+                row_data["program_title"] = title
+                row_data["source_run_name"] = str(row_data.get("source_run_name") or seq_name).strip() or str(seq_name).strip()
+                condition_key = str(row_data.get("condition_key") or row_data.get("source_run_name") or "").strip()
+                display_name = str(row_data.get("display_name") or condition_key or row_data.get("source_run_name") or "").strip()
+                desired_rows.append(
+                    [
+                        row_data["source_run_name"],
+                        condition_key,
+                        display_name,
+                        row_data.get("feed_pressure"),
+                        str(row_data.get("feed_pressure_units") or "").strip(),
+                        str(row_data.get("run_type") or "").strip(),
+                        row_data.get("pulse_width_on", row_data.get("pulse_width")),
+                        row_data.get("control_period"),
+                        row_data.get("exclude_first_n"),
+                        row_data.get("last_n_rows"),
+                        bool(row_data.get("enabled", True)),
+                    ]
+                )
+            for row in desired_rows:
+                ws_program.append(list(row))
+
+        wb.save(str(support_path))
+        changed = True
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
+
+    return {
+        "path": str(support_path),
+        "updated": bool(changed),
+        "created": False,
+        "program_count": len(desired_program_titles),
+    }
+
+
 def _to_support_int(v: object) -> int | None:
     num = _to_support_number(v)
     if num is None:
@@ -8906,6 +9148,122 @@ def _td_perf_fmt_surface_control_period_normalization(
     )
 
 
+def _td_perf_surface_control_period_label(value: object) -> str:
+    try:
+        numeric = float(value)
+        if math.isfinite(numeric):
+            return f"{numeric:g}"
+    except Exception:
+        pass
+    text = str(value or "").strip()
+    return text or "?"
+
+
+def _td_perf_surface_control_period_reason(*, point_count: int, distinct_x1: int, distinct_x2: int, fit_failed: bool = False) -> str:
+    reasons: list[str] = []
+    if point_count < 6:
+        reasons.append(f"{int(point_count)} points (<6)")
+    if distinct_x1 < 2:
+        reasons.append(f"{int(distinct_x1)} distinct x1 (<2)")
+    if distinct_x2 < 2:
+        reasons.append(f"{int(distinct_x2)} distinct x2 (<2)")
+    if fit_failed:
+        reasons.append("quadratic slice fit failed")
+    return "; ".join(reasons)
+
+
+def _td_perf_surface_control_period_entry_text(entry: Mapping[str, object]) -> str:
+    cp_text = _td_perf_surface_control_period_label(entry.get("control_period"))
+    point_count = int(entry.get("point_count") or 0)
+    distinct_x1 = int(entry.get("distinct_x1") or 0)
+    distinct_x2 = int(entry.get("distinct_x2") or 0)
+    reason = str(entry.get("reason") or "").strip()
+    detail = f"CP {cp_text}: {point_count} points, {distinct_x1} distinct x1, {distinct_x2} distinct x2"
+    return f"{detail} ({reason})" if reason else detail
+
+
+def _td_perf_format_surface_control_period_warning(ignored_periods: Sequence[Mapping[str, object]]) -> str:
+    ignored = [dict(entry) for entry in (ignored_periods or []) if isinstance(entry, Mapping)]
+    if not ignored:
+        return ""
+    details = "; ".join(_td_perf_surface_control_period_entry_text(entry) for entry in ignored)
+    return f"Ignored control periods for CP-surface fit: {details}"
+
+
+def _td_perf_format_surface_control_period_failure(
+    ignored_periods: Sequence[Mapping[str, object]],
+    *,
+    eligible_count: int,
+) -> str:
+    details = "; ".join(
+        _td_perf_surface_control_period_entry_text(entry)
+        for entry in (ignored_periods or [])
+        if isinstance(entry, Mapping)
+    )
+    prefix = "Quadratic Surface + Control Period requires at least two distinct control periods with valid surface coverage."
+    if details:
+        return f"{prefix} Eligible periods: {int(eligible_count)}. {details}"
+    return prefix
+
+
+def _td_perf_append_fit_warning(model: dict[str, object], text: str) -> None:
+    note = str(text or "").strip()
+    if not note:
+        return
+    warnings = model.get("warnings")
+    warning_list = [str(item).strip() for item in warnings] if isinstance(warnings, list) else []
+    warning_list = [item for item in warning_list if item]
+    if note not in warning_list:
+        warning_list.append(note)
+    model["warnings"] = warning_list
+    existing = [str(item).strip() for item in str(model.get("fit_warning_text") or "").splitlines() if str(item).strip()]
+    merged: list[str] = []
+    for item in existing + [note]:
+        if item and item not in merged:
+            merged.append(item)
+    model["fit_warning_text"] = "\n".join(merged)
+
+
+def _td_perf_surface_control_period_in_domain(model: Mapping[str, object], control_period: object) -> bool:
+    if control_period in (None, ""):
+        return True
+    try:
+        cp_numeric = float(control_period)
+    except Exception:
+        return False
+    domain = model.get("fit_domain_control_period")
+    if not isinstance(domain, Sequence) or isinstance(domain, (str, bytes)) or len(domain) < 2:
+        return True
+    try:
+        cp_min = float(domain[0])
+        cp_max = float(domain[1])
+    except Exception:
+        return True
+    if not (math.isfinite(cp_min) and math.isfinite(cp_max)):
+        return True
+    lo = min(cp_min, cp_max)
+    hi = max(cp_min, cp_max)
+    return (lo - 1e-9) <= cp_numeric <= (hi + 1e-9)
+
+
+def _td_perf_surface_control_period_out_of_domain_warning(model: Mapping[str, object], control_period: object) -> str:
+    if control_period in (None, "") or _td_perf_surface_control_period_in_domain(model, control_period):
+        return ""
+    domain = model.get("fit_domain_control_period")
+    if not isinstance(domain, Sequence) or isinstance(domain, (str, bytes)) or len(domain) < 2:
+        return ""
+    try:
+        cp_min = float(domain[0])
+        cp_max = float(domain[1])
+    except Exception:
+        return ""
+    cp_text = _td_perf_surface_control_period_label(control_period)
+    return (
+        f"Surface overlay omitted for control period {cp_text} because the fitted control-period domain is "
+        f"{min(cp_min, cp_max):g} to {max(cp_min, cp_max):g}."
+    )
+
+
 def _td_perf_prepare_xy(xs: Sequence[float], ys: Sequence[float]):
     np = _td_perf_import_numpy()
     if len(xs) != len(ys):
@@ -12689,6 +13047,60 @@ def _td_perf_matlab_primary_group(asset_metadata: Mapping[str, object]) -> tuple
     return asset_type, asset_specific
 
 
+def _td_perf_matlab_input_label(value: object, *, fallback: str) -> str:
+    text = str(value or "").strip()
+    return text if text else fallback
+
+
+def _td_perf_matlab_signature_parts(
+    plot_metadata: Mapping[str, object],
+    model: Mapping[str, object],
+    *,
+    x_var: str,
+    x1_var: str,
+    x2_var: str,
+    cp_var: str,
+) -> tuple[list[str], list[tuple[str, str]]]:
+    input1_label = _td_perf_matlab_input_label(plot_metadata.get("input1_target"), fallback="input 1")
+    input2_label = _td_perf_matlab_input_label(plot_metadata.get("input2_target"), fallback="input 2")
+    family = td_perf_normalize_fit_mode(model.get("fit_family"))
+    if family == TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD:
+        return [x1_var, x2_var, cp_var], [
+            (x1_var, input1_label),
+            (x2_var, input2_label),
+            (cp_var, "control period"),
+        ]
+    if str(plot_metadata.get("plot_dimension") or "").strip().lower() == "3d" or str(plot_metadata.get("input2_target") or "").strip():
+        return [x1_var, x2_var], [
+            (x1_var, input1_label),
+            (x2_var, input2_label),
+        ]
+    return [x_var], [(x_var, input1_label)]
+
+
+def _td_perf_matlab_equation_comment_lines(
+    *,
+    entry_name: object,
+    struct_path: str,
+    stat_label: str,
+    output_target: object,
+    args: Sequence[str],
+    inputs: Sequence[tuple[str, str]],
+    equation_text_field: str,
+) -> list[str]:
+    output_label = _td_perf_matlab_input_label(output_target, fallback="output")
+    usage = f"y = {struct_path}({', '.join(args)})"
+    inputs_text = ", ".join(f"{label} ({var})" for var, label in inputs)
+    return [
+        f"% {str(entry_name or '').strip()} [{stat_label}]",
+        f"% Path: {struct_path}",
+        f"% Usage: {usage}",
+        f"% Inputs: {inputs_text}",
+        f"% Output: y is predicted {output_label}; scalar and array inputs are evaluated element-wise.",
+        f"% See also: {equation_text_field} for the display-form equation text.",
+    ]
+
+
 def _td_perf_matlab_function_expr(
     model: Mapping[str, object],
     *,
@@ -12793,7 +13205,9 @@ def td_perf_export_saved_equations_matlab(
     lines: list[str] = [
         f"function out = {func_name}()",
         "% Auto-generated by EIDAT saved performance equation export.",
-        "% The returned struct is grouped by asset type and asset-specific type.",
+        f"% Usage: out = {func_name}();",
+        "% Returns: out.<asset_type>.<asset_specific_type>.<equation_slug> contains",
+        "% stat-specific function handles and equation text grouped by asset type.",
         "out = struct();",
         "",
     ]
@@ -12837,6 +13251,25 @@ def td_perf_export_saved_equations_matlab(
                 handle = f"@({x1_var}, {x2_var}) {_td_perf_matlab_function_expr(model, x_var=x_var, x1_var=x1_var, x2_var=x2_var, cp_var=cp_var)}"
             else:
                 handle = f"@({x_var}) {_td_perf_matlab_function_expr(model, x_var=x_var, x1_var=x1_var, x2_var=x2_var, cp_var=cp_var)}"
+            args, inputs = _td_perf_matlab_signature_parts(
+                plot_metadata,
+                model,
+                x_var=x_var,
+                x1_var=x1_var,
+                x2_var=x2_var,
+                cp_var=cp_var,
+            )
+            lines.extend(
+                _td_perf_matlab_equation_comment_lines(
+                    entry_name=entry.get("name") or "",
+                    struct_path=f"{prefix}.{field_key}",
+                    stat_label=stat,
+                    output_target=plot_metadata.get("output_target"),
+                    args=args,
+                    inputs=inputs,
+                    equation_text_field=f"{prefix}.equation_text_{field_key}",
+                )
+            )
             lines.append(f"{prefix}.{field_key} = {handle};")
             lines.append(f"{prefix}.equation_text_{field_key} = {_td_perf_matlab_quote(model.get('equation') or '')};")
         lines.append("")
@@ -12845,6 +13278,9 @@ def td_perf_export_saved_equations_matlab(
         [
             "end",
             "",
+            "% Piecewise linear predictor used by exported piecewise performance equations.",
+            "% Inputs: x values, coefficient vector, and breakpoint vector.",
+            "% Output: y predictions with hinge terms applied element-wise.",
             "function y = eidat_perf_piecewise_predict(x, coeffs, breakpoints)",
             "x = double(x);",
             "y = coeffs(1) + coeffs(2).*x;",
@@ -12853,6 +13289,9 @@ def td_perf_export_saved_equations_matlab(
             "end",
             "end",
             "",
+            "% Monotone PCHIP predictor used by exported monotone performance equations.",
+            "% Inputs: x values, knot locations, knot values, and left/right clamp values.",
+            "% Output: y predictions with PCHIP interpolation and end clamping.",
             "function y = eidat_perf_pchip_predict(x, knots, knot_values, left_y, right_y)",
             "x = double(x);",
             "y = interp1(knots, knot_values, x, 'pchip');",
@@ -12860,6 +13299,9 @@ def td_perf_export_saved_equations_matlab(
             "y(x > knots(end)) = right_y;",
             "end",
             "",
+            "% Control-period-aware quadratic surface predictor for exported 3D equations.",
+            "% Inputs: x1, x2, control_period, coefficient polynomials, and normalization terms.",
+            "% Output: y predictions evaluated element-wise over the normalized basis terms.",
             "function y = eidat_perf_surface_cp_predict(x1, x2, control_period, coeff_cp_models, x1_center, x1_scale, x2_center, x2_scale, cp_center, cp_scale)",
             "x1n = (double(x1) - x1_center) ./ x1_scale;",
             "x2n = (double(x2) - x2_center) ./ x2_scale;",
@@ -13695,6 +14137,12 @@ def update_test_data_trending_project_workbook(
     if not dry_run:
         _td_emit_progress(progress_cb, "Refreshing support workbook")
         t0 = time.perf_counter()
+        _sync_td_support_workbook_program_sheets(
+            wb_path,
+            global_repo=repo,
+            project_dir=project_dir,
+            param_defs=cfg_cols,
+        )
         _refresh_td_support_run_conditions_sheet(
             wb_path,
             project_dir=project_dir,

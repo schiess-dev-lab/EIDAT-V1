@@ -107,6 +107,40 @@ class TestTDExcelHeaderMapping(unittest.TestCase):
         except Exception:
             pass
 
+    def _append_multirow_sequence_block(
+        self,
+        cells: list[tuple[int, int, object]],
+        *,
+        sequence_row: int,
+        header_row: int,
+        data_row: int,
+        sequence_no: int,
+        time_values: list[float],
+        metrics: list[tuple[str, str, str, list[float]]],
+        indent: int = 0,
+    ) -> None:
+        base_col = 1 + int(indent)
+        cells.extend(
+            [
+                (int(sequence_row), base_col, "Sequence No:"),
+                (int(sequence_row), base_col + 2, int(sequence_no)),
+                (int(header_row), base_col, "Seq"),
+                (int(header_row) + 1, base_col, "Time"),
+                (int(header_row) + 2, base_col, "(sec)"),
+            ]
+        )
+        cells.extend((int(data_row) + idx, base_col, float(v)) for idx, v in enumerate(list(time_values)))
+        for metric_idx, (top, middle, bottom, values) in enumerate(list(metrics), start=1):
+            col = base_col + int(metric_idx)
+            cells.extend(
+                [
+                    (int(header_row), col, top),
+                    (int(header_row) + 1, col, middle),
+                    (int(header_row) + 2, col, bottom),
+                ]
+            )
+            cells.extend((int(data_row) + idx, col, float(v)) for idx, v in enumerate(list(values)))
+
     def _import_workbook(
         self,
         workbook_path: Path,
@@ -187,6 +221,35 @@ class TestTDExcelHeaderMapping(unittest.TestCase):
         finally:
             conn.close()
         return cols, rows
+
+    def _build_multirow_sequence_workbook(
+        self,
+        workbook_path: Path,
+        *,
+        blocks: list[dict[str, object]],
+        title: str = "DataPages",
+    ) -> None:
+        cells: list[tuple[int, int, object]] = []
+        for block in blocks:
+            self._append_multirow_sequence_block(
+                cells,
+                sequence_row=int(block.get("sequence_row") or 1),
+                header_row=int(block.get("header_row") or 2),
+                data_row=int(block.get("data_row") or 4),
+                sequence_no=int(block.get("sequence_no") or 1),
+                time_values=[float(v) for v in list(block.get("time_values") or [])],
+                metrics=[
+                    (
+                        str(spec[0]),
+                        str(spec[1]),
+                        str(spec[2]),
+                        [float(v) for v in list(spec[3])],
+                    )
+                    for spec in list(block.get("metrics") or [])
+                ],
+                indent=int(block.get("indent") or 0),
+            )
+        self._build_workbook_from_cells(workbook_path, title=title, cells=cells)
 
     def test_importer_reconstructs_split_and_merged_headers(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
@@ -447,6 +510,168 @@ class TestTDExcelHeaderMapping(unittest.TestCase):
             self.assertEqual(diagnostics.get("merge_status"), "merged_on_x_axis")
             self.assertEqual(diagnostics.get("merge_x_axis"), "Time")
 
+    def test_importer_merges_multirow_continuation_blocks_into_single_sequence(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            workbook_path = root / "td_multirow_continuation.xlsx"
+            sqlite_path = root / "td_multirow_continuation.sqlite3"
+            self._build_multirow_sequence_workbook(
+                workbook_path,
+                blocks=[
+                    {
+                        "sequence_row": 91,
+                        "header_row": 94,
+                        "data_row": 98,
+                        "sequence_no": 1,
+                        "time_values": [float(v) for v in range(41)],
+                        "metrics": [
+                            ("Thrust", "Norm", "(lbf)", [10.0 + float(v) for v in range(41)]),
+                            ("Isp", "Norm", "(sec)", [200.0 + float(v) for v in range(41)]),
+                        ],
+                    },
+                    {
+                        "sequence_row": 143,
+                        "header_row": 146,
+                        "data_row": 150,
+                        "sequence_no": 1,
+                        "time_values": [float(v) for v in range(41, 61)],
+                        "metrics": [
+                            ("Thrust", "Norm", "(lbf)", [1000.0 + float(v) for v in range(20)]),
+                            ("Cum Imp", "Norm", "(lbf-sec)", [300.0 + float(v) for v in range(20)]),
+                        ],
+                    },
+                ],
+            )
+
+            payload = self._import_workbook(workbook_path, sqlite_path, synthesize_td_seq_aliases=True)
+
+            self.assertEqual(self._sheet_info_names(sqlite_path), [("seq_1", "DataPages")])
+            cols, rows = self._table_rows(sqlite_path, sheet_name="seq_1")
+            self.assertEqual(cols, ["excel_row", "Time", "Thrust", "Isp", "Cum_Imp_N_Calc"])
+            self.assertEqual(len(rows), 61)
+            self.assertEqual(rows[0][1:], (0.0, 10.0, 200.0, None))
+            self.assertEqual(rows[40][1:], (40.0, 50.0, 240.0, None))
+            self.assertEqual(rows[41][1:], (41.0, 1000.0, None, 300.0))
+            self.assertEqual(rows[-1][1:], (60.0, 1019.0, None, 319.0))
+            diagnostics = dict((payload.get("sheets") or [])[0].get("diagnostics") or {})
+            self.assertEqual(diagnostics.get("merge_status"), "merged_on_x_axis")
+            self.assertEqual(diagnostics.get("merge_x_axis"), "Time")
+            self.assertEqual(diagnostics.get("x_min"), 0.0)
+            self.assertEqual(diagnostics.get("x_max"), 60.0)
+            self.assertEqual(len(list(diagnostics.get("source_blocks") or [])), 2)
+
+    def test_importer_merges_indented_multirow_continuation_blocks(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            workbook_path = root / "td_multirow_continuation_indented.xlsx"
+            sqlite_path = root / "td_multirow_continuation_indented.sqlite3"
+            self._build_multirow_sequence_workbook(
+                workbook_path,
+                blocks=[
+                    {
+                        "sequence_row": 91,
+                        "header_row": 94,
+                        "data_row": 98,
+                        "sequence_no": 1,
+                        "time_values": [float(v) for v in range(41)],
+                        "metrics": [
+                            ("Thrust", "Norm", "(lbf)", [10.0 + float(v) for v in range(41)]),
+                        ],
+                    },
+                    {
+                        "sequence_row": 143,
+                        "header_row": 146,
+                        "data_row": 150,
+                        "sequence_no": 1,
+                        "indent": 2,
+                        "time_values": [float(v) for v in range(41, 61)],
+                        "metrics": [
+                            ("Cum Imp", "Norm", "(lbf-sec)", [300.0 + float(v) for v in range(20)]),
+                        ],
+                    },
+                ],
+            )
+
+            payload = self._import_workbook(workbook_path, sqlite_path, synthesize_td_seq_aliases=True)
+
+            self.assertEqual(self._sheet_info_names(sqlite_path), [("seq_1", "DataPages")])
+            cols, rows = self._table_rows(sqlite_path, sheet_name="seq_1")
+            self.assertEqual(cols, ["excel_row", "Time", "Thrust", "Cum_Imp_N_Calc"])
+            self.assertEqual(len(rows), 61)
+            self.assertEqual(rows[0][1:], (0.0, 10.0, None))
+            self.assertEqual(rows[41][1:], (41.0, None, 300.0))
+            diagnostics = dict((payload.get("sheets") or [])[0].get("diagnostics") or {})
+            self.assertEqual(len(list(diagnostics.get("source_blocks") or [])), 2)
+
+    def test_importer_does_not_treat_multirow_header_rows_as_new_blocks(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            workbook_path = root / "td_multirow_detect.xlsx"
+            self._build_multirow_sequence_workbook(
+                workbook_path,
+                blocks=[
+                    {
+                        "sequence_row": 91,
+                        "header_row": 94,
+                        "data_row": 98,
+                        "sequence_no": 1,
+                        "time_values": [float(v) for v in range(41)],
+                        "metrics": [
+                            ("Thrust", "Norm", "(lbf)", [10.0 + float(v) for v in range(41)]),
+                            ("Isp", "Norm", "(sec)", [200.0 + float(v) for v in range(41)]),
+                        ],
+                    },
+                    {
+                        "sequence_row": 143,
+                        "header_row": 146,
+                        "data_row": 150,
+                        "sequence_no": 1,
+                        "time_values": [float(v) for v in range(41, 61)],
+                        "metrics": [
+                            ("Cum Imp", "Norm", "(lbf-sec)", [300.0 + float(v) for v in range(20)]),
+                        ],
+                    },
+                ],
+            )
+
+            from openpyxl import load_workbook  # type: ignore
+            import eidat_manager_excel_to_sqlite as etm  # type: ignore
+
+            wb = load_workbook(str(workbook_path), data_only=True, read_only=False)
+            try:
+                ws = wb["DataPages"]
+                trend_col_defs = etm._load_trend_column_defs()  # type: ignore[attr-defined]
+                canonical_defs = etm._canonical_header_defs(trend_col_defs)  # type: ignore[attr-defined]
+                blocks = etm._detect_synthetic_sequence_blocks(  # type: ignore[attr-defined]
+                    ws,
+                    sheet_name="DataPages",
+                    max_scan_rows=200,
+                    max_cols=200,
+                    lookahead_rows=60,
+                    min_numeric_count=8,
+                    min_numeric_ratio=0.60,
+                    min_data_cols=1,
+                    canonical_defs=canonical_defs,
+                    fuzzy_min_ratio=0.82,
+                    debug_table=False,
+                    start_import_order=1,
+                )
+            finally:
+                try:
+                    wb.close()
+                except Exception:
+                    pass
+
+            self.assertEqual(len(blocks), 2)
+            self.assertEqual(
+                [int(block.diagnostics.get("header_block_start") or 0) for block in blocks],
+                [94, 146],
+            )
+            self.assertEqual(
+                [int(block.diagnostics.get("header_block_end") or 0) for block in blocks],
+                [96, 148],
+            )
+
     def test_importer_prefers_first_value_on_duplicate_same_sequence_conflict(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
             root = Path(td)
@@ -478,6 +703,49 @@ class TestTDExcelHeaderMapping(unittest.TestCase):
             self.assertEqual(cols, ["excel_row", "Time", "Thrust"])
             self.assertEqual(rows[0][2], 10.0)
             self.assertEqual(rows[-1][2], 19.0)
+
+    def test_importer_merges_same_sequence_when_time_restarts_at_zero(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            workbook_path = root / "td_restart_zero_merge.xlsx"
+            sqlite_path = root / "td_restart_zero_merge.sqlite3"
+            self._build_multirow_sequence_workbook(
+                workbook_path,
+                blocks=[
+                    {
+                        "sequence_row": 20,
+                        "header_row": 23,
+                        "data_row": 27,
+                        "sequence_no": 1,
+                        "time_values": [float(v) for v in range(5)],
+                        "metrics": [
+                            ("Thrust", "Norm", "(lbf)", [10.0 + float(v) for v in range(5)]),
+                        ],
+                    },
+                    {
+                        "sequence_row": 45,
+                        "header_row": 48,
+                        "data_row": 52,
+                        "sequence_no": 1,
+                        "time_values": [float(v) for v in range(5)],
+                        "metrics": [
+                            ("Pf", "Norm", "(psia)", [300.0 + float(v) for v in range(5)]),
+                        ],
+                    },
+                ],
+            )
+
+            payload = self._import_workbook(workbook_path, sqlite_path, synthesize_td_seq_aliases=True)
+
+            self.assertEqual(self._sheet_info_names(sqlite_path), [("seq_1", "DataPages")])
+            cols, rows = self._table_rows(sqlite_path, sheet_name="seq_1")
+            self.assertEqual(cols, ["excel_row", "Time", "Thrust", "Pf_Norm_psia"])
+            self.assertEqual(len(rows), 5)
+            self.assertEqual(rows[0][1:], (0.0, 10.0, 300.0))
+            self.assertEqual(rows[-1][1:], (4.0, 14.0, 304.0))
+            diagnostics = dict((payload.get("sheets") or [])[0].get("diagnostics") or {})
+            self.assertEqual(diagnostics.get("merge_status"), "merged_on_x_axis")
+            self.assertEqual(len(list(diagnostics.get("source_blocks") or [])), 2)
 
     def test_importer_merges_cross_sheet_duplicate_sequence_numbers_by_time(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:

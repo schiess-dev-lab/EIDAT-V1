@@ -1618,6 +1618,25 @@ def _header_block_rows(ws, *, header_row: int, excel_col_indices: Sequence[int],
     return rows
 
 
+def _header_block_span(
+    ws,
+    *,
+    header_row: int,
+    excel_col_indices: Sequence[int],
+    max_extra_rows: int = 2,
+) -> tuple[int, int]:
+    rows = _header_block_rows(
+        ws,
+        header_row=int(header_row),
+        excel_col_indices=excel_col_indices,
+        max_extra_rows=int(max_extra_rows),
+    )
+    if not rows:
+        row = int(header_row)
+        return row, row
+    return min(int(r) for r in rows), max(int(r) for r in rows)
+
+
 def _reconstruct_headers(ws, *, header_row: int, excel_col_indices: Sequence[int], fallback_headers: Sequence[str]) -> list[str]:
     merged_ranges = _sheet_merged_ranges(ws)
     block_rows = _header_block_rows(ws, header_row=int(header_row), excel_col_indices=excel_col_indices)
@@ -2232,6 +2251,35 @@ def _header_signature(mapped_headers: Sequence[str]) -> tuple[str, ...]:
     return tuple(str(_normalize_header(value)).strip() for value in mapped_headers if str(_normalize_header(value)).strip())
 
 
+def _mapped_headers_x_axis(mapped_headers: Sequence[str]) -> tuple[str, int] | tuple[str, None]:
+    normalized = [_normalize_header(name) for name in mapped_headers]
+    for target in ("Time", "Pulse Number"):
+        target_norm = _normalize_header(target)
+        if target_norm in normalized:
+            return target, normalized.index(target_norm)
+    return "", None
+
+
+def _x_axis_range(
+    mapped_headers: Sequence[str],
+    data_rows: Sequence[tuple[int, list[float | None]]],
+) -> tuple[str, int | None, float | None, float | None]:
+    x_name, x_idx = _mapped_headers_x_axis(mapped_headers)
+    if x_idx is None:
+        return "", None, None, None
+    x_values: list[float] = []
+    for _excel_row, values in data_rows:
+        if int(x_idx) >= len(values):
+            continue
+        x_value = values[int(x_idx)]
+        if x_value is None:
+            continue
+        x_values.append(float(x_value))
+    if not x_values:
+        return str(x_name), int(x_idx), None, None
+    return str(x_name), int(x_idx), min(x_values), max(x_values)
+
+
 def _materialize_sequence_block(
     ws,
     *,
@@ -2248,6 +2296,11 @@ def _materialize_sequence_block(
     import_order: int,
 ) -> DetectedSequenceBlock | None:
     excel_col_indices = [int(c) for c, _ in cols]
+    header_block_start, header_block_end = _header_block_span(
+        ws,
+        header_row=int(header_row),
+        excel_col_indices=excel_col_indices,
+    )
     detected_headers = [str(h or "").strip() for _c, h in cols]
     headers = _reconstruct_headers(
         ws,
@@ -2272,10 +2325,15 @@ def _materialize_sequence_block(
     )
     if not data_rows:
         return None
-    meta_cells = _collect_meta_cells(ws, row_start=int(meta_row_start), row_end=int(meta_row_end))
+    meta_cells = _collect_meta_cells(
+        ws,
+        row_start=int(meta_row_start),
+        row_end=min(int(meta_row_end), int(header_block_start) - 1),
+    )
     sequence_token = _extract_sequence_token_from_meta_cells(meta_cells)
     run_base_name = _sequence_run_name(sequence_token, fallback_index=int(fallback_index))
     data_end_row = max(int(excel_row) for excel_row, _values in data_rows)
+    x_name, _x_idx, x_min, x_max = _x_axis_range(mapped_headers, data_rows)
     return DetectedSequenceBlock(
         source_sheet_name=str(source_sheet_name),
         header_row=int(header_row),
@@ -2290,10 +2348,15 @@ def _materialize_sequence_block(
         diagnostics={
             "header_signature": list(_header_signature(mapped_headers)),
             "meta_row_start": int(meta_row_start),
-            "meta_row_end": int(meta_row_end),
+            "meta_row_end": min(int(meta_row_end), int(header_block_start) - 1),
+            "header_block_start": int(header_block_start),
+            "header_block_end": int(header_block_end),
             "data_end_row": int(data_end_row),
             "rows_inserted": int(len(data_rows)),
             "sequence_token": str(sequence_token or ""),
+            "x_axis": str(x_name or ""),
+            "x_min": None if x_min is None else float(x_min),
+            "x_max": None if x_max is None else float(x_max),
         },
     )
 
@@ -2352,13 +2415,18 @@ def _detect_synthetic_sequence_blocks(
     )
     if not header_row or not cols:
         return []
+    header_block_start, header_block_end = _header_block_span(
+        ws,
+        header_row=int(header_row),
+        excel_col_indices=[int(c) for c, _h in cols],
+    )
     try:
         sheet_max_row = int(getattr(ws, "max_row", 0) or 0)
     except Exception:
         sheet_max_row = 0
     next_header_row, _next_cols = _find_first_header_row_in_range(
         ws,
-        start_row=int(header_row) + 1,
+        start_row=int(header_block_end) + 1,
         stop_row=sheet_max_row,
         max_cols=max_cols,
         lookahead_rows=lookahead_rows,
@@ -2366,14 +2434,21 @@ def _detect_synthetic_sequence_blocks(
         min_numeric_ratio=min_numeric_ratio,
         min_data_cols=min_data_cols,
     )
+    next_header_block_start = None
+    if next_header_row and _next_cols:
+        next_header_block_start, _next_header_block_end = _header_block_span(
+            ws,
+            header_row=int(next_header_row),
+            excel_col_indices=[int(c) for c, _h in _next_cols],
+        )
     block = _materialize_sequence_block(
         ws,
         source_sheet_name=str(sheet_name),
         header_row=int(header_row),
         cols=list(cols),
         meta_row_start=1,
-        meta_row_end=max(0, int(header_row) - 1),
-        stop_row=int(next_header_row) - 1 if next_header_row else None,
+        meta_row_end=max(0, int(header_block_start) - 1),
+        stop_row=int(next_header_block_start) - 1 if next_header_block_start else None,
         canonical_defs=canonical_defs,
         fuzzy_min_ratio=float(fuzzy_min_ratio),
         debug_table=bool(debug_table),
@@ -2386,7 +2461,7 @@ def _detect_synthetic_sequence_blocks(
     primary_x_name, _primary_x_idx = _select_block_x_axis(block)
     blocks.append(block)
 
-    search_row = int(block.diagnostics.get("data_end_row") or int(header_row)) + 1
+    search_row = int(block.diagnostics.get("header_block_end") or int(header_block_end)) + 1
     next_import_order = int(start_import_order) + 1
 
     while search_row <= sheet_max_row:
@@ -2402,9 +2477,14 @@ def _detect_synthetic_sequence_blocks(
         )
         if not next_header_row or not next_cols:
             break
+        next_header_block_start, next_header_block_end = _header_block_span(
+            ws,
+            header_row=int(next_header_row),
+            excel_col_indices=[int(c) for c, _h in next_cols],
+        )
         stop_header_row, _stop_cols = _find_first_header_row_in_range(
             ws,
-            start_row=int(next_header_row) + 1,
+            start_row=int(next_header_block_end) + 1,
             stop_row=sheet_max_row,
             max_cols=max_cols,
             lookahead_rows=lookahead_rows,
@@ -2412,14 +2492,21 @@ def _detect_synthetic_sequence_blocks(
             min_numeric_ratio=min_numeric_ratio,
             min_data_cols=min_data_cols,
         )
+        stop_header_block_start = None
+        if stop_header_row and _stop_cols:
+            stop_header_block_start, _stop_header_block_end = _header_block_span(
+                ws,
+                header_row=int(stop_header_row),
+                excel_col_indices=[int(c) for c, _h in _stop_cols],
+            )
         next_block = _materialize_sequence_block(
             ws,
             source_sheet_name=str(sheet_name),
             header_row=int(next_header_row),
             cols=list(next_cols),
             meta_row_start=max(1, int(search_row)),
-            meta_row_end=max(0, int(next_header_row) - 1),
-            stop_row=int(stop_header_row) - 1 if stop_header_row else None,
+            meta_row_end=max(0, int(next_header_block_start) - 1),
+            stop_row=int(stop_header_block_start) - 1 if stop_header_block_start else None,
             canonical_defs=canonical_defs,
             fuzzy_min_ratio=float(fuzzy_min_ratio),
             debug_table=bool(debug_table),
@@ -2427,7 +2514,7 @@ def _detect_synthetic_sequence_blocks(
             import_order=int(next_import_order),
         )
         if next_block is None:
-            search_row = int(next_header_row) + 1
+            search_row = int(next_header_block_end) + 1
             continue
         signature = tuple(next_block.diagnostics.get("header_signature") or [])
         has_sequence = bool(str(next_block.sequence_token or "").strip())
@@ -2437,19 +2524,14 @@ def _detect_synthetic_sequence_blocks(
         if has_sequence and (signature == primary_signature or (same_primary_x and bool(shared_headers))):
             blocks.append(next_block)
             next_import_order += 1
-            search_row = int(next_block.diagnostics.get("data_end_row") or int(next_header_row)) + 1
+            search_row = int(next_block.diagnostics.get("header_block_end") or int(next_header_block_end)) + 1
             continue
-        search_row = int(next_header_row) + 1
+        search_row = int(next_header_block_end) + 1
     return blocks
 
 
 def _select_block_x_axis(block: DetectedSequenceBlock) -> tuple[str, int] | tuple[str, None]:
-    normalized = [_normalize_header(name) for name in (block.mapped_headers or [])]
-    for target in ("Time", "Pulse Number"):
-        target_norm = _normalize_header(target)
-        if target_norm in normalized:
-            return target, normalized.index(target_norm)
-    return "", None
+    return _mapped_headers_x_axis(block.mapped_headers or [])
 
 
 def _logical_sheet_from_block(
@@ -2568,12 +2650,19 @@ def _merge_sequence_blocks_into_logical_sheets(blocks: Sequence[DetectedSequence
         diagnostics = {
             "merge_status": "merged_on_x_axis",
             "merge_x_axis": x_header,
+            "x_min": None if not row_map else float(min(row_map.keys())),
+            "x_max": None if not row_map else float(max(row_map.keys())),
             "source_blocks": [
                 {
                     "source_sheet_name": block.source_sheet_name,
                     "header_row": int(block.header_row),
                     "sequence_token": str(block.sequence_token or ""),
                     "rows_inserted": int(len(block.data_rows)),
+                    "header_block_start": int(block.diagnostics.get("header_block_start") or 0),
+                    "header_block_end": int(block.diagnostics.get("header_block_end") or 0),
+                    "x_axis": str(block.diagnostics.get("x_axis") or ""),
+                    "x_min": block.diagnostics.get("x_min"),
+                    "x_max": block.diagnostics.get("x_max"),
                 }
                 for block in ordered_blocks
             ],
