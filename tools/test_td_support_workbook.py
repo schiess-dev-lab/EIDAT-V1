@@ -31,6 +31,14 @@ def _have_scipy() -> bool:
     return True
 
 
+def _have_matplotlib() -> bool:
+    try:
+        import matplotlib  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
 def _have_pyside6() -> bool:
     try:
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -161,31 +169,203 @@ class _PerfControlPeriodHarness:
             setattr(self, name, getattr(TestDataTrendDialog, name).__get__(self, _PerfControlPeriodHarness))
 
 
-class _PerfBandFilterHarness:
-    def __init__(self, db_path: Path) -> None:
+class _PlotViewBandHarness:
+    def __init__(self) -> None:
+        _qt_app()
+        from PySide6 import QtWidgets
         from EIDAT_App_Files.ui_next.qt_main import TestDataTrendDialog  # type: ignore
 
-        self._db_path = Path(db_path)
+        self._mode = "curves"
+        self._last_plot_def = None
+        self._plot_note_base_text = ""
+        self.lbl_plot_note = QtWidgets.QLabel()
+        self.plot_band_frame = QtWidgets.QFrame()
+        self.plot_band_x_row = QtWidgets.QHBoxLayout()
+        self.plot_band_y_row = QtWidgets.QHBoxLayout()
+        self.ed_plot_x_band_min = QtWidgets.QLineEdit()
+        self.ed_plot_x_band_max = QtWidgets.QLineEdit()
+        self.ed_plot_y_band_min = QtWidgets.QLineEdit()
+        self.ed_plot_y_band_max = QtWidgets.QLineEdit()
+        self._axes = None
+        self._canvas = None
 
-        type(self)._perf_parse_band_value = staticmethod(TestDataTrendDialog._perf_parse_band_value)
-        type(self)._perf_axis_band_active = staticmethod(TestDataTrendDialog._perf_axis_band_active)
-        type(self)._perf_axis_band_contains = staticmethod(TestDataTrendDialog._perf_axis_band_contains)
-        type(self)._selection_observation_filters = staticmethod(TestDataTrendDialog._selection_observation_filters)
-        type(self)._perf_normalize_axis_band = classmethod(TestDataTrendDialog._perf_normalize_axis_band.__func__)
-        type(self)._perf_filter_points_by_axis_bands = classmethod(TestDataTrendDialog._perf_filter_points_by_axis_bands.__func__)
+        type(self)._view_band_active = staticmethod(TestDataTrendDialog._view_band_active)
+        type(self)._parse_view_band_value = staticmethod(TestDataTrendDialog._parse_view_band_value)
+        type(self)._normalize_view_band = classmethod(TestDataTrendDialog._normalize_view_band.__func__)
+        type(self)._plot_view_band_axes = staticmethod(TestDataTrendDialog._plot_view_band_axes)
+        type(self)._plot_view_band_note = staticmethod(TestDataTrendDialog._plot_view_band_note)
+
+        for row, widgets in (
+            (self.plot_band_x_row, (QtWidgets.QLabel("x"), self.ed_plot_x_band_min, QtWidgets.QLabel("to"), self.ed_plot_x_band_max)),
+            (self.plot_band_y_row, (QtWidgets.QLabel("y"), self.ed_plot_y_band_min, QtWidgets.QLabel("to"), self.ed_plot_y_band_max)),
+        ):
+            for widget in widgets:
+                row.addWidget(widget)
 
         for name in (
-            "_load_metric_series_for_selection",
-            "_load_perf_equation_metric_series",
-            "_resolve_td_y_col_units",
-            "_perf_build_master_aggregate_curve",
-            "_perf_collect_results",
+            "_set_plot_note",
+            "_displayed_plot_mode",
+            "_plot_view_band_mode_for_display",
+            "_current_plot_view_bands",
+            "_refresh_plot_note",
+            "_refresh_plot_view_band_controls",
+            "_apply_plot_view_bands_to_axes",
+            "_apply_current_plot_view_bands",
         ):
-            setattr(self, name, getattr(TestDataTrendDialog, name).__get__(self, _PerfBandFilterHarness))
+            setattr(self, name, getattr(TestDataTrendDialog, name).__get__(self, _PlotViewBandHarness))
 
-        self._run_display_text = lambda run_name: str(run_name)
+
+class _MockPlotAxis:
+    def __init__(self, *, xlim: tuple[float, float] = (0.0, 10.0), ylim: tuple[float, float] = (0.0, 100.0)) -> None:
+        self._xlim = tuple(xlim)
+        self._ylim = tuple(ylim)
+
+    def get_xlim(self) -> tuple[float, float]:
+        return self._xlim
+
+    def get_ylim(self) -> tuple[float, float]:
+        return self._ylim
+
+    def set_xlim(self, lo: float, hi: float) -> None:
+        self._xlim = (float(lo), float(hi))
+
+    def set_ylim(self, lo: float, hi: float) -> None:
+        self._ylim = (float(lo), float(hi))
+
+
+class _MockPlotCanvas:
+    def __init__(self) -> None:
+        self.draw_idle_calls = 0
+        self.draw_calls = 0
+
+    def draw_idle(self) -> None:
+        self.draw_idle_calls += 1
+
+    def draw(self) -> None:
+        self.draw_calls += 1
+
+
+class _PlotPerformanceHarness:
+    def __init__(self) -> None:
+        _qt_app()
+        from PySide6 import QtWidgets
+        from EIDAT_App_Files.ui_next.qt_main import TestDataTrendDialog  # type: ignore
+
+        self._plot_ready = True
+        self._db_path = Path("C:/tmp/fake.sqlite3")
+        self._perf_require_min_points = 2
+        self._perf_all_runs = ["RunA"]
+        self._perf_col_runs = {"input1": {"RunA"}, "output": {"RunA"}}
+        self._perf_results_by_stat = {}
+        self._highlight_sn = ""
+        self._last_plot_def = None
+        self._plot_note = ""
+
+        self.cb_perf_x_col = QtWidgets.QComboBox()
+        self.cb_perf_x_col.addItem("Input 1", "input1")
+        self.cb_perf_y_col = QtWidgets.QComboBox()
+        self.cb_perf_y_col.addItem("Output", "output")
+        self.cb_perf_z_col = QtWidgets.QComboBox()
+        self.cb_perf_z_col.addItem("None", "")
+        self.cb_perf_fit = QtWidgets.QCheckBox()
+        self.cb_perf_fit.setChecked(True)
+        self.cb_perf_view_stat = QtWidgets.QComboBox()
+        self.btn_save_plot_pdf = QtWidgets.QPushButton()
+        self.btn_add_auto_plot = QtWidgets.QPushButton()
+
+        self._perf_current_col_name = lambda cb: str(cb.currentData() or cb.currentText() or "").strip()
+        self._perf_norm_name = lambda value: "".join(ch.lower() for ch in str(value or "") if ch.isalnum())
+        self._perf_checked_stats = lambda: ["mean"]
+        self._perf_plot_stat_candidates = lambda: ["mean"]
+        self._selected_perf_runs = lambda: ["RunA"]
+        self._selected_perf_serials = lambda: ["SN1"]
+        self._selected_perf_run_type_mode = lambda: "steady_state"
+        self._selected_perf_filter_mode = lambda: "all_conditions"
+        self._selected_perf_control_period = lambda: None
+        self._perf_var_names = lambda: ("output", "input1", "")
+        self._common_runs_for_perf_vars = lambda output, input1, input2: ["RunA"]
+        self._perf_collect_results = lambda *args, **kwargs: (
+            {
+                "mean": {
+                    "plot_dimension": "2d",
+                    "master_model": {},
+                    "curves": {"SN1": [(1.0, 2.0, "RunA"), (2.0, 3.0, "RunA")]},
+                }
+            },
+            ["mean"],
+            "",
+        )
+        self._populate_perf_stats = lambda stats: None
+        self._update_perf_pair_summary = lambda **kwargs: None
+        self._set_plot_note = lambda text="": setattr(self, "_plot_note", str(text or ""))
+        self._update_perf_highlight_models = lambda: None
+        self._fill_perf_equations_table = lambda: None
+        self._redraw_performance_view = lambda: None
+        self._current_run_selection = lambda: {
+            "mode": "sequence",
+            "id": "sequence:RunA",
+            "member_sequences": ["RunA"],
+            "member_runs": ["RunA"],
+        }
+        self._selection_display_text = lambda selection: "RunA"
+        self._selection_condition_label = lambda selection: "RunA"
         self._perf_requested_surface_family = lambda: "auto_surface"
         self._perf_requested_fit_mode = lambda: "auto"
+
+        self._plot_performance = getattr(TestDataTrendDialog, "_plot_performance").__get__(self, _PlotPerformanceHarness)
+
+
+class _RenderPlotDefHarness:
+    def __init__(self) -> None:
+        from EIDAT_App_Files.ui_next.qt_main import TestDataTrendDialog  # type: ignore
+
+        self._db_path = Path("C:/tmp/fake.sqlite3")
+        self._serial_source_rows = []
+        self._run_name_by_display = {}
+        self._perf_all_runs = ["RunA"]
+        self._perf_require_min_points = 2
+        self.collect_calls: list[dict] = []
+
+        def _collect_results(
+            output_name: str,
+            input1_name: str,
+            input2_name: str,
+            plot_stats: list[str],
+            runs: list[str],
+            serials: list[str],
+            *,
+            fit_enabled: bool,
+            require_min_points: int,
+            control_period_filter=None,
+            display_control_period=None,
+            run_type_filter=None,
+        ):
+            self.collect_calls.append(
+                {
+                    "output_name": output_name,
+                    "input1_name": input1_name,
+                    "input2_name": input2_name,
+                    "plot_stats": list(plot_stats),
+                    "runs": list(runs),
+                    "serials": list(serials),
+                    "fit_enabled": bool(fit_enabled),
+                    "require_min_points": int(require_min_points),
+                    "control_period_filter": control_period_filter,
+                    "display_control_period": display_control_period,
+                    "run_type_filter": run_type_filter,
+                }
+            )
+            return ({"mean": {"plot_dimension": "2d"}}, ["mean"], "")
+
+        self._selection_from_plot_def = lambda d: {"member_runs": ["RunA"]}
+        self._selected_perf_runs = lambda: ["RunA"]
+        self._selected_perf_serials = lambda: ["SN1"]
+        self._selected_perf_run_type_mode = lambda: "steady_state"
+        self._common_runs_for_perf_vars = lambda output, input1, input2: ["RunA"]
+        self._perf_collect_results = _collect_results
+        self._render_performance_result = lambda ax, result, **kwargs: ax.plot([0.0, 1.0], [0.0, 1.0])
+
+        self._render_plot_def_to_figure = getattr(TestDataTrendDialog, "_render_plot_def_to_figure").__get__(self, _RenderPlotDefHarness)
 
 
 class _RunSelectionHarness:
@@ -319,7 +499,7 @@ class _MetricBoundsHarness:
 
 @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
 class TestTDTrendDialogCacheLoading(unittest.TestCase):
-    def test_load_cache_sync_fallback_uses_smart_ensure(self) -> None:
+    def test_load_cache_sync_fallback_validates_existing_cache(self) -> None:
         _qt_app()
         from PySide6 import QtWidgets
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
@@ -344,15 +524,14 @@ class TestTDTrendDialogCacheLoading(unittest.TestCase):
         load_cache = TestDataTrendDialog._load_cache.__get__(harness, _Harness)
         fake_db = harness._project_dir / "implementation_trending.sqlite3"
 
-        with mock.patch.object(be, "ensure_test_data_project_cache", return_value=fake_db) as ensure_mock:
+        with mock.patch.object(be, "validate_existing_test_data_project_cache", return_value=fake_db) as validate_mock:
             with mock.patch.object(QtWidgets.QMessageBox, "warning") as warning_mock:
                 load_cache(rebuild=False)
 
         warning_mock.assert_not_called()
-        ensure_mock.assert_called_once_with(
+        validate_mock.assert_called_once_with(
             harness._project_dir,
             harness._workbook_path,
-            rebuild=False,
         )
         self.assertEqual(harness._db_path, fake_db)
         self.assertEqual(harness._refresh_from_cache_calls, 1)
@@ -382,20 +561,19 @@ class TestTDTrendDialogCacheLoading(unittest.TestCase):
         )
         load_cache = TestDataTrendDialog._load_cache.__get__(harness, _Harness)
 
-        with mock.patch.object(be, "ensure_test_data_project_cache", side_effect=RuntimeError("boom")) as ensure_mock:
+        with mock.patch.object(be, "validate_existing_test_data_project_cache", side_effect=RuntimeError("boom")) as validate_mock:
             with mock.patch.object(QtWidgets.QMessageBox, "warning") as warning_mock:
                 load_cache(rebuild=False)
 
-        ensure_mock.assert_called_once_with(
+        validate_mock.assert_called_once_with(
             harness._project_dir,
             harness._workbook_path,
-            rebuild=False,
         )
         warning_mock.assert_called_once()
         self.assertEqual(harness._refresh_from_cache_calls, 0)
         self.assertEqual(harness._update_plot_zoom_actions_calls, 0)
 
-    def test_load_cache_progress_path_auto_builds_on_first_open(self) -> None:
+    def test_load_cache_progress_path_validates_existing_cache(self) -> None:
         _qt_app()
         from PySide6 import QtCore, QtWidgets
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
@@ -490,14 +668,15 @@ class TestTDTrendDialogCacheLoading(unittest.TestCase):
 
         fake_db = harness._project_dir / "implementation_trending.sqlite3"
         with mock.patch.object(qm, "ProjectTaskWorker", _ImmediateWorker):
-            with mock.patch.object(be, "ensure_test_data_project_cache", return_value=fake_db) as ensure_mock:
+            with mock.patch.object(be, "validate_existing_test_data_project_cache", return_value=fake_db) as validate_mock:
                 with mock.patch.object(QtWidgets.QMessageBox, "warning") as warning_mock:
                     harness._load_cache(rebuild=False)
 
         warning_mock.assert_not_called()
-        ensure_mock.assert_called_once()
-        self.assertEqual(ensure_mock.call_args.kwargs.get("rebuild"), False)
-        self.assertTrue(callable(ensure_mock.call_args.kwargs.get("progress_cb")))
+        validate_mock.assert_called_once_with(
+            harness._project_dir,
+            harness._workbook_path,
+        )
         self.assertEqual(harness._db_path, fake_db)
         self.assertEqual(harness._refresh_from_cache_calls, 1)
         self.assertEqual(harness._update_plot_zoom_actions_calls, 1)
@@ -588,13 +767,52 @@ class TestTDTrendDialogCacheLoading(unittest.TestCase):
         harness._cache_progress_timer.timeout.connect(harness._show_cache_progress_dialog)
 
         with mock.patch.object(qm, "ProjectTaskWorker", _ImmediateWorker):
-            with mock.patch.object(be, "ensure_test_data_project_cache", side_effect=RuntimeError("build failed")):
+            with mock.patch.object(be, "validate_existing_test_data_project_cache", side_effect=RuntimeError("build failed")):
                 with mock.patch.object(QtWidgets.QMessageBox, "warning") as warning_mock:
                     harness._load_cache(rebuild=False)
 
         warning_mock.assert_called_once()
         self.assertIn("build failed", str(warning_mock.call_args.args[2]))
         self.assertEqual(harness.lbl_cache.text(), "Cache DB: unavailable")
+
+    def test_load_cache_rebuild_path_still_uses_smart_ensure(self) -> None:
+        _qt_app()
+        from PySide6 import QtWidgets
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+        from EIDAT_App_Files.ui_next.qt_main import TestDataTrendDialog  # type: ignore
+
+        class _Harness:
+            pass
+
+        harness = _Harness()
+        harness._project_dir = Path("C:/tmp/project")
+        harness._workbook_path = Path("C:/tmp/project/project.xlsx")
+        harness.lbl_source = QtWidgets.QLabel()
+        harness.lbl_cache = QtWidgets.QLabel()
+        harness._refresh_from_cache_calls = 0
+        harness._update_plot_zoom_actions_calls = 0
+        harness._refresh_from_cache = lambda: setattr(harness, "_refresh_from_cache_calls", harness._refresh_from_cache_calls + 1)
+        harness._update_plot_zoom_actions = lambda: setattr(
+            harness,
+            "_update_plot_zoom_actions_calls",
+            harness._update_plot_zoom_actions_calls + 1,
+        )
+        load_cache = TestDataTrendDialog._load_cache.__get__(harness, _Harness)
+        fake_db = harness._project_dir / "implementation_trending.sqlite3"
+
+        with mock.patch.object(be, "ensure_test_data_project_cache", return_value=fake_db) as ensure_mock:
+            with mock.patch.object(QtWidgets.QMessageBox, "warning") as warning_mock:
+                load_cache(rebuild=True)
+
+        warning_mock.assert_not_called()
+        ensure_mock.assert_called_once_with(
+            harness._project_dir,
+            harness._workbook_path,
+            rebuild=True,
+        )
+        self.assertEqual(harness._db_path, fake_db)
+        self.assertEqual(harness._refresh_from_cache_calls, 1)
+        self.assertEqual(harness._update_plot_zoom_actions_calls, 1)
 
     def test_generate_debug_excel_files_uses_manual_export_only(self) -> None:
         _qt_app()
@@ -5169,60 +5387,104 @@ class TestTDSupportWorkbook(unittest.TestCase):
         self.assertFalse(harness.cb_perf_control_period.isEnabled())
 
     @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
-    def test_perf_axis_band_filter_helper_respects_open_ranges(self) -> None:
-        harness = _PerfBandFilterHarness(Path("C:/tmp/fake.sqlite3"))
-        points = [
-            (0.5, 10.0, "a"),
-            (1.5, 20.0, "b"),
-            (2.5, 30.0, "c"),
-            (3.5, 40.0, "d"),
-        ]
-        filtered = harness._perf_filter_points_by_axis_bands(
-            points,
-            {
-                "x": harness._perf_normalize_axis_band("X", 1.0, 3.0),
-                "y": harness._perf_normalize_axis_band("Y", "", 30.0),
-            },
-        )
-        self.assertEqual(filtered, [(1.5, 20.0, "b"), (2.5, 30.0, "c")])
+    def test_plot_view_band_parse_accepts_blank_and_open_ranges(self) -> None:
+        harness = _PlotViewBandHarness()
+        self.assertIsNone(harness._parse_view_band_value("", "Y", "min"))
+        self.assertEqual(harness._normalize_view_band("Y", "", 30.0), (None, 30.0))
+        self.assertEqual(harness._normalize_view_band("X", 1.5, None), (1.5, None))
 
     @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
-    def test_perf_collect_results_applies_x_and_y_band_filters_before_serial_qualification(self) -> None:
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
-            root = Path(td)
-            db_path = self._seed_perf_export_db_2d(
-                root,
-                rows=[
-                    ("SN1", "RunA", 1.0, 10.0, None),
-                    ("SN1", "RunA", 2.0, 20.0, None),
-                    ("SN1", "RunA", 3.0, 30.0, None),
-                    ("SN2", "RunA", 1.0, 100.0, None),
-                    ("SN2", "RunA", 2.0, 200.0, None),
-                ],
-            )
-            harness = _PerfBandFilterHarness(db_path)
-            results, plot_view_stats, fit_error_text = harness._perf_collect_results(
-                "thrust",
-                "impulse bit",
-                "",
-                ["mean"],
-                ["RunA"],
-                ["SN1", "SN2"],
-                fit_enabled=False,
-                require_min_points=2,
-                axis_band_filters={
-                    "x": harness._perf_normalize_axis_band("X", 1.5, None),
-                    "y": harness._perf_normalize_axis_band("Y", None, 40.0),
-                },
-            )
+    def test_plot_view_band_parse_rejects_invalid_values(self) -> None:
+        harness = _PlotViewBandHarness()
+        with self.assertRaisesRegex(ValueError, "must be a number"):
+            harness._parse_view_band_value("abc", "X", "min")
+        with self.assertRaisesRegex(ValueError, "cannot be greater than max"):
+            harness._normalize_view_band("Y", 5.0, 4.0)
 
-            self.assertEqual(fit_error_text, "")
-            self.assertEqual(plot_view_stats, ["mean"])
-            mean_result = results.get("mean") or {}
-            curves = mean_result.get("curves") or {}
-            self.assertEqual(set(curves.keys()), {"SN1"})
-            self.assertEqual([tuple(point[:2]) for point in curves["SN1"]], [(2.0, 20.0), (3.0, 30.0)])
-            self.assertTrue(all("RunA" in str(point[2]) for point in curves["SN1"]))
+    @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
+    def test_plot_view_band_controls_follow_active_mode(self) -> None:
+        harness = _PlotViewBandHarness()
+
+        harness._mode = "metrics"
+        harness._refresh_plot_view_band_controls()
+        self.assertFalse(harness.plot_band_frame.isHidden())
+        self.assertTrue(harness.ed_plot_x_band_min.isHidden())
+        self.assertFalse(harness.ed_plot_y_band_min.isHidden())
+
+        harness._mode = "performance"
+        harness._refresh_plot_view_band_controls()
+        self.assertFalse(harness.ed_plot_x_band_min.isHidden())
+        self.assertFalse(harness.ed_plot_y_band_min.isHidden())
+
+        harness._mode = "curves"
+        harness._refresh_plot_view_band_controls()
+        self.assertTrue(harness.plot_band_frame.isHidden())
+
+    @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
+    def test_metrics_view_band_changes_axis_limits_only(self) -> None:
+        harness = _PlotViewBandHarness()
+        axis = _MockPlotAxis(xlim=(0.0, 9.0), ylim=(0.0, 100.0))
+        harness.ed_plot_y_band_min.setText("10")
+        harness.ed_plot_y_band_max.setText("20")
+        harness._apply_plot_view_bands_to_axes(axis, mode="metrics")
+        self.assertEqual(axis.get_xlim(), (0.0, 9.0))
+        self.assertEqual(axis.get_ylim(), (10.0, 20.0))
+
+    @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
+    def test_performance_view_band_changes_axis_limits_only(self) -> None:
+        harness = _PlotViewBandHarness()
+        axis = _MockPlotAxis(xlim=(0.0, 9.0), ylim=(0.0, 100.0))
+        harness.ed_plot_x_band_min.setText("2")
+        harness.ed_plot_x_band_max.setText("4")
+        harness.ed_plot_y_band_min.setText("10")
+        harness.ed_plot_y_band_max.setText("20")
+        harness._apply_plot_view_bands_to_axes(axis, mode="performance")
+        self.assertEqual(axis.get_xlim(), (2.0, 4.0))
+        self.assertEqual(axis.get_ylim(), (10.0, 20.0))
+
+    @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
+    def test_view_band_edits_do_not_mutate_performance_results(self) -> None:
+        harness = _PlotViewBandHarness()
+        results = {"mean": {"curves": {"SN1": [(1.0, 2.0, "RunA")]}}}
+        harness._mode = "performance"
+        harness._last_plot_def = {"mode": "performance"}
+        harness._axes = _MockPlotAxis()
+        harness._canvas = _MockPlotCanvas()
+        harness._perf_results_by_stat = results
+        harness.ed_plot_x_band_min.setText("1")
+        harness.ed_plot_y_band_max.setText("20")
+        harness._apply_current_plot_view_bands()
+        self.assertIs(harness._perf_results_by_stat, results)
+
+    @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
+    def test_plot_performance_does_not_store_band_keys_in_last_plot_def(self) -> None:
+        harness = _PlotPerformanceHarness()
+        harness._plot_performance()
+        self.assertIsInstance(harness._last_plot_def, dict)
+        for key in ("x_band_min", "x_band_max", "y_band_min", "y_band_max"):
+            self.assertNotIn(key, harness._last_plot_def)
+
+    @unittest.skipUnless(_have_matplotlib(), "matplotlib not installed")
+    def test_render_plot_def_ignores_legacy_band_keys(self) -> None:
+        harness = _RenderPlotDefHarness()
+        fig = harness._render_plot_def_to_figure(
+            {
+                "mode": "performance",
+                "output": "output",
+                "input1": "input1",
+                "input2": "",
+                "stats": ["mean"],
+                "view_stat": "mean",
+                "fit_enabled": False,
+                "x_band_min": 1.0,
+                "x_band_max": 2.0,
+                "y_band_min": 3.0,
+                "y_band_max": 4.0,
+            }
+        )
+        self.assertIsNotNone(fig)
+        self.assertEqual(len(harness.collect_calls), 1)
+        self.assertEqual(harness.collect_calls[0]["plot_stats"], ["mean"])
 
     def test_perf_candidate_discovery_accepts_separated_x(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore

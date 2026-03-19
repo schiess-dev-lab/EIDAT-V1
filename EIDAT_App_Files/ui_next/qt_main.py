@@ -3062,6 +3062,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._auto_plot_path = self._project_dir / "auto_plots_test_data.json"
         self._plot_base_xlim: tuple[float, float] | None = None
         self._plot_base_ylim: tuple[float, float] | None = None
+        self._plot_note_base_text = ""
         self._plot_last_cursor_xy: tuple[float, float] | None = None
         self._zone_zoom_press_xy: tuple[float, float] | None = None
         self._zone_zoom_rect = None
@@ -3364,32 +3365,6 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         filter_row.addWidget(self.cb_perf_control_period, 1)
         perf_plot_layout.addLayout(filter_row)
 
-        band_x_row = QtWidgets.QHBoxLayout()
-        band_x_row.addWidget(QtWidgets.QLabel("X band filter:"))
-        self.ed_perf_x_band_min = QtWidgets.QLineEdit()
-        self.ed_perf_x_band_min.setPlaceholderText("min")
-        self.ed_perf_x_band_min.setToolTip("Optional lower bound for the plotted X-axis data band. Blank leaves it unbounded.")
-        band_x_row.addWidget(self.ed_perf_x_band_min, 1)
-        band_x_row.addWidget(QtWidgets.QLabel("to"))
-        self.ed_perf_x_band_max = QtWidgets.QLineEdit()
-        self.ed_perf_x_band_max.setPlaceholderText("max")
-        self.ed_perf_x_band_max.setToolTip("Optional upper bound for the plotted X-axis data band. Blank leaves it unbounded.")
-        band_x_row.addWidget(self.ed_perf_x_band_max, 1)
-        perf_plot_layout.addLayout(band_x_row)
-
-        band_y_row = QtWidgets.QHBoxLayout()
-        band_y_row.addWidget(QtWidgets.QLabel("Y band filter:"))
-        self.ed_perf_y_band_min = QtWidgets.QLineEdit()
-        self.ed_perf_y_band_min.setPlaceholderText("min")
-        self.ed_perf_y_band_min.setToolTip("Optional lower bound for the plotted Y-axis data band. Blank leaves it unbounded.")
-        band_y_row.addWidget(self.ed_perf_y_band_min, 1)
-        band_y_row.addWidget(QtWidgets.QLabel("to"))
-        self.ed_perf_y_band_max = QtWidgets.QLineEdit()
-        self.ed_perf_y_band_max.setPlaceholderText("max")
-        self.ed_perf_y_band_max.setToolTip("Optional upper bound for the plotted Y-axis data band. Blank leaves it unbounded.")
-        band_y_row.addWidget(self.ed_perf_y_band_max, 1)
-        perf_plot_layout.addLayout(band_y_row)
-
         fit_row = QtWidgets.QHBoxLayout()
         self.cb_perf_fit = QtWidgets.QCheckBox("Fit equation")
         self.cb_perf_fit.setChecked(True)
@@ -3620,6 +3595,48 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         plot_header.addWidget(self.btn_zoom_reset)
         plot_header.addWidget(self.btn_expand_plot)
         right_layout.addLayout(plot_header)
+
+        self.plot_band_frame = QtWidgets.QFrame()
+        self.plot_band_frame.setStyleSheet("QFrame { border: 0; background: transparent; }")
+        plot_band_layout = QtWidgets.QVBoxLayout(self.plot_band_frame)
+        plot_band_layout.setContentsMargins(0, 0, 0, 0)
+        plot_band_layout.setSpacing(6)
+
+        self.plot_band_x_row = QtWidgets.QHBoxLayout()
+        self.plot_band_x_row.addWidget(QtWidgets.QLabel("View X band:"))
+        self.ed_plot_x_band_min = QtWidgets.QLineEdit()
+        self.ed_plot_x_band_min.setPlaceholderText("min")
+        self.ed_plot_x_band_min.setToolTip("Optional lower X-axis view bound. Blank leaves it unbounded.")
+        self.plot_band_x_row.addWidget(self.ed_plot_x_band_min, 1)
+        self.plot_band_x_row.addWidget(QtWidgets.QLabel("to"))
+        self.ed_plot_x_band_max = QtWidgets.QLineEdit()
+        self.ed_plot_x_band_max.setPlaceholderText("max")
+        self.ed_plot_x_band_max.setToolTip("Optional upper X-axis view bound. Blank leaves it unbounded.")
+        self.plot_band_x_row.addWidget(self.ed_plot_x_band_max, 1)
+        plot_band_layout.addLayout(self.plot_band_x_row)
+
+        self.plot_band_y_row = QtWidgets.QHBoxLayout()
+        self.plot_band_y_row.addWidget(QtWidgets.QLabel("View Y band:"))
+        self.ed_plot_y_band_min = QtWidgets.QLineEdit()
+        self.ed_plot_y_band_min.setPlaceholderText("min")
+        self.ed_plot_y_band_min.setToolTip("Optional lower Y-axis view bound. Blank leaves it unbounded.")
+        self.plot_band_y_row.addWidget(self.ed_plot_y_band_min, 1)
+        self.plot_band_y_row.addWidget(QtWidgets.QLabel("to"))
+        self.ed_plot_y_band_max = QtWidgets.QLineEdit()
+        self.ed_plot_y_band_max.setPlaceholderText("max")
+        self.ed_plot_y_band_max.setToolTip("Optional upper Y-axis view bound. Blank leaves it unbounded.")
+        self.plot_band_y_row.addWidget(self.ed_plot_y_band_max, 1)
+        plot_band_layout.addLayout(self.plot_band_y_row)
+        for edit in (
+            self.ed_plot_x_band_min,
+            self.ed_plot_x_band_max,
+            self.ed_plot_y_band_min,
+            self.ed_plot_y_band_max,
+        ):
+            edit.textChanged.connect(lambda *_: self._apply_current_plot_view_bands())
+            edit.editingFinished.connect(self._finalize_plot_view_bands)
+
+        right_layout.addWidget(self.plot_band_frame)
 
         self.plot_container = QtWidgets.QFrame()
         plot_layout = QtWidgets.QVBoxLayout(self.plot_container)
@@ -3857,9 +3874,172 @@ class TestDataTrendDialog(QtWidgets.QDialog):
     def _set_plot_note(self, text: str = "") -> None:
         if not hasattr(self, "lbl_plot_note"):
             return
-        note = str(text or "").strip()
+        self._plot_note_base_text = str(text or "").strip()
+        self._refresh_plot_note()
+
+    def _displayed_plot_mode(self) -> str:
+        raw = str(((self._last_plot_def or {}).get("mode") if isinstance(self._last_plot_def, dict) else "") or "").strip().lower()
+        return raw if raw in {"curves", "metrics", "performance"} else str(getattr(self, "_mode", "") or "").strip().lower()
+
+    @staticmethod
+    def _view_band_active(bounds: tuple[float | None, float | None]) -> bool:
+        return bool(bounds[0] is not None or bounds[1] is not None)
+
+    @staticmethod
+    def _parse_view_band_value(raw_value: object, axis_label: str, edge_label: str) -> float | None:
+        text = str(raw_value or "").strip()
+        if not text:
+            return None
+        try:
+            value = float(text)
+        except Exception as exc:
+            raise ValueError(f"{axis_label} band {edge_label} must be a number.") from exc
+        if not math.isfinite(value):
+            raise ValueError(f"{axis_label} band {edge_label} must be finite.")
+        return float(value)
+
+    @classmethod
+    def _normalize_view_band(
+        cls,
+        axis_label: str,
+        lower_raw: object,
+        upper_raw: object,
+    ) -> tuple[float | None, float | None]:
+        lower = cls._parse_view_band_value(lower_raw, axis_label, "min")
+        upper = cls._parse_view_band_value(upper_raw, axis_label, "max")
+        if lower is not None and upper is not None and lower > upper:
+            raise ValueError(f"{axis_label} band min cannot be greater than max.")
+        return lower, upper
+
+    @staticmethod
+    def _plot_view_band_axes(mode: str) -> tuple[str, ...]:
+        current = str(mode or "").strip().lower()
+        if current == "metrics":
+            return ("y",)
+        if current == "performance":
+            return ("x", "y")
+        return tuple()
+
+    def _plot_view_band_mode_for_display(self) -> str:
+        display_mode = self._displayed_plot_mode()
+        active_mode = str(getattr(self, "_mode", "") or "").strip().lower()
+        if display_mode != active_mode:
+            return ""
+        return display_mode if display_mode in {"metrics", "performance"} else ""
+
+    def _current_plot_view_bands(self, *, mode: str | None = None) -> dict[str, tuple[float | None, float | None]]:
+        use_mode = str(mode or self._plot_view_band_mode_for_display() or self._mode or "").strip().lower()
+        allowed_axes = set(self._plot_view_band_axes(use_mode))
+        bands: dict[str, tuple[float | None, float | None]] = {}
+        if "x" in allowed_axes:
+            x_min = getattr(getattr(self, "ed_plot_x_band_min", None), "text", lambda: "")()
+            x_max = getattr(getattr(self, "ed_plot_x_band_max", None), "text", lambda: "")()
+            bands["x"] = self._normalize_view_band("X", x_min, x_max)
+        if "y" in allowed_axes:
+            y_min = getattr(getattr(self, "ed_plot_y_band_min", None), "text", lambda: "")()
+            y_max = getattr(getattr(self, "ed_plot_y_band_max", None), "text", lambda: "")()
+            bands["y"] = self._normalize_view_band("Y", y_min, y_max)
+        return bands
+
+    @staticmethod
+    def _plot_view_band_note(
+        axis_band_filters: dict[str, tuple[float | None, float | None]] | None,
+    ) -> str:
+        filters = axis_band_filters or {}
+        parts: list[str] = []
+        for axis in ("x", "y"):
+            lower, upper = filters.get(axis, (None, None))
+            if lower is None and upper is None:
+                continue
+            lo_txt = "-inf" if lower is None else f"{float(lower):.6g}"
+            hi_txt = "inf" if upper is None else f"{float(upper):.6g}"
+            parts.append(f"{axis.upper()} [{lo_txt}, {hi_txt}]")
+        if not parts:
+            return ""
+        return "View band active: " + " | ".join(parts)
+
+    def _refresh_plot_note(self) -> None:
+        if not hasattr(self, "lbl_plot_note"):
+            return
+        parts: list[str] = []
+        base_note = str(getattr(self, "_plot_note_base_text", "") or "").strip()
+        if base_note:
+            parts.append(base_note)
+        mode = self._plot_view_band_mode_for_display()
+        if mode:
+            try:
+                view_note = self._plot_view_band_note(self._current_plot_view_bands(mode=mode))
+            except ValueError:
+                view_note = ""
+            if view_note:
+                parts.append(view_note)
+        note = "\n".join(parts)
         self.lbl_plot_note.setText(note)
         self.lbl_plot_note.setVisible(bool(note))
+
+    def _refresh_plot_view_band_controls(self) -> None:
+        active_mode = str(getattr(self, "_mode", "") or "").strip().lower()
+        axes = set(self._plot_view_band_axes(active_mode))
+        if hasattr(self, "plot_band_frame"):
+            self.plot_band_frame.setVisible(bool(axes))
+        for attr, visible in (("plot_band_x_row", "x" in axes), ("plot_band_y_row", "y" in axes)):
+            row = getattr(self, attr, None)
+            if row is None:
+                continue
+            for i in range(row.count()):
+                item = row.itemAt(i)
+                widget = item.widget() if item is not None else None
+                if widget is not None:
+                    widget.setVisible(visible)
+        self._refresh_plot_note()
+
+    def _apply_plot_view_bands_to_axes(self, ax, *, mode: str | None = None) -> None:
+        if ax is None:
+            return
+        use_mode = str(mode or self._plot_view_band_mode_for_display() or self._mode or "").strip().lower()
+        axes = set(self._plot_view_band_axes(use_mode))
+        if not axes:
+            return
+        bands = self._current_plot_view_bands(mode=use_mode)
+        if "x" in axes:
+            x_bounds = bands.get("x", (None, None))
+            if self._view_band_active(x_bounds):
+                current_lo, current_hi = ax.get_xlim()
+                ax.set_xlim(x_bounds[0] if x_bounds[0] is not None else current_lo, x_bounds[1] if x_bounds[1] is not None else current_hi)
+        if "y" in axes:
+            y_bounds = bands.get("y", (None, None))
+            if self._view_band_active(y_bounds):
+                current_lo, current_hi = ax.get_ylim()
+                ax.set_ylim(y_bounds[0] if y_bounds[0] is not None else current_lo, y_bounds[1] if y_bounds[1] is not None else current_hi)
+
+    def _apply_current_plot_view_bands(self) -> None:
+        self._refresh_plot_note()
+        mode = self._plot_view_band_mode_for_display()
+        if not mode or not self._axes or not self._canvas:
+            return
+        try:
+            self._apply_plot_view_bands_to_axes(self._axes, mode=mode)
+        except ValueError:
+            return
+        try:
+            self._canvas.draw_idle()
+        except Exception:
+            try:
+                self._canvas.draw()
+            except Exception:
+                pass
+
+    def _finalize_plot_view_bands(self) -> None:
+        mode = self._plot_view_band_mode_for_display() or str(getattr(self, "_mode", "") or "").strip().lower()
+        if not self._plot_view_band_axes(mode):
+            self._refresh_plot_note()
+            return
+        try:
+            self._current_plot_view_bands(mode=mode)
+        except ValueError as exc:
+            QtWidgets.QMessageBox.warning(self, "Plot View Bands", str(exc))
+            return
+        self._apply_current_plot_view_bands()
 
     def _ensure_main_axes(self, plot_dimension: str = "2d") -> None:
         if not getattr(self, "_figure", None):
@@ -4194,6 +4374,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         canvas = FigureCanvas(fig)
         layout.addWidget(canvas, 1)
 
+        plot_mode = str((self._last_plot_def or {}).get("mode") or "").strip().lower()
+        if plot_mode in {"metrics", "performance"}:
+            try:
+                self._apply_plot_view_bands_to_axes(ax, mode=plot_mode)
+            except ValueError:
+                pass
         base_xlim = ax.get_xlim()
         base_ylim = ax.get_ylim()
 
@@ -4368,11 +4554,17 @@ class TestDataTrendDialog(QtWidgets.QDialog):
     def _load_cache(self, *, rebuild: bool) -> None:
         if not hasattr(self, "_report_progress"):
             try:
-                self._db_path = be.ensure_test_data_project_cache(
-                    self._project_dir,
-                    self._workbook_path,
-                    rebuild=bool(rebuild),
-                )
+                if rebuild:
+                    self._db_path = be.ensure_test_data_project_cache(
+                        self._project_dir,
+                        self._workbook_path,
+                        rebuild=True,
+                    )
+                else:
+                    self._db_path = be.validate_existing_test_data_project_cache(
+                        self._project_dir,
+                        self._workbook_path,
+                    )
                 self.lbl_source.setText(str(self._db_path))
                 self.lbl_cache.setText(f"Cache DB: {self._db_path}")
             except Exception as exc:
@@ -4386,18 +4578,23 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._set_cache_controls_enabled(False)
         self._cache_progress_visible = False
         self._cache_progress_heading = "Rebuilding Test Data Cache" if rebuild else "Loading Test Data Cache"
-        self._cache_progress_status = "Rebuilding raw cache" if rebuild else "Checking project cache"
+        self._cache_progress_status = "Rebuilding raw cache" if rebuild else "Validating existing project cache"
         self._cache_progress_detail = ""
         self.lbl_cache.setText("Cache DB: loading...")
         self._cache_progress_timer.start(150)
 
         def _task(report):
             report(self._cache_progress_status)
-            return be.ensure_test_data_project_cache(
+            if rebuild:
+                return be.ensure_test_data_project_cache(
+                    self._project_dir,
+                    self._workbook_path,
+                    rebuild=True,
+                    progress_cb=report,
+                )
+            return be.validate_existing_test_data_project_cache(
                 self._project_dir,
                 self._workbook_path,
-                rebuild=bool(rebuild),
-                progress_cb=report,
             )
 
         self._cache_worker = ProjectTaskWorker(_task, parent=self)
@@ -6895,6 +7092,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         if hasattr(self, "run_selector_frame"):
             self.run_selector_frame.setVisible(m != "performance")
         self._refresh_run_selection_visibility()
+        self._refresh_plot_view_band_controls()
         self.btn_plot.setText(
             "Plot Curves" if m == "curves" else ("Plot Metrics" if m == "metrics" else "Plot Performance")
         )
@@ -7051,6 +7249,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         if average_summaries:
             prefix = "Average value: " if len(average_summaries) == 1 else "Average values: "
             self._set_plot_note(prefix + " | ".join(average_summaries))
+        self._apply_plot_view_bands_to_axes(self._axes, mode="metrics")
+        self._refresh_plot_note()
         try:
             self._figure.tight_layout()
         except Exception:
@@ -7280,98 +7480,6 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         x_name = self._perf_current_col_name(self.cb_perf_x_col) if hasattr(self, "cb_perf_x_col") else ""
         y_name = self._perf_current_col_name(self.cb_perf_y_col) if hasattr(self, "cb_perf_y_col") else ""
         return x_name, y_name
-
-    @staticmethod
-    def _perf_parse_band_value(raw_value: object, axis_label: str, edge_label: str) -> float | None:
-        text = str(raw_value or "").strip()
-        if not text:
-            return None
-        try:
-            value = float(text)
-        except Exception as exc:
-            raise ValueError(f"{axis_label} band {edge_label} must be a number.") from exc
-        if not math.isfinite(value):
-            raise ValueError(f"{axis_label} band {edge_label} must be finite.")
-        return float(value)
-
-    @classmethod
-    def _perf_normalize_axis_band(
-        cls,
-        axis_label: str,
-        lower_raw: object,
-        upper_raw: object,
-    ) -> tuple[float | None, float | None]:
-        lower = cls._perf_parse_band_value(lower_raw, axis_label, "min")
-        upper = cls._perf_parse_band_value(upper_raw, axis_label, "max")
-        if lower is not None and upper is not None and lower > upper:
-            raise ValueError(f"{axis_label} band min cannot be greater than max.")
-        return lower, upper
-
-    def _current_perf_axis_band_filters(self) -> dict[str, tuple[float | None, float | None]]:
-        x_min = getattr(getattr(self, "ed_perf_x_band_min", None), "text", lambda: "")()
-        x_max = getattr(getattr(self, "ed_perf_x_band_max", None), "text", lambda: "")()
-        y_min = getattr(getattr(self, "ed_perf_y_band_min", None), "text", lambda: "")()
-        y_max = getattr(getattr(self, "ed_perf_y_band_max", None), "text", lambda: "")()
-        return {
-            "x": self._perf_normalize_axis_band("X", x_min, x_max),
-            "y": self._perf_normalize_axis_band("Y", y_min, y_max),
-        }
-
-    @staticmethod
-    def _perf_axis_band_active(bounds: tuple[float | None, float | None]) -> bool:
-        return bool(bounds[0] is not None or bounds[1] is not None)
-
-    @staticmethod
-    def _perf_axis_band_contains(value: object, bounds: tuple[float | None, float | None]) -> bool:
-        lower, upper = bounds
-        try:
-            numeric = float(value)
-        except Exception:
-            return False
-        if not math.isfinite(numeric):
-            return False
-        if lower is not None and numeric < lower:
-            return False
-        if upper is not None and numeric > upper:
-            return False
-        return True
-
-    @classmethod
-    def _perf_filter_points_by_axis_bands(
-        cls,
-        points: list[tuple],
-        axis_band_filters: dict[str, tuple[float | None, float | None]] | None,
-    ) -> list[tuple]:
-        filters = axis_band_filters or {}
-        x_bounds = filters.get("x", (None, None))
-        y_bounds = filters.get("y", (None, None))
-        if not cls._perf_axis_band_active(x_bounds) and not cls._perf_axis_band_active(y_bounds):
-            return list(points or [])
-        out: list[tuple] = []
-        for point in points or []:
-            if len(point) < 2:
-                continue
-            if not cls._perf_axis_band_contains(point[0], x_bounds):
-                continue
-            if not cls._perf_axis_band_contains(point[1], y_bounds):
-                continue
-            out.append(point)
-        return out
-
-    @staticmethod
-    def _perf_axis_band_note(axis_band_filters: dict[str, tuple[float | None, float | None]] | None) -> str:
-        filters = axis_band_filters or {}
-        parts: list[str] = []
-        for axis in ("x", "y"):
-            lower, upper = filters.get(axis, (None, None))
-            if lower is None and upper is None:
-                continue
-            lo_txt = "-inf" if lower is None else f"{float(lower):.6g}"
-            hi_txt = "inf" if upper is None else f"{float(upper):.6g}"
-            parts.append(f"{axis.upper()} [{lo_txt}, {hi_txt}]")
-        if not parts:
-            return ""
-        return "Data band filter active: " + " | ".join(parts) + " | Zoom still only changes the view."
 
     def _perf_requested_fit_mode(self) -> str:
         if not hasattr(self, "cb_perf_fit_model"):
@@ -7818,7 +7926,6 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         *,
         fit_enabled: bool,
         require_min_points: int,
-        axis_band_filters: dict[str, tuple[float | None, float | None]] | None = None,
         control_period_filter: object = None,
         display_control_period: object = None,
         run_type_filter: object = None,
@@ -7962,7 +8069,6 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                                 cp_numeric if cp_numeric is not None else cp_value,
                             )
                             pts_all.append(point)
-                    pts_all = self._perf_filter_points_by_axis_bands(pts_all, axis_band_filters)
                     pts_slice = [
                         (point[0], point[1], point[2], point[3])
                         for point in pts_all
@@ -8078,7 +8184,6 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                                     _obs_label(rdisp, _rn, row_output or row_input1),
                                 )
                             )
-                    pts_2d = self._perf_filter_points_by_axis_bands(pts_2d, axis_band_filters)
                     if len(pts_2d) >= require_min_points:
                         pts_2d.sort(key=lambda t: t[0])
                         curves[sn] = pts_2d
@@ -9398,6 +9503,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._ensure_main_axes(plot_dimension)
         hi_sn = str(getattr(self, "_highlight_sn", "") or "").strip()
         self._render_performance_result(self._axes, r, highlight_serial=hi_sn, select_equation_row=True)
+        self._apply_plot_view_bands_to_axes(self._axes, mode="performance")
+        self._refresh_plot_note()
         try:
             self._canvas.draw()
         except Exception:
@@ -9828,10 +9935,6 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             self.cb_perf_surface_model.currentIndexChanged.connect(lambda *_: self._clear_perf_results())
             self.sp_perf_degree.valueChanged.connect(lambda *_: self._clear_perf_results())
             self.cb_perf_norm_x.toggled.connect(lambda *_: self._clear_perf_results())
-            self.ed_perf_x_band_min.textChanged.connect(lambda *_: self._clear_perf_results())
-            self.ed_perf_x_band_max.textChanged.connect(lambda *_: self._clear_perf_results())
-            self.ed_perf_y_band_min.textChanged.connect(lambda *_: self._clear_perf_results())
-            self.ed_perf_y_band_max.textChanged.connect(lambda *_: self._clear_perf_results())
             self.btn_perf_save_equation.clicked.connect(self._save_current_performance_equation)
             self.btn_perf_saved_equations.clicked.connect(self._open_saved_performance_equations_popup)
             self.btn_perf_export_equations.clicked.connect(self._export_perf_equations_to_excel)
@@ -9893,11 +9996,6 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         run_type_mode = self._selected_perf_run_type_mode()
         perf_filter_mode = self._selected_perf_filter_mode()
         control_period_filter = self._selected_perf_control_period()
-        try:
-            axis_band_filters = self._current_perf_axis_band_filters()
-        except ValueError as exc:
-            QtWidgets.QMessageBox.warning(self, "Performance", str(exc))
-            return
         self._perf_results_by_stat, plot_view_stats, fit_error_text = self._perf_collect_results(
             output_target,
             input1_target,
@@ -9907,17 +10005,13 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             serials,
             fit_enabled=fit_enabled,
             require_min_points=require_min_points,
-            axis_band_filters=axis_band_filters,
             run_type_filter=run_type_mode,
             control_period_filter=(control_period_filter if perf_filter_mode == "match_control_period" else None),
             display_control_period=control_period_filter,
         )
 
         if not plot_view_stats:
-            detail = self._perf_axis_band_note(axis_band_filters)
             message = "No qualifying performance data found for the selected Output/Input pairing."
-            if detail:
-                message += "\n\n" + detail
             QtWidgets.QMessageBox.information(self, "Performance", message)
             return
 
@@ -9952,7 +10046,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         )
         if fit_error_text:
             QtWidgets.QMessageBox.warning(self, "Performance", fit_error_text)
-        self._set_plot_note(self._perf_axis_band_note(axis_band_filters))
+        self._set_plot_note("")
         self._update_perf_highlight_models()
         self._fill_perf_equations_table()
         self._redraw_performance_view()
@@ -9983,10 +10077,6 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             "performance_run_type_mode": run_type_mode,
             "performance_filter_mode": perf_filter_mode,
             "selected_control_period": control_period_filter,
-            "x_band_min": axis_band_filters.get("x", (None, None))[0],
-            "x_band_max": axis_band_filters.get("x", (None, None))[1],
-            "y_band_min": axis_band_filters.get("y", (None, None))[0],
-            "y_band_max": axis_band_filters.get("y", (None, None))[1],
             "highlight_serial": str(getattr(self, "_highlight_sn", "") or "").strip(),
         }
         self.btn_add_auto_plot.setEnabled(True)
@@ -10219,14 +10309,6 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             self._set_combo_to_value(self.cb_perf_y_col, str(d.get("output") or ""))
             self._set_combo_to_value(self.cb_perf_x_col, str(d.get("input1") or ""))
             self._set_combo_to_value(self.cb_perf_z_col, str(d.get("input2") or ""))
-            if hasattr(self, "ed_perf_x_band_min"):
-                self.ed_perf_x_band_min.setText("" if d.get("x_band_min") in (None, "") else str(d.get("x_band_min")))
-            if hasattr(self, "ed_perf_x_band_max"):
-                self.ed_perf_x_band_max.setText("" if d.get("x_band_max") in (None, "") else str(d.get("x_band_max")))
-            if hasattr(self, "ed_perf_y_band_min"):
-                self.ed_perf_y_band_min.setText("" if d.get("y_band_min") in (None, "") else str(d.get("y_band_min")))
-            if hasattr(self, "ed_perf_y_band_max"):
-                self.ed_perf_y_band_max.setText("" if d.get("y_band_max") in (None, "") else str(d.get("y_band_max")))
             self._on_perf_axis_changed("z" if str(d.get("input2") or "").strip() else "x")
             if hasattr(self, "cb_perf_fit"):
                 self.cb_perf_fit.setChecked(bool(d.get("fit_enabled", True)))
@@ -10697,10 +10779,6 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             run_type_mode = str(d.get("performance_run_type_mode") or self._selected_perf_run_type_mode()).strip().lower()
             perf_filter_mode = str(d.get("performance_filter_mode") or "all_conditions").strip().lower()
             control_period_filter = d.get("selected_control_period")
-            axis_band_filters = {
-                "x": self._perf_normalize_axis_band("X", d.get("x_band_min"), d.get("x_band_max")),
-                "y": self._perf_normalize_axis_band("Y", d.get("y_band_min"), d.get("y_band_max")),
-            }
             common_runs = self._common_runs_for_perf_vars(output, input1, input2)
             if common_runs:
                 common_set = set(common_runs)
@@ -10715,7 +10793,6 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 serials,
                 fit_enabled=fit_enabled,
                 require_min_points=require_min_points,
-                axis_band_filters=axis_band_filters,
                 run_type_filter=run_type_mode,
                 control_period_filter=(
                     control_period_filter

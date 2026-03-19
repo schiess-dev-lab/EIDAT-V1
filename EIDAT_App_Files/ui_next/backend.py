@@ -3785,6 +3785,15 @@ def td_support_workbook_path_for(workbook_path: Path, *, project_dir: Path | Non
     return proj_dir / f"{stem}{TD_SUPPORT_WORKBOOK_SUFFIX}"
 
 
+def _ordered_td_sheet_info_rows(conn: sqlite3.Connection) -> list[tuple]:
+    try:
+        cols = {str(row[1] or "") for row in conn.execute("PRAGMA table_info(__sheet_info)").fetchall()}
+    except Exception:
+        cols = set()
+    order_sql = "ORDER BY COALESCE(import_order, rowid), rowid" if "import_order" in cols else "ORDER BY rowid"
+    return conn.execute(f"SELECT sheet_name FROM __sheet_info {order_sql}").fetchall()
+
+
 def _discover_td_runs_for_docs(global_repo: Path | None, docs: list[dict] | None) -> list[str]:
     repo = Path(global_repo).expanduser() if global_repo is not None else None
     runs: list[str] = []
@@ -3805,7 +3814,7 @@ def _discover_td_runs_for_docs(global_repo: Path | None, docs: list[dict] | None
             continue
         try:
             with sqlite3.connect(str(p)) as conn:
-                rows = conn.execute("SELECT sheet_name FROM __sheet_info ORDER BY sheet_name").fetchall()
+                rows = _ordered_td_sheet_info_rows(conn)
         except Exception:
             try:
                 with sqlite3.connect(str(p)) as conn:
@@ -3846,7 +3855,7 @@ def _discover_td_runs_by_program_for_docs(global_repo: Path | None, docs: list[d
             continue
         try:
             with sqlite3.connect(str(p)) as conn:
-                rows = conn.execute("SELECT sheet_name FROM __sheet_info ORDER BY sheet_name").fetchall()
+                rows = _ordered_td_sheet_info_rows(conn)
         except Exception:
             try:
                 with sqlite3.connect(str(p)) as conn:
@@ -3865,8 +3874,6 @@ def _discover_td_runs_by_program_for_docs(global_repo: Path | None, docs: list[d
                 continue
             seen[program_title].add(run_name.lower())
             runs_by_program.setdefault(program_title, []).append(run_name)
-    for runs in runs_by_program.values():
-        runs.sort(key=str.lower)
     return runs_by_program
 
 
@@ -7563,7 +7570,7 @@ def rebuild_test_data_project_cache(
                 source_issue_notes: list[str] = []
                 # Discover runs
                 try:
-                    runs_rows = src.execute("SELECT sheet_name FROM __sheet_info ORDER BY sheet_name").fetchall()
+                    runs_rows = _ordered_td_sheet_info_rows(src)
                     runs = [str(r[0] or "").strip() for r in runs_rows if str(r[0] or "").strip()]
                 except Exception:
                     runs = []

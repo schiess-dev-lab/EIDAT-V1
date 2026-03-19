@@ -390,6 +390,14 @@ def _canonicalize_header(header: str, defs: List[Dict[str, Any]], *, min_ratio: 
     return raw
 
 
+def _is_blank(v: Any) -> bool:
+    if v is None:
+        return True
+    if isinstance(v, str) and not v.strip():
+        return True
+    return False
+
+
 def _sheet_cell_value(ws, row: int, col: int) -> Any:
     try:
         return ws.cell(row=int(row), column=int(col)).value
@@ -627,6 +635,107 @@ def _is_header_value(v: Any) -> bool:
     if _try_float(s) is not None:
         return False
     return True
+
+
+def _detect_header_row(
+    ws,
+    *,
+    max_scan_rows: int = 200,
+    max_cols: int = 200,
+    lookahead_rows: int = 60,
+    min_numeric_count: int = 8,
+    min_numeric_ratio: float = 0.60,
+    min_data_cols: int = 1,
+) -> Tuple[Optional[int], List[Tuple[int, str]]]:
+    """
+    Return (header_row_index_1_based, [(excel_col_index_1_based, header_text), ...]).
+    Picks the row that maximizes "header cells with numeric-heavy columns beneath".
+    """
+    try:
+        max_row = int(getattr(ws, "max_row", 0) or 0)
+        max_col = int(getattr(ws, "max_column", 0) or 0)
+    except Exception:
+        max_row = 0
+        max_col = 0
+    if max_row <= 0 or max_col <= 0:
+        return None, []
+
+    scan_rows = max(1, min(int(max_scan_rows), max_row))
+    scan_cols = max(1, min(int(max_cols), max_col))
+
+    best_row: Optional[int] = None
+    best_cols: List[Tuple[int, str]] = []
+    best_score = -1.0
+
+    for r in range(1, scan_rows + 1):
+        try:
+            header_tuple = next(
+                ws.iter_rows(min_row=r, max_row=r, min_col=1, max_col=scan_cols, values_only=True)
+            )
+        except Exception:
+            continue
+
+        header_vals = list(header_tuple)
+        if not any(_is_header_value(v) for v in header_vals):
+            continue
+
+        la_start = r + 1
+        la_end = min(max_row, r + int(lookahead_rows))
+        if la_start > la_end:
+            continue
+
+        try:
+            lookahead = list(
+                ws.iter_rows(min_row=la_start, max_row=la_end, min_col=1, max_col=scan_cols, values_only=True)
+            )
+        except Exception:
+            lookahead = []
+        if not lookahead:
+            continue
+
+        cols: List[Tuple[int, str]] = []
+        score = 0.0
+        min_required_score = 0.0
+        for ci, hv in enumerate(header_vals, start=1):
+            if not _is_header_value(hv):
+                continue
+            filled = 0
+            numeric = 0
+            for row_vals in lookahead:
+                try:
+                    v = row_vals[ci - 1]
+                except Exception:
+                    v = None
+                if _is_blank(v):
+                    continue
+                filled += 1
+                if _try_float(v) is not None:
+                    numeric += 1
+
+            # Short runs and sheets with a spacer row under the header should still import
+            # if every nonblank data row is numeric.
+            col_min_numeric_count = min(int(min_numeric_count), max(1, filled))
+            if numeric < int(col_min_numeric_count):
+                continue
+            ratio = float(numeric) / float(max(1, filled))
+            if ratio < float(min_numeric_ratio):
+                continue
+            cols.append((ci, str(hv).strip()))
+            min_required_score += float(col_min_numeric_count)
+            score += float(numeric) + 3.0 * float(ratio)
+
+        if len(cols) < int(min_data_cols):
+            continue
+        if score < float(min_required_score):
+            continue
+
+        score += 0.001 * float(scan_rows - r)
+        if score > best_score:
+            best_score = score
+            best_row = r
+            best_cols = cols
+
+    return best_row, best_cols
 
 
 def _auto_detect_header_row(excel_path: Path, *, max_scan_rows: int = 200, max_cols: int = 200, lookahead_rows: int = 60):

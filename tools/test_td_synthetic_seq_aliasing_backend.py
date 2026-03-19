@@ -105,6 +105,85 @@ class TestTDSyntheticSeqAliasingBackend(unittest.TestCase):
                 except Exception:
                     pass
 
+    def test_support_workbook_discovery_preserves_import_order(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            repo = Path(td)
+            sqlite_path = repo / "support" / "excel_sqlite" / "doc.sqlite3"
+            sqlite_path.parent.mkdir(parents=True, exist_ok=True)
+
+            conn = sqlite3.connect(str(sqlite_path))
+            try:
+                conn.execute(
+                    """
+                    CREATE TABLE __sheet_info (
+                        sheet_name TEXT PRIMARY KEY,
+                        source_sheet_name TEXT,
+                        table_name TEXT NOT NULL,
+                        header_row INTEGER NOT NULL,
+                        import_order INTEGER,
+                        excel_col_indices_json TEXT NOT NULL,
+                        headers_json TEXT NOT NULL,
+                        columns_json TEXT NOT NULL,
+                        mapped_headers_json TEXT,
+                        rows_inserted INTEGER NOT NULL
+                    )
+                    """
+                )
+                conn.executemany(
+                    """
+                    INSERT INTO __sheet_info(
+                        sheet_name, source_sheet_name, table_name, header_row, import_order,
+                        excel_col_indices_json, headers_json, columns_json,
+                        mapped_headers_json, rows_inserted
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            "seq_2",
+                            "PulseSummary",
+                            "sheet__seq_2",
+                            1,
+                            1,
+                            json.dumps([1, 2]),
+                            json.dumps(["Time", "Pf"]),
+                            json.dumps({"Time": "Time", "Pf": "Pf"}),
+                            json.dumps(["Time", "Pf"]),
+                            20,
+                        ),
+                        (
+                            "seq_1",
+                            "DataPages",
+                            "sheet__seq_1",
+                            1,
+                            2,
+                            json.dumps([1, 2]),
+                            json.dumps(["Time", "Thrust"]),
+                            json.dumps({"Time": "Time", "Thrust": "Thrust"}),
+                            json.dumps(["Time", "Thrust"]),
+                            20,
+                        ),
+                    ],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            docs = [
+                {
+                    "excel_sqlite_rel": str(sqlite_path.relative_to(repo)),
+                    "artifacts_rel": "",
+                    "program_title": "Program A",
+                }
+            ]
+
+            runs = be._discover_td_runs_for_docs(repo, docs)
+            runs_by_program = be._discover_td_runs_by_program_for_docs(repo, docs)
+
+            self.assertEqual(runs, ["seq_2", "seq_1"])
+            self.assertEqual(runs_by_program, {"Program A": ["seq_2", "seq_1"]})
+
 
 if __name__ == "__main__":
     unittest.main()

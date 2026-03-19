@@ -647,6 +647,7 @@ def _write_mat_sqlite(*, mat_path: Path, sqlite_path: Path, overwrite: bool) -> 
               source_sheet_name TEXT,
               table_name TEXT NOT NULL,
               header_row INTEGER NOT NULL,
+              import_order INTEGER,
               excel_col_indices_json TEXT NOT NULL,
               headers_json TEXT NOT NULL,
               columns_json TEXT NOT NULL,
@@ -658,6 +659,8 @@ def _write_mat_sqlite(*, mat_path: Path, sqlite_path: Path, overwrite: bool) -> 
             existing_cols = {r[1] for r in conn.execute("PRAGMA table_info(__sheet_info)").fetchall()}
             if "source_sheet_name" not in existing_cols:
                 conn.execute("ALTER TABLE __sheet_info ADD COLUMN source_sheet_name TEXT;")
+            if "import_order" not in existing_cols:
+                conn.execute("ALTER TABLE __sheet_info ADD COLUMN import_order INTEGER;")
             if "mapped_headers_json" not in existing_cols:
                 conn.execute("ALTER TABLE __sheet_info ADD COLUMN mapped_headers_json TEXT;")
         except Exception:
@@ -726,17 +729,18 @@ def _write_mat_sqlite(*, mat_path: Path, sqlite_path: Path, overwrite: bool) -> 
             conn.execute(
                 """
                 INSERT INTO __sheet_info(
-                  sheet_name, source_sheet_name, table_name, header_row,
+                  sheet_name, source_sheet_name, table_name, header_row, import_order,
                   excel_col_indices_json, headers_json, columns_json,
                   mapped_headers_json,
                   rows_inserted
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     safe_sheet_name,
                     safe_sheet_name,
                     table_name,
                     1,
+                    int(len(outputs) + 1),
                     json.dumps(excel_col_indices),
                     json.dumps(columns, ensure_ascii=False),
                     json.dumps({h: c for h, c in zip(columns, col_idents)}, ensure_ascii=False),
@@ -987,6 +991,7 @@ def write_mat_bundle_sqlite(
               source_sheet_name TEXT,
               table_name TEXT NOT NULL,
               header_row INTEGER NOT NULL,
+              import_order INTEGER,
               excel_col_indices_json TEXT NOT NULL,
               headers_json TEXT NOT NULL,
               columns_json TEXT NOT NULL,
@@ -998,6 +1003,8 @@ def write_mat_bundle_sqlite(
             existing_cols = {r[1] for r in conn.execute("PRAGMA table_info(__sheet_info)").fetchall()}
             if "source_sheet_name" not in existing_cols:
                 conn.execute("ALTER TABLE __sheet_info ADD COLUMN source_sheet_name TEXT;")
+            if "import_order" not in existing_cols:
+                conn.execute("ALTER TABLE __sheet_info ADD COLUMN import_order INTEGER;")
             if "mapped_headers_json" not in existing_cols:
                 conn.execute("ALTER TABLE __sheet_info ADD COLUMN mapped_headers_json TEXT;")
         except Exception:
@@ -1074,17 +1081,18 @@ def write_mat_bundle_sqlite(
             conn.execute(
                 """
                 INSERT INTO __sheet_info(
-                  sheet_name, source_sheet_name, table_name, header_row,
+                  sheet_name, source_sheet_name, table_name, header_row, import_order,
                   excel_col_indices_json, headers_json, columns_json,
                   mapped_headers_json,
                   rows_inserted
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     seq_name,
                     seq_name,
                     table_name,
                     1,
+                    int(len(outputs) + 1),
                     json.dumps(excel_col_indices),
                     json.dumps(run["headers"], ensure_ascii=False),
                     json.dumps({h: c for h, c in zip(run["headers"], run["col_idents"])}, ensure_ascii=False),
@@ -1153,6 +1161,25 @@ class DetectedSheet:
     headers: list[str]
     mapped_headers: list[str]
     col_idents: list[str]
+    data_rows: list[tuple[int, list[float | None]]]
+    meta_cells: list[tuple[int, int, str]]
+    import_order: int = 0
+    diagnostics: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class DetectedSequenceBlock:
+    source_sheet_name: str
+    header_row: int
+    excel_col_indices: list[int]
+    headers: list[str]
+    mapped_headers: list[str]
+    data_rows: list[tuple[int, list[float | None]]]
+    meta_cells: list[tuple[int, int, str]]
+    sequence_token: str
+    run_base_name: str
+    import_order: int
+    diagnostics: dict[str, Any]
 
 
 _SEQ_SHEET_RE = re.compile(r"^\s*seq(?:uence)?[\s_-]*\d+\s*$", flags=re.IGNORECASE)
@@ -1160,6 +1187,14 @@ _SEQ_SHEET_RE = re.compile(r"^\s*seq(?:uence)?[\s_-]*\d+\s*$", flags=re.IGNORECA
 
 def _looks_like_sequence_sheet_name(name: object) -> bool:
     return bool(_SEQ_SHEET_RE.match(str(name or "").strip()))
+
+
+_SEQ_META_LABELS = {
+    "sequence no",
+    "sequence number",
+    "seq no",
+    "seq number",
+}
 
 
 def _parse_env_file(path: Path) -> dict[str, str]:
@@ -1314,6 +1349,16 @@ _TD_CANONICAL_ALIASES: dict[str, list[str]] = {
     ],
     "Cf_calc": ["Cf", "Cf calc", "Cf_calc"],
     "Flowrate": ["Flowrate", "Flowrate (lbm/sec)", "Flow rate", "Flow Rate"],
+    "Pulse Number": [
+        "Pulse Number",
+        "Pulse #",
+        "Pulse",
+        "pulse number",
+        "pulse_number",
+        "pulsenumber",
+        "pulse",
+        "cycle",
+    ],
 }
 
 
@@ -1521,6 +1566,7 @@ def _sheet_header_value(ws, row: int, col: int, merged_ranges: list[tuple[int, i
 def _header_block_rows(ws, *, header_row: int, excel_col_indices: Sequence[int], max_extra_rows: int = 2) -> list[int]:
     merged_ranges = _sheet_merged_ranges(ws)
     rows = [int(header_row)]
+    min_header_fill = 1 if len(list(excel_col_indices)) <= 1 else max(2, int(math.ceil(len(list(excel_col_indices)) * 0.5)))
     try:
         max_row = int(getattr(ws, "max_row", 0) or 0)
     except Exception:
@@ -1540,6 +1586,8 @@ def _header_block_rows(ws, *, header_row: int, excel_col_indices: Sequence[int],
                 headerish += 1
         if filled <= 0:
             continue
+        if filled < int(min_header_fill):
+            break
         if numeric >= max(2, int(round(filled * 0.45))):
             break
         if headerish <= 0:
@@ -1559,6 +1607,8 @@ def _header_block_rows(ws, *, header_row: int, excel_col_indices: Sequence[int],
             if _is_header_value(v):
                 headerish += 1
         if filled <= 0:
+            break
+        if filled < int(min_header_fill):
             break
         if numeric >= max(2, int(round(filled * 0.45))):
             break
@@ -1644,9 +1694,9 @@ def _detect_header_row(
             lookahead = []
         if not lookahead:
             continue
-
         cols: list[tuple[int, str]] = []
         score = 0.0
+        min_required_score = 0.0
         for ci, hv in enumerate(header_vals, start=1):
             if not _is_header_value(hv):
                 continue
@@ -1662,19 +1712,23 @@ def _detect_header_row(
                 filled += 1
                 if _try_float(v) is not None:
                     numeric += 1
-            if numeric < int(min_numeric_count):
+            # Short runs and sheets with a spacer row under the header should still import
+            # if every nonblank data row is numeric.
+            col_min_numeric_count = min(int(min_numeric_count), max(1, filled))
+            if numeric < int(col_min_numeric_count):
                 continue
             ratio = float(numeric) / float(max(1, filled))
             if ratio < float(min_numeric_ratio):
                 continue
             cols.append((ci, str(hv).strip()))
+            min_required_score += float(col_min_numeric_count)
             # favor rows with many strong numeric columns
             score += float(numeric) + 3.0 * float(ratio)
 
         if len(cols) < int(min_data_cols):
             continue
         # require at least some total evidence of numeric columns
-        if score < float(min_numeric_count) * float(max(1, min_data_cols)):
+        if score < float(min_required_score):
             continue
 
         # prefer earlier rows when scores tie
@@ -1699,6 +1753,7 @@ def _iter_data_rows(
     debug: bool = False,
     row_id_min_run: int = 5,
     row_id_probe_limit: int = 400,
+    max_excel_row: int | None = None,
 ) -> Iterator[tuple[int, list[float | None]]]:
     """
     Yield rows as (excel_row_index_1_based, [values...]) for the selected columns.
@@ -1708,6 +1763,8 @@ def _iter_data_rows(
         max_row = int(getattr(ws, "max_row", 0) or 0)
     except Exception:
         max_row = 0
+    if max_excel_row is not None:
+        max_row = min(max_row, int(max_excel_row))
     if max_row <= header_row:
         return
 
@@ -1901,6 +1958,647 @@ def _iter_data_rows(
             yield int(br), bvals
 
 
+def _detect_header_row_in_range(
+    ws,
+    *,
+    start_row: int = 1,
+    stop_row: int | None = None,
+    max_scan_rows: int | None = 200,
+    max_cols: int = 200,
+    lookahead_rows: int = 60,
+    min_numeric_count: int = 8,
+    min_numeric_ratio: float = 0.60,
+    min_data_cols: int = 1,
+) -> tuple[int | None, list[tuple[int, str]]]:
+    try:
+        max_row = int(getattr(ws, "max_row", 0) or 0)
+        max_col = int(getattr(ws, "max_column", 0) or 0)
+    except Exception:
+        max_row = 0
+        max_col = 0
+    if max_row <= 0 or max_col <= 0:
+        return None, []
+
+    start = max(1, int(start_row))
+    stop = min(max_row, int(stop_row)) if stop_row is not None else max_row
+    if start > stop:
+        return None, []
+    if max_scan_rows is not None:
+        stop = min(stop, start + max(1, int(max_scan_rows)) - 1)
+
+    scan_cols = max(1, min(int(max_cols), max_col))
+    best_row: int | None = None
+    best_cols: list[tuple[int, str]] = []
+    best_score: float = -1.0
+
+    for r in range(start, stop + 1):
+        try:
+            header_tuple = next(
+                ws.iter_rows(min_row=r, max_row=r, min_col=1, max_col=scan_cols, values_only=True)
+            )
+        except Exception:
+            continue
+
+        header_vals = list(header_tuple)
+        if not any(_is_header_value(v) for v in header_vals):
+            continue
+
+        la_start = r + 1
+        la_end = min(max_row, r + int(lookahead_rows))
+        if stop_row is not None:
+            la_end = min(la_end, int(stop_row))
+        if la_start > la_end:
+            continue
+
+        try:
+            lookahead = list(
+                ws.iter_rows(min_row=la_start, max_row=la_end, min_col=1, max_col=scan_cols, values_only=True)
+            )
+        except Exception:
+            lookahead = []
+        if not lookahead:
+            continue
+
+        cols: list[tuple[int, str]] = []
+        score = 0.0
+        min_required_score = 0.0
+        for ci, hv in enumerate(header_vals, start=1):
+            if not _is_header_value(hv):
+                continue
+            filled = 0
+            numeric = 0
+            for row_vals in lookahead:
+                try:
+                    v = row_vals[ci - 1]
+                except Exception:
+                    v = None
+                if _is_blank(v):
+                    continue
+                filled += 1
+                if _try_float(v) is not None:
+                    numeric += 1
+            col_min_numeric_count = min(int(min_numeric_count), max(1, filled))
+            if numeric < int(col_min_numeric_count):
+                continue
+            ratio = float(numeric) / float(max(1, filled))
+            if ratio < float(min_numeric_ratio):
+                continue
+            cols.append((ci, str(hv).strip()))
+            min_required_score += float(col_min_numeric_count)
+            score += float(numeric) + 3.0 * float(ratio)
+
+        if len(cols) < int(min_data_cols):
+            continue
+        if score < float(min_required_score):
+            continue
+
+        bump = 0.001 * (max(1, stop - start + 1) - (r - start + 1))
+        score += bump
+        if score > best_score:
+            best_score = score
+            best_row = r
+            best_cols = cols
+
+    return best_row, best_cols
+
+
+def _find_first_header_row_in_range(
+    ws,
+    *,
+    start_row: int,
+    stop_row: int | None,
+    max_cols: int,
+    lookahead_rows: int,
+    min_numeric_count: int,
+    min_numeric_ratio: float,
+    min_data_cols: int,
+) -> tuple[int | None, list[tuple[int, str]]]:
+    try:
+        max_row = int(getattr(ws, "max_row", 0) or 0)
+        max_col = int(getattr(ws, "max_column", 0) or 0)
+    except Exception:
+        max_row = 0
+        max_col = 0
+    if max_row <= 0 or max_col <= 0:
+        return None, []
+
+    start = max(1, int(start_row))
+    stop = min(max_row, int(stop_row)) if stop_row is not None else max_row
+    scan_cols = max(1, min(int(max_cols), max_col))
+    for r in range(start, stop + 1):
+        try:
+            header_tuple = next(
+                ws.iter_rows(min_row=r, max_row=r, min_col=1, max_col=scan_cols, values_only=True)
+            )
+        except Exception:
+            continue
+        header_vals = list(header_tuple)
+        if not any(_is_header_value(v) for v in header_vals):
+            continue
+        la_start = r + 1
+        la_end = min(max_row, r + int(lookahead_rows))
+        if stop_row is not None:
+            la_end = min(la_end, int(stop_row))
+        if la_start > la_end:
+            continue
+        try:
+            lookahead = list(
+                ws.iter_rows(min_row=la_start, max_row=la_end, min_col=1, max_col=scan_cols, values_only=True)
+            )
+        except Exception:
+            lookahead = []
+        if not lookahead:
+            continue
+        cols: list[tuple[int, str]] = []
+        for ci, hv in enumerate(header_vals, start=1):
+            if not _is_header_value(hv):
+                continue
+            filled = 0
+            numeric = 0
+            for row_vals in lookahead:
+                try:
+                    v = row_vals[ci - 1]
+                except Exception:
+                    v = None
+                if _is_blank(v):
+                    continue
+                filled += 1
+                if _try_float(v) is not None:
+                    numeric += 1
+            col_min_numeric_count = min(int(min_numeric_count), max(1, filled))
+            if numeric < int(col_min_numeric_count):
+                continue
+            ratio = float(numeric) / float(max(1, filled))
+            if ratio < float(min_numeric_ratio):
+                continue
+            cols.append((ci, str(hv).strip()))
+        min_block_cols = max(int(min_data_cols), 2)
+        if len(cols) >= int(min_block_cols):
+            return int(r), cols
+    return None, []
+
+
+def _collect_meta_cells(
+    ws,
+    *,
+    row_start: int,
+    row_end: int,
+    max_cols: int = 80,
+) -> list[tuple[int, int, str]]:
+    try:
+        max_col = int(getattr(ws, "max_column", 0) or 0)
+    except Exception:
+        max_col = 0
+    if int(row_end) < int(row_start) or max_col <= 0:
+        return []
+    meta_max_col = max(1, min(int(max_cols), max_col))
+    rows = ws.iter_rows(
+        min_row=max(1, int(row_start)),
+        max_row=max(1, int(row_end)),
+        min_col=1,
+        max_col=meta_max_col,
+        values_only=True,
+    )
+    out: list[tuple[int, int, str]] = []
+    for rr, row_vals in enumerate(rows, start=max(1, int(row_start))):
+        for cc, value in enumerate(list(row_vals), start=1):
+            if _is_blank(value):
+                continue
+            out.append((int(rr), int(cc), str(value)))
+    return out
+
+
+def _normalize_sequence_token(value: object) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    m = re.match(r"^\s*seq(?:uence)?[\s_-]*(.+?)\s*$", raw, flags=re.IGNORECASE)
+    if m:
+        raw = str(m.group(1) or "").strip()
+    fv = _try_float(raw)
+    if fv is not None:
+        try:
+            rv = round(float(fv))
+            if abs(float(fv) - float(rv)) < 1e-9:
+                return str(int(rv))
+        except Exception:
+            pass
+    safe = _safe_ident(raw, prefix="seq").lower()
+    if safe == "seq":
+        return ""
+    if safe.startswith("seq_"):
+        return safe[4:]
+    return safe
+
+
+def _sequence_run_name(sequence_token: str, *, fallback_index: int) -> str:
+    token = _normalize_sequence_token(sequence_token)
+    if token:
+        return f"seq_{token}"
+    return f"seq_{max(1, int(fallback_index))}"
+
+
+def _extract_sequence_token_from_meta_cells(meta_cells: Sequence[tuple[int, int, str]]) -> str:
+    if not meta_cells:
+        return ""
+    cell_map = {(int(r), int(c)): str(v or "") for r, c, v in meta_cells}
+    max_row = max(int(r) for r, _c, _v in meta_cells)
+    max_col = max(int(c) for _r, c, _v in meta_cells)
+    for row, col, raw in sorted(meta_cells, key=lambda item: (int(item[0]), int(item[1]))):
+        label = _normalize_header(raw)
+        if label not in _SEQ_META_LABELS and not ("sequence" in label and ("no" in label or "number" in label)):
+            continue
+        candidates: list[str] = []
+        for delta_col in range(1, 5):
+            value = cell_map.get((int(row), int(col) + delta_col))
+            if value is not None:
+                candidates.append(value)
+        for delta_row in range(1, 3):
+            value = cell_map.get((int(row) + delta_row, int(col)))
+            if value is not None:
+                candidates.append(value)
+            if int(col) < max_col:
+                value = cell_map.get((int(row) + delta_row, int(col) + 1))
+                if value is not None:
+                    candidates.append(value)
+        for candidate in candidates:
+            token = _normalize_sequence_token(candidate)
+            if token:
+                return token
+    return ""
+
+
+def _header_signature(mapped_headers: Sequence[str]) -> tuple[str, ...]:
+    return tuple(str(_normalize_header(value)).strip() for value in mapped_headers if str(_normalize_header(value)).strip())
+
+
+def _materialize_sequence_block(
+    ws,
+    *,
+    source_sheet_name: str,
+    header_row: int,
+    cols: Sequence[tuple[int, str]],
+    meta_row_start: int,
+    meta_row_end: int,
+    stop_row: int | None,
+    canonical_defs: list[dict[str, Any]],
+    fuzzy_min_ratio: float,
+    debug_table: bool,
+    fallback_index: int,
+    import_order: int,
+) -> DetectedSequenceBlock | None:
+    excel_col_indices = [int(c) for c, _ in cols]
+    detected_headers = [str(h or "").strip() for _c, h in cols]
+    headers = _reconstruct_headers(
+        ws,
+        header_row=int(header_row),
+        excel_col_indices=excel_col_indices,
+        fallback_headers=detected_headers,
+    )
+    mapped_headers = [
+        _canonicalize_header(h, canonical_defs, min_ratio=float(fuzzy_min_ratio))
+        for h in headers
+    ]
+    data_rows = list(
+        _iter_data_rows(
+            ws,
+            header_row=int(header_row),
+            excel_col_indices=excel_col_indices,
+            headers=list(headers),
+            sheet_name=str(source_sheet_name),
+            debug=bool(debug_table),
+            max_excel_row=stop_row,
+        )
+    )
+    if not data_rows:
+        return None
+    meta_cells = _collect_meta_cells(ws, row_start=int(meta_row_start), row_end=int(meta_row_end))
+    sequence_token = _extract_sequence_token_from_meta_cells(meta_cells)
+    run_base_name = _sequence_run_name(sequence_token, fallback_index=int(fallback_index))
+    data_end_row = max(int(excel_row) for excel_row, _values in data_rows)
+    return DetectedSequenceBlock(
+        source_sheet_name=str(source_sheet_name),
+        header_row=int(header_row),
+        excel_col_indices=list(excel_col_indices),
+        headers=list(headers),
+        mapped_headers=list(mapped_headers),
+        data_rows=list(data_rows),
+        meta_cells=list(meta_cells),
+        sequence_token=str(sequence_token or ""),
+        run_base_name=str(run_base_name),
+        import_order=int(import_order),
+        diagnostics={
+            "header_signature": list(_header_signature(mapped_headers)),
+            "meta_row_start": int(meta_row_start),
+            "meta_row_end": int(meta_row_end),
+            "data_end_row": int(data_end_row),
+            "rows_inserted": int(len(data_rows)),
+            "sequence_token": str(sequence_token or ""),
+        },
+    )
+
+
+def _single_sheet_sequence_block(
+    ws,
+    *,
+    sheet_name: str,
+    header_row: int,
+    cols: Sequence[tuple[int, str]],
+    canonical_defs: list[dict[str, Any]],
+    fuzzy_min_ratio: float,
+    debug_table: bool,
+    import_order: int,
+) -> DetectedSequenceBlock | None:
+    return _materialize_sequence_block(
+        ws,
+        source_sheet_name=str(sheet_name),
+        header_row=int(header_row),
+        cols=list(cols),
+        meta_row_start=1,
+        meta_row_end=max(0, int(header_row) - 1),
+        stop_row=None,
+        canonical_defs=canonical_defs,
+        fuzzy_min_ratio=float(fuzzy_min_ratio),
+        debug_table=bool(debug_table),
+        fallback_index=max(1, int(import_order)),
+        import_order=int(import_order),
+    )
+
+
+def _detect_synthetic_sequence_blocks(
+    ws,
+    *,
+    sheet_name: str,
+    max_scan_rows: int,
+    max_cols: int,
+    lookahead_rows: int,
+    min_numeric_count: int,
+    min_numeric_ratio: float,
+    min_data_cols: int,
+    canonical_defs: list[dict[str, Any]],
+    fuzzy_min_ratio: float,
+    debug_table: bool,
+    start_import_order: int,
+) -> list[DetectedSequenceBlock]:
+    blocks: list[DetectedSequenceBlock] = []
+    header_row, cols = _detect_header_row(
+        ws,
+        max_scan_rows=max_scan_rows,
+        max_cols=max_cols,
+        lookahead_rows=lookahead_rows,
+        min_numeric_count=min_numeric_count,
+        min_numeric_ratio=min_numeric_ratio,
+        min_data_cols=min_data_cols,
+    )
+    if not header_row or not cols:
+        return []
+    try:
+        sheet_max_row = int(getattr(ws, "max_row", 0) or 0)
+    except Exception:
+        sheet_max_row = 0
+    next_header_row, _next_cols = _find_first_header_row_in_range(
+        ws,
+        start_row=int(header_row) + 1,
+        stop_row=sheet_max_row,
+        max_cols=max_cols,
+        lookahead_rows=lookahead_rows,
+        min_numeric_count=min_numeric_count,
+        min_numeric_ratio=min_numeric_ratio,
+        min_data_cols=min_data_cols,
+    )
+    block = _materialize_sequence_block(
+        ws,
+        source_sheet_name=str(sheet_name),
+        header_row=int(header_row),
+        cols=list(cols),
+        meta_row_start=1,
+        meta_row_end=max(0, int(header_row) - 1),
+        stop_row=int(next_header_row) - 1 if next_header_row else None,
+        canonical_defs=canonical_defs,
+        fuzzy_min_ratio=float(fuzzy_min_ratio),
+        debug_table=bool(debug_table),
+        fallback_index=max(1, int(start_import_order)),
+        import_order=int(start_import_order),
+    )
+    if block is None:
+        return []
+    primary_signature = tuple(block.diagnostics.get("header_signature") or [])
+    primary_x_name, _primary_x_idx = _select_block_x_axis(block)
+    blocks.append(block)
+
+    search_row = int(block.diagnostics.get("data_end_row") or int(header_row)) + 1
+    next_import_order = int(start_import_order) + 1
+
+    while search_row <= sheet_max_row:
+        next_header_row, next_cols = _find_first_header_row_in_range(
+            ws,
+            start_row=int(search_row),
+            stop_row=sheet_max_row,
+            max_cols=max_cols,
+            lookahead_rows=lookahead_rows,
+            min_numeric_count=min_numeric_count,
+            min_numeric_ratio=min_numeric_ratio,
+            min_data_cols=min_data_cols,
+        )
+        if not next_header_row or not next_cols:
+            break
+        stop_header_row, _stop_cols = _find_first_header_row_in_range(
+            ws,
+            start_row=int(next_header_row) + 1,
+            stop_row=sheet_max_row,
+            max_cols=max_cols,
+            lookahead_rows=lookahead_rows,
+            min_numeric_count=min_numeric_count,
+            min_numeric_ratio=min_numeric_ratio,
+            min_data_cols=min_data_cols,
+        )
+        next_block = _materialize_sequence_block(
+            ws,
+            source_sheet_name=str(sheet_name),
+            header_row=int(next_header_row),
+            cols=list(next_cols),
+            meta_row_start=max(1, int(search_row)),
+            meta_row_end=max(0, int(next_header_row) - 1),
+            stop_row=int(stop_header_row) - 1 if stop_header_row else None,
+            canonical_defs=canonical_defs,
+            fuzzy_min_ratio=float(fuzzy_min_ratio),
+            debug_table=bool(debug_table),
+            fallback_index=max(1, int(next_import_order)),
+            import_order=int(next_import_order),
+        )
+        if next_block is None:
+            search_row = int(next_header_row) + 1
+            continue
+        signature = tuple(next_block.diagnostics.get("header_signature") or [])
+        has_sequence = bool(str(next_block.sequence_token or "").strip())
+        x_name, _x_idx = _select_block_x_axis(next_block)
+        shared_headers = set(signature).intersection(primary_signature)
+        same_primary_x = bool(primary_x_name and x_name and str(primary_x_name) == str(x_name))
+        if has_sequence and (signature == primary_signature or (same_primary_x and bool(shared_headers))):
+            blocks.append(next_block)
+            next_import_order += 1
+            search_row = int(next_block.diagnostics.get("data_end_row") or int(next_header_row)) + 1
+            continue
+        search_row = int(next_header_row) + 1
+    return blocks
+
+
+def _select_block_x_axis(block: DetectedSequenceBlock) -> tuple[str, int] | tuple[str, None]:
+    normalized = [_normalize_header(name) for name in (block.mapped_headers or [])]
+    for target in ("Time", "Pulse Number"):
+        target_norm = _normalize_header(target)
+        if target_norm in normalized:
+            return target, normalized.index(target_norm)
+    return "", None
+
+
+def _logical_sheet_from_block(
+    block: DetectedSequenceBlock,
+    *,
+    sheet_name: str,
+    source_sheet_name: str | None = None,
+    import_order: int | None = None,
+    diagnostics: dict[str, Any] | None = None,
+) -> DetectedSheet:
+    mapped_headers = list(block.mapped_headers)
+    headers = list(block.headers)
+    col_idents = _dedupe_idents(mapped_headers)
+    return DetectedSheet(
+        sheet_name=str(sheet_name),
+        source_sheet_name=str(source_sheet_name or block.source_sheet_name),
+        table_name=_safe_table_name(str(sheet_name)),
+        header_row=int(block.header_row),
+        excel_col_indices=list(block.excel_col_indices),
+        headers=list(headers),
+        mapped_headers=list(mapped_headers),
+        col_idents=list(col_idents),
+        data_rows=list(block.data_rows),
+        meta_cells=list(block.meta_cells),
+        import_order=int(import_order if import_order is not None else block.import_order),
+        diagnostics=dict(diagnostics or block.diagnostics or {}),
+    )
+
+
+def _merge_sequence_blocks_into_logical_sheets(blocks: Sequence[DetectedSequenceBlock]) -> list[DetectedSheet]:
+    logical_sheets: list[DetectedSheet] = []
+    fallback_counts: dict[str, int] = {}
+    by_run: dict[str, list[DetectedSequenceBlock]] = {}
+    for block in sorted(blocks, key=lambda item: int(item.import_order)):
+        by_run.setdefault(str(block.run_base_name), []).append(block)
+
+    for run_name, run_blocks in sorted(by_run.items(), key=lambda item: min(int(b.import_order) for b in item[1])):
+        ordered_blocks = sorted(run_blocks, key=lambda item: int(item.import_order))
+        if len(ordered_blocks) == 1:
+            logical_sheets.append(_logical_sheet_from_block(ordered_blocks[0], sheet_name=run_name))
+            continue
+
+        first_x_name, first_x_idx = _select_block_x_axis(ordered_blocks[0])
+        if first_x_idx is None:
+            first_x_name = ""
+        can_merge = bool(first_x_name)
+        for block in ordered_blocks[1:]:
+            x_name, x_idx = _select_block_x_axis(block)
+            if x_idx is None or str(x_name) != str(first_x_name):
+                can_merge = False
+                break
+
+        if not can_merge:
+            for block in ordered_blocks:
+                count = fallback_counts.get(run_name, 0) + 1
+                fallback_counts[run_name] = count
+                fallback_name = run_name if count == 1 else f"{run_name}_{count}"
+                diagnostics = dict(block.diagnostics or {})
+                diagnostics["merge_status"] = "fallback_no_shared_x"
+                logical_sheets.append(
+                    _logical_sheet_from_block(
+                        block,
+                        sheet_name=fallback_name,
+                        diagnostics=diagnostics,
+                    )
+                )
+            continue
+
+        header_labels: dict[str, str] = {}
+        ordered_mapped_headers: list[str] = []
+        for block in ordered_blocks:
+            for raw_header, mapped_header in zip(block.headers, block.mapped_headers):
+                key = str(mapped_header or "").strip()
+                if not key:
+                    continue
+                if key not in header_labels:
+                    header_labels[key] = str(raw_header or "").strip() or key
+                    ordered_mapped_headers.append(key)
+
+        x_header = str(first_x_name)
+        if x_header in ordered_mapped_headers:
+            ordered_mapped_headers = [x_header] + [name for name in ordered_mapped_headers if name != x_header]
+
+        row_map: dict[float, dict[str, float | None]] = {}
+        row_first_excel: dict[float, int] = {}
+        for block in ordered_blocks:
+            idx_by_header = {str(name): idx for idx, name in enumerate(block.mapped_headers)}
+            x_idx = idx_by_header.get(x_header)
+            if x_idx is None:
+                continue
+            for excel_row, values in block.data_rows:
+                if x_idx >= len(values):
+                    continue
+                x_value = values[x_idx]
+                if x_value is None:
+                    continue
+                bucket = row_map.setdefault(float(x_value), {})
+                row_first_excel.setdefault(float(x_value), int(excel_row))
+                for mapped_header, idx in idx_by_header.items():
+                    if idx >= len(values):
+                        continue
+                    value = values[idx]
+                    if mapped_header not in bucket or bucket.get(mapped_header) is None:
+                        bucket[mapped_header] = value
+
+        merged_rows: list[tuple[int, list[float | None]]] = []
+        for out_idx, x_value in enumerate(sorted(row_map.keys()), start=1):
+            bucket = row_map.get(float(x_value)) or {}
+            values = [bucket.get(name) for name in ordered_mapped_headers]
+            merged_rows.append((out_idx, values))
+
+        merged_meta_cells: list[tuple[int, int, str]] = []
+        for block in ordered_blocks:
+            merged_meta_cells.extend(list(block.meta_cells))
+
+        diagnostics = {
+            "merge_status": "merged_on_x_axis",
+            "merge_x_axis": x_header,
+            "source_blocks": [
+                {
+                    "source_sheet_name": block.source_sheet_name,
+                    "header_row": int(block.header_row),
+                    "sequence_token": str(block.sequence_token or ""),
+                    "rows_inserted": int(len(block.data_rows)),
+                }
+                for block in ordered_blocks
+            ],
+        }
+        logical_sheets.append(
+            DetectedSheet(
+                sheet_name=str(run_name),
+                source_sheet_name=str(ordered_blocks[0].source_sheet_name),
+                table_name=_safe_table_name(str(run_name)),
+                header_row=int(ordered_blocks[0].header_row),
+                excel_col_indices=list(range(1, len(ordered_mapped_headers) + 1)),
+                headers=[header_labels.get(name) or name for name in ordered_mapped_headers],
+                mapped_headers=list(ordered_mapped_headers),
+                col_idents=_dedupe_idents(ordered_mapped_headers),
+                data_rows=list(merged_rows),
+                meta_cells=list(merged_meta_cells),
+                import_order=min(int(block.import_order) for block in ordered_blocks),
+                diagnostics=diagnostics,
+            )
+        )
+
+    logical_sheets.sort(key=lambda item: (int(item.import_order), int(item.header_row), str(item.sheet_name).lower()))
+    return logical_sheets
+
+
 def _write_workbook_sqlite(
     *,
     excel_path: Path,
@@ -2022,56 +2720,81 @@ def _write_workbook_sqlite(
             raise RuntimeError("Workbook has no sheets.")
         has_real_sequence_tabs = any(_looks_like_sequence_sheet_name(name) for name in sheetnames)
         sheets: list[DetectedSheet] = []
-        synthetic_seq_count = 0
-        for sheet_name in sheetnames:
-            ws = wb[sheet_name]
-            header_row, cols = _detect_header_row(
-                ws,
-                max_scan_rows=max_scan_rows,
-                max_cols=max_cols,
-                lookahead_rows=lookahead_rows,
-                min_numeric_count=min_numeric_count,
-                min_numeric_ratio=min_numeric_ratio,
-                min_data_cols=min_data_cols,
-            )
-            if not header_row or not cols:
-                _stderr(f"[SHEET] {sheet_name}: no data headers detected (skipped)")
-                continue
-            excel_col_indices = [c for c, _ in cols]
-            detected_headers = [h for _, h in cols]
-            headers = _reconstruct_headers(
-                ws,
-                header_row=int(header_row),
-                excel_col_indices=excel_col_indices,
-                fallback_headers=detected_headers,
-            )
-            mapped_headers = [
-                _canonicalize_header(h, canonical_defs, min_ratio=float(fuzzy_min_ratio))
-                for h in headers
-            ]
-            if debug_fuzzy and mapped_headers != headers:
-                for oh, mh in zip(headers, mapped_headers):
-                    if oh != mh:
-                        _stderr(f"[TEST_DATA] header map: {sheet_name}: {oh!r} -> {mh!r}")
-            effective_sheet_name = str(sheet_name)
-            if synthesize_td_seq_aliases and not has_real_sequence_tabs:
-                synthetic_seq_count += 1
-                effective_sheet_name = f"seq_{synthetic_seq_count}"
-                _stderr(f"[TD SYNTHETIC SEQ] {sheet_name} -> {effective_sheet_name}")
-            col_idents = _dedupe_idents(mapped_headers)
-            sheets.append(
-                DetectedSheet(
-                    sheet_name=effective_sheet_name,
-                    source_sheet_name=str(sheet_name),
-                    table_name=_safe_table_name(effective_sheet_name),
-                    header_row=int(header_row),
-                    excel_col_indices=excel_col_indices,
-                    headers=headers,
-                    mapped_headers=mapped_headers,
-                    col_idents=col_idents,
+        if synthesize_td_seq_aliases and not has_real_sequence_tabs:
+            all_blocks: list[DetectedSequenceBlock] = []
+            next_import_order = 1
+            for sheet_name in sheetnames:
+                ws = wb[sheet_name]
+                blocks = _detect_synthetic_sequence_blocks(
+                    ws,
+                    sheet_name=str(sheet_name),
+                    max_scan_rows=max_scan_rows,
+                    max_cols=max_cols,
+                    lookahead_rows=lookahead_rows,
+                    min_numeric_count=min_numeric_count,
+                    min_numeric_ratio=min_numeric_ratio,
+                    min_data_cols=min_data_cols,
+                    canonical_defs=canonical_defs,
+                    fuzzy_min_ratio=float(fuzzy_min_ratio),
+                    debug_table=bool(debug_table),
+                    start_import_order=int(next_import_order),
                 )
-            )
-            _stderr(f"[SHEET] {sheet_name}: header_row={header_row} cols={len(cols)} as {effective_sheet_name}")
+                if not blocks:
+                    _stderr(f"[SHEET] {sheet_name}: no data headers detected (skipped)")
+                    continue
+                next_import_order += len(blocks)
+                all_blocks.extend(blocks)
+                for block in blocks:
+                    if debug_fuzzy and block.mapped_headers != block.headers:
+                        for oh, mh in zip(block.headers, block.mapped_headers):
+                            if oh != mh:
+                                _stderr(f"[TEST_DATA] header map: {sheet_name}: {oh!r} -> {mh!r}")
+                    _stderr(
+                        f"[TD SYNTHETIC SEQ] {sheet_name} -> {block.run_base_name} "
+                        f"(header_row={block.header_row}, seq={block.sequence_token or 'fallback'})"
+                    )
+            sheets = _merge_sequence_blocks_into_logical_sheets(all_blocks)
+            for logical in sheets:
+                _stderr(
+                    f"[SHEET] {logical.source_sheet_name}: header_row={logical.header_row} "
+                    f"cols={len(logical.headers)} as {logical.sheet_name}"
+                )
+        else:
+            next_import_order = 1
+            for sheet_name in sheetnames:
+                ws = wb[sheet_name]
+                header_row, cols = _detect_header_row(
+                    ws,
+                    max_scan_rows=max_scan_rows,
+                    max_cols=max_cols,
+                    lookahead_rows=lookahead_rows,
+                    min_numeric_count=min_numeric_count,
+                    min_numeric_ratio=min_numeric_ratio,
+                    min_data_cols=min_data_cols,
+                )
+                if not header_row or not cols:
+                    _stderr(f"[SHEET] {sheet_name}: no data headers detected (skipped)")
+                    continue
+                block = _single_sheet_sequence_block(
+                    ws,
+                    sheet_name=str(sheet_name),
+                    header_row=int(header_row),
+                    cols=list(cols),
+                    canonical_defs=canonical_defs,
+                    fuzzy_min_ratio=float(fuzzy_min_ratio),
+                    debug_table=bool(debug_table),
+                    import_order=int(next_import_order),
+                )
+                if block is None:
+                    _stderr(f"[SHEET] {sheet_name}: no numeric data rows detected (skipped)")
+                    continue
+                next_import_order += 1
+                if debug_fuzzy and block.mapped_headers != block.headers:
+                    for oh, mh in zip(block.headers, block.mapped_headers):
+                        if oh != mh:
+                            _stderr(f"[TEST_DATA] header map: {sheet_name}: {oh!r} -> {mh!r}")
+                sheets.append(_logical_sheet_from_block(block, sheet_name=str(sheet_name)))
+                _stderr(f"[SHEET] {sheet_name}: header_row={header_row} cols={len(cols)} as {sheet_name}")
 
         if not sheets:
             raise RuntimeError("No sheets contained detectable numeric columns.")
@@ -2105,6 +2828,7 @@ def _write_workbook_sqlite(
                   source_sheet_name TEXT,
                   table_name TEXT NOT NULL,
                   header_row INTEGER NOT NULL,
+                  import_order INTEGER,
                   excel_col_indices_json TEXT NOT NULL,
                   headers_json TEXT NOT NULL,
                   columns_json TEXT NOT NULL,
@@ -2117,6 +2841,8 @@ def _write_workbook_sqlite(
                 existing_cols = {r[1] for r in conn.execute("PRAGMA table_info(__sheet_info)").fetchall()}
                 if "source_sheet_name" not in existing_cols:
                     conn.execute("ALTER TABLE __sheet_info ADD COLUMN source_sheet_name TEXT;")
+                if "import_order" not in existing_cols:
+                    conn.execute("ALTER TABLE __sheet_info ADD COLUMN import_order INTEGER;")
                 if "mapped_headers_json" not in existing_cols:
                     conn.execute("ALTER TABLE __sheet_info ADD COLUMN mapped_headers_json TEXT;")
             except Exception:
@@ -2145,28 +2871,16 @@ def _write_workbook_sqlite(
 
             outputs: list[dict[str, Any]] = []
             for s in sheets:
-                ws = wb[s.source_sheet_name]
-
-                # Store metadata cells above the detected header row for later parsing/trending.
-                try:
-                    meta_max_row = max(1, min(int(s.header_row) - 1, 250))
-                    meta_max_col = max(1, min(int(getattr(ws, "max_column", 0) or 0), 80))
-                except Exception:
-                    meta_max_row = 0
-                    meta_max_col = 0
-                if meta_max_row and meta_max_col:
-                    meta_rows = ws.iter_rows(min_row=1, max_row=meta_max_row, min_col=1, max_col=meta_max_col, values_only=True)
-                    meta_to_insert: list[tuple[str, int, int, str]] = []
-                    for rr, row_vals in enumerate(meta_rows, start=1):
-                        for cc, v in enumerate(list(row_vals), start=1):
-                            if _is_blank(v):
-                                continue
-                            meta_to_insert.append((s.sheet_name, int(rr), int(cc), str(v)))
-                    if meta_to_insert:
-                        conn.executemany(
-                            "INSERT INTO __meta_cells(sheet_name, excel_row, excel_col, value) VALUES(?, ?, ?, ?)",
-                            meta_to_insert,
-                        )
+                meta_to_insert = [
+                    (str(s.sheet_name), int(rr), int(cc), str(value))
+                    for rr, cc, value in list(s.meta_cells or [])
+                    if not _is_blank(value)
+                ]
+                if meta_to_insert:
+                    conn.executemany(
+                        "INSERT INTO __meta_cells(sheet_name, excel_row, excel_col, value) VALUES(?, ?, ?, ?)",
+                        meta_to_insert,
+                    )
 
                 col_defs = ", ".join([f"\"{c}\" REAL" for c in s.col_idents])
                 conn.execute(f"DROP TABLE IF EXISTS \"{s.table_name}\";")
@@ -2177,14 +2891,7 @@ def _write_workbook_sqlite(
                 ins_sql = f"INSERT INTO \"{s.table_name}\" (excel_row, " + ", ".join([f"\"{c}\"" for c in s.col_idents]) + f") VALUES({placeholders})"
 
                 batch: list[tuple[Any, ...]] = []
-                for excel_row, values in _iter_data_rows(
-                    ws,
-                    header_row=s.header_row,
-                    excel_col_indices=s.excel_col_indices,
-                    headers=list(s.headers),
-                    sheet_name=str(s.sheet_name),
-                    debug=bool(debug_table),
-                ):
+                for excel_row, values in list(s.data_rows or []):
                     batch.append((int(excel_row), *values))
                     if len(batch) >= 1000:
                         conn.executemany(ins_sql, batch)
@@ -2198,17 +2905,18 @@ def _write_workbook_sqlite(
                 conn.execute(
                     """
                     INSERT INTO __sheet_info(
-                      sheet_name, source_sheet_name, table_name, header_row,
+                      sheet_name, source_sheet_name, table_name, header_row, import_order,
                       excel_col_indices_json, headers_json, columns_json,
                       mapped_headers_json,
                       rows_inserted
-                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         s.sheet_name,
                         s.source_sheet_name,
                         s.table_name,
                         int(s.header_row),
+                        int(s.import_order),
                         json.dumps(list(s.excel_col_indices)),
                         json.dumps(list(s.headers), ensure_ascii=False),
                         json.dumps({h: c for h, c in zip(s.headers, s.col_idents)}, ensure_ascii=False),
@@ -2237,8 +2945,11 @@ def _write_workbook_sqlite(
                         "columns": list(s.headers),
                         "mapped_columns": list(getattr(s, "mapped_headers", list(s.headers))),
                         "rows_inserted": int(rows_inserted),
+                        "import_order": int(s.import_order),
                     }
                 )
+                if isinstance(s.diagnostics, dict) and s.diagnostics:
+                    outputs[-1]["diagnostics"] = dict(s.diagnostics)
                 _stderr(f"[SHEET DONE] {s.sheet_name}: rows={rows_inserted}")
 
             conn.commit()

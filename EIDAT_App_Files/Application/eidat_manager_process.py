@@ -1522,11 +1522,18 @@ def process_candidates(
                                         results_list = list((payload or {}).get("results") or [])
                                     except Exception:
                                         results_list = []
+                                    sqlite_errors: list[str] = []
                                     for r0 in results_list:
                                         try:
                                             sp = str((r0 or {}).get("sqlite_path") or "").strip()
                                         except Exception:
                                             sp = ""
+                                        try:
+                                            err = str((r0 or {}).get("error") or "").strip()
+                                        except Exception:
+                                            err = ""
+                                        if err:
+                                            sqlite_errors.append(err)
                                         if sp:
                                             try:
                                                 sqlite_abs = Path(sp).expanduser()
@@ -1538,6 +1545,9 @@ def process_candidates(
                                                 sqlite_rel = sp
                                             break
                                 if not sqlite_rel:
+                                    detail = next((msg for msg in sqlite_errors if msg), "")
+                                    if detail:
+                                        raise RuntimeError(detail)
                                     raise RuntimeError("excel_to_sqlite did not report an output sqlite_path")
                                 if isinstance(raw_meta, dict):
                                     raw_meta["excel_sqlite_rel"] = sqlite_rel

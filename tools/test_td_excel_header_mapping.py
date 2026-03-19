@@ -1,3 +1,4 @@
+import importlib.util
 import json
 import sqlite3
 import sys
@@ -12,6 +13,16 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 if str(APP_ROOT) not in sys.path:
     sys.path.insert(0, str(APP_ROOT))
+
+
+def _load_excel_extraction_module():
+    mod_path = ROOT / "EIDAT_App_Files" / "scripts" / "excel_extraction.py"
+    spec = importlib.util.spec_from_file_location("test_excel_extraction", mod_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Unable to load excel_extraction module from {mod_path}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)  # type: ignore[attr-defined]
+    return mod
 
 
 def _have_openpyxl() -> bool:
@@ -76,6 +87,26 @@ class TestTDExcelHeaderMapping(unittest.TestCase):
         except Exception:
             pass
 
+    def _build_workbook_from_cells(
+        self,
+        path: Path,
+        *,
+        title: str,
+        cells: list[tuple[int, int, object]],
+    ) -> None:
+        from openpyxl import Workbook  # type: ignore
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = str(title)
+        for row, col, value in cells:
+            ws.cell(row=int(row), column=int(col)).value = value
+        wb.save(str(path))
+        try:
+            wb.close()
+        except Exception:
+            pass
+
     def _import_workbook(
         self,
         workbook_path: Path,
@@ -129,6 +160,33 @@ class TestTDExcelHeaderMapping(unittest.TestCase):
         finally:
             conn.close()
         return [(str(row[0] or ""), str(row[1] or "")) for row in rows]
+
+    def _sheet_info_names_by_import_order(self, sqlite_path: Path) -> list[tuple[str, str, int]]:
+        conn = sqlite3.connect(str(sqlite_path))
+        try:
+            cols = {str(row[1] or "") for row in conn.execute("PRAGMA table_info(__sheet_info)").fetchall()}
+            order_sql = "ORDER BY COALESCE(import_order, rowid), rowid" if "import_order" in cols else "ORDER BY rowid"
+            rows = conn.execute(
+                f"SELECT sheet_name, COALESCE(source_sheet_name, ''), COALESCE(import_order, 0) FROM __sheet_info {order_sql}"
+            ).fetchall()
+        finally:
+            conn.close()
+        return [(str(row[0] or ""), str(row[1] or ""), int(row[2] or 0)) for row in rows]
+
+    def _table_rows(self, sqlite_path: Path, *, sheet_name: str) -> tuple[list[str], list[tuple[object, ...]]]:
+        conn = sqlite3.connect(str(sqlite_path))
+        try:
+            row = conn.execute(
+                "SELECT table_name FROM __sheet_info WHERE sheet_name=? LIMIT 1",
+                (sheet_name,),
+            ).fetchone()
+            self.assertIsNotNone(row, f"expected table for {sheet_name}")
+            table_name = str(row[0] or "")
+            cols = [str(r[1] or "") for r in conn.execute(f"PRAGMA table_info([{table_name}])").fetchall()]
+            rows = conn.execute(f"SELECT * FROM [{table_name}] ORDER BY excel_row").fetchall()
+        finally:
+            conn.close()
+        return cols, rows
 
     def test_importer_reconstructs_split_and_merged_headers(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
@@ -329,6 +387,188 @@ class TestTDExcelHeaderMapping(unittest.TestCase):
                 self._sheet_info_names(sqlite_path),
                 [("DataPages", "DataPages")],
             )
+
+    def test_importer_detects_short_numeric_runs(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            workbook_path = root / "td_short.xlsx"
+            sqlite_path = root / "td_short.sqlite3"
+            headers = [(1, 1, "Time"), (1, 2, "Thrust")]
+            data_rows = [[float(i), float(i) * 2.0] for i in range(5)]
+            self._build_workbook(workbook_path, headers=headers, data_rows=data_rows, title="DataPages")
+
+            payload = self._import_workbook(
+                workbook_path,
+                sqlite_path,
+                synthesize_td_seq_aliases=True,
+            )
+
+            self.assertTrue(sqlite_path.exists())
+            self.assertEqual(
+                self._sheet_info_names(sqlite_path),
+                [("seq_1", "DataPages")],
+            )
+            self.assertEqual(int((payload.get("sheets") or [])[0].get("rows_inserted") or 0), 5)
+
+    def test_importer_splits_repeated_sheet_blocks_and_merges_same_sequence_on_time(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            workbook_path = root / "td_split_merge.xlsx"
+            sqlite_path = root / "td_split_merge.sqlite3"
+            cells: list[tuple[int, int, object]] = [
+                (1, 1, "Sequence No:"),
+                (1, 3, 1),
+                (2, 1, "Time"),
+                (2, 2, "Thrust"),
+            ]
+            cells.extend((row + 3, 1, float(row)) for row in range(10))
+            cells.extend((row + 3, 2, 100.0 + float(row)) for row in range(10))
+            cells.extend(
+                [
+                    (20, 1, "Sequence No:"),
+                    (20, 3, 1),
+                    (21, 1, "Time"),
+                    (21, 2, "Pf"),
+                ]
+            )
+            cells.extend((row + 22, 1, float(row)) for row in range(10))
+            cells.extend((row + 22, 2, 300.0 + float(row)) for row in range(10))
+            self._build_workbook_from_cells(workbook_path, title="DataPages", cells=cells)
+
+            payload = self._import_workbook(workbook_path, sqlite_path, synthesize_td_seq_aliases=True)
+
+            self.assertEqual(self._sheet_info_names(sqlite_path), [("seq_1", "DataPages")])
+            cols, rows = self._table_rows(sqlite_path, sheet_name="seq_1")
+            self.assertEqual(cols, ["excel_row", "Time", "Thrust", "Pf"])
+            self.assertEqual(len(rows), 10)
+            self.assertEqual(rows[0][1:], (0.0, 100.0, 300.0))
+            self.assertEqual(rows[-1][1:], (9.0, 109.0, 309.0))
+            diagnostics = dict((payload.get("sheets") or [])[0].get("diagnostics") or {})
+            self.assertEqual(diagnostics.get("merge_status"), "merged_on_x_axis")
+            self.assertEqual(diagnostics.get("merge_x_axis"), "Time")
+
+    def test_importer_prefers_first_value_on_duplicate_same_sequence_conflict(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            workbook_path = root / "td_split_conflict.xlsx"
+            sqlite_path = root / "td_split_conflict.sqlite3"
+            cells: list[tuple[int, int, object]] = [
+                (1, 1, "Sequence No:"),
+                (1, 3, 1),
+                (2, 1, "Time"),
+                (2, 2, "Thrust"),
+            ]
+            cells.extend((row + 3, 1, float(row)) for row in range(10))
+            cells.extend((row + 3, 2, 10.0 + float(row)) for row in range(10))
+            cells.extend(
+                [
+                    (20, 1, "Sequence No:"),
+                    (20, 3, 1),
+                    (21, 1, "Time"),
+                    (21, 2, "Thrust"),
+                ]
+            )
+            cells.extend((row + 22, 1, float(row)) for row in range(10))
+            cells.extend((row + 22, 2, 1000.0 + float(row)) for row in range(10))
+            self._build_workbook_from_cells(workbook_path, title="DataPages", cells=cells)
+
+            self._import_workbook(workbook_path, sqlite_path, synthesize_td_seq_aliases=True)
+
+            cols, rows = self._table_rows(sqlite_path, sheet_name="seq_1")
+            self.assertEqual(cols, ["excel_row", "Time", "Thrust"])
+            self.assertEqual(rows[0][2], 10.0)
+            self.assertEqual(rows[-1][2], 19.0)
+
+    def test_importer_merges_cross_sheet_duplicate_sequence_numbers_by_time(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            workbook_path = root / "td_cross_sheet_merge.xlsx"
+            sqlite_path = root / "td_cross_sheet_merge.sqlite3"
+            sheets = [
+                {
+                    "title": "DataPages",
+                    "headers": [(1, 1, "Sequence No:"), (1, 3, 1), (2, 1, "Time"), (2, 2, "Thrust")],
+                    "data_rows": [[float(i), 50.0 + float(i)] for i in range(10)],
+                },
+                {
+                    "title": "PulseSummary",
+                    "headers": [(1, 1, "Sequence No:"), (1, 3, 1), (2, 1, "Time"), (2, 2, "Pf")],
+                    "data_rows": [[float(i), 250.0 + float(i)] for i in range(10)],
+                },
+            ]
+            self._build_multi_sheet_workbook(workbook_path, sheets=sheets)
+
+            self._import_workbook(workbook_path, sqlite_path, synthesize_td_seq_aliases=True)
+
+            self.assertEqual(self._sheet_info_names(sqlite_path), [("seq_1", "DataPages")])
+            cols, rows = self._table_rows(sqlite_path, sheet_name="seq_1")
+            self.assertEqual(cols, ["excel_row", "Time", "Thrust", "Pf"])
+            self.assertEqual(rows[3][1:], (3.0, 53.0, 253.0))
+
+    def test_importer_falls_back_to_separate_runs_when_duplicate_sequences_have_no_shared_x(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            workbook_path = root / "td_duplicate_no_shared_x.xlsx"
+            sqlite_path = root / "td_duplicate_no_shared_x.sqlite3"
+            sheets = [
+                {
+                    "title": "DataPages",
+                    "headers": [(1, 1, "Sequence No:"), (1, 3, 1), (2, 1, "Time"), (2, 2, "Thrust")],
+                    "data_rows": [[float(i), 10.0 + float(i)] for i in range(10)],
+                },
+                {
+                    "title": "PulseSummary",
+                    "headers": [(1, 1, "Sequence No:"), (1, 3, 1), (2, 1, "Pulse Number"), (2, 2, "Pf")],
+                    "data_rows": [[float(i), 20.0 + float(i)] for i in range(10)],
+                },
+            ]
+            self._build_multi_sheet_workbook(workbook_path, sheets=sheets)
+
+            payload = self._import_workbook(workbook_path, sqlite_path, synthesize_td_seq_aliases=True)
+
+            self.assertEqual(
+                self._sheet_info_names_by_import_order(sqlite_path),
+                [("seq_1", "DataPages", 1), ("seq_1_2", "PulseSummary", 2)],
+            )
+            diagnostics = [dict(item.get("diagnostics") or {}) for item in (payload.get("sheets") or [])]
+            self.assertEqual([item.get("merge_status") for item in diagnostics], ["fallback_no_shared_x", "fallback_no_shared_x"])
+
+    def test_script_extractor_reconstructs_headers_without_missing_helper_crash(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            workbook_path = root / "td_script.xlsx"
+            headers = [
+                (1, 1, "Seq Time"),
+                (2, 1, "(sec)"),
+                (1, 2, "Ti 10% Pc"),
+                (2, 2, "(msec)"),
+                (1, 3, "Thrust-N Calc"),
+                (2, 3, "(lbf)"),
+            ]
+            data_rows = [
+                [float(i), float(i) * 0.1, float(i) * 10.0]
+                for i in range(20)
+            ]
+            self._build_workbook(workbook_path, headers=headers, data_rows=data_rows)
+
+            excel_extraction = _load_excel_extraction_module()
+            config = {
+                "header_row": 0,
+                "statistics": ["mean"],
+                "columns": [
+                    {"name": "Time", "units": "sec"},
+                    {"name": "Ti_10_Pc_msec", "units": "msec"},
+                    {"name": "Thrust", "units": "lbf"},
+                ],
+            }
+
+            rows = excel_extraction.extract_from_excel(workbook_path, config)
+
+            self.assertEqual(len(rows), 3)
+            self.assertEqual([str(row.get("column") or "") for row in rows], ["Time", "Ti_10_Pc_msec", "Thrust"])
+            self.assertTrue(all(row.get("error") is None for row in rows))
+            for actual, expected in zip([float(row.get("value")) for row in rows], [9.5, 0.95, 95.0]):
+                self.assertAlmostEqual(actual, expected, places=8)
 
 
 if __name__ == "__main__":
