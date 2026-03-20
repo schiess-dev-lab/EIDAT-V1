@@ -2790,6 +2790,45 @@ class TestTDSupportWorkbook(unittest.TestCase):
             rebuild_mock.assert_not_called()
             calc_mock.assert_called_once_with(root / "implementation_trending.sqlite3", wb_path, progress_cb=None)
 
+    def test_sync_cache_uses_calc_only_refresh_when_impl_cache_is_incomplete(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            src_db = root / "src.sqlite3"
+            self._make_source_sqlite(src_db)
+
+            wb_path = root / "project.xlsx"
+            be._write_test_data_trending_workbook(
+                wb_path,
+                global_repo=root,
+                serials=["SN1"],
+                docs=[{"serial_number": "SN1", "excel_sqlite_rel": str(src_db)}],
+                config=self._make_config(),
+            )
+            support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+            be._write_td_support_workbook(
+                support_path,
+                sequence_names=["RunA"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+            )
+            be.ensure_test_data_project_cache(root, wb_path, rebuild=True)
+
+            with sqlite3.connect(str(root / "implementation_trending.sqlite3")) as conn:
+                conn.execute("DELETE FROM td_runs")
+                conn.execute("DELETE FROM td_columns_calc")
+                conn.execute("DELETE FROM td_metrics_calc")
+                conn.execute("DELETE FROM td_condition_observations")
+                conn.commit()
+
+            with mock.patch.object(be, "rebuild_test_data_project_cache") as rebuild_mock:
+                with mock.patch.object(be, "_rebuild_test_data_project_calc_cache_from_raw", return_value={"db_path": str(root / "implementation_trending.sqlite3")}) as calc_mock:
+                    payload = be.sync_test_data_project_cache(root, wb_path)
+
+            self.assertEqual(str(payload.get("mode") or ""), "calc_only")
+            rebuild_mock.assert_not_called()
+            calc_mock.assert_called_once_with(root / "implementation_trending.sqlite3", wb_path, progress_cb=None)
+
     def test_ensure_cache_rebuilds_raw_cache_after_raw_column_change(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
 
@@ -3227,7 +3266,8 @@ class TestTDSupportWorkbook(unittest.TestCase):
             self.assertTrue(any("Generating control-period performance sheets" in msg for msg in progress))
             self.assertTrue(any("Saving workbook with performance sheets" in msg for msg in progress))
 
-    def test_update_workbook_fails_when_cache_db_incomplete(self) -> None:
+    def test_update_workbook_repairs_incomplete_existing_cache_db(self) -> None:
+        from openpyxl import load_workbook  # type: ignore
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
 
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
@@ -3243,14 +3283,69 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 docs=[{"serial_number": "SN1", "excel_sqlite_rel": str(src_db)}],
                 config=self._make_config(),
             )
+            support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+            be._write_td_support_workbook(
+                support_path,
+                sequence_names=["RunA"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+            )
 
             db_path = root / "implementation_trending.sqlite3"
             with sqlite3.connect(str(db_path)) as conn:
                 be._ensure_test_data_tables(conn)
                 conn.commit()
 
-            with self.assertRaisesRegex(RuntimeError, "Project cache DB is incomplete"):
-                be.update_test_data_trending_project_workbook(root, wb_path, overwrite=True)
+            result = be.update_test_data_trending_project_workbook(root, wb_path, overwrite=True)
+            self.assertEqual(str(result.get("workbook") or ""), str(wb_path))
+            validated = be.validate_existing_test_data_project_cache(root, wb_path)
+            self.assertEqual(str(validated), str(db_path))
+
+            wb = load_workbook(str(wb_path), read_only=True, data_only=True)
+            try:
+                ws_calc = wb["Data_calc"]
+                values = {
+                    str(ws_calc.cell(r, 1).value or "").strip(): ws_calc.cell(r, 2).value
+                    for r in range(1, (ws_calc.max_row or 0) + 1)
+                }
+                self.assertIn("RunA.thrust.mean", values)
+            finally:
+                wb.close()
+
+    def test_update_workbook_repairs_schema_only_raw_and_impl_dbs(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            src_db = root / "src.sqlite3"
+            self._make_source_sqlite(src_db)
+
+            wb_path = root / "project.xlsx"
+            be._write_test_data_trending_workbook(
+                wb_path,
+                global_repo=root,
+                serials=["SN1"],
+                docs=[{"serial_number": "SN1", "excel_sqlite_rel": str(src_db)}],
+                config=self._make_config(),
+            )
+            support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+            be._write_td_support_workbook(
+                support_path,
+                sequence_names=["RunA"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+            )
+
+            with sqlite3.connect(str(root / "implementation_trending.sqlite3")) as conn:
+                be._ensure_test_data_tables(conn)
+                conn.commit()
+            with sqlite3.connect(str(root / "test_data_raw_cache.sqlite3")) as conn:
+                be._ensure_test_data_raw_cache_tables(conn)
+                conn.commit()
+
+            result = be.update_test_data_trending_project_workbook(root, wb_path, overwrite=True)
+            self.assertEqual(str(result.get("workbook") or ""), str(wb_path))
+            self.assertTrue((root / "test_data_raw_cache.sqlite3").exists())
+            validated = be.validate_existing_test_data_project_cache(root, wb_path)
+            self.assertEqual(str(validated), str(root / "implementation_trending.sqlite3"))
 
     def test_validate_existing_cache_requires_built_raw_and_calc_sections(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore

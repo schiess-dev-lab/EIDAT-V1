@@ -5919,6 +5919,8 @@ def _td_project_cache_refresh_mode(
     *,
     stale_context: bool,
     curve_count: int,
+    raw_complete: bool,
+    impl_complete: bool,
     expected_serials: set[str],
     cached_serials: set[str],
     cached_stats_csv: str,
@@ -5931,6 +5933,8 @@ def _td_project_cache_refresh_mode(
 ) -> tuple[str, str]:
     if stale_context:
         return "full", "context changed"
+    if not raw_complete and (expected_serials or cached_serials or curve_count > 0):
+        return "full", "raw cache is incomplete"
     if curve_count <= 0 and expected_serials:
         return "full", "raw cache is empty"
     if cached_raw_cols_csv != current_raw_cols_csv:
@@ -5939,6 +5943,8 @@ def _td_project_cache_refresh_mode(
         return "incremental_raw", "source SQLite inputs changed"
     if expected_serials and expected_serials != cached_serials:
         return "incremental_raw", "source serial set changed"
+    if raw_complete and not impl_complete:
+        return "calc", "implementation cache is incomplete"
     if cached_stats_csv != current_stats_csv:
         return "calc", "selected statistics changed"
     if int(cached_support_mtime_ns) != int(support_mtime_ns):
@@ -5952,6 +5958,64 @@ def _td_meta_value(conn: sqlite3.Connection, key: str) -> str:
     except Exception:
         return ""
     return str(row[0] or "").strip() if row and row[0] is not None else ""
+
+
+def _td_impl_cache_counts(conn: sqlite3.Connection) -> dict[str, int | bool]:
+    _ensure_test_data_impl_tables(conn)
+    try:
+        runs_count = int(conn.execute("SELECT COUNT(*) FROM td_runs").fetchone()[0] or 0)
+    except Exception:
+        runs_count = 0
+    try:
+        calc_y_count = int(conn.execute("SELECT COUNT(*) FROM td_columns_calc WHERE kind='y'").fetchone()[0] or 0)
+    except Exception:
+        calc_y_count = 0
+    try:
+        metrics_count = int(conn.execute("SELECT COUNT(*) FROM td_metrics_calc").fetchone()[0] or 0)
+    except Exception:
+        metrics_count = 0
+    return {
+        "runs": runs_count,
+        "calc_y": calc_y_count,
+        "metrics": metrics_count,
+        "complete": bool(runs_count > 0 and calc_y_count > 0 and metrics_count > 0),
+    }
+
+
+def _td_raw_cache_counts(conn: sqlite3.Connection) -> dict[str, int | bool]:
+    _ensure_test_data_raw_cache_tables(conn)
+    try:
+        raw_runs_count = int(conn.execute("SELECT COUNT(*) FROM td_raw_sequences").fetchone()[0] or 0)
+    except Exception:
+        raw_runs_count = 0
+    try:
+        raw_curve_count = int(conn.execute("SELECT COUNT(*) FROM td_curves_raw").fetchone()[0] or 0)
+    except Exception:
+        raw_curve_count = 0
+    try:
+        raw_y_count = int(conn.execute("SELECT COUNT(*) FROM td_columns_raw WHERE kind='y'").fetchone()[0] or 0)
+    except Exception:
+        raw_y_count = 0
+    return {
+        "raw_runs": raw_runs_count,
+        "raw_curves": raw_curve_count,
+        "raw_y": raw_y_count,
+        "complete": bool(raw_runs_count > 0 and raw_curve_count > 0 and raw_y_count > 0),
+    }
+
+
+def _td_is_recoverable_cache_validation_error(exc: BaseException | str) -> bool:
+    message = str(exc or "").strip()
+    if not message:
+        return False
+    recoverable_markers = (
+        "Project cache DB not found",
+        "Project cache DB is incomplete",
+        "Project raw cache DB not found",
+        "Project raw cache DB is incomplete",
+        "Project cache is stale",
+    )
+    return any(marker in message for marker in recoverable_markers)
 
 
 def inspect_test_data_project_cache_state(project_dir: Path, workbook_path: Path) -> dict[str, object]:
@@ -6020,12 +6084,10 @@ def inspect_test_data_project_cache_state(project_dir: Path, workbook_path: Path
         cached_node_root = _td_meta_value(conn, "node_root")
         cached_project_raw_signature = _td_meta_value(conn, "project_raw_signature")
         cached_schema_version = _td_meta_value(conn, "cache_schema_version")
+        impl_counts = _td_impl_cache_counts(conn)
     with sqlite3.connect(str(raw_db_path)) as conn:
-        _ensure_test_data_raw_cache_tables(conn)
-        try:
-            curve_count = int(conn.execute("SELECT COUNT(*) FROM td_curves_raw").fetchone()[0] or 0)
-        except Exception:
-            curve_count = 0
+        raw_counts = _td_raw_cache_counts(conn)
+        curve_count = int(raw_counts.get("raw_curves") or 0)
 
     current_node_root = str(_infer_node_root_from_workbook_path(wb_path))
     stale_context = False
@@ -6080,6 +6142,8 @@ def inspect_test_data_project_cache_state(project_dir: Path, workbook_path: Path
     refresh_mode, refresh_reason = _td_project_cache_refresh_mode(
         stale_context=bool(stale_context),
         curve_count=int(curve_count),
+        raw_complete=bool(raw_counts.get("complete")),
+        impl_complete=bool(impl_counts.get("complete")),
         expected_serials=set(expected_serials),
         cached_serials=set(cached_sources.keys()),
         cached_stats_csv=str(cached_stats_csv),
@@ -6095,6 +6159,10 @@ def inspect_test_data_project_cache_state(project_dir: Path, workbook_path: Path
         "raw_db_path": raw_db_path,
         "mode": refresh_mode,
         "reason": refresh_reason,
+        "impl_counts": dict(impl_counts),
+        "raw_counts": dict(raw_counts),
+        "impl_complete": bool(impl_counts.get("complete")),
+        "raw_complete": bool(raw_counts.get("complete")),
         "project_raw_signature": project_raw_signature,
         "current_stats_csv": current_stats_csv,
         "current_raw_cols_csv": current_raw_cols_csv,
@@ -14622,15 +14690,11 @@ def update_test_data_trending_project_workbook(
     repo = Path(global_repo).expanduser()
     project_dir = wb_path.parent
     db_path = project_dir / EIDAT_PROJECT_IMPLEMENTATION_DB
-    cache_missing = False
     if require_existing_cache:
         try:
-            _validate_test_data_project_cache_for_update(project_dir, wb_path)
+            validate_existing_test_data_project_cache(project_dir, wb_path)
         except RuntimeError as exc:
-            message = str(exc or "")
-            if "Project cache DB not found" in message:
-                cache_missing = True
-            else:
+            if not _td_is_recoverable_cache_validation_error(exc):
                 raise
 
     try:
