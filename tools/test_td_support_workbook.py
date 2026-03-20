@@ -2867,6 +2867,35 @@ class TestTDSupportWorkbook(unittest.TestCase):
             rebuild_mock.assert_called_once_with(root / "implementation_trending.sqlite3", wb_path, progress_cb=None)
             calc_mock.assert_not_called()
 
+    def test_full_rebuild_avoids_reloading_raw_cache_for_calc(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            src_db = root / "src.sqlite3"
+            self._make_source_sqlite(src_db)
+
+            wb_path = root / "project.xlsx"
+            be._write_test_data_trending_workbook(
+                wb_path,
+                global_repo=root,
+                serials=["SN1"],
+                docs=[{"serial_number": "SN1", "excel_sqlite_rel": str(src_db)}],
+                config=self._make_config(),
+            )
+            support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+            be._write_td_support_workbook(
+                support_path,
+                sequence_names=["RunA"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+            )
+
+            with mock.patch.object(be, "_rebuild_test_data_project_calc_cache_from_raw") as calc_from_raw_mock:
+                payload = be.rebuild_test_data_project_cache(root / "implementation_trending.sqlite3", wb_path)
+
+            self.assertGreater(int(payload.get("metrics_written") or 0), 0)
+            calc_from_raw_mock.assert_not_called()
+
     def test_sync_cache_noops_when_inputs_are_unchanged(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
 

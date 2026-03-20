@@ -14,7 +14,7 @@ from datetime import datetime
 from functools import lru_cache
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Callable, Dict, Iterable, Mapping, Optional, Sequence, TypeVar
+from typing import Callable, Dict, Iterable, Mapping, Optional, Sequence, TypeVar, cast
 
 
 APP_ROOT = Path(__file__).resolve().parents[1]
@@ -5424,6 +5424,76 @@ def _raw_curve_points(*, rows: list[dict], actual_x: str, y_name: str) -> tuple[
     return xs, ys
 
 
+def _raw_curve_points_multi(
+    *,
+    rows: list[dict],
+    actual_x: str,
+    y_columns_by_name: Mapping[str, str],
+) -> dict[str, tuple[list[float], list[float]]]:
+    series: dict[str, dict[str, object]] = {
+        str(y_name): {"actual_y": str(actual_y), "xs": [], "ys": []}
+        for y_name, actual_y in (y_columns_by_name or {}).items()
+        if str(y_name).strip() and str(actual_y).strip()
+    }
+    if not actual_x or not series:
+        return {}
+
+    for row in rows:
+        fx = _td_finite_float(row.get(actual_x))
+        if fx is None:
+            continue
+        x_val = float(fx)
+        for payload in series.values():
+            actual_y = str(payload.get("actual_y") or "").strip()
+            fy = _td_finite_float(row.get(actual_y))
+            if fy is None:
+                continue
+            cast(list[float], payload["xs"]).append(x_val)
+            cast(list[float], payload["ys"]).append(float(fy))
+
+    return {
+        y_name: (cast(list[float], payload["xs"]), cast(list[float], payload["ys"]))
+        for y_name, payload in series.items()
+    }
+
+
+def _td_apply_last_n_rows_limit(values: list[T], last_n_rows: int | None) -> list[T]:
+    if last_n_rows is None:
+        return values
+    try:
+        limit = int(last_n_rows)
+    except Exception:
+        return values
+    if limit <= 0:
+        return values
+    prior_rows = values[:-1]
+    effective_limit = max(0, limit - 1)
+    if effective_limit == 0:
+        return []
+    if len(prior_rows) <= effective_limit:
+        return prior_rows
+    return prior_rows[-effective_limit:]
+
+
+def _td_filter_curve_values(
+    xs: Sequence[object],
+    ys: Sequence[object],
+    *,
+    exclude_first_n: int | None,
+    last_n_rows: int | None,
+) -> list[float]:
+    filtered: list[float] = []
+    for raw_x, raw_y in zip(xs, ys):
+        fx = _td_finite_float(raw_x)
+        fy = _td_finite_float(raw_y)
+        if fx is None or fy is None:
+            continue
+        filtered.append(float(fy))
+    if exclude_first_n is not None and int(exclude_first_n) > 0:
+        filtered = filtered[int(exclude_first_n):]
+    return _td_apply_last_n_rows_limit(filtered, last_n_rows)
+
+
 def _read_test_data_run_labeling(workbook_path: Path) -> dict | None:
     """
     Read optional `td_run_labeling` JSON from the Test Data Trending workbook's Config sheet.
@@ -6469,6 +6539,265 @@ def _resolve_td_support_sequence_for_run(run_name: str, support_cfg: dict) -> di
     return _td_resolve_support_condition_for_source("", run, support_cfg)
 
 
+def _write_test_data_project_calc_cache_from_aggregates(
+    db_path: Path,
+    workbook_path: Path,
+    *,
+    cfg_cols: Sequence[Mapping[str, object]],
+    cfg_units: Mapping[str, str],
+    selected_stats: Sequence[str],
+    support_cfg: Mapping[str, object],
+    support_settings: Mapping[str, object],
+    bounds_by_sequence: Mapping[str, Mapping[str, object]],
+    condition_defaults_by_run: Mapping[str, Mapping[str, object]],
+    condition_meta_by_key: Mapping[str, Mapping[str, object]],
+    aggregated_curve_values: Mapping[tuple[str, str, str], Sequence[float]],
+    aggregated_obs_meta: Mapping[tuple[str, str], Mapping[str, object]],
+    condition_y_names: Mapping[str, set[str]],
+    computed_epoch_ns: int,
+    progress_cb: Callable[[str], None] | None = None,
+) -> dict[str, object]:
+    import time
+    import statistics
+
+    db_path = Path(db_path).expanduser()
+    wb_path = Path(workbook_path).expanduser()
+    total_started = time.perf_counter()
+    timings: dict[str, float] = {
+        "calc_aggregate_s": 0.0,
+        "calc_write_s": 0.0,
+        "total_s": 0.0,
+    }
+
+    _td_emit_progress(progress_cb, "Aggregating calculated Test Data cache")
+    t0 = time.perf_counter()
+    metrics_written = 0
+    calc_columns_written = 0
+    inserted_columns: set[tuple[str, str]] = set()
+    inserted_runs: set[str] = set()
+    run_rows_to_write: list[tuple[object, ...]] = []
+    column_rows_to_write: list[tuple[object, ...]] = []
+    obs_rows_to_write: list[tuple[object, ...]] = []
+    metric_rows_to_write: list[tuple[object, ...]] = []
+
+    def _compute_stats(values: list[float]) -> dict[str, float | int | None]:
+        n = len(values)
+        if n == 0:
+            return {"mean": None, "min": None, "max": None, "std": None, "median": None, "count": 0}
+        out: dict[str, float | int | None] = {
+            "mean": (sum(values) / n),
+            "min": min(values),
+            "max": max(values),
+            "median": statistics.median(values),
+            "count": n,
+        }
+        out["std"] = statistics.stdev(values) if n >= 2 else None
+        return out
+
+    def _compute_constant_stats(value: float) -> dict[str, float | int | None]:
+        return {
+            "mean": float(value),
+            "min": float(value),
+            "max": float(value),
+            "median": float(value),
+            "std": 0.0,
+            "count": 1,
+        }
+
+    for (condition_key, serial_txt), meta in aggregated_obs_meta.items():
+        condition_key_clean = str(condition_key or "").strip()
+        serial_clean = str(serial_txt or "").strip()
+        if not condition_key_clean or not serial_clean:
+            continue
+        condition_meta = dict(condition_meta_by_key.get(condition_key_clean) or {})
+        run_defaults = dict(condition_defaults_by_run.get(condition_key_clean) or {})
+        run_display_name = (
+            str(condition_meta.get("display_name") or run_defaults.get("display_name") or condition_key_clean).strip()
+            or condition_key_clean
+        )
+        default_x = str(run_defaults.get("default_x") or "Time").strip() or "Time"
+        pulse_width_value = _td_finite_float(
+            condition_meta.get("pulse_width_on", condition_meta.get("pulse_width", run_defaults.get("pulse_width")))
+        )
+        control_period_value = _td_finite_float(condition_meta.get("control_period", run_defaults.get("control_period")))
+        run_type_text = str(condition_meta.get("run_type") or run_defaults.get("run_type") or "").strip()
+        member_source_runs = sorted({str(v).strip() for v in (meta.get("source_run_names") or set()) if str(v).strip()})
+
+        if condition_key_clean not in inserted_runs:
+            inserted_runs.add(condition_key_clean)
+            run_rows_to_write.append(
+                (
+                    condition_key_clean,
+                    default_x,
+                    run_display_name,
+                    run_type_text,
+                    control_period_value,
+                    pulse_width_value,
+                )
+            )
+            calc_param_defs = _ordered_support_param_defs(
+                sequence_names=[condition_key_clean],
+                support_cfg={
+                    "bounds_by_sequence": {condition_key_clean: dict(bounds_by_sequence.get(condition_key_clean) or {})},
+                    "settings": dict(support_settings or {}),
+                },
+                fallback_defs=[dict(d) for d in cfg_cols if isinstance(d, Mapping)],
+            )
+            if not calc_param_defs:
+                calc_param_defs = [dict(d) for d in cfg_cols if isinstance(d, Mapping)]
+            for param_def in calc_param_defs:
+                col_name = str(param_def.get("name") or "").strip()
+                if not col_name or (condition_key_clean, col_name) in inserted_columns:
+                    continue
+                inserted_columns.add((condition_key_clean, col_name))
+                column_rows_to_write.append(
+                    (condition_key_clean, col_name, str(param_def.get("units") or cfg_units.get(col_name) or "").strip(), "y")
+                )
+                calc_columns_written += 1
+            if pulse_width_value is not None and (condition_key_clean, "pulse_width") not in inserted_columns:
+                inserted_columns.add((condition_key_clean, "pulse_width"))
+                column_rows_to_write.append(
+                    (condition_key_clean, "pulse_width", str(cfg_units.get("pulse_width") or "").strip(), "y")
+                )
+                calc_columns_written += 1
+
+        observation_id_calc = f"{_td_norm_ident_token(serial_clean)}__{_td_norm_ident_token(condition_key_clean)}"
+        program_titles_txt = ", ".join(sorted({str(v).strip() for v in (meta.get("program_titles") or set()) if str(v).strip()}))
+        member_source_runs_txt = ", ".join(member_source_runs)
+        source_mtime_max = max([int(v) for v in (meta.get("source_mtime_ns") or [])], default=0)
+        obs_rows_to_write.append(
+            (
+                observation_id_calc,
+                serial_clean,
+                condition_key_clean,
+                program_titles_txt,
+                member_source_runs_txt,
+                run_type_text,
+                pulse_width_value,
+                control_period_value,
+                source_mtime_max,
+                int(computed_epoch_ns),
+            )
+        )
+        for y_name in sorted(condition_y_names.get(condition_key_clean) or set()):
+            values = [float(v) for v in (aggregated_curve_values.get((condition_key_clean, serial_clean, y_name)) or [])]
+            stats_map = _compute_stats(values)
+            for stat in selected_stats:
+                metric_rows_to_write.append(
+                    (
+                        observation_id_calc,
+                        serial_clean,
+                        condition_key_clean,
+                        y_name,
+                        str(stat),
+                        stats_map.get(stat),
+                        int(computed_epoch_ns),
+                        source_mtime_max,
+                        program_titles_txt,
+                        member_source_runs_txt,
+                    )
+                )
+                metrics_written += 1
+        if pulse_width_value is not None:
+            stats_map = _compute_constant_stats(float(pulse_width_value))
+            for stat in selected_stats:
+                metric_rows_to_write.append(
+                    (
+                        observation_id_calc,
+                        serial_clean,
+                        condition_key_clean,
+                        "pulse_width",
+                        str(stat),
+                        stats_map.get(stat),
+                        int(computed_epoch_ns),
+                        source_mtime_max,
+                        program_titles_txt,
+                        member_source_runs_txt,
+                    )
+                )
+                metrics_written += 1
+    timings["calc_aggregate_s"] = round(time.perf_counter() - t0, 3)
+
+    support_mtime_ns = 0
+    try:
+        support_path_meta = Path(str(support_cfg.get("path") or "")).expanduser()
+        if support_path_meta.exists():
+            st = support_path_meta.stat()
+            support_mtime_ns = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)))
+    except Exception:
+        support_mtime_ns = 0
+
+    _td_emit_progress(progress_cb, "Writing calculated Test Data cache")
+    t0 = time.perf_counter()
+    with sqlite3.connect(str(db_path)) as conn:
+        _ensure_test_data_impl_tables(conn)
+        _purge_test_data_legacy_impl_raw_tables(conn)
+        conn.execute("DELETE FROM td_runs")
+        conn.execute("DELETE FROM td_columns_calc")
+        conn.execute("DELETE FROM td_metrics_calc")
+        conn.execute("DELETE FROM td_condition_observations")
+        if run_rows_to_write:
+            conn.executemany(
+                "INSERT OR REPLACE INTO td_runs(run_name, default_x, display_name, run_type, control_period, pulse_width) VALUES (?, ?, ?, ?, ?, ?)",
+                run_rows_to_write,
+            )
+        if column_rows_to_write:
+            conn.executemany(
+                "INSERT OR REPLACE INTO td_columns_calc(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
+                column_rows_to_write,
+            )
+        if obs_rows_to_write:
+            conn.executemany(
+                """
+                INSERT OR REPLACE INTO td_condition_observations(
+                    observation_id, serial, run_name, program_title, source_run_name, run_type, pulse_width, control_period, source_mtime_ns, computed_epoch_ns
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                obs_rows_to_write,
+            )
+        if metric_rows_to_write:
+            conn.executemany(
+                """
+                INSERT OR REPLACE INTO td_metrics_calc
+                (observation_id, serial, run_name, column_name, stat, value_num, computed_epoch_ns, source_mtime_ns, program_title, source_run_name)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                metric_rows_to_write,
+            )
+        conn.execute(
+            "INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)",
+            ("workbook_path", str(wb_path)),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)",
+            ("built_epoch_ns", str(int(computed_epoch_ns))),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)",
+            ("statistics", ",".join([str(s) for s in selected_stats])),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)",
+            ("support_workbook_path", str(support_cfg.get("path") or "")),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)",
+            ("support_workbook_mtime_ns", str(int(support_mtime_ns))),
+        )
+        conn.commit()
+    timings["calc_write_s"] = round(time.perf_counter() - t0, 3)
+    timings["total_s"] = round(time.perf_counter() - total_started, 3)
+
+    return {
+        "db_path": str(db_path),
+        "workbook": str(wb_path),
+        "metrics_written": metrics_written,
+        "calc_columns_written": calc_columns_written,
+        "mode": "calc_from_current_pass",
+        "timings": dict(timings),
+    }
+
+
 def _rebuild_test_data_project_calc_cache_from_raw(
     db_path: Path,
     workbook_path: Path,
@@ -7473,7 +7802,17 @@ def rebuild_test_data_project_cache(
 
     support_cfg = _read_td_support_workbook(wb_path, project_dir=db_path.parent)
     support_settings = dict(support_cfg.get("settings") or {})
+    bounds_by_sequence = {
+        str(k).strip(): dict(v)
+        for k, v in (support_cfg.get("bounds_by_sequence") or {}).items()
+        if str(k).strip() and isinstance(v, dict)
+    }
     support_sequences = [dict(s) for s in (support_cfg.get("sequences") or []) if isinstance(s, dict) and bool(s.get("enabled", True))]
+    condition_meta_by_key = {
+        str(row.get("condition_key") or "").strip(): dict(row)
+        for row in ((support_cfg.get("condition_groups") or support_cfg.get("run_conditions") or []))
+        if isinstance(row, dict) and str(row.get("condition_key") or "").strip()
+    }
 
     # Optional: run/sequence condition labeling (user-controlled via JSON stored in workbook Config).
     td_run_labeling = None
@@ -8148,6 +8487,9 @@ def rebuild_test_data_project_cache(
     run_y_calc_union: dict[str, dict[str, str]] = {}
     run_pulse_width_by_run: dict[str, object] = {}
     run_meta_by_run: dict[str, dict[str, object]] = {}
+    calc_aggregated_curve_values: dict[tuple[str, str, str], list[float]] = {}
+    calc_aggregated_obs_meta: dict[tuple[str, str], dict[str, object]] = {}
+    calc_condition_y_names: dict[str, set[str]] = {}
     raw_tables_created: set[str] = set()
     diagnostics_rows: list[tuple[str, str, str, str, str, str, int, int, str]] = []
     debug_diagnostics: list[dict] = []
@@ -8529,16 +8871,67 @@ def rebuild_test_data_project_cache(
                     run_curves_written = 0
                     if default_x:
                         actual_x = x_map.get(default_x, "")
-                        for y_name in matched_y_names:
-                            actual_y = y_actual_by_name.get(y_name, "")
-                            if not actual_x or not actual_y:
-                                continue
-                            t_extract = time.perf_counter()
-                            xs, ys = _raw_curve_points(rows=source_rows, actual_x=actual_x, y_name=actual_y)
-                            x_json_txt = json.dumps(xs, separators=(",", ":"), ensure_ascii=False)
-                            y_json_txt = json.dumps(ys, separators=(",", ":"), ensure_ascii=False)
-                            timings["raw_curve_extraction_s"] += time.perf_counter() - t_extract
-                            table_name = _td_raw_curve_table_name(effective_run, y_name)
+                        source_run_name_text = str(run_info.get("source_run_name") or run).strip()
+                        run_type_text = str(run_info.get("run_type") or "").strip()
+                        pulse_width_float = _finite_float(pulse_width_value)
+                        control_period_float = _finite_float(run_info.get("control_period"))
+                        matched_y_actuals = {
+                            str(y_name): str(y_actual_by_name.get(y_name) or "").strip()
+                            for y_name in matched_y_names
+                            if str(y_name).strip() and str(y_actual_by_name.get(y_name) or "").strip()
+                        }
+                        t_extract = time.perf_counter()
+                        curve_points_by_name = _raw_curve_points_multi(
+                            rows=source_rows,
+                            actual_x=actual_x,
+                            y_columns_by_name=matched_y_actuals,
+                        )
+                        serialized_curves = {
+                            y_name: (
+                                xs,
+                                ys,
+                                json.dumps(xs, separators=(",", ":"), ensure_ascii=False),
+                                json.dumps(ys, separators=(",", ":"), ensure_ascii=False),
+                            )
+                            for y_name, (xs, ys) in curve_points_by_name.items()
+                        }
+                        timings["raw_curve_extraction_s"] += time.perf_counter() - t_extract
+                        if full_reset and actual_x and serialized_curves:
+                            exclude_first_n = run_info.get("exclude_first_n")
+                            if exclude_first_n is None:
+                                exclude_first_n = support_settings.get("exclude_first_n_default")
+                            last_n_rows = run_info.get("last_n_rows")
+                            if last_n_rows is None:
+                                last_n_rows = support_settings.get("last_n_rows_default")
+                            obs_meta = calc_aggregated_obs_meta.setdefault(
+                                (str(effective_run), str(sn)),
+                                {
+                                    "program_titles": set(),
+                                    "source_run_names": set(),
+                                    "source_mtime_ns": [],
+                                },
+                            )
+                            if source_program_title:
+                                cast(set[str], obs_meta["program_titles"]).add(str(source_program_title))
+                            cast(set[str], obs_meta["source_run_names"]).add(source_run_name_text)
+                            if isinstance(mtime_ns, int):
+                                cast(list[int], obs_meta["source_mtime_ns"]).append(int(mtime_ns))
+                            exclude_first_n_int = _to_support_int(exclude_first_n)
+                            last_n_rows_int = _to_support_int(last_n_rows)
+                            for y_name in matched_y_names:
+                                curve_payload = serialized_curves.get(y_name)
+                                if curve_payload is None:
+                                    continue
+                                xs, ys, _x_json_txt, _y_json_txt = curve_payload
+                                filtered_y = _td_filter_curve_values(
+                                    xs,
+                                    ys,
+                                    exclude_first_n=exclude_first_n_int,
+                                    last_n_rows=last_n_rows_int,
+                                )
+                                calc_condition_y_names.setdefault(str(effective_run), set()).add(str(y_name))
+                                calc_aggregated_curve_values.setdefault((str(effective_run), str(sn), str(y_name)), []).extend(filtered_y)
+                        if actual_x and serialized_curves:
                             t_raw_write = time.perf_counter()
                             raw_conn.execute(
                                 """
@@ -8551,14 +8944,22 @@ def rebuild_test_data_project_cache(
                                     effective_run,
                                     sn,
                                     source_program_title,
-                                    str(run_info.get("source_run_name") or run).strip(),
-                                    str(run_info.get("run_type") or "").strip(),
-                                    _finite_float(pulse_width_value),
-                                    _finite_float(run_info.get("control_period")),
+                                    source_run_name_text,
+                                    run_type_text,
+                                    pulse_width_float,
+                                    control_period_float,
                                     mtime_ns,
                                     computed_epoch_ns,
                                 ),
                             )
+                            timings["raw_db_write_s"] += time.perf_counter() - t_raw_write
+                        for y_name in matched_y_names:
+                            curve_payload = serialized_curves.get(y_name)
+                            if curve_payload is None:
+                                continue
+                            xs, ys, x_json_txt, y_json_txt = curve_payload
+                            table_name = _td_raw_curve_table_name(effective_run, y_name)
+                            t_raw_write = time.perf_counter()
                             if table_name not in raw_tables_created:
                                 raw_conn.execute(
                                     f"""
@@ -8608,7 +9009,7 @@ def rebuild_test_data_project_cache(
                                     observation_id,
                                     sn,
                                     source_program_title,
-                                    str(run_info.get("source_run_name") or run).strip(),
+                                    source_run_name_text,
                                     x_json_txt,
                                     y_json_txt,
                                     int(len(xs)),
@@ -8978,7 +9379,45 @@ def rebuild_test_data_project_cache(
 
     _td_emit_progress(progress_cb, "Rebuilding calculated Test Data cache")
     t0 = time.perf_counter()
-    calc_payload = _rebuild_test_data_project_calc_cache_from_raw(db_path, wb_path, progress_cb=progress_cb)
+    if full_reset:
+        condition_defaults_by_run = {
+            str(run).strip(): {
+                "display_name": str(display_by_run.get(run) or (run_meta_by_run.get(run) or {}).get("display_name") or run).strip()
+                or str(run),
+                "default_x": str(run_default_x.get(run) or "").strip(),
+                "run_type": str((run_meta_by_run.get(run) or {}).get("run_type") or "").strip(),
+                "control_period": (run_meta_by_run.get(run) or {}).get("control_period"),
+                "pulse_width": (run_meta_by_run.get(run) or {}).get("pulse_width"),
+            }
+            for run in runs_all
+            if str(run).strip()
+        }
+        calc_payload = _write_test_data_project_calc_cache_from_aggregates(
+            db_path,
+            wb_path,
+            cfg_cols=[dict(c) for c in cfg_cols],
+            cfg_units=dict(cfg_units),
+            selected_stats=list(selected_stats),
+            support_cfg=dict(support_cfg),
+            support_settings=dict(support_settings),
+            bounds_by_sequence={str(k): dict(v) for k, v in bounds_by_sequence.items()},
+            condition_defaults_by_run=condition_defaults_by_run,
+            condition_meta_by_key={str(k): dict(v) for k, v in condition_meta_by_key.items()},
+            aggregated_curve_values={k: list(v) for k, v in calc_aggregated_curve_values.items()},
+            aggregated_obs_meta={
+                k: {
+                    "program_titles": set(v.get("program_titles") or set()),
+                    "source_run_names": set(v.get("source_run_names") or set()),
+                    "source_mtime_ns": list(v.get("source_mtime_ns") or []),
+                }
+                for k, v in calc_aggregated_obs_meta.items()
+            },
+            condition_y_names={str(k): set(v) for k, v in calc_condition_y_names.items()},
+            computed_epoch_ns=computed_epoch_ns,
+            progress_cb=progress_cb,
+        )
+    else:
+        calc_payload = _rebuild_test_data_project_calc_cache_from_raw(db_path, wb_path, progress_cb=progress_cb)
     timings["calc_rebuild_s"] = round(time.perf_counter() - t0, 3)
     timings["total_s"] = round(time.perf_counter() - total_started, 3)
     metrics_written = int(calc_payload.get("metrics_written") or 0)
