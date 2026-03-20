@@ -13039,6 +13039,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cb_project_overwrite.setStyleSheet("color:#0f172a; font-size: 12px;")
         self.btn_project_update = QtWidgets.QPushButton("Update Project")
         self.btn_project_perf_sheets = QtWidgets.QPushButton("Generate Performance Sheets")
+        self.btn_project_debug_excels = QtWidgets.QPushButton("Generate Debug Excel Files")
         self.btn_project_env = QtWidgets.QPushButton("Project Env")
         self.btn_project_delete = QtWidgets.QPushButton("Delete Project")
         self.btn_project_open_folder = QtWidgets.QPushButton("Open Folder")
@@ -13047,6 +13048,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for b in (
             self.btn_project_update,
             self.btn_project_perf_sheets,
+            self.btn_project_debug_excels,
             self.btn_project_env,
             self.btn_project_delete,
             self.btn_project_open_folder,
@@ -13069,6 +13071,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.btn_project_update.clicked.connect(self._act_update_project)
         self.btn_project_perf_sheets.clicked.connect(self._act_generate_project_performance_sheets)
+        self.btn_project_debug_excels.clicked.connect(self._act_generate_project_debug_excels)
         self.btn_project_env.clicked.connect(self._act_project_env)
         self.btn_project_delete.clicked.connect(self._act_delete_project)
         self.btn_project_open_folder.clicked.connect(self._act_open_project_folder)
@@ -13077,6 +13080,7 @@ class MainWindow(QtWidgets.QMainWindow):
         actions.addWidget(self.cb_project_overwrite)
         actions.addWidget(self.btn_project_update)
         actions.addWidget(self.btn_project_perf_sheets)
+        actions.addWidget(self.btn_project_debug_excels)
         actions.addWidget(self.btn_project_env)
         actions.addWidget(self.btn_project_delete)
         actions.addWidget(self.btn_project_open_folder)
@@ -13205,6 +13209,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.btn_project_update.setEnabled(bool(record) and is_update_supported and not project_busy)
         if hasattr(self, "btn_project_perf_sheets"):
             self.btn_project_perf_sheets.setEnabled(bool(record) and is_td and not project_busy)
+        if hasattr(self, "btn_project_debug_excels"):
+            self.btn_project_debug_excels.setEnabled(bool(record) and is_td and not project_busy)
         if hasattr(self, "btn_project_env"):
             self.btn_project_env.setEnabled(bool(record) and not project_busy)
         if hasattr(self, "btn_project_open_support"):
@@ -13273,9 +13279,14 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_project_task_error(self, message: str, heading: str) -> None:
         self._project_worker = None
         self._update_project_actions()
-        QtWidgets.QMessageBox.warning(self, heading, message)
+        msg = str(message or "").strip() or f"{heading} failed."
+        try:
+            self._append_log(f"[PROJECT TASK ERROR] {heading}: {msg}")
+        except Exception:
+            pass
+        QtWidgets.QMessageBox.warning(self, heading, msg)
         if self._project_popup_active:
-            self._repo_scan_dialog.finish(f"{heading} failed: {message}", success=False)
+            self._repo_scan_dialog.finish(f"{heading} failed: {msg}", success=False)
             self._project_popup_active = False
 
     def _handle_project_update_success(self, payload: object, *, wb_path: Path, ptype: str, started: float) -> str:
@@ -13291,6 +13302,12 @@ class MainWindow(QtWidgets.QMainWindow):
         cache_sync_mode = str(payload.get("cache_sync_mode") or "").strip()
         cache_sync_reason = str(payload.get("cache_sync_reason") or "").strip()
         cache_sync_counts = payload.get("cache_sync_counts") if isinstance(payload.get("cache_sync_counts"), dict) else {}
+        cache_state = payload.get("cache_state") if isinstance(payload.get("cache_state"), dict) else {}
+        cache_validation_ok = bool(payload.get("cache_validation_ok"))
+        cache_validation_error = str(payload.get("cache_validation_error") or "").strip()
+        cache_validation_summary = str(payload.get("cache_validation_summary") or "").strip()
+        cache_debug_path = str(payload.get("cache_debug_path") or "").strip()
+        backend_module_path = str(payload.get("backend_module_path") or "").strip()
         dbg = str(payload.get("debug_json") or "").strip()
         log_path = str(payload.get("log_path") or "").strip()
         elapsed_s = round(time.perf_counter() - started, 3)
@@ -13308,6 +13325,17 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"reingested={int(cache_sync_counts.get('reingested') or 0)}"
             )
         if ptype == getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending"):
+            self._append_log(
+                "[PROJECT UPDATE] TD cache validation="
+                f"{'ok' if cache_validation_ok else 'failed'}"
+                + (f": {cache_validation_error}" if cache_validation_error else "")
+            )
+            if cache_validation_summary:
+                self._append_log(f"[PROJECT UPDATE] TD cache summary: {cache_validation_summary}")
+            if cache_debug_path:
+                self._append_log(f"[PROJECT UPDATE] TD cache debug: {cache_debug_path}")
+            if backend_module_path:
+                self._append_log(f"[PROJECT UPDATE] Backend module: {backend_module_path}")
             timings = payload.get("timings")
             if not isinstance(timings, dict) and dbg:
                 try:
@@ -13369,6 +13397,23 @@ class MainWindow(QtWidgets.QMainWindow):
         if ptype == getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending"):
             if cache_sync_mode:
                 lines.append(f"Cache sync mode: {cache_sync_mode}")
+            lines.append(f"TD cache validation: {'ready' if cache_validation_ok else 'failed'}")
+            impl_counts = cache_state.get("impl_counts") if isinstance(cache_state.get("impl_counts"), dict) else {}
+            raw_counts = cache_state.get("raw_counts") if isinstance(cache_state.get("raw_counts"), dict) else {}
+            if impl_counts or raw_counts:
+                lines.append(
+                    "TD cache counts: "
+                    f"td_runs={int(impl_counts.get('td_runs') or 0)}, "
+                    f"td_columns_calc_y={int(impl_counts.get('td_columns_calc_y') or 0)}, "
+                    f"td_metrics_calc={int(impl_counts.get('td_metrics_calc') or 0)}, "
+                    f"td_raw_sequences={int(raw_counts.get('td_raw_sequences') or 0)}, "
+                    f"td_columns_raw_y={int(raw_counts.get('td_columns_raw_y') or 0)}, "
+                    f"td_curves_raw={int(raw_counts.get('td_curves_raw') or 0)}"
+                )
+            if cache_validation_summary:
+                lines.append(f"TD cache summary: {cache_validation_summary}")
+            if cache_debug_path:
+                lines.append(f"TD cache debug: {cache_debug_path}")
             lines.append("Recalculation includes support-workbook heuristics when present.")
             lines.append("Performance candidate sheets are now generated only on demand.")
             saved_refresh = payload.get("saved_equation_refresh")
@@ -13412,6 +13457,25 @@ class MainWindow(QtWidgets.QMainWindow):
         QtWidgets.QMessageBox.information(self, "Performance Sheets Generated", "\n".join(lines))
         self._show_toast("Performance sheets generated")
         return "Performance sheets generated"
+
+    def _handle_project_debug_excel_success(self, payload: object, *, wb_path: Path) -> str:
+        if not isinstance(payload, dict):
+            raise RuntimeError("Debug Excel export returned an invalid payload.")
+        ordered_keys = (
+            "implementation_excel",
+            "raw_cache_excel",
+            "raw_points_excel",
+        )
+        lines = [str(payload.get(key) or "").strip() for key in ordered_keys if str(payload.get(key) or "").strip()]
+        if not lines:
+            raise RuntimeError(f"No debug Excel files were generated for {wb_path}.")
+        QtWidgets.QMessageBox.information(
+            self,
+            "Debug Excel Files",
+            "Generated debug Excel files:\n\n" + "\n".join(lines),
+        )
+        self._show_toast("Debug Excel files generated")
+        return "Debug Excel files generated"
 
     def _act_open_project_folder(self) -> None:
         item = self._selected_project_item(2)
@@ -13571,6 +13635,38 @@ class MainWindow(QtWidgets.QMainWindow):
             )
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "Generate Performance Sheets", str(exc))
+
+    def _act_generate_project_debug_excels(self) -> None:
+        try:
+            record = self._selected_project_record()
+            if not record:
+                raise RuntimeError("Select a project in the list first.")
+            ptype = str(record.get("type") or "").strip()
+            if ptype != getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending"):
+                raise RuntimeError("Debug Excel export is available only for Test Data Trending projects.")
+            project_dir = Path(str(record.get("folder") or "")).expanduser()
+            wb_path = Path(str(record.get("workbook") or "")).expanduser()
+            project_name = str(record.get("name") or wb_path.stem or "").strip() or wb_path.stem
+
+            def _task(_report):
+                return be.export_test_data_project_debug_excels(
+                    project_dir,
+                    wb_path,
+                    force=True,
+                )
+
+            self._append_log(f"[PROJECT DEBUG EXCEL] Starting: {project_name}")
+            self._append_log(f"[PROJECT DEBUG EXCEL] Workbook: {wb_path}")
+            self._start_project_task(
+                heading="Generate Debug Excel Files",
+                status_text=f"Generating debug Excel files for {project_name}",
+                project_dir=project_dir,
+                log_prefix="project_debug_excel_files",
+                task_factory=_task,
+                on_success=lambda payload: self._handle_project_debug_excel_success(payload, wb_path=wb_path),
+            )
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Generate Debug Excel Files", str(exc))
 
     def _act_delete_project(self) -> None:
         try:

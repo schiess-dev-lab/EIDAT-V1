@@ -3221,6 +3221,17 @@ def _write_td_cache_debug_json(project_dir: Path, payload: dict) -> Path | None:
     return path
 
 
+def _read_td_cache_debug_json(project_dir: Path) -> dict[str, object]:
+    path = Path(project_dir).expanduser() / TD_CACHE_DEBUG_JSON
+    try:
+        if not path.exists() or not path.is_file():
+            return {}
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return dict(payload) if isinstance(payload, dict) else {}
+
+
 def _read_test_data_config_columns(workbook_path: Path) -> list[dict]:
     try:
         from openpyxl import load_workbook  # type: ignore
@@ -6254,6 +6265,90 @@ def inspect_test_data_project_cache_state(project_dir: Path, workbook_path: Path
         "unchanged_serials": list(unchanged_serials),
         "invalid_serials": list(invalid_serials),
     }
+
+
+def _td_cache_state_summary(state: Mapping[str, object] | None) -> dict[str, object]:
+    raw_state = dict(state or {})
+    impl_counts_raw = raw_state.get("impl_counts") if isinstance(raw_state.get("impl_counts"), Mapping) else {}
+    raw_counts_raw = raw_state.get("raw_counts") if isinstance(raw_state.get("raw_counts"), Mapping) else {}
+    sync_counts_raw = raw_state.get("counts") if isinstance(raw_state.get("counts"), Mapping) else {}
+    return {
+        "mode": str(raw_state.get("mode") or "").strip(),
+        "reason": str(raw_state.get("reason") or "").strip(),
+        "impl_complete": bool(raw_state.get("impl_complete")),
+        "raw_complete": bool(raw_state.get("raw_complete")),
+        "impl_counts": {
+            "td_runs": int(impl_counts_raw.get("runs") or 0),
+            "td_columns_calc_y": int(impl_counts_raw.get("calc_y") or 0),
+            "td_metrics_calc": int(impl_counts_raw.get("metrics") or 0),
+        },
+        "raw_counts": {
+            "td_raw_sequences": int(raw_counts_raw.get("raw_runs") or 0),
+            "td_columns_raw_y": int(raw_counts_raw.get("raw_y") or 0),
+            "td_curves_raw": int(raw_counts_raw.get("raw_curves") or 0),
+        },
+        "sync_counts": {
+            "added": int(sync_counts_raw.get("added") or 0),
+            "changed": int(sync_counts_raw.get("changed") or 0),
+            "removed": int(sync_counts_raw.get("removed") or 0),
+            "unchanged": int(sync_counts_raw.get("unchanged") or 0),
+            "invalid": int(sync_counts_raw.get("invalid") or 0),
+            "reingested": int(sync_counts_raw.get("reingested") or 0),
+        },
+    }
+
+
+def _td_cache_validation_summary_line(summary: Mapping[str, object] | None) -> str:
+    state = dict(summary or {})
+    impl_counts = state.get("impl_counts") if isinstance(state.get("impl_counts"), Mapping) else {}
+    raw_counts = state.get("raw_counts") if isinstance(state.get("raw_counts"), Mapping) else {}
+    sync_counts = state.get("sync_counts") if isinstance(state.get("sync_counts"), Mapping) else {}
+    parts = [
+        f"mode={str(state.get('mode') or 'n/a').strip() or 'n/a'}",
+        f"reason={str(state.get('reason') or 'n/a').strip() or 'n/a'}",
+        f"impl_complete={bool(state.get('impl_complete'))}",
+        f"raw_complete={bool(state.get('raw_complete'))}",
+        f"td_runs={int(impl_counts.get('td_runs') or 0)}",
+        f"td_columns_calc_y={int(impl_counts.get('td_columns_calc_y') or 0)}",
+        f"td_metrics_calc={int(impl_counts.get('td_metrics_calc') or 0)}",
+        f"td_raw_sequences={int(raw_counts.get('td_raw_sequences') or 0)}",
+        f"td_columns_raw_y={int(raw_counts.get('td_columns_raw_y') or 0)}",
+        f"td_curves_raw={int(raw_counts.get('td_curves_raw') or 0)}",
+        f"added={int(sync_counts.get('added') or 0)}",
+        f"changed={int(sync_counts.get('changed') or 0)}",
+        f"removed={int(sync_counts.get('removed') or 0)}",
+        f"unchanged={int(sync_counts.get('unchanged') or 0)}",
+        f"invalid={int(sync_counts.get('invalid') or 0)}",
+        f"reingested={int(sync_counts.get('reingested') or 0)}",
+    ]
+    return ", ".join(parts)
+
+
+def _td_record_post_build_validation(
+    project_dir: Path,
+    *,
+    state_summary: Mapping[str, object] | None,
+    validation_ok: bool,
+    validation_error: str = "",
+) -> Path | None:
+    payload = _read_td_cache_debug_json(project_dir)
+    existing_counts = payload.get("counts") if isinstance(payload.get("counts"), Mapping) else {}
+    payload["backend_module_path"] = str(Path(__file__).resolve())
+    payload["post_build_validation"] = {
+        "ok": bool(validation_ok),
+        "error": str(validation_error or "").strip(),
+        "summary": _td_cache_validation_summary_line(state_summary),
+        "cache_state": dict(state_summary or {}),
+        "build_counts": {
+            "serials_count": int(existing_counts.get("serials_count") or 0),
+            "valid_sources": int(existing_counts.get("valid_sources") or 0),
+            "missing_sources": int(existing_counts.get("missing_sources") or 0),
+            "invalid_sources": int(existing_counts.get("invalid_sources") or 0),
+            "curves_written": int(existing_counts.get("curves_written") or 0),
+            "metrics_written": int(existing_counts.get("metrics_written") or 0),
+        },
+    }
+    return _write_td_cache_debug_json(project_dir, payload)
 
 
 def ensure_test_data_project_cache(
@@ -9491,6 +9586,7 @@ def rebuild_test_data_project_cache(
             "reingested": int(preclassified_counts.get("reingested") or len(entries)),
         },
         "timings": dict(timings),
+        "debug_path": str(debug_path) if debug_path is not None else "",
     }
 
 
@@ -15627,7 +15723,52 @@ def update_test_data_trending_project_workbook(
                 "path": str(td_saved_performance_equations_path(project_dir)),
             }
 
+    cache_state_summary: dict[str, object] = {}
+    cache_validation_ok = False
+    cache_validation_error = ""
+    cache_debug_path = str(cache_sync_payload.get("debug_path") or "").strip()
+    backend_module_path = str(Path(__file__).resolve())
+    if not dry_run:
+        try:
+            cache_state_summary = _td_cache_state_summary(
+                inspect_test_data_project_cache_state(project_dir, wb_path)
+            )
+        except Exception as exc:
+            cache_validation_error = str(exc).strip()
+        else:
+            try:
+                validate_existing_test_data_project_cache(project_dir, wb_path)
+                cache_validation_ok = True
+            except Exception as exc:
+                cache_validation_error = str(exc).strip()
+        debug_path = _td_record_post_build_validation(
+            project_dir,
+            state_summary=cache_state_summary,
+            validation_ok=cache_validation_ok,
+            validation_error=cache_validation_error,
+        )
+        if debug_path is not None:
+            cache_debug_path = str(debug_path)
+        if not cache_validation_ok:
+            summary_line = _td_cache_validation_summary_line(cache_state_summary)
+            debug_hint = f" Debug: {cache_debug_path}." if cache_debug_path else ""
+            raise RuntimeError(
+                "Update Project finished workbook output, but final TD cache validation failed: "
+                f"{cache_validation_error or 'unknown validation error'}. "
+                f"Cache summary: {summary_line}."
+                + debug_hint
+            )
+
     timings["total_s"] = round(time.perf_counter() - total_started, 3)
+    debug_payload = {
+        "timings_s": dict(timings),
+        "cache_validation_ok": bool(cache_validation_ok),
+        "cache_validation_error": str(cache_validation_error or "").strip(),
+        "cache_state": dict(cache_state_summary),
+        "cache_validation_summary": _td_cache_validation_summary_line(cache_state_summary),
+        "cache_debug_path": str(cache_debug_path or "").strip(),
+        "backend_module_path": backend_module_path,
+    }
 
     return {
         "workbook": str(wb_path),
@@ -15644,7 +15785,13 @@ def update_test_data_trending_project_workbook(
         "cache_sync_reason": str(cache_sync_payload.get("reason") or ""),
         "saved_equation_refresh": saved_equation_refresh,
         "timings": dict(timings),
-        "debug_json": json.dumps({"timings_s": timings}, separators=(",", ":")),
+        "cache_state": dict(cache_state_summary),
+        "cache_validation_ok": bool(cache_validation_ok),
+        "cache_validation_error": str(cache_validation_error or "").strip(),
+        "cache_validation_summary": str(debug_payload.get("cache_validation_summary") or "").strip(),
+        "cache_debug_path": str(cache_debug_path or "").strip(),
+        "backend_module_path": backend_module_path,
+        "debug_json": json.dumps(debug_payload, separators=(",", ":")),
     }
 
 

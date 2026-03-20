@@ -951,6 +951,123 @@ class TestProjectUpdateUI(unittest.TestCase):
         self.assertEqual(result.get("workbook"), "x")
         perf_mock.assert_called_once()
 
+    def test_generate_debug_excel_files_uses_background_task_for_td_projects(self) -> None:
+        _qt_app()
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+        from EIDAT_App_Files.ui_next.qt_main import MainWindow  # type: ignore
+
+        class _Harness:
+            pass
+
+        harness = _Harness()
+        harness._selected_project_record = lambda: {
+            "name": "Proj",
+            "type": getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending"),
+            "folder": "C:/tmp/repo/projects/Proj",
+            "workbook": "C:/tmp/repo/projects/Proj/project.xlsx",
+        }
+        harness._append_log = lambda *_args, **_kwargs: None
+        captured: dict[str, object] = {}
+        harness._start_project_task = lambda **kwargs: captured.update(kwargs)
+        act = MainWindow._act_generate_project_debug_excels.__get__(harness, _Harness)
+
+        with mock.patch.object(
+            be,
+            "export_test_data_project_debug_excels",
+            return_value={"implementation_excel": Path("C:/tmp/repo/projects/Proj/implementation_trending.xlsx")},
+        ) as export_mock:
+            act()
+            self.assertEqual(captured.get("heading"), "Generate Debug Excel Files")
+            self.assertEqual(captured.get("log_prefix"), "project_debug_excel_files")
+            task_factory = captured.get("task_factory")
+            self.assertTrue(callable(task_factory))
+            result = task_factory(lambda *_args: None)  # type: ignore[misc]
+
+        self.assertIn("implementation_excel", result)
+        export_mock.assert_called_once_with(
+            Path("C:/tmp/repo/projects/Proj"),
+            Path("C:/tmp/repo/projects/Proj/project.xlsx"),
+            force=True,
+        )
+
+    def test_handle_project_update_success_logs_td_cache_summary_and_debug_path(self) -> None:
+        _qt_app()
+        from PySide6 import QtWidgets
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+        from EIDAT_App_Files.ui_next.qt_main import MainWindow  # type: ignore
+
+        class _Harness:
+            pass
+
+        logs: list[str] = []
+        harness = _Harness()
+        harness._append_log = logs.append
+        harness._show_toast = lambda message: setattr(harness, "_toast_message", str(message))
+        handle = MainWindow._handle_project_update_success.__get__(harness, _Harness)
+        payload = {
+            "workbook": "C:/tmp/repo/projects/Proj/project.xlsx",
+            "updated_cells": 5,
+            "missing_source": 0,
+            "missing_value": 0,
+            "serials_in_workbook": 1,
+            "serials_added": 0,
+            "added_serials": [],
+            "cache_sync_mode": "noop",
+            "cache_sync_reason": "",
+            "cache_sync_counts": {"added": 0, "changed": 0, "removed": 0, "unchanged": 1, "invalid": 0, "reingested": 0},
+            "cache_state": {
+                "impl_counts": {"td_runs": 1, "td_columns_calc_y": 1, "td_metrics_calc": 1},
+                "raw_counts": {"td_raw_sequences": 1, "td_columns_raw_y": 1, "td_curves_raw": 1},
+            },
+            "cache_validation_ok": True,
+            "cache_validation_error": "",
+            "cache_validation_summary": "mode=none, reason=n/a, impl_complete=True, raw_complete=True",
+            "cache_debug_path": "C:/tmp/repo/projects/Proj/td_cache_debug.json",
+            "backend_module_path": "C:/tmp/repo/EIDAT_App_Files/ui_next/backend.py",
+            "timings": {"total_s": 1.23},
+            "saved_equation_refresh": {"refreshed_count": 0, "failed_count": 0, "errors": []},
+            "debug_json": json.dumps({"timings_s": {"total_s": 1.23}}),
+        }
+
+        with mock.patch.object(QtWidgets.QMessageBox, "information") as info_mock:
+            result = handle(
+                payload,
+                wb_path=Path("C:/tmp/repo/projects/Proj/project.xlsx"),
+                ptype=getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending"),
+                started=time.perf_counter() - 1.0,
+            )
+
+        self.assertTrue(any("TD cache validation=ok" in line for line in logs))
+        self.assertTrue(any("TD cache summary:" in line for line in logs))
+        self.assertTrue(any("TD cache debug:" in line for line in logs))
+        self.assertTrue(any("Backend module:" in line for line in logs))
+        self.assertIn("Project updated in", result)
+        info_mock.assert_called_once()
+
+    def test_on_project_task_error_logs_failure_message(self) -> None:
+        _qt_app()
+        from PySide6 import QtWidgets
+        from EIDAT_App_Files.ui_next.qt_main import MainWindow  # type: ignore
+
+        class _Harness:
+            pass
+
+        logs: list[str] = []
+        harness = _Harness()
+        harness._project_worker = object()
+        harness._project_popup_active = False
+        harness._update_project_actions = lambda: setattr(harness, "_actions_updated", True)
+        harness._append_log = logs.append
+        handler = MainWindow._on_project_task_error.__get__(harness, _Harness)
+
+        with mock.patch.object(QtWidgets.QMessageBox, "warning") as warning_mock:
+            handler("final TD cache validation failed: boom", "Update Project")
+
+        self.assertIsNone(harness._project_worker)
+        self.assertTrue(bool(getattr(harness, "_actions_updated", False)))
+        self.assertTrue(any("final TD cache validation failed: boom" in line for line in logs))
+        warning_mock.assert_called_once()
+
 
 @unittest.skipUnless(_have_openpyxl(), "openpyxl not installed")
 class TestTDSupportWorkbook(unittest.TestCase):
@@ -3375,6 +3492,97 @@ class TestTDSupportWorkbook(unittest.TestCase):
             self.assertTrue((root / "test_data_raw_cache.sqlite3").exists())
             validated = be.validate_existing_test_data_project_cache(root, wb_path)
             self.assertEqual(str(validated), str(root / "implementation_trending.sqlite3"))
+
+    def test_update_workbook_returns_final_cache_validation_payload_and_debug_path(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            src_db = root / "src.sqlite3"
+            self._make_source_sqlite(src_db)
+
+            wb_path = root / "project.xlsx"
+            be._write_test_data_trending_workbook(
+                wb_path,
+                global_repo=root,
+                serials=["SN1"],
+                docs=[{"serial_number": "SN1", "excel_sqlite_rel": str(src_db)}],
+                config=self._make_config(),
+            )
+            support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+            be._write_td_support_workbook(
+                support_path,
+                sequence_names=["RunA"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+            )
+
+            result = be.update_test_data_trending_project_workbook(root, wb_path, overwrite=True)
+
+            self.assertTrue(bool(result.get("cache_validation_ok")))
+            self.assertEqual(str(result.get("cache_validation_error") or ""), "")
+            self.assertTrue(str(result.get("cache_validation_summary") or "").strip())
+            self.assertEqual(str(result.get("backend_module_path") or ""), str(Path(be.__file__).resolve()))
+            cache_state = result.get("cache_state") if isinstance(result.get("cache_state"), dict) else {}
+            impl_counts = cache_state.get("impl_counts") if isinstance(cache_state.get("impl_counts"), dict) else {}
+            raw_counts = cache_state.get("raw_counts") if isinstance(cache_state.get("raw_counts"), dict) else {}
+            self.assertGreater(int(impl_counts.get("td_runs") or 0), 0)
+            self.assertGreater(int(impl_counts.get("td_metrics_calc") or 0), 0)
+            self.assertGreater(int(raw_counts.get("td_curves_raw") or 0), 0)
+
+            debug_path = Path(str(result.get("cache_debug_path") or ""))
+            self.assertTrue(debug_path.exists())
+            debug_payload = json.loads(debug_path.read_text(encoding="utf-8"))
+            post_build = debug_payload.get("post_build_validation") if isinstance(debug_payload, dict) else {}
+            self.assertIsInstance(post_build, dict)
+            self.assertTrue(bool(post_build.get("ok")))
+            self.assertEqual(
+                int((((post_build.get("cache_state") or {}).get("impl_counts") or {}).get("td_runs") or 0)),
+                int(impl_counts.get("td_runs") or 0),
+            )
+
+    def test_update_workbook_raises_when_post_build_validation_fails(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            src_db = root / "src.sqlite3"
+            self._make_source_sqlite(src_db)
+
+            wb_path = root / "project.xlsx"
+            be._write_test_data_trending_workbook(
+                wb_path,
+                global_repo=root,
+                serials=["SN1"],
+                docs=[{"serial_number": "SN1", "excel_sqlite_rel": str(src_db)}],
+                config=self._make_config(),
+            )
+            support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+            be._write_td_support_workbook(
+                support_path,
+                sequence_names=["RunA"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+            )
+
+            with mock.patch.object(
+                be,
+                "validate_existing_test_data_project_cache",
+                side_effect=RuntimeError("Project cache DB is incomplete: synthetic failure"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "final TD cache validation failed"):
+                    be.update_test_data_trending_project_workbook(
+                        root,
+                        wb_path,
+                        overwrite=True,
+                        require_existing_cache=False,
+                    )
+
+            debug_path = root / be.TD_CACHE_DEBUG_JSON
+            self.assertTrue(debug_path.exists())
+            debug_payload = json.loads(debug_path.read_text(encoding="utf-8"))
+            post_build = debug_payload.get("post_build_validation") if isinstance(debug_payload, dict) else {}
+            self.assertIsInstance(post_build, dict)
+            self.assertFalse(bool(post_build.get("ok")))
+            self.assertIn("synthetic failure", str(post_build.get("error") or ""))
 
     def test_validate_existing_cache_requires_built_raw_and_calc_sections(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
