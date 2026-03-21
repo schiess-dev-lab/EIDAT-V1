@@ -119,6 +119,19 @@ def _td_serial_metadata_by_serial(rows: list[dict]) -> dict[str, dict]:
     return by_sn
 
 
+TD_UNKNOWN_PROGRAM_LABEL = "Unknown Program"
+
+
+def _td_display_program_title(value: object) -> str:
+    return str(value or "").strip() or TD_UNKNOWN_PROGRAM_LABEL
+
+
+def _td_serial_value(row: dict | None) -> str:
+    if not isinstance(row, dict):
+        return ""
+    return str(row.get("serial") or row.get("serial_number") or "").strip()
+
+
 def _td_metric_program_segments(labels: list[str], serial_rows: list[dict]) -> list[dict]:
     meta_by_sn = _td_serial_metadata_by_serial(serial_rows)
     segments: list[dict] = []
@@ -127,7 +140,7 @@ def _td_metric_program_segments(labels: list[str], serial_rows: list[dict]) -> l
         if not sn:
             continue
         row = meta_by_sn.get(sn) or {}
-        program = str(row.get("program_title") or "").strip() or "Unknown Program"
+        program = _td_display_program_title(row.get("program_title"))
         if segments and str(segments[-1].get("program") or "") == program:
             segments[-1]["end"] = idx
             serials = segments[-1].setdefault("serials", [])
@@ -156,9 +169,9 @@ def _td_order_metric_serials(labels: list[str], serial_rows: list[dict]) -> list
 
     def _sort_key(sn: str) -> tuple[int, str, str]:
         row = meta_by_sn.get(sn) or {}
-        program = str(row.get("program_title") or "").strip() or "Unknown Program"
+        program = _td_display_program_title(row.get("program_title"))
         return (
-            1 if program == "Unknown Program" else 0,
+            1 if program == TD_UNKNOWN_PROGRAM_LABEL else 0,
             program.casefold(),
             sn.casefold(),
         )
@@ -3121,6 +3134,11 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._highlight_sn = ""
         self._highlight_sns: list[str] = []
         self._serial_source_rows: list[dict] = []
+        self._serial_source_by_serial: dict[str, dict] = {}
+        self._available_program_filters: list[str] = []
+        self._available_serial_filter_rows: list[dict] = []
+        self._checked_program_filters: list[str] = []
+        self._checked_serial_filters: list[str] = []
         self._auto_plots: list[dict] = []
         self._last_plot_def: dict | None = None
         self._auto_plot_path = self._project_dir / "auto_plots_test_data.json"
@@ -3170,9 +3188,55 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             """
         )
 
-        root = QtWidgets.QHBoxLayout(self)
+        root = QtWidgets.QVBoxLayout(self)
         root.setContentsMargins(16, 16, 16, 16)
         root.setSpacing(16)
+
+        filter_frame = QtWidgets.QFrame()
+        filter_frame.setStyleSheet("QFrame { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 10px; }")
+        filter_layout = QtWidgets.QHBoxLayout(filter_frame)
+        filter_layout.setContentsMargins(12, 10, 12, 10)
+        filter_layout.setSpacing(12)
+
+        filter_text_layout = QtWidgets.QVBoxLayout()
+        filter_text_layout.setContentsMargins(0, 0, 0, 0)
+        filter_text_layout.setSpacing(2)
+        filter_title = QtWidgets.QLabel("Global Filters")
+        filter_title.setStyleSheet("font-size: 12px; font-weight: 800; color: #0f172a;")
+        self.lbl_program_filter_summary = QtWidgets.QLabel("Programs: -")
+        self.lbl_program_filter_summary.setStyleSheet("color: #334155; font-size: 11px;")
+        self.lbl_serial_filter_summary = QtWidgets.QLabel("Serials: -")
+        self.lbl_serial_filter_summary.setStyleSheet("color: #334155; font-size: 11px;")
+        filter_text_layout.addWidget(filter_title)
+        filter_text_layout.addWidget(self.lbl_program_filter_summary)
+        filter_text_layout.addWidget(self.lbl_serial_filter_summary)
+        filter_layout.addLayout(filter_text_layout, 1)
+
+        self.btn_program_filters = QtWidgets.QPushButton("Programs...")
+        self.btn_program_filters.clicked.connect(self._open_program_filter_popup)
+        self.btn_serial_filters = QtWidgets.QPushButton("Serials...")
+        self.btn_serial_filters.clicked.connect(self._open_serial_filter_popup)
+        self.btn_reset_global_filters = QtWidgets.QPushButton("Reset Filters")
+        self.btn_reset_global_filters.clicked.connect(self._reset_global_filters)
+        for btn in (self.btn_program_filters, self.btn_serial_filters, self.btn_reset_global_filters):
+            btn.setMinimumHeight(32)
+            btn.setStyleSheet(
+                """
+                QPushButton {
+                    padding: 6px 12px;
+                    border-radius: 8px;
+                    background: #ffffff;
+                    border: 1px solid #cbd5e1;
+                    font-size: 12px;
+                    font-weight: 700;
+                    color: #0f172a;
+                }
+                QPushButton:hover { background: #f8fafc; }
+                QPushButton:disabled { color: #94a3b8; border-color: #e2e8f0; }
+                """
+            )
+            filter_layout.addWidget(btn)
+        root.addWidget(filter_frame)
 
         splitter = QtWidgets.QSplitter()
         splitter.setOrientation(QtCore.Qt.Orientation.Horizontal)
@@ -3882,6 +3946,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         except Exception:
             pass
 
+        self._refresh_global_filter_summaries()
         self._load_cache(rebuild=False)
         self._load_auto_plots()
         self._set_mode("curves")
@@ -4883,35 +4948,350 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             dn: rn for rn, dn in self._run_display_by_name.items() if dn and int(counts.get(dn, 0)) == 1
         }
 
-        if hasattr(self, "cb_run_mode"):
-            has_conditions = bool(self._run_selection_views.get("condition"))
-            idx = self.cb_run_mode.findData("condition")
-            if idx >= 0:
-                self.cb_run_mode.model().item(idx).setEnabled(has_conditions)
-            if self._current_run_selector_mode() == "condition" and not has_conditions:
-                seq_idx = self.cb_run_mode.findData("sequence")
-                if seq_idx >= 0:
-                    self.cb_run_mode.setCurrentIndex(seq_idx)
-
-        prev_run = self._run_name_by_display.get(prev_id, prev_id)
-        prev_selection_id = prev_id or prev_run
-        if prev_selection_id and ":" not in prev_selection_id:
-            prev_selection_id = f"sequence:{prev_run or prev_selection_id}"
-        self._refresh_run_dropdown(prev_selection_id=prev_selection_id)
-
         try:
             source_rows = be.td_read_sources_metadata(self._workbook_path)
         except Exception:
             source_rows = []
         by_sn = _td_serial_metadata_by_serial(source_rows)
         self._serial_source_rows = [by_sn.get(sn, {"serial": sn, "serial_number": sn}) for sn in serials if str(sn).strip()]
+        self._serial_source_by_serial = _td_serial_metadata_by_serial(self._serial_source_rows)
+        self._refresh_global_filter_options()
 
-        keep = [sn for sn in (self._highlight_sns or []) if sn in set(serials)]
+        self._sync_run_mode_availability()
+        prev_run = self._run_name_by_display.get(prev_id, prev_id)
+        prev_selection_id = prev_id or prev_run
+        if prev_selection_id and ":" not in prev_selection_id:
+            prev_selection_id = f"sequence:{prev_run or prev_selection_id}"
+        self._refresh_run_dropdown(prev_selection_id=prev_selection_id)
+
+        keep = [sn for sn in (self._highlight_sns or []) if sn in set(self._active_serials())]
         self._set_highlight_serials(keep)
 
         self._refresh_columns_for_run()
         self._refresh_stats_preview()
         self._refresh_performance_ui()
+        self._update_plot_zoom_actions()
+
+    def _refresh_global_filter_options(self) -> None:
+        rows = [dict(row) for row in (self._serial_source_rows or []) if isinstance(row, dict)]
+        rows = [row for row in rows if _td_serial_value(row)]
+        rows.sort(key=lambda row: _td_serial_value(row).casefold())
+
+        program_values = sorted(
+            {_td_display_program_title(row.get("program_title")) for row in rows},
+            key=lambda value: (1 if value == TD_UNKNOWN_PROGRAM_LABEL else 0, value.casefold()),
+        )
+        prev_programs = set(self._available_program_filters or [])
+        prev_checked_programs = set(self._checked_program_filters or [])
+        prev_serials = {_td_serial_value(row) for row in (self._available_serial_filter_rows or []) if _td_serial_value(row)}
+        prev_checked_serials = set(self._checked_serial_filters or [])
+
+        if not prev_programs:
+            self._checked_program_filters = list(program_values)
+        else:
+            self._checked_program_filters = [
+                value
+                for value in program_values
+                if value in prev_checked_programs or value not in prev_programs
+            ]
+
+        serial_values = [_td_serial_value(row) for row in rows]
+        if not prev_serials:
+            self._checked_serial_filters = list(serial_values)
+        else:
+            self._checked_serial_filters = [
+                serial
+                for serial in serial_values
+                if serial in prev_checked_serials or serial not in prev_serials
+            ]
+
+        self._available_program_filters = list(program_values)
+        self._available_serial_filter_rows = list(rows)
+        self._refresh_global_filter_summaries()
+
+    def _refresh_global_filter_summaries(self) -> None:
+        total_programs = len(self._available_program_filters or [])
+        active_programs = self._active_program_filter_values()
+        total_serials = len(self._available_serial_filter_rows or [])
+        active_serial_rows = self._active_serial_rows()
+        active_serials = [_td_serial_value(row) for row in active_serial_rows]
+
+        if hasattr(self, "lbl_program_filter_summary"):
+            if total_programs <= 0:
+                program_text = "Programs: -"
+            elif len(active_programs) >= total_programs:
+                program_text = f"Programs: All ({total_programs})"
+            elif not active_programs:
+                program_text = f"Programs: None active (0/{total_programs})"
+            elif len(active_programs) <= 2:
+                program_text = "Programs: " + ", ".join(active_programs)
+            else:
+                program_text = f"Programs: {len(active_programs)} of {total_programs} active"
+            self.lbl_program_filter_summary.setText(program_text)
+            self.lbl_program_filter_summary.setToolTip(", ".join(active_programs))
+
+        if hasattr(self, "lbl_serial_filter_summary"):
+            if total_serials <= 0:
+                serial_text = "Serials: -"
+            elif len(active_serials) >= total_serials and len(self._checked_serial_filters or []) >= total_serials:
+                serial_text = f"Serials: All ({total_serials})"
+            elif not active_serials:
+                serial_text = f"Serials: None active (0/{total_serials})"
+            else:
+                serial_text = f"Serials: {len(active_serials)} of {total_serials} active"
+            self.lbl_serial_filter_summary.setText(serial_text)
+            shown = ", ".join(active_serials[:20])
+            if len(active_serials) > 20:
+                shown += f" (+{len(active_serials) - 20} more)"
+            self.lbl_serial_filter_summary.setToolTip(shown)
+
+        has_programs = bool(self._available_program_filters)
+        has_serials = bool(self._available_serial_filter_rows)
+        if hasattr(self, "btn_program_filters"):
+            self.btn_program_filters.setEnabled(has_programs)
+        if hasattr(self, "btn_serial_filters"):
+            self.btn_serial_filters.setEnabled(has_serials)
+        if hasattr(self, "btn_reset_global_filters"):
+            self.btn_reset_global_filters.setEnabled(has_programs or has_serials)
+
+    def _active_program_filter_values(self) -> list[str]:
+        selected = [value for value in (self._checked_program_filters or []) if str(value).strip()]
+        valid = {value for value in (self._available_program_filters or []) if str(value).strip()}
+        return [value for value in selected if value in valid]
+
+    def _active_serial_rows(self) -> list[dict]:
+        selected_programs = set(self._active_program_filter_values())
+        selected_serials = {str(serial).strip() for serial in (self._checked_serial_filters or []) if str(serial).strip()}
+        out: list[dict] = []
+        for row in (self._available_serial_filter_rows or []):
+            serial = _td_serial_value(row)
+            if not serial or serial not in selected_serials:
+                continue
+            if _td_display_program_title((row or {}).get("program_title")) not in selected_programs:
+                continue
+            out.append(dict(row))
+        return out
+
+    def _active_serials(self) -> list[str]:
+        return [_td_serial_value(row) for row in self._active_serial_rows() if _td_serial_value(row)]
+
+    def _row_program_label(self, row: dict | None) -> str:
+        if not isinstance(row, dict):
+            return TD_UNKNOWN_PROGRAM_LABEL
+        program_title = str(row.get("program_title") or "").strip()
+        if program_title:
+            return program_title
+        serial = _td_serial_value(row)
+        source_row = (self._serial_source_by_serial or {}).get(serial) or {}
+        return _td_display_program_title(source_row.get("program_title"))
+
+    def _row_matches_global_filters(self, row: dict | None) -> bool:
+        if not isinstance(row, dict):
+            return False
+        serial = _td_serial_value(row)
+        if serial:
+            active_serials = set(self._active_serials())
+            if serial not in active_serials:
+                return False
+        program_label = self._row_program_label(row)
+        return program_label in set(self._active_program_filter_values())
+
+    def _filter_rows_for_global_selection(self, rows: list[dict]) -> list[dict]:
+        return [dict(row) for row in (rows or []) if self._row_matches_global_filters(row)]
+
+    def _visible_run_selection_items(self, mode: str) -> list[dict]:
+        selected_programs = set(self._active_program_filter_values())
+        out: list[dict] = []
+        for item in (self._run_selection_views.get(mode) or []):
+            if not isinstance(item, dict):
+                continue
+            raw_programs = item.get("member_programs") or []
+            if isinstance(raw_programs, list):
+                member_programs = [_td_display_program_title(value) for value in raw_programs if str(value).strip()]
+            else:
+                member_programs = []
+            if not member_programs:
+                member_programs = [_td_display_program_title(item.get("program_title"))]
+            if not any(program in selected_programs for program in member_programs):
+                continue
+            out.append(dict(item))
+        return out
+
+    def _sync_run_mode_availability(self) -> None:
+        if not hasattr(self, "cb_run_mode"):
+            return
+        has_conditions = bool(self._visible_run_selection_items("condition"))
+        idx = self.cb_run_mode.findData("condition")
+        if idx >= 0:
+            try:
+                self.cb_run_mode.model().item(idx).setEnabled(has_conditions)
+            except Exception:
+                pass
+        if self._current_run_selector_mode() == "condition" and not has_conditions:
+            seq_idx = self.cb_run_mode.findData("sequence")
+            if seq_idx >= 0:
+                self.cb_run_mode.setCurrentIndex(seq_idx)
+
+    def _show_filter_checklist_popup(self, *, title: str, entries: list[dict], selected_values: list[str]) -> list[str] | None:
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle(title)
+        dlg.resize(720, 540)
+        layout = QtWidgets.QVBoxLayout(dlg)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        ed_filter = QtWidgets.QLineEdit()
+        ed_filter.setPlaceholderText("Filter...")
+        layout.addWidget(ed_filter)
+
+        listw = QtWidgets.QListWidget()
+        listw.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
+        layout.addWidget(listw, 1)
+
+        selected = {str(value).strip() for value in (selected_values or []) if str(value).strip()}
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            value = str(entry.get("value") or "").strip()
+            label = str(entry.get("label") or value).strip() or value
+            if not value:
+                continue
+            item = QtWidgets.QListWidgetItem(label)
+            item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(QtCore.Qt.CheckState.Checked if value in selected else QtCore.Qt.CheckState.Unchecked)
+            item.setData(QtCore.Qt.ItemDataRole.UserRole, value)
+            item.setData(QtCore.Qt.ItemDataRole.UserRole + 1, str(entry.get("search") or label).strip().lower())
+            listw.addItem(item)
+
+        def _apply_filter() -> None:
+            needle = str(ed_filter.text() or "").strip().lower()
+            for idx in range(listw.count()):
+                item = listw.item(idx)
+                hay = str(item.data(QtCore.Qt.ItemDataRole.UserRole + 1) or "").strip()
+                item.setHidden(bool(needle) and needle not in hay)
+
+        ed_filter.textChanged.connect(_apply_filter)
+        _apply_filter()
+
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_select_all = QtWidgets.QPushButton("Select All")
+        btn_clear = QtWidgets.QPushButton("Clear")
+        btn_select_all.clicked.connect(
+            lambda: [
+                listw.item(i).setCheckState(QtCore.Qt.CheckState.Checked)
+                for i in range(listw.count())
+                if listw.item(i) is not None
+            ]
+        )
+        btn_clear.clicked.connect(
+            lambda: [
+                listw.item(i).setCheckState(QtCore.Qt.CheckState.Unchecked)
+                for i in range(listw.count())
+                if listw.item(i) is not None
+            ]
+        )
+        btn_row.addWidget(btn_select_all)
+        btn_row.addWidget(btn_clear)
+        btn_row.addStretch(1)
+        layout.addLayout(btn_row)
+
+        action_row = QtWidgets.QHBoxLayout()
+        action_row.addStretch(1)
+        btn_apply = QtWidgets.QPushButton("Apply")
+        btn_cancel = QtWidgets.QPushButton("Cancel")
+        action_row.addWidget(btn_apply)
+        action_row.addWidget(btn_cancel)
+        layout.addLayout(action_row)
+
+        btn_apply.clicked.connect(dlg.accept)
+        btn_cancel.clicked.connect(dlg.reject)
+        _fit_widget_to_screen(dlg)
+        if dlg.exec() != int(QtWidgets.QDialog.DialogCode.Accepted):
+            return None
+
+        chosen: list[str] = []
+        for idx in range(listw.count()):
+            item = listw.item(idx)
+            if item and item.checkState() == QtCore.Qt.CheckState.Checked:
+                value = str(item.data(QtCore.Qt.ItemDataRole.UserRole) or "").strip()
+                if value:
+                    chosen.append(value)
+        return chosen
+
+    def _open_program_filter_popup(self) -> None:
+        entries = [
+            {"value": value, "label": value, "search": value.lower()}
+            for value in (self._available_program_filters or [])
+            if str(value).strip()
+        ]
+        chosen = self._show_filter_checklist_popup(
+            title="Visible Programs",
+            entries=entries,
+            selected_values=self._checked_program_filters,
+        )
+        if chosen is None:
+            return
+        self._checked_program_filters = [value for value in (self._available_program_filters or []) if value in set(chosen)]
+        self._on_global_filters_changed()
+
+    def _open_serial_filter_popup(self) -> None:
+        entries: list[dict] = []
+        for row in (self._available_serial_filter_rows or []):
+            serial = _td_serial_value(row)
+            if not serial:
+                continue
+            program = _td_display_program_title((row or {}).get("program_title"))
+            doc_type = str((row or {}).get("document_type") or "").strip()
+            parts = [serial, program]
+            if doc_type:
+                parts.append(doc_type)
+            entries.append(
+                {
+                    "value": serial,
+                    "label": " | ".join(parts),
+                    "search": self._serial_row_filter_text(row),
+                }
+            )
+        chosen = self._show_filter_checklist_popup(
+            title="Visible Serials",
+            entries=entries,
+            selected_values=self._checked_serial_filters,
+        )
+        if chosen is None:
+            return
+        self._checked_serial_filters = [
+            _td_serial_value(row)
+            for row in (self._available_serial_filter_rows or [])
+            if _td_serial_value(row) in set(chosen)
+        ]
+        self._on_global_filters_changed()
+
+    def _reset_global_filters(self) -> None:
+        self._checked_program_filters = list(self._available_program_filters or [])
+        self._checked_serial_filters = [
+            _td_serial_value(row)
+            for row in (self._available_serial_filter_rows or [])
+            if _td_serial_value(row)
+        ]
+        self._on_global_filters_changed()
+
+    def _on_global_filters_changed(self) -> None:
+        self._refresh_global_filter_summaries()
+        self._sync_run_mode_availability()
+        prev_selection_id = str((self._current_run_selection() or {}).get("id") or "").strip()
+        self._refresh_run_dropdown(prev_selection_id=(prev_selection_id or None))
+        if hasattr(self, "_clear_perf_results"):
+            self._clear_perf_results()
+        self._set_highlight_serials(list(self._highlight_sns or []))
+
+        last_mode = str((self._last_plot_def or {}).get("mode") or "").strip().lower()
+        if last_mode and last_mode == self._mode:
+            if last_mode == "performance":
+                self._plot_performance()
+            elif last_mode == "metrics":
+                self._plot_metrics()
+            elif last_mode == "curves":
+                self._plot_curves()
         self._update_plot_zoom_actions()
 
     @staticmethod
@@ -4921,304 +5301,6 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             if not it:
                 continue
             it.setCheckState(QtCore.Qt.CheckState.Checked if checked else QtCore.Qt.CheckState.Unchecked)
-
-    def _refresh_performance_ui(self) -> None:
-        if not getattr(self, "_db_path", None):
-            return
-        if (
-            not hasattr(self, "cb_perf_plotter")
-            or not hasattr(self, "cb_perf_x_col")
-            or not hasattr(self, "cb_perf_y_col")
-            or not hasattr(self, "list_perf_stats")
-            or not hasattr(self, "cb_perf_view_stat")
-            or not hasattr(self, "tbl_perf_equations")
-        ):
-            return
-
-        # Load plotter definitions + available stats from excel_trend_config.json (central).
-        try:
-            cfg = be.load_excel_trend_config(be.DEFAULT_EXCEL_TREND_CONFIG)
-        except Exception:
-            cfg = {}
-        plotters = cfg.get("performance_plotters") if isinstance(cfg, dict) else []
-        self._perf_plotters = [p for p in plotters if isinstance(p, dict)] if isinstance(plotters, list) else []
-        stats = cfg.get("statistics") if isinstance(cfg, dict) else []
-        self._perf_available_stats = (
-            [str(s).strip().lower() for s in stats if isinstance(s, str) and str(s).strip()]
-            if isinstance(stats, list)
-            else ["mean", "min", "max", "std"]
-        )
-        if not self._perf_available_stats:
-            self._perf_available_stats = ["mean", "min", "max", "std"]
-        elif "mean" not in self._perf_available_stats:
-            self._perf_available_stats.insert(0, "mean")
-
-        # Keep the Metrics tab stat selector consistent with excel_trend_config.json.
-        if hasattr(self, "list_stats"):
-            try:
-                prev = {it.text().strip().lower() for it in self.list_stats.selectedItems() if it and it.text().strip()}
-            except Exception:
-                prev = set()
-            prev_average = bool(
-                "average" in prev
-                or (hasattr(self, "cb_metric_average") and self.cb_metric_average.isChecked())
-            )
-            self.list_stats.blockSignals(True)
-            try:
-                self.list_stats.clear()
-                metric_stats = [st for st in self._perf_available_stats if str(st).strip().lower() != "average"]
-                for st in metric_stats:
-                    self.list_stats.addItem(QtWidgets.QListWidgetItem(st))
-
-                # Restore selection where possible; otherwise default to the first entry.
-                restored = False
-                if prev:
-                    for i in range(self.list_stats.count()):
-                        it = self.list_stats.item(i)
-                        if it and it.text().strip().lower() in prev:
-                            it.setSelected(True)
-                            restored = True
-                if not restored and self.list_stats.count() > 0:
-                    self.list_stats.item(0).setSelected(True)
-            finally:
-                self.list_stats.blockSignals(False)
-            if hasattr(self, "cb_metric_average"):
-                self.cb_metric_average.blockSignals(True)
-                self.cb_metric_average.setChecked(prev_average)
-                self.cb_metric_average.blockSignals(False)
-
-        self.cb_perf_plotter.blockSignals(True)
-        self.cb_perf_plotter.clear()
-        self.cb_perf_plotter.setEnabled(True)
-        self.cb_perf_plotter.addItem("Custom", None)
-        for p in self._perf_plotters:
-            name = str(p.get("name") or "Performance Plot").strip()
-            self.cb_perf_plotter.addItem(name or "Performance Plot", p)
-        self.cb_perf_plotter.blockSignals(False)
-
-        def _norm(s: str) -> str:
-            return "".join(ch.lower() for ch in str(s or "").strip() if ch.isalnum())
-
-        # Include any columns referenced by performance_plotters presets even if they are not
-        # present in the current td_columns union yet (lets users pick without re-typing).
-        extra_cols: list[str] = []
-        try:
-            seen_cols: set[str] = set()
-            for p in self._perf_plotters:
-                if not isinstance(p, dict):
-                    continue
-                for spec in (p.get("x") or {}, p.get("y") or {}):
-                    if not isinstance(spec, dict):
-                        continue
-                    col = str(spec.get("column") or "").strip()
-                    if not col:
-                        continue
-                    nk = _norm(col)
-                    if not nk or nk in seen_cols:
-                        continue
-                    seen_cols.add(nk)
-                    extra_cols.append(col)
-        except Exception:
-            extra_cols = []
-
-        # Available columns = union of td_columns(kind='y') across all runs.
-        try:
-            runs = be.td_list_runs(self._db_path)
-        except Exception:
-            runs = []
-        union: dict[str, dict] = {}
-        col_runs: dict[str, set[str]] = {}
-        for rn in runs:
-            try:
-                cols = be.td_list_y_columns(self._db_path, rn)
-            except Exception:
-                cols = []
-            for c in cols:
-                nm = str((c or {}).get("name") or "").strip()
-                if not nm:
-                    continue
-                units = str((c or {}).get("units") or "").strip()
-                key = _norm(nm)
-                col_runs.setdefault(key, set()).add(str(rn))
-                if key not in union:
-                    union[key] = {"name": nm, "units": units}
-                else:
-                    if not str(union[key].get("units") or "").strip() and units:
-                        union[key]["units"] = units
-        self._perf_available_columns = sorted(union.values(), key=lambda d: str(d.get("name") or "").lower())
-        self._perf_col_runs = col_runs
-        self._perf_all_runs = [str(r).strip() for r in runs if str(r).strip()]
-
-        def _fill_col_combo(cb: QtWidgets.QComboBox) -> None:
-            prev_text = str(cb.currentText() or "").strip()
-            prev_data = cb.currentData() if hasattr(cb, "currentData") else None
-            cb.blockSignals(True)
-            cb.clear()
-            existing_norms = {_norm(str(c.get("name") or "")) for c in self._perf_available_columns if str(c.get("name") or "").strip()}
-            for nm in extra_cols:
-                if _norm(nm) in existing_norms:
-                    continue
-                cb.addItem(nm, nm)
-            for c in self._perf_available_columns:
-                nm = str(c.get("name") or "").strip()
-                if not nm:
-                    continue
-                units = str(c.get("units") or "").strip()
-                label = f"{nm} ({units})" if units else nm
-                cb.addItem(label, nm)
-            cb.blockSignals(False)
-            # Restore selection as best-effort.
-            want = str(prev_data or "").strip() or prev_text
-            want = want.split(" (", 1)[0].strip()
-            if want:
-                want_norm = _norm(want)
-                for i in range(cb.count()):
-                    if _norm(str(cb.itemData(i) or "").strip()) == want_norm:
-                        cb.setCurrentIndex(i)
-                        break
-                else:
-                    cb.setEditText(want)
-
-        _fill_col_combo(self.cb_perf_x_col)
-        _fill_col_combo(self.cb_perf_y_col)
-
-        def _common_runs_for_pair(x_name: str, y_name: str) -> list[str]:
-            xn = _norm(x_name)
-            yn = _norm(y_name)
-            xr = set(self._perf_col_runs.get(xn) or set())
-            yr = set(self._perf_col_runs.get(yn) or set())
-            common = xr & yr
-            if not common:
-                return []
-            order = {r: i for i, r in enumerate(self._perf_all_runs or [])}
-            return sorted(common, key=lambda r: order.get(r, 10**9))
-
-        def _update_common_runs_label() -> None:
-            if not hasattr(self, "lbl_perf_common_runs"):
-                return
-            x_name = self._perf_current_col_name(self.cb_perf_x_col)
-            y_name = self._perf_current_col_name(self.cb_perf_y_col)
-            common = _common_runs_for_pair(x_name, y_name) if x_name and y_name else []
-            if not x_name or not y_name:
-                self.lbl_perf_common_runs.setText("Common runs for X/Y: —")
-                return
-            if x_name.strip().lower() == y_name.strip().lower():
-                self.lbl_perf_common_runs.setText("Common runs for X/Y: — (X and Y must be different)")
-                return
-            if not common:
-                self.lbl_perf_common_runs.setText("Common runs for X/Y: 0 (no run contains both columns)")
-                return
-            shown = ", ".join(common[:4])
-            extra = f" (+{len(common) - 4})" if len(common) > 4 else ""
-            self.lbl_perf_common_runs.setText(f"Common runs for X/Y: {len(common)} — {shown}{extra}")
-
-        def _filter_axis_options(*, changed: str) -> None:
-            # Keep the dropdowns focused: when one axis is selected from the list,
-            # restrict the other axis choices to columns that co-occur on at least one run.
-            if not hasattr(self, "_perf_col_runs"):
-                return
-            if changed not in {"x", "y"}:
-                return
-            try:
-                if changed == "x":
-                    pivot = self._perf_current_col_name(self.cb_perf_x_col)
-                    other = self.cb_perf_y_col
-                else:
-                    pivot = self._perf_current_col_name(self.cb_perf_y_col)
-                    other = self.cb_perf_x_col
-                pnorm = _norm(pivot)
-                pruns = set(self._perf_col_runs.get(pnorm) or set())
-                if not pivot or not pruns:
-                    return
-                # Allowed = any col that shares at least one run with pivot (and isn't the pivot itself).
-                allowed_norms = {k for k, rs in (self._perf_col_runs or {}).items() if (set(rs or set()) & pruns)}
-                allowed_norms.discard(pnorm)
-
-                prev = self._perf_current_col_name(other)
-                prev_norm = _norm(prev)
-                other.blockSignals(True)
-                other.clear()
-                for c in self._perf_available_columns:
-                    nm = str(c.get("name") or "").strip()
-                    if not nm:
-                        continue
-                    nk = _norm(nm)
-                    if nk not in allowed_norms:
-                        continue
-                    units = str(c.get("units") or "").strip()
-                    label = f"{nm} ({units})" if units else nm
-                    other.addItem(label, nm)
-                other.blockSignals(False)
-                if prev_norm and prev_norm in allowed_norms:
-                    other.setCurrentText(prev)
-                elif other.count() > 0:
-                    other.setCurrentIndex(0)
-            finally:
-                _update_common_runs_label()
-
-        # Signals (connect once)
-        if not getattr(self, "_perf_axis_signals_connected", False):
-            self.cb_perf_x_col.currentIndexChanged.connect(lambda *_: _filter_axis_options(changed="x"))
-            self.cb_perf_y_col.currentIndexChanged.connect(lambda *_: _filter_axis_options(changed="y"))
-            try:
-                self.cb_perf_x_col.editTextChanged.connect(lambda *_: _update_common_runs_label())
-                self.cb_perf_y_col.editTextChanged.connect(lambda *_: _update_common_runs_label())
-            except Exception:
-                pass
-            self._perf_axis_signals_connected = True
-
-        _update_common_runs_label()
-
-        # Stats checklist
-        prev_checked = set()
-        for i in range(self.list_perf_stats.count()):
-            it = self.list_perf_stats.item(i)
-            if it and it.checkState() == QtCore.Qt.CheckState.Checked:
-                prev_checked.add(it.text().strip().lower())
-
-        self.list_perf_stats.blockSignals(True)
-        self.list_perf_stats.clear()
-        for st in self._perf_available_stats:
-            it = QtWidgets.QListWidgetItem(st)
-            it.setFlags(it.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
-            it.setCheckState(QtCore.Qt.CheckState.Checked if (st in prev_checked) else QtCore.Qt.CheckState.Unchecked)
-            self.list_perf_stats.addItem(it)
-        if not prev_checked:
-            # Default selection: mean
-            for i in range(self.list_perf_stats.count()):
-                it = self.list_perf_stats.item(i)
-                if it and it.text().strip().lower() == "mean":
-                    it.setCheckState(QtCore.Qt.CheckState.Checked)
-                    break
-        self.list_perf_stats.blockSignals(False)
-
-        # View stat is derived from checked stats.
-        checked_now = [
-            self.list_perf_stats.item(i).text().strip().lower()
-            for i in range(self.list_perf_stats.count())
-            if self.list_perf_stats.item(i) and self.list_perf_stats.item(i).checkState() == QtCore.Qt.CheckState.Checked
-        ]
-        self.cb_perf_view_stat.blockSignals(True)
-        prev_view = str(self.cb_perf_view_stat.currentText() or "").strip().lower()
-        self.cb_perf_view_stat.clear()
-        for st in checked_now:
-            self.cb_perf_view_stat.addItem(st, st)
-        if prev_view and prev_view in checked_now:
-            self.cb_perf_view_stat.setCurrentText(prev_view)
-        elif checked_now:
-            self.cb_perf_view_stat.setCurrentIndex(0)
-        self.cb_perf_view_stat.blockSignals(False)
-
-        # Signals (connect once)
-        if not getattr(self, "_perf_signals_connected", False):
-            self.cb_perf_plotter.currentIndexChanged.connect(self._on_perf_preset_changed)
-            self.list_perf_stats.itemChanged.connect(self._on_perf_stats_changed)
-            self.cb_perf_view_stat.currentIndexChanged.connect(self._on_perf_view_stat_changed)
-            self._perf_signals_connected = True
-
-        # If we have presets and no user selections yet, apply the first preset.
-        if self.cb_perf_plotter.count() > 1 and self.cb_perf_plotter.currentIndex() == 0:
-            self.cb_perf_plotter.setCurrentIndex(1)
 
     def _open_auto_report_options(self) -> None:
         if not self._plot_ready:
@@ -6422,7 +6504,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             return []
         program_title, source_run_name = self._selection_observation_filters(selection)
         try:
-            return be.td_load_metric_series(
+            rows = be.td_load_metric_series(
                 self._db_path,
                 run_name,
                 column_name,
@@ -6432,6 +6514,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 control_period_filter=control_period_filter,
                 run_type_filter=run_type_filter,
             )
+            return self._filter_rows_for_global_selection(rows)
         except Exception:
             return []
 
@@ -6447,16 +6530,18 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         if not getattr(self, "_db_path", None):
             return []
         program_title, source_run_name = self._selection_observation_filters(selection)
+        active_serials = [str(value).strip() for value in (serials or self._active_serials()) if str(value).strip()]
         try:
-            return be.td_load_curves(
+            rows = be.td_load_curves(
                 self._db_path,
                 run_name,
                 y_name,
                 x_name,
-                serials=serials,
+                serials=active_serials,
                 program_title=(program_title or None),
                 source_run_name=(source_run_name or None),
             )
+            return self._filter_rows_for_global_selection(rows)
         except Exception:
             return []
 
@@ -6564,7 +6649,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             if isinstance(data, dict) and str(data.get("id") or "").strip()
         }
         had_items = self.list_metric_run_conditions.count() > 0
-        items = [dict(d) for d in (self._run_selection_views.get("condition") or []) if isinstance(d, dict)]
+        items = self._visible_run_selection_items("condition")
         self.list_metric_run_conditions.blockSignals(True)
         self.list_metric_run_conditions.clear()
         try:
@@ -6675,7 +6760,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             from matplotlib.transforms import blended_transform_factory
         except Exception:
             return
-        segments = _td_metric_program_segments(labels, self._serial_source_rows)
+        segments = _td_metric_program_segments(labels, self._active_serial_rows())
         if not segments:
             return
         palette = ["#1d4ed8", "#0f766e", "#b45309", "#7c3aed", "#be123c", "#334155"]
@@ -6807,7 +6892,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             current = self._current_run_selection()
             prev_selection_id = str(current.get("id") or "").strip()
         mode = self._current_run_selector_mode()
-        items = [dict(d) for d in (self._run_selection_views.get(mode) or []) if isinstance(d, dict)]
+        items = self._visible_run_selection_items(mode)
         self._populate_metric_condition_list()
         self.cb_run.blockSignals(True)
         self.cb_run.clear()
@@ -7061,11 +7146,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         return f"Highlighted serials: {len(sels)} ({shown}{extra})"
 
     def _set_highlight_serials(self, serials: list[str]) -> None:
+        allowed_serials = {serial for serial in self._active_serials() if str(serial).strip()}
         cleaned: list[str] = []
         seen: set[str] = set()
         for sn in (serials or []):
             val = str(sn or "").strip()
-            if not val or val in seen:
+            if not val or val in seen or val not in allowed_serials:
                 continue
             seen.add(val)
             cleaned.append(val)
@@ -7080,7 +7166,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             self._redraw_performance_view()
 
     def _open_highlight_serials_popup(self) -> None:
-        rows = [r for r in (self._serial_source_rows or []) if isinstance(r, dict)]
+        rows = [r for r in self._active_serial_rows() if isinstance(r, dict)]
         if not rows:
             QtWidgets.QMessageBox.information(self, "Highlighted Serials", "No serial metadata available.")
             return
@@ -7102,10 +7188,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
         selected = {str(sn).strip() for sn in (self._highlight_sns or []) if str(sn).strip()}
         for row in rows:
-            sn = str(row.get("serial") or row.get("serial_number") or "").strip()
+            sn = _td_serial_value(row)
             if not sn:
                 continue
-            program = str(row.get("program_title") or "").strip()
+            program = _td_display_program_title((row or {}).get("program_title"))
             doc_type = str(row.get("document_type") or "").strip()
             label_parts = [sn]
             if program:
@@ -7256,7 +7342,11 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             return
 
         try:
-            labels = _td_order_metric_serials(be.td_list_serials(self._db_path), self._serial_source_rows)
+            serial_rows = self._active_serial_rows()
+            labels = _td_order_metric_serials(
+                [_td_serial_value(row) for row in serial_rows if _td_serial_value(row)],
+                serial_rows,
+            )
         except Exception:
             labels = []
         if not labels:
@@ -7443,7 +7533,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             if not x_col_title:
                 x_col_title = x_col
             try:
-                curves = self._load_curves_for_selection(run, y_col, x_col, selection=selection, serials=None)
+                curves = self._load_curves_for_selection(run, y_col, x_col, selection=selection, serials=self._active_serials())
             except Exception as exc:
                 QtWidgets.QMessageBox.warning(self, "Plot Curves", str(exc))
                 return
@@ -7511,10 +7601,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
     def _selected_perf_serials(self) -> list[str]:
         if not getattr(self, "_db_path", None):
             return []
-        try:
-            return be.td_list_serials(self._db_path)
-        except Exception:
-            return []
+        return self._active_serials()
 
     def _selected_perf_filter_mode(self) -> str:
         if not hasattr(self, "cb_perf_filter_mode"):
@@ -8576,75 +8663,6 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         if select_equation_row:
             self._select_perf_equation_row(stat_label)
 
-    def _on_perf_preset_changed(self) -> None:
-        plotter = self._selected_perf_plotter()
-        if not plotter:
-            return
-        x_spec = plotter.get("x") or {}
-        y_spec = plotter.get("y") or {}
-        x_target = str((x_spec.get("column") if isinstance(x_spec, dict) else "") or "").strip()
-        y_target = str((y_spec.get("column") if isinstance(y_spec, dict) else "") or "").strip()
-        stats = plotter.get("stats") or []
-        if not isinstance(stats, list) or not all(isinstance(s, str) for s in stats):
-            stats = ["mean"]
-        stats = [str(s).strip().lower() for s in stats if str(s).strip()]
-        if not stats:
-            stats = ["mean"]
-
-        fit = plotter.get("fit") or {}
-        if not isinstance(fit, dict):
-            fit = {}
-        try:
-            deg = int(fit.get("degree") or 0)
-        except Exception:
-            deg = 0
-        deg = max(0, deg)
-        normx = bool(fit.get("normalize_x", True))
-        try:
-            req = int(plotter.get("require_min_points") or 2)
-        except Exception:
-            req = 2
-        self._perf_require_min_points = max(1, int(req))
-
-        # Apply X/Y selections.
-        for cb, want in ((self.cb_perf_x_col, x_target), (self.cb_perf_y_col, y_target)):
-            if not want:
-                continue
-            want_key = want.strip()
-            want_norm = "".join(ch.lower() for ch in want_key if ch.isalnum())
-            found = False
-            for i in range(cb.count()):
-                cur = str(cb.itemData(i) or "").strip()
-                cur_norm = "".join(ch.lower() for ch in cur if ch.isalnum())
-                if cur == want_key or (want_norm and cur_norm == want_norm):
-                    cb.setCurrentIndex(i)
-                    found = True
-                    break
-            if not found:
-                cb.setEditText(want_key)
-
-        # Apply stats checkboxes.
-        if hasattr(self, "list_perf_stats"):
-            self.list_perf_stats.blockSignals(True)
-            for i in range(self.list_perf_stats.count()):
-                it = self.list_perf_stats.item(i)
-                if not it:
-                    continue
-                st = it.text().strip().lower()
-                it.setCheckState(QtCore.Qt.CheckState.Checked if st in set(stats) else QtCore.Qt.CheckState.Unchecked)
-            self.list_perf_stats.blockSignals(False)
-            self._sync_perf_view_stats()
-
-        # Apply fit defaults.
-        if hasattr(self, "cb_perf_fit"):
-            self.cb_perf_fit.setChecked(deg > 0)
-        if hasattr(self, "sp_perf_degree") and deg > 0:
-            self.sp_perf_degree.setValue(min(max(1, deg), 6))
-        if hasattr(self, "cb_perf_norm_x"):
-            self.cb_perf_norm_x.setChecked(bool(normx))
-
-        self._clear_perf_results()
-
     def _on_perf_stats_changed(self) -> None:
         self._sync_perf_view_stats()
         self._clear_perf_results()
@@ -9672,160 +9690,6 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         except Exception:
             pass
         self._capture_main_plot_base_view()
-
-    def _plot_performance(self) -> None:
-        if not self._plot_ready or not self._db_path:
-            return
-        x_target = self._perf_current_col_name(self.cb_perf_x_col) if hasattr(self, "cb_perf_x_col") else ""
-        y_target = self._perf_current_col_name(self.cb_perf_y_col) if hasattr(self, "cb_perf_y_col") else ""
-        if not x_target or not y_target:
-            QtWidgets.QMessageBox.information(self, "Performance", "Select X and Y columns.")
-            return
-        if x_target.strip().lower() == y_target.strip().lower():
-            QtWidgets.QMessageBox.information(self, "Performance", "X and Y must be different columns.")
-            return
-        stats = self._perf_checked_stats()
-        if not stats:
-            QtWidgets.QMessageBox.information(self, "Performance", "Select at least one stat.")
-            return
-
-        runs = self._selected_perf_runs()
-        if not runs:
-            QtWidgets.QMessageBox.information(self, "Performance", "No runs found in cache.")
-            return
-
-        # Enforce "same run" constraint: only consider runs where BOTH columns exist.
-        try:
-            def _norm(s: str) -> str:
-                return "".join(ch.lower() for ch in str(s or "").strip() if ch.isalnum())
-
-            xk = _norm(x_target)
-            yk = _norm(y_target)
-            xr = set(getattr(self, "_perf_col_runs", {}).get(xk) or set())
-            yr = set(getattr(self, "_perf_col_runs", {}).get(yk) or set())
-            common = xr & yr
-            if not common:
-                QtWidgets.QMessageBox.information(
-                    self, "Performance", "X and Y must both exist on at least one common run/condition."
-                )
-                return
-            order = {r: i for i, r in enumerate(getattr(self, "_perf_all_runs", runs) or [])}
-            runs = [r for r in runs if r in common]
-            runs.sort(key=lambda r: order.get(r, 10**9))
-        except Exception:
-            pass
-
-        serials = self._selected_perf_serials()
-        if not serials:
-            QtWidgets.QMessageBox.information(self, "Performance", "No serial numbers found in cache.")
-            return
-
-        fit_enabled = bool(getattr(self, "cb_perf_fit", None) and self.cb_perf_fit.isChecked())
-        degree = int(self.sp_perf_degree.value()) if hasattr(self, "sp_perf_degree") else 2
-        normx = bool(getattr(self, "cb_perf_norm_x", None) and self.cb_perf_norm_x.isChecked())
-        require_min_points = int(getattr(self, "_perf_require_min_points", 1) or 1)
-        require_min_points = max(1, require_min_points)
-
-        self._perf_results_by_stat = {}
-
-        for st in stats:
-            # Per-run maps for the selected stat.
-            per_run: list[tuple[str, str, dict[str, float], dict[str, float], str, str]] = []
-            for rn in runs:
-                x_col, x_units = self._resolve_td_y_col_units(rn, x_target)
-                y_col, y_units = self._resolve_td_y_col_units(rn, y_target)
-                xmap = self._load_metric_map(rn, x_col, st)
-                ymap = self._load_metric_map(rn, y_col, st)
-                per_run.append((rn, self._run_display_text(rn), xmap, ymap, x_units, y_units))
-
-            curves: dict[str, list[tuple[float, float, str]]] = {}
-            pooled_x: list[float] = []
-            pooled_y: list[float] = []
-            for sn in serials:
-                pts: list[tuple[float, float, str]] = []
-                for _rn, rdisp, xmap, ymap, _xu, _yu in per_run:
-                    if sn not in xmap or sn not in ymap:
-                        continue
-                    pts.append((float(xmap[sn]), float(ymap[sn]), str(rdisp or _rn)))
-                if len(pts) >= require_min_points:
-                    pts.sort(key=lambda t: t[0])
-                    curves[sn] = pts
-                    pooled_x.extend([p[0] for p in pts])
-                    pooled_y.extend([p[1] for p in pts])
-
-            if not curves:
-                continue
-
-            # Units: prefer first non-empty.
-            x_units = next((u for *_rest, u, _ in per_run if str(u).strip()), "")
-            y_units = next((u for *_rest, _, u in per_run if str(u).strip()), "")
-
-            master_model: dict = {}
-            highlight_model: dict = {}
-            if fit_enabled and degree > 0 and pooled_x:
-                try:
-                    m = self._perf_poly_fit(pooled_x, pooled_y, degree, normalize_x=normx)
-                except Exception as exc:
-                    QtWidgets.QMessageBox.warning(self, "Performance", str(exc))
-                    m = None
-                if m:
-                    # Fit line for plotting.
-                    try:
-                        import numpy as np  # type: ignore
-
-                        x_min = float(min(pooled_x))
-                        x_max = float(max(pooled_x))
-                        xfit = np.linspace(x_min, x_max, 220)
-                        coeffs = m.get("coeffs") or []
-                        p = np.poly1d(coeffs)
-                        if bool(m.get("normalize_x")):
-                            x0 = float(m.get("x0") or 0.0)
-                            sx = float(m.get("sx") or 1.0) or 1.0
-                            xfit_n = (xfit - x0) / sx
-                        else:
-                            xfit_n = xfit
-                        yfit = p(xfit_n)
-                        m["xfit"] = xfit.tolist()
-                        m["yfit"] = yfit.tolist()
-                    except Exception:
-                        pass
-                    master_model = m
-
-            # Highlight model computed later in _update_perf_highlight_models (and cached per highlight).
-            self._perf_results_by_stat[st] = {
-                "x_target": x_target,
-                "y_target": y_target,
-                "x_units": x_units,
-                "y_units": y_units,
-                "curves": curves,
-                "master_model": master_model,
-                "highlight_serial": "",
-                "highlight_model": highlight_model,
-            }
-
-        if not self._perf_results_by_stat:
-            QtWidgets.QMessageBox.information(self, "Performance", "No metric data found for the selected columns/stats.")
-            return
-
-        # View stat options = stats we actually computed.
-        prev_view = str(self.cb_perf_view_stat.currentText() or "").strip().lower() if hasattr(self, "cb_perf_view_stat") else ""
-        if hasattr(self, "cb_perf_view_stat"):
-            self.cb_perf_view_stat.blockSignals(True)
-            self.cb_perf_view_stat.clear()
-            for st in sorted(self._perf_results_by_stat.keys(), key=lambda s: str(s).lower()):
-                self.cb_perf_view_stat.addItem(st, st)
-            if prev_view and prev_view in self._perf_results_by_stat:
-                self.cb_perf_view_stat.setCurrentText(prev_view)
-            else:
-                self.cb_perf_view_stat.setCurrentIndex(0)
-            self.cb_perf_view_stat.blockSignals(False)
-
-        self._update_perf_highlight_models()
-        self._fill_perf_equations_table()
-        self._redraw_performance_view()
-
-        self.btn_save_plot_pdf.setEnabled(True)
-        self.btn_add_auto_plot.setEnabled(False)
 
     def _open_performance_tabs_dialog(self) -> None:
         QtWidgets.QMessageBox.information(
@@ -10932,7 +10796,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             multi_run = len(runs) > 1
             for run in runs:
                 x = self._resolve_curve_x_key(run, x_label)
-                curves = self._load_curves_for_selection(run, y, x, selection=selection, serials=None)  # type: ignore[arg-type]
+                curves = self._load_curves_for_selection(run, y, x, selection=selection, serials=self._active_serials())  # type: ignore[arg-type]
                 for s in curves:
                     xs = s.get("x") or []
                     ys2 = s.get("y") or []
@@ -10967,9 +10831,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             ax.set_title(str(d.get("name") or "") or self._compose_run_title(selection, stats_label))
             ax.set_xlabel("Serial Number")
             ax.set_ylabel(stats[0] if len(stats) == 1 else "Metric value")
+            serial_rows = self._active_serial_rows()
             labels = _td_order_metric_serials(
-                be.td_list_serials(self._db_path),  # type: ignore[arg-type]
-                self._serial_source_rows,
+                [_td_serial_value(row) for row in serial_rows if _td_serial_value(row)],
+                serial_rows,
             )
             x_idx = list(range(len(labels)))
             multi_run = len(runs) > 1

@@ -404,6 +404,8 @@ class _RunSelectionHarness:
         self._run_selection_views = {"sequence": [], "condition": []}
         self._run_display_by_name = {}
         self._run_name_by_display = {}
+        self._available_program_filters = ["Program A", "Program B", "Unknown Program"]
+        self._checked_program_filters = list(self._available_program_filters)
         self._is_internal_run_label = TestDataTrendDialog._is_internal_run_label
         self._metric_title_suffix = TestDataTrendDialog._metric_title_suffix
         self._selection_summary_text = TestDataTrendDialog._selection_summary_text
@@ -429,6 +431,9 @@ class _RunSelectionHarness:
             "_sync_main_auto_plot_actions",
             "_auto_plot_display_name",
             "_selected_auto_plot_definitions",
+            "_active_program_filter_values",
+            "_visible_run_selection_items",
+            "_sync_run_mode_availability",
             "_refresh_run_selection_visibility",
             "_on_metric_condition_selection_changed",
             "_refresh_run_dropdown",
@@ -461,6 +466,54 @@ class _RunSelectionHarness:
             if it.checkState() == QtCore.Qt.CheckState.Checked and isinstance(data, dict):
                 out.append(str(data.get("id") or "").strip())
         return out
+
+
+class _GlobalFilterHarness:
+    def __init__(self) -> None:
+        _qt_app()
+        from PySide6 import QtWidgets
+        from EIDAT_App_Files.ui_next.qt_main import TestDataTrendDialog  # type: ignore
+
+        self._db_path = Path("C:/tmp/fake.sqlite3")
+        self._mode = "curves"
+        self._highlight_sn = ""
+        self._highlight_sns: list[str] = []
+        self._perf_results_by_stat = {}
+        self._serial_source_rows = [
+            {"serial": "SN1", "serial_number": "SN1", "program_title": "Program A", "document_type": "TD"},
+            {"serial": "SN2", "serial_number": "SN2", "program_title": "Program B", "document_type": "TD"},
+        ]
+        self._serial_source_by_serial = {"SN1": dict(self._serial_source_rows[0]), "SN2": dict(self._serial_source_rows[1])}
+        self._available_program_filters = ["Program A", "Program B"]
+        self._available_serial_filter_rows = list(self._serial_source_rows)
+        self._checked_program_filters = ["Program A"]
+        self._checked_serial_filters = ["SN1", "SN2"]
+        self.lbl_highlight_serials = QtWidgets.QLabel()
+        self._refresh_stats_preview_calls = 0
+        self._refresh_stats_preview = lambda: setattr(
+            self,
+            "_refresh_stats_preview_calls",
+            int(getattr(self, "_refresh_stats_preview_calls", 0)) + 1,
+        )
+        self._update_perf_highlight_models = lambda: None
+        self._fill_perf_equations_table = lambda: None
+        self._redraw_performance_view = lambda: None
+        self._selection_observation_filters = lambda selection=None: ("", "")
+
+        for name in (
+            "_active_program_filter_values",
+            "_active_serial_rows",
+            "_active_serials",
+            "_row_program_label",
+            "_row_matches_global_filters",
+            "_filter_rows_for_global_selection",
+            "_load_metric_series_for_selection",
+            "_load_curves_for_selection",
+            "_selected_perf_serials",
+            "_highlight_summary_text",
+            "_set_highlight_serials",
+        ):
+            setattr(self, name, getattr(TestDataTrendDialog, name).__get__(self, _GlobalFilterHarness))
 
 
 class _SavedPerfActionHarness:
@@ -2218,6 +2271,40 @@ class TestTDSupportWorkbook(unittest.TestCase):
             self.assertEqual(len(cond_items), 1)
             self.assertEqual(cond_items[0].get("run_name"), condition_key)
             self.assertEqual(cond_items[0].get("member_sequences"), ["Seq1", "Seq2"])
+            self.assertEqual(cond_items[0].get("member_programs"), ["Program A"])
+
+    def test_run_selection_views_normalize_blank_programs_to_unknown_program(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            db_path = root / "implementation_trending.sqlite3"
+            wb_path = root / "project.xlsx"
+
+            be._write_test_data_trending_workbook(
+                wb_path,
+                global_repo=root,
+                serials=["SN1"],
+                docs=[{"serial_number": "SN1", "excel_sqlite_rel": ""}],
+                config=self._make_config(),
+            )
+
+            with sqlite3.connect(str(db_path)) as conn:
+                be._ensure_test_data_impl_tables(conn)
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO td_runs(run_name, default_x, display_name, run_type, control_period, pulse_width)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    ("SeqBlank", "Time", "SeqBlank", "", None, None),
+                )
+                conn.commit()
+
+            views = be.td_list_run_selection_views(db_path, wb_path, project_dir=root)
+            seq_items = views.get("sequence") or []
+            cond_items = views.get("condition") or []
+            self.assertEqual(seq_items[0].get("member_programs"), ["Unknown Program"])
+            self.assertEqual(cond_items[0].get("member_programs"), ["Unknown Program"])
 
     def test_run_condition_label_prefers_derived_pm_fields_over_display_name(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
@@ -4858,6 +4945,69 @@ class TestTDSupportWorkbook(unittest.TestCase):
         self.assertEqual(harness.checked_condition_ids(), ["condition:seq1", "condition:seq3"])
 
     @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
+    def test_run_dropdown_hides_unchecked_program_items(self) -> None:
+        harness = _RunSelectionHarness()
+        harness._checked_program_filters = ["Program A"]
+        harness._run_selection_views["sequence"] = [
+            {
+                "mode": "sequence",
+                "id": "sequence:a",
+                "run_name": "RunA",
+                "sequence_name": "SeqA",
+                "display_text": "Program A - SeqA",
+                "program_title": "Program A",
+                "member_programs": ["Program A"],
+                "member_runs": ["RunA"],
+                "member_sequences": ["SeqA"],
+                "details_text": "Program: Program A | Source Sequence: SeqA",
+            },
+            {
+                "mode": "sequence",
+                "id": "sequence:b",
+                "run_name": "RunB",
+                "sequence_name": "SeqB",
+                "display_text": "Program B - SeqB",
+                "program_title": "Program B",
+                "member_programs": ["Program B"],
+                "member_runs": ["RunB"],
+                "member_sequences": ["SeqB"],
+                "details_text": "Program: Program B | Source Sequence: SeqB",
+            },
+        ]
+        harness._run_selection_views["condition"] = [
+            {
+                "mode": "condition",
+                "id": "condition:a",
+                "run_name": "RunA",
+                "display_text": "Condition A",
+                "run_condition": "Condition A",
+                "member_programs": ["Program A"],
+                "member_runs": ["RunA"],
+                "member_sequences": ["SeqA"],
+                "details_text": "Source Sequences: SeqA",
+            },
+            {
+                "mode": "condition",
+                "id": "condition:b",
+                "run_name": "RunB",
+                "display_text": "Condition B",
+                "run_condition": "Condition B",
+                "member_programs": ["Program B"],
+                "member_runs": ["RunB"],
+                "member_sequences": ["SeqB"],
+                "details_text": "Source Sequences: SeqB",
+            },
+        ]
+
+        harness._sync_run_mode_availability()
+        harness._refresh_run_dropdown()
+
+        self.assertEqual(harness.cb_run.count(), 1)
+        self.assertEqual(harness.cb_run.itemText(0), "Program A - SeqA")
+        self.assertEqual(harness.list_metric_run_conditions.count(), 1)
+        self.assertEqual(harness.list_metric_run_conditions.item(0).text(), "Condition A")
+
+    @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
     def test_current_run_selections_and_member_runs_follow_checked_conditions(self) -> None:
         harness = _RunSelectionHarness()
         harness._run_selection_views["condition"] = [
@@ -6724,6 +6874,46 @@ class TestTDSupportWorkbook(unittest.TestCase):
         self.assertIsNotNone(fig)
         self.assertEqual(len(harness.collect_calls), 1)
         self.assertEqual(harness.collect_calls[0]["plot_stats"], ["mean"])
+
+    def test_metric_series_loader_filters_programs_and_serials(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        harness = _GlobalFilterHarness()
+        rows = [
+            {"observation_id": "obs_a", "serial": "SN1", "value_num": 1.0, "program_title": "Program A"},
+            {"observation_id": "obs_b", "serial": "SN2", "value_num": 2.0, "program_title": "Program B"},
+        ]
+
+        with mock.patch.object(be, "td_load_metric_series", return_value=rows) as load_mock:
+            result = harness._load_metric_series_for_selection("RunA", "thrust", "mean")
+
+        load_mock.assert_called_once()
+        self.assertEqual([row.get("serial") for row in result], ["SN1"])
+
+    def test_curve_loader_filters_programs_and_serials(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        harness = _GlobalFilterHarness()
+        rows = [
+            {"serial": "SN1", "program_title": "Program A", "x": [0.0, 1.0], "y": [1.0, 2.0]},
+            {"serial": "SN2", "program_title": "Program B", "x": [0.0, 1.0], "y": [2.0, 3.0]},
+        ]
+
+        with mock.patch.object(be, "td_load_curves", return_value=rows) as load_mock:
+            result = harness._load_curves_for_selection("RunA", "thrust", "Time")
+
+        load_mock.assert_called_once()
+        self.assertEqual(load_mock.call_args.kwargs.get("serials"), ["SN1"])
+        self.assertEqual([row.get("serial") for row in result], ["SN1"])
+
+    def test_selected_perf_serials_and_highlight_use_active_filter_intersection(self) -> None:
+        harness = _GlobalFilterHarness()
+
+        self.assertEqual(harness._selected_perf_serials(), ["SN1"])
+        harness._set_highlight_serials(["SN1", "SN2"])
+
+        self.assertEqual(harness._highlight_sns, ["SN1"])
+        self.assertEqual(harness._highlight_sn, "SN1")
 
     def test_perf_candidate_discovery_accepts_separated_x(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore

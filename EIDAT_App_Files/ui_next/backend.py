@@ -5857,6 +5857,10 @@ def _td_resolve_support_condition_for_source(program_title: object, source_run_n
     }
 
 
+def _td_display_program_title(value: object) -> str:
+    return str(value or "").strip() or "Unknown Program"
+
+
 def td_list_run_selection_views(db_path: Path, workbook_path: Path, *, project_dir: Path | None = None) -> dict[str, list[dict]]:
     runs_ex = [
         dict(item)
@@ -5882,6 +5886,7 @@ def td_list_run_selection_views(db_path: Path, workbook_path: Path, *, project_d
             continue
         obs = {
             "program_title": str(row.get("program_title") or "").strip(),
+            "program_label": _td_display_program_title(row.get("program_title")),
             "source_run_name": source_run_name,
         }
         if condition_key:
@@ -5902,16 +5907,22 @@ def td_list_run_selection_views(db_path: Path, workbook_path: Path, *, project_d
         if not source_rows:
             source_rows = list(observations_by_source_run.get(run_name) or [])
         member_sequences: list[str] = []
+        member_programs: list[str] = []
         detail_rows: list[str] = []
         seen_sequence_labels: set[str] = set()
+        seen_program_labels: set[str] = set()
         for obs in source_rows:
             program_title = str(obs.get("program_title") or "").strip()
+            program_label = str(obs.get("program_label") or "").strip() or _td_display_program_title(program_title)
             source_run_name = str(obs.get("source_run_name") or "").strip() or run_name
             detail = source_run_name if not program_title else f"{program_title}: {source_run_name}"
             detail_rows.append(detail)
             if source_run_name.lower() not in seen_sequence_labels:
                 seen_sequence_labels.add(source_run_name.lower())
                 member_sequences.append(source_run_name)
+            if program_label.casefold() not in seen_program_labels:
+                seen_program_labels.add(program_label.casefold())
+                member_programs.append(program_label)
             sequence_items.append(
                 {
                     "mode": "sequence",
@@ -5923,6 +5934,7 @@ def td_list_run_selection_views(db_path: Path, workbook_path: Path, *, project_d
                     "display_text": source_run_name if not program_title else f"{program_title} - {source_run_name}",
                     "run_condition": run_display_name,
                     "member_runs": [run_name],
+                    "member_programs": [program_label],
                     "member_sequences": [source_run_name],
                     "details_text": (
                         f"Program: {program_title or TD_SUPPORT_DEFAULT_PROGRAM_TITLE} | "
@@ -5942,11 +5954,13 @@ def td_list_run_selection_views(db_path: Path, workbook_path: Path, *, project_d
                     "display_text": run_name,
                     "run_condition": run_display_name,
                     "member_runs": [run_name],
+                    "member_programs": [_td_display_program_title("")],
                     "member_sequences": [run_name],
                     "details_text": f"Run Condition: {run_display_name}",
                 }
             )
             member_sequences = [run_name]
+            member_programs = [_td_display_program_title("")]
             detail_rows = [run_name]
         condition_items.append(
             {
@@ -5956,6 +5970,7 @@ def td_list_run_selection_views(db_path: Path, workbook_path: Path, *, project_d
                 "display_text": run_display_name,
                 "run_condition": run_display_name,
                 "member_runs": [run_name],
+                "member_programs": list(member_programs or [_td_display_program_title("")]),
                 "member_sequences": member_sequences,
                 "details_text": "Source Sequences: " + ", ".join(detail_rows),
             }
