@@ -233,11 +233,13 @@ class ProjectTaskWorker(QtCore.QThread):
                     self._write_log_line(handle, f"Timings JSON: {json.dumps(timings, sort_keys=True)}")
             self.completed.emit(payload)
         except Exception as e:
+            msg = str(e or "").strip() or type(e).__name__
             if self._log_path is not None:
-                self._write_log_line(handle, f"ERROR: {e}")
-                self.failed.emit(f"{e}\n\nLog: {self._log_path}")
+                for line in (msg.splitlines() or [msg]):
+                    self._write_log_line(handle, f"ERROR: {line}")
+                self.failed.emit(f"{msg}\n\nLog: {self._log_path}")
             else:
-                self.failed.emit(str(e))
+                self.failed.emit(msg)
         finally:
             if handle is not None:
                 try:
@@ -13267,6 +13269,10 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             msg = on_success(payload)
         except Exception as exc:
+            try:
+                self._append_log(f"[PROJECT TASK ERROR] {heading}: {exc}")
+            except Exception:
+                pass
             QtWidgets.QMessageBox.warning(self, heading, str(exc))
             if self._project_popup_active:
                 self._repo_scan_dialog.finish(f"{heading} failed: {exc}", success=False)
@@ -13322,8 +13328,21 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"changed={int(cache_sync_counts.get('changed') or 0)}, "
                 f"removed={int(cache_sync_counts.get('removed') or 0)}, "
                 f"unchanged={int(cache_sync_counts.get('unchanged') or 0)}, "
+                f"missing={int(cache_sync_counts.get('missing') or 0)}, "
+                f"invalid={int(cache_sync_counts.get('invalid') or 0)}, "
                 f"reingested={int(cache_sync_counts.get('reingested') or 0)}"
             )
+        if ptype == getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending") and not cache_validation_ok:
+            failure_lines = ["Update Project did not finish with a Trend/Analyze-ready Test Data build."]
+            if cache_validation_error:
+                failure_lines.append(cache_validation_error)
+            if cache_validation_summary:
+                failure_lines.append(f"TD cache summary: {cache_validation_summary}")
+            if cache_debug_path:
+                failure_lines.append(f"TD cache debug: {cache_debug_path}")
+            if log_path:
+                failure_lines.append(f"Log: {log_path}")
+            raise RuntimeError("\n".join(failure_lines))
         if ptype == getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending"):
             self._append_log(
                 "[PROJECT UPDATE] TD cache validation="
@@ -13400,6 +13419,7 @@ class MainWindow(QtWidgets.QMainWindow):
             lines.append(f"TD cache validation: {'ready' if cache_validation_ok else 'failed'}")
             impl_counts = cache_state.get("impl_counts") if isinstance(cache_state.get("impl_counts"), dict) else {}
             raw_counts = cache_state.get("raw_counts") if isinstance(cache_state.get("raw_counts"), dict) else {}
+            source_status_counts = cache_state.get("source_status_counts") if isinstance(cache_state.get("source_status_counts"), dict) else {}
             if impl_counts or raw_counts:
                 lines.append(
                     "TD cache counts: "
@@ -13410,12 +13430,19 @@ class MainWindow(QtWidgets.QMainWindow):
                     f"td_columns_raw_y={int(raw_counts.get('td_columns_raw_y') or 0)}, "
                     f"td_curves_raw={int(raw_counts.get('td_curves_raw') or 0)}"
                 )
+            if source_status_counts:
+                lines.append(
+                    "TD source status: "
+                    f"missing={int(source_status_counts.get('missing') or 0)}, "
+                    f"invalid={int(source_status_counts.get('invalid') or 0)}, "
+                    f"non_ok={int(source_status_counts.get('non_ok') or 0)}"
+                )
             if cache_validation_summary:
                 lines.append(f"TD cache summary: {cache_validation_summary}")
             if cache_debug_path:
                 lines.append(f"TD cache debug: {cache_debug_path}")
-            lines.append("Recalculation includes support-workbook heuristics when present.")
-            lines.append("Performance candidate sheets are now generated only on demand.")
+            lines.append("Trend/Analyze is ready. No additional cache build is required.")
+            lines.append("Performance candidate sheets remain on demand.")
             saved_refresh = payload.get("saved_equation_refresh")
             if isinstance(saved_refresh, dict):
                 lines.append(
@@ -13433,8 +13460,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if dbg:
             self._append_log(f"[PROJECT UPDATE] Debug JSON: {dbg}")
         QtWidgets.QMessageBox.information(self, "Project Updated", msg)
-        self._show_toast(f"Project updated: {updated} cell(s)")
-        return f"Project updated in {elapsed_s:.1f}s"
+        self._show_toast(f"Project updated and ready: {updated} cell(s)")
+        return f"Project updated and ready in {elapsed_s:.1f}s"
 
     def _handle_project_performance_sheet_success(self, payload: object, *, wb_path: Path) -> str:
         if not isinstance(payload, dict):
@@ -13648,11 +13675,12 @@ class MainWindow(QtWidgets.QMainWindow):
             wb_path = Path(str(record.get("workbook") or "")).expanduser()
             project_name = str(record.get("name") or wb_path.stem or "").strip() or wb_path.stem
 
-            def _task(_report):
+            def _task(report):
                 return be.export_test_data_project_debug_excels(
                     project_dir,
                     wb_path,
                     force=True,
+                    progress_cb=report,
                 )
 
             self._append_log(f"[PROJECT DEBUG EXCEL] Starting: {project_name}")

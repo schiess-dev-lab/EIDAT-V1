@@ -10,6 +10,7 @@ import sys
 import shutil
 import subprocess
 import re
+from contextlib import closing
 from datetime import datetime
 from functools import lru_cache
 from difflib import SequenceMatcher
@@ -121,6 +122,16 @@ def _td_cache_selected_stats(stats: object) -> list[str]:
     if "std" not in out:
         out.append("std")
     return out
+
+
+def _td_parse_metric_label(value: object) -> tuple[str, str, str] | None:
+    txt = str(value or "").strip()
+    if not txt or "." not in txt:
+        return None
+    parts = [part.strip() for part in txt.split(".") if part.strip()]
+    if len(parts) < 3:
+        return None
+    return parts[0], parts[1], parts[2].lower()
 
 
 def _read_repo_root_name() -> str:
@@ -6095,6 +6106,8 @@ def _td_is_recoverable_cache_validation_error(exc: BaseException | str) -> bool:
         "Project raw cache DB not found",
         "Project raw cache DB is incomplete",
         "Project cache is stale",
+        "Project cache contains non-ok source rows",
+        "Project workbook outputs are incomplete",
     )
     return any(marker in message for marker in recoverable_markers)
 
@@ -6109,10 +6122,10 @@ def inspect_test_data_project_cache_state(project_dir: Path, workbook_path: Path
     raw_db_path = td_raw_cache_db_path_for(proj_dir)
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with sqlite3.connect(str(db_path)) as conn:
+    with closing(sqlite3.connect(str(db_path))) as conn:
         _ensure_test_data_impl_tables(conn)
         conn.commit()
-    with sqlite3.connect(str(raw_db_path)) as conn:
+    with closing(sqlite3.connect(str(raw_db_path))) as conn:
         _ensure_test_data_raw_cache_tables(conn)
         conn.commit()
 
@@ -6141,7 +6154,7 @@ def inspect_test_data_project_cache_state(project_dir: Path, workbook_path: Path
     ]
     expected_serials = {str(item.get("serial") or "").strip() for item in source_states if str(item.get("serial") or "").strip()}
 
-    with sqlite3.connect(str(db_path)) as conn:
+    with closing(sqlite3.connect(str(db_path))) as conn:
         _ensure_test_data_impl_tables(conn)
         cached_sources_rows = conn.execute(
             "SELECT serial, sqlite_path, mtime_ns, size_bytes, status, last_ingested_epoch_ns, COALESCE(raw_fingerprint, '') FROM td_sources"
@@ -6166,7 +6179,7 @@ def inspect_test_data_project_cache_state(project_dir: Path, workbook_path: Path
         cached_project_raw_signature = _td_meta_value(conn, "project_raw_signature")
         cached_schema_version = _td_meta_value(conn, "cache_schema_version")
         impl_counts = _td_impl_cache_counts(conn)
-    with sqlite3.connect(str(raw_db_path)) as conn:
+    with closing(sqlite3.connect(str(raw_db_path))) as conn:
         raw_counts = _td_raw_cache_counts(conn)
         curve_count = int(raw_counts.get("raw_curves") or 0)
 
@@ -6191,6 +6204,7 @@ def inspect_test_data_project_cache_state(project_dir: Path, workbook_path: Path
     added_serials: list[str] = []
     changed_serials: list[str] = []
     unchanged_serials: list[str] = []
+    missing_serials: list[str] = []
     invalid_serials: list[str] = []
     fingerprints_by_serial: dict[str, str] = {}
     source_state_by_serial: dict[str, dict[str, object]] = {}
@@ -6202,7 +6216,10 @@ def inspect_test_data_project_cache_state(project_dir: Path, workbook_path: Path
         fingerprint = str(item.get("fingerprint") or "").strip()
         fingerprints_by_serial[serial] = fingerprint
         cached = cached_sources.get(serial) or {}
-        if str(item.get("status") or "").strip().lower() != "ok":
+        item_status = str(item.get("status") or "").strip().lower()
+        if item_status == "missing":
+            missing_serials.append(serial)
+        elif item_status != "ok":
             invalid_serials.append(serial)
         if not cached:
             added_serials.append(serial)
@@ -6256,13 +6273,16 @@ def inspect_test_data_project_cache_state(project_dir: Path, workbook_path: Path
             "changed": len(changed_serials),
             "removed": len(removed_serials),
             "unchanged": len(unchanged_serials),
+            "missing": len(missing_serials),
             "invalid": len(invalid_serials),
+            "non_ok": len(missing_serials) + len(invalid_serials),
             "reingested": len(added_serials) + len(changed_serials),
         },
         "added_serials": list(added_serials),
         "changed_serials": list(changed_serials),
         "removed_serials": list(removed_serials),
         "unchanged_serials": list(unchanged_serials),
+        "missing_serials": list(missing_serials),
         "invalid_serials": list(invalid_serials),
     }
 
@@ -6292,7 +6312,9 @@ def _td_cache_state_summary(state: Mapping[str, object] | None) -> dict[str, obj
             "changed": int(sync_counts_raw.get("changed") or 0),
             "removed": int(sync_counts_raw.get("removed") or 0),
             "unchanged": int(sync_counts_raw.get("unchanged") or 0),
+            "missing": int(sync_counts_raw.get("missing") or 0),
             "invalid": int(sync_counts_raw.get("invalid") or 0),
+            "non_ok": int(sync_counts_raw.get("non_ok") or 0),
             "reingested": int(sync_counts_raw.get("reingested") or 0),
         },
     }
@@ -6318,9 +6340,32 @@ def _td_cache_validation_summary_line(summary: Mapping[str, object] | None) -> s
         f"changed={int(sync_counts.get('changed') or 0)}",
         f"removed={int(sync_counts.get('removed') or 0)}",
         f"unchanged={int(sync_counts.get('unchanged') or 0)}",
+        f"missing={int(sync_counts.get('missing') or 0)}",
         f"invalid={int(sync_counts.get('invalid') or 0)}",
+        f"non_ok={int(sync_counts.get('non_ok') or 0)}",
         f"reingested={int(sync_counts.get('reingested') or 0)}",
     ]
+    workbook_outputs = state.get("workbook_outputs") if isinstance(state.get("workbook_outputs"), Mapping) else {}
+    source_status_counts = state.get("source_status_counts") if isinstance(state.get("source_status_counts"), Mapping) else {}
+    data_calc = workbook_outputs.get("data_calc") if isinstance(workbook_outputs.get("data_calc"), Mapping) else {}
+    metrics_long = workbook_outputs.get("metrics_long") if isinstance(workbook_outputs.get("metrics_long"), Mapping) else {}
+    raw_cache_long = workbook_outputs.get("raw_cache_long") if isinstance(workbook_outputs.get("raw_cache_long"), Mapping) else {}
+    if source_status_counts:
+        parts.extend(
+            [
+                f"source_missing={int(source_status_counts.get('missing') or 0)}",
+                f"source_invalid={int(source_status_counts.get('invalid') or 0)}",
+                f"source_non_ok={int(source_status_counts.get('non_ok') or 0)}",
+            ]
+        )
+    if workbook_outputs:
+        parts.extend(
+            [
+                f"data_calc_ok={bool(data_calc.get('ok'))}",
+                f"metrics_long_rows={int(metrics_long.get('rows') or 0)}",
+                f"raw_cache_long_rows={int(raw_cache_long.get('rows') or 0)}",
+            ]
+        )
     return ", ".join(parts)
 
 
@@ -6351,6 +6396,440 @@ def _td_record_post_build_validation(
     return _write_td_cache_debug_json(project_dir, payload)
 
 
+def _td_non_ok_source_failures(conn: sqlite3.Connection) -> list[dict[str, str]]:
+    diag_by_serial: dict[str, str] = {}
+    try:
+        diag_rows = conn.execute(
+            """
+            SELECT serial, COALESCE(run_name, ''), COALESCE(reason, '')
+            FROM td_source_diagnostics
+            ORDER BY serial ASC, CASE WHEN COALESCE(run_name, '') = '' THEN 0 ELSE 1 END ASC, rowid ASC
+            """
+        ).fetchall()
+    except Exception:
+        diag_rows = []
+    for serial, _run_name, reason in diag_rows:
+        sn = str(serial or "").strip()
+        rs = str(reason or "").strip()
+        if not sn or not rs or sn in diag_by_serial:
+            continue
+        diag_by_serial[sn] = rs
+
+    try:
+        rows = conn.execute(
+            """
+            SELECT serial, lower(COALESCE(status, '')), COALESCE(sqlite_path, '')
+            FROM td_sources
+            WHERE lower(COALESCE(status, '')) <> 'ok'
+            ORDER BY serial ASC
+            """
+        ).fetchall()
+    except Exception:
+        rows = []
+
+    out: list[dict[str, str]] = []
+    for serial, status, sqlite_path in rows:
+        sn = str(serial or "").strip()
+        st = str(status or "").strip().lower()
+        sp = str(sqlite_path or "").strip()
+        if not sn:
+            continue
+        reason = diag_by_serial.get(sn) or ""
+        if not reason:
+            if st == "missing":
+                reason = f"Source SQLite could not be resolved{': ' + sp if sp else ''}"
+            elif st:
+                reason = f"Source status={st}"
+            else:
+                reason = "Source status is not ok"
+        out.append(
+            {
+                "serial": sn,
+                "status": st or "unknown",
+                "reason": reason,
+            }
+        )
+    return out
+
+
+def _td_format_source_failure_lines(source_failures: Sequence[Mapping[str, object]] | None, *, limit: int = 4) -> str:
+    lines: list[str] = []
+    for item in source_failures or []:
+        serial = str((item or {}).get("serial") or "").strip()
+        status = str((item or {}).get("status") or "").strip().lower() or "unknown"
+        reason = str((item or {}).get("reason") or "").strip()
+        if not serial:
+            continue
+        line = f"{serial} [{status}]"
+        if reason:
+            line += f": {reason}"
+        lines.append(line)
+    if not lines:
+        return ""
+    return " | ".join(lines[: max(1, int(limit))])
+
+
+def _td_expected_metric_labels_from_cache(conn: sqlite3.Connection) -> list[str]:
+    _ensure_test_data_impl_tables(conn)
+    stats_csv = str(_td_meta_value(conn, "statistics") or "").strip()
+    stats = _td_normalize_selected_stats([part.strip() for part in stats_csv.split(",") if part.strip()])
+    runs = [
+        str(row[0] or "").strip()
+        for row in conn.execute("SELECT run_name FROM td_runs ORDER BY run_name ASC").fetchall()
+        if str(row[0] or "").strip()
+    ]
+    y_by_run: dict[str, set[str]] = {}
+    for run_name, name in conn.execute(
+        "SELECT run_name, name FROM td_columns_calc WHERE kind='y' ORDER BY run_name ASC, name ASC"
+    ).fetchall():
+        run = str(run_name or "").strip()
+        col = str(name or "").strip()
+        if not run or not col:
+            continue
+        y_by_run.setdefault(run, set()).add(col)
+    labels: list[str] = []
+    for run in runs:
+        for col in sorted(y_by_run.get(run, set()), key=lambda value: str(value).lower()):
+            for stat in stats:
+                labels.append(f"{run}.{col}.{stat}")
+    return labels
+
+
+def _td_validate_generated_workbook_outputs(
+    workbook_path: Path,
+    *,
+    expected_serials: Sequence[str],
+    expected_metric_labels: Sequence[str],
+    expected_metrics_long_rows: int,
+    expected_raw_long_rows: int,
+) -> dict[str, object]:
+    try:
+        from openpyxl import load_workbook  # type: ignore
+    except Exception as exc:
+        raise RuntimeError(
+            "openpyxl is required to validate Test Data Trending workbook outputs. "
+            "Install it with `py -m pip install openpyxl` within the project environment."
+        ) from exc
+
+    expected_serial_list = [str(value).strip() for value in expected_serials if str(value).strip()]
+    expected_metric_set = {str(value).strip() for value in expected_metric_labels if str(value).strip()}
+    metrics_header = [
+        "observation_id",
+        "serial",
+        "condition_key",
+        "condition_display",
+        "program_title",
+        "source_run_name",
+        "parameter_name",
+        "stat",
+        "value_num",
+        "source_mtime_ns",
+    ]
+    raw_header = [
+        "observation_id",
+        "serial",
+        "program_title",
+        "source_run_name",
+        "condition_key",
+        "condition_display",
+        "x_axis_kind",
+        "run_type",
+        "pulse_width",
+        "control_period",
+        "source_mtime_ns",
+    ]
+    summary: dict[str, object] = {
+        "ok": False,
+        "data_calc": {
+            "exists": False,
+            "ok": False,
+            "serial_headers": 0,
+            "expected_serial_headers": len(expected_serial_list),
+            "metric_rows": 0,
+            "expected_metric_rows": len(expected_metric_set),
+        },
+        "metrics_long": {
+            "exists": False,
+            "ok": False,
+            "rows": 0,
+            "expected_rows": int(expected_metrics_long_rows),
+        },
+        "raw_cache_long": {
+            "exists": False,
+            "ok": False,
+            "rows": 0,
+            "expected_rows": int(expected_raw_long_rows),
+        },
+    }
+    problems: list[str] = []
+
+    def _sample(values: Sequence[str], *, limit: int = 3) -> str:
+        return ", ".join([str(value).strip() for value in values[:limit] if str(value).strip()])
+
+    def _count_data_rows(ws) -> int:
+        count = 0
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            if any(value not in (None, "") for value in row):
+                count += 1
+        return count
+
+    wb = load_workbook(str(Path(workbook_path).expanduser()), read_only=True, data_only=True)
+    try:
+        if "Data_calc" not in wb.sheetnames:
+            problems.append("Project workbook outputs are incomplete: missing sheet Data_calc.")
+        else:
+            ws = wb["Data_calc"]
+            data_calc = summary["data_calc"] if isinstance(summary.get("data_calc"), dict) else {}
+            data_calc["exists"] = True
+            header_values = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), tuple())
+            header = [str(value or "").strip() for value in header_values]
+            actual_serials = [value for value in header[1:] if value]
+            data_calc["serial_headers"] = len(actual_serials)
+            if not header or header[0] != "Metric":
+                problems.append("Project workbook outputs are incomplete: Data_calc header row is invalid.")
+            if actual_serials != expected_serial_list:
+                problems.append(
+                    "Project workbook outputs are incomplete: Data_calc serial headers do not match the Sources sheet."
+                )
+            metric_labels: list[str] = []
+            for row in ws.iter_rows(min_row=2, max_col=1, values_only=True):
+                metric = _td_parse_metric_label(row[0] if row else "")
+                if metric is None:
+                    continue
+                metric_labels.append(str(row[0] or "").strip())
+            metric_set = set(metric_labels)
+            data_calc["metric_rows"] = len(metric_labels)
+            if not expected_metric_set:
+                problems.append("Project workbook outputs are incomplete: cache produced no expected Data_calc metric labels.")
+            if not metric_labels:
+                problems.append("Project workbook outputs are incomplete: Data_calc has no generated metric label rows.")
+            if len(metric_labels) != len(metric_set):
+                problems.append("Project workbook outputs are incomplete: Data_calc contains duplicate metric labels.")
+            missing_labels = sorted(expected_metric_set - metric_set)
+            extra_labels = sorted(metric_set - expected_metric_set)
+            if missing_labels or extra_labels:
+                detail_parts: list[str] = []
+                if missing_labels:
+                    detail_parts.append(
+                        f"missing labels ({len(missing_labels)}): {_sample(missing_labels)}"
+                    )
+                if extra_labels:
+                    detail_parts.append(
+                        f"unexpected labels ({len(extra_labels)}): {_sample(extra_labels)}"
+                    )
+                problems.append(
+                    "Project workbook outputs are incomplete: Data_calc metric labels do not match the cache. "
+                    + "; ".join([part for part in detail_parts if part])
+                    + "."
+                )
+            data_calc["ok"] = not any("Data_calc" in problem for problem in problems)
+
+        if "Metrics_long" not in wb.sheetnames:
+            problems.append("Project workbook outputs are incomplete: missing sheet Metrics_long.")
+        else:
+            ws = wb["Metrics_long"]
+            metrics_long = summary["metrics_long"] if isinstance(summary.get("metrics_long"), dict) else {}
+            metrics_long["exists"] = True
+            header_values = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), tuple())
+            header = [str(value or "").strip() for value in header_values]
+            row_count = _count_data_rows(ws)
+            metrics_long["rows"] = row_count
+            if header[: len(metrics_header)] != metrics_header:
+                problems.append("Project workbook outputs are incomplete: Metrics_long header row is invalid.")
+            if row_count <= 0:
+                problems.append("Project workbook outputs are incomplete: Metrics_long has no data rows.")
+            if row_count != int(expected_metrics_long_rows):
+                problems.append(
+                    "Project workbook outputs are incomplete: Metrics_long row count does not match td_metrics_calc."
+                )
+            metrics_long["ok"] = not any("Metrics_long" in problem for problem in problems)
+
+        if "RawCache_long" not in wb.sheetnames:
+            problems.append("Project workbook outputs are incomplete: missing sheet RawCache_long.")
+        else:
+            ws = wb["RawCache_long"]
+            raw_cache_long = summary["raw_cache_long"] if isinstance(summary.get("raw_cache_long"), dict) else {}
+            raw_cache_long["exists"] = True
+            header_values = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), tuple())
+            header = [str(value or "").strip() for value in header_values]
+            row_count = _count_data_rows(ws)
+            raw_cache_long["rows"] = row_count
+            if header[: len(raw_header)] != raw_header:
+                problems.append("Project workbook outputs are incomplete: RawCache_long header row is invalid.")
+            if row_count <= 0:
+                problems.append("Project workbook outputs are incomplete: RawCache_long has no data rows.")
+            if row_count != int(expected_raw_long_rows):
+                problems.append(
+                    "Project workbook outputs are incomplete: RawCache_long row count does not match td_raw_condition_observations."
+                )
+            raw_cache_long["ok"] = not any("RawCache_long" in problem for problem in problems)
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
+
+    summary["ok"] = not problems
+    summary["problems"] = list(problems)
+    return summary
+
+
+def _td_collect_project_readiness(project_dir: Path, workbook_path: Path) -> dict[str, object]:
+    proj_dir = Path(project_dir).expanduser()
+    wb_path = Path(workbook_path).expanduser()
+    db_path = proj_dir / EIDAT_PROJECT_IMPLEMENTATION_DB
+    raw_db_path = td_raw_cache_db_path_for(proj_dir)
+    if not wb_path.exists():
+        raise FileNotFoundError(f"Workbook not found: {wb_path}")
+
+    readiness: dict[str, object] = {
+        "db_path": db_path,
+        "raw_db_path": raw_db_path,
+        "summary": {},
+        "source_failures": [],
+        "problems": [],
+    }
+    problems: list[str] = []
+    summary: dict[str, object] = {}
+
+    if not db_path.exists() or not db_path.is_file():
+        problems.append(f"Project cache DB not found: {db_path}.")
+    if not raw_db_path.exists() or not raw_db_path.is_file():
+        problems.append(f"Project raw cache DB not found: {raw_db_path}.")
+
+    if not problems:
+        state = inspect_test_data_project_cache_state(proj_dir, wb_path)
+        summary = _td_cache_state_summary(state)
+        refresh_mode = str(state.get("mode") or "").strip().lower()
+        if refresh_mode and refresh_mode != "none":
+            reason = str(state.get("reason") or "project cache is stale").strip() or "project cache is stale"
+            problems.append(f"Project cache is stale: {reason}.")
+
+        with closing(sqlite3.connect(str(db_path))) as conn:
+            _ensure_test_data_impl_tables(conn)
+            required_impl_tables = ("td_runs", "td_columns_calc", "td_metrics_calc")
+            impl_tables = {
+                str(row[0] or "").strip()
+                for row in conn.execute(
+                    """
+                    SELECT name
+                    FROM sqlite_master
+                    WHERE type='table' AND name IN (?, ?, ?)
+                    """,
+                    required_impl_tables,
+                ).fetchall()
+                if str(row[0] or "").strip()
+            }
+            missing_impl_tables = [name for name in required_impl_tables if name not in impl_tables]
+            if missing_impl_tables:
+                problems.append(
+                    f"Project cache DB is incomplete ({', '.join(missing_impl_tables)} missing): {db_path}."
+                )
+            impl_counts = _td_impl_cache_counts(conn)
+            if not bool(impl_counts.get("complete")):
+                problems.append(f"Project cache DB is incomplete: {db_path}.")
+
+            source_failures = _td_non_ok_source_failures(conn)
+            readiness["source_failures"] = list(source_failures)
+            source_status_counts = {
+                "missing": sum(1 for item in source_failures if str(item.get("status") or "").strip().lower() == "missing"),
+                "invalid": sum(1 for item in source_failures if str(item.get("status") or "").strip().lower() not in {"", "ok", "missing"}),
+                "non_ok": len(source_failures),
+            }
+            summary["source_status_counts"] = source_status_counts
+            if source_failures:
+                problems.append(
+                    "Project cache contains non-ok source rows: "
+                    f"{int(source_status_counts.get('non_ok') or 0)} "
+                    f"(missing={int(source_status_counts.get('missing') or 0)}, "
+                    f"invalid={int(source_status_counts.get('invalid') or 0)})."
+                )
+
+            expected_metric_labels = _td_expected_metric_labels_from_cache(conn)
+            expected_metrics_long_rows = int(conn.execute("SELECT COUNT(*) FROM td_metrics_calc").fetchone()[0] or 0)
+
+        with closing(sqlite3.connect(str(raw_db_path))) as conn:
+            _ensure_test_data_raw_cache_tables(conn)
+            required_raw_tables = ("td_raw_sequences", "td_columns_raw", "td_curves_raw")
+            raw_tables = {
+                str(row[0] or "").strip()
+                for row in conn.execute(
+                    """
+                    SELECT name
+                    FROM sqlite_master
+                    WHERE type='table' AND name IN (?, ?, ?)
+                    """,
+                    required_raw_tables,
+                ).fetchall()
+                if str(row[0] or "").strip()
+            }
+            missing_raw_tables = [name for name in required_raw_tables if name not in raw_tables]
+            if missing_raw_tables:
+                problems.append(
+                    f"Project raw cache DB is incomplete ({', '.join(missing_raw_tables)} missing): {raw_db_path}."
+                )
+            raw_counts = _td_raw_cache_counts(conn)
+            if not bool(raw_counts.get("complete")):
+                problems.append(f"Project raw cache DB is incomplete: {raw_db_path}.")
+            expected_raw_long_rows = int(
+                conn.execute("SELECT COUNT(*) FROM td_raw_condition_observations").fetchone()[0] or 0
+            )
+
+        expected_serials = [
+            str(item.get("serial") or "").strip()
+            for item in _read_test_data_sources(wb_path)
+            if str(item.get("serial") or "").strip()
+        ]
+        if not expected_serials:
+            problems.append("Project workbook outputs are incomplete: Sources sheet has no serial rows.")
+
+        workbook_outputs = _td_validate_generated_workbook_outputs(
+            wb_path,
+            expected_serials=expected_serials,
+            expected_metric_labels=expected_metric_labels,
+            expected_metrics_long_rows=expected_metrics_long_rows,
+            expected_raw_long_rows=expected_raw_long_rows,
+        )
+        summary["workbook_outputs"] = workbook_outputs
+        for problem in workbook_outputs.get("problems") or []:
+            if str(problem).strip():
+                problems.append(str(problem).strip())
+
+    readiness["summary"] = summary
+    readiness["problems"] = list(dict.fromkeys([str(problem).strip() for problem in problems if str(problem).strip()]))
+    return readiness
+
+
+def _td_project_readiness_error_message(
+    readiness: Mapping[str, object],
+    *,
+    guidance: str,
+) -> str:
+    problems = [str(problem).strip() for problem in (readiness.get("problems") or []) if str(problem).strip()]
+    source_failures = readiness.get("source_failures") if isinstance(readiness.get("source_failures"), Sequence) else []
+    summary = readiness.get("summary") if isinstance(readiness.get("summary"), Mapping) else {}
+    parts: list[str] = []
+    if problems:
+        parts.append(" ".join(problems))
+    source_txt = _td_format_source_failure_lines(cast(Sequence[Mapping[str, object]], source_failures), limit=4)
+    if source_txt:
+        parts.append(f"Source details: {source_txt}.")
+    summary_txt = _td_cache_validation_summary_line(summary)
+    if summary_txt:
+        parts.append(f"Cache summary: {summary_txt}.")
+    if guidance:
+        parts.append(guidance)
+    return " ".join([part for part in parts if part]).strip()
+
+
+def _td_ensure_project_ready(project_dir: Path, workbook_path: Path, *, guidance: str) -> dict[str, object]:
+    readiness = _td_collect_project_readiness(project_dir, workbook_path)
+    problems = [str(problem).strip() for problem in (readiness.get("problems") or []) if str(problem).strip()]
+    if problems:
+        raise RuntimeError(_td_project_readiness_error_message(readiness, guidance=guidance))
+    return readiness
+
+
 def ensure_test_data_project_cache(
     project_dir: Path,
     workbook_path: Path,
@@ -6376,20 +6855,43 @@ def export_test_data_project_debug_excels(
     workbook_path: Path,
     *,
     force: bool = True,
+    progress_cb: Callable[[str], None] | None = None,
 ) -> dict[str, Path]:
     """
-    Export optional Excel debug files for an already-built TD project cache.
+    Ensure the TD cache exists, then export optional Excel debug files.
     """
     proj_dir = Path(project_dir).expanduser()
-    db_path = validate_existing_test_data_project_cache(proj_dir, workbook_path)
+    db_path = proj_dir / EIDAT_PROJECT_IMPLEMENTATION_DB
     raw_db_path = td_raw_cache_db_path_for(proj_dir)
+    cache_warning: Exception | None = None
+    try:
+        _td_emit_progress(progress_cb, "Ensuring project cache")
+        payload = sync_test_data_project_cache(
+            proj_dir,
+            workbook_path,
+            rebuild=False,
+            progress_cb=progress_cb,
+        )
+        db_path = Path(str(payload.get("db_path") or db_path)).expanduser()
+        raw_db_path = Path(str(payload.get("raw_db_path") or raw_db_path)).expanduser()
+    except Exception as exc:
+        cache_warning = exc
+        _td_emit_progress(progress_cb, f"Cache refresh failed; exporting existing SQLite files anyway: {exc}")
+    try:
+        validate_existing_test_data_project_cache(proj_dir, workbook_path)
+    except Exception as exc:
+        if cache_warning is None:
+            cache_warning = exc
+        _td_emit_progress(progress_cb, f"Cache validation failed; exporting existing SQLite files anyway: {exc}")
 
     generated: dict[str, Path] = {}
 
+    _td_emit_progress(progress_cb, "Exporting implementation cache Excel mirror")
     impl_xlsx_path = _sync_sqlite_excel_mirror(db_path, force=force)
     if impl_xlsx_path is not None:
         generated["implementation_excel"] = impl_xlsx_path
 
+    _td_emit_progress(progress_cb, "Exporting raw cache Excel mirror")
     raw_xlsx_path = _sync_sqlite_excel_mirror(raw_db_path, force=force)
     if raw_xlsx_path is not None:
         generated["raw_cache_excel"] = raw_xlsx_path
@@ -6398,8 +6900,17 @@ def export_test_data_project_debug_excels(
     if raw_points_path.exists():
         generated["raw_points_excel"] = raw_points_path
 
-    return generated
-
+    if generated:
+        return generated
+    if cache_warning is not None:
+        raise RuntimeError(
+            "No debug Excel files were generated because no project SQLite files could be exported."
+        ) from cache_warning
+    if not workbook_path.exists():
+        raise FileNotFoundError(f"Workbook not found: {Path(workbook_path).expanduser()}")
+    raise RuntimeError(
+        "No debug Excel files were generated because the project SQLite files were not found."
+    )
 
 def _sync_sqlite_excel_mirror(db_path: Path, *, force: bool = False) -> Path | None:
     db_path = Path(db_path).expanduser()
@@ -6424,7 +6935,7 @@ def _sync_sqlite_excel_mirror(db_path: Path, *, force: bool = False) -> Path | N
     header_font = Font(bold=True)
     header_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
 
-    with sqlite3.connect(str(db_path)) as conn:
+    with closing(sqlite3.connect(str(db_path))) as conn:
         tables = [
             str(row[0] or "").strip()
             for row in conn.execute(
@@ -6534,7 +7045,7 @@ def _sync_td_raw_points_workbook(db_path: Path, *, force: bool = False) -> Path 
             return int(round(f))
         return float(f)
 
-    with sqlite3.connect(str(db_path)) as conn:
+    with closing(sqlite3.connect(str(db_path))) as conn:
         _ensure_test_data_raw_cache_tables(conn)
         rows = conn.execute(
             """
@@ -7425,130 +7936,24 @@ def _rebuild_test_data_project_calc_cache_from_raw(
 
 def _validate_test_data_project_cache_for_update(project_dir: Path, workbook_path: Path) -> Path:
     """
-    Validate that the project-local TD cache DB is present and populated enough
-    to regenerate workbook sheets without reopening source files.
+    Validate that the project-local TD project is fully ready for downstream TD actions.
     """
-    proj_dir = Path(project_dir).expanduser()
-    wb_path = Path(workbook_path).expanduser()
-    db_path = proj_dir / EIDAT_PROJECT_IMPLEMENTATION_DB
     guidance = (
-        "Test Data workbook updates use the existing project cache only. "
-        "Run 'Build / Refresh Cache' first to create or refresh implementation_trending.sqlite3."
+        "Run 'Update Project' first to rebuild all required Test Data cache and workbook outputs."
     )
-
-    if not wb_path.exists():
-        raise FileNotFoundError(f"Workbook not found: {wb_path}")
-    if not db_path.exists() or not db_path.is_file():
-        raise RuntimeError(
-            f"Project cache DB not found: {db_path}. {guidance}"
-        )
-
-    try:
-        with sqlite3.connect(str(db_path)) as conn:
-            required_tables = ("td_runs", "td_columns_calc", "td_metrics_calc")
-            table_rows = conn.execute(
-                """
-                SELECT name
-                FROM sqlite_master
-                WHERE type='table' AND name IN (?, ?, ?)
-                """,
-                required_tables,
-            ).fetchall()
-            existing_tables = {str(r[0] or "").strip() for r in table_rows if str(r[0] or "").strip()}
-            missing_tables = [name for name in required_tables if name not in existing_tables]
-            if missing_tables:
-                raise RuntimeError(
-                    f"Project cache DB is incomplete ({', '.join(missing_tables)} missing): {db_path}. {guidance}"
-                )
-
-            runs_count = int(conn.execute("SELECT COUNT(*) FROM td_runs").fetchone()[0] or 0)
-            y_cols_count = int(
-                conn.execute("SELECT COUNT(*) FROM td_columns_calc WHERE kind='y'").fetchone()[0] or 0
-            )
-            metrics_count = int(conn.execute("SELECT COUNT(*) FROM td_metrics_calc").fetchone()[0] or 0)
-    except RuntimeError:
-        raise
-    except Exception as exc:
-        raise RuntimeError(f"Failed to validate project cache DB: {db_path}. {guidance}") from exc
-
-    if runs_count <= 0 or y_cols_count <= 0 or metrics_count <= 0:
-        raise RuntimeError(
-            f"Project cache DB is incomplete: {db_path}. {guidance}"
-        )
-
-    return db_path
+    readiness = _td_ensure_project_ready(project_dir, workbook_path, guidance=guidance)
+    return Path(str(readiness.get("db_path") or (Path(project_dir).expanduser() / EIDAT_PROJECT_IMPLEMENTATION_DB))).expanduser()
 
 
 def validate_existing_test_data_project_cache(project_dir: Path, workbook_path: Path) -> Path:
     """
-    Validate that an existing TD project cache is present and populated enough
-    for Trend/Analyze to open without rebuilding.
+    Validate that an existing TD project is fully ready for Trend/Analyze.
     """
-    proj_dir = Path(project_dir).expanduser()
-    wb_path = Path(workbook_path).expanduser()
-    db_path = proj_dir / EIDAT_PROJECT_IMPLEMENTATION_DB
-    raw_db_path = td_raw_cache_db_path_for(proj_dir)
     guidance = (
-        "Trend/Analyze now opens the existing SQLite cache only. "
-        f"Use 'Build / Refresh Cache' to create or refresh {EIDAT_PROJECT_IMPLEMENTATION_DB} and {EIDAT_PROJECT_TD_RAW_CACHE_DB}."
+        "Run 'Update Project' to rebuild all required Test Data cache and workbook outputs before opening Trend / Analyze."
     )
-
-    if not wb_path.exists():
-        raise FileNotFoundError(f"Workbook not found: {wb_path}")
-    if not db_path.exists() or not db_path.is_file():
-        raise RuntimeError(f"Project cache DB not found: {db_path}. {guidance}")
-    if not raw_db_path.exists() or not raw_db_path.is_file():
-        raise RuntimeError(f"Project raw cache DB not found: {raw_db_path}. {guidance}")
-
-    try:
-        with sqlite3.connect(str(db_path)) as conn:
-            _ensure_test_data_impl_tables(conn)
-            required_tables = (
-                "td_runs",
-                "td_columns_calc",
-                "td_metrics_calc",
-            )
-            table_rows = conn.execute(
-                """
-                SELECT name
-                FROM sqlite_master
-                WHERE type='table' AND name IN (?, ?, ?)
-                """,
-                required_tables,
-            ).fetchall()
-            existing_tables = {str(r[0] or "").strip() for r in table_rows if str(r[0] or "").strip()}
-            missing_tables = [name for name in required_tables if name not in existing_tables]
-            if missing_tables:
-                raise RuntimeError(
-                    f"Project cache DB is incomplete ({', '.join(missing_tables)} missing): {db_path}. {guidance}"
-                )
-
-            runs_count = int(conn.execute("SELECT COUNT(*) FROM td_runs").fetchone()[0] or 0)
-            calc_y_count = int(conn.execute("SELECT COUNT(*) FROM td_columns_calc WHERE kind='y'").fetchone()[0] or 0)
-            metrics_count = int(conn.execute("SELECT COUNT(*) FROM td_metrics_calc").fetchone()[0] or 0)
-        with sqlite3.connect(str(raw_db_path)) as conn:
-            _ensure_test_data_raw_cache_tables(conn)
-            raw_runs_count = int(conn.execute("SELECT COUNT(*) FROM td_raw_sequences").fetchone()[0] or 0)
-            raw_curve_count = int(conn.execute("SELECT COUNT(*) FROM td_curves_raw").fetchone()[0] or 0)
-            raw_y_count = int(conn.execute("SELECT COUNT(*) FROM td_columns_raw WHERE kind='y'").fetchone()[0] or 0)
-    except RuntimeError:
-        raise
-    except Exception as exc:
-        raise RuntimeError(f"Failed to validate project cache DB: {db_path}. {guidance}") from exc
-
-    if runs_count <= 0 or raw_runs_count <= 0 or raw_curve_count <= 0 or raw_y_count <= 0 or calc_y_count <= 0 or metrics_count <= 0:
-        raise RuntimeError(f"Project cache DB is incomplete: {db_path}. {guidance}")
-
-    state = inspect_test_data_project_cache_state(proj_dir, wb_path)
-    refresh_mode = str(state.get("mode") or "").strip().lower()
-    if refresh_mode and refresh_mode != "none":
-        reason = str(state.get("reason") or "project cache is stale").strip() or "project cache is stale"
-        raise RuntimeError(
-            f"Project cache is stale: {reason}. "
-            "Run 'Update Project' to refresh the implementation before opening Trend / Analyze."
-        )
-
-    return db_path
+    readiness = _td_ensure_project_ready(project_dir, workbook_path, guidance=guidance)
+    return Path(str(readiness.get("db_path") or (Path(project_dir).expanduser() / EIDAT_PROJECT_IMPLEMENTATION_DB))).expanduser()
 
 
 def _td_delete_serial_rows_from_cache(
@@ -9566,6 +9971,14 @@ def rebuild_test_data_project_cache(
             + reason_txt
             + debug_txt
         )
+    if missing_sources or invalid_sources:
+        raise RuntimeError(
+            "Test Data cache build did not ingest all source SQLite files successfully. "
+            f"Missing sources: {missing_sources}; invalid sources: {invalid_sources}. "
+            "Fix the unresolved or invalid source SQLite entries before continuing."
+            + reason_txt
+            + debug_txt
+        )
 
     return {
         "db_path": str(db_path),
@@ -9582,7 +9995,10 @@ def rebuild_test_data_project_cache(
             "changed": int(preclassified_counts.get("changed") or 0),
             "removed": int(preclassified_counts.get("removed") or 0),
             "unchanged": int(preclassified_counts.get("unchanged") or 0),
+            "missing": int(preclassified_counts.get("missing") or missing_sources),
             "invalid": int(preclassified_counts.get("invalid") or invalid_sources),
+            "non_ok": int(preclassified_counts.get("missing") or missing_sources)
+            + int(preclassified_counts.get("invalid") or invalid_sources),
             "reingested": int(preclassified_counts.get("reingested") or len(entries)),
         },
         "timings": dict(timings),
@@ -15416,27 +15832,22 @@ def update_test_data_trending_project_workbook(
         timings["pre_cache_workbook_save_s"] = round(time.perf_counter() - t0, 3)
         _td_emit_progress(progress_cb, "Ensuring project cache")
         t0 = time.perf_counter()
-        cache_sync_payload = sync_test_data_project_cache(
-            project_dir,
-            wb_path,
-            rebuild=False,
-            progress_cb=progress_cb,
-        )
+        try:
+            cache_sync_payload = sync_test_data_project_cache(
+                project_dir,
+                wb_path,
+                rebuild=False,
+                progress_cb=progress_cb,
+            )
+        except Exception as exc:
+            _td_emit_progress(progress_cb, f"Project cache build failed: {exc}")
+            raise
         db_path = Path(str(cache_sync_payload.get("db_path") or db_path)).expanduser()
         timings["cache_ensure_s"] = round(time.perf_counter() - t0, 3)
 
-    def _parse_metric(s: object) -> tuple[str, str, str] | None:
-        txt = str(s or "").strip()
-        if not txt or "." not in txt:
-            return None
-        parts = [p.strip() for p in txt.split(".") if p.strip()]
-        if len(parts) < 3:
-            return None
-        return parts[0], parts[1], parts[2].lower()
-
     _td_emit_progress(progress_cb, "Reading project cache")
     t0 = time.perf_counter()
-    with sqlite3.connect(str(db_path)) as conn:
+    with closing(sqlite3.connect(str(db_path))) as conn:
         _ensure_test_data_impl_tables(conn)
         src_missing = int(
             conn.execute(
@@ -15473,7 +15884,7 @@ def update_test_data_trending_project_workbook(
             "SELECT run_name, name, units FROM td_columns_calc WHERE kind='y'"
         ).fetchall()
         runs_rows = conn.execute("SELECT run_name FROM td_runs ORDER BY run_name").fetchall()
-    with sqlite3.connect(str(_td_resolve_raw_cache_db_path(db_path))) as raw_conn:
+    with closing(sqlite3.connect(str(_td_resolve_raw_cache_db_path(db_path)))) as raw_conn:
         _ensure_test_data_raw_cache_tables(raw_conn)
         raw_cache_long_rows = raw_conn.execute(
             """
@@ -15568,7 +15979,7 @@ def update_test_data_trending_project_workbook(
     # Populate Data_calc values.
     serial_cols_calc = {str(sn): idx + 2 for idx, sn in enumerate(serials)}
     for r in range(2, (ws_data_calc.max_row or 0) + 1):
-        parsed = _parse_metric(ws_data_calc.cell(r, 1).value)
+        parsed = _td_parse_metric_label(ws_data_calc.cell(r, 1).value)
         if parsed is None:
             continue
         run, col, stat = parsed
@@ -15724,23 +16135,25 @@ def update_test_data_trending_project_workbook(
             }
 
     cache_state_summary: dict[str, object] = {}
+    readiness: dict[str, object] = {}
     cache_validation_ok = False
     cache_validation_error = ""
     cache_debug_path = str(cache_sync_payload.get("debug_path") or "").strip()
     backend_module_path = str(Path(__file__).resolve())
     if not dry_run:
         try:
-            cache_state_summary = _td_cache_state_summary(
-                inspect_test_data_project_cache_state(project_dir, wb_path)
-            )
+            readiness = _td_collect_project_readiness(project_dir, wb_path)
+            cache_state_summary = dict(readiness.get("summary") or {})
         except Exception as exc:
             cache_validation_error = str(exc).strip()
         else:
-            try:
-                validate_existing_test_data_project_cache(project_dir, wb_path)
+            if not [str(problem).strip() for problem in (readiness.get("problems") or []) if str(problem).strip()]:
                 cache_validation_ok = True
-            except Exception as exc:
-                cache_validation_error = str(exc).strip()
+            else:
+                cache_validation_error = _td_project_readiness_error_message(
+                    readiness,
+                    guidance="Run 'Update Project' again after fixing the reported TD source or workbook issues.",
+                )
         debug_path = _td_record_post_build_validation(
             project_dir,
             state_summary=cache_state_summary,
@@ -15750,14 +16163,35 @@ def update_test_data_trending_project_workbook(
         if debug_path is not None:
             cache_debug_path = str(debug_path)
         if not cache_validation_ok:
+            source_status_counts = (
+                cache_state_summary.get("source_status_counts")
+                if isinstance(cache_state_summary.get("source_status_counts"), Mapping)
+                else {}
+            )
+            source_detail = _td_format_source_failure_lines(
+                cast(Sequence[Mapping[str, object]], readiness.get("source_failures") or []),
+                limit=4,
+            )
             summary_line = _td_cache_validation_summary_line(cache_state_summary)
+            sync_mode = str(cache_sync_payload.get("mode") or "unknown").strip() or "unknown"
+            sync_reason = str(cache_sync_payload.get("reason") or "").strip()
             debug_hint = f" Debug: {cache_debug_path}." if cache_debug_path else ""
-            raise RuntimeError(
-                "Update Project finished workbook output, but final TD cache validation failed: "
+            failure_message = (
+                "Update Project did not produce a Trend/Analyze-ready Test Data project: "
                 f"{cache_validation_error or 'unknown validation error'}. "
-                f"Cache summary: {summary_line}."
+                f"Cache sync mode={sync_mode}"
+                + (f", reason={sync_reason}" if sync_reason else "")
+                + ". "
+                + "Source counts: "
+                + f"missing={int(source_status_counts.get('missing') or 0)}, "
+                + f"invalid={int(source_status_counts.get('invalid') or 0)}, "
+                + f"non_ok={int(source_status_counts.get('non_ok') or 0)}. "
+                + (f"Details: {source_detail}. " if source_detail else "")
+                + f"Cache summary: {summary_line}."
                 + debug_hint
             )
+            _td_emit_progress(progress_cb, failure_message)
+            raise RuntimeError(failure_message)
 
     timings["total_s"] = round(time.perf_counter() - total_started, 3)
     debug_payload = {
@@ -21591,6 +22025,18 @@ def create_eidat_project(
                 sequences_by_program=sequences_by_program,
             ),
         )
+        try:
+            cache_payload = sync_test_data_project_cache(
+                project_dir,
+                workbook_path,
+                rebuild=False,
+            )
+            meta_cache_paths = {
+                "cache_db_path": str(cache_payload.get("db_path") or (project_dir / EIDAT_PROJECT_IMPLEMENTATION_DB)),
+                "raw_cache_db_path": str(cache_payload.get("raw_db_path") or td_raw_cache_db_path_for(project_dir)),
+            }
+        except Exception as exc:
+            meta_cache_paths = {"cache_init_error": str(exc)}
 
     else:
         raise RuntimeError(f"Unsupported project type: {project_type}")
@@ -21616,6 +22062,8 @@ def create_eidat_project(
         meta["support_workbook"] = str(Path(support_workbook_path).name)
     if isinstance(config_snapshot, dict):
         meta["config_snapshot"] = config_snapshot
+    if project_type == EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING:
+        meta.update(meta_cache_paths)
     description = _format_continued_population_description(continued_population_clean)
     if description:
         meta["description"] = description
