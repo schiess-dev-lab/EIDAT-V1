@@ -71,6 +71,39 @@ def _td_validation_context():
     return stack
 
 
+def _td_update_context(project_dir: Path, workbook_path: Path):
+    stack = ExitStack()
+    impl_db = project_dir / backend.EIDAT_PROJECT_IMPLEMENTATION_DB
+    raw_db = project_dir / backend.EIDAT_PROJECT_TD_RAW_CACHE_DB
+    for patcher in _td_validation_patchers():
+        stack.enter_context(patcher)
+    stack.enter_context(
+        patch.object(
+            backend,
+            "sync_test_data_project_cache",
+            return_value={
+                "db_path": str(impl_db),
+                "raw_db_path": str(raw_db),
+                "mode": "noop",
+                "counts": {},
+                "reason": "",
+            },
+        )
+    )
+    stack.enter_context(patch.object(backend, "_sync_td_support_workbook_program_sheets", return_value=None))
+    stack.enter_context(patch.object(backend, "_refresh_td_support_run_conditions_sheet", return_value=None))
+    stack.enter_context(patch.object(backend, "_sync_project_workbook_metadata_inplace", return_value=None))
+    stack.enter_context(patch.object(backend, "read_eidat_index_documents", return_value=[]))
+    stack.enter_context(
+        patch.object(
+            backend,
+            "td_perf_refresh_saved_equation_store",
+            return_value={"refreshed_count": 0, "failed_count": 0, "errors": [], "path": str(project_dir / "saved.json")},
+        )
+    )
+    return stack
+
+
 def _create_ready_td_project_fixture(project_dir: Path) -> tuple[Path, Path, Path]:
     if Workbook is None:
         raise RuntimeError("openpyxl is required for TD readiness tests")
@@ -229,6 +262,173 @@ def _create_ready_td_project_fixture(project_dir: Path) -> tuple[Path, Path, Pat
         conn.commit()
 
     return workbook_path, impl_db, raw_db
+
+
+def _append_excluded_td_source_to_fixture(
+    project_dir: Path,
+    workbook_path: Path,
+    *,
+    serial: str = "SN-002",
+    program_title: str = "Program Beta",
+    document_type: str = "TD",
+    metadata_rel: str = "docs/sn002.json",
+    artifacts_rel: str = "debug/ocr/sn002",
+    excel_sqlite_rel: str = "missing_source.sqlite3",
+) -> dict[str, str]:
+    if Workbook is None:
+        raise RuntimeError("openpyxl is required for TD readiness tests")
+    from openpyxl import load_workbook  # type: ignore
+
+    wb = load_workbook(str(workbook_path))
+    try:
+        ws_sources = wb["Sources"]
+        ws_sources.append([serial, program_title, document_type, metadata_rel, artifacts_rel, excel_sqlite_rel])
+        wb.save(str(workbook_path))
+    finally:
+        wb.close()
+
+    source_row = {
+        "serial": serial,
+        "serial_number": serial,
+        "program_title": program_title,
+        "document_type": document_type,
+        "metadata_rel": metadata_rel,
+        "artifacts_rel": artifacts_rel,
+        "excel_sqlite_rel": excel_sqlite_rel,
+    }
+    with patch.object(backend, "_load_excel_trend_config", return_value={"x_axis": {}}):
+        project_raw_signature = backend._td_build_project_raw_signature(workbook_path, raw_columns_csv="Pressure")
+    runtime_state = backend._td_source_runtime_state(
+        workbook_path,
+        source_row,
+        project_raw_signature=project_raw_signature,
+    )
+    reason = str((runtime_state.get("source_resolution") or {}).get("reason") or "Source excluded from compilation.")
+    with closing(sqlite3.connect(str(project_dir / backend.EIDAT_PROJECT_IMPLEMENTATION_DB))) as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO td_sources(serial, sqlite_path, mtime_ns, size_bytes, status, last_ingested_epoch_ns, raw_fingerprint)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                serial,
+                str(runtime_state.get("sqlite_path") or ""),
+                int(runtime_state.get("mtime_ns") or 0),
+                int(runtime_state.get("size_bytes") or 0),
+                str(runtime_state.get("status") or "missing"),
+                1,
+                str(runtime_state.get("fingerprint") or ""),
+            ),
+        )
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO td_source_metadata(
+                serial, program_title, document_type, metadata_rel, artifacts_rel, excel_sqlite_rel, metadata_mtime_ns
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (serial, program_title, document_type, metadata_rel, artifacts_rel, excel_sqlite_rel, 0),
+        )
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO td_source_diagnostics(
+                serial, resolved_sqlite_path, status, run_name, x_axis_kind, matched_y_json, curves_written, metrics_written, reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                serial,
+                str(runtime_state.get("sqlite_path") or ""),
+                str(runtime_state.get("status") or "missing"),
+                "",
+                "",
+                "[]",
+                0,
+                0,
+                reason,
+            ),
+        )
+        conn.commit()
+    return source_row
+
+
+def _set_fixture_source_missing(project_dir: Path, workbook_path: Path, *, serial: str = "SN-001") -> None:
+    if Workbook is None:
+        raise RuntimeError("openpyxl is required for TD readiness tests")
+    from openpyxl import load_workbook  # type: ignore
+
+    wb = load_workbook(str(workbook_path))
+    try:
+        ws_sources = wb["Sources"]
+        headers = {
+            str(ws_sources.cell(1, col).value or "").strip().lower(): col
+            for col in range(1, (ws_sources.max_column or 0) + 1)
+            if str(ws_sources.cell(1, col).value or "").strip()
+        }
+        for row in range(2, (ws_sources.max_row or 0) + 1):
+            if str(ws_sources.cell(row, headers["serial_number"]).value or "").strip() != serial:
+                continue
+            ws_sources.cell(row, headers["excel_sqlite_rel"]).value = "missing_source.sqlite3"
+            break
+        wb.save(str(workbook_path))
+    finally:
+        wb.close()
+
+    source_row = {
+        "serial": serial,
+        "serial_number": serial,
+        "program_title": "Program Alpha",
+        "document_type": "TD",
+        "metadata_rel": "",
+        "artifacts_rel": "",
+        "excel_sqlite_rel": "missing_source.sqlite3",
+    }
+    with patch.object(backend, "_load_excel_trend_config", return_value={"x_axis": {}}):
+        project_raw_signature = backend._td_build_project_raw_signature(workbook_path, raw_columns_csv="Pressure")
+    runtime_state = backend._td_source_runtime_state(
+        workbook_path,
+        source_row,
+        project_raw_signature=project_raw_signature,
+    )
+    reason = str((runtime_state.get("source_resolution") or {}).get("reason") or "Source SQLite not found.")
+    with closing(sqlite3.connect(str(project_dir / backend.EIDAT_PROJECT_IMPLEMENTATION_DB))) as conn:
+        conn.execute(
+            """
+            UPDATE td_sources
+            SET sqlite_path=?, mtime_ns=?, size_bytes=?, status=?, last_ingested_epoch_ns=?, raw_fingerprint=?
+            WHERE serial=?
+            """,
+            (
+                str(runtime_state.get("sqlite_path") or ""),
+                int(runtime_state.get("mtime_ns") or 0),
+                int(runtime_state.get("size_bytes") or 0),
+                str(runtime_state.get("status") or "missing"),
+                1,
+                str(runtime_state.get("fingerprint") or ""),
+                serial,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO td_source_diagnostics(
+                serial, resolved_sqlite_path, status, run_name, x_axis_kind, matched_y_json, curves_written, metrics_written, reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                serial,
+                str(runtime_state.get("sqlite_path") or ""),
+                str(runtime_state.get("status") or "missing"),
+                "",
+                "",
+                "[]",
+                0,
+                0,
+                reason,
+            ),
+        )
+        conn.execute(
+            "UPDATE td_source_metadata SET excel_sqlite_rel=? WHERE serial=?",
+            ("missing_source.sqlite3", serial),
+        )
+        conn.commit()
 
 
 class TestBackendTdCacheBootstrap(unittest.TestCase):
@@ -476,32 +676,118 @@ class TestBackendTdCacheBootstrap(unittest.TestCase):
                     impl_db,
                 )
 
-    def test_ready_validator_rejects_non_ok_source_rows_for_update_and_open(self) -> None:
+    def test_ready_validator_accepts_excluded_source_rows_for_update_and_open(self) -> None:
         if Workbook is None:
             self.skipTest("openpyxl is required for TD readiness tests")
         with tempfile.TemporaryDirectory() as tmpdir:
             project_dir = Path(tmpdir) / "project"
-            workbook_path, _impl_db, _raw_db = _create_ready_td_project_fixture(project_dir)
-            with closing(sqlite3.connect(str(project_dir / backend.EIDAT_PROJECT_IMPLEMENTATION_DB))) as conn:
-                conn.execute("UPDATE td_sources SET status=? WHERE serial=?", ("missing", "SN-001"))
-                conn.execute(
-                    """
-                    INSERT OR REPLACE INTO td_source_diagnostics(
-                        serial, resolved_sqlite_path, status, run_name, x_axis_kind, matched_y_json, curves_written, metrics_written, reason
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    ("SN-001", "", "missing", "", "", "[]", 0, 0, "Source SQLite not found for SN-001"),
-                )
-                conn.commit()
+            workbook_path, impl_db, _raw_db = _create_ready_td_project_fixture(project_dir)
+            _append_excluded_td_source_to_fixture(project_dir, workbook_path)
             with _td_validation_context():
                 for validator in (
                     backend.validate_existing_test_data_project_cache,
                     backend._validate_test_data_project_cache_for_update,
                 ):
-                    with self.assertRaises(RuntimeError) as ctx:
-                        validator(project_dir, workbook_path)
-                    self.assertIn("Project cache contains non-ok source rows", str(ctx.exception))
-                    self.assertIn("SN-001 [missing]", str(ctx.exception))
+                    self.assertEqual(validator(project_dir, workbook_path), impl_db)
+                readiness = backend._td_collect_project_readiness(project_dir, workbook_path)
+            self.assertEqual(readiness["problems"], [])
+            self.assertEqual(readiness["compiled_serials"], ["SN-001"])
+            self.assertEqual(len(readiness["excluded_sources"]), 1)
+            self.assertEqual(readiness["excluded_sources"][0]["serial"], "SN-002")
+            self.assertIn("ignored until fixed", str(readiness.get("warning_summary") or ""))
+
+    def test_update_succeeds_with_excluded_sources_and_rewrites_compiled_serial_headers(self) -> None:
+        if Workbook is None:
+            self.skipTest("openpyxl is required for TD readiness tests")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir) / "project"
+            workbook_path, impl_db, raw_db = _create_ready_td_project_fixture(project_dir)
+            _append_excluded_td_source_to_fixture(project_dir, workbook_path)
+            from openpyxl import load_workbook  # type: ignore
+
+            wb_existing = load_workbook(str(workbook_path))
+            try:
+                ws_data_calc = wb_existing["Data_calc"]
+                ws_data_calc.cell(1, 3).value = "SN-002"
+                wb_existing.save(str(workbook_path))
+            finally:
+                wb_existing.close()
+
+            with _td_update_context(project_dir, workbook_path):
+                payload = backend.update_test_data_trending_project_workbook(
+                    project_dir,
+                    workbook_path,
+                )
+
+            self.assertTrue(payload["cache_validation_ok"])
+            self.assertEqual(payload["db_path"], str(impl_db))
+            self.assertEqual(payload["compiled_serials"], ["SN-001"])
+            self.assertEqual(payload["compiled_serials_count"], 1)
+            self.assertEqual(payload["serials_with_source"], 1)
+            self.assertEqual(payload["excluded_sources_count"], 1)
+            self.assertEqual(payload["excluded_sources"][0]["serial"], "SN-002")
+            self.assertIn("ignored until fixed", str(payload.get("warning_summary") or ""))
+            self.assertEqual(payload["cache_state"]["compiled_serials_count"], 1)
+            self.assertEqual(payload["cache_state"]["excluded_sources_count"], 1)
+
+            wb_check = load_workbook(str(workbook_path), read_only=True, data_only=True)
+            try:
+                ws_data_calc = wb_check["Data_calc"]
+                header = [str(value or "").strip() for value in next(ws_data_calc.iter_rows(min_row=1, max_row=1, values_only=True))]
+            finally:
+                wb_check.close()
+            self.assertEqual(header[:2], ["Metric", "SN-001"])
+            self.assertNotIn("SN-002", header)
+
+            with _td_validation_context():
+                self.assertEqual(
+                    backend.validate_existing_test_data_project_cache(project_dir, workbook_path),
+                    impl_db,
+                )
+
+    def test_update_fails_when_all_sources_are_excluded(self) -> None:
+        if Workbook is None:
+            self.skipTest("openpyxl is required for TD readiness tests")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir) / "project"
+            workbook_path, _impl_db, _raw_db = _create_ready_td_project_fixture(project_dir)
+            _set_fixture_source_missing(project_dir, workbook_path)
+            with _td_update_context(project_dir, workbook_path):
+                with self.assertRaises(RuntimeError) as ctx:
+                    backend.update_test_data_trending_project_workbook(project_dir, workbook_path)
+            self.assertIn("Project cache has no compiled Test Data sources", str(ctx.exception))
+
+    def test_update_fails_when_compiled_outputs_validate_incomplete(self) -> None:
+        if Workbook is None:
+            self.skipTest("openpyxl is required for TD readiness tests")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir) / "project"
+            workbook_path, _impl_db, _raw_db = _create_ready_td_project_fixture(project_dir)
+            failed_readiness = {
+                "summary": {
+                    "mode": "none",
+                    "reason": "",
+                    "impl_complete": True,
+                    "raw_complete": True,
+                },
+                "compiled_serials": ["SN-001"],
+                "excluded_sources": [],
+                "warning_summary": "",
+                "problems": ["Project workbook outputs are incomplete: RawCache_long has no data rows."],
+            }
+            with _td_update_context(project_dir, workbook_path), patch.object(
+                backend,
+                "_td_collect_project_readiness",
+                return_value=failed_readiness,
+            ):
+                with self.assertRaises(RuntimeError) as ctx:
+                    backend.update_test_data_trending_project_workbook(
+                        project_dir,
+                        workbook_path,
+                        require_existing_cache=False,
+                    )
+            self.assertIn("Project workbook outputs are incomplete", str(ctx.exception))
+            self.assertIn("RawCache_long", str(ctx.exception))
 
     def test_ready_validator_rejects_workbook_output_mismatch(self) -> None:
         if Workbook is None:

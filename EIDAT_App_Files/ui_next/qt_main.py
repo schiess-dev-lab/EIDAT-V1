@@ -13298,6 +13298,20 @@ class MainWindow(QtWidgets.QMainWindow):
     def _handle_project_update_success(self, payload: object, *, wb_path: Path, ptype: str, started: float) -> str:
         if not isinstance(payload, dict):
             raise RuntimeError("Project update returned an invalid payload.")
+
+        def _td_excluded_source_line(item: object) -> str:
+            row = item if isinstance(item, dict) else {}
+            serial = str(row.get("serial") or "").strip() or "unknown serial"
+            reference = (
+                str(row.get("metadata_rel") or "").strip()
+                or str(row.get("excel_sqlite_rel") or "").strip()
+                or str(row.get("artifacts_rel") or "").strip()
+            )
+            reason = str(row.get("reason") or "").strip() or "Excluded from compilation."
+            if reference:
+                return f"{serial} ({reference}): {reason}"
+            return f"{serial}: {reason}"
+
         updated = int(payload.get("updated_cells") or 0)
         missing_src = int(payload.get("missing_source") or 0)
         missing_val = int(payload.get("missing_value") or 0)
@@ -13305,6 +13319,11 @@ class MainWindow(QtWidgets.QMainWindow):
         have_src = int(payload.get("serials_with_source") or 0)
         serials_added = int(payload.get("serials_added") or 0)
         added_serials = payload.get("added_serials") or []
+        compiled_serials = [str(value).strip() for value in (payload.get("compiled_serials") or []) if str(value).strip()]
+        compiled_serials_count = int(payload.get("compiled_serials_count") or len(compiled_serials))
+        excluded_sources = [dict(item) for item in (payload.get("excluded_sources") or []) if isinstance(item, dict)]
+        excluded_sources_count = int(payload.get("excluded_sources_count") or len(excluded_sources))
+        warning_summary = str(payload.get("warning_summary") or "").strip()
         cache_sync_mode = str(payload.get("cache_sync_mode") or "").strip()
         cache_sync_reason = str(payload.get("cache_sync_reason") or "").strip()
         cache_sync_counts = payload.get("cache_sync_counts") if isinstance(payload.get("cache_sync_counts"), dict) else {}
@@ -13397,6 +13416,17 @@ class MainWindow(QtWidgets.QMainWindow):
                 for err in (saved_refresh.get("errors") or []):
                     if str(err).strip():
                         self._append_log(f"[PROJECT UPDATE] Saved equation refresh error: {err}")
+            if excluded_sources_count:
+                self._append_log(
+                    f"[PROJECT UPDATE WARNING] Excluded TD sources: {excluded_sources_count}"
+                    + (f" | {warning_summary}" if warning_summary else "")
+                )
+                for item in excluded_sources[:20]:
+                    self._append_log(f"[PROJECT UPDATE WARNING] {_td_excluded_source_line(item)}")
+                if len(excluded_sources) > 20:
+                    self._append_log(
+                        f"[PROJECT UPDATE WARNING] ... and {len(excluded_sources) - 20} more excluded TD source(s)"
+                    )
 
         lines = [
             f"Updated cells: {updated}",
@@ -13404,15 +13434,26 @@ class MainWindow(QtWidgets.QMainWindow):
         ]
         if serials_added:
             lines.append(f"Serials auto-added: {serials_added}")
-        lines.extend(
-            [
-                f"Serials with debug source: {have_src}",
-                f"Missing debug source: {missing_src}",
-                f"No value found: {missing_val}",
-                "",
-                f"Workbook: {payload.get('workbook') or wb_path}",
-            ]
-        )
+        if ptype == getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending"):
+            lines.extend(
+                [
+                    f"Compiled serials: {compiled_serials_count}",
+                    f"Excluded TD sources: {excluded_sources_count}",
+                    f"No value found: {missing_val}",
+                    "",
+                    f"Workbook: {payload.get('workbook') or wb_path}",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    f"Serials with debug source: {have_src}",
+                    f"Missing debug source: {missing_src}",
+                    f"No value found: {missing_val}",
+                    "",
+                    f"Workbook: {payload.get('workbook') or wb_path}",
+                ]
+            )
         if ptype == getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending"):
             if cache_sync_mode:
                 lines.append(f"Cache sync mode: {cache_sync_mode}")
@@ -13432,11 +13473,19 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
             if source_status_counts:
                 lines.append(
-                    "TD source status: "
+                    "TD excluded source counts: "
                     f"missing={int(source_status_counts.get('missing') or 0)}, "
                     f"invalid={int(source_status_counts.get('invalid') or 0)}, "
                     f"non_ok={int(source_status_counts.get('non_ok') or 0)}"
                 )
+            if warning_summary:
+                lines.append(warning_summary)
+            if excluded_sources:
+                lines.append("Excluded from compilation until fixed:")
+                for item in excluded_sources[:10]:
+                    lines.append(_td_excluded_source_line(item))
+                if len(excluded_sources) > 10:
+                    lines.append(f"... and {len(excluded_sources) - 10} more excluded TD source(s)")
             if cache_validation_summary:
                 lines.append(f"TD cache summary: {cache_validation_summary}")
             if cache_debug_path:
@@ -13460,6 +13509,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if dbg:
             self._append_log(f"[PROJECT UPDATE] Debug JSON: {dbg}")
         QtWidgets.QMessageBox.information(self, "Project Updated", msg)
+        if excluded_sources_count:
+            self._show_toast(f"Project updated with warnings: {updated} cell(s)")
+            return f"Project updated with warnings in {elapsed_s:.1f}s"
         self._show_toast(f"Project updated and ready: {updated} cell(s)")
         return f"Project updated and ready in {elapsed_s:.1f}s"
 

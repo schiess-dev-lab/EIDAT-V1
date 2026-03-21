@@ -37,6 +37,7 @@ class _DummyMainWindow:
         self._project_popup_active = True
         self._repo_scan_dialog = _DummyRepoScanDialog()
         self.logs: list[str] = []
+        self.toasts: list[str] = []
         self.actions_updated = 0
 
     def _update_project_actions(self) -> None:
@@ -44,6 +45,9 @@ class _DummyMainWindow:
 
     def _append_log(self, text: str) -> None:
         self.logs.append(str(text))
+
+    def _show_toast(self, text: str) -> None:
+        self.toasts.append(str(text))
 
 
 @unittest.skipIf(QtWidgets is None or ProjectTaskWorker is None or MainWindow is None, "PySide6 is required")
@@ -100,3 +104,72 @@ class TestProjectTaskWorker(unittest.TestCase):
             [(f"Update Project failed: {message}", False)],
         )
         self.assertFalse(dummy._project_popup_active)
+
+    def test_project_update_success_popup_includes_excluded_source_warning(self) -> None:
+        dummy = _DummyMainWindow()
+        payload = {
+            "updated_cells": 12,
+            "missing_source": 1,
+            "missing_value": 0,
+            "serials_in_workbook": 2,
+            "serials_with_source": 1,
+            "serials_added": 0,
+            "added_serials": [],
+            "compiled_serials": ["SN-001"],
+            "compiled_serials_count": 1,
+            "excluded_sources": [
+                {
+                    "serial": "SN-002",
+                    "status": "missing",
+                    "reason": "No usable raw curves were written for any discovered run.",
+                    "metadata_rel": "docs/sn002.json",
+                    "artifacts_rel": "debug/ocr/sn002",
+                    "excel_sqlite_rel": "missing_source.sqlite3",
+                }
+            ],
+            "excluded_sources_count": 1,
+            "warning_summary": "Excluded 1 TD source from compilation (missing=1, invalid=0). They will be ignored until fixed.",
+            "workbook": "C:\\temp\\project.xlsx",
+            "cache_sync_mode": "full_rebuild",
+            "cache_sync_reason": "context changed",
+            "cache_sync_counts": {
+                "added": 0,
+                "changed": 0,
+                "removed": 0,
+                "unchanged": 1,
+                "missing": 1,
+                "invalid": 0,
+                "reingested": 0,
+            },
+            "cache_state": {
+                "impl_counts": {"td_runs": 1, "td_columns_calc_y": 1, "td_metrics_calc": 2},
+                "raw_counts": {"td_raw_sequences": 1, "td_columns_raw_y": 1, "td_curves_raw": 1},
+                "source_status_counts": {"missing": 1, "invalid": 0, "non_ok": 1},
+            },
+            "cache_validation_ok": True,
+            "cache_validation_error": "",
+            "cache_validation_summary": "mode=none, compiled_serials=1, excluded_sources=1",
+            "cache_debug_path": "C:\\temp\\td_cache_debug.json",
+            "backend_module_path": "C:\\temp\\backend.py",
+            "saved_equation_refresh": {"refreshed_count": 0, "failed_count": 0, "errors": []},
+            "debug_json": "",
+        }
+
+        with patch.object(QtWidgets.QMessageBox, "information") as info_mock:
+            result = MainWindow._handle_project_update_success(
+                dummy,
+                payload,
+                wb_path=Path("C:/temp/project.xlsx"),
+                ptype="Test Data Trending",
+                started=0.0,
+            )
+
+        info_mock.assert_called_once()
+        popup_text = info_mock.call_args.args[2]
+        self.assertIn("Excluded 1 TD source from compilation", popup_text)
+        self.assertIn("SN-002 (docs/sn002.json)", popup_text)
+        self.assertIn("will be ignored until fixed", popup_text)
+        self.assertTrue(any("Excluded TD sources: 1" in log for log in dummy.logs))
+        self.assertTrue(any("SN-002 (docs/sn002.json)" in log for log in dummy.logs))
+        self.assertEqual(dummy.toasts, ["Project updated with warnings: 12 cell(s)"])
+        self.assertIn("with warnings", result)

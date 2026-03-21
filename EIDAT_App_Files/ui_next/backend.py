@@ -6108,6 +6108,7 @@ def _td_is_recoverable_cache_validation_error(exc: BaseException | str) -> bool:
         "Project cache is stale",
         "Project cache contains non-ok source rows",
         "Project workbook outputs are incomplete",
+        "Project cache has no compiled Test Data sources",
     )
     return any(marker in message for marker in recoverable_markers)
 
@@ -6350,6 +6351,10 @@ def _td_cache_validation_summary_line(summary: Mapping[str, object] | None) -> s
     data_calc = workbook_outputs.get("data_calc") if isinstance(workbook_outputs.get("data_calc"), Mapping) else {}
     metrics_long = workbook_outputs.get("metrics_long") if isinstance(workbook_outputs.get("metrics_long"), Mapping) else {}
     raw_cache_long = workbook_outputs.get("raw_cache_long") if isinstance(workbook_outputs.get("raw_cache_long"), Mapping) else {}
+    if "compiled_serials_count" in state:
+        parts.append(f"compiled_serials={int(state.get('compiled_serials_count') or 0)}")
+    if "excluded_sources_count" in state:
+        parts.append(f"excluded_sources={int(state.get('excluded_sources_count') or 0)}")
     if source_status_counts:
         parts.extend(
             [
@@ -6396,7 +6401,46 @@ def _td_record_post_build_validation(
     return _write_td_cache_debug_json(project_dir, payload)
 
 
-def _td_non_ok_source_failures(conn: sqlite3.Connection) -> list[dict[str, str]]:
+def _td_source_status_counts(source_rows: Sequence[Mapping[str, object]] | None) -> dict[str, int]:
+    rows = list(source_rows or [])
+    return {
+        "missing": sum(1 for item in rows if str(item.get("status") or "").strip().lower() == "missing"),
+        "invalid": sum(
+            1
+            for item in rows
+            if str(item.get("status") or "").strip().lower() not in {"", "ok", "missing"}
+        ),
+        "non_ok": len(rows),
+    }
+
+
+def _td_compiled_serials_from_cache(conn: sqlite3.Connection, workbook_path: Path) -> list[str]:
+    _ensure_test_data_impl_tables(conn)
+    compiled_serial_set = {
+        str(row[0] or "").strip()
+        for row in conn.execute(
+            """
+            SELECT serial
+            FROM td_sources
+            WHERE lower(COALESCE(status, '')) = 'ok'
+            ORDER BY serial ASC
+            """
+        ).fetchall()
+        if str(row[0] or "").strip()
+    }
+    if not compiled_serial_set:
+        return []
+    source_serials = [
+        str(item.get("serial") or "").strip()
+        for item in _read_test_data_sources(Path(workbook_path).expanduser())
+        if str(item.get("serial") or "").strip()
+    ]
+    ordered = [serial for serial in source_serials if serial in compiled_serial_set]
+    extras = sorted(compiled_serial_set - set(ordered), key=lambda value: str(value).lower())
+    return ordered + extras
+
+
+def _td_excluded_source_details(conn: sqlite3.Connection) -> list[dict[str, str]]:
     diag_by_serial: dict[str, str] = {}
     try:
         diag_rows = conn.execute(
@@ -6418,17 +6462,27 @@ def _td_non_ok_source_failures(conn: sqlite3.Connection) -> list[dict[str, str]]
     try:
         rows = conn.execute(
             """
-            SELECT serial, lower(COALESCE(status, '')), COALESCE(sqlite_path, '')
-            FROM td_sources
-            WHERE lower(COALESCE(status, '')) <> 'ok'
-            ORDER BY serial ASC
+            SELECT
+                s.serial,
+                lower(COALESCE(s.status, '')),
+                COALESCE(s.sqlite_path, ''),
+                COALESCE(m.program_title, ''),
+                COALESCE(m.document_type, ''),
+                COALESCE(m.metadata_rel, ''),
+                COALESCE(m.artifacts_rel, ''),
+                COALESCE(m.excel_sqlite_rel, '')
+            FROM td_sources s
+            LEFT JOIN td_source_metadata m
+              ON m.serial = s.serial
+            WHERE lower(COALESCE(s.status, '')) <> 'ok'
+            ORDER BY s.serial ASC
             """
         ).fetchall()
     except Exception:
         rows = []
 
     out: list[dict[str, str]] = []
-    for serial, status, sqlite_path in rows:
+    for serial, status, sqlite_path, program_title, document_type, metadata_rel, artifacts_rel, excel_sqlite_rel in rows:
         sn = str(serial or "").strip()
         st = str(status or "").strip().lower()
         sp = str(sqlite_path or "").strip()
@@ -6447,9 +6501,31 @@ def _td_non_ok_source_failures(conn: sqlite3.Connection) -> list[dict[str, str]]
                 "serial": sn,
                 "status": st or "unknown",
                 "reason": reason,
+                "program_title": str(program_title or "").strip(),
+                "document_type": str(document_type or "").strip(),
+                "metadata_rel": str(metadata_rel or "").strip(),
+                "artifacts_rel": str(artifacts_rel or "").strip(),
+                "excel_sqlite_rel": str(excel_sqlite_rel or "").strip(),
             }
         )
     return out
+
+
+def _td_non_ok_source_failures(conn: sqlite3.Connection) -> list[dict[str, str]]:
+    return _td_excluded_source_details(conn)
+
+
+def _td_excluded_source_warning_summary(excluded_sources: Sequence[Mapping[str, object]] | None) -> str:
+    rows = list(excluded_sources or [])
+    if not rows:
+        return ""
+    counts = _td_source_status_counts(rows)
+    noun = "source" if len(rows) == 1 else "sources"
+    return (
+        f"Excluded {len(rows)} TD {noun} from compilation "
+        f"(missing={int(counts.get('missing') or 0)}, invalid={int(counts.get('invalid') or 0)}). "
+        "They will be ignored until fixed."
+    )
 
 
 def _td_format_source_failure_lines(source_failures: Sequence[Mapping[str, object]] | None, *, limit: int = 4) -> str:
@@ -6458,9 +6534,16 @@ def _td_format_source_failure_lines(source_failures: Sequence[Mapping[str, objec
         serial = str((item or {}).get("serial") or "").strip()
         status = str((item or {}).get("status") or "").strip().lower() or "unknown"
         reason = str((item or {}).get("reason") or "").strip()
+        reference = (
+            str((item or {}).get("metadata_rel") or "").strip()
+            or str((item or {}).get("excel_sqlite_rel") or "").strip()
+            or str((item or {}).get("artifacts_rel") or "").strip()
+        )
         if not serial:
             continue
         line = f"{serial} [{status}]"
+        if reference:
+            line += f" ({reference})"
         if reason:
             line += f": {reason}"
         lines.append(line)
@@ -6589,7 +6672,7 @@ def _td_validate_generated_workbook_outputs(
                 problems.append("Project workbook outputs are incomplete: Data_calc header row is invalid.")
             if actual_serials != expected_serial_list:
                 problems.append(
-                    "Project workbook outputs are incomplete: Data_calc serial headers do not match the Sources sheet."
+                    "Project workbook outputs are incomplete: Data_calc serial headers do not match the compiled source set."
                 )
             metric_labels: list[str] = []
             for row in ws.iter_rows(min_row=2, max_col=1, values_only=True):
@@ -6687,9 +6770,14 @@ def _td_collect_project_readiness(project_dir: Path, workbook_path: Path) -> dic
         "raw_db_path": raw_db_path,
         "summary": {},
         "source_failures": [],
+        "excluded_sources": [],
+        "compiled_serials": [],
+        "warning_summary": "",
+        "warnings": [],
         "problems": [],
     }
     problems: list[str] = []
+    warnings: list[str] = []
     summary: dict[str, object] = {}
 
     if not db_path.exists() or not db_path.is_file():
@@ -6729,20 +6817,24 @@ def _td_collect_project_readiness(project_dir: Path, workbook_path: Path) -> dic
             if not bool(impl_counts.get("complete")):
                 problems.append(f"Project cache DB is incomplete: {db_path}.")
 
-            source_failures = _td_non_ok_source_failures(conn)
+            source_failures = _td_excluded_source_details(conn)
+            compiled_serials = _td_compiled_serials_from_cache(conn, wb_path)
             readiness["source_failures"] = list(source_failures)
-            source_status_counts = {
-                "missing": sum(1 for item in source_failures if str(item.get("status") or "").strip().lower() == "missing"),
-                "invalid": sum(1 for item in source_failures if str(item.get("status") or "").strip().lower() not in {"", "ok", "missing"}),
-                "non_ok": len(source_failures),
-            }
+            readiness["excluded_sources"] = list(source_failures)
+            readiness["compiled_serials"] = list(compiled_serials)
+            source_status_counts = _td_source_status_counts(source_failures)
             summary["source_status_counts"] = source_status_counts
+            summary["compiled_serials_count"] = len(compiled_serials)
+            summary["excluded_sources_count"] = len(source_failures)
             if source_failures:
+                warning_summary = _td_excluded_source_warning_summary(source_failures)
+                readiness["warning_summary"] = warning_summary
+                summary["warning_summary"] = warning_summary
+                if warning_summary:
+                    warnings.append(warning_summary)
+            if not compiled_serials:
                 problems.append(
-                    "Project cache contains non-ok source rows: "
-                    f"{int(source_status_counts.get('non_ok') or 0)} "
-                    f"(missing={int(source_status_counts.get('missing') or 0)}, "
-                    f"invalid={int(source_status_counts.get('invalid') or 0)})."
+                    "Project cache has no compiled Test Data sources. All sources are currently excluded from compilation."
                 )
 
             expected_metric_labels = _td_expected_metric_labels_from_cache(conn)
@@ -6775,27 +6867,30 @@ def _td_collect_project_readiness(project_dir: Path, workbook_path: Path) -> dic
                 conn.execute("SELECT COUNT(*) FROM td_raw_condition_observations").fetchone()[0] or 0
             )
 
-        expected_serials = [
+        source_sheet_serials = [
             str(item.get("serial") or "").strip()
             for item in _read_test_data_sources(wb_path)
             if str(item.get("serial") or "").strip()
         ]
-        if not expected_serials:
+        if not source_sheet_serials:
             problems.append("Project workbook outputs are incomplete: Sources sheet has no serial rows.")
 
-        workbook_outputs = _td_validate_generated_workbook_outputs(
-            wb_path,
-            expected_serials=expected_serials,
-            expected_metric_labels=expected_metric_labels,
-            expected_metrics_long_rows=expected_metrics_long_rows,
-            expected_raw_long_rows=expected_raw_long_rows,
-        )
-        summary["workbook_outputs"] = workbook_outputs
-        for problem in workbook_outputs.get("problems") or []:
-            if str(problem).strip():
-                problems.append(str(problem).strip())
+        compiled_serials = list(readiness.get("compiled_serials") or [])
+        if compiled_serials:
+            workbook_outputs = _td_validate_generated_workbook_outputs(
+                wb_path,
+                expected_serials=compiled_serials,
+                expected_metric_labels=expected_metric_labels,
+                expected_metrics_long_rows=expected_metrics_long_rows,
+                expected_raw_long_rows=expected_raw_long_rows,
+            )
+            summary["workbook_outputs"] = workbook_outputs
+            for problem in workbook_outputs.get("problems") or []:
+                if str(problem).strip():
+                    problems.append(str(problem).strip())
 
     readiness["summary"] = summary
+    readiness["warnings"] = list(dict.fromkeys([str(warning).strip() for warning in warnings if str(warning).strip()]))
     readiness["problems"] = list(dict.fromkeys([str(problem).strip() for problem in problems if str(problem).strip()]))
     return readiness
 
@@ -9921,6 +10016,17 @@ def rebuild_test_data_project_cache(
     timings["calc_rebuild_s"] = round(time.perf_counter() - t0, 3)
     timings["total_s"] = round(time.perf_counter() - total_started, 3)
     metrics_written = int(calc_payload.get("metrics_written") or 0)
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        excluded_sources_payload = _td_excluded_source_details(conn)
+        compiled_serials_payload = _td_compiled_serials_from_cache(conn, wb_path)
+    excluded_source_counts = _td_source_status_counts(excluded_sources_payload)
+    warning_summary = _td_excluded_source_warning_summary(excluded_sources_payload)
+    debug_payload["compiled_serials"] = list(compiled_serials_payload)
+    debug_payload["excluded_sources"] = list(excluded_sources_payload)
+    debug_payload["warning_summary"] = warning_summary
+    debug_payload["counts"]["valid_sources"] = int(len(compiled_serials_payload))
+    debug_payload["counts"]["compiled_sources"] = int(len(compiled_serials_payload))
+    debug_payload["counts"]["excluded_sources"] = int(len(excluded_sources_payload))
     debug_payload["counts"]["metrics_written"] = int(metrics_written)
     debug_payload["calc_payload"] = dict(calc_payload or {})
     debug_payload["timings"] = dict(timings)
@@ -9971,11 +10077,11 @@ def rebuild_test_data_project_cache(
             + reason_txt
             + debug_txt
         )
-    if missing_sources or invalid_sources:
+    if not compiled_serials_payload:
         raise RuntimeError(
-            "Test Data cache build did not ingest all source SQLite files successfully. "
+            "Test Data cache has no compiled sources after excluding corrupt or unusable inputs. "
             f"Missing sources: {missing_sources}; invalid sources: {invalid_sources}. "
-            "Fix the unresolved or invalid source SQLite entries before continuing."
+            "Fix at least one excluded source and run 'Build / Refresh Cache' again."
             + reason_txt
             + debug_txt
         )
@@ -9987,6 +10093,11 @@ def rebuild_test_data_project_cache(
         "serials_count": len(entries),
         "missing_sources": missing_sources,
         "invalid_sources": invalid_sources,
+        "compiled_serials": list(compiled_serials_payload),
+        "compiled_serials_count": int(len(compiled_serials_payload)),
+        "excluded_sources": list(excluded_sources_payload),
+        "excluded_sources_count": int(len(excluded_sources_payload)),
+        "warning_summary": warning_summary,
         "curves_written": curves_written,
         "metrics_written": metrics_written,
         "runs": sorted(runs_all),
@@ -9999,6 +10110,8 @@ def rebuild_test_data_project_cache(
             "invalid": int(preclassified_counts.get("invalid") or invalid_sources),
             "non_ok": int(preclassified_counts.get("missing") or missing_sources)
             + int(preclassified_counts.get("invalid") or invalid_sources),
+            "compiled": int(len(compiled_serials_payload)),
+            "excluded": int(len(excluded_sources_payload)),
             "reingested": int(preclassified_counts.get("reingested") or len(entries)),
         },
         "timings": dict(timings),
@@ -15825,6 +15938,9 @@ def update_test_data_trending_project_workbook(
         "counts": {},
         "reason": "",
     }
+    compiled_serials: list[str] = []
+    excluded_sources: list[dict[str, str]] = []
+    warning_summary = ""
     if not dry_run:
         _td_emit_progress(progress_cb, "Saving workbook before cache validation")
         t0 = time.perf_counter()
@@ -15849,12 +15965,9 @@ def update_test_data_trending_project_workbook(
     t0 = time.perf_counter()
     with closing(sqlite3.connect(str(db_path))) as conn:
         _ensure_test_data_impl_tables(conn)
-        src_missing = int(
-            conn.execute(
-                "SELECT COUNT(*) FROM td_sources WHERE lower(status) <> 'ok'"
-            ).fetchone()[0]
-            or 0
-        )
+        compiled_serials = _td_compiled_serials_from_cache(conn, wb_path)
+        excluded_sources = _td_excluded_source_details(conn)
+        src_missing = int(len(excluded_sources))
         rows = conn.execute(
             """
             SELECT serial, run_name, column_name, stat, value_num
@@ -15908,6 +16021,7 @@ def update_test_data_trending_project_workbook(
         ).fetchall()
     timings["cache_read_s"] = round(time.perf_counter() - t0, 3)
     post_cache_started = time.perf_counter()
+    warning_summary = _td_excluded_source_warning_summary(excluded_sources)
 
     metric_map: dict[tuple[str, str, str, str], float | int | None] = {}
     for sn, run, col, stat, val in rows:
@@ -15945,21 +16059,21 @@ def update_test_data_trending_project_workbook(
         except Exception:
             pass
         ws_data_calc = wb.create_sheet("Data_calc")
-    ws_data_calc.append(["Metric"] + [str(s) for s in serials])
+    ws_data_calc.append(["Metric"] + [str(s) for s in compiled_serials])
     try:
         ws_data_calc.freeze_panes = "B2"
     except Exception:
         pass
 
     for run in runs:
-        ws_data_calc.append([run] + [""] * len(serials))
+        ws_data_calc.append([run] + [""] * len(compiled_serials))
         ys = y_by_run.get(run, []) or []
         # Prefer config order first.
         ys_ordered = [n for n in cfg_order if n in ys] + sorted([n for n in ys if n not in cfg_order], key=lambda s: str(s).lower())
         for col in ys_ordered:
             for stat in stats:
-                ws_data_calc.append([f"{run}.{col}.{stat}"] + [""] * len(serials))
-        ws_data_calc.append([""] + [""] * len(serials))
+                ws_data_calc.append([f"{run}.{col}.{stat}"] + [""] * len(compiled_serials))
+        ws_data_calc.append([""] + [""] * len(compiled_serials))
 
     updated_cells = 0
     missing_value = 0
@@ -15977,7 +16091,7 @@ def update_test_data_trending_project_workbook(
         return current != new_value
 
     # Populate Data_calc values.
-    serial_cols_calc = {str(sn): idx + 2 for idx, sn in enumerate(serials)}
+    serial_cols_calc = {str(sn): idx + 2 for idx, sn in enumerate(compiled_serials)}
     for r in range(2, (ws_data_calc.max_row or 0) + 1):
         parsed = _td_parse_metric_label(ws_data_calc.cell(r, 1).value)
         if parsed is None:
@@ -16144,6 +16258,17 @@ def update_test_data_trending_project_workbook(
         try:
             readiness = _td_collect_project_readiness(project_dir, wb_path)
             cache_state_summary = dict(readiness.get("summary") or {})
+            excluded_sources = [
+                dict(item)
+                for item in (readiness.get("excluded_sources") or [])
+                if isinstance(item, Mapping)
+            ]
+            compiled_serials = [
+                str(value).strip()
+                for value in (readiness.get("compiled_serials") or [])
+                if str(value).strip()
+            ]
+            warning_summary = str(readiness.get("warning_summary") or warning_summary).strip()
         except Exception as exc:
             cache_validation_error = str(exc).strip()
         else:
@@ -16182,7 +16307,7 @@ def update_test_data_trending_project_workbook(
                 f"Cache sync mode={sync_mode}"
                 + (f", reason={sync_reason}" if sync_reason else "")
                 + ". "
-                + "Source counts: "
+                + "Excluded source counts: "
                 + f"missing={int(source_status_counts.get('missing') or 0)}, "
                 + f"invalid={int(source_status_counts.get('invalid') or 0)}, "
                 + f"non_ok={int(source_status_counts.get('non_ok') or 0)}. "
@@ -16192,6 +16317,8 @@ def update_test_data_trending_project_workbook(
             )
             _td_emit_progress(progress_cb, failure_message)
             raise RuntimeError(failure_message)
+        if warning_summary:
+            _td_emit_progress(progress_cb, warning_summary)
 
     timings["total_s"] = round(time.perf_counter() - total_started, 3)
     debug_payload = {
@@ -16202,6 +16329,11 @@ def update_test_data_trending_project_workbook(
         "cache_validation_summary": _td_cache_validation_summary_line(cache_state_summary),
         "cache_debug_path": str(cache_debug_path or "").strip(),
         "backend_module_path": backend_module_path,
+        "compiled_serials": list(compiled_serials),
+        "compiled_serials_count": int(len(compiled_serials)),
+        "excluded_sources": list(excluded_sources),
+        "excluded_sources_count": int(len(excluded_sources)),
+        "warning_summary": warning_summary,
     }
 
     return {
@@ -16211,8 +16343,14 @@ def update_test_data_trending_project_workbook(
         "missing_source": int(src_missing),
         "missing_value": int(missing_value),
         "serials_in_workbook": int(len(serials)),
+        "serials_with_source": int(len(compiled_serials)),
         "serials_added": int(len(added_serials)),
         "added_serials": list(added_serials),
+        "compiled_serials": list(compiled_serials),
+        "compiled_serials_count": int(len(compiled_serials)),
+        "excluded_sources": list(excluded_sources),
+        "excluded_sources_count": int(len(excluded_sources)),
+        "warning_summary": warning_summary,
         "dry_run": bool(dry_run),
         "cache_sync_mode": str(cache_sync_payload.get("mode") or ""),
         "cache_sync_counts": dict(cache_sync_payload.get("counts") or {}),
