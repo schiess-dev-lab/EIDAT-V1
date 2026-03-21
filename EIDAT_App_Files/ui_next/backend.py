@@ -6791,7 +6791,11 @@ def _td_collect_project_readiness(project_dir: Path, workbook_path: Path) -> dic
         refresh_mode = str(state.get("mode") or "").strip().lower()
         if refresh_mode and refresh_mode != "none":
             reason = str(state.get("reason") or "project cache is stale").strip() or "project cache is stale"
-            problems.append(f"Project cache is stale: {reason}.")
+            stale_message = f"Project cache is stale: {reason}."
+            if refresh_mode == "calc":
+                warnings.append(stale_message)
+            else:
+                problems.append(stale_message)
 
         with closing(sqlite3.connect(str(db_path))) as conn:
             _ensure_test_data_impl_tables(conn)
@@ -6887,10 +6891,13 @@ def _td_collect_project_readiness(project_dir: Path, workbook_path: Path) -> dic
             summary["workbook_outputs"] = workbook_outputs
             for problem in workbook_outputs.get("problems") or []:
                 if str(problem).strip():
-                    problems.append(str(problem).strip())
+                    warnings.append(str(problem).strip())
 
+    deduped_warnings = list(dict.fromkeys([str(warning).strip() for warning in warnings if str(warning).strip()]))
+    if deduped_warnings:
+        summary["warnings"] = list(deduped_warnings)
     readiness["summary"] = summary
-    readiness["warnings"] = list(dict.fromkeys([str(warning).strip() for warning in warnings if str(warning).strip()]))
+    readiness["warnings"] = deduped_warnings
     readiness["problems"] = list(dict.fromkeys([str(problem).strip() for problem in problems if str(problem).strip()]))
     return readiness
 
@@ -16250,6 +16257,7 @@ def update_test_data_trending_project_workbook(
 
     cache_state_summary: dict[str, object] = {}
     readiness: dict[str, object] = {}
+    readiness_warnings: list[str] = []
     cache_validation_ok = False
     cache_validation_error = ""
     cache_debug_path = str(cache_sync_payload.get("debug_path") or "").strip()
@@ -16266,6 +16274,11 @@ def update_test_data_trending_project_workbook(
             compiled_serials = [
                 str(value).strip()
                 for value in (readiness.get("compiled_serials") or [])
+                if str(value).strip()
+            ]
+            readiness_warnings = [
+                str(value).strip()
+                for value in (readiness.get("warnings") or [])
                 if str(value).strip()
             ]
             warning_summary = str(readiness.get("warning_summary") or warning_summary).strip()
@@ -16334,6 +16347,7 @@ def update_test_data_trending_project_workbook(
         "excluded_sources": list(excluded_sources),
         "excluded_sources_count": int(len(excluded_sources)),
         "warning_summary": warning_summary,
+        "cache_validation_warnings": list(readiness_warnings),
     }
 
     return {
@@ -16361,6 +16375,7 @@ def update_test_data_trending_project_workbook(
         "cache_validation_ok": bool(cache_validation_ok),
         "cache_validation_error": str(cache_validation_error or "").strip(),
         "cache_validation_summary": str(debug_payload.get("cache_validation_summary") or "").strip(),
+        "cache_validation_warnings": list(readiness_warnings),
         "cache_debug_path": str(cache_debug_path or "").strip(),
         "backend_module_path": backend_module_path,
         "debug_json": json.dumps(debug_payload, separators=(",", ":")),

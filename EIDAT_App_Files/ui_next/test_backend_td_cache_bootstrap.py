@@ -757,44 +757,55 @@ class TestBackendTdCacheBootstrap(unittest.TestCase):
                     backend.update_test_data_trending_project_workbook(project_dir, workbook_path)
             self.assertIn("Project cache has no compiled Test Data sources", str(ctx.exception))
 
-    def test_update_fails_when_compiled_outputs_validate_incomplete(self) -> None:
+    def test_update_succeeds_when_post_build_validation_has_only_nonfatal_diagnostics(self) -> None:
         if Workbook is None:
             self.skipTest("openpyxl is required for TD readiness tests")
         with tempfile.TemporaryDirectory() as tmpdir:
             project_dir = Path(tmpdir) / "project"
             workbook_path, _impl_db, _raw_db = _create_ready_td_project_fixture(project_dir)
-            failed_readiness = {
+            tolerated_readiness = {
                 "summary": {
-                    "mode": "none",
-                    "reason": "",
+                    "mode": "calc",
+                    "reason": "selected statistics changed",
                     "impl_complete": True,
                     "raw_complete": True,
+                    "workbook_outputs": {
+                        "ok": False,
+                        "problems": ["Project workbook outputs are incomplete: RawCache_long has no data rows."],
+                    },
                 },
                 "compiled_serials": ["SN-001"],
                 "excluded_sources": [],
                 "warning_summary": "",
-                "problems": ["Project workbook outputs are incomplete: RawCache_long has no data rows."],
+                "warnings": [
+                    "Project cache is stale: selected statistics changed.",
+                    "Project workbook outputs are incomplete: RawCache_long has no data rows.",
+                ],
+                "problems": [],
             }
             with _td_update_context(project_dir, workbook_path), patch.object(
                 backend,
                 "_td_collect_project_readiness",
-                return_value=failed_readiness,
+                return_value=tolerated_readiness,
             ):
-                with self.assertRaises(RuntimeError) as ctx:
-                    backend.update_test_data_trending_project_workbook(
-                        project_dir,
-                        workbook_path,
-                        require_existing_cache=False,
-                    )
-            self.assertIn("Project workbook outputs are incomplete", str(ctx.exception))
-            self.assertIn("RawCache_long", str(ctx.exception))
+                payload = backend.update_test_data_trending_project_workbook(
+                    project_dir,
+                    workbook_path,
+                    require_existing_cache=False,
+                )
+            self.assertTrue(payload["cache_validation_ok"])
+            self.assertEqual(str(payload.get("cache_validation_error") or ""), "")
+            self.assertEqual(str((payload.get("cache_state") or {}).get("mode") or ""), "calc")
+            warnings = [str(value).strip() for value in (payload.get("cache_validation_warnings") or []) if str(value).strip()]
+            self.assertTrue(any("selected statistics changed" in warning for warning in warnings))
+            self.assertTrue(any("RawCache_long" in warning for warning in warnings))
 
-    def test_ready_validator_rejects_workbook_output_mismatch(self) -> None:
+    def test_ready_validator_allows_workbook_output_mismatch_as_warning(self) -> None:
         if Workbook is None:
             self.skipTest("openpyxl is required for TD readiness tests")
         with tempfile.TemporaryDirectory() as tmpdir:
             project_dir = Path(tmpdir) / "project"
-            workbook_path, _impl_db, _raw_db = _create_ready_td_project_fixture(project_dir)
+            workbook_path, impl_db, _raw_db = _create_ready_td_project_fixture(project_dir)
             from openpyxl import load_workbook  # type: ignore
 
             wb_existing = load_workbook(str(workbook_path))
@@ -806,17 +817,20 @@ class TestBackendTdCacheBootstrap(unittest.TestCase):
                 wb_existing.close()
 
             with _td_validation_context():
-                with self.assertRaises(RuntimeError) as ctx:
-                    backend.validate_existing_test_data_project_cache(project_dir, workbook_path)
-            self.assertIn("Project workbook outputs are incomplete", str(ctx.exception))
-            self.assertIn("RawCache_long", str(ctx.exception))
+                self.assertEqual(
+                    backend.validate_existing_test_data_project_cache(project_dir, workbook_path),
+                    impl_db,
+                )
+                readiness = backend._td_collect_project_readiness(project_dir, workbook_path)
+            self.assertEqual(readiness["problems"], [])
+            self.assertTrue(any("RawCache_long" in warning for warning in readiness["warnings"]))
 
-    def test_ready_validator_rejects_missing_metrics_long_sheet(self) -> None:
+    def test_ready_validator_allows_missing_metrics_long_sheet_as_warning(self) -> None:
         if Workbook is None:
             self.skipTest("openpyxl is required for TD readiness tests")
         with tempfile.TemporaryDirectory() as tmpdir:
             project_dir = Path(tmpdir) / "project"
-            workbook_path, _impl_db, _raw_db = _create_ready_td_project_fixture(project_dir)
+            workbook_path, impl_db, _raw_db = _create_ready_td_project_fixture(project_dir)
             from openpyxl import load_workbook  # type: ignore
 
             wb_existing = load_workbook(str(workbook_path))
@@ -827,17 +841,20 @@ class TestBackendTdCacheBootstrap(unittest.TestCase):
                 wb_existing.close()
 
             with _td_validation_context():
-                with self.assertRaises(RuntimeError) as ctx:
-                    backend.validate_existing_test_data_project_cache(project_dir, workbook_path)
-            self.assertIn("Project workbook outputs are incomplete", str(ctx.exception))
-            self.assertIn("Metrics_long", str(ctx.exception))
+                self.assertEqual(
+                    backend.validate_existing_test_data_project_cache(project_dir, workbook_path),
+                    impl_db,
+                )
+                readiness = backend._td_collect_project_readiness(project_dir, workbook_path)
+            self.assertEqual(readiness["problems"], [])
+            self.assertTrue(any("Metrics_long" in warning for warning in readiness["warnings"]))
 
-    def test_ready_validator_rejects_data_calc_without_generated_metric_rows(self) -> None:
+    def test_ready_validator_allows_data_calc_without_generated_metric_rows_as_warning(self) -> None:
         if Workbook is None:
             self.skipTest("openpyxl is required for TD readiness tests")
         with tempfile.TemporaryDirectory() as tmpdir:
             project_dir = Path(tmpdir) / "project"
-            workbook_path, _impl_db, _raw_db = _create_ready_td_project_fixture(project_dir)
+            workbook_path, impl_db, _raw_db = _create_ready_td_project_fixture(project_dir)
             from openpyxl import load_workbook  # type: ignore
 
             wb_existing = load_workbook(str(workbook_path))
@@ -850,10 +867,34 @@ class TestBackendTdCacheBootstrap(unittest.TestCase):
                 wb_existing.close()
 
             with _td_validation_context():
-                with self.assertRaises(RuntimeError) as ctx:
-                    backend.validate_existing_test_data_project_cache(project_dir, workbook_path)
-            self.assertIn("Project workbook outputs are incomplete", str(ctx.exception))
-            self.assertIn("Data_calc", str(ctx.exception))
+                self.assertEqual(
+                    backend.validate_existing_test_data_project_cache(project_dir, workbook_path),
+                    impl_db,
+                )
+                readiness = backend._td_collect_project_readiness(project_dir, workbook_path)
+            self.assertEqual(readiness["problems"], [])
+            self.assertTrue(any("Data_calc" in warning for warning in readiness["warnings"]))
+
+    def test_ready_validator_allows_calc_only_staleness_as_warning(self) -> None:
+        if Workbook is None:
+            self.skipTest("openpyxl is required for TD readiness tests")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir) / "project"
+            workbook_path, impl_db, _raw_db = _create_ready_td_project_fixture(project_dir)
+            calc_stale_cfg = {"statistics": ["mean"], "columns": list(TEST_TD_COLUMNS)}
+
+            with _td_validation_context(), patch.object(
+                backend,
+                "_load_project_td_trend_config",
+                return_value=calc_stale_cfg,
+            ):
+                self.assertEqual(
+                    backend.validate_existing_test_data_project_cache(project_dir, workbook_path),
+                    impl_db,
+                )
+                readiness = backend._td_collect_project_readiness(project_dir, workbook_path)
+            self.assertEqual(readiness["problems"], [])
+            self.assertTrue(any("selected statistics changed" in warning for warning in readiness["warnings"]))
 
 
 if __name__ == "__main__":

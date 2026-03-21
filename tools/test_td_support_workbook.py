@@ -2872,6 +2872,48 @@ class TestTDSupportWorkbook(unittest.TestCase):
             rebuild_mock.assert_not_called()
             calc_mock.assert_called_once_with(root / "implementation_trending.sqlite3", wb_path, progress_cb=None)
 
+    def test_validate_existing_cache_allows_calc_only_staleness_after_support_change(self) -> None:
+        from openpyxl import load_workbook  # type: ignore
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            src_db = root / "src.sqlite3"
+            self._make_source_sqlite(src_db)
+
+            wb_path = root / "project.xlsx"
+            be._write_test_data_trending_workbook(
+                wb_path,
+                global_repo=root,
+                serials=["SN1"],
+                docs=[{"serial_number": "SN1", "excel_sqlite_rel": str(src_db)}],
+                config=self._make_config(),
+            )
+            support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+            be._write_td_support_workbook(
+                support_path,
+                sequence_names=["RunA"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+            )
+            be.ensure_test_data_project_cache(root, wb_path, rebuild=True)
+
+            wb = load_workbook(str(support_path))
+            try:
+                ws_settings = wb["Settings"]
+                ws_settings.cell(3, 2).value = 3
+                wb.save(str(support_path))
+            finally:
+                wb.close()
+
+            validated = be.validate_existing_test_data_project_cache(root, wb_path)
+            readiness = be._td_collect_project_readiness(root, wb_path)
+
+            self.assertEqual(str(validated), str(root / "implementation_trending.sqlite3"))
+            self.assertEqual(readiness["problems"], [])
+            self.assertTrue(
+                any("support workbook changed" in str(warning).lower() for warning in (readiness.get("warnings") or []))
+            )
+
     def test_ensure_cache_uses_calc_only_refresh_after_statistics_change(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
 
@@ -3601,7 +3643,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 config=self._make_config(),
             )
 
-            with self.assertRaisesRegex(RuntimeError, "Build / Refresh Cache"):
+            with self.assertRaisesRegex(RuntimeError, "Project cache DB not found|Project raw cache DB not found"):
                 be.validate_existing_test_data_project_cache(root, wb_path)
 
             support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
