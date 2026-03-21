@@ -396,9 +396,11 @@ class _RunSelectionHarness:
         self.btn_open_all_auto = QtWidgets.QPushButton()
         self.btn_delete_auto = QtWidgets.QPushButton()
         self.btn_save_all_auto = QtWidgets.QPushButton()
+        self.btn_view_auto_plots = QtWidgets.QPushButton()
         self._plot_ready = True
         self._db_path = "db.sqlite3"
         self._auto_plots = []
+        self._auto_plot_path = Path(tempfile.mkdtemp()) / "auto_plots_test_data.json"
         self._run_selection_views = {"sequence": [], "condition": []}
         self._run_display_by_name = {}
         self._run_name_by_display = {}
@@ -424,12 +426,16 @@ class _RunSelectionHarness:
             "_select_run_by_id",
             "_selection_from_plot_def",
             "_populate_metric_condition_list",
+            "_sync_main_auto_plot_actions",
+            "_auto_plot_display_name",
+            "_selected_auto_plot_definitions",
             "_refresh_run_selection_visibility",
             "_on_metric_condition_selection_changed",
             "_refresh_run_dropdown",
             "_refresh_auto_plots_list",
             "_update_auto_actions",
             "_open_selected_auto_plot",
+            "_delete_selected_auto_plots",
         ):
             setattr(self, name, getattr(TestDataTrendDialog, name).__get__(self, _RunSelectionHarness))
 
@@ -495,6 +501,15 @@ class _MetricBoundsHarness:
         self._project_dir = Path(project_dir)
         self._workbook_path = Path(workbook_path)
         self._metric_bounds_for_run = TestDataTrendDialog._metric_bounds_for_run.__get__(self, _MetricBoundsHarness)
+
+
+def _build_test_data_dialog():
+    _qt_app()
+    from EIDAT_App_Files.ui_next.qt_main import TestDataTrendDialog  # type: ignore
+
+    with mock.patch.object(TestDataTrendDialog, "_load_cache", lambda self, rebuild=False: None):
+        with mock.patch.object(TestDataTrendDialog, "_load_auto_plots", lambda self: None):
+            return TestDataTrendDialog(Path(tempfile.mkdtemp()), Path(tempfile.mkdtemp()) / "project.xlsx")
 
 
 @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
@@ -852,6 +867,217 @@ class TestTDTrendDialogCacheLoading(unittest.TestCase):
         self.assertIn("implementation_trending.xlsx", info_args[2])
         self.assertIn("test_data_raw_cache.xlsx", info_args[2])
         self.assertIn("test_data_raw_points.xlsx", info_args[2])
+
+
+@unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
+class TestTDTrendDialogLayout(unittest.TestCase):
+    def test_metrics_y_columns_section_preserves_selection_when_collapsed(self) -> None:
+        dlg = _build_test_data_dialog()
+        try:
+            from PySide6 import QtWidgets
+
+            for name in ("thrust", "current"):
+                dlg.list_y_metrics.addItem(QtWidgets.QListWidgetItem(name))
+            dlg.list_y_metrics.item(1).setSelected(True)
+
+            dlg.section_metrics_y_columns.set_expanded(False)
+            dlg.section_metrics_y_columns.set_expanded(True)
+
+            self.assertTrue(dlg.list_y_metrics.item(1).isSelected())
+        finally:
+            dlg.close()
+
+    def test_curve_axes_section_preserves_combo_values_when_collapsed(self) -> None:
+        dlg = _build_test_data_dialog()
+        try:
+            dlg.cb_y_curve.addItems(["thrust", "current"])
+            dlg.cb_x.addItems(["Time", "Pulse Number"])
+            dlg.cb_y_curve.setCurrentText("current")
+            dlg.cb_x.setCurrentText("Pulse Number")
+
+            dlg.section_curve_axes.set_expanded(False)
+            dlg.section_curve_axes.set_expanded(True)
+
+            self.assertEqual(dlg.cb_y_curve.currentText(), "current")
+            self.assertEqual(dlg.cb_x.currentText(), "Pulse Number")
+        finally:
+            dlg.close()
+
+    def test_performance_equations_section_defaults_collapsed_without_fixed_minimum_height(self) -> None:
+        dlg = _build_test_data_dialog()
+        try:
+            self.assertFalse(dlg.section_perf_equations.is_expanded())
+            self.assertEqual(dlg.tbl_perf_equations.minimumHeight(), 0)
+        finally:
+            dlg.close()
+
+    def test_view_auto_plots_button_tracks_saved_plot_availability_and_opens_popup(self) -> None:
+        dlg = _build_test_data_dialog()
+        try:
+            dlg._plot_ready = True
+            dlg._db_path = Path(tempfile.mkdtemp()) / "cache.sqlite3"
+            dlg._auto_plots = []
+            dlg._sync_main_auto_plot_actions()
+            self.assertFalse(dlg.btn_view_auto_plots.isEnabled())
+
+            dlg._auto_plots = [{"name": "Plot 1", "mode": "curves", "y": ["thrust"], "x": "Time"}]
+            dlg._sync_main_auto_plot_actions()
+            self.assertTrue(dlg.btn_view_auto_plots.isEnabled())
+
+            with mock.patch("PySide6.QtWidgets.QDialog.exec", return_value=0) as exec_mock:
+                dlg._open_auto_plots_popup()
+
+            exec_mock.assert_called_once()
+        finally:
+            dlg.close()
+
+    def test_test_data_dialog_show_event_fits_to_screen(self) -> None:
+        dlg = _build_test_data_dialog()
+        try:
+            from PySide6 import QtGui
+
+            with mock.patch("EIDAT_App_Files.ui_next.qt_main._fit_widget_to_screen") as fit_mock:
+                dlg.showEvent(QtGui.QShowEvent())
+
+            fit_mock.assert_called_once_with(dlg)
+        finally:
+            dlg.close()
+
+    def test_popup_auto_plot_open_selected_uses_supplied_list_widget(self) -> None:
+        _qt_app()
+        from PySide6 import QtWidgets
+
+        harness = _RunSelectionHarness()
+        harness._run_selection_views["condition"] = [
+            {
+                "mode": "condition",
+                "id": "condition:seq1",
+                "run_name": "Seq1",
+                "display_text": "350 psia, SS",
+                "run_condition": "350 psia, SS",
+                "member_runs": ["Seq1"],
+                "member_sequences": ["Seq1", "Seq2"],
+                "details_text": "Source Sequences: Seq1, Seq2",
+            },
+            {
+                "mode": "condition",
+                "id": "condition:seq3",
+                "run_name": "Seq3",
+                "display_text": "410 psia, PM",
+                "run_condition": "410 psia, PM",
+                "member_runs": ["Seq3"],
+                "member_sequences": ["Seq3"],
+                "details_text": "Source Sequences: Seq3",
+            },
+        ]
+        harness._auto_plots = [
+            {
+                "mode": "metrics",
+                "selector_mode": "condition",
+                "selection_id": "condition:multi:condition:seq1|condition:seq3",
+                "selection_ids": ["condition:seq1", "condition:seq3"],
+                "selection_labels": ["350 psia, SS", "410 psia, PM"],
+                "run_conditions": ["350 psia, SS", "410 psia, PM"],
+                "member_runs": ["Seq1", "Seq3"],
+                "member_sequences": ["Seq1", "Seq2", "Seq3"],
+                "stats": ["mean"],
+                "y": ["thrust"],
+            }
+        ]
+        popup_list = QtWidgets.QListWidget()
+        popup_list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        harness._refresh_auto_plots_list(popup_list)
+        popup_list.item(0).setSelected(True)
+
+        harness._open_selected_auto_plot(list_widget=popup_list)
+
+        self.assertEqual(harness.checked_condition_ids(), ["condition:seq1", "condition:seq3"])
+        self.assertTrue(harness._plot_metrics_called)
+
+    def test_popup_auto_plot_delete_updates_saved_definitions_and_list(self) -> None:
+        _qt_app()
+        from PySide6 import QtWidgets
+
+        harness = _RunSelectionHarness()
+        harness._auto_plots = [
+            {"name": "Plot 1", "mode": "metrics", "stats": ["mean"], "y": ["thrust"]},
+            {"name": "Plot 2", "mode": "curves", "y": ["current"], "x": "Time"},
+        ]
+        popup_list = QtWidgets.QListWidget()
+        popup_list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        harness._refresh_auto_plots_list(popup_list)
+        popup_list.item(0).setSelected(True)
+
+        harness._delete_selected_auto_plots(list_widget=popup_list)
+
+        self.assertEqual([d.get("name") for d in harness._auto_plots], ["Plot 2"])
+        self.assertEqual(popup_list.count(), 1)
+        self.assertEqual(popup_list.item(0).text(), "Plot 2")
+
+    @unittest.skipUnless(_have_matplotlib(), "matplotlib not installed")
+    def test_open_all_auto_plots_panel_still_opens(self) -> None:
+        _qt_app()
+        from PySide6 import QtWidgets
+        from matplotlib.figure import Figure
+
+        class _DummyCanvas(QtWidgets.QWidget):
+            def __init__(self, figure) -> None:
+                super().__init__()
+                self.figure = figure
+
+            def mpl_connect(self, *_args, **_kwargs) -> int:
+                return 0
+
+            def draw_idle(self) -> None:
+                return None
+
+        dlg = _build_test_data_dialog()
+        try:
+            dlg._plot_ready = True
+            dlg._db_path = Path(tempfile.mkdtemp()) / "cache.sqlite3"
+            dlg._auto_plots = [{"name": "Plot 1", "mode": "metrics", "stats": ["mean"], "y": ["thrust"]}]
+
+            with mock.patch.object(dlg, "_render_plot_def_to_figure", return_value=Figure()):
+                with mock.patch("matplotlib.backends.backend_qtagg.FigureCanvasQTAgg", _DummyCanvas):
+                    with mock.patch("PySide6.QtWidgets.QDialog.exec", return_value=0) as exec_mock:
+                        dlg._open_all_auto_plots_panel()
+
+            exec_mock.assert_called_once()
+        finally:
+            dlg.close()
+
+    @unittest.skipUnless(_have_matplotlib(), "matplotlib not installed")
+    def test_save_all_auto_plots_pdf_still_exports_all_saved_plots(self) -> None:
+        saved_figures: list[object] = []
+
+        class _DummyPdfPages:
+            def __init__(self, _path: str) -> None:
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> None:
+                return None
+
+            def savefig(self, fig) -> None:
+                saved_figures.append(fig)
+
+        dlg = _build_test_data_dialog()
+        try:
+            dlg._plot_ready = True
+            dlg._db_path = Path(tempfile.mkdtemp()) / "cache.sqlite3"
+            dlg._auto_plots = [{"name": "Plot 1", "mode": "metrics", "stats": ["mean"], "y": ["thrust"]}]
+
+            with mock.patch("PySide6.QtWidgets.QFileDialog.getSaveFileName", return_value=("C:/tmp/auto.pdf", "PDF")):
+                with mock.patch("matplotlib.backends.backend_pdf.PdfPages", _DummyPdfPages):
+                    with mock.patch.object(dlg, "_render_plot_def_to_figure", return_value=object()) as render_mock:
+                        dlg._save_all_auto_plots_pdf()
+
+            render_mock.assert_called_once()
+            self.assertEqual(len(saved_figures), 1)
+        finally:
+            dlg.close()
 
 
 @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")

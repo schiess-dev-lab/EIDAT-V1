@@ -15,12 +15,13 @@ if str(APP_ROOT) not in sys.path:
 
 try:
     from PySide6 import QtCore, QtWidgets
-    from ui_next.qt_main import MainWindow, ProjectTaskWorker
+    from ui_next.qt_main import MainWindow, ProjectTaskWorker, TestDataTrendDialog
 except Exception:  # pragma: no cover - optional dependency guard for local runs
     QtCore = None  # type: ignore[assignment]
     QtWidgets = None  # type: ignore[assignment]
     MainWindow = None  # type: ignore[assignment]
     ProjectTaskWorker = None  # type: ignore[assignment]
+    TestDataTrendDialog = None  # type: ignore[assignment]
 
 
 class _DummyRepoScanDialog:
@@ -173,3 +174,33 @@ class TestProjectTaskWorker(unittest.TestCase):
         self.assertTrue(any("SN-002 (docs/sn002.json)" in log for log in dummy.logs))
         self.assertEqual(dummy.toasts, ["Project updated with warnings: 12 cell(s)"])
         self.assertIn("with warnings", result)
+
+    def test_test_data_trend_load_cache_uses_fast_open_validator(self) -> None:
+        class _DummyTrendDialog:
+            def __init__(self) -> None:
+                self._project_dir = Path("C:/temp/project")
+                self._workbook_path = Path("C:/temp/project/project.xlsx")
+                self.lbl_source = QtWidgets.QLabel("")
+                self.lbl_cache = QtWidgets.QLabel("")
+                self._db_path = None
+                self.refresh_calls = 0
+                self.zoom_calls = 0
+
+            def _refresh_from_cache(self) -> None:
+                self.refresh_calls += 1
+
+            def _update_plot_zoom_actions(self) -> None:
+                self.zoom_calls += 1
+
+        dummy = _DummyTrendDialog()
+        expected_db = Path("C:/temp/project/implementation_trending.sqlite3")
+
+        with patch("ui_next.qt_main.be.validate_test_data_project_cache_for_open", return_value=expected_db) as open_validate_mock:
+            TestDataTrendDialog._load_cache(dummy, rebuild=False)
+
+        open_validate_mock.assert_called_once_with(dummy._project_dir, dummy._workbook_path)
+        self.assertEqual(dummy._db_path, expected_db)
+        self.assertEqual(dummy.lbl_source.text(), str(expected_db))
+        self.assertEqual(dummy.lbl_cache.text(), f"Cache DB: {expected_db}")
+        self.assertEqual(dummy.refresh_calls, 1)
+        self.assertEqual(dummy.zoom_calls, 1)

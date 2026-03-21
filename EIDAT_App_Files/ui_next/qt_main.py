@@ -46,6 +46,68 @@ def _fit_widget_to_screen(widget: QtWidgets.QWidget, margin: int = 40) -> None:
         pass
 
 
+class _CollapsibleSection(QtWidgets.QFrame):
+    toggled = QtCore.Signal(bool)
+
+    def __init__(self, title: str, body: QtWidgets.QWidget, *, expanded: bool = True, parent=None):
+        super().__init__(parent)
+        self._body = body
+        self._expanded = False
+        self.setStyleSheet("QFrame { background: transparent; border: 0; }")
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        self.btn_toggle = QtWidgets.QToolButton(self)
+        self.btn_toggle.setCheckable(True)
+        self.btn_toggle.setChecked(bool(expanded))
+        self.btn_toggle.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.btn_toggle.setStyleSheet(
+            """
+            QToolButton {
+                background: #ffffff;
+                border: 1px solid #e2e8f0;
+                border-radius: 8px;
+                padding: 6px 10px;
+                font-size: 12px;
+                font-weight: 800;
+                color: #0f172a;
+                text-align: left;
+            }
+            QToolButton:hover { background: #f8fafc; }
+            """
+        )
+        self.btn_toggle.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Fixed,
+        )
+        self.btn_toggle.clicked.connect(lambda checked: self.set_expanded(bool(checked)))
+        layout.addWidget(self.btn_toggle)
+        layout.addWidget(self._body)
+        self.set_title(title)
+        self.set_expanded(bool(expanded))
+
+    def set_title(self, title: str) -> None:
+        self.btn_toggle.setText(str(title or "").strip())
+
+    def is_expanded(self) -> bool:
+        return self._expanded
+
+    def set_expanded(self, expanded: bool) -> None:
+        expanded = bool(expanded)
+        self._expanded = expanded
+        self.btn_toggle.blockSignals(True)
+        self.btn_toggle.setChecked(expanded)
+        self.btn_toggle.setArrowType(
+            QtCore.Qt.ArrowType.DownArrow if expanded else QtCore.Qt.ArrowType.RightArrow
+        )
+        self.btn_toggle.blockSignals(False)
+        self._body.setVisible(expanded)
+        self.updateGeometry()
+        self.toggled.emit(expanded)
+
+
 def _td_serial_metadata_by_serial(rows: list[dict]) -> dict[str, dict]:
     by_sn: dict[str, dict] = {}
     for row in rows or []:
@@ -3079,7 +3141,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._cache_progress_timer.timeout.connect(self._show_cache_progress_dialog)
 
         self.setWindowTitle("Test Data - Trend / Analyze")
-        self.resize(1020, 680)
+        self.resize(920, 620)
         self.setStyleSheet(
             """
             QDialog { background: #f8fafc; color: #0f172a; }
@@ -3114,14 +3176,21 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
         splitter = QtWidgets.QSplitter()
         splitter.setOrientation(QtCore.Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
         root.addWidget(splitter)
 
         # Left panel: controls
+        left_scroll = QtWidgets.QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        left_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        left_scroll.setStyleSheet("QScrollArea { background: transparent; border: 0; }")
         left = QtWidgets.QFrame()
         left.setStyleSheet("QFrame { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 10px; }")
         left_layout = QtWidgets.QVBoxLayout(left)
         left_layout.setContentsMargins(12, 12, 12, 12)
         left_layout.setSpacing(10)
+        left_scroll.setWidget(left)
 
         title = QtWidgets.QLabel("Test Data Trend / Analyze")
         title.setStyleSheet("font-size: 14px; font-weight: 700;")
@@ -3228,14 +3297,15 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         metrics_layout.setContentsMargins(10, 10, 10, 10)
         metrics_layout.setSpacing(8)
 
-        lbl_y_multi = QtWidgets.QLabel("Y Columns (multi-select)")
-        lbl_y_multi.setStyleSheet("font-size: 12px; font-weight: 700; color: #334155;")
-        metrics_layout.addWidget(lbl_y_multi)
+        metrics_y_body = QtWidgets.QWidget()
+        metrics_y_layout = QtWidgets.QVBoxLayout(metrics_y_body)
+        metrics_y_layout.setContentsMargins(0, 0, 0, 0)
+        metrics_y_layout.setSpacing(8)
 
         self.list_y_metrics = QtWidgets.QListWidget()
         self.list_y_metrics.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
         self.list_y_metrics.itemSelectionChanged.connect(self._refresh_stats_preview)
-        metrics_layout.addWidget(self.list_y_metrics, 1)
+        metrics_y_layout.addWidget(self.list_y_metrics, 1)
 
         y_sel_row = QtWidgets.QHBoxLayout()
         self.btn_y_select_all = QtWidgets.QPushButton("Select All")
@@ -3245,7 +3315,14 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         y_sel_row.addWidget(self.btn_y_select_all)
         y_sel_row.addWidget(self.btn_y_clear_all)
         y_sel_row.addStretch(1)
-        metrics_layout.addLayout(y_sel_row)
+        metrics_y_layout.addLayout(y_sel_row)
+
+        self.section_metrics_y_columns = _CollapsibleSection(
+            "Y Columns (multi-select)",
+            metrics_y_body,
+            expanded=True,
+        )
+        metrics_layout.addWidget(self.section_metrics_y_columns, 1)
 
         lbl_stats = QtWidgets.QLabel("Stats (multi-select)")
         lbl_stats.setStyleSheet("font-size: 12px; font-weight: 700; color: #334155;")
@@ -3282,19 +3359,31 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         curves_layout.setContentsMargins(10, 10, 10, 10)
         curves_layout.setSpacing(8)
 
+        curves_axes_body = QtWidgets.QWidget()
+        curves_axes_layout = QtWidgets.QVBoxLayout(curves_axes_body)
+        curves_axes_layout.setContentsMargins(0, 0, 0, 0)
+        curves_axes_layout.setSpacing(8)
+
         row_y_curve = QtWidgets.QHBoxLayout()
         row_y_curve.addWidget(QtWidgets.QLabel("Y Column:"))
         self.cb_y_curve = QtWidgets.QComboBox()
         self.cb_y_curve.currentIndexChanged.connect(self._refresh_stats_preview)
         row_y_curve.addWidget(self.cb_y_curve, 1)
-        curves_layout.addLayout(row_y_curve)
+        curves_axes_layout.addLayout(row_y_curve)
 
         row_curves = QtWidgets.QHBoxLayout()
         self.cb_x = QtWidgets.QComboBox()
         self.cb_x.currentIndexChanged.connect(self._refresh_curve_y_columns)
         row_curves.addWidget(QtWidgets.QLabel("X Column:"))
         row_curves.addWidget(self.cb_x, 1)
-        curves_layout.addLayout(row_curves)
+        curves_axes_layout.addLayout(row_curves)
+
+        self.section_curve_axes = _CollapsibleSection(
+            "Curve Axes",
+            curves_axes_body,
+            expanded=True,
+        )
+        curves_layout.addWidget(self.section_curve_axes)
 
         # Performance tab (candidate discovery + project-wide plotting)
         tab_perf = QtWidgets.QWidget()
@@ -3422,6 +3511,11 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         view_row.addWidget(self.cb_perf_view_stat, 1)
         perf_plot_layout.addLayout(view_row)
 
+        perf_eq_body = QtWidgets.QWidget()
+        perf_eq_layout = QtWidgets.QVBoxLayout(perf_eq_body)
+        perf_eq_layout.setContentsMargins(0, 0, 0, 0)
+        perf_eq_layout.setSpacing(8)
+
         eq_row = QtWidgets.QHBoxLayout()
         lbl_eq = QtWidgets.QLabel("Equations (per stat)")
         lbl_eq.setStyleSheet("font-size: 12px; font-weight: 700; color: #0f172a;")
@@ -3436,7 +3530,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self.btn_perf_export_equations = QtWidgets.QPushButton("Export Equation to Excel")
         self.btn_perf_export_equations.setEnabled(False)
         eq_row.addWidget(self.btn_perf_export_equations)
-        perf_plot_layout.addLayout(eq_row)
+        perf_eq_layout.addLayout(eq_row)
 
         self.tbl_perf_equations = QtWidgets.QTableWidget(0, 9)
         self.tbl_perf_equations.setHorizontalHeaderLabels(
@@ -3459,8 +3553,15 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             self.tbl_perf_equations.horizontalHeader().setStretchLastSection(True)
         except Exception:
             pass
-        self.tbl_perf_equations.setMinimumHeight(160)
-        perf_plot_layout.addWidget(self.tbl_perf_equations, 1)
+        self.tbl_perf_equations.setMinimumHeight(0)
+        perf_eq_layout.addWidget(self.tbl_perf_equations, 1)
+
+        self.section_perf_equations = _CollapsibleSection(
+            "Performance Equations",
+            perf_eq_body,
+            expanded=False,
+        )
+        perf_plot_layout.addWidget(self.section_perf_equations)
 
         tabs.addTab(tab_metrics, "Metrics")
         tabs.addTab(tab_curves, "Curves")
@@ -3538,8 +3639,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self.lbl_highlight_serials.setStyleSheet("color: #64748b; font-size: 11px;")
         self.lbl_highlight_serials.setWordWrap(True)
         left_layout.addWidget(self.lbl_highlight_serials)
+        left_layout.addStretch(1)
 
-        splitter.addWidget(left)
+        splitter.addWidget(left_scroll)
 
         # Right panel: plot + stats
         right = QtWidgets.QFrame()
@@ -3738,74 +3840,37 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self.btn_stats_toggle.toggled.connect(_toggle_stats)
         _toggle_stats(False)
 
-        # Bottom actions: saving + auto-plots (kept within plot panel; centered, not full-width)
+        # Bottom actions: saving + auto-plots
         self.btn_add_auto_plot = QtWidgets.QPushButton("Add to Auto-Plots")
         self.btn_add_auto_plot.setEnabled(False)
         self.btn_add_auto_plot.clicked.connect(self._add_current_plot_to_autoplots)
         self.btn_save_plot_pdf = QtWidgets.QPushButton("Save Plot PDF")
         self.btn_save_plot_pdf.setEnabled(False)
         self.btn_save_plot_pdf.clicked.connect(self._save_plot_pdf)
+        self.btn_view_auto_plots = QtWidgets.QPushButton("View Auto-Plots...")
+        self.btn_view_auto_plots.setEnabled(False)
+        self.btn_view_auto_plots.clicked.connect(self._open_auto_plots_popup)
         self.lbl_source = QtWidgets.QLabel("")
         self.lbl_source.setStyleSheet("color: #64748b; font-size: 11px;")
         self.lbl_source.setWordWrap(True)
 
-        self.list_auto_plots = QtWidgets.QListWidget()
-        self.list_auto_plots.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.list_auto_plots.itemDoubleClicked.connect(lambda *_: self._open_selected_auto_plot())
-        self.list_auto_plots.itemSelectionChanged.connect(self._update_auto_actions)
-        self.list_auto_plots.setMinimumHeight(110)
-        self.list_auto_plots.setMaximumHeight(160)
-
-        self.btn_open_auto = QtWidgets.QPushButton("Open")
-        self.btn_open_auto.setEnabled(False)
-        self.btn_open_auto.clicked.connect(self._open_selected_auto_plot)
-        self.btn_open_all_auto = QtWidgets.QPushButton("Open All")
-        self.btn_open_all_auto.setEnabled(False)
-        self.btn_open_all_auto.clicked.connect(self._open_all_auto_plots_panel)
-        self.btn_delete_auto = QtWidgets.QPushButton("Delete")
-        self.btn_delete_auto.setEnabled(False)
-        self.btn_delete_auto.clicked.connect(self._delete_selected_auto_plots)
-        self.btn_save_all_auto = QtWidgets.QPushButton("Save All PDF")
-        self.btn_save_all_auto.setEnabled(False)
-        self.btn_save_all_auto.clicked.connect(self._save_all_auto_plots_pdf)
-        self.btn_auto_report = QtWidgets.QPushButton("Auto Report…")
-        self.btn_auto_report.setEnabled(False)
-        self.btn_auto_report.clicked.connect(self._open_auto_report_options)
-
-        self._actions_frame = QtWidgets.QFrame()
-        self._actions_frame.setStyleSheet(
+        footer_frame = QtWidgets.QFrame()
+        footer_frame.setStyleSheet(
             "QFrame { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 10px; }"
         )
-        self._actions_frame.setMinimumHeight(130)
+        footer_layout = QtWidgets.QVBoxLayout(footer_frame)
+        footer_layout.setContentsMargins(10, 8, 10, 8)
+        footer_layout.setSpacing(8)
 
-        actions = QtWidgets.QVBoxLayout(self._actions_frame)
-        actions.setContentsMargins(10, 8, 10, 8)
-        actions.setSpacing(8)
-
-        # Ordered buttons row (current plot actions, then auto-plot list actions).
-        btn_row = QtWidgets.QHBoxLayout()
-        btn_row.setSpacing(8)
-        btn_row.addWidget(self.btn_add_auto_plot)
-        btn_row.addWidget(self.btn_save_plot_pdf)
-        btn_row.addSpacing(10)
-        btn_row.addWidget(self.btn_open_auto)
-        btn_row.addWidget(self.btn_open_all_auto)
-        btn_row.addWidget(self.btn_delete_auto)
-        btn_row.addWidget(self.btn_save_all_auto)
-        btn_row.addSpacing(10)
-        btn_row.addWidget(self.btn_auto_report)
-        btn_row.addStretch(1)
-        actions.addLayout(btn_row)
-
-        auto_lbl = QtWidgets.QLabel("Auto-Plots")
-        auto_lbl.setStyleSheet("font-size: 12px; font-weight: 800; color: #0f172a;")
-        actions.addWidget(auto_lbl)
-        self.list_auto_plots.setMaximumHeight(120)
-        self.list_auto_plots.setMinimumHeight(90)
-        actions.addWidget(self.list_auto_plots, 1)
-
-        actions.addWidget(self.lbl_source)
-        right_layout.addWidget(self._actions_frame, 2)
+        footer_row = QtWidgets.QHBoxLayout()
+        footer_row.setSpacing(8)
+        footer_row.addWidget(self.btn_add_auto_plot)
+        footer_row.addWidget(self.btn_save_plot_pdf)
+        footer_row.addWidget(self.btn_view_auto_plots)
+        footer_row.addStretch(1)
+        footer_layout.addLayout(footer_row)
+        footer_layout.addWidget(self.lbl_source)
+        right_layout.addWidget(footer_frame, 0)
 
         splitter.addWidget(right)
         splitter.setStretchFactor(0, 1)
@@ -3821,11 +3886,69 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._load_auto_plots()
         self._set_mode("curves")
 
+    def showEvent(self, event: QtGui.QShowEvent) -> None:  # type: ignore[override]
+        super().showEvent(event)
+        _fit_widget_to_screen(self)
+
     @staticmethod
     def _metric_title_suffix(stats: list[str] | tuple[str, ...] | None) -> str:
         items = [str(s).strip().lower() for s in (stats or []) if str(s).strip()]
         title_items = [s for s in items if s != "average"]
         return "/".join(title_items)
+
+    def _sync_main_auto_plot_actions(self) -> None:
+        enabled = bool(self._auto_plots) and self._plot_ready and bool(self._db_path)
+        if hasattr(self, "btn_view_auto_plots"):
+            self.btn_view_auto_plots.setEnabled(enabled)
+
+    def _auto_plot_display_name(self, plot_def: dict) -> str:
+        name = str((plot_def or {}).get("name") or "").strip()
+        if name:
+            return name
+        mode = str((plot_def or {}).get("mode") or "").strip().lower()
+        selection = self._selection_from_plot_def(plot_def or {})
+        run_disp = self._selection_display_text(selection) or str((plot_def or {}).get("run") or "").strip()
+        if mode == "curves":
+            y = ", ".join([str(x) for x in ((plot_def or {}).get("y") or []) if str(x).strip()])
+            x = str((plot_def or {}).get("x") or "").strip()
+            return f"Curves: {run_disp} {y} vs {x}".strip()
+        if mode == "performance":
+            output = str((plot_def or {}).get("output") or "").strip()
+            input1 = str((plot_def or {}).get("input1") or "").strip()
+            input2 = str((plot_def or {}).get("input2") or "").strip()
+            return (
+                f"Performance: {output} vs {input1},{input2}".strip()
+                if input2
+                else f"Performance: {output} vs {input1}".strip()
+            )
+        y = ", ".join([str(x) for x in ((plot_def or {}).get("y") or []) if str(x).strip()])
+        stats_val = (plot_def or {}).get("stats")
+        stats = (
+            [str(x).strip() for x in stats_val if str(x).strip()]
+            if isinstance(stats_val, list)
+            else []
+        )
+        if not stats:
+            st = str((plot_def or {}).get("stat") or "").strip()
+            if st:
+                stats = [st]
+        stats_label = self._metric_title_suffix(stats) or "metrics"
+        return f"Metrics: {run_disp} {stats_label} ({y})".strip()
+
+    def _selected_auto_plot_definitions(
+        self,
+        *,
+        list_widget: QtWidgets.QListWidget | None = None,
+    ) -> list[dict]:
+        widget = list_widget if list_widget is not None else getattr(self, "list_auto_plots", None)
+        if widget is None:
+            return []
+        out: list[dict] = []
+        for item in widget.selectedItems():
+            data = item.data(QtCore.Qt.ItemDataRole.UserRole)
+            if isinstance(data, dict):
+                out.append(dict(data))
+        return out
 
     def _init_plot_area(self, layout: QtWidgets.QVBoxLayout) -> None:
         try:
@@ -4128,11 +4251,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     getattr(self, b).setEnabled(enabled)
                 except Exception:
                     pass
-        # Auto report requires a built cache and matplotlib plotting support.
-        try:
-            self.btn_auto_report.setEnabled(bool(self._plot_ready and self._db_path))
-        except Exception:
-            pass
+        self._sync_main_auto_plot_actions()
 
     def _zoom_main_plot(self, factor: float) -> None:
         if not self._axes or not self._canvas:
@@ -4551,6 +4670,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         btn_row.addWidget(btn_close)
         layout.addLayout(btn_row)
 
+        _fit_widget_to_screen(dlg)
         dlg.exec()
 
     def _load_cache(self, *, rebuild: bool) -> None:
@@ -4565,7 +4685,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     )
                     self._db_path = Path(str(payload.get("db_path") or "")).expanduser()
                 else:
-                    self._db_path = be.validate_existing_test_data_project_cache(
+                    self._db_path = be.validate_test_data_project_cache_for_open(
                         self._project_dir,
                         self._workbook_path,
                     )
@@ -4598,7 +4718,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     progress_cb=report,
                 )
                 return Path(str(payload.get("db_path") or "")).expanduser()
-            return be.validate_existing_test_data_project_cache(
+            return be.validate_test_data_project_cache_for_open(
                 self._project_dir,
                 self._workbook_path,
             )
@@ -10159,60 +10279,49 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     self._auto_plots = [d for d in data if isinstance(d, dict)]
         except Exception:
             self._auto_plots = []
+        self._sync_main_auto_plot_actions()
         self._refresh_auto_plots_list()
 
-    def _refresh_auto_plots_list(self) -> None:
-        if not hasattr(self, "list_auto_plots"):
+    def _refresh_auto_plots_list(self, list_widget: QtWidgets.QListWidget | None = None) -> None:
+        widget = list_widget if list_widget is not None else getattr(self, "list_auto_plots", None)
+        if widget is None:
             return
-        self.list_auto_plots.clear()
+        widget.clear()
         for d in self._auto_plots:
-            name = str(d.get("name") or "").strip()
-            if not name:
-                mode = str(d.get("mode") or "").strip()
-                selection = self._selection_from_plot_def(d)
-                run_disp = self._selection_display_text(selection) or str(d.get("run") or "").strip()
-                if mode == "curves":
-                    y = ", ".join([str(x) for x in (d.get("y") or []) if str(x).strip()])
-                    x = str(d.get("x") or "").strip()
-                    name = f"Curves: {run_disp} {y} vs {x}".strip()
-                elif mode == "performance":
-                    output = str(d.get("output") or "").strip()
-                    input1 = str(d.get("input1") or "").strip()
-                    input2 = str(d.get("input2") or "").strip()
-                    if input2:
-                        name = f"Performance: {output} vs {input1},{input2}".strip()
-                    else:
-                        name = f"Performance: {output} vs {input1}".strip()
-                else:
-                    y = ", ".join([str(x) for x in (d.get("y") or []) if str(x).strip()])
-                    stats_val = d.get("stats")
-                    stats = (
-                        [str(x).strip() for x in stats_val if str(x).strip()]
-                        if isinstance(stats_val, list)
-                        else []
-                    )
-                    if not stats:
-                        st = str(d.get("stat") or "").strip()
-                        if st:
-                            stats = [st]
-                    stats_label = self._metric_title_suffix(stats) or "metrics"
-                    name = f"Metrics: {run_disp} {stats_label} ({y})".strip()
-            item = QtWidgets.QListWidgetItem(name or "Auto-Plot")
+            item = QtWidgets.QListWidgetItem(self._auto_plot_display_name(d) or "Auto-Plot")
             item.setData(QtCore.Qt.ItemDataRole.UserRole, d)
-            self.list_auto_plots.addItem(item)
-        self._update_auto_actions()
+            widget.addItem(item)
+        self._update_auto_actions(list_widget=widget)
 
-    def _update_auto_actions(self) -> None:
-        selected = self.list_auto_plots.selectedItems() if hasattr(self, "list_auto_plots") else []
+    def _update_auto_actions(
+        self,
+        *,
+        list_widget: QtWidgets.QListWidget | None = None,
+        btn_open: QtWidgets.QPushButton | None = None,
+        btn_open_all: QtWidgets.QPushButton | None = None,
+        btn_delete: QtWidgets.QPushButton | None = None,
+        btn_save_all: QtWidgets.QPushButton | None = None,
+        btn_auto_report: QtWidgets.QPushButton | None = None,
+    ) -> None:
+        widget = list_widget if list_widget is not None else getattr(self, "list_auto_plots", None)
+        selected = widget.selectedItems() if widget is not None else []
         has = bool(selected)
-        if hasattr(self, "btn_open_auto"):
-            self.btn_open_auto.setEnabled(has and self._plot_ready and bool(self._db_path))
-        if hasattr(self, "btn_open_all_auto"):
-            self.btn_open_all_auto.setEnabled(bool(self._auto_plots) and self._plot_ready and bool(self._db_path))
-        if hasattr(self, "btn_delete_auto"):
-            self.btn_delete_auto.setEnabled(has)
-        if hasattr(self, "btn_save_all_auto"):
-            self.btn_save_all_auto.setEnabled(bool(self._auto_plots) and self._plot_ready and bool(self._db_path))
+        open_btn = btn_open if btn_open is not None else getattr(self, "btn_open_auto", None)
+        open_all_btn = btn_open_all if btn_open_all is not None else getattr(self, "btn_open_all_auto", None)
+        delete_btn = btn_delete if btn_delete is not None else getattr(self, "btn_delete_auto", None)
+        save_all_btn = btn_save_all if btn_save_all is not None else getattr(self, "btn_save_all_auto", None)
+        auto_report_btn = btn_auto_report if btn_auto_report is not None else getattr(self, "btn_auto_report", None)
+        if open_btn is not None:
+            open_btn.setEnabled(has and self._plot_ready and bool(self._db_path))
+        if open_all_btn is not None:
+            open_all_btn.setEnabled(bool(self._auto_plots) and self._plot_ready and bool(self._db_path))
+        if delete_btn is not None:
+            delete_btn.setEnabled(has)
+        if save_all_btn is not None:
+            save_all_btn.setEnabled(bool(self._auto_plots) and self._plot_ready and bool(self._db_path))
+        if auto_report_btn is not None:
+            auto_report_btn.setEnabled(bool(self._plot_ready and self._db_path))
+        self._sync_main_auto_plot_actions()
 
     def _add_current_plot_to_autoplots(self) -> None:
         if not self._last_plot_def:
@@ -10256,15 +10365,23 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "Auto-Plots", str(exc))
             return
+        self._sync_main_auto_plot_actions()
         self._refresh_auto_plots_list()
 
-    def _open_selected_auto_plot(self) -> None:
+    def _open_selected_auto_plot(
+        self,
+        plot_def: dict | None = None,
+        *,
+        list_widget: QtWidgets.QListWidget | None = None,
+    ) -> None:
         if not self._db_path or not self._plot_ready:
             return
-        items = self.list_auto_plots.selectedItems() if hasattr(self, "list_auto_plots") else []
-        if not items:
-            return
-        d = items[0].data(QtCore.Qt.ItemDataRole.UserRole)
+        d = dict(plot_def) if isinstance(plot_def, dict) else None
+        if d is None:
+            selected = self._selected_auto_plot_definitions(list_widget=list_widget)
+            if not selected:
+                return
+            d = selected[0]
         if not isinstance(d, dict):
             return
         mode = str(d.get("mode") or "").strip().lower()
@@ -10390,6 +10507,90 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                             self.cb_perf_view_stat.setCurrentIndex(i)
                             break
             self._redraw_performance_view()
+
+    def _open_auto_plots_popup(self) -> None:
+        if not self._plot_ready or not self._db_path:
+            QtWidgets.QMessageBox.information(self, "Auto-Plots", "Plotting is unavailable.")
+            return
+        if not self._auto_plots:
+            QtWidgets.QMessageBox.information(self, "Auto-Plots", "No auto-plots available.")
+            return
+
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Auto-Plots")
+        dlg.resize(760, 560)
+        dlg.setStyleSheet(
+            """
+            QDialog { background: #ffffff; color: #0f172a; }
+            QLabel { color: #0f172a; }
+            QListWidget {
+                background: #ffffff;
+                border: 1px solid #e2e8f0;
+                border-radius: 8px;
+                padding: 6px;
+            }
+            QListWidget::item { padding: 4px 6px; }
+            QListWidget::item:selected { background: #dbeafe; color: #1e3a8a; }
+            """
+        )
+        layout = QtWidgets.QVBoxLayout(dlg)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
+        title = QtWidgets.QLabel("Saved Auto-Plots")
+        title.setStyleSheet("font-size: 13px; font-weight: 800;")
+        layout.addWidget(title)
+
+        hint = QtWidgets.QLabel("Open a saved plot in the main viewer, open all in tabs, or manage saved entries.")
+        hint.setStyleSheet("color: #64748b; font-size: 11px;")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        list_widget = QtWidgets.QListWidget()
+        list_widget.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        layout.addWidget(list_widget, 1)
+
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_row.setSpacing(8)
+        btn_open = QtWidgets.QPushButton("Open")
+        btn_open_all = QtWidgets.QPushButton("Open All")
+        btn_delete = QtWidgets.QPushButton("Delete")
+        btn_save_all = QtWidgets.QPushButton("Save All PDF")
+        btn_auto_report = QtWidgets.QPushButton("Auto Report...")
+        btn_close = QtWidgets.QPushButton("Close")
+        for btn in (btn_open, btn_open_all, btn_delete, btn_save_all, btn_auto_report):
+            btn_row.addWidget(btn)
+        btn_row.addStretch(1)
+        btn_row.addWidget(btn_close)
+        layout.addLayout(btn_row)
+
+        def _sync_buttons() -> None:
+            self._update_auto_actions(
+                list_widget=list_widget,
+                btn_open=btn_open,
+                btn_open_all=btn_open_all,
+                btn_delete=btn_delete,
+                btn_save_all=btn_save_all,
+                btn_auto_report=btn_auto_report,
+            )
+
+        def _delete_selected() -> None:
+            self._delete_selected_auto_plots(list_widget=list_widget)
+            _sync_buttons()
+
+        self._refresh_auto_plots_list(list_widget)
+        _sync_buttons()
+        list_widget.itemDoubleClicked.connect(lambda *_: self._open_selected_auto_plot(list_widget=list_widget))
+        list_widget.itemSelectionChanged.connect(_sync_buttons)
+        btn_open.clicked.connect(lambda: self._open_selected_auto_plot(list_widget=list_widget))
+        btn_open_all.clicked.connect(self._open_all_auto_plots_panel)
+        btn_delete.clicked.connect(_delete_selected)
+        btn_save_all.clicked.connect(self._save_all_auto_plots_pdf)
+        btn_auto_report.clicked.connect(self._open_auto_report_options)
+        btn_close.clicked.connect(dlg.accept)
+
+        _fit_widget_to_screen(dlg)
+        dlg.exec()
 
     def _open_all_auto_plots_panel(self) -> None:
         if not self._plot_ready or not self._db_path:
@@ -10688,15 +10889,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
         dlg.exec()
 
-    def _delete_selected_auto_plots(self) -> None:
-        items = self.list_auto_plots.selectedItems() if hasattr(self, "list_auto_plots") else []
-        if not items:
-            return
-        to_del = []
-        for it in items:
-            d = it.data(QtCore.Qt.ItemDataRole.UserRole)
-            if isinstance(d, dict):
-                to_del.append(d)
+    def _delete_selected_auto_plots(
+        self,
+        *,
+        list_widget: QtWidgets.QListWidget | None = None,
+    ) -> None:
+        to_del = self._selected_auto_plot_definitions(list_widget=list_widget)
         if not to_del:
             return
         self._auto_plots = [d for d in self._auto_plots if d not in to_del]
@@ -10705,7 +10903,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "Auto-Plots", str(exc))
             return
-        self._refresh_auto_plots_list()
+        self._sync_main_auto_plot_actions()
+        self._refresh_auto_plots_list(list_widget=list_widget)
 
     def _render_plot_def_to_figure(self, d: dict):
         from matplotlib.figure import Figure

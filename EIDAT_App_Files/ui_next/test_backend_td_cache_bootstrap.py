@@ -676,6 +676,30 @@ class TestBackendTdCacheBootstrap(unittest.TestCase):
                     impl_db,
                 )
 
+    def test_open_validator_defers_generated_workbook_output_scan(self) -> None:
+        if Workbook is None:
+            self.skipTest("openpyxl is required for TD readiness tests")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir) / "project"
+            workbook_path, impl_db, _raw_db = _create_ready_td_project_fixture(project_dir)
+            with _td_validation_context(), patch.object(
+                backend,
+                "_td_validate_generated_workbook_outputs",
+                side_effect=AssertionError("workbook output scan should be deferred on open"),
+            ) as validate_outputs_mock:
+                self.assertEqual(
+                    backend.validate_test_data_project_cache_for_open(project_dir, workbook_path),
+                    impl_db,
+                )
+                readiness = backend._td_collect_project_readiness(
+                    project_dir,
+                    workbook_path,
+                    validate_workbook_outputs=False,
+                )
+            validate_outputs_mock.assert_not_called()
+            self.assertEqual(readiness["problems"], [])
+            self.assertTrue(bool((readiness.get("summary") or {}).get("workbook_outputs_deferred")))
+
     def test_ready_validator_accepts_excluded_source_rows_for_update_and_open(self) -> None:
         if Workbook is None:
             self.skipTest("openpyxl is required for TD readiness tests")

@@ -6757,7 +6757,12 @@ def _td_validate_generated_workbook_outputs(
     return summary
 
 
-def _td_collect_project_readiness(project_dir: Path, workbook_path: Path) -> dict[str, object]:
+def _td_collect_project_readiness(
+    project_dir: Path,
+    workbook_path: Path,
+    *,
+    validate_workbook_outputs: bool = True,
+) -> dict[str, object]:
     proj_dir = Path(project_dir).expanduser()
     wb_path = Path(workbook_path).expanduser()
     db_path = proj_dir / EIDAT_PROJECT_IMPLEMENTATION_DB
@@ -6880,7 +6885,7 @@ def _td_collect_project_readiness(project_dir: Path, workbook_path: Path) -> dic
             problems.append("Project workbook outputs are incomplete: Sources sheet has no serial rows.")
 
         compiled_serials = list(readiness.get("compiled_serials") or [])
-        if compiled_serials:
+        if compiled_serials and validate_workbook_outputs:
             workbook_outputs = _td_validate_generated_workbook_outputs(
                 wb_path,
                 expected_serials=compiled_serials,
@@ -6892,6 +6897,8 @@ def _td_collect_project_readiness(project_dir: Path, workbook_path: Path) -> dic
             for problem in workbook_outputs.get("problems") or []:
                 if str(problem).strip():
                     warnings.append(str(problem).strip())
+        elif compiled_serials:
+            summary["workbook_outputs_deferred"] = True
 
     deduped_warnings = list(dict.fromkeys([str(warning).strip() for warning in warnings if str(warning).strip()]))
     if deduped_warnings:
@@ -6924,8 +6931,18 @@ def _td_project_readiness_error_message(
     return " ".join([part for part in parts if part]).strip()
 
 
-def _td_ensure_project_ready(project_dir: Path, workbook_path: Path, *, guidance: str) -> dict[str, object]:
-    readiness = _td_collect_project_readiness(project_dir, workbook_path)
+def _td_ensure_project_ready(
+    project_dir: Path,
+    workbook_path: Path,
+    *,
+    guidance: str,
+    validate_workbook_outputs: bool = True,
+) -> dict[str, object]:
+    readiness = _td_collect_project_readiness(
+        project_dir,
+        workbook_path,
+        validate_workbook_outputs=validate_workbook_outputs,
+    )
     problems = [str(problem).strip() for problem in (readiness.get("problems") or []) if str(problem).strip()]
     if problems:
         raise RuntimeError(_td_project_readiness_error_message(readiness, guidance=guidance))
@@ -8055,6 +8072,25 @@ def validate_existing_test_data_project_cache(project_dir: Path, workbook_path: 
         "Run 'Update Project' to rebuild all required Test Data cache and workbook outputs before opening Trend / Analyze."
     )
     readiness = _td_ensure_project_ready(project_dir, workbook_path, guidance=guidance)
+    return Path(str(readiness.get("db_path") or (Path(project_dir).expanduser() / EIDAT_PROJECT_IMPLEMENTATION_DB))).expanduser()
+
+
+def validate_test_data_project_cache_for_open(project_dir: Path, workbook_path: Path) -> Path:
+    """
+    Fast-open validation for Trend/Analyze.
+
+    This checks that the cached SQLite project state is usable, but defers the
+    generated workbook sheet scan until an explicit rebuild/update workflow.
+    """
+    guidance = (
+        "Run 'Update Project' to rebuild all required Test Data cache and workbook outputs before opening Trend / Analyze."
+    )
+    readiness = _td_ensure_project_ready(
+        project_dir,
+        workbook_path,
+        guidance=guidance,
+        validate_workbook_outputs=False,
+    )
     return Path(str(readiness.get("db_path") or (Path(project_dir).expanduser() / EIDAT_PROJECT_IMPLEMENTATION_DB))).expanduser()
 
 
