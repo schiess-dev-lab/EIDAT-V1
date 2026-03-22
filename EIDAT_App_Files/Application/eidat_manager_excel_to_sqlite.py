@@ -10,7 +10,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 
 try:
     # Common execution mode: `python EIDAT_App_Files/Application/eidat_manager.py ...`
@@ -686,6 +686,7 @@ def _write_mat_sqlite(*, mat_path: Path, sqlite_path: Path, overwrite: bool) -> 
             );
             """
         )
+        _create_sequence_context_table(conn)
 
         outputs: list[dict[str, Any]] = []
         for sheet_name, df in sheets:
@@ -755,6 +756,28 @@ def _write_mat_sqlite(*, mat_path: Path, sqlite_path: Path, overwrite: bool) -> 
                 )
             except Exception:
                 pass
+            _insert_sequence_context_row(
+                conn,
+                {
+                    "sheet_name": safe_sheet_name,
+                    "source_sheet_name": safe_sheet_name,
+                    "data_mode_raw": "",
+                    "run_type": "",
+                    "on_time_value": None,
+                    "on_time_units": "",
+                    "off_time_value": None,
+                    "off_time_units": "",
+                    "control_period": None,
+                    "nominal_pf_value": None,
+                    "nominal_pf_units": "",
+                    "nominal_tf_value": None,
+                    "nominal_tf_units": "",
+                    "suppression_voltage_value": None,
+                    "suppression_voltage_units": "",
+                    "extraction_status": "incomplete",
+                    "extraction_reason": "sequence context unavailable for MAT source",
+                },
+            )
             outputs.append(
                 {
                     "sheet": safe_sheet_name,
@@ -1030,6 +1053,7 @@ def write_mat_bundle_sqlite(
             );
             """
         )
+        _create_sequence_context_table(conn)
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS __mat_bundle_members (
@@ -1124,6 +1148,28 @@ def write_mat_bundle_sqlite(
                     "",
                 ),
             )
+            _insert_sequence_context_row(
+                conn,
+                {
+                    "sheet_name": seq_name,
+                    "source_sheet_name": seq_name,
+                    "data_mode_raw": "",
+                    "run_type": "",
+                    "on_time_value": None,
+                    "on_time_units": "",
+                    "off_time_value": None,
+                    "off_time_units": "",
+                    "control_period": None,
+                    "nominal_pf_value": None,
+                    "nominal_pf_units": "",
+                    "nominal_tf_value": None,
+                    "nominal_tf_units": "",
+                    "suppression_voltage_value": None,
+                    "suppression_voltage_units": "",
+                    "extraction_status": "incomplete",
+                    "extraction_reason": "sequence context unavailable for MAT bundle source",
+                },
+            )
             outputs.append(
                 {
                     "sheet": seq_name,
@@ -1195,6 +1241,23 @@ _SEQ_META_LABELS = {
     "seq no",
     "seq number",
 }
+
+_SEQ_CONTEXT_FUZZY_MIN_RATIO = 0.82
+_SEQ_CONTEXT_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
+    "data_mode": ("data mode", "datamode"),
+    "on_time": ("on time", "ontime"),
+    "off_time": ("off time", "offtime"),
+    "nominal_pf": ("nominal pf", "nominal p f"),
+    "nominal_tf": ("nominal tf", "nominal t f"),
+    "suppression_voltage": ("suppression voltage", "supp voltage"),
+}
+_SEQ_CONTEXT_VALUE_OFFSETS: tuple[tuple[int, int], ...] = (
+    (1, 0),
+    (2, 0),
+    (0, 1),
+    (1, 1),
+    (0, 2),
+)
 
 
 def _parse_env_file(path: Path) -> dict[str, str]:
@@ -2247,6 +2310,350 @@ def _extract_sequence_token_from_meta_cells(meta_cells: Sequence[tuple[int, int,
     return ""
 
 
+def _collapse_meta_text(value: object) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip())
+
+
+def _normalize_sequence_meta_label(value: object) -> str:
+    return _normalize_header(_collapse_meta_text(value))
+
+
+def _normalize_sequence_meta_units(value: object) -> str:
+    txt = _collapse_meta_text(value)
+    if not txt:
+        return ""
+    txt = txt.replace("deg", "").replace("°", "").strip()
+    return re.sub(r"\s+", "", txt).lower()
+
+
+def _normalize_sequence_data_mode(value: object) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    key = "".join(ch.lower() for ch in raw if ch.isalnum())
+    if key in {"ss", "steadystate", "steady"}:
+        return "SS"
+    if key in {"pm", "pulsemode", "pulsedmode", "pulsed", "pulse"}:
+        return "PM"
+    return raw
+
+
+def _sequence_context_field_match(value: object, field_name: str) -> tuple[int, int, float] | None:
+    label = _normalize_sequence_meta_label(value)
+    if not label:
+        return None
+    label_compact = label.replace(" ", "")
+    allow_fuzzy = str(field_name) in {"data_mode", "on_time", "off_time", "suppression_voltage"}
+    best: tuple[int, int, float] | None = None
+    for alias in _SEQ_CONTEXT_FIELD_ALIASES.get(str(field_name), ()):
+        alias_norm = _normalize_sequence_meta_label(alias)
+        if not alias_norm:
+            continue
+        alias_compact = alias_norm.replace(" ", "")
+        alias_compact_len = len(alias_compact)
+        match: tuple[int, int, float] | None = None
+        if label_compact == alias_compact:
+            match = (0, -alias_compact_len, 1.0)
+        elif (
+            alias_compact_len >= 5
+            and min(len(label_compact), len(alias_compact)) >= 5
+            and (label_compact.startswith(alias_compact) or alias_compact.startswith(label_compact))
+        ):
+            score = float(min(len(label_compact), len(alias_compact))) / float(max(len(label_compact), len(alias_compact)))
+            match = (1, -alias_compact_len, score)
+        elif allow_fuzzy and alias_compact_len >= 4:
+            score = float(difflib.SequenceMatcher(a=alias_compact, b=label_compact).ratio())
+            if score >= float(_SEQ_CONTEXT_FUZZY_MIN_RATIO):
+                match = (2, -alias_compact_len, -score)
+        if match is None:
+            continue
+        if best is None or match < best:
+            best = match
+    return best
+
+
+def _parse_numeric_with_units(primary: object, secondary: object = None) -> tuple[float | None, str]:
+    if _is_blank(primary):
+        return None, ""
+    raw = _collapse_meta_text(primary)
+    if not raw:
+        return None, ""
+    numeric = _try_float(primary)
+    if numeric is not None:
+        if not _is_blank(secondary):
+            secondary_txt = _collapse_meta_text(secondary)
+            if secondary_txt and _try_float(secondary_txt) is None:
+                return float(numeric), secondary_txt
+        return float(numeric), ""
+    match = re.search(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", raw.replace(",", ""))
+    if not match:
+        return None, ""
+    try:
+        numeric = float(match.group(0))
+    except Exception:
+        return None, ""
+    units = _collapse_meta_text((raw[: match.start()] + " " + raw[match.end() :]).strip())
+    if not units and not _is_blank(secondary):
+        secondary_txt = _collapse_meta_text(secondary)
+        if secondary_txt and _try_float(secondary_txt) is None:
+            units = secondary_txt
+    return float(numeric), units
+
+
+def _extract_sequence_context_candidate(
+    field_name: str,
+    *,
+    row: int,
+    col: int,
+    cell_map: dict[tuple[int, int], str],
+) -> dict[str, object] | None:
+    for row_off, col_off in _SEQ_CONTEXT_VALUE_OFFSETS:
+        value_row = int(row) + int(row_off)
+        value_col = int(col) + int(col_off)
+        raw_value = cell_map.get((value_row, value_col))
+        if _is_blank(raw_value):
+            continue
+        if str(field_name) == "data_mode":
+            text = _collapse_meta_text(raw_value)
+            if text:
+                return {
+                    "row": int(value_row),
+                    "col": int(value_col),
+                    "raw": text,
+                    "run_type": _normalize_sequence_data_mode(text),
+                }
+            continue
+        neighbor = cell_map.get((value_row, value_col + 1))
+        numeric, units = _parse_numeric_with_units(raw_value, neighbor)
+        if numeric is None:
+            continue
+        return {
+            "row": int(value_row),
+            "col": int(value_col),
+            "value": float(numeric),
+            "units": _collapse_meta_text(units),
+        }
+    return None
+
+
+def _values_equal_with_units(
+    lhs_value: float | None,
+    lhs_units: str,
+    rhs_value: float | None,
+    rhs_units: str,
+) -> bool:
+    if lhs_value is None or rhs_value is None:
+        return False
+    if abs(float(lhs_value) - float(rhs_value)) > 1e-9:
+        return False
+    lhs_norm = _normalize_sequence_meta_units(lhs_units)
+    rhs_norm = _normalize_sequence_meta_units(rhs_units)
+    return not lhs_norm or not rhs_norm or lhs_norm == rhs_norm
+
+
+def _merge_sequence_context_numeric_candidates(
+    field_name: str,
+    candidates: Sequence[dict[str, object]],
+) -> tuple[float | None, str, str | None]:
+    chosen_value: float | None = None
+    chosen_units = ""
+    for cand in candidates:
+        value = _try_float(cand.get("value"))
+        if value is None:
+            continue
+        units = _collapse_meta_text(cand.get("units"))
+        if chosen_value is None:
+            chosen_value = float(value)
+            chosen_units = units
+            continue
+        if not _values_equal_with_units(chosen_value, chosen_units, float(value), units):
+            return None, "", f"{field_name} conflict"
+        if not chosen_units and units:
+            chosen_units = units
+    return chosen_value, chosen_units, None
+
+
+def _merge_sequence_context_mode_candidates(
+    candidates: Sequence[dict[str, object]],
+) -> tuple[str, str, str | None]:
+    chosen_raw = ""
+    chosen_type = ""
+    for cand in candidates:
+        raw = _collapse_meta_text(cand.get("raw"))
+        run_type = _collapse_meta_text(cand.get("run_type"))
+        if not raw:
+            continue
+        if not chosen_raw:
+            chosen_raw = raw
+            chosen_type = run_type
+            continue
+        if _normalize_sequence_meta_label(raw) != _normalize_sequence_meta_label(chosen_raw):
+            return "", "", "data_mode conflict"
+        if not chosen_type and run_type:
+            chosen_type = run_type
+    return chosen_raw, chosen_type, None
+
+
+def _sequence_context_from_meta_cells(
+    *,
+    sheet_name: str,
+    source_sheet_name: str,
+    meta_cells: Sequence[tuple[int, int, str]],
+) -> dict[str, object]:
+    cell_map = {
+        (int(row), int(col)): str(value)
+        for row, col, value in list(meta_cells or [])
+        if not _is_blank(value)
+    }
+    field_candidates: dict[str, list[dict[str, object]]] = {name: [] for name in _SEQ_CONTEXT_FIELD_ALIASES}
+    for row, col, raw in sorted(meta_cells, key=lambda item: (int(item[0]), int(item[1]))):
+        for field_name in _SEQ_CONTEXT_FIELD_ALIASES:
+            if _sequence_context_field_match(raw, field_name) is None:
+                continue
+            candidate = _extract_sequence_context_candidate(
+                field_name,
+                row=int(row),
+                col=int(col),
+                cell_map=cell_map,
+            )
+            if candidate is not None:
+                field_candidates[field_name].append(dict(candidate))
+
+    conflicts: list[str] = []
+    data_mode_raw, run_type, err = _merge_sequence_context_mode_candidates(field_candidates["data_mode"])
+    if err:
+        conflicts.append(err)
+    on_time_value, on_time_units, err = _merge_sequence_context_numeric_candidates("on_time", field_candidates["on_time"])
+    if err:
+        conflicts.append(err)
+    off_time_value, off_time_units, err = _merge_sequence_context_numeric_candidates("off_time", field_candidates["off_time"])
+    if err:
+        conflicts.append(err)
+    nominal_pf_value, nominal_pf_units, err = _merge_sequence_context_numeric_candidates("nominal_pf", field_candidates["nominal_pf"])
+    if err:
+        conflicts.append(err)
+    nominal_tf_value, nominal_tf_units, err = _merge_sequence_context_numeric_candidates("nominal_tf", field_candidates["nominal_tf"])
+    if err:
+        conflicts.append(err)
+    suppression_voltage_value, suppression_voltage_units, err = _merge_sequence_context_numeric_candidates(
+        "suppression_voltage",
+        field_candidates["suppression_voltage"],
+    )
+    if err:
+        conflicts.append(err)
+
+    extraction_status = "ok"
+    reasons: list[str] = []
+    missing_core: list[str] = []
+    if not data_mode_raw or not run_type:
+        missing_core.append("data_mode")
+    if on_time_value is None:
+        missing_core.append("on_time")
+    if off_time_value is None:
+        missing_core.append("off_time")
+    if nominal_pf_value is None or not _collapse_meta_text(nominal_pf_units):
+        missing_core.append("nominal_pf")
+    if conflicts:
+        extraction_status = "conflict"
+        reasons.extend(conflicts)
+    elif missing_core:
+        extraction_status = "incomplete"
+        reasons.append("missing core fields: " + ", ".join(missing_core))
+
+    return {
+        "sheet_name": str(sheet_name),
+        "source_sheet_name": str(source_sheet_name),
+        "data_mode_raw": data_mode_raw,
+        "run_type": run_type,
+        "on_time_value": on_time_value,
+        "on_time_units": _collapse_meta_text(on_time_units),
+        "off_time_value": off_time_value,
+        "off_time_units": _collapse_meta_text(off_time_units),
+        "control_period": off_time_value,
+        "nominal_pf_value": nominal_pf_value,
+        "nominal_pf_units": _collapse_meta_text(nominal_pf_units),
+        "nominal_tf_value": nominal_tf_value,
+        "nominal_tf_units": _collapse_meta_text(nominal_tf_units),
+        "suppression_voltage_value": suppression_voltage_value,
+        "suppression_voltage_units": _collapse_meta_text(suppression_voltage_units),
+        "extraction_status": extraction_status,
+        "extraction_reason": "; ".join([reason for reason in reasons if str(reason).strip()]),
+    }
+
+
+def _create_sequence_context_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS __sequence_context (
+          sheet_name TEXT PRIMARY KEY,
+          source_sheet_name TEXT,
+          data_mode_raw TEXT,
+          run_type TEXT,
+          on_time_value REAL,
+          on_time_units TEXT,
+          off_time_value REAL,
+          off_time_units TEXT,
+          control_period REAL,
+          nominal_pf_value REAL,
+          nominal_pf_units TEXT,
+          nominal_tf_value REAL,
+          nominal_tf_units TEXT,
+          suppression_voltage_value REAL,
+          suppression_voltage_units TEXT,
+          extraction_status TEXT,
+          extraction_reason TEXT
+        );
+        """
+    )
+
+
+def _insert_sequence_context_row(conn: sqlite3.Connection, row: Mapping[str, object] | None) -> None:
+    if not isinstance(row, Mapping):
+        return
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO __sequence_context(
+          sheet_name,
+          source_sheet_name,
+          data_mode_raw,
+          run_type,
+          on_time_value,
+          on_time_units,
+          off_time_value,
+          off_time_units,
+          control_period,
+          nominal_pf_value,
+          nominal_pf_units,
+          nominal_tf_value,
+          nominal_tf_units,
+          suppression_voltage_value,
+          suppression_voltage_units,
+          extraction_status,
+          extraction_reason
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            str(row.get("sheet_name") or "").strip(),
+            str(row.get("source_sheet_name") or "").strip(),
+            str(row.get("data_mode_raw") or "").strip(),
+            str(row.get("run_type") or "").strip(),
+            _try_float(row.get("on_time_value")),
+            str(row.get("on_time_units") or "").strip(),
+            _try_float(row.get("off_time_value")),
+            str(row.get("off_time_units") or "").strip(),
+            _try_float(row.get("control_period")),
+            _try_float(row.get("nominal_pf_value")),
+            str(row.get("nominal_pf_units") or "").strip(),
+            _try_float(row.get("nominal_tf_value")),
+            str(row.get("nominal_tf_units") or "").strip(),
+            _try_float(row.get("suppression_voltage_value")),
+            str(row.get("suppression_voltage_units") or "").strip(),
+            str(row.get("extraction_status") or "").strip(),
+            str(row.get("extraction_reason") or "").strip(),
+        ),
+    )
+
+
 def _header_signature(mapped_headers: Sequence[str]) -> tuple[str, ...]:
     return tuple(str(_normalize_header(value)).strip() for value in mapped_headers if str(_normalize_header(value)).strip())
 
@@ -2325,10 +2732,11 @@ def _materialize_sequence_block(
     )
     if not data_rows:
         return None
+    first_data_row = min(int(excel_row) for excel_row, _values in data_rows)
     meta_cells = _collect_meta_cells(
         ws,
         row_start=int(meta_row_start),
-        row_end=min(int(meta_row_end), int(header_block_start) - 1),
+        row_end=max(0, int(first_data_row) - 1),
     )
     sequence_token = _extract_sequence_token_from_meta_cells(meta_cells)
     run_base_name = _sequence_run_name(sequence_token, fallback_index=int(fallback_index))
@@ -2348,7 +2756,7 @@ def _materialize_sequence_block(
         diagnostics={
             "header_signature": list(_header_signature(mapped_headers)),
             "meta_row_start": int(meta_row_start),
-            "meta_row_end": min(int(meta_row_end), int(header_block_start) - 1),
+            "meta_row_end": max(0, int(first_data_row) - 1),
             "header_block_start": int(header_block_start),
             "header_block_end": int(header_block_end),
             "data_end_row": int(data_end_row),
@@ -2462,6 +2870,7 @@ def _detect_synthetic_sequence_blocks(
     blocks.append(block)
 
     search_row = int(block.diagnostics.get("header_block_end") or int(header_block_end)) + 1
+    meta_window_start = int(search_row)
     next_import_order = int(start_import_order) + 1
 
     while search_row <= sheet_max_row:
@@ -2504,7 +2913,7 @@ def _detect_synthetic_sequence_blocks(
             source_sheet_name=str(sheet_name),
             header_row=int(next_header_row),
             cols=list(next_cols),
-            meta_row_start=max(1, int(search_row)),
+            meta_row_start=max(1, int(meta_window_start)),
             meta_row_end=max(0, int(next_header_block_start) - 1),
             stop_row=int(stop_header_block_start) - 1 if stop_header_block_start else None,
             canonical_defs=canonical_defs,
@@ -2525,6 +2934,7 @@ def _detect_synthetic_sequence_blocks(
             blocks.append(next_block)
             next_import_order += 1
             search_row = int(next_block.diagnostics.get("header_block_end") or int(next_header_block_end)) + 1
+            meta_window_start = int(search_row)
             continue
         search_row = int(next_header_block_end) + 1
     return blocks
@@ -2957,6 +3367,7 @@ def _write_workbook_sqlite(
                 );
                 """
             )
+            _create_sequence_context_table(conn)
 
             outputs: list[dict[str, Any]] = []
             for s in sheets:
@@ -2970,6 +3381,14 @@ def _write_workbook_sqlite(
                         "INSERT INTO __meta_cells(sheet_name, excel_row, excel_col, value) VALUES(?, ?, ?, ?)",
                         meta_to_insert,
                     )
+                _insert_sequence_context_row(
+                    conn,
+                    _sequence_context_from_meta_cells(
+                        sheet_name=str(s.sheet_name),
+                        source_sheet_name=str(s.source_sheet_name),
+                        meta_cells=list(s.meta_cells or []),
+                    ),
+                )
 
                 col_defs = ", ".join([f"\"{c}\" REAL" for c in s.col_idents])
                 conn.execute(f"DROP TABLE IF EXISTS \"{s.table_name}\";")

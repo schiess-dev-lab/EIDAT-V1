@@ -4009,6 +4009,255 @@ def _discover_td_runs_by_program_for_docs(global_repo: Path | None, docs: list[d
     return runs_by_program
 
 
+def _td_read_sequence_context_rows(conn: sqlite3.Connection) -> list[dict[str, object]]:
+    try:
+        has_table = bool(
+            conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='__sequence_context' LIMIT 1"
+            ).fetchone()
+        )
+    except Exception:
+        has_table = False
+    if not has_table:
+        return []
+    try:
+        cursor = conn.execute(
+            """
+            SELECT
+                sheet_name,
+                source_sheet_name,
+                data_mode_raw,
+                run_type,
+                on_time_value,
+                on_time_units,
+                off_time_value,
+                off_time_units,
+                control_period,
+                nominal_pf_value,
+                nominal_pf_units,
+                nominal_tf_value,
+                nominal_tf_units,
+                suppression_voltage_value,
+                suppression_voltage_units,
+                extraction_status,
+                extraction_reason
+            FROM __sequence_context
+            ORDER BY rowid
+            """
+        )
+    except Exception:
+        return []
+    names = [str(col[0] or "").strip() for col in (cursor.description or [])]
+    out: list[dict[str, object]] = []
+    for row in cursor.fetchall():
+        payload = {names[idx]: row[idx] for idx in range(min(len(names), len(row)))}
+        sheet_name = str(payload.get("sheet_name") or "").strip()
+        if sheet_name:
+            out.append(payload)
+    return out
+
+
+def _td_read_sequence_context_by_run(conn: sqlite3.Connection) -> dict[str, dict[str, object]]:
+    by_run: dict[str, dict[str, object]] = {}
+    for row in _td_read_sequence_context_rows(conn):
+        run_name = str(row.get("sheet_name") or "").strip()
+        if not run_name:
+            continue
+        key = _td_support_norm_name(run_name)
+        if key and key not in by_run:
+            by_run[key] = dict(row)
+    return by_run
+
+
+def _td_sequence_context_is_usable(row: Mapping[str, object] | None) -> bool:
+    if not isinstance(row, Mapping):
+        return False
+    status = str(row.get("extraction_status") or "").strip().lower()
+    if status != "ok":
+        return False
+    run_type = td_normalize_run_type(row.get("run_type"))
+    pressure_units = str(row.get("nominal_pf_units") or "").strip()
+    return bool(
+        run_type
+        and row.get("on_time_value") not in (None, "")
+        and row.get("off_time_value") not in (None, "")
+        and row.get("control_period") not in (None, "")
+        and row.get("nominal_pf_value") not in (None, "")
+        and pressure_units
+    )
+
+
+def _td_support_blankish(value: object) -> bool:
+    return value is None or str(value).strip() == ""
+
+
+def _td_sequence_context_support_fields(row: Mapping[str, object] | None) -> dict[str, object]:
+    if not isinstance(row, Mapping):
+        return {}
+    return {
+        "feed_pressure": row.get("nominal_pf_value"),
+        "feed_pressure_units": str(row.get("nominal_pf_units") or "").strip(),
+        "feed_temperature": row.get("nominal_tf_value"),
+        "feed_temperature_units": str(row.get("nominal_tf_units") or "").strip(),
+        "run_type": td_normalize_run_type(row.get("run_type")),
+        "pulse_width": row.get("on_time_value"),
+        "pulse_width_on": row.get("on_time_value"),
+        "control_period": row.get("control_period", row.get("off_time_value")),
+        "suppression_voltage": row.get("suppression_voltage_value"),
+    }
+
+
+def _td_support_name_is_default(value: object, source_run_name: object) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return True
+    source = str(source_run_name or "").strip()
+    return bool(source) and _td_support_norm_name(text) == _td_support_norm_name(source)
+
+
+def _td_support_row_has_condition_values(row: Mapping[str, object] | None) -> bool:
+    if not isinstance(row, Mapping):
+        return False
+    return any(
+        not _td_support_blankish(row.get(field))
+        for field in (
+            "feed_pressure",
+            "feed_pressure_units",
+            "feed_temperature",
+            "feed_temperature_units",
+            "run_type",
+            "pulse_width_on",
+            "pulse_width",
+            "control_period",
+            "suppression_voltage",
+        )
+    )
+
+
+def _td_support_row_has_core_bundle(row: Mapping[str, object] | None) -> bool:
+    if not isinstance(row, Mapping):
+        return False
+    return bool(
+        not _td_support_blankish(row.get("feed_pressure"))
+        and str(row.get("feed_pressure_units") or "").strip()
+        and td_normalize_run_type(row.get("run_type"))
+        and not _td_support_blankish(row.get("pulse_width_on", row.get("pulse_width")))
+        and not _td_support_blankish(row.get("control_period"))
+    )
+
+
+def _td_support_row_is_promotable(row: Mapping[str, object] | None) -> bool:
+    if not isinstance(row, Mapping):
+        return False
+    source_run_name = str(row.get("source_run_name") or "").strip()
+    explicit_condition_key = str(row.get("condition_key") or "").strip()
+    explicit_display_name = str(row.get("display_name") or "").strip()
+    if explicit_condition_key and not _td_support_name_is_default(explicit_condition_key, source_run_name):
+        return True
+    if explicit_display_name and not _td_support_name_is_default(explicit_display_name, source_run_name):
+        return True
+    return _td_support_row_has_core_bundle(row)
+
+
+def _td_prefill_support_row_from_sequence_context(
+    row: Mapping[str, object] | None,
+    source_context: Mapping[str, object] | None,
+    *,
+    blank_unusable_defaults: bool,
+) -> dict[str, object]:
+    payload = dict(row or {})
+    source_run_name = str(payload.get("source_run_name") or "").strip()
+    had_condition_values = _td_support_row_has_condition_values(payload)
+    if not _td_sequence_context_is_usable(source_context):
+        if (
+            blank_unusable_defaults
+            and not _td_support_row_has_condition_values(payload)
+            and _td_support_name_is_default(payload.get("condition_key"), source_run_name)
+        ):
+            payload["condition_key"] = ""
+        if (
+            blank_unusable_defaults
+            and not _td_support_row_has_condition_values(payload)
+            and _td_support_name_is_default(payload.get("display_name"), source_run_name)
+        ):
+            payload["display_name"] = ""
+        return payload
+
+    support_fields = _td_sequence_context_support_fields(source_context)
+    for field_name, field_value in support_fields.items():
+        if _td_support_blankish(payload.get(field_name)):
+            payload[field_name] = field_value
+    derived_label = td_build_run_condition_label(payload)
+    if derived_label and not had_condition_values:
+        if _td_support_name_is_default(payload.get("condition_key"), source_run_name):
+            payload["condition_key"] = derived_label
+        if _td_support_name_is_default(payload.get("display_name"), source_run_name):
+            payload["display_name"] = derived_label
+    return payload
+
+
+def _discover_td_sequence_context_by_program_for_docs(
+    global_repo: Path | None,
+    docs: list[dict] | None,
+) -> dict[str, dict[str, dict[str, object]]]:
+    repo = Path(global_repo).expanduser() if global_repo is not None else None
+    out: dict[str, dict[str, dict[str, object]]] = {}
+    for d in (docs or []):
+        if repo is None or not isinstance(d, dict):
+            continue
+        program_title = str(d.get("program_title") or "").strip() or TD_SUPPORT_DEFAULT_PROGRAM_TITLE
+        resolved = _resolve_td_source_sqlite_for_node(
+            repo,
+            excel_sqlite_rel=str((d or {}).get("excel_sqlite_rel") or "").strip(),
+            artifacts_rel=str((d or {}).get("artifacts_rel") or "").strip(),
+        )
+        p = resolved.get("path")
+        if not p:
+            continue
+        p = Path(p).expanduser()
+        if not p.exists() or not p.is_file():
+            continue
+        try:
+            with sqlite3.connect(str(p)) as conn:
+                rows = _td_read_sequence_context_rows(conn)
+        except Exception:
+            rows = []
+        for row in rows:
+            run_name = str(row.get("sheet_name") or "").strip()
+            run_key = _td_support_norm_name(run_name)
+            if not run_key:
+                continue
+            existing = dict((out.get(program_title) or {}).get(run_key) or {})
+            if not existing or (_td_sequence_context_is_usable(row) and not _td_sequence_context_is_usable(existing)):
+                out.setdefault(program_title, {})[run_key] = dict(row)
+    return out
+
+
+def _td_lookup_sequence_context(
+    sequence_context_by_program: Mapping[str, Mapping[str, Mapping[str, object]]] | None,
+    program_title: object,
+    source_run_name: object,
+) -> dict[str, object]:
+    title_key = _td_support_norm_name(program_title)
+    run_key = _td_support_norm_name(source_run_name)
+    if not run_key or not isinstance(sequence_context_by_program, Mapping):
+        return {}
+    for title, rows in sequence_context_by_program.items():
+        if _td_support_norm_name(title) != title_key:
+            continue
+        if isinstance(rows, Mapping) and run_key in rows:
+            return dict(rows.get(run_key) or {})
+    matches: list[dict[str, object]] = []
+    for rows in sequence_context_by_program.values():
+        if not isinstance(rows, Mapping):
+            continue
+        if run_key in rows:
+            matches.append(dict(rows.get(run_key) or {}))
+    if len(matches) == 1:
+        return matches[0]
+    return {}
+
+
 TD_SUPPORT_PROGRAMS_SHEET = "Programs"
 TD_SUPPORT_RUN_CONDITIONS_SHEET = "RunConditions"
 TD_SUPPORT_RUN_CONDITION_BOUNDS_SHEET = "RunConditionBounds"
@@ -4108,23 +4357,29 @@ def _td_support_program_row_defaults(source_run_name: object, *, program_title: 
         "display_name": source,
         "feed_pressure": None,
         "feed_pressure_units": "",
+        "feed_temperature": None,
+        "feed_temperature_units": "",
         "run_type": "",
         "pulse_width": None,
         "pulse_width_on": None,
         "control_period": None,
+        "suppression_voltage": None,
         "exclude_first_n": None,
         "last_n_rows": None,
         "enabled": True,
     }
 
 
-def _td_condition_identity_parts(row: Mapping[str, object]) -> tuple[str, str, str, str, str]:
+def _td_condition_identity_parts(row: Mapping[str, object]) -> tuple[str, str, str, str, str, str, str, str]:
     return (
         _td_format_compact_value(row.get("feed_pressure")).lower(),
         str(row.get("feed_pressure_units") or "").strip().lower(),
+        _td_format_compact_value(row.get("feed_temperature")).lower(),
+        str(row.get("feed_temperature_units") or "").strip().lower(),
         td_normalize_run_type(row.get("run_type")).lower(),
         _td_format_compact_value(row.get("pulse_width_on", row.get("pulse_width"))).lower(),
         _td_format_compact_value(row.get("control_period")).lower(),
+        _td_format_compact_value(row.get("suppression_voltage")).lower(),
     )
 
 
@@ -4136,13 +4391,13 @@ def _td_condition_base_key(row: Mapping[str, object]) -> str:
         or row.get("sequence_name")
         or ""
     ).strip()
-    has_condition_fields = any(bool(part) for part in _td_condition_identity_parts(row))
+    has_core_bundle = _td_support_row_has_core_bundle(row)
     if explicit:
         if not source_run_name:
             return explicit
         if _td_support_norm_name(explicit) != _td_support_norm_name(source_run_name):
             return explicit
-    if has_condition_fields:
+    if has_core_bundle:
         parts = [
             _td_format_compact_value(row.get("feed_pressure")),
             str(row.get("feed_pressure_units") or "").strip(),
@@ -4157,7 +4412,7 @@ def _td_condition_base_key(row: Mapping[str, object]) -> str:
     return explicit or source_run_name
 
 
-def _td_support_condition_group_identity(row: Mapping[str, object]) -> tuple[str, str, str, str, str, str]:
+def _td_support_condition_group_identity(row: Mapping[str, object]) -> tuple[str, str, str, str, str, str, str, str, str]:
     condition_parts = _td_condition_identity_parts(row)
     if any(bool(part) for part in condition_parts):
         return ("",) + condition_parts
@@ -4165,11 +4420,13 @@ def _td_support_condition_group_identity(row: Mapping[str, object]) -> tuple[str
 
 
 def _td_group_program_rows_into_conditions(rows: Sequence[Mapping[str, object]]) -> list[dict]:
-    grouped: dict[tuple[str, str, str, str, str, str], dict] = {}
+    grouped: dict[tuple[str, str, str, str, str, str, str, str, str], dict] = {}
     for raw_row in rows or []:
         if not isinstance(raw_row, Mapping):
             continue
         if not bool(raw_row.get("enabled", True)):
+            continue
+        if not _td_support_row_is_promotable(raw_row):
             continue
         source_run_name = str(raw_row.get("source_run_name") or "").strip()
         condition_key = _td_condition_base_key(raw_row)
@@ -4187,10 +4444,13 @@ def _td_group_program_rows_into_conditions(rows: Sequence[Mapping[str, object]])
                 "display_name": display_name,
                 "feed_pressure": raw_row.get("feed_pressure"),
                 "feed_pressure_units": str(raw_row.get("feed_pressure_units") or "").strip(),
+                "feed_temperature": raw_row.get("feed_temperature"),
+                "feed_temperature_units": str(raw_row.get("feed_temperature_units") or "").strip(),
                 "run_type": str(raw_row.get("run_type") or "").strip(),
                 "pulse_width": raw_row.get("pulse_width_on", raw_row.get("pulse_width")),
                 "pulse_width_on": raw_row.get("pulse_width_on", raw_row.get("pulse_width")),
                 "control_period": raw_row.get("control_period"),
+                "suppression_voltage": raw_row.get("suppression_voltage"),
                 "member_rows": [],
                 "member_sequences": [],
                 "member_programs": [],
@@ -4229,9 +4489,12 @@ def _td_group_program_rows_into_conditions(rows: Sequence[Mapping[str, object]])
             suffix_parts = [
                 _td_format_compact_value(group.get("feed_pressure")),
                 str(group.get("feed_pressure_units") or "").strip(),
+                _td_format_compact_value(group.get("feed_temperature")),
+                str(group.get("feed_temperature_units") or "").strip(),
                 td_normalize_run_type(group.get("run_type")),
                 _td_format_compact_value(group.get("pulse_width_on")),
                 _td_format_compact_value(group.get("control_period")),
+                _td_format_compact_value(group.get("suppression_voltage")),
             ]
             suffix = re.sub(r"[^A-Za-z0-9]+", "_", "_".join([p for p in suffix_parts if str(p).strip()])).strip("_")
             group["condition_key"] = f"{base_key}_{suffix or str(dup_count + 1)}"
@@ -4358,6 +4621,9 @@ def _write_td_support_workbook(
                 "exclude_first_n",
                 "last_n_rows",
                 "enabled",
+                "feed_temperature",
+                "feed_temperature_units",
+                "suppression_voltage",
             ]
         )
         for seq_name in (program_sequence_map.get(title) or []):
@@ -4375,6 +4641,9 @@ def _write_td_support_workbook(
                     "",
                     "",
                     True,
+                    "",
+                    "",
+                    "",
                 ]
             )
 
@@ -4442,6 +4711,9 @@ def _refresh_td_support_run_conditions_sheet(
         "min_value",
         "max_value",
         "enabled",
+        "feed_temperature",
+        "feed_temperature_units",
+        "suppression_voltage",
     ]
     desired_rows: list[list[object]] = []
     rows_written = 0
@@ -4477,6 +4749,9 @@ def _refresh_td_support_run_conditions_sheet(
                     bound.get("min_value"),
                     bound.get("max_value"),
                     bool(bound.get("enabled", row.get("enabled", True))),
+                    row.get("feed_temperature"),
+                    str(row.get("feed_temperature_units") or "").strip(),
+                    row.get("suppression_voltage"),
                 ]
             )
             rows_written += 1
@@ -4593,12 +4868,16 @@ def _sync_td_support_workbook_program_sheets(
     )
     discovered_runs_by_program = _discover_td_runs_by_program_for_docs(repo, chosen_docs) if chosen_docs else {}
     discovered_sequence_names = _discover_td_runs_for_docs(repo, chosen_docs) if chosen_docs else []
+    discovered_sequence_context_by_program = (
+        _discover_td_sequence_context_by_program_for_docs(repo, chosen_docs) if chosen_docs else {}
+    )
     clean_param_defs = [
         dict(d)
         for d in (param_defs or [])
         if isinstance(d, dict) and str(d.get("name") or "").strip()
     ]
 
+    created = False
     if not support_path.exists():
         _write_td_support_workbook(
             support_path,
@@ -4607,14 +4886,9 @@ def _sync_td_support_workbook_program_sheets(
             program_titles=discovered_program_titles,
             sequences_by_program=discovered_runs_by_program,
         )
-        return {
-            "path": str(support_path),
-            "updated": True,
-            "created": True,
-            "program_count": len(discovered_program_titles) or 1,
-        }
+        created = True
 
-    if not discovered_program_titles and not discovered_runs_by_program:
+    if not discovered_program_titles and not discovered_runs_by_program and not created:
         return {
             "path": str(support_path),
             "updated": False,
@@ -4735,6 +5009,9 @@ def _sync_td_support_workbook_program_sheets(
             "exclude_first_n",
             "last_n_rows",
             "enabled",
+            "feed_temperature",
+            "feed_temperature_units",
+            "suppression_voltage",
         ]
         for title in desired_program_titles:
             sheet_name = desired_sheet_by_title[title]
@@ -4762,8 +5039,17 @@ def _sync_td_support_workbook_program_sheets(
                 row_data = dict(existing_rows.get(seq_key) or _td_support_program_row_defaults(seq_name, program_title=title))
                 row_data["program_title"] = title
                 row_data["source_run_name"] = str(row_data.get("source_run_name") or seq_name).strip() or str(seq_name).strip()
-                condition_key = str(row_data.get("condition_key") or row_data.get("source_run_name") or "").strip()
-                display_name = str(row_data.get("display_name") or condition_key or row_data.get("source_run_name") or "").strip()
+                row_data = _td_prefill_support_row_from_sequence_context(
+                    row_data,
+                    _td_lookup_sequence_context(
+                        discovered_sequence_context_by_program,
+                        title,
+                        row_data.get("source_run_name"),
+                    ),
+                    blank_unusable_defaults=True,
+                )
+                condition_key = str(row_data.get("condition_key") or "").strip()
+                display_name = str(row_data.get("display_name") or "").strip()
                 desired_rows.append(
                     [
                         row_data["source_run_name"],
@@ -4777,6 +5063,9 @@ def _sync_td_support_workbook_program_sheets(
                         row_data.get("exclude_first_n"),
                         row_data.get("last_n_rows"),
                         bool(row_data.get("enabled", True)),
+                        row_data.get("feed_temperature"),
+                        str(row_data.get("feed_temperature_units") or "").strip(),
+                        row_data.get("suppression_voltage"),
                     ]
                 )
             for row in desired_rows:
@@ -4793,7 +5082,7 @@ def _sync_td_support_workbook_program_sheets(
     return {
         "path": str(support_path),
         "updated": bool(changed),
-        "created": False,
+        "created": bool(created),
         "program_count": len(desired_program_titles),
     }
 
@@ -4990,10 +5279,13 @@ def _read_td_support_workbook(workbook_path: Path, *, project_dir: Path | None =
                     "display_name": raw_display_name or condition_key,
                     "feed_pressure": ws.cell(row, headers.get("feed_pressure", 3)).value if headers.get("feed_pressure") else None,
                     "feed_pressure_units": str(ws.cell(row, headers.get("feed_pressure_units", 4)).value or "").strip(),
+                    "feed_temperature": ws.cell(row, headers.get("feed_temperature", 5)).value if headers.get("feed_temperature") else None,
+                    "feed_temperature_units": str(ws.cell(row, headers.get("feed_temperature_units", 6)).value or "").strip() if headers.get("feed_temperature_units") else "",
                     "run_type": str(ws.cell(row, headers.get("run_type", 5)).value or "").strip(),
                     "pulse_width": ws.cell(row, headers.get("pulse_width_on", 6)).value if headers.get("pulse_width_on") else None,
                     "pulse_width_on": ws.cell(row, headers.get("pulse_width_on", 6)).value if headers.get("pulse_width_on") else None,
                     "control_period": ws.cell(row, headers.get("control_period", 7)).value if headers.get("control_period") else None,
+                    "suppression_voltage": ws.cell(row, headers.get("suppression_voltage", 10)).value if headers.get("suppression_voltage") else None,
                     "sheet_name": str(ws.cell(row, headers.get("sheet_name", 8)).value or "").strip() if headers.get("sheet_name") else "",
                     "member_sequences_text": str(ws.cell(row, headers.get("member_sequences", 9)).value or "").strip() if headers.get("member_sequences") else "",
                     "member_programs_text": str(ws.cell(row, headers.get("member_programs", 10)).value or "").strip() if headers.get("member_programs") else "",
@@ -5053,6 +5345,7 @@ def _read_td_support_workbook(workbook_path: Path, *, project_dir: Path | None =
                 }
             ]
 
+        new_program_schema_detected = False
         for idx, prog in enumerate(program_rows):
             title = str(prog.get("program_title") or "").strip()
             sheet_name = str(prog.get("sheet_name") or "").strip() or _td_support_program_sheet_name(title, idx)
@@ -5065,7 +5358,18 @@ def _read_td_support_workbook(workbook_path: Path, *, project_dir: Path | None =
                 if key:
                     headers[key] = col
             rows_out: list[dict] = []
-            has_full_condition_columns = any(k in headers for k in ("display_name", "feed_pressure", "pulse_width_on", "control_period"))
+            has_full_condition_columns = any(
+                k in headers
+                for k in (
+                    "display_name",
+                    "feed_pressure",
+                    "feed_temperature",
+                    "pulse_width_on",
+                    "control_period",
+                    "suppression_voltage",
+                )
+            )
+            new_program_schema_detected = new_program_schema_detected or bool(has_full_condition_columns)
             for row in range(2, (ws.max_row or 0) + 1):
                 source_run = str(ws.cell(row, headers.get("source_run_name", 1)).value or "").strip()
                 condition_key = str(ws.cell(row, headers.get("condition_key", 2)).value or "").strip()
@@ -5089,10 +5393,13 @@ def _read_td_support_workbook(workbook_path: Path, *, project_dir: Path | None =
                             "display_name": raw_display_name or (condition_key or source_run),
                             "feed_pressure": ws.cell(row, headers.get("feed_pressure")).value if headers.get("feed_pressure") else None,
                             "feed_pressure_units": str(ws.cell(row, headers.get("feed_pressure_units")).value or "").strip() if headers.get("feed_pressure_units") else "",
+                            "feed_temperature": ws.cell(row, headers.get("feed_temperature")).value if headers.get("feed_temperature") else None,
+                            "feed_temperature_units": str(ws.cell(row, headers.get("feed_temperature_units")).value or "").strip() if headers.get("feed_temperature_units") else "",
                             "run_type": str(ws.cell(row, headers.get("run_type")).value or "").strip() if headers.get("run_type") else "",
                             "pulse_width": ws.cell(row, headers.get("pulse_width_on")).value if headers.get("pulse_width_on") else None,
                             "pulse_width_on": ws.cell(row, headers.get("pulse_width_on")).value if headers.get("pulse_width_on") else None,
                             "control_period": ws.cell(row, headers.get("control_period")).value if headers.get("control_period") else None,
+                            "suppression_voltage": ws.cell(row, headers.get("suppression_voltage")).value if headers.get("suppression_voltage") else None,
                         }
                     )
                     row_out["display_name"] = _td_effective_run_condition_label(
@@ -5175,10 +5482,13 @@ def _read_td_support_workbook(workbook_path: Path, *, project_dir: Path | None =
                         "display_name": cond_key,
                         "feed_pressure": row.get("feed_pressure"),
                         "feed_pressure_units": str(row.get("feed_pressure_units") or "").strip(),
+                        "feed_temperature": None,
+                        "feed_temperature_units": "",
                         "run_type": str(row.get("run_type") or "").strip(),
                         "pulse_width": row.get("pulse_width"),
                         "pulse_width_on": row.get("pulse_width"),
                         "control_period": row.get("control_period"),
+                        "suppression_voltage": None,
                         "enabled": bool(row.get("enabled", True)),
                     }
                 )
@@ -5231,12 +5541,7 @@ def _read_td_support_workbook(workbook_path: Path, *, project_dir: Path | None =
             for row in (rows or [])
             if isinstance(row, dict)
         ]
-        has_new_program_schema = any(
-            str(row.get("display_name") or "").strip()
-            or row.get("feed_pressure") not in (None, "")
-            or row.get("control_period") not in (None, "")
-            for row in full_program_rows
-        )
+        has_new_program_schema = bool(new_program_schema_detected)
 
         sequences: list[dict] = []
         if has_new_program_schema:
@@ -5247,10 +5552,13 @@ def _read_td_support_workbook(workbook_path: Path, *, project_dir: Path | None =
                     "display_name": str(group.get("display_name") or "").strip(),
                     "feed_pressure": group.get("feed_pressure"),
                     "feed_pressure_units": str(group.get("feed_pressure_units") or "").strip(),
+                    "feed_temperature": group.get("feed_temperature"),
+                    "feed_temperature_units": str(group.get("feed_temperature_units") or "").strip(),
                     "run_type": str(group.get("run_type") or "").strip(),
                     "pulse_width": group.get("pulse_width_on"),
                     "pulse_width_on": group.get("pulse_width_on"),
                     "control_period": group.get("control_period"),
+                    "suppression_voltage": group.get("suppression_voltage"),
                     "sheet_name": str(group.get("sheet_name") or "").strip(),
                     "member_sequences_text": ", ".join([str(v).strip() for v in (group.get("member_sequences") or []) if str(v).strip()]),
                     "member_programs_text": ", ".join([str(v).strip() for v in (group.get("member_programs") or []) if str(v).strip()]),
@@ -5273,10 +5581,13 @@ def _read_td_support_workbook(workbook_path: Path, *, project_dir: Path | None =
                             "program_title": str(member.get("program_title") or "").strip(),
                             "feed_pressure": group.get("feed_pressure"),
                             "feed_pressure_units": str(group.get("feed_pressure_units") or "").strip(),
+                            "feed_temperature": group.get("feed_temperature"),
+                            "feed_temperature_units": str(group.get("feed_temperature_units") or "").strip(),
                             "run_type": str(group.get("run_type") or "").strip(),
                             "pulse_width": group.get("pulse_width_on"),
                             "pulse_width_on": group.get("pulse_width_on"),
                             "control_period": group.get("control_period"),
+                            "suppression_voltage": group.get("suppression_voltage"),
                             "exclude_first_n": member.get("exclude_first_n"),
                             "last_n_rows": member.get("last_n_rows"),
                             "enabled": bool(member.get("enabled", True)),
@@ -5298,10 +5609,13 @@ def _read_td_support_workbook(workbook_path: Path, *, project_dir: Path | None =
                             "program_title": str(program_title or "").strip(),
                             "feed_pressure": condition.get("feed_pressure"),
                             "feed_pressure_units": str(condition.get("feed_pressure_units") or "").strip(),
+                            "feed_temperature": condition.get("feed_temperature"),
+                            "feed_temperature_units": str(condition.get("feed_temperature_units") or "").strip(),
                             "run_type": str(condition.get("run_type") or "").strip(),
                             "pulse_width": condition.get("pulse_width"),
                             "pulse_width_on": condition.get("pulse_width_on"),
                             "control_period": condition.get("control_period"),
+                            "suppression_voltage": condition.get("suppression_voltage"),
                             "exclude_first_n": row.get("exclude_first_n"),
                             "last_n_rows": row.get("last_n_rows"),
                             "enabled": bool(row.get("enabled", True) and condition.get("enabled", True)),
@@ -5770,10 +6084,13 @@ def _td_resolved_support_condition_payload(
         "source_run_name": str(source_run_name or "").strip(),
         "feed_pressure": condition.get("feed_pressure", (mapping or {}).get("feed_pressure")),
         "feed_pressure_units": str(condition.get("feed_pressure_units") or (mapping or {}).get("feed_pressure_units") or "").strip(),
+        "feed_temperature": condition.get("feed_temperature", (mapping or {}).get("feed_temperature")),
+        "feed_temperature_units": str(condition.get("feed_temperature_units") or (mapping or {}).get("feed_temperature_units") or "").strip(),
         "run_type": str(condition.get("run_type") or (mapping or {}).get("run_type") or "").strip(),
         "pulse_width": condition.get("pulse_width", (mapping or {}).get("pulse_width")),
         "pulse_width_on": condition.get("pulse_width_on", condition.get("pulse_width", (mapping or {}).get("pulse_width_on", (mapping or {}).get("pulse_width")))),
         "control_period": condition.get("control_period", (mapping or {}).get("control_period")),
+        "suppression_voltage": condition.get("suppression_voltage", (mapping or {}).get("suppression_voltage")),
         "exclude_first_n": (mapping or {}).get("exclude_first_n"),
         "last_n_rows": (mapping or {}).get("last_n_rows"),
         "matched_support": bool(mapping or condition),
@@ -5847,10 +6164,13 @@ def _td_resolve_support_condition_for_source(program_title: object, source_run_n
         "source_run_name": source_run,
         "feed_pressure": None,
         "feed_pressure_units": "",
+        "feed_temperature": None,
+        "feed_temperature_units": "",
         "run_type": "",
         "pulse_width": None,
         "pulse_width_on": None,
         "control_period": None,
+        "suppression_voltage": None,
         "exclude_first_n": None,
         "last_n_rows": None,
         "matched_support": False,
@@ -6222,6 +6542,7 @@ def inspect_test_data_project_cache_state(project_dir: Path, workbook_path: Path
     unchanged_serials: list[str] = []
     missing_serials: list[str] = []
     invalid_serials: list[str] = []
+    source_rebuild_needed = False
     fingerprints_by_serial: dict[str, str] = {}
     source_state_by_serial: dict[str, dict[str, object]] = {}
     for item in source_states:
@@ -6239,14 +6560,18 @@ def inspect_test_data_project_cache_state(project_dir: Path, workbook_path: Path
             invalid_serials.append(serial)
         if not cached:
             added_serials.append(serial)
+            if item_status == "ok":
+                source_rebuild_needed = True
             continue
         if str(cached.get("raw_fingerprint") or "").strip() != fingerprint:
             changed_serials.append(serial)
+            if item_status == "ok":
+                source_rebuild_needed = True
             continue
         unchanged_serials.append(serial)
 
     removed_serials = sorted(set(cached_sources.keys()) - expected_serials)
-    source_state_stale = bool(added_serials or changed_serials or removed_serials)
+    source_state_stale = bool(source_rebuild_needed or removed_serials)
     if cached_schema_version != TD_PROJECT_CACHE_SCHEMA_VERSION:
         source_state_stale = True
         stale_context = True
@@ -8865,6 +9190,7 @@ def rebuild_test_data_project_cache(
         "pulse on",
         "pulse_on",
     ]
+    current_source_sequence_context_by_run: dict[str, dict[str, object]] = {}
 
     def _read_run_rows(src: sqlite3.Connection, table: str, *, cols: set[str], order_by: str) -> list[dict]:
         q_table = _quote_ident(table)
@@ -8887,6 +9213,11 @@ def rebuild_test_data_project_cache(
 
     def _resolve_support_sequence(program_title: str, source_run: str, rows: list[dict], cols: set[str]) -> dict:
         effective = _td_resolve_support_condition_for_source(program_title, source_run, support_cfg)
+        effective = _td_prefill_support_row_from_sequence_context(
+            effective,
+            current_source_sequence_context_by_run.get(_td_support_norm_name(source_run)),
+            blank_unusable_defaults=False,
+        )
         if not support_sequences:
             return effective
 
@@ -8916,11 +9247,16 @@ def rebuild_test_data_project_cache(
                     "sequence_name": str(seq.get("condition_key") or seq.get("sequence_name") or source_run).strip() or str(source_run or "").strip(),
                     "display_name": str(seq.get("display_name") or seq.get("condition_key") or seq.get("sequence_name") or source_run).strip() or str(source_run or "").strip(),
                     "source_run_name": str(source_run or "").strip(),
+                    "feed_pressure": seq.get("feed_pressure", effective.get("feed_pressure")),
+                    "feed_pressure_units": str(seq.get("feed_pressure_units") or effective.get("feed_pressure_units") or "").strip(),
+                    "feed_temperature": seq.get("feed_temperature", effective.get("feed_temperature")),
+                    "feed_temperature_units": str(seq.get("feed_temperature_units") or effective.get("feed_temperature_units") or "").strip(),
                     "pulse_width": _td_support_sequence_pulse_width(seq),
                     "exclude_first_n": seq.get("exclude_first_n"),
                     "last_n_rows": seq.get("last_n_rows"),
                     "run_type": str(seq.get("run_type") or effective.get("run_type") or "").strip(),
                     "control_period": seq.get("control_period", effective.get("control_period")),
+                    "suppression_voltage": seq.get("suppression_voltage", effective.get("suppression_voltage")),
                     "program_title": str(program_title or "").strip(),
                     "matched_support": False,
                 }
@@ -8944,14 +9280,24 @@ def rebuild_test_data_project_cache(
                 "sequence_name": str(seq.get("condition_key") or seq.get("sequence_name") or source_run).strip() or str(source_run or "").strip(),
                 "display_name": str(seq.get("display_name") or seq.get("condition_key") or seq.get("sequence_name") or source_run).strip() or str(source_run or "").strip(),
                 "source_run_name": str(source_run or "").strip(),
+                "feed_pressure": seq.get("feed_pressure", effective.get("feed_pressure")),
+                "feed_pressure_units": str(seq.get("feed_pressure_units") or effective.get("feed_pressure_units") or "").strip(),
+                "feed_temperature": seq.get("feed_temperature", effective.get("feed_temperature")),
+                "feed_temperature_units": str(seq.get("feed_temperature_units") or effective.get("feed_temperature_units") or "").strip(),
                 "pulse_width": _td_support_sequence_pulse_width(seq),
                 "exclude_first_n": seq.get("exclude_first_n"),
                 "last_n_rows": seq.get("last_n_rows"),
                 "run_type": str(seq.get("run_type") or effective.get("run_type") or "").strip(),
                 "control_period": seq.get("control_period", effective.get("control_period")),
+                "suppression_voltage": seq.get("suppression_voltage", effective.get("suppression_voltage")),
                 "program_title": str(program_title or "").strip(),
                 "matched_support": True,
             }
+        effective = _td_prefill_support_row_from_sequence_context(
+            effective,
+            current_source_sequence_context_by_run.get(_td_support_norm_name(source_run)),
+            blank_unusable_defaults=False,
+        )
         return effective
 
     def _filter_rows_for_metric(
@@ -9318,6 +9664,7 @@ def rebuild_test_data_project_cache(
         try:
             src = sqlite3.connect(str(sqlite_path))
             try:
+                current_source_sequence_context_by_run = _td_read_sequence_context_by_run(src)
                 source_curves_written = 0
                 discovered_runs = 0
                 schema_runs = 0
@@ -15726,7 +16073,25 @@ def generate_test_data_project_performance_sheets(
     wb_path = Path(workbook_path).expanduser()
     if not wb_path.exists():
         raise FileNotFoundError(f"Project workbook not found: {wb_path}")
-    db_path = _validate_test_data_project_cache_for_update(proj_dir, wb_path)
+    db_path = proj_dir / EIDAT_PROJECT_IMPLEMENTATION_DB
+    perf_cache_ready = False
+    if db_path.exists() and db_path.is_file():
+        try:
+            with closing(sqlite3.connect(str(db_path))) as conn:
+                _ensure_test_data_impl_tables(conn)
+                perf_cache_ready = bool(
+                    int(conn.execute("SELECT COUNT(*) FROM td_condition_observations").fetchone()[0] or 0) > 0
+                    and int(conn.execute("SELECT COUNT(*) FROM td_metrics_calc").fetchone()[0] or 0) > 0
+                )
+        except Exception:
+            perf_cache_ready = False
+    if not perf_cache_ready:
+        db_path = ensure_test_data_project_cache(
+            proj_dir,
+            wb_path,
+            rebuild=False,
+            progress_cb=progress_cb,
+        )
 
     timings: dict[str, float | int] = {
         "perf_candidates_main_s": 0.0,
@@ -16006,8 +16371,9 @@ def update_test_data_trending_project_workbook(
         timings["pre_cache_workbook_save_s"] = round(time.perf_counter() - t0, 3)
         _td_emit_progress(progress_cb, "Ensuring project cache")
         t0 = time.perf_counter()
+        state_before_cache_sync = inspect_test_data_project_cache_state(project_dir, wb_path)
         try:
-            cache_sync_payload = sync_test_data_project_cache(
+            db_path = ensure_test_data_project_cache(
                 project_dir,
                 wb_path,
                 rebuild=False,
@@ -16016,7 +16382,15 @@ def update_test_data_trending_project_workbook(
         except Exception as exc:
             _td_emit_progress(progress_cb, f"Project cache build failed: {exc}")
             raise
-        db_path = Path(str(cache_sync_payload.get("db_path") or db_path)).expanduser()
+        db_path = Path(db_path).expanduser()
+        cache_sync_payload = {
+            "db_path": str(db_path),
+            "raw_db_path": str(td_raw_cache_db_path_for(project_dir)),
+            "workbook": str(wb_path),
+            "mode": str(state_before_cache_sync.get("mode") or "noop").strip() or "noop",
+            "counts": dict(state_before_cache_sync.get("counts") or {}),
+            "reason": str(state_before_cache_sync.get("reason") or "").strip(),
+        }
         timings["cache_ensure_s"] = round(time.perf_counter() - t0, 3)
 
     _td_emit_progress(progress_cb, "Reading project cache")
@@ -16314,6 +16688,13 @@ def update_test_data_trending_project_workbook(
     cache_debug_path = str(cache_sync_payload.get("debug_path") or "").strip()
     backend_module_path = str(Path(__file__).resolve())
     if not dry_run:
+        validation_exc: Exception | None = None
+        try:
+            validate_existing_test_data_project_cache(project_dir, wb_path)
+            cache_validation_ok = True
+        except Exception as exc:
+            validation_exc = exc
+            cache_validation_error = f"final TD cache validation failed: {exc}"
         try:
             readiness = _td_collect_project_readiness(project_dir, wb_path)
             cache_state_summary = dict(readiness.get("summary") or {})
@@ -16333,16 +16714,16 @@ def update_test_data_trending_project_workbook(
                 if str(value).strip()
             ]
             warning_summary = str(readiness.get("warning_summary") or warning_summary).strip()
-        except Exception as exc:
-            cache_validation_error = str(exc).strip()
-        else:
-            if not [str(problem).strip() for problem in (readiness.get("problems") or []) if str(problem).strip()]:
-                cache_validation_ok = True
-            else:
+            if cache_validation_ok and [str(problem).strip() for problem in (readiness.get("problems") or []) if str(problem).strip()]:
+                cache_validation_ok = False
                 cache_validation_error = _td_project_readiness_error_message(
                     readiness,
                     guidance="Run 'Update Project' again after fixing the reported TD source or workbook issues.",
                 )
+        except Exception as exc:
+            if validation_exc is None:
+                cache_validation_error = f"final TD cache validation failed: {exc}"
+            cache_validation_ok = False
         debug_path = _td_record_post_build_validation(
             project_dir,
             state_summary=cache_state_summary,
@@ -16366,8 +16747,8 @@ def update_test_data_trending_project_workbook(
             sync_reason = str(cache_sync_payload.get("reason") or "").strip()
             debug_hint = f" Debug: {cache_debug_path}." if cache_debug_path else ""
             failure_message = (
-                "Update Project did not produce a Trend/Analyze-ready Test Data project: "
-                f"{cache_validation_error or 'unknown validation error'}. "
+                f"{cache_validation_error or 'final TD cache validation failed: unknown validation error'}. "
+                + "Update Project did not produce a Trend/Analyze-ready Test Data project. "
                 f"Cache sync mode={sync_mode}"
                 + (f", reason={sync_reason}" if sync_reason else "")
                 + ". "
@@ -22228,6 +22609,17 @@ def create_eidat_project(
                 ),
                 sequences_by_program=sequences_by_program,
             ),
+        )
+        _sync_td_support_workbook_program_sheets(
+            workbook_path,
+            global_repo=repo,
+            project_dir=project_dir,
+            param_defs=list(cfg.get("columns") or []),
+        )
+        _refresh_td_support_run_conditions_sheet(
+            workbook_path,
+            project_dir=project_dir,
+            param_defs=list(cfg.get("columns") or []),
         )
         try:
             cache_payload = sync_test_data_project_cache(

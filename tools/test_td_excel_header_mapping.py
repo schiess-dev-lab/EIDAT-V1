@@ -222,6 +222,20 @@ class TestTDExcelHeaderMapping(unittest.TestCase):
             conn.close()
         return cols, rows
 
+    def _sequence_context_row(self, sqlite_path: Path, *, sheet_name: str) -> dict[str, object]:
+        conn = sqlite3.connect(str(sqlite_path))
+        try:
+            cursor = conn.execute(
+                "SELECT * FROM __sequence_context WHERE sheet_name=? LIMIT 1",
+                (sheet_name,),
+            )
+            row = cursor.fetchone()
+            self.assertIsNotNone(row, f"expected __sequence_context row for {sheet_name}")
+            names = [str(col[0] or "") for col in (cursor.description or [])]
+        finally:
+            conn.close()
+        return {names[idx]: row[idx] for idx in range(min(len(names), len(row or [])))}
+
     def _build_multirow_sequence_workbook(
         self,
         workbook_path: Path,
@@ -772,6 +786,188 @@ class TestTDExcelHeaderMapping(unittest.TestCase):
             cols, rows = self._table_rows(sqlite_path, sheet_name="seq_1")
             self.assertEqual(cols, ["excel_row", "Time", "Thrust", "Pf"])
             self.assertEqual(rows[3][1:], (3.0, 53.0, 253.0))
+
+    def test_importer_extracts_sequence_context_from_vertical_metadata_band(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            workbook_path = root / "td_sequence_context.xlsx"
+            sqlite_path = root / "td_sequence_context.sqlite3"
+            cells: list[tuple[int, int, object]] = [
+                (1, 1, "Data Mode"),
+                (2, 1, "Pulse Mode"),
+                (1, 2, "Ontime"),
+                (2, 2, 0.08),
+                (2, 3, "sec"),
+                (1, 4, "Offtime"),
+                (2, 4, 1.92),
+                (2, 5, "sec"),
+                (1, 6, "Nominal Pf"),
+                (2, 6, 200),
+                (2, 7, "psia"),
+                (1, 8, "Nominal Tf"),
+                (2, 8, 70),
+                (2, 9, "F"),
+                (1, 10, "Suppression Voltage"),
+                (2, 10, 24),
+                (2, 11, "V"),
+                (5, 1, "Time"),
+                (5, 2, "Thrust"),
+            ]
+            cells.extend((row + 6, 1, float(row)) for row in range(20))
+            cells.extend((row + 6, 2, 100.0 + float(row)) for row in range(20))
+            self._build_workbook_from_cells(workbook_path, title="Seq1", cells=cells)
+
+            self._import_workbook(workbook_path, sqlite_path)
+
+            row = self._sequence_context_row(sqlite_path, sheet_name="Seq1")
+            self.assertEqual(str(row.get("extraction_status") or ""), "ok")
+            self.assertEqual(str(row.get("run_type") or ""), "PM")
+            self.assertAlmostEqual(float(row.get("on_time_value") or 0.0), 0.08, places=8)
+            self.assertEqual(str(row.get("on_time_units") or ""), "sec")
+            self.assertAlmostEqual(float(row.get("off_time_value") or 0.0), 1.92, places=8)
+            self.assertAlmostEqual(float(row.get("control_period") or 0.0), 1.92, places=8)
+            self.assertAlmostEqual(float(row.get("nominal_pf_value") or 0.0), 200.0, places=8)
+            self.assertEqual(str(row.get("nominal_pf_units") or ""), "psia")
+            self.assertAlmostEqual(float(row.get("nominal_tf_value") or 0.0), 70.0, places=8)
+            self.assertEqual(str(row.get("nominal_tf_units") or ""), "F")
+            self.assertAlmostEqual(float(row.get("suppression_voltage_value") or 0.0), 24.0, places=8)
+            self.assertEqual(str(row.get("suppression_voltage_units") or ""), "V")
+
+    def test_importer_extracts_sequence_context_across_matching_merged_blocks(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            workbook_path = root / "td_sequence_context_merge.xlsx"
+            sqlite_path = root / "td_sequence_context_merge.sqlite3"
+            cells: list[tuple[int, int, object]] = [
+                (1, 1, "Sequence No:"),
+                (1, 3, 1),
+                (1, 4, "Datamode"),
+                (2, 4, "Pulse Mode"),
+                (1, 5, "Ontime"),
+                (2, 5, 0.08),
+                (2, 6, "sec"),
+                (1, 7, "Offtime"),
+                (2, 7, 1.92),
+                (2, 8, "sec"),
+                (1, 9, "Nominal PF"),
+                (2, 9, 200),
+                (2, 10, "psia"),
+                (2, 1, "Time"),
+                (2, 2, "Thrust"),
+            ]
+            cells.extend((row + 3, 1, float(row)) for row in range(10))
+            cells.extend((row + 3, 2, 100.0 + float(row)) for row in range(10))
+            cells.extend(
+                [
+                    (18, 4, "Data Mode"),
+                    (19, 4, "Pulse Mode"),
+                    (18, 5, "On time"),
+                    (19, 5, 0.08),
+                    (19, 6, "sec"),
+                    (18, 7, "Off time"),
+                    (19, 7, 1.92),
+                    (19, 8, "sec"),
+                    (18, 9, "Nominal Pf"),
+                    (19, 9, 200),
+                    (19, 10, "psia"),
+                    (20, 1, "Sequence No:"),
+                    (20, 3, 1),
+                    (21, 1, "Time"),
+                    (21, 2, "Pf"),
+                ]
+            )
+            cells.extend((row + 22, 1, float(row)) for row in range(10))
+            cells.extend((row + 22, 2, 300.0 + float(row)) for row in range(10))
+            self._build_workbook_from_cells(workbook_path, title="DataPages", cells=cells)
+
+            self._import_workbook(workbook_path, sqlite_path, synthesize_td_seq_aliases=True)
+
+            row = self._sequence_context_row(sqlite_path, sheet_name="seq_1")
+            self.assertEqual(str(row.get("extraction_status") or ""), "ok")
+            self.assertEqual(str(row.get("run_type") or ""), "PM")
+            self.assertAlmostEqual(float(row.get("control_period") or 0.0), 1.92, places=8)
+
+    def test_importer_marks_conflicting_merged_sequence_context_as_conflict(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            workbook_path = root / "td_sequence_context_conflict.xlsx"
+            sqlite_path = root / "td_sequence_context_conflict.sqlite3"
+            cells: list[tuple[int, int, object]] = [
+                (1, 1, "Sequence No:"),
+                (1, 3, 1),
+                (1, 4, "Data Mode"),
+                (2, 4, "Pulse Mode"),
+                (1, 5, "Ontime"),
+                (2, 5, 0.08),
+                (2, 6, "sec"),
+                (1, 7, "Offtime"),
+                (2, 7, 1.92),
+                (2, 8, "sec"),
+                (1, 9, "Nominal PF"),
+                (2, 9, 200),
+                (2, 10, "psia"),
+                (2, 1, "Time"),
+                (2, 2, "Thrust"),
+            ]
+            cells.extend((row + 3, 1, float(row)) for row in range(10))
+            cells.extend((row + 3, 2, 100.0 + float(row)) for row in range(10))
+            cells.extend(
+                [
+                    (18, 4, "Data Mode"),
+                    (19, 4, "Pulse Mode"),
+                    (18, 5, "Ontime"),
+                    (19, 5, 0.08),
+                    (19, 6, "sec"),
+                    (18, 7, "Offtime"),
+                    (19, 7, 2.5),
+                    (19, 8, "sec"),
+                    (18, 9, "Nominal PF"),
+                    (19, 9, 200),
+                    (19, 10, "psia"),
+                    (20, 1, "Sequence No:"),
+                    (20, 3, 1),
+                    (21, 1, "Time"),
+                    (21, 2, "Pf"),
+                ]
+            )
+            cells.extend((row + 22, 1, float(row)) for row in range(10))
+            cells.extend((row + 22, 2, 300.0 + float(row)) for row in range(10))
+            self._build_workbook_from_cells(workbook_path, title="DataPages", cells=cells)
+
+            self._import_workbook(workbook_path, sqlite_path, synthesize_td_seq_aliases=True)
+
+            row = self._sequence_context_row(sqlite_path, sheet_name="seq_1")
+            self.assertEqual(str(row.get("extraction_status") or ""), "conflict")
+            self.assertIn("off_time conflict", str(row.get("extraction_reason") or "").lower())
+
+    def test_importer_marks_incomplete_sequence_context_when_core_fields_are_missing(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            workbook_path = root / "td_sequence_context_incomplete.xlsx"
+            sqlite_path = root / "td_sequence_context_incomplete.sqlite3"
+            cells: list[tuple[int, int, object]] = [
+                (1, 1, "Data Mode"),
+                (2, 1, "Pulse Mode"),
+                (1, 2, "Ontime"),
+                (2, 2, 0.08),
+                (2, 3, "sec"),
+                (1, 4, "Offtime"),
+                (2, 4, 1.92),
+                (2, 5, "sec"),
+                (1, 6, "Nominal Pf"),
+                (2, 6, 200),
+                (5, 1, "Time"),
+                (5, 2, "Thrust"),
+            ]
+            cells.extend((row + 6, 1, float(row)) for row in range(20))
+            cells.extend((row + 6, 2, 100.0 + float(row)) for row in range(20))
+            self._build_workbook_from_cells(workbook_path, title="Seq1", cells=cells)
+
+            self._import_workbook(workbook_path, sqlite_path)
+
+            row = self._sequence_context_row(sqlite_path, sheet_name="Seq1")
+            self.assertEqual(str(row.get("extraction_status") or ""), "incomplete")
+            self.assertIn("nominal_pf", str(row.get("extraction_reason") or ""))
 
     def test_importer_falls_back_to_separate_runs_when_duplicate_sequences_have_no_shared_x(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
