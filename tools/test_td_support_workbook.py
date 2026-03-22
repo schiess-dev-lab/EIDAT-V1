@@ -186,6 +186,7 @@ class _PlotViewBandHarness:
         self.ed_plot_x_band_max = QtWidgets.QLineEdit()
         self.ed_plot_y_band_min = QtWidgets.QLineEdit()
         self.ed_plot_y_band_max = QtWidgets.QLineEdit()
+        self.btn_view_bands = QtWidgets.QPushButton()
         self._axes = None
         self._canvas = None
 
@@ -206,13 +207,75 @@ class _PlotViewBandHarness:
             "_set_plot_note",
             "_displayed_plot_mode",
             "_plot_view_band_mode_for_display",
+            "_plot_band_enabled_axes",
             "_current_plot_view_bands",
+            "_current_enabled_plot_view_bands",
             "_refresh_plot_note",
             "_refresh_plot_view_band_controls",
             "_apply_plot_view_bands_to_axes",
             "_apply_current_plot_view_bands",
         ):
             setattr(self, name, getattr(TestDataTrendDialog, name).__get__(self, _PlotViewBandHarness))
+
+
+class _MockLegendButton:
+    def __init__(self) -> None:
+        self.visible = False
+        self.enabled = False
+
+    def setVisible(self, visible: bool) -> None:
+        self.visible = bool(visible)
+
+    def setEnabled(self, enabled: bool) -> None:
+        self.enabled = bool(enabled)
+
+
+class _MockLegendHandle:
+    def __init__(self, color: str) -> None:
+        self._color = color
+
+    def get_color(self) -> str:
+        return self._color
+
+
+class _MockLegend:
+    def __init__(self) -> None:
+        self.removed = False
+
+    def remove(self) -> None:
+        self.removed = True
+
+
+class _MockLegendAxis:
+    def __init__(self, entry_count: int) -> None:
+        self.legend_calls = 0
+        self.legend_obj = _MockLegend()
+        self._handles = [_MockLegendHandle(f"C{i}") for i in range(entry_count)]
+        self._labels = [f"Series {i}" for i in range(entry_count)]
+
+    def get_legend_handles_labels(self):
+        return self._handles, self._labels
+
+    def get_legend(self):
+        return self.legend_obj
+
+    def legend(self, **_kwargs):
+        self.legend_calls += 1
+        return self.legend_obj
+
+
+class _LegendHarness:
+    def __init__(self) -> None:
+        from EIDAT_App_Files.ui_next.qt_main import TestDataTrendDialog  # type: ignore
+
+        self.btn_plot_legend = _MockLegendButton()
+        type(self)._legend_handle_color = staticmethod(TestDataTrendDialog._legend_handle_color)
+
+        for name in (
+            "_collect_legend_entries",
+            "_apply_interactive_legend_policy",
+        ):
+            setattr(self, name, getattr(TestDataTrendDialog, name).__get__(self, _LegendHarness))
 
 
 class _MockPlotAxis:
@@ -924,35 +987,162 @@ class TestTDTrendDialogCacheLoading(unittest.TestCase):
 
 @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
 class TestTDTrendDialogLayout(unittest.TestCase):
-    def test_metrics_y_columns_section_preserves_selection_when_collapsed(self) -> None:
+    def test_filter_summary_card_height_stays_fixed_when_dialog_grows(self) -> None:
+        dlg = _build_test_data_dialog()
+        try:
+            app = _qt_app()
+            dlg.show()
+            app.processEvents()
+            initial_height = dlg.filter_frame.height()
+            dlg.resize(dlg.width(), dlg.height() + 220)
+            app.processEvents()
+            self.assertEqual(dlg.filter_frame.height(), initial_height)
+        finally:
+            dlg.close()
+
+    def test_mode_panel_tracks_active_content_height_without_vertical_growth(self) -> None:
+        dlg = _build_test_data_dialog()
+        try:
+            app = _qt_app()
+            dlg.show()
+            app.processEvents()
+
+            dlg._set_mode("curves")
+            app.processEvents()
+            curves_height = dlg._tabs.maximumHeight()
+
+            dlg.resize(dlg.width(), dlg.height() + 240)
+            app.processEvents()
+            self.assertEqual(dlg._tabs.maximumHeight(), curves_height)
+            self.assertEqual(dlg._tabs.minimumHeight(), curves_height)
+
+            dlg._set_mode("performance")
+            app.processEvents()
+            perf_height = dlg._tabs.maximumHeight()
+            self.assertGreater(perf_height, curves_height)
+        finally:
+            dlg.close()
+
+    def test_metric_popup_summaries_reflect_backing_selection_state(self) -> None:
+        dlg = _build_test_data_dialog()
+        try:
+            from PySide6 import QtWidgets
+
+            for name in ("thrust", "current", "voltage"):
+                dlg.list_y_metrics.addItem(QtWidgets.QListWidgetItem(name))
+            dlg.list_y_metrics.selectAll()
+            dlg._refresh_metric_selector_summaries()
+            self.assertEqual(dlg.lbl_metric_y_columns_summary.text(), "Y Columns: All (3)")
+            self.assertEqual(dlg.lbl_metric_stats_summary.text(), "Stats: mean")
+
+            dlg.list_y_metrics.clearSelection()
+            dlg.list_y_metrics.item(1).setSelected(True)
+            self.assertEqual(dlg.lbl_metric_y_columns_summary.text(), "Y Columns: current")
+
+            dlg.list_stats.clearSelection()
+            dlg.list_stats.item(2).setSelected(True)
+            self.assertEqual(dlg.lbl_metric_stats_summary.text(), "Stats: max")
+        finally:
+            dlg.close()
+
+    def test_metric_y_columns_popup_applies_and_cancel_preserves_selection(self) -> None:
         dlg = _build_test_data_dialog()
         try:
             from PySide6 import QtWidgets
 
             for name in ("thrust", "current"):
                 dlg.list_y_metrics.addItem(QtWidgets.QListWidgetItem(name))
-            dlg.list_y_metrics.item(1).setSelected(True)
+            dlg._set_list_widget_selection(dlg.list_y_metrics, ["thrust", "current"])
+            dlg._refresh_metric_y_columns_summary()
 
-            dlg.section_metrics_y_columns.set_expanded(False)
-            dlg.section_metrics_y_columns.set_expanded(True)
+            with mock.patch.object(dlg, "_show_filter_checklist_popup", return_value=["current"]):
+                dlg._open_metric_y_columns_popup()
+            self.assertEqual(
+                [item.text() for item in dlg.list_y_metrics.selectedItems()],
+                ["current"],
+            )
+            self.assertEqual(dlg.lbl_metric_y_columns_summary.text(), "Y Columns: current")
 
-            self.assertTrue(dlg.list_y_metrics.item(1).isSelected())
+            with mock.patch.object(dlg, "_show_filter_checklist_popup", return_value=None):
+                dlg._open_metric_y_columns_popup()
+            self.assertEqual(
+                [item.text() for item in dlg.list_y_metrics.selectedItems()],
+                ["current"],
+            )
         finally:
             dlg.close()
 
-    def test_curve_axes_section_preserves_combo_values_when_collapsed(self) -> None:
+    def test_metric_stats_popup_applies_and_cancel_preserves_selection(self) -> None:
         dlg = _build_test_data_dialog()
         try:
-            dlg.cb_y_curve.addItems(["thrust", "current"])
-            dlg.cb_x.addItems(["Time", "Pulse Number"])
-            dlg.cb_y_curve.setCurrentText("current")
-            dlg.cb_x.setCurrentText("Pulse Number")
+            dlg._refresh_metric_stats_summary()
+            with mock.patch.object(dlg, "_show_filter_checklist_popup", return_value=["min", "max"]):
+                dlg._open_metric_stats_popup()
+            self.assertEqual(
+                sorted(item.text() for item in dlg.list_stats.selectedItems()),
+                ["max", "min"],
+            )
+            self.assertEqual(dlg.lbl_metric_stats_summary.text(), "Stats: min, max")
 
-            dlg.section_curve_axes.set_expanded(False)
-            dlg.section_curve_axes.set_expanded(True)
+            with mock.patch.object(dlg, "_show_filter_checklist_popup", return_value=None):
+                dlg._open_metric_stats_popup()
+            self.assertEqual(
+                sorted(item.text() for item in dlg.list_stats.selectedItems()),
+                ["max", "min"],
+            )
+        finally:
+            dlg.close()
 
-            self.assertEqual(dlg.cb_y_curve.currentText(), "current")
-            self.assertEqual(dlg.cb_x.currentText(), "Pulse Number")
+    def test_checklist_popup_select_all_and_clear_buttons_drive_selection(self) -> None:
+        dlg = _build_test_data_dialog()
+        try:
+            from PySide6 import QtWidgets
+
+            entries = [
+                {"value": "thrust", "label": "thrust", "search": "thrust"},
+                {"value": "current", "label": "current", "search": "current"},
+            ]
+
+            def _find_pick_dialog():
+                matches = [
+                    widget
+                    for widget in QtWidgets.QApplication.topLevelWidgets()
+                    if isinstance(widget, QtWidgets.QDialog) and widget.windowTitle() == "Pick"
+                ]
+                if matches:
+                    return matches[-1]
+                raise AssertionError("Pick dialog not found")
+
+            def _exec_select_all():
+                dialog = _find_pick_dialog()
+                for button in dialog.findChildren(QtWidgets.QPushButton):
+                    if button.text() == "Select All":
+                        button.click()
+                        break
+                return int(QtWidgets.QDialog.DialogCode.Accepted)
+
+            def _exec_clear():
+                dialog = _find_pick_dialog()
+                for button in dialog.findChildren(QtWidgets.QPushButton):
+                    if button.text() == "Clear":
+                        button.click()
+                        break
+                return int(QtWidgets.QDialog.DialogCode.Accepted)
+
+            with mock.patch("PySide6.QtWidgets.QDialog.exec", side_effect=_exec_select_all):
+                chosen_all = dlg._show_filter_checklist_popup(title="Pick", entries=entries, selected_values=[])
+            self.assertEqual(chosen_all, ["thrust", "current"])
+
+            with mock.patch(
+                "PySide6.QtWidgets.QDialog.exec",
+                side_effect=_exec_clear,
+            ):
+                chosen_none = dlg._show_filter_checklist_popup(
+                    title="Pick",
+                    entries=entries,
+                    selected_values=["thrust", "current"],
+                )
+            self.assertEqual(chosen_none, [])
         finally:
             dlg.close()
 
@@ -1046,6 +1236,14 @@ class TestTDTrendDialogLayout(unittest.TestCase):
 
         self.assertEqual(harness.checked_condition_ids(), ["condition:seq1", "condition:seq3"])
         self.assertTrue(harness._plot_metrics_called)
+        self.assertEqual(
+            [item.text() for item in harness.list_y_metrics.selectedItems()],
+            ["thrust"],
+        )
+        self.assertEqual(
+            [item.text() for item in harness.list_stats.selectedItems()],
+            ["mean"],
+        )
 
     def test_popup_auto_plot_delete_updates_saved_definitions_and_list(self) -> None:
         _qt_app()
@@ -1483,7 +1681,11 @@ class TestTDSupportWorkbook(unittest.TestCase):
                     on_time_units,
                     off_time_value,
                     off_time_units,
-                    off_time_value,
+                    (
+                        (float(on_time_value) + float(off_time_value))
+                        if on_time_value is not None and off_time_value is not None
+                        else None
+                    ),
                     nominal_pf_value,
                     nominal_pf_units,
                     nominal_tf_value,
@@ -1963,7 +2165,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 self.assertEqual(str(ws_prog.cell(2, headers["feed_pressure_units"]).value or "").strip(), "psia")
                 self.assertEqual(str(ws_prog.cell(2, headers["run_type"]).value or "").strip(), "PM")
                 self.assertEqual(ws_prog.cell(2, headers["pulse_width_on"]).value, 5)
-                self.assertEqual(ws_prog.cell(2, headers["control_period"]).value, 20)
+                self.assertEqual(ws_prog.cell(2, headers["control_period"]).value, 25)
                 self.assertEqual(ws_prog.cell(2, headers["feed_temperature"]).value, 70)
                 self.assertEqual(str(ws_prog.cell(2, headers["feed_temperature_units"]).value or "").strip(), "F")
                 self.assertEqual(ws_prog.cell(2, headers["suppression_voltage"]).value, 24)
@@ -2031,7 +2233,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 self.assertEqual(str(ws_prog.cell(2, headers["condition_key"]).value or "").strip(), "RunA")
                 self.assertEqual(str(ws_prog.cell(2, headers["run_type"]).value or "").strip(), "PM")
                 self.assertEqual(ws_prog.cell(2, headers["pulse_width_on"]).value, 5)
-                self.assertEqual(ws_prog.cell(2, headers["control_period"]).value, 20)
+                self.assertEqual(ws_prog.cell(2, headers["control_period"]).value, 25)
             finally:
                 wb.close()
 
@@ -2603,7 +2805,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
         }
         self.assertEqual(
             be._td_effective_run_condition_label(row),
-            "350 psia, PM, 60 Sec ON / 120 Sec OFF",
+            "350 psia, PM, 60 Sec ON / 60 Sec OFF",
         )
 
     def test_run_condition_label_prefers_derived_non_pm_fields_over_display_name(self) -> None:
@@ -2676,8 +2878,8 @@ class TestTDSupportWorkbook(unittest.TestCase):
             views = be.td_list_run_selection_views(db_path, wb_path, project_dir=root)
             cond_items = views.get("condition") or []
             self.assertEqual(len(cond_items), 1)
-            self.assertEqual(cond_items[0].get("display_text"), "350 psia, PM, 60 Sec ON / 120 Sec OFF")
-            self.assertEqual(cond_items[0].get("run_condition"), "350 psia, PM, 60 Sec ON / 120 Sec OFF")
+            self.assertEqual(cond_items[0].get("display_text"), "350 psia, PM, 60 Sec ON / 60 Sec OFF")
+            self.assertEqual(cond_items[0].get("run_condition"), "350 psia, PM, 60 Sec ON / 60 Sec OFF")
 
     def test_rebuild_new_schema_aggregates_across_programs_and_skips_disabled_rows(self) -> None:
         from openpyxl import load_workbook  # type: ignore
@@ -3012,7 +3214,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 )
                 conn.execute(
                     "INSERT OR REPLACE INTO td_runs(run_name, default_x, display_name, run_type, control_period, pulse_width) VALUES (?, ?, ?, ?, ?, ?)",
-                    ("Seq3", "Time", "350 psia, PM, 60 Sec ON / 120 Sec OFF", "pulsed mode", 120, 60),
+                    ("Seq3", "Time", "350 psia, PM, 60 Sec ON / 60 Sec OFF", "pulsed mode", 120, 60),
                 )
                 conn.execute(
                     """
@@ -3048,7 +3250,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 [item.get("display_text") for item in seq_items],
                 ["Default Program - Seq3", "Default Program - Seq1", "Default Program - Seq2"],
             )
-            self.assertEqual([item.get("display_text") for item in cond_items], ["350 psia, PM, 60 Sec ON / 120 Sec OFF", "350 psia, SS"])
+            self.assertEqual([item.get("display_text") for item in cond_items], ["350 psia, PM, 60 Sec ON / 60 Sec OFF", "350 psia, SS"])
             ss_group = next(item for item in cond_items if item.get("display_text") == "350 psia, SS")
             self.assertEqual(ss_group.get("member_runs"), ["Seq1"])
             self.assertEqual(ss_group.get("member_sequences"), ["Seq1", "Seq2"])
@@ -7033,29 +7235,50 @@ class TestTDSupportWorkbook(unittest.TestCase):
     def test_plot_view_band_controls_follow_active_mode(self) -> None:
         harness = _PlotViewBandHarness()
 
+        harness._mode = "curves"
+        harness._refresh_plot_view_band_controls()
+        self.assertFalse(harness.ed_plot_x_band_min.isHidden())
+        self.assertFalse(harness.ed_plot_y_band_min.isHidden())
+        self.assertTrue(harness.ed_plot_x_band_min.isEnabled())
+        self.assertTrue(harness.ed_plot_y_band_min.isEnabled())
+
         harness._mode = "metrics"
         harness._refresh_plot_view_band_controls()
-        self.assertFalse(harness.plot_band_frame.isHidden())
-        self.assertTrue(harness.ed_plot_x_band_min.isHidden())
         self.assertFalse(harness.ed_plot_y_band_min.isHidden())
+        self.assertFalse(harness.ed_plot_x_band_min.isHidden())
+        self.assertFalse(harness.ed_plot_y_band_min.isHidden())
+        self.assertFalse(harness.ed_plot_x_band_min.isEnabled())
+        self.assertTrue(harness.ed_plot_y_band_min.isEnabled())
 
         harness._mode = "performance"
         harness._refresh_plot_view_band_controls()
         self.assertFalse(harness.ed_plot_x_band_min.isHidden())
         self.assertFalse(harness.ed_plot_y_band_min.isHidden())
-
-        harness._mode = "curves"
-        harness._refresh_plot_view_band_controls()
-        self.assertTrue(harness.plot_band_frame.isHidden())
+        self.assertTrue(harness.ed_plot_x_band_min.isEnabled())
+        self.assertTrue(harness.ed_plot_y_band_min.isEnabled())
 
     @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
     def test_metrics_view_band_changes_axis_limits_only(self) -> None:
         harness = _PlotViewBandHarness()
         axis = _MockPlotAxis(xlim=(0.0, 9.0), ylim=(0.0, 100.0))
+        harness.ed_plot_x_band_min.setText("2")
+        harness.ed_plot_x_band_max.setText("4")
         harness.ed_plot_y_band_min.setText("10")
         harness.ed_plot_y_band_max.setText("20")
         harness._apply_plot_view_bands_to_axes(axis, mode="metrics")
         self.assertEqual(axis.get_xlim(), (0.0, 9.0))
+        self.assertEqual(axis.get_ylim(), (10.0, 20.0))
+
+    @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
+    def test_curves_view_band_changes_both_axis_limits(self) -> None:
+        harness = _PlotViewBandHarness()
+        axis = _MockPlotAxis(xlim=(0.0, 9.0), ylim=(0.0, 100.0))
+        harness.ed_plot_x_band_min.setText("2")
+        harness.ed_plot_x_band_max.setText("4")
+        harness.ed_plot_y_band_min.setText("10")
+        harness.ed_plot_y_band_max.setText("20")
+        harness._apply_plot_view_bands_to_axes(axis, mode="curves")
+        self.assertEqual(axis.get_xlim(), (2.0, 4.0))
         self.assertEqual(axis.get_ylim(), (10.0, 20.0))
 
     @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
@@ -7069,6 +7292,25 @@ class TestTDSupportWorkbook(unittest.TestCase):
         harness._apply_plot_view_bands_to_axes(axis, mode="performance")
         self.assertEqual(axis.get_xlim(), (2.0, 4.0))
         self.assertEqual(axis.get_ylim(), (10.0, 20.0))
+
+    def test_interactive_legend_policy_keeps_inline_legend_for_eight_or_fewer_entries(self) -> None:
+        harness = _LegendHarness()
+        axis = _MockLegendAxis(8)
+        entries = harness._apply_interactive_legend_policy(axis, overflow_button=harness.btn_plot_legend)
+        self.assertEqual(len(entries), 8)
+        self.assertEqual(axis.legend_calls, 1)
+        self.assertFalse(harness.btn_plot_legend.visible)
+        self.assertFalse(harness.btn_plot_legend.enabled)
+
+    def test_interactive_legend_policy_switches_to_popup_for_more_than_eight_entries(self) -> None:
+        harness = _LegendHarness()
+        axis = _MockLegendAxis(9)
+        entries = harness._apply_interactive_legend_policy(axis, overflow_button=harness.btn_plot_legend)
+        self.assertEqual(len(entries), 9)
+        self.assertEqual(axis.legend_calls, 0)
+        self.assertTrue(axis.legend_obj.removed)
+        self.assertTrue(harness.btn_plot_legend.visible)
+        self.assertTrue(harness.btn_plot_legend.enabled)
 
     @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
     def test_view_band_edits_do_not_mutate_performance_results(self) -> None:

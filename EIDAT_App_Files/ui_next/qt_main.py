@@ -3157,6 +3157,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._cache_progress_timer = QtCore.QTimer(self)
         self._cache_progress_timer.setSingleShot(True)
         self._cache_progress_timer.timeout.connect(self._show_cache_progress_dialog)
+        self._plot_band_popup: QtWidgets.QDialog | None = None
+        self._main_plot_legend_entries: list[dict[str, str]] = []
 
         self.setWindowTitle("Test Data - Trend / Analyze")
         self.resize(920, 620)
@@ -3193,7 +3195,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         root.setSpacing(16)
 
         filter_frame = QtWidgets.QFrame()
+        self.filter_frame = filter_frame
         filter_frame.setStyleSheet("QFrame { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 10px; }")
+        filter_frame.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Fixed,
+        )
         filter_layout = QtWidgets.QHBoxLayout(filter_frame)
         filter_layout.setContentsMargins(12, 10, 12, 10)
         filter_layout.setSpacing(12)
@@ -3205,11 +3212,20 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         filter_title.setStyleSheet("font-size: 12px; font-weight: 800; color: #0f172a;")
         self.lbl_program_filter_summary = QtWidgets.QLabel("Programs: -")
         self.lbl_program_filter_summary.setStyleSheet("color: #334155; font-size: 11px;")
+        self.lbl_program_filter_summary.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Fixed,
+        )
         self.lbl_serial_filter_summary = QtWidgets.QLabel("Serials: -")
         self.lbl_serial_filter_summary.setStyleSheet("color: #334155; font-size: 11px;")
+        self.lbl_serial_filter_summary.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Fixed,
+        )
         filter_text_layout.addWidget(filter_title)
         filter_text_layout.addWidget(self.lbl_program_filter_summary)
         filter_text_layout.addWidget(self.lbl_serial_filter_summary)
+        filter_text_layout.addStretch(1)
         filter_layout.addLayout(filter_text_layout, 1)
 
         self.btn_program_filters = QtWidgets.QPushButton("Programs...")
@@ -3236,12 +3252,13 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 """
             )
             filter_layout.addWidget(btn)
-        root.addWidget(filter_frame)
+        root.addWidget(filter_frame, 0)
 
         splitter = QtWidgets.QSplitter()
+        self.main_splitter = splitter
         splitter.setOrientation(QtCore.Qt.Orientation.Horizontal)
         splitter.setChildrenCollapsible(False)
-        root.addWidget(splitter)
+        root.addWidget(splitter, 1)
 
         # Left panel: controls
         left_scroll = QtWidgets.QScrollArea()
@@ -3348,11 +3365,11 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._run_name_by_display: dict[str, str] = {}
         self._run_selection_views: dict[str, list[dict]] = {"sequence": [], "condition": []}
 
-        tabs = QtWidgets.QTabWidget()
-        try:
-            tabs.tabBar().hide()
-        except Exception:
-            pass
+        tabs = QtWidgets.QStackedWidget()
+        tabs.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Fixed,
+        )
         self._tabs = tabs
 
         # Metrics tab
@@ -3360,41 +3377,33 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         metrics_layout = QtWidgets.QVBoxLayout(tab_metrics)
         metrics_layout.setContentsMargins(10, 10, 10, 10)
         metrics_layout.setSpacing(8)
+        metrics_layout.setSizeConstraint(QtWidgets.QLayout.SizeConstraint.SetMinimumSize)
 
-        metrics_y_body = QtWidgets.QWidget()
-        metrics_y_layout = QtWidgets.QVBoxLayout(metrics_y_body)
-        metrics_y_layout.setContentsMargins(0, 0, 0, 0)
-        metrics_y_layout.setSpacing(8)
-
-        self.list_y_metrics = QtWidgets.QListWidget()
+        self.list_y_metrics = QtWidgets.QListWidget(tab_metrics)
         self.list_y_metrics.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.list_y_metrics.itemSelectionChanged.connect(self._refresh_stats_preview)
-        metrics_y_layout.addWidget(self.list_y_metrics, 1)
+        self.list_y_metrics.hide()
+        self.list_y_metrics.itemSelectionChanged.connect(self._on_metric_y_selection_changed)
 
-        y_sel_row = QtWidgets.QHBoxLayout()
-        self.btn_y_select_all = QtWidgets.QPushButton("Select All")
-        self.btn_y_clear_all = QtWidgets.QPushButton("Clear")
-        self.btn_y_select_all.clicked.connect(lambda: self.list_y_metrics.selectAll())
-        self.btn_y_clear_all.clicked.connect(lambda: self.list_y_metrics.clearSelection())
-        y_sel_row.addWidget(self.btn_y_select_all)
-        y_sel_row.addWidget(self.btn_y_clear_all)
-        y_sel_row.addStretch(1)
-        metrics_y_layout.addLayout(y_sel_row)
-
-        self.section_metrics_y_columns = _CollapsibleSection(
-            "Y Columns (multi-select)",
-            metrics_y_body,
-            expanded=True,
+        metrics_y_row = QtWidgets.QHBoxLayout()
+        metrics_y_row.setSpacing(8)
+        self.btn_metric_y_columns_popup = QtWidgets.QPushButton("Y Columns...")
+        self.btn_metric_y_columns_popup.clicked.connect(self._open_metric_y_columns_popup)
+        self.lbl_metric_y_columns_summary = QtWidgets.QLabel("Y Columns: -")
+        self.lbl_metric_y_columns_summary.setStyleSheet("color: #64748b; font-size: 11px;")
+        self.lbl_metric_y_columns_summary.setWordWrap(False)
+        self.lbl_metric_y_columns_summary.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Fixed,
         )
-        metrics_layout.addWidget(self.section_metrics_y_columns, 1)
+        metrics_y_row.addWidget(self.btn_metric_y_columns_popup)
+        metrics_y_row.addWidget(self.lbl_metric_y_columns_summary, 1)
+        metrics_layout.addLayout(metrics_y_row)
 
-        lbl_stats = QtWidgets.QLabel("Stats (multi-select)")
-        lbl_stats.setStyleSheet("font-size: 12px; font-weight: 700; color: #334155;")
-        metrics_layout.addWidget(lbl_stats)
-
-        self.list_stats = QtWidgets.QListWidget()
+        self.list_stats = QtWidgets.QListWidget(tab_metrics)
         self.list_stats.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
         self.list_stats.setMaximumHeight(92)
+        self.list_stats.hide()
+        self.list_stats.itemSelectionChanged.connect(self._refresh_metric_stats_summary)
         for st in ["mean", "min", "max", "std"]:
             self.list_stats.addItem(QtWidgets.QListWidgetItem(st))
         # Default selection: mean (matches prior single-select default behavior).
@@ -3403,7 +3412,21 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             if it.text().strip().lower() == "mean":
                 it.setSelected(True)
                 break
-        metrics_layout.addWidget(self.list_stats)
+
+        stats_row = QtWidgets.QHBoxLayout()
+        stats_row.setSpacing(8)
+        self.btn_metric_stats_popup = QtWidgets.QPushButton("Stats...")
+        self.btn_metric_stats_popup.clicked.connect(self._open_metric_stats_popup)
+        self.lbl_metric_stats_summary = QtWidgets.QLabel("Stats: mean")
+        self.lbl_metric_stats_summary.setStyleSheet("color: #64748b; font-size: 11px;")
+        self.lbl_metric_stats_summary.setWordWrap(False)
+        self.lbl_metric_stats_summary.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Fixed,
+        )
+        stats_row.addWidget(self.btn_metric_stats_popup)
+        stats_row.addWidget(self.lbl_metric_stats_summary, 1)
+        metrics_layout.addLayout(stats_row)
 
         self.cb_metric_average = QtWidgets.QCheckBox("Average")
         self.cb_metric_average.setChecked(False)
@@ -3422,8 +3445,15 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         curves_layout = QtWidgets.QVBoxLayout(tab_curves)
         curves_layout.setContentsMargins(10, 10, 10, 10)
         curves_layout.setSpacing(8)
+        curves_layout.setSizeConstraint(QtWidgets.QLayout.SizeConstraint.SetMinimumSize)
 
-        curves_axes_body = QtWidgets.QWidget()
+        curves_axes_body = QtWidgets.QFrame()
+        self.curves_axes_panel = curves_axes_body
+        curves_axes_body.setStyleSheet("QFrame { background: transparent; border: 0; }")
+        curves_axes_body.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Fixed,
+        )
         curves_axes_layout = QtWidgets.QVBoxLayout(curves_axes_body)
         curves_axes_layout.setContentsMargins(0, 0, 0, 0)
         curves_axes_layout.setSpacing(8)
@@ -3442,12 +3472,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         row_curves.addWidget(self.cb_x, 1)
         curves_axes_layout.addLayout(row_curves)
 
-        self.section_curve_axes = _CollapsibleSection(
-            "Curve Axes",
-            curves_axes_body,
-            expanded=True,
-        )
-        curves_layout.addWidget(self.section_curve_axes)
+        curves_layout.addWidget(curves_axes_body, 0)
 
         # Performance tab (candidate discovery + project-wide plotting)
         tab_perf = QtWidgets.QWidget()
@@ -3627,10 +3652,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         )
         perf_plot_layout.addWidget(self.section_perf_equations)
 
-        tabs.addTab(tab_metrics, "Metrics")
-        tabs.addTab(tab_curves, "Curves")
-        tabs.addTab(tab_perf, "Performance")
-        left_layout.addWidget(tabs)
+        tabs.addWidget(tab_metrics)
+        tabs.addWidget(tab_curves)
+        tabs.addWidget(tab_perf)
+        left_layout.addWidget(tabs, 0)
 
         self.run_selector_frame = QtWidgets.QFrame()
         self.run_selector_frame.setStyleSheet(
@@ -3757,15 +3782,30 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self.btn_zoom_in.clicked.connect(lambda: self._zoom_main_plot(0.8))
         self.btn_zoom_reset.clicked.connect(self._reset_main_plot_zoom)
         self.btn_expand_plot.clicked.connect(self._open_main_plot_popup)
+        self.btn_view_bands = QtWidgets.QPushButton("View Bands...")
+        self.btn_view_bands.setStyleSheet(zoom_btn_css)
+        self.btn_view_bands.setToolTip("Set optional view bands for the current plot axes")
+        self.btn_view_bands.clicked.connect(self._open_plot_band_popup)
+        self.btn_plot_legend = QtWidgets.QPushButton("Legend...")
+        self.btn_plot_legend.setStyleSheet(zoom_btn_css)
+        self.btn_plot_legend.setVisible(False)
+        self.btn_plot_legend.setEnabled(False)
+        self.btn_plot_legend.clicked.connect(self._open_main_plot_legend_popup)
         plot_header.addWidget(self.btn_zone_zoom)
         plot_header.addWidget(self.btn_zoom_out)
         plot_header.addWidget(self.btn_zoom_in)
         plot_header.addWidget(self.btn_zoom_reset)
         plot_header.addWidget(self.btn_expand_plot)
+        plot_header.addWidget(self.btn_view_bands)
+        plot_header.addWidget(self.btn_plot_legend)
         right_layout.addLayout(plot_header)
 
         self.plot_band_frame = QtWidgets.QFrame()
         self.plot_band_frame.setStyleSheet("QFrame { border: 0; background: transparent; }")
+        self.plot_band_frame.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Fixed,
+        )
         plot_band_layout = QtWidgets.QVBoxLayout(self.plot_band_frame)
         plot_band_layout.setContentsMargins(0, 0, 0, 0)
         plot_band_layout.setSpacing(6)
@@ -3803,8 +3843,6 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         ):
             edit.textChanged.connect(lambda *_: self._apply_current_plot_view_bands())
             edit.editingFinished.connect(self._finalize_plot_view_bands)
-
-        right_layout.addWidget(self.plot_band_frame)
 
         self.plot_container = QtWidgets.QFrame()
         plot_layout = QtWidgets.QVBoxLayout(self.plot_container)
@@ -3949,17 +3987,343 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._refresh_global_filter_summaries()
         self._load_cache(rebuild=False)
         self._load_auto_plots()
+        self._refresh_metric_selector_summaries()
         self._set_mode("curves")
 
     def showEvent(self, event: QtGui.QShowEvent) -> None:  # type: ignore[override]
         super().showEvent(event)
         _fit_widget_to_screen(self)
+        self._schedule_mode_panel_height_sync()
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        self._schedule_mode_panel_height_sync()
+
+    def _schedule_mode_panel_height_sync(self) -> None:
+        if not hasattr(self, "_tabs"):
+            return
+        QtCore.QTimer.singleShot(0, self._sync_mode_panel_height)
+
+    def _sync_mode_panel_height(self) -> None:
+        stack = getattr(self, "_tabs", None)
+        if stack is None or not hasattr(stack, "currentWidget"):
+            return
+        current = stack.currentWidget()
+        if current is None:
+            return
+        try:
+            layout = current.layout()
+            if layout is not None:
+                layout.activate()
+        except Exception:
+            pass
+        try:
+            hint_height = max(current.minimumSizeHint().height(), current.sizeHint().height())
+        except Exception:
+            hint_height = 0
+        if hint_height <= 0:
+            return
+        try:
+            stack.setMinimumHeight(hint_height)
+            stack.setMaximumHeight(hint_height)
+            stack.updateGeometry()
+        except Exception:
+            pass
 
     @staticmethod
     def _metric_title_suffix(stats: list[str] | tuple[str, ...] | None) -> str:
         items = [str(s).strip().lower() for s in (stats or []) if str(s).strip()]
         title_items = [s for s in items if s != "average"]
         return "/".join(title_items)
+
+    @staticmethod
+    def _popup_selection_summary(
+        selected_items: list[str] | tuple[str, ...] | None,
+        *,
+        total_count: int,
+        empty_text: str = "-",
+    ) -> str:
+        selected = [str(item).strip() for item in (selected_items or []) if str(item).strip()]
+        total = max(0, int(total_count or 0))
+        if total <= 0:
+            return empty_text
+        if not selected:
+            return "None selected"
+        if len(selected) >= total:
+            return f"All ({total})"
+        if len(selected) <= 2:
+            return ", ".join(selected)
+        return f"{len(selected)} of {total} selected"
+
+    @staticmethod
+    def _list_widget_item_texts(list_widget: QtWidgets.QListWidget | None) -> list[str]:
+        if list_widget is None:
+            return []
+        return [
+            str(list_widget.item(i).text() or "").strip()
+            for i in range(list_widget.count())
+            if list_widget.item(i) is not None and str(list_widget.item(i).text() or "").strip()
+        ]
+
+    @staticmethod
+    def _selected_list_widget_texts(list_widget: QtWidgets.QListWidget | None) -> list[str]:
+        if list_widget is None:
+            return []
+        return [str(item.text() or "").strip() for item in list_widget.selectedItems() if str(item.text() or "").strip()]
+
+    def _set_list_widget_selection(self, list_widget: QtWidgets.QListWidget, values: list[str] | tuple[str, ...]) -> None:
+        wanted = {str(value).strip() for value in (values or []) if str(value).strip()}
+        list_widget.blockSignals(True)
+        try:
+            list_widget.clearSelection()
+            for i in range(list_widget.count()):
+                item = list_widget.item(i)
+                if item is not None and item.text() in wanted:
+                    item.setSelected(True)
+        finally:
+            list_widget.blockSignals(False)
+
+    def _on_metric_y_selection_changed(self) -> None:
+        self._refresh_metric_y_columns_summary()
+        self._refresh_stats_preview()
+
+    def _refresh_metric_y_columns_summary(self) -> None:
+        if not hasattr(self, "lbl_metric_y_columns_summary"):
+            return
+        selected = self._selected_list_widget_texts(getattr(self, "list_y_metrics", None))
+        all_items = self._list_widget_item_texts(getattr(self, "list_y_metrics", None))
+        text = "Y Columns: " + self._popup_selection_summary(selected, total_count=len(all_items))
+        self.lbl_metric_y_columns_summary.setText(text)
+        self.lbl_metric_y_columns_summary.setToolTip(", ".join(selected))
+        self._schedule_mode_panel_height_sync()
+
+    def _refresh_metric_stats_summary(self) -> None:
+        if not hasattr(self, "lbl_metric_stats_summary"):
+            return
+        selected = self._selected_list_widget_texts(getattr(self, "list_stats", None))
+        all_items = self._list_widget_item_texts(getattr(self, "list_stats", None))
+        text = "Stats: " + self._popup_selection_summary(selected, total_count=len(all_items))
+        self.lbl_metric_stats_summary.setText(text)
+        self.lbl_metric_stats_summary.setToolTip(", ".join(selected))
+        self._schedule_mode_panel_height_sync()
+
+    def _refresh_metric_selector_summaries(self) -> None:
+        self._refresh_metric_y_columns_summary()
+        self._refresh_metric_stats_summary()
+
+    def _open_metric_y_columns_popup(self) -> None:
+        if not hasattr(self, "list_y_metrics"):
+            return
+        entries = [
+            {"value": text, "label": text, "search": text.lower()}
+            for text in self._list_widget_item_texts(self.list_y_metrics)
+        ]
+        chosen = self._show_filter_checklist_popup(
+            title="Metric Y Columns",
+            entries=entries,
+            selected_values=self._selected_list_widget_texts(self.list_y_metrics),
+        )
+        if chosen is None:
+            return
+        self._set_list_widget_selection(self.list_y_metrics, chosen)
+        self._on_metric_y_selection_changed()
+
+    def _open_metric_stats_popup(self) -> None:
+        if not hasattr(self, "list_stats"):
+            return
+        entries = [
+            {"value": text, "label": text, "search": text.lower()}
+            for text in self._list_widget_item_texts(self.list_stats)
+        ]
+        chosen = self._show_filter_checklist_popup(
+            title="Metric Stats",
+            entries=entries,
+            selected_values=self._selected_list_widget_texts(self.list_stats),
+        )
+        if chosen is None:
+            return
+        self._set_list_widget_selection(self.list_stats, chosen)
+        self._refresh_metric_stats_summary()
+
+    def _plot_band_enabled_axes(self, mode: str) -> tuple[str, ...]:
+        current = str(mode or "").strip().lower()
+        if current == "metrics":
+            return ("y",)
+        if current in {"curves", "performance"}:
+            return ("x", "y")
+        return tuple()
+
+    @staticmethod
+    def _legend_handle_color(handle: object) -> str:
+        try:
+            from matplotlib import colors as mcolors
+        except Exception:
+            mcolors = None
+        for getter_name in ("get_color", "get_facecolor", "get_edgecolor"):
+            getter = getattr(handle, getter_name, None)
+            if not callable(getter):
+                continue
+            try:
+                raw_value = getter()
+            except Exception:
+                continue
+            value = raw_value
+            if hasattr(value, "tolist"):
+                try:
+                    value = value.tolist()
+                except Exception:
+                    pass
+            if isinstance(value, (list, tuple)) and value:
+                first = value[0]
+                if isinstance(first, (list, tuple)) and first:
+                    value = tuple(first)
+            if mcolors is not None:
+                try:
+                    return str(mcolors.to_hex(value))
+                except Exception:
+                    pass
+            text = str(value or "").strip()
+            if text:
+                return text
+        return "#64748b"
+
+    def _collect_legend_entries(self, ax) -> list[dict[str, str]]:
+        if ax is None or not hasattr(ax, "get_legend_handles_labels"):
+            return []
+        try:
+            handles, labels = ax.get_legend_handles_labels()
+        except Exception:
+            return []
+        out: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for handle, label in zip(handles or [], labels or []):
+            label_text = str(label or "").strip()
+            if not label_text or label_text.startswith("_"):
+                continue
+            if label_text in seen:
+                continue
+            seen.add(label_text)
+            out.append({"label": label_text, "color": self._legend_handle_color(handle)})
+        return out
+
+    def _apply_interactive_legend_policy(
+        self,
+        ax,
+        *,
+        overflow_button: QtWidgets.QPushButton | None = None,
+    ) -> list[dict[str, str]]:
+        entries = self._collect_legend_entries(ax)
+        try:
+            legend = ax.get_legend()
+        except Exception:
+            legend = None
+        if legend is not None:
+            try:
+                legend.remove()
+            except Exception:
+                pass
+        overflow = len(entries) > 8
+        if not overflow and entries:
+            try:
+                ax.legend(fontsize=8, loc="best")
+            except Exception:
+                pass
+        if overflow_button is not None:
+            overflow_button.setVisible(bool(entries) and overflow)
+            overflow_button.setEnabled(bool(entries) and overflow)
+        return entries
+
+    def _open_legend_popup(
+        self,
+        entries: list[dict[str, str]] | tuple[dict[str, str], ...] | None,
+        *,
+        title: str,
+    ) -> None:
+        legend_entries = [dict(entry) for entry in (entries or []) if isinstance(entry, dict)]
+        if not legend_entries:
+            return
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle(title)
+        dlg.resize(460, 520)
+        layout = QtWidgets.QVBoxLayout(dlg)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        ed_filter = QtWidgets.QLineEdit()
+        ed_filter.setPlaceholderText("Filter legend entries...")
+        layout.addWidget(ed_filter)
+
+        listw = QtWidgets.QListWidget()
+        listw.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
+        layout.addWidget(listw, 1)
+
+        for entry in legend_entries:
+            label_text = str(entry.get("label") or "").strip()
+            if not label_text:
+                continue
+            item = QtWidgets.QListWidgetItem(label_text)
+            color_text = str(entry.get("color") or "#64748b").strip() or "#64748b"
+            pixmap = QtGui.QPixmap(12, 12)
+            pixmap.fill(QtGui.QColor(color_text))
+            item.setIcon(QtGui.QIcon(pixmap))
+            item.setData(QtCore.Qt.ItemDataRole.UserRole + 1, label_text.lower())
+            listw.addItem(item)
+
+        def _apply_filter() -> None:
+            needle = str(ed_filter.text() or "").strip().lower()
+            for idx in range(listw.count()):
+                item = listw.item(idx)
+                hay = str(item.data(QtCore.Qt.ItemDataRole.UserRole + 1) or "").strip()
+                item.setHidden(bool(needle) and needle not in hay)
+
+        ed_filter.textChanged.connect(_apply_filter)
+        _apply_filter()
+
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_row.addStretch(1)
+        btn_close = QtWidgets.QPushButton("Close")
+        btn_close.clicked.connect(dlg.accept)
+        btn_row.addWidget(btn_close)
+        layout.addLayout(btn_row)
+
+        _fit_widget_to_screen(dlg)
+        dlg.exec()
+
+    def _open_main_plot_legend_popup(self) -> None:
+        self._open_legend_popup(self._main_plot_legend_entries, title="Plot Legend")
+
+    def _ensure_plot_band_popup(self) -> QtWidgets.QDialog:
+        popup = getattr(self, "_plot_band_popup", None)
+        if isinstance(popup, QtWidgets.QDialog):
+            return popup
+        popup = QtWidgets.QDialog(self, QtCore.Qt.WindowType.Popup)
+        popup.setWindowTitle("View Bands")
+        popup.setModal(False)
+        popup.setStyleSheet("QDialog { background: #ffffff; border: 1px solid #e2e8f0; }")
+        layout = QtWidgets.QVBoxLayout(popup)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+        layout.addWidget(self.plot_band_frame)
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_row.addStretch(1)
+        btn_close = QtWidgets.QPushButton("Close")
+        btn_close.clicked.connect(popup.hide)
+        btn_row.addWidget(btn_close)
+        layout.addLayout(btn_row)
+        self._plot_band_popup = popup
+        return popup
+
+    def _open_plot_band_popup(self) -> None:
+        popup = self._ensure_plot_band_popup()
+        self._refresh_plot_view_band_controls()
+        popup.adjustSize()
+        target = getattr(self, "btn_view_bands", None)
+        if target is not None:
+            pos = target.mapToGlobal(QtCore.QPoint(0, target.height() + 4))
+            popup.move(pos)
+        popup.show()
+        popup.raise_()
+        popup.activateWindow()
 
     def _sync_main_auto_plot_actions(self) -> None:
         enabled = bool(self._auto_plots) and self._plot_ready and bool(self._db_path)
@@ -4104,9 +4468,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
     @staticmethod
     def _plot_view_band_axes(mode: str) -> tuple[str, ...]:
         current = str(mode or "").strip().lower()
-        if current == "metrics":
-            return ("y",)
-        if current == "performance":
+        if current in {"curves", "metrics", "performance"}:
             return ("x", "y")
         return tuple()
 
@@ -4115,7 +4477,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         active_mode = str(getattr(self, "_mode", "") or "").strip().lower()
         if display_mode != active_mode:
             return ""
-        return display_mode if display_mode in {"metrics", "performance"} else ""
+        return display_mode if display_mode in {"curves", "metrics", "performance"} else ""
 
     def _current_plot_view_bands(self, *, mode: str | None = None) -> dict[str, tuple[float | None, float | None]]:
         use_mode = str(mode or self._plot_view_band_mode_for_display() or self._mode or "").strip().lower()
@@ -4126,6 +4488,20 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             x_max = getattr(getattr(self, "ed_plot_x_band_max", None), "text", lambda: "")()
             bands["x"] = self._normalize_view_band("X", x_min, x_max)
         if "y" in allowed_axes:
+            y_min = getattr(getattr(self, "ed_plot_y_band_min", None), "text", lambda: "")()
+            y_max = getattr(getattr(self, "ed_plot_y_band_max", None), "text", lambda: "")()
+            bands["y"] = self._normalize_view_band("Y", y_min, y_max)
+        return bands
+
+    def _current_enabled_plot_view_bands(self, *, mode: str | None = None) -> dict[str, tuple[float | None, float | None]]:
+        use_mode = str(mode or self._plot_view_band_mode_for_display() or self._mode or "").strip().lower()
+        enabled_axes = set(self._plot_band_enabled_axes(use_mode))
+        bands: dict[str, tuple[float | None, float | None]] = {}
+        if "x" in enabled_axes:
+            x_min = getattr(getattr(self, "ed_plot_x_band_min", None), "text", lambda: "")()
+            x_max = getattr(getattr(self, "ed_plot_x_band_max", None), "text", lambda: "")()
+            bands["x"] = self._normalize_view_band("X", x_min, x_max)
+        if "y" in enabled_axes:
             y_min = getattr(getattr(self, "ed_plot_y_band_min", None), "text", lambda: "")()
             y_max = getattr(getattr(self, "ed_plot_y_band_max", None), "text", lambda: "")()
             bands["y"] = self._normalize_view_band("Y", y_min, y_max)
@@ -4158,7 +4534,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         mode = self._plot_view_band_mode_for_display()
         if mode:
             try:
-                view_note = self._plot_view_band_note(self._current_plot_view_bands(mode=mode))
+                view_note = self._plot_view_band_note(self._current_enabled_plot_view_bands(mode=mode))
             except ValueError:
                 view_note = ""
             if view_note:
@@ -4170,8 +4546,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
     def _refresh_plot_view_band_controls(self) -> None:
         active_mode = str(getattr(self, "_mode", "") or "").strip().lower()
         axes = set(self._plot_view_band_axes(active_mode))
-        if hasattr(self, "plot_band_frame"):
-            self.plot_band_frame.setVisible(bool(axes))
+        enabled_axes = set(self._plot_band_enabled_axes(active_mode))
+        if hasattr(self, "btn_view_bands"):
+            self.btn_view_bands.setVisible(bool(axes))
+            self.btn_view_bands.setEnabled(bool(getattr(self, "_plot_ready", False)) and bool(axes))
         for attr, visible in (("plot_band_x_row", "x" in axes), ("plot_band_y_row", "y" in axes)):
             row = getattr(self, attr, None)
             if row is None:
@@ -4181,16 +4559,18 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 widget = item.widget() if item is not None else None
                 if widget is not None:
                     widget.setVisible(visible)
+                    axis = "x" if attr == "plot_band_x_row" else "y"
+                    widget.setEnabled(axis in enabled_axes)
         self._refresh_plot_note()
 
     def _apply_plot_view_bands_to_axes(self, ax, *, mode: str | None = None) -> None:
         if ax is None:
             return
         use_mode = str(mode or self._plot_view_band_mode_for_display() or self._mode or "").strip().lower()
-        axes = set(self._plot_view_band_axes(use_mode))
+        axes = set(self._plot_band_enabled_axes(use_mode))
         if not axes:
             return
-        bands = self._current_plot_view_bands(mode=use_mode)
+        bands = self._current_enabled_plot_view_bands(mode=use_mode)
         if "x" in axes:
             x_bounds = bands.get("x", (None, None))
             if self._view_band_active(x_bounds):
@@ -4225,7 +4605,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             self._refresh_plot_note()
             return
         try:
-            self._current_plot_view_bands(mode=mode)
+            self._current_enabled_plot_view_bands(mode=mode)
         except ValueError as exc:
             QtWidgets.QMessageBox.warning(self, "Plot View Bands", str(exc))
             return
@@ -4316,6 +4696,11 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     getattr(self, b).setEnabled(enabled)
                 except Exception:
                     pass
+        if hasattr(self, "btn_view_bands"):
+            try:
+                self.btn_view_bands.setEnabled(bool(self._plot_ready and self._plot_view_band_axes(self._mode)))
+            except Exception:
+                pass
         self._sync_main_auto_plot_actions()
 
     def _zoom_main_plot(self, factor: float) -> None:
@@ -4530,7 +4915,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         btn_out = QtWidgets.QPushButton("Zoom -")
         btn_in = QtWidgets.QPushButton("Zoom +")
         btn_reset = QtWidgets.QPushButton("Reset")
-        for b in (btn_mag, btn_out, btn_in, btn_reset):
+        btn_legend = QtWidgets.QPushButton("Legend...")
+        btn_legend.setVisible(False)
+        btn_legend.setEnabled(False)
+        for b in (btn_mag, btn_out, btn_in, btn_reset, btn_legend):
             b.setStyleSheet(
                 """
                 QPushButton {
@@ -4552,6 +4940,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         top.addWidget(btn_out)
         top.addWidget(btn_in)
         top.addWidget(btn_reset)
+        top.addWidget(btn_legend)
         top.addSpacing(10)
         top.addWidget(hint)
         top.addStretch(1)
@@ -4561,11 +4950,13 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         layout.addWidget(canvas, 1)
 
         plot_mode = str((self._last_plot_def or {}).get("mode") or "").strip().lower()
-        if plot_mode in {"metrics", "performance"}:
+        if plot_mode in {"curves", "metrics", "performance"}:
             try:
                 self._apply_plot_view_bands_to_axes(ax, mode=plot_mode)
             except ValueError:
                 pass
+        popup_legend_entries = self._apply_interactive_legend_policy(ax, overflow_button=btn_legend)
+        btn_legend.clicked.connect(lambda: self._open_legend_popup(popup_legend_entries, title="Plot Legend"))
         base_xlim = ax.get_xlim()
         base_ylim = ax.get_ylim()
 
@@ -6931,6 +7322,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             self.cb_y_curve.clear()
             self.cb_x.clear()
             self.list_y_metrics.clear()
+            self._refresh_metric_selector_summaries()
+            self._schedule_mode_panel_height_sync()
             return
 
         y_cols: list[dict] = []
@@ -7003,6 +7396,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         if not restored and self.list_y_metrics.count() > 0:
             self.list_y_metrics.selectAll()
         self.list_y_metrics.blockSignals(False)
+        self._refresh_metric_y_columns_summary()
 
         prev_x = self.cb_x.currentText()
         self.cb_x.blockSignals(True)
@@ -7042,6 +7436,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             self.cb_x.setCurrentText(want)
         self.cb_x.blockSignals(False)
         self._refresh_curve_y_columns()
+        self._schedule_mode_panel_height_sync()
 
     def _refresh_curve_y_columns(self) -> None:
         if not self._db_path or not hasattr(self, "cb_y_curve") or not hasattr(self, "cb_x"):
@@ -7075,6 +7470,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self.cb_y_curve.blockSignals(False)
         if self._mode == "curves":
             self._refresh_stats_preview()
+        self._schedule_mode_panel_height_sync()
 
     def _resolve_curve_x_key(self, run: str, x_label: str) -> str:
         """
@@ -7281,7 +7677,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             y_col = (getattr(self, "cb_y_curve", None).currentText() or "").strip() if hasattr(self, "cb_y_curve") else ""
         else:
             # Preview first selected Y column (keeps table compact).
-            selected = [it.text() for it in self.list_y_metrics.selectedItems()] if hasattr(self, "list_y_metrics") else []
+            selected = self._selected_list_widget_texts(getattr(self, "list_y_metrics", None))
             y_col = (selected[0] if selected else "").strip()
         self._populate_stats_table(run, y_col, self._highlight_sn)
 
@@ -7311,6 +7707,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         if m != "performance":
             self._refresh_stats_preview()
         self._update_perf_primary_equation_banner()
+        self._schedule_mode_panel_height_sync()
 
     def _plot_current_mode(self) -> None:
         self._set_plot_note("")
@@ -7329,13 +7726,13 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         selection = self._current_run_selection()
         selections = self._current_run_selections()
         runs = self._current_member_runs()
-        stats = [it.text().strip().lower() for it in self.list_stats.selectedItems()] if hasattr(self, "list_stats") else []
+        stats = [text.lower() for text in self._selected_list_widget_texts(getattr(self, "list_stats", None))]
         stats = [s for s in stats if s]
         if hasattr(self, "cb_metric_average") and self.cb_metric_average.isChecked() and "average" not in stats:
             stats.append("average")
         if not runs or not stats:
             return
-        y_cols = [it.text().strip() for it in self.list_y_metrics.selectedItems()] if hasattr(self, "list_y_metrics") else []
+        y_cols = self._selected_list_widget_texts(getattr(self, "list_y_metrics", None))
         y_cols = [c for c in y_cols if c]
         if not y_cols:
             QtWidgets.QMessageBox.information(self, "Plot Metrics", "Select at least one Y column.")
@@ -7458,10 +7855,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._axes.set_xticks(x)
         self._axes.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
         self._axes.grid(True, alpha=0.25)
-        try:
-            self._axes.legend(fontsize=8, loc="best")
-        except Exception:
-            pass
+        self._main_plot_legend_entries = self._apply_interactive_legend_policy(
+            self._axes,
+            overflow_button=getattr(self, "btn_plot_legend", None),
+        )
         if average_summaries:
             prefix = "Average value: " if len(average_summaries) == 1 else "Average values: "
             self._set_plot_note(prefix + " | ".join(average_summaries))
@@ -7561,10 +7958,11 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.information(self, "Plot Curves", "No curve data found for this selection.")
             return
         self._axes.grid(True, alpha=0.25)
-        try:
-            self._axes.legend(fontsize=8, loc="best")
-        except Exception:
-            pass
+        self._main_plot_legend_entries = self._apply_interactive_legend_policy(
+            self._axes,
+            overflow_button=getattr(self, "btn_plot_legend", None),
+        )
+        self._apply_plot_view_bands_to_axes(self._axes, mode="curves")
         try:
             self._figure.tight_layout()
         except Exception:
@@ -8109,6 +8507,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
     def _clear_perf_results(self) -> None:
         self._perf_results_by_stat = {}
         self._perf_plot_view_stats = []
+        self._main_plot_legend_entries = []
+        if hasattr(self, "btn_plot_legend"):
+            self.btn_plot_legend.setVisible(False)
+            self.btn_plot_legend.setEnabled(False)
         if hasattr(self, "tbl_perf_equations"):
             try:
                 self.tbl_perf_equations.setRowCount(0)
@@ -9683,6 +10085,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._ensure_main_axes(plot_dimension)
         hi_sn = str(getattr(self, "_highlight_sn", "") or "").strip()
         self._render_performance_result(self._axes, r, highlight_serial=hi_sn, select_equation_row=True)
+        self._main_plot_legend_entries = self._apply_interactive_legend_policy(
+            self._axes,
+            overflow_button=getattr(self, "btn_plot_legend", None),
+        )
         self._apply_plot_view_bands_to_axes(self._axes, mode="performance")
         self._refresh_plot_note()
         try:
@@ -9853,6 +10259,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 self.cb_metric_average.blockSignals(True)
                 self.cb_metric_average.setChecked(prev_average)
                 self.cb_metric_average.blockSignals(False)
+            self._refresh_metric_stats_summary()
 
         prev_output, prev_input1, prev_input2 = self._perf_var_names()
         prev_run_type_mode = self._selected_perf_run_type_mode()
@@ -9978,9 +10385,11 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             if hasattr(self, "lbl_perf_common_runs"):
                 self.lbl_perf_common_runs.setText("Common runs for selected variables: 0 (no test data metric columns are available)")
             self._clear_perf_results()
+            self._schedule_mode_panel_height_sync()
             return
 
         self._on_perf_axis_changed()
+        self._schedule_mode_panel_height_sync()
 
     def _on_perf_preset_changed(self) -> None:
         self._on_perf_axis_changed()

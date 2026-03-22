@@ -1247,17 +1247,13 @@ _SEQ_CONTEXT_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
     "data_mode": ("data mode", "datamode"),
     "on_time": ("on time", "ontime"),
     "off_time": ("off time", "offtime"),
-    "nominal_pf": ("nominal pf", "nominal p f"),
-    "nominal_tf": ("nominal tf", "nominal t f"),
-    "suppression_voltage": ("suppression voltage", "supp voltage"),
+    "duty_cycle": ("duty cycle", "dutycycle"),
+    "nominal_pf": ("nominal pf", "nominal p f", "pf nom", "pfnom", "pf nominal"),
+    "nominal_tf": ("nominal tf", "nominal t f", "tf nom", "tfnom", "tf nominal", "tp nom", "tpnom"),
+    "suppression_voltage": ("suppression voltage", "supp voltage", "vs nom", "vsnom", "vs nominal"),
+    "valve_voltage": ("value voltage", "valve voltage", "vv nom", "vvnom", "vv nominal"),
 }
-_SEQ_CONTEXT_VALUE_OFFSETS: tuple[tuple[int, int], ...] = (
-    (1, 0),
-    (2, 0),
-    (0, 1),
-    (1, 1),
-    (0, 2),
-)
+_SEQ_CONTEXT_SEPARATOR_TOKENS = {"=", ":", "-", "–", "—"}
 
 
 def _parse_env_file(path: Path) -> dict[str, str]:
@@ -2326,6 +2322,13 @@ def _normalize_sequence_meta_units(value: object) -> str:
     return re.sub(r"\s+", "", txt).lower()
 
 
+def _sequence_context_default_time_units(value: object, units: object) -> str:
+    if value in (None, ""):
+        return ""
+    txt = _collapse_meta_text(units)
+    return txt or "sec"
+
+
 def _normalize_sequence_data_mode(value: object) -> str:
     raw = str(value or "").strip()
     if not raw:
@@ -2342,26 +2345,28 @@ def _sequence_context_field_match(value: object, field_name: str) -> tuple[int, 
     label = _normalize_sequence_meta_label(value)
     if not label:
         return None
-    label_compact = label.replace(" ", "")
-    allow_fuzzy = str(field_name) in {"data_mode", "on_time", "off_time", "suppression_voltage"}
+    label_compact = "".join(ch.lower() for ch in _collapse_meta_text(value) if ch.isalnum())
+    allow_fuzzy = str(field_name) in {"data_mode", "on_time", "off_time", "duty_cycle", "suppression_voltage", "valve_voltage"}
     best: tuple[int, int, float] | None = None
     for alias in _SEQ_CONTEXT_FIELD_ALIASES.get(str(field_name), ()):
-        alias_norm = _normalize_sequence_meta_label(alias)
-        if not alias_norm:
+        alias_compact = "".join(ch.lower() for ch in _collapse_meta_text(alias) if ch.isalnum())
+        if not alias_compact:
             continue
-        alias_compact = alias_norm.replace(" ", "")
         alias_compact_len = len(alias_compact)
+        short_alias = alias_compact_len <= 5 and alias_compact in {"pfnom", "tfnom", "tpnom", "vsnom", "vvnom"}
         match: tuple[int, int, float] | None = None
         if label_compact == alias_compact:
             match = (0, -alias_compact_len, 1.0)
         elif (
+            not short_alias
+            and
             alias_compact_len >= 5
             and min(len(label_compact), len(alias_compact)) >= 5
             and (label_compact.startswith(alias_compact) or alias_compact.startswith(label_compact))
         ):
             score = float(min(len(label_compact), len(alias_compact))) / float(max(len(label_compact), len(alias_compact)))
             match = (1, -alias_compact_len, score)
-        elif allow_fuzzy and alias_compact_len >= 4:
+        elif allow_fuzzy and not short_alias and alias_compact_len >= 4:
             score = float(difflib.SequenceMatcher(a=alias_compact, b=label_compact).ratio())
             if score >= float(_SEQ_CONTEXT_FUZZY_MIN_RATIO):
                 match = (2, -alias_compact_len, -score)
@@ -2400,6 +2405,64 @@ def _parse_numeric_with_units(primary: object, secondary: object = None) -> tupl
     return float(numeric), units
 
 
+def _parse_duty_cycle_value(primary: object, secondary: object = None) -> tuple[float | None, float | None, str]:
+    raw_parts = [_collapse_meta_text(primary)]
+    if not _is_blank(secondary):
+        raw_parts.append(_collapse_meta_text(secondary))
+    raw = " ".join(part for part in raw_parts if part).strip()
+    if not raw:
+        return None, None, ""
+    match = re.search(
+        r"(?P<on>[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*(?P<on_units>[A-Za-z/\^\d_-]*)?\s*on\b.*?"
+        r"(?P<off>[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*(?P<off_units>[A-Za-z/\^\d_-]*)?\s*off\b",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None, None, ""
+    try:
+        on_value = float(match.group("on"))
+        off_value = float(match.group("off"))
+    except Exception:
+        return None, None, ""
+    on_units = _collapse_meta_text(match.group("on_units") or "")
+    off_units = _collapse_meta_text(match.group("off_units") or "")
+    units = on_units or off_units or "sec"
+    return float(on_value), float(off_value), units
+
+
+def _sequence_context_is_separator_text(value: object) -> bool:
+    txt = _collapse_meta_text(value)
+    return not txt or txt in _SEQ_CONTEXT_SEPARATOR_TOKENS
+
+
+def _sequence_context_looks_like_label(value: object) -> bool:
+    txt = _collapse_meta_text(value)
+    if not txt:
+        return False
+    return any(_sequence_context_field_match(txt, field_name) is not None for field_name in _SEQ_CONTEXT_FIELD_ALIASES)
+
+
+def _sequence_context_horizontal_candidates(
+    *,
+    row: int,
+    col: int,
+    cell_map: Mapping[tuple[int, int], str],
+) -> list[tuple[int, int, str]]:
+    out: list[tuple[int, int, str]] = []
+    for delta in range(1, 5):
+        probe_col = int(col) + int(delta)
+        raw = cell_map.get((int(row), probe_col))
+        if _sequence_context_is_separator_text(raw):
+            continue
+        text = _collapse_meta_text(raw)
+        if not text:
+            continue
+        out.append((int(row), int(probe_col), text))
+        break
+    return out
+
+
 def _extract_sequence_context_candidate(
     field_name: str,
     *,
@@ -2407,15 +2470,19 @@ def _extract_sequence_context_candidate(
     col: int,
     cell_map: dict[tuple[int, int], str],
 ) -> dict[str, object] | None:
-    for row_off, col_off in _SEQ_CONTEXT_VALUE_OFFSETS:
+    candidates: list[tuple[int, int, str]] = []
+    for row_off in (1, 2):
         value_row = int(row) + int(row_off)
-        value_col = int(col) + int(col_off)
-        raw_value = cell_map.get((value_row, value_col))
+        raw_value = cell_map.get((value_row, int(col)))
         if _is_blank(raw_value):
             continue
+        candidates.append((int(value_row), int(col), _collapse_meta_text(raw_value)))
+    candidates.extend(_sequence_context_horizontal_candidates(row=int(row), col=int(col), cell_map=cell_map))
+
+    for value_row, value_col, raw_value in candidates:
         if str(field_name) == "data_mode":
             text = _collapse_meta_text(raw_value)
-            if text:
+            if text and not _sequence_context_looks_like_label(text):
                 return {
                     "row": int(value_row),
                     "col": int(value_col),
@@ -2423,7 +2490,18 @@ def _extract_sequence_context_candidate(
                     "run_type": _normalize_sequence_data_mode(text),
                 }
             continue
-        neighbor = cell_map.get((value_row, value_col + 1))
+        neighbor = cell_map.get((int(value_row), int(value_col) + 1))
+        if str(field_name) == "duty_cycle":
+            on_value, off_value, units = _parse_duty_cycle_value(raw_value, neighbor)
+            if on_value is None or off_value is None:
+                continue
+            return {
+                "row": int(value_row),
+                "col": int(value_col),
+                "on_value": float(on_value),
+                "off_value": float(off_value),
+                "units": _sequence_context_default_time_units(on_value, units),
+            }
         numeric, units = _parse_numeric_with_units(raw_value, neighbor)
         if numeric is None:
             continue
@@ -2494,6 +2572,49 @@ def _merge_sequence_context_mode_candidates(
     return chosen_raw, chosen_type, None
 
 
+def _merge_sequence_context_duty_cycle_candidates(
+    candidates: Sequence[dict[str, object]],
+) -> tuple[float | None, float | None, str, str | None]:
+    chosen_on: float | None = None
+    chosen_off: float | None = None
+    chosen_units = ""
+    for cand in candidates:
+        on_value = _try_float(cand.get("on_value"))
+        off_value = _try_float(cand.get("off_value"))
+        units = _collapse_meta_text(cand.get("units"))
+        if on_value is None or off_value is None:
+            continue
+        units = _sequence_context_default_time_units(on_value, units)
+        if chosen_on is None and chosen_off is None:
+            chosen_on = float(on_value)
+            chosen_off = float(off_value)
+            chosen_units = units
+            continue
+        same_on = _values_equal_with_units(chosen_on, chosen_units, float(on_value), units)
+        same_off = _values_equal_with_units(chosen_off, chosen_units, float(off_value), units)
+        if not same_on or not same_off:
+            return None, None, "", "duty_cycle conflict"
+        if not chosen_units and units:
+            chosen_units = units
+    return chosen_on, chosen_off, chosen_units, None
+
+
+def _merge_sequence_context_primary_secondary_numeric(
+    field_name: str,
+    primary_value: float | None,
+    primary_units: str,
+    secondary_value: float | None,
+    secondary_units: str,
+) -> tuple[float | None, str, str | None]:
+    if primary_value is None:
+        return secondary_value, secondary_units, None
+    if secondary_value is None:
+        return primary_value, primary_units, None
+    if not _values_equal_with_units(primary_value, primary_units, secondary_value, secondary_units):
+        return None, "", f"{field_name} conflict"
+    return primary_value, primary_units or secondary_units, None
+
+
 def _sequence_context_from_meta_cells(
     *,
     sheet_name: str,
@@ -2529,6 +2650,27 @@ def _sequence_context_from_meta_cells(
     off_time_value, off_time_units, err = _merge_sequence_context_numeric_candidates("off_time", field_candidates["off_time"])
     if err:
         conflicts.append(err)
+    duty_on_value, duty_off_value, duty_units, err = _merge_sequence_context_duty_cycle_candidates(field_candidates["duty_cycle"])
+    if err:
+        conflicts.append(err)
+    on_time_value, on_time_units, err = _merge_sequence_context_primary_secondary_numeric(
+        "on_time",
+        on_time_value,
+        on_time_units,
+        duty_on_value,
+        duty_units,
+    )
+    if err:
+        conflicts.append(err)
+    off_time_value, off_time_units, err = _merge_sequence_context_primary_secondary_numeric(
+        "off_time",
+        off_time_value,
+        off_time_units,
+        duty_off_value,
+        duty_units,
+    )
+    if err:
+        conflicts.append(err)
     nominal_pf_value, nominal_pf_units, err = _merge_sequence_context_numeric_candidates("nominal_pf", field_candidates["nominal_pf"])
     if err:
         conflicts.append(err)
@@ -2541,6 +2683,18 @@ def _sequence_context_from_meta_cells(
     )
     if err:
         conflicts.append(err)
+    valve_voltage_value, valve_voltage_units, err = _merge_sequence_context_numeric_candidates(
+        "valve_voltage",
+        field_candidates["valve_voltage"],
+    )
+    if err:
+        conflicts.append(err)
+
+    on_time_units = _sequence_context_default_time_units(on_time_value, on_time_units)
+    off_time_units = _sequence_context_default_time_units(off_time_value, off_time_units)
+    control_period = None
+    if on_time_value is not None and off_time_value is not None:
+        control_period = float(on_time_value) + float(off_time_value)
 
     extraction_status = "ok"
     reasons: list[str] = []
@@ -2569,13 +2723,15 @@ def _sequence_context_from_meta_cells(
         "on_time_units": _collapse_meta_text(on_time_units),
         "off_time_value": off_time_value,
         "off_time_units": _collapse_meta_text(off_time_units),
-        "control_period": off_time_value,
+        "control_period": control_period,
         "nominal_pf_value": nominal_pf_value,
         "nominal_pf_units": _collapse_meta_text(nominal_pf_units),
         "nominal_tf_value": nominal_tf_value,
         "nominal_tf_units": _collapse_meta_text(nominal_tf_units),
         "suppression_voltage_value": suppression_voltage_value,
         "suppression_voltage_units": _collapse_meta_text(suppression_voltage_units),
+        "valve_voltage_value": valve_voltage_value,
+        "valve_voltage_units": _collapse_meta_text(valve_voltage_units),
         "extraction_status": extraction_status,
         "extraction_reason": "; ".join([reason for reason in reasons if str(reason).strip()]),
     }
@@ -2600,6 +2756,8 @@ def _create_sequence_context_table(conn: sqlite3.Connection) -> None:
           nominal_tf_units TEXT,
           suppression_voltage_value REAL,
           suppression_voltage_units TEXT,
+          valve_voltage_value REAL,
+          valve_voltage_units TEXT,
           extraction_status TEXT,
           extraction_reason TEXT
         );
@@ -2628,9 +2786,11 @@ def _insert_sequence_context_row(conn: sqlite3.Connection, row: Mapping[str, obj
           nominal_tf_units,
           suppression_voltage_value,
           suppression_voltage_units,
+          valve_voltage_value,
+          valve_voltage_units,
           extraction_status,
           extraction_reason
-        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             str(row.get("sheet_name") or "").strip(),
@@ -2648,6 +2808,8 @@ def _insert_sequence_context_row(conn: sqlite3.Connection, row: Mapping[str, obj
             str(row.get("nominal_tf_units") or "").strip(),
             _try_float(row.get("suppression_voltage_value")),
             str(row.get("suppression_voltage_units") or "").strip(),
+            _try_float(row.get("valve_voltage_value")),
+            str(row.get("valve_voltage_units") or "").strip(),
             str(row.get("extraction_status") or "").strip(),
             str(row.get("extraction_reason") or "").strip(),
         ),

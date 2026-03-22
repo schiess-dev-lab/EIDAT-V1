@@ -825,7 +825,7 @@ class TestTDExcelHeaderMapping(unittest.TestCase):
             self.assertAlmostEqual(float(row.get("on_time_value") or 0.0), 0.08, places=8)
             self.assertEqual(str(row.get("on_time_units") or ""), "sec")
             self.assertAlmostEqual(float(row.get("off_time_value") or 0.0), 1.92, places=8)
-            self.assertAlmostEqual(float(row.get("control_period") or 0.0), 1.92, places=8)
+            self.assertAlmostEqual(float(row.get("control_period") or 0.0), 2.0, places=8)
             self.assertAlmostEqual(float(row.get("nominal_pf_value") or 0.0), 200.0, places=8)
             self.assertEqual(str(row.get("nominal_pf_units") or ""), "psia")
             self.assertAlmostEqual(float(row.get("nominal_tf_value") or 0.0), 70.0, places=8)
@@ -885,7 +885,91 @@ class TestTDExcelHeaderMapping(unittest.TestCase):
             row = self._sequence_context_row(sqlite_path, sheet_name="seq_1")
             self.assertEqual(str(row.get("extraction_status") or ""), "ok")
             self.assertEqual(str(row.get("run_type") or ""), "PM")
-            self.assertAlmostEqual(float(row.get("control_period") or 0.0), 1.92, places=8)
+            self.assertAlmostEqual(float(row.get("control_period") or 0.0), 2.0, places=8)
+
+    def test_importer_extracts_sequence_context_from_duty_cycle_shorthand_layout(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            workbook_path = root / "td_sequence_context_duty_cycle.xlsx"
+            sqlite_path = root / "td_sequence_context_duty_cycle.sqlite3"
+            cells: list[tuple[int, int, object]] = [
+                (1, 2, "Duty Cycle"),
+                (1, 3, "="),
+                (1, 4, "0.1 sec On / 1.9 sec Off"),
+                (2, 2, "Data Mode"),
+                (2, 3, "="),
+                (2, 4, "Pulse Mode"),
+                (1, 7, "Pf (nom)"),
+                (1, 8, "="),
+                (1, 9, 257),
+                (1, 10, "psia"),
+                (2, 7, "Tp (nom)"),
+                (2, 8, "="),
+                (2, 9, 70),
+                (2, 10, "F"),
+                (1, 12, "Vv (nom)"),
+                (1, 13, "="),
+                (1, 14, 28),
+                (1, 15, "V"),
+                (2, 12, "Vs (nom)"),
+                (2, 13, "="),
+                (2, 14, 30),
+                (2, 15, "V"),
+                (5, 1, "Pulse Number"),
+                (5, 2, "Thrust"),
+            ]
+            cells.extend((row + 6, 1, float(row)) for row in range(20))
+            cells.extend((row + 6, 2, 100.0 + float(row)) for row in range(20))
+            self._build_workbook_from_cells(workbook_path, title="Seq4", cells=cells)
+
+            self._import_workbook(workbook_path, sqlite_path)
+
+            row = self._sequence_context_row(sqlite_path, sheet_name="Seq4")
+            self.assertEqual(str(row.get("extraction_status") or ""), "ok")
+            self.assertEqual(str(row.get("run_type") or ""), "PM")
+            self.assertAlmostEqual(float(row.get("on_time_value") or 0.0), 0.1, places=8)
+            self.assertEqual(str(row.get("on_time_units") or ""), "sec")
+            self.assertAlmostEqual(float(row.get("off_time_value") or 0.0), 1.9, places=8)
+            self.assertEqual(str(row.get("off_time_units") or ""), "sec")
+            self.assertAlmostEqual(float(row.get("control_period") or 0.0), 2.0, places=8)
+            self.assertAlmostEqual(float(row.get("nominal_pf_value") or 0.0), 257.0, places=8)
+            self.assertEqual(str(row.get("nominal_pf_units") or ""), "psia")
+            self.assertAlmostEqual(float(row.get("nominal_tf_value") or 0.0), 70.0, places=8)
+            self.assertEqual(str(row.get("nominal_tf_units") or ""), "F")
+            self.assertAlmostEqual(float(row.get("suppression_voltage_value") or 0.0), 30.0, places=8)
+            self.assertEqual(str(row.get("suppression_voltage_units") or ""), "V")
+            self.assertAlmostEqual(float(row.get("valve_voltage_value") or 0.0), 28.0, places=8)
+            self.assertEqual(str(row.get("valve_voltage_units") or ""), "V")
+
+    def test_importer_defaults_missing_time_units_to_seconds(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            workbook_path = root / "td_sequence_context_default_seconds.xlsx"
+            sqlite_path = root / "td_sequence_context_default_seconds.sqlite3"
+            cells: list[tuple[int, int, object]] = [
+                (1, 1, "Data Mode"),
+                (2, 1, "Pulse Mode"),
+                (1, 2, "On time"),
+                (2, 2, 0.1),
+                (1, 4, "Off time"),
+                (2, 4, 1.9),
+                (1, 6, "Nominal Pf"),
+                (2, 6, 257),
+                (2, 7, "psia"),
+                (5, 1, "Time"),
+                (5, 2, "Thrust"),
+            ]
+            cells.extend((row + 6, 1, float(row)) for row in range(20))
+            cells.extend((row + 6, 2, 100.0 + float(row)) for row in range(20))
+            self._build_workbook_from_cells(workbook_path, title="Seq1", cells=cells)
+
+            self._import_workbook(workbook_path, sqlite_path)
+
+            row = self._sequence_context_row(sqlite_path, sheet_name="Seq1")
+            self.assertEqual(str(row.get("extraction_status") or ""), "ok")
+            self.assertEqual(str(row.get("on_time_units") or ""), "sec")
+            self.assertEqual(str(row.get("off_time_units") or ""), "sec")
+            self.assertAlmostEqual(float(row.get("control_period") or 0.0), 2.0, places=8)
 
     def test_importer_marks_conflicting_merged_sequence_context_as_conflict(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:

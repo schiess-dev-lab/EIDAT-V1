@@ -5978,14 +5978,20 @@ def td_build_run_condition_label(sequence_row: dict | None) -> str:
         parts.append(run_type)
     if run_type == "PM":
         on_time = _td_format_compact_value(_td_support_sequence_pulse_width(sequence_row))
-        off_time = _td_format_compact_value(sequence_row.get("control_period"))
+        off_time = ""
+        on_numeric = _td_finite_float(_td_support_sequence_pulse_width(sequence_row))
+        control_period_numeric = _td_finite_float(sequence_row.get("control_period"))
+        if on_numeric is not None and control_period_numeric is not None and control_period_numeric >= on_numeric:
+            off_time = _td_format_compact_value(control_period_numeric - on_numeric)
+        elif sequence_row.get("off_time") not in (None, ""):
+            off_time = _td_format_compact_value(sequence_row.get("off_time"))
         timing = ""
         if on_time and off_time:
             timing = f"{on_time} Sec ON / {off_time} Sec OFF"
         elif on_time:
             timing = f"{on_time} Sec ON"
-        elif off_time:
-            timing = f"{off_time} Sec OFF"
+        elif control_period_numeric is not None:
+            timing = f"{_td_format_compact_value(control_period_numeric)} Sec Period"
         if timing:
             parts.append(timing)
     return ", ".join(part for part in parts if str(part).strip())
