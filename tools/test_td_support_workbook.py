@@ -1000,6 +1000,32 @@ class TestTDTrendDialogLayout(unittest.TestCase):
         finally:
             dlg.close()
 
+    def test_left_panel_width_locks_after_show_and_ignores_splitter_resize(self) -> None:
+        dlg = _build_test_data_dialog()
+        try:
+            app = _qt_app()
+            dlg.show()
+            app.processEvents()
+
+            left_panel = dlg._left_panel_scroll
+            self.assertIsNotNone(left_panel)
+            assert left_panel is not None
+            locked_width = dlg._left_panel_locked_width
+            self.assertIsNotNone(locked_width)
+            assert locked_width is not None
+
+            self.assertEqual(left_panel.minimumWidth(), locked_width)
+            self.assertEqual(left_panel.maximumWidth(), locked_width)
+            self.assertEqual(left_panel.width(), locked_width)
+
+            dlg.main_splitter.setSizes([max(1, locked_width // 2), max(1, dlg.width())])
+            app.processEvents()
+
+            self.assertEqual(left_panel.width(), locked_width)
+            self.assertEqual(dlg.main_splitter.sizes()[0], locked_width)
+        finally:
+            dlg.close()
+
     def test_mode_panel_tracks_active_content_height_without_vertical_growth(self) -> None:
         dlg = _build_test_data_dialog()
         try:

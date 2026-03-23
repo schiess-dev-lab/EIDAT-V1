@@ -3159,6 +3159,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._cache_progress_timer.timeout.connect(self._show_cache_progress_dialog)
         self._plot_band_popup: QtWidgets.QDialog | None = None
         self._main_plot_legend_entries: list[dict[str, str]] = []
+        self._left_panel_scroll: QtWidgets.QScrollArea | None = None
+        self._left_panel_locked_width: int | None = None
+        self._left_panel_width_initialized = False
 
         self.setWindowTitle("Test Data - Trend / Analyze")
         self.resize(920, 620)
@@ -3266,6 +3269,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         left_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
         left_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         left_scroll.setStyleSheet("QScrollArea { background: transparent; border: 0; }")
+        self._left_panel_scroll = left_scroll
         left = QtWidgets.QFrame()
         left.setStyleSheet("QFrame { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 10px; }")
         left_layout = QtWidgets.QVBoxLayout(left)
@@ -3975,8 +3979,14 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         right_layout.addWidget(footer_frame, 0)
 
         splitter.addWidget(right)
+        splitter.setHandleWidth(0)
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 3)
+        try:
+            splitter.handle(1).setEnabled(False)
+            splitter.handle(1).hide()
+        except Exception:
+            pass
 
         self._report_progress = RunProgressDialog(self)
         try:
@@ -3994,10 +4004,38 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         super().showEvent(event)
         _fit_widget_to_screen(self)
         self._schedule_mode_panel_height_sync()
+        QtCore.QTimer.singleShot(0, self._initialize_left_panel_width)
 
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:  # type: ignore[override]
         super().resizeEvent(event)
         self._schedule_mode_panel_height_sync()
+
+    def _initialize_left_panel_width(self) -> None:
+        if self._left_panel_width_initialized:
+            return
+        panel = self._left_panel_scroll
+        splitter = getattr(self, "main_splitter", None)
+        if panel is None or splitter is None:
+            return
+        width = panel.width()
+        if width <= 0:
+            try:
+                width = max(panel.sizeHint().width(), panel.minimumSizeHint().width())
+            except Exception:
+                width = 0
+        if width <= 0:
+            return
+        self._left_panel_locked_width = int(width)
+        self._left_panel_width_initialized = True
+        panel.setMinimumWidth(self._left_panel_locked_width)
+        panel.setMaximumWidth(self._left_panel_locked_width)
+        panel.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Fixed,
+            QtWidgets.QSizePolicy.Policy.Expanding,
+        )
+        total_width = max(1, splitter.width())
+        right_width = max(1, total_width - self._left_panel_locked_width)
+        splitter.setSizes([self._left_panel_locked_width, right_width])
 
     def _schedule_mode_panel_height_sync(self) -> None:
         if not hasattr(self, "_tabs"):
