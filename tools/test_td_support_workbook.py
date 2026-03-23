@@ -1172,11 +1172,21 @@ class TestTDTrendDialogLayout(unittest.TestCase):
         finally:
             dlg.close()
 
-    def test_performance_equations_section_defaults_collapsed_without_fixed_minimum_height(self) -> None:
+    def test_performance_equations_open_in_popup_window(self) -> None:
         dlg = _build_test_data_dialog()
         try:
-            self.assertFalse(dlg.section_perf_equations.is_expanded())
+            app = _qt_app()
+            self.assertIsNotNone(dlg._perf_equations_popup)
             self.assertEqual(dlg.tbl_perf_equations.minimumHeight(), 0)
+            assert dlg._perf_equations_popup is not None
+            self.assertFalse(dlg._perf_equations_popup.isVisible())
+
+            dlg._open_performance_equations_popup()
+            app.processEvents()
+
+            self.assertTrue(dlg._perf_equations_popup.isVisible())
+            self.assertEqual(dlg._perf_equations_popup.windowTitle(), "Performance Equations")
+            self.assertIn(dlg.tbl_perf_equations, dlg._perf_equations_popup.findChildren(type(dlg.tbl_perf_equations)))
         finally:
             dlg.close()
 

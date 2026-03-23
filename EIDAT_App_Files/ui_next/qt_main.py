@@ -3162,6 +3162,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._left_panel_scroll: QtWidgets.QScrollArea | None = None
         self._left_panel_locked_width: int | None = None
         self._left_panel_width_initialized = False
+        self._perf_equations_popup: QtWidgets.QDialog | None = None
 
         self.setWindowTitle("Test Data - Trend / Analyze")
         self.resize(920, 620)
@@ -3604,6 +3605,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         view_row.addWidget(self.cb_perf_view_stat, 1)
         perf_plot_layout.addLayout(view_row)
 
+        self.btn_perf_equations_popup = QtWidgets.QPushButton("Performance Equations...")
+        perf_plot_layout.addWidget(self.btn_perf_equations_popup, 0, QtCore.Qt.AlignmentFlag.AlignLeft)
+
         perf_eq_body = QtWidgets.QWidget()
         perf_eq_layout = QtWidgets.QVBoxLayout(perf_eq_body)
         perf_eq_layout.setContentsMargins(0, 0, 0, 0)
@@ -3649,12 +3653,20 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self.tbl_perf_equations.setMinimumHeight(0)
         perf_eq_layout.addWidget(self.tbl_perf_equations, 1)
 
-        self.section_perf_equations = _CollapsibleSection(
-            "Performance Equations",
-            perf_eq_body,
-            expanded=False,
-        )
-        perf_plot_layout.addWidget(self.section_perf_equations)
+        perf_eq_popup = QtWidgets.QDialog(self)
+        perf_eq_popup.setWindowTitle("Performance Equations")
+        perf_eq_popup.resize(1180, 420)
+        perf_eq_popup_layout = QtWidgets.QVBoxLayout(perf_eq_popup)
+        perf_eq_popup_layout.setContentsMargins(12, 12, 12, 12)
+        perf_eq_popup_layout.setSpacing(8)
+        perf_eq_popup_layout.addWidget(perf_eq_body, 1)
+        perf_eq_close_row = QtWidgets.QHBoxLayout()
+        perf_eq_close_row.addStretch(1)
+        btn_close_perf_eq_popup = QtWidgets.QPushButton("Close")
+        btn_close_perf_eq_popup.clicked.connect(perf_eq_popup.close)
+        perf_eq_close_row.addWidget(btn_close_perf_eq_popup)
+        perf_eq_popup_layout.addLayout(perf_eq_close_row)
+        self._perf_equations_popup = perf_eq_popup
 
         tabs.addWidget(tab_metrics)
         tabs.addWidget(tab_curves)
@@ -9727,6 +9739,16 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "Export Equation to Excel", str(exc))
 
+    def _open_performance_equations_popup(self) -> None:
+        dlg = getattr(self, "_perf_equations_popup", None)
+        if dlg is None:
+            return
+        if dlg.isMinimized():
+            dlg.showNormal()
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
     def _perf_default_saved_name(self) -> str:
         results = getattr(self, "_perf_results_by_stat", {}) or {}
         first_result = next((r for r in results.values() if isinstance(r, dict)), {}) or {}
@@ -10406,6 +10428,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             self.cb_perf_surface_model.currentIndexChanged.connect(lambda *_: self._clear_perf_results())
             self.sp_perf_degree.valueChanged.connect(lambda *_: self._clear_perf_results())
             self.cb_perf_norm_x.toggled.connect(lambda *_: self._clear_perf_results())
+            self.btn_perf_equations_popup.clicked.connect(self._open_performance_equations_popup)
             self.btn_perf_save_equation.clicked.connect(self._save_current_performance_equation)
             self.btn_perf_saved_equations.clicked.connect(self._open_saved_performance_equations_popup)
             self.btn_perf_export_equations.clicked.connect(self._export_perf_equations_to_excel)
