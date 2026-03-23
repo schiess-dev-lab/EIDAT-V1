@@ -687,10 +687,23 @@ class TestBackendTdCacheBootstrap(unittest.TestCase):
                 "_td_validate_generated_workbook_outputs",
                 side_effect=AssertionError("workbook output scan should be deferred on open"),
             ) as validate_outputs_mock:
-                self.assertEqual(
-                    backend.validate_test_data_project_cache_for_open(project_dir, workbook_path),
-                    impl_db,
-                )
+                with patch.object(
+                    backend,
+                    "inspect_test_data_project_cache_state",
+                    side_effect=AssertionError("open validator should not inspect source cache state"),
+                ), patch.object(
+                    backend,
+                    "td_read_sources_metadata",
+                    side_effect=AssertionError("open validator should not read workbook sources"),
+                ), patch.object(
+                    backend,
+                    "_read_td_support_workbook",
+                    side_effect=AssertionError("open validator should not read support workbook"),
+                ):
+                    self.assertEqual(
+                        backend.validate_test_data_project_cache_for_open(project_dir, workbook_path),
+                        impl_db,
+                    )
                 readiness = backend._td_collect_project_readiness(
                     project_dir,
                     workbook_path,
@@ -699,6 +712,55 @@ class TestBackendTdCacheBootstrap(unittest.TestCase):
             validate_outputs_mock.assert_not_called()
             self.assertEqual(readiness["problems"], [])
             self.assertTrue(bool((readiness.get("summary") or {}).get("workbook_outputs_deferred")))
+
+    def test_open_validator_fails_fast_when_raw_cache_db_missing(self) -> None:
+        if Workbook is None:
+            self.skipTest("openpyxl is required for TD readiness tests")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir) / "project"
+            workbook_path, _impl_db, raw_db = _create_ready_td_project_fixture(project_dir)
+            raw_db.unlink()
+            with self.assertRaises(RuntimeError) as ctx:
+                backend.validate_test_data_project_cache_for_open(project_dir, workbook_path)
+            self.assertIn("Project raw cache DB not found", str(ctx.exception))
+            self.assertIn("Update Project", str(ctx.exception))
+
+    def test_open_validator_fails_fast_when_required_impl_table_missing(self) -> None:
+        if Workbook is None:
+            self.skipTest("openpyxl is required for TD readiness tests")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir) / "project"
+            workbook_path, impl_db, _raw_db = _create_ready_td_project_fixture(project_dir)
+            with closing(sqlite3.connect(str(impl_db))) as conn:
+                conn.execute("DROP TABLE td_metrics_calc")
+                conn.commit()
+            with self.assertRaises(RuntimeError) as ctx:
+                backend.validate_test_data_project_cache_for_open(project_dir, workbook_path)
+            self.assertIn("missing required tables", str(ctx.exception))
+            self.assertIn("td_metrics_calc", str(ctx.exception))
+
+    def test_read_sources_metadata_from_cache_uses_cache_metadata(self) -> None:
+        if Workbook is None:
+            self.skipTest("openpyxl is required for TD readiness tests")
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            project_dir = Path(tmpdir) / "project"
+            _workbook_path, impl_db, _raw_db = _create_ready_td_project_fixture(project_dir)
+            with closing(sqlite3.connect(str(impl_db))) as conn:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO td_source_metadata(
+                        serial, program_title, document_type, metadata_rel, artifacts_rel, excel_sqlite_rel, metadata_mtime_ns
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    ("SN-001", "Program Alpha", "TD", "meta/doc1.json", "artifacts/doc1", "source.sqlite3", 1),
+                )
+                conn.commit()
+            rows = backend.td_read_sources_metadata_from_cache(impl_db)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["serial"], "SN-001")
+            self.assertEqual(rows[0]["program_title"], "Program Alpha")
+            self.assertEqual(rows[0]["document_type"], "TD")
+            self.assertEqual(rows[0]["metadata_rel"], "meta/doc1.json")
 
     def test_ready_validator_accepts_excluded_source_rows_for_update_and_open(self) -> None:
         if Workbook is None:

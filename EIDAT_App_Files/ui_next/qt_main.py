@@ -5340,7 +5340,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         }
 
         try:
-            source_rows = be.td_read_sources_metadata(self._workbook_path)
+            source_rows = be.td_read_sources_metadata_from_cache(self._db_path)
         except Exception:
             source_rows = []
         by_sn = _td_serial_metadata_by_serial(source_rows)

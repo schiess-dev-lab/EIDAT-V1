@@ -655,7 +655,7 @@ class TestTDTrendDialogCacheLoading(unittest.TestCase):
         load_cache = TestDataTrendDialog._load_cache.__get__(harness, _Harness)
         fake_db = harness._project_dir / "implementation_trending.sqlite3"
 
-        with mock.patch.object(be, "validate_existing_test_data_project_cache", return_value=fake_db) as validate_mock:
+        with mock.patch.object(be, "validate_test_data_project_cache_for_open", return_value=fake_db) as validate_mock:
             with mock.patch.object(QtWidgets.QMessageBox, "warning") as warning_mock:
                 load_cache(rebuild=False)
 
@@ -692,7 +692,7 @@ class TestTDTrendDialogCacheLoading(unittest.TestCase):
         )
         load_cache = TestDataTrendDialog._load_cache.__get__(harness, _Harness)
 
-        with mock.patch.object(be, "validate_existing_test_data_project_cache", side_effect=RuntimeError("boom")) as validate_mock:
+        with mock.patch.object(be, "validate_test_data_project_cache_for_open", side_effect=RuntimeError("boom")) as validate_mock:
             with mock.patch.object(QtWidgets.QMessageBox, "warning") as warning_mock:
                 load_cache(rebuild=False)
 
@@ -799,7 +799,7 @@ class TestTDTrendDialogCacheLoading(unittest.TestCase):
 
         fake_db = harness._project_dir / "implementation_trending.sqlite3"
         with mock.patch.object(qm, "ProjectTaskWorker", _ImmediateWorker):
-            with mock.patch.object(be, "validate_existing_test_data_project_cache", return_value=fake_db) as validate_mock:
+            with mock.patch.object(be, "validate_test_data_project_cache_for_open", return_value=fake_db) as validate_mock:
                 with mock.patch.object(QtWidgets.QMessageBox, "warning") as warning_mock:
                     harness._load_cache(rebuild=False)
 
@@ -898,7 +898,7 @@ class TestTDTrendDialogCacheLoading(unittest.TestCase):
         harness._cache_progress_timer.timeout.connect(harness._show_cache_progress_dialog)
 
         with mock.patch.object(qm, "ProjectTaskWorker", _ImmediateWorker):
-            with mock.patch.object(be, "validate_existing_test_data_project_cache", side_effect=RuntimeError("build failed")):
+            with mock.patch.object(be, "validate_test_data_project_cache_for_open", side_effect=RuntimeError("build failed")):
                 with mock.patch.object(QtWidgets.QMessageBox, "warning") as warning_mock:
                     harness._load_cache(rebuild=False)
 
@@ -2820,8 +2820,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
         }
         self.assertEqual(be._td_effective_run_condition_label(row), "410 psia, SS")
 
-    def test_run_selection_views_use_derived_condition_display_name(self) -> None:
-        from openpyxl import load_workbook  # type: ignore
+    def test_run_selection_views_use_cached_condition_display_name(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
 
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
@@ -2836,25 +2835,6 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 docs=[{"serial_number": "SN1", "excel_sqlite_rel": ""}],
                 config=self._make_config(),
             )
-            support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
-            be._write_td_support_workbook(
-                support_path,
-                sequence_names=["Seq1"],
-                param_defs=[{"name": "thrust", "units": "lbf"}],
-            )
-
-            wb = load_workbook(str(support_path))
-            try:
-                ws_prog = wb[self._default_program_sheet_name(be)]
-                ws_prog.cell(2, 3).value = "sequence"
-                ws_prog.cell(2, 4).value = 350
-                ws_prog.cell(2, 5).value = "psia"
-                ws_prog.cell(2, 6).value = "pulsed mode"
-                ws_prog.cell(2, 7).value = 60
-                ws_prog.cell(2, 8).value = 120
-                wb.save(str(support_path))
-            finally:
-                wb.close()
 
             with sqlite3.connect(str(db_path)) as conn:
                 be._ensure_test_data_impl_tables(conn)
@@ -2863,7 +2843,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
                     INSERT OR REPLACE INTO td_runs(run_name, default_x, display_name, run_type, control_period, pulse_width)
                     VALUES (?, ?, ?, ?, ?, ?)
                     """,
-                    ("Seq1", "Time", "sequence", "pulsed mode", 120, 60),
+                    ("Seq1", "Time", "350 psia, PM, 60 Sec ON / 60 Sec OFF", "pulsed mode", 120, 60),
                 )
                 conn.execute(
                     """

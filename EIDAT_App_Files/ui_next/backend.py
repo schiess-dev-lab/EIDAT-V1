@@ -6188,6 +6188,8 @@ def _td_display_program_title(value: object) -> str:
 
 
 def td_list_run_selection_views(db_path: Path, workbook_path: Path, *, project_dir: Path | None = None) -> dict[str, list[dict]]:
+    del workbook_path
+    del project_dir
     runs_ex = [
         dict(item)
         for item in (td_list_runs_ex(db_path) or [])
@@ -6196,29 +6198,28 @@ def td_list_run_selection_views(db_path: Path, workbook_path: Path, *, project_d
     if not runs_ex:
         return {"sequence": [], "condition": []}
 
-    try:
-        support_cfg = _read_td_support_workbook(workbook_path, project_dir=project_dir)
-    except Exception:
-        support_cfg = {"exists": False}
-
     observations_by_condition: dict[str, list[dict]] = {}
-    observations_by_source_run: dict[str, list[dict]] = {}
-    for row in ((support_cfg.get("sequences") or [])):
-        if not isinstance(row, dict) or not bool(row.get("enabled", True)):
+    with closing(sqlite3.connect(str(Path(db_path).expanduser()))) as conn:
+        _ensure_test_data_impl_tables(conn)
+        rows = conn.execute(
+            """
+            SELECT run_name, COALESCE(program_title, ''), COALESCE(source_run_name, '')
+            FROM td_condition_observations
+            ORDER BY run_name, program_title, source_run_name, observation_id
+            """
+        ).fetchall()
+    for run_name, program_title, source_run_name in rows:
+        run_key = str(run_name or "").strip()
+        if not run_key:
             continue
-        condition_key = str(row.get("condition_key") or row.get("sequence_name") or "").strip()
-        source_run_name = str(row.get("source_run_name") or "").strip()
-        if not condition_key and not source_run_name:
-            continue
-        obs = {
-            "program_title": str(row.get("program_title") or "").strip(),
-            "program_label": _td_display_program_title(row.get("program_title")),
-            "source_run_name": source_run_name,
-        }
-        if condition_key:
-            observations_by_condition.setdefault(condition_key, []).append(obs)
-        if source_run_name:
-            observations_by_source_run.setdefault(source_run_name, []).append(obs)
+        seq_name = str(source_run_name or "").strip() or run_key
+        observations_by_condition.setdefault(run_key, []).append(
+            {
+                "program_title": str(program_title or "").strip(),
+                "program_label": _td_display_program_title(program_title),
+                "source_run_name": seq_name,
+            }
+        )
 
     sequence_items: list[dict] = []
     condition_items: list[dict] = []
@@ -6226,12 +6227,8 @@ def td_list_run_selection_views(db_path: Path, workbook_path: Path, *, project_d
         run_name = str(item.get("run_name") or "").strip()
         if not run_name:
             continue
-        support_payload = _td_resolve_support_condition_for_source("", run_name, support_cfg)
-        run_display_name = str(support_payload.get("display_name") or item.get("display_name") or run_name).strip() or run_name
-        resolved_condition_key = str(support_payload.get("condition_key") or "").strip()
-        source_rows = list(observations_by_condition.get(resolved_condition_key) or [])
-        if not source_rows:
-            source_rows = list(observations_by_source_run.get(run_name) or [])
+        run_display_name = str(item.get("display_name") or run_name).strip() or run_name
+        source_rows = list(observations_by_condition.get(run_name) or [])
         member_sequences: list[str] = []
         member_programs: list[str] = []
         detail_rows: list[str] = []
@@ -6333,7 +6330,7 @@ def td_list_runs_ex(db_path: Path) -> list[dict]:
     path = Path(db_path).expanduser()
     if not path.exists():
         return []
-    with sqlite3.connect(str(path)) as conn:
+    with closing(sqlite3.connect(str(path))) as conn:
         _ensure_test_data_impl_tables(conn)
         rows = conn.execute(
             "SELECT run_name, display_name FROM td_runs ORDER BY run_name"
@@ -8425,19 +8422,72 @@ def validate_test_data_project_cache_for_open(project_dir: Path, workbook_path: 
     """
     Fast-open validation for Trend/Analyze.
 
-    This checks that the cached SQLite project state is usable, but defers the
-    generated workbook sheet scan until an explicit rebuild/update workflow.
+    This only checks the project-local cache DBs required by the viewer.
+    Source freshness belongs to Update Project / explicit cache refresh.
     """
-    guidance = (
-        "Run 'Update Project' to rebuild all required Test Data cache and workbook outputs before opening Trend / Analyze."
-    )
-    readiness = _td_ensure_project_ready(
-        project_dir,
-        workbook_path,
-        guidance=guidance,
-        validate_workbook_outputs=False,
-    )
-    return Path(str(readiness.get("db_path") or (Path(project_dir).expanduser() / EIDAT_PROJECT_IMPLEMENTATION_DB))).expanduser()
+    del workbook_path
+    proj_dir = Path(project_dir).expanduser()
+    db_path = proj_dir / EIDAT_PROJECT_IMPLEMENTATION_DB
+    raw_db_path = td_raw_cache_db_path_for(proj_dir)
+    guidance = "Run 'Update Project' to rebuild the project cache before opening Trend / Analyze."
+
+    if not db_path.exists() or not db_path.is_file():
+        raise RuntimeError(f"Project cache DB not found: {db_path}. {guidance}")
+    if not raw_db_path.exists() or not raw_db_path.is_file():
+        raise RuntimeError(f"Project raw cache DB not found: {raw_db_path}. {guidance}")
+
+    def _check_required_tables(conn: sqlite3.Connection, table_names: Sequence[str]) -> list[str]:
+        rows = conn.execute(
+            f"SELECT name FROM sqlite_master WHERE type='table' AND name IN ({','.join(['?'] * len(table_names))})",
+            tuple(table_names),
+        ).fetchall()
+        present = {str(row[0] or "").strip() for row in rows if str(row[0] or "").strip()}
+        return [name for name in table_names if name not in present]
+
+    try:
+        with closing(sqlite3.connect(str(db_path))) as conn:
+            missing_impl_tables = _check_required_tables(
+                conn,
+                ("td_sources", "td_runs", "td_columns_calc", "td_metrics_calc"),
+            )
+            if missing_impl_tables:
+                raise RuntimeError(
+                    f"Project cache DB is missing required tables ({', '.join(missing_impl_tables)}): {db_path}. {guidance}"
+                )
+            sources_count = int(conn.execute("SELECT COUNT(*) FROM td_sources").fetchone()[0] or 0)
+            runs_count = int(conn.execute("SELECT COUNT(*) FROM td_runs").fetchone()[0] or 0)
+            calc_y_count = int(conn.execute("SELECT COUNT(*) FROM td_columns_calc WHERE kind='y'").fetchone()[0] or 0)
+            metrics_count = int(conn.execute("SELECT COUNT(*) FROM td_metrics_calc").fetchone()[0] or 0)
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(f"Project cache DB is unreadable: {db_path}. {guidance}") from exc
+
+    if sources_count <= 0 or runs_count <= 0 or calc_y_count <= 0 or metrics_count <= 0:
+        raise RuntimeError(f"Project cache DB is incomplete: {db_path}. {guidance}")
+
+    try:
+        with closing(sqlite3.connect(str(raw_db_path))) as conn:
+            missing_raw_tables = _check_required_tables(
+                conn,
+                ("td_raw_sequences", "td_columns_raw", "td_curves_raw"),
+            )
+            if missing_raw_tables:
+                raise RuntimeError(
+                    f"Project raw cache DB is missing required tables ({', '.join(missing_raw_tables)}): {raw_db_path}. {guidance}"
+                )
+            raw_runs_count = int(conn.execute("SELECT COUNT(*) FROM td_raw_sequences").fetchone()[0] or 0)
+            raw_y_count = int(conn.execute("SELECT COUNT(*) FROM td_columns_raw WHERE kind='y'").fetchone()[0] or 0)
+            raw_curve_count = int(conn.execute("SELECT COUNT(*) FROM td_curves_raw").fetchone()[0] or 0)
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(f"Project raw cache DB is unreadable: {raw_db_path}. {guidance}") from exc
+
+    if raw_runs_count <= 0 or raw_y_count <= 0 or raw_curve_count <= 0:
+        raise RuntimeError(f"Project raw cache DB is incomplete: {raw_db_path}. {guidance}")
+
+    return db_path
 
 
 def _td_delete_serial_rows_from_cache(
@@ -10614,7 +10664,7 @@ def td_list_y_columns(db_path: Path, run_name: str) -> list[dict]:
     run = str(run_name or "").strip()
     if not run:
         return []
-    with sqlite3.connect(str(path)) as conn:
+    with closing(sqlite3.connect(str(path))) as conn:
         _ensure_test_data_impl_tables(conn)
         rows = conn.execute(
             "SELECT name, units FROM td_columns_calc WHERE run_name=? AND kind='y' ORDER BY name",
@@ -10721,6 +10771,46 @@ def td_read_sources_metadata(workbook_path: Path) -> list[dict]:
             wb.close()
         except Exception:
             pass
+
+
+def td_read_sources_metadata_from_cache(db_path: Path) -> list[dict]:
+    path = Path(db_path).expanduser()
+    if not path.exists():
+        return []
+    with sqlite3.connect(str(path)) as conn:
+        _ensure_test_data_impl_tables(conn)
+        rows = conn.execute(
+            """
+            SELECT
+                s.serial,
+                COALESCE(m.program_title, ''),
+                COALESCE(m.document_type, ''),
+                COALESCE(m.metadata_rel, ''),
+                COALESCE(m.artifacts_rel, ''),
+                COALESCE(m.excel_sqlite_rel, '')
+            FROM td_sources s
+            LEFT JOIN td_source_metadata m
+              ON m.serial = s.serial
+            ORDER BY s.serial
+            """
+        ).fetchall()
+    out: list[dict] = []
+    for serial, program_title, document_type, metadata_rel, artifacts_rel, excel_sqlite_rel in rows:
+        sn = str(serial or "").strip()
+        if not sn:
+            continue
+        out.append(
+            {
+                "serial": sn,
+                "serial_number": sn,
+                "program_title": str(program_title or "").strip(),
+                "document_type": str(document_type or "").strip(),
+                "metadata_rel": str(metadata_rel or "").strip(),
+                "artifacts_rel": str(artifacts_rel or "").strip(),
+                "excel_sqlite_rel": str(excel_sqlite_rel or "").strip(),
+            }
+        )
+    return out
 
 
 def td_load_metric_series(
