@@ -17120,13 +17120,14 @@ def read_eidat_index_documents(global_repo: Path) -> list[dict]:
     db_path = eidat_support_dir(repo) / "eidat_index.sqlite3"
     if not db_path.exists():
         raise FileNotFoundError(f"EIDAT index DB not found: {db_path}")
-    with sqlite3.connect(str(db_path)) as conn:
+    with closing(sqlite3.connect(str(db_path))) as conn:
         conn.row_factory = sqlite3.Row
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(documents)").fetchall()}
         select_cols: list[str] = [
             "id",
             "program_title",
             "asset_type",
+            "asset_specific_type",
             "serial_number",
             "part_number",
             "revision",
@@ -17180,7 +17181,7 @@ def read_eidat_index_groups(global_repo: Path) -> list[dict]:
     db_path = eidat_support_dir(repo) / "eidat_index.sqlite3"
     if not db_path.exists():
         return []
-    with sqlite3.connect(str(db_path)) as conn:
+    with closing(sqlite3.connect(str(db_path))) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             "SELECT group_id, title_norm, member_count FROM groups ORDER BY member_count DESC, group_id"
@@ -17194,7 +17195,7 @@ def read_eidat_support_files(global_repo: Path) -> list[dict]:
     db_path = eidat_support_dir(repo) / "eidat_support.sqlite3"
     if not db_path.exists():
         return []
-    with sqlite3.connect(str(db_path)) as conn:
+    with closing(sqlite3.connect(str(db_path))) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             """
@@ -17215,6 +17216,12 @@ def read_files_with_index_metadata(global_repo: Path) -> list[dict]:
     index_db = eidat_support_dir(repo) / "eidat_index.sqlite3"
     support_dir = eidat_support_dir(repo)
 
+    def _norm_rel(rel_path: object) -> str:
+        try:
+            return str(rel_path or "").replace("\\", "/").strip()
+        except Exception:
+            return str(rel_path or "").strip()
+
     def _ignore_rel_path(rel_path: str) -> bool:
         # Hide generated PDFs/Excels from the Files tab. These are outputs, not
         # original documents.
@@ -17228,7 +17235,7 @@ def read_files_with_index_metadata(global_repo: Path) -> list[dict]:
     # Read all files
     files_by_path: dict[str, dict] = {}
     if support_db.exists():
-        with sqlite3.connect(str(support_db)) as conn:
+        with closing(sqlite3.connect(str(support_db))) as conn:
             conn.row_factory = sqlite3.Row
             for r in conn.execute("SELECT * FROM files").fetchall():
                 rel = str(r["rel_path"] or "")
@@ -17239,10 +17246,10 @@ def read_files_with_index_metadata(global_repo: Path) -> list[dict]:
     # Read all indexed documents
     docs_by_artifacts: dict[str, dict] = {}
     if index_db.exists():
-        with sqlite3.connect(str(index_db)) as conn:
+        with closing(sqlite3.connect(str(index_db))) as conn:
             conn.row_factory = sqlite3.Row
             for r in conn.execute("SELECT * FROM documents").fetchall():
-                artifacts = r["artifacts_rel"] or ""
+                artifacts = _norm_rel(r["artifacts_rel"] or "")
                 docs_by_artifacts[artifacts] = dict(r)
 
     # Join: for each file, try to find its document metadata
@@ -17262,7 +17269,7 @@ def read_files_with_index_metadata(global_repo: Path) -> list[dict]:
                     art_rel = str(Path(art_dir).relative_to(support_dir))
                 except Exception:
                     art_rel = str(art_dir)
-            matched_doc = docs_by_artifacts.get(art_rel)
+            matched_doc = docs_by_artifacts.get(_norm_rel(art_rel))
 
         merged = {**file_info}
         if matched_doc:
@@ -21554,6 +21561,271 @@ def list_eidat_projects(global_repo: Path) -> list[dict]:
         out.append(p)
 
     return out
+
+
+PRODUCT_CENTER_IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp")
+
+
+def _product_center_display_value(value: object, fallback: str) -> str:
+    txt = str(value or "").strip()
+    return txt or fallback
+
+
+def _product_center_slug(value: object, *, fallback: str = "product") -> str:
+    txt = re.sub(r"[^A-Za-z0-9]+", "_", str(value or "").strip().lower()).strip("_")
+    return txt or fallback
+
+
+def _product_center_compact_equation_label(entry: Mapping[str, object]) -> str:
+    plot_meta = entry.get("plot_metadata")
+    plot_meta = plot_meta if isinstance(plot_meta, Mapping) else {}
+    output_target = str(plot_meta.get("output_target") or "").strip()
+    input1_target = str(plot_meta.get("input1_target") or "").strip()
+    input2_target = str(plot_meta.get("input2_target") or "").strip()
+    if output_target and input1_target and input2_target:
+        return f"{output_target} vs {input1_target}, {input2_target}"
+    if output_target and input1_target:
+        return f"{output_target} vs {input1_target}"
+    return str(entry.get("name") or "").strip()
+
+
+def product_center_images_dir() -> Path:
+    path = DATA_ROOT / "user_inputs" / "product_center" / "images"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def resolve_product_center_image(asset_specific_type: str) -> Path | None:
+    slug = _product_center_slug(asset_specific_type, fallback="product")
+    root = product_center_images_dir()
+    for ext in PRODUCT_CENTER_IMAGE_EXTENSIONS:
+        cand = root / f"{slug}{ext}"
+        if cand.exists():
+            return cand
+    return None
+
+
+def list_product_center_products(global_repo: Path) -> list[dict]:
+    repo = Path(global_repo).expanduser()
+    docs = read_eidat_index_documents(repo)
+    files = read_files_with_index_metadata(repo)
+
+    docs_by_metadata_rel: dict[str, dict[str, object]] = {}
+    docs_by_artifacts_rel: dict[str, dict[str, object]] = {}
+    for row in files:
+        if not isinstance(row, dict):
+            continue
+        metadata_rel = str(row.get("metadata_rel") or "").strip()
+        artifacts_rel = str(row.get("artifacts_rel") or "").strip()
+        if metadata_rel and metadata_rel not in docs_by_metadata_rel:
+            docs_by_metadata_rel[metadata_rel] = row
+        if artifacts_rel and artifacts_rel not in docs_by_artifacts_rel:
+            docs_by_artifacts_rel[artifacts_rel] = row
+
+    products: dict[tuple[str, str, str], dict[str, object]] = {}
+    metadata_to_product_keys: dict[str, set[tuple[str, str, str]]] = {}
+
+    def _product_bucket(doc: Mapping[str, object]) -> dict[str, object]:
+        asset_type = _product_center_display_value(doc.get("asset_type"), "(No Asset Type)")
+        asset_specific_type = _product_center_display_value(doc.get("asset_specific_type"), "(No Asset Specific Type)")
+        vendor = _product_center_display_value(doc.get("vendor"), "(No Vendor)")
+        key = (asset_type, asset_specific_type, vendor)
+        bucket = products.get(key)
+        if bucket is None:
+            image_path = resolve_product_center_image(asset_specific_type)
+            bucket = {
+                "key": "|".join(key),
+                "asset_type": asset_type,
+                "asset_specific_type": asset_specific_type,
+                "vendor": vendor,
+                "image_path": str(image_path) if image_path is not None else "",
+                "documents": [],
+                "part_numbers": set(),
+                "acceptance_test_plan_numbers": set(),
+                "serial_numbers": set(),
+                "document_types": set(),
+                "metadata_rels": set(),
+                "projects": [],
+                "project_dirs": set(),
+                "saved_performance_equations": [],
+                "counts": {
+                    "documents": 0,
+                    "eidp_documents": 0,
+                    "td_documents": 0,
+                    "serials": 0,
+                    "part_numbers": 0,
+                    "acceptance_test_plan_numbers": 0,
+                    "projects": 0,
+                    "saved_performance_equations": 0,
+                },
+            }
+            products[key] = bucket
+        return bucket
+
+    for doc in docs:
+        if not isinstance(doc, dict):
+            continue
+        bucket = _product_bucket(doc)
+        metadata_rel = str(doc.get("metadata_rel") or "").strip()
+        artifacts_rel = str(doc.get("artifacts_rel") or "").strip()
+        matched = docs_by_metadata_rel.get(metadata_rel) or docs_by_artifacts_rel.get(artifacts_rel) or {}
+        document_type = str(doc.get("document_type") or doc.get("document_type_acronym") or "").strip() or "(No Doc Type)"
+        row = {
+            "rel_path": str(matched.get("rel_path") or "").strip(),
+            "metadata_rel": metadata_rel,
+            "artifacts_rel": artifacts_rel,
+            "document_type": str(doc.get("document_type") or "").strip(),
+            "document_type_acronym": str(doc.get("document_type_acronym") or "").strip(),
+            "serial_number": str(doc.get("serial_number") or "").strip(),
+            "part_number": str(doc.get("part_number") or "").strip(),
+            "acceptance_test_plan_number": str(doc.get("acceptance_test_plan_number") or "").strip(),
+            "program_title": str(doc.get("program_title") or "").strip(),
+            "vendor": str(doc.get("vendor") or "").strip(),
+            "asset_type": str(doc.get("asset_type") or "").strip(),
+            "asset_specific_type": str(doc.get("asset_specific_type") or "").strip(),
+            "excel_sqlite_rel": str(doc.get("excel_sqlite_rel") or "").strip(),
+            "tables_sqlite_rel": str(doc.get("tables_sqlite_rel") or "").strip(),
+            "display_document_type": document_type,
+        }
+        cast(list[dict[str, object]], bucket["documents"]).append(row)
+        cast(dict[str, int], bucket["counts"])["documents"] += 1
+        if _is_confirmed_doc_type(doc, "EIDP"):
+            cast(dict[str, int], bucket["counts"])["eidp_documents"] += 1
+        if _is_confirmed_doc_type(doc, "TD"):
+            cast(dict[str, int], bucket["counts"])["td_documents"] += 1
+        if row["part_number"]:
+            cast(set[str], bucket["part_numbers"]).add(str(row["part_number"]))
+        if row["acceptance_test_plan_number"]:
+            cast(set[str], bucket["acceptance_test_plan_numbers"]).add(str(row["acceptance_test_plan_number"]))
+        if row["serial_number"]:
+            cast(set[str], bucket["serial_numbers"]).add(str(row["serial_number"]))
+        cast(set[str], bucket["document_types"]).add(document_type)
+        if metadata_rel:
+            cast(set[str], bucket["metadata_rels"]).add(metadata_rel)
+            metadata_to_product_keys.setdefault(metadata_rel, set()).add(
+                (
+                    str(bucket.get("asset_type") or ""),
+                    str(bucket.get("asset_specific_type") or ""),
+                    str(bucket.get("vendor") or ""),
+                )
+            )
+
+    for project in list_eidat_projects(repo):
+        if not isinstance(project, dict):
+            continue
+        raw_dir = str(project.get("project_dir") or "").strip()
+        raw_workbook = str(project.get("workbook") or "").strip()
+        if not raw_dir:
+            continue
+        project_dir = Path(raw_dir).expanduser()
+        if not project_dir.is_absolute():
+            project_dir = repo / project_dir
+        workbook_path: Path | None = None
+        if raw_workbook:
+            workbook_path = Path(raw_workbook).expanduser()
+            if not workbook_path.is_absolute():
+                workbook_path = repo / workbook_path
+        meta = _read_project_meta(project_dir)
+        selected_rels = {
+            str(value).strip()
+            for value in (meta.get("selected_metadata_rel") or [])
+            if str(value).strip()
+        }
+        if not selected_rels:
+            continue
+        matched_product_keys: set[tuple[str, str, str]] = set()
+        for metadata_rel in selected_rels:
+            matched_product_keys.update(metadata_to_product_keys.get(metadata_rel, set()))
+        if not matched_product_keys:
+            continue
+        saved_entries: list[dict[str, object]] = []
+        if str(project.get("type") or "").strip() == EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING:
+            try:
+                store = load_td_saved_performance_equations(project_dir)
+            except Exception:
+                store = {"entries": []}
+            for entry in (store.get("entries") or []):
+                if not isinstance(entry, dict):
+                    continue
+                saved_entries.append(
+                    {
+                        "id": str(entry.get("id") or "").strip(),
+                        "project_name": str(project.get("name") or "").strip(),
+                        "project_dir": str(project_dir),
+                        "project_workbook": str(workbook_path) if workbook_path is not None else "",
+                        "name": str(entry.get("name") or "").strip(),
+                        "saved_at": str(entry.get("saved_at") or "").strip(),
+                        "updated_at": str(entry.get("updated_at") or "").strip(),
+                        "equation_rows": list(entry.get("equation_rows") or []),
+                        "plot_metadata": dict(entry.get("plot_metadata") or {}) if isinstance(entry.get("plot_metadata"), Mapping) else {},
+                        "summary": _product_center_compact_equation_label(entry),
+                    }
+                )
+        project_payload = {
+            "name": str(project.get("name") or "").strip(),
+            "type": str(project.get("type") or "").strip(),
+            "project_dir": str(project_dir),
+            "workbook": str(workbook_path) if workbook_path is not None else "",
+            "selected_count": len(selected_rels),
+            "saved_performance_equations": saved_entries,
+        }
+        for key in matched_product_keys:
+            bucket = products.get(key)
+            if bucket is None:
+                continue
+            project_dirs = cast(set[str], bucket["project_dirs"])
+            if project_payload["project_dir"] not in project_dirs:
+                cast(list[dict[str, object]], bucket["projects"]).append(dict(project_payload))
+                project_dirs.add(str(project_payload["project_dir"]))
+            cast(list[dict[str, object]], bucket["saved_performance_equations"]).extend(
+                [dict(item) for item in saved_entries]
+            )
+
+    output: list[dict[str, object]] = []
+    for key in sorted(products.keys(), key=lambda item: (item[1].casefold(), item[0].casefold(), item[2].casefold())):
+        bucket = products[key]
+        documents = cast(list[dict[str, object]], bucket["documents"])
+        documents.sort(
+            key=lambda item: (
+                str(item.get("display_document_type") or "").casefold(),
+                str(item.get("serial_number") or "").casefold(),
+                str(item.get("part_number") or "").casefold(),
+                str(item.get("metadata_rel") or "").casefold(),
+            )
+        )
+        projects_payload = cast(list[dict[str, object]], bucket["projects"])
+        projects_payload.sort(key=lambda item: (str(item.get("name") or "").casefold(), str(item.get("type") or "").casefold()))
+        equations_payload = cast(list[dict[str, object]], bucket["saved_performance_equations"])
+        equations_payload.sort(key=lambda item: (str(item.get("project_name") or "").casefold(), str(item.get("name") or "").casefold()))
+        counts = cast(dict[str, int], bucket["counts"])
+        part_numbers = sorted(cast(set[str], bucket["part_numbers"]))
+        atp_numbers = sorted(cast(set[str], bucket["acceptance_test_plan_numbers"]))
+        serial_numbers = sorted(cast(set[str], bucket["serial_numbers"]))
+        document_types = sorted(cast(set[str], bucket["document_types"]))
+        counts["serials"] = len(serial_numbers)
+        counts["part_numbers"] = len(part_numbers)
+        counts["acceptance_test_plan_numbers"] = len(atp_numbers)
+        counts["projects"] = len(projects_payload)
+        counts["saved_performance_equations"] = len(equations_payload)
+        output.append(
+            {
+                "key": str(bucket.get("key") or ""),
+                "display_name": str(bucket.get("asset_specific_type") or ""),
+                "asset_type": str(bucket.get("asset_type") or ""),
+                "asset_specific_type": str(bucket.get("asset_specific_type") or ""),
+                "vendor": str(bucket.get("vendor") or ""),
+                "image_path": str(bucket.get("image_path") or ""),
+                "counts": dict(counts),
+                "part_numbers": part_numbers,
+                "acceptance_test_plan_numbers": atp_numbers,
+                "serial_numbers": serial_numbers,
+                "document_types": document_types,
+                "documents": [dict(item) for item in documents],
+                "projects": [dict(item) for item in projects_payload],
+                "saved_performance_equations": [dict(item) for item in equations_payload],
+            }
+        )
+    return output
 
 
 def delete_eidat_project(global_repo: Path, project_dir: Path) -> dict:

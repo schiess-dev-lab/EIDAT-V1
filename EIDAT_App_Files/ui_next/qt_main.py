@@ -12530,9 +12530,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.btn_tab_setup = QtWidgets.QPushButton("⚙  Setup")
         self.btn_tab_files = QtWidgets.QPushButton("Files")
+        self.btn_tab_product_center = QtWidgets.QPushButton("Product Center")
         self.btn_tab_projects = QtWidgets.QPushButton("Projects")
 
-        for btn in [self.btn_tab_setup, self.btn_tab_files, self.btn_tab_projects]:
+        for btn in [self.btn_tab_setup, self.btn_tab_files, self.btn_tab_product_center, self.btn_tab_projects]:
             btn.setCheckable(True)
             btn.setStyleSheet("""
                 QPushButton {
@@ -12583,15 +12584,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tab_process = QtWidgets.QWidget()
         # NOTE: tab_plot and tab_outputs removed - they were unused
         self.tab_files = QtWidgets.QWidget()
+        self.tab_product_center = QtWidgets.QWidget()
         self.tab_projects = QtWidgets.QWidget()
         self.tabs.addTab(self.tab_setup, "Setup")
         self.tabs.addTab(self.tab_files, "Files")
+        self.tabs.addTab(self.tab_product_center, "Product Center")
         self.tabs.addTab(self.tab_projects, "Projects")
 
         # Connect tab buttons to switch content
         self.btn_tab_setup.clicked.connect(lambda: self._switch_tab(0))
         self.btn_tab_files.clicked.connect(lambda: self._switch_tab(1))
-        self.btn_tab_projects.clicked.connect(lambda: self._switch_tab(2))
+        self.btn_tab_product_center.clicked.connect(lambda: self._switch_tab(2))
+        self.btn_tab_projects.clicked.connect(lambda: self._switch_tab(3))
 
         self.tabs.currentChanged.connect(self._on_tab_changed)
 
@@ -12667,6 +12671,14 @@ class MainWindow(QtWidgets.QMainWindow):
         # Create toast notification widget
         self._toast = ToastNotification(self)
         self._toast.hide()
+        self._files_external_rel_paths: set[str] | None = None
+        self._files_external_filter_label = ""
+        self._projects_all: list[dict] = []
+        self._projects_external_dirs: set[str] | None = None
+        self._projects_external_filter_label = ""
+        self._product_center_products: list[dict] = []
+        self._product_center_filtered: list[dict] = []
+        self._product_center_current: dict | None = None
 
         layout = QtWidgets.QVBoxLayout(central)
         layout.addWidget(header)
@@ -12698,6 +12710,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._setup_tab_setup()
         self._setup_tab_process()
         self._setup_tab_files()
+        self._setup_tab_product_center()
         self._setup_tab_projects()
         # Data Outputs tab replaced by top-level master button
 
@@ -13933,6 +13946,32 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lbl_files_deep_status.setWordWrap(True)
         r.addWidget(self.lbl_files_deep_status)
 
+        files_subset_row = QtWidgets.QHBoxLayout()
+        self.lbl_files_subset = QtWidgets.QLabel("")
+        self.lbl_files_subset.setWordWrap(True)
+        self.lbl_files_subset.setStyleSheet(
+            "font-size: 11px; color: #1e3a8a; background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 8px; padding: 6px 8px;"
+        )
+        self.btn_files_clear_subset = QtWidgets.QPushButton("Clear")
+        self.btn_files_clear_subset.setStyleSheet(
+            """
+            QPushButton {
+                padding: 6px 10px;
+                border-radius: 6px;
+                background: #ffffff;
+                color: #374151;
+                border: 1px solid #d1d5db;
+                font-size: 12px;
+                font-weight: 600;
+            }
+            QPushButton:hover { background: #f9fafb; }
+            """
+        )
+        self.btn_files_clear_subset.clicked.connect(self._clear_files_external_subset)
+        files_subset_row.addWidget(self.lbl_files_subset, 1)
+        files_subset_row.addWidget(self.btn_files_clear_subset)
+        r.addLayout(files_subset_row)
+
         # Table
         # Include all available metadata as columns so filtering can search across everything.
         # (Support DB: files.*) + (Index DB: documents.*)
@@ -14074,6 +14113,376 @@ class MainWindow(QtWidgets.QMainWindow):
         # Store file data for filtering
         self._files_data: list[dict] = []
         self._files_filtered: list[dict] = []
+        self._update_files_external_filter_banner()
+
+    def _setup_tab_product_center(self):
+        root = QtWidgets.QHBoxLayout(self.tab_product_center)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(14)
+
+        left = QtWidgets.QFrame()
+        left.setFixedWidth(360)
+        left.setStyleSheet(
+            """
+            QFrame {
+                background: #ffffff;
+                border: 1px solid #e5e7eb;
+                border-radius: 10px;
+            }
+            """
+        )
+        l = QtWidgets.QVBoxLayout(left)
+        l.setContentsMargins(14, 14, 14, 14)
+        l.setSpacing(10)
+
+        title = QtWidgets.QLabel("Product Center")
+        title.setStyleSheet("font-size: 15px; font-weight: 800; color: #0f172a;")
+        desc = QtWidgets.QLabel(
+            "Browse products built from Asset Type, Asset Specific Type, and Vendor. "
+            "Use this as the visual launch point into documents and linked projects."
+        )
+        desc.setWordWrap(True)
+        desc.setStyleSheet("font-size: 11px; color: #475569;")
+        l.addWidget(title)
+        l.addWidget(desc)
+
+        self.ed_product_center_search = QtWidgets.QLineEdit()
+        self.ed_product_center_search.setPlaceholderText("Search products, vendors, part numbers, serials, document types ...")
+        self.ed_product_center_search.setStyleSheet(
+            """
+            QLineEdit {
+                padding: 8px 10px;
+                border-radius: 8px;
+                background: #ffffff;
+                color: #1f2937;
+                border: 1px solid #d1d5db;
+                font-size: 12px;
+            }
+            """
+        )
+        self.ed_product_center_search.textChanged.connect(self._apply_product_center_filter)
+        l.addWidget(self.ed_product_center_search)
+
+        self.lbl_product_center_status = QtWidgets.QLabel("")
+        self.lbl_product_center_status.setWordWrap(True)
+        self.lbl_product_center_status.setStyleSheet("font-size: 11px; color: #64748b;")
+        l.addWidget(self.lbl_product_center_status)
+
+        self.list_product_center = QtWidgets.QListWidget()
+        self.list_product_center.setIconSize(QtCore.QSize(72, 72))
+        self.list_product_center.setSpacing(6)
+        self.list_product_center.setStyleSheet(
+            """
+            QListWidget {
+                background: #ffffff;
+                color: #1f2937;
+                border: none;
+                font-size: 12px;
+            }
+            QListWidget::item {
+                border: 1px solid #e2e8f0;
+                border-radius: 10px;
+                padding: 10px;
+                margin: 0px;
+            }
+            QListWidget::item:selected {
+                background: #eff6ff;
+                color: #1e3a8a;
+                border: 1px solid #93c5fd;
+            }
+            QListWidget::item:hover:!selected {
+                background: #f8fafc;
+            }
+            """
+        )
+        self.list_product_center.currentRowChanged.connect(self._on_product_center_selection_changed)
+        l.addWidget(self.list_product_center, 1)
+
+        actions = QtWidgets.QHBoxLayout()
+        self.btn_product_center_refresh = QtWidgets.QPushButton("Refresh")
+        self.btn_product_center_open_image_folder = QtWidgets.QPushButton("Open Image Folder")
+        for btn in (self.btn_product_center_refresh, self.btn_product_center_open_image_folder):
+            btn.setStyleSheet(
+                """
+                QPushButton {
+                    padding: 8px 12px;
+                    border-radius: 8px;
+                    background: #ffffff;
+                    color: #374151;
+                    border: 1px solid #d1d5db;
+                    font-size: 12px;
+                    font-weight: 600;
+                }
+                QPushButton:hover { background: #f9fafb; }
+                """
+            )
+        self.btn_product_center_refresh.clicked.connect(self._refresh_product_center)
+        self.btn_product_center_open_image_folder.clicked.connect(self._act_product_center_open_image_folder)
+        actions.addWidget(self.btn_product_center_refresh)
+        actions.addWidget(self.btn_product_center_open_image_folder)
+        l.addLayout(actions)
+
+        right = QtWidgets.QFrame()
+        right.setStyleSheet(
+            """
+            QFrame {
+                background: #ffffff;
+                border: 1px solid #e5e7eb;
+                border-radius: 10px;
+            }
+            """
+        )
+        r = QtWidgets.QVBoxLayout(right)
+        r.setContentsMargins(0, 0, 0, 0)
+        r.setSpacing(0)
+
+        self.product_center_scroll = QtWidgets.QScrollArea()
+        self.product_center_scroll.setWidgetResizable(True)
+        self.product_center_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        self.product_center_scroll.setStyleSheet("QScrollArea { border: none; background: #ffffff; }")
+        self.product_center_body = QtWidgets.QWidget()
+        body = QtWidgets.QVBoxLayout(self.product_center_body)
+        body.setContentsMargins(18, 18, 18, 18)
+        body.setSpacing(16)
+
+        hero_row = QtWidgets.QHBoxLayout()
+        hero_row.setSpacing(16)
+
+        self.lbl_product_center_hero = QtWidgets.QLabel()
+        self.lbl_product_center_hero.setMinimumSize(320, 220)
+        self.lbl_product_center_hero.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.lbl_product_center_hero.setStyleSheet(
+            """
+            QLabel {
+                background: #f8fafc;
+                color: #0f172a;
+                border: 1px solid #dbe2ea;
+                border-radius: 14px;
+                font-size: 16px;
+                font-weight: 700;
+                padding: 12px;
+            }
+            """
+        )
+        hero_row.addWidget(self.lbl_product_center_hero, 0)
+
+        summary_col = QtWidgets.QVBoxLayout()
+        summary_col.setSpacing(8)
+        self.lbl_product_center_title = QtWidgets.QLabel("Select a product")
+        self.lbl_product_center_title.setStyleSheet("font-size: 22px; font-weight: 800; color: #0f172a;")
+        self.lbl_product_center_subtitle = QtWidgets.QLabel("")
+        self.lbl_product_center_subtitle.setWordWrap(True)
+        self.lbl_product_center_subtitle.setStyleSheet("font-size: 12px; color: #475569;")
+        self.lbl_product_center_stats = QtWidgets.QLabel("")
+        self.lbl_product_center_stats.setWordWrap(True)
+        self.lbl_product_center_stats.setStyleSheet("font-size: 12px; color: #0f172a;")
+        self.lbl_product_center_parts = QtWidgets.QLabel("")
+        self.lbl_product_center_parts.setWordWrap(True)
+        self.lbl_product_center_parts.setStyleSheet("font-size: 12px; color: #334155;")
+        self.lbl_product_center_atps = QtWidgets.QLabel("")
+        self.lbl_product_center_atps.setWordWrap(True)
+        self.lbl_product_center_atps.setStyleSheet("font-size: 12px; color: #334155;")
+        self.lbl_product_center_serials = QtWidgets.QLabel("")
+        self.lbl_product_center_serials.setWordWrap(True)
+        self.lbl_product_center_serials.setStyleSheet("font-size: 12px; color: #334155;")
+        summary_col.addWidget(self.lbl_product_center_title)
+        summary_col.addWidget(self.lbl_product_center_subtitle)
+        summary_col.addWidget(self.lbl_product_center_stats)
+        summary_col.addWidget(self.lbl_product_center_parts)
+        summary_col.addWidget(self.lbl_product_center_atps)
+        summary_col.addWidget(self.lbl_product_center_serials)
+        summary_col.addStretch(1)
+        hero_row.addLayout(summary_col, 1)
+        body.addLayout(hero_row)
+
+        docs_hdr = QtWidgets.QHBoxLayout()
+        docs_title = QtWidgets.QLabel("Documents by Type")
+        docs_title.setStyleSheet("font-size: 14px; font-weight: 800; color: #0f172a;")
+        self.lbl_product_center_doc_hint = QtWidgets.QLabel("")
+        self.lbl_product_center_doc_hint.setStyleSheet("font-size: 11px; color: #64748b;")
+        docs_hdr.addWidget(docs_title)
+        docs_hdr.addStretch(1)
+        docs_hdr.addWidget(self.lbl_product_center_doc_hint)
+        body.addLayout(docs_hdr)
+
+        self.tree_product_center_docs = QtWidgets.QTreeWidget()
+        self.tree_product_center_docs.setColumnCount(5)
+        self.tree_product_center_docs.setHeaderLabels(["Document", "Serial", "Part #", "ATP #", "Program"])
+        self.tree_product_center_docs.setRootIsDecorated(True)
+        self.tree_product_center_docs.setAlternatingRowColors(True)
+        self.tree_product_center_docs.setStyleSheet(
+            """
+            QTreeWidget {
+                background: #ffffff;
+                alternate-background-color: #f8fafc;
+                color: #1f2937;
+                border: 1px solid #e5e7eb;
+                border-radius: 10px;
+                padding: 4px;
+            }
+            QHeaderView::section {
+                background: #f3f4f6;
+                color: #1f2937;
+                padding: 6px 8px;
+                border: 1px solid #e5e7eb;
+                font-weight: 600;
+            }
+            """
+        )
+        self.tree_product_center_docs.itemSelectionChanged.connect(self._update_product_center_doc_actions)
+        body.addWidget(self.tree_product_center_docs)
+
+        doc_actions = QtWidgets.QHBoxLayout()
+        doc_actions.addStretch(1)
+        self.btn_product_doc_open_file = QtWidgets.QPushButton("Open File")
+        self.btn_product_doc_open_metadata = QtWidgets.QPushButton("Open Metadata")
+        self.btn_product_doc_open_combined = QtWidgets.QPushButton("Open combined.txt")
+        self.btn_product_doc_show_files = QtWidgets.QPushButton("Show in Files")
+        for btn in (
+            self.btn_product_doc_open_file,
+            self.btn_product_doc_open_metadata,
+            self.btn_product_doc_open_combined,
+            self.btn_product_doc_show_files,
+        ):
+            btn.setStyleSheet(
+                """
+                QPushButton {
+                    padding: 8px 12px;
+                    border-radius: 8px;
+                    background: #ffffff;
+                    color: #374151;
+                    border: 1px solid #d1d5db;
+                    font-size: 12px;
+                    font-weight: 600;
+                }
+                QPushButton:hover { background: #f9fafb; }
+                """
+            )
+        self.btn_product_doc_open_file.clicked.connect(self._act_product_center_open_doc_file)
+        self.btn_product_doc_open_metadata.clicked.connect(self._act_product_center_open_doc_metadata)
+        self.btn_product_doc_open_combined.clicked.connect(self._act_product_center_open_doc_combined)
+        self.btn_product_doc_show_files.clicked.connect(self._act_product_center_show_files)
+        doc_actions.addWidget(self.btn_product_doc_open_file)
+        doc_actions.addWidget(self.btn_product_doc_open_metadata)
+        doc_actions.addWidget(self.btn_product_doc_open_combined)
+        doc_actions.addWidget(self.btn_product_doc_show_files)
+        body.addLayout(doc_actions)
+
+        proj_hdr = QtWidgets.QHBoxLayout()
+        proj_title = QtWidgets.QLabel("Projects")
+        proj_title.setStyleSheet("font-size: 14px; font-weight: 800; color: #0f172a;")
+        self.lbl_product_center_project_hint = QtWidgets.QLabel("")
+        self.lbl_product_center_project_hint.setStyleSheet("font-size: 11px; color: #64748b;")
+        proj_hdr.addWidget(proj_title)
+        proj_hdr.addStretch(1)
+        proj_hdr.addWidget(self.lbl_product_center_project_hint)
+        body.addLayout(proj_hdr)
+
+        self.tbl_product_center_projects = QtWidgets.QTableWidget(0, 4)
+        self.tbl_product_center_projects.setHorizontalHeaderLabels(["Name", "Type", "Folder", "Workbook"])
+        self.tbl_product_center_projects.verticalHeader().setVisible(False)
+        self.tbl_product_center_projects.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.tbl_product_center_projects.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        self.tbl_product_center_projects.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.tbl_product_center_projects.horizontalHeader().setStretchLastSection(True)
+        self.tbl_product_center_projects.itemSelectionChanged.connect(self._update_product_center_doc_actions)
+        self.tbl_product_center_projects.setStyleSheet(
+            """
+            QTableWidget {
+                background: #ffffff;
+                alternate-background-color: #f8fafc;
+                color: #1f2937;
+                border: 1px solid #e5e7eb;
+                border-radius: 10px;
+            }
+            QHeaderView::section {
+                background: #f3f4f6;
+                color: #1f2937;
+                padding: 6px 8px;
+                border: 1px solid #e5e7eb;
+                font-weight: 600;
+            }
+            """
+        )
+        body.addWidget(self.tbl_product_center_projects)
+
+        project_actions = QtWidgets.QHBoxLayout()
+        project_actions.addStretch(1)
+        self.btn_product_project_open_folder = QtWidgets.QPushButton("Open Folder")
+        self.btn_product_project_open_workbook = QtWidgets.QPushButton("Open Workbook")
+        self.btn_product_project_show_projects = QtWidgets.QPushButton("Show in Projects")
+        for btn in (
+            self.btn_product_project_open_folder,
+            self.btn_product_project_open_workbook,
+            self.btn_product_project_show_projects,
+        ):
+            btn.setStyleSheet(
+                """
+                QPushButton {
+                    padding: 8px 12px;
+                    border-radius: 8px;
+                    background: #ffffff;
+                    color: #374151;
+                    border: 1px solid #d1d5db;
+                    font-size: 12px;
+                    font-weight: 600;
+                }
+                QPushButton:hover { background: #f9fafb; }
+                """
+            )
+        self.btn_product_project_open_folder.clicked.connect(self._act_product_center_open_project_folder)
+        self.btn_product_project_open_workbook.clicked.connect(self._act_product_center_open_project_workbook)
+        self.btn_product_project_show_projects.clicked.connect(self._act_product_center_show_projects)
+        project_actions.addWidget(self.btn_product_project_open_folder)
+        project_actions.addWidget(self.btn_product_project_open_workbook)
+        project_actions.addWidget(self.btn_product_project_show_projects)
+        body.addLayout(project_actions)
+
+        eq_hdr = QtWidgets.QHBoxLayout()
+        eq_title = QtWidgets.QLabel("Saved Performance Equations")
+        eq_title.setStyleSheet("font-size: 14px; font-weight: 800; color: #0f172a;")
+        self.lbl_product_center_eq_hint = QtWidgets.QLabel("")
+        self.lbl_product_center_eq_hint.setStyleSheet("font-size: 11px; color: #64748b;")
+        eq_hdr.addWidget(eq_title)
+        eq_hdr.addStretch(1)
+        eq_hdr.addWidget(self.lbl_product_center_eq_hint)
+        body.addLayout(eq_hdr)
+
+        self.tbl_product_center_equations = QtWidgets.QTableWidget(0, 5)
+        self.tbl_product_center_equations.setHorizontalHeaderLabels(["Project", "Equation", "Summary", "Saved", "Updated"])
+        self.tbl_product_center_equations.verticalHeader().setVisible(False)
+        self.tbl_product_center_equations.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.tbl_product_center_equations.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        self.tbl_product_center_equations.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.tbl_product_center_equations.horizontalHeader().setStretchLastSection(True)
+        self.tbl_product_center_equations.setStyleSheet(
+            """
+            QTableWidget {
+                background: #ffffff;
+                alternate-background-color: #f8fafc;
+                color: #1f2937;
+                border: 1px solid #e5e7eb;
+                border-radius: 10px;
+            }
+            QHeaderView::section {
+                background: #f3f4f6;
+                color: #1f2937;
+                padding: 6px 8px;
+                border: 1px solid #e5e7eb;
+                font-weight: 600;
+            }
+            """
+        )
+        body.addWidget(self.tbl_product_center_equations)
+
+        self.product_center_scroll.setWidget(self.product_center_body)
+        r.addWidget(self.product_center_scroll, 1)
+
+        root.addWidget(left)
+        root.addWidget(right, 1)
+
+        self._set_product_center_empty_state("Select a Global Repo in Setup to load Product Center.")
+        self._update_product_center_doc_actions()
 
     def _setup_tab_projects(self):
         root = QtWidgets.QHBoxLayout(self.tab_projects)
@@ -14206,6 +14615,51 @@ class MainWindow(QtWidgets.QMainWindow):
         header_row.addWidget(self.lbl_projects_status)
         r.addLayout(header_row)
 
+        projects_filter_row = QtWidgets.QHBoxLayout()
+        self.ed_projects_filter = QtWidgets.QLineEdit()
+        self.ed_projects_filter.setPlaceholderText("Filter projects by name, type, folder, workbook ...")
+        self.ed_projects_filter.setStyleSheet(
+            """
+            QLineEdit {
+                padding: 6px 10px;
+                border-radius: 6px;
+                background: #ffffff;
+                color: #374151;
+                border: 1px solid #d1d5db;
+                font-size: 12px;
+            }
+            """
+        )
+        self.ed_projects_filter.textChanged.connect(self._apply_projects_filter)
+        projects_filter_row.addWidget(self.ed_projects_filter, 1)
+        r.addLayout(projects_filter_row)
+
+        projects_subset_row = QtWidgets.QHBoxLayout()
+        self.lbl_projects_subset = QtWidgets.QLabel("")
+        self.lbl_projects_subset.setWordWrap(True)
+        self.lbl_projects_subset.setStyleSheet(
+            "font-size: 11px; color: #1e3a8a; background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 8px; padding: 6px 8px;"
+        )
+        self.btn_projects_clear_subset = QtWidgets.QPushButton("Clear")
+        self.btn_projects_clear_subset.setStyleSheet(
+            """
+            QPushButton {
+                padding: 6px 10px;
+                border-radius: 6px;
+                background: #ffffff;
+                color: #374151;
+                border: 1px solid #d1d5db;
+                font-size: 12px;
+                font-weight: 600;
+            }
+            QPushButton:hover { background: #f9fafb; }
+            """
+        )
+        self.btn_projects_clear_subset.clicked.connect(self._clear_projects_external_subset)
+        projects_subset_row.addWidget(self.lbl_projects_subset, 1)
+        projects_subset_row.addWidget(self.btn_projects_clear_subset)
+        r.addLayout(projects_subset_row)
+
         cols = ["Name", "Type", "Folder", "Workbook"]
         self.tbl_projects = QtWidgets.QTableWidget(0, len(cols))
         self.tbl_projects.setHorizontalHeaderLabels(cols)
@@ -14301,6 +14755,395 @@ class MainWindow(QtWidgets.QMainWindow):
         root.addWidget(right, 1)
 
         self._refresh_projects()
+        self._update_projects_external_filter_banner()
+
+    def _product_center_placeholder_pixmap(self, text: str, *, width: int, height: int) -> QtGui.QPixmap:
+        pix = QtGui.QPixmap(width, height)
+        pix.fill(QtCore.Qt.GlobalColor.transparent)
+        painter = QtGui.QPainter(pix)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        rect = QtCore.QRectF(1, 1, width - 2, height - 2)
+        gradient = QtGui.QLinearGradient(0, 0, width, height)
+        gradient.setColorAt(0, QtGui.QColor("#eff6ff"))
+        gradient.setColorAt(1, QtGui.QColor("#dbeafe"))
+        painter.setBrush(QtGui.QBrush(gradient))
+        painter.setPen(QtGui.QPen(QtGui.QColor("#93c5fd"), 1.5))
+        painter.drawRoundedRect(rect, 16, 16)
+
+        font = painter.font()
+        font.setBold(True)
+        font.setPointSize(max(10, min(20, width // 14)))
+        painter.setFont(font)
+        painter.setPen(QtGui.QColor("#1e3a8a"))
+        painter.drawText(
+            QtCore.QRectF(18, 18, width - 36, height - 36),
+            QtCore.Qt.AlignmentFlag.AlignCenter | QtCore.Qt.TextFlag.TextWordWrap,
+            str(text or "").strip() or "No Image",
+        )
+        painter.end()
+        return pix
+
+    def _product_center_pixmap(self, product: dict, *, width: int, height: int) -> QtGui.QPixmap:
+        image_path = str(product.get("image_path") or "").strip()
+        if image_path:
+            try:
+                pix = QtGui.QPixmap(image_path)
+                if not pix.isNull():
+                    return pix.scaled(
+                        width,
+                        height,
+                        QtCore.Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                        QtCore.Qt.TransformationMode.SmoothTransformation,
+                    )
+            except Exception:
+                pass
+        return self._product_center_placeholder_pixmap(
+            str(product.get("asset_specific_type") or product.get("display_name") or "No Image"),
+            width=width,
+            height=height,
+        )
+
+    def _product_center_search_blob(self, product: dict) -> str:
+        parts: list[str] = [
+            str(product.get("asset_type") or ""),
+            str(product.get("asset_specific_type") or ""),
+            str(product.get("vendor") or ""),
+        ]
+        for key in ("part_numbers", "acceptance_test_plan_numbers", "serial_numbers", "document_types"):
+            for value in (product.get(key) or []):
+                parts.append(str(value or ""))
+        for doc in (product.get("documents") or []):
+            if not isinstance(doc, dict):
+                continue
+            for key in ("document_type", "document_type_acronym", "serial_number", "part_number", "program_title", "metadata_rel"):
+                parts.append(str(doc.get(key) or ""))
+        for project in (product.get("projects") or []):
+            if not isinstance(project, dict):
+                continue
+            parts.append(str(project.get("name") or ""))
+            parts.append(str(project.get("type") or ""))
+        return "\n".join(part for part in parts if part).lower()
+
+    def _set_product_center_empty_state(self, message: str) -> None:
+        self._product_center_current = None
+        self.lbl_product_center_status.setText(str(message or ""))
+        self.lbl_product_center_title.setText("Product Center")
+        self.lbl_product_center_subtitle.setText(str(message or ""))
+        self.lbl_product_center_stats.setText("")
+        self.lbl_product_center_parts.setText("")
+        self.lbl_product_center_atps.setText("")
+        self.lbl_product_center_serials.setText("")
+        self.lbl_product_center_doc_hint.setText("")
+        self.lbl_product_center_project_hint.setText("")
+        self.lbl_product_center_eq_hint.setText("")
+        self.lbl_product_center_hero.setPixmap(
+            self._product_center_placeholder_pixmap("Product Center", width=320, height=220)
+        )
+        self.tree_product_center_docs.clear()
+        self.tbl_product_center_projects.setRowCount(0)
+        self.tbl_product_center_equations.setRowCount(0)
+        self._update_product_center_doc_actions()
+
+    def _refresh_product_center(self) -> None:
+        repo_raw = (self.ed_global_repo.text() or "").strip() if hasattr(self, "ed_global_repo") else ""
+        self.list_product_center.clear()
+        self._product_center_products = []
+        self._product_center_filtered = []
+        if not repo_raw:
+            self._set_product_center_empty_state("Select a Global Repo in Setup to load Product Center.")
+            return
+        try:
+            products = be.list_product_center_products(Path(repo_raw))
+        except FileNotFoundError:
+            self._set_product_center_empty_state("No indexed products found. Run scan/index first so Product Center has source data.")
+            return
+        except Exception as exc:
+            self._set_product_center_empty_state(f"Unable to load Product Center: {exc}")
+            return
+        self._product_center_products = [dict(item) for item in products if isinstance(item, dict)]
+        if not self._product_center_products:
+            self._set_product_center_empty_state("No indexed products found. Run scan/index first so Product Center has source data.")
+            return
+        self._apply_product_center_filter()
+
+    def _apply_product_center_filter(self) -> None:
+        products = list(getattr(self, "_product_center_products", []) or [])
+        text = (self.ed_product_center_search.text() or "").strip().lower() if hasattr(self, "ed_product_center_search") else ""
+        if text:
+            products = [item for item in products if text in self._product_center_search_blob(item)]
+        self._product_center_filtered = products
+        self.list_product_center.clear()
+        for product in products:
+            counts = product.get("counts") if isinstance(product.get("counts"), dict) else {}
+            subtitle = f"{product.get('asset_type') or ''} | {product.get('vendor') or ''}"
+            summary = (
+                f"{int(counts.get('documents') or 0)} docs | "
+                f"{int(counts.get('projects') or 0)} projects | "
+                f"{int(counts.get('saved_performance_equations') or 0)} saved equations"
+            )
+            item = QtWidgets.QListWidgetItem(
+                QtGui.QIcon(self._product_center_pixmap(product, width=72, height=72)),
+                f"{str(product.get('display_name') or product.get('asset_specific_type') or '')}\n{subtitle}\n{summary}",
+            )
+            item.setData(QtCore.Qt.ItemDataRole.UserRole, dict(product))
+            self.list_product_center.addItem(item)
+        total = len(getattr(self, "_product_center_products", []) or [])
+        shown = len(products)
+        self.lbl_product_center_status.setText(f"{shown} of {total} product(s)" if shown != total else f"{shown} product(s)")
+        if products:
+            self.list_product_center.setCurrentRow(0)
+        else:
+            self._set_product_center_empty_state("No products match the current Product Center filter.")
+
+    def _on_product_center_selection_changed(self, _row: int) -> None:
+        item = self.list_product_center.currentItem()
+        product = item.data(QtCore.Qt.ItemDataRole.UserRole) if item is not None else None
+        if not isinstance(product, dict):
+            self._set_product_center_empty_state("Select a product to see documents, projects, and saved equations.")
+            return
+        self._product_center_current = dict(product)
+        counts = product.get("counts") if isinstance(product.get("counts"), dict) else {}
+        self.lbl_product_center_title.setText(str(product.get("asset_specific_type") or ""))
+        self.lbl_product_center_subtitle.setText(
+            f"Asset Type: {str(product.get('asset_type') or '')}\nVendor: {str(product.get('vendor') or '')}"
+        )
+        self.lbl_product_center_stats.setText(
+            "Documents: {documents} | EIDP: {eidp} | TD: {td} | Projects: {projects} | Saved Equations: {equations}".format(
+                documents=int(counts.get("documents") or 0),
+                eidp=int(counts.get("eidp_documents") or 0),
+                td=int(counts.get("td_documents") or 0),
+                projects=int(counts.get("projects") or 0),
+                equations=int(counts.get("saved_performance_equations") or 0),
+            )
+        )
+        self.lbl_product_center_parts.setText(
+            "Part Numbers: " + (", ".join(str(value) for value in (product.get("part_numbers") or [])) or "None")
+        )
+        self.lbl_product_center_atps.setText(
+            "Acceptance Test Plans: "
+            + (", ".join(str(value) for value in (product.get("acceptance_test_plan_numbers") or [])) or "None")
+        )
+        self.lbl_product_center_serials.setText(
+            "Serial Numbers: " + (", ".join(str(value) for value in (product.get("serial_numbers") or [])) or "None")
+        )
+        self.lbl_product_center_hero.setPixmap(self._product_center_pixmap(product, width=320, height=220))
+        self._populate_product_center_documents(product)
+        self._populate_product_center_projects(product)
+        self._populate_product_center_equations(product)
+        self._update_product_center_doc_actions()
+
+    def _populate_product_center_documents(self, product: dict) -> None:
+        self.tree_product_center_docs.clear()
+        groups: dict[str, list[dict]] = {}
+        for doc in (product.get("documents") or []):
+            if not isinstance(doc, dict):
+                continue
+            groups.setdefault(str(doc.get("display_document_type") or "(No Doc Type)"), []).append(doc)
+        for doc_type in sorted(groups.keys(), key=str.casefold):
+            docs = groups[doc_type]
+            parent = QtWidgets.QTreeWidgetItem([f"{doc_type} ({len(docs)})"])
+            parent.setFirstColumnSpanned(True)
+            parent.setFlags(parent.flags() & ~QtCore.Qt.ItemFlag.ItemIsSelectable)
+            self.tree_product_center_docs.addTopLevelItem(parent)
+            for doc in docs:
+                child = QtWidgets.QTreeWidgetItem(
+                    [
+                        str(doc.get("metadata_rel") or doc.get("rel_path") or "(Document)"),
+                        str(doc.get("serial_number") or ""),
+                        str(doc.get("part_number") or ""),
+                        str(doc.get("acceptance_test_plan_number") or ""),
+                        str(doc.get("program_title") or ""),
+                    ]
+                )
+                child.setData(0, QtCore.Qt.ItemDataRole.UserRole, dict(doc))
+                parent.addChild(child)
+        self.tree_product_center_docs.expandAll()
+        self.tree_product_center_docs.resizeColumnToContents(0)
+        self.lbl_product_center_doc_hint.setText(
+            f"{len(product.get('documents') or [])} document(s) linked to this product"
+        )
+
+    def _populate_product_center_projects(self, product: dict) -> None:
+        projects = [dict(item) for item in (product.get("projects") or []) if isinstance(item, dict)]
+        self.tbl_product_center_projects.setRowCount(0)
+        for row, project in enumerate(projects):
+            self.tbl_product_center_projects.insertRow(row)
+            item_name = QtWidgets.QTableWidgetItem(str(project.get("name") or ""))
+            item_type = QtWidgets.QTableWidgetItem(str(project.get("type") or ""))
+            item_folder = QtWidgets.QTableWidgetItem(str(project.get("project_dir") or ""))
+            item_workbook = QtWidgets.QTableWidgetItem(str(project.get("workbook") or ""))
+            item_name.setData(QtCore.Qt.ItemDataRole.UserRole, dict(project))
+            self.tbl_product_center_projects.setItem(row, 0, item_name)
+            self.tbl_product_center_projects.setItem(row, 1, item_type)
+            self.tbl_product_center_projects.setItem(row, 2, item_folder)
+            self.tbl_product_center_projects.setItem(row, 3, item_workbook)
+        self.tbl_product_center_projects.resizeColumnsToContents()
+        self.tbl_product_center_projects.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.tbl_product_center_projects.horizontalHeader().setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.lbl_product_center_project_hint.setText(f"{len(projects)} linked project(s)")
+
+    def _populate_product_center_equations(self, product: dict) -> None:
+        equations = [dict(item) for item in (product.get("saved_performance_equations") or []) if isinstance(item, dict)]
+        self.tbl_product_center_equations.setRowCount(0)
+        for row, entry in enumerate(equations):
+            self.tbl_product_center_equations.insertRow(row)
+            values = [
+                str(entry.get("project_name") or ""),
+                str(entry.get("name") or ""),
+                str(entry.get("summary") or ""),
+                str(entry.get("saved_at") or ""),
+                str(entry.get("updated_at") or ""),
+            ]
+            for col, value in enumerate(values):
+                item = QtWidgets.QTableWidgetItem(value)
+                item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+                self.tbl_product_center_equations.setItem(row, col, item)
+        self.tbl_product_center_equations.resizeColumnsToContents()
+        self.tbl_product_center_equations.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.lbl_product_center_eq_hint.setText(f"{len(equations)} saved equation(s)")
+
+    def _selected_product_center_document(self) -> dict | None:
+        item = self.tree_product_center_docs.currentItem()
+        if item is None:
+            return None
+        doc = item.data(0, QtCore.Qt.ItemDataRole.UserRole)
+        return dict(doc) if isinstance(doc, dict) else None
+
+    def _selected_product_center_project(self) -> dict | None:
+        row = self.tbl_product_center_projects.currentRow()
+        if row < 0:
+            return None
+        item = self.tbl_product_center_projects.item(row, 0)
+        if item is None:
+            return None
+        payload = item.data(QtCore.Qt.ItemDataRole.UserRole)
+        return dict(payload) if isinstance(payload, dict) else None
+
+    def _update_product_center_doc_actions(self) -> None:
+        doc = self._selected_product_center_document()
+        current = self._product_center_current if isinstance(self._product_center_current, dict) else {}
+        has_files_target = bool(
+            [
+                str(item.get("rel_path") or "").strip()
+                for item in (current.get("documents") or [])
+                if isinstance(item, dict) and str(item.get("rel_path") or "").strip()
+            ]
+        )
+        for btn in (
+            self.btn_product_doc_open_file,
+            self.btn_product_doc_open_metadata,
+            self.btn_product_doc_open_combined,
+        ):
+            btn.setEnabled(bool(doc))
+        self.btn_product_doc_show_files.setEnabled(has_files_target)
+        project = self._selected_product_center_project()
+        self.btn_product_project_open_folder.setEnabled(bool(project))
+        self.btn_product_project_open_workbook.setEnabled(bool(project))
+        self.btn_product_project_show_projects.setEnabled(bool(current.get("projects")))
+
+    def _act_product_center_open_image_folder(self) -> None:
+        try:
+            be.open_path(be.product_center_images_dir())
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Product Center", str(exc))
+
+    def _act_product_center_open_doc_file(self) -> None:
+        doc = self._selected_product_center_document()
+        repo_raw = (self.ed_global_repo.text() or "").strip()
+        if not doc or not repo_raw:
+            return
+        rel_path = str(doc.get("rel_path") or "").strip()
+        if not rel_path:
+            QtWidgets.QMessageBox.warning(self, "Product Center", "No tracked source file is linked to this document.")
+            return
+        try:
+            be.open_path(Path(repo_raw).expanduser() / rel_path)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Open File", str(exc))
+
+    def _act_product_center_open_doc_metadata(self) -> None:
+        doc = self._selected_product_center_document()
+        repo_raw = (self.ed_global_repo.text() or "").strip()
+        if not doc or not repo_raw:
+            return
+        metadata_rel = str(doc.get("metadata_rel") or "").strip()
+        if not metadata_rel:
+            QtWidgets.QMessageBox.warning(self, "Product Center", "No metadata JSON is linked to this document.")
+            return
+        try:
+            be.open_path(be.eidat_support_dir(Path(repo_raw).expanduser()) / metadata_rel)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Open Metadata", str(exc))
+
+    def _act_product_center_open_doc_combined(self) -> None:
+        doc = self._selected_product_center_document()
+        repo_raw = (self.ed_global_repo.text() or "").strip()
+        if not doc or not repo_raw:
+            return
+        support_dir = be.eidat_support_dir(Path(repo_raw).expanduser())
+        combined = None
+        artifacts_rel = str(doc.get("artifacts_rel") or "").strip()
+        if artifacts_rel:
+            combined = support_dir / artifacts_rel / "combined.txt"
+        if combined is None or not combined.exists():
+            rel_path = str(doc.get("rel_path") or "").strip()
+            if rel_path:
+                artifacts = be.get_file_artifacts_path(Path(repo_raw).expanduser(), rel_path)
+                if artifacts is not None:
+                    combined = artifacts / "combined.txt"
+        if combined is None or not combined.exists():
+            QtWidgets.QMessageBox.warning(self, "Product Center", "combined.txt was not found for this document.")
+            return
+        try:
+            be.open_path(combined)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Open combined.txt", str(exc))
+
+    def _act_product_center_show_files(self) -> None:
+        current = self._product_center_current if isinstance(self._product_center_current, dict) else {}
+        rel_paths = [
+            str(item.get("rel_path") or "").strip()
+            for item in (current.get("documents") or [])
+            if isinstance(item, dict) and str(item.get("rel_path") or "").strip()
+        ]
+        if not rel_paths:
+            QtWidgets.QMessageBox.warning(self, "Product Center", "No tracked files are linked to this product.")
+            return
+        label = f"Filtered from Product Center: {str(current.get('asset_specific_type') or '').strip()}"
+        self._set_files_external_subset(rel_paths, label=label)
+        self._switch_tab(1)
+
+    def _act_product_center_open_project_folder(self) -> None:
+        project = self._selected_product_center_project()
+        if not project:
+            return
+        try:
+            be.open_path(Path(str(project.get("project_dir") or "")).expanduser())
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Open Folder", str(exc))
+
+    def _act_product_center_open_project_workbook(self) -> None:
+        project = self._selected_product_center_project()
+        if not project:
+            return
+        try:
+            be.open_path(Path(str(project.get("workbook") or "")).expanduser())
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Open Workbook", str(exc))
+
+    def _act_product_center_show_projects(self) -> None:
+        current = self._product_center_current if isinstance(self._product_center_current, dict) else {}
+        project_dirs = [
+            str(item.get("project_dir") or "").strip()
+            for item in (current.get("projects") or [])
+            if isinstance(item, dict) and str(item.get("project_dir") or "").strip()
+        ]
+        if not project_dirs:
+            QtWidgets.QMessageBox.warning(self, "Product Center", "No linked projects are available for this product.")
+            return
+        label = f"Filtered from Product Center: {str(current.get('asset_specific_type') or '').strip()}"
+        self._set_projects_external_subset(project_dirs, label=label)
+        self._switch_tab(3)
 
     def _refresh_projects(self) -> None:
         tbl = getattr(self, "tbl_projects", None)
@@ -14308,9 +15151,11 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         repo_raw = (self.ed_global_repo.text() or "").strip() if hasattr(self, "ed_global_repo") else ""
         self.btn_project_new.setEnabled(bool(repo_raw))
+        self._projects_all = []
         tbl.setRowCount(0)
         if not repo_raw:
             self.lbl_projects_status.setText("Select a Global Repo in Setup")
+            self._update_projects_external_filter_banner()
             self._update_project_actions()
             return
 
@@ -14322,30 +15167,110 @@ class MainWindow(QtWidgets.QMainWindow):
             self._append_log(f"[PROJECTS] Failed to load registry: {exc}")
             return
 
-        for r, p in enumerate(projects):
+        records: list[dict] = []
+        for p in projects:
             name = str(p.get("name") or "").strip()
             ptype = str(p.get("type") or "").strip()
             rel_folder = str(p.get("project_dir") or "").strip()
             rel_workbook = str(p.get("workbook") or "").strip()
             folder_abs = (repo / rel_folder).expanduser() if rel_folder and not Path(rel_folder).is_absolute() else Path(rel_folder).expanduser()
             workbook_abs = (repo / rel_workbook).expanduser() if rel_workbook and not Path(rel_workbook).is_absolute() else Path(rel_workbook).expanduser()
+            records.append(
+                {
+                    "name": name,
+                    "type": ptype,
+                    "project_dir": str(folder_abs),
+                    "project_dir_display": rel_folder,
+                    "workbook": str(workbook_abs),
+                    "workbook_display": rel_workbook,
+                }
+            )
 
+        self._projects_all = records
+        self._apply_projects_filter()
+
+    def _normalize_project_dir_key(self, value: object) -> str:
+        try:
+            return str(Path(str(value or "")).expanduser().resolve()).casefold()
+        except Exception:
+            return str(Path(str(value or "")).expanduser().absolute()).casefold()
+
+    def _update_projects_external_filter_banner(self) -> None:
+        active = bool(getattr(self, "_projects_external_dirs", None))
+        label = getattr(self, "_projects_external_filter_label", "").strip()
+        if hasattr(self, "lbl_projects_subset"):
+            self.lbl_projects_subset.setVisible(active)
+            self.lbl_projects_subset.setText(label if active else "")
+        if hasattr(self, "btn_projects_clear_subset"):
+            self.btn_projects_clear_subset.setVisible(active)
+
+    def _set_projects_external_subset(self, project_dirs: list[str], *, label: str) -> None:
+        cleaned = {
+            self._normalize_project_dir_key(value)
+            for value in (project_dirs or [])
+            if str(value).strip()
+        }
+        self._projects_external_dirs = cleaned or None
+        self._projects_external_filter_label = str(label or "").strip()
+        self._update_projects_external_filter_banner()
+        self._apply_projects_filter()
+
+    def _clear_projects_external_subset(self) -> None:
+        self._projects_external_dirs = None
+        self._projects_external_filter_label = ""
+        self._update_projects_external_filter_banner()
+        self._apply_projects_filter()
+
+    def _apply_projects_filter(self) -> None:
+        tbl = getattr(self, "tbl_projects", None)
+        if not tbl:
+            return
+        records = list(getattr(self, "_projects_all", []) or [])
+        external_dirs = getattr(self, "_projects_external_dirs", None)
+        if external_dirs is not None:
+            records = [
+                item for item in records
+                if self._normalize_project_dir_key(item.get("project_dir")) in external_dirs
+            ]
+        search = (self.ed_projects_filter.text() or "").strip().lower() if hasattr(self, "ed_projects_filter") else ""
+        if search:
+            records = [
+                item for item in records
+                if search in "\n".join(
+                    [
+                        str(item.get("name") or ""),
+                        str(item.get("type") or ""),
+                        str(item.get("project_dir_display") or ""),
+                        str(item.get("workbook_display") or ""),
+                    ]
+                ).lower()
+            ]
+        self._populate_projects_table(records)
+
+    def _populate_projects_table(self, projects: list[dict]) -> None:
+        tbl = getattr(self, "tbl_projects", None)
+        if not tbl:
+            return
+        tbl.setRowCount(0)
+        for r, p in enumerate(projects):
             tbl.insertRow(r)
-            item_name = QtWidgets.QTableWidgetItem(name)
-            item_type = QtWidgets.QTableWidgetItem(ptype)
-            item_folder = QtWidgets.QTableWidgetItem(rel_folder)
-            item_workbook = QtWidgets.QTableWidgetItem(rel_workbook)
-            item_folder.setData(QtCore.Qt.ItemDataRole.UserRole, str(folder_abs))
-            item_workbook.setData(QtCore.Qt.ItemDataRole.UserRole, str(workbook_abs))
+            item_name = QtWidgets.QTableWidgetItem(str(p.get("name") or ""))
+            item_type = QtWidgets.QTableWidgetItem(str(p.get("type") or ""))
+            item_folder = QtWidgets.QTableWidgetItem(str(p.get("project_dir_display") or ""))
+            item_workbook = QtWidgets.QTableWidgetItem(str(p.get("workbook_display") or ""))
+            item_name.setData(QtCore.Qt.ItemDataRole.UserRole, dict(p))
+            item_folder.setData(QtCore.Qt.ItemDataRole.UserRole, str(p.get("project_dir") or ""))
+            item_workbook.setData(QtCore.Qt.ItemDataRole.UserRole, str(p.get("workbook") or ""))
             tbl.setItem(r, 0, item_name)
             tbl.setItem(r, 1, item_type)
             tbl.setItem(r, 2, item_folder)
             tbl.setItem(r, 3, item_workbook)
-
         tbl.resizeColumnsToContents()
         tbl.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Stretch)
         tbl.horizontalHeader().setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.Stretch)
-        self.lbl_projects_status.setText(f"{len(projects)} project(s)")
+        total = len(getattr(self, "_projects_all", []) or [])
+        shown = len(projects)
+        self.lbl_projects_status.setText(f"{shown} of {total} project(s)" if shown != total else f"{shown} project(s)")
         self._update_project_actions()
 
     def _act_new_project(self) -> None:
@@ -14989,7 +15914,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # Update button checked states
         self.btn_tab_setup.setChecked(idx == 0)
         self.btn_tab_files.setChecked(idx == 1)
-        self.btn_tab_projects.setChecked(idx == 2)
+        self.btn_tab_product_center.setChecked(idx == 2)
+        self.btn_tab_projects.setChecked(idx == 3)
         # Switch the actual tab
         self.tabs.setCurrentIndex(idx)
 
@@ -14997,6 +15923,8 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             if self.tabs.widget(idx) is self.tab_files:
                 self._refresh_files_tab()
+            elif self.tabs.widget(idx) is self.tab_product_center:
+                self._refresh_product_center()
             elif self.tabs.widget(idx) is self.tab_projects:
                 self._refresh_projects()
         except Exception:
@@ -15136,13 +16064,40 @@ class MainWindow(QtWidgets.QMainWindow):
         if base_files is None:
             base_files = getattr(self, "_files_data", []) or []
 
-        deep_matches: set[str] | None = getattr(self, "_files_deep_matches", None)
-        if deep_matches is not None:
-            files = [f for f in (base_files or []) if str(f.get("rel_path") or "") in deep_matches]
+        external_rel_paths = getattr(self, "_files_external_rel_paths", None)
+        if external_rel_paths is not None:
+            files = [f for f in (base_files or []) if str(f.get("rel_path") or "") in external_rel_paths]
         else:
             files = list(base_files or [])
 
+        deep_matches: set[str] | None = getattr(self, "_files_deep_matches", None)
+        if deep_matches is not None:
+            files = [f for f in files if str(f.get("rel_path") or "") in deep_matches]
+
         self._populate_files_table(files)
+
+    def _update_files_external_filter_banner(self) -> None:
+        label = getattr(self, "_files_external_filter_label", "").strip()
+        rel_paths = getattr(self, "_files_external_rel_paths", None)
+        active = bool(rel_paths)
+        if hasattr(self, "lbl_files_subset"):
+            self.lbl_files_subset.setVisible(active)
+            self.lbl_files_subset.setText(label if active else "")
+        if hasattr(self, "btn_files_clear_subset"):
+            self.btn_files_clear_subset.setVisible(active)
+
+    def _set_files_external_subset(self, rel_paths: list[str], *, label: str) -> None:
+        cleaned = {str(value).strip() for value in (rel_paths or []) if str(value).strip()}
+        self._files_external_rel_paths = cleaned or None
+        self._files_external_filter_label = str(label or "").strip()
+        self._update_files_external_filter_banner()
+        self._files_refresh_table_view()
+
+    def _clear_files_external_subset(self) -> None:
+        self._files_external_rel_paths = None
+        self._files_external_filter_label = ""
+        self._update_files_external_filter_banner()
+        self._files_refresh_table_view()
 
     def _populate_files_table(self, files: list[dict]) -> None:
         """Populate the table with file data."""
