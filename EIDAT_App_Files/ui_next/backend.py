@@ -2445,11 +2445,16 @@ def _ensure_test_data_raw_cache_tables(conn: sqlite3.Connection) -> None:
             run_type TEXT,
             pulse_width REAL,
             control_period REAL,
+            suppression_voltage REAL,
             source_mtime_ns INTEGER,
             computed_epoch_ns INTEGER NOT NULL
         )
         """
     )
+    try:
+        conn.execute("ALTER TABLE td_raw_condition_observations ADD COLUMN suppression_voltage REAL")
+    except Exception:
+        pass
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS td_raw_curve_catalog (
@@ -3021,11 +3026,16 @@ def _ensure_test_data_impl_tables(conn: sqlite3.Connection) -> None:
             run_type TEXT,
             pulse_width REAL,
             control_period REAL,
+            suppression_voltage REAL,
             source_mtime_ns INTEGER,
             computed_epoch_ns INTEGER NOT NULL
         )
         """
     )
+    try:
+        conn.execute("ALTER TABLE td_condition_observations ADD COLUMN suppression_voltage REAL")
+    except Exception:
+        pass
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS td_columns_calc (
@@ -6203,12 +6213,12 @@ def td_list_run_selection_views(db_path: Path, workbook_path: Path, *, project_d
         _ensure_test_data_impl_tables(conn)
         rows = conn.execute(
             """
-            SELECT run_name, COALESCE(program_title, ''), COALESCE(source_run_name, '')
+            SELECT run_name, COALESCE(program_title, ''), COALESCE(source_run_name, ''), suppression_voltage
             FROM td_condition_observations
             ORDER BY run_name, program_title, source_run_name, observation_id
             """
         ).fetchall()
-    for run_name, program_title, source_run_name in rows:
+    for run_name, program_title, source_run_name, suppression_voltage in rows:
         run_key = str(run_name or "").strip()
         if not run_key:
             continue
@@ -6218,6 +6228,8 @@ def td_list_run_selection_views(db_path: Path, workbook_path: Path, *, project_d
                 "program_title": str(program_title or "").strip(),
                 "program_label": _td_display_program_title(program_title),
                 "source_run_name": seq_name,
+                "suppression_voltage": suppression_voltage,
+                "suppression_voltage_label": _td_format_compact_value(suppression_voltage),
             }
         )
 
@@ -6231,13 +6243,17 @@ def td_list_run_selection_views(db_path: Path, workbook_path: Path, *, project_d
         source_rows = list(observations_by_condition.get(run_name) or [])
         member_sequences: list[str] = []
         member_programs: list[str] = []
+        member_suppression_voltages: list[str] = []
         detail_rows: list[str] = []
         seen_sequence_labels: set[str] = set()
         seen_program_labels: set[str] = set()
+        seen_suppression_labels: set[str] = set()
         for obs in source_rows:
             program_title = str(obs.get("program_title") or "").strip()
             program_label = str(obs.get("program_label") or "").strip() or _td_display_program_title(program_title)
             source_run_name = str(obs.get("source_run_name") or "").strip() or run_name
+            suppression_voltage = obs.get("suppression_voltage")
+            suppression_voltage_label = str(obs.get("suppression_voltage_label") or "").strip()
             detail = source_run_name if not program_title else f"{program_title}: {source_run_name}"
             detail_rows.append(detail)
             if source_run_name.lower() not in seen_sequence_labels:
@@ -6246,6 +6262,9 @@ def td_list_run_selection_views(db_path: Path, workbook_path: Path, *, project_d
             if program_label.casefold() not in seen_program_labels:
                 seen_program_labels.add(program_label.casefold())
                 member_programs.append(program_label)
+            if suppression_voltage_label and suppression_voltage_label.casefold() not in seen_suppression_labels:
+                seen_suppression_labels.add(suppression_voltage_label.casefold())
+                member_suppression_voltages.append(suppression_voltage_label)
             sequence_items.append(
                 {
                     "mode": "sequence",
@@ -6259,6 +6278,8 @@ def td_list_run_selection_views(db_path: Path, workbook_path: Path, *, project_d
                     "member_runs": [run_name],
                     "member_programs": [program_label],
                     "member_sequences": [source_run_name],
+                    "suppression_voltage": suppression_voltage,
+                    "member_suppression_voltages": ([suppression_voltage_label] if suppression_voltage_label else []),
                     "details_text": (
                         f"Program: {program_title or TD_SUPPORT_DEFAULT_PROGRAM_TITLE} | "
                         f"Source Sequence: {source_run_name} | Run Condition: {run_display_name}"
@@ -6279,11 +6300,14 @@ def td_list_run_selection_views(db_path: Path, workbook_path: Path, *, project_d
                     "member_runs": [run_name],
                     "member_programs": [_td_display_program_title("")],
                     "member_sequences": [run_name],
+                    "suppression_voltage": None,
+                    "member_suppression_voltages": [],
                     "details_text": f"Run Condition: {run_display_name}",
                 }
             )
             member_sequences = [run_name]
             member_programs = [_td_display_program_title("")]
+            member_suppression_voltages = []
             detail_rows = [run_name]
         condition_items.append(
             {
@@ -6295,6 +6319,8 @@ def td_list_run_selection_views(db_path: Path, workbook_path: Path, *, project_d
                 "member_runs": [run_name],
                 "member_programs": list(member_programs or [_td_display_program_title("")]),
                 "member_sequences": member_sequences,
+                "suppression_voltage": (member_suppression_voltages[0] if len(member_suppression_voltages) == 1 else None),
+                "member_suppression_voltages": list(member_suppression_voltages),
                 "details_text": "Source Sequences: " + ", ".join(detail_rows),
             }
         )
@@ -7688,6 +7714,9 @@ def _write_test_data_project_calc_cache_from_aggregates(
             condition_meta.get("pulse_width_on", condition_meta.get("pulse_width", run_defaults.get("pulse_width")))
         )
         control_period_value = _td_finite_float(condition_meta.get("control_period", run_defaults.get("control_period")))
+        suppression_voltage_value = _td_finite_float(
+            condition_meta.get("suppression_voltage", run_defaults.get("suppression_voltage"))
+        )
         run_type_text = str(condition_meta.get("run_type") or run_defaults.get("run_type") or "").strip()
         member_source_runs = sorted({str(v).strip() for v in (meta.get("source_run_names") or set()) if str(v).strip()})
 
@@ -7743,6 +7772,7 @@ def _write_test_data_project_calc_cache_from_aggregates(
                 run_type_text,
                 pulse_width_value,
                 control_period_value,
+                suppression_voltage_value,
                 source_mtime_max,
                 int(computed_epoch_ns),
             )
@@ -7818,8 +7848,8 @@ def _write_test_data_project_calc_cache_from_aggregates(
             conn.executemany(
                 """
                 INSERT OR REPLACE INTO td_condition_observations(
-                    observation_id, serial, run_name, program_title, source_run_name, run_type, pulse_width, control_period, source_mtime_ns, computed_epoch_ns
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    observation_id, serial, run_name, program_title, source_run_name, run_type, pulse_width, control_period, suppression_voltage, source_mtime_ns, computed_epoch_ns
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 obs_rows_to_write,
             )
@@ -8035,7 +8065,7 @@ def _rebuild_test_data_project_calc_cache_from_raw(
         try:
             raw_obs_rows = raw_conn.execute(
                 """
-                SELECT observation_id, run_name, serial, COALESCE(program_title, ''), COALESCE(source_run_name, ''), COALESCE(run_type, ''), pulse_width, control_period, source_mtime_ns
+                SELECT observation_id, run_name, serial, COALESCE(program_title, ''), COALESCE(source_run_name, ''), COALESCE(run_type, ''), pulse_width, control_period, suppression_voltage, source_mtime_ns
                 FROM td_raw_condition_observations
                 ORDER BY run_name, serial, observation_id
                 """
@@ -8096,7 +8126,7 @@ def _rebuild_test_data_project_calc_cache_from_raw(
             }
 
         raw_obs_by_id: dict[str, dict[str, object]] = {}
-        for observation_id, run_name, serial, program_title, source_run_name, run_type, pulse_width, control_period, source_mtime_ns in raw_obs_rows:
+        for observation_id, run_name, serial, program_title, source_run_name, run_type, pulse_width, control_period, suppression_voltage, source_mtime_ns in raw_obs_rows:
             obs_id = str(observation_id or "").strip()
             if not obs_id:
                 continue
@@ -8109,6 +8139,7 @@ def _rebuild_test_data_project_calc_cache_from_raw(
                 "run_type": str(run_type or "").strip(),
                 "pulse_width": pulse_width,
                 "control_period": control_period,
+                "suppression_voltage": suppression_voltage,
                 "source_mtime_ns": source_mtime_ns,
             }
         for run_name, _y_name, _x_name, observation_id, serial, program_title, source_run_name, _x_json, _y_json, source_mtime_ns in raw_curve_rows:
@@ -8123,6 +8154,7 @@ def _rebuild_test_data_project_calc_cache_from_raw(
                     "run_type": "",
                     "pulse_width": None,
                     "control_period": None,
+                    "suppression_voltage": None,
                     "source_mtime_ns": source_mtime_ns,
                 }
         support_rows = [
@@ -8269,6 +8301,7 @@ def _rebuild_test_data_project_calc_cache_from_raw(
             member_source_runs_txt = ", ".join(member_source_runs)
             source_mtime_max = max([int(v) for v in (meta.get("source_mtime_ns") or [])], default=0)
             pulse_width_value = _finite_float(condition_meta.get("pulse_width_on", condition_meta.get("pulse_width")))
+            suppression_voltage_value = _finite_float(condition_meta.get("suppression_voltage"))
             obs_rows_to_write.append(
                 (
                     observation_id_calc,
@@ -8279,6 +8312,7 @@ def _rebuild_test_data_project_calc_cache_from_raw(
                     str(condition_meta.get("run_type") or "").strip(),
                     pulse_width_value,
                     _finite_float(condition_meta.get("control_period")),
+                    suppression_voltage_value,
                     source_mtime_max,
                     computed_epoch_ns,
                 )
@@ -8347,8 +8381,8 @@ def _rebuild_test_data_project_calc_cache_from_raw(
             conn.executemany(
                 """
                 INSERT OR REPLACE INTO td_condition_observations(
-                    observation_id, serial, run_name, program_title, source_run_name, run_type, pulse_width, control_period, source_mtime_ns, computed_epoch_ns
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    observation_id, serial, run_name, program_title, source_run_name, run_type, pulse_width, control_period, suppression_voltage, source_mtime_ns, computed_epoch_ns
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 obs_rows_to_write,
             )
@@ -9799,6 +9833,7 @@ def rebuild_test_data_project_cache(
                             "run_type": str(run_info.get("run_type") or "").strip(),
                             "control_period": run_info.get("control_period"),
                             "pulse_width": pulse_width_value,
+                            "suppression_voltage": run_info.get("suppression_voltage"),
                         },
                     )
 
@@ -9931,6 +9966,7 @@ def rebuild_test_data_project_cache(
                         run_type_text = str(run_info.get("run_type") or "").strip()
                         pulse_width_float = _finite_float(pulse_width_value)
                         control_period_float = _finite_float(run_info.get("control_period"))
+                        suppression_voltage_float = _finite_float(run_info.get("suppression_voltage"))
                         matched_y_actuals = {
                             str(y_name): str(y_actual_by_name.get(y_name) or "").strip()
                             for y_name in matched_y_names
@@ -9992,8 +10028,8 @@ def rebuild_test_data_project_cache(
                             raw_conn.execute(
                                 """
                                 INSERT OR REPLACE INTO td_raw_condition_observations(
-                                    observation_id, run_name, serial, program_title, source_run_name, run_type, pulse_width, control_period, source_mtime_ns, computed_epoch_ns
-                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                    observation_id, run_name, serial, program_title, source_run_name, run_type, pulse_width, control_period, suppression_voltage, source_mtime_ns, computed_epoch_ns
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                                 """,
                                 (
                                     observation_id,
@@ -10004,6 +10040,7 @@ def rebuild_test_data_project_cache(
                                     run_type_text,
                                     pulse_width_float,
                                     control_period_float,
+                                    suppression_voltage_float,
                                     mtime_ns,
                                     computed_epoch_ns,
                                 ),
@@ -10444,6 +10481,7 @@ def rebuild_test_data_project_cache(
                 "run_type": str((run_meta_by_run.get(run) or {}).get("run_type") or "").strip(),
                 "control_period": (run_meta_by_run.get(run) or {}).get("control_period"),
                 "pulse_width": (run_meta_by_run.get(run) or {}).get("pulse_width"),
+                "suppression_voltage": (run_meta_by_run.get(run) or {}).get("suppression_voltage"),
             }
             for run in runs_all
             if str(run).strip()
@@ -10813,6 +10851,53 @@ def td_read_sources_metadata_from_cache(db_path: Path) -> list[dict]:
     return out
 
 
+def td_read_observation_filter_rows_from_cache(db_path: Path) -> list[dict]:
+    path = Path(db_path).expanduser()
+    if not path.exists():
+        return []
+    with sqlite3.connect(str(path)) as conn:
+        _ensure_test_data_impl_tables(conn)
+        rows = conn.execute(
+            """
+            SELECT
+                o.observation_id,
+                o.serial,
+                COALESCE(o.program_title, ''),
+                COALESCE(o.source_run_name, ''),
+                o.suppression_voltage,
+                COALESCE(m.document_type, ''),
+                COALESCE(m.metadata_rel, ''),
+                COALESCE(m.artifacts_rel, ''),
+                COALESCE(m.excel_sqlite_rel, '')
+            FROM td_condition_observations o
+            LEFT JOIN td_source_metadata m
+              ON m.serial = o.serial
+            ORDER BY o.serial, o.run_name, o.observation_id
+            """
+        ).fetchall()
+    out: list[dict] = []
+    for observation_id, serial, program_title, source_run_name, suppression_voltage, document_type, metadata_rel, artifacts_rel, excel_sqlite_rel in rows:
+        sn = str(serial or "").strip()
+        obs_id = str(observation_id or "").strip()
+        if not sn or not obs_id:
+            continue
+        out.append(
+            {
+                "observation_id": obs_id,
+                "serial": sn,
+                "serial_number": sn,
+                "program_title": str(program_title or "").strip(),
+                "source_run_name": str(source_run_name or "").strip(),
+                "suppression_voltage": suppression_voltage,
+                "document_type": str(document_type or "").strip(),
+                "metadata_rel": str(metadata_rel or "").strip(),
+                "artifacts_rel": str(artifacts_rel or "").strip(),
+                "excel_sqlite_rel": str(excel_sqlite_rel or "").strip(),
+            }
+        )
+    return out
+
+
 def td_load_metric_series(
     db_path: Path,
     run_name: str,
@@ -10841,7 +10926,8 @@ def td_load_metric_series(
             COALESCE(m.program_title, ''),
             COALESCE(m.source_run_name, ''),
             COALESCE(o.run_type, ''),
-            o.control_period
+            o.control_period,
+            o.suppression_voltage
         FROM td_metrics_calc m
         LEFT JOIN td_condition_observations o
           ON o.observation_id = m.observation_id
@@ -10887,6 +10973,7 @@ def td_load_metric_series(
             "source_run_name": str(r[4] or "").strip(),
             "run_type": str(r[5] or "").strip(),
             "control_period": r[6],
+            "suppression_voltage": r[7],
         }
         for r in rows
         if str(r[0] or "").strip() and str(r[1] or "").strip()
@@ -15957,7 +16044,20 @@ def td_load_curves(
         if x and axis_kind and x != axis_kind:
             return []
         curve_sql = [
-            f"SELECT observation_id, serial, COALESCE(program_title, ''), COALESCE(source_run_name, ''), x_json, y_json FROM {_quote_ident(table_name)} WHERE 1=1"
+            f"""
+            SELECT
+                c.observation_id,
+                c.serial,
+                COALESCE(c.program_title, ''),
+                COALESCE(c.source_run_name, ''),
+                o.suppression_voltage,
+                c.x_json,
+                c.y_json
+            FROM {_quote_ident(table_name)} c
+            LEFT JOIN td_raw_condition_observations o
+              ON o.observation_id = c.observation_id
+            WHERE 1=1
+            """
         ]
         curve_params: list[object] = []
         if want:
@@ -15970,12 +16070,12 @@ def td_load_curves(
         if src_run:
             curve_sql.append(" AND lower(COALESCE(source_run_name, '')) = lower(?)")
             curve_params.append(src_run)
-        curve_sql.append(" ORDER BY serial, observation_id")
+        curve_sql.append(" ORDER BY c.serial, c.observation_id")
         try:
             rows = conn.execute("".join(curve_sql), tuple(curve_params)).fetchall()
         except sqlite3.OperationalError:
             legacy_sql = [
-                f"SELECT '' AS observation_id, serial, '' AS program_title, '' AS source_run_name, x_json, y_json FROM {_quote_ident(table_name)} WHERE 1=1"
+                f"SELECT '' AS observation_id, serial, '' AS program_title, '' AS source_run_name, NULL AS suppression_voltage, x_json, y_json FROM {_quote_ident(table_name)} WHERE 1=1"
             ]
             legacy_params: list[object] = []
             if want:
@@ -15985,7 +16085,7 @@ def td_load_curves(
             legacy_sql.append(" ORDER BY serial")
             rows = conn.execute("".join(legacy_sql), tuple(legacy_params)).fetchall()
     out: list[dict] = []
-    for observation_id, sn, program_title, source_run_name, xj, yj in rows:
+    for observation_id, sn, program_title, source_run_name, suppression_voltage, xj, yj in rows:
         try:
             xs = json.loads(xj or "[]")
             ys = json.loads(yj or "[]")
@@ -16000,6 +16100,7 @@ def td_load_curves(
                 "serial": str(sn or "").strip(),
                 "program_title": str(program_title or "").strip(),
                 "source_run_name": str(source_run_name or "").strip(),
+                "suppression_voltage": suppression_voltage,
                 "x": xs,
                 "y": ys,
             }

@@ -59,6 +59,16 @@ def update_project(
         return dict(be.update_eidp_trending_project_workbook(repo, wb, overwrite=overwrite) or {})
     if project_type == getattr(be, "EIDAT_PROJECT_TYPE_RAW_TRENDING", "EIDP Raw File Trending"):
         return dict(be.update_eidp_raw_trending_project_workbook(repo, wb, overwrite=overwrite) or {})
+    if project_type == getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending"):
+        return dict(
+            be.update_test_data_trending_project_workbook(
+                repo,
+                wb,
+                overwrite=overwrite,
+                include_performance_sheets=True,
+            )
+            or {}
+        )
     raise RuntimeError(f"Unsupported project type: {project_type}")
 
 
@@ -71,4 +81,3 @@ def delete_project(node_root: str | Path | None, *, project_dir: str | Path) -> 
 def open_path(path: str | Path) -> None:
     be = _be()
     be.open_path(Path(path).expanduser())
-

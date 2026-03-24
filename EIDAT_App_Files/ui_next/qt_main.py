@@ -132,6 +132,45 @@ def _td_serial_value(row: dict | None) -> str:
     return str(row.get("serial") or row.get("serial_number") or "").strip()
 
 
+def _td_compact_filter_value(value: object) -> str:
+    if value is None or isinstance(value, bool):
+        return ""
+    if isinstance(value, (int, float)):
+        try:
+            num = float(value)
+        except Exception:
+            return ""
+        if not math.isfinite(num):
+            return ""
+        return f"{num:g}"
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        num = float(raw)
+    except Exception:
+        return raw
+    if not math.isfinite(num):
+        return raw
+    return f"{num:g}"
+
+
+def _td_suppression_voltage_filter_value(row: dict | None) -> str:
+    if not isinstance(row, dict):
+        return ""
+    return _td_compact_filter_value(row.get("suppression_voltage"))
+
+
+def _td_compact_filter_sort_key(value: object) -> tuple[int, float, str]:
+    label = _td_compact_filter_value(value)
+    if not label:
+        return (2, 0.0, "")
+    try:
+        return (0, float(label), label.casefold())
+    except Exception:
+        return (1, 0.0, label.casefold())
+
+
 def _td_metric_program_segments(labels: list[str], serial_rows: list[dict]) -> list[dict]:
     meta_by_sn = _td_serial_metadata_by_serial(serial_rows)
     segments: list[dict] = []
@@ -3135,10 +3174,13 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._highlight_sns: list[str] = []
         self._serial_source_rows: list[dict] = []
         self._serial_source_by_serial: dict[str, dict] = {}
+        self._global_filter_rows: list[dict] = []
         self._available_program_filters: list[str] = []
         self._available_serial_filter_rows: list[dict] = []
+        self._available_suppression_voltage_filters: list[str] = []
         self._checked_program_filters: list[str] = []
         self._checked_serial_filters: list[str] = []
+        self._checked_suppression_voltage_filters: list[str] = []
         self._auto_plots: list[dict] = []
         self._last_plot_def: dict | None = None
         self._auto_plot_path = self._project_dir / "auto_plots_test_data.json"
@@ -3226,9 +3268,16 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             QtWidgets.QSizePolicy.Policy.Expanding,
             QtWidgets.QSizePolicy.Policy.Fixed,
         )
+        self.lbl_suppression_voltage_filter_summary = QtWidgets.QLabel("Suppression Voltage: -")
+        self.lbl_suppression_voltage_filter_summary.setStyleSheet("color: #334155; font-size: 11px;")
+        self.lbl_suppression_voltage_filter_summary.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Fixed,
+        )
         filter_text_layout.addWidget(filter_title)
         filter_text_layout.addWidget(self.lbl_program_filter_summary)
         filter_text_layout.addWidget(self.lbl_serial_filter_summary)
+        filter_text_layout.addWidget(self.lbl_suppression_voltage_filter_summary)
         filter_text_layout.addStretch(1)
         filter_layout.addLayout(filter_text_layout, 1)
 
@@ -3236,9 +3285,16 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self.btn_program_filters.clicked.connect(self._open_program_filter_popup)
         self.btn_serial_filters = QtWidgets.QPushButton("Serials...")
         self.btn_serial_filters.clicked.connect(self._open_serial_filter_popup)
+        self.btn_suppression_voltage_filters = QtWidgets.QPushButton("Suppression Voltage...")
+        self.btn_suppression_voltage_filters.clicked.connect(self._open_suppression_voltage_filter_popup)
         self.btn_reset_global_filters = QtWidgets.QPushButton("Reset Filters")
         self.btn_reset_global_filters.clicked.connect(self._reset_global_filters)
-        for btn in (self.btn_program_filters, self.btn_serial_filters, self.btn_reset_global_filters):
+        for btn in (
+            self.btn_program_filters,
+            self.btn_serial_filters,
+            self.btn_suppression_voltage_filters,
+            self.btn_reset_global_filters,
+        ):
             btn.setMinimumHeight(32)
             btn.setStyleSheet(
                 """
@@ -5393,9 +5449,14 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             source_rows = be.td_read_sources_metadata_from_cache(self._db_path)
         except Exception:
             source_rows = []
+        try:
+            filter_rows = be.td_read_observation_filter_rows_from_cache(self._db_path)
+        except Exception:
+            filter_rows = []
         by_sn = _td_serial_metadata_by_serial(source_rows)
         self._serial_source_rows = [by_sn.get(sn, {"serial": sn, "serial_number": sn}) for sn in serials if str(sn).strip()]
         self._serial_source_by_serial = _td_serial_metadata_by_serial(self._serial_source_rows)
+        self._global_filter_rows = [dict(row) for row in (filter_rows or []) if isinstance(row, dict)]
         self._refresh_global_filter_options()
 
         self._sync_run_mode_availability()
@@ -5414,18 +5475,22 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._update_plot_zoom_actions()
 
     def _refresh_global_filter_options(self) -> None:
-        rows = [dict(row) for row in (self._serial_source_rows or []) if isinstance(row, dict)]
-        rows = [row for row in rows if _td_serial_value(row)]
-        rows.sort(key=lambda row: _td_serial_value(row).casefold())
+        serial_rows = [dict(row) for row in (self._serial_source_rows or []) if isinstance(row, dict)]
+        serial_rows = [row for row in serial_rows if _td_serial_value(row)]
+        serial_rows.sort(key=lambda row: _td_serial_value(row).casefold())
 
+        filter_rows = [dict(row) for row in (self._global_filter_rows or []) if isinstance(row, dict) and _td_serial_value(row)]
+        program_source_rows = filter_rows or serial_rows
         program_values = sorted(
-            {_td_display_program_title(row.get("program_title")) for row in rows},
+            {_td_display_program_title(row.get("program_title")) for row in program_source_rows},
             key=lambda value: (1 if value == TD_UNKNOWN_PROGRAM_LABEL else 0, value.casefold()),
         )
         prev_programs = set(self._available_program_filters or [])
         prev_checked_programs = set(self._checked_program_filters or [])
         prev_serials = {_td_serial_value(row) for row in (self._available_serial_filter_rows or []) if _td_serial_value(row)}
         prev_checked_serials = set(self._checked_serial_filters or [])
+        prev_suppression = set(self._available_suppression_voltage_filters or [])
+        prev_checked_suppression = set(self._checked_suppression_voltage_filters or [])
 
         if not prev_programs:
             self._checked_program_filters = list(program_values)
@@ -5436,7 +5501,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 if value in prev_checked_programs or value not in prev_programs
             ]
 
-        serial_values = [_td_serial_value(row) for row in rows]
+        serial_values = [_td_serial_value(row) for row in serial_rows]
         if not prev_serials:
             self._checked_serial_filters = list(serial_values)
         else:
@@ -5446,8 +5511,22 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 if serial in prev_checked_serials or serial not in prev_serials
             ]
 
+        suppression_values = sorted(
+            {_td_suppression_voltage_filter_value(row) for row in filter_rows if _td_suppression_voltage_filter_value(row)},
+            key=_td_compact_filter_sort_key,
+        )
+        if not prev_suppression:
+            self._checked_suppression_voltage_filters = list(suppression_values)
+        else:
+            self._checked_suppression_voltage_filters = [
+                value
+                for value in suppression_values
+                if value in prev_checked_suppression or value not in prev_suppression
+            ]
+
         self._available_program_filters = list(program_values)
-        self._available_serial_filter_rows = list(rows)
+        self._available_serial_filter_rows = list(serial_rows)
+        self._available_suppression_voltage_filters = list(suppression_values)
         self._refresh_global_filter_summaries()
 
     def _refresh_global_filter_summaries(self) -> None:
@@ -5456,6 +5535,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         total_serials = len(self._available_serial_filter_rows or [])
         active_serial_rows = self._active_serial_rows()
         active_serials = [_td_serial_value(row) for row in active_serial_rows]
+        total_suppression = len(self._available_suppression_voltage_filters or [])
+        active_suppression = self._active_suppression_voltage_filter_values()
 
         if hasattr(self, "lbl_program_filter_summary"):
             if total_programs <= 0:
@@ -5486,31 +5567,75 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 shown += f" (+{len(active_serials) - 20} more)"
             self.lbl_serial_filter_summary.setToolTip(shown)
 
+        if hasattr(self, "lbl_suppression_voltage_filter_summary"):
+            if total_suppression <= 0:
+                suppression_text = "Suppression Voltage: -"
+            elif len(active_suppression) >= total_suppression:
+                suppression_text = f"Suppression Voltage: All ({total_suppression})"
+            elif not active_suppression:
+                suppression_text = f"Suppression Voltage: None active (0/{total_suppression})"
+            elif len(active_suppression) <= 3:
+                suppression_text = "Suppression Voltage: " + ", ".join(active_suppression)
+            else:
+                suppression_text = f"Suppression Voltage: {len(active_suppression)} of {total_suppression} active"
+            self.lbl_suppression_voltage_filter_summary.setText(suppression_text)
+            self.lbl_suppression_voltage_filter_summary.setToolTip(", ".join(active_suppression))
+
         has_programs = bool(self._available_program_filters)
         has_serials = bool(self._available_serial_filter_rows)
+        has_suppression = bool(self._available_suppression_voltage_filters)
         if hasattr(self, "btn_program_filters"):
             self.btn_program_filters.setEnabled(has_programs)
         if hasattr(self, "btn_serial_filters"):
             self.btn_serial_filters.setEnabled(has_serials)
+        if hasattr(self, "btn_suppression_voltage_filters"):
+            self.btn_suppression_voltage_filters.setEnabled(has_suppression)
         if hasattr(self, "btn_reset_global_filters"):
-            self.btn_reset_global_filters.setEnabled(has_programs or has_serials)
+            self.btn_reset_global_filters.setEnabled(has_programs or has_serials or has_suppression)
 
     def _active_program_filter_values(self) -> list[str]:
         selected = [value for value in (self._checked_program_filters or []) if str(value).strip()]
         valid = {value for value in (self._available_program_filters or []) if str(value).strip()}
         return [value for value in selected if value in valid]
 
+    def _active_suppression_voltage_filter_values(self) -> list[str]:
+        selected = [value for value in (self._checked_suppression_voltage_filters or []) if str(value).strip()]
+        valid = {value for value in (self._available_suppression_voltage_filters or []) if str(value).strip()}
+        return [value for value in selected if value in valid]
+
     def _active_serial_rows(self) -> list[dict]:
         selected_programs = set(self._active_program_filter_values())
         selected_serials = {str(serial).strip() for serial in (self._checked_serial_filters or []) if str(serial).strip()}
-        out: list[dict] = []
-        for row in (self._available_serial_filter_rows or []):
+        selected_suppression = set(self._active_suppression_voltage_filter_values())
+        if not self._global_filter_rows:
+            out: list[dict] = []
+            for row in (self._available_serial_filter_rows or []):
+                serial = _td_serial_value(row)
+                if not serial or serial not in selected_serials:
+                    continue
+                if _td_display_program_title((row or {}).get("program_title")) not in selected_programs:
+                    continue
+                out.append(dict(row))
+            return out
+
+        matching_serials: set[str] = set()
+        for row in (self._global_filter_rows or []):
+            if not isinstance(row, dict):
+                continue
             serial = _td_serial_value(row)
             if not serial or serial not in selected_serials:
                 continue
-            if _td_display_program_title((row or {}).get("program_title")) not in selected_programs:
+            if self._row_program_label(row) not in selected_programs:
                 continue
-            out.append(dict(row))
+            suppression_voltage = _td_suppression_voltage_filter_value(row)
+            if selected_suppression and suppression_voltage not in selected_suppression:
+                continue
+            matching_serials.add(serial)
+        out = []
+        for row in (self._available_serial_filter_rows or []):
+            serial = _td_serial_value(row)
+            if serial and serial in matching_serials:
+                out.append(dict(row))
         return out
 
     def _active_serials(self) -> list[str]:
@@ -5529,19 +5654,27 @@ class TestDataTrendDialog(QtWidgets.QDialog):
     def _row_matches_global_filters(self, row: dict | None) -> bool:
         if not isinstance(row, dict):
             return False
+        program_label = self._row_program_label(row)
+        if program_label not in set(self._active_program_filter_values()):
+            return False
+        selected_suppression = set(self._active_suppression_voltage_filter_values())
+        if selected_suppression:
+            suppression_voltage = _td_suppression_voltage_filter_value(row)
+            if not suppression_voltage or suppression_voltage not in selected_suppression:
+                return False
         serial = _td_serial_value(row)
         if serial:
             active_serials = set(self._active_serials())
             if serial not in active_serials:
                 return False
-        program_label = self._row_program_label(row)
-        return program_label in set(self._active_program_filter_values())
+        return True
 
     def _filter_rows_for_global_selection(self, rows: list[dict]) -> list[dict]:
         return [dict(row) for row in (rows or []) if self._row_matches_global_filters(row)]
 
     def _visible_run_selection_items(self, mode: str) -> list[dict]:
         selected_programs = set(self._active_program_filter_values())
+        selected_suppression = set(self._active_suppression_voltage_filter_values())
         out: list[dict] = []
         for item in (self._run_selection_views.get(mode) or []):
             if not isinstance(item, dict):
@@ -5554,6 +5687,17 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             if not member_programs:
                 member_programs = [_td_display_program_title(item.get("program_title"))]
             if not any(program in selected_programs for program in member_programs):
+                continue
+            raw_suppression = item.get("member_suppression_voltages") or []
+            if isinstance(raw_suppression, list):
+                member_suppression = [_td_compact_filter_value(value) for value in raw_suppression if _td_compact_filter_value(value)]
+            else:
+                member_suppression = []
+            if not member_suppression:
+                single_suppression = _td_compact_filter_value(item.get("suppression_voltage"))
+                if single_suppression:
+                    member_suppression = [single_suppression]
+            if selected_suppression and member_suppression and not any(value in selected_suppression for value in member_suppression):
                 continue
             out.append(dict(item))
         return out
@@ -5707,6 +5851,24 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         ]
         self._on_global_filters_changed()
 
+    def _open_suppression_voltage_filter_popup(self) -> None:
+        entries = [
+            {"value": value, "label": value, "search": value.lower()}
+            for value in (self._available_suppression_voltage_filters or [])
+            if str(value).strip()
+        ]
+        chosen = self._show_filter_checklist_popup(
+            title="Visible Suppression Voltages",
+            entries=entries,
+            selected_values=self._checked_suppression_voltage_filters,
+        )
+        if chosen is None:
+            return
+        self._checked_suppression_voltage_filters = [
+            value for value in (self._available_suppression_voltage_filters or []) if value in set(chosen)
+        ]
+        self._on_global_filters_changed()
+
     def _reset_global_filters(self) -> None:
         self._checked_program_filters = list(self._available_program_filters or [])
         self._checked_serial_filters = [
@@ -5714,6 +5876,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             for row in (self._available_serial_filter_rows or [])
             if _td_serial_value(row)
         ]
+        self._checked_suppression_voltage_filters = list(self._available_suppression_voltage_filters or [])
         self._on_global_filters_changed()
 
     def _on_global_filters_changed(self) -> None:
@@ -14201,7 +14364,7 @@ class MainWindow(QtWidgets.QMainWindow):
                         repo,
                         wb_path,
                         overwrite=overwrite,
-                        include_performance_sheets=False,
+                        include_performance_sheets=True,
                         progress_cb=report,
                     )
                 raise RuntimeError(f"Unsupported project type: {ptype}")

@@ -468,7 +468,9 @@ class _RunSelectionHarness:
         self._run_display_by_name = {}
         self._run_name_by_display = {}
         self._available_program_filters = ["Program A", "Program B", "Unknown Program"]
+        self._available_suppression_voltage_filters = ["24", "28"]
         self._checked_program_filters = list(self._available_program_filters)
+        self._checked_suppression_voltage_filters = list(self._available_suppression_voltage_filters)
         self._is_internal_run_label = TestDataTrendDialog._is_internal_run_label
         self._metric_title_suffix = TestDataTrendDialog._metric_title_suffix
         self._selection_summary_text = TestDataTrendDialog._selection_summary_text
@@ -495,6 +497,7 @@ class _RunSelectionHarness:
             "_auto_plot_display_name",
             "_selected_auto_plot_definitions",
             "_active_program_filter_values",
+            "_active_suppression_voltage_filter_values",
             "_visible_run_selection_items",
             "_sync_run_mode_availability",
             "_refresh_run_selection_visibility",
@@ -547,10 +550,16 @@ class _GlobalFilterHarness:
             {"serial": "SN2", "serial_number": "SN2", "program_title": "Program B", "document_type": "TD"},
         ]
         self._serial_source_by_serial = {"SN1": dict(self._serial_source_rows[0]), "SN2": dict(self._serial_source_rows[1])}
+        self._global_filter_rows = [
+            {"observation_id": "obs_a", "serial": "SN1", "serial_number": "SN1", "program_title": "Program A", "suppression_voltage": 24.0},
+            {"observation_id": "obs_b", "serial": "SN2", "serial_number": "SN2", "program_title": "Program B", "suppression_voltage": 28.0},
+        ]
         self._available_program_filters = ["Program A", "Program B"]
         self._available_serial_filter_rows = list(self._serial_source_rows)
+        self._available_suppression_voltage_filters = ["24", "28"]
         self._checked_program_filters = ["Program A"]
         self._checked_serial_filters = ["SN1", "SN2"]
+        self._checked_suppression_voltage_filters = ["24", "28"]
         self.lbl_highlight_serials = QtWidgets.QLabel()
         self._refresh_stats_preview_calls = 0
         self._refresh_stats_preview = lambda: setattr(
@@ -565,6 +574,7 @@ class _GlobalFilterHarness:
 
         for name in (
             "_active_program_filter_values",
+            "_active_suppression_voltage_filter_values",
             "_active_serial_rows",
             "_active_serials",
             "_row_program_label",
@@ -1430,8 +1440,34 @@ class TestProjectUpdateUI(unittest.TestCase):
         args, kwargs = update_mock.call_args
         self.assertEqual(Path(args[1]), Path("C:/tmp/repo/projects/Proj/project.xlsx"))
         self.assertTrue(bool(kwargs.get("overwrite")))
-        self.assertFalse(bool(kwargs.get("include_performance_sheets")))
+        self.assertTrue(bool(kwargs.get("include_performance_sheets")))
         self.assertTrue(callable(kwargs.get("progress_cb")))
+
+    def test_node_backend_update_project_dispatches_td_projects_with_performance_refresh(self) -> None:
+        from EIDAT_App_Files.Production import node_backend  # type: ignore
+
+        be_mock = mock.Mock()
+        be_mock.EIDAT_PROJECT_TYPE_TRENDING = "EIDP Trending"
+        be_mock.EIDAT_PROJECT_TYPE_RAW_TRENDING = "EIDP Raw File Trending"
+        be_mock.EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING = "Test Data Trending"
+        be_mock.update_test_data_trending_project_workbook.return_value = {"workbook": "x"}
+
+        with mock.patch.object(node_backend, "_be", return_value=be_mock):
+            with mock.patch.object(node_backend, "global_repo", return_value=Path("C:/tmp/repo")):
+                result = node_backend.update_project(
+                    "C:/tmp/node",
+                    workbook_path="C:/tmp/repo/projects/Proj/project.xlsx",
+                    project_type="Test Data Trending",
+                    overwrite=True,
+                )
+
+        self.assertEqual(result.get("workbook"), "x")
+        be_mock.update_test_data_trending_project_workbook.assert_called_once_with(
+            Path("C:/tmp/repo"),
+            Path("C:/tmp/repo/projects/Proj/project.xlsx"),
+            overwrite=True,
+            include_performance_sheets=True,
+        )
 
     def test_generate_performance_sheets_uses_background_task_for_td_projects(self) -> None:
         _qt_app()
@@ -2156,7 +2192,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
             root = Path(td)
             src_db = root / "src.sqlite3"
-            self._make_source_sqlite_with_sequence_context(src_db)
+            self._make_source_sqlite(src_db)
             wb_path = root / "project.xlsx"
             Workbook().save(str(wb_path))
             support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
@@ -2218,7 +2254,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
             root = Path(td)
             src_db = root / "src.sqlite3"
-            self._make_source_sqlite_with_sequence_context(src_db)
+            self._make_source_sqlite(src_db)
             wb_path = root / "project.xlsx"
             Workbook().save(str(wb_path))
             support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
@@ -3271,6 +3307,61 @@ class TestTDSupportWorkbook(unittest.TestCase):
             self.assertEqual(ss_group.get("member_runs"), ["Seq1"])
             self.assertEqual(ss_group.get("member_sequences"), ["Seq1", "Seq2"])
 
+    def test_run_selection_views_include_member_suppression_voltages(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            db_path = root / "implementation_trending.sqlite3"
+            wb_path = root / "project.xlsx"
+
+            be._write_test_data_trending_workbook(
+                wb_path,
+                global_repo=root,
+                serials=["SN1", "SN2"],
+                docs=[
+                    {"serial_number": "SN1", "excel_sqlite_rel": ""},
+                    {"serial_number": "SN2", "excel_sqlite_rel": ""},
+                ],
+                config=self._make_config(),
+            )
+
+            with sqlite3.connect(str(db_path)) as conn:
+                be._ensure_test_data_impl_tables(conn)
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO td_runs(run_name, default_x, display_name, run_type, control_period, pulse_width)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    ("RunA", "Time", "RunA", "steady state", None, None),
+                )
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO td_condition_observations
+                    (observation_id, serial, run_name, program_title, source_run_name, run_type, pulse_width, control_period, suppression_voltage, source_mtime_ns, computed_epoch_ns)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    ("SN1__RunA", "SN1", "RunA", "Program A", "Seq1", "steady state", None, None, 24.0, 0, 0),
+                )
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO td_condition_observations
+                    (observation_id, serial, run_name, program_title, source_run_name, run_type, pulse_width, control_period, suppression_voltage, source_mtime_ns, computed_epoch_ns)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    ("SN2__RunA", "SN2", "RunA", "Program A", "Seq2", "steady state", None, None, 28.0, 0, 0),
+                )
+                conn.commit()
+
+            views = be.td_list_run_selection_views(db_path, wb_path, project_dir=root)
+            seq_items = views.get("sequence") or []
+            cond_items = views.get("condition") or []
+
+            seq1 = next(item for item in seq_items if item.get("source_run_name") == "Seq1")
+            self.assertEqual(seq1.get("member_suppression_voltages"), ["24"])
+            cond = next(item for item in cond_items if item.get("run_name") == "RunA")
+            self.assertEqual(cond.get("member_suppression_voltages"), ["24", "28"])
+
     def test_rebuild_prefers_workbook_config_columns_over_runtime_config(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
 
@@ -4152,7 +4243,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
             finally:
                 wb.close()
 
-    def test_update_workbook_skips_performance_sheets_by_default_and_reports_stage_timings(self) -> None:
+    def test_update_workbook_refreshes_performance_sheets_after_support_save_and_reports_stage_timings(self) -> None:
         from openpyxl import load_workbook  # type: ignore
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
 
@@ -4176,11 +4267,28 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 param_defs=[{"name": "thrust", "units": "lbf"}],
             )
 
+            be.update_test_data_trending_project_workbook(
+                root,
+                wb_path,
+                overwrite=True,
+                include_performance_sheets=True,
+            )
+
+            time.sleep(0.05)
+            support_wb = load_workbook(str(support_path))
+            try:
+                ws_settings = support_wb["Settings"]
+                ws_settings.cell(3, 2).value = 3
+                support_wb.save(str(support_path))
+            finally:
+                support_wb.close()
+
             progress: list[str] = []
             result = be.update_test_data_trending_project_workbook(
                 root,
                 wb_path,
                 overwrite=True,
+                include_performance_sheets=True,
                 progress_cb=progress.append,
             )
 
@@ -4196,13 +4304,20 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 "post_cache_workbook_build_s",
             ):
                 self.assertIn(key, timings)
-            self.assertEqual(timings.get("perf_candidates_main_s"), 0.0)
-            self.assertEqual(timings.get("perf_candidates_cp_total_s"), 0.0)
-            self.assertEqual(timings.get("perf_candidates_cp_count"), 0)
+            self.assertEqual(str(result.get("cache_sync_mode") or ""), "calc")
+            self.assertEqual(str(result.get("cache_sync_reason") or ""), "support workbook changed")
+            self.assertEqual(int(timings.get("perf_candidates_cp_count") or 0), 0)
 
             wb = load_workbook(str(wb_path), read_only=True, data_only=True)
             try:
-                self.assertNotIn("Performance_candidates", wb.sheetnames)
+                self.assertIn("Data_calc", wb.sheetnames)
+                ws_calc = wb["Data_calc"]
+                values = {
+                    str(ws_calc.cell(r, 1).value or "").strip(): ws_calc.cell(r, 2).value
+                    for r in range(1, (ws_calc.max_row or 0) + 1)
+                }
+                self.assertIn("RunA.thrust.mean", values)
+                self.assertIn("Performance_candidates", wb.sheetnames)
                 self.assertFalse(any(str(name).startswith("Performance_candidates_CP_") for name in wb.sheetnames))
             finally:
                 wb.close()
@@ -4215,6 +4330,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 "Rebuilding Data_calc",
                 "Writing Metrics_long",
                 "Writing RawCache_long",
+                "Generating performance candidate sheets",
                 "Syncing workbook metadata",
                 "Saving updated workbook",
             ]
@@ -4552,6 +4668,79 @@ class TestTDSupportWorkbook(unittest.TestCase):
             self.assertEqual(curves[0].get("x"), [0, 1, 2])
             self.assertEqual(curves[0].get("y"), [10, 20, 30])
             self.assertTrue(str(curves[0].get("observation_id") or "").strip())
+
+    def test_rebuild_uses_support_workbook_suppression_voltage_for_cache_and_gui_filters(self) -> None:
+        from openpyxl import load_workbook  # type: ignore
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            src_db = root / "src.sqlite3"
+            self._make_source_sqlite(src_db)
+
+            wb_path = root / "project.xlsx"
+            be._write_test_data_trending_workbook(
+                wb_path,
+                global_repo=root,
+                serials=["SN1"],
+                docs=[{"serial_number": "SN1", "excel_sqlite_rel": str(src_db)}],
+                config=self._make_config(),
+            )
+            support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+            be._write_td_support_workbook(
+                support_path,
+                sequence_names=["RunA"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+            )
+
+            wb = load_workbook(str(support_path))
+            try:
+                ws_prog = wb[self._default_program_sheet_name(be)]
+                self._set_sheet_row(
+                    ws_prog,
+                    2,
+                    {
+                        "condition_key": "RunA",
+                        "source_run_name": "RunA",
+                        "feed_pressure": 100,
+                        "feed_pressure_units": "psia",
+                        "run_type": "steady state",
+                        "suppression_voltage": 24,
+                    },
+                )
+                wb.save(str(support_path))
+            finally:
+                wb.close()
+            self._refresh_support_conditions(be, wb_path, root)
+
+            impl_db = root / "implementation_trending.sqlite3"
+            be.rebuild_test_data_project_cache(impl_db, wb_path)
+
+            with sqlite3.connect(str(impl_db)) as conn:
+                row = conn.execute(
+                    "SELECT suppression_voltage FROM td_condition_observations WHERE serial=? AND run_name=?",
+                    ("SN1", "RunA"),
+                ).fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(float(row[0]), 24.0)
+
+            raw_db = root / "test_data_raw_cache.sqlite3"
+            with sqlite3.connect(str(raw_db)) as conn:
+                row = conn.execute(
+                    "SELECT suppression_voltage FROM td_raw_condition_observations WHERE serial=? AND run_name=?",
+                    ("SN1", "RunA"),
+                ).fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(float(row[0]), 24.0)
+
+            filter_rows = be.td_read_observation_filter_rows_from_cache(impl_db)
+            self.assertEqual([row.get("suppression_voltage") for row in filter_rows], [24.0])
+
+            metric_rows = be.td_load_metric_series(impl_db, "RunA", "thrust", "mean")
+            self.assertEqual([row.get("suppression_voltage") for row in metric_rows], [24.0])
+
+            curves = be.td_load_curves(impl_db, "RunA", "thrust", "Time")
+            self.assertEqual([row.get("suppression_voltage") for row in curves], [24.0])
 
     def test_debug_export_writes_excel_mirror_for_project_cache(self) -> None:
         from openpyxl import load_workbook  # type: ignore
@@ -5496,6 +5685,75 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 "member_programs": ["Program B"],
                 "member_runs": ["RunB"],
                 "member_sequences": ["SeqB"],
+                "details_text": "Source Sequences: SeqB",
+            },
+        ]
+
+        harness._sync_run_mode_availability()
+        harness._refresh_run_dropdown()
+
+        self.assertEqual(harness.cb_run.count(), 1)
+        self.assertEqual(harness.cb_run.itemText(0), "Program A - SeqA")
+        self.assertEqual(harness.list_metric_run_conditions.count(), 1)
+        self.assertEqual(harness.list_metric_run_conditions.item(0).text(), "Condition A")
+
+    @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
+    def test_run_dropdown_hides_unchecked_suppression_voltage_items(self) -> None:
+        harness = _RunSelectionHarness()
+        harness._checked_suppression_voltage_filters = ["24"]
+        harness._run_selection_views["sequence"] = [
+            {
+                "mode": "sequence",
+                "id": "sequence:a",
+                "run_name": "RunA",
+                "sequence_name": "SeqA",
+                "display_text": "Program A - SeqA",
+                "program_title": "Program A",
+                "member_programs": ["Program A"],
+                "member_runs": ["RunA"],
+                "member_sequences": ["SeqA"],
+                "suppression_voltage": 24.0,
+                "member_suppression_voltages": ["24"],
+                "details_text": "Program: Program A | Source Sequence: SeqA",
+            },
+            {
+                "mode": "sequence",
+                "id": "sequence:b",
+                "run_name": "RunB",
+                "sequence_name": "SeqB",
+                "display_text": "Program B - SeqB",
+                "program_title": "Program B",
+                "member_programs": ["Program B"],
+                "member_runs": ["RunB"],
+                "member_sequences": ["SeqB"],
+                "suppression_voltage": 28.0,
+                "member_suppression_voltages": ["28"],
+                "details_text": "Program: Program B | Source Sequence: SeqB",
+            },
+        ]
+        harness._run_selection_views["condition"] = [
+            {
+                "mode": "condition",
+                "id": "condition:a",
+                "run_name": "RunA",
+                "display_text": "Condition A",
+                "run_condition": "Condition A",
+                "member_programs": ["Program A"],
+                "member_runs": ["RunA"],
+                "member_sequences": ["SeqA"],
+                "member_suppression_voltages": ["24"],
+                "details_text": "Source Sequences: SeqA",
+            },
+            {
+                "mode": "condition",
+                "id": "condition:b",
+                "run_name": "RunB",
+                "display_text": "Condition B",
+                "run_condition": "Condition B",
+                "member_programs": ["Program B"],
+                "member_runs": ["RunB"],
+                "member_sequences": ["SeqB"],
+                "member_suppression_voltages": ["28"],
                 "details_text": "Source Sequences: SeqB",
             },
         ]
@@ -7416,13 +7674,15 @@ class TestTDSupportWorkbook(unittest.TestCase):
         self.assertEqual(len(harness.collect_calls), 1)
         self.assertEqual(harness.collect_calls[0]["plot_stats"], ["mean"])
 
-    def test_metric_series_loader_filters_programs_and_serials(self) -> None:
+    def test_metric_series_loader_filters_programs_serials_and_suppression_voltage(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
 
         harness = _GlobalFilterHarness()
+        harness._checked_suppression_voltage_filters = ["24"]
         rows = [
-            {"observation_id": "obs_a", "serial": "SN1", "value_num": 1.0, "program_title": "Program A"},
-            {"observation_id": "obs_b", "serial": "SN2", "value_num": 2.0, "program_title": "Program B"},
+            {"observation_id": "obs_a", "serial": "SN1", "value_num": 1.0, "program_title": "Program A", "suppression_voltage": 24.0},
+            {"observation_id": "obs_b", "serial": "SN2", "value_num": 2.0, "program_title": "Program B", "suppression_voltage": 28.0},
+            {"observation_id": "obs_c", "serial": "SN1", "value_num": 3.0, "program_title": "Program A", "suppression_voltage": 28.0},
         ]
 
         with mock.patch.object(be, "td_load_metric_series", return_value=rows) as load_mock:
@@ -7430,14 +7690,17 @@ class TestTDSupportWorkbook(unittest.TestCase):
 
         load_mock.assert_called_once()
         self.assertEqual([row.get("serial") for row in result], ["SN1"])
+        self.assertEqual([row.get("observation_id") for row in result], ["obs_a"])
 
-    def test_curve_loader_filters_programs_and_serials(self) -> None:
+    def test_curve_loader_filters_programs_serials_and_suppression_voltage(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
 
         harness = _GlobalFilterHarness()
+        harness._checked_suppression_voltage_filters = ["24"]
         rows = [
-            {"serial": "SN1", "program_title": "Program A", "x": [0.0, 1.0], "y": [1.0, 2.0]},
-            {"serial": "SN2", "program_title": "Program B", "x": [0.0, 1.0], "y": [2.0, 3.0]},
+            {"observation_id": "obs_a", "serial": "SN1", "program_title": "Program A", "suppression_voltage": 24.0, "x": [0.0, 1.0], "y": [1.0, 2.0]},
+            {"observation_id": "obs_b", "serial": "SN2", "program_title": "Program B", "suppression_voltage": 28.0, "x": [0.0, 1.0], "y": [2.0, 3.0]},
+            {"observation_id": "obs_c", "serial": "SN1", "program_title": "Program A", "suppression_voltage": 28.0, "x": [0.0, 1.0], "y": [3.0, 4.0]},
         ]
 
         with mock.patch.object(be, "td_load_curves", return_value=rows) as load_mock:
@@ -7446,6 +7709,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
         load_mock.assert_called_once()
         self.assertEqual(load_mock.call_args.kwargs.get("serials"), ["SN1"])
         self.assertEqual([row.get("serial") for row in result], ["SN1"])
+        self.assertEqual([row.get("observation_id") for row in result], ["obs_a"])
 
     def test_selected_perf_serials_and_highlight_use_active_filter_intersection(self) -> None:
         harness = _GlobalFilterHarness()
