@@ -3204,6 +3204,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._left_panel_scroll: QtWidgets.QScrollArea | None = None
         self._left_panel_locked_width: int | None = None
         self._left_panel_width_initialized = False
+        self._startup_size_locked = False
         self._perf_equations_popup: QtWidgets.QDialog | None = None
 
         self.setWindowTitle("Test Data - Trend / Analyze")
@@ -4070,9 +4071,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
     def showEvent(self, event: QtGui.QShowEvent) -> None:  # type: ignore[override]
         super().showEvent(event)
-        _fit_widget_to_screen(self)
         self._schedule_mode_panel_height_sync()
-        QtCore.QTimer.singleShot(0, self._initialize_left_panel_width)
+        QtCore.QTimer.singleShot(0, self._finalize_initial_window_size)
 
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:  # type: ignore[override]
         super().resizeEvent(event)
@@ -4104,6 +4104,68 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         total_width = max(1, splitter.width())
         right_width = max(1, total_width - self._left_panel_locked_width)
         splitter.setSizes([self._left_panel_locked_width, right_width])
+
+    def _finalize_initial_window_size(self) -> None:
+        if self._startup_size_locked:
+            return
+        try:
+            layout = self.layout()
+            if layout is not None:
+                layout.activate()
+        except Exception:
+            pass
+        self._sync_mode_panel_height()
+
+        panel = self._left_panel_scroll
+        splitter = getattr(self, "main_splitter", None)
+        left_width = 0
+        if panel is not None:
+            panel_widget = panel.widget()
+            if panel_widget is not None:
+                try:
+                    left_width = max(panel_widget.sizeHint().width(), panel_widget.minimumSizeHint().width())
+                except Exception:
+                    left_width = 0
+            try:
+                left_width += panel.frameWidth() * 2
+            except Exception:
+                pass
+
+        right_width = 0
+        if splitter is not None and splitter.count() >= 2:
+            right_panel = splitter.widget(1)
+            if right_panel is not None:
+                try:
+                    right_width = max(right_panel.sizeHint().width(), right_panel.minimumSizeHint().width())
+                except Exception:
+                    right_width = 0
+
+        filter_width = 0
+        try:
+            filter_width = max(self.filter_frame.sizeHint().width(), self.filter_frame.minimumSizeHint().width())
+        except Exception:
+            filter_width = 0
+
+        try:
+            size_hint = self.sizeHint()
+            minimum_hint = self.minimumSizeHint()
+            target_width = max(
+                self.width(),
+                size_hint.width(),
+                minimum_hint.width(),
+                filter_width,
+                left_width + right_width + max(0, splitter.handleWidth() if splitter is not None else 0) + 32,
+            )
+            target_height = max(self.height(), size_hint.height(), minimum_hint.height())
+        except Exception:
+            target_width = self.width()
+            target_height = self.height()
+
+        self.resize(target_width, target_height)
+        _fit_widget_to_screen(self)
+        self._initialize_left_panel_width()
+        self.setFixedSize(self.size())
+        self._startup_size_locked = True
 
     def _schedule_mode_panel_height_sync(self) -> None:
         if not hasattr(self, "_tabs"):
