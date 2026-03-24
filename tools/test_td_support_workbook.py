@@ -156,14 +156,42 @@ class _PerfControlPeriodHarness:
             for text, data in values:
                 cb.addItem(text, data)
         self.cb_perf_z_col.setCurrentIndex(1)
+        self._global_filter_rows = [
+            {"observation_id": "obs_a", "serial": "SN1", "serial_number": "SN1", "program_title": "Program A", "control_period": 60.0, "suppression_voltage": 24.0},
+            {"observation_id": "obs_b", "serial": "SN2", "serial_number": "SN2", "program_title": "Program B", "control_period": 120.0, "suppression_voltage": 28.0},
+        ]
+        self._serial_source_by_serial = {
+            "SN1": {"serial": "SN1", "serial_number": "SN1", "program_title": "Program A"},
+            "SN2": {"serial": "SN2", "serial_number": "SN2", "program_title": "Program B"},
+        }
+        self._available_program_filters = ["Program A", "Program B"]
+        self._available_serial_filter_rows = [
+            {"serial": "SN1", "serial_number": "SN1", "program_title": "Program A"},
+            {"serial": "SN2", "serial_number": "SN2", "program_title": "Program B"},
+        ]
+        self._available_control_period_filters = ["60", "120"]
+        self._available_suppression_voltage_filters = ["24", "28"]
+        self._checked_program_filters = ["Program A"]
+        self._checked_serial_filters = ["SN1", "SN2"]
+        self._checked_control_period_filters = ["60", "120"]
+        self._checked_suppression_voltage_filters = ["24", "28"]
 
         for name in (
+            "_active_control_period_filter_values",
+            "_active_program_filter_values",
+            "_active_suppression_voltage_filter_values",
+            "_active_serial_rows",
+            "_active_serials",
+            "_row_program_label",
+            "_row_matches_global_filters",
             "_selected_perf_run_type_mode",
             "_selected_perf_filter_mode",
             "_perf_current_col_name",
             "_perf_var_names",
             "_perf_requested_surface_family",
             "_selected_perf_control_period",
+            "_perf_available_control_periods",
+            "_refresh_perf_control_period_options",
             "_update_perf_control_period_state",
         ):
             setattr(self, name, getattr(TestDataTrendDialog, name).__get__(self, _PerfControlPeriodHarness))
@@ -375,6 +403,9 @@ class _PlotPerformanceHarness:
         self._perf_requested_surface_family = lambda: "auto_surface"
         self._perf_requested_fit_mode = lambda: "auto"
 
+        self._perf_partial_cp_fit_messages = getattr(
+            TestDataTrendDialog, "_perf_partial_cp_fit_messages"
+        ).__get__(self, _PlotPerformanceHarness)
         self._plot_performance = getattr(TestDataTrendDialog, "_plot_performance").__get__(self, _PlotPerformanceHarness)
 
 
@@ -1133,6 +1164,138 @@ class TestTDTrendDialogLayout(unittest.TestCase):
                 sorted(item.text() for item in dlg.list_stats.selectedItems()),
                 ["max", "min"],
             )
+        finally:
+            dlg.close()
+
+    def test_curve_popup_summaries_reflect_backing_selection_state(self) -> None:
+        dlg = _build_test_data_dialog()
+        try:
+            dlg.cb_y_curve.clear()
+            dlg.cb_y_curve.addItem("thrust", "thrust")
+            dlg.cb_y_curve.addItem("current", "current")
+            dlg.cb_y_curve.setCurrentIndex(1)
+            dlg.cb_x.clear()
+            dlg.cb_x.addItem("Time", "time_s")
+            dlg.cb_x.addItem("Pulse Number", "pulse_number")
+            dlg.cb_x.setCurrentIndex(0)
+
+            dlg._refresh_curve_selector_summaries()
+
+            self.assertEqual(dlg.lbl_curve_y_column_summary.text(), "Y Column: current")
+            self.assertEqual(dlg.lbl_curve_x_column_summary.text(), "X Column: Time")
+        finally:
+            dlg.close()
+
+    def test_curve_popup_applies_and_cancel_preserves_selection(self) -> None:
+        dlg = _build_test_data_dialog()
+        try:
+            dlg.cb_y_curve.clear()
+            dlg.cb_y_curve.addItem("thrust", "thrust")
+            dlg.cb_y_curve.addItem("current", "current")
+            dlg.cb_y_curve.setCurrentIndex(0)
+            dlg.cb_x.clear()
+            dlg.cb_x.addItem("Time", "time_s")
+            dlg.cb_x.addItem("Pulse Number", "pulse_number")
+            dlg.cb_x.setCurrentIndex(0)
+            dlg._refresh_curve_selector_summaries()
+
+            with mock.patch.object(dlg, "_show_filter_single_select_popup", side_effect=["current", "pulse_number"]):
+                dlg._open_curve_y_column_popup()
+                dlg._open_curve_x_column_popup()
+
+            self.assertEqual(dlg._current_curve_y_name(), "current")
+            self.assertEqual(dlg._current_curve_x_key(), "pulse_number")
+            self.assertEqual(dlg.lbl_curve_y_column_summary.text(), "Y Column: current")
+            self.assertEqual(dlg.lbl_curve_x_column_summary.text(), "X Column: Pulse Number")
+
+            with mock.patch.object(dlg, "_show_filter_single_select_popup", return_value=None):
+                dlg._open_curve_y_column_popup()
+                dlg._open_curve_x_column_popup()
+
+            self.assertEqual(dlg._current_curve_y_name(), "current")
+            self.assertEqual(dlg._current_curve_x_key(), "pulse_number")
+        finally:
+            dlg.close()
+
+    def test_refresh_curve_y_columns_uses_selected_x_backend_key(self) -> None:
+        dlg = _build_test_data_dialog()
+        try:
+            from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+            dlg._db_path = Path("C:/tmp/fake.sqlite3")
+            dlg._mode = "curves"
+            dlg._current_member_runs = lambda: ["RunA"]
+            dlg.cb_x.clear()
+            dlg.cb_x.addItem("Time", "time_s")
+            dlg.cb_x.setCurrentIndex(0)
+
+            calls: list[tuple[str, str]] = []
+
+            def _fake_list_curve_y_columns(_db_path, run_name, x_name):
+                calls.append((str(run_name), str(x_name)))
+                return [{"name": "thrust", "units": "lbf"}]
+
+            with mock.patch.object(be, "td_list_curve_y_columns", side_effect=_fake_list_curve_y_columns):
+                dlg._refresh_curve_y_columns()
+
+            self.assertEqual(calls, [("RunA", "time_s")])
+            self.assertEqual(dlg._current_curve_y_name(), "thrust")
+            self.assertEqual(dlg.lbl_curve_y_column_summary.text(), "Y Column: thrust")
+        finally:
+            dlg.close()
+
+    def test_plot_curves_uses_selected_x_backend_key(self) -> None:
+        dlg = _build_test_data_dialog()
+        try:
+            class _Axis:
+                def clear(self) -> None:
+                    pass
+
+                def set_title(self, _value) -> None:
+                    pass
+
+                def set_xlabel(self, _value) -> None:
+                    pass
+
+                def set_ylabel(self, _value) -> None:
+                    pass
+
+                def plot(self, *_args, **_kwargs):
+                    return [object()]
+
+                def grid(self, *_args, **_kwargs) -> None:
+                    pass
+
+            dlg._db_path = Path("C:/tmp/fake.sqlite3")
+            dlg._plot_ready = True
+            dlg._mode = "curves"
+            dlg._current_member_runs = lambda: ["RunA"]
+            dlg._current_run_selection = lambda: {}
+            dlg._active_serials = lambda: []
+            dlg._axes = _Axis()
+            dlg._canvas = _MockPlotCanvas()
+            dlg._figure = type("_Figure", (), {"tight_layout": lambda self: None})()
+            dlg._ensure_main_axes = lambda *_args, **_kwargs: None
+            dlg._apply_interactive_legend_policy = lambda *_args, **_kwargs: []
+            dlg._apply_plot_view_bands_to_axes = lambda *_args, **_kwargs: None
+            dlg._capture_main_plot_base_view = lambda: None
+            dlg.cb_x.clear()
+            dlg.cb_x.addItem("Time", "time_s")
+            dlg.cb_x.setCurrentIndex(0)
+            dlg.cb_y_curve.clear()
+            dlg.cb_y_curve.addItem("thrust", "thrust")
+            dlg.cb_y_curve.setCurrentIndex(0)
+
+            calls: list[tuple[str, str, str]] = []
+
+            def _fake_load_curves(run_name, y_name, x_name, **kwargs):
+                calls.append((str(run_name), str(y_name), str(x_name)))
+                return [{"serial": "SN1", "x": [0.0, 1.0], "y": [1.0, 2.0]}]
+
+            with mock.patch.object(dlg, "_load_curves_for_selection", side_effect=_fake_load_curves):
+                dlg._plot_curves()
+
+            self.assertEqual(calls, [("RunA", "thrust", "time_s")])
         finally:
             dlg.close()
 
@@ -6848,6 +7011,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
                     "surface_fit_family": "quadratic_surface_control_period",
                     "performance_run_type_mode": "pulsed_mode",
                     "performance_filter_mode": "all_conditions",
+                    "selected_control_period": 60.0,
                     "require_min_points": 2,
                 },
             )
@@ -6886,6 +7050,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
                     "surface_fit_family": "quadratic_surface_control_period",
                     "performance_run_type_mode": "pulsed_mode",
                     "performance_filter_mode": "all_conditions",
+                    "selected_control_period": 60.0,
                     "require_min_points": 2,
                 },
             )
@@ -6894,6 +7059,66 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 fit_error_text,
                 "Quadratic Surface + Control Period requires usable control-period values for all fitted pulsed-mode points.",
             )
+
+    @unittest.skipUnless(_have_openpyxl(), "openpyxl not installed")
+    def test_perf_collect_saved_equation_snapshot_keeps_ignored_cp_warning_when_fit_succeeds(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            rows: list[tuple[str, str, float, float, float, float | None]] = []
+            for cp, serial in ((60.0, "SN60"), (120.0, "SN120")):
+                c0 = 18.0 + (0.04 * cp)
+                c1 = 0.8 + (0.002 * cp)
+                c2 = -0.03 + (0.0004 * cp)
+                c3 = 0.03
+                c4 = 0.01 + (0.00002 * cp)
+                c5 = 0.002
+                for x1 in (1.0, 2.0, 3.0):
+                    for x2 in (10.0, 20.0, 30.0):
+                        y_val = c0 + (c1 * x1) + (c2 * x2) + (c3 * x1 * x1) + (c4 * x1 * x2) + (c5 * x2 * x2)
+                        rows.append((serial, "RunCP", x1, x2, y_val, cp))
+            cp = 180.0
+            for x1, x2 in (
+                (1.0, 10.0),
+                (1.0, 20.0),
+                (2.0, 10.0),
+                (2.0, 20.0),
+            ):
+                y_val = 16.0 + (0.04 * cp) + (0.9 * x1) - (0.02 * x2) + (0.03 * x1 * x1) + (0.01 * x1 * x2)
+                rows.append(("SN180", "RunCP", x1, x2, y_val, cp))
+            db_path = self._seed_perf_export_db_3d(root, rows=rows)
+            self._seed_perf_source_metadata(
+                db_path,
+                [("SN60", "Thruster", "Hall_A"), ("SN120", "Thruster", "Hall_A"), ("SN180", "Thruster", "Hall_A")],
+            )
+
+            snapshot = be.td_perf_collect_saved_equation_snapshot(
+                db_path,
+                {
+                    "output": "thrust",
+                    "input1": "impulse bit",
+                    "input2": "feed pressure",
+                    "member_runs": ["RunCP"],
+                    "stats": ["mean"],
+                    "fit_enabled": True,
+                    "surface_fit_family": "quadratic_surface_control_period",
+                    "performance_run_type_mode": "pulsed_mode",
+                    "performance_filter_mode": "all_conditions",
+                    "selected_control_period": 60.0,
+                    "require_min_points": 2,
+                },
+            )
+            plot_metadata = dict(snapshot.get("plot_metadata") or {})
+            self.assertEqual(str(plot_metadata.get("fit_error_text") or "").strip(), "")
+            self.assertIn("Ignored control periods", str(plot_metadata.get("fit_warning_text") or ""))
+            self.assertIn("CP 180", str(plot_metadata.get("fit_warning_text") or ""))
+            mean_result = dict((snapshot.get("results_by_stat") or {}).get("mean") or {})
+            master_model = dict(mean_result.get("master_model") or {})
+            self.assertEqual([float(v) for v in (master_model.get("eligible_control_period_values") or [])], [60.0, 120.0])
+            ignored = list(master_model.get("ignored_control_periods") or [])
+            self.assertEqual(len(ignored), 1)
+            self.assertEqual(float(ignored[0].get("control_period") or 0.0), 180.0)
 
     @unittest.skipUnless(_have_openpyxl(), "openpyxl not installed")
     @unittest.skipUnless(_have_scipy(), "scipy not installed")
@@ -7186,6 +7411,80 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 self.assertIn("cp_center", params_values)
                 self.assertIn("coeff_cp_models", params_values)
                 self.assertGreater(support_ws.max_row, 1)
+            finally:
+                wb.close()
+
+    @unittest.skipUnless(_have_openpyxl(), "openpyxl not installed")
+    def test_perf_export_equation_workbook_allows_cp_surface_with_ignored_slices(self) -> None:
+        from openpyxl import load_workbook  # type: ignore
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            rows: list[tuple[str, str, float, float, float, float | None]] = []
+            for cp, serial in ((60.0, "SN60"), (120.0, "SN120")):
+                c0 = 18.0 + (0.04 * cp)
+                c1 = 0.8 + (0.002 * cp)
+                c2 = -0.03 + (0.0004 * cp)
+                c3 = 0.03
+                c4 = 0.01 + (0.00002 * cp)
+                c5 = 0.002
+                for x1 in (1.0, 2.0, 3.0):
+                    for x2 in (10.0, 20.0, 30.0):
+                        y_val = c0 + (c1 * x1) + (c2 * x2) + (c3 * x1 * x1) + (c4 * x1 * x2) + (c5 * x2 * x2)
+                        rows.append((serial, "RunCP", x1, x2, y_val, cp))
+            cp = 180.0
+            for x1, x2 in (
+                (1.0, 10.0),
+                (1.0, 20.0),
+                (2.0, 10.0),
+                (2.0, 20.0),
+            ):
+                y_val = 16.0 + (0.04 * cp) + (0.9 * x1) - (0.02 * x2) + (0.03 * x1 * x1) + (0.01 * x1 * x2)
+                rows.append(("SN180", "RunCP", x1, x2, y_val, cp))
+            db_path = self._seed_perf_export_db_3d(root, rows=rows)
+            self._seed_perf_source_metadata(
+                db_path,
+                [("SN60", "Thruster", "Hall_A"), ("SN120", "Thruster", "Hall_A"), ("SN180", "Thruster", "Hall_A")],
+            )
+            snapshot = be.td_perf_collect_saved_equation_snapshot(
+                db_path,
+                {
+                    "output": "thrust",
+                    "input1": "impulse bit",
+                    "input2": "feed pressure",
+                    "member_runs": ["RunCP"],
+                    "stats": ["mean"],
+                    "fit_enabled": True,
+                    "surface_fit_family": "quadratic_surface_control_period",
+                    "performance_run_type_mode": "pulsed_mode",
+                    "performance_filter_mode": "all_conditions",
+                    "selected_control_period": 60.0,
+                    "require_min_points": 2,
+                },
+            )
+
+            out_path = root / "perf_export_cp_partial.xlsx"
+            be.td_perf_export_equation_workbook(
+                db_path,
+                out_path,
+                plot_metadata=snapshot.get("plot_metadata") or {},
+                results_by_stat=snapshot.get("results_by_stat") or {},
+                run_specs=snapshot.get("run_specs") or [],
+                run_type_filter="pulsed_mode",
+            )
+
+            wb = load_workbook(str(out_path), read_only=False, data_only=False)
+            try:
+                ws = wb["Equation Export"]
+                header_row = next(
+                    r for r in range(1, (ws.max_row or 0) + 1) if str(ws.cell(r, 1).value or "").strip() == "run_name"
+                )
+                headers = [str(ws.cell(header_row, c).value or "").strip() for c in range(1, (ws.max_column or 0) + 1)]
+                self.assertIn("control_period", headers)
+                pred_formula = str(ws.cell(header_row + 1, headers.index("pred_mean") + 1).value or "")
+                self.assertTrue(pred_formula.startswith("="))
+                self.assertIn("^2", pred_formula)
             finally:
                 wb.close()
 
@@ -7576,6 +7875,15 @@ class TestTDSupportWorkbook(unittest.TestCase):
         self.assertFalse(harness.cb_perf_control_period.isEnabled())
 
     @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
+    def test_perf_control_period_options_follow_active_global_filters(self) -> None:
+        harness = _PerfControlPeriodHarness()
+        harness.cb_perf_control_period.setCurrentIndex(harness.cb_perf_control_period.findData(120.0))
+        harness._refresh_perf_control_period_options()
+        self.assertEqual(harness.cb_perf_control_period.count(), 1)
+        self.assertEqual(harness.cb_perf_control_period.itemData(0), 60.0)
+        self.assertEqual(harness._selected_perf_control_period(), 60.0)
+
+    @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
     def test_plot_view_band_parse_accepts_blank_and_open_ranges(self) -> None:
         harness = _PlotViewBandHarness()
         self.assertIsNone(harness._parse_view_band_value("", "Y", "min"))
@@ -7699,8 +8007,21 @@ class TestTDSupportWorkbook(unittest.TestCase):
         harness._perf_collect_results = lambda *args, **kwargs: (
             {
                 "mean": {
-                    "plot_dimension": "2d",
-                    "master_model": {"fit_warning_text": "Ignored control periods for CP-surface fit: CP 180: 4 points, 2 distinct x1, 2 distinct x2 (4 points (<6))"},
+                    "plot_dimension": "3d",
+                    "surface_fit_family": "quadratic_surface_control_period",
+                    "master_model": {
+                        "fit_family": "quadratic_surface_control_period",
+                        "ignored_control_periods": [
+                            {
+                                "control_period": 180.0,
+                                "point_count": 4,
+                                "distinct_x1": 2,
+                                "distinct_x2": 2,
+                                "reason": "4 points (<6)",
+                            }
+                        ],
+                        "fit_warning_text": "Ignored control periods for CP-surface fit: CP 180: 4 points, 2 distinct x1, 2 distinct x2 (4 points (<6))",
+                    },
                     "curves": {"SN1": [(1.0, 2.0, "RunA"), (2.0, 3.0, "RunA")]},
                     "fit_warning_text": "Ignored control periods for CP-surface fit: CP 180: 4 points, 2 distinct x1, 2 distinct x2 (4 points (<6))",
                 }
@@ -7711,8 +8032,85 @@ class TestTDSupportWorkbook(unittest.TestCase):
         from PySide6 import QtWidgets
 
         with mock.patch.object(QtWidgets.QMessageBox, "warning") as warning_mock:
-            harness._plot_performance()
+            with mock.patch.object(QtWidgets.QMessageBox, "information") as info_mock:
+                harness._plot_performance()
         warning_mock.assert_not_called()
+        info_mock.assert_not_called()
+        self.assertIn("Ignored control periods", harness._plot_note)
+
+    @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
+    def test_plot_performance_shows_info_popup_for_manual_cp_partial_fit(self) -> None:
+        harness = _PlotPerformanceHarness()
+        harness._perf_collect_results = lambda *args, **kwargs: (
+            {
+                "mean": {
+                    "plot_dimension": "3d",
+                    "surface_fit_family": "quadratic_surface_control_period",
+                    "master_model": {
+                        "fit_family": "quadratic_surface_control_period",
+                        "ignored_control_periods": [
+                            {
+                                "control_period": 180.0,
+                                "point_count": 4,
+                                "distinct_x1": 2,
+                                "distinct_x2": 2,
+                                "reason": "4 points (<6)",
+                            }
+                        ],
+                        "fit_warning_text": "Ignored control periods for CP-surface fit: CP 180: 4 points, 2 distinct x1, 2 distinct x2 (4 points (<6))",
+                    },
+                    "points_3d": {"SN1": [(1.0, 2.0, 3.0, "RunA")]},
+                    "fit_warning_text": "Ignored control periods for CP-surface fit: CP 180: 4 points, 2 distinct x1, 2 distinct x2 (4 points (<6))",
+                }
+            },
+            ["mean"],
+            "",
+        )
+        from PySide6 import QtWidgets
+
+        with mock.patch.object(QtWidgets.QMessageBox, "warning") as warning_mock:
+            with mock.patch.object(QtWidgets.QMessageBox, "information") as info_mock:
+                harness._plot_performance(user_initiated=True)
+        warning_mock.assert_not_called()
+        info_mock.assert_called_once()
+        self.assertIn("Ignored control periods", str(info_mock.call_args.args[2]))
+        self.assertIn("Ignored control periods", harness._plot_note)
+
+    @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
+    def test_plot_performance_auto_replot_suppresses_cp_partial_fit_popup(self) -> None:
+        harness = _PlotPerformanceHarness()
+        harness._perf_collect_results = lambda *args, **kwargs: (
+            {
+                "mean": {
+                    "plot_dimension": "3d",
+                    "surface_fit_family": "quadratic_surface_control_period",
+                    "master_model": {
+                        "fit_family": "quadratic_surface_control_period",
+                        "ignored_control_periods": [
+                            {
+                                "control_period": 180.0,
+                                "point_count": 4,
+                                "distinct_x1": 2,
+                                "distinct_x2": 2,
+                                "reason": "4 points (<6)",
+                            }
+                        ],
+                        "fit_warning_text": "Ignored control periods for CP-surface fit: CP 180: 4 points, 2 distinct x1, 2 distinct x2 (4 points (<6))",
+                    },
+                    "points_3d": {"SN1": [(1.0, 2.0, 3.0, "RunA")]},
+                    "fit_warning_text": "Ignored control periods for CP-surface fit: CP 180: 4 points, 2 distinct x1, 2 distinct x2 (4 points (<6))",
+                }
+            },
+            ["mean"],
+            "",
+        )
+        from PySide6 import QtWidgets
+
+        with mock.patch.object(QtWidgets.QMessageBox, "warning") as warning_mock:
+            with mock.patch.object(QtWidgets.QMessageBox, "information") as info_mock:
+                harness._plot_performance()
+        warning_mock.assert_not_called()
+        info_mock.assert_not_called()
         self.assertIn("Ignored control periods", harness._plot_note)
 
     @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")

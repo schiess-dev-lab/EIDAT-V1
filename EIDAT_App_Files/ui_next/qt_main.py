@@ -3539,18 +3539,42 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         curves_axes_layout.setContentsMargins(0, 0, 0, 0)
         curves_axes_layout.setSpacing(8)
 
+        self.cb_y_curve = QtWidgets.QComboBox(tab_curves)
+        self.cb_y_curve.hide()
+        self.cb_y_curve.currentIndexChanged.connect(self._on_curve_y_column_changed)
+
         row_y_curve = QtWidgets.QHBoxLayout()
-        row_y_curve.addWidget(QtWidgets.QLabel("Y Column:"))
-        self.cb_y_curve = QtWidgets.QComboBox()
-        self.cb_y_curve.currentIndexChanged.connect(self._refresh_stats_preview)
-        row_y_curve.addWidget(self.cb_y_curve, 1)
+        row_y_curve.setSpacing(8)
+        self.btn_curve_y_column_popup = QtWidgets.QPushButton("Y Column...")
+        self.btn_curve_y_column_popup.clicked.connect(self._open_curve_y_column_popup)
+        self.lbl_curve_y_column_summary = QtWidgets.QLabel("Y Column: -")
+        self.lbl_curve_y_column_summary.setStyleSheet("color: #64748b; font-size: 11px;")
+        self.lbl_curve_y_column_summary.setWordWrap(False)
+        self.lbl_curve_y_column_summary.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Fixed,
+        )
+        row_y_curve.addWidget(self.btn_curve_y_column_popup)
+        row_y_curve.addWidget(self.lbl_curve_y_column_summary, 1)
         curves_axes_layout.addLayout(row_y_curve)
 
+        self.cb_x = QtWidgets.QComboBox(tab_curves)
+        self.cb_x.hide()
+        self.cb_x.currentIndexChanged.connect(self._on_curve_x_column_changed)
+
         row_curves = QtWidgets.QHBoxLayout()
-        self.cb_x = QtWidgets.QComboBox()
-        self.cb_x.currentIndexChanged.connect(self._refresh_curve_y_columns)
-        row_curves.addWidget(QtWidgets.QLabel("X Column:"))
-        row_curves.addWidget(self.cb_x, 1)
+        row_curves.setSpacing(8)
+        self.btn_curve_x_column_popup = QtWidgets.QPushButton("X Column...")
+        self.btn_curve_x_column_popup.clicked.connect(self._open_curve_x_column_popup)
+        self.lbl_curve_x_column_summary = QtWidgets.QLabel("X Column: -")
+        self.lbl_curve_x_column_summary.setStyleSheet("color: #64748b; font-size: 11px;")
+        self.lbl_curve_x_column_summary.setWordWrap(False)
+        self.lbl_curve_x_column_summary.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Fixed,
+        )
+        row_curves.addWidget(self.btn_curve_x_column_popup)
+        row_curves.addWidget(self.lbl_curve_x_column_summary, 1)
         curves_axes_layout.addLayout(row_curves)
 
         curves_layout.addWidget(curves_axes_body, 0)
@@ -4297,6 +4321,19 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             return []
         return [str(item.text() or "").strip() for item in list_widget.selectedItems() if str(item.text() or "").strip()]
 
+    @staticmethod
+    def _combo_box_current_value(combo_box: QtWidgets.QComboBox | None) -> str:
+        if combo_box is None:
+            return ""
+        try:
+            value = combo_box.currentData()
+        except Exception:
+            value = None
+        txt = str(value if value is not None else combo_box.currentText() or "").strip()
+        if txt:
+            return txt
+        return str(combo_box.currentText() or "").strip()
+
     def _set_list_widget_selection(self, list_widget: QtWidgets.QListWidget, values: list[str] | tuple[str, ...]) -> None:
         wanted = {str(value).strip() for value in (values or []) if str(value).strip()}
         list_widget.blockSignals(True)
@@ -4337,6 +4374,48 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._refresh_metric_y_columns_summary()
         self._refresh_metric_stats_summary()
 
+    def _current_curve_y_name(self) -> str:
+        return self._combo_box_current_value(getattr(self, "cb_y_curve", None))
+
+    def _current_curve_x_key(self) -> str:
+        return self._combo_box_current_value(getattr(self, "cb_x", None))
+
+    def _current_curve_x_label(self) -> str:
+        if not hasattr(self, "cb_x"):
+            return ""
+        label = str(self.cb_x.currentText() or "").strip()
+        return label or self._current_curve_x_key()
+
+    def _refresh_curve_y_column_summary(self) -> None:
+        if not hasattr(self, "lbl_curve_y_column_summary"):
+            return
+        selected = self._current_curve_y_name()
+        text = f"Y Column: {selected or '-'}"
+        self.lbl_curve_y_column_summary.setText(text)
+        self.lbl_curve_y_column_summary.setToolTip(selected)
+        self._schedule_mode_panel_height_sync()
+
+    def _refresh_curve_x_column_summary(self) -> None:
+        if not hasattr(self, "lbl_curve_x_column_summary"):
+            return
+        selected = self._current_curve_x_label()
+        text = f"X Column: {selected or '-'}"
+        self.lbl_curve_x_column_summary.setText(text)
+        self.lbl_curve_x_column_summary.setToolTip(selected)
+        self._schedule_mode_panel_height_sync()
+
+    def _refresh_curve_selector_summaries(self) -> None:
+        self._refresh_curve_y_column_summary()
+        self._refresh_curve_x_column_summary()
+
+    def _on_curve_y_column_changed(self) -> None:
+        self._refresh_curve_y_column_summary()
+        self._refresh_stats_preview()
+
+    def _on_curve_x_column_changed(self) -> None:
+        self._refresh_curve_x_column_summary()
+        self._refresh_curve_y_columns()
+
     def _open_metric_y_columns_popup(self) -> None:
         if not hasattr(self, "list_y_metrics"):
             return
@@ -4370,6 +4449,142 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             return
         self._set_list_widget_selection(self.list_stats, chosen)
         self._refresh_metric_stats_summary()
+
+    def _show_filter_single_select_popup(
+        self,
+        *,
+        title: str,
+        entries: list[dict],
+        selected_value: str,
+    ) -> str | None:
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle(title)
+        dlg.resize(720, 540)
+        layout = QtWidgets.QVBoxLayout(dlg)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        ed_filter = QtWidgets.QLineEdit()
+        ed_filter.setPlaceholderText("Filter...")
+        layout.addWidget(ed_filter)
+
+        listw = QtWidgets.QListWidget()
+        listw.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        layout.addWidget(listw, 1)
+
+        want = self._perf_norm_name(selected_value)
+        current_item = None
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            value = str(entry.get("value") or "").strip()
+            label = str(entry.get("label") or value).strip() or value
+            if not value:
+                continue
+            item = QtWidgets.QListWidgetItem(label)
+            item.setData(QtCore.Qt.ItemDataRole.UserRole, value)
+            item.setData(QtCore.Qt.ItemDataRole.UserRole + 1, str(entry.get("search") or label).strip().lower())
+            listw.addItem(item)
+            if want and self._perf_norm_name(value) == want:
+                current_item = item
+
+        if current_item is None and listw.count() > 0:
+            current_item = listw.item(0)
+        if current_item is not None:
+            listw.setCurrentItem(current_item)
+
+        def _apply_filter() -> None:
+            needle = str(ed_filter.text() or "").strip().lower()
+            first_visible = None
+            for idx in range(listw.count()):
+                item = listw.item(idx)
+                hay = str(item.data(QtCore.Qt.ItemDataRole.UserRole + 1) or "").strip()
+                hidden = bool(needle) and needle not in hay
+                item.setHidden(hidden)
+                if not hidden and first_visible is None:
+                    first_visible = item
+            if listw.currentItem() is None or (listw.currentItem() and listw.currentItem().isHidden()):
+                if first_visible is not None:
+                    listw.setCurrentItem(first_visible)
+
+        ed_filter.textChanged.connect(_apply_filter)
+        _apply_filter()
+
+        chosen: dict[str, str | None] = {"value": None}
+
+        def _apply() -> None:
+            item = listw.currentItem()
+            if item is None or item.isHidden():
+                return
+            value = str(item.data(QtCore.Qt.ItemDataRole.UserRole) or "").strip()
+            if not value:
+                return
+            chosen["value"] = value
+            dlg.accept()
+
+        listw.itemDoubleClicked.connect(lambda *_: _apply())
+
+        action_row = QtWidgets.QHBoxLayout()
+        action_row.addStretch(1)
+        btn_apply = QtWidgets.QPushButton("Apply")
+        btn_cancel = QtWidgets.QPushButton("Cancel")
+        action_row.addWidget(btn_apply)
+        action_row.addWidget(btn_cancel)
+        layout.addLayout(action_row)
+
+        btn_apply.clicked.connect(_apply)
+        btn_cancel.clicked.connect(dlg.reject)
+        _fit_widget_to_screen(dlg)
+        if dlg.exec() != int(QtWidgets.QDialog.DialogCode.Accepted):
+            return None
+        return str(chosen.get("value") or "").strip() or None
+
+    def _open_curve_y_column_popup(self) -> None:
+        if not hasattr(self, "cb_y_curve"):
+            return
+        entries = [
+            {"value": self._combo_box_current_value(self.cb_y_curve) if i == self.cb_y_curve.currentIndex() else str(self.cb_y_curve.itemData(i) or self.cb_y_curve.itemText(i) or "").strip(),
+             "label": str(self.cb_y_curve.itemText(i) or "").strip(),
+             "search": str(self.cb_y_curve.itemText(i) or "").strip().lower()}
+            for i in range(self.cb_y_curve.count())
+            if str(self.cb_y_curve.itemText(i) or "").strip()
+        ]
+        chosen = self._show_filter_single_select_popup(
+            title="Curve Y Column",
+            entries=entries,
+            selected_value=self._current_curve_y_name(),
+        )
+        if chosen is None:
+            return
+        self._set_combo_to_value(self.cb_y_curve, chosen)
+        self._on_curve_y_column_changed()
+
+    def _open_curve_x_column_popup(self) -> None:
+        if not hasattr(self, "cb_x"):
+            return
+        entries = [
+            {
+                "value": str(self.cb_x.itemData(i) if self.cb_x.itemData(i) is not None else self.cb_x.itemText(i) or "").strip(),
+                "label": str(self.cb_x.itemText(i) or "").strip(),
+                "search": " ".join(
+                    [
+                        str(self.cb_x.itemText(i) or "").strip().lower(),
+                        str(self.cb_x.itemData(i) or "").strip().lower(),
+                    ]
+                ).strip(),
+            }
+            for i in range(self.cb_x.count())
+            if str(self.cb_x.itemText(i) or "").strip()
+        ]
+        chosen = self._show_filter_single_select_popup(
+            title="Curve X Column",
+            entries=entries,
+            selected_value=self._current_curve_x_key() or self._current_curve_x_label(),
+        )
+        if chosen is None:
+            return
+        self._set_combo_to_value(self.cb_x, chosen)
+        self._on_curve_x_column_changed()
 
     def _plot_band_enabled_axes(self, mode: str) -> tuple[str, ...]:
         current = str(mode or "").strip().lower()
@@ -6092,6 +6307,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._sync_run_mode_availability()
         prev_selection_id = str((self._current_run_selection() or {}).get("id") or "").strip()
         self._refresh_run_dropdown(prev_selection_id=(prev_selection_id or None))
+        if hasattr(self, "_refresh_perf_control_period_options"):
+            self._refresh_perf_control_period_options()
+        if hasattr(self, "_update_perf_control_period_state"):
+            self._update_perf_control_period_state()
         if hasattr(self, "_clear_perf_results"):
             self._clear_perf_results()
         self._set_highlight_serials(list(self._highlight_sns or []))
@@ -7750,6 +7969,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             self.cb_x.clear()
             self.list_y_metrics.clear()
             self._refresh_metric_selector_summaries()
+            self._refresh_curve_selector_summaries()
             self._schedule_mode_panel_height_sync()
             return
 
@@ -7825,7 +8045,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self.list_y_metrics.blockSignals(False)
         self._refresh_metric_y_columns_summary()
 
-        prev_x = self.cb_x.currentText()
+        prev_x = self._current_curve_x_key() or self._current_curve_x_label()
         self.cb_x.blockSignals(True)
         self.cb_x.clear()
         xs_raw = [str(x or "").strip() for x in (x_cols or []) if str(x or "").strip()]
@@ -7860,8 +8080,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         elif _norm_name(want) in pulse_norms:
             want = "Pulse Number"
         if want:
-            self.cb_x.setCurrentText(want)
+            self._set_combo_to_value(self.cb_x, want)
         self.cb_x.blockSignals(False)
+        self._refresh_curve_x_column_summary()
         self._refresh_curve_y_columns()
         self._schedule_mode_panel_height_sync()
 
@@ -7869,17 +8090,19 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         if not self._db_path or not hasattr(self, "cb_y_curve") or not hasattr(self, "cb_x"):
             return
         runs = self._current_member_runs()
-        prev_y = self.cb_y_curve.currentText()
+        prev_y = self._current_curve_y_name()
         self.cb_y_curve.blockSignals(True)
         self.cb_y_curve.clear()
         if not runs:
             self.cb_y_curve.blockSignals(False)
+            self._refresh_curve_y_column_summary()
             return
-        x_label = (self.cb_x.currentText() or "").strip()
+        x_key = self._current_curve_x_key()
+        x_label = self._current_curve_x_label()
         seen_y: set[str] = set()
         y_names: list[str] = []
         for run in runs:
-            x_col = self._resolve_curve_x_key(run, x_label)
+            x_col = self._resolve_curve_x_key(run, x_key or x_label)
             try:
                 y_cols = be.td_list_curve_y_columns(self._db_path, run, x_col)
             except Exception:
@@ -7889,12 +8112,14 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 if name and name not in seen_y:
                     seen_y.add(name)
                     y_names.append(name)
-        self.cb_y_curve.addItems(y_names)
-        if prev_y and prev_y in y_names:
-            self.cb_y_curve.setCurrentText(prev_y)
+        for name in y_names:
+            self.cb_y_curve.addItem(name, name)
+        if prev_y:
+            self._set_combo_to_value(self.cb_y_curve, prev_y)
         elif y_names:
             self.cb_y_curve.setCurrentIndex(0)
         self.cb_y_curve.blockSignals(False)
+        self._refresh_curve_y_column_summary()
         if self._mode == "curves":
             self._refresh_stats_preview()
         self._schedule_mode_panel_height_sync()
@@ -8101,7 +8326,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         run = self._current_run_name()
         y_col = ""
         if self._mode == "curves":
-            y_col = (getattr(self, "cb_y_curve", None).currentText() or "").strip() if hasattr(self, "cb_y_curve") else ""
+            y_col = self._current_curve_y_name()
         else:
             # Preview first selected Y column (keeps table compact).
             selected = self._selected_list_widget_texts(getattr(self, "list_y_metrics", None))
@@ -8139,7 +8364,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
     def _plot_current_mode(self) -> None:
         self._set_plot_note("")
         if self._mode == "performance":
-            self._plot_performance()
+            self._plot_performance(user_initiated=True)
         elif self._mode == "metrics":
             self._plot_metrics()
         else:
@@ -8331,8 +8556,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._ensure_main_axes("2d")
         selection = self._current_run_selection()
         runs = self._current_member_runs()
-        y_col = (self.cb_y_curve.currentText() or "").strip() if hasattr(self, "cb_y_curve") else ""
-        x_label = (self.cb_x.currentText() or "").strip()
+        y_col = self._current_curve_y_name()
+        x_key = self._current_curve_x_key()
+        x_label = self._current_curve_x_label()
         if not runs or not y_col:
             return
         if not x_label:
@@ -8351,7 +8577,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         multi_run = len(runs) > 1
         x_col_title = ""
         for run in runs:
-            x_col = self._resolve_curve_x_key(run, x_label)
+            x_col = self._resolve_curve_x_key(run, x_key or x_label)
             if not x_col:
                 continue
             if not x_col_title:
@@ -8464,6 +8690,52 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             txt = str(self.cb_perf_control_period.currentText() or "").strip()
             return txt or None
         return value
+
+    def _perf_available_control_periods(self) -> list[object]:
+        rows = [
+            dict(row)
+            for row in (getattr(self, "_global_filter_rows", None) or [])
+            if isinstance(row, dict)
+        ]
+        if rows and callable(getattr(self, "_row_matches_global_filters", None)):
+            values_by_label: dict[str, object] = {}
+            for row in rows:
+                if not self._row_matches_global_filters(row):
+                    continue
+                raw_value = row.get("control_period")
+                label = _td_compact_filter_value(raw_value)
+                if not label or label in values_by_label:
+                    continue
+                values_by_label[label] = raw_value
+            if values_by_label:
+                return [
+                    values_by_label[label]
+                    for label in sorted(values_by_label.keys(), key=_td_compact_filter_sort_key)
+                ]
+            return []
+        if not getattr(self, "_db_path", None):
+            return []
+        try:
+            return list(be.td_list_control_periods(self._db_path) or [])
+        except Exception:
+            return []
+
+    def _refresh_perf_control_period_options(self) -> None:
+        if not hasattr(self, "cb_perf_control_period"):
+            return
+        prev_control_period = self._selected_perf_control_period()
+        control_periods = self._perf_available_control_periods()
+        self.cb_perf_control_period.blockSignals(True)
+        self.cb_perf_control_period.clear()
+        for cp in control_periods:
+            self.cb_perf_control_period.addItem(str(cp), cp)
+        if prev_control_period not in (None, ""):
+            match_idx = self.cb_perf_control_period.findData(prev_control_period)
+            if match_idx >= 0:
+                self.cb_perf_control_period.setCurrentIndex(match_idx)
+        elif self.cb_perf_control_period.count() > 0:
+            self.cb_perf_control_period.setCurrentIndex(0)
+        self.cb_perf_control_period.blockSignals(False)
 
     def _update_perf_control_period_state(self) -> None:
         if not hasattr(self, "cb_perf_control_period"):
@@ -10705,10 +10977,6 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         except Exception:
             runs = []
         try:
-            control_periods = be.td_list_control_periods(self._db_path)
-        except Exception:
-            control_periods = []
-        try:
             available_run_type_modes = be.td_list_performance_run_type_modes(self._db_path)
         except Exception:
             available_run_type_modes = ["steady_state", "pulsed_mode"]
@@ -10766,18 +11034,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 mode_idx = self.cb_perf_filter_mode.findData("all_conditions")
             if mode_idx >= 0:
                 self.cb_perf_filter_mode.setCurrentIndex(mode_idx)
-        if hasattr(self, "cb_perf_control_period"):
-            self.cb_perf_control_period.blockSignals(True)
-            self.cb_perf_control_period.clear()
-            for cp in control_periods:
-                self.cb_perf_control_period.addItem(str(cp), cp)
-            if prev_control_period not in (None, ""):
-                match_idx = self.cb_perf_control_period.findData(prev_control_period)
-                if match_idx >= 0:
-                    self.cb_perf_control_period.setCurrentIndex(match_idx)
-            elif self.cb_perf_control_period.count() > 0:
-                self.cb_perf_control_period.setCurrentIndex(0)
-            self.cb_perf_control_period.blockSignals(False)
+        self._refresh_perf_control_period_options()
         self._filter_perf_axis_options(changed="x")
         self._filter_perf_axis_options(changed="z")
         self._update_perf_control_period_state()
@@ -10829,7 +11086,46 @@ class TestDataTrendDialog(QtWidgets.QDialog):
     def _on_perf_preset_changed(self) -> None:
         self._on_perf_axis_changed()
 
-    def _plot_performance(self) -> None:
+    def _perf_partial_cp_fit_messages(self, stats: list[str]) -> list[str]:
+        if not isinstance(stats, list) or not stats:
+            return []
+        cp_surface_family = str(
+            getattr(be, "TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD", "quadratic_surface_control_period")
+        ).strip().lower()
+        format_warning = getattr(be, "_td_perf_format_surface_control_period_warning", None)
+        messages: list[str] = []
+        for stat in stats:
+            result = (self._perf_results_by_stat or {}).get(stat) or {}
+            if not isinstance(result, dict):
+                continue
+            master_model = result.get("master_model") or {}
+            if not isinstance(master_model, dict) or not master_model:
+                continue
+            fit_family = str(
+                master_model.get("fit_family") or result.get("surface_fit_family") or ""
+            ).strip().lower()
+            if fit_family != cp_surface_family:
+                continue
+            ignored = [
+                dict(entry)
+                for entry in (master_model.get("ignored_control_periods") or [])
+                if isinstance(entry, dict)
+            ]
+            if not ignored:
+                continue
+            if callable(format_warning):
+                text = str(format_warning(ignored) or "").strip()
+            else:
+                text = str(
+                    master_model.get("fit_warning_text")
+                    or result.get("fit_warning_text")
+                    or ""
+                ).strip()
+            if text and text not in messages:
+                messages.append(text)
+        return messages
+
+    def _plot_performance(self, *, user_initiated: bool = False) -> None:
         if not self._plot_ready or not self._db_path:
             return
         self._set_plot_note("")
@@ -10927,6 +11223,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         )
         if fit_error_text and not has_master_model:
             QtWidgets.QMessageBox.warning(self, "Performance", fit_error_text)
+        partial_cp_messages = self._perf_partial_cp_fit_messages(plot_view_stats)
+        if user_initiated and partial_cp_messages:
+            QtWidgets.QMessageBox.information(self, "Performance", "\n".join(partial_cp_messages))
         self._set_plot_note("\n".join(fit_warning_notes))
         self._update_perf_highlight_models()
         self._fill_perf_equations_table()
@@ -11115,7 +11414,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         if mode == "curves":
             ys = d.get("y") or []
             if isinstance(ys, list) and ys:
-                self.cb_y_curve.setCurrentText(str(ys[0]))
+                self._set_combo_to_value(self.cb_y_curve, str(ys[0]))
             x = str(d.get("x") or "").strip()
             if x:
                 def _norm_name(s: str) -> str:
@@ -11128,7 +11427,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     want = "Time"
                 elif _norm_name(want) in pulse_norms:
                     want = "Pulse Number"
-                self.cb_x.setCurrentText(want)
+                self._set_combo_to_value(self.cb_x, want)
             self._plot_curves()
         elif mode == "metrics":
             stats_val = d.get("stats")
