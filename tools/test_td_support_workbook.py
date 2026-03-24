@@ -468,8 +468,10 @@ class _RunSelectionHarness:
         self._run_display_by_name = {}
         self._run_name_by_display = {}
         self._available_program_filters = ["Program A", "Program B", "Unknown Program"]
+        self._available_control_period_filters = []
         self._available_suppression_voltage_filters = ["24", "28"]
         self._checked_program_filters = list(self._available_program_filters)
+        self._checked_control_period_filters = []
         self._checked_suppression_voltage_filters = list(self._available_suppression_voltage_filters)
         self._is_internal_run_label = TestDataTrendDialog._is_internal_run_label
         self._metric_title_suffix = TestDataTrendDialog._metric_title_suffix
@@ -496,6 +498,7 @@ class _RunSelectionHarness:
             "_sync_main_auto_plot_actions",
             "_auto_plot_display_name",
             "_selected_auto_plot_definitions",
+            "_active_control_period_filter_values",
             "_active_program_filter_values",
             "_active_suppression_voltage_filter_values",
             "_visible_run_selection_items",
@@ -551,14 +554,16 @@ class _GlobalFilterHarness:
         ]
         self._serial_source_by_serial = {"SN1": dict(self._serial_source_rows[0]), "SN2": dict(self._serial_source_rows[1])}
         self._global_filter_rows = [
-            {"observation_id": "obs_a", "serial": "SN1", "serial_number": "SN1", "program_title": "Program A", "suppression_voltage": 24.0},
-            {"observation_id": "obs_b", "serial": "SN2", "serial_number": "SN2", "program_title": "Program B", "suppression_voltage": 28.0},
+            {"observation_id": "obs_a", "serial": "SN1", "serial_number": "SN1", "program_title": "Program A", "control_period": 60.0, "suppression_voltage": 24.0},
+            {"observation_id": "obs_b", "serial": "SN2", "serial_number": "SN2", "program_title": "Program B", "control_period": 120.0, "suppression_voltage": 28.0},
         ]
         self._available_program_filters = ["Program A", "Program B"]
         self._available_serial_filter_rows = list(self._serial_source_rows)
+        self._available_control_period_filters = ["60", "120"]
         self._available_suppression_voltage_filters = ["24", "28"]
         self._checked_program_filters = ["Program A"]
         self._checked_serial_filters = ["SN1", "SN2"]
+        self._checked_control_period_filters = ["60", "120"]
         self._checked_suppression_voltage_filters = ["24", "28"]
         self.lbl_highlight_serials = QtWidgets.QLabel()
         self._refresh_stats_preview_calls = 0
@@ -573,6 +578,8 @@ class _GlobalFilterHarness:
         self._selection_observation_filters = lambda selection=None: ("", "")
 
         for name in (
+            "_active_control_period_filter_values",
+            "_single_active_control_period_filter_value",
             "_active_program_filter_values",
             "_active_suppression_voltage_filter_values",
             "_active_serial_rows",
@@ -3307,7 +3314,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
             self.assertEqual(ss_group.get("member_runs"), ["Seq1"])
             self.assertEqual(ss_group.get("member_sequences"), ["Seq1", "Seq2"])
 
-    def test_run_selection_views_include_member_suppression_voltages(self) -> None:
+    def test_run_selection_views_include_member_suppression_voltages_and_control_periods(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
 
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
@@ -3333,7 +3340,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
                     INSERT OR REPLACE INTO td_runs(run_name, default_x, display_name, run_type, control_period, pulse_width)
                     VALUES (?, ?, ?, ?, ?, ?)
                     """,
-                    ("RunA", "Time", "RunA", "steady state", None, None),
+                    ("RunA", "Time", "RunA", "pulsed mode", 60.0, None),
                 )
                 conn.execute(
                     """
@@ -3341,7 +3348,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
                     (observation_id, serial, run_name, program_title, source_run_name, run_type, pulse_width, control_period, suppression_voltage, source_mtime_ns, computed_epoch_ns)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    ("SN1__RunA", "SN1", "RunA", "Program A", "Seq1", "steady state", None, None, 24.0, 0, 0),
+                    ("SN1__RunA", "SN1", "RunA", "Program A", "Seq1", "pulsed mode", None, 60.0, 24.0, 0, 0),
                 )
                 conn.execute(
                     """
@@ -3349,7 +3356,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
                     (observation_id, serial, run_name, program_title, source_run_name, run_type, pulse_width, control_period, suppression_voltage, source_mtime_ns, computed_epoch_ns)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    ("SN2__RunA", "SN2", "RunA", "Program A", "Seq2", "steady state", None, None, 28.0, 0, 0),
+                    ("SN2__RunA", "SN2", "RunA", "Program A", "Seq2", "pulsed mode", None, 120.0, 28.0, 0, 0),
                 )
                 conn.commit()
 
@@ -3358,8 +3365,10 @@ class TestTDSupportWorkbook(unittest.TestCase):
             cond_items = views.get("condition") or []
 
             seq1 = next(item for item in seq_items if item.get("source_run_name") == "Seq1")
+            self.assertEqual(seq1.get("member_control_periods"), ["60"])
             self.assertEqual(seq1.get("member_suppression_voltages"), ["24"])
             cond = next(item for item in cond_items if item.get("run_name") == "RunA")
+            self.assertEqual(cond.get("member_control_periods"), ["60", "120"])
             self.assertEqual(cond.get("member_suppression_voltages"), ["24", "28"])
 
     def test_rebuild_prefers_workbook_config_columns_over_runtime_config(self) -> None:
@@ -4704,7 +4713,8 @@ class TestTDSupportWorkbook(unittest.TestCase):
                         "source_run_name": "RunA",
                         "feed_pressure": 100,
                         "feed_pressure_units": "psia",
-                        "run_type": "steady state",
+                        "run_type": "pulsed mode",
+                        "control_period": 60,
                         "suppression_voltage": 24,
                     },
                 )
@@ -4718,28 +4728,33 @@ class TestTDSupportWorkbook(unittest.TestCase):
 
             with sqlite3.connect(str(impl_db)) as conn:
                 row = conn.execute(
-                    "SELECT suppression_voltage FROM td_condition_observations WHERE serial=? AND run_name=?",
+                    "SELECT control_period, suppression_voltage FROM td_condition_observations WHERE serial=? AND run_name=?",
                     ("SN1", "RunA"),
                 ).fetchone()
             self.assertIsNotNone(row)
-            self.assertEqual(float(row[0]), 24.0)
+            self.assertEqual(float(row[0]), 60.0)
+            self.assertEqual(float(row[1]), 24.0)
 
             raw_db = root / "test_data_raw_cache.sqlite3"
             with sqlite3.connect(str(raw_db)) as conn:
                 row = conn.execute(
-                    "SELECT suppression_voltage FROM td_raw_condition_observations WHERE serial=? AND run_name=?",
+                    "SELECT control_period, suppression_voltage FROM td_raw_condition_observations WHERE serial=? AND run_name=?",
                     ("SN1", "RunA"),
                 ).fetchone()
             self.assertIsNotNone(row)
-            self.assertEqual(float(row[0]), 24.0)
+            self.assertEqual(float(row[0]), 60.0)
+            self.assertEqual(float(row[1]), 24.0)
 
             filter_rows = be.td_read_observation_filter_rows_from_cache(impl_db)
+            self.assertEqual([row.get("control_period") for row in filter_rows], [60.0])
             self.assertEqual([row.get("suppression_voltage") for row in filter_rows], [24.0])
 
             metric_rows = be.td_load_metric_series(impl_db, "RunA", "thrust", "mean")
+            self.assertEqual([row.get("control_period") for row in metric_rows], [60.0])
             self.assertEqual([row.get("suppression_voltage") for row in metric_rows], [24.0])
 
             curves = be.td_load_curves(impl_db, "RunA", "thrust", "Time")
+            self.assertEqual([row.get("control_period") for row in curves], [60.0])
             self.assertEqual([row.get("suppression_voltage") for row in curves], [24.0])
 
     def test_debug_export_writes_excel_mirror_for_project_cache(self) -> None:
@@ -5754,6 +5769,76 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 "member_runs": ["RunB"],
                 "member_sequences": ["SeqB"],
                 "member_suppression_voltages": ["28"],
+                "details_text": "Source Sequences: SeqB",
+            },
+        ]
+
+        harness._sync_run_mode_availability()
+        harness._refresh_run_dropdown()
+
+        self.assertEqual(harness.cb_run.count(), 1)
+        self.assertEqual(harness.cb_run.itemText(0), "Program A - SeqA")
+        self.assertEqual(harness.list_metric_run_conditions.count(), 1)
+        self.assertEqual(harness.list_metric_run_conditions.item(0).text(), "Condition A")
+
+    @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
+    def test_run_dropdown_hides_unchecked_control_period_items(self) -> None:
+        harness = _RunSelectionHarness()
+        harness._available_control_period_filters = ["60", "120"]
+        harness._checked_control_period_filters = ["60"]
+        harness._run_selection_views["sequence"] = [
+            {
+                "mode": "sequence",
+                "id": "sequence:a",
+                "run_name": "RunA",
+                "sequence_name": "SeqA",
+                "display_text": "Program A - SeqA",
+                "program_title": "Program A",
+                "member_programs": ["Program A"],
+                "member_runs": ["RunA"],
+                "member_sequences": ["SeqA"],
+                "control_period": 60.0,
+                "member_control_periods": ["60"],
+                "details_text": "Program: Program A | Source Sequence: SeqA",
+            },
+            {
+                "mode": "sequence",
+                "id": "sequence:b",
+                "run_name": "RunB",
+                "sequence_name": "SeqB",
+                "display_text": "Program B - SeqB",
+                "program_title": "Program B",
+                "member_programs": ["Program B"],
+                "member_runs": ["RunB"],
+                "member_sequences": ["SeqB"],
+                "control_period": 120.0,
+                "member_control_periods": ["120"],
+                "details_text": "Program: Program B | Source Sequence: SeqB",
+            },
+        ]
+        harness._run_selection_views["condition"] = [
+            {
+                "mode": "condition",
+                "id": "condition:a",
+                "run_name": "RunA",
+                "display_text": "Condition A",
+                "run_condition": "Condition A",
+                "member_programs": ["Program A"],
+                "member_runs": ["RunA"],
+                "member_sequences": ["SeqA"],
+                "member_control_periods": ["60"],
+                "details_text": "Source Sequences: SeqA",
+            },
+            {
+                "mode": "condition",
+                "id": "condition:b",
+                "run_name": "RunB",
+                "display_text": "Condition B",
+                "run_condition": "Condition B",
+                "member_programs": ["Program B"],
+                "member_runs": ["RunB"],
+                "member_sequences": ["SeqB"],
+                "member_control_periods": ["120"],
                 "details_text": "Source Sequences: SeqB",
             },
         ]
@@ -7674,33 +7759,36 @@ class TestTDSupportWorkbook(unittest.TestCase):
         self.assertEqual(len(harness.collect_calls), 1)
         self.assertEqual(harness.collect_calls[0]["plot_stats"], ["mean"])
 
-    def test_metric_series_loader_filters_programs_serials_and_suppression_voltage(self) -> None:
+    def test_metric_series_loader_filters_programs_serials_suppression_and_control_period(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
 
         harness = _GlobalFilterHarness()
+        harness._checked_control_period_filters = ["60"]
         harness._checked_suppression_voltage_filters = ["24"]
         rows = [
-            {"observation_id": "obs_a", "serial": "SN1", "value_num": 1.0, "program_title": "Program A", "suppression_voltage": 24.0},
-            {"observation_id": "obs_b", "serial": "SN2", "value_num": 2.0, "program_title": "Program B", "suppression_voltage": 28.0},
-            {"observation_id": "obs_c", "serial": "SN1", "value_num": 3.0, "program_title": "Program A", "suppression_voltage": 28.0},
+            {"observation_id": "obs_a", "serial": "SN1", "value_num": 1.0, "program_title": "Program A", "control_period": 60.0, "suppression_voltage": 24.0},
+            {"observation_id": "obs_b", "serial": "SN2", "value_num": 2.0, "program_title": "Program B", "control_period": 120.0, "suppression_voltage": 28.0},
+            {"observation_id": "obs_c", "serial": "SN1", "value_num": 3.0, "program_title": "Program A", "control_period": 120.0, "suppression_voltage": 28.0},
         ]
 
         with mock.patch.object(be, "td_load_metric_series", return_value=rows) as load_mock:
             result = harness._load_metric_series_for_selection("RunA", "thrust", "mean")
 
         load_mock.assert_called_once()
+        self.assertEqual(load_mock.call_args.kwargs.get("control_period_filter"), "60")
         self.assertEqual([row.get("serial") for row in result], ["SN1"])
         self.assertEqual([row.get("observation_id") for row in result], ["obs_a"])
 
-    def test_curve_loader_filters_programs_serials_and_suppression_voltage(self) -> None:
+    def test_curve_loader_filters_programs_serials_suppression_and_control_period(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
 
         harness = _GlobalFilterHarness()
+        harness._checked_control_period_filters = ["60"]
         harness._checked_suppression_voltage_filters = ["24"]
         rows = [
-            {"observation_id": "obs_a", "serial": "SN1", "program_title": "Program A", "suppression_voltage": 24.0, "x": [0.0, 1.0], "y": [1.0, 2.0]},
-            {"observation_id": "obs_b", "serial": "SN2", "program_title": "Program B", "suppression_voltage": 28.0, "x": [0.0, 1.0], "y": [2.0, 3.0]},
-            {"observation_id": "obs_c", "serial": "SN1", "program_title": "Program A", "suppression_voltage": 28.0, "x": [0.0, 1.0], "y": [3.0, 4.0]},
+            {"observation_id": "obs_a", "serial": "SN1", "program_title": "Program A", "control_period": 60.0, "suppression_voltage": 24.0, "x": [0.0, 1.0], "y": [1.0, 2.0]},
+            {"observation_id": "obs_b", "serial": "SN2", "program_title": "Program B", "control_period": 120.0, "suppression_voltage": 28.0, "x": [0.0, 1.0], "y": [2.0, 3.0]},
+            {"observation_id": "obs_c", "serial": "SN1", "program_title": "Program A", "control_period": 120.0, "suppression_voltage": 28.0, "x": [0.0, 1.0], "y": [3.0, 4.0]},
         ]
 
         with mock.patch.object(be, "td_load_curves", return_value=rows) as load_mock:
@@ -7708,6 +7796,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
 
         load_mock.assert_called_once()
         self.assertEqual(load_mock.call_args.kwargs.get("serials"), ["SN1"])
+        self.assertEqual(load_mock.call_args.kwargs.get("control_period_filter"), "60")
         self.assertEqual([row.get("serial") for row in result], ["SN1"])
         self.assertEqual([row.get("observation_id") for row in result], ["obs_a"])
 

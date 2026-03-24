@@ -161,6 +161,12 @@ def _td_suppression_voltage_filter_value(row: dict | None) -> str:
     return _td_compact_filter_value(row.get("suppression_voltage"))
 
 
+def _td_control_period_filter_value(row: dict | None) -> str:
+    if not isinstance(row, dict):
+        return ""
+    return _td_compact_filter_value(row.get("control_period"))
+
+
 def _td_compact_filter_sort_key(value: object) -> tuple[int, float, str]:
     label = _td_compact_filter_value(value)
     if not label:
@@ -3177,9 +3183,11 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._global_filter_rows: list[dict] = []
         self._available_program_filters: list[str] = []
         self._available_serial_filter_rows: list[dict] = []
+        self._available_control_period_filters: list[str] = []
         self._available_suppression_voltage_filters: list[str] = []
         self._checked_program_filters: list[str] = []
         self._checked_serial_filters: list[str] = []
+        self._checked_control_period_filters: list[str] = []
         self._checked_suppression_voltage_filters: list[str] = []
         self._auto_plots: list[dict] = []
         self._last_plot_def: dict | None = None
@@ -3208,7 +3216,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._perf_equations_popup: QtWidgets.QDialog | None = None
 
         self.setWindowTitle("Test Data - Trend / Analyze")
-        self.resize(920, 620)
+        self.resize(1280, 760)
+        self.setSizeGripEnabled(True)
         self.setStyleSheet(
             """
             QDialog { background: #f8fafc; color: #0f172a; }
@@ -3275,10 +3284,17 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             QtWidgets.QSizePolicy.Policy.Expanding,
             QtWidgets.QSizePolicy.Policy.Fixed,
         )
+        self.lbl_control_period_filter_summary = QtWidgets.QLabel("Control Period: -")
+        self.lbl_control_period_filter_summary.setStyleSheet("color: #334155; font-size: 11px;")
+        self.lbl_control_period_filter_summary.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Fixed,
+        )
         filter_text_layout.addWidget(filter_title)
         filter_text_layout.addWidget(self.lbl_program_filter_summary)
         filter_text_layout.addWidget(self.lbl_serial_filter_summary)
         filter_text_layout.addWidget(self.lbl_suppression_voltage_filter_summary)
+        filter_text_layout.addWidget(self.lbl_control_period_filter_summary)
         filter_text_layout.addStretch(1)
         filter_layout.addLayout(filter_text_layout, 1)
 
@@ -3288,12 +3304,15 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self.btn_serial_filters.clicked.connect(self._open_serial_filter_popup)
         self.btn_suppression_voltage_filters = QtWidgets.QPushButton("Suppression Voltage...")
         self.btn_suppression_voltage_filters.clicked.connect(self._open_suppression_voltage_filter_popup)
+        self.btn_control_period_filters = QtWidgets.QPushButton("Control Period...")
+        self.btn_control_period_filters.clicked.connect(self._open_control_period_filter_popup)
         self.btn_reset_global_filters = QtWidgets.QPushButton("Reset Filters")
         self.btn_reset_global_filters.clicked.connect(self._reset_global_filters)
         for btn in (
             self.btn_program_filters,
             self.btn_serial_filters,
             self.btn_suppression_voltage_filters,
+            self.btn_control_period_filters,
             self.btn_reset_global_filters,
         ):
             btn.setMinimumHeight(32)
@@ -4078,6 +4097,56 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         super().resizeEvent(event)
         self._schedule_mode_panel_height_sync()
 
+    def _preferred_left_panel_width(self) -> int:
+        panel = self._left_panel_scroll
+        if panel is None:
+            return 0
+        panel_widget = panel.widget()
+        if panel_widget is None:
+            return 0
+        try:
+            panel_widget.ensurePolished()
+            layout = panel_widget.layout()
+            if layout is not None:
+                layout.activate()
+        except Exception:
+            pass
+
+        width_candidates: list[int] = []
+        for candidate in (
+            getattr(panel_widget, "sizeHint", None),
+            getattr(panel_widget, "minimumSizeHint", None),
+        ):
+            if callable(candidate):
+                try:
+                    width_candidates.append(int(candidate().width()))
+                except Exception:
+                    pass
+
+        try:
+            for child in panel_widget.findChildren(QtWidgets.QWidget):
+                if not child.isVisibleTo(panel_widget):
+                    continue
+                pos = child.mapTo(panel_widget, QtCore.QPoint(0, 0))
+                child_width = max(
+                    int(child.sizeHint().width()),
+                    int(child.minimumSizeHint().width()),
+                    int(child.minimumWidth()),
+                )
+                width_candidates.append(int(pos.x()) + child_width)
+        except Exception:
+            pass
+
+        try:
+            width_candidates.append(panel.frameWidth() * 2)
+        except Exception:
+            pass
+
+        preferred = max(width_candidates or [0])
+        if preferred <= 0:
+            return 0
+        return preferred + 24
+
     def _initialize_left_panel_width(self) -> None:
         if self._left_panel_width_initialized:
             return
@@ -4085,7 +4154,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         splitter = getattr(self, "main_splitter", None)
         if panel is None or splitter is None:
             return
-        width = panel.width()
+        width = max(panel.width(), self._preferred_left_panel_width())
         if width <= 0:
             try:
                 width = max(panel.sizeHint().width(), panel.minimumSizeHint().width())
@@ -4118,18 +4187,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
         panel = self._left_panel_scroll
         splitter = getattr(self, "main_splitter", None)
-        left_width = 0
-        if panel is not None:
-            panel_widget = panel.widget()
-            if panel_widget is not None:
-                try:
-                    left_width = max(panel_widget.sizeHint().width(), panel_widget.minimumSizeHint().width())
-                except Exception:
-                    left_width = 0
-            try:
-                left_width += panel.frameWidth() * 2
-            except Exception:
-                pass
+        left_width = self._preferred_left_panel_width()
 
         right_width = 0
         if splitter is not None and splitter.count() >= 2:
@@ -4154,9 +4212,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 size_hint.width(),
                 minimum_hint.width(),
                 filter_width,
-                left_width + right_width + max(0, splitter.handleWidth() if splitter is not None else 0) + 32,
+                left_width + max(right_width, 720) + max(0, splitter.handleWidth() if splitter is not None else 0) + 32,
             )
-            target_height = max(self.height(), size_hint.height(), minimum_hint.height())
+            target_height = max(self.height(), size_hint.height(), minimum_hint.height(), 760)
         except Exception:
             target_width = self.width()
             target_height = self.height()
@@ -4164,7 +4222,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self.resize(target_width, target_height)
         _fit_widget_to_screen(self)
         self._initialize_left_panel_width()
-        self.setFixedSize(self.size())
+        self.setMinimumSize(self.size())
         self._startup_size_locked = True
 
     def _schedule_mode_panel_height_sync(self) -> None:
@@ -5551,6 +5609,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         prev_checked_programs = set(self._checked_program_filters or [])
         prev_serials = {_td_serial_value(row) for row in (self._available_serial_filter_rows or []) if _td_serial_value(row)}
         prev_checked_serials = set(self._checked_serial_filters or [])
+        prev_control_periods = set(self._available_control_period_filters or [])
+        prev_checked_control_periods = set(self._checked_control_period_filters or [])
         prev_suppression = set(self._available_suppression_voltage_filters or [])
         prev_checked_suppression = set(self._checked_suppression_voltage_filters or [])
 
@@ -5573,6 +5633,19 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 if serial in prev_checked_serials or serial not in prev_serials
             ]
 
+        control_period_values = sorted(
+            {_td_control_period_filter_value(row) for row in filter_rows if _td_control_period_filter_value(row)},
+            key=_td_compact_filter_sort_key,
+        )
+        if not prev_control_periods:
+            self._checked_control_period_filters = list(control_period_values)
+        else:
+            self._checked_control_period_filters = [
+                value
+                for value in control_period_values
+                if value in prev_checked_control_periods or value not in prev_control_periods
+            ]
+
         suppression_values = sorted(
             {_td_suppression_voltage_filter_value(row) for row in filter_rows if _td_suppression_voltage_filter_value(row)},
             key=_td_compact_filter_sort_key,
@@ -5588,6 +5661,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
         self._available_program_filters = list(program_values)
         self._available_serial_filter_rows = list(serial_rows)
+        self._available_control_period_filters = list(control_period_values)
         self._available_suppression_voltage_filters = list(suppression_values)
         self._refresh_global_filter_summaries()
 
@@ -5597,6 +5671,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         total_serials = len(self._available_serial_filter_rows or [])
         active_serial_rows = self._active_serial_rows()
         active_serials = [_td_serial_value(row) for row in active_serial_rows]
+        total_control_periods = len(self._available_control_period_filters or [])
+        active_control_periods = self._active_control_period_filter_values()
         total_suppression = len(self._available_suppression_voltage_filters or [])
         active_suppression = self._active_suppression_voltage_filter_values()
 
@@ -5629,6 +5705,20 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 shown += f" (+{len(active_serials) - 20} more)"
             self.lbl_serial_filter_summary.setToolTip(shown)
 
+        if hasattr(self, "lbl_control_period_filter_summary"):
+            if total_control_periods <= 0:
+                control_text = "Control Period: -"
+            elif len(active_control_periods) >= total_control_periods:
+                control_text = f"Control Period: All ({total_control_periods})"
+            elif not active_control_periods:
+                control_text = f"Control Period: None active (0/{total_control_periods})"
+            elif len(active_control_periods) <= 3:
+                control_text = "Control Period: " + ", ".join(active_control_periods)
+            else:
+                control_text = f"Control Period: {len(active_control_periods)} of {total_control_periods} active"
+            self.lbl_control_period_filter_summary.setText(control_text)
+            self.lbl_control_period_filter_summary.setToolTip(", ".join(active_control_periods))
+
         if hasattr(self, "lbl_suppression_voltage_filter_summary"):
             if total_suppression <= 0:
                 suppression_text = "Suppression Voltage: -"
@@ -5645,15 +5735,18 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
         has_programs = bool(self._available_program_filters)
         has_serials = bool(self._available_serial_filter_rows)
+        has_control_periods = bool(self._available_control_period_filters)
         has_suppression = bool(self._available_suppression_voltage_filters)
         if hasattr(self, "btn_program_filters"):
             self.btn_program_filters.setEnabled(has_programs)
         if hasattr(self, "btn_serial_filters"):
             self.btn_serial_filters.setEnabled(has_serials)
+        if hasattr(self, "btn_control_period_filters"):
+            self.btn_control_period_filters.setEnabled(has_control_periods)
         if hasattr(self, "btn_suppression_voltage_filters"):
             self.btn_suppression_voltage_filters.setEnabled(has_suppression)
         if hasattr(self, "btn_reset_global_filters"):
-            self.btn_reset_global_filters.setEnabled(has_programs or has_serials or has_suppression)
+            self.btn_reset_global_filters.setEnabled(has_programs or has_serials or has_control_periods or has_suppression)
 
     def _active_program_filter_values(self) -> list[str]:
         selected = [value for value in (self._checked_program_filters or []) if str(value).strip()]
@@ -5665,9 +5758,19 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         valid = {value for value in (self._available_suppression_voltage_filters or []) if str(value).strip()}
         return [value for value in selected if value in valid]
 
+    def _active_control_period_filter_values(self) -> list[str]:
+        selected = [value for value in (self._checked_control_period_filters or []) if str(value).strip()]
+        valid = {value for value in (self._available_control_period_filters or []) if str(value).strip()}
+        return [value for value in selected if value in valid]
+
+    def _single_active_control_period_filter_value(self) -> object | None:
+        active = self._active_control_period_filter_values()
+        return active[0] if len(active) == 1 else None
+
     def _active_serial_rows(self) -> list[dict]:
         selected_programs = set(self._active_program_filter_values())
         selected_serials = {str(serial).strip() for serial in (self._checked_serial_filters or []) if str(serial).strip()}
+        selected_control_periods = set(self._active_control_period_filter_values())
         selected_suppression = set(self._active_suppression_voltage_filter_values())
         if not self._global_filter_rows:
             out: list[dict] = []
@@ -5688,6 +5791,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             if not serial or serial not in selected_serials:
                 continue
             if self._row_program_label(row) not in selected_programs:
+                continue
+            control_period = _td_control_period_filter_value(row)
+            if selected_control_periods and control_period not in selected_control_periods:
                 continue
             suppression_voltage = _td_suppression_voltage_filter_value(row)
             if selected_suppression and suppression_voltage not in selected_suppression:
@@ -5719,6 +5825,11 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         program_label = self._row_program_label(row)
         if program_label not in set(self._active_program_filter_values()):
             return False
+        selected_control_periods = set(self._active_control_period_filter_values())
+        if selected_control_periods:
+            control_period = _td_control_period_filter_value(row)
+            if not control_period or control_period not in selected_control_periods:
+                return False
         selected_suppression = set(self._active_suppression_voltage_filter_values())
         if selected_suppression:
             suppression_voltage = _td_suppression_voltage_filter_value(row)
@@ -5736,6 +5847,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
     def _visible_run_selection_items(self, mode: str) -> list[dict]:
         selected_programs = set(self._active_program_filter_values())
+        selected_control_periods = set(self._active_control_period_filter_values())
         selected_suppression = set(self._active_suppression_voltage_filter_values())
         out: list[dict] = []
         for item in (self._run_selection_views.get(mode) or []):
@@ -5749,6 +5861,21 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             if not member_programs:
                 member_programs = [_td_display_program_title(item.get("program_title"))]
             if not any(program in selected_programs for program in member_programs):
+                continue
+            raw_control_periods = item.get("member_control_periods") or []
+            if isinstance(raw_control_periods, list):
+                member_control_periods = [
+                    _td_compact_filter_value(value)
+                    for value in raw_control_periods
+                    if _td_compact_filter_value(value)
+                ]
+            else:
+                member_control_periods = []
+            if not member_control_periods:
+                single_control_period = _td_compact_filter_value(item.get("control_period"))
+                if single_control_period:
+                    member_control_periods = [single_control_period]
+            if selected_control_periods and not any(value in selected_control_periods for value in member_control_periods):
                 continue
             raw_suppression = item.get("member_suppression_voltages") or []
             if isinstance(raw_suppression, list):
@@ -5931,6 +6058,24 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         ]
         self._on_global_filters_changed()
 
+    def _open_control_period_filter_popup(self) -> None:
+        entries = [
+            {"value": value, "label": value, "search": value.lower()}
+            for value in (self._available_control_period_filters or [])
+            if str(value).strip()
+        ]
+        chosen = self._show_filter_checklist_popup(
+            title="Visible Control Periods",
+            entries=entries,
+            selected_values=self._checked_control_period_filters,
+        )
+        if chosen is None:
+            return
+        self._checked_control_period_filters = [
+            value for value in (self._available_control_period_filters or []) if value in set(chosen)
+        ]
+        self._on_global_filters_changed()
+
     def _reset_global_filters(self) -> None:
         self._checked_program_filters = list(self._available_program_filters or [])
         self._checked_serial_filters = [
@@ -5938,6 +6083,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             for row in (self._available_serial_filter_rows or [])
             if _td_serial_value(row)
         ]
+        self._checked_control_period_filters = list(self._available_control_period_filters or [])
         self._checked_suppression_voltage_filters = list(self._available_suppression_voltage_filters or [])
         self._on_global_filters_changed()
 
@@ -7169,6 +7315,11 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         if not getattr(self, "_db_path", None):
             return []
         program_title, source_run_name = self._selection_observation_filters(selection)
+        loader_control_period_filter = (
+            control_period_filter
+            if control_period_filter not in (None, "")
+            else self._single_active_control_period_filter_value()
+        )
         try:
             rows = be.td_load_metric_series(
                 self._db_path,
@@ -7177,7 +7328,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 stat,
                 program_title=(program_title or None),
                 source_run_name=(source_run_name or None),
-                control_period_filter=control_period_filter,
+                control_period_filter=loader_control_period_filter,
                 run_type_filter=run_type_filter,
             )
             return self._filter_rows_for_global_selection(rows)
@@ -7206,6 +7357,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 serials=active_serials,
                 program_title=(program_title or None),
                 source_run_name=(source_run_name or None),
+                control_period_filter=self._single_active_control_period_filter_value(),
             )
             return self._filter_rows_for_global_selection(rows)
         except Exception:
@@ -9490,10 +9642,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
     def _load_metric_map(self, run_name: str, col_name: str, stat: str) -> dict[str, float]:
         if not self._db_path:
             return {}
-        try:
-            series = be.td_load_metric_series(self._db_path, run_name, col_name, stat)
-        except Exception:
-            series = []
+        series = self._load_metric_series_for_selection(run_name, col_name, stat)
         out: dict[str, float] = {}
         for r in series:
             sn = str(r.get("serial") or "").strip()

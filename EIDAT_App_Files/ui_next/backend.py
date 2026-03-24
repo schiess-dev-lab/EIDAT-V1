@@ -6213,12 +6213,12 @@ def td_list_run_selection_views(db_path: Path, workbook_path: Path, *, project_d
         _ensure_test_data_impl_tables(conn)
         rows = conn.execute(
             """
-            SELECT run_name, COALESCE(program_title, ''), COALESCE(source_run_name, ''), suppression_voltage
+            SELECT run_name, COALESCE(program_title, ''), COALESCE(source_run_name, ''), control_period, suppression_voltage
             FROM td_condition_observations
             ORDER BY run_name, program_title, source_run_name, observation_id
             """
         ).fetchall()
-    for run_name, program_title, source_run_name, suppression_voltage in rows:
+    for run_name, program_title, source_run_name, control_period, suppression_voltage in rows:
         run_key = str(run_name or "").strip()
         if not run_key:
             continue
@@ -6228,6 +6228,8 @@ def td_list_run_selection_views(db_path: Path, workbook_path: Path, *, project_d
                 "program_title": str(program_title or "").strip(),
                 "program_label": _td_display_program_title(program_title),
                 "source_run_name": seq_name,
+                "control_period": control_period,
+                "control_period_label": _td_format_compact_value(control_period),
                 "suppression_voltage": suppression_voltage,
                 "suppression_voltage_label": _td_format_compact_value(suppression_voltage),
             }
@@ -6243,15 +6245,19 @@ def td_list_run_selection_views(db_path: Path, workbook_path: Path, *, project_d
         source_rows = list(observations_by_condition.get(run_name) or [])
         member_sequences: list[str] = []
         member_programs: list[str] = []
+        member_control_periods: list[str] = []
         member_suppression_voltages: list[str] = []
         detail_rows: list[str] = []
         seen_sequence_labels: set[str] = set()
         seen_program_labels: set[str] = set()
+        seen_control_period_labels: set[str] = set()
         seen_suppression_labels: set[str] = set()
         for obs in source_rows:
             program_title = str(obs.get("program_title") or "").strip()
             program_label = str(obs.get("program_label") or "").strip() or _td_display_program_title(program_title)
             source_run_name = str(obs.get("source_run_name") or "").strip() or run_name
+            control_period = obs.get("control_period")
+            control_period_label = str(obs.get("control_period_label") or "").strip()
             suppression_voltage = obs.get("suppression_voltage")
             suppression_voltage_label = str(obs.get("suppression_voltage_label") or "").strip()
             detail = source_run_name if not program_title else f"{program_title}: {source_run_name}"
@@ -6262,6 +6268,9 @@ def td_list_run_selection_views(db_path: Path, workbook_path: Path, *, project_d
             if program_label.casefold() not in seen_program_labels:
                 seen_program_labels.add(program_label.casefold())
                 member_programs.append(program_label)
+            if control_period_label and control_period_label.casefold() not in seen_control_period_labels:
+                seen_control_period_labels.add(control_period_label.casefold())
+                member_control_periods.append(control_period_label)
             if suppression_voltage_label and suppression_voltage_label.casefold() not in seen_suppression_labels:
                 seen_suppression_labels.add(suppression_voltage_label.casefold())
                 member_suppression_voltages.append(suppression_voltage_label)
@@ -6278,6 +6287,8 @@ def td_list_run_selection_views(db_path: Path, workbook_path: Path, *, project_d
                     "member_runs": [run_name],
                     "member_programs": [program_label],
                     "member_sequences": [source_run_name],
+                    "control_period": control_period,
+                    "member_control_periods": ([control_period_label] if control_period_label else []),
                     "suppression_voltage": suppression_voltage,
                     "member_suppression_voltages": ([suppression_voltage_label] if suppression_voltage_label else []),
                     "details_text": (
@@ -6300,6 +6311,8 @@ def td_list_run_selection_views(db_path: Path, workbook_path: Path, *, project_d
                     "member_runs": [run_name],
                     "member_programs": [_td_display_program_title("")],
                     "member_sequences": [run_name],
+                    "control_period": None,
+                    "member_control_periods": [],
                     "suppression_voltage": None,
                     "member_suppression_voltages": [],
                     "details_text": f"Run Condition: {run_display_name}",
@@ -6307,6 +6320,7 @@ def td_list_run_selection_views(db_path: Path, workbook_path: Path, *, project_d
             )
             member_sequences = [run_name]
             member_programs = [_td_display_program_title("")]
+            member_control_periods = []
             member_suppression_voltages = []
             detail_rows = [run_name]
         condition_items.append(
@@ -6319,6 +6333,8 @@ def td_list_run_selection_views(db_path: Path, workbook_path: Path, *, project_d
                 "member_runs": [run_name],
                 "member_programs": list(member_programs or [_td_display_program_title("")]),
                 "member_sequences": member_sequences,
+                "control_period": (member_control_periods[0] if len(member_control_periods) == 1 else None),
+                "member_control_periods": list(member_control_periods),
                 "suppression_voltage": (member_suppression_voltages[0] if len(member_suppression_voltages) == 1 else None),
                 "member_suppression_voltages": list(member_suppression_voltages),
                 "details_text": "Source Sequences: " + ", ".join(detail_rows),
@@ -10864,6 +10880,7 @@ def td_read_observation_filter_rows_from_cache(db_path: Path) -> list[dict]:
                 o.serial,
                 COALESCE(o.program_title, ''),
                 COALESCE(o.source_run_name, ''),
+                o.control_period,
                 o.suppression_voltage,
                 COALESCE(m.document_type, ''),
                 COALESCE(m.metadata_rel, ''),
@@ -10876,7 +10893,7 @@ def td_read_observation_filter_rows_from_cache(db_path: Path) -> list[dict]:
             """
         ).fetchall()
     out: list[dict] = []
-    for observation_id, serial, program_title, source_run_name, suppression_voltage, document_type, metadata_rel, artifacts_rel, excel_sqlite_rel in rows:
+    for observation_id, serial, program_title, source_run_name, control_period, suppression_voltage, document_type, metadata_rel, artifacts_rel, excel_sqlite_rel in rows:
         sn = str(serial or "").strip()
         obs_id = str(observation_id or "").strip()
         if not sn or not obs_id:
@@ -10888,6 +10905,7 @@ def td_read_observation_filter_rows_from_cache(db_path: Path) -> list[dict]:
                 "serial_number": sn,
                 "program_title": str(program_title or "").strip(),
                 "source_run_name": str(source_run_name or "").strip(),
+                "control_period": control_period,
                 "suppression_voltage": suppression_voltage,
                 "document_type": str(document_type or "").strip(),
                 "metadata_rel": str(metadata_rel or "").strip(),
@@ -16014,6 +16032,7 @@ def td_load_curves(
     *,
     program_title: str | None = None,
     source_run_name: str | None = None,
+    control_period_filter: object = None,
 ) -> list[dict]:
     run = str(run_name or "").strip()
     y = str(y_name or "").strip()
@@ -16050,6 +16069,7 @@ def td_load_curves(
                 c.serial,
                 COALESCE(c.program_title, ''),
                 COALESCE(c.source_run_name, ''),
+                o.control_period,
                 o.suppression_voltage,
                 c.x_json,
                 c.y_json
@@ -16070,12 +16090,22 @@ def td_load_curves(
         if src_run:
             curve_sql.append(" AND lower(COALESCE(source_run_name, '')) = lower(?)")
             curve_params.append(src_run)
+        if control_period_filter not in (None, ""):
+            cp_filter_num = _to_support_number(control_period_filter)
+            if cp_filter_num is not None:
+                curve_sql.append(" AND ABS(COALESCE(o.control_period, 0) - ?) <= 1e-9")
+                curve_params.append(cp_filter_num)
+            else:
+                curve_sql.append(
+                    " AND lower(TRIM(CAST(o.control_period AS TEXT))) = lower(TRIM(CAST(? AS TEXT)))"
+                )
+                curve_params.append(str(control_period_filter))
         curve_sql.append(" ORDER BY c.serial, c.observation_id")
         try:
             rows = conn.execute("".join(curve_sql), tuple(curve_params)).fetchall()
         except sqlite3.OperationalError:
             legacy_sql = [
-                f"SELECT '' AS observation_id, serial, '' AS program_title, '' AS source_run_name, NULL AS suppression_voltage, x_json, y_json FROM {_quote_ident(table_name)} WHERE 1=1"
+                f"SELECT '' AS observation_id, serial, '' AS program_title, '' AS source_run_name, NULL AS control_period, NULL AS suppression_voltage, x_json, y_json FROM {_quote_ident(table_name)} WHERE 1=1"
             ]
             legacy_params: list[object] = []
             if want:
@@ -16085,7 +16115,7 @@ def td_load_curves(
             legacy_sql.append(" ORDER BY serial")
             rows = conn.execute("".join(legacy_sql), tuple(legacy_params)).fetchall()
     out: list[dict] = []
-    for observation_id, sn, program_title, source_run_name, suppression_voltage, xj, yj in rows:
+    for observation_id, sn, program_title, source_run_name, control_period, suppression_voltage, xj, yj in rows:
         try:
             xs = json.loads(xj or "[]")
             ys = json.loads(yj or "[]")
@@ -16100,6 +16130,7 @@ def td_load_curves(
                 "serial": str(sn or "").strip(),
                 "program_title": str(program_title or "").strip(),
                 "source_run_name": str(source_run_name or "").strip(),
+                "control_period": control_period,
                 "suppression_voltage": suppression_voltage,
                 "x": xs,
                 "y": ys,
