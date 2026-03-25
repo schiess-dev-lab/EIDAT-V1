@@ -3200,10 +3200,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._zone_zoom_rect = None
         self._perf_plotters: list[dict] = []
         self._cache_worker: ProjectTaskWorker | None = None
+        self._export_worker: ProjectTaskWorker | None = None
         self._cache_progress_visible = False
         self._cache_progress_heading = "Test Data Cache"
         self._cache_progress_status = "Preparing cache"
         self._cache_progress_detail = ""
+        self._export_progress_visible = False
         self._cache_progress_timer = QtCore.QTimer(self)
         self._cache_progress_timer.setSingleShot(True)
         self._cache_progress_timer.timeout.connect(self._show_cache_progress_dialog)
@@ -10205,7 +10207,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         return False
 
     def _update_perf_export_button_state(self) -> None:
-        enabled = self._perf_has_exportable_models()
+        export_busy = bool(getattr(self, "_export_worker", None) and self._export_worker.isRunning())
+        enabled = self._perf_has_exportable_models() and not export_busy
         for widget_name in ("btn_perf_export_equations", "btn_perf_save_equation"):
             if hasattr(self, widget_name):
                 try:
@@ -10214,7 +10217,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     pass
         if hasattr(self, "btn_perf_saved_equations"):
             try:
-                self.btn_perf_saved_equations.setEnabled(bool(getattr(self, "_project_dir", None)))
+                self.btn_perf_saved_equations.setEnabled(bool(getattr(self, "_project_dir", None)) and not export_busy)
             except Exception:
                 pass
 
@@ -10306,6 +10309,147 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         else:
             subprocess.Popen(["xdg-open", resolved])
 
+    def _handle_perf_excel_export_success(self, payload: object, *, heading: str) -> str:
+        exported_path = Path(payload).expanduser() if isinstance(payload, (str, Path)) else None
+        if exported_path is None:
+            raise RuntimeError(f"{heading} returned an invalid output path.")
+        self._open_spreadsheet_path(exported_path)
+        return f"{heading} complete: {exported_path.name}"
+
+    def _start_perf_export_task(
+        self,
+        *,
+        heading: str,
+        status_text: str,
+        task_factory,
+        on_success,
+    ) -> None:
+        if self._cache_worker is not None and self._cache_worker.isRunning():
+            QtWidgets.QMessageBox.information(self, heading, "Wait for the cache task to finish first.")
+            return
+        if self._export_worker is not None and self._export_worker.isRunning():
+            QtWidgets.QMessageBox.information(self, heading, "An Excel export is already running.")
+            return
+
+        self._update_perf_export_button_state()
+        self._export_progress_visible = False
+        try:
+            self._report_progress.lbl_heading.setText(heading)
+            self._report_progress.begin(status_text)
+            self._report_progress.detail_label.setText("")
+            self._export_progress_visible = True
+        except Exception:
+            self._export_progress_visible = False
+
+        self._export_worker = ProjectTaskWorker(task_factory, parent=self)
+        self._update_perf_export_button_state()
+        self._export_worker.progress.connect(self._on_perf_export_task_progress)
+        self._export_worker.completed.connect(lambda payload: self._on_perf_export_task_done(payload, on_success, heading))
+        self._export_worker.failed.connect(lambda message: self._on_perf_export_task_error(message, heading))
+        self._export_worker.start()
+
+    def _on_perf_export_task_progress(self, text: str) -> None:
+        msg = str(text or "").strip()
+        if not msg or not self._export_progress_visible:
+            return
+        try:
+            self._report_progress.detail_label.setText(msg)
+        except Exception:
+            pass
+
+    def _on_perf_export_task_done(self, payload: object, on_success, heading: str) -> None:
+        self._export_worker = None
+        self._update_perf_export_button_state()
+        try:
+            msg = on_success(payload)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, heading, str(exc))
+            if self._export_progress_visible:
+                try:
+                    self._report_progress.finish(f"{heading} failed: {exc}", success=False)
+                except Exception:
+                    pass
+                self._export_progress_visible = False
+            return
+        if self._export_progress_visible:
+            try:
+                self._report_progress.finish(msg or f"{heading} complete", success=True)
+            except Exception:
+                pass
+            self._export_progress_visible = False
+
+    def _on_perf_export_task_error(self, message: str, heading: str) -> None:
+        self._export_worker = None
+        self._update_perf_export_button_state()
+        msg = str(message or "").strip() or f"{heading} failed."
+        QtWidgets.QMessageBox.warning(self, heading, msg)
+        if self._export_progress_visible:
+            try:
+                self._report_progress.finish(f"{heading} failed: {msg}", success=False)
+            except Exception:
+                pass
+            self._export_progress_visible = False
+
+    def _start_perf_equation_excel_export(
+        self,
+        output_path: Path,
+        *,
+        plot_metadata: dict[str, object],
+        results_by_stat: dict[str, dict[str, object]],
+        run_specs: list[dict[str, object]],
+        control_period_filter: object = None,
+        run_type_filter: object = None,
+    ) -> None:
+        output = Path(output_path).expanduser()
+        project_dir = Path(getattr(self, "_project_dir", output.parent)).expanduser()
+
+        def _task(report):
+            return be.td_perf_export_equation_workbook(
+                self._db_path,
+                output,
+                plot_metadata=plot_metadata,
+                results_by_stat=results_by_stat,
+                run_specs=run_specs,
+                control_period_filter=control_period_filter,
+                run_type_filter=run_type_filter,
+                progress_cb=report,
+            )
+
+        self._start_perf_export_task(
+            heading="Export Equation to Excel",
+            status_text=f"Exporting equation workbook to {output.name}",
+            task_factory=_task,
+            on_success=lambda payload: self._handle_perf_excel_export_success(payload, heading="Export Equation to Excel"),
+        )
+
+    def _start_saved_perf_equations_excel_export(
+        self,
+        output_path: Path,
+        *,
+        entries: list[dict],
+    ) -> None:
+        output = Path(output_path).expanduser()
+        project_dir = Path(getattr(self, "_project_dir", output.parent)).expanduser()
+        entry_count = len(entries)
+
+        def _task(report):
+            return be.td_perf_export_saved_equations_workbook(
+                self._db_path,
+                output,
+                entries=entries,
+                progress_cb=report,
+            )
+
+        self._start_perf_export_task(
+            heading="Export Saved Performance Equations to Excel",
+            status_text=f"Exporting {entry_count} saved equation(s) to {output.name}",
+            task_factory=_task,
+            on_success=lambda payload: self._handle_perf_excel_export_success(
+                payload,
+                heading="Export Saved Performance Equations to Excel",
+            ),
+        )
+
     def _export_perf_equations_to_excel(self) -> None:
         if not self._perf_has_exportable_models():
             QtWidgets.QMessageBox.information(self, "Performance", "No exportable master equations are available.")
@@ -10372,8 +10516,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             plot_metadata["asset_type"] = str(asset_metadata.get("primary_asset_type") or "").strip()
             plot_metadata["asset_specific_type"] = str(asset_metadata.get("primary_asset_specific_type") or "").strip()
         try:
-            exported = be.td_perf_export_equation_workbook(
-                self._db_path,
+            self._start_perf_equation_excel_export(
                 Path(out_path),
                 plot_metadata=plot_metadata,
                 results_by_stat=results,
@@ -10381,7 +10524,6 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 control_period_filter=control_period_filter,
                 run_type_filter=run_type_mode,
             )
-            self._open_spreadsheet_path(Path(exported))
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "Export Equation to Excel", str(exc))
 
@@ -10663,8 +10805,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             if not out_path:
                 return
             try:
-                exported = be.td_perf_export_saved_equations_workbook(self._db_path, Path(out_path), entries=entries)
-                self._open_spreadsheet_path(Path(exported))
+                self._start_saved_perf_equations_excel_export(Path(out_path), entries=entries)
             except Exception as exc:
                 QtWidgets.QMessageBox.warning(dlg, "Saved Performance Equations", str(exc))
 
@@ -12278,6 +12419,190 @@ class ProjectEnvDialog(QtWidgets.QDialog):
             self._load()
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "Delete Overrides", str(exc))
+
+
+class MetadataBatchEditorDialog(QtWidgets.QDialog):
+    FIELD_DEFS = [
+        ("Program", "program_title"),
+        ("Asset Type", "asset_type"),
+        ("Asset Specific Type", "asset_specific_type"),
+        ("Vendor", "vendor"),
+        ("Part Number", "part_number"),
+        ("Revision", "revision"),
+        ("Test Date", "test_date"),
+        ("Report Date", "report_date"),
+        ("Acceptance Test Plan", "acceptance_test_plan_number"),
+        ("Document Type", "document_type"),
+        ("Document Acronym", "document_type_acronym"),
+    ]
+
+    def __init__(self, rows: list[dict], *, choices: dict[str, list[str]] | None = None, parent=None):
+        super().__init__(parent)
+        self._rows = [dict(row) for row in (rows or []) if isinstance(row, dict)]
+        self._choices = dict(choices or {})
+        self._widgets: dict[str, QtWidgets.QComboBox] = {}
+        self._dirty_fields: set[str] = set()
+        self._loading = False
+
+        self.setWindowTitle("Edit Metadata")
+        self.resize(760, 620)
+
+        root = QtWidgets.QVBoxLayout(self)
+        root.setContentsMargins(14, 14, 14, 14)
+        root.setSpacing(10)
+
+        title = QtWidgets.QLabel("Bulk-edit metadata for the selected files.")
+        title.setStyleSheet("font-size: 15px; font-weight: 700; color: #0f172a;")
+        root.addWidget(title)
+
+        serials = [str(row.get("serial_number") or "").strip() for row in self._rows if str(row.get("serial_number") or "").strip()]
+        serial_preview = ", ".join(serials[:8])
+        if len(serials) > 8:
+            serial_preview += f" ... (+{len(serials) - 8})"
+        summary = QtWidgets.QLabel(
+            f"Selected files: {len(self._rows)}"
+            + (f"\nSerials: {serial_preview}" if serial_preview else "")
+            + "\nLeave a field unchanged to keep existing values. Enter a value to apply it to every selected file."
+        )
+        summary.setWordWrap(True)
+        summary.setStyleSheet("font-size: 11px; color: #475569;")
+        root.addWidget(summary)
+
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        body = QtWidgets.QWidget()
+        form = QtWidgets.QFormLayout(body)
+        form.setLabelAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
+        form.setFormAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
+        form.setSpacing(10)
+
+        self._loading = True
+        try:
+            for label, key in self.FIELD_DEFS:
+                combo = QtWidgets.QComboBox()
+                combo.setEditable(True)
+                combo.setInsertPolicy(QtWidgets.QComboBox.InsertPolicy.NoInsert)
+                combo.setMinimumWidth(320)
+                combo.setStyleSheet(
+                    """
+                    QComboBox {
+                        padding: 6px 8px;
+                        border-radius: 6px;
+                        background: #ffffff;
+                        color: #1f2937;
+                        border: 1px solid #d1d5db;
+                        font-size: 12px;
+                    }
+                    QComboBox::drop-down { border: none; }
+                    QComboBox QAbstractItemView {
+                        background: #ffffff;
+                        color: #1f2937;
+                        selection-background-color: #dbeafe;
+                        selection-color: #1f2937;
+                        border: 1px solid #d1d5db;
+                    }
+                    QLineEdit {
+                        color: #1f2937;
+                    }
+                    """
+                )
+                values = [str(v).strip() for v in (self._choices.get(key) or []) if str(v).strip()]
+                if values:
+                    combo.addItems(values)
+                common = self._shared_value(key)
+                if common:
+                    combo.setCurrentText(common)
+                try:
+                    le = combo.lineEdit()
+                    if le is not None:
+                        if common:
+                            le.setPlaceholderText("")
+                        else:
+                            le.setPlaceholderText("(mixed; enter value to override)")
+                except Exception:
+                    pass
+                combo.currentTextChanged.connect(lambda _text, field=key: self._mark_dirty(field))
+                self._widgets[key] = combo
+                form.addRow(label + ":", combo)
+        finally:
+            self._loading = False
+
+        scroll.setWidget(body)
+        root.addWidget(scroll, 1)
+
+        buttons = QtWidgets.QHBoxLayout()
+        buttons.addStretch(1)
+        self.btn_apply = QtWidgets.QPushButton("Apply")
+        self.btn_cancel = QtWidgets.QPushButton("Cancel")
+        for btn in (self.btn_apply, self.btn_cancel):
+            btn.setStyleSheet(
+                """
+                QPushButton {
+                    padding: 8px 12px;
+                    border-radius: 8px;
+                    background: #ffffff;
+                    color: #374151;
+                    border: 1px solid #d1d5db;
+                    font-size: 12px;
+                    font-weight: 600;
+                }
+                QPushButton:hover { background: #f9fafb; }
+                """
+            )
+        self.btn_apply.setStyleSheet(
+            """
+            QPushButton {
+                padding: 8px 12px;
+                border-radius: 8px;
+                background: #0f766e;
+                color: #ffffff;
+                border: 1px solid #0f766e;
+                font-size: 12px;
+                font-weight: 700;
+            }
+            QPushButton:hover { background: #0d9488; }
+            """
+        )
+        self.btn_apply.clicked.connect(self.accept)
+        self.btn_cancel.clicked.connect(self.reject)
+        buttons.addWidget(self.btn_apply)
+        buttons.addWidget(self.btn_cancel)
+        root.addLayout(buttons)
+
+        _fit_widget_to_screen(self, margin=24)
+
+    def _shared_value(self, key: str) -> str:
+        seen: set[str] = set()
+        value = ""
+        for row in self._rows:
+            current = str(row.get(key) or "").strip()
+            if not current:
+                current = ""
+            seen.add(current)
+            value = current
+            if len(seen) > 1:
+                return ""
+        return value
+
+    def _mark_dirty(self, field: str) -> None:
+        if self._loading:
+            return
+        self._dirty_fields.add(str(field or "").strip())
+
+    def field_updates(self) -> dict[str, str]:
+        updates: dict[str, str] = {}
+        for _label, key in self.FIELD_DEFS:
+            if key not in self._dirty_fields:
+                continue
+            widget = self._widgets.get(key)
+            if widget is None:
+                continue
+            value = str(widget.currentText() or "").strip()
+            if not value:
+                continue
+            updates[key] = value
+        return updates
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -13980,6 +14305,8 @@ class MainWindow(QtWidgets.QMainWindow):
             ("Program", "program_title"),
             ("Asset", "asset_type"),
             ("Asset Specific", "asset_specific_type"),
+            ("Metadata Source", "metadata_source"),
+            ("Manual Override Fields", "manual_override_fields"),
             ("Serial", "serial_number"),
             ("Part #", "part_number"),
             ("Revision", "revision"),
@@ -13989,6 +14316,8 @@ class MainWindow(QtWidgets.QMainWindow):
             ("ATP #", "acceptance_test_plan_number"),
             ("Report Date", "report_date"),
             ("Test Date", "test_date"),
+            ("Manual Override Updated", "manual_override_updated_at"),
+            ("Applied Rule", "applied_asset_specific_type_rule"),
             ("Processed", "_processed"),
             ("Needs Processing", "needs_processing"),
             ("Certification", "_certification"),
@@ -14069,6 +14398,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_files_open_artifacts = QtWidgets.QPushButton("Open Artifacts")
         self.btn_files_open_combined = QtWidgets.QPushButton("Open combined.txt")
         self.btn_files_show_explorer = QtWidgets.QPushButton("Show in Explorer")
+        self.btn_files_edit_metadata = QtWidgets.QPushButton("Edit Metadata")
         self.btn_files_update_metadata = QtWidgets.QPushButton("Update Metadata")
         self.btn_files_certify_all = QtWidgets.QPushButton("Certify All")
 
@@ -14076,6 +14406,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         for b in (self.btn_files_open_pdf, self.btn_files_open_metadata,
                   self.btn_files_open_artifacts, self.btn_files_open_combined, self.btn_files_show_explorer,
+                  self.btn_files_edit_metadata,
                   self.btn_files_update_metadata, self.btn_files_certify_all):
             b.setStyleSheet("""
                 QPushButton {
@@ -14095,6 +14426,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_files_open_artifacts.clicked.connect(self._act_files_open_artifacts)
         self.btn_files_open_combined.clicked.connect(self._act_files_open_combined)
         self.btn_files_show_explorer.clicked.connect(self._act_files_show_explorer)
+        self.btn_files_edit_metadata.clicked.connect(self._act_files_edit_metadata)
         self.btn_files_update_metadata.clicked.connect(self._act_files_update_metadata)
         self.btn_files_certify_all.clicked.connect(self._act_files_certify_all)
 
@@ -14103,6 +14435,7 @@ class MainWindow(QtWidgets.QMainWindow):
         actions.addWidget(self.btn_files_open_artifacts)
         actions.addWidget(self.btn_files_open_combined)
         actions.addWidget(self.btn_files_show_explorer)
+        actions.addWidget(self.btn_files_edit_metadata)
         actions.addWidget(self.btn_files_update_metadata)
         actions.addWidget(self.btn_files_certify_all)
         r.addLayout(actions)
@@ -14285,12 +14618,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lbl_product_center_serials = QtWidgets.QLabel("")
         self.lbl_product_center_serials.setWordWrap(True)
         self.lbl_product_center_serials.setStyleSheet("font-size: 12px; color: #334155;")
+        self.lbl_product_center_image_debug = QtWidgets.QLabel("")
+        self.lbl_product_center_image_debug.setWordWrap(True)
+        self.lbl_product_center_image_debug.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.lbl_product_center_image_debug.setStyleSheet(
+            "font-size: 11px; color: #475569; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 8px;"
+        )
         summary_col.addWidget(self.lbl_product_center_title)
         summary_col.addWidget(self.lbl_product_center_subtitle)
         summary_col.addWidget(self.lbl_product_center_stats)
         summary_col.addWidget(self.lbl_product_center_parts)
         summary_col.addWidget(self.lbl_product_center_atps)
         summary_col.addWidget(self.lbl_product_center_serials)
+        summary_col.addWidget(self.lbl_product_center_image_debug)
         summary_col.addStretch(1)
         hero_row.addLayout(summary_col, 1)
         body.addLayout(hero_row)
@@ -14783,24 +15123,61 @@ class MainWindow(QtWidgets.QMainWindow):
         painter.end()
         return pix
 
-    def _product_center_pixmap(self, product: dict, *, width: int, height: int) -> QtGui.QPixmap:
+    def _product_center_image_status_text(self, product: dict, *, image_path: str = "", decode_ok: bool = False) -> str:
+        asset_specific = str(product.get("asset_specific_type") or product.get("display_name") or "").strip()
+        try:
+            details = be.product_center_image_lookup_details(asset_specific)
+        except Exception:
+            details = {
+                "asset_specific_type": asset_specific,
+                "search_dir": "",
+                "expected_files": [],
+                "resolved_path": str(image_path or "").strip(),
+                "resolved_exists": bool(image_path),
+            }
+        expected = ", ".join(str(x or "").strip() for x in (details.get("expected_files") or []) if str(x or "").strip())
+        resolved_path = str(image_path or details.get("resolved_path") or "").strip()
+        search_dir = str(details.get("search_dir") or "").strip()
+        if resolved_path and decode_ok:
+            status = f"Image loaded from: {resolved_path}"
+        elif resolved_path:
+            status = f"Image file found but Qt could not decode it: {resolved_path}"
+        else:
+            status = "No matching image file found."
+        lines = [
+            f"Asset Specific Type: {asset_specific or '(blank)'}",
+            status,
+        ]
+        if expected:
+            lines.append(f"Expected names: {expected}")
+        if search_dir:
+            lines.append(f"Search folder: {search_dir}")
+        return "\n".join(lines)
+
+    def _product_center_pixmap(self, product: dict, *, width: int, height: int) -> tuple[QtGui.QPixmap, str]:
         image_path = str(product.get("image_path") or "").strip()
         if image_path:
             try:
                 pix = QtGui.QPixmap(image_path)
                 if not pix.isNull():
-                    return pix.scaled(
-                        width,
-                        height,
-                        QtCore.Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-                        QtCore.Qt.TransformationMode.SmoothTransformation,
+                    return (
+                        pix.scaled(
+                            width,
+                            height,
+                            QtCore.Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                            QtCore.Qt.TransformationMode.SmoothTransformation,
+                        ),
+                        self._product_center_image_status_text(product, image_path=image_path, decode_ok=True),
                     )
             except Exception:
                 pass
-        return self._product_center_placeholder_pixmap(
-            str(product.get("asset_specific_type") or product.get("display_name") or "No Image"),
-            width=width,
-            height=height,
+        return (
+            self._product_center_placeholder_pixmap(
+                str(product.get("asset_specific_type") or product.get("display_name") or "No Image"),
+                width=width,
+                height=height,
+            ),
+            self._product_center_image_status_text(product, image_path=image_path, decode_ok=False),
         )
 
     def _product_center_search_blob(self, product: dict) -> str:
@@ -14815,8 +15192,19 @@ class MainWindow(QtWidgets.QMainWindow):
         for doc in (product.get("documents") or []):
             if not isinstance(doc, dict):
                 continue
-            for key in ("document_type", "document_type_acronym", "serial_number", "part_number", "program_title", "metadata_rel"):
+            for key in (
+                "document_type",
+                "document_type_acronym",
+                "serial_number",
+                "part_number",
+                "program_title",
+                "metadata_rel",
+                "metadata_source",
+                "applied_asset_specific_type_rule",
+            ):
                 parts.append(str(doc.get(key) or ""))
+            for value in (doc.get("manual_override_fields") or []):
+                parts.append(str(value or ""))
         for project in (product.get("projects") or []):
             if not isinstance(project, dict):
                 continue
@@ -14833,12 +15221,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lbl_product_center_parts.setText("")
         self.lbl_product_center_atps.setText("")
         self.lbl_product_center_serials.setText("")
+        self.lbl_product_center_image_debug.setText("")
         self.lbl_product_center_doc_hint.setText("")
         self.lbl_product_center_project_hint.setText("")
         self.lbl_product_center_eq_hint.setText("")
-        self.lbl_product_center_hero.setPixmap(
-            self._product_center_placeholder_pixmap("Product Center", width=320, height=220)
-        )
+        pix, debug_text = self._product_center_pixmap({}, width=320, height=220)
+        self.lbl_product_center_hero.setPixmap(pix)
+        self.lbl_product_center_image_debug.setText(debug_text)
         self.tree_product_center_docs.clear()
         self.tbl_product_center_projects.setRowCount(0)
         self.tbl_product_center_equations.setRowCount(0)
@@ -14882,7 +15271,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"{int(counts.get('saved_performance_equations') or 0)} saved equations"
             )
             item = QtWidgets.QListWidgetItem(
-                QtGui.QIcon(self._product_center_pixmap(product, width=72, height=72)),
+                QtGui.QIcon(self._product_center_pixmap(product, width=72, height=72)[0]),
                 f"{str(product.get('display_name') or product.get('asset_specific_type') or '')}\n{subtitle}\n{summary}",
             )
             item.setData(QtCore.Qt.ItemDataRole.UserRole, dict(product))
@@ -14926,7 +15315,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lbl_product_center_serials.setText(
             "Serial Numbers: " + (", ".join(str(value) for value in (product.get("serial_numbers") or [])) or "None")
         )
-        self.lbl_product_center_hero.setPixmap(self._product_center_pixmap(product, width=320, height=220))
+        hero_pix, image_debug = self._product_center_pixmap(product, width=320, height=220)
+        self.lbl_product_center_hero.setPixmap(hero_pix)
+        self.lbl_product_center_image_debug.setText(image_debug)
         self._populate_product_center_documents(product)
         self._populate_product_center_projects(product)
         self._populate_product_center_equations(product)
@@ -16516,6 +16907,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "_filename",
             "program_title",
             "asset_type",
+            "metadata_source",
             "file_extension",
             "report_date",
             "test_date",
@@ -16706,6 +17098,75 @@ class MainWindow(QtWidgets.QMainWindow):
                 infos.append(info)
         return infos
 
+    def _metadata_editor_choices(self) -> dict[str, list[str]]:
+        try:
+            return dict(be._build_validation_lists(self._files_data or []))
+        except Exception:
+            return {}
+
+    def _selected_files_have_manual_override(self, infos: list[dict]) -> bool:
+        for info in infos or []:
+            if bool(info.get("has_manual_override")):
+                return True
+            source = str(info.get("metadata_source") or "").strip().lower()
+            if source in {"manual_override", "mixed"}:
+                return True
+            manual_fields = str(info.get("manual_override_fields") or "").strip()
+            if manual_fields:
+                return True
+        return False
+
+    def _act_files_edit_metadata(self) -> None:
+        infos = self._selected_files_info()
+        if not infos:
+            QtWidgets.QMessageBox.information(self, "Edit Metadata", "Select one or more files first.")
+            return
+        repo_raw = (self.ed_global_repo.text() or "").strip()
+        if not repo_raw:
+            QtWidgets.QMessageBox.warning(self, "Edit Metadata", "No global repository selected.")
+            return
+        rel_paths = [str(i.get("rel_path") or "").strip() for i in infos if str(i.get("rel_path") or "").strip()]
+        if not rel_paths:
+            QtWidgets.QMessageBox.warning(self, "Edit Metadata", "Selected rows are missing file paths.")
+            return
+
+        dlg = MetadataBatchEditorDialog(infos, choices=self._metadata_editor_choices(), parent=self)
+        if dlg.exec() != int(QtWidgets.QDialog.DialogCode.Accepted):
+            return
+        updates = dlg.field_updates()
+        if not updates:
+            QtWidgets.QMessageBox.information(self, "Edit Metadata", "No metadata fields were changed.")
+            return
+        repo = Path(repo_raw).expanduser()
+
+        def _on_success(payload: dict):
+            ok = int(payload.get("updated") or 0)
+            failed = int(payload.get("failed") or 0)
+            results = payload.get("results") or []
+            index_error = payload.get("index_error")
+            for r in results:
+                if not r.get("ok") and r.get("error"):
+                    self._append_log(f"[METADATA EDIT] FAILED: {r.get('rel_path')}: {r.get('error')}")
+            if index_error:
+                self._append_log(f"[METADATA EDIT] Index rebuild failed: {index_error}")
+            if failed > 0:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Edit Metadata",
+                    f"Updated {ok} file(s), but {failed} failed.\n\nSee Debug Console for details.",
+                )
+            else:
+                self._show_toast(f"Updated metadata for {ok} file(s).")
+            self._refresh_files_tab()
+            return f"Metadata edit complete - ok={ok}, failed={failed}"
+
+        self._start_manager_action(
+            heading="Edit Metadata",
+            status_text="Applying metadata edits",
+            task=lambda: be.edit_metadata_for_files(repo, rel_paths, updates),
+            on_success=_on_success,
+        )
+
     def _act_files_open_pdf(self) -> None:
         """Open the source file (PDF or Excel)."""
         info = self._selected_file_info()
@@ -16815,6 +17276,24 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "Update Metadata", "Selected rows are missing file paths.")
             return
         repo = Path(repo_raw).expanduser()
+        overwrite_manual_fields = False
+        if self._selected_files_have_manual_override(infos):
+            msg = QtWidgets.QMessageBox(self)
+            msg.setWindowTitle("Update Metadata")
+            msg.setIcon(QtWidgets.QMessageBox.Icon.Warning)
+            msg.setText("Some selected files contain manual metadata overrides.")
+            msg.setInformativeText(
+                "Choose whether metadata refresh is allowed to overwrite those manual fields."
+            )
+            overwrite_btn = msg.addButton("Overwrite", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+            preserve_btn = msg.addButton("Do Not Overwrite", QtWidgets.QMessageBox.ButtonRole.DestructiveRole)
+            cancel_btn = msg.addButton("Cancel", QtWidgets.QMessageBox.ButtonRole.RejectRole)
+            msg.setDefaultButton(preserve_btn)
+            msg.exec()
+            clicked = msg.clickedButton()
+            if clicked is cancel_btn:
+                return
+            overwrite_manual_fields = clicked is overwrite_btn
 
         def _on_success(payload: dict):
             ok = int(payload.get("updated") or 0)
@@ -16840,7 +17319,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._start_manager_action(
             heading="Update Metadata",
             status_text="Updating metadata",
-            task=lambda: be.refresh_metadata_only(repo, rel_paths),
+            task=lambda: be.refresh_metadata_only(repo, rel_paths, overwrite_manual_fields=overwrite_manual_fields),
             on_success=_on_success,
         )
 
@@ -16955,6 +17434,7 @@ class MainWindow(QtWidgets.QMainWindow):
         act_open_combined = menu.addAction("Open combined.txt")
         menu.addSeparator()
         act_show_explorer = menu.addAction("Show in Explorer")
+        act_edit_metadata = menu.addAction("Edit Metadata")
         act_update_metadata = menu.addAction("Update Metadata Only")
         menu.addSeparator()
         act_recertify = menu.addAction("Re-analyze Certification")
@@ -16964,6 +17444,7 @@ class MainWindow(QtWidgets.QMainWindow):
         act_open_artifacts.triggered.connect(self._act_files_open_artifacts)
         act_open_combined.triggered.connect(self._act_files_open_combined)
         act_show_explorer.triggered.connect(self._act_files_show_explorer)
+        act_edit_metadata.triggered.connect(self._act_files_edit_metadata)
         act_update_metadata.triggered.connect(self._act_files_update_metadata)
         act_recertify.triggered.connect(self._act_files_recertify)
 

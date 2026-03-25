@@ -47,6 +47,10 @@ CREATE TABLE IF NOT EXISTS documents (
   excel_sqlite_rel TEXT,
   tables_sqlite_rel TEXT,
   file_extension TEXT,
+  metadata_source TEXT,
+  manual_override_fields_json TEXT,
+  manual_override_updated_at TEXT,
+  applied_asset_specific_type_rule TEXT,
   title_norm TEXT,
   similarity_group TEXT,
   indexed_epoch_ns INTEGER NOT NULL,
@@ -378,6 +382,10 @@ def build_index(paths: SupportPaths, *, similarity: float = 0.86) -> IndexSummar
                 "excel_sqlite_rel": meta.get("excel_sqlite_rel"),
                 "tables_sqlite_rel": tables_sqlite_rel,
                 "file_extension": meta.get("file_extension"),
+                "metadata_source": meta.get("metadata_source"),
+                "manual_override_fields_json": json.dumps(meta.get("manual_override_fields") or [], ensure_ascii=True),
+                "manual_override_updated_at": meta.get("manual_override_updated_at"),
+                "applied_asset_specific_type_rule": meta.get("applied_asset_specific_type_rule"),
                 "title_norm": title_norm,
                 "similarity_group": "",
                 "certification_status": cert_info.get("certification_status"),
@@ -388,7 +396,8 @@ def build_index(paths: SupportPaths, *, similarity: float = 0.86) -> IndexSummar
     _group_docs(docs, similarity)
 
     now_ns = time.time_ns()
-    with _connect(index_db) as conn:
+    conn = _connect(index_db)
+    try:
         conn.executescript(SCHEMA_SQL)
         # Migration: add columns if they don't exist (for existing databases)
         migration_columns = [
@@ -407,6 +416,10 @@ def build_index(paths: SupportPaths, *, similarity: float = 0.86) -> IndexSummar
             ("excel_sqlite_rel", "TEXT"),
             ("tables_sqlite_rel", "TEXT"),
             ("file_extension", "TEXT"),
+            ("metadata_source", "TEXT"),
+            ("manual_override_fields_json", "TEXT"),
+            ("manual_override_updated_at", "TEXT"),
+            ("applied_asset_specific_type_rule", "TEXT"),
         ]
         for col_name, col_type in migration_columns:
             try:
@@ -423,9 +436,10 @@ def build_index(paths: SupportPaths, *, similarity: float = 0.86) -> IndexSummar
                   serial_number, part_number, revision, test_date, report_date, document_type,
                   document_type_acronym, document_type_status, document_type_source, document_type_reason,
                   document_type_evidence_json, document_type_review_required, vendor, acceptance_test_plan_number,
-                  excel_sqlite_rel, tables_sqlite_rel, file_extension, title_norm, similarity_group, indexed_epoch_ns,
+                  excel_sqlite_rel, tables_sqlite_rel, file_extension, metadata_source, manual_override_fields_json,
+                  manual_override_updated_at, applied_asset_specific_type_rule, title_norm, similarity_group, indexed_epoch_ns,
                   certification_status, certification_pass_rate
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     d["metadata_rel"],
@@ -450,6 +464,10 @@ def build_index(paths: SupportPaths, *, similarity: float = 0.86) -> IndexSummar
                     d.get("excel_sqlite_rel"),
                     d.get("tables_sqlite_rel"),
                     d.get("file_extension"),
+                    d.get("metadata_source"),
+                    d.get("manual_override_fields_json"),
+                    d.get("manual_override_updated_at"),
+                    d.get("applied_asset_specific_type_rule"),
                     d["title_norm"],
                     d["similarity_group"],
                     now_ns,
@@ -473,6 +491,11 @@ def build_index(paths: SupportPaths, *, similarity: float = 0.86) -> IndexSummar
                 (g["group_id"], g["title_norm"], g["member_count"]),
             )
         conn.commit()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
     return IndexSummary(
         index_db=index_db,

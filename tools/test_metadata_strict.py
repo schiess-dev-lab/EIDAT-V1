@@ -367,6 +367,97 @@ class TestStrictMetadataAllowlists(unittest.TestCase):
             meta = emd.canonicalize_metadata_for_file(p, existing_meta=None, extracted_meta={}, default_document_type="EIDP")
             self.assertEqual(meta.get("asset_type"), "Pump")
 
+    def test_asset_specific_type_rule_sets_asset_type_and_vendor(self):
+        with tempfile.TemporaryDirectory() as td:
+            data_root = Path(td)
+            _write_candidates(
+                data_root,
+                {
+                    "program_titles": ["Starlink"],
+                    "asset_types": ["Valve"],
+                    "asset_specific_types": ["Valve1"],
+                    "vendors": ["MOOG"],
+                    "asset_specific_type_rules": [
+                        {"asset_specific_type": "Valve1", "asset_type": "Valve", "vendor": "MOOG"}
+                    ],
+                },
+            )
+            _write_doc_type_strategies(data_root, _strategy_payload())
+            os.environ["EIDAT_DATA_ROOT"] = str(data_root)
+
+            p = Path(td) / "Starlink" / "SN4001_report.pdf"
+            meta = emd.canonicalize_metadata_for_file(
+                p,
+                existing_meta=None,
+                extracted_meta={"asset_specific_type": "Valve1"},
+                default_document_type="EIDP",
+            )
+            self.assertEqual(meta.get("asset_type"), "Valve")
+            self.assertEqual(meta.get("vendor"), "MOOG")
+            self.assertEqual(meta.get("metadata_source"), "heuristic")
+            self.assertEqual(meta.get("applied_asset_specific_type_rule"), "Valve1")
+
+    def test_manual_override_fields_survive_canonicalize_without_overwrite(self):
+        with tempfile.TemporaryDirectory() as td:
+            data_root = Path(td)
+            _write_candidates(
+                data_root,
+                {
+                    "program_titles": ["Starlink"],
+                    "asset_types": ["Valve"],
+                    "asset_specific_types": ["Valve1"],
+                    "vendors": ["MOOG", "ACME"],
+                },
+            )
+            _write_doc_type_strategies(data_root, _strategy_payload())
+            os.environ["EIDAT_DATA_ROOT"] = str(data_root)
+
+            p = Path(td) / "Starlink" / "SN4001_report.pdf"
+            meta = emd.canonicalize_metadata_for_file(
+                p,
+                existing_meta={
+                    "vendor": "MOOG",
+                    "manual_override_fields": ["vendor"],
+                    "manual_override_updated_at": "2026-03-24T00:00:00+00:00",
+                },
+                extracted_meta={"vendor": "ACME"},
+                default_document_type="EIDP",
+            )
+            self.assertEqual(meta.get("vendor"), "MOOG")
+            self.assertEqual(meta.get("manual_override_fields"), ["vendor"])
+            self.assertEqual(meta.get("metadata_source"), "mixed")
+
+    def test_canonicalize_overwrite_manual_fields_clears_locks(self):
+        with tempfile.TemporaryDirectory() as td:
+            data_root = Path(td)
+            _write_candidates(
+                data_root,
+                {
+                    "program_titles": ["Starlink"],
+                    "asset_types": ["Valve"],
+                    "asset_specific_types": ["Valve1"],
+                    "vendors": ["MOOG", "ACME"],
+                },
+            )
+            _write_doc_type_strategies(data_root, _strategy_payload())
+            os.environ["EIDAT_DATA_ROOT"] = str(data_root)
+
+            p = Path(td) / "Starlink" / "SN4001_report.pdf"
+            meta = emd.canonicalize_metadata_for_file(
+                p,
+                existing_meta={
+                    "vendor": "MOOG",
+                    "manual_override_fields": ["vendor"],
+                    "manual_override_updated_at": "2026-03-24T00:00:00+00:00",
+                },
+                extracted_meta={"vendor": "ACME"},
+                default_document_type="EIDP",
+                overwrite_manual_fields=True,
+            )
+            self.assertEqual(meta.get("vendor"), "ACME")
+            self.assertEqual(meta.get("manual_override_fields"), [])
+            self.assertEqual(meta.get("manual_override_updated_at"), "")
+
 
 if __name__ == "__main__":
     unittest.main()

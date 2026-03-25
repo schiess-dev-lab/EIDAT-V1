@@ -33,8 +33,10 @@
     "Bracket",
     "Structure"
   ],
-    "asset_specific_types": [
+  "asset_specific_types": [
     "Valve1"
+  ],
+  "asset_specific_type_rules": [
   ],
   "document_types": [
     {

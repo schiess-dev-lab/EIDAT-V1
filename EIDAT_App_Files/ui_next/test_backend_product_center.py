@@ -311,3 +311,12 @@ class TestBackendProductCenter(unittest.TestCase):
                 target.write_bytes(b"png")
                 resolved = backend.resolve_product_center_image("Pump Model")
                 self.assertEqual(resolved, target)
+
+    def test_product_center_image_lookup_details_reports_expected_names(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_root = Path(tmpdir) / "data_root"
+            with patch.object(backend, "DATA_ROOT", data_root):
+                details = backend.product_center_image_lookup_details("Pump Model")
+                self.assertIn("pump_model.png", details["expected_files"])
+                self.assertTrue(str(details["search_dir"]).endswith(str(Path("user_inputs") / "product_center" / "images")))
+                self.assertEqual(details["resolved_path"], "")

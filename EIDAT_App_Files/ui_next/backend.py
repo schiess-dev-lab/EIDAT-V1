@@ -582,7 +582,72 @@ def _merge_metadata(primary: Optional[Mapping[str, object]], fallback: Optional[
     return out
 
 
-def refresh_metadata_only(global_repo: Path, rel_paths: list[str]) -> Dict[str, object]:
+METADATA_EDITOR_FIELDS = (
+    "program_title",
+    "asset_type",
+    "asset_specific_type",
+    "vendor",
+    "part_number",
+    "revision",
+    "test_date",
+    "report_date",
+    "acceptance_test_plan_number",
+    "document_type",
+    "document_type_acronym",
+)
+
+
+def _sync_projects_for_metadata_rels(repo: Path, updated_metadata_rels: set[str]) -> tuple[list[dict], list[dict]]:
+    projects_synced: list[dict] = []
+    projects_sync_failed: list[dict] = []
+    if not updated_metadata_rels:
+        return projects_synced, projects_sync_failed
+    try:
+        projects = list_eidat_projects(repo)
+    except Exception:
+        projects = []
+    for pr in projects:
+        try:
+            raw_dir = str(pr.get("project_dir") or "").strip()
+            proj_dir = Path(raw_dir).expanduser()
+            if not proj_dir.is_absolute():
+                proj_dir = repo / proj_dir
+
+            selected = _project_selected_metadata_rels(proj_dir)
+            if not selected or not selected.intersection(updated_metadata_rels):
+                continue
+
+            raw_wb = str(pr.get("workbook") or "").strip()
+            wb_path = Path(raw_wb).expanduser()
+            if not wb_path.is_absolute():
+                wb_path = repo / wb_path
+
+            res = sync_project_workbook_metadata(repo, wb_path)
+            projects_synced.append(
+                {
+                    "name": pr.get("name"),
+                    "type": pr.get("type"),
+                    "workbook": str(wb_path),
+                    "result": res,
+                }
+            )
+        except Exception as exc:
+            projects_sync_failed.append(
+                {
+                    "name": pr.get("name"),
+                    "type": pr.get("type"),
+                    "error": str(exc),
+                }
+            )
+    return projects_synced, projects_sync_failed
+
+
+def refresh_metadata_only(
+    global_repo: Path,
+    rel_paths: list[str],
+    *,
+    overwrite_manual_fields: bool = False,
+) -> Dict[str, object]:
     """Refresh metadata JSONs from existing artifacts without re-OCR."""
     repo = Path(global_repo).expanduser()
     if not repo.exists():
@@ -643,6 +708,7 @@ def refresh_metadata_only(global_repo: Path, rel_paths: list[str]) -> Dict[str, 
                 existing_meta=existing_meta,
                 extracted_meta=extracted_meta,
                 default_document_type=default_doc_type,
+                overwrite_manual_fields=overwrite_manual_fields,
             )
             metadata_path = emd.write_metadata(Path(artifacts_dir), abs_path, clean_meta)
 
@@ -690,48 +756,7 @@ def refresh_metadata_only(global_repo: Path, rel_paths: list[str]) -> Dict[str, 
     except Exception as exc:
         index_error = str(exc)
 
-    projects_synced: list[dict] = []
-    projects_sync_failed: list[dict] = []
-    if updated_metadata_rels:
-        try:
-            projects = list_eidat_projects(repo)
-        except Exception:
-            projects = []
-        for pr in projects:
-            try:
-                raw_dir = str(pr.get("project_dir") or "").strip()
-                proj_dir = Path(raw_dir).expanduser()
-                if not proj_dir.is_absolute():
-                    proj_dir = repo / proj_dir
-
-                selected = _project_selected_metadata_rels(proj_dir)
-                if not selected:
-                    continue
-                if not (selected.intersection(updated_metadata_rels)):
-                    continue
-
-                raw_wb = str(pr.get("workbook") or "").strip()
-                wb_path = Path(raw_wb).expanduser()
-                if not wb_path.is_absolute():
-                    wb_path = repo / wb_path
-
-                res = sync_project_workbook_metadata(repo, wb_path)
-                projects_synced.append(
-                    {
-                        "name": pr.get("name"),
-                        "type": pr.get("type"),
-                        "workbook": str(wb_path),
-                        "result": res,
-                    }
-                )
-            except Exception as exc:
-                projects_sync_failed.append(
-                    {
-                        "name": pr.get("name"),
-                        "type": pr.get("type"),
-                        "error": str(exc),
-                    }
-                )
+    projects_synced, projects_sync_failed = _sync_projects_for_metadata_rels(repo, updated_metadata_rels)
 
     return {
         "updated": updated,
@@ -743,6 +768,130 @@ def refresh_metadata_only(global_repo: Path, rel_paths: list[str]) -> Dict[str, 
         "updated_metadata_rel": sorted(updated_metadata_rels),
         "projects_synced": projects_synced,
         "projects_sync_failed": projects_sync_failed,
+        "overwrite_manual_fields": bool(overwrite_manual_fields),
+    }
+
+
+def edit_metadata_for_files(
+    global_repo: Path,
+    rel_paths: list[str],
+    field_updates: Mapping[str, object],
+) -> Dict[str, object]:
+    repo = Path(global_repo).expanduser()
+    if not repo.exists():
+        raise RuntimeError(f"Global repo does not exist: {repo}")
+
+    emd = _load_eidat_metadata_module()
+    updates = {
+        str(key or "").strip(): str(value or "").strip()
+        for key, value in dict(field_updates or {}).items()
+        if str(key or "").strip() in METADATA_EDITOR_FIELDS and str(value or "").strip()
+    }
+    if not updates:
+        raise RuntimeError("No metadata fields were changed.")
+
+    results: list[dict] = []
+    updated = 0
+    failed = 0
+    updated_metadata_rels: set[str] = set()
+
+    clean_rel_paths = [str(p).strip() for p in (rel_paths or []) if str(p).strip()]
+    for rel_path in clean_rel_paths:
+        try:
+            abs_path = (repo / rel_path).expanduser()
+            if not abs_path.exists():
+                raise FileNotFoundError(f"Missing file: {abs_path}")
+            artifacts_dir = get_file_artifacts_path(repo, rel_path)
+            if not artifacts_dir:
+                raise FileNotFoundError(f"Artifacts folder not found for: {rel_path}")
+            artifacts_dir = Path(artifacts_dir)
+            artifacts_dir.mkdir(parents=True, exist_ok=True)
+
+            existing_meta = None
+            try:
+                existing_meta = emd.load_metadata_from_artifacts(artifacts_dir, abs_path)
+            except Exception:
+                existing_meta = None
+            if not existing_meta:
+                try:
+                    existing_meta = _load_metadata_from_artifacts_dir(artifacts_dir)
+                except Exception:
+                    existing_meta = None
+
+            if not existing_meta:
+                extracted_meta = None
+                if abs_path.suffix.lower() in EXCEL_EXTENSIONS:
+                    try:
+                        extracted_meta = emd.extract_metadata_from_excel(abs_path)
+                    except Exception:
+                        extracted_meta = None
+                else:
+                    combined_path = artifacts_dir / "combined.txt"
+                    combined_text = ""
+                    if combined_path.exists():
+                        try:
+                            combined_text = combined_path.read_text(encoding="utf-8", errors="ignore")
+                        except Exception:
+                            combined_text = ""
+                    if combined_text.strip():
+                        try:
+                            extracted_meta = emd.extract_metadata_from_text(combined_text, pdf_path=abs_path)
+                        except Exception:
+                            extracted_meta = None
+                existing_meta = emd.canonicalize_metadata_for_file(
+                    abs_path,
+                    existing_meta=None,
+                    extracted_meta=extracted_meta,
+                    default_document_type="Unknown",
+                )
+
+            clean_meta = emd.apply_manual_metadata_overrides(existing_meta, updates)
+            metadata_path = emd.write_metadata(artifacts_dir, abs_path, clean_meta)
+            if metadata_path is None:
+                raise RuntimeError(f"Failed to write metadata for: {rel_path}")
+            try:
+                rel = str(Path(metadata_path).resolve().relative_to(eidat_support_dir(repo).resolve()))
+            except Exception:
+                rel = ""
+            if rel:
+                updated_metadata_rels.add(rel)
+            results.append(
+                {
+                    "rel_path": rel_path,
+                    "ok": True,
+                    "metadata_path": str(metadata_path),
+                }
+            )
+            updated += 1
+        except Exception as exc:
+            results.append(
+                {
+                    "rel_path": rel_path,
+                    "ok": False,
+                    "error": str(exc),
+                }
+            )
+            failed += 1
+
+    index_result = None
+    index_error = None
+    try:
+        index_result = eidat_manager_index(repo)
+    except Exception as exc:
+        index_error = str(exc)
+
+    projects_synced, projects_sync_failed = _sync_projects_for_metadata_rels(repo, updated_metadata_rels)
+
+    return {
+        "updated": updated,
+        "failed": failed,
+        "results": results,
+        "index": index_result,
+        "index_error": index_error,
+        "updated_metadata_rel": sorted(updated_metadata_rels),
+        "projects_synced": projects_synced,
+        "projects_sync_failed": projects_sync_failed,
+        "field_updates": dict(updates),
     }
 
 
@@ -2982,10 +3131,30 @@ def _ensure_test_data_impl_tables(conn: sqlite3.Connection) -> None:
             metadata_rel TEXT,
             artifacts_rel TEXT,
             excel_sqlite_rel TEXT,
-            metadata_mtime_ns INTEGER
+            metadata_mtime_ns INTEGER,
+            metadata_source TEXT,
+            manual_override_fields_json TEXT,
+            manual_override_updated_at TEXT,
+            applied_asset_specific_type_rule TEXT
         )
         """
     )
+    try:
+        conn.execute("ALTER TABLE td_source_metadata ADD COLUMN metadata_source TEXT")
+    except Exception:
+        pass
+    try:
+        conn.execute("ALTER TABLE td_source_metadata ADD COLUMN manual_override_fields_json TEXT")
+    except Exception:
+        pass
+    try:
+        conn.execute("ALTER TABLE td_source_metadata ADD COLUMN manual_override_updated_at TEXT")
+    except Exception:
+        pass
+    try:
+        conn.execute("ALTER TABLE td_source_metadata ADD COLUMN applied_asset_specific_type_rule TEXT")
+    except Exception:
+        pass
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS td_runs (
@@ -3460,6 +3629,9 @@ TD_SOURCE_METADATA_FIELDS = (
     "document_type",
     "document_type_acronym",
     "similarity_group",
+    "metadata_source",
+    "manual_override_updated_at",
+    "applied_asset_specific_type_rule",
 )
 
 
@@ -3602,6 +3774,10 @@ def _load_td_source_metadata(workbook_path: Path, source_row: Mapping[str, objec
         "artifacts_rel": artifacts_rel,
         "excel_sqlite_rel": excel_sqlite_rel,
         "metadata_mtime_ns": int(metadata_mtime_ns),
+        "manual_override_fields_json": json.dumps(
+            [str(v).strip() for v in (meta_from_file.get("manual_override_fields") or []) if str(v).strip()],
+            ensure_ascii=True,
+        ),
     }
     for key in TD_SOURCE_METADATA_FIELDS:
         out[key] = str(merged.get(key) or "").strip()
@@ -9742,8 +9918,12 @@ def rebuild_test_data_project_cache(
                 metadata_rel,
                 artifacts_rel,
                 excel_sqlite_rel,
-                metadata_mtime_ns
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                metadata_mtime_ns,
+                metadata_source,
+                manual_override_fields_json,
+                manual_override_updated_at,
+                applied_asset_specific_type_rule
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 sn,
@@ -9763,6 +9943,10 @@ def rebuild_test_data_project_cache(
                 str(source_meta.get("artifacts_rel") or "").strip(),
                 str(source_meta.get("excel_sqlite_rel") or "").strip(),
                 int(source_meta.get("metadata_mtime_ns") or 0),
+                str(source_meta.get("metadata_source") or "").strip(),
+                str(source_meta.get("manual_override_fields_json") or "").strip(),
+                str(source_meta.get("manual_override_updated_at") or "").strip(),
+                str(source_meta.get("applied_asset_specific_type_rule") or "").strip(),
             ),
         )
         impl_conn.execute(
@@ -13682,6 +13866,162 @@ def td_perf_collect_equation_export_rows(
     return out
 
 
+def td_perf_collect_condition_export_rows(
+    db_path: Path,
+    *,
+    run_specs: Sequence[Mapping[str, object]],
+    control_period_filter: object = None,
+    run_type_filter: object = None,
+) -> list[dict[str, object]]:
+    path = Path(db_path).expanduser()
+    if not path.exists():
+        return []
+
+    out: list[dict[str, object]] = []
+    for spec in run_specs or []:
+        run_name = str((spec or {}).get("run_name") or "").strip()
+        if not run_name:
+            continue
+        display_name = str((spec or {}).get("display_name") or run_name).strip()
+        input1_column = str((spec or {}).get("input1_column") or "").strip()
+        input2_column = str((spec or {}).get("input2_column") or "").strip()
+        output_column = str((spec or {}).get("output_column") or "").strip()
+        if not input1_column or not output_column:
+            continue
+
+        x1_rows = _td_perf_export_series_for_stat(
+            path,
+            run_name,
+            input1_column,
+            "mean",
+            control_period_filter=control_period_filter,
+            run_type_filter=run_type_filter,
+        )
+        y_rows = _td_perf_export_series_for_stat(
+            path,
+            run_name,
+            output_column,
+            "mean",
+            control_period_filter=control_period_filter,
+            run_type_filter=run_type_filter,
+        )
+        if not x1_rows or not y_rows:
+            continue
+
+        x1_map = {
+            str(row.get("observation_id") or "").strip(): dict(row)
+            for row in x1_rows
+            if isinstance(row, dict) and str(row.get("observation_id") or "").strip()
+        }
+        y_map = {
+            str(row.get("observation_id") or "").strip(): dict(row)
+            for row in y_rows
+            if isinstance(row, dict) and str(row.get("observation_id") or "").strip()
+        }
+        x2_map: dict[str, dict[str, object]] = {}
+        observation_ids = set(x1_map.keys()) & set(y_map.keys())
+        if input2_column:
+            x2_rows = _td_perf_export_series_for_stat(
+                path,
+                run_name,
+                input2_column,
+                "mean",
+                control_period_filter=control_period_filter,
+                run_type_filter=run_type_filter,
+            )
+            x2_map = {
+                str(row.get("observation_id") or "").strip(): dict(row)
+                for row in x2_rows
+                if isinstance(row, dict) and str(row.get("observation_id") or "").strip()
+            }
+            observation_ids &= set(x2_map.keys())
+        if not observation_ids:
+            continue
+
+        x1_values: list[float] = []
+        x2_values: list[float] = []
+        y_values: list[float] = []
+        control_period_values: list[object] = []
+        program_titles: list[object] = []
+        source_run_names: list[object] = []
+        for obs_id in sorted(observation_ids):
+            row_x1 = x1_map.get(obs_id) or {}
+            row_y = y_map.get(obs_id) or {}
+            try:
+                x1 = float(row_x1.get("value_num"))
+                y = float(row_y.get("value_num"))
+            except Exception:
+                continue
+            if not (math.isfinite(x1) and math.isfinite(y)):
+                continue
+            if input2_column:
+                row_x2 = x2_map.get(obs_id) or {}
+                try:
+                    x2 = float(row_x2.get("value_num"))
+                except Exception:
+                    continue
+                if not math.isfinite(x2):
+                    continue
+                x2_values.append(float(x2))
+                control_period = row_y.get("control_period", row_x2.get("control_period", row_x1.get("control_period")))
+                program_titles.append(
+                    row_y.get("program_title") or row_x1.get("program_title") or row_x2.get("program_title") or ""
+                )
+                source_run_names.append(
+                    row_y.get("source_run_name") or row_x1.get("source_run_name") or row_x2.get("source_run_name") or ""
+                )
+            else:
+                control_period = row_y.get("control_period", row_x1.get("control_period"))
+                program_titles.append(row_y.get("program_title") or row_x1.get("program_title") or "")
+                source_run_names.append(row_y.get("source_run_name") or row_x1.get("source_run_name") or "")
+            x1_values.append(float(x1))
+            y_values.append(float(y))
+            control_period_values.append(control_period)
+
+        if not x1_values or not y_values:
+            continue
+
+        finite_control_periods = [
+            float(value)
+            for value in control_period_values
+            if isinstance(value, (int, float)) and math.isfinite(float(value))
+        ]
+        control_period_value: object
+        if finite_control_periods:
+            control_period_value = float(sum(finite_control_periods) / max(1, len(finite_control_periods)))
+        else:
+            control_period_value = next((value for value in control_period_values if value not in (None, "")), None)
+
+        out.append(
+            {
+                "run_name": run_name,
+                "display_name": display_name,
+                "program_title": _td_perf_join_unique_text(program_titles),
+                "source_run_name": _td_perf_join_unique_text(source_run_names),
+                "control_period": control_period_value,
+                "condition_label": _td_perf_export_condition_label({"run_name": run_name}, display_name=display_name),
+                "input_1": float(sum(x1_values) / max(1, len(x1_values))),
+                "input_2": (
+                    float(sum(x2_values) / max(1, len(x2_values)))
+                    if input2_column and x2_values
+                    else None
+                ),
+                "actual_mean": float(sum(y_values) / max(1, len(y_values))),
+                "sample_count": int(len(y_values)),
+            }
+        )
+
+    out.sort(
+        key=lambda row: (
+            str(row.get("run_name") or "").lower(),
+            str(row.get("condition_label") or "").lower(),
+            float(row.get("input_1") or 0.0),
+            float(row.get("input_2") or 0.0) if row.get("input_2") not in (None, "") else float("-inf"),
+        )
+    )
+    return out
+
+
 TD_PERF_EQ_STRICTNESS_PRESETS: dict[str, dict[str, float]] = {
     "tight": {
         "perf_eq_x_rel_tol": 0.08,
@@ -14060,6 +14400,273 @@ def _td_perf_derived_3sigma_equation_text(
     return f"({mean_eq}) {sign} 3*({std_eq})", norm_text
 
 
+def _td_perf_export_models_by_stat(results_by_stat: Mapping[str, Mapping[str, object]]) -> dict[str, dict[str, object]]:
+    models_by_stat: dict[str, dict[str, object]] = {}
+    for stat in TD_PERF_EXPORT_STATS_ORDER:
+        result = dict((results_by_stat or {}).get(stat) or {})
+        model = _td_perf_exportable_model(result)
+        if model is not None:
+            models_by_stat[stat] = dict(model)
+    return models_by_stat
+
+
+def _td_perf_predict_export_value(
+    model: Mapping[str, object],
+    *,
+    input_1: object,
+    input_2: object = None,
+    control_period: object = None,
+) -> float | None:
+    try:
+        x1 = float(input_1)
+    except Exception:
+        return None
+    if not math.isfinite(x1):
+        return None
+    family = td_perf_normalize_fit_mode(model.get("fit_family"))
+    try:
+        if family in {
+            TD_PERF_FIT_FAMILY_PLANE,
+            TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE,
+            TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD,
+        }:
+            try:
+                x2 = float(input_2)
+            except Exception:
+                return None
+            if not math.isfinite(x2):
+                return None
+            values = td_perf_predict_surface(model, [x1], [x2], control_period=control_period)
+        else:
+            values = td_perf_predict_model(model, [x1])
+    except Exception:
+        return None
+    if not values:
+        return None
+    try:
+        value = float(values[0])
+    except Exception:
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _td_perf_static_norm_value(raw_value: object, center: object, scale: object) -> float | None:
+    try:
+        raw_num = float(raw_value)
+        center_num = float(center or 0.0)
+        scale_num = float(scale or 1.0) or 1.0
+    except Exception:
+        return None
+    if not (math.isfinite(raw_num) and math.isfinite(center_num) and math.isfinite(scale_num)):
+        return None
+    return float((raw_num - center_num) / scale_num)
+
+
+def _td_perf_write_static_saved_export_sheet(
+    workbook,
+    *,
+    sheet_name: str,
+    plot_metadata: Mapping[str, object],
+    results_by_stat: Mapping[str, Mapping[str, object]],
+    export_rows: Sequence[Mapping[str, object]],
+    control_period_filter: object = None,
+    run_type_filter: object = None,
+):
+    try:
+        from openpyxl.styles import Alignment, Font, PatternFill  # type: ignore
+        from openpyxl.utils import get_column_letter  # type: ignore
+    except Exception as exc:  # pragma: no cover - depends on optional dep
+        raise RuntimeError(
+            "openpyxl is required to export performance equations to Excel. "
+            "Install it with `py -m pip install openpyxl` within the project environment."
+        ) from exc
+
+    models_by_stat = _td_perf_export_models_by_stat(results_by_stat)
+    if not models_by_stat:
+        raise RuntimeError("No exportable master performance equations are available for the saved export.")
+
+    plot_dimension = str(plot_metadata.get("plot_dimension") or "2d").strip().lower()
+    is_surface = plot_dimension == "3d" or bool(str(plot_metadata.get("input2_target") or "").strip())
+    output_target = str(plot_metadata.get("output_target") or "").strip()
+    input1_target = str(plot_metadata.get("input1_target") or "").strip()
+    input2_target = str(plot_metadata.get("input2_target") or "").strip()
+    output_units = str(plot_metadata.get("output_units") or plot_metadata.get("y_units") or "").strip()
+    input1_units = str(plot_metadata.get("input1_units") or plot_metadata.get("x_units") or "").strip()
+    input2_units = str(plot_metadata.get("input2_units") or "").strip()
+
+    helper_source_stat = "mean" if "mean" in models_by_stat else next(iter(models_by_stat.keys()))
+    helper_model = models_by_stat[helper_source_stat]
+    helper_family = td_perf_normalize_fit_mode(helper_model.get("fit_family"))
+    uses_control_period_norm = any(
+        td_perf_normalize_fit_mode((model or {}).get("fit_family")) == TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD
+        for model in models_by_stat.values()
+        if isinstance(model, Mapping)
+    )
+
+    ws = workbook.create_sheet(title=sheet_name)
+    header_font = Font(bold=True)
+    header_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+    section_fill = PatternFill(start_color="E2F0D9", end_color="E2F0D9", fill_type="solid")
+
+    metadata_rows: list[tuple[object, object]] = [
+        ("Export Timestamp", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+        ("Export Mode", "Static per-condition"),
+        ("Plot Dimension", "3D" if is_surface else "2D"),
+        ("Asset Type", str(plot_metadata.get("asset_type") or "").strip()),
+        ("Asset Specific Type", str(plot_metadata.get("asset_specific_type") or "").strip()),
+        ("Output Target", output_target),
+        ("Output Units", output_units),
+        ("Input 1 Target", input1_target),
+        ("Input 1 Units", input1_units),
+        ("Input 2 Target", input2_target if is_surface else ""),
+        ("Input 2 Units", input2_units if is_surface else ""),
+        ("Run Selection", str(plot_metadata.get("run_selection_label") or plot_metadata.get("display_text") or plot_metadata.get("run_condition") or "").strip()),
+        ("Member Runs", ", ".join(str(v).strip() for v in (plot_metadata.get("member_runs") or []) if str(v).strip())),
+        ("Condition Family", td_perf_run_type_mode_label(plot_metadata.get("performance_run_type_mode") or run_type_filter)),
+        ("PM Filter Mode", str(plot_metadata.get("performance_filter_mode") or "all_conditions").strip()),
+        ("Selected Control Period", "" if control_period_filter in (None, "") else str(control_period_filter)),
+        ("Helper Normalization Source", helper_source_stat),
+    ]
+    for row_idx, (label, value) in enumerate(metadata_rows, start=1):
+        ws.cell(row_idx, 1).value = label
+        ws.cell(row_idx, 2).value = value
+        ws.cell(row_idx, 1).font = header_font
+
+    stat_meta_header_row = len(metadata_rows) + 2
+    for col_idx, value in enumerate(["Stat", "Fit Family", "Equation", "Normalization"], start=1):
+        cell = ws.cell(stat_meta_header_row, col_idx)
+        cell.value = value
+        cell.font = header_font
+        cell.fill = section_fill
+    stat_meta_row = stat_meta_header_row + 1
+    unavailable_stats: list[str] = []
+    for stat in TD_PERF_EXPORT_STATS_ORDER:
+        model = models_by_stat.get(stat)
+        derived_eq, derived_norm = _td_perf_derived_3sigma_equation_text(stat, models_by_stat)
+        if model is None and not derived_eq:
+            unavailable_stats.append(stat)
+            continue
+        ws.cell(stat_meta_row, 1).value = stat
+        ws.cell(stat_meta_row, 2).value = (
+            td_perf_fit_family_label(model.get("fit_family"))
+            if model is not None
+            else "Derived from Mean and Std"
+        )
+        ws.cell(stat_meta_row, 3).value = derived_eq or str((model or {}).get("equation") or "")
+        ws.cell(stat_meta_row, 4).value = derived_norm or str((model or {}).get("x_norm_equation") or "")
+        stat_meta_row += 1
+    if unavailable_stats:
+        ws.cell(stat_meta_row, 1).value = "Unavailable Stats"
+        ws.cell(stat_meta_row, 2).value = ", ".join(unavailable_stats)
+        ws.cell(stat_meta_row, 1).font = header_font
+        stat_meta_row += 1
+
+    data_header_row = stat_meta_row + 2
+    headers = ["run_name", "program_title", "source_run_name", "control_period"]
+    if uses_control_period_norm:
+        headers.append("control_period_norm")
+    headers.extend(["condition_label", "input_1"])
+    if is_surface:
+        headers.append("input_2")
+    headers.append("input_1_norm")
+    if is_surface:
+        headers.append("input_2_norm")
+    headers.extend([f"pred_{stat}" for stat in TD_PERF_EXPORT_STATS_ORDER])
+    headers.extend(["actual_mean", "pct_delta_mean"])
+    col_by_name = {name: idx for idx, name in enumerate(headers, start=1)}
+    for col_idx, name in enumerate(headers, start=1):
+        cell = ws.cell(data_header_row, col_idx)
+        cell.value = name
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center")
+    ws.freeze_panes = ws.cell(data_header_row + 1, 1)
+
+    for idx, row in enumerate(export_rows, start=data_header_row + 1):
+        input_1 = row.get("input_1")
+        input_2 = row.get("input_2")
+        control_period = row.get("control_period")
+        ws.cell(idx, col_by_name["run_name"]).value = str(row.get("run_name") or "")
+        ws.cell(idx, col_by_name["program_title"]).value = str(row.get("program_title") or "")
+        ws.cell(idx, col_by_name["source_run_name"]).value = str(row.get("source_run_name") or "")
+        ws.cell(idx, col_by_name["control_period"]).value = control_period
+        ws.cell(idx, col_by_name["condition_label"]).value = str(row.get("condition_label") or "")
+        ws.cell(idx, col_by_name["input_1"]).value = input_1
+        if is_surface:
+            ws.cell(idx, col_by_name["input_2"]).value = input_2
+
+        control_period_norm = None
+        input_1_norm = None
+        input_2_norm = None
+        if helper_family == TD_PERF_FIT_MODE_POLYNOMIAL and bool(helper_model.get("normalize_x")):
+            input_1_norm = _td_perf_static_norm_value(input_1, helper_model.get("x0"), helper_model.get("sx"))
+        elif helper_family == TD_PERF_FIT_MODE_HYBRID_QUADRATIC_RESIDUAL and bool((helper_model.get("params") or {}).get("normalize_x")):
+            input_1_norm = _td_perf_static_norm_value(
+                input_1,
+                (helper_model.get("params") or {}).get("x0"),
+                (helper_model.get("params") or {}).get("sx"),
+            )
+        elif helper_family in {TD_PERF_FIT_FAMILY_PLANE, TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE}:
+            input_1_norm = _td_perf_static_norm_value(input_1, helper_model.get("x1_center"), helper_model.get("x1_scale"))
+            if is_surface:
+                input_2_norm = _td_perf_static_norm_value(input_2, helper_model.get("x2_center"), helper_model.get("x2_scale"))
+        elif helper_family == TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD:
+            input_1_norm = _td_perf_static_norm_value(input_1, helper_model.get("x1_center"), helper_model.get("x1_scale"))
+            if is_surface:
+                input_2_norm = _td_perf_static_norm_value(input_2, helper_model.get("x2_center"), helper_model.get("x2_scale"))
+            control_period_norm = _td_perf_static_norm_value(control_period, helper_model.get("cp_center"), helper_model.get("cp_scale"))
+
+        if uses_control_period_norm and control_period_norm is not None:
+            ws.cell(idx, col_by_name["control_period_norm"]).value = control_period_norm
+        if input_1_norm is not None:
+            ws.cell(idx, col_by_name["input_1_norm"]).value = input_1_norm
+        if is_surface and input_2_norm is not None:
+            ws.cell(idx, col_by_name["input_2_norm"]).value = input_2_norm
+
+        predicted_by_stat: dict[str, float] = {}
+        for stat in TD_PERF_EXPORT_STATS_ORDER:
+            predicted: float | None
+            if stat in {"min_3sigma", "max_3sigma"} and {"mean", "std"} <= set(predicted_by_stat.keys()):
+                predicted = td_perf_mean_3sigma_value(predicted_by_stat, stat)
+            else:
+                model = models_by_stat.get(stat)
+                predicted = (
+                    _td_perf_predict_export_value(
+                        model,
+                        input_1=input_1,
+                        input_2=input_2,
+                        control_period=control_period,
+                    )
+                    if model is not None
+                    else None
+                )
+            if predicted is None:
+                continue
+            predicted_by_stat[stat] = float(predicted)
+            ws.cell(idx, col_by_name[f"pred_{stat}"]).value = float(predicted)
+
+        actual_mean = row.get("actual_mean")
+        ws.cell(idx, col_by_name["actual_mean"]).value = actual_mean
+        actual_num = _td_perf_finite_float(actual_mean)
+        pred_mean = predicted_by_stat.get("mean")
+        if actual_num not in (None, 0.0) and pred_mean is not None:
+            ws.cell(idx, col_by_name["pct_delta_mean"]).value = float((pred_mean - actual_num) / actual_num)
+
+    for name, col_idx in col_by_name.items():
+        width = 16
+        if name in {"run_name", "program_title", "source_run_name"}:
+            width = 24
+        elif name == "condition_label":
+            width = 32
+        elif name in {"control_period", "control_period_norm", "pct_delta_mean"}:
+            width = 18
+        elif name.startswith("pred_"):
+            width = 20
+        ws.column_dimensions[get_column_letter(col_idx)].width = width
+
+    return ws
+
+
 def td_perf_export_equation_workbook(
     db_path: Path,
     output_path: Path,
@@ -14069,6 +14676,7 @@ def td_perf_export_equation_workbook(
     run_specs: Sequence[Mapping[str, object]],
     control_period_filter: object = None,
     run_type_filter: object = None,
+    progress_cb: Callable[[str], None] | None = None,
 ) -> Path:
     try:
         from openpyxl import Workbook  # type: ignore
@@ -14082,6 +14690,7 @@ def td_perf_export_equation_workbook(
 
     path = Path(output_path).expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
+    _td_emit_progress(progress_cb, "Collecting cached export rows")
     export_rows = td_perf_collect_equation_export_rows(
         db_path,
         run_specs=run_specs,
@@ -14089,12 +14698,7 @@ def td_perf_export_equation_workbook(
         run_type_filter=run_type_filter,
     )
 
-    models_by_stat: dict[str, dict[str, object]] = {}
-    for stat in TD_PERF_EXPORT_STATS_ORDER:
-        result = dict((results_by_stat or {}).get(stat) or {})
-        model = _td_perf_exportable_model(result)
-        if model is not None:
-            models_by_stat[stat] = dict(model)
+    models_by_stat = _td_perf_export_models_by_stat(results_by_stat)
     if not models_by_stat:
         raise RuntimeError("No exportable master performance equations are available for the current plot.")
 
@@ -14116,6 +14720,7 @@ def td_perf_export_equation_workbook(
         if isinstance(model, Mapping)
     )
 
+    _td_emit_progress(progress_cb, "Building Excel workbook")
     wb = Workbook()
     ws = wb.active
     if ws is None:
@@ -14381,8 +14986,10 @@ def td_perf_export_equation_workbook(
     for col_idx, width in {1: 14, 2: 20, 3: 14, 4: 14, 5: 14, 6: 14, 7: 14, 8: 14, 9: 14, 10: 14, 11: 14}.items():
         ws_support.column_dimensions[get_column_letter(col_idx)].width = width
 
+    _td_emit_progress(progress_cb, "Saving Excel workbook")
     wb.save(str(path))
     wb.close()
+    _td_emit_progress(progress_cb, f"Excel export ready: {path.name}")
     return path
 
 
@@ -15291,50 +15898,20 @@ def _td_perf_unique_sheet_name(base: str, used: set[str]) -> str:
     return candidate
 
 
-def _td_perf_copy_sheet_between_workbooks(source_ws, target_ws) -> None:
-    from copy import copy
-
-    for row in source_ws.iter_rows():
-        for cell in row:
-            new_cell = target_ws.cell(row=cell.row, column=cell.column, value=cell.value)
-            if cell.has_style:
-                new_cell._style = copy(cell._style)
-            if cell.number_format:
-                new_cell.number_format = cell.number_format
-            if cell.font:
-                new_cell.font = copy(cell.font)
-            if cell.fill:
-                new_cell.fill = copy(cell.fill)
-            if cell.border:
-                new_cell.border = copy(cell.border)
-            if cell.alignment:
-                new_cell.alignment = copy(cell.alignment)
-            if cell.protection:
-                new_cell.protection = copy(cell.protection)
-    for key, dim in source_ws.column_dimensions.items():
-        target_ws.column_dimensions[key].width = dim.width
-        target_ws.column_dimensions[key].hidden = dim.hidden
-    for idx, dim in source_ws.row_dimensions.items():
-        target_ws.row_dimensions[idx].height = dim.height
-        target_ws.row_dimensions[idx].hidden = dim.hidden
-    target_ws.freeze_panes = source_ws.freeze_panes
-    target_ws.sheet_state = source_ws.sheet_state
-
-
 def td_perf_export_saved_equations_workbook(
     db_path: Path,
     output_path: Path,
     *,
     entries: Sequence[Mapping[str, object]],
+    progress_cb: Callable[[str], None] | None = None,
 ) -> Path:
     try:
-        from openpyxl import Workbook, load_workbook  # type: ignore
+        from openpyxl import Workbook  # type: ignore
     except Exception as exc:
         raise RuntimeError(
             "openpyxl is required to export saved performance equations to Excel. "
             "Install it with `py -m pip install openpyxl` within the project environment."
         ) from exc
-    import tempfile
 
     usable_entries = [_td_perf_normalize_saved_entry(entry) for entry in (entries or [])]
     usable_entries = [entry for entry in usable_entries if entry is not None]
@@ -15343,17 +15920,6 @@ def td_perf_export_saved_equations_workbook(
 
     path = Path(output_path).expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
-    if len(usable_entries) == 1:
-        entry = usable_entries[0]
-        return td_perf_export_equation_workbook(
-            db_path,
-            path,
-            plot_metadata=_td_perf_saved_entry_plot_metadata(entry),
-            results_by_stat=dict(entry.get("results_by_stat") or {}),
-            run_specs=list(entry.get("run_specs") or []),
-            control_period_filter=_td_perf_saved_entry_control_period_filter(entry),
-            run_type_filter=_td_perf_saved_entry_run_type_filter(entry),
-        )
     wb = Workbook()
     try:
         default_ws = wb.active
@@ -15362,37 +15928,38 @@ def td_perf_export_saved_equations_workbook(
     except Exception:
         pass
     used_sheet_names: set[str] = set()
-
-    with tempfile.TemporaryDirectory() as temp_dir:
-        temp_root = Path(temp_dir)
+    total = len(usable_entries)
+    _td_emit_progress(progress_cb, f"Preparing saved equation export ({total} sheet(s))")
+    try:
         for index, entry in enumerate(usable_entries, start=1):
-            temp_path = temp_root / f"saved_perf_export_{index}.xlsx"
-            td_perf_export_equation_workbook(
+            entry_name = str(entry.get("name") or f"Equation {index}").strip() or f"Equation {index}"
+            _td_emit_progress(progress_cb, f"Writing saved equation {index}/{total}: {entry_name}")
+            control_period_filter = _td_perf_saved_entry_control_period_filter(entry)
+            run_type_filter = _td_perf_saved_entry_run_type_filter(entry)
+            export_rows = td_perf_collect_condition_export_rows(
                 db_path,
-                temp_path,
-                plot_metadata=_td_perf_saved_entry_plot_metadata(entry),
-                results_by_stat=dict(entry.get("results_by_stat") or {}),
                 run_specs=list(entry.get("run_specs") or []),
-                control_period_filter=_td_perf_saved_entry_control_period_filter(entry),
-                run_type_filter=_td_perf_saved_entry_run_type_filter(entry),
+                control_period_filter=control_period_filter,
+                run_type_filter=run_type_filter,
             )
-            temp_wb = load_workbook(str(temp_path), read_only=False, data_only=False)
+            sheet_name = _td_perf_unique_sheet_name(entry_name, used_sheet_names)
             try:
-                base_slug = _td_perf_saved_slug(entry.get("name") or f"equation_{index}")
-                for ws in temp_wb.worksheets:
-                    suffix = ""
-                    raw_title = str(ws.title or "").strip().lower()
-                    if raw_title == "model parameters":
-                        suffix = "_params"
-                    elif raw_title == "model support":
-                        suffix = "_support"
-                    target_name = _td_perf_unique_sheet_name(f"{base_slug}{suffix}" if suffix else base_slug, used_sheet_names)
-                    target_ws = wb.create_sheet(title=target_name)
-                    _td_perf_copy_sheet_between_workbooks(ws, target_ws)
-            finally:
-                temp_wb.close()
-    wb.save(str(path))
-    wb.close()
+                _td_perf_write_static_saved_export_sheet(
+                    wb,
+                    sheet_name=sheet_name,
+                    plot_metadata=_td_perf_saved_entry_plot_metadata(entry),
+                    results_by_stat=dict(entry.get("results_by_stat") or {}),
+                    export_rows=export_rows,
+                    control_period_filter=control_period_filter,
+                    run_type_filter=run_type_filter,
+                )
+            except Exception as exc:
+                raise RuntimeError(f"Failed to export saved equation '{entry_name}': {exc}") from exc
+        _td_emit_progress(progress_cb, "Saving Excel workbook")
+        wb.save(str(path))
+    finally:
+        wb.close()
+    _td_emit_progress(progress_cb, f"Excel export ready: {path.name}")
     return path
 
 
@@ -17189,6 +17756,10 @@ def read_eidat_index_documents(global_repo: Path) -> list[dict]:
             "excel_sqlite_rel",
             "tables_sqlite_rel",
             "file_extension",
+            "metadata_source",
+            "manual_override_fields_json",
+            "manual_override_updated_at",
+            "applied_asset_specific_type_rule",
         ):
             if opt in cols:
                 select_cols.append(opt)
@@ -17214,6 +17785,19 @@ def read_eidat_index_documents(global_repo: Path) -> list[dict]:
         d.setdefault("excel_sqlite_rel", None)
         d.setdefault("tables_sqlite_rel", None)
         d.setdefault("file_extension", None)
+        d.setdefault("metadata_source", None)
+        d.setdefault("manual_override_fields_json", None)
+        d.setdefault("manual_override_updated_at", None)
+        d.setdefault("applied_asset_specific_type_rule", None)
+        try:
+            raw_manual_fields = json.loads(str(d.get("manual_override_fields_json") or "[]"))
+        except Exception:
+            raw_manual_fields = []
+        if not isinstance(raw_manual_fields, list):
+            raw_manual_fields = []
+        manual_fields = [str(v).strip() for v in raw_manual_fields if str(v).strip()]
+        d["manual_override_fields"] = manual_fields
+        d["has_manual_override"] = bool(manual_fields)
         docs.append(d)
     return docs
 
@@ -17291,8 +17875,17 @@ def read_files_with_index_metadata(global_repo: Path) -> list[dict]:
         with closing(sqlite3.connect(str(index_db))) as conn:
             conn.row_factory = sqlite3.Row
             for r in conn.execute("SELECT * FROM documents").fetchall():
-                artifacts = _norm_rel(r["artifacts_rel"] or "")
-                docs_by_artifacts[artifacts] = dict(r)
+                doc = dict(r)
+                try:
+                    raw_manual_fields = json.loads(str(doc.get("manual_override_fields_json") or "[]"))
+                except Exception:
+                    raw_manual_fields = []
+                if not isinstance(raw_manual_fields, list):
+                    raw_manual_fields = []
+                doc["manual_override_fields"] = [str(v).strip() for v in raw_manual_fields if str(v).strip()]
+                doc["has_manual_override"] = bool(doc["manual_override_fields"])
+                artifacts = _norm_rel(doc.get("artifacts_rel") or "")
+                docs_by_artifacts[artifacts] = doc
 
     # Join: for each file, try to find its document metadata
     result: list[dict] = []
@@ -17339,6 +17932,13 @@ def read_files_with_index_metadata(global_repo: Path) -> list[dict]:
                 "indexed_epoch_ns": matched_doc.get("indexed_epoch_ns"),
                 "certification_status": matched_doc.get("certification_status"),
                 "certification_pass_rate": matched_doc.get("certification_pass_rate"),
+                "metadata_source": matched_doc.get("metadata_source"),
+                "manual_override_fields": ", ".join(
+                    str(v).strip() for v in (matched_doc.get("manual_override_fields") or []) if str(v).strip()
+                ),
+                "manual_override_updated_at": matched_doc.get("manual_override_updated_at"),
+                "applied_asset_specific_type_rule": matched_doc.get("applied_asset_specific_type_rule"),
+                "has_manual_override": bool(matched_doc.get("has_manual_override")),
             })
         result.append(merged)
 
@@ -21641,6 +22241,11 @@ def product_center_images_dir() -> Path:
     return path
 
 
+def product_center_expected_image_names(asset_specific_type: str) -> list[str]:
+    slug = _product_center_slug(asset_specific_type, fallback="product")
+    return [f"{slug}{ext}" for ext in PRODUCT_CENTER_IMAGE_EXTENSIONS]
+
+
 def resolve_product_center_image(asset_specific_type: str) -> Path | None:
     slug = _product_center_slug(asset_specific_type, fallback="product")
     wanted = _product_center_norm_key(asset_specific_type)
@@ -21684,6 +22289,18 @@ def resolve_product_center_image(asset_specific_type: str) -> Path | None:
         ranked.sort(key=lambda item: (item[0], item[1], str(item[2]).casefold()))
         return ranked[0][2]
     return None
+
+
+def product_center_image_lookup_details(asset_specific_type: str) -> dict[str, object]:
+    asset_specific = str(asset_specific_type or "").strip()
+    resolved = resolve_product_center_image(asset_specific)
+    return {
+        "asset_specific_type": asset_specific,
+        "search_dir": str(product_center_images_dir()),
+        "expected_files": product_center_expected_image_names(asset_specific),
+        "resolved_path": str(resolved) if resolved is not None else "",
+        "resolved_exists": bool(resolved is not None and resolved.exists()),
+    }
 
 
 def list_product_center_products(global_repo: Path) -> list[dict]:
@@ -21766,6 +22383,10 @@ def list_product_center_products(global_repo: Path) -> list[dict]:
             "asset_specific_type": str(doc.get("asset_specific_type") or "").strip(),
             "excel_sqlite_rel": str(doc.get("excel_sqlite_rel") or "").strip(),
             "tables_sqlite_rel": str(doc.get("tables_sqlite_rel") or "").strip(),
+            "metadata_source": str(doc.get("metadata_source") or "").strip(),
+            "manual_override_fields": [str(v).strip() for v in (doc.get("manual_override_fields") or []) if str(v).strip()],
+            "manual_override_updated_at": str(doc.get("manual_override_updated_at") or "").strip(),
+            "applied_asset_specific_type_rule": str(doc.get("applied_asset_specific_type_rule") or "").strip(),
             "display_document_type": document_type,
         }
         cast(list[dict[str, object]], bucket["documents"]).append(row)

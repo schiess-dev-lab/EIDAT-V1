@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -28,6 +29,24 @@ ALLOWED_KEYS = {
     "document_type_reason",
     "document_type_evidence",
     "document_type_review_required",
+    "metadata_source",
+    "manual_override_fields",
+    "manual_override_updated_at",
+    "applied_asset_specific_type_rule",
+}
+
+MANUAL_EDITABLE_FIELDS = {
+    "program_title",
+    "asset_type",
+    "asset_specific_type",
+    "vendor",
+    "part_number",
+    "revision",
+    "test_date",
+    "report_date",
+    "acceptance_test_plan_number",
+    "document_type",
+    "document_type_acronym",
 }
 
 DEFAULT_CANDIDATES = {
@@ -63,6 +82,7 @@ DEFAULT_CANDIDATES = {
         {"name": "End Item Data Package", "acronym": "EIDP", "aliases": ["EIDP", "End Item Data Package", "End-Item Data Package"]},
         {"name": "Test Data", "acronym": "TD", "aliases": ["TD", "Test Data", "Test-Data", "TestData", "Hot Fire Test", "Hot Fire Test Data", "Hotfire Test Data"]},
     ],
+    "asset_specific_type_rules": [],
 }
 
 DEFAULT_DOCUMENT_TYPE_STRATEGIES = {
@@ -203,6 +223,105 @@ def _as_clean_str(v: object) -> str:
     if v is None:
         return ""
     return str(v).strip()
+
+
+def _normalize_override_fields(value: object) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    raw = value if isinstance(value, list) else []
+    for item in raw:
+        field = str(item or "").strip()
+        if not field or field not in MANUAL_EDITABLE_FIELDS:
+            continue
+        if field in seen:
+            continue
+        seen.add(field)
+        out.append(field)
+    return out
+
+
+def _asset_specific_rule_entries(candidates: dict) -> list[dict[str, str]]:
+    raw = candidates.get("asset_specific_type_rules") if isinstance(candidates, dict) else None
+    if not isinstance(raw, list):
+        return []
+    asset_type_entries = _iter_named_alias_entries(candidates.get("asset_types") or [])
+    asset_specific_entries = _iter_named_alias_entries(candidates.get("asset_specific_types") or [])
+    vendor_entries = _iter_named_alias_entries(candidates.get("vendors") or [])
+    out: list[dict[str, str]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        specific = _best_named_entry_match_in_blob(
+            _as_clean_str(item.get("asset_specific_type")),
+            asset_specific_entries,
+        )
+        if not specific:
+            continue
+        rule: dict[str, str] = {"asset_specific_type": specific}
+        asset_type = _best_named_entry_match_in_blob(_as_clean_str(item.get("asset_type")), asset_type_entries)
+        vendor = _best_named_entry_match_in_blob(_as_clean_str(item.get("vendor")), vendor_entries)
+        if asset_type:
+            rule["asset_type"] = asset_type
+        if vendor:
+            rule["vendor"] = vendor
+        out.append(rule)
+    return out
+
+
+def _rule_key_for_asset_specific_type(value: object, candidates: dict) -> str:
+    specific = _as_clean_str(value)
+    if not specific:
+        return ""
+    entries = _asset_specific_rule_entries(candidates)
+    for entry in entries:
+        if _as_clean_str(entry.get("asset_specific_type")) == specific:
+            return specific
+    return ""
+
+
+def _apply_asset_specific_type_rule(
+    meta: dict[str, object],
+    *,
+    candidates: dict,
+    protected_fields: set[str] | None = None,
+) -> str:
+    protected = protected_fields or set()
+    specific = _as_clean_str(meta.get("asset_specific_type"))
+    if not specific or specific in {"Unknown", "unknown"}:
+        return ""
+    entries = _asset_specific_rule_entries(candidates)
+    for entry in entries:
+        if _as_clean_str(entry.get("asset_specific_type")) != specific:
+            continue
+        for field in ("asset_type", "vendor"):
+            if field in protected:
+                continue
+            value = _as_clean_str(entry.get(field))
+            if value:
+                meta[field] = value
+        return specific
+    return ""
+
+
+def _derive_metadata_source(
+    payload: dict[str, object],
+    *,
+    manual_fields: list[str],
+    applied_rule: str,
+) -> str:
+    manual_count = len(manual_fields)
+    if manual_count:
+        nonempty_curated = 0
+        for field in MANUAL_EDITABLE_FIELDS:
+            if field in {"document_type", "document_type_acronym"}:
+                continue
+            value = _as_clean_str(payload.get(field))
+            if value and value not in {"Unknown", "unknown"}:
+                nonempty_curated += 1
+        return "manual_override" if manual_count >= max(1, nonempty_curated) else "mixed"
+    if applied_rule:
+        return "heuristic"
+    return "scanned"
 
 
 def _infer_serial_from_path(path: Path) -> str | None:
@@ -554,6 +673,7 @@ def canonicalize_metadata_for_file(
     existing_meta: Any = None,
     extracted_meta: Any = None,
     default_document_type: str | None = None,
+    overwrite_manual_fields: bool = False,
 ) -> dict:
     """
     Produce a single canonical metadata dict for a file, with stable precedence:
@@ -569,6 +689,23 @@ def canonicalize_metadata_for_file(
 
     existing = existing_meta if isinstance(existing_meta, dict) else {}
     extracted = extracted_meta if isinstance(extracted_meta, dict) else {}
+    existing_manual_fields = _normalize_override_fields(existing.get("manual_override_fields"))
+    manual_override_set = set() if overwrite_manual_fields else set(existing_manual_fields)
+    existing_for_priority = dict(existing)
+    if overwrite_manual_fields:
+        for field in existing_manual_fields:
+            existing_for_priority.pop(field, None)
+        if {"document_type", "document_type_acronym"}.intersection(existing_manual_fields):
+            for key in (
+                "document_type",
+                "document_type_acronym",
+                "document_type_status",
+                "document_type_source",
+                "document_type_reason",
+                "document_type_evidence",
+                "document_type_review_required",
+            ):
+                existing_for_priority.pop(key, None)
 
     if default_document_type is None:
         default_document_type = "Unknown"
@@ -628,7 +765,7 @@ def canonicalize_metadata_for_file(
         if key == "excel_sqlite_rel":
             # Keep optional; only set when present in some input.
             pass
-        v = existing.get(key)
+        v = existing_for_priority.get(key)
         if not _is_missing(v):
             merged[key] = v
             continue
@@ -663,7 +800,7 @@ def canonicalize_metadata_for_file(
     def _strict(entries: list[dict], field: str) -> str:
         if not entries:
             return "Unknown"
-        for src in (existing, extracted):
+        for src in (existing_for_priority, extracted):
             v = _as_clean_str(src.get(field))
             if not v:
                 continue
@@ -685,14 +822,29 @@ def canonicalize_metadata_for_file(
     merged["part_number"] = _strict(pn_entries, "part_number")
     merged["acceptance_test_plan_number"] = _strict(atp_entries, "acceptance_test_plan_number")
 
-    doc_type_meta = None
-    for src in (existing, extracted):
-        doc_type_meta = _doc_type_payload_from_meta(src, strategy)
-        if doc_type_meta is not None:
-            break
-    if doc_type_meta is None:
-        doc_type_meta = identify_document_type(p)
-    merged.update(doc_type_meta)
+    if {"document_type", "document_type_acronym"}.intersection(manual_override_set):
+        merged["document_type"] = _as_clean_str(existing.get("document_type")) or "Unknown"
+        merged["document_type_acronym"] = _as_clean_str(existing.get("document_type_acronym")) or merged["document_type"]
+        merged["document_type_status"] = "manual"
+        merged["document_type_source"] = "manual_override"
+        merged["document_type_reason"] = "manual_override"
+        merged["document_type_evidence"] = []
+        merged["document_type_review_required"] = False
+    else:
+        doc_type_meta = None
+        for src in (existing_for_priority, extracted):
+            doc_type_meta = _doc_type_payload_from_meta(src, strategy)
+            if doc_type_meta is not None:
+                break
+        if doc_type_meta is None:
+            doc_type_meta = identify_document_type(p)
+        merged.update(doc_type_meta)
+
+    applied_rule = _apply_asset_specific_type_rule(
+        merged,
+        candidates=cand,
+        protected_fields={field for field in manual_override_set if field in {"asset_type", "vendor"}},
+    )
 
     # Fill string keys with Unknown so JSON and index consumers are stable.
     for k in [
@@ -720,6 +872,28 @@ def canonicalize_metadata_for_file(
             merged["excel_sqlite_rel"] = v
             break
 
+    if manual_override_set:
+        for field in manual_override_set:
+            value = existing.get(field)
+            if isinstance(value, list):
+                continue
+            if value is None:
+                continue
+            merged[field] = value
+
+    if overwrite_manual_fields:
+        merged["manual_override_fields"] = []
+        merged["manual_override_updated_at"] = ""
+    else:
+        merged["manual_override_fields"] = sorted(manual_override_set)
+        merged["manual_override_updated_at"] = _as_clean_str(existing.get("manual_override_updated_at"))
+    merged["applied_asset_specific_type_rule"] = applied_rule
+    merged["metadata_source"] = _derive_metadata_source(
+        merged,
+        manual_fields=_normalize_override_fields(merged.get("manual_override_fields")),
+        applied_rule=applied_rule,
+    )
+
     return sanitize_metadata(merged, default_document_type=str(default_document_type or "").strip() or "Unknown")
 
 
@@ -734,6 +908,12 @@ def sanitize_metadata(raw: Any, *, default_document_type: str = "Unknown") -> di
         if key not in ALLOWED_KEYS:
             continue
         cleaned[key] = v
+
+    manual_fields = _normalize_override_fields(cleaned.get("manual_override_fields"))
+    manual_set = set(manual_fields)
+    cleaned["manual_override_fields"] = manual_fields
+    cleaned["manual_override_updated_at"] = _as_clean_str(cleaned.get("manual_override_updated_at"))
+    cleaned["applied_asset_specific_type_rule"] = _as_clean_str(cleaned.get("applied_asset_specific_type_rule"))
 
     # Enforce strict allowlists for curated fields (value-only; no filename/folder context here).
     try:
@@ -753,6 +933,8 @@ def sanitize_metadata(raw: Any, *, default_document_type: str = "Unknown") -> di
     def _enforce(field: str, entries: list[dict]) -> None:
         if field not in cleaned:
             return
+        if field in manual_set:
+            return
         if not entries:
             cleaned[field] = "Unknown"
             return
@@ -766,11 +948,34 @@ def sanitize_metadata(raw: Any, *, default_document_type: str = "Unknown") -> di
     _enforce("part_number", pn_entries)
     _enforce("acceptance_test_plan_number", atp_entries)
 
-    carried = _doc_type_payload_from_meta(cleaned, strategy)
-    if carried is None:
-        dt = _coerce_doc_type_code(default_document_type, strategy)
-        carried = _doc_type_payload(dt, status="unknown", source="sanitize", reason="no_match")
-    cleaned.update(carried)
+    applied_rule = _apply_asset_specific_type_rule(
+        cleaned,
+        candidates=cand,
+        protected_fields={field for field in manual_set if field in {"asset_type", "vendor"}},
+    )
+
+    if {"document_type", "document_type_acronym"}.intersection(manual_set):
+        doc_type = _as_clean_str(cleaned.get("document_type")) or "Unknown"
+        cleaned["document_type"] = doc_type
+        cleaned["document_type_acronym"] = _as_clean_str(cleaned.get("document_type_acronym")) or doc_type
+        cleaned["document_type_status"] = "manual"
+        cleaned["document_type_source"] = "manual_override"
+        cleaned["document_type_reason"] = "manual_override"
+        cleaned["document_type_evidence"] = []
+        cleaned["document_type_review_required"] = False
+    else:
+        carried = _doc_type_payload_from_meta(cleaned, strategy)
+        if carried is None:
+            dt = _coerce_doc_type_code(default_document_type, strategy)
+            carried = _doc_type_payload(dt, status="unknown", source="sanitize", reason="no_match")
+        cleaned.update(carried)
+
+    cleaned["applied_asset_specific_type_rule"] = applied_rule or _as_clean_str(cleaned.get("applied_asset_specific_type_rule"))
+    cleaned["metadata_source"] = _derive_metadata_source(
+        cleaned,
+        manual_fields=manual_fields,
+        applied_rule=_as_clean_str(cleaned.get("applied_asset_specific_type_rule")),
+    )
     return cleaned
 
 
@@ -2027,6 +2232,45 @@ def write_metadata(artifacts_dir: Path, pdf_path: Path, metadata: dict) -> Optio
     except Exception:
         return None
     return target
+
+
+def apply_manual_metadata_overrides(metadata: Any, field_updates: dict[str, object]) -> dict:
+    base = sanitize_metadata(metadata if isinstance(metadata, dict) else {}, default_document_type="Unknown")
+    updates: dict[str, object] = {}
+    for key, value in (field_updates or {}).items():
+        field = str(key or "").strip()
+        if field not in MANUAL_EDITABLE_FIELDS:
+            continue
+        text = str(value or "").strip()
+        if not text:
+            continue
+        updates[field] = text
+    if not updates:
+        return base
+
+    manual_fields = set(_normalize_override_fields(base.get("manual_override_fields")))
+    for field, value in updates.items():
+        base[field] = value
+        manual_fields.add(field)
+
+    if {"document_type", "document_type_acronym"}.intersection(manual_fields):
+        doc_type = str(base.get("document_type") or "").strip() or "Unknown"
+        base["document_type"] = doc_type
+        base["document_type_acronym"] = str(base.get("document_type_acronym") or "").strip() or doc_type
+        base["document_type_status"] = "manual"
+        base["document_type_source"] = "manual_override"
+        base["document_type_reason"] = "manual_override"
+        base["document_type_evidence"] = []
+        base["document_type_review_required"] = False
+
+    base["manual_override_fields"] = sorted(manual_fields)
+    base["manual_override_updated_at"] = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    base["metadata_source"] = _derive_metadata_source(
+        base,
+        manual_fields=_normalize_override_fields(base.get("manual_override_fields")),
+        applied_rule=_as_clean_str(base.get("applied_asset_specific_type_rule")),
+    )
+    return sanitize_metadata(base, default_document_type="Unknown")
 
 
 def normalize_title(value: str) -> str:

@@ -100,6 +100,8 @@ class TestQtMainProductCenter(unittest.TestCase):
             self.assertEqual(window.list_product_center.count(), 1)
             self.assertEqual(window.lbl_product_center_title.text(), "Pump Model")
             self.assertIn("Asset Type: Pump", window.lbl_product_center_subtitle.text())
+            self.assertIn("Asset Specific Type: Pump Model", window.lbl_product_center_image_debug.text())
+            self.assertIn("pump_model.png", window.lbl_product_center_image_debug.text())
             self.assertEqual(window.tree_product_center_docs.topLevelItemCount(), 1)
             self.assertEqual(window.tbl_product_center_projects.rowCount(), 1)
             self.assertEqual(window.tbl_product_center_equations.rowCount(), 1)
