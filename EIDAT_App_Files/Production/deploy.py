@@ -13,6 +13,7 @@ import uuid
 import shutil
 from pathlib import Path
 
+from . import sync_product_center_assets
 from .node_layout import node_layout
 
 
@@ -449,6 +450,11 @@ def main(argv: list[str] | None = None) -> int:
             )
     except Exception:
         pass
+
+    try:
+        sync_product_center_assets(runtime_root, node_root)
+    except Exception as exc:
+        raise RuntimeError(f"Failed to sync Product Center assets into node UserData: {exc}") from exc
 
     req_src = Path(args.requirements_source).expanduser() if str(args.requirements_source or "").strip() else (Path(__file__).resolve().parent / "requirements-node-ui.txt")
     if not req_src.exists():

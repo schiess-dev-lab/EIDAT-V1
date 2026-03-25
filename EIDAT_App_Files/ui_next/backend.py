@@ -3078,6 +3078,28 @@ def _ensure_test_data_impl_tables(conn: sqlite3.Connection) -> None:
         pass
     conn.execute(
         """
+        CREATE INDEX IF NOT EXISTS td_metrics_calc_run_col_stat_idx
+        ON td_metrics_calc (run_name, column_name, stat, serial, observation_id)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS td_metrics_calc_stat_run_col_idx
+        ON td_metrics_calc (stat, run_name, column_name, serial, observation_id)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS td_condition_observations_run_type_cp_idx
+        ON td_condition_observations (
+            lower(replace(replace(replace(replace(trim(COALESCE(run_type, '')), '-', ''), ' ', ''), '/', ''), '_', '')),
+            control_period,
+            observation_id
+        )
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS td_terms (
             row_index INTEGER PRIMARY KEY,
             term TEXT,
@@ -14341,14 +14363,23 @@ def td_perf_export_equation_workbook(
         actual_mean_ref = _td_perf_excel_ref(col_by_name["actual_mean"], idx)
         ws.cell(idx, col_by_name["pct_delta_mean"]).value = f'=IF(OR({actual_mean_ref}="",{actual_mean_ref}=0),"",({pred_mean_ref}-{actual_mean_ref})/{actual_mean_ref})'
 
-    for ws_cur in (ws, ws_params, ws_support):
-        for col_idx in range(1, (ws_cur.max_column or 0) + 1):
-            max_len = 0
-            for row_idx in range(1, (ws_cur.max_row or 0) + 1):
-                value = ws_cur.cell(row_idx, col_idx).value
-                text = str(value) if value not in (None, "") else ""
-                max_len = max(max_len, len(text))
-            ws_cur.column_dimensions[get_column_letter(col_idx)].width = min(max(12, max_len + 2), 64)
+    for name, col_idx in col_by_name.items():
+        width = 16
+        if name in {"run_name", "program_title", "source_run_name"}:
+            width = 24
+        elif name == "condition_label":
+            width = 32
+        elif name in {"control_period", "control_period_norm", "pct_delta_mean"}:
+            width = 18
+        elif name.startswith("pred_"):
+            width = 20
+        ws.column_dimensions[get_column_letter(col_idx)].width = width
+
+    for col_idx, width in {1: 14, 2: 20, 3: 24, 4: 48}.items():
+        ws_params.column_dimensions[get_column_letter(col_idx)].width = width
+
+    for col_idx, width in {1: 14, 2: 20, 3: 14, 4: 14, 5: 14, 6: 14, 7: 14, 8: 14, 9: 14, 10: 14, 11: 14}.items():
+        ws_support.column_dimensions[get_column_letter(col_idx)].width = width
 
     wb.save(str(path))
     wb.close()
@@ -15312,6 +15343,17 @@ def td_perf_export_saved_equations_workbook(
 
     path = Path(output_path).expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
+    if len(usable_entries) == 1:
+        entry = usable_entries[0]
+        return td_perf_export_equation_workbook(
+            db_path,
+            path,
+            plot_metadata=_td_perf_saved_entry_plot_metadata(entry),
+            results_by_stat=dict(entry.get("results_by_stat") or {}),
+            run_specs=list(entry.get("run_specs") or []),
+            control_period_filter=_td_perf_saved_entry_control_period_filter(entry),
+            run_type_filter=_td_perf_saved_entry_run_type_filter(entry),
+        )
     wb = Workbook()
     try:
         default_ws = wb.active
@@ -15738,7 +15780,7 @@ def td_discover_performance_candidates(
             FROM td_metrics_calc m
             LEFT JOIN td_condition_observations o
               ON o.observation_id = m.observation_id
-            WHERE lower(m.stat) IN ('mean', 'min', 'max', 'median', 'std')
+            WHERE m.stat IN ('mean', 'min', 'max', 'median', 'std')
         """
         metric_params: list[object] = []
         run_type_sql, run_type_params = _td_perf_run_type_sql_clause(run_type_filter, "o.run_type")

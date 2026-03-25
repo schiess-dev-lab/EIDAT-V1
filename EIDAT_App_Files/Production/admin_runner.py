@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from . import sync_product_center_assets
 
 @dataclass(frozen=True)
 class PipelineResult:
@@ -347,6 +348,16 @@ def run_update_processor(
             on_log(f"[REQ full] {req_full}")
             on_log(f"[REQ ui] {req_ui}")
 
+        asset_sync = sync_product_center_assets(runtime, node)
+        outputs["product_center_assets"] = asset_sync
+        if on_log is not None:
+            on_log(
+                "[PRODUCT CENTER ASSETS] "
+                f"present={bool(asset_sync.get('present'))} "
+                f"scanned={int(asset_sync.get('scanned') or 0)} "
+                f"copied={int(asset_sync.get('copied') or 0)}"
+            )
+
         from .bootstrap_env import main as bootstrap_main
         from .node_layout import node_layout
 
@@ -407,6 +418,7 @@ def run_update_processor(
             "runtime_updated": runtime_updated,
             "ui_updated": ui_updated,
             "updated": updated,
+            "product_center_assets": asset_sync,
         }
 
         if rc_runtime != 0:
