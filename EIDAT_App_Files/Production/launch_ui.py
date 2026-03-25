@@ -45,7 +45,7 @@ def main(argv: list[str] | None = None) -> int:
     def _select_tab() -> None:
         try:
             if args.mode == "projects" and hasattr(w, "_switch_tab"):
-                w._switch_tab(2)  # type: ignore[attr-defined]
+                w._switch_tab(3)  # type: ignore[attr-defined]
             elif args.mode == "files" and hasattr(w, "_switch_tab"):
                 w._switch_tab(1)  # type: ignore[attr-defined]
         except Exception:
@@ -58,4 +58,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

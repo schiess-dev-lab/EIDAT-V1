@@ -54,7 +54,7 @@ class NodeMainWindow:  # thin wrapper; delegates UI to ui_next.qt_main.MainWindo
         def _select_tab() -> None:
             try:
                 if self._start_tab == "projects" and hasattr(self._w, "_switch_tab"):
-                    self._w._switch_tab(2)  # type: ignore[attr-defined]
+                    self._w._switch_tab(3)  # type: ignore[attr-defined]
                 elif hasattr(self._w, "_switch_tab"):
                     self._w._switch_tab(1)  # type: ignore[attr-defined]
             except Exception:
@@ -90,4 +90,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

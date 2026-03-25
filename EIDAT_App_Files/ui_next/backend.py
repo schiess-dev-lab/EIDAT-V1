@@ -21618,6 +21618,10 @@ def _product_center_slug(value: object, *, fallback: str = "product") -> str:
     return txt or fallback
 
 
+def _product_center_norm_key(value: object) -> str:
+    return "".join(ch.lower() for ch in str(value or "").strip() if ch.isalnum())
+
+
 def _product_center_compact_equation_label(entry: Mapping[str, object]) -> str:
     plot_meta = entry.get("plot_metadata")
     plot_meta = plot_meta if isinstance(plot_meta, Mapping) else {}
@@ -21639,11 +21643,46 @@ def product_center_images_dir() -> Path:
 
 def resolve_product_center_image(asset_specific_type: str) -> Path | None:
     slug = _product_center_slug(asset_specific_type, fallback="product")
+    wanted = _product_center_norm_key(asset_specific_type)
     root = product_center_images_dir()
     for ext in PRODUCT_CENTER_IMAGE_EXTENSIONS:
         cand = root / f"{slug}{ext}"
         if cand.exists():
             return cand
+    folder = root / slug
+    if folder.exists() and folder.is_dir():
+        nested = sorted(
+            [
+                path
+                for path in folder.iterdir()
+                if path.is_file() and path.suffix.lower() in PRODUCT_CENTER_IMAGE_EXTENSIONS
+            ],
+            key=lambda path: path.name.casefold(),
+        )
+        if nested:
+            return nested[0]
+    if not wanted:
+        return None
+    ranked: list[tuple[int, int, Path]] = []
+    for path in root.rglob("*"):
+        if not path.is_file() or path.suffix.lower() not in PRODUCT_CENTER_IMAGE_EXTENSIONS:
+            continue
+        stem_key = _product_center_norm_key(path.stem)
+        parent_key = _product_center_norm_key(path.parent.name if path.parent != root else "")
+        score = None
+        if stem_key == wanted:
+            score = 0
+        elif parent_key == wanted:
+            score = 1
+        elif wanted and stem_key and (wanted in stem_key or stem_key in wanted):
+            score = 2
+        elif wanted and parent_key and (wanted in parent_key or parent_key in wanted):
+            score = 3
+        if score is not None:
+            ranked.append((score, len(path.parts), path))
+    if ranked:
+        ranked.sort(key=lambda item: (item[0], item[1], str(item[2]).casefold()))
+        return ranked[0][2]
     return None
 
 

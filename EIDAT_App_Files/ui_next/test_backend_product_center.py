@@ -299,3 +299,15 @@ class TestBackendProductCenter(unittest.TestCase):
                 target.write_bytes(b"jpeg")
                 resolved = backend.resolve_product_center_image("Pump Model")
                 self.assertEqual(resolved, target)
+
+    def test_resolve_product_center_image_matches_nested_asset_specific_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_root = Path(tmpdir) / "data_root"
+            with patch.object(backend, "DATA_ROOT", data_root):
+                image_dir = backend.product_center_images_dir()
+                nested = image_dir / "Pump Model"
+                nested.mkdir(parents=True, exist_ok=True)
+                target = nested / "Hero Image.PNG"
+                target.write_bytes(b"png")
+                resolved = backend.resolve_product_center_image("Pump Model")
+                self.assertEqual(resolved, target)
