@@ -13052,6 +13052,24 @@ def _td_perf_join_unique_text(values: Sequence[object]) -> str:
     return ", ".join(out)
 
 
+def _td_perf_unique_run_specs(run_specs: Sequence[Mapping[str, object]]) -> list[dict[str, object]]:
+    unique: list[dict[str, object]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for raw_spec in run_specs or []:
+        if not isinstance(raw_spec, Mapping):
+            continue
+        spec = dict(raw_spec)
+        key = tuple(
+            str(spec.get(name) or "").strip().lower()
+            for name in ("run_name", "input1_column", "input2_column", "output_column")
+        )
+        if not key[0] or key in seen:
+            continue
+        seen.add(key)
+        unique.append(spec)
+    return unique
+
+
 def _td_perf_control_period_cluster_key(value: object) -> tuple[str, object]:
     try:
         num = float(value)
@@ -13105,6 +13123,9 @@ def _td_perf_cluster_points_3d(
                     "x2_center": x2,
                     "points": [point],
                     "_cp_key": point.get("_cp_key"),
+                    "_x1_sum": x1,
+                    "_x2_sum": x2,
+                    "_point_count": 1,
                 }
             )
             continue
@@ -13116,6 +13137,9 @@ def _td_perf_cluster_points_3d(
                     "x2_center": x2,
                     "points": [point],
                     "_cp_key": point.get("_cp_key"),
+                    "_x1_sum": x1,
+                    "_x2_sum": x2,
+                    "_point_count": 1,
                 }
             )
             continue
@@ -13124,11 +13148,19 @@ def _td_perf_cluster_points_3d(
         tol_x1 = max(float(abs_tol), float(rel_tol) * max(abs(ref_x1), abs(x1)))
         tol_x2 = max(float(abs_tol), float(rel_tol) * max(abs(ref_x2), abs(x2)))
         if abs(x1 - ref_x1) <= tol_x1 and abs(x2 - ref_x2) <= tol_x2:
-            pts = list(cluster.get("points") or [])
+            pts = cluster.get("points")
+            if not isinstance(pts, list):
+                pts = []
+                cluster["points"] = pts
             pts.append(point)
-            cluster["points"] = pts
-            cluster["x1_center"] = float(sum(float(p.get("x1") or 0.0) for p in pts) / max(1, len(pts)))
-            cluster["x2_center"] = float(sum(float(p.get("x2") or 0.0) for p in pts) / max(1, len(pts)))
+            point_count = int(cluster.get("_point_count") or 0) + 1
+            x1_sum = float(cluster.get("_x1_sum") or 0.0) + x1
+            x2_sum = float(cluster.get("_x2_sum") or 0.0) + x2
+            cluster["_point_count"] = point_count
+            cluster["_x1_sum"] = x1_sum
+            cluster["_x2_sum"] = x2_sum
+            cluster["x1_center"] = float(x1_sum / max(1, point_count))
+            cluster["x2_center"] = float(x2_sum / max(1, point_count))
             continue
         clusters.append(
             {
@@ -13136,9 +13168,15 @@ def _td_perf_cluster_points_3d(
                 "x2_center": x2,
                 "points": [point],
                 "_cp_key": point.get("_cp_key"),
+                "_x1_sum": x1,
+                "_x2_sum": x2,
+                "_point_count": 1,
             }
         )
-    return clusters
+    return [
+        {k: v for k, v in cluster.items() if not str(k).startswith("_") or str(k) == "_cp_key"}
+        for cluster in clusters
+    ]
 
 def _td_perf_fit_surface_family(
     x1s: list[float],
@@ -13690,6 +13728,7 @@ def td_perf_collect_equation_export_rows(
     run_specs: Sequence[Mapping[str, object]],
     control_period_filter: object = None,
     run_type_filter: object = None,
+    progress_cb: Callable[[str], None] | None = None,
 ) -> list[dict[str, object]]:
     path = Path(db_path).expanduser()
     if not path.exists():
@@ -13713,11 +13752,16 @@ def td_perf_collect_equation_export_rows(
         float(strictness_defaults["perf_eq_x_abs_tol"]),
     )
 
+    unique_specs = _td_perf_unique_run_specs(run_specs)
     out: list[dict[str, object]] = []
-    for spec in run_specs or []:
+    for spec_index, spec in enumerate(unique_specs, start=1):
         run_name = str((spec or {}).get("run_name") or "").strip()
         if not run_name:
             continue
+        _td_emit_progress(
+            progress_cb,
+            f"Collecting cached export rows ({spec_index}/{max(1, len(unique_specs))}): {run_name}",
+        )
         display_name = str((spec or {}).get("display_name") or run_name).strip()
         input1_column = str((spec or {}).get("input1_column") or "").strip()
         input2_column = str((spec or {}).get("input2_column") or "").strip()
@@ -13878,7 +13922,7 @@ def td_perf_collect_condition_export_rows(
         return []
 
     out: list[dict[str, object]] = []
-    for spec in run_specs or []:
+    for spec in _td_perf_unique_run_specs(run_specs):
         run_name = str((spec or {}).get("run_name") or "").strip()
         if not run_name:
             continue
@@ -14149,6 +14193,8 @@ def _td_perf_cluster_points(
                     "x_min": x_val,
                     "x_max": x_val,
                     "points": [point],
+                    "_x_sum": x_val,
+                    "_point_count": 1,
                 }
             )
             continue
@@ -14157,14 +14203,20 @@ def _td_perf_cluster_points(
         ref = float(cluster.get("x_center") or x_val)
         tol = max(float(abs_tol), float(rel_tol) * max(abs(ref), abs(x_val)))
         if abs(x_val - ref) <= tol:
-            pts = list(cluster.get("points") or [])
+            pts = cluster.get("points")
+            if not isinstance(pts, list):
+                pts = []
+                cluster["points"] = pts
             pts.append(point)
             x_min = min(float(cluster.get("x_min") or x_val), x_val)
             x_max = max(float(cluster.get("x_max") or x_val), x_val)
-            cluster["points"] = pts
+            point_count = int(cluster.get("_point_count") or 0) + 1
+            x_sum = float(cluster.get("_x_sum") or 0.0) + x_val
             cluster["x_min"] = x_min
             cluster["x_max"] = x_max
-            cluster["x_center"] = float(sum(float(p.get("x") or 0.0) for p in pts) / max(1, len(pts)))
+            cluster["_point_count"] = point_count
+            cluster["_x_sum"] = x_sum
+            cluster["x_center"] = float(x_sum / max(1, point_count))
             continue
 
         clusters.append(
@@ -14173,10 +14225,12 @@ def _td_perf_cluster_points(
                 "x_min": x_val,
                 "x_max": x_val,
                 "points": [point],
+                "_x_sum": x_val,
+                "_point_count": 1,
             }
         )
 
-    return clusters
+    return [{k: v for k, v in cluster.items() if not str(k).startswith("_")} for cluster in clusters]
 
 
 def _td_perf_summarize_points(
@@ -14696,6 +14750,7 @@ def td_perf_export_equation_workbook(
         run_specs=run_specs,
         control_period_filter=control_period_filter,
         run_type_filter=run_type_filter,
+        progress_cb=progress_cb,
     )
 
     models_by_stat = _td_perf_export_models_by_stat(results_by_stat)

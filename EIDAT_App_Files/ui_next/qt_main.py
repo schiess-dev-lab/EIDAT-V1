@@ -12440,12 +12440,10 @@ class MetadataBatchEditorDialog(QtWidgets.QDialog):
         super().__init__(parent)
         self._rows = [dict(row) for row in (rows or []) if isinstance(row, dict)]
         self._choices = dict(choices or {})
-        self._widgets: dict[str, QtWidgets.QComboBox] = {}
-        self._dirty_fields: set[str] = set()
-        self._loading = False
+        self._field_labels = {key: label for label, key in self.FIELD_DEFS}
 
         self.setWindowTitle("Edit Metadata")
-        self.resize(760, 620)
+        self.resize(680, 320)
 
         root = QtWidgets.QVBoxLayout(self)
         root.setContentsMargins(14, 14, 14, 14)
@@ -12462,74 +12460,70 @@ class MetadataBatchEditorDialog(QtWidgets.QDialog):
         summary = QtWidgets.QLabel(
             f"Selected files: {len(self._rows)}"
             + (f"\nSerials: {serial_preview}" if serial_preview else "")
-            + "\nLeave a field unchanged to keep existing values. Enter a value to apply it to every selected file."
+            + "\nChoose one metadata field, enter the new value, and apply it to every selected file."
         )
         summary.setWordWrap(True)
         summary.setStyleSheet("font-size: 11px; color: #475569;")
         root.addWidget(summary)
 
-        scroll = QtWidgets.QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
-        body = QtWidgets.QWidget()
-        form = QtWidgets.QFormLayout(body)
+        form = QtWidgets.QFormLayout()
         form.setLabelAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
         form.setFormAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
         form.setSpacing(10)
 
-        self._loading = True
-        try:
-            for label, key in self.FIELD_DEFS:
-                combo = QtWidgets.QComboBox()
-                combo.setEditable(True)
-                combo.setInsertPolicy(QtWidgets.QComboBox.InsertPolicy.NoInsert)
-                combo.setMinimumWidth(320)
-                combo.setStyleSheet(
-                    """
-                    QComboBox {
-                        padding: 6px 8px;
-                        border-radius: 6px;
-                        background: #ffffff;
-                        color: #1f2937;
-                        border: 1px solid #d1d5db;
-                        font-size: 12px;
-                    }
-                    QComboBox::drop-down { border: none; }
-                    QComboBox QAbstractItemView {
-                        background: #ffffff;
-                        color: #1f2937;
-                        selection-background-color: #dbeafe;
-                        selection-color: #1f2937;
-                        border: 1px solid #d1d5db;
-                    }
-                    QLineEdit {
-                        color: #1f2937;
-                    }
-                    """
-                )
-                values = [str(v).strip() for v in (self._choices.get(key) or []) if str(v).strip()]
-                if values:
-                    combo.addItems(values)
-                common = self._shared_value(key)
-                if common:
-                    combo.setCurrentText(common)
-                try:
-                    le = combo.lineEdit()
-                    if le is not None:
-                        if common:
-                            le.setPlaceholderText("")
-                        else:
-                            le.setPlaceholderText("(mixed; enter value to override)")
-                except Exception:
-                    pass
-                combo.currentTextChanged.connect(lambda _text, field=key: self._mark_dirty(field))
-                self._widgets[key] = combo
-                form.addRow(label + ":", combo)
-        finally:
-            self._loading = False
+        combo_style = (
+            """
+            QComboBox {
+                padding: 6px 8px;
+                border-radius: 6px;
+                background: #ffffff;
+                color: #1f2937;
+                border: 1px solid #d1d5db;
+                font-size: 12px;
+            }
+            QComboBox::drop-down { border: none; }
+            QComboBox QAbstractItemView {
+                background: #ffffff;
+                color: #1f2937;
+                selection-background-color: #dbeafe;
+                selection-color: #1f2937;
+                border: 1px solid #d1d5db;
+            }
+            QLineEdit {
+                color: #1f2937;
+            }
+            """
+        )
 
-        scroll.setWidget(body)
-        root.addWidget(scroll, 1)
+        self.cmb_field = QtWidgets.QComboBox()
+        self.cmb_field.setMinimumWidth(280)
+        self.cmb_field.setStyleSheet(combo_style)
+        for label, key in self.FIELD_DEFS:
+            self.cmb_field.addItem(label, key)
+        form.addRow("Field:", self.cmb_field)
+
+        self.cmb_value = QtWidgets.QComboBox()
+        self.cmb_value.setEditable(True)
+        self.cmb_value.setInsertPolicy(QtWidgets.QComboBox.InsertPolicy.NoInsert)
+        self.cmb_value.setMinimumWidth(320)
+        self.cmb_value.setStyleSheet(combo_style)
+        try:
+            le = self.cmb_value.lineEdit()
+            if le is not None:
+                le.setPlaceholderText("Enter new value")
+        except Exception:
+            pass
+        form.addRow("New Value:", self.cmb_value)
+
+        self.lbl_current = QtWidgets.QLabel("")
+        self.lbl_current.setWordWrap(True)
+        self.lbl_current.setStyleSheet("font-size: 11px; color: #475569;")
+        form.addRow("Current:", self.lbl_current)
+
+        root.addLayout(form)
+
+        self.cmb_field.currentIndexChanged.connect(self._on_field_changed)
+        self._on_field_changed(self.cmb_field.currentIndex())
 
         buttons = QtWidgets.QHBoxLayout()
         buttons.addStretch(1)
@@ -12585,24 +12579,36 @@ class MetadataBatchEditorDialog(QtWidgets.QDialog):
                 return ""
         return value
 
-    def _mark_dirty(self, field: str) -> None:
-        if self._loading:
-            return
-        self._dirty_fields.add(str(field or "").strip())
+    def _field_key(self) -> str:
+        return str(self.cmb_field.currentData() or "").strip()
+
+    def _on_field_changed(self, _index: int) -> None:
+        key = self._field_key()
+        self.cmb_value.blockSignals(True)
+        try:
+            self.cmb_value.clear()
+            values = [str(v).strip() for v in (self._choices.get(key) or []) if str(v).strip()]
+            if values:
+                self.cmb_value.addItems(values)
+            self.cmb_value.setCurrentIndex(-1)
+            self.cmb_value.setEditText("")
+        finally:
+            self.cmb_value.blockSignals(False)
+        shared = self._shared_value(key)
+        label = self._field_labels.get(key, key)
+        if shared:
+            self.lbl_current.setText(f"{label} is the same across the selection: {shared}")
+        else:
+            self.lbl_current.setText(f"{label} has mixed values across the selection.")
 
     def field_updates(self) -> dict[str, str]:
-        updates: dict[str, str] = {}
-        for _label, key in self.FIELD_DEFS:
-            if key not in self._dirty_fields:
-                continue
-            widget = self._widgets.get(key)
-            if widget is None:
-                continue
-            value = str(widget.currentText() or "").strip()
-            if not value:
-                continue
-            updates[key] = value
-        return updates
+        key = self._field_key()
+        value = str(self.cmb_value.currentText() or "").strip()
+        if not key or not value:
+            return {}
+        if value == self._shared_value(key):
+            return {}
+        return {key: value}
 
 
 class MainWindow(QtWidgets.QMainWindow):

@@ -86,8 +86,11 @@ class TestQtMainFilesMetadata(unittest.TestCase):
         )
         try:
             self.assertEqual(dlg.field_updates(), {})
-            dlg._widgets["vendor"].setCurrentText("Vendor C")
+            dlg.cmb_field.setCurrentIndex(dlg.cmb_field.findData("vendor"))
+            dlg.cmb_value.setCurrentText("Vendor C")
             self.assertEqual(dlg.field_updates(), {"vendor": "Vendor C"})
+            dlg.cmb_field.setCurrentIndex(dlg.cmb_field.findData("program_title"))
+            self.assertEqual(dlg.field_updates(), {})
         finally:
             dlg.close()
 

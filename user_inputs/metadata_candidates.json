@@ -37,6 +37,11 @@
     "Valve1"
   ],
   "asset_specific_type_rules": [
+    {
+      "asset_specific_type": "Valve1",
+      "asset_type": "Valve",
+      "vendor": "MOOG"
+    }
   ],
   "document_types": [
     {

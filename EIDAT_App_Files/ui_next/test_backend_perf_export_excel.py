@@ -148,6 +148,45 @@ def _data_header_row(ws) -> int:
 
 @unittest.skipIf(load_workbook is None, "openpyxl is required")
 class TestBackendPerfExportExcel(unittest.TestCase):
+    def test_cluster_points_merges_large_single_cluster_without_losing_center(self) -> None:
+        points = [
+            {"x": 1.0 + (idx * 1e-6), "run_name": "cond_2d", "observation_id": f"obs_{idx}"}
+            for idx in range(500)
+        ]
+
+        clusters = backend._td_perf_cluster_points(points, rel_tol=0.05, abs_tol=0.0)
+
+        self.assertEqual(len(clusters), 1)
+        cluster = clusters[0]
+        expected_center = sum(float(point["x"]) for point in points) / len(points)
+        self.assertAlmostEqual(float(cluster["x_center"]), expected_center, places=9)
+        self.assertEqual(len(cluster["points"]), len(points))
+
+    def test_collect_equation_export_rows_ignores_duplicate_run_specs(self) -> None:
+        db_path = _create_perf_export_db()
+
+        rows = backend.td_perf_collect_equation_export_rows(
+            db_path,
+            run_specs=[
+                {
+                    "run_name": "cond_2d",
+                    "display_name": "Condition 2D",
+                    "input1_column": "Input",
+                    "output_column": "Output",
+                },
+                {
+                    "run_name": "cond_2d",
+                    "display_name": "Condition 2D Duplicate",
+                    "input1_column": "Input",
+                    "output_column": "Output",
+                },
+            ],
+            run_type_filter="pulsed_mode",
+        )
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual([str(row["run_name"]) for row in rows], ["cond_2d", "cond_2d"])
+
     def test_collect_condition_export_rows_aggregates_cached_means(self) -> None:
         db_path = _create_perf_export_db()
 
