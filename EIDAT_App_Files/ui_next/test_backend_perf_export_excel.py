@@ -146,6 +146,14 @@ def _data_header_row(ws) -> int:
     raise AssertionError("Data header row not found")
 
 
+def _find_label_row(ws, label: str) -> int:
+    for row_idx in range(1, ws.max_row + 1):
+        for col_idx in range(1, ws.max_column + 1):
+            if str(ws.cell(row_idx, col_idx).value or "").strip() == str(label).strip():
+                return row_idx
+    raise AssertionError(f"Label not found: {label}")
+
+
 @unittest.skipIf(load_workbook is None, "openpyxl is required")
 class TestBackendPerfExportExcel(unittest.TestCase):
     def test_cluster_points_merges_large_single_cluster_without_losing_center(self) -> None:
@@ -210,6 +218,242 @@ class TestBackendPerfExportExcel(unittest.TestCase):
         self.assertAlmostEqual(float(row["input_1"]), 12.0)
         self.assertAlmostEqual(float(row["actual_mean"]), 120.0)
         self.assertEqual(int(row["sample_count"]), 2)
+
+    def test_export_interactive_equation_workbook_2d_creates_calculator_and_checker(self) -> None:
+        db_path = _create_perf_export_db()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_path = Path(tmpdir) / "interactive_2d.xlsx"
+            results = {
+                "mean": {
+                    "master_model": {
+                        "fit_family": "polynomial",
+                        "coeffs": [10.0, 0.0],
+                        "normalize_x": False,
+                        "equation": "10*x",
+                        "x_norm_equation": "",
+                    }
+                },
+                "min": {
+                    "master_model": {
+                        "fit_family": "polynomial",
+                        "coeffs": [9.0, 0.0],
+                        "normalize_x": False,
+                        "equation": "9*x",
+                        "x_norm_equation": "",
+                    }
+                },
+                "max": {
+                    "master_model": {
+                        "fit_family": "polynomial",
+                        "coeffs": [11.0, 0.0],
+                        "normalize_x": False,
+                        "equation": "11*x",
+                        "x_norm_equation": "",
+                    }
+                },
+                "std": {
+                    "master_model": {
+                        "fit_family": "polynomial",
+                        "coeffs": [5.0],
+                        "normalize_x": False,
+                        "equation": "5",
+                        "x_norm_equation": "",
+                    }
+                },
+            }
+
+            exported = backend.td_perf_export_interactive_equation_workbook(
+                db_path,
+                out_path,
+                plot_metadata={
+                    "plot_dimension": "2d",
+                    "output_target": "Output",
+                    "output_units": "u",
+                    "input1_target": "Input",
+                    "input1_units": "u",
+                    "input2_target": "",
+                    "input2_units": "",
+                    "run_selection_label": "Condition 2D",
+                    "member_runs": ["cond_2d"],
+                    "performance_run_type_mode": "pulsed_mode",
+                    "performance_filter_mode": "all_conditions",
+                },
+                results_by_stat=results,
+                run_specs=[
+                    {
+                        "run_name": "cond_2d",
+                        "display_name": "Condition 2D",
+                        "input1_column": "Input",
+                        "output_column": "Output",
+                    }
+                ],
+                run_type_filter="pulsed_mode",
+                include_regression_checker=True,
+            )
+
+            self.assertEqual(exported, out_path)
+            wb = load_workbook(str(out_path), data_only=False)
+            try:
+                self.assertEqual(wb.sheetnames, ["Interactive Calculator", "Mean Regression Checker"])
+                self.assertIsNotNone(wb.defined_names.get("Input_1"))
+
+                ws = wb["Interactive Calculator"]
+                pred_mean_row = _find_label_row(ws, "pred_mean")
+                self.assertIn("Input_1", str(ws.cell(pred_mean_row, 5).value or ""))
+
+                scenario_row = _find_label_row(ws, "Scenario Table") + 3
+                headers = {
+                    str(ws.cell(scenario_row, col_idx).value or "").strip(): col_idx
+                    for col_idx in range(1, ws.max_column + 1)
+                    if str(ws.cell(scenario_row, col_idx).value or "").strip()
+                }
+                self.assertIn("pred_max_3sigma", headers)
+                scenario_formula = str(ws.cell(scenario_row + 1, headers["pred_mean"]).value or "")
+                self.assertTrue(scenario_formula.startswith("="))
+                self.assertIn("IFERROR", scenario_formula)
+
+                checker = wb["Mean Regression Checker"]
+                header_row = _data_header_row(checker)
+                checker_headers = {
+                    str(checker.cell(header_row, col_idx).value or "").strip(): col_idx
+                    for col_idx in range(1, checker.max_column + 1)
+                    if str(checker.cell(header_row, col_idx).value or "").strip()
+                }
+                self.assertIn("pred_mean", checker_headers)
+                pred_formula = str(checker.cell(header_row + 1, checker_headers["pred_mean"]).value or "")
+                self.assertTrue(pred_formula.startswith("="))
+                self.assertIn("IFERROR", pred_formula)
+                pct_formula = str(checker.cell(header_row + 1, checker_headers["pct_delta_mean"]).value or "")
+                self.assertIn("/", pct_formula)
+            finally:
+                wb.close()
+
+    def test_export_interactive_equation_workbook_3d_uses_input_2_and_omits_checker_when_disabled(self) -> None:
+        db_path = _create_perf_export_db()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_path = Path(tmpdir) / "interactive_3d.xlsx"
+            results = {
+                "mean": {
+                    "master_model": {
+                        "fit_family": "plane",
+                        "coeffs": [0.0, 2.0, 3.0],
+                        "x1_center": 0.0,
+                        "x1_scale": 1.0,
+                        "x2_center": 0.0,
+                        "x2_scale": 1.0,
+                        "equation": "2*x1 + 3*x2",
+                        "x_norm_equation": "",
+                    }
+                }
+            }
+
+            backend.td_perf_export_interactive_equation_workbook(
+                db_path,
+                out_path,
+                plot_metadata={
+                    "plot_dimension": "3d",
+                    "output_target": "Output3D",
+                    "output_units": "u",
+                    "input1_target": "X1",
+                    "input1_units": "u",
+                    "input2_target": "X2",
+                    "input2_units": "u",
+                    "run_selection_label": "Condition 3D",
+                    "member_runs": ["cond_3d"],
+                    "performance_run_type_mode": "pulsed_mode",
+                    "performance_filter_mode": "all_conditions",
+                },
+                results_by_stat=results,
+                run_specs=[
+                    {
+                        "run_name": "cond_3d",
+                        "display_name": "Condition 3D",
+                        "input1_column": "X1",
+                        "input2_column": "X2",
+                        "output_column": "Output3D",
+                    }
+                ],
+                run_type_filter="pulsed_mode",
+                include_regression_checker=False,
+            )
+
+            wb = load_workbook(str(out_path), data_only=False)
+            try:
+                self.assertEqual(wb.sheetnames, ["Interactive Calculator"])
+                self.assertIsNotNone(wb.defined_names.get("Input_2"))
+                self.assertIsNone(wb.defined_names.get("Control_Period"))
+
+                ws = wb["Interactive Calculator"]
+                pred_mean_row = _find_label_row(ws, "pred_mean")
+                self.assertIn("Input_2", str(ws.cell(pred_mean_row, 5).value or ""))
+                pred_min_row = _find_label_row(ws, "pred_min")
+                self.assertEqual(str(ws.cell(pred_min_row, 5).value or "").strip(), "")
+                unavailable_row = _find_label_row(ws, "Unavailable Stats")
+                self.assertIn("min", str(ws.cell(unavailable_row, 2).value or ""))
+            finally:
+                wb.close()
+
+    def test_export_interactive_equation_workbook_cp_surface_includes_control_period_name(self) -> None:
+        db_path = _create_perf_export_db()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_path = Path(tmpdir) / "interactive_cp.xlsx"
+            results = {
+                "mean": {
+                    "master_model": {
+                        "fit_family": "quadratic_surface_control_period",
+                        "coeff_cp_models": [[1.0], [2.0], [3.0], [4.0], [5.0], [6.0]],
+                        "x1_center": 0.0,
+                        "x1_scale": 1.0,
+                        "x2_center": 0.0,
+                        "x2_scale": 1.0,
+                        "cp_center": 0.0,
+                        "cp_scale": 1.0,
+                        "equation": "cp_surface",
+                        "x_norm_equation": "",
+                    }
+                }
+            }
+
+            backend.td_perf_export_interactive_equation_workbook(
+                db_path,
+                out_path,
+                plot_metadata={
+                    "plot_dimension": "3d",
+                    "output_target": "Output3D",
+                    "output_units": "u",
+                    "input1_target": "X1",
+                    "input1_units": "u",
+                    "input2_target": "X2",
+                    "input2_units": "u",
+                    "run_selection_label": "Condition 3D",
+                    "member_runs": ["cond_3d"],
+                    "performance_run_type_mode": "pulsed_mode",
+                    "performance_filter_mode": "match_control_period",
+                    "selected_control_period": 30.0,
+                },
+                results_by_stat=results,
+                run_specs=[
+                    {
+                        "run_name": "cond_3d",
+                        "display_name": "Condition 3D",
+                        "input1_column": "X1",
+                        "input2_column": "X2",
+                        "output_column": "Output3D",
+                    }
+                ],
+                control_period_filter=30.0,
+                run_type_filter="pulsed_mode",
+                include_regression_checker=False,
+            )
+
+            wb = load_workbook(str(out_path), data_only=False)
+            try:
+                self.assertIsNotNone(wb.defined_names.get("Control_Period"))
+                ws = wb["Interactive Calculator"]
+                pred_mean_row = _find_label_row(ws, "pred_mean")
+                self.assertIn("Control_Period", str(ws.cell(pred_mean_row, 5).value or ""))
+            finally:
+                wb.close()
 
     def test_export_saved_equations_workbook_writes_static_condition_sheets(self) -> None:
         db_path = _create_perf_export_db()

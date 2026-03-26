@@ -3726,6 +3726,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self.btn_perf_saved_equations = QtWidgets.QPushButton("Saved Performance Equations")
         self.btn_perf_saved_equations.setEnabled(True)
         eq_row.addWidget(self.btn_perf_saved_equations)
+        self.cb_perf_include_reg_checker = QtWidgets.QCheckBox("Include Mean Regression Checker")
+        self.cb_perf_include_reg_checker.setChecked(True)
+        eq_row.addWidget(self.cb_perf_include_reg_checker)
+        self.btn_perf_export_interactive = QtWidgets.QPushButton("Export Interactive Workbook")
+        self.btn_perf_export_interactive.setEnabled(False)
+        eq_row.addWidget(self.btn_perf_export_interactive)
         self.btn_perf_export_equations = QtWidgets.QPushButton("Export Equation to Excel")
         self.btn_perf_export_equations.setEnabled(False)
         eq_row.addWidget(self.btn_perf_export_equations)
@@ -10209,7 +10215,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
     def _update_perf_export_button_state(self) -> None:
         export_busy = bool(getattr(self, "_export_worker", None) and self._export_worker.isRunning())
         enabled = self._perf_has_exportable_models() and not export_busy
-        for widget_name in ("btn_perf_export_equations", "btn_perf_save_equation"):
+        for widget_name in ("btn_perf_export_equations", "btn_perf_export_interactive", "btn_perf_save_equation"):
             if hasattr(self, widget_name):
                 try:
                     getattr(self, widget_name).setEnabled(enabled)
@@ -10422,6 +10428,39 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             on_success=lambda payload: self._handle_perf_excel_export_success(payload, heading="Export Equation to Excel"),
         )
 
+    def _start_perf_interactive_equation_export(
+        self,
+        output_path: Path,
+        *,
+        plot_metadata: dict[str, object],
+        results_by_stat: dict[str, dict[str, object]],
+        run_specs: list[dict[str, object]],
+        control_period_filter: object = None,
+        run_type_filter: object = None,
+        include_regression_checker: bool = True,
+    ) -> None:
+        output = Path(output_path).expanduser()
+
+        def _task(report):
+            return be.td_perf_export_interactive_equation_workbook(
+                self._db_path,
+                output,
+                plot_metadata=plot_metadata,
+                results_by_stat=results_by_stat,
+                run_specs=run_specs,
+                control_period_filter=control_period_filter,
+                run_type_filter=run_type_filter,
+                include_regression_checker=include_regression_checker,
+                progress_cb=report,
+            )
+
+        self._start_perf_export_task(
+            heading="Export Interactive Workbook",
+            status_text=f"Exporting interactive workbook to {output.name}",
+            task_factory=_task,
+            on_success=lambda payload: self._handle_perf_excel_export_success(payload, heading="Export Interactive Workbook"),
+        )
+
     def _start_saved_perf_equations_excel_export(
         self,
         output_path: Path,
@@ -10449,6 +10488,89 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 heading="Export Saved Performance Equations to Excel",
             ),
         )
+
+    def _export_perf_interactive_equation_workbook(self) -> None:
+        if not self._perf_has_exportable_models():
+            QtWidgets.QMessageBox.information(self, "Performance", "No exportable master equations are available.")
+            return
+        if not getattr(self, "_db_path", None):
+            QtWidgets.QMessageBox.information(self, "Performance", "Build/refresh cache first.")
+            return
+        results = getattr(self, "_perf_results_by_stat", {}) or {}
+        first_result = next((r for r in results.values() if isinstance(r, dict)), {}) or {}
+        output_target = str(first_result.get("output_target") or "").strip()
+        input1_target = str(first_result.get("input1_target") or "").strip()
+        input2_target = str(first_result.get("input2_target") or "").strip()
+        if not output_target or not input1_target:
+            QtWidgets.QMessageBox.information(self, "Performance", "Plot a performance fit before exporting equations.")
+            return
+
+        plot_def = dict(getattr(self, "_last_plot_def", {}) or {})
+        current_selection = self._current_run_selection()
+        runs = [str(v).strip() for v in (plot_def.get("member_runs") or current_selection.get("member_runs") or []) if str(v).strip()]
+        run_specs = self._perf_export_run_specs(runs, output_target, input1_target, input2_target)
+        run_type_mode = str(
+            plot_def.get("performance_run_type_mode") or self._selected_perf_run_type_mode()
+        ).strip().lower()
+        perf_filter_mode = str(plot_def.get("performance_filter_mode") or self._selected_perf_filter_mode()).strip().lower()
+        control_period_filter = plot_def.get("selected_control_period")
+        if run_type_mode != "pulsed_mode" or perf_filter_mode != "match_control_period":
+            control_period_filter = None
+
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_name = (
+            f"interactive_performance_equation_{self._perf_export_slug(output_target)}_vs_"
+            f"{self._perf_export_slug(input1_target)}"
+        )
+        if str(input2_target or "").strip():
+            default_name += f"_{self._perf_export_slug(input2_target)}"
+        default_name += f"_{timestamp}.xlsx"
+        out_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Export Interactive Workbook",
+            str(self._project_dir / default_name),
+            "Excel Files (*.xlsx)",
+        )
+        if not out_path:
+            return
+
+        plot_metadata = {
+            "plot_dimension": str(first_result.get("plot_dimension") or plot_def.get("plot_dimension") or "2d"),
+            "output_target": output_target,
+            "output_units": str(first_result.get("output_units") or first_result.get("y_units") or "").strip(),
+            "input1_target": input1_target,
+            "input1_units": str(first_result.get("input1_units") or first_result.get("x_units") or "").strip(),
+            "input2_target": input2_target,
+            "input2_units": str(first_result.get("input2_units") or "").strip(),
+            "run_selection_label": str(plot_def.get("run_condition") or plot_def.get("display_text") or self._selection_condition_label(current_selection)).strip(),
+            "member_runs": list(runs),
+            "performance_run_type_mode": run_type_mode,
+            "performance_filter_mode": perf_filter_mode or "all_conditions",
+            "selected_control_period": control_period_filter,
+        }
+        try:
+            asset_metadata = be.td_perf_collect_asset_metadata(self._db_path, be._td_perf_entry_serials(results))
+        except Exception:
+            asset_metadata = {}
+        if isinstance(asset_metadata, dict):
+            plot_metadata["asset_type"] = str(asset_metadata.get("primary_asset_type") or "").strip()
+            plot_metadata["asset_specific_type"] = str(asset_metadata.get("primary_asset_specific_type") or "").strip()
+
+        include_regression_checker = bool(
+            getattr(self, "cb_perf_include_reg_checker", None) and self.cb_perf_include_reg_checker.isChecked()
+        )
+        try:
+            self._start_perf_interactive_equation_export(
+                Path(out_path),
+                plot_metadata=plot_metadata,
+                results_by_stat=results,
+                run_specs=run_specs,
+                control_period_filter=control_period_filter,
+                run_type_filter=run_type_mode,
+                include_regression_checker=include_regression_checker,
+            )
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Export Interactive Workbook", str(exc))
 
     def _export_perf_equations_to_excel(self) -> None:
         if not self._perf_has_exportable_models():
@@ -11203,6 +11325,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             self.btn_perf_equations_popup.clicked.connect(self._open_performance_equations_popup)
             self.btn_perf_save_equation.clicked.connect(self._save_current_performance_equation)
             self.btn_perf_saved_equations.clicked.connect(self._open_saved_performance_equations_popup)
+            self.btn_perf_export_interactive.clicked.connect(self._export_perf_interactive_equation_workbook)
             self.btn_perf_export_equations.clicked.connect(self._export_perf_equations_to_excel)
             self._perf_signals_connected = True
 

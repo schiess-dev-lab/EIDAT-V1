@@ -14516,6 +14516,439 @@ def _td_perf_static_norm_value(raw_value: object, center: object, scale: object)
     return float((raw_num - center_num) / scale_num)
 
 
+TD_PERF_INTERACTIVE_OUTPUT_STATS = ["mean", "min", "max", "min_3sigma", "max_3sigma"]
+
+
+def _td_perf_ordered_unique_refs(values: Sequence[object]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        ref = str(value or "").strip()
+        if not ref or ref in seen:
+            continue
+        seen.add(ref)
+        out.append(ref)
+    return out
+
+
+def _td_perf_excel_guarded_formula(formula: str, required_refs: Sequence[object]) -> str:
+    body = str(formula or "").strip()
+    if not body:
+        return ""
+    if body.startswith("="):
+        body = body[1:]
+    refs = _td_perf_ordered_unique_refs(required_refs)
+    if refs:
+        guard = "OR(" + ",".join(f'{ref}=""' for ref in refs) + ")"
+        return f'=IF({guard},"",IFERROR({body},""))'
+    return f'=IFERROR({body},"")'
+
+
+def _td_perf_interactive_summary_rows(
+    models_by_stat: Mapping[str, Mapping[str, object]],
+) -> tuple[list[tuple[str, str, str, str]], list[str]]:
+    rows: list[tuple[str, str, str, str]] = []
+    unavailable: list[str] = []
+    for stat in TD_PERF_INTERACTIVE_OUTPUT_STATS:
+        model = models_by_stat.get(stat)
+        derived_eq, derived_norm = _td_perf_derived_3sigma_equation_text(stat, models_by_stat)
+        if model is None and not derived_eq:
+            unavailable.append(stat)
+            continue
+        rows.append(
+            (
+                stat,
+                (
+                    td_perf_fit_family_label(model.get("fit_family"))
+                    if model is not None
+                    else "Derived from Mean and Std"
+                ),
+                derived_eq or str((model or {}).get("equation") or ""),
+                derived_norm or str((model or {}).get("x_norm_equation") or ""),
+            )
+        )
+    return rows, unavailable
+
+
+def _td_perf_interactive_formula_map(
+    models_by_stat: Mapping[str, Mapping[str, object]],
+    *,
+    raw_x_ref: str,
+    raw_x2_ref: str = "",
+    raw_cp_ref: str = "",
+) -> dict[str, str]:
+    formula_specs: dict[str, tuple[str, list[str]]] = {}
+    pchip_support_by_stat: dict[str, list[dict[str, object]]] = {}
+    for stat, raw_model in (models_by_stat or {}).items():
+        model = dict(raw_model or {})
+        family = td_perf_normalize_fit_mode(model.get("fit_family"))
+        if family == TD_PERF_FIT_MODE_MONOTONE_PCHIP:
+            pchip_support_by_stat[str(stat)] = [dict(seg) for seg in _td_perf_pchip_segment_rows(model, str(stat))]
+
+    for stat, raw_model in (models_by_stat or {}).items():
+        model = dict(raw_model or {})
+        family = td_perf_normalize_fit_mode(model.get("fit_family"))
+        if not family:
+            continue
+        stat_norm_x_ref = raw_x_ref
+        stat_norm_x1_ref = raw_x_ref
+        stat_norm_x2_ref = raw_x2_ref
+        stat_norm_cp_ref = raw_cp_ref
+        required_refs = [raw_x_ref]
+        if family == TD_PERF_FIT_MODE_POLYNOMIAL and bool(model.get("normalize_x")):
+            stat_norm_x_ref = _td_perf_excel_norm_expr(raw_x_ref, model.get("x0"), model.get("sx"))
+        elif family == TD_PERF_FIT_MODE_HYBRID_QUADRATIC_RESIDUAL and bool((model.get("params") or {}).get("normalize_x")):
+            stat_norm_x_ref = _td_perf_excel_norm_expr(
+                raw_x_ref,
+                (model.get("params") or {}).get("x0"),
+                (model.get("params") or {}).get("sx"),
+            )
+        elif family in {TD_PERF_FIT_FAMILY_PLANE, TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE}:
+            required_refs.append(raw_x2_ref)
+            stat_norm_x1_ref = _td_perf_excel_norm_expr(raw_x_ref, model.get("x1_center"), model.get("x1_scale"))
+            stat_norm_x2_ref = _td_perf_excel_norm_expr(raw_x2_ref, model.get("x2_center"), model.get("x2_scale"))
+        elif family == TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD:
+            required_refs.extend([raw_x2_ref, raw_cp_ref])
+            stat_norm_x1_ref = _td_perf_excel_norm_expr(raw_x_ref, model.get("x1_center"), model.get("x1_scale"))
+            stat_norm_x2_ref = _td_perf_excel_norm_expr(raw_x2_ref, model.get("x2_center"), model.get("x2_scale"))
+            stat_norm_cp_ref = _td_perf_excel_norm_expr(raw_cp_ref, model.get("cp_center"), model.get("cp_scale"))
+        formula = _td_perf_excel_formula_for_model(
+            model,
+            raw_x_ref=raw_x_ref,
+            norm_x_ref=stat_norm_x_ref,
+            raw_x1_ref=raw_x_ref,
+            raw_x2_ref=raw_x2_ref,
+            norm_x1_ref=stat_norm_x1_ref,
+            norm_x2_ref=stat_norm_x2_ref,
+            raw_cp_ref=raw_cp_ref,
+            norm_cp_ref=stat_norm_cp_ref,
+            pchip_segments=pchip_support_by_stat.get(str(stat)),
+        )
+        if formula:
+            formula_specs[str(stat)] = (formula, _td_perf_ordered_unique_refs(required_refs))
+
+    mean_spec = formula_specs.get("mean")
+    std_spec = formula_specs.get("std")
+    if mean_spec and std_spec:
+        mean_formula, mean_refs = mean_spec
+        std_formula, std_refs = std_spec
+        derived_refs = _td_perf_ordered_unique_refs([*mean_refs, *std_refs])
+        formula_specs["min_3sigma"] = (f"=({mean_formula[1:]})-(3*({std_formula[1:]}))", derived_refs)
+        formula_specs["max_3sigma"] = (f"=({mean_formula[1:]})+(3*({std_formula[1:]}))", derived_refs)
+
+    return {
+        stat: _td_perf_excel_guarded_formula(formula, required_refs)
+        for stat, (formula, required_refs) in formula_specs.items()
+    }
+
+
+def _td_perf_add_defined_name(workbook, *, name: str, sheet_name: str, cell_ref: str) -> None:
+    from openpyxl.workbook.defined_name import DefinedName  # type: ignore
+
+    safe_sheet_name = str(sheet_name or "").replace("'", "''")
+    workbook.defined_names.add(DefinedName(name=name, attr_text=f"'{safe_sheet_name}'!{cell_ref}"))
+
+
+def _td_perf_write_interactive_calculator_sheet(
+    workbook,
+    worksheet,
+    *,
+    plot_metadata: Mapping[str, object],
+    results_by_stat: Mapping[str, Mapping[str, object]],
+    control_period_filter: object = None,
+    run_type_filter: object = None,
+):
+    try:
+        from openpyxl.styles import Alignment, Font, PatternFill  # type: ignore
+        from openpyxl.utils import get_column_letter  # type: ignore
+    except Exception as exc:  # pragma: no cover - depends on optional dep
+        raise RuntimeError(
+            "openpyxl is required to export performance equations to Excel. "
+            "Install it with `py -m pip install openpyxl` within the project environment."
+        ) from exc
+
+    ws = worksheet
+    models_by_stat = _td_perf_export_models_by_stat(results_by_stat)
+    if not models_by_stat:
+        raise RuntimeError("No exportable master performance equations are available for the current plot.")
+
+    plot_dimension = str(plot_metadata.get("plot_dimension") or "2d").strip().lower()
+    is_surface = plot_dimension == "3d" or bool(str(plot_metadata.get("input2_target") or "").strip())
+    uses_control_period_input = any(
+        td_perf_normalize_fit_mode((model or {}).get("fit_family")) == TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD
+        for model in models_by_stat.values()
+        if isinstance(model, Mapping)
+    )
+    output_target = str(plot_metadata.get("output_target") or "").strip()
+    input1_target = str(plot_metadata.get("input1_target") or "").strip()
+    input2_target = str(plot_metadata.get("input2_target") or "").strip()
+    output_units = str(plot_metadata.get("output_units") or plot_metadata.get("y_units") or "").strip()
+    input1_units = str(plot_metadata.get("input1_units") or plot_metadata.get("x_units") or "").strip()
+    input2_units = str(plot_metadata.get("input2_units") or "").strip()
+
+    ws.title = "Interactive Calculator"
+    header_font = Font(bold=True)
+    header_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+    section_fill = PatternFill(start_color="E2F0D9", end_color="E2F0D9", fill_type="solid")
+    editable_fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+
+    metadata_rows: list[tuple[object, object]] = [
+        ("Export Timestamp", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+        ("Export Mode", "Interactive calculator"),
+        ("Plot Dimension", "3D" if is_surface else "2D"),
+        ("Asset Type", str(plot_metadata.get("asset_type") or "").strip()),
+        ("Asset Specific Type", str(plot_metadata.get("asset_specific_type") or "").strip()),
+        ("Output Target", output_target),
+        ("Output Units", output_units),
+        ("Input 1 Target", input1_target),
+        ("Input 1 Units", input1_units),
+        ("Input 2 Target", input2_target if is_surface else ""),
+        ("Input 2 Units", input2_units if is_surface else ""),
+        (
+            "Run Selection",
+            str(plot_metadata.get("run_selection_label") or plot_metadata.get("display_text") or plot_metadata.get("run_condition") or "").strip(),
+        ),
+        ("Member Runs", ", ".join(str(v).strip() for v in (plot_metadata.get("member_runs") or []) if str(v).strip())),
+        ("Condition Family", td_perf_run_type_mode_label(plot_metadata.get("performance_run_type_mode") or run_type_filter)),
+        ("PM Filter Mode", str(plot_metadata.get("performance_filter_mode") or "all_conditions").strip()),
+        (
+            "Selected Control Period",
+            "" if control_period_filter in (None, "") else str(control_period_filter),
+        ),
+    ]
+    for row_idx, (label, value) in enumerate(metadata_rows, start=1):
+        ws.cell(row_idx, 1).value = label
+        ws.cell(row_idx, 2).value = value
+        ws.cell(row_idx, 1).font = header_font
+
+    stat_meta_header_row = len(metadata_rows) + 2
+    for col_idx, value in enumerate(["Stat", "Fit Family", "Equation", "Normalization"], start=1):
+        cell = ws.cell(stat_meta_header_row, col_idx)
+        cell.value = value
+        cell.font = header_font
+        cell.fill = section_fill
+    stat_meta_row = stat_meta_header_row + 1
+    summary_rows, unavailable_stats = _td_perf_interactive_summary_rows(models_by_stat)
+    for stat, family, equation, normalization in summary_rows:
+        ws.cell(stat_meta_row, 1).value = stat
+        ws.cell(stat_meta_row, 2).value = family
+        ws.cell(stat_meta_row, 3).value = equation
+        ws.cell(stat_meta_row, 4).value = normalization
+        stat_meta_row += 1
+    if unavailable_stats:
+        ws.cell(stat_meta_row, 1).value = "Unavailable Stats"
+        ws.cell(stat_meta_row, 2).value = ", ".join(unavailable_stats)
+        ws.cell(stat_meta_row, 1).font = header_font
+        stat_meta_row += 1
+
+    panel_row = stat_meta_row + 2
+    ws.cell(panel_row, 1).value = "Interactive Calculator"
+    ws.cell(panel_row, 1).font = header_font
+    ws.cell(panel_row + 1, 1).value = "Enter values in highlighted cells."
+    ws.cell(panel_row, 4).value = "Live Outputs"
+    ws.cell(panel_row, 4).font = header_font
+
+    input_rows: list[tuple[str, str, str, str]] = [
+        ("Input 1", "Input_1", input1_target, input1_units),
+    ]
+    if is_surface:
+        input_rows.append(("Input 2", "Input_2", input2_target, input2_units))
+    if uses_control_period_input:
+        input_rows.append(("Control Period", "Control_Period", "Control Period", ""))
+
+    output_rows = [
+        ("pred_mean", "mean"),
+        ("pred_min", "min"),
+        ("pred_max", "max"),
+        ("pred_min_3sigma", "min_3sigma"),
+        ("pred_max_3sigma", "max_3sigma"),
+    ]
+    calculator_formula_map = _td_perf_interactive_formula_map(
+        models_by_stat,
+        raw_x_ref="Input_1",
+        raw_x2_ref=("Input_2" if is_surface else ""),
+        raw_cp_ref=("Control_Period" if uses_control_period_input else ""),
+    )
+
+    panel_start_row = panel_row + 3
+    panel_span = max(len(input_rows), len(output_rows))
+    for idx in range(panel_span):
+        row_idx = panel_start_row + idx
+        if idx < len(input_rows):
+            label, defined_name, target, units = input_rows[idx]
+            ws.cell(row_idx, 1).value = label
+            ws.cell(row_idx, 1).font = header_font
+            input_cell = ws.cell(row_idx, 2)
+            input_cell.fill = editable_fill
+            input_cell.alignment = Alignment(horizontal="center")
+            ws.cell(row_idx, 3).value = " ".join(part for part in [target, f"({units})" if units else ""] if part).strip()
+            _td_perf_add_defined_name(
+                workbook,
+                name=defined_name,
+                sheet_name=ws.title,
+                cell_ref=_td_perf_excel_ref(2, row_idx, absolute=True),
+            )
+        if idx < len(output_rows):
+            label, stat = output_rows[idx]
+            ws.cell(row_idx, 4).value = label
+            ws.cell(row_idx, 4).font = header_font
+            ws.cell(row_idx, 5).value = calculator_formula_map.get(stat) or ""
+            ws.cell(row_idx, 6).value = output_units
+
+    scenario_title_row = panel_start_row + panel_span + 3
+    ws.cell(scenario_title_row, 1).value = "Scenario Table"
+    ws.cell(scenario_title_row, 1).font = header_font
+    ws.cell(scenario_title_row + 1, 1).value = "Edit the highlighted input cells to evaluate multiple cases."
+
+    scenario_header_row = scenario_title_row + 3
+    scenario_headers = ["scenario_id", "input_1"]
+    if is_surface:
+        scenario_headers.append("input_2")
+    if uses_control_period_input:
+        scenario_headers.append("control_period")
+    scenario_headers.extend(["pred_mean", "pred_min", "pred_max", "pred_min_3sigma", "pred_max_3sigma"])
+    col_by_name = {name: idx for idx, name in enumerate(scenario_headers, start=1)}
+    for col_idx, name in enumerate(scenario_headers, start=1):
+        cell = ws.cell(scenario_header_row, col_idx)
+        cell.value = name
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center")
+
+    for offset in range(50):
+        row_idx = scenario_header_row + 1 + offset
+        ws.cell(row_idx, col_by_name["scenario_id"]).value = offset + 1
+        input_cols = ["input_1"]
+        if is_surface:
+            input_cols.append("input_2")
+        if uses_control_period_input:
+            input_cols.append("control_period")
+        for input_name in input_cols:
+            cell = ws.cell(row_idx, col_by_name[input_name])
+            cell.fill = editable_fill
+        formula_map = _td_perf_interactive_formula_map(
+            models_by_stat,
+            raw_x_ref=_td_perf_excel_ref(col_by_name["input_1"], row_idx),
+            raw_x2_ref=(_td_perf_excel_ref(col_by_name["input_2"], row_idx) if is_surface else ""),
+            raw_cp_ref=(_td_perf_excel_ref(col_by_name["control_period"], row_idx) if uses_control_period_input else ""),
+        )
+        for stat in TD_PERF_INTERACTIVE_OUTPUT_STATS:
+            key = f"pred_{stat}"
+            if key in col_by_name:
+                ws.cell(row_idx, col_by_name[key]).value = formula_map.get(stat) or ""
+
+    widths = {
+        1: 18,
+        2: 16,
+        3: 28,
+        4: 18,
+        5: 22,
+        6: 16,
+    }
+    for col_idx, width in widths.items():
+        ws.column_dimensions[get_column_letter(col_idx)].width = width
+    for name, col_idx in col_by_name.items():
+        width = 16
+        if name == "scenario_id":
+            width = 12
+        elif name in {"pred_mean", "pred_min", "pred_max", "pred_min_3sigma", "pred_max_3sigma"}:
+            width = 20
+        ws.column_dimensions[get_column_letter(col_idx)].width = max(
+            width,
+            float(ws.column_dimensions[get_column_letter(col_idx)].width or 0),
+        )
+    ws.freeze_panes = ws.cell(scenario_header_row + 1, 1)
+    return ws
+
+
+def _td_perf_write_interactive_regression_checker_sheet(
+    workbook,
+    *,
+    plot_metadata: Mapping[str, object],
+    results_by_stat: Mapping[str, Mapping[str, object]],
+    export_rows: Sequence[Mapping[str, object]],
+):
+    try:
+        from openpyxl.styles import Alignment, Font, PatternFill  # type: ignore
+        from openpyxl.utils import get_column_letter  # type: ignore
+    except Exception as exc:  # pragma: no cover - depends on optional dep
+        raise RuntimeError(
+            "openpyxl is required to export performance equations to Excel. "
+            "Install it with `py -m pip install openpyxl` within the project environment."
+        ) from exc
+
+    models_by_stat = _td_perf_export_models_by_stat(results_by_stat)
+    mean_model = models_by_stat.get("mean")
+    if mean_model is None:
+        return None
+
+    plot_dimension = str(plot_metadata.get("plot_dimension") or "2d").strip().lower()
+    is_surface = plot_dimension == "3d" or bool(str(plot_metadata.get("input2_target") or "").strip())
+    uses_control_period_input = any(
+        td_perf_normalize_fit_mode((model or {}).get("fit_family")) == TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD
+        for model in models_by_stat.values()
+        if isinstance(model, Mapping)
+    )
+    include_control_period = uses_control_period_input or any(
+        row.get("control_period") not in (None, "") for row in (export_rows or [])
+    )
+
+    ws = workbook.create_sheet(title="Mean Regression Checker")
+    header_font = Font(bold=True)
+    header_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+    headers = ["run_name", "condition_label", "program_title", "source_run_name"]
+    if include_control_period:
+        headers.append("control_period")
+    headers.append("input_1")
+    if is_surface:
+        headers.append("input_2")
+    headers.extend(["pred_mean", "actual_mean", "pct_delta_mean"])
+    col_by_name = {name: idx for idx, name in enumerate(headers, start=1)}
+    for col_idx, name in enumerate(headers, start=1):
+        cell = ws.cell(1, col_idx)
+        cell.value = name
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center")
+
+    for row_idx, row in enumerate(export_rows or [], start=2):
+        ws.cell(row_idx, col_by_name["run_name"]).value = str(row.get("run_name") or "")
+        ws.cell(row_idx, col_by_name["condition_label"]).value = str(row.get("condition_label") or "")
+        ws.cell(row_idx, col_by_name["program_title"]).value = str(row.get("program_title") or "")
+        ws.cell(row_idx, col_by_name["source_run_name"]).value = str(row.get("source_run_name") or "")
+        if include_control_period:
+            ws.cell(row_idx, col_by_name["control_period"]).value = row.get("control_period")
+        ws.cell(row_idx, col_by_name["input_1"]).value = row.get("input_1")
+        if is_surface:
+            ws.cell(row_idx, col_by_name["input_2"]).value = row.get("input_2")
+
+        formula_map = _td_perf_interactive_formula_map(
+            models_by_stat,
+            raw_x_ref=_td_perf_excel_ref(col_by_name["input_1"], row_idx),
+            raw_x2_ref=(_td_perf_excel_ref(col_by_name["input_2"], row_idx) if is_surface else ""),
+            raw_cp_ref=(_td_perf_excel_ref(col_by_name["control_period"], row_idx) if include_control_period else ""),
+        )
+        ws.cell(row_idx, col_by_name["pred_mean"]).value = formula_map.get("mean") or ""
+        ws.cell(row_idx, col_by_name["actual_mean"]).value = row.get("actual_mean")
+        pred_ref = _td_perf_excel_ref(col_by_name["pred_mean"], row_idx)
+        actual_ref = _td_perf_excel_ref(col_by_name["actual_mean"], row_idx)
+        ws.cell(row_idx, col_by_name["pct_delta_mean"]).value = (
+            f'=IF(OR({pred_ref}="",{actual_ref}="",{actual_ref}=0),"",({pred_ref}-{actual_ref})/{actual_ref})'
+        )
+
+    for name, col_idx in col_by_name.items():
+        width = 16
+        if name in {"run_name", "program_title", "source_run_name"}:
+            width = 24
+        elif name == "condition_label":
+            width = 32
+        elif name.startswith("pred_") or name == "pct_delta_mean":
+            width = 20
+        ws.column_dimensions[get_column_letter(col_idx)].width = width
+    ws.freeze_panes = "A2"
+    return ws
+
+
 def _td_perf_write_static_saved_export_sheet(
     workbook,
     *,
@@ -14719,6 +15152,71 @@ def _td_perf_write_static_saved_export_sheet(
         ws.column_dimensions[get_column_letter(col_idx)].width = width
 
     return ws
+
+
+def td_perf_export_interactive_equation_workbook(
+    db_path: Path,
+    output_path: Path,
+    *,
+    plot_metadata: Mapping[str, object],
+    results_by_stat: Mapping[str, Mapping[str, object]],
+    run_specs: Sequence[Mapping[str, object]],
+    control_period_filter: object = None,
+    run_type_filter: object = None,
+    include_regression_checker: bool = True,
+    progress_cb: Callable[[str], None] | None = None,
+) -> Path:
+    try:
+        from openpyxl import Workbook  # type: ignore
+    except Exception as exc:  # pragma: no cover - depends on optional dep
+        raise RuntimeError(
+            "openpyxl is required to export performance equations to Excel. "
+            "Install it with `py -m pip install openpyxl` within the project environment."
+        ) from exc
+
+    path = Path(output_path).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    models_by_stat = _td_perf_export_models_by_stat(results_by_stat)
+    if not models_by_stat:
+        raise RuntimeError("No exportable master performance equations are available for the current plot.")
+
+    _td_emit_progress(progress_cb, "Building interactive equation workbook")
+    wb = Workbook()
+    ws = wb.active
+    if ws is None:
+        ws = wb.create_sheet("Interactive Calculator")
+    try:
+        _td_emit_progress(progress_cb, "Writing interactive calculator sheet")
+        _td_perf_write_interactive_calculator_sheet(
+            wb,
+            ws,
+            plot_metadata=plot_metadata,
+            results_by_stat=results_by_stat,
+            control_period_filter=control_period_filter,
+            run_type_filter=run_type_filter,
+        )
+
+        if include_regression_checker and "mean" in models_by_stat:
+            _td_emit_progress(progress_cb, "Loading mean regression checker")
+            export_rows = td_perf_collect_condition_export_rows(
+                db_path,
+                run_specs=run_specs,
+                control_period_filter=control_period_filter,
+                run_type_filter=run_type_filter,
+            )
+            _td_perf_write_interactive_regression_checker_sheet(
+                wb,
+                plot_metadata=plot_metadata,
+                results_by_stat=results_by_stat,
+                export_rows=export_rows,
+            )
+
+        _td_emit_progress(progress_cb, "Saving interactive workbook")
+        wb.save(str(path))
+    finally:
+        wb.close()
+    _td_emit_progress(progress_cb, f"Interactive workbook ready: {path.name}")
+    return path
 
 
 def td_perf_export_equation_workbook(

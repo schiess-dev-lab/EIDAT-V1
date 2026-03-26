@@ -1367,6 +1367,9 @@ class TestTDTrendDialogLayout(unittest.TestCase):
             self.assertTrue(dlg._perf_equations_popup.isVisible())
             self.assertEqual(dlg._perf_equations_popup.windowTitle(), "Performance Equations")
             self.assertIn(dlg.tbl_perf_equations, dlg._perf_equations_popup.findChildren(type(dlg.tbl_perf_equations)))
+            self.assertIn(dlg.btn_perf_export_interactive, dlg._perf_equations_popup.findChildren(type(dlg.btn_perf_export_interactive)))
+            self.assertIn(dlg.cb_perf_include_reg_checker, dlg._perf_equations_popup.findChildren(type(dlg.cb_perf_include_reg_checker)))
+            self.assertTrue(dlg.cb_perf_include_reg_checker.isChecked())
         finally:
             dlg.close()
 

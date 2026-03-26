@@ -253,6 +253,91 @@ class TestProjectTaskWorker(unittest.TestCase):
             self.assertEqual(dummy.opened, [out_path])
             self.assertIn("Export Equation to Excel complete", result)
 
+    def test_start_perf_interactive_equation_export_uses_project_task(self) -> None:
+        class _DummyExportWindow:
+            def __init__(self) -> None:
+                self._db_path = Path("C:/temp/cache.sqlite3")
+                self._project_dir = Path("C:/temp/project")
+                self.started: dict[str, object] | None = None
+                self.opened: list[Path] = []
+
+            def _start_perf_export_task(self, **kwargs) -> None:
+                self.started = dict(kwargs)
+
+            def _open_spreadsheet_path(self, file_path: Path) -> None:
+                self.opened.append(Path(file_path))
+
+            def _handle_perf_excel_export_success(self, payload: object, *, heading: str) -> str:
+                return TestDataTrendDialog._handle_perf_excel_export_success(self, payload, heading=heading)
+
+        dummy = _DummyExportWindow()
+        out_path = Path("C:/temp/interactive_performance.xlsx")
+
+        with patch("ui_next.qt_main.be.td_perf_export_interactive_equation_workbook", return_value=out_path) as export_mock:
+            TestDataTrendDialog._start_perf_interactive_equation_export(
+                dummy,
+                out_path,
+                plot_metadata={"output_target": "Efficiency"},
+                results_by_stat={"mean": {"master_model": {"fit_family": "polynomial"}}},
+                run_specs=[{"run_name": "cond_a"}],
+                control_period_filter=12,
+                run_type_filter="pulsed_mode",
+                include_regression_checker=False,
+            )
+
+            self.assertIsNotNone(dummy.started)
+            task_factory = dummy.started["task_factory"]
+            on_success = dummy.started["on_success"]
+            self.assertEqual(dummy.started["heading"], "Export Interactive Workbook")
+            self.assertEqual(dummy.started["status_text"], "Exporting interactive workbook to interactive_performance.xlsx")
+
+            progress_messages: list[str] = []
+            payload = task_factory(progress_messages.append)
+            export_mock.assert_called_once()
+            export_mock.call_args.kwargs["progress_cb"]("step one")
+            self.assertEqual(progress_messages, ["step one"])
+            self.assertEqual(export_mock.call_args.kwargs["include_regression_checker"], False)
+            self.assertEqual(payload, out_path)
+
+            result = on_success(payload)
+            self.assertEqual(dummy.opened, [out_path])
+            self.assertIn("Export Interactive Workbook complete", result)
+
+    def test_update_perf_export_button_state_toggles_new_interactive_button(self) -> None:
+        class _Worker:
+            def __init__(self, running: bool) -> None:
+                self._running = running
+
+            def isRunning(self) -> bool:
+                return self._running
+
+        class _DummyExportButtons:
+            def __init__(self) -> None:
+                self.btn_perf_export_equations = QtWidgets.QPushButton()
+                self.btn_perf_export_interactive = QtWidgets.QPushButton()
+                self.btn_perf_save_equation = QtWidgets.QPushButton()
+                self.btn_perf_saved_equations = QtWidgets.QPushButton()
+                self._project_dir = Path("C:/temp/project")
+                self._export_worker = None
+
+            def _perf_has_exportable_models(self) -> bool:
+                return True
+
+        dummy = _DummyExportButtons()
+
+        TestDataTrendDialog._update_perf_export_button_state(dummy)
+        self.assertTrue(dummy.btn_perf_export_equations.isEnabled())
+        self.assertTrue(dummy.btn_perf_export_interactive.isEnabled())
+        self.assertTrue(dummy.btn_perf_save_equation.isEnabled())
+        self.assertTrue(dummy.btn_perf_saved_equations.isEnabled())
+
+        dummy._export_worker = _Worker(True)
+        TestDataTrendDialog._update_perf_export_button_state(dummy)
+        self.assertFalse(dummy.btn_perf_export_equations.isEnabled())
+        self.assertFalse(dummy.btn_perf_export_interactive.isEnabled())
+        self.assertFalse(dummy.btn_perf_save_equation.isEnabled())
+        self.assertFalse(dummy.btn_perf_saved_equations.isEnabled())
+
     def test_start_saved_perf_equations_excel_export_uses_project_task(self) -> None:
         class _DummyExportWindow:
             def __init__(self) -> None:
