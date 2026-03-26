@@ -60,6 +60,8 @@ EXCEL_ARTIFACT_SUFFIX = "__excel"
 TD_DEFAULT_STATS_ORDER = ["mean", "min", "max", "std"]
 TD_ALLOWED_STATS_ORDER = ["mean", "min", "max", "std", "median", "count"]
 TD_ALLOWED_STATS = set(TD_ALLOWED_STATS_ORDER)
+TD_METRIC_PLOT_SOURCE_AGGREGATE = "aggregate"
+TD_METRIC_PLOT_SOURCE_ALL_SEQUENCES = "all_sequences"
 # Default repository root where PDFs may live (user-organized, nested or flat)
 DEFAULT_REPO_ROOT = ROOT / "Data Packages"
 DEFAULT_PDF_DIR = DEFAULT_REPO_ROOT
@@ -122,6 +124,13 @@ def _td_cache_selected_stats(stats: object) -> list[str]:
     if "std" not in out:
         out.append("std")
     return out
+
+
+def td_metric_normalize_plot_source(value: object) -> str:
+    raw = str(value or "").strip().lower()
+    if raw == TD_METRIC_PLOT_SOURCE_ALL_SEQUENCES:
+        return TD_METRIC_PLOT_SOURCE_ALL_SEQUENCES
+    return TD_METRIC_PLOT_SOURCE_AGGREGATE
 
 
 def _td_parse_metric_label(value: object) -> tuple[str, str, str] | None:
@@ -2500,7 +2509,7 @@ GLOBAL_RUN_MIRROR_DIRNAME = "global_run_mirror"
 LOCAL_PROJECTS_MIRROR_DIRNAME = "projects"
 PROJECT_UPDATE_DEBUG_JSON = "update_debug.json"
 TD_CACHE_DEBUG_JSON = "td_cache_debug.json"
-TD_PROJECT_CACHE_SCHEMA_VERSION = "2"
+TD_PROJECT_CACHE_SCHEMA_VERSION = "3"
 
 # Central runtime config used to define Test Data trending workbooks (independent of node-local DATA_ROOT).
 CENTRAL_EXCEL_TREND_CONFIG = ROOT / "user_inputs" / "excel_trend_config.json"
@@ -3207,6 +3216,27 @@ def _ensure_test_data_impl_tables(conn: sqlite3.Connection) -> None:
         pass
     conn.execute(
         """
+        CREATE TABLE IF NOT EXISTS td_condition_observations_sequences (
+            observation_id TEXT PRIMARY KEY,
+            serial TEXT NOT NULL,
+            run_name TEXT NOT NULL,
+            program_title TEXT,
+            source_run_name TEXT,
+            run_type TEXT,
+            pulse_width REAL,
+            control_period REAL,
+            suppression_voltage REAL,
+            source_mtime_ns INTEGER,
+            computed_epoch_ns INTEGER NOT NULL
+        )
+        """
+    )
+    try:
+        conn.execute("ALTER TABLE td_condition_observations_sequences ADD COLUMN suppression_voltage REAL")
+    except Exception:
+        pass
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS td_columns_calc (
             run_name TEXT NOT NULL,
             name TEXT NOT NULL,
@@ -3247,6 +3277,35 @@ def _ensure_test_data_impl_tables(conn: sqlite3.Connection) -> None:
         pass
     conn.execute(
         """
+        CREATE TABLE IF NOT EXISTS td_metrics_calc_sequences (
+            observation_id TEXT NOT NULL,
+            serial TEXT NOT NULL,
+            run_name TEXT NOT NULL,
+            column_name TEXT NOT NULL,
+            stat TEXT NOT NULL,
+            value_num REAL,
+            computed_epoch_ns INTEGER NOT NULL,
+            source_mtime_ns INTEGER,
+            program_title TEXT,
+            source_run_name TEXT,
+            PRIMARY KEY (observation_id, column_name, stat)
+        )
+        """
+    )
+    try:
+        conn.execute("ALTER TABLE td_metrics_calc_sequences ADD COLUMN observation_id TEXT")
+    except Exception:
+        pass
+    try:
+        conn.execute("ALTER TABLE td_metrics_calc_sequences ADD COLUMN program_title TEXT")
+    except Exception:
+        pass
+    try:
+        conn.execute("ALTER TABLE td_metrics_calc_sequences ADD COLUMN source_run_name TEXT")
+    except Exception:
+        pass
+    conn.execute(
+        """
         CREATE INDEX IF NOT EXISTS td_metrics_calc_run_col_stat_idx
         ON td_metrics_calc (run_name, column_name, stat, serial, observation_id)
         """
@@ -3259,8 +3318,30 @@ def _ensure_test_data_impl_tables(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         """
+        CREATE INDEX IF NOT EXISTS td_metrics_calc_sequences_run_col_stat_idx
+        ON td_metrics_calc_sequences (run_name, column_name, stat, serial, observation_id)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS td_metrics_calc_sequences_stat_run_col_idx
+        ON td_metrics_calc_sequences (stat, run_name, column_name, serial, observation_id)
+        """
+    )
+    conn.execute(
+        """
         CREATE INDEX IF NOT EXISTS td_condition_observations_run_type_cp_idx
         ON td_condition_observations (
+            lower(replace(replace(replace(replace(trim(COALESCE(run_type, '')), '-', ''), ' ', ''), '/', ''), '_', '')),
+            control_period,
+            observation_id
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS td_condition_observations_sequences_run_type_cp_idx
+        ON td_condition_observations_sequences (
             lower(replace(replace(replace(replace(trim(COALESCE(run_type, '')), '-', ''), ' ', ''), '/', ''), '_', '')),
             control_period,
             observation_id
@@ -3302,6 +3383,33 @@ def _ensure_test_data_impl_tables(conn: sqlite3.Connection) -> None:
         )
         """
     )
+
+
+def _td_metric_source_table_name(metric_source: object) -> str:
+    return (
+        "td_metrics_calc_sequences"
+        if td_metric_normalize_plot_source(metric_source) == TD_METRIC_PLOT_SOURCE_ALL_SEQUENCES
+        else "td_metrics_calc"
+    )
+
+
+def _td_metric_source_observation_table_name(metric_source: object) -> str:
+    return (
+        "td_condition_observations_sequences"
+        if td_metric_normalize_plot_source(metric_source) == TD_METRIC_PLOT_SOURCE_ALL_SEQUENCES
+        else "td_condition_observations"
+    )
+
+
+def _td_preferred_sequence_observation_table(conn: sqlite3.Connection) -> str:
+    _ensure_test_data_impl_tables(conn)
+    try:
+        count = int(
+            conn.execute("SELECT COUNT(*) FROM td_condition_observations_sequences").fetchone()[0] or 0
+        )
+    except Exception:
+        count = 0
+    return "td_condition_observations_sequences" if count > 0 else "td_condition_observations"
 
 
 def _ensure_test_data_tables(conn: sqlite3.Connection) -> None:
@@ -6151,6 +6259,24 @@ def td_perf_run_type_mode_label(value: object) -> str:
     return "All run conditions"
 
 
+TD_PERF_PLOT_METHOD_LEGACY_SERIAL_CURVES = "legacy_serial_curves"
+TD_PERF_PLOT_METHOD_CACHED_CONDITION_MEANS = "cached_condition_means"
+
+
+def td_perf_normalize_plot_method(value: object) -> str:
+    raw = str(value or "").strip().lower()
+    if raw == TD_PERF_PLOT_METHOD_CACHED_CONDITION_MEANS:
+        return TD_PERF_PLOT_METHOD_CACHED_CONDITION_MEANS
+    return TD_PERF_PLOT_METHOD_LEGACY_SERIAL_CURVES
+
+
+def td_perf_plot_method_label(value: object) -> str:
+    normalized = td_perf_normalize_plot_method(value)
+    if normalized == TD_PERF_PLOT_METHOD_CACHED_CONDITION_MEANS:
+        return "Run Conditions"
+    return "Legacy Serial Curves"
+
+
 def _td_perf_run_type_sql_key(column_expr: str) -> str:
     return (
         f"lower(replace(replace(replace(replace(trim(COALESCE({column_expr}, '')), '-', ''), ' ', ''), '/', ''), '_', ''))"
@@ -6409,10 +6535,11 @@ def td_list_run_selection_views(db_path: Path, workbook_path: Path, *, project_d
     observations_by_condition: dict[str, list[dict]] = {}
     with closing(sqlite3.connect(str(Path(db_path).expanduser()))) as conn:
         _ensure_test_data_impl_tables(conn)
+        obs_table = _td_preferred_sequence_observation_table(conn)
         rows = conn.execute(
-            """
+            f"""
             SELECT run_name, COALESCE(program_title, ''), COALESCE(source_run_name, ''), control_period, suppression_voltage
-            FROM td_condition_observations
+            FROM {obs_table}
             ORDER BY run_name, program_title, source_run_name, observation_id
             """
         ).fetchall()
@@ -6644,11 +6771,31 @@ def _td_impl_cache_counts(conn: sqlite3.Connection) -> dict[str, int | bool]:
         metrics_count = int(conn.execute("SELECT COUNT(*) FROM td_metrics_calc").fetchone()[0] or 0)
     except Exception:
         metrics_count = 0
+    try:
+        sequence_obs_count = int(
+            conn.execute("SELECT COUNT(*) FROM td_condition_observations_sequences").fetchone()[0] or 0
+        )
+    except Exception:
+        sequence_obs_count = 0
+    try:
+        sequence_metrics_count = int(
+            conn.execute("SELECT COUNT(*) FROM td_metrics_calc_sequences").fetchone()[0] or 0
+        )
+    except Exception:
+        sequence_metrics_count = 0
     return {
         "runs": runs_count,
         "calc_y": calc_y_count,
         "metrics": metrics_count,
-        "complete": bool(runs_count > 0 and calc_y_count > 0 and metrics_count > 0),
+        "sequence_observations": sequence_obs_count,
+        "sequence_metrics": sequence_metrics_count,
+        "complete": bool(
+            runs_count > 0
+            and calc_y_count > 0
+            and metrics_count > 0
+            and sequence_obs_count > 0
+            and sequence_metrics_count > 0
+        ),
     }
 
 
@@ -6885,6 +7032,8 @@ def _td_cache_state_summary(state: Mapping[str, object] | None) -> dict[str, obj
             "td_runs": int(impl_counts_raw.get("runs") or 0),
             "td_columns_calc_y": int(impl_counts_raw.get("calc_y") or 0),
             "td_metrics_calc": int(impl_counts_raw.get("metrics") or 0),
+            "td_condition_observations_sequences": int(impl_counts_raw.get("sequence_observations") or 0),
+            "td_metrics_calc_sequences": int(impl_counts_raw.get("sequence_metrics") or 0),
         },
         "raw_counts": {
             "td_raw_sequences": int(raw_counts_raw.get("raw_runs") or 0),
@@ -6917,6 +7066,8 @@ def _td_cache_validation_summary_line(summary: Mapping[str, object] | None) -> s
         f"td_runs={int(impl_counts.get('td_runs') or 0)}",
         f"td_columns_calc_y={int(impl_counts.get('td_columns_calc_y') or 0)}",
         f"td_metrics_calc={int(impl_counts.get('td_metrics_calc') or 0)}",
+        f"td_condition_observations_sequences={int(impl_counts.get('td_condition_observations_sequences') or 0)}",
+        f"td_metrics_calc_sequences={int(impl_counts.get('td_metrics_calc_sequences') or 0)}",
         f"td_raw_sequences={int(raw_counts.get('td_raw_sequences') or 0)}",
         f"td_columns_raw_y={int(raw_counts.get('td_columns_raw_y') or 0)}",
         f"td_curves_raw={int(raw_counts.get('td_curves_raw') or 0)}",
@@ -7167,6 +7318,7 @@ def _td_validate_generated_workbook_outputs(
     expected_serials: Sequence[str],
     expected_metric_labels: Sequence[str],
     expected_metrics_long_rows: int,
+    expected_metrics_long_sequence_rows: int,
     expected_raw_long_rows: int,
 ) -> dict[str, object]:
     try:
@@ -7219,6 +7371,12 @@ def _td_validate_generated_workbook_outputs(
             "ok": False,
             "rows": 0,
             "expected_rows": int(expected_metrics_long_rows),
+        },
+        "metrics_long_sequences": {
+            "exists": False,
+            "ok": False,
+            "rows": 0,
+            "expected_rows": int(expected_metrics_long_sequence_rows),
         },
         "raw_cache_long": {
             "exists": False,
@@ -7310,6 +7468,34 @@ def _td_validate_generated_workbook_outputs(
                 )
             metrics_long["ok"] = not any("Metrics_long" in problem for problem in problems)
 
+        if "Metrics_long_sequences" not in wb.sheetnames:
+            problems.append("Project workbook outputs are incomplete: missing sheet Metrics_long_sequences.")
+        else:
+            ws = wb["Metrics_long_sequences"]
+            metrics_long_sequences = (
+                summary["metrics_long_sequences"]
+                if isinstance(summary.get("metrics_long_sequences"), dict)
+                else {}
+            )
+            metrics_long_sequences["exists"] = True
+            header_values = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), tuple())
+            header = [str(value or "").strip() for value in header_values]
+            row_count = _count_data_rows(ws)
+            metrics_long_sequences["rows"] = row_count
+            if header[: len(metrics_header)] != metrics_header:
+                problems.append(
+                    "Project workbook outputs are incomplete: Metrics_long_sequences header row is invalid."
+                )
+            if row_count <= 0:
+                problems.append("Project workbook outputs are incomplete: Metrics_long_sequences has no data rows.")
+            if row_count != int(expected_metrics_long_sequence_rows):
+                problems.append(
+                    "Project workbook outputs are incomplete: Metrics_long_sequences row count does not match td_metrics_calc_sequences."
+                )
+            metrics_long_sequences["ok"] = not any(
+                "Metrics_long_sequences" in problem for problem in problems
+            )
+
         if "RawCache_long" not in wb.sheetnames:
             problems.append("Project workbook outputs are incomplete: missing sheet RawCache_long.")
         else:
@@ -7387,14 +7573,20 @@ def _td_collect_project_readiness(
 
         with closing(sqlite3.connect(str(db_path))) as conn:
             _ensure_test_data_impl_tables(conn)
-            required_impl_tables = ("td_runs", "td_columns_calc", "td_metrics_calc")
+            required_impl_tables = (
+                "td_runs",
+                "td_columns_calc",
+                "td_metrics_calc",
+                "td_condition_observations_sequences",
+                "td_metrics_calc_sequences",
+            )
             impl_tables = {
                 str(row[0] or "").strip()
                 for row in conn.execute(
                     """
                     SELECT name
                     FROM sqlite_master
-                    WHERE type='table' AND name IN (?, ?, ?)
+                    WHERE type='table' AND name IN (?, ?, ?, ?, ?)
                     """,
                     required_impl_tables,
                 ).fetchall()
@@ -7431,6 +7623,9 @@ def _td_collect_project_readiness(
 
             expected_metric_labels = _td_expected_metric_labels_from_cache(conn)
             expected_metrics_long_rows = int(conn.execute("SELECT COUNT(*) FROM td_metrics_calc").fetchone()[0] or 0)
+            expected_metrics_long_sequence_rows = int(
+                conn.execute("SELECT COUNT(*) FROM td_metrics_calc_sequences").fetchone()[0] or 0
+            )
 
         with closing(sqlite3.connect(str(raw_db_path))) as conn:
             _ensure_test_data_raw_cache_tables(conn)
@@ -7474,6 +7669,7 @@ def _td_collect_project_readiness(
                 expected_serials=compiled_serials,
                 expected_metric_labels=expected_metric_labels,
                 expected_metrics_long_rows=expected_metrics_long_rows,
+                expected_metrics_long_sequence_rows=expected_metrics_long_sequence_rows,
                 expected_raw_long_rows=expected_raw_long_rows,
             )
             summary["workbook_outputs"] = workbook_outputs
@@ -7862,6 +8058,8 @@ def _write_test_data_project_calc_cache_from_aggregates(
     aggregated_curve_values: Mapping[tuple[str, str, str], Sequence[float]],
     aggregated_obs_meta: Mapping[tuple[str, str], Mapping[str, object]],
     condition_y_names: Mapping[str, set[str]],
+    sequence_obs_rows: Sequence[tuple[object, ...]] | None = None,
+    sequence_metric_rows: Sequence[tuple[object, ...]] | None = None,
     computed_epoch_ns: int,
     progress_cb: Callable[[str], None] | None = None,
 ) -> dict[str, object]:
@@ -7880,6 +8078,8 @@ def _write_test_data_project_calc_cache_from_aggregates(
     _td_emit_progress(progress_cb, "Aggregating calculated Test Data cache")
     t0 = time.perf_counter()
     metrics_written = 0
+    sequence_observations_written = 0
+    sequence_metrics_written = 0
     calc_columns_written = 0
     inserted_columns: set[tuple[str, str]] = set()
     inserted_runs: set[str] = set()
@@ -8048,6 +8248,8 @@ def _write_test_data_project_calc_cache_from_aggregates(
         conn.execute("DELETE FROM td_columns_calc")
         conn.execute("DELETE FROM td_metrics_calc")
         conn.execute("DELETE FROM td_condition_observations")
+        conn.execute("DELETE FROM td_metrics_calc_sequences")
+        conn.execute("DELETE FROM td_condition_observations_sequences")
         if run_rows_to_write:
             conn.executemany(
                 "INSERT OR REPLACE INTO td_runs(run_name, default_x, display_name, run_type, control_period, pulse_width) VALUES (?, ?, ?, ?, ?, ?)",
@@ -8076,6 +8278,28 @@ def _write_test_data_project_calc_cache_from_aggregates(
                 """,
                 metric_rows_to_write,
             )
+        sequence_obs_rows_list = list(sequence_obs_rows or [])
+        sequence_metric_rows_list = list(sequence_metric_rows or [])
+        if sequence_obs_rows_list:
+            conn.executemany(
+                """
+                INSERT OR REPLACE INTO td_condition_observations_sequences(
+                    observation_id, serial, run_name, program_title, source_run_name, run_type, pulse_width, control_period, suppression_voltage, source_mtime_ns, computed_epoch_ns
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                sequence_obs_rows_list,
+            )
+            sequence_observations_written = len(sequence_obs_rows_list)
+        if sequence_metric_rows_list:
+            conn.executemany(
+                """
+                INSERT OR REPLACE INTO td_metrics_calc_sequences
+                (observation_id, serial, run_name, column_name, stat, value_num, computed_epoch_ns, source_mtime_ns, program_title, source_run_name)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                sequence_metric_rows_list,
+            )
+            sequence_metrics_written = len(sequence_metric_rows_list)
         conn.execute(
             "INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)",
             ("workbook_path", str(wb_path)),
@@ -8105,6 +8329,8 @@ def _write_test_data_project_calc_cache_from_aggregates(
         "workbook": str(wb_path),
         "metrics_written": metrics_written,
         "calc_columns_written": calc_columns_written,
+        "sequence_observations_written": sequence_observations_written,
+        "sequence_metrics_written": sequence_metrics_written,
         "mode": "calc_from_current_pass",
         "timings": dict(timings),
     }
@@ -8396,12 +8622,15 @@ def _rebuild_test_data_project_calc_cache_from_raw(
         aggregated_curve_values: dict[tuple[str, str, str], list[float]] = {}
         aggregated_obs_meta: dict[tuple[str, str], dict[str, object]] = {}
         condition_y_names: dict[str, set[str]] = {}
+        sequence_obs_rows_by_id: dict[str, tuple[object, ...]] = {}
+        sequence_metric_rows_by_key: dict[tuple[str, str, str], tuple[object, ...]] = {}
         t0 = time.perf_counter()
         for run_name_raw, y_name_raw, x_name_raw, observation_id, serial, program_title, source_run_name_raw, x_json, y_json, source_mtime_ns in raw_curve_rows:
             raw_run = str(run_name_raw or "").strip()
             y_name = str(y_name_raw or "").strip()
+            obs_id = str(observation_id or "").strip()
             serial_txt = str(serial or "").strip()
-            if not raw_run or not y_name or not serial_txt:
+            if not raw_run or not y_name or not serial_txt or not obs_id:
                 continue
             source_run_name = str(source_run_name_raw or raw_run).strip() or raw_run
             program_norm = _td_support_norm_name(program_title)
@@ -8454,6 +8683,63 @@ def _rebuild_test_data_project_calc_cache_from_raw(
             obs_meta["source_run_names"].add(source_run_name)
             if isinstance(source_mtime_ns, int):
                 obs_meta["source_mtime_ns"].append(int(source_mtime_ns))
+
+            raw_obs_meta = dict(raw_obs_by_id.get(obs_id) or {})
+            sequence_pulse_width = _finite_float(
+                support_row.get("pulse_width_on", support_row.get("pulse_width", raw_obs_meta.get("pulse_width")))
+            )
+            sequence_control_period = _finite_float(
+                support_row.get("control_period", raw_obs_meta.get("control_period"))
+            )
+            sequence_suppression_voltage = _finite_float(
+                support_row.get("suppression_voltage", raw_obs_meta.get("suppression_voltage"))
+            )
+            sequence_run_type = str(
+                support_row.get("run_type") or raw_obs_meta.get("run_type") or ""
+            ).strip()
+            sequence_source_mtime = int(source_mtime_ns or raw_obs_meta.get("source_mtime_ns") or 0)
+            sequence_obs_rows_by_id[obs_id] = (
+                obs_id,
+                serial_txt,
+                condition_key,
+                prog_txt,
+                source_run_name,
+                sequence_run_type,
+                sequence_pulse_width,
+                sequence_control_period,
+                sequence_suppression_voltage,
+                sequence_source_mtime,
+                computed_epoch_ns,
+            )
+            stats_map = _compute_stats(list(filtered_y))
+            for stat in selected_stats:
+                sequence_metric_rows_by_key[(obs_id, y_name, str(stat))] = (
+                    obs_id,
+                    serial_txt,
+                    condition_key,
+                    y_name,
+                    str(stat),
+                    stats_map.get(stat),
+                    computed_epoch_ns,
+                    sequence_source_mtime,
+                    prog_txt,
+                    source_run_name,
+                )
+            if sequence_pulse_width is not None:
+                pulse_stats_map = _compute_constant_stats(float(sequence_pulse_width))
+                for stat in selected_stats:
+                    sequence_metric_rows_by_key[(obs_id, "pulse_width", str(stat))] = (
+                        obs_id,
+                        serial_txt,
+                        condition_key,
+                        "pulse_width",
+                        str(stat),
+                        pulse_stats_map.get(stat),
+                        computed_epoch_ns,
+                        sequence_source_mtime,
+                        prog_txt,
+                        source_run_name,
+                    )
 
         metrics_written = 0
         calc_columns_written = 0
@@ -8609,6 +8895,26 @@ def _rebuild_test_data_project_calc_cache_from_raw(
                 """,
                 metric_rows_to_write,
             )
+        sequence_obs_rows_to_write = list(sequence_obs_rows_by_id.values())
+        sequence_metric_rows_to_write = list(sequence_metric_rows_by_key.values())
+        if sequence_obs_rows_to_write:
+            conn.executemany(
+                """
+                INSERT OR REPLACE INTO td_condition_observations_sequences(
+                    observation_id, serial, run_name, program_title, source_run_name, run_type, pulse_width, control_period, suppression_voltage, source_mtime_ns, computed_epoch_ns
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                sequence_obs_rows_to_write,
+            )
+        if sequence_metric_rows_to_write:
+            conn.executemany(
+                """
+                INSERT OR REPLACE INTO td_metrics_calc_sequences
+                (observation_id, serial, run_name, column_name, stat, value_num, computed_epoch_ns, source_mtime_ns, program_title, source_run_name)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                sequence_metric_rows_to_write,
+            )
         conn.execute(
             "INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)",
             ("workbook_path", str(wb_path)),
@@ -8639,6 +8945,8 @@ def _rebuild_test_data_project_calc_cache_from_raw(
         "workbook": str(wb_path),
         "metrics_written": metrics_written,
         "calc_columns_written": calc_columns_written,
+        "sequence_observations_written": len(sequence_obs_rows_by_id),
+        "sequence_metrics_written": len(sequence_metric_rows_by_key),
         "mode": "calc_from_raw",
         "timings": dict(timings),
     }
@@ -8696,7 +9004,14 @@ def validate_test_data_project_cache_for_open(project_dir: Path, workbook_path: 
         with closing(sqlite3.connect(str(db_path))) as conn:
             missing_impl_tables = _check_required_tables(
                 conn,
-                ("td_sources", "td_runs", "td_columns_calc", "td_metrics_calc"),
+                (
+                    "td_sources",
+                    "td_runs",
+                    "td_columns_calc",
+                    "td_metrics_calc",
+                    "td_condition_observations_sequences",
+                    "td_metrics_calc_sequences",
+                ),
             )
             if missing_impl_tables:
                 raise RuntimeError(
@@ -8706,12 +9021,21 @@ def validate_test_data_project_cache_for_open(project_dir: Path, workbook_path: 
             runs_count = int(conn.execute("SELECT COUNT(*) FROM td_runs").fetchone()[0] or 0)
             calc_y_count = int(conn.execute("SELECT COUNT(*) FROM td_columns_calc WHERE kind='y'").fetchone()[0] or 0)
             metrics_count = int(conn.execute("SELECT COUNT(*) FROM td_metrics_calc").fetchone()[0] or 0)
+            sequence_obs_count = int(conn.execute("SELECT COUNT(*) FROM td_condition_observations_sequences").fetchone()[0] or 0)
+            sequence_metrics_count = int(conn.execute("SELECT COUNT(*) FROM td_metrics_calc_sequences").fetchone()[0] or 0)
     except RuntimeError:
         raise
     except Exception as exc:
         raise RuntimeError(f"Project cache DB is unreadable: {db_path}. {guidance}") from exc
 
-    if sources_count <= 0 or runs_count <= 0 or calc_y_count <= 0 or metrics_count <= 0:
+    if (
+        sources_count <= 0
+        or runs_count <= 0
+        or calc_y_count <= 0
+        or metrics_count <= 0
+        or sequence_obs_count <= 0
+        or sequence_metrics_count <= 0
+    ):
         raise RuntimeError(f"Project cache DB is incomplete: {db_path}. {guidance}")
 
     try:
@@ -9319,6 +9643,16 @@ def rebuild_test_data_project_cache(
         out["std"] = statistics.stdev(values) if n >= 2 else None
         return out
 
+    def _compute_constant_stats(value: float) -> dict[str, float | int | None]:
+        return {
+            "mean": float(value),
+            "min": float(value),
+            "max": float(value),
+            "median": float(value),
+            "std": 0.0,
+            "count": 1,
+        }
+
     def _quote_ident(name: str) -> str:
         return '"' + (name or "").replace('"', '""') + '"'
 
@@ -9687,6 +10021,8 @@ def rebuild_test_data_project_cache(
                 "td_columns_calc",
                 "td_metrics_calc",
                 "td_condition_observations",
+                "td_metrics_calc_sequences",
+                "td_condition_observations_sequences",
                 "td_terms",
                 "td_source_diagnostics",
             ):
@@ -9793,6 +10129,8 @@ def rebuild_test_data_project_cache(
     calc_aggregated_curve_values: dict[tuple[str, str, str], list[float]] = {}
     calc_aggregated_obs_meta: dict[tuple[str, str], dict[str, object]] = {}
     calc_condition_y_names: dict[str, set[str]] = {}
+    calc_sequence_obs_rows_by_id: dict[str, tuple[object, ...]] = {}
+    calc_sequence_metric_rows_by_key: dict[tuple[str, str, str], tuple[object, ...]] = {}
     raw_tables_created: set[str] = set()
     diagnostics_rows: list[tuple[str, str, str, str, str, str, int, int, str]] = []
     debug_diagnostics: list[dict] = []
@@ -10232,6 +10570,26 @@ def rebuild_test_data_project_cache(
                                 cast(list[int], obs_meta["source_mtime_ns"]).append(int(mtime_ns))
                             exclude_first_n_int = _to_support_int(exclude_first_n)
                             last_n_rows_int = _to_support_int(last_n_rows)
+                            sequence_pulse_width = _finite_float(
+                                run_info.get("pulse_width_on", run_info.get("pulse_width"))
+                            )
+                            sequence_control_period = _finite_float(run_info.get("control_period"))
+                            sequence_suppression_voltage = _finite_float(run_info.get("suppression_voltage"))
+                            sequence_run_type = str(run_info.get("run_type") or "").strip()
+                            sequence_source_mtime = int(mtime_ns or 0)
+                            calc_sequence_obs_rows_by_id[str(observation_id)] = (
+                                str(observation_id),
+                                str(sn),
+                                str(effective_run),
+                                str(source_program_title or ""),
+                                str(source_run_name_text or ""),
+                                sequence_run_type,
+                                sequence_pulse_width,
+                                sequence_control_period,
+                                sequence_suppression_voltage,
+                                sequence_source_mtime,
+                                computed_epoch_ns,
+                            )
                             for y_name in matched_y_names:
                                 curve_payload = serialized_curves.get(y_name)
                                 if curve_payload is None:
@@ -10245,6 +10603,35 @@ def rebuild_test_data_project_cache(
                                 )
                                 calc_condition_y_names.setdefault(str(effective_run), set()).add(str(y_name))
                                 calc_aggregated_curve_values.setdefault((str(effective_run), str(sn), str(y_name)), []).extend(filtered_y)
+                                sequence_stats_map = _compute_stats(list(filtered_y))
+                                for stat in selected_stats:
+                                    calc_sequence_metric_rows_by_key[(str(observation_id), str(y_name), str(stat))] = (
+                                        str(observation_id),
+                                        str(sn),
+                                        str(effective_run),
+                                        str(y_name),
+                                        str(stat),
+                                        sequence_stats_map.get(stat),
+                                        computed_epoch_ns,
+                                        sequence_source_mtime,
+                                        str(source_program_title or ""),
+                                        str(source_run_name_text or ""),
+                                    )
+                            if sequence_pulse_width is not None:
+                                pulse_stats_map = _compute_constant_stats(float(sequence_pulse_width))
+                                for stat in selected_stats:
+                                    calc_sequence_metric_rows_by_key[(str(observation_id), "pulse_width", str(stat))] = (
+                                        str(observation_id),
+                                        str(sn),
+                                        str(effective_run),
+                                        "pulse_width",
+                                        str(stat),
+                                        pulse_stats_map.get(stat),
+                                        computed_epoch_ns,
+                                        sequence_source_mtime,
+                                        str(source_program_title or ""),
+                                        str(source_run_name_text or ""),
+                                    )
                         if actual_x and serialized_curves:
                             t_raw_write = time.perf_counter()
                             raw_conn.execute(
@@ -10729,6 +11116,8 @@ def rebuild_test_data_project_cache(
                 for k, v in calc_aggregated_obs_meta.items()
             },
             condition_y_names={str(k): set(v) for k, v in calc_condition_y_names.items()},
+            sequence_obs_rows=list(calc_sequence_obs_rows_by_id.values()),
+            sequence_metric_rows=list(calc_sequence_metric_rows_by_key.values()),
             computed_epoch_ns=computed_epoch_ns,
             progress_cb=progress_cb,
         )
@@ -11079,8 +11468,9 @@ def td_read_observation_filter_rows_from_cache(db_path: Path) -> list[dict]:
         return []
     with sqlite3.connect(str(path)) as conn:
         _ensure_test_data_impl_tables(conn)
+        obs_table = _td_preferred_sequence_observation_table(conn)
         rows = conn.execute(
-            """
+            f"""
             SELECT
                 o.observation_id,
                 o.serial,
@@ -11092,7 +11482,7 @@ def td_read_observation_filter_rows_from_cache(db_path: Path) -> list[dict]:
                 COALESCE(m.metadata_rel, ''),
                 COALESCE(m.artifacts_rel, ''),
                 COALESCE(m.excel_sqlite_rel, '')
-            FROM td_condition_observations o
+            FROM {obs_table} o
             LEFT JOIN td_source_metadata m
               ON m.serial = o.serial
             ORDER BY o.serial, o.run_name, o.observation_id
@@ -11132,6 +11522,7 @@ def td_load_metric_series(
     source_run_name: str | None = None,
     control_period_filter: object = None,
     run_type_filter: object = None,
+    metric_source: object = TD_METRIC_PLOT_SOURCE_AGGREGATE,
 ) -> list[dict]:
     path = Path(db_path).expanduser()
     if not path.exists():
@@ -11141,8 +11532,11 @@ def td_load_metric_series(
     st = str(stat or "").strip().lower()
     if not run or not col or not st:
         return []
+    metric_source_norm = td_metric_normalize_plot_source(metric_source)
+    metrics_table = _td_metric_source_table_name(metric_source_norm)
+    observations_table = _td_metric_source_observation_table_name(metric_source_norm)
     metric_sql = [
-        """
+        f"""
         SELECT
             m.observation_id,
             m.serial,
@@ -11152,15 +11546,15 @@ def td_load_metric_series(
             COALESCE(o.run_type, ''),
             o.control_period,
             o.suppression_voltage
-        FROM td_metrics_calc m
-        LEFT JOIN td_condition_observations o
+        FROM {metrics_table} m
+        LEFT JOIN {observations_table} o
           ON o.observation_id = m.observation_id
         WHERE m.run_name=? AND m.column_name=? AND m.stat=?
         """
     ]
     metric_params: list[object] = [run, col, st]
-    prog = str(program_title or "").strip()
-    src_run = str(source_run_name or "").strip()
+    prog = str(program_title or "").strip() if metric_source_norm == TD_METRIC_PLOT_SOURCE_ALL_SEQUENCES else ""
+    src_run = str(source_run_name or "").strip() if metric_source_norm == TD_METRIC_PLOT_SOURCE_ALL_SEQUENCES else ""
     if prog:
         metric_sql.append(" AND lower(COALESCE(m.program_title, '')) = lower(?)")
         metric_params.append(prog)
@@ -14066,6 +14460,183 @@ def td_perf_collect_condition_export_rows(
     return out
 
 
+def td_perf_collect_cached_condition_mean_export_rows(
+    db_path: Path,
+    *,
+    run_specs: Sequence[Mapping[str, object]],
+    control_period_filter: object = None,
+    run_type_filter: object = None,
+    progress_cb: Callable[[str], None] | None = None,
+) -> list[dict[str, object]]:
+    path = Path(db_path).expanduser()
+    if not path.exists():
+        return []
+
+    out: list[dict[str, object]] = []
+    unique_specs = _td_perf_unique_run_specs(run_specs)
+    for spec_index, spec in enumerate(unique_specs, start=1):
+        run_name = str((spec or {}).get("run_name") or "").strip()
+        if not run_name:
+            continue
+        _td_emit_progress(
+            progress_cb,
+            f"Collecting cached run-condition rows ({spec_index}/{max(1, len(unique_specs))}): {run_name}",
+        )
+        display_name = str((spec or {}).get("display_name") or run_name).strip()
+        input1_column = str((spec or {}).get("input1_column") or "").strip()
+        input2_column = str((spec or {}).get("input2_column") or "").strip()
+        output_column = str((spec or {}).get("output_column") or "").strip()
+        if not input1_column or not output_column:
+            continue
+        x1_rows = _td_perf_export_series_for_stat(
+            path,
+            run_name,
+            input1_column,
+            "mean",
+            control_period_filter=control_period_filter,
+            run_type_filter=run_type_filter,
+        )
+        y_rows = _td_perf_export_series_for_stat(
+            path,
+            run_name,
+            output_column,
+            "mean",
+            control_period_filter=control_period_filter,
+            run_type_filter=run_type_filter,
+        )
+        if not x1_rows or not y_rows:
+            continue
+        x1_map = {
+            str(row.get("observation_id") or "").strip(): dict(row)
+            for row in x1_rows
+            if isinstance(row, dict) and str(row.get("observation_id") or "").strip()
+        }
+        y_map = {
+            str(row.get("observation_id") or "").strip(): dict(row)
+            for row in y_rows
+            if isinstance(row, dict) and str(row.get("observation_id") or "").strip()
+        }
+        x2_map: dict[str, dict[str, object]] = {}
+        observation_ids = set(x1_map.keys()) & set(y_map.keys())
+        if input2_column:
+            x2_rows = _td_perf_export_series_for_stat(
+                path,
+                run_name,
+                input2_column,
+                "mean",
+                control_period_filter=control_period_filter,
+                run_type_filter=run_type_filter,
+            )
+            x2_map = {
+                str(row.get("observation_id") or "").strip(): dict(row)
+                for row in x2_rows
+                if isinstance(row, dict) and str(row.get("observation_id") or "").strip()
+            }
+            observation_ids &= set(x2_map.keys())
+        for obs_id in sorted(observation_ids):
+            row_x1 = x1_map.get(obs_id) or {}
+            row_y = y_map.get(obs_id) or {}
+            row_x2 = x2_map.get(obs_id) or {}
+            try:
+                x1 = float(row_x1.get("value_num"))
+                y = float(row_y.get("value_num"))
+            except Exception:
+                continue
+            if not (math.isfinite(x1) and math.isfinite(y)):
+                continue
+            x2_value: float | None = None
+            if input2_column:
+                try:
+                    x2_value = float(row_x2.get("value_num"))
+                except Exception:
+                    continue
+                if not math.isfinite(float(x2_value)):
+                    continue
+            base_row = row_y or row_x1 or row_x2
+            serial = str(base_row.get("serial") or row_x1.get("serial") or row_x2.get("serial") or "").strip()
+            if not serial:
+                continue
+            label_source = row_y or row_x1 or row_x2
+            out.append(
+                {
+                    "observation_id": obs_id,
+                    "run_name": run_name,
+                    "display_name": display_name,
+                    "program_title": str(
+                        base_row.get("program_title")
+                        or row_x1.get("program_title")
+                        or row_x2.get("program_title")
+                        or ""
+                    ).strip(),
+                    "source_run_name": str(
+                        base_row.get("source_run_name")
+                        or row_x1.get("source_run_name")
+                        or row_x2.get("source_run_name")
+                        or ""
+                    ).strip(),
+                    "control_period": base_row.get(
+                        "control_period",
+                        row_x1.get("control_period", row_x2.get("control_period")),
+                    ),
+                    "suppression_voltage": base_row.get(
+                        "suppression_voltage",
+                        row_x1.get("suppression_voltage", row_x2.get("suppression_voltage")),
+                    ),
+                    "condition_label": _td_perf_export_condition_label(label_source, display_name=display_name),
+                    "serial": serial,
+                    "input_1": float(x1),
+                    "input_2": float(x2_value) if isinstance(x2_value, (int, float)) else None,
+                    "actual_mean": float(y),
+                    "sample_count": 1,
+                }
+            )
+    out.sort(
+        key=lambda row: (
+            str(row.get("run_name") or "").lower(),
+            str(row.get("serial") or "").lower(),
+            float(row.get("input_1") or 0.0),
+            float(row.get("input_2") or 0.0) if row.get("input_2") not in (None, "") else float("-inf"),
+            str(row.get("observation_id") or "").lower(),
+        )
+    )
+    return out
+
+
+def td_perf_collect_export_rows_for_method(
+    db_path: Path,
+    *,
+    run_specs: Sequence[Mapping[str, object]],
+    performance_plot_method: object = None,
+    legacy_row_mode: str = "equation",
+    control_period_filter: object = None,
+    run_type_filter: object = None,
+    progress_cb: Callable[[str], None] | None = None,
+) -> list[dict[str, object]]:
+    normalized_method = td_perf_normalize_plot_method(performance_plot_method)
+    if normalized_method == TD_PERF_PLOT_METHOD_CACHED_CONDITION_MEANS:
+        return td_perf_collect_cached_condition_mean_export_rows(
+            db_path,
+            run_specs=run_specs,
+            control_period_filter=control_period_filter,
+            run_type_filter=run_type_filter,
+            progress_cb=progress_cb,
+        )
+    if str(legacy_row_mode or "").strip().lower() == "condition":
+        return td_perf_collect_condition_export_rows(
+            db_path,
+            run_specs=run_specs,
+            control_period_filter=control_period_filter,
+            run_type_filter=run_type_filter,
+        )
+    return td_perf_collect_equation_export_rows(
+        db_path,
+        run_specs=run_specs,
+        control_period_filter=control_period_filter,
+        run_type_filter=run_type_filter,
+        progress_cb=progress_cb,
+    )
+
+
 TD_PERF_EQ_STRICTNESS_PRESETS: dict[str, dict[str, float]] = {
     "tight": {
         "perf_eq_x_rel_tol": 0.08,
@@ -14695,6 +15266,7 @@ def _td_perf_write_interactive_calculator_sheet(
     metadata_rows: list[tuple[object, object]] = [
         ("Export Timestamp", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
         ("Export Mode", "Interactive calculator"),
+        ("Performance Method", td_perf_plot_method_label(plot_metadata.get("performance_plot_method"))),
         ("Plot Dimension", "3D" if is_surface else "2D"),
         ("Asset Type", str(plot_metadata.get("asset_type") or "").strip()),
         ("Asset Specific Type", str(plot_metadata.get("asset_specific_type") or "").strip()),
@@ -14896,13 +15468,13 @@ def _td_perf_write_interactive_regression_checker_sheet(
     ws = workbook.create_sheet(title="Mean Regression Checker")
     header_font = Font(bold=True)
     header_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
-    headers = ["run_name", "condition_label", "program_title", "source_run_name"]
+    headers = ["run_name", "display_name", "serial", "observation_id", "condition_label", "program_title", "source_run_name", "suppression_voltage"]
     if include_control_period:
         headers.append("control_period")
     headers.append("input_1")
     if is_surface:
         headers.append("input_2")
-    headers.extend(["pred_mean", "actual_mean", "pct_delta_mean"])
+    headers.extend(["pred_mean", "sample_count", "actual_mean", "pct_delta_mean"])
     col_by_name = {name: idx for idx, name in enumerate(headers, start=1)}
     for col_idx, name in enumerate(headers, start=1):
         cell = ws.cell(1, col_idx)
@@ -14913,9 +15485,13 @@ def _td_perf_write_interactive_regression_checker_sheet(
 
     for row_idx, row in enumerate(export_rows or [], start=2):
         ws.cell(row_idx, col_by_name["run_name"]).value = str(row.get("run_name") or "")
+        ws.cell(row_idx, col_by_name["display_name"]).value = str(row.get("display_name") or "")
+        ws.cell(row_idx, col_by_name["serial"]).value = str(row.get("serial") or "")
+        ws.cell(row_idx, col_by_name["observation_id"]).value = str(row.get("observation_id") or "")
         ws.cell(row_idx, col_by_name["condition_label"]).value = str(row.get("condition_label") or "")
         ws.cell(row_idx, col_by_name["program_title"]).value = str(row.get("program_title") or "")
         ws.cell(row_idx, col_by_name["source_run_name"]).value = str(row.get("source_run_name") or "")
+        ws.cell(row_idx, col_by_name["suppression_voltage"]).value = row.get("suppression_voltage")
         if include_control_period:
             ws.cell(row_idx, col_by_name["control_period"]).value = row.get("control_period")
         ws.cell(row_idx, col_by_name["input_1"]).value = row.get("input_1")
@@ -14929,6 +15505,7 @@ def _td_perf_write_interactive_regression_checker_sheet(
             raw_cp_ref=(_td_perf_excel_ref(col_by_name["control_period"], row_idx) if include_control_period else ""),
         )
         ws.cell(row_idx, col_by_name["pred_mean"]).value = formula_map.get("mean") or ""
+        ws.cell(row_idx, col_by_name["sample_count"]).value = row.get("sample_count")
         ws.cell(row_idx, col_by_name["actual_mean"]).value = row.get("actual_mean")
         pred_ref = _td_perf_excel_ref(col_by_name["pred_mean"], row_idx)
         actual_ref = _td_perf_excel_ref(col_by_name["actual_mean"], row_idx)
@@ -14938,10 +15515,16 @@ def _td_perf_write_interactive_regression_checker_sheet(
 
     for name, col_idx in col_by_name.items():
         width = 16
-        if name in {"run_name", "program_title", "source_run_name"}:
+        if name in {"run_name", "display_name", "program_title", "source_run_name"}:
             width = 24
         elif name == "condition_label":
             width = 32
+        elif name in {"observation_id", "serial"}:
+            width = 20
+        elif name == "suppression_voltage":
+            width = 18
+        elif name == "sample_count":
+            width = 14
         elif name.startswith("pred_") or name == "pct_delta_mean":
             width = 20
         ws.column_dimensions[get_column_letter(col_idx)].width = width
@@ -14998,6 +15581,7 @@ def _td_perf_write_static_saved_export_sheet(
     metadata_rows: list[tuple[object, object]] = [
         ("Export Timestamp", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
         ("Export Mode", "Static per-condition"),
+        ("Performance Method", td_perf_plot_method_label(plot_metadata.get("performance_plot_method"))),
         ("Plot Dimension", "3D" if is_surface else "2D"),
         ("Asset Type", str(plot_metadata.get("asset_type") or "").strip()),
         ("Asset Specific Type", str(plot_metadata.get("asset_specific_type") or "").strip()),
@@ -15049,7 +15633,7 @@ def _td_perf_write_static_saved_export_sheet(
         stat_meta_row += 1
 
     data_header_row = stat_meta_row + 2
-    headers = ["run_name", "program_title", "source_run_name", "control_period"]
+    headers = ["run_name", "display_name", "serial", "observation_id", "program_title", "source_run_name", "suppression_voltage", "control_period"]
     if uses_control_period_norm:
         headers.append("control_period_norm")
     headers.extend(["condition_label", "input_1"])
@@ -15059,7 +15643,7 @@ def _td_perf_write_static_saved_export_sheet(
     if is_surface:
         headers.append("input_2_norm")
     headers.extend([f"pred_{stat}" for stat in TD_PERF_EXPORT_STATS_ORDER])
-    headers.extend(["actual_mean", "pct_delta_mean"])
+    headers.extend(["sample_count", "actual_mean", "pct_delta_mean"])
     col_by_name = {name: idx for idx, name in enumerate(headers, start=1)}
     for col_idx, name in enumerate(headers, start=1):
         cell = ws.cell(data_header_row, col_idx)
@@ -15074,8 +15658,12 @@ def _td_perf_write_static_saved_export_sheet(
         input_2 = row.get("input_2")
         control_period = row.get("control_period")
         ws.cell(idx, col_by_name["run_name"]).value = str(row.get("run_name") or "")
+        ws.cell(idx, col_by_name["display_name"]).value = str(row.get("display_name") or "")
+        ws.cell(idx, col_by_name["serial"]).value = str(row.get("serial") or "")
+        ws.cell(idx, col_by_name["observation_id"]).value = str(row.get("observation_id") or "")
         ws.cell(idx, col_by_name["program_title"]).value = str(row.get("program_title") or "")
         ws.cell(idx, col_by_name["source_run_name"]).value = str(row.get("source_run_name") or "")
+        ws.cell(idx, col_by_name["suppression_voltage"]).value = row.get("suppression_voltage")
         ws.cell(idx, col_by_name["control_period"]).value = control_period
         ws.cell(idx, col_by_name["condition_label"]).value = str(row.get("condition_label") or "")
         ws.cell(idx, col_by_name["input_1"]).value = input_1
@@ -15132,6 +15720,7 @@ def _td_perf_write_static_saved_export_sheet(
             predicted_by_stat[stat] = float(predicted)
             ws.cell(idx, col_by_name[f"pred_{stat}"]).value = float(predicted)
 
+        ws.cell(idx, col_by_name["sample_count"]).value = row.get("sample_count")
         actual_mean = row.get("actual_mean")
         ws.cell(idx, col_by_name["actual_mean"]).value = actual_mean
         actual_num = _td_perf_finite_float(actual_mean)
@@ -15141,10 +15730,16 @@ def _td_perf_write_static_saved_export_sheet(
 
     for name, col_idx in col_by_name.items():
         width = 16
-        if name in {"run_name", "program_title", "source_run_name"}:
+        if name in {"run_name", "display_name", "program_title", "source_run_name"}:
             width = 24
         elif name == "condition_label":
             width = 32
+        elif name in {"observation_id", "serial"}:
+            width = 20
+        elif name == "suppression_voltage":
+            width = 18
+        elif name == "sample_count":
+            width = 14
         elif name in {"control_period", "control_period_norm", "pct_delta_mean"}:
             width = 18
         elif name.startswith("pred_"):
@@ -15161,6 +15756,7 @@ def td_perf_export_interactive_equation_workbook(
     plot_metadata: Mapping[str, object],
     results_by_stat: Mapping[str, Mapping[str, object]],
     run_specs: Sequence[Mapping[str, object]],
+    regression_checker_rows: Sequence[Mapping[str, object]] | None = None,
     control_period_filter: object = None,
     run_type_filter: object = None,
     include_regression_checker: bool = True,
@@ -15198,12 +15794,19 @@ def td_perf_export_interactive_equation_workbook(
 
         if include_regression_checker and "mean" in models_by_stat:
             _td_emit_progress(progress_cb, "Loading mean regression checker")
-            export_rows = td_perf_collect_condition_export_rows(
-                db_path,
-                run_specs=run_specs,
-                control_period_filter=control_period_filter,
-                run_type_filter=run_type_filter,
-            )
+            override_rows = [dict(row) for row in (regression_checker_rows or []) if isinstance(row, Mapping)]
+            if override_rows:
+                export_rows = override_rows
+            else:
+                export_rows = td_perf_collect_export_rows_for_method(
+                    db_path,
+                    run_specs=run_specs,
+                    performance_plot_method=plot_metadata.get("performance_plot_method"),
+                    legacy_row_mode="condition",
+                    control_period_filter=control_period_filter,
+                    run_type_filter=run_type_filter,
+                    progress_cb=progress_cb,
+                )
             _td_perf_write_interactive_regression_checker_sheet(
                 wb,
                 plot_metadata=plot_metadata,
@@ -15243,9 +15846,10 @@ def td_perf_export_equation_workbook(
     path = Path(output_path).expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
     _td_emit_progress(progress_cb, "Collecting cached export rows")
-    export_rows = td_perf_collect_equation_export_rows(
+    export_rows = td_perf_collect_export_rows_for_method(
         db_path,
         run_specs=run_specs,
+        performance_plot_method=plot_metadata.get("performance_plot_method"),
         control_period_filter=control_period_filter,
         run_type_filter=run_type_filter,
         progress_cb=progress_cb,
@@ -15291,6 +15895,7 @@ def td_perf_export_equation_workbook(
     metadata_rows: list[tuple[object, object]] = [
         ("Export Timestamp", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
         ("Plot Dimension", "3D" if is_surface else "2D"),
+        ("Performance Method", td_perf_plot_method_label(plot_metadata.get("performance_plot_method"))),
         ("Asset Type", str(plot_metadata.get("asset_type") or "").strip()),
         ("Asset Specific Type", str(plot_metadata.get("asset_specific_type") or "").strip()),
         ("Output Target", output_target),
@@ -15341,7 +15946,7 @@ def td_perf_export_equation_workbook(
         stat_meta_row += 1
 
     data_header_row = stat_meta_row + 2
-    headers = ["run_name", "program_title", "source_run_name", "control_period"]
+    headers = ["run_name", "display_name", "serial", "observation_id", "program_title", "source_run_name", "suppression_voltage", "control_period"]
     if uses_control_period_norm:
         headers.append("control_period_norm")
     headers.extend(["condition_label", "input_1"])
@@ -15351,7 +15956,7 @@ def td_perf_export_equation_workbook(
     if is_surface:
         headers.append("input_2_norm")
     headers.extend([f"pred_{stat}" for stat in TD_PERF_EXPORT_STATS_ORDER])
-    headers.extend(["actual_mean", "pct_delta_mean"])
+    headers.extend(["sample_count", "actual_mean", "pct_delta_mean"])
     col_by_name = {name: idx for idx, name in enumerate(headers, start=1)}
     for col_idx, name in enumerate(headers, start=1):
         cell = ws.cell(data_header_row, col_idx)
@@ -15449,8 +16054,12 @@ def td_perf_export_equation_workbook(
 
     for idx, row in enumerate(export_rows, start=data_header_row + 1):
         ws.cell(idx, col_by_name["run_name"]).value = str(row.get("run_name") or "")
+        ws.cell(idx, col_by_name["display_name"]).value = str(row.get("display_name") or "")
+        ws.cell(idx, col_by_name["serial"]).value = str(row.get("serial") or "")
+        ws.cell(idx, col_by_name["observation_id"]).value = str(row.get("observation_id") or "")
         ws.cell(idx, col_by_name["program_title"]).value = str(row.get("program_title") or "")
         ws.cell(idx, col_by_name["source_run_name"]).value = str(row.get("source_run_name") or "")
+        ws.cell(idx, col_by_name["suppression_voltage"]).value = row.get("suppression_voltage")
         ws.cell(idx, col_by_name["control_period"]).value = row.get("control_period")
         if uses_control_period_norm:
             raw_cp_ref = _td_perf_excel_ref(col_by_name["control_period"], idx)
@@ -15516,6 +16125,7 @@ def td_perf_export_equation_workbook(
             if formula:
                 ws.cell(idx, col_by_name[f"pred_{stat}"]).value = formula
 
+        ws.cell(idx, col_by_name["sample_count"]).value = row.get("sample_count")
         ws.cell(idx, col_by_name["actual_mean"]).value = row.get("actual_mean")
         pred_mean_ref = _td_perf_excel_ref(col_by_name["pred_mean"], idx)
         actual_mean_ref = _td_perf_excel_ref(col_by_name["actual_mean"], idx)
@@ -15523,10 +16133,16 @@ def td_perf_export_equation_workbook(
 
     for name, col_idx in col_by_name.items():
         width = 16
-        if name in {"run_name", "program_title", "source_run_name"}:
+        if name in {"run_name", "display_name", "program_title", "source_run_name"}:
             width = 24
         elif name == "condition_label":
             width = 32
+        elif name in {"observation_id", "serial"}:
+            width = 20
+        elif name == "suppression_voltage":
+            width = 18
+        elif name == "sample_count":
+            width = 14
         elif name in {"control_period", "control_period_norm", "pct_delta_mean"}:
             width = 18
         elif name.startswith("pred_"):
@@ -15810,6 +16426,7 @@ def td_perf_collect_saved_equation_snapshot(
     output_target = str(plot_definition.get("output") or plot_definition.get("output_target") or "").strip()
     input1_target = str(plot_definition.get("input1") or plot_definition.get("input1_target") or "").strip()
     input2_target = str(plot_definition.get("input2") or plot_definition.get("input2_target") or "").strip()
+    performance_plot_method = td_perf_normalize_plot_method(plot_definition.get("performance_plot_method"))
     if not output_target or not input1_target:
         raise RuntimeError("Saved performance equation is missing output/input targets.")
 
@@ -15926,7 +16543,7 @@ def td_perf_collect_saved_equation_snapshot(
                         path,
                         run_name,
                         str(spec.get("input1_column") or ""),
-                        stat,
+                        ("mean" if performance_plot_method == TD_PERF_PLOT_METHOD_CACHED_CONDITION_MEANS else stat),
                         control_period_filter=control_period_filter,
                         run_type_filter=run_type_filter,
                     )
@@ -15936,7 +16553,7 @@ def td_perf_collect_saved_equation_snapshot(
                         path,
                         run_name,
                         str(spec.get("input2_column") or ""),
-                        stat,
+                        ("mean" if performance_plot_method == TD_PERF_PLOT_METHOD_CACHED_CONDITION_MEANS else stat),
                         control_period_filter=control_period_filter,
                         run_type_filter=run_type_filter,
                     )
@@ -16089,6 +16706,7 @@ def td_perf_collect_saved_equation_snapshot(
                 "plot_dimension": "3d",
                 "surface_fit_family": surface_family,
                 "selected_control_period": selected_control_period,
+                "performance_plot_method": performance_plot_method,
                 "points_3d": points_3d,
                 "master_model": master_model,
                 "fit_warning_text": str(master_model.get("fit_warning_text") or "").strip(),
@@ -16103,7 +16721,7 @@ def td_perf_collect_saved_equation_snapshot(
                         path,
                         run_name,
                         str(spec.get("input1_column") or ""),
-                        stat,
+                        ("mean" if performance_plot_method == TD_PERF_PLOT_METHOD_CACHED_CONDITION_MEANS else stat),
                         control_period_filter=control_period_filter,
                         run_type_filter=run_type_filter,
                     )
@@ -16154,23 +16772,49 @@ def td_perf_collect_saved_equation_snapshot(
                 continue
 
             master_model: dict[str, object] = {}
-            aggregate_x, aggregate_y, aggregate_weights = _aggregate_curve(curves)
-            if fit_enabled and aggregate_x:
-                try:
-                    fitted = td_perf_fit_model(
-                        aggregate_x,
-                        aggregate_y,
-                        fit_mode=fit_mode,
-                        polynomial_degree=polynomial_degree,
-                        normalize_x=normalize_x,
-                        sample_weights=(aggregate_weights or None),
-                    )
-                    if isinstance(fitted, dict):
-                        fitted.update(td_perf_build_fit_curve(fitted, min(aggregate_x), max(aggregate_x), points=220))
-                        master_model = fitted
-                except Exception as exc:
-                    if not fit_error_text:
-                        fit_error_text = str(exc)
+            if performance_plot_method == TD_PERF_PLOT_METHOD_CACHED_CONDITION_MEANS:
+                pooled_x: list[float] = []
+                pooled_y: list[float] = []
+                for points in curves.values():
+                    for point in points or []:
+                        if len(point) < 2:
+                            continue
+                        pooled_x.append(float(point[0]))
+                        pooled_y.append(float(point[1]))
+                if fit_enabled and pooled_x:
+                    try:
+                        fitted = td_perf_fit_model(
+                            pooled_x,
+                            pooled_y,
+                            fit_mode=fit_mode,
+                            polynomial_degree=polynomial_degree,
+                            normalize_x=normalize_x,
+                            sample_weights=None,
+                        )
+                        if isinstance(fitted, dict):
+                            fitted.update(td_perf_build_fit_curve(fitted, min(pooled_x), max(pooled_x), points=220))
+                            master_model = fitted
+                    except Exception as exc:
+                        if not fit_error_text:
+                            fit_error_text = str(exc)
+            else:
+                aggregate_x, aggregate_y, aggregate_weights = _aggregate_curve(curves)
+                if fit_enabled and aggregate_x:
+                    try:
+                        fitted = td_perf_fit_model(
+                            aggregate_x,
+                            aggregate_y,
+                            fit_mode=fit_mode,
+                            polynomial_degree=polynomial_degree,
+                            normalize_x=normalize_x,
+                            sample_weights=(aggregate_weights or None),
+                        )
+                        if isinstance(fitted, dict):
+                            fitted.update(td_perf_build_fit_curve(fitted, min(aggregate_x), max(aggregate_x), points=220))
+                            master_model = fitted
+                    except Exception as exc:
+                        if not fit_error_text:
+                            fit_error_text = str(exc)
 
             results[stat] = {
                 "pair_label": pair_label,
@@ -16184,6 +16828,7 @@ def td_perf_collect_saved_equation_snapshot(
                 "stat_label": stat,
                 "fit_mode": fit_mode,
                 "plot_dimension": "2d",
+                "performance_plot_method": performance_plot_method,
                 "curves": curves,
                 "master_model": master_model,
             }
@@ -16208,6 +16853,7 @@ def td_perf_collect_saved_equation_snapshot(
         "performance_run_type_mode": run_type_filter,
         "performance_filter_mode": filter_mode,
         "selected_control_period": selected_control_period,
+        "performance_plot_method": performance_plot_method,
         "asset_type": str(asset_metadata.get("primary_asset_type") or "").strip(),
         "asset_specific_type": str(asset_metadata.get("primary_asset_specific_type") or "").strip(),
     }
@@ -16239,7 +16885,13 @@ def td_perf_build_saved_equation_entry(
     now_txt = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     clean_name = str(name or "").strip() or "Saved Performance Equation"
     asset_metadata = td_perf_collect_asset_metadata(db_path, _td_perf_entry_serials(results_by_stat))
+    plot_def = dict(_td_perf_json_safe(plot_definition) if isinstance(plot_definition, Mapping) else {})
     plot_meta = dict(_td_perf_json_safe(plot_metadata) if isinstance(plot_metadata, Mapping) else {})
+    normalized_method = td_perf_normalize_plot_method(
+        plot_def.get("performance_plot_method") or plot_meta.get("performance_plot_method")
+    )
+    plot_def["performance_plot_method"] = normalized_method
+    plot_meta["performance_plot_method"] = normalized_method
     plot_meta["asset_type"] = str(asset_metadata.get("primary_asset_type") or "").strip()
     plot_meta["asset_specific_type"] = str(asset_metadata.get("primary_asset_specific_type") or "").strip()
     return {
@@ -16248,7 +16900,7 @@ def td_perf_build_saved_equation_entry(
         "slug": _td_perf_saved_slug(clean_name),
         "saved_at": str(existing_saved_at or now_txt),
         "updated_at": now_txt,
-        "plot_definition": _td_perf_json_safe(plot_definition),
+        "plot_definition": plot_def,
         "plot_metadata": plot_meta,
         "run_specs": _td_perf_json_safe(run_specs),
         "results_by_stat": _td_perf_serializable_results(results_by_stat),
@@ -16269,6 +16921,11 @@ def _td_perf_normalize_saved_entry(raw: object) -> dict[str, object] | None:
     updated_at = str(raw.get("updated_at") or saved_at or "").strip()
     plot_definition = dict(raw.get("plot_definition") or {}) if isinstance(raw.get("plot_definition"), Mapping) else {}
     plot_metadata = dict(raw.get("plot_metadata") or {}) if isinstance(raw.get("plot_metadata"), Mapping) else {}
+    normalized_method = td_perf_normalize_plot_method(
+        plot_definition.get("performance_plot_method") or plot_metadata.get("performance_plot_method")
+    )
+    plot_definition["performance_plot_method"] = normalized_method
+    plot_metadata["performance_plot_method"] = normalized_method
     results_by_stat = raw.get("results_by_stat") or {}
     if not isinstance(results_by_stat, Mapping):
         results_by_stat = {}
@@ -16413,10 +17070,22 @@ def td_perf_refresh_saved_equation_store(project_dir: Path, db_path: Path) -> di
 
 def _td_perf_saved_entry_plot_metadata(entry: Mapping[str, object]) -> dict[str, object]:
     plot_metadata = dict(entry.get("plot_metadata") or {}) if isinstance(entry.get("plot_metadata"), Mapping) else {}
+    plot_definition = dict(entry.get("plot_definition") or {}) if isinstance(entry.get("plot_definition"), Mapping) else {}
     asset_metadata = dict(entry.get("asset_metadata") or {}) if isinstance(entry.get("asset_metadata"), Mapping) else {}
+    plot_metadata["performance_plot_method"] = td_perf_normalize_plot_method(
+        plot_metadata.get("performance_plot_method") or plot_definition.get("performance_plot_method")
+    )
     plot_metadata["asset_type"] = str(asset_metadata.get("primary_asset_type") or plot_metadata.get("asset_type") or "").strip()
     plot_metadata["asset_specific_type"] = str(asset_metadata.get("primary_asset_specific_type") or plot_metadata.get("asset_specific_type") or "").strip()
     return plot_metadata
+
+
+def _td_perf_saved_entry_plot_method(entry: Mapping[str, object]) -> str:
+    plot_definition = dict(entry.get("plot_definition") or {}) if isinstance(entry.get("plot_definition"), Mapping) else {}
+    plot_metadata = dict(entry.get("plot_metadata") or {}) if isinstance(entry.get("plot_metadata"), Mapping) else {}
+    return td_perf_normalize_plot_method(
+        plot_definition.get("performance_plot_method") or plot_metadata.get("performance_plot_method")
+    )
 
 
 def _td_perf_saved_entry_control_period_filter(entry: Mapping[str, object]) -> object:
@@ -16489,11 +17158,14 @@ def td_perf_export_saved_equations_workbook(
             _td_emit_progress(progress_cb, f"Writing saved equation {index}/{total}: {entry_name}")
             control_period_filter = _td_perf_saved_entry_control_period_filter(entry)
             run_type_filter = _td_perf_saved_entry_run_type_filter(entry)
-            export_rows = td_perf_collect_condition_export_rows(
+            export_rows = td_perf_collect_export_rows_for_method(
                 db_path,
                 run_specs=list(entry.get("run_specs") or []),
+                performance_plot_method=_td_perf_saved_entry_plot_method(entry),
+                legacy_row_mode="condition",
                 control_period_filter=control_period_filter,
                 run_type_filter=run_type_filter,
+                progress_cb=progress_cb,
             )
             sheet_name = _td_perf_unique_sheet_name(entry_name, used_sheet_names)
             try:
@@ -17556,6 +18228,7 @@ def update_test_data_trending_project_workbook(
     timings: dict[str, float | int] = {
         "data_calc_build_s": 0.0,
         "metrics_long_sheet_s": 0.0,
+        "metrics_long_sequences_sheet_s": 0.0,
         "raw_cache_long_sheet_s": 0.0,
         "perf_candidates_main_s": 0.0,
         "perf_candidates_cp_total_s": 0.0,
@@ -17815,6 +18488,25 @@ def update_test_data_trending_project_workbook(
             ORDER BY m.run_name, m.serial, m.observation_id, m.column_name, m.stat
             """
         ).fetchall()
+        metric_rows_long_sequences = conn.execute(
+            """
+            SELECT
+                m.observation_id,
+                m.serial,
+                m.run_name,
+                COALESCE(r.display_name, ''),
+                COALESCE(m.program_title, ''),
+                COALESCE(m.source_run_name, ''),
+                m.column_name,
+                m.stat,
+                m.value_num,
+                m.source_mtime_ns
+            FROM td_metrics_calc_sequences m
+            LEFT JOIN td_runs r
+              ON r.run_name = m.run_name
+            ORDER BY m.run_name, m.serial, m.observation_id, m.column_name, m.stat
+            """
+        ).fetchall()
         y_units_rows = conn.execute(
             "SELECT run_name, name, units FROM td_columns_calc WHERE kind='y'"
         ).fetchall()
@@ -17965,6 +18657,28 @@ def update_test_data_trending_project_workbook(
     for row in metric_rows_long:
         ws_metrics_long.append(list(row))
     timings["metrics_long_sheet_s"] = round(time.perf_counter() - t0, 3)
+
+    _td_emit_progress(progress_cb, "Writing Metrics_long_sequences")
+    t0 = time.perf_counter()
+    ws_metrics_long_sequences = _td_reset_workbook_sheet(
+        wb,
+        "Metrics_long_sequences",
+        [
+            "observation_id",
+            "serial",
+            "condition_key",
+            "condition_display",
+            "program_title",
+            "source_run_name",
+            "parameter_name",
+            "stat",
+            "value_num",
+            "source_mtime_ns",
+        ],
+    )
+    for row in metric_rows_long_sequences:
+        ws_metrics_long_sequences.append(list(row))
+    timings["metrics_long_sequences_sheet_s"] = round(time.perf_counter() - t0, 3)
 
     _td_emit_progress(progress_cb, "Writing RawCache_long")
     t0 = time.perf_counter()

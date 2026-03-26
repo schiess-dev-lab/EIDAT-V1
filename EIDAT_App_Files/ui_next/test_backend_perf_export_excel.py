@@ -219,6 +219,29 @@ class TestBackendPerfExportExcel(unittest.TestCase):
         self.assertAlmostEqual(float(row["actual_mean"]), 120.0)
         self.assertEqual(int(row["sample_count"]), 2)
 
+    def test_collect_cached_condition_mean_export_rows_preserves_observation_points(self) -> None:
+        db_path = _create_perf_export_db()
+
+        rows = backend.td_perf_collect_cached_condition_mean_export_rows(
+            db_path,
+            run_specs=[
+                {
+                    "run_name": "cond_2d",
+                    "display_name": "Condition 2D",
+                    "input1_column": "Input",
+                    "output_column": "Output",
+                }
+            ],
+            run_type_filter="pulsed_mode",
+        )
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual([str(row["observation_id"]) for row in rows], ["SN-001__cond_2d", "SN-002__cond_2d"])
+        self.assertEqual([str(row["serial"]) for row in rows], ["SN-001", "SN-002"])
+        self.assertEqual([int(row["sample_count"]) for row in rows], [1, 1])
+        self.assertAlmostEqual(float(rows[0]["input_1"]), 10.0)
+        self.assertAlmostEqual(float(rows[1]["actual_mean"]), 140.0)
+
     def test_export_interactive_equation_workbook_2d_creates_calculator_and_checker(self) -> None:
         db_path = _create_perf_export_db()
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -325,6 +348,84 @@ class TestBackendPerfExportExcel(unittest.TestCase):
                 self.assertIn("IFERROR", pred_formula)
                 pct_formula = str(checker.cell(header_row + 1, checker_headers["pct_delta_mean"]).value or "")
                 self.assertIn("/", pct_formula)
+            finally:
+                wb.close()
+
+    def test_export_interactive_equation_workbook_uses_regression_checker_row_override(self) -> None:
+        db_path = _create_perf_export_db()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_path = Path(tmpdir) / "interactive_override.xlsx"
+            results = {
+                "mean": {
+                    "master_model": {
+                        "fit_family": "polynomial",
+                        "coeffs": [10.0, 0.0],
+                        "normalize_x": False,
+                        "equation": "10*x",
+                        "x_norm_equation": "",
+                    }
+                }
+            }
+
+            exported = backend.td_perf_export_interactive_equation_workbook(
+                db_path,
+                out_path,
+                plot_metadata={
+                    "plot_dimension": "2d",
+                    "output_target": "Output",
+                    "output_units": "u",
+                    "input1_target": "Input",
+                    "input1_units": "u",
+                    "input2_target": "",
+                    "input2_units": "",
+                    "run_selection_label": "Condition 2D",
+                    "member_runs": ["cond_2d"],
+                    "performance_run_type_mode": "pulsed_mode",
+                    "performance_filter_mode": "all_conditions",
+                },
+                results_by_stat=results,
+                run_specs=[
+                    {
+                        "run_name": "cond_2d",
+                        "display_name": "Condition 2D",
+                        "input1_column": "Input",
+                        "output_column": "Output",
+                    }
+                ],
+                regression_checker_rows=[
+                    {
+                        "observation_id": "SN-001__cond_2d",
+                        "run_name": "cond_2d",
+                        "display_name": "Condition 2D",
+                        "program_title": "Program A",
+                        "source_run_name": "Run A",
+                        "control_period": None,
+                        "suppression_voltage": None,
+                        "condition_label": "Condition 2D | Program A | Run A",
+                        "serial": "SN-001",
+                        "input_1": 10.0,
+                        "input_2": None,
+                        "actual_mean": 100.0,
+                        "sample_count": 1,
+                    }
+                ],
+                run_type_filter="pulsed_mode",
+                include_regression_checker=True,
+            )
+
+            self.assertEqual(exported, out_path)
+            wb = load_workbook(str(out_path), data_only=False)
+            try:
+                checker = wb["Mean Regression Checker"]
+                header_row = _data_header_row(checker)
+                checker_headers = {
+                    str(checker.cell(header_row, col_idx).value or "").strip(): col_idx
+                    for col_idx in range(1, checker.max_column + 1)
+                    if str(checker.cell(header_row, col_idx).value or "").strip()
+                }
+                self.assertEqual(str(checker.cell(header_row + 1, checker_headers["serial"]).value or ""), "SN-001")
+                self.assertEqual(str(checker.cell(header_row + 1, checker_headers["program_title"]).value or ""), "Program A")
+                self.assertEqual(checker.cell(header_row + 2, checker_headers["serial"]).value, None)
             finally:
                 wb.close()
 

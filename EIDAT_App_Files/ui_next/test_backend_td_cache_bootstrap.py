@@ -156,6 +156,11 @@ def _create_ready_td_project_fixture(project_dir: Path) -> tuple[Path, Path, Pat
     ws_metrics_long.append(["obs1", "SN-001", "RunA", "RunA", "Program Alpha", "RunA", "Pressure", "mean", 1.23, 1])
     ws_metrics_long.append(["obs1", "SN-001", "RunA", "RunA", "Program Alpha", "RunA", "Pressure", "max", 1.45, 1])
 
+    ws_metrics_long_sequences = wb.create_sheet("Metrics_long_sequences")
+    ws_metrics_long_sequences.append(TEST_METRICS_LONG_HEADER)
+    ws_metrics_long_sequences.append(["obs1", "SN-001", "RunA", "RunA", "Program Alpha", "RunA", "Pressure", "mean", 1.23, 1])
+    ws_metrics_long_sequences.append(["obs1", "SN-001", "RunA", "RunA", "Program Alpha", "RunA", "Pressure", "max", 1.45, 1])
+
     ws_raw_cache_long = wb.create_sheet("RawCache_long")
     ws_raw_cache_long.append(TEST_RAW_CACHE_LONG_HEADER)
     ws_raw_cache_long.append(["obs1", "SN-001", "Program Alpha", "RunA", "RunA", "RunA", "time", "", None, None, 1])
@@ -219,6 +224,25 @@ def _create_ready_td_project_fixture(project_dir: Path) -> tuple[Path, Path, Pat
         conn.executemany(
             """
             INSERT OR REPLACE INTO td_metrics_calc(
+                observation_id, serial, run_name, column_name, stat, value_num, computed_epoch_ns, source_mtime_ns, program_title, source_run_name
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                ("obs1", "SN-001", "RunA", "Pressure", "mean", 1.23, 1, 1, "Program Alpha", "RunA"),
+                ("obs1", "SN-001", "RunA", "Pressure", "max", 1.45, 1, 1, "Program Alpha", "RunA"),
+            ],
+        )
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO td_condition_observations_sequences(
+                observation_id, serial, run_name, program_title, source_run_name, run_type, pulse_width, control_period, suppression_voltage, source_mtime_ns, computed_epoch_ns
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("obs1", "SN-001", "RunA", "Program Alpha", "RunA", "", None, None, None, 1, 1),
+        )
+        conn.executemany(
+            """
+            INSERT OR REPLACE INTO td_metrics_calc_sequences(
                 observation_id, serial, run_name, column_name, stat, value_num, computed_epoch_ns, source_mtime_ns, program_title, source_run_name
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
@@ -732,12 +756,12 @@ class TestBackendTdCacheBootstrap(unittest.TestCase):
             project_dir = Path(tmpdir) / "project"
             workbook_path, impl_db, _raw_db = _create_ready_td_project_fixture(project_dir)
             with closing(sqlite3.connect(str(impl_db))) as conn:
-                conn.execute("DROP TABLE td_metrics_calc")
+                conn.execute("DROP TABLE td_metrics_calc_sequences")
                 conn.commit()
             with self.assertRaises(RuntimeError) as ctx:
                 backend.validate_test_data_project_cache_for_open(project_dir, workbook_path)
             self.assertIn("missing required tables", str(ctx.exception))
-            self.assertIn("td_metrics_calc", str(ctx.exception))
+            self.assertIn("td_metrics_calc_sequences", str(ctx.exception))
 
     def test_read_sources_metadata_from_cache_uses_cache_metadata(self) -> None:
         if Workbook is None:
@@ -934,6 +958,30 @@ class TestBackendTdCacheBootstrap(unittest.TestCase):
                 readiness = backend._td_collect_project_readiness(project_dir, workbook_path)
             self.assertEqual(readiness["problems"], [])
             self.assertTrue(any("Metrics_long" in warning for warning in readiness["warnings"]))
+
+    def test_ready_validator_allows_missing_metrics_long_sequences_sheet_as_warning(self) -> None:
+        if Workbook is None:
+            self.skipTest("openpyxl is required for TD readiness tests")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir) / "project"
+            workbook_path, impl_db, _raw_db = _create_ready_td_project_fixture(project_dir)
+            from openpyxl import load_workbook  # type: ignore
+
+            wb_existing = load_workbook(str(workbook_path))
+            try:
+                del wb_existing["Metrics_long_sequences"]
+                wb_existing.save(str(workbook_path))
+            finally:
+                wb_existing.close()
+
+            with _td_validation_context():
+                self.assertEqual(
+                    backend.validate_existing_test_data_project_cache(project_dir, workbook_path),
+                    impl_db,
+                )
+                readiness = backend._td_collect_project_readiness(project_dir, workbook_path)
+            self.assertEqual(readiness["problems"], [])
+            self.assertTrue(any("Metrics_long_sequences" in warning for warning in readiness["warnings"]))
 
     def test_ready_validator_allows_data_calc_without_generated_metric_rows_as_warning(self) -> None:
         if Workbook is None:

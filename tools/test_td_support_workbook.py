@@ -379,6 +379,19 @@ class _PlotPerformanceHarness:
             {
                 "mean": {
                     "plot_dimension": "2d",
+                    "performance_plot_method": "legacy_serial_curves",
+                    "master_model": {},
+                    "curves": {"SN1": [(1.0, 2.0, "RunA"), (2.0, 3.0, "RunA")]},
+                }
+            },
+            ["mean"],
+            "",
+        )
+        self._perf_collect_cached_condition_mean_results = lambda *args, **kwargs: (
+            {
+                "mean": {
+                    "plot_dimension": "2d",
+                    "performance_plot_method": "cached_condition_means",
                     "master_model": {},
                     "curves": {"SN1": [(1.0, 2.0, "RunA"), (2.0, 3.0, "RunA")]},
                 }
@@ -392,6 +405,7 @@ class _PlotPerformanceHarness:
         self._update_perf_highlight_models = lambda: None
         self._fill_perf_equations_table = lambda: None
         self._redraw_performance_view = lambda: None
+        self._run_display_text = lambda run_name: str(run_name or "")
         self._current_run_selection = lambda: {
             "mode": "sequence",
             "id": "sequence:RunA",
@@ -406,7 +420,102 @@ class _PlotPerformanceHarness:
         self._perf_partial_cp_fit_messages = getattr(
             TestDataTrendDialog, "_perf_partial_cp_fit_messages"
         ).__get__(self, _PlotPerformanceHarness)
+        self._perf_normalize_plot_method = getattr(
+            TestDataTrendDialog, "_perf_normalize_plot_method"
+        ).__get__(self, _PlotPerformanceHarness)
         self._plot_performance = getattr(TestDataTrendDialog, "_plot_performance").__get__(self, _PlotPerformanceHarness)
+        self._plot_performance_cached_condition_means = getattr(
+            TestDataTrendDialog, "_plot_performance_cached_condition_means"
+        ).__get__(self, _PlotPerformanceHarness)
+
+
+class _PerfRegressionCheckerRowsHarness:
+    def __init__(self) -> None:
+        from EIDAT_App_Files.ui_next.qt_main import TestDataTrendDialog  # type: ignore
+
+        self._perf_results_by_stat = {
+            "mean": {
+                "plot_dimension": "2d",
+                "curves": {"SN1": [(1.0, 10.0, "Cond A"), (2.0, 20.0, "Cond B")]},
+                "regression_checker_rows": [
+                    {
+                        "observation_id": "obs_live_sn1",
+                        "run_name": "RunA",
+                        "display_name": "Condition A",
+                        "program_title": "Program A",
+                        "source_run_name": "Source A",
+                        "control_period": 60.0,
+                        "suppression_voltage": 24.0,
+                        "condition_label": "Condition A",
+                        "serial": "SN1",
+                        "input_1": 1.0,
+                        "input_2": None,
+                        "actual_mean": 10.0,
+                        "sample_count": 1,
+                    }
+                ],
+            }
+        }
+        self._selected_perf_serials = lambda: ["SN1", "SN2"]
+        self._load_series_calls = 0
+
+        def _load_series(
+            run_name: str,
+            column_name: str,
+            stat: str,
+            *,
+            control_period_filter=None,
+            run_type_filter=None,
+        ):
+            self._load_series_calls += 1
+            rows = {
+                ("RunA", "Input", "mean"): [
+                    {
+                        "observation_id": "obs_sn1",
+                        "serial": "SN1",
+                        "value_num": 1.0,
+                        "program_title": "Program A",
+                        "source_run_name": "Source A",
+                        "control_period": 60.0,
+                        "suppression_voltage": 24.0,
+                    },
+                    {
+                        "observation_id": "obs_sn2",
+                        "serial": "SN2",
+                        "value_num": 9.0,
+                        "program_title": "Program B",
+                        "source_run_name": "Source B",
+                        "control_period": 60.0,
+                        "suppression_voltage": 24.0,
+                    },
+                ],
+                ("RunA", "Output", "mean"): [
+                    {
+                        "observation_id": "obs_sn1",
+                        "serial": "SN1",
+                        "value_num": 10.0,
+                        "program_title": "Program A",
+                        "source_run_name": "Source A",
+                        "control_period": 60.0,
+                        "suppression_voltage": 24.0,
+                    },
+                    {
+                        "observation_id": "obs_sn2",
+                        "serial": "SN2",
+                        "value_num": 90.0,
+                        "program_title": "Program B",
+                        "source_run_name": "Source B",
+                        "control_period": 60.0,
+                        "suppression_voltage": 24.0,
+                    },
+                ],
+            }
+            return [dict(row) for row in rows.get((run_name, column_name, stat), [])]
+
+        self._load_perf_equation_metric_series = _load_series
+        self._perf_current_regression_checker_rows = getattr(
+            TestDataTrendDialog, "_perf_current_regression_checker_rows"
+        ).__get__(self, _PerfRegressionCheckerRowsHarness)
 
 
 class _RenderPlotDefHarness:
@@ -419,6 +528,7 @@ class _RenderPlotDefHarness:
         self._perf_all_runs = ["RunA"]
         self._perf_require_min_points = 2
         self.collect_calls: list[dict] = []
+        self.cached_collect_calls: list[dict] = []
 
         def _collect_results(
             output_name: str,
@@ -451,12 +561,47 @@ class _RenderPlotDefHarness:
             )
             return ({"mean": {"plot_dimension": "2d"}}, ["mean"], "")
 
+        def _collect_cached_results(
+            output_name: str,
+            input1_name: str,
+            input2_name: str,
+            plot_stats: list[str],
+            runs: list[str],
+            serials: list[str],
+            *,
+            fit_enabled: bool,
+            require_min_points: int,
+            control_period_filter=None,
+            display_control_period=None,
+            run_type_filter=None,
+        ):
+            self.cached_collect_calls.append(
+                {
+                    "output_name": output_name,
+                    "input1_name": input1_name,
+                    "input2_name": input2_name,
+                    "plot_stats": list(plot_stats),
+                    "runs": list(runs),
+                    "serials": list(serials),
+                    "fit_enabled": bool(fit_enabled),
+                    "require_min_points": int(require_min_points),
+                    "control_period_filter": control_period_filter,
+                    "display_control_period": display_control_period,
+                    "run_type_filter": run_type_filter,
+                }
+            )
+            return ({"mean": {"plot_dimension": "2d", "performance_plot_method": "cached_condition_means"}}, ["mean"], "")
+
         self._selection_from_plot_def = lambda d: {"member_runs": ["RunA"]}
         self._selected_perf_runs = lambda: ["RunA"]
         self._selected_perf_serials = lambda: ["SN1"]
         self._selected_perf_run_type_mode = lambda: "steady_state"
         self._common_runs_for_perf_vars = lambda output, input1, input2: ["RunA"]
         self._perf_collect_results = _collect_results
+        self._perf_collect_cached_condition_mean_results = _collect_cached_results
+        self._perf_normalize_plot_method = getattr(
+            TestDataTrendDialog, "_perf_normalize_plot_method"
+        ).__get__(self, _RenderPlotDefHarness)
         self._render_performance_result = lambda ax, result, **kwargs: ax.plot([0.0, 1.0], [0.0, 1.0])
 
         self._render_plot_def_to_figure = getattr(TestDataTrendDialog, "_render_plot_def_to_figure").__get__(self, _RenderPlotDefHarness)
@@ -637,7 +782,12 @@ class _SavedPerfActionHarness:
         self._toast_message = ""
         self._perf_results_by_stat = {"mean": {"master_model": {"fit_family": "polynomial"}}}
 
-        for name in ("_save_current_performance_equation", "_format_saved_performance_entry_detail"):
+        for name in (
+            "_save_current_performance_equation",
+            "_format_saved_performance_entry_detail",
+            "_perf_normalize_plot_method",
+            "_perf_plot_method_label",
+        ):
             setattr(self, name, getattr(TestDataTrendDialog, name).__get__(self, _SavedPerfActionHarness))
 
         self._perf_has_exportable_models = lambda: True
@@ -7866,6 +8016,25 @@ class TestTDSupportWorkbook(unittest.TestCase):
         self.assertEqual(harness._toast_message, "Saved performance equation")
 
     @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
+    def test_saved_perf_detail_includes_plot_method(self) -> None:
+        harness = _SavedPerfActionHarness(Path(tempfile.mkdtemp()))
+        detail = harness._format_saved_performance_entry_detail(
+            {
+                "name": "Saved Equation",
+                "updated_at": "2026-01-01 00:00:00",
+                "plot_metadata": {
+                    "plot_dimension": "2d",
+                    "performance_plot_method": "cached_condition_means",
+                    "output_target": "output",
+                    "input1_target": "input1",
+                },
+                "asset_metadata": {},
+                "equation_rows": [],
+            }
+        )
+        self.assertIn("Method: Run Conditions", detail)
+
+    @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
     def test_perf_control_period_combo_enables_for_control_period_surface_slice(self) -> None:
         harness = _PerfControlPeriodHarness()
         harness.cb_perf_filter_mode.setCurrentIndex(harness.cb_perf_filter_mode.findData("all_conditions"))
@@ -8003,6 +8172,34 @@ class TestTDSupportWorkbook(unittest.TestCase):
         self.assertIsInstance(harness._last_plot_def, dict)
         for key in ("x_band_min", "x_band_max", "y_band_min", "y_band_max"):
             self.assertNotIn(key, harness._last_plot_def)
+
+    @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
+    def test_plot_performance_cached_condition_means_sets_method_in_last_plot_def(self) -> None:
+        harness = _PlotPerformanceHarness()
+        harness._plot_performance_cached_condition_means()
+        self.assertIsInstance(harness._last_plot_def, dict)
+        self.assertEqual(harness._last_plot_def.get("performance_plot_method"), "cached_condition_means")
+
+    def test_perf_current_regression_checker_rows_use_only_qualifying_serial_points(self) -> None:
+        harness = _PerfRegressionCheckerRowsHarness()
+        rows = harness._perf_current_regression_checker_rows(
+            [
+                {
+                    "run_name": "RunA",
+                    "display_name": "Condition A",
+                    "input1_column": "Input",
+                    "output_column": "Output",
+                }
+            ],
+            run_type_filter="pulsed_mode",
+        )
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row.get("serial"), "SN1")
+        self.assertEqual(row.get("program_title"), "Program A")
+        self.assertEqual(row.get("observation_id"), "obs_live_sn1")
+        self.assertEqual(int(row.get("sample_count") or 0), 1)
+        self.assertEqual(harness._load_series_calls, 0)
 
     @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
     def test_plot_performance_surfaces_cp_fit_warning_as_plot_note(self) -> None:
@@ -8159,6 +8356,26 @@ class TestTDSupportWorkbook(unittest.TestCase):
         self.assertIsNotNone(fig)
         self.assertEqual(len(harness.collect_calls), 1)
         self.assertEqual(harness.collect_calls[0]["plot_stats"], ["mean"])
+
+    @unittest.skipUnless(_have_matplotlib(), "matplotlib not installed")
+    def test_render_plot_def_routes_cached_condition_mean_method_to_parallel_collector(self) -> None:
+        harness = _RenderPlotDefHarness()
+        fig = harness._render_plot_def_to_figure(
+            {
+                "mode": "performance",
+                "performance_plot_method": "cached_condition_means",
+                "output": "output",
+                "input1": "input1",
+                "input2": "",
+                "stats": ["mean"],
+                "view_stat": "mean",
+                "fit_enabled": False,
+            }
+        )
+        self.assertIsNotNone(fig)
+        self.assertEqual(len(harness.collect_calls), 0)
+        self.assertEqual(len(harness.cached_collect_calls), 1)
+        self.assertEqual(harness.cached_collect_calls[0]["plot_stats"], ["mean"])
 
     def test_metric_series_loader_filters_programs_serials_suppression_and_control_period(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
