@@ -1325,6 +1325,45 @@ class TestTDTrendDialogLayout(unittest.TestCase):
         finally:
             dlg.close()
 
+    def test_smart_solver_mode_hides_plot_controls_and_updates_run_button_text(self) -> None:
+        dlg = _build_test_data_dialog()
+        try:
+            app = _qt_app()
+            dlg.show()
+            app.processEvents()
+
+            dlg._set_mode("smart_solver")
+            app.processEvents()
+
+            self.assertEqual(dlg._mode, "smart_solver")
+            self.assertTrue(dlg.btn_mode_solver.isChecked())
+            self.assertEqual(dlg._tabs.currentIndex(), 3)
+            self.assertEqual(dlg.btn_plot.text(), "Run Smart Solver")
+            self.assertFalse(dlg.run_selector_frame.isVisible())
+            self.assertTrue(dlg.smart_solver_frame.isVisible())
+            self.assertFalse(dlg.plot_container.isVisible())
+            self.assertFalse(dlg.btn_zone_zoom.isVisible())
+            self.assertFalse(dlg.btn_zoom_in.isVisible())
+            self.assertFalse(dlg.btn_view_bands.isVisible())
+            self.assertFalse(dlg.btn_stats_toggle.isVisible())
+            self.assertFalse(dlg.footer_frame.isVisible())
+        finally:
+            dlg.close()
+
+    def test_switching_to_smart_solver_does_not_clear_existing_performance_results(self) -> None:
+        dlg = _build_test_data_dialog()
+        try:
+            dlg._perf_results_by_stat = {"mean": {"master_model": {"equation": "y=x"}}}
+            dlg._set_mode("smart_solver")
+
+            self.assertIn("mean", dlg._perf_results_by_stat)
+            self.assertEqual(
+                str(((dlg._perf_results_by_stat.get("mean") or {}).get("master_model") or {}).get("equation") or ""),
+                "y=x",
+            )
+        finally:
+            dlg.close()
+
     def test_metric_popup_summaries_reflect_backing_selection_state(self) -> None:
         dlg = _build_test_data_dialog()
         try:
@@ -2301,6 +2340,95 @@ class TestTDSupportWorkbook(unittest.TestCase):
                     """,
                     (observation_id, serial, run, "thrust", "mean", float(y_val), 0, 0, be.TD_SUPPORT_DEFAULT_PROGRAM_TITLE, run),
                 )
+            conn.commit()
+        return db_path
+
+    def _seed_smart_solver_db(
+        self,
+        root: Path,
+        *,
+        mixed_suppression_voltage: bool = False,
+    ) -> Path:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        db_path = root / "implementation_trending.sqlite3"
+        with sqlite3.connect(str(db_path)) as conn:
+            be._ensure_test_data_impl_tables(conn)
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO td_runs
+                (run_name, default_x, display_name, run_type, control_period, pulse_width)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                ("RunA", "Time", "RunA", "pulsed mode", 0.2, None),
+            )
+            for name, units in (
+                ("prop_per_pulse", "lbm"),
+                ("duty_cycle", "%"),
+                ("isp", "sec"),
+            ):
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO td_columns_calc(run_name, name, units, kind)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    ("RunA", name, units, "y"),
+                )
+
+            point_idx = 0
+            for cp_value, suppression_voltage in (
+                (0.2, 24.0),
+                (2.0, 28.0 if mixed_suppression_voltage else 24.0),
+            ):
+                for input_1 in (1.0, 2.0, 3.0):
+                    for input_2 in (10.0, 20.0):
+                        point_idx += 1
+                        observation_id = f"obs_{point_idx}"
+                        actual = 50.0 + (3.0 * input_1) + (0.5 * input_2) + (2.0 * cp_value)
+                        conn.execute(
+                            """
+                            INSERT OR REPLACE INTO td_condition_observations_sequences
+                            (observation_id, serial, run_name, program_title, source_run_name, run_type, pulse_width, control_period, suppression_voltage, source_mtime_ns, computed_epoch_ns)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                observation_id,
+                                "SN1",
+                                "RunA",
+                                "Program A",
+                                "RunA",
+                                "pulsed mode",
+                                None,
+                                cp_value,
+                                suppression_voltage,
+                                0,
+                                0,
+                            ),
+                        )
+                        for column_name, value_num in (
+                            ("prop_per_pulse", input_1),
+                            ("duty_cycle", input_2),
+                            ("isp", actual),
+                        ):
+                            conn.execute(
+                                """
+                                INSERT OR REPLACE INTO td_metrics_calc_sequences
+                                (observation_id, serial, run_name, column_name, stat, value_num, computed_epoch_ns, source_mtime_ns, program_title, source_run_name)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                """,
+                                (
+                                    observation_id,
+                                    "SN1",
+                                    "RunA",
+                                    column_name,
+                                    "mean",
+                                    value_num,
+                                    0,
+                                    0,
+                                    "Program A",
+                                    "RunA",
+                                ),
+                            )
             conn.commit()
         return db_path
 
@@ -6628,6 +6756,22 @@ class TestTDSupportWorkbook(unittest.TestCase):
         model = be.td_perf_fit_model(xs, ys, fit_mode="piecewise_3")
         self.assertIsNone(model)
 
+    def test_perf_piecewise_candidate_breaks_caps_dense_three_segment_search(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        unique_x = [float(i) for i in range(200)]
+        candidates = be._td_perf_piecewise_candidate_breaks(
+            unique_x,
+            segment_count=3,
+            min_points_per_segment=2,
+            min_span=1.0,
+        )
+        self.assertTrue(candidates)
+        self.assertLessEqual(
+            len(candidates),
+            be.TD_PERF_PIECEWISE_MAX_BREAK_CANDIDATES_3 * be.TD_PERF_PIECEWISE_MAX_BREAK_CANDIDATES_3,
+        )
+
     def test_perf_predict_model_piecewise_hits_breakpoint_exactly(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
 
@@ -8577,6 +8721,77 @@ class TestTDSupportWorkbook(unittest.TestCase):
 
         self.assertEqual(harness._highlight_sns, ["SN1"])
         self.assertEqual(harness._highlight_sn, "SN1")
+
+    def test_td_smart_solver_run_uses_sequence_metric_source_and_scores_rows(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            db_path = self._seed_smart_solver_db(root)
+
+            with mock.patch.object(be, "td_load_metric_series", wraps=be.td_load_metric_series) as load_mock:
+                result = be.td_smart_solver_run(
+                    db_path,
+                    output_target="isp",
+                    input1_target="prop_per_pulse",
+                    input2_target="duty_cycle",
+                    runs=["RunA"],
+                    serials=["SN1"],
+                    program_filters=["Program A"],
+                )
+
+            self.assertTrue(load_mock.called)
+            self.assertTrue(
+                all(
+                    call.kwargs.get("metric_source") == be.TD_METRIC_PLOT_SOURCE_ALL_SEQUENCES
+                    for call in load_mock.call_args_list
+                )
+            )
+            self.assertEqual(result["fit_family"], be.TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD)
+            self.assertTrue(str(result.get("equation") or "").strip())
+            self.assertEqual(int(result.get("sample_count") or 0), 12)
+            self.assertEqual(int(result.get("fell_out_count") or 0), 0)
+            self.assertGreater(float(result.get("residual_threshold") or 0.0), 0.0)
+            self.assertEqual(len(result.get("slice_rows") or []), 2)
+
+    def test_td_smart_solver_run_warns_for_multiple_suppression_voltages(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            db_path = self._seed_smart_solver_db(root, mixed_suppression_voltage=True)
+
+            result = be.td_smart_solver_run(
+                db_path,
+                output_target="isp",
+                input1_target="prop_per_pulse",
+                input2_target="duty_cycle",
+                runs=["RunA"],
+                serials=["SN1"],
+                program_filters=["Program A"],
+            )
+
+            self.assertEqual(sorted(result.get("distinct_suppression_voltages") or []), ["24", "28"])
+            self.assertIn("multiple voltages", str(result.get("warning_text") or ""))
+
+    def test_td_smart_solver_run_errors_when_control_period_filter_is_too_narrow(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            db_path = self._seed_smart_solver_db(root)
+
+            with self.assertRaisesRegex(RuntimeError, "Broaden the active control-period filter"):
+                be.td_smart_solver_run(
+                    db_path,
+                    output_target="isp",
+                    input1_target="prop_per_pulse",
+                    input2_target="duty_cycle",
+                    runs=["RunA"],
+                    serials=["SN1"],
+                    program_filters=["Program A"],
+                    control_period_filters=["0.2"],
+                )
 
     def test_perf_candidate_discovery_accepts_separated_x(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore

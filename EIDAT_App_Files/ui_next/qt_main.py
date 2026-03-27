@@ -3175,7 +3175,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._workbook_path = Path(workbook_path).expanduser()
         self._db_path: Path | None = None
         self._plot_ready = False
-        self._mode = "curves"  # curves | metrics | performance
+        self._mode = "curves"  # curves | metrics | performance | smart_solver
         self._highlight_sn = ""
         self._highlight_sns: list[str] = []
         self._serial_source_rows: list[dict] = []
@@ -3216,6 +3216,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._left_panel_width_initialized = False
         self._startup_size_locked = False
         self._perf_equations_popup: QtWidgets.QDialog | None = None
+        self._smart_solver_config: dict[str, str] = {}
+        self._smart_solver_result: dict[str, object] | None = None
+        self._smart_solver_popup: QtWidgets.QDialog | None = None
+        self._smart_solver_worker: ProjectTaskWorker | None = None
+        self._smart_solver_progress_visible = False
+        self._smart_solver_signals_connected = False
 
         self.setWindowTitle("Test Data - Trend / Analyze")
         self.resize(1280, 760)
@@ -3367,7 +3373,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self.btn_mode_curves = QtWidgets.QPushButton("Plot Curves")
         self.btn_mode_metrics = QtWidgets.QPushButton("Plot Metrics")
         self.btn_mode_perf = QtWidgets.QPushButton("Performance")
-        for b in (self.btn_mode_curves, self.btn_mode_metrics, self.btn_mode_perf):
+        self.btn_mode_solver = QtWidgets.QPushButton("Smart Equation Solver")
+        for b in (self.btn_mode_curves, self.btn_mode_metrics, self.btn_mode_perf, self.btn_mode_solver):
             b.setCheckable(True)
             b.setStyleSheet(
                 """
@@ -3392,14 +3399,17 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._mode_group.addButton(self.btn_mode_curves)
         self._mode_group.addButton(self.btn_mode_metrics)
         self._mode_group.addButton(self.btn_mode_perf)
+        self._mode_group.addButton(self.btn_mode_solver)
         self.btn_mode_curves.clicked.connect(lambda: self._set_mode("curves"))
         self.btn_mode_metrics.clicked.connect(lambda: self._set_mode("metrics"))
         self.btn_mode_perf.clicked.connect(lambda: self._set_mode("performance"))
+        self.btn_mode_solver.clicked.connect(lambda: self._set_mode("smart_solver"))
 
         switch_row.addWidget(switch_lbl)
         switch_row.addWidget(self.btn_mode_curves)
         switch_row.addWidget(self.btn_mode_metrics)
         switch_row.addWidget(self.btn_mode_perf)
+        switch_row.addWidget(self.btn_mode_solver)
         switch_row.addStretch(1)
         left_layout.addLayout(switch_row)
 
@@ -3808,9 +3818,37 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         perf_eq_popup_layout.addLayout(perf_eq_close_row)
         self._perf_equations_popup = perf_eq_popup
 
+        tab_solver = QtWidgets.QWidget()
+        solver_tab_layout = QtWidgets.QVBoxLayout(tab_solver)
+        solver_tab_layout.setContentsMargins(10, 10, 10, 10)
+        solver_tab_layout.setSpacing(8)
+
+        solver_intro = QtWidgets.QLabel(
+            "Compute-only control-period-aware equation solving from sequence-level mean data."
+        )
+        solver_intro.setWordWrap(True)
+        solver_intro.setStyleSheet("color: #334155; font-size: 11px;")
+        solver_tab_layout.addWidget(solver_intro)
+
+        self.lbl_solver_tab_config = QtWidgets.QLabel("Solver config: -")
+        self.lbl_solver_tab_config.setWordWrap(True)
+        self.lbl_solver_tab_config.setStyleSheet("color: #64748b; font-size: 11px;")
+        solver_tab_layout.addWidget(self.lbl_solver_tab_config)
+
+        self.lbl_solver_tab_filters = QtWidgets.QLabel("Active filters: -")
+        self.lbl_solver_tab_filters.setWordWrap(True)
+        self.lbl_solver_tab_filters.setStyleSheet("color: #64748b; font-size: 11px;")
+        solver_tab_layout.addWidget(self.lbl_solver_tab_filters)
+
+        self.btn_solver_tab_config = QtWidgets.QPushButton("Solver Config...")
+        self.btn_solver_tab_config.clicked.connect(self._open_smart_solver_config_popup)
+        solver_tab_layout.addWidget(self.btn_solver_tab_config, 0, QtCore.Qt.AlignmentFlag.AlignLeft)
+        solver_tab_layout.addStretch(1)
+
         tabs.addWidget(tab_metrics)
         tabs.addWidget(tab_curves)
         tabs.addWidget(tab_perf)
+        tabs.addWidget(tab_solver)
         left_layout.addWidget(tabs, 0)
 
         self.run_selector_frame = QtWidgets.QFrame()
@@ -3898,6 +3936,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         plot_header = QtWidgets.QHBoxLayout()
         plot_title = QtWidgets.QLabel("Plot")
         plot_title.setStyleSheet("font-size: 14px; font-weight: 700;")
+        self.lbl_right_panel_title = plot_title
         plot_header.addWidget(plot_title)
         plot_header.addStretch(1)
 
@@ -3956,6 +3995,95 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         plot_header.addWidget(self.btn_plot_legend)
         right_layout.addLayout(plot_header)
 
+        self.smart_solver_frame = QtWidgets.QFrame()
+        self.smart_solver_frame.setVisible(False)
+        self.smart_solver_frame.setStyleSheet(
+            "QFrame { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 10px; }"
+        )
+        smart_solver_layout = QtWidgets.QVBoxLayout(self.smart_solver_frame)
+        smart_solver_layout.setContentsMargins(12, 12, 12, 12)
+        smart_solver_layout.setSpacing(10)
+
+        smart_solver_action_row = QtWidgets.QHBoxLayout()
+        self.btn_solver_config = QtWidgets.QPushButton("Solver Config...")
+        self.btn_solver_config.clicked.connect(self._open_smart_solver_config_popup)
+        self.btn_solver_run = QtWidgets.QPushButton("Run Smart Solver")
+        self.btn_solver_run.clicked.connect(lambda: self._run_smart_solver(user_initiated=True))
+        self.btn_solver_resolve = QtWidgets.QPushButton("Re-solve")
+        self.btn_solver_resolve.setEnabled(False)
+        self.btn_solver_resolve.clicked.connect(lambda: self._run_smart_solver(user_initiated=True))
+        smart_solver_action_row.addWidget(self.btn_solver_config)
+        smart_solver_action_row.addWidget(self.btn_solver_run)
+        smart_solver_action_row.addWidget(self.btn_solver_resolve)
+        smart_solver_action_row.addStretch(1)
+        smart_solver_layout.addLayout(smart_solver_action_row)
+
+        self.lbl_smart_solver_config = QtWidgets.QLabel("Config: -")
+        self.lbl_smart_solver_config.setWordWrap(True)
+        self.lbl_smart_solver_config.setStyleSheet("color: #334155; font-size: 11px;")
+        smart_solver_layout.addWidget(self.lbl_smart_solver_config)
+
+        self.lbl_smart_solver_filters = QtWidgets.QLabel("Active filters: -")
+        self.lbl_smart_solver_filters.setWordWrap(True)
+        self.lbl_smart_solver_filters.setStyleSheet("color: #64748b; font-size: 11px;")
+        smart_solver_layout.addWidget(self.lbl_smart_solver_filters)
+
+        self.lbl_smart_solver_equation = QtWidgets.QLabel("Equation: -")
+        self.lbl_smart_solver_equation.setWordWrap(False)
+        self.lbl_smart_solver_equation.setTextInteractionFlags(
+            QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self.lbl_smart_solver_equation.setStyleSheet(
+            "font-size: 12px; font-weight: 800; color: #0f172a; padding-top: 4px;"
+        )
+        smart_solver_layout.addWidget(self.lbl_smart_solver_equation)
+
+        self.lbl_smart_solver_norm = QtWidgets.QLabel("Normalization: -")
+        self.lbl_smart_solver_norm.setWordWrap(True)
+        self.lbl_smart_solver_norm.setTextInteractionFlags(
+            QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self.lbl_smart_solver_norm.setStyleSheet("color: #334155; font-size: 11px;")
+        smart_solver_layout.addWidget(self.lbl_smart_solver_norm)
+
+        self.lbl_smart_solver_summary = QtWidgets.QLabel("Summary: -")
+        self.lbl_smart_solver_summary.setWordWrap(True)
+        self.lbl_smart_solver_summary.setStyleSheet("color: #0f172a; font-size: 11px; font-weight: 700;")
+        smart_solver_layout.addWidget(self.lbl_smart_solver_summary)
+
+        self.lbl_smart_solver_warning = QtWidgets.QLabel("")
+        self.lbl_smart_solver_warning.setVisible(False)
+        self.lbl_smart_solver_warning.setWordWrap(True)
+        self.lbl_smart_solver_warning.setStyleSheet("color: #92400e; font-size: 11px;")
+        smart_solver_layout.addWidget(self.lbl_smart_solver_warning)
+
+        self.tbl_smart_solver_diagnostics = QtWidgets.QTableWidget(0, 6)
+        self.tbl_smart_solver_diagnostics.setHorizontalHeaderLabels(
+            [
+                "control_period",
+                "point_count",
+                "distinct_input_1",
+                "distinct_input_2",
+                "eligible",
+                "reason",
+            ]
+        )
+        self.tbl_smart_solver_diagnostics.setEditTriggers(
+            QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        self.tbl_smart_solver_diagnostics.setSelectionBehavior(
+            QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.tbl_smart_solver_diagnostics.setSelectionMode(
+            QtWidgets.QAbstractItemView.SelectionMode.SingleSelection
+        )
+        try:
+            self.tbl_smart_solver_diagnostics.horizontalHeader().setStretchLastSection(True)
+        except Exception:
+            pass
+        smart_solver_layout.addWidget(self.tbl_smart_solver_diagnostics, 1)
+        right_layout.addWidget(self.smart_solver_frame, 4)
+
         self.plot_band_frame = QtWidgets.QFrame()
         self.plot_band_frame.setStyleSheet("QFrame { border: 0; background: transparent; }")
         self.plot_band_frame.setSizePolicy(
@@ -4001,6 +4129,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             edit.editingFinished.connect(self._finalize_plot_view_bands)
 
         self.plot_container = QtWidgets.QFrame()
+        self.plot_container_frame = self.plot_container
         plot_layout = QtWidgets.QVBoxLayout(self.plot_container)
         plot_layout.setContentsMargins(0, 0, 0, 0)
         self._canvas = None
@@ -4113,6 +4242,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self.lbl_source.setWordWrap(True)
 
         footer_frame = QtWidgets.QFrame()
+        self.footer_frame = footer_frame
         footer_frame.setStyleSheet(
             "QFrame { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 10px; }"
         )
@@ -4807,7 +4937,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         popup.activateWindow()
 
     def _sync_main_auto_plot_actions(self) -> None:
-        enabled = bool(self._auto_plots) and self._plot_ready and bool(self._db_path)
+        enabled = (
+            bool(self._auto_plots)
+            and self._plot_ready
+            and bool(self._db_path)
+            and str(getattr(self, "_mode", "") or "").strip().lower() != "smart_solver"
+        )
         if hasattr(self, "btn_view_auto_plots"):
             self.btn_view_auto_plots.setEnabled(enabled)
 
@@ -5173,7 +5308,15 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
     def _update_plot_zoom_actions(self) -> None:
         is_3d = str(getattr(getattr(self, "_axes", None), "name", "") or "").strip().lower() == "3d"
-        enabled = bool(self._plot_ready and self._axes and self._canvas and self._last_plot_def and not is_3d)
+        solver_mode = str(getattr(self, "_mode", "") or "").strip().lower() == "smart_solver"
+        enabled = bool(
+            (not solver_mode)
+            and self._plot_ready
+            and self._axes
+            and self._canvas
+            and self._last_plot_def
+            and not is_3d
+        )
         for b in ("btn_zone_zoom", "btn_zoom_out", "btn_zoom_in", "btn_zoom_reset", "btn_expand_plot"):
             if hasattr(self, b):
                 try:
@@ -5182,7 +5325,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     pass
         if hasattr(self, "btn_view_bands"):
             try:
-                self.btn_view_bands.setEnabled(bool(self._plot_ready and self._plot_view_band_axes(self._mode)))
+                self.btn_view_bands.setEnabled(
+                    bool((not solver_mode) and self._plot_ready and self._plot_view_band_axes(self._mode))
+                )
             except Exception:
                 pass
         self._sync_main_auto_plot_actions()
@@ -5850,6 +5995,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._refresh_columns_for_run()
         self._refresh_stats_preview()
         self._refresh_performance_ui()
+        self._clear_smart_solver_result()
+        self._refresh_smart_solver_ui()
         self._update_plot_zoom_actions()
 
     def _refresh_global_filter_options(self) -> None:
@@ -6356,7 +6503,11 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             self._update_perf_control_period_state()
         if hasattr(self, "_clear_perf_results"):
             self._clear_perf_results()
+        if hasattr(self, "_clear_smart_solver_result"):
+            self._clear_smart_solver_result()
         self._set_highlight_serials(list(self._highlight_sns or []))
+        if hasattr(self, "_refresh_smart_solver_ui"):
+            self._refresh_smart_solver_ui()
 
         last_mode = str((self._last_plot_def or {}).get("mode") or "").strip().lower()
         if last_mode and last_mode == self._mode:
@@ -8440,9 +8591,473 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             y_col = (selected[0] if selected else "").strip()
         self._populate_stats_table(run, y_col, self._highlight_sn)
 
+    def _smart_solver_available_column_names(self) -> list[str]:
+        seen: set[str] = set()
+        names: list[str] = []
+        for col in (getattr(self, "_perf_available_columns", []) or []):
+            if not isinstance(col, dict):
+                continue
+            name = str(col.get("name") or "").strip()
+            key = self._perf_norm_name(name)
+            if not name or not key or key in seen:
+                continue
+            seen.add(key)
+            names.append(name)
+        return names
+
+    def _smart_solver_config_text(self, config: dict[str, object] | None = None) -> str:
+        cfg = config if isinstance(config, dict) else (self._smart_solver_config or {})
+        output_name = str(cfg.get("output_target") or "").strip()
+        input1_name = str(cfg.get("input1_target") or "").strip()
+        input2_name = str(cfg.get("input2_target") or "").strip()
+        if not output_name or not input1_name or not input2_name:
+            return "Config: -"
+        return f"Config: Output = {output_name} | Input 1 = {input1_name} | Input 2 = {input2_name}"
+
+    def _smart_solver_filter_summary_text(self) -> str:
+        parts = [
+            str(getattr(getattr(self, "lbl_program_filter_summary", None), "text", lambda: "")() or "").strip(),
+            str(getattr(getattr(self, "lbl_serial_filter_summary", None), "text", lambda: "")() or "").strip(),
+            str(getattr(getattr(self, "lbl_suppression_voltage_filter_summary", None), "text", lambda: "")() or "").strip(),
+            str(getattr(getattr(self, "lbl_control_period_filter_summary", None), "text", lambda: "")() or "").strip(),
+        ]
+        parts = [part for part in parts if part]
+        return "Active filters: " + (" | ".join(parts) if parts else "-")
+
+    @staticmethod
+    def _smart_solver_combo_value(combo_box: QtWidgets.QComboBox) -> str:
+        data = combo_box.currentData()
+        text = str(data if data not in (None, "") else combo_box.currentText() or "").strip()
+        return text
+
+    @staticmethod
+    def _smart_solver_display_value(value: object) -> str:
+        if isinstance(value, bool):
+            return "Yes" if value else "No"
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            numeric = float(value)
+            return f"{numeric:.6g}" if math.isfinite(numeric) else ""
+        text = str(value or "").strip()
+        return text
+
+    def _refresh_smart_solver_ui(self) -> None:
+        is_solver = str(getattr(self, "_mode", "") or "").strip().lower() == "smart_solver"
+        busy = bool(getattr(self, "_smart_solver_worker", None) and self._smart_solver_worker.isRunning())
+        has_result = isinstance(self._smart_solver_result, dict) and bool(self._smart_solver_result)
+
+        if hasattr(self, "lbl_right_panel_title"):
+            self.lbl_right_panel_title.setText("Smart Equation Solver" if is_solver else "Plot")
+        if hasattr(self, "smart_solver_frame"):
+            self.smart_solver_frame.setVisible(is_solver)
+        if hasattr(self, "plot_container"):
+            self.plot_container.setVisible(not is_solver)
+        if hasattr(self, "lbl_plot_note"):
+            self.lbl_plot_note.setVisible((not is_solver) and bool(self.lbl_plot_note.text().strip()))
+        if hasattr(self, "btn_stats_toggle"):
+            self.btn_stats_toggle.setVisible(not is_solver)
+        if hasattr(self, "_stats_frame"):
+            self._stats_frame.setVisible((not is_solver) and bool(getattr(self, "btn_stats_toggle", None) and self.btn_stats_toggle.isChecked()))
+        if hasattr(self, "footer_frame"):
+            self.footer_frame.setVisible(not is_solver)
+
+        for widget_name in (
+            "btn_zone_zoom",
+            "btn_zoom_out",
+            "btn_zoom_in",
+            "btn_zoom_reset",
+            "btn_expand_plot",
+            "btn_view_bands",
+        ):
+            widget = getattr(self, widget_name, None)
+            if widget is not None:
+                widget.setVisible(not is_solver)
+        if hasattr(self, "btn_plot_legend"):
+            show_legend = (not is_solver) and bool(getattr(self, "_main_plot_legend_entries", None))
+            self.btn_plot_legend.setVisible(show_legend)
+            self.btn_plot_legend.setEnabled(show_legend)
+
+        config_text = self._smart_solver_config_text()
+        filter_text = self._smart_solver_filter_summary_text()
+        if hasattr(self, "lbl_solver_tab_config"):
+            self.lbl_solver_tab_config.setText(config_text)
+        if hasattr(self, "lbl_solver_tab_filters"):
+            self.lbl_solver_tab_filters.setText(filter_text)
+        if hasattr(self, "lbl_smart_solver_config"):
+            self.lbl_smart_solver_config.setText(config_text)
+        if hasattr(self, "lbl_smart_solver_filters"):
+            self.lbl_smart_solver_filters.setText(filter_text)
+
+        for widget_name in ("btn_solver_config", "btn_solver_tab_config"):
+            widget = getattr(self, widget_name, None)
+            if widget is not None:
+                widget.setEnabled(not busy)
+        if hasattr(self, "btn_solver_run"):
+            self.btn_solver_run.setEnabled(bool(getattr(self, "_db_path", None)) and not busy)
+        if hasattr(self, "btn_solver_resolve"):
+            self.btn_solver_resolve.setEnabled(has_result and not busy)
+        if hasattr(self, "btn_plot"):
+            if is_solver:
+                self.btn_plot.setEnabled(bool(getattr(self, "_db_path", None)) and not busy)
+            elif not busy and getattr(self, "_cache_worker", None) is None:
+                self.btn_plot.setEnabled(True)
+
+    def _clear_smart_solver_result(self, *, clear_saved: bool = True) -> None:
+        if clear_saved:
+            self._smart_solver_result = None
+        if hasattr(self, "lbl_smart_solver_equation"):
+            self.lbl_smart_solver_equation.setText("Equation: -")
+            self.lbl_smart_solver_equation.setToolTip("")
+        if hasattr(self, "lbl_smart_solver_norm"):
+            self.lbl_smart_solver_norm.setText("Normalization: -")
+            self.lbl_smart_solver_norm.setToolTip("")
+        if hasattr(self, "lbl_smart_solver_summary"):
+            self.lbl_smart_solver_summary.setText("Summary: -")
+        if hasattr(self, "lbl_smart_solver_warning"):
+            self.lbl_smart_solver_warning.clear()
+            self.lbl_smart_solver_warning.setVisible(False)
+        if hasattr(self, "tbl_smart_solver_diagnostics"):
+            try:
+                self.tbl_smart_solver_diagnostics.setRowCount(0)
+            except Exception:
+                pass
+        self._refresh_smart_solver_ui()
+
+    def _open_smart_solver_config_popup(self) -> None:
+        if not getattr(self, "_db_path", None):
+            QtWidgets.QMessageBox.information(
+                self,
+                "Smart Equation Solver",
+                "Build / Refresh Cache before configuring Smart Equation Solver.",
+            )
+            return
+
+        column_names = self._smart_solver_available_column_names()
+        if not column_names:
+            self._refresh_performance_ui()
+            column_names = self._smart_solver_available_column_names()
+        if not column_names:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Smart Equation Solver",
+                "No cached Y columns are available for Smart Equation Solver.",
+            )
+            return
+
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Smart Equation Solver Config")
+        dlg.resize(720, 340)
+        self._smart_solver_popup = dlg
+        layout = QtWidgets.QVBoxLayout(dlg)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        intro = QtWidgets.QLabel(
+            "Configure the sequence-level control-period-aware solve. Smart Equation Solver v1 uses pulsed-mode mean rows only."
+        )
+        intro.setWordWrap(True)
+        intro.setStyleSheet("color: #334155; font-size: 11px;")
+        layout.addWidget(intro)
+
+        form = QtWidgets.QFormLayout()
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setSpacing(8)
+
+        def _build_combo() -> QtWidgets.QComboBox:
+            combo = QtWidgets.QComboBox()
+            combo.setEditable(True)
+            combo.addItem("", "")
+            for name in column_names:
+                combo.addItem(name, name)
+            return combo
+
+        combo_output = _build_combo()
+        combo_input1 = _build_combo()
+        combo_input2 = _build_combo()
+        for combo, key in (
+            (combo_output, "output_target"),
+            (combo_input1, "input1_target"),
+            (combo_input2, "input2_target"),
+        ):
+            wanted = str((self._smart_solver_config or {}).get(key) or "").strip()
+            if not wanted:
+                continue
+            for idx in range(combo.count()):
+                if self._perf_norm_name(combo.itemText(idx)) == self._perf_norm_name(wanted):
+                    combo.setCurrentIndex(idx)
+                    break
+            else:
+                combo.setEditText(wanted)
+
+        form.addRow("Output:", combo_output)
+        form.addRow("Input 1:", combo_input1)
+        form.addRow("Input 2:", combo_input2)
+        form.addRow("Condition Family:", QtWidgets.QLabel("Pulsed mode only"))
+        form.addRow("Data Source:", QtWidgets.QLabel("td_metrics_calc_sequences"))
+        form.addRow(
+            "Program Filters:",
+            QtWidgets.QLabel(
+                str(getattr(self, "lbl_program_filter_summary", None).text() if hasattr(self, "lbl_program_filter_summary") else "-")
+            ),
+        )
+        form.addRow(
+            "Serial Filters:",
+            QtWidgets.QLabel(
+                str(getattr(self, "lbl_serial_filter_summary", None).text() if hasattr(self, "lbl_serial_filter_summary") else "-")
+            ),
+        )
+        form.addRow(
+            "Suppression Filters:",
+            QtWidgets.QLabel(
+                str(
+                    getattr(self, "lbl_suppression_voltage_filter_summary", None).text()
+                    if hasattr(self, "lbl_suppression_voltage_filter_summary")
+                    else "-"
+                )
+            ),
+        )
+        form.addRow(
+            "CP Filters:",
+            QtWidgets.QLabel(
+                str(
+                    getattr(self, "lbl_control_period_filter_summary", None).text()
+                    if hasattr(self, "lbl_control_period_filter_summary")
+                    else "-"
+                )
+            ),
+        )
+        layout.addLayout(form)
+
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_row.addStretch(1)
+        btn_cancel = QtWidgets.QPushButton("Cancel")
+        btn_cancel.clicked.connect(dlg.reject)
+        btn_row.addWidget(btn_cancel)
+        btn_solve = QtWidgets.QPushButton("Solve")
+        btn_row.addWidget(btn_solve)
+        layout.addLayout(btn_row)
+
+        def _solve() -> None:
+            output_name = self._smart_solver_combo_value(combo_output)
+            input1_name = self._smart_solver_combo_value(combo_input1)
+            input2_name = self._smart_solver_combo_value(combo_input2)
+            if not output_name or not input1_name or not input2_name:
+                QtWidgets.QMessageBox.warning(
+                    dlg,
+                    "Smart Equation Solver",
+                    "Select Output, Input 1, and Input 2 before solving.",
+                )
+                return
+            norm_values = {
+                self._perf_norm_name(output_name),
+                self._perf_norm_name(input1_name),
+                self._perf_norm_name(input2_name),
+            }
+            if len(norm_values) < 3:
+                QtWidgets.QMessageBox.warning(
+                    dlg,
+                    "Smart Equation Solver",
+                    "Output, Input 1, and Input 2 must be different columns.",
+                )
+                return
+            self._smart_solver_config = {
+                "output_target": output_name,
+                "input1_target": input1_name,
+                "input2_target": input2_name,
+            }
+            self._refresh_smart_solver_ui()
+            dlg.accept()
+            self._run_smart_solver(user_initiated=True)
+
+        btn_solve.clicked.connect(_solve)
+        _fit_widget_to_screen(dlg)
+        dlg.exec()
+
+    def _run_smart_solver(self, *, user_initiated: bool = False) -> None:
+        if not getattr(self, "_db_path", None):
+            if user_initiated:
+                QtWidgets.QMessageBox.information(
+                    self,
+                    "Smart Equation Solver",
+                    "Build / Refresh Cache before running Smart Equation Solver.",
+                )
+            return
+        if self._cache_worker is not None and self._cache_worker.isRunning():
+            if user_initiated:
+                QtWidgets.QMessageBox.information(
+                    self,
+                    "Smart Equation Solver",
+                    "Wait for the cache task to finish first.",
+                )
+            return
+        if self._smart_solver_worker is not None and self._smart_solver_worker.isRunning():
+            if user_initiated:
+                QtWidgets.QMessageBox.information(
+                    self,
+                    "Smart Equation Solver",
+                    "Smart Equation Solver is already running.",
+                )
+            return
+        if not self._smart_solver_config:
+            if user_initiated:
+                self._open_smart_solver_config_popup()
+            return
+        if not be.td_smart_solver_has_sequence_rows(self._db_path):
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Smart Equation Solver",
+                "Smart Equation Solver requires sequence-level metrics in td_metrics_calc_sequences. Build / Refresh Cache first.",
+            )
+            return
+
+        runs = []
+        try:
+            runs = be.td_list_runs(self._db_path)
+        except Exception:
+            runs = []
+        serials = self._active_serials()
+        if not runs:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Smart Equation Solver",
+                "No runs are available in the current cache.",
+            )
+            return
+        if not serials:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Smart Equation Solver",
+                "No serials remain after applying the active global filters.",
+            )
+            return
+
+        config = dict(self._smart_solver_config or {})
+        self._smart_solver_progress_visible = False
+        try:
+            self._report_progress.lbl_heading.setText("Smart Equation Solver")
+            self._report_progress.begin("Loading sequence rows")
+            self._report_progress.detail_label.setText("")
+            self._smart_solver_progress_visible = True
+        except Exception:
+            self._smart_solver_progress_visible = False
+
+        def _task(report):
+            return be.td_smart_solver_run(
+                self._db_path,
+                output_target=str(config.get("output_target") or "").strip(),
+                input1_target=str(config.get("input1_target") or "").strip(),
+                input2_target=str(config.get("input2_target") or "").strip(),
+                runs=runs,
+                serials=serials,
+                program_filters=self._active_program_filter_values(),
+                suppression_voltage_filters=self._active_suppression_voltage_filter_values(),
+                control_period_filters=self._active_control_period_filter_values(),
+                progress_cb=report,
+            )
+
+        self._smart_solver_worker = ProjectTaskWorker(_task, parent=self)
+        self._smart_solver_worker.progress.connect(self._on_smart_solver_task_progress)
+        self._smart_solver_worker.completed.connect(self._on_smart_solver_done)
+        self._smart_solver_worker.failed.connect(self._on_smart_solver_error)
+        self._smart_solver_signals_connected = True
+        self._refresh_smart_solver_ui()
+        self._smart_solver_worker.start()
+
+    def _on_smart_solver_task_progress(self, text: str) -> None:
+        msg = str(text or "").strip()
+        if not msg or not self._smart_solver_progress_visible:
+            return
+        try:
+            self._report_progress.detail_label.setText(msg)
+        except Exception:
+            pass
+
+    def _on_smart_solver_done(self, payload: object) -> None:
+        self._smart_solver_worker = None
+        self._smart_solver_signals_connected = False
+        result = dict(payload) if isinstance(payload, dict) else {}
+        self._render_smart_solver_result(result)
+        if self._smart_solver_progress_visible:
+            try:
+                self._report_progress.finish("Smart Equation Solver complete", success=True)
+            except Exception:
+                pass
+            self._smart_solver_progress_visible = False
+        self._refresh_smart_solver_ui()
+
+    def _on_smart_solver_error(self, message: str) -> None:
+        had_result = isinstance(self._smart_solver_result, dict) and bool(self._smart_solver_result)
+        self._smart_solver_worker = None
+        self._smart_solver_signals_connected = False
+        if not had_result:
+            self._clear_smart_solver_result()
+        else:
+            self._refresh_smart_solver_ui()
+        msg = str(message or "").strip() or "Smart Equation Solver failed."
+        QtWidgets.QMessageBox.warning(self, "Smart Equation Solver", msg)
+        if self._smart_solver_progress_visible:
+            try:
+                self._report_progress.finish(f"Smart Equation Solver failed: {msg}", success=False)
+            except Exception:
+                pass
+            self._smart_solver_progress_visible = False
+
+    def _render_smart_solver_result(self, result: dict[str, object]) -> None:
+        self._smart_solver_result = dict(result or {})
+        equation_text = str((result or {}).get("equation") or "").strip()
+        norm_text = str((result or {}).get("x_norm_equation") or "").strip()
+        rmse = (result or {}).get("rmse")
+        threshold = (result or {}).get("residual_threshold")
+        in_fit_percent = (result or {}).get("in_fit_percent")
+        fell_out_count = int((result or {}).get("fell_out_count") or 0)
+        sample_count = int((result or {}).get("sample_count") or 0)
+        summary_text = (
+            "In-fit: "
+            f"{float(in_fit_percent):.2f}% | Fell out: {fell_out_count} / {sample_count} | "
+            f"RMSE: {float(rmse):.6g} | Threshold: {float(threshold):.6g}"
+            if isinstance(rmse, (int, float))
+            and isinstance(threshold, (int, float))
+            and isinstance(in_fit_percent, (int, float))
+            else "Summary: unavailable"
+        )
+        if hasattr(self, "lbl_smart_solver_equation"):
+            self.lbl_smart_solver_equation.setText(f"Equation: {equation_text or '-'}")
+            self.lbl_smart_solver_equation.setToolTip(equation_text)
+        if hasattr(self, "lbl_smart_solver_norm"):
+            self.lbl_smart_solver_norm.setText(f"Normalization: {norm_text or '-'}")
+            self.lbl_smart_solver_norm.setToolTip(norm_text)
+        if hasattr(self, "lbl_smart_solver_summary"):
+            self.lbl_smart_solver_summary.setText(summary_text)
+
+        warning_text = str((result or {}).get("warning_text") or "").strip()
+        if hasattr(self, "lbl_smart_solver_warning"):
+            self.lbl_smart_solver_warning.setText(warning_text)
+            self.lbl_smart_solver_warning.setVisible(bool(warning_text))
+
+        rows = [dict(row) for row in ((result or {}).get("slice_rows") or []) if isinstance(row, dict)]
+        if hasattr(self, "tbl_smart_solver_diagnostics"):
+            self.tbl_smart_solver_diagnostics.setRowCount(len(rows))
+            for row_idx, row in enumerate(rows):
+                values = [
+                    self._smart_solver_display_value(row.get("control_period")),
+                    self._smart_solver_display_value(row.get("point_count")),
+                    self._smart_solver_display_value(row.get("distinct_input_1")),
+                    self._smart_solver_display_value(row.get("distinct_input_2")),
+                    self._smart_solver_display_value(row.get("eligible")),
+                    self._smart_solver_display_value(row.get("reason")),
+                ]
+                for col_idx, value in enumerate(values):
+                    item = QtWidgets.QTableWidgetItem(value)
+                    item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+                    self.tbl_smart_solver_diagnostics.setItem(row_idx, col_idx, item)
+            try:
+                self.tbl_smart_solver_diagnostics.resizeColumnsToContents()
+            except Exception:
+                pass
+        self._refresh_smart_solver_ui()
+
     def _set_mode(self, mode: str) -> None:
         m = str(mode or "").strip().lower()
-        if m not in {"curves", "metrics", "performance"}:
+        if m not in {"curves", "metrics", "performance", "smart_solver"}:
             return
         self._mode = m
         if hasattr(self, "_tabs"):
@@ -8450,31 +9065,43 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 self._tabs.setCurrentIndex(0)
             elif m == "curves":
                 self._tabs.setCurrentIndex(1)
-            else:
+            elif m == "performance":
                 self._tabs.setCurrentIndex(2)
+            else:
+                self._tabs.setCurrentIndex(3)
         self.btn_mode_curves.setChecked(m == "curves")
         self.btn_mode_metrics.setChecked(m == "metrics")
         if hasattr(self, "btn_mode_perf"):
             self.btn_mode_perf.setChecked(m == "performance")
+        if hasattr(self, "btn_mode_solver"):
+            self.btn_mode_solver.setChecked(m == "smart_solver")
         if hasattr(self, "run_selector_frame"):
-            self.run_selector_frame.setVisible(m != "performance")
+            self.run_selector_frame.setVisible(m not in {"performance", "smart_solver"})
         self._refresh_run_selection_visibility()
         self._refresh_plot_view_band_controls()
-        self.btn_plot.setText(
-            "Plot Curves" if m == "curves" else ("Plot Metrics" if m == "metrics" else "Plot Performance (Legacy)")
-        )
+        if m == "curves":
+            self.btn_plot.setText("Plot Curves")
+        elif m == "metrics":
+            self.btn_plot.setText("Plot Metrics")
+        elif m == "performance":
+            self.btn_plot.setText("Plot Performance (Legacy)")
+        else:
+            self.btn_plot.setText("Run Smart Solver")
         if hasattr(self, "btn_plot_perf_cached"):
             self.btn_plot_perf_cached.setVisible(m == "performance")
             self.btn_plot_perf_cached.setEnabled(m == "performance")
-        if m != "performance":
+        if m not in {"performance", "smart_solver"}:
             self._refresh_stats_preview()
         self._update_perf_primary_equation_banner()
+        self._refresh_smart_solver_ui()
         self._schedule_mode_panel_height_sync()
 
     def _plot_current_mode(self) -> None:
         self._set_plot_note("")
         if self._mode == "performance":
             self._plot_performance(user_initiated=True)
+        elif self._mode == "smart_solver":
+            self._run_smart_solver(user_initiated=True)
         elif self._mode == "metrics":
             self._plot_metrics()
         else:

@@ -3401,6 +3401,22 @@ def _td_metric_source_observation_table_name(metric_source: object) -> str:
     )
 
 
+def td_smart_solver_has_sequence_rows(db_path: Path) -> bool:
+    path = Path(db_path).expanduser()
+    if not path.exists():
+        return False
+    with sqlite3.connect(str(path)) as conn:
+        _ensure_test_data_impl_tables(conn)
+        try:
+            row = conn.execute("SELECT COUNT(*) FROM td_metrics_calc_sequences").fetchone()
+        except Exception:
+            return False
+    try:
+        return bool(int((row[0] if row else 0) or 0) > 0)
+    except Exception:
+        return False
+
+
 def _td_preferred_sequence_observation_table(conn: sqlite3.Connection) -> str:
     _ensure_test_data_impl_tables(conn)
     try:
@@ -11749,6 +11765,8 @@ TD_PERF_FIT_MODE_AUTO_SURFACE = "auto_surface"
 TD_PERF_FIT_FAMILY_PLANE = "plane"
 TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE = "quadratic_surface"
 TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD = "quadratic_surface_control_period"
+TD_PERF_PIECEWISE_MAX_BREAK_CANDIDATES_2 = 64
+TD_PERF_PIECEWISE_MAX_BREAK_CANDIDATES_3 = 24
 TD_PERF_FIT_MODES = {
     TD_PERF_FIT_MODE_AUTO,
     TD_PERF_FIT_MODE_POLYNOMIAL,
@@ -12208,21 +12226,40 @@ def _td_perf_piecewise_candidate_breaks(
     if len(values) < max(2, int(segment_count)):
         return []
 
+    def _sample_indices(start: int, stop: int, *, max_count: int) -> list[int]:
+        if stop <= start or max_count <= 0:
+            return []
+        count = stop - start
+        if count <= max_count:
+            return list(range(start, stop))
+        if max_count == 1:
+            return [start + ((count - 1) // 2)]
+        step = float(count - 1) / float(max_count - 1)
+        last = stop - 1
+        sampled = sorted({start + int(round(step * idx)) for idx in range(max_count)} | {start, last})
+        return [idx for idx in sampled if start <= idx < stop]
+
     def _valid_spans(boundaries: Sequence[float]) -> bool:
         parts = [values[0], *[float(v) for v in boundaries], values[-1]]
         return all((parts[i + 1] - parts[i]) >= float(min_span) for i in range(len(parts) - 1))
 
     candidates: list[tuple[float, ...]] = []
     if int(segment_count) == 2:
-        for idx in range(min_points_per_segment - 1, len(values) - min_points_per_segment):
+        start = min_points_per_segment - 1
+        stop = len(values) - min_points_per_segment
+        for idx in _sample_indices(start, stop, max_count=TD_PERF_PIECEWISE_MAX_BREAK_CANDIDATES_2):
             bp = float(values[idx])
             if _valid_spans([bp]):
                 candidates.append((bp,))
         return candidates
     if int(segment_count) == 3:
-        for idx1 in range(min_points_per_segment - 1, len(values) - ((2 * min_points_per_segment) - 1)):
+        start1 = min_points_per_segment - 1
+        stop1 = len(values) - ((2 * min_points_per_segment) - 1)
+        for idx1 in _sample_indices(start1, stop1, max_count=TD_PERF_PIECEWISE_MAX_BREAK_CANDIDATES_3):
             bp1 = float(values[idx1])
-            for idx2 in range(idx1 + min_points_per_segment, len(values) - min_points_per_segment):
+            start2 = idx1 + min_points_per_segment
+            stop2 = len(values) - min_points_per_segment
+            for idx2 in _sample_indices(start2, stop2, max_count=TD_PERF_PIECEWISE_MAX_BREAK_CANDIDATES_3):
                 bp2 = float(values[idx2])
                 if _valid_spans([bp1, bp2]):
                     candidates.append((bp1, bp2))
@@ -14600,6 +14637,339 @@ def td_perf_collect_cached_condition_mean_export_rows(
         )
     )
     return out
+
+
+def _td_smart_solver_compact_value(value: object) -> str:
+    if value is None or isinstance(value, bool):
+        return ""
+    if isinstance(value, (int, float)):
+        try:
+            numeric = float(value)
+        except Exception:
+            return ""
+        return f"{numeric:g}" if math.isfinite(numeric) else ""
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        numeric = float(raw)
+    except Exception:
+        return raw
+    return f"{numeric:g}" if math.isfinite(numeric) else raw
+
+
+def _td_smart_solver_match_filter_value(value: object, allowed: set[str]) -> bool:
+    if not allowed:
+        return True
+    compact = _td_smart_solver_compact_value(value)
+    return bool(compact and compact in allowed)
+
+
+def _td_smart_solver_warning_text(messages: Sequence[object]) -> str:
+    merged: list[str] = []
+    for raw in messages or []:
+        text = str(raw or "").strip()
+        if text and text not in merged:
+            merged.append(text)
+    return "\n".join(merged)
+
+
+def td_smart_solver_run(
+    db_path: Path,
+    *,
+    output_target: str,
+    input1_target: str,
+    input2_target: str,
+    runs: Sequence[object],
+    serials: Sequence[object],
+    program_filters: Sequence[object] | None = None,
+    suppression_voltage_filters: Sequence[object] | None = None,
+    control_period_filters: Sequence[object] | None = None,
+    progress_cb: Callable[[str], None] | None = None,
+) -> dict[str, object]:
+    path = Path(db_path).expanduser()
+    if not path.exists():
+        raise RuntimeError("Build / Refresh Cache first.")
+    if not td_smart_solver_has_sequence_rows(path):
+        raise RuntimeError(
+            "Smart Equation Solver requires sequence-level metrics in td_metrics_calc_sequences. "
+            "Build / Refresh Cache first."
+        )
+
+    output_name = str(output_target or "").strip()
+    input1_name = str(input1_target or "").strip()
+    input2_name = str(input2_target or "").strip()
+    if not output_name or not input1_name or not input2_name:
+        raise RuntimeError("Select Output, Input 1, and Input 2 before running Smart Equation Solver.")
+
+    runs_list = [str(value or "").strip() for value in (runs or []) if str(value or "").strip()]
+    serial_set = {str(value or "").strip() for value in (serials or []) if str(value or "").strip()}
+    if not runs_list:
+        raise RuntimeError("No runs are available for Smart Equation Solver.")
+    if not serial_set:
+        raise RuntimeError("No serials remain after applying the active global filters.")
+
+    program_allowed = {str(value or "").strip() for value in (program_filters or []) if str(value or "").strip()}
+    suppression_allowed = {
+        _td_smart_solver_compact_value(value)
+        for value in (suppression_voltage_filters or [])
+        if _td_smart_solver_compact_value(value)
+    }
+    control_period_allowed = {
+        _td_smart_solver_compact_value(value)
+        for value in (control_period_filters or [])
+        if _td_smart_solver_compact_value(value)
+    }
+
+    output_units = ""
+    input1_units = ""
+    input2_units = ""
+    points: list[dict[str, object]] = []
+    distinct_suppression_voltages: list[str] = []
+    seen_suppression_voltages: set[str] = set()
+    sequence_metric_source = TD_METRIC_PLOT_SOURCE_ALL_SEQUENCES
+
+    _td_emit_progress(progress_cb, "Loading sequence rows")
+
+    for run_name in runs_list:
+        output_col, output_units_candidate = _td_perf_resolve_y_col_units(path, run_name, output_name)
+        input1_col, input1_units_candidate = _td_perf_resolve_y_col_units(path, run_name, input1_name)
+        input2_col, input2_units_candidate = _td_perf_resolve_y_col_units(path, run_name, input2_name)
+        if not output_col or not input1_col or not input2_col:
+            continue
+        output_units = output_units or output_units_candidate
+        input1_units = input1_units or input1_units_candidate
+        input2_units = input2_units or input2_units_candidate
+
+        x1_rows = td_load_metric_series(
+            path,
+            run_name,
+            input1_col,
+            "mean",
+            run_type_filter="pulsed_mode",
+            metric_source=sequence_metric_source,
+        )
+        x2_rows = td_load_metric_series(
+            path,
+            run_name,
+            input2_col,
+            "mean",
+            run_type_filter="pulsed_mode",
+            metric_source=sequence_metric_source,
+        )
+        y_rows = td_load_metric_series(
+            path,
+            run_name,
+            output_col,
+            "mean",
+            run_type_filter="pulsed_mode",
+            metric_source=sequence_metric_source,
+        )
+        if not x1_rows or not x2_rows or not y_rows:
+            continue
+
+        x1_map = {
+            str(row.get("observation_id") or "").strip(): dict(row)
+            for row in x1_rows
+            if isinstance(row, dict) and str(row.get("observation_id") or "").strip()
+        }
+        x2_map = {
+            str(row.get("observation_id") or "").strip(): dict(row)
+            for row in x2_rows
+            if isinstance(row, dict) and str(row.get("observation_id") or "").strip()
+        }
+        y_map = {
+            str(row.get("observation_id") or "").strip(): dict(row)
+            for row in y_rows
+            if isinstance(row, dict) and str(row.get("observation_id") or "").strip()
+        }
+        for observation_id in sorted(set(x1_map.keys()) & set(x2_map.keys()) & set(y_map.keys())):
+            row_x1 = x1_map.get(observation_id) or {}
+            row_x2 = x2_map.get(observation_id) or {}
+            row_y = y_map.get(observation_id) or {}
+            base_row = row_y or row_x1 or row_x2
+            serial = str(base_row.get("serial") or row_x1.get("serial") or row_x2.get("serial") or "").strip()
+            if not serial or serial not in serial_set:
+                continue
+            program_title = str(
+                base_row.get("program_title")
+                or row_x1.get("program_title")
+                or row_x2.get("program_title")
+                or ""
+            ).strip()
+            if program_allowed and (program_title or "Unknown Program") not in program_allowed:
+                continue
+            suppression_voltage = base_row.get(
+                "suppression_voltage",
+                row_x1.get("suppression_voltage", row_x2.get("suppression_voltage")),
+            )
+            if not _td_smart_solver_match_filter_value(suppression_voltage, suppression_allowed):
+                continue
+            control_period = base_row.get(
+                "control_period",
+                row_x1.get("control_period", row_x2.get("control_period")),
+            )
+            if not _td_smart_solver_match_filter_value(control_period, control_period_allowed):
+                continue
+            x1_value = _td_finite_float(row_x1.get("value_num"))
+            x2_value = _td_finite_float(row_x2.get("value_num"))
+            y_value = _td_finite_float(row_y.get("value_num"))
+            cp_value = _td_finite_float(control_period)
+            if None in (x1_value, x2_value, y_value, cp_value):
+                continue
+            suppression_label = _td_smart_solver_compact_value(suppression_voltage)
+            if suppression_label and suppression_label not in seen_suppression_voltages:
+                seen_suppression_voltages.add(suppression_label)
+                distinct_suppression_voltages.append(suppression_label)
+            points.append(
+                {
+                    "observation_id": observation_id,
+                    "run_name": run_name,
+                    "serial": serial,
+                    "program_title": program_title or "Unknown Program",
+                    "source_run_name": str(
+                        base_row.get("source_run_name")
+                        or row_x1.get("source_run_name")
+                        or row_x2.get("source_run_name")
+                        or ""
+                    ).strip(),
+                    "condition_label": _td_perf_export_condition_label(base_row, display_name=str(run_name or "").strip()),
+                    "control_period": float(cp_value),
+                    "suppression_voltage": suppression_voltage,
+                    "input_1": float(x1_value),
+                    "input_2": float(x2_value),
+                    "actual_mean": float(y_value),
+                    "sample_count": 1,
+                }
+            )
+
+    if not points:
+        raise RuntimeError(
+            "No qualifying sequence-level mean rows were found for the selected Smart Equation Solver inputs."
+        )
+
+    control_period_values = sorted({float(point["control_period"]) for point in points})
+    if len(control_period_values) < 2:
+        if control_period_allowed:
+            raise RuntimeError(
+                "Smart Equation Solver requires at least two distinct control periods after filtering. "
+                "Broaden the active control-period filter and try again."
+            )
+        raise RuntimeError("Smart Equation Solver requires at least two distinct control periods.")
+
+    x1_values = [float(point["input_1"]) for point in points]
+    x2_values = [float(point["input_2"]) for point in points]
+    y_values = [float(point["actual_mean"]) for point in points]
+    cp_values = [float(point["control_period"]) for point in points]
+
+    fit_mode = TD_PERF_FIT_MODE_POLYNOMIAL_SURFACE
+    support = _td_perf_analyze_quadratic_surface_control_period_fit_support(
+        x1_values,
+        x2_values,
+        y_values,
+        cp_values,
+        fit_mode=fit_mode,
+    )
+    eligible_control_period_values = [float(value) for value in (support.get("eligible_control_period_values") or [])]
+    slice_rows_raw = [dict(item) for item in (support.get("slice_rows") or []) if isinstance(item, Mapping)]
+    slice_rows = [
+        {
+            "control_period": row.get("control_period"),
+            "point_count": int(row.get("point_count") or 0),
+            "distinct_input_1": int(row.get("distinct_x1") or 0),
+            "distinct_input_2": int(row.get("distinct_x2") or 0),
+            "eligible": bool(row.get("eligible")),
+            "reason": str(row.get("reason") or "").strip(),
+        }
+        for row in slice_rows_raw
+    ]
+
+    if len(eligible_control_period_values) < 2:
+        failure_text = _td_perf_format_surface_control_period_failure(
+            support.get("ignored_control_periods") or [],
+            eligible_count=len(eligible_control_period_values),
+        )
+        if control_period_allowed:
+            failure_text = f"{failure_text} Broaden the active control-period filter and try again."
+        raise RuntimeError(failure_text)
+
+    _td_emit_progress(progress_cb, "Fitting control-period slices")
+    model = _td_perf_fit_quadratic_surface_control_period_model(
+        x1_values,
+        x2_values,
+        y_values,
+        cp_values,
+        fit_mode=fit_mode,
+    )
+    if not isinstance(model, dict):
+        raise RuntimeError(
+            "Smart Equation Solver could not fit a control-period-aware quadratic surface for the filtered sequence rows."
+        )
+
+    _td_emit_progress(progress_cb, "Binding CP coefficients")
+    predictions = td_perf_predict_surface(
+        model,
+        x1_values,
+        x2_values,
+        control_period=cp_values,
+    )
+    if len(predictions) != len(points):
+        raise RuntimeError("Smart Equation Solver could not score the fitted surface.")
+
+    _td_emit_progress(progress_cb, "Scoring residuals")
+    np = _td_perf_import_numpy()
+    abs_residuals = np.asarray(
+        [abs(float(point["actual_mean"]) - float(predictions[idx])) for idx, point in enumerate(points)],
+        dtype=float,
+    )
+    mad_abs = float(np.median(abs_residuals)) if abs_residuals.size else 0.0
+    residual_threshold = float(3.0 * 1.4826 * mad_abs) if math.isfinite(mad_abs) else 0.0
+    rmse = float(model.get("rmse") or 0.0) if isinstance(model.get("rmse"), (int, float)) else 0.0
+    if not math.isfinite(residual_threshold) or residual_threshold <= 0.0:
+        residual_threshold = float(3.0 * rmse) if math.isfinite(rmse) and rmse > 0.0 else 1e-9
+    in_fit_count = int(sum(1 for value in abs_residuals.tolist() if float(value) <= residual_threshold))
+    sample_count = int(len(points))
+    fell_out_count = int(max(0, sample_count - in_fit_count))
+    in_fit_percent = float((100.0 * in_fit_count / sample_count) if sample_count > 0 else 0.0)
+
+    warning_messages: list[str] = []
+    fit_warning_text = str(model.get("fit_warning_text") or "").strip()
+    if fit_warning_text:
+        warning_messages.append(fit_warning_text)
+    if len(distinct_suppression_voltages) > 1:
+        warning_messages.append(
+            "Suppression voltage is not modeled in Smart Equation Solver v1; "
+            f"the fitted rows include multiple voltages: {', '.join(distinct_suppression_voltages)}."
+        )
+
+    return {
+        "fit_family": str(model.get("fit_family") or ""),
+        "equation": str(model.get("equation") or "").strip(),
+        "x_norm_equation": str(model.get("x_norm_equation") or "").strip(),
+        "rmse": float(rmse),
+        "residual_threshold": float(residual_threshold),
+        "in_fit_count": int(in_fit_count),
+        "fell_out_count": int(fell_out_count),
+        "sample_count": int(sample_count),
+        "in_fit_percent": float(in_fit_percent),
+        "warning_text": _td_smart_solver_warning_text(warning_messages),
+        "ignored_control_periods": [dict(item) for item in (support.get("ignored_control_periods") or []) if isinstance(item, Mapping)],
+        "slice_rows": slice_rows,
+        "control_period_domain": [
+            float(value)
+            for value in (model.get("fit_domain_control_period") or [min(control_period_values), max(control_period_values)])
+            if isinstance(value, (int, float))
+        ][:2],
+        "distinct_suppression_voltages": list(distinct_suppression_voltages),
+        "output_target": output_name,
+        "output_units": output_units,
+        "input1_target": input1_name,
+        "input1_units": input1_units,
+        "input2_target": input2_name,
+        "input2_units": input2_units,
+        "run_count": int(len({str(point.get('run_name') or '').strip() for point in points if str(point.get('run_name') or '').strip()})),
+        "serial_count": int(len({str(point.get('serial') or '').strip() for point in points if str(point.get('serial') or '').strip()})),
+    }
 
 
 def td_perf_collect_export_rows_for_method(
