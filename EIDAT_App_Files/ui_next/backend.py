@@ -11765,6 +11765,7 @@ TD_PERF_FIT_MODE_AUTO_SURFACE = "auto_surface"
 TD_PERF_FIT_FAMILY_PLANE = "plane"
 TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE = "quadratic_surface"
 TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD = "quadratic_surface_control_period"
+TD_PERF_FIT_FAMILY_QUADRATIC_CURVE_CONTROL_PERIOD = "quadratic_curve_control_period"
 TD_PERF_PIECEWISE_MAX_BREAK_CANDIDATES_2 = 64
 TD_PERF_PIECEWISE_MAX_BREAK_CANDIDATES_3 = 24
 TD_PERF_FIT_MODES = {
@@ -11783,6 +11784,7 @@ TD_PERF_FIT_MODES = {
     TD_PERF_FIT_FAMILY_PLANE,
     TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE,
     TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD,
+    TD_PERF_FIT_FAMILY_QUADRATIC_CURVE_CONTROL_PERIOD,
 }
 TD_PERF_FIT_COMPLEXITY_PENALTIES = {
     TD_PERF_FIT_MODE_POLYNOMIAL: 0.0,
@@ -11806,6 +11808,7 @@ TD_PERF_FIT_FAMILY_PRIORITY = {
     TD_PERF_FIT_FAMILY_PLANE: 8,
     TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE: 9,
     TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD: 10,
+    TD_PERF_FIT_FAMILY_QUADRATIC_CURVE_CONTROL_PERIOD: 11,
 }
 TD_PERF_EXPORT_STATS_ORDER = ["mean", "min", "max", "std", "min_3sigma", "max_3sigma"]
 
@@ -11845,6 +11848,8 @@ def td_perf_fit_family_label(value: object) -> str:
         return "Quadratic Surface"
     if fam == TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD:
         return "Quadratic Surface + Control Period"
+    if fam == TD_PERF_FIT_FAMILY_QUADRATIC_CURVE_CONTROL_PERIOD:
+        return "Quadratic Curve + Control Period"
     return "Auto"
 
 
@@ -11976,6 +11981,31 @@ def _td_perf_fmt_surface_control_period_normalization(
     )
 
 
+def _td_perf_fmt_curve_control_period_equation(coeff_cp_models: Sequence[Sequence[object]]) -> str:
+    labels = ["x'^2", "x'", ""]
+    parts: list[str] = []
+    for coeffs, label in zip(coeff_cp_models, labels):
+        coeff_expr = _td_perf_fmt_variable_poly_expr(coeffs, "cp'")
+        if not label:
+            parts.append(f"({coeff_expr})")
+        else:
+            parts.append(f"({coeff_expr})*{label}")
+    expr = " + ".join(part for part in parts if part.strip())
+    return f"y = {expr}" if expr else ""
+
+
+def _td_perf_fmt_curve_control_period_normalization(
+    x_center: float,
+    x_scale: float,
+    cp_center: float,
+    cp_scale: float,
+) -> str:
+    return (
+        f"x' = (x - {_td_perf_fmt_num(x_center)}) / {_td_perf_fmt_num(x_scale)} ; "
+        f"cp' = (control_period - {_td_perf_fmt_num(cp_center)}) / {_td_perf_fmt_num(cp_scale)}"
+    )
+
+
 def _td_perf_surface_control_period_label(value: object) -> str:
     try:
         numeric = float(value)
@@ -12000,6 +12030,17 @@ def _td_perf_surface_control_period_reason(*, point_count: int, distinct_x1: int
     return "; ".join(reasons)
 
 
+def _td_perf_curve_control_period_reason(*, point_count: int, distinct_x1: int, fit_failed: bool = False) -> str:
+    reasons: list[str] = []
+    if point_count < 3:
+        reasons.append(f"{int(point_count)} points (<3)")
+    if distinct_x1 < 2:
+        reasons.append(f"{int(distinct_x1)} distinct x1 (<2)")
+    if fit_failed:
+        reasons.append("quadratic slice fit failed")
+    return "; ".join(reasons)
+
+
 def _td_perf_surface_control_period_entry_text(entry: Mapping[str, object]) -> str:
     cp_text = _td_perf_surface_control_period_label(entry.get("control_period"))
     point_count = int(entry.get("point_count") or 0)
@@ -12007,6 +12048,15 @@ def _td_perf_surface_control_period_entry_text(entry: Mapping[str, object]) -> s
     distinct_x2 = int(entry.get("distinct_x2") or 0)
     reason = str(entry.get("reason") or "").strip()
     detail = f"CP {cp_text}: {point_count} points, {distinct_x1} distinct x1, {distinct_x2} distinct x2"
+    return f"{detail} ({reason})" if reason else detail
+
+
+def _td_perf_curve_control_period_entry_text(entry: Mapping[str, object]) -> str:
+    cp_text = _td_perf_surface_control_period_label(entry.get("control_period"))
+    point_count = int(entry.get("point_count") or 0)
+    distinct_x1 = int(entry.get("distinct_x1") or 0)
+    reason = str(entry.get("reason") or "").strip()
+    detail = f"CP {cp_text}: {point_count} points, {distinct_x1} distinct x1"
     return f"{detail} ({reason})" if reason else detail
 
 
@@ -12029,6 +12079,30 @@ def _td_perf_format_surface_control_period_failure(
         if isinstance(entry, Mapping)
     )
     prefix = "Quadratic Surface + Control Period requires at least two distinct control periods with valid surface coverage."
+    if details:
+        return f"{prefix} Eligible periods: {int(eligible_count)}. {details}"
+    return prefix
+
+
+def _td_perf_format_curve_control_period_warning(ignored_periods: Sequence[Mapping[str, object]]) -> str:
+    ignored = [dict(entry) for entry in (ignored_periods or []) if isinstance(entry, Mapping)]
+    if not ignored:
+        return ""
+    details = "; ".join(_td_perf_curve_control_period_entry_text(entry) for entry in ignored)
+    return f"Ignored control periods for CP-curve fit: {details}"
+
+
+def _td_perf_format_curve_control_period_failure(
+    ignored_periods: Sequence[Mapping[str, object]],
+    *,
+    eligible_count: int,
+) -> str:
+    details = "; ".join(
+        _td_perf_curve_control_period_entry_text(entry)
+        for entry in (ignored_periods or [])
+        if isinstance(entry, Mapping)
+    )
+    prefix = "Quadratic Curve + Control Period requires at least two distinct control periods with valid curve coverage."
     if details:
         return f"{prefix} Eligible periods: {int(eligible_count)}. {details}"
     return prefix
@@ -13976,6 +14050,250 @@ def _td_perf_fit_quadratic_surface_control_period_model(
     return model
 
 
+def _td_perf_analyze_quadratic_curve_control_period_fit_support(
+    xs: list[float],
+    ys: list[float],
+    control_periods: Sequence[float],
+) -> dict[str, object]:
+    np = _td_perf_import_numpy()
+    diagnostics: dict[str, object] = {
+        "eligible_control_period_values": [],
+        "ignored_control_periods": [],
+        "slice_models": [],
+        "slice_rows": [],
+        "x_center": 0.0,
+        "x_scale": 1.0,
+    }
+    if len(xs) != len(ys) or len(xs) != len(control_periods):
+        return diagnostics
+    x_arr = np.asarray([float(v) for v in xs], dtype=float)
+    y_arr = np.asarray([float(v) for v in ys], dtype=float)
+    cp_arr = np.asarray([float(v) for v in control_periods], dtype=float)
+    if not bool(np.all(np.isfinite(x_arr) & np.isfinite(y_arr) & np.isfinite(cp_arr))):
+        return diagnostics
+    if len(x_arr) < 3:
+        return diagnostics
+
+    cp_groups: dict[float, list[int]] = {}
+    for idx, cp_value in enumerate(cp_arr.tolist()):
+        cp_groups.setdefault(round(float(cp_value), 12), []).append(idx)
+
+    x_center = float(np.mean(x_arr))
+    x_scale = float(np.std(x_arr)) or 1.0
+    x_norm_all = (x_arr - x_center) / x_scale
+    diagnostics.update(
+        {
+            "x_center": float(x_center),
+            "x_scale": float(x_scale),
+        }
+    )
+
+    slice_rows: list[dict[str, object]] = []
+    slice_models: list[dict[str, object]] = []
+    eligible_control_period_values: list[float] = []
+    ignored_control_periods: list[dict[str, object]] = []
+    for cp_value in sorted(float(v) for v in cp_groups.keys()):
+        idxs = cp_groups.get(round(float(cp_value), 12), [])
+        slice_x = x_arr[idxs]
+        slice_y = y_arr[idxs]
+        point_count = int(len(idxs))
+        distinct_x1 = len({round(float(v), 12) for v in slice_x.tolist()})
+        reason = _td_perf_curve_control_period_reason(
+            point_count=point_count,
+            distinct_x1=distinct_x1,
+        )
+        row = {
+            "control_period": float(cp_value),
+            "point_count": point_count,
+            "distinct_x1": int(distinct_x1),
+            "distinct_x2": None,
+            "eligible": not bool(reason),
+            "reason": reason,
+        }
+        if reason:
+            ignored_control_periods.append(dict(row))
+            slice_rows.append(dict(row))
+            continue
+        slice_x_norm = np.asarray([float(x_norm_all[idx]) for idx in idxs], dtype=float)
+        design = np.vander(slice_x_norm, 3, increasing=False)
+        coeffs, _residuals, rank, _singular = np.linalg.lstsq(design, slice_y, rcond=None)
+        coeff_list = [float(v) for v in coeffs.tolist()]
+        if int(rank) < int(design.shape[1]) or len(coeff_list) != 3:
+            row["eligible"] = False
+            row["reason"] = _td_perf_curve_control_period_reason(
+                point_count=point_count,
+                distinct_x1=distinct_x1,
+                fit_failed=True,
+            )
+            ignored_control_periods.append(dict(row))
+            slice_rows.append(dict(row))
+            continue
+        eligible_control_period_values.append(float(cp_value))
+        row["eligible"] = True
+        row["reason"] = ""
+        slice_rows.append(dict(row))
+        slice_models.append(
+            {
+                "control_period": float(cp_value),
+                "coeffs": coeff_list,
+                "point_count": point_count,
+                "distinct_x1": int(distinct_x1),
+            }
+        )
+
+    diagnostics.update(
+        {
+            "eligible_control_period_values": [float(v) for v in eligible_control_period_values],
+            "ignored_control_periods": ignored_control_periods,
+            "slice_models": slice_models,
+            "slice_rows": slice_rows,
+        }
+    )
+    return diagnostics
+
+
+def _td_perf_predict_quadratic_curve_control_period(
+    model: Mapping[str, object],
+    x_values: Iterable[float],
+    control_period,
+) -> list[float]:
+    np = _td_perf_import_numpy()
+    x_list = [float(v) for v in x_values]
+    count = len(x_list)
+    if count <= 0:
+        return []
+    if control_period is None:
+        raise ValueError("Control-period-aware curve prediction requires control_period.")
+    if isinstance(control_period, Iterable) and not isinstance(control_period, (str, bytes)):
+        cp_values = [float(v) for v in control_period]
+        if len(cp_values) != count:
+            raise ValueError("control_period iterable length must match x inputs.")
+    else:
+        cp_values = [float(control_period)] * count
+    x_center = float(model.get("x_center") or 0.0)
+    x_scale = float(model.get("x_scale") or 1.0) or 1.0
+    x_norm = (np.asarray(x_list, dtype=float) - x_center) / x_scale
+    cp_norm, _cp_center, _cp_scale = _td_perf_surface_normalize_control_period(
+        cp_values,
+        center=float(model.get("cp_center") or 0.0),
+        scale=float(model.get("cp_scale") or 1.0),
+    )
+    coeff_cp_models = [
+        np.asarray([float(v) for v in coeffs], dtype=float)
+        for coeffs in (model.get("coeff_cp_models") or [])
+    ]
+    if len(coeff_cp_models) != 3:
+        return []
+    coeff_columns = [np.poly1d(coeffs)(cp_norm) for coeffs in coeff_cp_models]
+    y_hat = (
+        (coeff_columns[0] * (x_norm ** 2))
+        + (coeff_columns[1] * x_norm)
+        + coeff_columns[2]
+    )
+    return [float(v) for v in y_hat.tolist()]
+
+
+def _td_perf_fit_quadratic_curve_control_period_model(
+    xs: list[float],
+    ys: list[float],
+    control_periods: Sequence[float],
+) -> dict[str, object] | None:
+    np = _td_perf_import_numpy()
+    if len(xs) != len(ys) or len(xs) != len(control_periods):
+        return None
+    x_arr = np.asarray([float(v) for v in xs], dtype=float)
+    y_arr = np.asarray([float(v) for v in ys], dtype=float)
+    cp_arr = np.asarray([float(v) for v in control_periods], dtype=float)
+    if not bool(np.all(np.isfinite(x_arr) & np.isfinite(y_arr) & np.isfinite(cp_arr))):
+        return None
+    if len(x_arr) < 3:
+        return None
+
+    support = _td_perf_analyze_quadratic_curve_control_period_fit_support(xs, ys, control_periods)
+    cp_values = [float(v) for v in (support.get("eligible_control_period_values") or [])]
+    slice_models = [dict(item) for item in (support.get("slice_models") or []) if isinstance(item, Mapping)]
+    ignored_control_periods = [dict(item) for item in (support.get("ignored_control_periods") or []) if isinstance(item, Mapping)]
+    x_center = float(support.get("x_center") or 0.0)
+    x_scale = float(support.get("x_scale") or 1.0)
+    if len(cp_values) < 2 or len(slice_models) < 2:
+        return None
+
+    coeff_rows = [[float(v) for v in (slice_model.get("coeffs") or [])] for slice_model in slice_models]
+    cp_norm, cp_center, cp_scale = _td_perf_surface_normalize_control_period(cp_values)
+    cp_degree = 1 if len(cp_values) == 2 else 2
+    coeff_matrix_arr = np.asarray(coeff_rows, dtype=float)
+    coeff_cp_models: list[list[float]] = []
+    coeffs_at_center: list[float] = []
+    for basis_idx in range(coeff_matrix_arr.shape[1]):
+        coeff_values = coeff_matrix_arr[:, basis_idx]
+        cp_coeffs = np.polyfit(cp_norm, coeff_values, cp_degree)
+        coeff_cp_models.append([float(v) for v in cp_coeffs.tolist()])
+        coeffs_at_center.append(float(np.poly1d(cp_coeffs)(0.0)))
+
+    y_hat = np.asarray(
+        _td_perf_predict_quadratic_curve_control_period(
+            {
+                "x_center": float(x_center),
+                "x_scale": float(x_scale),
+                "cp_center": float(cp_center),
+                "cp_scale": float(cp_scale),
+                "coeff_cp_models": coeff_cp_models,
+            },
+            x_arr.tolist(),
+            cp_arr.tolist(),
+        ),
+        dtype=float,
+    )
+    params: dict[str, object] = {
+        "cp_center": float(cp_center),
+        "cp_scale": float(cp_scale),
+        "control_period_degree": int(cp_degree),
+        "control_period_values": [float(v) for v in cp_values],
+        "eligible_control_period_values": [float(v) for v in cp_values],
+        "ignored_control_periods": [dict(entry) for entry in ignored_control_periods],
+        "fit_domain_control_period": [float(min(cp_values)), float(max(cp_values))],
+        "coeff_cp_models": [[float(v) for v in coeffs] for coeffs in coeff_cp_models],
+    }
+    for basis_idx, coeffs in enumerate(coeff_cp_models):
+        params[f"basis_{basis_idx}_cp_coeffs"] = [float(v) for v in coeffs]
+    model = _td_perf_finalize_model(
+        fit_family=TD_PERF_FIT_FAMILY_QUADRATIC_CURVE_CONTROL_PERIOD,
+        fit_mode=TD_PERF_FIT_MODE_POLYNOMIAL,
+        equation=_td_perf_fmt_curve_control_period_equation(coeff_cp_models),
+        x_norm_equation=_td_perf_fmt_curve_control_period_normalization(
+            x_center,
+            x_scale,
+            cp_center,
+            cp_scale,
+        ),
+        params=params,
+        param_count=(len(coeff_cp_models) * (cp_degree + 1)),
+        x_values=list(range(len(y_arr))),
+        y_true=y_arr,
+        y_hat=y_hat,
+        composite_score=False,
+        extra={
+            "coeffs": [float(v) for v in coeffs_at_center],
+            "coeff_cp_models": [[float(v) for v in coeffs] for coeffs in coeff_cp_models],
+            "x_center": float(x_center),
+            "x_scale": float(x_scale),
+            "cp_center": float(cp_center),
+            "cp_scale": float(cp_scale),
+            "control_period_values": [float(v) for v in cp_values],
+            "eligible_control_period_values": [float(v) for v in cp_values],
+            "ignored_control_periods": [dict(entry) for entry in ignored_control_periods],
+            "control_period_degree": int(cp_degree),
+            "fit_domain_control_period": [float(min(cp_values)), float(max(cp_values))],
+            "slice_models": slice_models,
+            "solver": "slice_polyfit_curve",
+        },
+    )
+    warning_text = _td_perf_format_curve_control_period_warning(ignored_control_periods)
+    if warning_text:
+        _td_perf_append_fit_warning(model, warning_text)
+    return model
+
+
 def _td_perf_fit_quadratic_surface_iterative(
     x1_arr,
     x2_arr,
@@ -14679,7 +14997,7 @@ def td_smart_solver_run(
     *,
     output_target: str,
     input1_target: str,
-    input2_target: str,
+    input2_target: str = "",
     control_period_hard_input: bool = True,
     runs: Sequence[object],
     serials: Sequence[object],
@@ -14700,8 +15018,8 @@ def td_smart_solver_run(
     output_name = str(output_target or "").strip()
     input1_name = str(input1_target or "").strip()
     input2_name = str(input2_target or "").strip()
-    if not output_name or not input1_name or not input2_name:
-        raise RuntimeError("Select Output, Input 1, and Input 2 before running Smart Equation Solver.")
+    if not output_name or not input1_name:
+        raise RuntimeError("Select Output and Input 1 before running Smart Equation Solver.")
 
     runs_list = [str(value or "").strip() for value in (runs or []) if str(value or "").strip()]
     serial_set = {str(value or "").strip() for value in (serials or []) if str(value or "").strip()}
@@ -14735,12 +15053,16 @@ def td_smart_solver_run(
     for run_name in runs_list:
         output_col, output_units_candidate = _td_perf_resolve_y_col_units(path, run_name, output_name)
         input1_col, input1_units_candidate = _td_perf_resolve_y_col_units(path, run_name, input1_name)
-        input2_col, input2_units_candidate = _td_perf_resolve_y_col_units(path, run_name, input2_name)
-        if not output_col or not input1_col or not input2_col:
+        input2_col = ""
+        input2_units_candidate = ""
+        if input2_name:
+            input2_col, input2_units_candidate = _td_perf_resolve_y_col_units(path, run_name, input2_name)
+        if not output_col or not input1_col or (input2_name and not input2_col):
             continue
         output_units = output_units or output_units_candidate
         input1_units = input1_units or input1_units_candidate
-        input2_units = input2_units or input2_units_candidate
+        if input2_name:
+            input2_units = input2_units or input2_units_candidate
 
         x1_rows = td_load_metric_series(
             path,
@@ -14750,13 +15072,17 @@ def td_smart_solver_run(
             run_type_filter="pulsed_mode",
             metric_source=sequence_metric_source,
         )
-        x2_rows = td_load_metric_series(
-            path,
-            run_name,
-            input2_col,
-            "mean",
-            run_type_filter="pulsed_mode",
-            metric_source=sequence_metric_source,
+        x2_rows = (
+            td_load_metric_series(
+                path,
+                run_name,
+                input2_col,
+                "mean",
+                run_type_filter="pulsed_mode",
+                metric_source=sequence_metric_source,
+            )
+            if input2_name and input2_col
+            else []
         )
         y_rows = td_load_metric_series(
             path,
@@ -14766,7 +15092,7 @@ def td_smart_solver_run(
             run_type_filter="pulsed_mode",
             metric_source=sequence_metric_source,
         )
-        if not x1_rows or not x2_rows or not y_rows:
+        if not x1_rows or not y_rows or (input2_name and not x2_rows):
             continue
 
         x1_map = {
@@ -14784,7 +15110,10 @@ def td_smart_solver_run(
             for row in y_rows
             if isinstance(row, dict) and str(row.get("observation_id") or "").strip()
         }
-        for observation_id in sorted(set(x1_map.keys()) & set(x2_map.keys()) & set(y_map.keys())):
+        common_ids = set(x1_map.keys()) & set(y_map.keys())
+        if input2_name:
+            common_ids &= set(x2_map.keys())
+        for observation_id in sorted(common_ids):
             row_x1 = x1_map.get(observation_id) or {}
             row_x2 = x2_map.get(observation_id) or {}
             row_y = y_map.get(observation_id) or {}
@@ -14813,10 +15142,10 @@ def td_smart_solver_run(
             if not _td_smart_solver_match_filter_value(control_period, control_period_allowed):
                 continue
             x1_value = _td_finite_float(row_x1.get("value_num"))
-            x2_value = _td_finite_float(row_x2.get("value_num"))
+            x2_value = _td_finite_float(row_x2.get("value_num")) if input2_name else None
             y_value = _td_finite_float(row_y.get("value_num"))
             cp_value = _td_finite_float(control_period)
-            if None in (x1_value, x2_value, y_value, cp_value):
+            if x1_value is None or y_value is None or cp_value is None or (input2_name and x2_value is None):
                 continue
             suppression_label = _td_smart_solver_compact_value(suppression_voltage)
             if suppression_label and suppression_label not in seen_suppression_voltages:
@@ -14838,7 +15167,7 @@ def td_smart_solver_run(
                     "control_period": float(cp_value),
                     "suppression_voltage": suppression_voltage,
                     "input_1": float(x1_value),
-                    "input_2": float(x2_value),
+                    "input_2": (float(x2_value) if input2_name and x2_value is not None else None),
                     "actual_mean": float(y_value),
                     "sample_count": 1,
                 }
@@ -14859,60 +15188,102 @@ def td_smart_solver_run(
         raise RuntimeError("Smart Equation Solver requires at least two distinct control periods.")
 
     x1_values = [float(point["input_1"]) for point in points]
-    x2_values = [float(point["input_2"]) for point in points]
     y_values = [float(point["actual_mean"]) for point in points]
     cp_values = [float(point["control_period"]) for point in points]
+    x2_values = [float(point["input_2"]) for point in points if point.get("input_2") not in (None, "")]
 
     fit_mode = TD_PERF_FIT_MODE_POLYNOMIAL_SURFACE
-    support = _td_perf_analyze_quadratic_surface_control_period_fit_support(
-        x1_values,
-        x2_values,
-        y_values,
-        cp_values,
-        fit_mode=fit_mode,
-    )
-    eligible_control_period_values = [float(value) for value in (support.get("eligible_control_period_values") or [])]
-    slice_rows_raw = [dict(item) for item in (support.get("slice_rows") or []) if isinstance(item, Mapping)]
-    slice_rows = [
-        {
-            "control_period": row.get("control_period"),
-            "point_count": int(row.get("point_count") or 0),
-            "distinct_input_1": int(row.get("distinct_x1") or 0),
-            "distinct_input_2": int(row.get("distinct_x2") or 0),
-            "eligible": bool(row.get("eligible")),
-            "reason": str(row.get("reason") or "").strip(),
-        }
-        for row in slice_rows_raw
-    ]
+    if input2_name:
+        support = _td_perf_analyze_quadratic_surface_control_period_fit_support(
+            x1_values,
+            x2_values,
+            y_values,
+            cp_values,
+            fit_mode=fit_mode,
+        )
+        eligible_control_period_values = [float(value) for value in (support.get("eligible_control_period_values") or [])]
+        slice_rows_raw = [dict(item) for item in (support.get("slice_rows") or []) if isinstance(item, Mapping)]
+        slice_rows = [
+            {
+                "control_period": row.get("control_period"),
+                "point_count": int(row.get("point_count") or 0),
+                "distinct_input_1": int(row.get("distinct_x1") or 0),
+                "distinct_input_2": int(row.get("distinct_x2") or 0),
+                "eligible": bool(row.get("eligible")),
+                "reason": str(row.get("reason") or "").strip(),
+            }
+            for row in slice_rows_raw
+        ]
+    else:
+        support = _td_perf_analyze_quadratic_curve_control_period_fit_support(
+            x1_values,
+            y_values,
+            cp_values,
+        )
+        eligible_control_period_values = [float(value) for value in (support.get("eligible_control_period_values") or [])]
+        slice_rows_raw = [dict(item) for item in (support.get("slice_rows") or []) if isinstance(item, Mapping)]
+        slice_rows = [
+            {
+                "control_period": row.get("control_period"),
+                "point_count": int(row.get("point_count") or 0),
+                "distinct_input_1": int(row.get("distinct_x1") or 0),
+                "distinct_input_2": None,
+                "eligible": bool(row.get("eligible")),
+                "reason": str(row.get("reason") or "").strip(),
+            }
+            for row in slice_rows_raw
+        ]
 
     if len(eligible_control_period_values) < 2:
-        failure_text = _td_perf_format_surface_control_period_failure(
-            support.get("ignored_control_periods") or [],
-            eligible_count=len(eligible_control_period_values),
-        )
+        if input2_name:
+            failure_text = _td_perf_format_surface_control_period_failure(
+                support.get("ignored_control_periods") or [],
+                eligible_count=len(eligible_control_period_values),
+            )
+        else:
+            failure_text = _td_perf_format_curve_control_period_failure(
+                support.get("ignored_control_periods") or [],
+                eligible_count=len(eligible_control_period_values),
+            )
         if control_period_allowed:
             failure_text = f"{failure_text} Broaden the active control-period filter and try again."
         raise RuntimeError(failure_text)
 
     _td_emit_progress(progress_cb, "Fitting control-period slices")
-    model = _td_perf_fit_quadratic_surface_control_period_model(
-        x1_values,
-        x2_values,
-        y_values,
-        cp_values,
-        fit_mode=fit_mode,
+    model = (
+        _td_perf_fit_quadratic_surface_control_period_model(
+            x1_values,
+            x2_values,
+            y_values,
+            cp_values,
+            fit_mode=fit_mode,
+        )
+        if input2_name
+        else _td_perf_fit_quadratic_curve_control_period_model(
+            x1_values,
+            y_values,
+            cp_values,
+        )
     )
     if not isinstance(model, dict):
         raise RuntimeError(
-            "Smart Equation Solver could not fit a control-period-aware quadratic surface for the filtered sequence rows."
+            "Smart Equation Solver could not fit a control-period-aware model for the filtered sequence rows."
         )
 
     _td_emit_progress(progress_cb, "Binding CP coefficients")
-    predictions = td_perf_predict_surface(
-        model,
-        x1_values,
-        x2_values,
-        control_period=cp_values,
+    predictions = (
+        td_perf_predict_surface(
+            model,
+            x1_values,
+            x2_values,
+            control_period=cp_values,
+        )
+        if input2_name
+        else _td_perf_predict_quadratic_curve_control_period(
+            model,
+            x1_values,
+            cp_values,
+        )
     )
     if len(predictions) != len(points):
         raise RuntimeError("Smart Equation Solver could not score the fitted surface.")

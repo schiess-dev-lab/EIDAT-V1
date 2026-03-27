@@ -3216,7 +3216,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._left_panel_width_initialized = False
         self._startup_size_locked = False
         self._perf_equations_popup: QtWidgets.QDialog | None = None
-        self._smart_solver_config: dict[str, str] = {}
+        self._smart_solver_config: dict[str, object] = {}
         self._smart_solver_result: dict[str, object] | None = None
         self._smart_solver_popup: QtWidgets.QDialog | None = None
         self._smart_solver_worker: ProjectTaskWorker | None = None
@@ -8610,12 +8610,17 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         output_name = str(cfg.get("output_target") or "").strip()
         input1_name = str(cfg.get("input1_target") or "").strip()
         input2_name = str(cfg.get("input2_target") or "").strip()
-        if not output_name or not input1_name or not input2_name:
+        if not output_name or not input1_name:
             return "Config: -"
         cp_mode = "Hard Input" if bool(cfg.get("control_period_hard_input", True)) else "Swept Input"
+        if input2_name:
+            return (
+                f"Config: Output = {output_name} | Input 1 = {input1_name} | "
+                f"Input 2 = {input2_name} | Control Period = {cp_mode}"
+            )
         return (
             f"Config: Output = {output_name} | Input 1 = {input1_name} | "
-            f"Input 2 = {input2_name} | Control Period = {cp_mode}"
+            f"2D Solver | Control Period = {cp_mode}"
         )
 
     def _smart_solver_filter_summary_text(self) -> str:
@@ -8790,7 +8795,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     break
         form.addRow("Output:", combo_output)
         form.addRow("Input 1:", combo_input1)
-        form.addRow("Input 2:", combo_input2)
+        form.addRow("Input 2 (Optional):", combo_input2)
         cb_cp_hard_input = QtWidgets.QCheckBox("Treat Control Period as hard input")
         cb_cp_hard_input.setChecked(bool((self._smart_solver_config or {}).get("control_period_hard_input", True)))
         form.addRow("Control Period:", cb_cp_hard_input)
@@ -8843,23 +8848,22 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             output_name = self._smart_solver_combo_value(combo_output)
             input1_name = self._smart_solver_combo_value(combo_input1)
             input2_name = self._smart_solver_combo_value(combo_input2)
-            if not output_name or not input1_name or not input2_name:
+            if not output_name or not input1_name:
                 QtWidgets.QMessageBox.warning(
                     dlg,
                     "Smart Equation Solver",
-                    "Select Output, Input 1, and Input 2 before solving.",
+                    "Select Output and Input 1 before solving.",
                 )
                 return
-            norm_values = {
-                self._perf_norm_name(output_name),
-                self._perf_norm_name(input1_name),
-                self._perf_norm_name(input2_name),
-            }
-            if len(norm_values) < 3:
+            chosen_names = [output_name, input1_name]
+            if input2_name:
+                chosen_names.append(input2_name)
+            norm_values = {self._perf_norm_name(name) for name in chosen_names if str(name).strip()}
+            if len(norm_values) < len(chosen_names):
                 QtWidgets.QMessageBox.warning(
                     dlg,
                     "Smart Equation Solver",
-                    "Output, Input 1, and Input 2 must be different columns.",
+                    "Output and selected input columns must be different.",
                 )
                 return
             self._smart_solver_config = {

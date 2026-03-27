@@ -8756,6 +8756,30 @@ class TestTDSupportWorkbook(unittest.TestCase):
             self.assertGreater(float(result.get("residual_threshold") or 0.0), 0.0)
             self.assertEqual(len(result.get("slice_rows") or []), 2)
 
+    def test_td_smart_solver_run_supports_single_input_plus_control_period(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            db_path = self._seed_smart_solver_db(root)
+
+            result = be.td_smart_solver_run(
+                db_path,
+                output_target="isp",
+                input1_target="prop_per_pulse",
+                input2_target="",
+                control_period_hard_input=True,
+                runs=["RunA"],
+                serials=["SN1"],
+                program_filters=["Program A"],
+            )
+
+            self.assertEqual(result["fit_family"], be.TD_PERF_FIT_FAMILY_QUADRATIC_CURVE_CONTROL_PERIOD)
+            self.assertEqual(str(result.get("input2_target") or ""), "")
+            self.assertTrue(str(result.get("equation") or "").strip())
+            self.assertEqual(int(result.get("sample_count") or 0), 12)
+            self.assertEqual(len(result.get("slice_rows") or []), 2)
+
     def test_td_smart_solver_run_warns_for_multiple_suppression_voltages(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
 
