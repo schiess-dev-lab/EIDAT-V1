@@ -9383,6 +9383,66 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 return True
         return False
 
+    def _perf_build_regression_checker_row(
+        self,
+        *,
+        observation_id: str,
+        run_name_value: str,
+        run_display: str,
+        row_input1: dict,
+        row_output: dict,
+        row_input2: dict | None = None,
+    ) -> dict[str, object]:
+        row_input1 = dict(row_input1 or {})
+        row_output = dict(row_output or {})
+        row_input2 = dict(row_input2 or {})
+        base_row = row_output or row_input1 or row_input2
+        labeler = getattr(be, "_td_perf_export_condition_label", None)
+        if callable(labeler):
+            try:
+                condition_label = str(labeler(base_row, display_name=run_display) or "").strip()
+            except Exception:
+                condition_label = str(run_display or run_name_value).strip()
+        else:
+            condition_label = str(run_display or run_name_value).strip()
+        return {
+            "observation_id": str(observation_id or "").strip(),
+            "run_name": str(run_name_value or "").strip(),
+            "display_name": str(run_display or run_name_value).strip(),
+            "program_title": str(
+                base_row.get("program_title")
+                or row_input1.get("program_title")
+                or row_input2.get("program_title")
+                or ""
+            ).strip(),
+            "source_run_name": str(
+                base_row.get("source_run_name")
+                or row_input1.get("source_run_name")
+                or row_input2.get("source_run_name")
+                or ""
+            ).strip(),
+            "control_period": base_row.get(
+                "control_period",
+                row_input1.get("control_period", row_input2.get("control_period")),
+            ),
+            "suppression_voltage": base_row.get(
+                "suppression_voltage",
+                row_input1.get("suppression_voltage", row_input2.get("suppression_voltage")),
+            ),
+            "condition_label": condition_label,
+            "serial": str(
+                base_row.get("serial") or row_input1.get("serial") or row_input2.get("serial") or ""
+            ).strip(),
+            "input_1": float(row_input1.get("value_num") or 0.0),
+            "input_2": (
+                float(row_input2.get("value_num") or 0.0)
+                if row_input2 and isinstance(row_input2.get("value_num"), (int, float))
+                else None
+            ),
+            "actual_mean": float(row_output.get("value_num") or 0.0),
+            "sample_count": 1,
+        }
+
     def _perf_collect_results(
         self,
         output_name: str,
@@ -9451,120 +9511,6 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 return abs(float(value) - float(target)) <= 1e-9
             except Exception:
                 return str(value or "").strip().lower() == str(target or "").strip().lower()
-
-        def _checker_row(
-            *,
-            observation_id: str,
-            run_name_value: str,
-            run_display: str,
-            row_input1: dict,
-            row_output: dict,
-            row_input2: dict | None = None,
-        ) -> dict:
-            row_input2 = dict(row_input2 or {})
-            base_row = row_output or row_input1 or row_input2
-            labeler = getattr(be, "_td_perf_export_condition_label", None)
-            if callable(labeler):
-                try:
-                    condition_label = str(labeler(base_row, display_name=run_display) or "").strip()
-                except Exception:
-                    condition_label = str(run_display or run_name_value).strip()
-            else:
-                condition_label = str(run_display or run_name_value).strip()
-            return {
-                "observation_id": str(observation_id or "").strip(),
-                "run_name": str(run_name_value or "").strip(),
-                "display_name": str(run_display or run_name_value).strip(),
-                "program_title": str(
-                    base_row.get("program_title")
-                    or row_input1.get("program_title")
-                    or row_input2.get("program_title")
-                    or ""
-                ).strip(),
-                "source_run_name": str(
-                    base_row.get("source_run_name")
-                    or row_input1.get("source_run_name")
-                    or row_input2.get("source_run_name")
-                    or ""
-                ).strip(),
-                "control_period": base_row.get(
-                    "control_period",
-                    row_input1.get("control_period", row_input2.get("control_period")),
-                ),
-                "suppression_voltage": base_row.get(
-                    "suppression_voltage",
-                    row_input1.get("suppression_voltage", row_input2.get("suppression_voltage")),
-                ),
-                "condition_label": condition_label,
-                "serial": str(
-                    base_row.get("serial") or row_input1.get("serial") or row_input2.get("serial") or ""
-                ).strip(),
-                "input_1": float(row_input1.get("value_num") or 0.0),
-                "input_2": (
-                    float(row_input2.get("value_num") or 0.0)
-                    if row_input2 and isinstance(row_input2.get("value_num"), (int, float))
-                    else None
-                ),
-                "actual_mean": float(row_output.get("value_num") or 0.0),
-                "sample_count": 1,
-            }
-
-        def _checker_row(
-            *,
-            observation_id: str,
-            run_name_value: str,
-            run_display: str,
-            row_input1: dict,
-            row_output: dict,
-            row_input2: dict | None = None,
-        ) -> dict:
-            row_input2 = dict(row_input2 or {})
-            base_row = row_output or row_input1 or row_input2
-            labeler = getattr(be, "_td_perf_export_condition_label", None)
-            if callable(labeler):
-                try:
-                    condition_label = str(labeler(base_row, display_name=run_display) or "").strip()
-                except Exception:
-                    condition_label = str(run_display or run_name_value).strip()
-            else:
-                condition_label = str(run_display or run_name_value).strip()
-            return {
-                "observation_id": str(observation_id or "").strip(),
-                "run_name": str(run_name_value or "").strip(),
-                "display_name": str(run_display or run_name_value).strip(),
-                "program_title": str(
-                    base_row.get("program_title")
-                    or row_input1.get("program_title")
-                    or row_input2.get("program_title")
-                    or ""
-                ).strip(),
-                "source_run_name": str(
-                    base_row.get("source_run_name")
-                    or row_input1.get("source_run_name")
-                    or row_input2.get("source_run_name")
-                    or ""
-                ).strip(),
-                "control_period": base_row.get(
-                    "control_period",
-                    row_input1.get("control_period", row_input2.get("control_period")),
-                ),
-                "suppression_voltage": base_row.get(
-                    "suppression_voltage",
-                    row_input1.get("suppression_voltage", row_input2.get("suppression_voltage")),
-                ),
-                "condition_label": condition_label,
-                "serial": str(
-                    base_row.get("serial") or row_input1.get("serial") or row_input2.get("serial") or ""
-                ).strip(),
-                "input_1": float(row_input1.get("value_num") or 0.0),
-                "input_2": (
-                    float(row_input2.get("value_num") or 0.0)
-                    if row_input2 and isinstance(row_input2.get("value_num"), (int, float))
-                    else None
-                ),
-                "actual_mean": float(row_output.get("value_num") or 0.0),
-                "sample_count": 1,
-            }
 
         for st in equation_stats:
             if is_surface:
@@ -9655,7 +9601,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                             pts_all.append(point)
                             if not use_cp_surface or _cp_matches(point[4], display_control_period):
                                 visible_rows.append(
-                                    _checker_row(
+                                    self._perf_build_regression_checker_row(
                                         observation_id=obs_id,
                                         run_name_value=_rn,
                                         run_display=rdisp,
@@ -9823,7 +9769,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                                 )
                             )
                             visible_rows.append(
-                                _checker_row(
+                                self._perf_build_regression_checker_row(
                                     observation_id=obs_id,
                                     run_name_value=_rn,
                                     run_display=rdisp,
@@ -10055,7 +10001,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                             if not use_cp_surface or _cp_matches(point[4], display_control_period):
                                 pts_slice.append((point[0], point[1], point[2], point[3]))
                                 visible_rows.append(
-                                    _checker_row(
+                                    self._perf_build_regression_checker_row(
                                         observation_id=obs_id,
                                         run_name_value=_rn,
                                         run_display=rdisp,
@@ -10224,7 +10170,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                                 )
                             )
                             visible_rows.append(
-                                _checker_row(
+                                self._perf_build_regression_checker_row(
                                     observation_id=obs_id,
                                     run_name_value=_rn,
                                     run_display=rdisp,
@@ -11062,7 +11008,6 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         if not qualifying_serials:
             qualifying_serials = {str(serial).strip() for serial in self._selected_perf_serials() if str(serial).strip()}
 
-        labeler = getattr(be, "_td_perf_export_condition_label", None)
         out: list[dict[str, object]] = []
         for spec in run_specs or []:
             if not isinstance(spec, dict):
@@ -11140,47 +11085,15 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                         continue
                     if not math.isfinite(float(input_2)):
                         continue
-                base_row = row_y or row_x1 or row_x2
-                label_row = row_y or row_x1 or row_x2
-                if callable(labeler):
-                    try:
-                        condition_label = str(labeler(label_row, display_name=display_name) or "").strip()
-                    except Exception:
-                        condition_label = display_name
-                else:
-                    condition_label = display_name
                 out.append(
-                    {
-                        "observation_id": observation_id,
-                        "run_name": run_name,
-                        "display_name": display_name,
-                        "program_title": str(
-                            base_row.get("program_title")
-                            or row_x1.get("program_title")
-                            or row_x2.get("program_title")
-                            or ""
-                        ).strip(),
-                        "source_run_name": str(
-                            base_row.get("source_run_name")
-                            or row_x1.get("source_run_name")
-                            or row_x2.get("source_run_name")
-                            or ""
-                        ).strip(),
-                        "control_period": base_row.get(
-                            "control_period",
-                            row_x1.get("control_period", row_x2.get("control_period")),
-                        ),
-                        "suppression_voltage": base_row.get(
-                            "suppression_voltage",
-                            row_x1.get("suppression_voltage", row_x2.get("suppression_voltage")),
-                        ),
-                        "condition_label": condition_label,
-                        "serial": serial,
-                        "input_1": float(input_1),
-                        "input_2": (float(input_2) if isinstance(input_2, (int, float)) else None),
-                        "actual_mean": float(actual_mean),
-                        "sample_count": 1,
-                    }
+                    self._perf_build_regression_checker_row(
+                        observation_id=observation_id,
+                        run_name_value=run_name,
+                        run_display=display_name,
+                        row_input1=row_x1,
+                        row_output=row_y,
+                        row_input2=row_x2,
+                    )
                 )
         out.sort(
             key=lambda row: (

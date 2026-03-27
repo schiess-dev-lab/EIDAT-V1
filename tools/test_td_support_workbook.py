@@ -513,9 +513,87 @@ class _PerfRegressionCheckerRowsHarness:
             return [dict(row) for row in rows.get((run_name, column_name, stat), [])]
 
         self._load_perf_equation_metric_series = _load_series
+        self._perf_build_regression_checker_row = getattr(
+            TestDataTrendDialog, "_perf_build_regression_checker_row"
+        ).__get__(self, _PerfRegressionCheckerRowsHarness)
         self._perf_current_regression_checker_rows = getattr(
             TestDataTrendDialog, "_perf_current_regression_checker_rows"
         ).__get__(self, _PerfRegressionCheckerRowsHarness)
+
+
+class _CachedConditionMeanCollectorHarness:
+    def __init__(self, *, is_surface: bool = False) -> None:
+        from EIDAT_App_Files.ui_next.qt_main import TestDataTrendDialog  # type: ignore
+
+        self._rows: dict[tuple[str, str, str], list[dict[str, object]]] = {}
+        self._surface_family = "auto_surface"
+        if is_surface:
+            points = [
+                ("obs1", 1.0, 1.0, 10.0),
+                ("obs2", 1.0, 2.0, 12.0),
+                ("obs3", 2.0, 1.0, 14.0),
+                ("obs4", 2.0, 2.0, 16.0),
+            ]
+            self._rows[("RunA", "Input1", "mean")] = []
+            self._rows[("RunA", "Input2", "mean")] = []
+            self._rows[("RunA", "Output", "mean")] = []
+            for observation_id, input_1, input_2, output_value in points:
+                common = {
+                    "observation_id": observation_id,
+                    "serial": "SN1",
+                    "program_title": "Program A",
+                    "source_run_name": "Source A",
+                    "control_period": 60.0,
+                    "suppression_voltage": 24.0,
+                }
+                self._rows[("RunA", "Input1", "mean")].append({**common, "value_num": input_1})
+                self._rows[("RunA", "Input2", "mean")].append({**common, "value_num": input_2})
+                self._rows[("RunA", "Output", "mean")].append({**common, "value_num": output_value})
+        else:
+            self._rows[("RunA", "Input1", "mean")] = [
+                {
+                    "observation_id": "obs1",
+                    "serial": "SN1",
+                    "value_num": 1.0,
+                    "program_title": "Program A",
+                    "source_run_name": "Source A",
+                    "control_period": 60.0,
+                    "suppression_voltage": 24.0,
+                }
+            ]
+            self._rows[("RunA", "Output", "mean")] = [
+                {
+                    "observation_id": "obs1",
+                    "serial": "SN1",
+                    "value_num": 10.0,
+                    "program_title": "Program A",
+                    "source_run_name": "Source A",
+                    "control_period": 60.0,
+                    "suppression_voltage": 24.0,
+                }
+            ]
+
+        self._perf_requested_surface_family = lambda: self._surface_family
+        self._resolve_td_y_col_units = lambda run_name, metric_name: (str(metric_name or "").strip(), "u")
+        self._run_display_text = lambda run_name: f"Display {run_name}"
+        self._perf_requested_fit_mode = lambda: "auto"
+        self._perf_build_regression_checker_row = getattr(
+            TestDataTrendDialog, "_perf_build_regression_checker_row"
+        ).__get__(self, _CachedConditionMeanCollectorHarness)
+        self._perf_collect_cached_condition_mean_results = getattr(
+            TestDataTrendDialog, "_perf_collect_cached_condition_mean_results"
+        ).__get__(self, _CachedConditionMeanCollectorHarness)
+
+    def _load_perf_equation_metric_series(
+        self,
+        run_name: str,
+        column_name: str,
+        stat: str,
+        *,
+        control_period_filter=None,
+        run_type_filter=None,
+    ) -> list[dict[str, object]]:
+        return [dict(row) for row in self._rows.get((run_name, column_name, stat), [])]
 
 
 class _RenderPlotDefHarness:
@@ -8179,6 +8257,79 @@ class TestTDSupportWorkbook(unittest.TestCase):
         harness._plot_performance_cached_condition_means()
         self.assertIsInstance(harness._last_plot_def, dict)
         self.assertEqual(harness._last_plot_def.get("performance_plot_method"), "cached_condition_means")
+
+    def test_perf_collect_cached_condition_mean_results_builds_checker_rows_for_2d(self) -> None:
+        harness = _CachedConditionMeanCollectorHarness()
+        results, plot_view_stats, fit_error_text = harness._perf_collect_cached_condition_mean_results(
+            "Output",
+            "Input1",
+            "",
+            ["mean"],
+            ["RunA"],
+            ["SN1"],
+            fit_enabled=False,
+            require_min_points=1,
+        )
+        self.assertEqual(plot_view_stats, ["mean"])
+        self.assertEqual(fit_error_text, "")
+        mean_result = results.get("mean") or {}
+        self.assertEqual(mean_result.get("performance_plot_method"), "cached_condition_means")
+        self.assertEqual(mean_result.get("curves"), {"SN1": [(1.0, 10.0, "Display RunA | Program A | Source A")]})
+        rows = mean_result.get("regression_checker_rows") or []
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(
+            rows[0],
+            {
+                "observation_id": "obs1",
+                "run_name": "RunA",
+                "display_name": "Display RunA",
+                "program_title": "Program A",
+                "source_run_name": "Source A",
+                "control_period": 60.0,
+                "suppression_voltage": 24.0,
+                "condition_label": "Display RunA | Program A | Source A",
+                "serial": "SN1",
+                "input_1": 1.0,
+                "input_2": None,
+                "actual_mean": 10.0,
+                "sample_count": 1,
+            },
+        )
+
+    def test_perf_collect_cached_condition_mean_results_builds_checker_rows_for_3d(self) -> None:
+        harness = _CachedConditionMeanCollectorHarness(is_surface=True)
+        results, plot_view_stats, fit_error_text = harness._perf_collect_cached_condition_mean_results(
+            "Output",
+            "Input1",
+            "Input2",
+            ["mean"],
+            ["RunA"],
+            ["SN1"],
+            fit_enabled=False,
+            require_min_points=2,
+        )
+        self.assertEqual(plot_view_stats, ["mean"])
+        self.assertEqual(fit_error_text, "")
+        mean_result = results.get("mean") or {}
+        self.assertEqual(mean_result.get("performance_plot_method"), "cached_condition_means")
+        self.assertEqual(
+            mean_result.get("points_3d"),
+            {
+                "SN1": [
+                    (1.0, 1.0, 10.0, "Display RunA | Program A | Source A"),
+                    (1.0, 2.0, 12.0, "Display RunA | Program A | Source A"),
+                    (2.0, 1.0, 14.0, "Display RunA | Program A | Source A"),
+                    (2.0, 2.0, 16.0, "Display RunA | Program A | Source A"),
+                ]
+            },
+        )
+        rows = mean_result.get("regression_checker_rows") or []
+        self.assertEqual(len(rows), 4)
+        self.assertEqual(rows[0].get("observation_id"), "obs1")
+        self.assertEqual(rows[0].get("condition_label"), "Display RunA | Program A | Source A")
+        self.assertEqual(rows[0].get("input_1"), 1.0)
+        self.assertEqual(rows[0].get("input_2"), 1.0)
+        self.assertEqual(rows[0].get("actual_mean"), 10.0)
 
     def test_perf_current_regression_checker_rows_use_only_qualifying_serial_points(self) -> None:
         harness = _PerfRegressionCheckerRowsHarness()
