@@ -8735,6 +8735,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
                     output_target="isp",
                     input1_target="prop_per_pulse",
                     input2_target="duty_cycle",
+                    control_period_hard_input=True,
                     runs=["RunA"],
                     serials=["SN1"],
                     program_filters=["Program A"],
@@ -8749,6 +8750,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
             )
             self.assertEqual(result["fit_family"], be.TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD)
             self.assertTrue(str(result.get("equation") or "").strip())
+            self.assertTrue(bool(result.get("control_period_hard_input")))
             self.assertEqual(int(result.get("sample_count") or 0), 12)
             self.assertEqual(int(result.get("fell_out_count") or 0), 0)
             self.assertGreater(float(result.get("residual_threshold") or 0.0), 0.0)
@@ -8766,6 +8768,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 output_target="isp",
                 input1_target="prop_per_pulse",
                 input2_target="duty_cycle",
+                control_period_hard_input=True,
                 runs=["RunA"],
                 serials=["SN1"],
                 program_filters=["Program A"],
@@ -8787,6 +8790,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
                     output_target="isp",
                     input1_target="prop_per_pulse",
                     input2_target="duty_cycle",
+                    control_period_hard_input=True,
                     runs=["RunA"],
                     serials=["SN1"],
                     program_filters=["Program A"],

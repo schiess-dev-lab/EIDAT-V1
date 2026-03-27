@@ -8612,7 +8612,11 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         input2_name = str(cfg.get("input2_target") or "").strip()
         if not output_name or not input1_name or not input2_name:
             return "Config: -"
-        return f"Config: Output = {output_name} | Input 1 = {input1_name} | Input 2 = {input2_name}"
+        cp_mode = "Hard Input" if bool(cfg.get("control_period_hard_input", True)) else "Swept Input"
+        return (
+            f"Config: Output = {output_name} | Input 1 = {input1_name} | "
+            f"Input 2 = {input2_name} | Control Period = {cp_mode}"
+        )
 
     def _smart_solver_filter_summary_text(self) -> str:
         parts = [
@@ -8764,7 +8768,6 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
         def _build_combo() -> QtWidgets.QComboBox:
             combo = QtWidgets.QComboBox()
-            combo.setEditable(True)
             combo.addItem("", "")
             for name in column_names:
                 combo.addItem(name, name)
@@ -8785,12 +8788,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 if self._perf_norm_name(combo.itemText(idx)) == self._perf_norm_name(wanted):
                     combo.setCurrentIndex(idx)
                     break
-            else:
-                combo.setEditText(wanted)
-
         form.addRow("Output:", combo_output)
         form.addRow("Input 1:", combo_input1)
         form.addRow("Input 2:", combo_input2)
+        cb_cp_hard_input = QtWidgets.QCheckBox("Treat Control Period as hard input")
+        cb_cp_hard_input.setChecked(bool((self._smart_solver_config or {}).get("control_period_hard_input", True)))
+        form.addRow("Control Period:", cb_cp_hard_input)
         form.addRow("Condition Family:", QtWidgets.QLabel("Pulsed mode only"))
         form.addRow("Data Source:", QtWidgets.QLabel("td_metrics_calc_sequences"))
         form.addRow(
@@ -8863,6 +8866,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 "output_target": output_name,
                 "input1_target": input1_name,
                 "input2_target": input2_name,
+                "control_period_hard_input": bool(cb_cp_hard_input.isChecked()),
             }
             self._refresh_smart_solver_ui()
             dlg.accept()
@@ -8946,6 +8950,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 output_target=str(config.get("output_target") or "").strip(),
                 input1_target=str(config.get("input1_target") or "").strip(),
                 input2_target=str(config.get("input2_target") or "").strip(),
+                control_period_hard_input=bool(config.get("control_period_hard_input", True)),
                 runs=runs,
                 serials=serials,
                 program_filters=self._active_program_filter_values(),
