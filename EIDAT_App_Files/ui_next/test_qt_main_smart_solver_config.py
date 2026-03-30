@@ -1,0 +1,212 @@
+import os
+import shutil
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+APP_ROOT = Path(__file__).resolve().parents[1]
+if str(APP_ROOT) not in sys.path:
+    sys.path.insert(0, str(APP_ROOT))
+
+
+try:
+    from PySide6 import QtWidgets
+    from ui_next.qt_main import ProjectTaskWorker, TestDataTrendDialog
+except Exception:  # pragma: no cover - optional dependency guard for local runs
+    QtWidgets = None  # type: ignore[assignment]
+    ProjectTaskWorker = None  # type: ignore[assignment]
+    TestDataTrendDialog = None  # type: ignore[assignment]
+
+
+@unittest.skipIf(QtWidgets is None or TestDataTrendDialog is None or ProjectTaskWorker is None, "PySide6 is required")
+class TestQtMainSmartSolverConfig(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+    def _make_window(self) -> TestDataTrendDialog:
+        tmpdir = tempfile.mkdtemp()
+        project_dir = Path(tmpdir) / "project"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        workbook_path = project_dir / "project.xlsx"
+        workbook_path.write_text("", encoding="utf-8")
+        with patch.object(TestDataTrendDialog, "_load_cache", lambda self, *, rebuild: None), patch.object(
+            TestDataTrendDialog, "_load_auto_plots", lambda self: None
+        ):
+            window = TestDataTrendDialog(project_dir, workbook_path)
+        window._test_tmpdir = tmpdir  # type: ignore[attr-defined]
+        return window
+
+    def test_smart_solver_config_summary_and_backend_call_include_sequence_cap(self) -> None:
+        window = self._make_window()
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                db_path = Path(tmpdir) / "cache.sqlite3"
+                db_path.write_text("", encoding="utf-8")
+                window._db_path = db_path
+                window._smart_solver_config = {
+                    "output_target": "Output",
+                    "input1_target": "Input1",
+                    "input2_target": "",
+                    "control_period_hard_input": True,
+                    "keep_first_sequences_per_serial": 0,
+                }
+                self.assertIn("Seq cap = Unlimited", window._smart_solver_config_text())
+
+                window._smart_solver_config["keep_first_sequences_per_serial"] = 3
+                config_text = window._smart_solver_config_text()
+                self.assertIn("Seq cap = first 3 / serial", config_text)
+
+                solver_calls: list[dict[str, object]] = []
+
+                def _fake_solver(*_args, **kwargs):
+                    solver_calls.append(dict(kwargs))
+                    return {
+                        "equation": "y = x",
+                        "x_norm_equation": "x' = x",
+                        "rmse": 0.0,
+                        "residual_threshold": 0.0,
+                        "in_fit_percent": 100.0,
+                        "fell_out_count": 0,
+                        "sample_count": 2,
+                        "warning_text": "",
+                        "slice_rows": [],
+                        "keep_first_sequences_per_serial": int(kwargs.get("keep_first_sequences_per_serial") or 0),
+                        "dropped_sequence_count": 1,
+                        "dropped_point_count": 2,
+                    }
+
+                with patch.object(TestDataTrendDialog, "_active_serials", return_value=["SN-001"]), patch.object(
+                    TestDataTrendDialog, "_active_program_filter_values", return_value=[]
+                ), patch.object(
+                    TestDataTrendDialog, "_active_suppression_voltage_filter_values", return_value=[]
+                ), patch.object(
+                    TestDataTrendDialog, "_active_control_period_filter_values", return_value=[]
+                ), patch(
+                    "ui_next.qt_main.be.td_smart_solver_has_sequence_rows", return_value=True
+                ), patch(
+                    "ui_next.qt_main.be.td_list_runs", return_value=["CondA", "CondB"]
+                ), patch(
+                    "ui_next.qt_main.be.td_smart_solver_run", side_effect=_fake_solver
+                ), patch.object(
+                    ProjectTaskWorker, "start", lambda self: self.run()
+                ), patch(
+                    "ui_next.qt_main.QtWidgets.QMessageBox.warning"
+                ) as warning_mock, patch(
+                    "ui_next.qt_main.QtWidgets.QMessageBox.information"
+                ) as info_mock:
+                    window._run_smart_solver(user_initiated=True)
+
+                warning_mock.assert_not_called()
+                info_mock.assert_not_called()
+                self.assertEqual(len(solver_calls), 1)
+                self.assertEqual(solver_calls[0]["keep_first_sequences_per_serial"], 3)
+                self.assertIn("Dropped: 1 seq / 2 pts", window.lbl_smart_solver_summary.text())
+        finally:
+            window.close()
+            tmpdir = getattr(window, "_test_tmpdir", "")
+            if tmpdir:
+                shutil.rmtree(str(tmpdir), ignore_errors=True)
+
+    def test_export_smart_solver_equations_to_excel_reuses_performance_export_path(self) -> None:
+        window = self._make_window()
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                db_path = Path(tmpdir) / "cache.sqlite3"
+                db_path.write_text("", encoding="utf-8")
+                out_path = Path(tmpdir) / "smart_solver_export.xlsx"
+                window._db_path = db_path
+                window._run_display_by_name = {"CondA": "Condition A"}
+                window._smart_solver_config = {
+                    "output_target": "Output",
+                    "input1_target": "Input1",
+                    "input2_target": "",
+                    "control_period_hard_input": True,
+                    "keep_first_sequences_per_serial": 2,
+                }
+                window._smart_solver_result = {
+                    "fit_family": "quadratic_curve_control_period",
+                    "master_model": {
+                        "fit_family": "quadratic_curve_control_period",
+                        "coeff_cp_models": [[1.0], [2.0], [3.0]],
+                        "x_center": 0.0,
+                        "x_scale": 1.0,
+                        "cp_center": 0.0,
+                        "cp_scale": 1.0,
+                    },
+                    "fit_points": [
+                        {
+                            "run_name": "CondA",
+                            "serial": "SN-001",
+                            "observation_id": "obs-1",
+                            "program_title": "Program Alpha",
+                            "source_run_name": "Seq-1",
+                            "suppression_voltage": 5.0,
+                            "control_period": 30.0,
+                            "condition_label": "Condition A",
+                            "input_1": 1.0,
+                            "input_2": None,
+                            "actual_mean": 11.0,
+                            "sample_count": 1,
+                        }
+                    ],
+                    "output_target": "Output",
+                    "output_units": "u",
+                    "input1_target": "Input1",
+                    "input1_units": "u",
+                    "input2_target": "",
+                    "input2_units": "",
+                }
+                export_calls: list[dict[str, object]] = []
+
+                def _capture_start(output_path: Path, **kwargs):
+                    export_calls.append({"output_path": Path(output_path), **kwargs})
+
+                with patch.object(
+                    TestDataTrendDialog,
+                    "_active_control_period_filter_values",
+                    return_value=[30.0],
+                ), patch.object(
+                    TestDataTrendDialog,
+                    "_start_perf_equation_excel_export",
+                    side_effect=_capture_start,
+                ), patch(
+                    "ui_next.qt_main.be.td_perf_collect_asset_metadata",
+                    return_value={},
+                ), patch(
+                    "ui_next.qt_main.QtWidgets.QFileDialog.getSaveFileName",
+                    return_value=(str(out_path), "Excel Files (*.xlsx)"),
+                ), patch(
+                    "ui_next.qt_main.QtWidgets.QMessageBox.information"
+                ) as info_mock, patch(
+                    "ui_next.qt_main.QtWidgets.QMessageBox.warning"
+                ) as warning_mock:
+                    window._export_smart_solver_equations_to_excel()
+
+                info_mock.assert_not_called()
+                warning_mock.assert_not_called()
+                self.assertEqual(len(export_calls), 1)
+                call = export_calls[0]
+                self.assertEqual(call["output_path"], out_path)
+                self.assertEqual(call["run_type_filter"], "pulsed_mode")
+                self.assertEqual(call["control_period_filter"], 30.0)
+                self.assertEqual(call["plot_metadata"]["performance_plot_method"], "cached_condition_means")
+                self.assertEqual(call["plot_metadata"]["selected_control_period"], 30.0)
+                self.assertEqual(call["results_by_stat"]["mean"]["master_model"]["fit_family"], "quadratic_curve_control_period")
+                self.assertEqual(call["run_specs"][0]["run_name"], "CondA")
+                self.assertEqual(call["export_rows_override"][0]["display_name"], "Condition A")
+                self.assertEqual(call["export_rows_override"][0]["serial"], "SN-001")
+        finally:
+            window.close()
+            tmpdir = getattr(window, "_test_tmpdir", "")
+            if tmpdir:
+                shutil.rmtree(str(tmpdir), ignore_errors=True)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -429,6 +429,95 @@ class TestBackendPerfExportExcel(unittest.TestCase):
             finally:
                 wb.close()
 
+    def test_export_equation_workbook_supports_quadratic_curve_control_period_with_override_rows(self) -> None:
+        db_path = _create_perf_export_db()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_path = Path(tmpdir) / "smart_solver_curve_cp.xlsx"
+            exported = backend.td_perf_export_equation_workbook(
+                db_path,
+                out_path,
+                plot_metadata={
+                    "plot_dimension": "2d",
+                    "output_target": "Output",
+                    "output_units": "u",
+                    "input1_target": "Input",
+                    "input1_units": "u",
+                    "input2_target": "",
+                    "input2_units": "",
+                    "run_selection_label": "Smart Equation Solver",
+                    "member_runs": ["cond_2d"],
+                    "performance_run_type_mode": "pulsed_mode",
+                    "performance_filter_mode": "match_control_period",
+                    "selected_control_period": 30.0,
+                    "performance_plot_method": "cached_condition_means",
+                },
+                results_by_stat={
+                    "mean": {
+                        "master_model": {
+                            "fit_family": "quadratic_curve_control_period",
+                            "coeff_cp_models": [[1.0, 0.0], [2.0, 0.0], [3.0, 0.0]],
+                            "x_center": 0.0,
+                            "x_scale": 1.0,
+                            "cp_center": 0.0,
+                            "cp_scale": 1.0,
+                            "equation": "y = a(cp')*x'^2 + b(cp')*x' + c(cp')",
+                            "x_norm_equation": "x' = (x-0)/1; cp' = (control_period-0)/1",
+                        }
+                    }
+                },
+                run_specs=[
+                    {
+                        "run_name": "cond_2d",
+                        "display_name": "Condition 2D",
+                        "input1_column": "Input",
+                        "output_column": "Output",
+                    }
+                ],
+                control_period_filter=30.0,
+                run_type_filter="pulsed_mode",
+                export_rows_override=[
+                    {
+                        "run_name": "cond_2d",
+                        "display_name": "Condition 2D",
+                        "serial": "SN-001",
+                        "observation_id": "SN-001__seq_1",
+                        "program_title": "Program A",
+                        "source_run_name": "Seq-1",
+                        "suppression_voltage": 5.0,
+                        "control_period": 30.0,
+                        "condition_label": "Condition 2D",
+                        "input_1": 10.0,
+                        "input_2": None,
+                        "actual_mean": 120.0,
+                        "sample_count": 1,
+                    }
+                ],
+            )
+
+            self.assertEqual(exported, out_path)
+            wb = load_workbook(str(out_path), data_only=False)
+            try:
+                ws = wb["Equation Export"]
+                header_row = _data_header_row(ws)
+                headers = {
+                    str(ws.cell(header_row, col_idx).value or "").strip(): col_idx
+                    for col_idx in range(1, ws.max_column + 1)
+                    if str(ws.cell(header_row, col_idx).value or "").strip()
+                }
+                self.assertIn("control_period_norm", headers)
+                formula_row = header_row + 1
+                control_period_norm_formula = str(ws.cell(formula_row, headers["control_period_norm"]).value or "")
+                pred_formula = str(ws.cell(formula_row, headers["pred_mean"]).value or "")
+                raw_cp_ref = backend._td_perf_excel_ref(headers["control_period"], formula_row)
+                raw_x_ref = backend._td_perf_excel_ref(headers["input_1"], formula_row)
+                self.assertTrue(control_period_norm_formula.startswith("="))
+                self.assertIn(raw_cp_ref, control_period_norm_formula)
+                self.assertTrue(pred_formula.startswith("="))
+                self.assertIn(raw_cp_ref, pred_formula)
+                self.assertIn(raw_x_ref, pred_formula)
+            finally:
+                wb.close()
+
     def test_export_interactive_equation_workbook_3d_uses_input_2_and_omits_checker_when_disabled(self) -> None:
         db_path = _create_perf_export_db()
         with tempfile.TemporaryDirectory() as tmpdir:

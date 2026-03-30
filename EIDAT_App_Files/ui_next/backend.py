@@ -14992,6 +14992,81 @@ def _td_smart_solver_warning_text(messages: Sequence[object]) -> str:
     return "\n".join(merged)
 
 
+def _td_smart_solver_sequence_cap_value(value: object) -> int:
+    try:
+        limit = int(value)
+    except Exception:
+        return 0
+    return limit if limit > 0 else 0
+
+
+def _td_smart_solver_sequence_identity(point: Mapping[str, object]) -> str:
+    source_run_name = str(point.get("source_run_name") or "").strip()
+    if source_run_name:
+        return source_run_name
+    return str(point.get("observation_id") or "").strip()
+
+
+def _td_smart_solver_sequence_sort_key(value: object) -> tuple[tuple[int, object], ...]:
+    text = str(value or "").strip().casefold()
+    if not text:
+        return ((1, ""),)
+    parts = re.split(r"(\d+)", text)
+    key: list[tuple[int, object]] = []
+    for part in parts:
+        if not part:
+            continue
+        if part.isdigit():
+            key.append((0, int(part)))
+        else:
+            key.append((1, part))
+    return tuple(key or [(1, text)])
+
+
+def _td_smart_solver_apply_sequence_cap(
+    points: Sequence[Mapping[str, object]],
+    keep_first_sequences_per_serial: object,
+) -> tuple[list[dict[str, object]], int, int]:
+    limit = _td_smart_solver_sequence_cap_value(keep_first_sequences_per_serial)
+    materialized = [dict(point) for point in (points or []) if isinstance(point, Mapping)]
+    if limit <= 0 or not materialized:
+        return materialized, 0, 0
+
+    kept_by_serial: dict[str, set[str]] = {}
+    dropped_sequence_count = 0
+
+    serial_sequences: dict[str, dict[str, str]] = {}
+    for point in materialized:
+        serial = str(point.get("serial") or "").strip()
+        if not serial:
+            continue
+        sequence_identity = _td_smart_solver_sequence_identity(point)
+        sequence_key = sequence_identity.casefold()
+        if not sequence_key:
+            continue
+        serial_sequences.setdefault(serial, {}).setdefault(sequence_key, sequence_identity)
+
+    for serial, sequence_map in serial_sequences.items():
+        ordered_keys = sorted(
+            sequence_map.keys(),
+            key=lambda key: _td_smart_solver_sequence_sort_key(sequence_map.get(key) or key),
+        )
+        kept_by_serial[serial] = set(ordered_keys[:limit])
+        dropped_sequence_count += max(0, len(ordered_keys) - min(limit, len(ordered_keys)))
+
+    filtered_points: list[dict[str, object]] = []
+    for point in materialized:
+        serial = str(point.get("serial") or "").strip()
+        if not serial:
+            continue
+        sequence_identity = _td_smart_solver_sequence_identity(point)
+        sequence_key = sequence_identity.casefold()
+        if sequence_key and sequence_key in kept_by_serial.get(serial, set()):
+            filtered_points.append(point)
+    dropped_point_count = max(0, len(materialized) - len(filtered_points))
+    return filtered_points, dropped_sequence_count, dropped_point_count
+
+
 def td_smart_solver_run(
     db_path: Path,
     *,
@@ -14999,6 +15074,7 @@ def td_smart_solver_run(
     input1_target: str,
     input2_target: str = "",
     control_period_hard_input: bool = True,
+    keep_first_sequences_per_serial: int | None = None,
     runs: Sequence[object],
     serials: Sequence[object],
     program_filters: Sequence[object] | None = None,
@@ -15044,6 +15120,9 @@ def td_smart_solver_run(
     input1_units = ""
     input2_units = ""
     points: list[dict[str, object]] = []
+    keep_sequence_limit = _td_smart_solver_sequence_cap_value(keep_first_sequences_per_serial)
+    dropped_sequence_count = 0
+    dropped_point_count = 0
     distinct_suppression_voltages: list[str] = []
     seen_suppression_voltages: set[str] = set()
     sequence_metric_source = TD_METRIC_PLOT_SOURCE_ALL_SEQUENCES
@@ -15172,6 +15251,13 @@ def td_smart_solver_run(
                     "sample_count": 1,
                 }
             )
+
+    if keep_sequence_limit > 0:
+        _td_emit_progress(progress_cb, "Applying sequence cap")
+        points, dropped_sequence_count, dropped_point_count = _td_smart_solver_apply_sequence_cap(
+            points,
+            keep_sequence_limit,
+        )
 
     if not points:
         raise RuntimeError(
@@ -15313,12 +15399,28 @@ def td_smart_solver_run(
             "Suppression voltage is not modeled in Smart Equation Solver v1; "
             f"the fitted rows include multiple voltages: {', '.join(distinct_suppression_voltages)}."
         )
+    if keep_sequence_limit > 0:
+        if dropped_sequence_count > 0 or dropped_point_count > 0:
+            warning_messages.append(
+                "Sequence cap kept the first "
+                f"{keep_sequence_limit} sequence(s) per serial and dropped "
+                f"{dropped_sequence_count} later sequence(s) / {dropped_point_count} fit point(s)."
+            )
+        else:
+            warning_messages.append(
+                f"Sequence cap kept the first {keep_sequence_limit} sequence(s) per serial; no later sequences were present after filtering."
+            )
 
     return {
         "fit_family": str(model.get("fit_family") or ""),
         "equation": str(model.get("equation") or "").strip(),
         "x_norm_equation": str(model.get("x_norm_equation") or "").strip(),
+        "master_model": dict(model),
+        "fit_points": [dict(point) for point in points],
         "control_period_hard_input": bool(control_period_hard_input),
+        "keep_first_sequences_per_serial": int(keep_sequence_limit),
+        "dropped_sequence_count": int(dropped_sequence_count),
+        "dropped_point_count": int(dropped_point_count),
         "rmse": float(rmse),
         "residual_threshold": float(residual_threshold),
         "in_fit_count": int(in_fit_count),
@@ -15738,6 +15840,23 @@ def _td_perf_excel_formula_for_model(
             f"({norm_x1_ref}^2)",
             f"({norm_x1_ref}*{norm_x2_ref})",
             f"({norm_x2_ref}^2)",
+        ]
+        expr_terms: list[str] = []
+        for coeffs, basis in zip(coeff_cp_models, basis_terms):
+            cp_expr = _td_perf_excel_polynomial_expr(coeffs, norm_cp_ref)
+            if not basis:
+                expr_terms.append(cp_expr)
+            else:
+                expr_terms.append(f"({cp_expr}*{basis})")
+        return "=" + "+".join(expr_terms)
+    if family == TD_PERF_FIT_FAMILY_QUADRATIC_CURVE_CONTROL_PERIOD:
+        coeff_cp_models = [[float(v) for v in coeffs] for coeffs in (model.get("coeff_cp_models") or [])]
+        if len(coeff_cp_models) != 3 or not norm_cp_ref:
+            return ""
+        basis_terms = [
+            f"({norm_x_ref}^2)",
+            norm_x_ref,
+            "",
         ]
         expr_terms: list[str] = []
         for coeffs, basis in zip(coeff_cp_models, basis_terms):
@@ -16574,6 +16693,7 @@ def td_perf_export_equation_workbook(
     run_specs: Sequence[Mapping[str, object]],
     control_period_filter: object = None,
     run_type_filter: object = None,
+    export_rows_override: Sequence[Mapping[str, object]] | None = None,
     progress_cb: Callable[[str], None] | None = None,
 ) -> Path:
     try:
@@ -16588,15 +16708,29 @@ def td_perf_export_equation_workbook(
 
     path = Path(output_path).expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
-    _td_emit_progress(progress_cb, "Collecting cached export rows")
-    export_rows = td_perf_collect_export_rows_for_method(
-        db_path,
-        run_specs=run_specs,
-        performance_plot_method=plot_metadata.get("performance_plot_method"),
-        control_period_filter=control_period_filter,
-        run_type_filter=run_type_filter,
-        progress_cb=progress_cb,
-    )
+    if export_rows_override is None:
+        _td_emit_progress(progress_cb, "Collecting cached export rows")
+        export_rows = td_perf_collect_export_rows_for_method(
+            db_path,
+            run_specs=run_specs,
+            performance_plot_method=plot_metadata.get("performance_plot_method"),
+            control_period_filter=control_period_filter,
+            run_type_filter=run_type_filter,
+            progress_cb=progress_cb,
+        )
+    else:
+        _td_emit_progress(progress_cb, "Preparing export rows")
+        export_rows = [dict(row) for row in (export_rows_override or []) if isinstance(row, Mapping)]
+        export_rows.sort(
+            key=lambda row: (
+                str(row.get("run_name") or "").lower(),
+                float(row.get("input_1") or 0.0) if row.get("input_1") not in (None, "") else float("-inf"),
+                float(row.get("input_2") or 0.0) if row.get("input_2") not in (None, "") else float("-inf"),
+                str(row.get("condition_label") or "").lower(),
+                str(row.get("serial") or "").lower(),
+                str(row.get("observation_id") or "").lower(),
+            )
+        )
 
     models_by_stat = _td_perf_export_models_by_stat(results_by_stat)
     if not models_by_stat:
@@ -16615,7 +16749,8 @@ def td_perf_export_equation_workbook(
     helper_model = models_by_stat[helper_source_stat]
     helper_family = td_perf_normalize_fit_mode(helper_model.get("fit_family"))
     uses_control_period_norm = any(
-        td_perf_normalize_fit_mode((model or {}).get("fit_family")) == TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD
+        td_perf_normalize_fit_mode((model or {}).get("fit_family"))
+        in {TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD, TD_PERF_FIT_FAMILY_QUADRATIC_CURVE_CONTROL_PERIOD}
         for model in models_by_stat.values()
         if isinstance(model, Mapping)
     )
@@ -16794,6 +16929,9 @@ def td_perf_export_equation_workbook(
         if is_surface:
             helper_x2_template = _td_perf_excel_norm_expr("{X2}", helper_model.get("x2_center"), helper_model.get("x2_scale"))
         helper_cp_template = _td_perf_excel_norm_expr("{CP}", helper_model.get("cp_center"), helper_model.get("cp_scale"))
+    elif helper_family == TD_PERF_FIT_FAMILY_QUADRATIC_CURVE_CONTROL_PERIOD:
+        helper_x_template = _td_perf_excel_norm_expr("{X}", helper_model.get("x_center"), helper_model.get("x_scale"))
+        helper_cp_template = _td_perf_excel_norm_expr("{CP}", helper_model.get("cp_center"), helper_model.get("cp_scale"))
 
     for idx, row in enumerate(export_rows, start=data_header_row + 1):
         ws.cell(idx, col_by_name["run_name"]).value = str(row.get("run_name") or "")
@@ -16852,6 +16990,9 @@ def td_perf_export_equation_workbook(
                 elif family == TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD:
                     stat_norm_x1_ref = _td_perf_excel_norm_expr(raw_x_ref, model.get("x1_center"), model.get("x1_scale"))
                     stat_norm_x2_ref = _td_perf_excel_norm_expr(raw_x2_ref, model.get("x2_center"), model.get("x2_scale"))
+                    stat_norm_cp_ref = _td_perf_excel_norm_expr(raw_cp_ref, model.get("cp_center"), model.get("cp_scale"))
+                elif family == TD_PERF_FIT_FAMILY_QUADRATIC_CURVE_CONTROL_PERIOD:
+                    stat_norm_x_ref = _td_perf_excel_norm_expr(raw_x_ref, model.get("x_center"), model.get("x_scale"))
                     stat_norm_cp_ref = _td_perf_excel_norm_expr(raw_cp_ref, model.get("cp_center"), model.get("cp_scale"))
                 formula = _td_perf_excel_formula_for_model(
                     model,

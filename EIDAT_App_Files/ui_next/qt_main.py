@@ -3683,12 +3683,23 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         perf_plot_layout.addLayout(mode_row)
 
         filter_row = QtWidgets.QHBoxLayout()
-        filter_row.addWidget(QtWidgets.QLabel("PM control-period filter:"))
+        self.lbl_perf_filter_mode = QtWidgets.QLabel("Pulsed-mode control-period filter:")
+        self.lbl_perf_filter_mode.setToolTip(
+            "Applies only when Condition family is Pulsed mode. Steady-state conditions remain available via the selector above."
+        )
+        filter_row.addWidget(self.lbl_perf_filter_mode)
         self.cb_perf_filter_mode = QtWidgets.QComboBox()
-        self.cb_perf_filter_mode.addItem("All run conditions", "all_conditions")
+        self.cb_perf_filter_mode.addItem("All PM control periods", "all_conditions")
         self.cb_perf_filter_mode.addItem("Match control period", "match_control_period")
+        self.cb_perf_filter_mode.setToolTip(
+            "Filters pulsed-mode rows by control period. Steady-state rows are selected with Condition family."
+        )
         filter_row.addWidget(self.cb_perf_filter_mode, 1)
-        filter_row.addWidget(QtWidgets.QLabel("Control period:"))
+        self.lbl_perf_control_period = QtWidgets.QLabel("Control period:")
+        self.lbl_perf_control_period.setToolTip(
+            "Select the pulsed-mode control period to match when the filter mode requires it."
+        )
+        filter_row.addWidget(self.lbl_perf_control_period)
         self.cb_perf_control_period = QtWidgets.QComboBox()
         self.cb_perf_control_period.setEnabled(False)
         filter_row.addWidget(self.cb_perf_control_period, 1)
@@ -4012,9 +4023,13 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self.btn_solver_resolve = QtWidgets.QPushButton("Re-solve")
         self.btn_solver_resolve.setEnabled(False)
         self.btn_solver_resolve.clicked.connect(lambda: self._run_smart_solver(user_initiated=True))
+        self.btn_solver_export_equations = QtWidgets.QPushButton("Export Equation to Excel")
+        self.btn_solver_export_equations.setEnabled(False)
+        self.btn_solver_export_equations.clicked.connect(self._export_smart_solver_equations_to_excel)
         smart_solver_action_row.addWidget(self.btn_solver_config)
         smart_solver_action_row.addWidget(self.btn_solver_run)
         smart_solver_action_row.addWidget(self.btn_solver_resolve)
+        smart_solver_action_row.addWidget(self.btn_solver_export_equations)
         smart_solver_action_row.addStretch(1)
         smart_solver_layout.addLayout(smart_solver_action_row)
 
@@ -8613,15 +8628,61 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         if not output_name or not input1_name:
             return "Config: -"
         cp_mode = "Hard Input" if bool(cfg.get("control_period_hard_input", True)) else "Swept Input"
+        seq_cap_raw = getattr(be, "_td_smart_solver_sequence_cap_value", None)
+        seq_cap_value = seq_cap_raw(cfg.get("keep_first_sequences_per_serial")) if callable(seq_cap_raw) else 0
+        seq_cap_text = "Unlimited" if seq_cap_value <= 0 else f"first {seq_cap_value} / serial"
         if input2_name:
             return (
                 f"Config: Output = {output_name} | Input 1 = {input1_name} | "
-                f"Input 2 = {input2_name} | Control Period = {cp_mode}"
+                f"Input 2 = {input2_name} | Control Period = {cp_mode} | Seq cap = {seq_cap_text}"
             )
         return (
             f"Config: Output = {output_name} | Input 1 = {input1_name} | "
-            f"2D Solver | Control Period = {cp_mode}"
+            f"2D Solver | Control Period = {cp_mode} | Seq cap = {seq_cap_text}"
         )
+
+    def _smart_solver_has_exportable_model(self) -> bool:
+        result = dict(getattr(self, "_smart_solver_result", {}) or {})
+        model = result.get("master_model") or {}
+        return isinstance(model, dict) and bool(str(model.get("fit_family") or "").strip())
+
+    def _smart_solver_export_rows(self, result: dict[str, object] | None = None) -> list[dict[str, object]]:
+        payload = result if isinstance(result, dict) else (getattr(self, "_smart_solver_result", {}) or {})
+        rows: list[dict[str, object]] = []
+        for raw_row in (payload.get("fit_points") or []):
+            if not isinstance(raw_row, dict):
+                continue
+            run_name = str(raw_row.get("run_name") or "").strip()
+            if not run_name:
+                continue
+            rows.append(
+                {
+                    "run_name": run_name,
+                    "display_name": self._run_display_text(run_name),
+                    "serial": str(raw_row.get("serial") or "").strip(),
+                    "observation_id": str(raw_row.get("observation_id") or "").strip(),
+                    "program_title": str(raw_row.get("program_title") or "").strip(),
+                    "source_run_name": str(raw_row.get("source_run_name") or "").strip(),
+                    "suppression_voltage": raw_row.get("suppression_voltage"),
+                    "control_period": raw_row.get("control_period"),
+                    "condition_label": str(raw_row.get("condition_label") or "").strip(),
+                    "input_1": raw_row.get("input_1"),
+                    "input_2": raw_row.get("input_2"),
+                    "actual_mean": raw_row.get("actual_mean"),
+                    "sample_count": raw_row.get("sample_count"),
+                }
+            )
+        rows.sort(
+            key=lambda row: (
+                str(row.get("run_name") or "").lower(),
+                float(row.get("input_1") or 0.0) if row.get("input_1") not in (None, "") else float("-inf"),
+                float(row.get("input_2") or 0.0) if row.get("input_2") not in (None, "") else float("-inf"),
+                str(row.get("condition_label") or "").lower(),
+                str(row.get("serial") or "").lower(),
+                str(row.get("observation_id") or "").lower(),
+            )
+        )
+        return rows
 
     def _smart_solver_filter_summary_text(self) -> str:
         parts = [
@@ -8652,6 +8713,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
     def _refresh_smart_solver_ui(self) -> None:
         is_solver = str(getattr(self, "_mode", "") or "").strip().lower() == "smart_solver"
         busy = bool(getattr(self, "_smart_solver_worker", None) and self._smart_solver_worker.isRunning())
+        export_busy = bool(getattr(self, "_export_worker", None) and self._export_worker.isRunning())
         has_result = isinstance(self._smart_solver_result, dict) and bool(self._smart_solver_result)
 
         if hasattr(self, "lbl_right_panel_title"):
@@ -8704,6 +8766,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             self.btn_solver_run.setEnabled(bool(getattr(self, "_db_path", None)) and not busy)
         if hasattr(self, "btn_solver_resolve"):
             self.btn_solver_resolve.setEnabled(has_result and not busy)
+        if hasattr(self, "btn_solver_export_equations"):
+            self.btn_solver_export_equations.setEnabled(self._smart_solver_has_exportable_model() and not busy and not export_busy)
         if hasattr(self, "btn_plot"):
             if is_solver:
                 self.btn_plot.setEnabled(bool(getattr(self, "_db_path", None)) and not busy)
@@ -8754,7 +8818,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
         dlg = QtWidgets.QDialog(self)
         dlg.setWindowTitle("Smart Equation Solver Config")
-        dlg.resize(720, 340)
+        dlg.resize(720, 380)
         self._smart_solver_popup = dlg
         layout = QtWidgets.QVBoxLayout(dlg)
         layout.setContentsMargins(12, 12, 12, 12)
@@ -8799,6 +8863,20 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         cb_cp_hard_input = QtWidgets.QCheckBox("Treat Control Period as hard input")
         cb_cp_hard_input.setChecked(bool((self._smart_solver_config or {}).get("control_period_hard_input", True)))
         form.addRow("Control Period:", cb_cp_hard_input)
+        sp_keep_sequences = QtWidgets.QSpinBox()
+        sp_keep_sequences.setRange(0, 99999)
+        sp_keep_sequences.setSpecialValueText("Unlimited")
+        sp_keep_sequences.setToolTip(
+            "Keep only the first N sequences per serial after the active solver filters are applied. Later sequences are dropped from the fit."
+        )
+        seq_cap_raw = getattr(be, "_td_smart_solver_sequence_cap_value", None)
+        seq_cap_value = (
+            seq_cap_raw((self._smart_solver_config or {}).get("keep_first_sequences_per_serial"))
+            if callable(seq_cap_raw)
+            else 0
+        )
+        sp_keep_sequences.setValue(int(seq_cap_value))
+        form.addRow("Keep first N sequences / serial:", sp_keep_sequences)
         form.addRow("Condition Family:", QtWidgets.QLabel("Pulsed mode only"))
         form.addRow("Data Source:", QtWidgets.QLabel("td_metrics_calc_sequences"))
         form.addRow(
@@ -8871,6 +8949,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 "input1_target": input1_name,
                 "input2_target": input2_name,
                 "control_period_hard_input": bool(cb_cp_hard_input.isChecked()),
+                "keep_first_sequences_per_serial": int(sp_keep_sequences.value()),
             }
             self._refresh_smart_solver_ui()
             dlg.accept()
@@ -8955,6 +9034,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 input1_target=str(config.get("input1_target") or "").strip(),
                 input2_target=str(config.get("input2_target") or "").strip(),
                 control_period_hard_input=bool(config.get("control_period_hard_input", True)),
+                keep_first_sequences_per_serial=int(config.get("keep_first_sequences_per_serial") or 0),
                 runs=runs,
                 serials=serials,
                 program_filters=self._active_program_filter_values(),
@@ -9019,6 +9099,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         in_fit_percent = (result or {}).get("in_fit_percent")
         fell_out_count = int((result or {}).get("fell_out_count") or 0)
         sample_count = int((result or {}).get("sample_count") or 0)
+        keep_first_sequences = int((result or {}).get("keep_first_sequences_per_serial") or 0)
+        dropped_sequence_count = int((result or {}).get("dropped_sequence_count") or 0)
+        dropped_point_count = int((result or {}).get("dropped_point_count") or 0)
         summary_text = (
             "In-fit: "
             f"{float(in_fit_percent):.2f}% | Fell out: {fell_out_count} / {sample_count} | "
@@ -9028,6 +9111,11 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             and isinstance(in_fit_percent, (int, float))
             else "Summary: unavailable"
         )
+        if keep_first_sequences > 0:
+            seq_cap_summary = f"Seq cap: first {keep_first_sequences} / serial"
+            if dropped_sequence_count > 0 or dropped_point_count > 0:
+                seq_cap_summary += f" | Dropped: {dropped_sequence_count} seq / {dropped_point_count} pts"
+            summary_text = f"{summary_text} | {seq_cap_summary}" if summary_text else seq_cap_summary
         if hasattr(self, "lbl_smart_solver_equation"):
             self.lbl_smart_solver_equation.setText(f"Equation: {equation_text or '-'}")
             self.lbl_smart_solver_equation.setToolTip(equation_text)
@@ -9038,6 +9126,16 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             self.lbl_smart_solver_summary.setText(summary_text)
 
         warning_text = str((result or {}).get("warning_text") or "").strip()
+        if keep_first_sequences > 0:
+            seq_cap_warning = (
+                "Sequence cap kept the first "
+                f"{keep_first_sequences} sequence(s) per serial and dropped "
+                f"{dropped_sequence_count} sequence(s) / {dropped_point_count} point(s)."
+                if dropped_sequence_count > 0 or dropped_point_count > 0
+                else f"Sequence cap kept the first {keep_first_sequences} sequence(s) per serial."
+            )
+            if seq_cap_warning not in warning_text:
+                warning_text = "\n".join([part for part in [warning_text, seq_cap_warning] if str(part).strip()])
         if hasattr(self, "lbl_smart_solver_warning"):
             self.lbl_smart_solver_warning.setText(warning_text)
             self.lbl_smart_solver_warning.setVisible(bool(warning_text))
@@ -11845,6 +11943,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         run_specs: list[dict[str, object]],
         control_period_filter: object = None,
         run_type_filter: object = None,
+        export_rows_override: list[dict[str, object]] | None = None,
     ) -> None:
         output = Path(output_path).expanduser()
         project_dir = Path(getattr(self, "_project_dir", output.parent)).expanduser()
@@ -11858,6 +11957,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 run_specs=run_specs,
                 control_period_filter=control_period_filter,
                 run_type_filter=run_type_filter,
+                export_rows_override=export_rows_override,
                 progress_cb=report,
             )
 
@@ -12098,6 +12198,113 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 run_specs=run_specs,
                 control_period_filter=control_period_filter,
                 run_type_filter=run_type_mode,
+            )
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Export Equation to Excel", str(exc))
+
+    def _export_smart_solver_equations_to_excel(self) -> None:
+        if not getattr(self, "_db_path", None):
+            QtWidgets.QMessageBox.information(self, "Export Equation to Excel", "Build/refresh cache first.")
+            return
+        if not self._smart_solver_has_exportable_model():
+            QtWidgets.QMessageBox.information(
+                self,
+                "Export Equation to Excel",
+                "Run Smart Equation Solver before exporting its workbook.",
+            )
+            return
+
+        result = dict(getattr(self, "_smart_solver_result", {}) or {})
+        config = dict(getattr(self, "_smart_solver_config", {}) or {})
+        export_rows = self._smart_solver_export_rows(result)
+        if not export_rows:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Export Equation to Excel",
+                "No Smart Equation Solver fit points are available to export.",
+            )
+            return
+
+        output_target = str(result.get("output_target") or config.get("output_target") or "").strip()
+        input1_target = str(result.get("input1_target") or config.get("input1_target") or "").strip()
+        input2_target = str(result.get("input2_target") or config.get("input2_target") or "").strip()
+        if not output_target or not input1_target:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Export Equation to Excel",
+                "Smart Equation Solver output/input targets are incomplete.",
+            )
+            return
+
+        run_names = sorted({str(row.get("run_name") or "").strip() for row in export_rows if str(row.get("run_name") or "").strip()})
+        run_specs = self._perf_export_run_specs(run_names, output_target, input1_target, input2_target)
+        if not run_specs:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Export Equation to Excel",
+                "No qualifying run-condition mappings are available for the Smart Equation Solver export.",
+            )
+            return
+
+        control_period_filters = list(self._active_control_period_filter_values() or [])
+        selected_control_period = control_period_filters[0] if len(control_period_filters) == 1 else None
+        performance_filter_mode = "match_control_period" if selected_control_period not in (None, "") else "all_conditions"
+
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_name = (
+            f"smart_solver_equation_export_run_conditions_{self._perf_export_slug(output_target)}_vs_"
+            f"{self._perf_export_slug(input1_target)}"
+        )
+        if str(input2_target or "").strip():
+            default_name += f"_{self._perf_export_slug(input2_target)}"
+        default_name += f"_{timestamp}.xlsx"
+        out_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Export Equation to Excel",
+            str(self._project_dir / default_name),
+            "Excel Files (*.xlsx)",
+        )
+        if not out_path:
+            return
+
+        results_by_stat = {
+            "mean": {
+                "master_model": dict(result.get("master_model") or {}),
+            }
+        }
+        plot_metadata = {
+            "plot_dimension": str(result.get("plot_dimension") or ("3d" if str(input2_target or "").strip() else "2d")).strip().lower(),
+            "output_target": output_target,
+            "output_units": str(result.get("output_units") or "").strip(),
+            "input1_target": input1_target,
+            "input1_units": str(result.get("input1_units") or "").strip(),
+            "input2_target": input2_target,
+            "input2_units": str(result.get("input2_units") or "").strip(),
+            "run_selection_label": "Smart Equation Solver",
+            "member_runs": list(run_names),
+            "performance_run_type_mode": "pulsed_mode",
+            "performance_filter_mode": performance_filter_mode,
+            "selected_control_period": selected_control_period,
+            "performance_plot_method": "cached_condition_means",
+        }
+        try:
+            asset_serials = sorted({str(row.get("serial") or "").strip() for row in export_rows if str(row.get("serial") or "").strip()})
+            asset_metadata = be.td_perf_collect_asset_metadata(self._db_path, asset_serials)
+        except Exception:
+            asset_metadata = {}
+        if isinstance(asset_metadata, dict):
+            plot_metadata["asset_type"] = str(asset_metadata.get("primary_asset_type") or "").strip()
+            plot_metadata["asset_specific_type"] = str(asset_metadata.get("primary_asset_specific_type") or "").strip()
+
+        try:
+            self._start_perf_equation_excel_export(
+                Path(out_path),
+                plot_metadata=plot_metadata,
+                results_by_stat=results_by_stat,
+                run_specs=run_specs,
+                control_period_filter=selected_control_period,
+                run_type_filter="pulsed_mode",
+                export_rows_override=export_rows,
             )
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "Export Equation to Excel", str(exc))
