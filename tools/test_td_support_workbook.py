@@ -6899,6 +6899,8 @@ class TestTDSupportWorkbook(unittest.TestCase):
         self.assertEqual(be.td_perf_fit_family_label("hybrid_quadratic_residual"), "Hybrid + Quadratic Residual")
         self.assertEqual(be.td_perf_fit_family_label("monotone_pchip"), "Monotone PCHIP")
         self.assertEqual(be.td_perf_fit_family_label("quadratic_surface_control_period"), "Quadratic Surface + Control Period")
+        self.assertEqual(be.td_perf_fit_family_label("quadratic_3input_control_period"), "Quadratic 3-Input + Control Period")
+        self.assertEqual(be.td_perf_fit_family_label("staged_mediator_control_period"), "Staged Mediator + Control Period")
 
     @unittest.skipUnless(_have_scipy(), "scipy not installed")
     def test_perf_fit_model_hybrid_quadratic_residual_competes_and_predicts(self) -> None:

@@ -52,6 +52,8 @@ class _FakeNumpy:
 def _create_smart_solver_db(tmpdir: str, rows: list[dict[str, object]]) -> Path:
     db_path = Path(tmpdir) / "smart_solver.sqlite3"
     runs = sorted({str(row.get("run_name") or "").strip() for row in rows if str(row.get("run_name") or "").strip()})
+    has_input2 = any("input_2" in row for row in rows)
+    has_input3 = any("input_3" in row for row in rows)
     with closing(sqlite3.connect(str(db_path))) as conn:
         backend._ensure_test_data_impl_tables(conn)
         conn.executemany(
@@ -60,12 +62,15 @@ def _create_smart_solver_db(tmpdir: str, rows: list[dict[str, object]]) -> Path:
         )
         column_rows: list[tuple[str, str, str, str]] = []
         for run_name in runs:
-            column_rows.extend(
-                [
-                    (run_name, "Input1", "arb", "y"),
-                    (run_name, "Output", "arb", "y"),
-                ]
-            )
+            run_columns = [
+                (run_name, "Input1", "arb", "y"),
+                (run_name, "Output", "arb", "y"),
+            ]
+            if has_input2:
+                run_columns.insert(1, (run_name, "Input2", "arb", "y"))
+            if has_input3:
+                run_columns.insert(2 if has_input2 else 1, (run_name, "Input3", "arb", "y"))
+            column_rows.extend(run_columns)
         conn.executemany(
             "INSERT OR REPLACE INTO td_columns_calc(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
             column_rows,
@@ -82,6 +87,8 @@ def _create_smart_solver_db(tmpdir: str, rows: list[dict[str, object]]) -> Path:
             control_period = float(row.get("control_period") or 0.0)
             suppression_voltage = float(row.get("suppression_voltage") or 5.0)
             input_1 = float(row.get("input_1") or 0.0)
+            input_2 = float(row.get("input_2") or 0.0) if "input_2" in row else None
+            input_3 = float(row.get("input_3") or 0.0) if "input_3" in row else None
             output = float(row.get("output") or 0.0)
             observation_rows.append(
                 (
@@ -126,6 +133,36 @@ def _create_smart_solver_db(tmpdir: str, rows: list[dict[str, object]]) -> Path:
                     ),
                 ]
             )
+            if has_input2 and input_2 is not None:
+                metric_rows.append(
+                    (
+                        observation_id,
+                        serial,
+                        run_name,
+                        "Input2",
+                        "mean",
+                        input_2,
+                        idx,
+                        idx,
+                        program_title,
+                        source_run_name,
+                    )
+                )
+            if has_input3 and input_3 is not None:
+                metric_rows.append(
+                    (
+                        observation_id,
+                        serial,
+                        run_name,
+                        "Input3",
+                        "mean",
+                        input_3,
+                        idx,
+                        idx,
+                        program_title,
+                        source_run_name,
+                    )
+                )
 
         conn.executemany(
             """
@@ -294,6 +331,46 @@ def _negative_interval_count(xs: list[float], ys: list[float], *, breakpoint: fl
         elif not is_negative:
             in_interval = False
     return intervals
+
+
+def _build_three_input_rows(
+    *,
+    control_periods: list[float],
+    serial: str = "SN-001",
+    run_name: str = "CondA",
+) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    lattice = [
+        (0.8, 1.0),
+        (1.2, 1.3),
+        (1.6, 1.6),
+        (2.0, 1.9),
+        (2.4, 2.2),
+        (2.8, 2.5),
+        (3.2, 2.8),
+        (3.6, 3.1),
+        (4.0, 3.4),
+        (4.4, 3.7),
+    ]
+    for cp_index, control_period in enumerate(control_periods):
+        for point_index, (x1_value, x2_value) in enumerate(lattice):
+            x3_value = (0.6 * x1_value) + (1.1 * x2_value) + (0.015 * control_period)
+            output = (2.8 * x1_value) - (1.4 * x2_value) + (0.9 * x3_value) + (0.08 * control_period)
+            rows.append(
+                {
+                    "observation_id": f"{serial}-{run_name}-{int(control_period)}-{point_index:02d}",
+                    "serial": serial,
+                    "run_name": run_name,
+                    "program_title": "Program Alpha",
+                    "source_run_name": f"Seq-{cp_index + 1}-{point_index + 1}",
+                    "control_period": float(control_period),
+                    "input_1": float(x1_value),
+                    "input_2": float(x2_value),
+                    "input_3": float(x3_value),
+                    "output": float(output),
+                }
+            )
+    return rows
 
 
 class TestBackendTdSmartSolver(unittest.TestCase):
@@ -486,6 +563,197 @@ class TestBackendTdSmartSolver(unittest.TestCase):
         self.assertEqual(captured["fit_xs"], [2.0, 2.0])
         self.assertNotIn(1.0, captured["fit_xs"])
         self.assertNotIn(10.0, captured["fit_xs"])
+
+    def test_three_input_solver_prefers_direct_branch_when_staged_is_not_materially_better(self) -> None:
+        rows = _build_three_input_rows(control_periods=[40.0, 80.0])
+        ordered_rows = sorted(rows, key=lambda row: str(row["observation_id"]))
+        direct_support = {
+            "eligible_control_period_values": [40.0, 80.0],
+            "ignored_control_periods": [],
+            "slice_rows": [
+                {
+                    "control_period": 40.0,
+                    "point_count": 10,
+                    "distinct_x1": 10,
+                    "distinct_x2": 10,
+                    "distinct_x3": 10,
+                    "eligible": True,
+                    "reason": "",
+                },
+                {
+                    "control_period": 80.0,
+                    "point_count": 10,
+                    "distinct_x1": 10,
+                    "distinct_x2": 10,
+                    "distinct_x3": 10,
+                    "eligible": True,
+                    "reason": "",
+                },
+            ],
+        }
+        direct_model = {
+            "fit_family": backend.TD_PERF_FIT_FAMILY_QUADRATIC_3INPUT_CONTROL_PERIOD,
+            "equation": "y = direct",
+            "x_norm_equation": "x' = direct",
+            "rmse": 1.0,
+        }
+        staged_model = {
+            "fit_family": backend.TD_PERF_FIT_FAMILY_STAGED_MEDIATOR_CONTROL_PERIOD,
+            "equation": "y = staged",
+            "x_norm_equation": "x' = staged",
+            "rmse": 0.99,
+        }
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            db_path = _create_smart_solver_db(tmpdir, rows)
+            with patch.object(
+                backend,
+                "_td_perf_analyze_quadratic_3input_control_period_fit_support",
+                return_value=direct_support,
+            ), patch.object(
+                backend,
+                "_td_perf_fit_quadratic_3input_control_period_model",
+                return_value=direct_model,
+            ), patch.object(
+                backend,
+                "_td_perf_fit_staged_mediator_control_period_model",
+                return_value=staged_model,
+            ), patch.object(
+                backend,
+                "_td_perf_predict_quadratic_3input_control_period",
+                return_value=[float(row["output"]) for row in ordered_rows],
+            ), patch.object(
+                backend,
+                "_td_perf_import_numpy",
+                return_value=_FakeNumpy,
+            ):
+                result = backend.td_smart_solver_run(
+                    db_path,
+                    output_target="Output",
+                    input1_target="Input1",
+                    input2_target="Input2",
+                    input3_target="Input3",
+                    runs=["CondA"],
+                    serials=["SN-001"],
+                )
+
+        self.assertEqual(result["fit_family"], backend.TD_PERF_FIT_FAMILY_QUADRATIC_3INPUT_CONTROL_PERIOD)
+        self.assertEqual(result["solver_branch"], backend.TD_PERF_FIT_FAMILY_QUADRATIC_3INPUT_CONTROL_PERIOD)
+        self.assertEqual(result["input3_target"], "Input3")
+        self.assertEqual(result["candidate_scores"]["selected"], backend.TD_PERF_FIT_FAMILY_QUADRATIC_3INPUT_CONTROL_PERIOD)
+        self.assertIn("did not improve RMSE by at least 5%", result["selection_reason"])
+        self.assertEqual(result["slice_rows"][0]["distinct_input_3"], 10)
+        self.assertIn("Correlation helper", result["variable_descriptors"]["input3"])
+        self.assertTrue(all("input_3" in point for point in result["fit_points"]))
+
+    def test_three_input_solver_uses_staged_branch_when_it_beats_direct_by_five_percent(self) -> None:
+        rows = _build_three_input_rows(control_periods=[40.0, 80.0])
+        ordered_rows = sorted(rows, key=lambda row: str(row["observation_id"]))
+        direct_support = {
+            "eligible_control_period_values": [40.0, 80.0],
+            "ignored_control_periods": [],
+            "slice_rows": [
+                {
+                    "control_period": 40.0,
+                    "point_count": 10,
+                    "distinct_x1": 10,
+                    "distinct_x2": 10,
+                    "distinct_x3": 10,
+                    "eligible": True,
+                    "reason": "",
+                },
+                {
+                    "control_period": 80.0,
+                    "point_count": 10,
+                    "distinct_x1": 10,
+                    "distinct_x2": 10,
+                    "distinct_x3": 10,
+                    "eligible": True,
+                    "reason": "",
+                },
+            ],
+        }
+        staged_model = {
+            "fit_family": backend.TD_PERF_FIT_FAMILY_STAGED_MEDIATOR_CONTROL_PERIOD,
+            "equation": "x3_hat = f(...); y = g(...)",
+            "x_norm_equation": "x3' = f(...); y' = g(...)",
+            "rmse": 4.0,
+            "stage1_model": {
+                "fit_family": backend.TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD,
+            },
+            "stage2_model": {
+                "fit_family": backend.TD_PERF_FIT_FAMILY_QUADRATIC_CURVE_CONTROL_PERIOD,
+            },
+            "stage1_slice_rows": [
+                {"control_period": 40.0, "eligible": True, "reason": ""},
+                {"control_period": 80.0, "eligible": True, "reason": ""},
+            ],
+            "stage2_slice_rows": [
+                {"control_period": 40.0, "eligible": True, "reason": ""},
+                {"control_period": 80.0, "eligible": True, "reason": ""},
+            ],
+        }
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            db_path = _create_smart_solver_db(tmpdir, rows)
+            with patch.object(
+                backend,
+                "_td_perf_analyze_quadratic_3input_control_period_fit_support",
+                return_value=direct_support,
+            ), patch.object(
+                backend,
+                "_td_perf_fit_quadratic_3input_control_period_model",
+                return_value={
+                    "fit_family": backend.TD_PERF_FIT_FAMILY_QUADRATIC_3INPUT_CONTROL_PERIOD,
+                    "equation": "y = direct",
+                    "x_norm_equation": "x' = direct",
+                    "rmse": 10.0,
+                },
+            ), patch.object(
+                backend,
+                "_td_perf_fit_staged_mediator_control_period_model",
+                return_value=staged_model,
+            ), patch.object(
+                backend,
+                "td_perf_predict_surface",
+                return_value=[float(row["input_3"]) for row in ordered_rows],
+            ), patch.object(
+                backend,
+                "td_perf_predict_model",
+                return_value=[float(row["output"]) for row in ordered_rows],
+            ), patch.object(
+                backend,
+                "_td_perf_import_numpy",
+                return_value=_FakeNumpy,
+            ):
+                result = backend.td_smart_solver_run(
+                    db_path,
+                    output_target="Output",
+                    input1_target="Input1",
+                    input2_target="Input2",
+                    input3_target="Input3",
+                    runs=["CondA"],
+                    serials=["SN-001"],
+                )
+
+        self.assertEqual(result["fit_family"], backend.TD_PERF_FIT_FAMILY_STAGED_MEDIATOR_CONTROL_PERIOD)
+        self.assertEqual(result["candidate_scores"]["selected"], backend.TD_PERF_FIT_FAMILY_STAGED_MEDIATOR_CONTROL_PERIOD)
+        self.assertIn("improved RMSE by at least 5%", result["selection_reason"])
+        self.assertEqual(result["slice_rows"][0]["distinct_input_3"], 10)
+        self.assertEqual(result["master_model"]["stage1_model"]["fit_family"], backend.TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD)
+        self.assertEqual(result["master_model"]["stage2_model"]["fit_family"], backend.TD_PERF_FIT_FAMILY_QUADRATIC_CURVE_CONTROL_PERIOD)
+
+    def test_three_input_solver_requires_input2_before_input3(self) -> None:
+        rows = _build_three_input_rows(control_periods=[40.0, 80.0])
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            db_path = _create_smart_solver_db(tmpdir, rows)
+            with self.assertRaisesRegex(RuntimeError, "Select Input 2 before using Input 3"):
+                backend.td_smart_solver_run(
+                    db_path,
+                    output_target="Output",
+                    input1_target="Input1",
+                    input3_target="Input3",
+                    runs=["CondA"],
+                    serials=["SN-001"],
+                )
 
     @unittest.skipUnless(_have_scipy(), "scipy is required")
     def test_smart_solver_prefers_stabilized_curve_family_for_low_x_bend(self) -> None:

@@ -14350,6 +14350,453 @@ def _td_perf_fit_quadratic_surface_control_period_model(
     return model
 
 
+def _td_perf_analyze_quadratic_3input_control_period_fit_support(
+    x1s: list[float],
+    x2s: list[float],
+    x3s: list[float],
+    ys: list[float],
+    control_periods: Sequence[float],
+) -> dict[str, object]:
+    np = _td_perf_import_numpy()
+    diagnostics: dict[str, object] = {
+        "eligible_control_period_values": [],
+        "ignored_control_periods": [],
+        "slice_models": [],
+        "slice_rows": [],
+        "x1_center": 0.0,
+        "x1_scale": 1.0,
+        "x2_center": 0.0,
+        "x2_scale": 1.0,
+        "x3_center": 0.0,
+        "x3_scale": 1.0,
+    }
+    if len(x1s) != len(x2s) or len(x1s) != len(x3s) or len(x1s) != len(ys) or len(x1s) != len(control_periods):
+        return diagnostics
+    x1_arr = np.asarray([float(v) for v in x1s], dtype=float)
+    x2_arr = np.asarray([float(v) for v in x2s], dtype=float)
+    x3_arr = np.asarray([float(v) for v in x3s], dtype=float)
+    y_arr = np.asarray([float(v) for v in ys], dtype=float)
+    cp_arr = np.asarray([float(v) for v in control_periods], dtype=float)
+    if not bool(np.all(np.isfinite(x1_arr) & np.isfinite(x2_arr) & np.isfinite(x3_arr) & np.isfinite(y_arr) & np.isfinite(cp_arr))):
+        return diagnostics
+    if len(x1_arr) < 10:
+        return diagnostics
+
+    cp_groups: dict[float, list[int]] = {}
+    for idx, cp_value in enumerate(cp_arr.tolist()):
+        cp_groups.setdefault(round(float(cp_value), 12), []).append(idx)
+
+    x1n_all, x2n_all, x3n_all, x1_center, x1_scale, x2_center, x2_scale, x3_center, x3_scale = _td_perf_surface_normalize_three_axes(
+        x1_arr,
+        x2_arr,
+        x3_arr,
+    )
+    diagnostics.update(
+        {
+            "x1_center": float(x1_center),
+            "x1_scale": float(x1_scale),
+            "x2_center": float(x2_center),
+            "x2_scale": float(x2_scale),
+            "x3_center": float(x3_center),
+            "x3_scale": float(x3_scale),
+        }
+    )
+
+    slice_rows: list[dict[str, object]] = []
+    slice_models: list[dict[str, object]] = []
+    eligible_control_period_values: list[float] = []
+    ignored_control_periods: list[dict[str, object]] = []
+    for cp_value in sorted(float(v) for v in cp_groups.keys()):
+        idxs = cp_groups.get(round(float(cp_value), 12), [])
+        slice_x1 = x1_arr[idxs]
+        slice_x2 = x2_arr[idxs]
+        slice_x3 = x3_arr[idxs]
+        slice_y = y_arr[idxs]
+        point_count = int(len(idxs))
+        distinct_x1 = len({round(float(v), 12) for v in slice_x1.tolist()})
+        distinct_x2 = len({round(float(v), 12) for v in slice_x2.tolist()})
+        distinct_x3 = len({round(float(v), 12) for v in slice_x3.tolist()})
+        reason = _td_perf_three_input_control_period_reason(
+            point_count=point_count,
+            distinct_x1=distinct_x1,
+            distinct_x2=distinct_x2,
+            distinct_x3=distinct_x3,
+        )
+        row = {
+            "control_period": float(cp_value),
+            "point_count": point_count,
+            "distinct_x1": int(distinct_x1),
+            "distinct_x2": int(distinct_x2),
+            "distinct_x3": int(distinct_x3),
+            "eligible": not bool(reason),
+            "reason": reason,
+        }
+        if reason:
+            ignored_control_periods.append(dict(row))
+            slice_rows.append(dict(row))
+            continue
+        slice_x1n = np.asarray([float(x1n_all[idx]) for idx in idxs], dtype=float)
+        slice_x2n = np.asarray([float(x2n_all[idx]) for idx in idxs], dtype=float)
+        slice_x3n = np.asarray([float(x3n_all[idx]) for idx in idxs], dtype=float)
+        design = _td_perf_three_input_design_matrix(slice_x1n, slice_x2n, slice_x3n)
+        _rank_coeffs, _residuals, rank, _singular = np.linalg.lstsq(design, slice_y, rcond=None)
+        if int(rank) < int(design.shape[1]):
+            row["eligible"] = False
+            row["reason"] = _td_perf_three_input_control_period_reason(
+                point_count=point_count,
+                distinct_x1=distinct_x1,
+                distinct_x2=distinct_x2,
+                distinct_x3=distinct_x3,
+                fit_failed=True,
+            )
+            ignored_control_periods.append(dict(row))
+            slice_rows.append(dict(row))
+            continue
+        coeffs, solver, cond_number, ridge_alpha = _td_perf_surface_solve_linear_system(design, slice_y)
+        coeff_list = [float(v) for v in coeffs.tolist()]
+        if len(coeff_list) != 10 or not all(math.isfinite(value) for value in coeff_list):
+            row["eligible"] = False
+            row["reason"] = _td_perf_three_input_control_period_reason(
+                point_count=point_count,
+                distinct_x1=distinct_x1,
+                distinct_x2=distinct_x2,
+                distinct_x3=distinct_x3,
+                fit_failed=True,
+            )
+            ignored_control_periods.append(dict(row))
+            slice_rows.append(dict(row))
+            continue
+        eligible_control_period_values.append(float(cp_value))
+        row["eligible"] = True
+        row["reason"] = ""
+        slice_rows.append(dict(row))
+        slice_models.append(
+            {
+                "control_period": float(cp_value),
+                "coeffs": coeff_list,
+                "solver": str(solver or ""),
+                "condition_number": float(cond_number),
+                "ridge_alpha": float(ridge_alpha),
+                "point_count": point_count,
+                "distinct_x1": int(distinct_x1),
+                "distinct_x2": int(distinct_x2),
+                "distinct_x3": int(distinct_x3),
+            }
+        )
+
+    diagnostics.update(
+        {
+            "eligible_control_period_values": [float(v) for v in eligible_control_period_values],
+            "ignored_control_periods": ignored_control_periods,
+            "slice_models": slice_models,
+            "slice_rows": slice_rows,
+        }
+    )
+    return diagnostics
+
+
+def _td_perf_fit_quadratic_3input_control_period_model(
+    x1s: list[float],
+    x2s: list[float],
+    x3s: list[float],
+    ys: list[float],
+    control_periods: Sequence[float],
+) -> dict[str, object] | None:
+    np = _td_perf_import_numpy()
+    if len(x1s) != len(x2s) or len(x1s) != len(x3s) or len(x1s) != len(ys) or len(x1s) != len(control_periods):
+        return None
+    x1_arr = np.asarray([float(v) for v in x1s], dtype=float)
+    x2_arr = np.asarray([float(v) for v in x2s], dtype=float)
+    x3_arr = np.asarray([float(v) for v in x3s], dtype=float)
+    y_arr = np.asarray([float(v) for v in ys], dtype=float)
+    cp_arr = np.asarray([float(v) for v in control_periods], dtype=float)
+    if not bool(np.all(np.isfinite(x1_arr) & np.isfinite(x2_arr) & np.isfinite(x3_arr) & np.isfinite(y_arr) & np.isfinite(cp_arr))):
+        return None
+    if len(x1_arr) < 10:
+        return None
+
+    support = _td_perf_analyze_quadratic_3input_control_period_fit_support(x1s, x2s, x3s, ys, control_periods)
+    cp_values = [float(v) for v in (support.get("eligible_control_period_values") or [])]
+    slice_models = [dict(item) for item in (support.get("slice_models") or []) if isinstance(item, Mapping)]
+    ignored_control_periods = [dict(item) for item in (support.get("ignored_control_periods") or []) if isinstance(item, Mapping)]
+    x1_center = float(support.get("x1_center") or 0.0)
+    x1_scale = float(support.get("x1_scale") or 1.0)
+    x2_center = float(support.get("x2_center") or 0.0)
+    x2_scale = float(support.get("x2_scale") or 1.0)
+    x3_center = float(support.get("x3_center") or 0.0)
+    x3_scale = float(support.get("x3_scale") or 1.0)
+    if len(cp_values) < 2 or len(slice_models) < 2:
+        return None
+
+    coeff_rows = [[float(v) for v in (slice_model.get("coeffs") or [])] for slice_model in slice_models]
+    cp_norm, cp_center, cp_scale = _td_perf_surface_normalize_control_period(cp_values)
+    cp_degree = 1 if len(cp_values) == 2 else 2
+    coeff_matrix_arr = np.asarray(coeff_rows, dtype=float)
+    coeff_cp_models: list[list[float]] = []
+    coeffs_at_center: list[float] = []
+    for basis_idx in range(coeff_matrix_arr.shape[1]):
+        coeff_values = coeff_matrix_arr[:, basis_idx]
+        cp_coeffs = np.polyfit(cp_norm, coeff_values, cp_degree)
+        coeff_cp_models.append([float(v) for v in cp_coeffs.tolist()])
+        coeffs_at_center.append(float(np.poly1d(cp_coeffs)(0.0)))
+
+    y_hat = np.asarray(
+        _td_perf_predict_quadratic_3input_control_period(
+            {
+                "fit_family": TD_PERF_FIT_FAMILY_QUADRATIC_3INPUT_CONTROL_PERIOD,
+                "x1_center": float(x1_center),
+                "x1_scale": float(x1_scale),
+                "x2_center": float(x2_center),
+                "x2_scale": float(x2_scale),
+                "x3_center": float(x3_center),
+                "x3_scale": float(x3_scale),
+                "cp_center": float(cp_center),
+                "cp_scale": float(cp_scale),
+                "coeff_cp_models": coeff_cp_models,
+            },
+            x1_arr.tolist(),
+            x2_arr.tolist(),
+            x3_arr.tolist(),
+            cp_arr.tolist(),
+        ),
+        dtype=float,
+    )
+    params: dict[str, object] = {
+        "cp_center": float(cp_center),
+        "cp_scale": float(cp_scale),
+        "control_period_degree": int(cp_degree),
+        "control_period_values": [float(v) for v in cp_values],
+        "eligible_control_period_values": [float(v) for v in cp_values],
+        "ignored_control_periods": [dict(entry) for entry in ignored_control_periods],
+        "fit_domain_control_period": [float(min(cp_values)), float(max(cp_values))],
+        "coeff_cp_models": [[float(v) for v in coeffs] for coeffs in coeff_cp_models],
+    }
+    for basis_idx, coeffs in enumerate(coeff_cp_models):
+        params[f"basis_{basis_idx}_cp_coeffs"] = [float(v) for v in coeffs]
+    model = _td_perf_finalize_model(
+        fit_family=TD_PERF_FIT_FAMILY_QUADRATIC_3INPUT_CONTROL_PERIOD,
+        fit_mode=TD_PERF_FIT_FAMILY_QUADRATIC_3INPUT_CONTROL_PERIOD,
+        equation=_td_perf_fmt_3input_control_period_equation(coeff_cp_models),
+        x_norm_equation=_td_perf_fmt_3input_control_period_normalization(
+            x1_center,
+            x1_scale,
+            x2_center,
+            x2_scale,
+            x3_center,
+            x3_scale,
+            cp_center,
+            cp_scale,
+        ),
+        params=params,
+        param_count=(len(coeff_cp_models) * (cp_degree + 1)),
+        x_values=list(range(len(y_arr))),
+        y_true=y_arr,
+        y_hat=y_hat,
+        composite_score=False,
+        extra={
+            "coeffs": [float(v) for v in coeffs_at_center],
+            "coeff_cp_models": [[float(v) for v in coeffs] for coeffs in coeff_cp_models],
+            "x1_center": float(x1_center),
+            "x1_scale": float(x1_scale),
+            "x2_center": float(x2_center),
+            "x2_scale": float(x2_scale),
+            "x3_center": float(x3_center),
+            "x3_scale": float(x3_scale),
+            "cp_center": float(cp_center),
+            "cp_scale": float(cp_scale),
+            "control_period_values": [float(v) for v in cp_values],
+            "eligible_control_period_values": [float(v) for v in cp_values],
+            "ignored_control_periods": [dict(entry) for entry in ignored_control_periods],
+            "control_period_degree": int(cp_degree),
+            "fit_domain_control_period": [float(min(cp_values)), float(max(cp_values))],
+            "slice_models": slice_models,
+            "solver": "slice_polyfit",
+        },
+    )
+    warning_text = _td_perf_format_three_input_control_period_warning(ignored_control_periods)
+    if warning_text:
+        _td_perf_append_fit_warning(model, warning_text)
+    return model
+
+
+def _td_perf_merge_warning_texts(*texts: object, prefix: str = "") -> str:
+    parts: list[str] = []
+    for raw in texts:
+        txt = str(raw or "").strip()
+        if not txt:
+            continue
+        for line in txt.splitlines():
+            line_txt = str(line or "").strip()
+            if not line_txt:
+                continue
+            candidate = f"{prefix}{line_txt}" if prefix else line_txt
+            if candidate not in parts:
+                parts.append(candidate)
+    return "\n".join(parts)
+
+
+def _td_perf_fit_staged_mediator_control_period_model(
+    x1s: list[float],
+    x2s: list[float],
+    x3s: list[float],
+    ys: list[float],
+    control_periods: Sequence[float],
+    *,
+    mediator_target: object,
+    fit_mode: str,
+) -> dict[str, object] | None:
+    np = _td_perf_import_numpy()
+    stage1_support = _td_perf_analyze_quadratic_surface_control_period_fit_support(
+        x1s,
+        x2s,
+        x3s,
+        control_periods,
+        fit_mode=fit_mode,
+    )
+    stage1_model = _td_perf_fit_quadratic_surface_control_period_model(
+        x1s,
+        x2s,
+        x3s,
+        control_periods,
+        fit_mode=fit_mode,
+    )
+    if not isinstance(stage1_model, dict):
+        return None
+    stage2_support = _td_perf_analyze_quadratic_curve_control_period_fit_support(x3s, ys, control_periods)
+    stage2_legacy = _td_perf_fit_quadratic_curve_control_period_model(x3s, ys, control_periods)
+    stage2_model = _td_perf_fit_hybrid_quadratic_residual_control_period_model(
+        x3s,
+        ys,
+        control_periods,
+        support=stage2_support,
+        legacy_model=stage2_legacy,
+    )
+    if not isinstance(stage2_model, dict):
+        stage2_model = stage2_legacy
+    if not isinstance(stage2_model, dict):
+        return None
+
+    x3_hat = td_perf_predict_surface(stage1_model, x1s, x2s, control_period=control_periods)
+    if len(x3_hat) != len(ys):
+        return None
+    y_hat = td_perf_predict_model(stage2_model, x3_hat, control_period=control_periods)
+    if len(y_hat) != len(ys):
+        return None
+    y_hat_arr = np.asarray([float(v) for v in y_hat], dtype=float)
+    y_arr = np.asarray([float(v) for v in ys], dtype=float)
+    model = _td_perf_finalize_model(
+        fit_family=TD_PERF_FIT_FAMILY_STAGED_MEDIATOR_CONTROL_PERIOD,
+        fit_mode=TD_PERF_FIT_FAMILY_STAGED_MEDIATOR_CONTROL_PERIOD,
+        equation=_td_perf_fmt_staged_mediator_control_period_equation(
+            stage1_model.get("equation"),
+            stage2_model.get("equation"),
+            mediator_target=mediator_target,
+        ),
+        x_norm_equation=_td_perf_fmt_staged_mediator_control_period_normalization(
+            stage1_model.get("x_norm_equation"),
+            stage2_model,
+            mediator_target=mediator_target,
+        ),
+        params={
+            "mediator_target": str(mediator_target or "").strip(),
+            "stage1_fit_family": str(stage1_model.get("fit_family") or ""),
+            "stage2_fit_family": str(stage2_model.get("fit_family") or ""),
+        },
+        param_count=int(stage1_model.get("param_count") or 0) + int(stage2_model.get("param_count") or 0),
+        x_values=list(range(len(y_arr))),
+        y_true=y_arr,
+        y_hat=y_hat_arr,
+        composite_score=False,
+        extra={
+            "mediator_target": str(mediator_target or "").strip(),
+            "stage1_model": dict(stage1_model),
+            "stage2_model": dict(stage2_model),
+            "stage1_fit_family": str(stage1_model.get("fit_family") or ""),
+            "stage2_fit_family": str(stage2_model.get("fit_family") or ""),
+            "control_period_values": [float(v) for v in (stage2_model.get("control_period_values") or []) if isinstance(v, (int, float))],
+            "fit_domain_control_period": [
+                float(v)
+                for v in (stage2_model.get("fit_domain_control_period") or [])
+                if isinstance(v, (int, float))
+            ][:2],
+            "stage1_slice_rows": [dict(row) for row in (stage1_support.get("slice_rows") or []) if isinstance(row, Mapping)],
+            "stage2_slice_rows": [dict(row) for row in (stage2_support.get("slice_rows") or []) if isinstance(row, Mapping)],
+            "solver": "staged_mediator_cp",
+            "low_x_breakpoint": _td_finite_float(stage2_model.get("low_x_breakpoint")),
+            "low_x_window_enabled": bool(stage2_model.get("low_x_window_enabled")),
+            "stabilization_passes": int(stage2_model.get("stabilization_passes") or 0),
+            "fallback_used": bool(stage2_model.get("fallback_used")),
+            "base_fit_family": str(stage2_model.get("base_fit_family") or stage2_model.get("fit_family") or ""),
+            "ignored_control_periods": [
+                {"stage": "stage1", **dict(entry)}
+                for entry in (stage1_model.get("ignored_control_periods") or [])
+                if isinstance(entry, Mapping)
+            ] + [
+                {"stage": "stage2", **dict(entry)}
+                for entry in (stage2_model.get("ignored_control_periods") or [])
+                if isinstance(entry, Mapping)
+            ],
+            "support_profile": {
+                "stage1": dict(stage1_model.get("support_profile") or {}) if isinstance(stage1_model.get("support_profile"), Mapping) else {},
+                "stage2": dict(stage2_model.get("support_profile") or {}) if isinstance(stage2_model.get("support_profile"), Mapping) else {},
+            },
+        },
+    )
+    combined_warning = _td_perf_merge_warning_texts(
+        _td_perf_merge_warning_texts(stage1_model.get("fit_warning_text"), prefix="Stage 1: "),
+        _td_perf_merge_warning_texts(stage2_model.get("fit_warning_text"), prefix="Stage 2: "),
+    )
+    if combined_warning:
+        _td_perf_append_fit_warning(model, combined_warning)
+    return model
+
+
+def _td_smart_solver_stage_slice_rows(
+    points: Sequence[Mapping[str, object]],
+    *,
+    stage1_model: Mapping[str, object],
+    stage2_model: Mapping[str, object],
+) -> list[dict[str, object]]:
+    cp_groups: dict[float, list[Mapping[str, object]]] = {}
+    for point in points:
+        cp_value = _td_finite_float(point.get("control_period"))
+        if cp_value is None:
+            continue
+        cp_groups.setdefault(round(float(cp_value), 12), []).append(point)
+    stage1_rows = {
+        round(float(entry.get("control_period") or 0.0), 12): dict(entry)
+        for entry in (stage1_model.get("stage1_slice_rows") or stage1_model.get("slice_rows") or [])
+        if isinstance(entry, Mapping)
+    }
+    stage2_rows = {
+        round(float(entry.get("control_period") or 0.0), 12): dict(entry)
+        for entry in (stage2_model.get("stage2_slice_rows") or stage2_model.get("slice_rows") or [])
+        if isinstance(entry, Mapping)
+    }
+    rows: list[dict[str, object]] = []
+    for cp_key in sorted(cp_groups.keys()):
+        members = cp_groups.get(cp_key, [])
+        stage1_row = stage1_rows.get(cp_key, {})
+        stage2_row = stage2_rows.get(cp_key, {})
+        reasons: list[str] = []
+        if stage1_row and not bool(stage1_row.get("eligible")):
+            reasons.append(f"Stage 1: {str(stage1_row.get('reason') or '').strip()}")
+        if stage2_row and not bool(stage2_row.get("eligible")):
+            reasons.append(f"Stage 2: {str(stage2_row.get('reason') or '').strip()}")
+        rows.append(
+            {
+                "control_period": float(cp_key),
+                "point_count": int(len(members)),
+                "distinct_x1": len({round(float(point.get("input_1") or 0.0), 12) for point in members if _td_finite_float(point.get("input_1")) is not None}),
+                "distinct_x2": len({round(float(point.get("input_2") or 0.0), 12) for point in members if _td_finite_float(point.get("input_2")) is not None}),
+                "distinct_x3": len({round(float(point.get("input_3") or 0.0), 12) for point in members if _td_finite_float(point.get("input_3")) is not None}),
+                "eligible": bool(stage1_row.get("eligible", True)) and bool(stage2_row.get("eligible", True)),
+                "reason": "; ".join(part for part in reasons if part),
+            }
+        )
+    return rows
+
+
 def _td_perf_analyze_quadratic_curve_control_period_fit_support(
     xs: list[float],
     ys: list[float],
@@ -15963,6 +16410,19 @@ def _td_smart_solver_warning_text(messages: Sequence[object]) -> str:
     return "\n".join(merged)
 
 
+TD_SMART_SOLVER_VARIABLE_DESCRIPTORS = {
+    "output": "Metric the solver predicts.",
+    "input1": "Primary driver. Always required.",
+    "input2": "Secondary direct driver for the 3D solve.",
+    "input3": "Correlation helper. Use when a third metric improves the solve, especially in edge cases.",
+    "control_period": "Control-period behavior remains unchanged in this solver pass.",
+}
+
+
+def td_smart_solver_variable_descriptors() -> dict[str, str]:
+    return dict(TD_SMART_SOLVER_VARIABLE_DESCRIPTORS)
+
+
 def _td_smart_solver_sequence_cap_value(value: object) -> int:
     try:
         limit = int(value)
@@ -16044,6 +16504,7 @@ def td_smart_solver_run(
     output_target: str,
     input1_target: str,
     input2_target: str = "",
+    input3_target: str = "",
     control_period_hard_input: bool = True,
     keep_first_sequences_per_serial: int | None = None,
     runs: Sequence[object],
@@ -16065,8 +16526,11 @@ def td_smart_solver_run(
     output_name = str(output_target or "").strip()
     input1_name = str(input1_target or "").strip()
     input2_name = str(input2_target or "").strip()
+    input3_name = str(input3_target or "").strip()
     if not output_name or not input1_name:
         raise RuntimeError("Select Output and Input 1 before running Smart Equation Solver.")
+    if input3_name and not input2_name:
+        raise RuntimeError("Select Input 2 before using Input 3 in Smart Equation Solver.")
 
     runs_list = [str(value or "").strip() for value in (runs or []) if str(value or "").strip()]
     serial_set = {str(value or "").strip() for value in (serials or []) if str(value or "").strip()}
@@ -16090,6 +16554,7 @@ def td_smart_solver_run(
     output_units = ""
     input1_units = ""
     input2_units = ""
+    input3_units = ""
     points: list[dict[str, object]] = []
     keep_sequence_limit = _td_smart_solver_sequence_cap_value(keep_first_sequences_per_serial)
     dropped_sequence_count = 0
@@ -16105,14 +16570,20 @@ def td_smart_solver_run(
         input1_col, input1_units_candidate = _td_perf_resolve_y_col_units(path, run_name, input1_name)
         input2_col = ""
         input2_units_candidate = ""
+        input3_col = ""
+        input3_units_candidate = ""
         if input2_name:
             input2_col, input2_units_candidate = _td_perf_resolve_y_col_units(path, run_name, input2_name)
-        if not output_col or not input1_col or (input2_name and not input2_col):
+        if input3_name:
+            input3_col, input3_units_candidate = _td_perf_resolve_y_col_units(path, run_name, input3_name)
+        if not output_col or not input1_col or (input2_name and not input2_col) or (input3_name and not input3_col):
             continue
         output_units = output_units or output_units_candidate
         input1_units = input1_units or input1_units_candidate
         if input2_name:
             input2_units = input2_units or input2_units_candidate
+        if input3_name:
+            input3_units = input3_units or input3_units_candidate
 
         x1_rows = td_load_metric_series(
             path,
@@ -16134,6 +16605,18 @@ def td_smart_solver_run(
             if input2_name and input2_col
             else []
         )
+        x3_rows = (
+            td_load_metric_series(
+                path,
+                run_name,
+                input3_col,
+                "mean",
+                run_type_filter="pulsed_mode",
+                metric_source=sequence_metric_source,
+            )
+            if input3_name and input3_col
+            else []
+        )
         y_rows = td_load_metric_series(
             path,
             run_name,
@@ -16142,7 +16625,7 @@ def td_smart_solver_run(
             run_type_filter="pulsed_mode",
             metric_source=sequence_metric_source,
         )
-        if not x1_rows or not y_rows or (input2_name and not x2_rows):
+        if not x1_rows or not y_rows or (input2_name and not x2_rows) or (input3_name and not x3_rows):
             continue
 
         x1_map = {
@@ -16155,6 +16638,11 @@ def td_smart_solver_run(
             for row in x2_rows
             if isinstance(row, dict) and str(row.get("observation_id") or "").strip()
         }
+        x3_map = {
+            str(row.get("observation_id") or "").strip(): dict(row)
+            for row in x3_rows
+            if isinstance(row, dict) and str(row.get("observation_id") or "").strip()
+        }
         y_map = {
             str(row.get("observation_id") or "").strip(): dict(row)
             for row in y_rows
@@ -16163,39 +16651,50 @@ def td_smart_solver_run(
         common_ids = set(x1_map.keys()) & set(y_map.keys())
         if input2_name:
             common_ids &= set(x2_map.keys())
+        if input3_name:
+            common_ids &= set(x3_map.keys())
         for observation_id in sorted(common_ids):
             row_x1 = x1_map.get(observation_id) or {}
             row_x2 = x2_map.get(observation_id) or {}
+            row_x3 = x3_map.get(observation_id) or {}
             row_y = y_map.get(observation_id) or {}
-            base_row = row_y or row_x1 or row_x2
-            serial = str(base_row.get("serial") or row_x1.get("serial") or row_x2.get("serial") or "").strip()
+            base_row = row_y or row_x1 or row_x2 or row_x3
+            serial = str(base_row.get("serial") or row_x1.get("serial") or row_x2.get("serial") or row_x3.get("serial") or "").strip()
             if not serial or serial not in serial_set:
                 continue
             program_title = str(
                 base_row.get("program_title")
                 or row_x1.get("program_title")
                 or row_x2.get("program_title")
+                or row_x3.get("program_title")
                 or ""
             ).strip()
             if program_allowed and (program_title or "Unknown Program") not in program_allowed:
                 continue
             suppression_voltage = base_row.get(
                 "suppression_voltage",
-                row_x1.get("suppression_voltage", row_x2.get("suppression_voltage")),
+                row_x1.get("suppression_voltage", row_x2.get("suppression_voltage", row_x3.get("suppression_voltage"))),
             )
             if not _td_smart_solver_match_filter_value(suppression_voltage, suppression_allowed):
                 continue
             control_period = base_row.get(
                 "control_period",
-                row_x1.get("control_period", row_x2.get("control_period")),
+                row_x1.get("control_period", row_x2.get("control_period", row_x3.get("control_period"))),
             )
             if not _td_smart_solver_match_filter_value(control_period, control_period_allowed):
                 continue
             x1_value = _td_finite_float(row_x1.get("value_num"))
             x2_value = _td_finite_float(row_x2.get("value_num")) if input2_name else None
+            x3_value = _td_finite_float(row_x3.get("value_num")) if input3_name else None
             y_value = _td_finite_float(row_y.get("value_num"))
             cp_value = _td_finite_float(control_period)
-            if x1_value is None or y_value is None or cp_value is None or (input2_name and x2_value is None):
+            if (
+                x1_value is None
+                or y_value is None
+                or cp_value is None
+                or (input2_name and x2_value is None)
+                or (input3_name and x3_value is None)
+            ):
                 continue
             suppression_label = _td_smart_solver_compact_value(suppression_voltage)
             if suppression_label and suppression_label not in seen_suppression_voltages:
@@ -16218,6 +16717,7 @@ def td_smart_solver_run(
                     "suppression_voltage": suppression_voltage,
                     "input_1": float(x1_value),
                     "input_2": (float(x2_value) if input2_name and x2_value is not None else None),
+                    "input_3": (float(x3_value) if input3_name and x3_value is not None else None),
                     "actual_mean": float(y_value),
                     "sample_count": 1,
                 }
@@ -16248,9 +16748,147 @@ def td_smart_solver_run(
     y_values = [float(point["actual_mean"]) for point in points]
     cp_values = [float(point["control_period"]) for point in points]
     x2_values = [float(point["input_2"]) for point in points if point.get("input_2") not in (None, "")]
+    x3_values = [float(point["input_3"]) for point in points if point.get("input_3") not in (None, "")]
 
     fit_mode = TD_PERF_FIT_MODE_POLYNOMIAL_SURFACE
-    if input2_name:
+    variable_descriptors = td_smart_solver_variable_descriptors()
+    support: dict[str, object] = {}
+    slice_rows: list[dict[str, object]] = []
+    selection_reason = "Current solver path selected from configured inputs."
+    candidate_scores: dict[str, object] = {}
+
+    if input3_name:
+        direct_support = _td_perf_analyze_quadratic_3input_control_period_fit_support(
+            x1_values,
+            x2_values,
+            x3_values,
+            y_values,
+            cp_values,
+        )
+        direct_eligible_control_period_values = [float(value) for value in (direct_support.get("eligible_control_period_values") or [])]
+        direct_model = None
+        if len(direct_eligible_control_period_values) >= 2:
+            _td_emit_progress(progress_cb, "Fitting 3-input direct control-period slices")
+            direct_model = _td_perf_fit_quadratic_3input_control_period_model(
+                x1_values,
+                x2_values,
+                x3_values,
+                y_values,
+                cp_values,
+            )
+        staged_model = None
+        _td_emit_progress(progress_cb, "Evaluating staged mediator candidate")
+        staged_model = _td_perf_fit_staged_mediator_control_period_model(
+            x1_values,
+            x2_values,
+            x3_values,
+            y_values,
+            cp_values,
+            mediator_target=input3_name,
+            fit_mode=fit_mode,
+        )
+
+        direct_rmse = float(direct_model.get("rmse")) if isinstance(direct_model, Mapping) and isinstance(direct_model.get("rmse"), (int, float)) else float("inf")
+        staged_rmse = float(staged_model.get("rmse")) if isinstance(staged_model, Mapping) and isinstance(staged_model.get("rmse"), (int, float)) else float("inf")
+        candidate_scores = {
+            "selected": "",
+            "direct": {
+                "available": bool(isinstance(direct_model, Mapping)),
+                "fit_family": str((direct_model or {}).get("fit_family") or TD_PERF_FIT_FAMILY_QUADRATIC_3INPUT_CONTROL_PERIOD),
+                "rmse": (float(direct_rmse) if math.isfinite(direct_rmse) else None),
+                "eligible_control_period_count": int(len(direct_eligible_control_period_values)),
+            },
+            "staged": {
+                "available": bool(isinstance(staged_model, Mapping)),
+                "fit_family": str((staged_model or {}).get("fit_family") or TD_PERF_FIT_FAMILY_STAGED_MEDIATOR_CONTROL_PERIOD),
+                "rmse": (float(staged_rmse) if math.isfinite(staged_rmse) else None),
+            },
+        }
+
+        if isinstance(direct_model, Mapping) and isinstance(staged_model, Mapping):
+            if math.isfinite(staged_rmse) and math.isfinite(direct_rmse) and staged_rmse <= (0.95 * direct_rmse):
+                model = dict(staged_model)
+                support = {}
+                slice_rows = [
+                    {
+                        "control_period": row.get("control_period"),
+                        "point_count": int(row.get("point_count") or 0),
+                        "distinct_input_1": int(row.get("distinct_x1") or 0),
+                        "distinct_input_2": int(row.get("distinct_x2") or 0),
+                        "distinct_input_3": int(row.get("distinct_x3") or 0),
+                        "eligible": bool(row.get("eligible")),
+                        "reason": str(row.get("reason") or "").strip(),
+                    }
+                    for row in _td_smart_solver_stage_slice_rows(points, stage1_model=model, stage2_model=model)
+                ]
+                selection_reason = (
+                    "Staged mediator branch selected because it improved RMSE by at least 5% "
+                    f"({staged_rmse:.6g} vs {direct_rmse:.6g})."
+                )
+            else:
+                model = dict(direct_model)
+                support = dict(direct_support)
+                slice_rows = [
+                    {
+                        "control_period": row.get("control_period"),
+                        "point_count": int(row.get("point_count") or 0),
+                        "distinct_input_1": int(row.get("distinct_x1") or 0),
+                        "distinct_input_2": int(row.get("distinct_x2") or 0),
+                        "distinct_input_3": int(row.get("distinct_x3") or 0),
+                        "eligible": bool(row.get("eligible")),
+                        "reason": str(row.get("reason") or "").strip(),
+                    }
+                    for row in (direct_support.get("slice_rows") or [])
+                    if isinstance(row, Mapping)
+                ]
+                selection_reason = (
+                    "Direct 3-input branch retained because the staged mediator branch did not improve RMSE by at least 5%."
+                )
+        elif isinstance(direct_model, Mapping):
+            model = dict(direct_model)
+            support = dict(direct_support)
+            slice_rows = [
+                {
+                    "control_period": row.get("control_period"),
+                    "point_count": int(row.get("point_count") or 0),
+                    "distinct_input_1": int(row.get("distinct_x1") or 0),
+                    "distinct_input_2": int(row.get("distinct_x2") or 0),
+                    "distinct_input_3": int(row.get("distinct_x3") or 0),
+                    "eligible": bool(row.get("eligible")),
+                    "reason": str(row.get("reason") or "").strip(),
+                }
+                for row in (direct_support.get("slice_rows") or [])
+                if isinstance(row, Mapping)
+            ]
+            selection_reason = "Direct 3-input branch selected because the staged mediator candidate was unavailable."
+        elif isinstance(staged_model, Mapping):
+            model = dict(staged_model)
+            support = {}
+            slice_rows = [
+                {
+                    "control_period": row.get("control_period"),
+                    "point_count": int(row.get("point_count") or 0),
+                    "distinct_input_1": int(row.get("distinct_x1") or 0),
+                    "distinct_input_2": int(row.get("distinct_x2") or 0),
+                    "distinct_input_3": int(row.get("distinct_x3") or 0),
+                    "eligible": bool(row.get("eligible")),
+                    "reason": str(row.get("reason") or "").strip(),
+                }
+                for row in _td_smart_solver_stage_slice_rows(points, stage1_model=model, stage2_model=model)
+            ]
+            direct_failure_text = _td_perf_format_three_input_control_period_failure(
+                direct_support.get("ignored_control_periods") or [],
+                eligible_count=len(direct_eligible_control_period_values),
+            )
+            selection_reason = f"Staged mediator branch selected because the direct 3-input branch was unavailable. {direct_failure_text}"
+        else:
+            direct_failure_text = _td_perf_format_three_input_control_period_failure(
+                direct_support.get("ignored_control_periods") or [],
+                eligible_count=len(direct_eligible_control_period_values),
+            )
+            raise RuntimeError(f"{direct_failure_text} Staged mediator candidate was also unavailable.")
+        candidate_scores["selected"] = str(model.get("fit_family") or "")
+    elif input2_name:
         support = _td_perf_analyze_quadratic_surface_control_period_fit_support(
             x1_values,
             x2_values,
@@ -16266,6 +16904,7 @@ def td_smart_solver_run(
                 "point_count": int(row.get("point_count") or 0),
                 "distinct_input_1": int(row.get("distinct_x1") or 0),
                 "distinct_input_2": int(row.get("distinct_x2") or 0),
+                "distinct_input_3": None,
                 "eligible": bool(row.get("eligible")),
                 "reason": str(row.get("reason") or "").strip(),
             }
@@ -16285,13 +16924,14 @@ def td_smart_solver_run(
                 "point_count": int(row.get("point_count") or 0),
                 "distinct_input_1": int(row.get("distinct_x1") or 0),
                 "distinct_input_2": None,
+                "distinct_input_3": None,
                 "eligible": bool(row.get("eligible")),
                 "reason": str(row.get("reason") or "").strip(),
             }
             for row in slice_rows_raw
         ]
 
-    if len(eligible_control_period_values) < 2:
+    if not input3_name and len(eligible_control_period_values) < 2:
         if input2_name:
             failure_text = _td_perf_format_surface_control_period_failure(
                 support.get("ignored_control_periods") or [],
@@ -16306,50 +16946,70 @@ def td_smart_solver_run(
             failure_text = f"{failure_text} Broaden the active control-period filter and try again."
         raise RuntimeError(failure_text)
 
-    _td_emit_progress(progress_cb, "Fitting control-period slices")
-    if input2_name:
-        model = _td_perf_fit_quadratic_surface_control_period_model(
-            x1_values,
-            x2_values,
-            y_values,
-            cp_values,
-            fit_mode=fit_mode,
-        )
-    else:
-        legacy_curve_model = _td_perf_fit_quadratic_curve_control_period_model(
-            x1_values,
-            y_values,
-            cp_values,
-        )
-        model = _td_perf_fit_hybrid_quadratic_residual_control_period_model(
-            x1_values,
-            y_values,
-            cp_values,
-            support=support,
-            legacy_model=legacy_curve_model,
-        )
+    if not input3_name:
+        _td_emit_progress(progress_cb, "Fitting control-period slices")
+        if input2_name:
+            model = _td_perf_fit_quadratic_surface_control_period_model(
+                x1_values,
+                x2_values,
+                y_values,
+                cp_values,
+                fit_mode=fit_mode,
+            )
+        else:
+            legacy_curve_model = _td_perf_fit_quadratic_curve_control_period_model(
+                x1_values,
+                y_values,
+                cp_values,
+            )
+            model = _td_perf_fit_hybrid_quadratic_residual_control_period_model(
+                x1_values,
+                y_values,
+                cp_values,
+                support=support,
+                legacy_model=legacy_curve_model,
+            )
+            if not isinstance(model, dict):
+                model = legacy_curve_model
         if not isinstance(model, dict):
-            model = legacy_curve_model
-    if not isinstance(model, dict):
-        raise RuntimeError(
-            "Smart Equation Solver could not fit a control-period-aware model for the filtered sequence rows."
-        )
+            raise RuntimeError(
+                "Smart Equation Solver could not fit a control-period-aware model for the filtered sequence rows."
+            )
+        candidate_scores = {"selected": str(model.get("fit_family") or "")}
+
+    model["solver_branch"] = str(model.get("fit_family") or "")
+    model["selection_reason"] = selection_reason
+    model["candidate_scores"] = dict(candidate_scores)
 
     _td_emit_progress(progress_cb, "Binding CP coefficients")
-    predictions = (
-        td_perf_predict_surface(
+    if input3_name and str(model.get("fit_family") or "") == TD_PERF_FIT_FAMILY_QUADRATIC_3INPUT_CONTROL_PERIOD:
+        predictions = _td_perf_predict_quadratic_3input_control_period(
             model,
             x1_values,
             x2_values,
-            control_period=cp_values,
+            x3_values,
+            cp_values,
         )
-        if input2_name
-        else td_perf_predict_model(
-            model,
-            x1_values,
-            control_period=cp_values,
+    elif input3_name and str(model.get("fit_family") or "") == TD_PERF_FIT_FAMILY_STAGED_MEDIATOR_CONTROL_PERIOD:
+        stage1_model = dict(model.get("stage1_model") or {})
+        stage2_model = dict(model.get("stage2_model") or {})
+        mediator_predictions = td_perf_predict_surface(stage1_model, x1_values, x2_values, control_period=cp_values)
+        predictions = td_perf_predict_model(stage2_model, mediator_predictions, control_period=cp_values)
+    else:
+        predictions = (
+            td_perf_predict_surface(
+                model,
+                x1_values,
+                x2_values,
+                control_period=cp_values,
+            )
+            if input2_name
+            else td_perf_predict_model(
+                model,
+                x1_values,
+                control_period=cp_values,
+            )
         )
-    )
     if len(predictions) != len(points):
         raise RuntimeError("Smart Equation Solver could not score the fitted surface.")
 
@@ -16407,7 +17067,11 @@ def td_smart_solver_run(
         "sample_count": int(sample_count),
         "in_fit_percent": float(in_fit_percent),
         "warning_text": _td_smart_solver_warning_text(warning_messages),
-        "ignored_control_periods": [dict(item) for item in (support.get("ignored_control_periods") or []) if isinstance(item, Mapping)],
+        "ignored_control_periods": (
+            [dict(item) for item in (support.get("ignored_control_periods") or []) if isinstance(item, Mapping)]
+            if support
+            else [dict(row) for row in slice_rows if not bool(row.get("eligible"))]
+        ),
         "slice_rows": slice_rows,
         "low_x_breakpoint": _td_finite_float(model.get("low_x_breakpoint")),
         "low_x_window_enabled": bool(model.get("low_x_window_enabled")),
@@ -16431,6 +17095,12 @@ def td_smart_solver_run(
         "input1_units": input1_units,
         "input2_target": input2_name,
         "input2_units": input2_units,
+        "input3_target": input3_name,
+        "input3_units": input3_units,
+        "solver_branch": str(model.get("fit_family") or ""),
+        "selection_reason": selection_reason,
+        "candidate_scores": dict(candidate_scores),
+        "variable_descriptors": variable_descriptors,
         "run_count": int(len({str(point.get('run_name') or '').strip() for point in points if str(point.get('run_name') or '').strip()})),
         "serial_count": int(len({str(point.get('serial') or '').strip() for point in points if str(point.get('serial') or '').strip()})),
     }
@@ -16690,6 +17360,8 @@ def _td_perf_exportable_model(result: Mapping[str, object]) -> dict[str, object]
         return None
     family = td_perf_normalize_fit_mode(model.get("fit_family"))
     if not family:
+        return None
+    if family not in TD_PERF_EXPORTABLE_FIT_FAMILIES:
         return None
     return model
 

@@ -53,6 +53,7 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
                     "output_target": "Output",
                     "input1_target": "Input1",
                     "input2_target": "",
+                    "input3_target": "",
                     "control_period_hard_input": True,
                     "keep_first_sequences_per_serial": 0,
                 }
@@ -61,6 +62,7 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
                 window._smart_solver_config["keep_first_sequences_per_serial"] = 3
                 config_text = window._smart_solver_config_text()
                 self.assertIn("Seq cap = first 3 / serial", config_text)
+                self.assertIn("2D Solver", config_text)
 
                 solver_calls: list[dict[str, object]] = []
 
@@ -106,7 +108,116 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
                 info_mock.assert_not_called()
                 self.assertEqual(len(solver_calls), 1)
                 self.assertEqual(solver_calls[0]["keep_first_sequences_per_serial"], 3)
+                self.assertEqual(solver_calls[0]["input3_target"], "")
                 self.assertIn("Dropped: 1 seq / 2 pts", window.lbl_smart_solver_summary.text())
+        finally:
+            window.close()
+            tmpdir = getattr(window, "_test_tmpdir", "")
+            if tmpdir:
+                shutil.rmtree(str(tmpdir), ignore_errors=True)
+
+    def test_smart_solver_config_popup_shows_input3_guidance(self) -> None:
+        window = self._make_window()
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                db_path = Path(tmpdir) / "cache.sqlite3"
+                db_path.write_text("", encoding="utf-8")
+                window._db_path = db_path
+                window._perf_available_columns = [
+                    {"name": "Output"},
+                    {"name": "Input1"},
+                    {"name": "Input2"},
+                    {"name": "Input3"},
+                ]
+                captured: dict[str, str] = {}
+
+                def _inspect_dialog():
+                    dialog = window._smart_solver_popup
+                    captured["guide"] = dialog.findChild(QtWidgets.QLabel, "smart_solver_input_guide").text()
+                    captured["output"] = dialog.findChild(QtWidgets.QLabel, "smart_solver_help_output").text()
+                    captured["input3"] = dialog.findChild(QtWidgets.QLabel, "smart_solver_help_input3").text()
+                    captured["control_period"] = dialog.findChild(
+                        QtWidgets.QLabel, "smart_solver_help_control_period"
+                    ).text()
+                    dialog.reject()
+                    return 0
+
+                with patch(
+                    "ui_next.qt_main.QtWidgets.QDialog.exec",
+                    side_effect=_inspect_dialog,
+                ):
+                    window._open_smart_solver_config_popup()
+
+                self.assertIn("direct 3D solve", captured["guide"])
+                self.assertEqual(captured["output"], "Metric the solver predicts.")
+                self.assertIn("Correlation helper", captured["input3"])
+                self.assertIn("remains unchanged", captured["control_period"])
+        finally:
+            window.close()
+            tmpdir = getattr(window, "_test_tmpdir", "")
+            if tmpdir:
+                shutil.rmtree(str(tmpdir), ignore_errors=True)
+
+    def test_smart_solver_config_popup_rejects_duplicate_input3_selection(self) -> None:
+        window = self._make_window()
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                db_path = Path(tmpdir) / "cache.sqlite3"
+                db_path.write_text("", encoding="utf-8")
+                window._db_path = db_path
+                window._perf_available_columns = [
+                    {"name": "Output"},
+                    {"name": "Input1"},
+                    {"name": "Input2"},
+                    {"name": "Input3"},
+                ]
+
+                def _select_combo_value(combo: QtWidgets.QComboBox, value: str) -> None:
+                    for index in range(combo.count()):
+                        if combo.itemText(index) == value:
+                            combo.setCurrentIndex(index)
+                            return
+                    raise AssertionError(f"missing combo value {value!r}")
+
+                def _run_dialog():
+                    dialog = window._smart_solver_popup
+                    _select_combo_value(dialog.findChild(QtWidgets.QComboBox, "smart_solver_combo_output"), "Output")
+                    _select_combo_value(dialog.findChild(QtWidgets.QComboBox, "smart_solver_combo_input1"), "Input1")
+                    _select_combo_value(dialog.findChild(QtWidgets.QComboBox, "smart_solver_combo_input2"), "Input2")
+                    _select_combo_value(dialog.findChild(QtWidgets.QComboBox, "smart_solver_combo_input3"), "Input2")
+                    dialog.findChild(QtWidgets.QPushButton, "smart_solver_btn_solve").click()
+                    dialog.reject()
+                    return 0
+
+                with patch(
+                    "ui_next.qt_main.QtWidgets.QDialog.exec",
+                    side_effect=_run_dialog,
+                ), patch(
+                    "ui_next.qt_main.QtWidgets.QMessageBox.warning"
+                ) as warning_mock, patch.object(
+                    TestDataTrendDialog,
+                    "_run_smart_solver",
+                ) as run_mock:
+                    window._open_smart_solver_config_popup()
+
+                warning_mock.assert_called_once()
+                self.assertIn("must be different", warning_mock.call_args[0][2])
+                run_mock.assert_not_called()
+        finally:
+            window.close()
+            tmpdir = getattr(window, "_test_tmpdir", "")
+            if tmpdir:
+                shutil.rmtree(str(tmpdir), ignore_errors=True)
+
+    def test_smart_solver_exportability_ignores_solver_only_fit_families(self) -> None:
+        window = self._make_window()
+        try:
+            window._smart_solver_result = {
+                "master_model": {
+                    "fit_family": "quadratic_3input_control_period",
+                }
+            }
+            self.assertFalse(window._smart_solver_has_exportable_model())
         finally:
             window.close()
             tmpdir = getattr(window, "_test_tmpdir", "")
@@ -126,6 +237,7 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
                     "output_target": "Output",
                     "input1_target": "Input1",
                     "input2_target": "",
+                    "input3_target": "",
                     "control_period_hard_input": True,
                     "keep_first_sequences_per_serial": 2,
                 }
@@ -161,6 +273,8 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
                     "input1_units": "u",
                     "input2_target": "",
                     "input2_units": "",
+                    "input3_target": "",
+                    "input3_units": "",
                 }
                 export_calls: list[dict[str, object]] = []
 

@@ -4093,13 +4093,14 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self.lbl_smart_solver_warning.setStyleSheet("color: #92400e; font-size: 11px;")
         smart_solver_layout.addWidget(self.lbl_smart_solver_warning)
 
-        self.tbl_smart_solver_diagnostics = QtWidgets.QTableWidget(0, 6)
+        self.tbl_smart_solver_diagnostics = QtWidgets.QTableWidget(0, 7)
         self.tbl_smart_solver_diagnostics.setHorizontalHeaderLabels(
             [
                 "control_period",
                 "point_count",
                 "distinct_input_1",
                 "distinct_input_2",
+                "distinct_input_3",
                 "eligible",
                 "reason",
             ]
@@ -8642,26 +8643,31 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         output_name = str(cfg.get("output_target") or "").strip()
         input1_name = str(cfg.get("input1_target") or "").strip()
         input2_name = str(cfg.get("input2_target") or "").strip()
+        input3_name = str(cfg.get("input3_target") or "").strip()
         if not output_name or not input1_name:
             return "Config: -"
         cp_mode = "Hard Input" if bool(cfg.get("control_period_hard_input", True)) else "Swept Input"
         seq_cap_raw = getattr(be, "_td_smart_solver_sequence_cap_value", None)
         seq_cap_value = seq_cap_raw(cfg.get("keep_first_sequences_per_serial")) if callable(seq_cap_raw) else 0
         seq_cap_text = "Unlimited" if seq_cap_value <= 0 else f"first {seq_cap_value} / serial"
+        parts = [
+            f"Output = {output_name} (predicts)",
+            f"Input 1 = {input1_name} (primary)",
+        ]
         if input2_name:
-            return (
-                f"Config: Output = {output_name} | Input 1 = {input1_name} | "
-                f"Input 2 = {input2_name} | Control Period = {cp_mode} | Seq cap = {seq_cap_text}"
-            )
-        return (
-            f"Config: Output = {output_name} | Input 1 = {input1_name} | "
-            f"2D Solver | Control Period = {cp_mode} | Seq cap = {seq_cap_text}"
-        )
+            parts.append(f"Input 2 = {input2_name} (direct)")
+        else:
+            parts.append("2D Solver")
+        if input3_name:
+            parts.append(f"Input 3 = {input3_name} (helper)")
+        parts.append(f"Control Period = {cp_mode}")
+        parts.append(f"Seq cap = {seq_cap_text}")
+        return "Config: " + " | ".join(parts)
 
     def _smart_solver_has_exportable_model(self) -> bool:
         result = dict(getattr(self, "_smart_solver_result", {}) or {})
-        model = result.get("master_model") or {}
-        return isinstance(model, dict) and bool(str(model.get("fit_family") or "").strip())
+        exportable = getattr(be, "_td_perf_exportable_model", None)
+        return bool(callable(exportable) and exportable(result))
 
     def _smart_solver_export_rows(self, result: dict[str, object] | None = None) -> list[dict[str, object]]:
         payload = result if isinstance(result, dict) else (getattr(self, "_smart_solver_result", {}) or {})
@@ -8685,6 +8691,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     "condition_label": str(raw_row.get("condition_label") or "").strip(),
                     "input_1": raw_row.get("input_1"),
                     "input_2": raw_row.get("input_2"),
+                    "input_3": raw_row.get("input_3"),
                     "actual_mean": raw_row.get("actual_mean"),
                     "sample_count": raw_row.get("sample_count"),
                 }
@@ -8694,6 +8701,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 str(row.get("run_name") or "").lower(),
                 float(row.get("input_1") or 0.0) if row.get("input_1") not in (None, "") else float("-inf"),
                 float(row.get("input_2") or 0.0) if row.get("input_2") not in (None, "") else float("-inf"),
+                float(row.get("input_3") or 0.0) if row.get("input_3") not in (None, "") else float("-inf"),
                 str(row.get("condition_label") or "").lower(),
                 str(row.get("serial") or "").lower(),
                 str(row.get("observation_id") or "").lower(),
@@ -8842,11 +8850,19 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         layout.setSpacing(8)
 
         intro = QtWidgets.QLabel(
-            "Configure the sequence-level control-period-aware solve. Smart Equation Solver v1 uses pulsed-mode mean rows only."
+            "Configure the sequence-level control-period-aware solve. Smart Equation Solver uses pulsed-mode mean rows only."
         )
         intro.setWordWrap(True)
         intro.setStyleSheet("color: #334155; font-size: 11px;")
         layout.addWidget(intro)
+
+        guide = QtWidgets.QLabel(
+            "Use Input 2 for a direct 3D solve. Use Input 3 when another metric helps connect the inputs to the output in harder regions."
+        )
+        guide.setObjectName("smart_solver_input_guide")
+        guide.setWordWrap(True)
+        guide.setStyleSheet("color: #475569; font-size: 11px;")
+        layout.addWidget(guide)
 
         form = QtWidgets.QFormLayout()
         form.setContentsMargins(0, 0, 0, 0)
@@ -8860,12 +8876,18 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             return combo
 
         combo_output = _build_combo()
+        combo_output.setObjectName("smart_solver_combo_output")
         combo_input1 = _build_combo()
+        combo_input1.setObjectName("smart_solver_combo_input1")
         combo_input2 = _build_combo()
+        combo_input2.setObjectName("smart_solver_combo_input2")
+        combo_input3 = _build_combo()
+        combo_input3.setObjectName("smart_solver_combo_input3")
         for combo, key in (
             (combo_output, "output_target"),
             (combo_input1, "input1_target"),
             (combo_input2, "input2_target"),
+            (combo_input3, "input3_target"),
         ):
             wanted = str((self._smart_solver_config or {}).get(key) or "").strip()
             if not wanted:
@@ -8875,11 +8897,39 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     combo.setCurrentIndex(idx)
                     break
         form.addRow("Output:", combo_output)
+        lbl_output_help = QtWidgets.QLabel("Metric the solver predicts.")
+        lbl_output_help.setObjectName("smart_solver_help_output")
+        lbl_output_help.setWordWrap(True)
+        lbl_output_help.setStyleSheet("color: #64748b; font-size: 10px;")
+        form.addRow("", lbl_output_help)
         form.addRow("Input 1:", combo_input1)
+        lbl_input1_help = QtWidgets.QLabel("Primary driver. Always required.")
+        lbl_input1_help.setObjectName("smart_solver_help_input1")
+        lbl_input1_help.setWordWrap(True)
+        lbl_input1_help.setStyleSheet("color: #64748b; font-size: 10px;")
+        form.addRow("", lbl_input1_help)
         form.addRow("Input 2 (Optional):", combo_input2)
+        lbl_input2_help = QtWidgets.QLabel("Secondary direct driver for the 3D solve.")
+        lbl_input2_help.setObjectName("smart_solver_help_input2")
+        lbl_input2_help.setWordWrap(True)
+        lbl_input2_help.setStyleSheet("color: #64748b; font-size: 10px;")
+        form.addRow("", lbl_input2_help)
+        form.addRow("Input 3 (Optional):", combo_input3)
+        lbl_input3_help = QtWidgets.QLabel(
+            "Correlation helper. Use when a third metric improves the solve, especially in edge cases."
+        )
+        lbl_input3_help.setObjectName("smart_solver_help_input3")
+        lbl_input3_help.setWordWrap(True)
+        lbl_input3_help.setStyleSheet("color: #64748b; font-size: 10px;")
+        form.addRow("", lbl_input3_help)
         cb_cp_hard_input = QtWidgets.QCheckBox("Treat Control Period as hard input")
         cb_cp_hard_input.setChecked(bool((self._smart_solver_config or {}).get("control_period_hard_input", True)))
         form.addRow("Control Period:", cb_cp_hard_input)
+        lbl_cp_help = QtWidgets.QLabel("Control-period behavior remains unchanged in this solver pass.")
+        lbl_cp_help.setObjectName("smart_solver_help_control_period")
+        lbl_cp_help.setWordWrap(True)
+        lbl_cp_help.setStyleSheet("color: #64748b; font-size: 10px;")
+        form.addRow("", lbl_cp_help)
         sp_keep_sequences = QtWidgets.QSpinBox()
         sp_keep_sequences.setRange(0, 99999)
         sp_keep_sequences.setSpecialValueText("Unlimited")
@@ -8936,6 +8986,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         btn_cancel.clicked.connect(dlg.reject)
         btn_row.addWidget(btn_cancel)
         btn_solve = QtWidgets.QPushButton("Solve")
+        btn_solve.setObjectName("smart_solver_btn_solve")
         btn_row.addWidget(btn_solve)
         layout.addLayout(btn_row)
 
@@ -8943,6 +8994,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             output_name = self._smart_solver_combo_value(combo_output)
             input1_name = self._smart_solver_combo_value(combo_input1)
             input2_name = self._smart_solver_combo_value(combo_input2)
+            input3_name = self._smart_solver_combo_value(combo_input3)
             if not output_name or not input1_name:
                 QtWidgets.QMessageBox.warning(
                     dlg,
@@ -8950,9 +9002,18 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     "Select Output and Input 1 before solving.",
                 )
                 return
+            if input3_name and not input2_name:
+                QtWidgets.QMessageBox.warning(
+                    dlg,
+                    "Smart Equation Solver",
+                    "Select Input 2 before using Input 3.",
+                )
+                return
             chosen_names = [output_name, input1_name]
             if input2_name:
                 chosen_names.append(input2_name)
+            if input3_name:
+                chosen_names.append(input3_name)
             norm_values = {self._perf_norm_name(name) for name in chosen_names if str(name).strip()}
             if len(norm_values) < len(chosen_names):
                 QtWidgets.QMessageBox.warning(
@@ -8965,6 +9026,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 "output_target": output_name,
                 "input1_target": input1_name,
                 "input2_target": input2_name,
+                "input3_target": input3_name,
                 "control_period_hard_input": bool(cb_cp_hard_input.isChecked()),
                 "keep_first_sequences_per_serial": int(sp_keep_sequences.value()),
             }
@@ -9050,6 +9112,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 output_target=str(config.get("output_target") or "").strip(),
                 input1_target=str(config.get("input1_target") or "").strip(),
                 input2_target=str(config.get("input2_target") or "").strip(),
+                input3_target=str(config.get("input3_target") or "").strip(),
                 control_period_hard_input=bool(config.get("control_period_hard_input", True)),
                 keep_first_sequences_per_serial=int(config.get("keep_first_sequences_per_serial") or 0),
                 runs=runs,
@@ -9119,6 +9182,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         keep_first_sequences = int((result or {}).get("keep_first_sequences_per_serial") or 0)
         dropped_sequence_count = int((result or {}).get("dropped_sequence_count") or 0)
         dropped_point_count = int((result or {}).get("dropped_point_count") or 0)
+        solver_branch = str((result or {}).get("solver_branch") or "").strip()
+        selection_reason = str((result or {}).get("selection_reason") or "").strip()
         summary_text = (
             "In-fit: "
             f"{float(in_fit_percent):.2f}% | Fell out: {fell_out_count} / {sample_count} | "
@@ -9133,6 +9198,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             if dropped_sequence_count > 0 or dropped_point_count > 0:
                 seq_cap_summary += f" | Dropped: {dropped_sequence_count} seq / {dropped_point_count} pts"
             summary_text = f"{summary_text} | {seq_cap_summary}" if summary_text else seq_cap_summary
+        if solver_branch:
+            solver_label = getattr(be, "td_perf_fit_family_label", None)
+            solver_branch_text = solver_label(solver_branch) if callable(solver_label) else solver_branch
+            summary_text = f"{summary_text} | Branch: {solver_branch_text}" if summary_text else f"Branch: {solver_branch_text}"
+        if selection_reason:
+            summary_text = f"{summary_text} | {selection_reason}" if summary_text else selection_reason
         if hasattr(self, "lbl_smart_solver_equation"):
             self.lbl_smart_solver_equation.setText(f"Equation: {equation_text or '-'}")
             self.lbl_smart_solver_equation.setToolTip(equation_text)
@@ -9166,6 +9237,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     self._smart_solver_display_value(row.get("point_count")),
                     self._smart_solver_display_value(row.get("distinct_input_1")),
                     self._smart_solver_display_value(row.get("distinct_input_2")),
+                    self._smart_solver_display_value(row.get("distinct_input_3")),
                     self._smart_solver_display_value(row.get("eligible")),
                     self._smart_solver_display_value(row.get("reason")),
                 ]
