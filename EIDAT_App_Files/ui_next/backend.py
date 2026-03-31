@@ -11766,6 +11766,15 @@ TD_PERF_FIT_FAMILY_PLANE = "plane"
 TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE = "quadratic_surface"
 TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD = "quadratic_surface_control_period"
 TD_PERF_FIT_FAMILY_QUADRATIC_CURVE_CONTROL_PERIOD = "quadratic_curve_control_period"
+TD_PERF_FIT_FAMILY_HYBRID_QUADRATIC_RESIDUAL_CONTROL_PERIOD = "hybrid_quadratic_residual_control_period"
+TD_PERF_CURVE_CONTROL_PERIOD_FAMILIES = {
+    TD_PERF_FIT_FAMILY_QUADRATIC_CURVE_CONTROL_PERIOD,
+    TD_PERF_FIT_FAMILY_HYBRID_QUADRATIC_RESIDUAL_CONTROL_PERIOD,
+}
+TD_PERF_ANY_CONTROL_PERIOD_FAMILIES = {
+    TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD,
+    *TD_PERF_CURVE_CONTROL_PERIOD_FAMILIES,
+}
 TD_PERF_PIECEWISE_MAX_BREAK_CANDIDATES_2 = 64
 TD_PERF_PIECEWISE_MAX_BREAK_CANDIDATES_3 = 24
 TD_PERF_FIT_MODES = {
@@ -11785,6 +11794,7 @@ TD_PERF_FIT_MODES = {
     TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE,
     TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD,
     TD_PERF_FIT_FAMILY_QUADRATIC_CURVE_CONTROL_PERIOD,
+    TD_PERF_FIT_FAMILY_HYBRID_QUADRATIC_RESIDUAL_CONTROL_PERIOD,
 }
 TD_PERF_FIT_COMPLEXITY_PENALTIES = {
     TD_PERF_FIT_MODE_POLYNOMIAL: 0.0,
@@ -11792,6 +11802,7 @@ TD_PERF_FIT_COMPLEXITY_PENALTIES = {
     TD_PERF_FIT_MODE_SATURATING_EXPONENTIAL: 0.0,
     TD_PERF_FIT_MODE_HYBRID_SATURATING_LINEAR: 0.10,
     TD_PERF_FIT_MODE_HYBRID_QUADRATIC_RESIDUAL: 0.20,
+    TD_PERF_FIT_FAMILY_HYBRID_QUADRATIC_RESIDUAL_CONTROL_PERIOD: 0.25,
     TD_PERF_FIT_MODE_PIECEWISE_2: 0.15,
     TD_PERF_FIT_MODE_PIECEWISE_3: 0.30,
     TD_PERF_FIT_MODE_MONOTONE_PCHIP: 0.35,
@@ -11808,7 +11819,8 @@ TD_PERF_FIT_FAMILY_PRIORITY = {
     TD_PERF_FIT_FAMILY_PLANE: 8,
     TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE: 9,
     TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD: 10,
-    TD_PERF_FIT_FAMILY_QUADRATIC_CURVE_CONTROL_PERIOD: 11,
+    TD_PERF_FIT_FAMILY_HYBRID_QUADRATIC_RESIDUAL_CONTROL_PERIOD: 11,
+    TD_PERF_FIT_FAMILY_QUADRATIC_CURVE_CONTROL_PERIOD: 12,
 }
 TD_PERF_EXPORT_STATS_ORDER = ["mean", "min", "max", "std", "min_3sigma", "max_3sigma"]
 
@@ -11850,6 +11862,8 @@ def td_perf_fit_family_label(value: object) -> str:
         return "Quadratic Surface + Control Period"
     if fam == TD_PERF_FIT_FAMILY_QUADRATIC_CURVE_CONTROL_PERIOD:
         return "Quadratic Curve + Control Period"
+    if fam == TD_PERF_FIT_FAMILY_HYBRID_QUADRATIC_RESIDUAL_CONTROL_PERIOD:
+        return "Hybrid + CP Residual"
     return "Auto"
 
 
@@ -12004,6 +12018,25 @@ def _td_perf_fmt_curve_control_period_normalization(
         f"x' = (x - {_td_perf_fmt_num(x_center)}) / {_td_perf_fmt_num(x_scale)} ; "
         f"cp' = (control_period - {_td_perf_fmt_num(cp_center)}) / {_td_perf_fmt_num(cp_scale)}"
     )
+
+
+def _td_perf_fmt_hybrid_curve_control_period_equation(
+    base_equation: object,
+    residual_cp_models: Sequence[Sequence[object]],
+) -> str:
+    base_expr = str(base_equation or "").strip()
+    residual_expr = _td_perf_fmt_curve_control_period_equation(residual_cp_models).strip()
+    if base_expr.lower().startswith("y ="):
+        base_expr = base_expr[3:].strip()
+    if residual_expr.lower().startswith("y ="):
+        residual_expr = residual_expr[3:].strip()
+    if base_expr and residual_expr:
+        return f"y = ({base_expr}) + ({residual_expr})"
+    if base_expr:
+        return f"y = {base_expr}"
+    if residual_expr:
+        return f"y = {residual_expr}"
+    return ""
 
 
 def _td_perf_surface_control_period_label(value: object) -> str:
@@ -12592,7 +12625,12 @@ def td_perf_normalize_surface_family(value: object) -> str:
     return TD_PERF_FIT_MODE_AUTO_SURFACE
 
 
-def td_perf_predict_model(model: Mapping[str, object], xs: Iterable[float]) -> list[float]:
+def td_perf_predict_model(
+    model: Mapping[str, object],
+    xs: Iterable[float],
+    *,
+    control_period: object = None,
+) -> list[float]:
     np = _td_perf_import_numpy()
     family = td_perf_normalize_fit_mode(model.get("fit_family"))
     x_arr = np.asarray([float(v) for v in xs], dtype=float)
@@ -12663,6 +12701,14 @@ def td_perf_predict_model(model: Mapping[str, object], xs: Iterable[float]) -> l
         design = _td_perf_piecewise_basis(x_arr, breakpoints)
         y_hat = design.dot(np.asarray(coeffs, dtype=float))
         return [float(v) for v in y_hat.tolist()]
+    if family == TD_PERF_FIT_FAMILY_QUADRATIC_CURVE_CONTROL_PERIOD:
+        if control_period in (None, ""):
+            return []
+        return _td_perf_predict_quadratic_curve_control_period(model, x_arr.tolist(), control_period)
+    if family == TD_PERF_FIT_FAMILY_HYBRID_QUADRATIC_RESIDUAL_CONTROL_PERIOD:
+        if control_period in (None, ""):
+            return []
+        return _td_perf_predict_hybrid_quadratic_residual_control_period(model, x_arr.tolist(), control_period)
     return []
 
 
@@ -14294,6 +14340,677 @@ def _td_perf_fit_quadratic_curve_control_period_model(
     return model
 
 
+def _td_perf_curve_cp_balanced_aggregate(
+    xs: Sequence[float],
+    ys: Sequence[float],
+    control_periods: Sequence[float],
+    *,
+    eligible_control_period_values: Sequence[float],
+) -> dict[str, list[float] | list[int]]:
+    eligible_keys = {round(float(value), 12) for value in (eligible_control_period_values or [])}
+    curves: dict[str, list[tuple[float, float, str]]] = {}
+    for idx, (x_value, y_value, cp_value) in enumerate(zip(xs, ys, control_periods)):
+        cp_key = round(float(cp_value), 12)
+        if cp_key not in eligible_keys:
+            continue
+        curves.setdefault(f"cp_{cp_key:.12g}", []).append((float(x_value), float(y_value), f"cp_{idx}"))
+    return td_perf_build_aggregate_curve(curves, max_bins=24, min_serials_per_bin=1, return_meta=True)
+
+
+def _td_perf_curve_cp_detect_low_x_window(
+    x_values,
+    residual_values,
+    control_period_values,
+):
+    np = _td_perf_import_numpy()
+    x_arr = np.asarray([float(value) for value in x_values], dtype=float)
+    residual_arr = np.asarray([float(value) for value in residual_values], dtype=float)
+    cp_arr = np.asarray([float(value) for value in control_period_values], dtype=float)
+    info: dict[str, object] = {
+        "low_x_breakpoint": None,
+        "low_x_window_enabled": False,
+        "candidate_cutoff": None,
+        "residual_abs_threshold": 0.0,
+        "low_x_bins": [],
+        "point_bin_signs": {},
+    }
+    if len(x_arr) < 3:
+        return info
+    x_min = float(np.min(x_arr))
+    x_max = float(np.max(x_arr))
+    x_span = float(x_max - x_min)
+    if not math.isfinite(x_span) or x_span <= 0.0:
+        return info
+
+    abs_residuals = np.abs(residual_arr)
+    median_abs = float(np.median(abs_residuals))
+    mad_abs = float(np.median(np.abs(abs_residuals - median_abs)))
+    residual_abs_threshold = float(median_abs + (1.5 * mad_abs))
+    candidate_cutoff = float(x_min + (0.30 * x_span))
+    candidate_indices = [idx for idx, x_value in enumerate(x_arr.tolist()) if float(x_value) <= candidate_cutoff]
+    if len(candidate_indices) < 3:
+        info["candidate_cutoff"] = candidate_cutoff
+        info["residual_abs_threshold"] = residual_abs_threshold
+        return info
+
+    ordered_candidate_indices = sorted(candidate_indices, key=lambda idx: (float(x_arr[idx]), idx))
+    bin_count = min(6, max(3, int(math.floor(math.sqrt(len(ordered_candidate_indices))))))
+    if len(ordered_candidate_indices) < bin_count:
+        bin_count = len(ordered_candidate_indices)
+    if bin_count < 1:
+        return info
+
+    bins: list[dict[str, object]] = []
+    point_bin_signs: dict[int, int] = {}
+    for bin_index, raw_chunk in enumerate(np.array_split(np.asarray(ordered_candidate_indices, dtype=int), bin_count)):
+        idxs = [int(value) for value in raw_chunk.tolist()]
+        if not idxs:
+            continue
+        bin_x = np.asarray([float(x_arr[idx]) for idx in idxs], dtype=float)
+        bin_residuals = np.asarray([float(residual_arr[idx]) for idx in idxs], dtype=float)
+        median_residual = float(np.median(bin_residuals))
+        median_sign = 1 if median_residual > 0.0 else (-1 if median_residual < 0.0 else 0)
+        if median_sign == 0:
+            sign_consistency = 0.0
+        else:
+            sign_consistency = float(
+                sum(
+                    1
+                    for value in bin_residuals.tolist()
+                    if (value > 0.0 and median_sign > 0) or (value < 0.0 and median_sign < 0)
+                )
+                / max(1, len(idxs))
+            )
+        distinct_control_periods = len({round(float(cp_arr[idx]), 12) for idx in idxs})
+        significant = bool(
+            median_sign != 0
+            and abs(median_residual) >= residual_abs_threshold
+            and distinct_control_periods >= 2
+            and sign_consistency >= 0.7
+        )
+        bins.append(
+            {
+                "bin_index": int(bin_index),
+                "left": float(np.min(bin_x)),
+                "right": float(np.max(bin_x)),
+                "point_count": int(len(idxs)),
+                "distinct_control_periods": int(distinct_control_periods),
+                "median_residual": float(median_residual),
+                "sign": int(median_sign),
+                "sign_consistency": float(sign_consistency),
+                "significant": bool(significant),
+            }
+        )
+        for idx in idxs:
+            point_bin_signs[int(idx)] = int(median_sign)
+
+    last_significant_index = -1
+    for bin_row in bins:
+        if bool(bin_row.get("significant")) and int(bin_row.get("bin_index") or 0) == (last_significant_index + 1):
+            last_significant_index = int(bin_row.get("bin_index") or 0)
+            continue
+        break
+
+    info["candidate_cutoff"] = float(candidate_cutoff)
+    info["residual_abs_threshold"] = float(residual_abs_threshold)
+    info["low_x_bins"] = bins
+    if last_significant_index >= 0:
+        last_bin = bins[last_significant_index]
+        breakpoint = float(last_bin.get("right") or candidate_cutoff)
+        info["low_x_breakpoint"] = breakpoint
+        info["low_x_window_enabled"] = True
+        info["point_bin_signs"] = {
+            idx: sign
+            for idx, sign in point_bin_signs.items()
+            if float(x_arr[idx]) <= breakpoint
+        }
+    return info
+
+
+def _td_perf_curve_cp_point_weights(
+    x_values,
+    residual_values,
+    *,
+    low_x_window_enabled: bool,
+    low_x_breakpoint: float | None,
+    point_bin_signs: Mapping[int, object],
+):
+    np = _td_perf_import_numpy()
+    x_arr = np.asarray([float(value) for value in x_values], dtype=float)
+    residual_arr = np.asarray([float(value) for value in residual_values], dtype=float)
+    if not low_x_window_enabled or low_x_breakpoint is None:
+        return np.ones(len(x_arr), dtype=float)
+    weights = np.full(len(x_arr), 0.6, dtype=float)
+    for idx, (x_value, residual_value) in enumerate(zip(x_arr.tolist(), residual_arr.tolist())):
+        if float(x_value) > float(low_x_breakpoint):
+            continue
+        local_sign_raw = point_bin_signs.get(int(idx), 0)
+        try:
+            local_sign = int(local_sign_raw)
+        except Exception:
+            local_sign = 0
+        residual_sign = 1 if residual_value > 0.0 else (-1 if residual_value < 0.0 else 0)
+        weights[idx] = 2.5 if (local_sign != 0 and local_sign == residual_sign) else 1.0
+    return weights
+
+
+def _td_perf_curve_cp_fit_residual_slice(
+    x_norm_values,
+    residual_values,
+    sample_weights,
+    *,
+    penalty_multiplier: float,
+):
+    np = _td_perf_import_numpy()
+    x_norm = np.asarray([float(value) for value in x_norm_values], dtype=float)
+    residual_arr = np.asarray([float(value) for value in residual_values], dtype=float)
+    weight_arr = np.asarray([float(value) for value in sample_weights], dtype=float)
+    if len(x_norm) != len(residual_arr) or len(x_norm) != len(weight_arr) or len(x_norm) < 3:
+        return None
+    design = np.column_stack([x_norm ** 2, x_norm, np.ones_like(x_norm)])
+    ridge_diag = float(max(penalty_multiplier, 1e-9)) * np.asarray([8.0, 2.0, 0.5], dtype=float)
+    xtwx = design.T.dot(weight_arr[:, None] * design) + np.diag(ridge_diag)
+    xtwy = design.T.dot(weight_arr * residual_arr)
+    try:
+        coeffs = np.linalg.solve(xtwx, xtwy)
+    except Exception:
+        return None
+    return np.asarray(coeffs, dtype=float)
+
+
+def _td_perf_predict_hybrid_quadratic_residual_control_period(
+    model: Mapping[str, object],
+    x_values: Iterable[float],
+    control_period,
+) -> list[float]:
+    np = _td_perf_import_numpy()
+    x_list = [float(value) for value in x_values]
+    count = len(x_list)
+    if count <= 0:
+        return []
+    if control_period is None:
+        raise ValueError("Control-period-aware curve prediction requires control_period.")
+    if isinstance(control_period, Iterable) and not isinstance(control_period, (str, bytes)):
+        cp_values = [float(value) for value in control_period]
+        if len(cp_values) != count:
+            raise ValueError("control_period iterable length must match x inputs.")
+    else:
+        cp_values = [float(control_period)] * count
+    x_arr = np.asarray(x_list, dtype=float)
+    base_params = dict(model.get("base_params") or (model.get("params") or {}).get("base_params") or {})
+    base = (
+        float(base_params.get("b") or 0.0)
+        + (float(base_params.get("m") or 0.0) * x_arr)
+        + (
+            float(base_params.get("A") or 0.0)
+            * (1.0 - np.exp(-float(base_params.get("k") or 0.0) * x_arr))
+        )
+    )
+    x_center = float(model.get("x_center") or 0.0)
+    x_scale = float(model.get("x_scale") or 1.0) or 1.0
+    x_norm = (x_arr - x_center) / x_scale
+    cp_norm, _cp_center, _cp_scale = _td_perf_surface_normalize_control_period(
+        cp_values,
+        center=float(model.get("cp_center") or 0.0),
+        scale=float(model.get("cp_scale") or 1.0),
+    )
+    residual_cp_models = [
+        np.asarray([float(value) for value in coeffs], dtype=float)
+        for coeffs in (model.get("residual_cp_models") or model.get("coeff_cp_models") or [])
+    ]
+    if len(residual_cp_models) != 3:
+        return [float(value) for value in base.tolist()]
+    residual_coeff_columns = [np.poly1d(coeffs)(cp_norm) for coeffs in residual_cp_models]
+    residual = (
+        (residual_coeff_columns[0] * (x_norm ** 2))
+        + (residual_coeff_columns[1] * x_norm)
+        + residual_coeff_columns[2]
+    )
+    return [float(value) for value in (base + residual).tolist()]
+
+
+def _td_perf_fit_hybrid_quadratic_residual_control_period_candidate(
+    xs: list[float],
+    ys: list[float],
+    control_periods: Sequence[float],
+    *,
+    support: Mapping[str, object],
+    penalty_multiplier: float,
+) -> tuple[dict[str, object] | None, dict[str, object]]:
+    np = _td_perf_import_numpy()
+    diagnostics: dict[str, object] = {
+        "reason": "",
+        "low_x_breakpoint": None,
+        "low_x_window_enabled": False,
+        "support_profile": {},
+        "base_fit_family": "",
+        "base_params": {},
+        "residual_cp_models": [],
+    }
+    if len(xs) != len(ys) or len(xs) != len(control_periods):
+        diagnostics["reason"] = "input vectors are inconsistent"
+        return None, diagnostics
+
+    x_arr = np.asarray([float(value) for value in xs], dtype=float)
+    y_arr = np.asarray([float(value) for value in ys], dtype=float)
+    cp_arr = np.asarray([float(value) for value in control_periods], dtype=float)
+    if not bool(np.all(np.isfinite(x_arr) & np.isfinite(y_arr) & np.isfinite(cp_arr))):
+        diagnostics["reason"] = "input vectors contain non-finite values"
+        return None, diagnostics
+
+    eligible_control_period_values = [float(value) for value in (support.get("eligible_control_period_values") or [])]
+    ignored_control_periods = [dict(item) for item in (support.get("ignored_control_periods") or []) if isinstance(item, Mapping)]
+    if len(eligible_control_period_values) < 2:
+        diagnostics["reason"] = "at least two eligible control periods are required"
+        return None, diagnostics
+
+    aggregate_curve = _td_perf_curve_cp_balanced_aggregate(
+        x_arr.tolist(),
+        y_arr.tolist(),
+        cp_arr.tolist(),
+        eligible_control_period_values=eligible_control_period_values,
+    )
+    aggregate_x = [float(value) for value in (aggregate_curve.get("x") or [])]
+    aggregate_y = [float(value) for value in (aggregate_curve.get("y") or [])]
+    if len(aggregate_x) < 4 or len(aggregate_y) < 4:
+        diagnostics["reason"] = "cp-balanced aggregate curve did not produce enough support points"
+        diagnostics["support_profile"] = {"aggregate_curve": aggregate_curve}
+        return None, diagnostics
+
+    base_model = _td_perf_fit_hybrid_saturating_linear_model(
+        aggregate_x,
+        aggregate_y,
+        fit_mode=TD_PERF_FIT_FAMILY_HYBRID_QUADRATIC_RESIDUAL_CONTROL_PERIOD,
+    )
+    if not isinstance(base_model, dict):
+        diagnostics["reason"] = "global backbone fit failed"
+        diagnostics["support_profile"] = {"aggregate_curve": aggregate_curve}
+        return None, diagnostics
+
+    base_pred = np.asarray(td_perf_predict_model(base_model, x_arr.tolist()), dtype=float)
+    residual_arr = y_arr - base_pred
+    low_x_info = _td_perf_curve_cp_detect_low_x_window(x_arr.tolist(), residual_arr.tolist(), cp_arr.tolist())
+    point_weights = _td_perf_curve_cp_point_weights(
+        x_arr.tolist(),
+        residual_arr.tolist(),
+        low_x_window_enabled=bool(low_x_info.get("low_x_window_enabled")),
+        low_x_breakpoint=_td_finite_float(low_x_info.get("low_x_breakpoint")),
+        point_bin_signs=dict(low_x_info.get("point_bin_signs") or {}),
+    )
+
+    x_center = float(support.get("x_center") or 0.0)
+    x_scale = float(support.get("x_scale") or 1.0) or 1.0
+    x_norm = (x_arr - x_center) / x_scale
+    cp_values = [float(value) for value in eligible_control_period_values]
+    cp_norm, cp_center, cp_scale = _td_perf_surface_normalize_control_period(cp_values)
+    cp_degree = 1 if len(cp_values) == 2 else 2
+    cp_key_to_indices: dict[float, list[int]] = {}
+    for idx, cp_value in enumerate(cp_arr.tolist()):
+        cp_key_to_indices.setdefault(round(float(cp_value), 12), []).append(idx)
+
+    coeff_rows: list[list[float]] = []
+    slice_models: list[dict[str, object]] = []
+    slice_fit_weights: list[float] = []
+    for cp_value in cp_values:
+        idxs = cp_key_to_indices.get(round(float(cp_value), 12), [])
+        if len(idxs) < 3:
+            diagnostics["reason"] = f"residual slice fit lacks support for control period {cp_value:g}"
+            diagnostics["support_profile"] = {
+                "aggregate_curve": aggregate_curve,
+                "low_x_bins": [dict(row) for row in (low_x_info.get("low_x_bins") or []) if isinstance(row, Mapping)],
+            }
+            return None, diagnostics
+        slice_coeffs = _td_perf_curve_cp_fit_residual_slice(
+            [float(x_norm[idx]) for idx in idxs],
+            [float(residual_arr[idx]) for idx in idxs],
+            [float(point_weights[idx]) for idx in idxs],
+            penalty_multiplier=penalty_multiplier,
+        )
+        if slice_coeffs is None or len(slice_coeffs) != 3:
+            diagnostics["reason"] = f"residual slice fit failed for control period {cp_value:g}"
+            diagnostics["support_profile"] = {
+                "aggregate_curve": aggregate_curve,
+                "low_x_bins": [dict(row) for row in (low_x_info.get("low_x_bins") or []) if isinstance(row, Mapping)],
+            }
+            return None, diagnostics
+        point_count = int(len(idxs))
+        distinct_x1 = len({round(float(x_arr[idx]), 12) for idx in idxs})
+        slice_weight = float(min(point_count, 4))
+        coeff_rows.append([float(value) for value in slice_coeffs.tolist()])
+        slice_fit_weights.append(slice_weight)
+        slice_models.append(
+            {
+                "control_period": float(cp_value),
+                "residual_coeffs": [float(value) for value in slice_coeffs.tolist()],
+                "point_count": int(point_count),
+                "distinct_x1": int(distinct_x1),
+                "slice_weight": float(slice_weight),
+            }
+        )
+
+    coeff_matrix_arr = np.asarray(coeff_rows, dtype=float)
+    slice_weight_arr = np.asarray(slice_fit_weights, dtype=float)
+    residual_cp_models: list[list[float]] = []
+    residual_coeffs_at_center: list[float] = []
+    for basis_idx in range(coeff_matrix_arr.shape[1]):
+        coeff_values = coeff_matrix_arr[:, basis_idx]
+        cp_coeffs = np.polyfit(cp_norm, coeff_values, cp_degree, w=slice_weight_arr)
+        residual_cp_models.append([float(value) for value in cp_coeffs.tolist()])
+        residual_coeffs_at_center.append(float(np.poly1d(cp_coeffs)(0.0)))
+
+    y_hat = np.asarray(
+        _td_perf_predict_hybrid_quadratic_residual_control_period(
+            {
+                "base_params": dict(base_model.get("params") or {}),
+                "residual_cp_models": residual_cp_models,
+                "x_center": float(x_center),
+                "x_scale": float(x_scale),
+                "cp_center": float(cp_center),
+                "cp_scale": float(cp_scale),
+            },
+            x_arr.tolist(),
+            cp_arr.tolist(),
+        ),
+        dtype=float,
+    )
+
+    support_profile = {
+        "aggregate_curve": {
+            "x": [float(value) for value in aggregate_x],
+            "y": [float(value) for value in aggregate_y],
+            "serial_support": [int(value) for value in (aggregate_curve.get("serial_support") or [])],
+            "edge_weight": [float(value) for value in (aggregate_curve.get("edge_weight") or [])],
+        },
+        "candidate_cutoff": low_x_info.get("candidate_cutoff"),
+        "residual_abs_threshold": float(low_x_info.get("residual_abs_threshold") or 0.0),
+        "low_x_bins": [dict(row) for row in (low_x_info.get("low_x_bins") or []) if isinstance(row, Mapping)],
+        "slice_fit_weights": [float(value) for value in slice_fit_weights],
+    }
+    params: dict[str, object] = {
+        "base_params": dict(base_model.get("params") or {}),
+        "cp_center": float(cp_center),
+        "cp_scale": float(cp_scale),
+        "control_period_degree": int(cp_degree),
+        "control_period_values": [float(value) for value in cp_values],
+        "eligible_control_period_values": [float(value) for value in cp_values],
+        "ignored_control_periods": [dict(entry) for entry in ignored_control_periods],
+        "fit_domain_control_period": [float(min(cp_values)), float(max(cp_values))],
+        "residual_cp_models": [[float(value) for value in coeffs] for coeffs in residual_cp_models],
+        "low_x_breakpoint": _td_finite_float(low_x_info.get("low_x_breakpoint")),
+        "low_x_window_enabled": bool(low_x_info.get("low_x_window_enabled")),
+        "support_profile": support_profile,
+        "stabilization_passes": 0,
+        "fallback_used": False,
+    }
+    for basis_idx, coeffs in enumerate(residual_cp_models):
+        params[f"basis_{basis_idx}_cp_coeffs"] = [float(value) for value in coeffs]
+    model = _td_perf_finalize_model(
+        fit_family=TD_PERF_FIT_FAMILY_HYBRID_QUADRATIC_RESIDUAL_CONTROL_PERIOD,
+        fit_mode=TD_PERF_FIT_FAMILY_HYBRID_QUADRATIC_RESIDUAL_CONTROL_PERIOD,
+        equation=_td_perf_fmt_hybrid_curve_control_period_equation(base_model.get("equation"), residual_cp_models),
+        x_norm_equation=_td_perf_fmt_curve_control_period_normalization(
+            float(x_center),
+            float(x_scale),
+            float(cp_center),
+            float(cp_scale),
+        ),
+        params=params,
+        param_count=(4 + (len(residual_cp_models) * (cp_degree + 1))),
+        x_values=x_arr,
+        y_true=y_arr,
+        y_hat=y_hat,
+        composite_score=False,
+        extra={
+            "coeffs": [float(value) for value in residual_coeffs_at_center],
+            "coeff_cp_models": [[float(value) for value in coeffs] for coeffs in residual_cp_models],
+            "residual_cp_models": [[float(value) for value in coeffs] for coeffs in residual_cp_models],
+            "base_fit_family": str(base_model.get("fit_family") or ""),
+            "base_params": dict(base_model.get("params") or {}),
+            "x_center": float(x_center),
+            "x_scale": float(x_scale),
+            "cp_center": float(cp_center),
+            "cp_scale": float(cp_scale),
+            "control_period_values": [float(value) for value in cp_values],
+            "eligible_control_period_values": [float(value) for value in cp_values],
+            "ignored_control_periods": [dict(entry) for entry in ignored_control_periods],
+            "control_period_degree": int(cp_degree),
+            "fit_domain": [float(np.min(x_arr)), float(np.max(x_arr))],
+            "fit_domain_control_period": [float(min(cp_values)), float(max(cp_values))],
+            "slice_models": slice_models,
+            "low_x_breakpoint": _td_finite_float(low_x_info.get("low_x_breakpoint")),
+            "low_x_window_enabled": bool(low_x_info.get("low_x_window_enabled")),
+            "stabilization_passes": 0,
+            "fallback_used": False,
+            "support_profile": support_profile,
+            "solver": "hybrid_curve_cp_residual",
+        },
+    )
+    warning_text = _td_perf_format_curve_control_period_warning(ignored_control_periods)
+    if warning_text:
+        _td_perf_append_fit_warning(model, warning_text)
+
+    diagnostics.update(
+        {
+            "low_x_breakpoint": model.get("low_x_breakpoint"),
+            "low_x_window_enabled": bool(model.get("low_x_window_enabled")),
+            "support_profile": support_profile,
+            "base_fit_family": str(base_model.get("fit_family") or ""),
+            "base_params": dict(base_model.get("params") or {}),
+            "residual_cp_models": [[float(value) for value in coeffs] for coeffs in residual_cp_models],
+        }
+    )
+    return model, diagnostics
+
+
+def _td_perf_curve_cp_stability_checks(model: Mapping[str, object]) -> tuple[bool, list[dict[str, object]]]:
+    np = _td_perf_import_numpy()
+    x_domain = model.get("fit_domain")
+    if not isinstance(x_domain, Sequence) or isinstance(x_domain, (str, bytes)) or len(x_domain) < 2:
+        return True, []
+    try:
+        x_min = float(x_domain[0])
+        x_max = float(x_domain[1])
+    except Exception:
+        return True, []
+    if not math.isfinite(x_min) or not math.isfinite(x_max) or x_max <= x_min:
+        return True, []
+
+    cp_values = [float(value) for value in (model.get("control_period_values") or [])]
+    cp_eval_values = sorted(
+        {
+            *cp_values,
+            *[
+                float((cp_values[idx] + cp_values[idx + 1]) / 2.0)
+                for idx in range(max(0, len(cp_values) - 1))
+            ],
+        }
+    )
+    if not cp_eval_values:
+        return True, []
+
+    x_grid = np.linspace(float(x_min), float(x_max), 220)
+    low_x_breakpoint = _td_finite_float(model.get("low_x_breakpoint")) if bool(model.get("low_x_window_enabled")) else None
+    rows: list[dict[str, object]] = []
+    stable = True
+    for cp_value in cp_eval_values:
+        y_values = np.asarray(
+            _td_perf_predict_hybrid_quadratic_residual_control_period(model, x_grid.tolist(), cp_value),
+            dtype=float,
+        )
+        if len(y_values) != len(x_grid):
+            continue
+        dx = np.diff(x_grid)
+        dy = np.diff(y_values)
+        slope = dy / np.where(dx == 0.0, 1.0, dx)
+        mid_x = (x_grid[:-1] + x_grid[1:]) / 2.0
+        positive_slopes = np.asarray([float(value) for value in slope.tolist() if float(value) > 0.0], dtype=float)
+        median_positive_slope = float(np.median(positive_slopes)) if positive_slopes.size else 0.0
+        slope_threshold = float(abs(median_positive_slope) * 0.02)
+        negative_mask = np.asarray(
+            [
+                bool((low_x_breakpoint is None or float(midpoint) > float(low_x_breakpoint)) and float(delta) < -slope_threshold)
+                for midpoint, delta in zip(mid_x.tolist(), slope.tolist())
+            ],
+            dtype=bool,
+        )
+        negative_interval_count = 0
+        in_interval = False
+        for is_negative in negative_mask.tolist():
+            if is_negative and not in_interval:
+                negative_interval_count += 1
+                in_interval = True
+            elif not is_negative:
+                in_interval = False
+        worst_negative_slope = float(np.min(slope[negative_mask])) if bool(np.any(negative_mask)) else 0.0
+        rows.append(
+            {
+                "control_period": float(cp_value),
+                "negative_interval_count": int(negative_interval_count),
+                "median_positive_slope": float(median_positive_slope),
+                "slope_threshold": float(slope_threshold),
+                "worst_negative_slope": float(worst_negative_slope),
+            }
+        )
+        if negative_interval_count > 1:
+            stable = False
+    return stable, rows
+
+
+def _td_perf_curve_cp_apply_fallback_metadata(
+    legacy_model: Mapping[str, object],
+    *,
+    reason: str,
+    diagnostics: Mapping[str, object],
+    stabilization_passes: int,
+) -> dict[str, object]:
+    fallback_model = dict(legacy_model or {})
+    fallback_model["fallback_used"] = True
+    fallback_model["fallback_reason"] = str(reason or "").strip()
+    fallback_model["stabilization_passes"] = int(stabilization_passes)
+    fallback_model["low_x_breakpoint"] = diagnostics.get("low_x_breakpoint")
+    fallback_model["low_x_window_enabled"] = bool(diagnostics.get("low_x_window_enabled"))
+    fallback_model["support_profile"] = diagnostics.get("support_profile") if isinstance(diagnostics.get("support_profile"), Mapping) else {}
+    fallback_model["base_fit_family"] = str(diagnostics.get("base_fit_family") or "")
+    fallback_model["base_params"] = (
+        dict(diagnostics.get("base_params") or {})
+        if isinstance(diagnostics.get("base_params"), Mapping)
+        else {}
+    )
+    fallback_model["residual_cp_models"] = [
+        [float(value) for value in coeffs]
+        for coeffs in (diagnostics.get("residual_cp_models") or [])
+        if isinstance(coeffs, Sequence) and not isinstance(coeffs, (str, bytes))
+    ]
+    _td_perf_append_fit_warning(
+        fallback_model,
+        f"Stabilized CP curve fit fell back to legacy quadratic CP model: {str(reason or '').strip()}",
+    )
+    return fallback_model
+
+
+def _td_perf_fit_hybrid_quadratic_residual_control_period_model(
+    xs: list[float],
+    ys: list[float],
+    control_periods: Sequence[float],
+    *,
+    support: Mapping[str, object] | None = None,
+    legacy_model: Mapping[str, object] | None = None,
+) -> dict[str, object] | None:
+    support_data = (
+        dict(support or {})
+        if isinstance(support, Mapping)
+        else _td_perf_analyze_quadratic_curve_control_period_fit_support(xs, ys, control_periods)
+    )
+    legacy_baseline = dict(legacy_model or {}) if isinstance(legacy_model, Mapping) else _td_perf_fit_quadratic_curve_control_period_model(xs, ys, control_periods)
+    candidate, diagnostics = _td_perf_fit_hybrid_quadratic_residual_control_period_candidate(
+        xs,
+        ys,
+        control_periods,
+        support=support_data,
+        penalty_multiplier=1.0,
+    )
+    if not isinstance(candidate, dict):
+        if isinstance(legacy_baseline, Mapping):
+            return _td_perf_curve_cp_apply_fallback_metadata(
+                legacy_baseline,
+                reason=str(diagnostics.get("reason") or "stabilized candidate fit failed"),
+                diagnostics=diagnostics,
+                stabilization_passes=0,
+            )
+        return None
+
+    stable, stability_rows = _td_perf_curve_cp_stability_checks(candidate)
+    support_profile = dict(candidate.get("support_profile") or {})
+    support_profile["stability_checks"] = [dict(row) for row in stability_rows]
+    candidate["support_profile"] = support_profile
+    candidate["stabilization_passes"] = 0
+    candidate["fallback_used"] = False
+
+    stabilization_passes = 0
+    if not stable:
+        stabilization_passes = 1
+        stabilized_candidate, stabilized_diagnostics = _td_perf_fit_hybrid_quadratic_residual_control_period_candidate(
+            xs,
+            ys,
+            control_periods,
+            support=support_data,
+            penalty_multiplier=2.0,
+        )
+        if not isinstance(stabilized_candidate, dict):
+            if isinstance(legacy_baseline, Mapping):
+                return _td_perf_curve_cp_apply_fallback_metadata(
+                    legacy_baseline,
+                    reason=str(stabilized_diagnostics.get("reason") or "stabilization refit failed"),
+                    diagnostics=stabilized_diagnostics,
+                    stabilization_passes=stabilization_passes,
+                )
+            return candidate
+        stable, stability_rows = _td_perf_curve_cp_stability_checks(stabilized_candidate)
+        support_profile = dict(stabilized_candidate.get("support_profile") or {})
+        support_profile["stability_checks"] = [dict(row) for row in stability_rows]
+        stabilized_candidate["support_profile"] = support_profile
+        stabilized_candidate["stabilization_passes"] = stabilization_passes
+        stabilized_candidate["fallback_used"] = False
+        candidate = stabilized_candidate
+        diagnostics = stabilized_diagnostics
+        if not stable and isinstance(legacy_baseline, Mapping):
+            return _td_perf_curve_cp_apply_fallback_metadata(
+                legacy_baseline,
+                reason="stabilization pass still found offshoots outside the inferred low-x window",
+                diagnostics=diagnostics,
+                stabilization_passes=stabilization_passes,
+            )
+
+    try:
+        candidate_rmse = float(candidate.get("rmse"))
+    except Exception:
+        candidate_rmse = float("inf")
+    try:
+        legacy_rmse = float((legacy_baseline or {}).get("rmse"))
+    except Exception:
+        legacy_rmse = float("inf")
+    if (
+        isinstance(legacy_baseline, Mapping)
+        and math.isfinite(candidate_rmse)
+        and math.isfinite(legacy_rmse)
+        and legacy_rmse > 0.0
+        and candidate_rmse > (1.15 * legacy_rmse)
+    ):
+        return _td_perf_curve_cp_apply_fallback_metadata(
+            legacy_baseline,
+            reason=(
+                "stabilized candidate RMSE exceeded the legacy quadratic CP baseline "
+                f"({candidate_rmse:.4g} vs {legacy_rmse:.4g})"
+            ),
+            diagnostics=diagnostics,
+            stabilization_passes=stabilization_passes,
+        )
+
+    candidate["stabilization_passes"] = int(stabilization_passes)
+    candidate["fallback_used"] = False
+    return candidate
+
+
 def _td_perf_fit_quadratic_surface_iterative(
     x1_arr,
     x2_arr,
@@ -15336,21 +16053,29 @@ def td_smart_solver_run(
         raise RuntimeError(failure_text)
 
     _td_emit_progress(progress_cb, "Fitting control-period slices")
-    model = (
-        _td_perf_fit_quadratic_surface_control_period_model(
+    if input2_name:
+        model = _td_perf_fit_quadratic_surface_control_period_model(
             x1_values,
             x2_values,
             y_values,
             cp_values,
             fit_mode=fit_mode,
         )
-        if input2_name
-        else _td_perf_fit_quadratic_curve_control_period_model(
+    else:
+        legacy_curve_model = _td_perf_fit_quadratic_curve_control_period_model(
             x1_values,
             y_values,
             cp_values,
         )
-    )
+        model = _td_perf_fit_hybrid_quadratic_residual_control_period_model(
+            x1_values,
+            y_values,
+            cp_values,
+            support=support,
+            legacy_model=legacy_curve_model,
+        )
+        if not isinstance(model, dict):
+            model = legacy_curve_model
     if not isinstance(model, dict):
         raise RuntimeError(
             "Smart Equation Solver could not fit a control-period-aware model for the filtered sequence rows."
@@ -15365,10 +16090,10 @@ def td_smart_solver_run(
             control_period=cp_values,
         )
         if input2_name
-        else _td_perf_predict_quadratic_curve_control_period(
+        else td_perf_predict_model(
             model,
             x1_values,
-            cp_values,
+            control_period=cp_values,
         )
     )
     if len(predictions) != len(points):
@@ -15430,6 +16155,16 @@ def td_smart_solver_run(
         "warning_text": _td_smart_solver_warning_text(warning_messages),
         "ignored_control_periods": [dict(item) for item in (support.get("ignored_control_periods") or []) if isinstance(item, Mapping)],
         "slice_rows": slice_rows,
+        "low_x_breakpoint": _td_finite_float(model.get("low_x_breakpoint")),
+        "low_x_window_enabled": bool(model.get("low_x_window_enabled")),
+        "stabilization_passes": int(model.get("stabilization_passes") or 0),
+        "fallback_used": bool(model.get("fallback_used")),
+        "support_profile": (
+            dict(model.get("support_profile") or {})
+            if isinstance(model.get("support_profile"), Mapping)
+            else {}
+        ),
+        "base_fit_family": str(model.get("base_fit_family") or ""),
         "control_period_domain": [
             float(value)
             for value in (model.get("fit_domain_control_period") or [min(control_period_values), max(control_period_values)])
@@ -15866,6 +16601,30 @@ def _td_perf_excel_formula_for_model(
             else:
                 expr_terms.append(f"({cp_expr}*{basis})")
         return "=" + "+".join(expr_terms)
+    if family == TD_PERF_FIT_FAMILY_HYBRID_QUADRATIC_RESIDUAL_CONTROL_PERIOD:
+        residual_cp_models = [[float(v) for v in coeffs] for coeffs in (model.get("residual_cp_models") or model.get("coeff_cp_models") or [])]
+        base_params = dict(model.get("base_params") or (params or {}).get("base_params") or {})
+        if len(residual_cp_models) != 3 or not norm_cp_ref:
+            return ""
+        base_expr = (
+            f"{_td_perf_excel_num(base_params.get('b'))}"
+            f"+({_td_perf_excel_num(base_params.get('m'))}*{raw_x_ref})"
+            f"+({_td_perf_excel_num(base_params.get('A'))}*(1-EXP(-{_td_perf_excel_num(base_params.get('k'))}*{raw_x_ref})))"
+        )
+        basis_terms = [
+            f"({norm_x_ref}^2)",
+            norm_x_ref,
+            "",
+        ]
+        expr_terms: list[str] = []
+        for coeffs, basis in zip(residual_cp_models, basis_terms):
+            cp_expr = _td_perf_excel_polynomial_expr(coeffs, norm_cp_ref)
+            if not basis:
+                expr_terms.append(cp_expr)
+            else:
+                expr_terms.append(f"({cp_expr}*{basis})")
+        residual_expr = "+".join(expr_terms) if expr_terms else "0"
+        return f"=({base_expr})+({residual_expr})"
     return ""
 
 
@@ -15924,6 +16683,8 @@ def _td_perf_predict_export_value(
             if not math.isfinite(x2):
                 return None
             values = td_perf_predict_surface(model, [x1], [x2], control_period=control_period)
+        elif family in TD_PERF_CURVE_CONTROL_PERIOD_FAMILIES:
+            values = td_perf_predict_model(model, [x1], control_period=control_period)
         else:
             values = td_perf_predict_model(model, [x1])
     except Exception:
@@ -16045,6 +16806,10 @@ def _td_perf_interactive_formula_map(
             stat_norm_x1_ref = _td_perf_excel_norm_expr(raw_x_ref, model.get("x1_center"), model.get("x1_scale"))
             stat_norm_x2_ref = _td_perf_excel_norm_expr(raw_x2_ref, model.get("x2_center"), model.get("x2_scale"))
             stat_norm_cp_ref = _td_perf_excel_norm_expr(raw_cp_ref, model.get("cp_center"), model.get("cp_scale"))
+        elif family in TD_PERF_CURVE_CONTROL_PERIOD_FAMILIES:
+            required_refs.append(raw_cp_ref)
+            stat_norm_x_ref = _td_perf_excel_norm_expr(raw_x_ref, model.get("x_center"), model.get("x_scale"))
+            stat_norm_cp_ref = _td_perf_excel_norm_expr(raw_cp_ref, model.get("cp_center"), model.get("cp_scale"))
         formula = _td_perf_excel_formula_for_model(
             model,
             raw_x_ref=raw_x_ref,
@@ -16108,7 +16873,7 @@ def _td_perf_write_interactive_calculator_sheet(
     plot_dimension = str(plot_metadata.get("plot_dimension") or "2d").strip().lower()
     is_surface = plot_dimension == "3d" or bool(str(plot_metadata.get("input2_target") or "").strip())
     uses_control_period_input = any(
-        td_perf_normalize_fit_mode((model or {}).get("fit_family")) == TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD
+        td_perf_normalize_fit_mode((model or {}).get("fit_family")) in TD_PERF_ANY_CONTROL_PERIOD_FAMILIES
         for model in models_by_stat.values()
         if isinstance(model, Mapping)
     )
@@ -16319,7 +17084,7 @@ def _td_perf_write_interactive_regression_checker_sheet(
     plot_dimension = str(plot_metadata.get("plot_dimension") or "2d").strip().lower()
     is_surface = plot_dimension == "3d" or bool(str(plot_metadata.get("input2_target") or "").strip())
     uses_control_period_input = any(
-        td_perf_normalize_fit_mode((model or {}).get("fit_family")) == TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD
+        td_perf_normalize_fit_mode((model or {}).get("fit_family")) in TD_PERF_ANY_CONTROL_PERIOD_FAMILIES
         for model in models_by_stat.values()
         if isinstance(model, Mapping)
     )
@@ -16430,7 +17195,7 @@ def _td_perf_write_static_saved_export_sheet(
     helper_model = models_by_stat[helper_source_stat]
     helper_family = td_perf_normalize_fit_mode(helper_model.get("fit_family"))
     uses_control_period_norm = any(
-        td_perf_normalize_fit_mode((model or {}).get("fit_family")) == TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD
+        td_perf_normalize_fit_mode((model or {}).get("fit_family")) in TD_PERF_ANY_CONTROL_PERIOD_FAMILIES
         for model in models_by_stat.values()
         if isinstance(model, Mapping)
     )
@@ -16551,6 +17316,9 @@ def _td_perf_write_static_saved_export_sheet(
             input_1_norm = _td_perf_static_norm_value(input_1, helper_model.get("x1_center"), helper_model.get("x1_scale"))
             if is_surface:
                 input_2_norm = _td_perf_static_norm_value(input_2, helper_model.get("x2_center"), helper_model.get("x2_scale"))
+            control_period_norm = _td_perf_static_norm_value(control_period, helper_model.get("cp_center"), helper_model.get("cp_scale"))
+        elif helper_family in TD_PERF_CURVE_CONTROL_PERIOD_FAMILIES:
+            input_1_norm = _td_perf_static_norm_value(input_1, helper_model.get("x_center"), helper_model.get("x_scale"))
             control_period_norm = _td_perf_static_norm_value(control_period, helper_model.get("cp_center"), helper_model.get("cp_scale"))
 
         if uses_control_period_norm and control_period_norm is not None:
@@ -16908,6 +17676,24 @@ def td_perf_export_equation_workbook(
                 ws_support.cell(support_row, 8).value = padded[2] if len(padded) > 2 else ""
                 ws_support.cell(support_row, 9).value = padded[3] if len(padded) > 3 else ""
                 support_row += 1
+        elif family in TD_PERF_CURVE_CONTROL_PERIOD_FAMILIES:
+            cp_values = [float(v) for v in (model.get("control_period_values") or [])]
+            cp_min = float(min(cp_values)) if cp_values else 0.0
+            cp_max = float(max(cp_values)) if cp_values else 0.0
+            coeff_source = model.get("residual_cp_models") if family == TD_PERF_FIT_FAMILY_HYBRID_QUADRATIC_RESIDUAL_CONTROL_PERIOD else model.get("coeff_cp_models")
+            for basis_idx, coeffs in enumerate(coeff_source or []):
+                coeff_list = [float(v) for v in coeffs]
+                padded = coeff_list + [""] * max(0, 4 - len(coeff_list))
+                ws_support.cell(support_row, 1).value = stat
+                ws_support.cell(support_row, 2).value = family
+                ws_support.cell(support_row, 3).value = basis_idx
+                ws_support.cell(support_row, 4).value = cp_min
+                ws_support.cell(support_row, 5).value = cp_max
+                ws_support.cell(support_row, 6).value = padded[0] if len(padded) > 0 else ""
+                ws_support.cell(support_row, 7).value = padded[1] if len(padded) > 1 else ""
+                ws_support.cell(support_row, 8).value = padded[2] if len(padded) > 2 else ""
+                ws_support.cell(support_row, 9).value = padded[3] if len(padded) > 3 else ""
+                support_row += 1
 
     helper_x_template = ""
     helper_x2_template = ""
@@ -16930,6 +17716,9 @@ def td_perf_export_equation_workbook(
             helper_x2_template = _td_perf_excel_norm_expr("{X2}", helper_model.get("x2_center"), helper_model.get("x2_scale"))
         helper_cp_template = _td_perf_excel_norm_expr("{CP}", helper_model.get("cp_center"), helper_model.get("cp_scale"))
     elif helper_family == TD_PERF_FIT_FAMILY_QUADRATIC_CURVE_CONTROL_PERIOD:
+        helper_x_template = _td_perf_excel_norm_expr("{X}", helper_model.get("x_center"), helper_model.get("x_scale"))
+        helper_cp_template = _td_perf_excel_norm_expr("{CP}", helper_model.get("cp_center"), helper_model.get("cp_scale"))
+    elif helper_family == TD_PERF_FIT_FAMILY_HYBRID_QUADRATIC_RESIDUAL_CONTROL_PERIOD:
         helper_x_template = _td_perf_excel_norm_expr("{X}", helper_model.get("x_center"), helper_model.get("x_scale"))
         helper_cp_template = _td_perf_excel_norm_expr("{CP}", helper_model.get("cp_center"), helper_model.get("cp_scale"))
 
@@ -16992,6 +17781,9 @@ def td_perf_export_equation_workbook(
                     stat_norm_x2_ref = _td_perf_excel_norm_expr(raw_x2_ref, model.get("x2_center"), model.get("x2_scale"))
                     stat_norm_cp_ref = _td_perf_excel_norm_expr(raw_cp_ref, model.get("cp_center"), model.get("cp_scale"))
                 elif family == TD_PERF_FIT_FAMILY_QUADRATIC_CURVE_CONTROL_PERIOD:
+                    stat_norm_x_ref = _td_perf_excel_norm_expr(raw_x_ref, model.get("x_center"), model.get("x_scale"))
+                    stat_norm_cp_ref = _td_perf_excel_norm_expr(raw_cp_ref, model.get("cp_center"), model.get("cp_scale"))
+                elif family == TD_PERF_FIT_FAMILY_HYBRID_QUADRATIC_RESIDUAL_CONTROL_PERIOD:
                     stat_norm_x_ref = _td_perf_excel_norm_expr(raw_x_ref, model.get("x_center"), model.get("x_scale"))
                     stat_norm_cp_ref = _td_perf_excel_norm_expr(raw_cp_ref, model.get("cp_center"), model.get("cp_scale"))
                 formula = _td_perf_excel_formula_for_model(
@@ -18139,6 +18931,11 @@ def _td_perf_matlab_signature_parts(
             (x2_var, input2_label),
             (cp_var, "control period"),
         ]
+    if family in TD_PERF_CURVE_CONTROL_PERIOD_FAMILIES:
+        return [x_var, cp_var], [
+            (x_var, input1_label),
+            (cp_var, "control period"),
+        ]
     if str(plot_metadata.get("plot_dimension") or "").strip().lower() == "3d" or str(plot_metadata.get("input2_target") or "").strip():
         return [x1_var, x2_var], [
             (x1_var, input1_label),
@@ -18255,6 +19052,28 @@ def _td_perf_matlab_function_expr(
             f"{_td_perf_matlab_num(model.get('x2_center'))}, {_td_perf_matlab_num(model.get('x2_scale') or 1.0)}, "
             f"{_td_perf_matlab_num(model.get('cp_center'))}, {_td_perf_matlab_num(model.get('cp_scale') or 1.0)})"
         )
+    if family == TD_PERF_FIT_FAMILY_QUADRATIC_CURVE_CONTROL_PERIOD:
+        coeff_cp_models = [_td_perf_matlab_vector(coeffs) for coeffs in (model.get("coeff_cp_models") or [])]
+        coeff_matrix = "{" + ", ".join(coeff_cp_models) + "}"
+        return (
+            f"eidat_perf_curve_cp_predict({x_var}, {cp_var}, {coeff_matrix}, "
+            f"{_td_perf_matlab_num(model.get('x_center'))}, {_td_perf_matlab_num(model.get('x_scale') or 1.0)}, "
+            f"{_td_perf_matlab_num(model.get('cp_center'))}, {_td_perf_matlab_num(model.get('cp_scale') or 1.0)})"
+        )
+    if family == TD_PERF_FIT_FAMILY_HYBRID_QUADRATIC_RESIDUAL_CONTROL_PERIOD:
+        residual_cp_models = [_td_perf_matlab_vector(coeffs) for coeffs in (model.get("residual_cp_models") or model.get("coeff_cp_models") or [])]
+        coeff_matrix = "{" + ", ".join(residual_cp_models) + "}"
+        base_params = dict(model.get("base_params") or (params or {}).get("base_params") or {})
+        base_expr = (
+            f"({_td_perf_matlab_num(base_params.get('b'))} + "
+            f"({_td_perf_matlab_num(base_params.get('m'))}.*{x_var}) + "
+            f"({_td_perf_matlab_num(base_params.get('A'))}.*(1 - exp(-{_td_perf_matlab_num(base_params.get('k'))}.*{x_var}))))"
+        )
+        return (
+            f"({base_expr} + eidat_perf_curve_cp_predict({x_var}, {cp_var}, {coeff_matrix}, "
+            f"{_td_perf_matlab_num(model.get('x_center'))}, {_td_perf_matlab_num(model.get('x_scale') or 1.0)}, "
+            f"{_td_perf_matlab_num(model.get('cp_center'))}, {_td_perf_matlab_num(model.get('cp_scale') or 1.0)}))"
+        )
     return "[]"
 
 
@@ -18316,6 +19135,8 @@ def td_perf_export_saved_equations_matlab(
             family = td_perf_normalize_fit_mode(model.get("fit_family"))
             if family == TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD:
                 handle = f"@({x1_var}, {x2_var}, {cp_var}) {_td_perf_matlab_function_expr(model, x_var=x_var, x1_var=x1_var, x2_var=x2_var, cp_var=cp_var)}"
+            elif family in TD_PERF_CURVE_CONTROL_PERIOD_FAMILIES:
+                handle = f"@({x_var}, {cp_var}) {_td_perf_matlab_function_expr(model, x_var=x_var, x1_var=x1_var, x2_var=x2_var, cp_var=cp_var)}"
             elif str(plot_metadata.get("plot_dimension") or "").strip().lower() == "3d" or str(plot_metadata.get("input2_target") or "").strip():
                 handle = f"@({x1_var}, {x2_var}) {_td_perf_matlab_function_expr(model, x_var=x_var, x1_var=x1_var, x2_var=x2_var, cp_var=cp_var)}"
             else:
@@ -18366,6 +19187,20 @@ def td_perf_export_saved_equations_matlab(
             "y = interp1(knots, knot_values, x, 'pchip');",
             "y(x < knots(1)) = left_y;",
             "y(x > knots(end)) = right_y;",
+            "end",
+            "",
+            "% Control-period-aware quadratic curve predictor used by exported 2D CP equations.",
+            "% Inputs: x, control_period, coefficient polynomials, and normalization terms.",
+            "% Output: y predictions evaluated element-wise over the normalized 2D curve basis terms.",
+            "function y = eidat_perf_curve_cp_predict(x, control_period, coeff_cp_models, x_center, x_scale, cp_center, cp_scale)",
+            "xn = (double(x) - x_center) ./ x_scale;",
+            "cpn = (double(control_period) - cp_center) ./ cp_scale;",
+            "basis = {xn.^2, xn, ones(size(xn))};",
+            "y = zeros(size(xn));",
+            "for idx = 1:min(numel(coeff_cp_models), numel(basis))",
+            "    coeffs = coeff_cp_models{idx};",
+            "    y = y + polyval(coeffs, cpn) .* basis{idx};",
+            "end",
             "end",
             "",
             "% Control-period-aware quadratic surface predictor for exported 3D equations.",

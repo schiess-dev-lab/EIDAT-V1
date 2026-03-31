@@ -207,6 +207,29 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
             if tmpdir:
                 shutil.rmtree(str(tmpdir), ignore_errors=True)
 
+    def test_trend_analyze_left_panel_width_stays_bounded_across_modes(self) -> None:
+        window = self._make_window()
+        try:
+            window.show()
+            self._app.processEvents()
+
+            preferred_curves_width = window._preferred_left_panel_width()
+            self.assertLess(preferred_curves_width, window.width())
+            self.assertLessEqual(window._left_panel_scroll.width(), preferred_curves_width)
+
+            window._set_mode("performance")
+            self._app.processEvents()
+
+            preferred_perf_width = window._preferred_left_panel_width()
+            self.assertLess(preferred_perf_width, window.width())
+            self.assertLessEqual(window._left_panel_scroll.width(), preferred_perf_width)
+            self.assertLess(window._tabs.currentWidget().sizeHint().width(), window.width())
+        finally:
+            window.close()
+            tmpdir = getattr(window, "_test_tmpdir", "")
+            if tmpdir:
+                shutil.rmtree(str(tmpdir), ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()

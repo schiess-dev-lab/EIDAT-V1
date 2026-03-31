@@ -139,6 +139,39 @@ def _saved_entry(
     }
 
 
+def _curve_cp_model() -> dict[str, object]:
+    return {
+        "fit_family": backend.TD_PERF_FIT_FAMILY_QUADRATIC_CURVE_CONTROL_PERIOD,
+        "coeff_cp_models": [[0.0, 0.2], [0.0, 2.0], [5.0]],
+        "x_center": 0.0,
+        "x_scale": 1.0,
+        "cp_center": 0.0,
+        "cp_scale": 1.0,
+        "equation": "y = a(cp')*x'^2 + b(cp')*x' + c(cp')",
+        "x_norm_equation": "x' = (x-0)/1; cp' = (control_period-0)/1",
+    }
+
+
+def _hybrid_curve_cp_model() -> dict[str, object]:
+    return {
+        "fit_family": backend.TD_PERF_FIT_FAMILY_HYBRID_QUADRATIC_RESIDUAL_CONTROL_PERIOD,
+        "base_fit_family": backend.TD_PERF_FIT_MODE_HYBRID_SATURATING_LINEAR,
+        "base_params": {"b": 10.0, "m": 1.5, "A": 4.0, "k": 0.5},
+        "residual_cp_models": [[0.0, 0.05], [0.0, 0.2], [0.0, 0.5]],
+        "coeff_cp_models": [[0.0, 0.05], [0.0, 0.2], [0.0, 0.5]],
+        "x_center": 0.0,
+        "x_scale": 1.0,
+        "cp_center": 0.0,
+        "cp_scale": 1.0,
+        "equation": "y = backbone(x) + a(cp')*x'^2 + b(cp')*x' + c(cp')",
+        "x_norm_equation": "x' = (x-0)/1; cp' = (control_period-0)/1",
+        "params": {
+            "base_params": {"b": 10.0, "m": 1.5, "A": 4.0, "k": 0.5},
+            "residual_cp_models": [[0.0, 0.05], [0.0, 0.2], [0.0, 0.5]],
+        },
+    }
+
+
 def _data_header_row(ws) -> int:
     for row_idx in range(1, ws.max_row + 1):
         if ws.cell(row_idx, 1).value == "run_name":
@@ -518,6 +551,145 @@ class TestBackendPerfExportExcel(unittest.TestCase):
             finally:
                 wb.close()
 
+    def test_predict_export_value_supports_curve_cp_families(self) -> None:
+        legacy_value = backend._td_perf_predict_export_value(
+            _curve_cp_model(),
+            input_1=2.0,
+            control_period=3.0,
+        )
+        hybrid_value = backend._td_perf_predict_export_value(
+            _hybrid_curve_cp_model(),
+            input_1=2.0,
+            control_period=3.0,
+        )
+
+        self.assertAlmostEqual(float(legacy_value or 0.0), 9.8, places=6)
+        self.assertTrue(hybrid_value is not None)
+        self.assertGreater(float(hybrid_value or 0.0), 0.0)
+
+    def test_export_interactive_equation_workbook_2d_hybrid_curve_cp_uses_control_period_input(self) -> None:
+        db_path = _create_perf_export_db()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_path = Path(tmpdir) / "interactive_curve_cp.xlsx"
+            backend.td_perf_export_interactive_equation_workbook(
+                db_path,
+                out_path,
+                plot_metadata={
+                    "plot_dimension": "2d",
+                    "output_target": "Output",
+                    "output_units": "u",
+                    "input1_target": "Input",
+                    "input1_units": "u",
+                    "input2_target": "",
+                    "input2_units": "",
+                    "run_selection_label": "Smart Equation Solver",
+                    "member_runs": ["cond_2d"],
+                    "performance_run_type_mode": "pulsed_mode",
+                    "performance_filter_mode": "match_control_period",
+                    "selected_control_period": 30.0,
+                    "performance_plot_method": "cached_condition_means",
+                },
+                results_by_stat={"mean": {"master_model": _hybrid_curve_cp_model()}},
+                run_specs=[
+                    {
+                        "run_name": "cond_2d",
+                        "display_name": "Condition 2D",
+                        "input1_column": "Input",
+                        "output_column": "Output",
+                    }
+                ],
+                run_type_filter="pulsed_mode",
+                include_regression_checker=False,
+            )
+
+            wb = load_workbook(str(out_path), data_only=False)
+            try:
+                self.assertIsNotNone(wb.defined_names.get("Control_Period"))
+                ws = wb["Interactive Calculator"]
+                pred_mean_row = _find_label_row(ws, "pred_mean")
+                self.assertIn("Control_Period", str(ws.cell(pred_mean_row, 5).value or ""))
+                scenario_header_row = _find_label_row(ws, "scenario_id")
+                scenario_headers = {
+                    str(ws.cell(scenario_header_row, col_idx).value or "").strip(): col_idx
+                    for col_idx in range(1, ws.max_column + 1)
+                    if str(ws.cell(scenario_header_row, col_idx).value or "").strip()
+                }
+                self.assertIn("control_period", scenario_headers)
+                scenario_formula = str(ws.cell(scenario_header_row + 1, scenario_headers["pred_mean"]).value or "")
+                raw_cp_ref = backend._td_perf_excel_ref(scenario_headers["control_period"], scenario_header_row + 1)
+                self.assertIn(raw_cp_ref, scenario_formula)
+            finally:
+                wb.close()
+
+    def test_export_interactive_equation_workbook_curve_cp_checker_includes_control_period_predictions(self) -> None:
+        db_path = _create_perf_export_db()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_path = Path(tmpdir) / "interactive_curve_cp_checker.xlsx"
+            backend.td_perf_export_interactive_equation_workbook(
+                db_path,
+                out_path,
+                plot_metadata={
+                    "plot_dimension": "2d",
+                    "output_target": "Output",
+                    "output_units": "u",
+                    "input1_target": "Input",
+                    "input1_units": "u",
+                    "input2_target": "",
+                    "input2_units": "",
+                    "run_selection_label": "Smart Equation Solver",
+                    "member_runs": ["cond_2d"],
+                    "performance_run_type_mode": "pulsed_mode",
+                    "performance_filter_mode": "match_control_period",
+                    "selected_control_period": 30.0,
+                    "performance_plot_method": "cached_condition_means",
+                },
+                results_by_stat={"mean": {"master_model": _hybrid_curve_cp_model()}},
+                run_specs=[
+                    {
+                        "run_name": "cond_2d",
+                        "display_name": "Condition 2D",
+                        "input1_column": "Input",
+                        "output_column": "Output",
+                    }
+                ],
+                regression_checker_rows=[
+                    {
+                        "run_name": "cond_2d",
+                        "display_name": "Condition 2D",
+                        "serial": "SN-001",
+                        "observation_id": "SN-001__curve_cp",
+                        "program_title": "Program A",
+                        "source_run_name": "Seq-1",
+                        "suppression_voltage": 5.0,
+                        "control_period": 30.0,
+                        "condition_label": "Condition 2D",
+                        "input_1": 10.0,
+                        "input_2": None,
+                        "actual_mean": 120.0,
+                        "sample_count": 1,
+                    }
+                ],
+                run_type_filter="pulsed_mode",
+                include_regression_checker=True,
+            )
+
+            wb = load_workbook(str(out_path), data_only=False)
+            try:
+                checker = wb["Mean Regression Checker"]
+                header_row = _data_header_row(checker)
+                headers = {
+                    str(checker.cell(header_row, col_idx).value or "").strip(): col_idx
+                    for col_idx in range(1, checker.max_column + 1)
+                    if str(checker.cell(header_row, col_idx).value or "").strip()
+                }
+                self.assertIn("control_period", headers)
+                pred_formula = str(checker.cell(header_row + 1, headers["pred_mean"]).value or "")
+                self.assertTrue(pred_formula.startswith("="))
+                raw_cp_ref = backend._td_perf_excel_ref(headers["control_period"], header_row + 1)
+                self.assertIn(raw_cp_ref, pred_formula)
+            finally:
+                wb.close()
+
     def test_export_interactive_equation_workbook_3d_uses_input_2_and_omits_checker_when_disabled(self) -> None:
         db_path = _create_perf_export_db()
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -768,6 +940,42 @@ class TestBackendPerfExportExcel(unittest.TestCase):
                 self.assertAlmostEqual(float(ws_3d.cell(header_row_3d + 1, headers_3d["actual_mean"]).value), 13.0)
             finally:
                 wb.close()
+
+    def test_saved_perf_export_matlab_supports_curve_cp_families(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_path = Path(tmpdir) / "curve_cp_export.m"
+            backend.td_perf_export_saved_equations_matlab(
+                out_path,
+                entries=[
+                    _saved_entry(
+                        name="Curve CP Legacy",
+                        plot_metadata={
+                            "plot_dimension": "2d",
+                            "output_target": "Output",
+                            "input1_target": "Input",
+                            "input2_target": "",
+                        },
+                        run_specs=[],
+                        results_by_stat={"mean": {"master_model": _curve_cp_model()}},
+                    ),
+                    _saved_entry(
+                        name="Curve CP Hybrid",
+                        plot_metadata={
+                            "plot_dimension": "2d",
+                            "output_target": "Output",
+                            "input1_target": "Input",
+                            "input2_target": "",
+                        },
+                        run_specs=[],
+                        results_by_stat={"mean": {"master_model": _hybrid_curve_cp_model()}},
+                    ),
+                ],
+            )
+            text = out_path.read_text(encoding="utf-8")
+
+        self.assertIn("function y = eidat_perf_curve_cp_predict", text)
+        self.assertIn("control period (control_period)", text)
+        self.assertIn("@(Input, control_period)", text)
 
     def test_export_saved_equations_workbook_handles_missing_cached_rows(self) -> None:
         db_path = _create_perf_export_db()

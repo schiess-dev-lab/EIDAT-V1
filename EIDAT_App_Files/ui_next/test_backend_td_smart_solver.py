@@ -2,6 +2,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+import math
 from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
@@ -13,6 +14,14 @@ if str(APP_ROOT) not in sys.path:
 
 
 from ui_next import backend  # noqa: E402
+
+
+def _have_scipy() -> bool:
+    try:
+        import scipy  # noqa: F401
+    except Exception:
+        return False
+    return True
 
 
 class _FakeArray(list):
@@ -185,9 +194,12 @@ def _run_solver_with_captures(
             "fit_domain_control_period": [min(captured["fit_cps"]), max(captured["fit_cps"])],
         }
 
-    def _fake_predict(_model, xs, control_periods):
+    def _fake_hybrid_fit(xs, ys, control_periods, **_kwargs):
+        return _fake_fit(xs, ys, control_periods)
+
+    def _fake_predict(_model, xs, *, control_period=None):
         captured["predict_xs"] = [float(value) for value in xs]
-        captured["predict_cps"] = [float(value) for value in control_periods]
+        captured["predict_cps"] = [float(value) for value in (control_period or [])]
         return list(captured.get("fit_ys") or [])
 
     with patch.object(
@@ -200,7 +212,11 @@ def _run_solver_with_captures(
         side_effect=_fake_fit,
     ), patch.object(
         backend,
-        "_td_perf_predict_quadratic_curve_control_period",
+        "_td_perf_fit_hybrid_quadratic_residual_control_period_model",
+        side_effect=_fake_hybrid_fit,
+    ), patch.object(
+        backend,
+        "td_perf_predict_model",
         side_effect=_fake_predict,
     ), patch.object(
         backend,
@@ -217,6 +233,67 @@ def _run_solver_with_captures(
             program_filters=program_filters,
         )
     return result, captured
+
+
+def _build_curve_cp_rows(
+    *,
+    control_periods: list[float],
+    xs: list[float],
+    low_x_bend: bool,
+    serial: str = "SN-001",
+    run_name: str = "CondA",
+) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for cp_index, control_period in enumerate(control_periods):
+        for point_index, x_value in enumerate(xs):
+            base = 160.0 + (42.0 * (1.0 - math.exp(-1700.0 * x_value))) + (220.0 * x_value) + (0.05 * control_period)
+            if low_x_bend:
+                bend = (18.0 + (0.04 * control_period)) * math.exp(-((x_value - 0.0009) / 0.00055) ** 2)
+                tail_noise = (0.35 if point_index % 2 == 0 else -0.35) if x_value >= 0.0035 else 0.0
+            else:
+                bend = 0.0
+                tail_noise = (0.08 if point_index % 2 == 0 else -0.08)
+            rows.append(
+                {
+                    "observation_id": f"{serial}-{run_name}-{int(control_period)}-{point_index}",
+                    "serial": serial,
+                    "run_name": run_name,
+                    "program_title": "Program Alpha",
+                    "source_run_name": f"Seq-{cp_index + 1}-{point_index + 1}",
+                    "control_period": float(control_period),
+                    "input_1": float(x_value),
+                    "output": float(base + bend + tail_noise),
+                }
+            )
+    return rows
+
+
+def _negative_interval_count(xs: list[float], ys: list[float], *, breakpoint: float | None) -> int:
+    intervals = 0
+    in_interval = False
+    positive_slopes = [
+        (ys[idx + 1] - ys[idx]) / (xs[idx + 1] - xs[idx])
+        for idx in range(len(xs) - 1)
+        if xs[idx + 1] > xs[idx] and (ys[idx + 1] - ys[idx]) > 0.0
+    ]
+    positive_slopes = [float(value) for value in positive_slopes if math.isfinite(float(value))]
+    median_positive = sorted(positive_slopes)[len(positive_slopes) // 2] if positive_slopes else 0.0
+    threshold = abs(float(median_positive)) * 0.02
+    for idx in range(len(xs) - 1):
+        x_mid = (xs[idx] + xs[idx + 1]) / 2.0
+        if breakpoint is not None and x_mid <= breakpoint:
+            continue
+        dx = xs[idx + 1] - xs[idx]
+        if dx <= 0.0:
+            continue
+        slope = (ys[idx + 1] - ys[idx]) / dx
+        is_negative = float(slope) < -threshold
+        if is_negative and not in_interval:
+            intervals += 1
+            in_interval = True
+        elif not is_negative:
+            in_interval = False
+    return intervals
 
 
 class TestBackendTdSmartSolver(unittest.TestCase):
@@ -409,6 +486,104 @@ class TestBackendTdSmartSolver(unittest.TestCase):
         self.assertEqual(captured["fit_xs"], [2.0, 2.0])
         self.assertNotIn(1.0, captured["fit_xs"])
         self.assertNotIn(10.0, captured["fit_xs"])
+
+    @unittest.skipUnless(_have_scipy(), "scipy is required")
+    def test_smart_solver_prefers_stabilized_curve_family_for_low_x_bend(self) -> None:
+        xs = [0.0003, 0.0006, 0.0009, 0.0012, 0.0016, 0.0022, 0.0035, 0.0060, 0.0120]
+        rows = _build_curve_cp_rows(control_periods=[40.0, 80.0, 120.0], xs=xs, low_x_bend=True)
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            db_path = _create_smart_solver_db(tmpdir, rows)
+            result = backend.td_smart_solver_run(
+                db_path,
+                output_target="Output",
+                input1_target="Input1",
+                runs=["CondA"],
+                serials=["SN-001"],
+            )
+
+        self.assertEqual(
+            result["fit_family"],
+            backend.TD_PERF_FIT_FAMILY_HYBRID_QUADRATIC_RESIDUAL_CONTROL_PERIOD,
+        )
+        self.assertTrue(bool(result.get("low_x_window_enabled")))
+        breakpoint = float(result.get("low_x_breakpoint") or 0.0)
+        self.assertGreater(breakpoint, 0.0003)
+        self.assertLess(breakpoint, 0.0025)
+        self.assertFalse(bool(result.get("fallback_used")))
+
+        model = dict(result.get("master_model") or {})
+        dense_x = [xs[0] + ((xs[-1] - xs[0]) * idx / 119.0) for idx in range(120)]
+        for control_period in (40.0, 60.0, 80.0, 100.0, 120.0):
+            predictions = backend.td_perf_predict_model(
+                model,
+                dense_x,
+                control_period=[control_period] * len(dense_x),
+            )
+            self.assertEqual(len(predictions), len(dense_x))
+            self.assertLessEqual(
+                _negative_interval_count(dense_x, predictions, breakpoint=breakpoint),
+                1,
+            )
+
+    @unittest.skipUnless(_have_scipy(), "scipy is required")
+    def test_smart_solver_smooth_curve_disables_low_x_window_or_falls_back_cleanly(self) -> None:
+        xs = [0.0003, 0.0006, 0.0009, 0.0012, 0.0016, 0.0022, 0.0035, 0.0060, 0.0120]
+        rows = _build_curve_cp_rows(control_periods=[40.0, 80.0, 120.0], xs=xs, low_x_bend=False)
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            db_path = _create_smart_solver_db(tmpdir, rows)
+            result = backend.td_smart_solver_run(
+                db_path,
+                output_target="Output",
+                input1_target="Input1",
+                runs=["CondA"],
+                serials=["SN-001"],
+            )
+
+        self.assertIn(
+            result["fit_family"],
+            {
+                backend.TD_PERF_FIT_FAMILY_HYBRID_QUADRATIC_RESIDUAL_CONTROL_PERIOD,
+                backend.TD_PERF_FIT_FAMILY_QUADRATIC_CURVE_CONTROL_PERIOD,
+            },
+        )
+        if result["fit_family"] == backend.TD_PERF_FIT_FAMILY_HYBRID_QUADRATIC_RESIDUAL_CONTROL_PERIOD:
+            self.assertFalse(bool(result.get("low_x_window_enabled")))
+            self.assertFalse(bool(result.get("fallback_used")))
+        else:
+            self.assertTrue(bool(result.get("fallback_used")))
+            self.assertIsInstance(result.get("support_profile"), dict)
+
+    @unittest.skipUnless(_have_scipy(), "scipy is required")
+    def test_hybrid_curve_cp_fit_uses_linear_cp_degree_with_two_periods(self) -> None:
+        xs = [0.0003, 0.0006, 0.0009, 0.0012, 0.0016, 0.0022, 0.0035, 0.0060]
+        rows = _build_curve_cp_rows(control_periods=[60.0, 120.0], xs=xs, low_x_bend=True)
+        x_values = [float(row["input_1"]) for row in rows]
+        y_values = [float(row["output"]) for row in rows]
+        cp_values = [float(row["control_period"]) for row in rows]
+
+        model = backend._td_perf_fit_hybrid_quadratic_residual_control_period_model(
+            x_values,
+            y_values,
+            cp_values,
+        )
+
+        self.assertIsNotNone(model)
+        assert model is not None
+        self.assertEqual(
+            str(model.get("fit_family") or ""),
+            backend.TD_PERF_FIT_FAMILY_HYBRID_QUADRATIC_RESIDUAL_CONTROL_PERIOD,
+        )
+        self.assertEqual(int(model.get("control_period_degree") or 0), 1)
+        residual_cp_models = model.get("residual_cp_models") or []
+        self.assertEqual(len(residual_cp_models), 3)
+        self.assertTrue(all(len(coeffs) == 2 for coeffs in residual_cp_models))
+        predictions = backend.td_perf_predict_model(
+            model,
+            x_values,
+            control_period=cp_values,
+        )
+        self.assertEqual(len(predictions), len(x_values))
+        self.assertTrue(all(math.isfinite(float(value)) for value in predictions))
 
 
 if __name__ == "__main__":

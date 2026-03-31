@@ -3364,10 +3364,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
         title = QtWidgets.QLabel("Test Data Trend / Analyze")
         title.setStyleSheet("font-size: 14px; font-weight: 700;")
+        title.setWordWrap(True)
         left_layout.addWidget(title)
 
         # Clear mode switcher (tabs hidden; these buttons are the main UI).
-        switch_row = QtWidgets.QHBoxLayout()
         switch_lbl = QtWidgets.QLabel("Mode:")
         switch_lbl.setStyleSheet("font-size: 12px; font-weight: 700; color: #334155;")
         self.btn_mode_curves = QtWidgets.QPushButton("Plot Curves")
@@ -3405,15 +3405,22 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self.btn_mode_perf.clicked.connect(lambda: self._set_mode("performance"))
         self.btn_mode_solver.clicked.connect(lambda: self._set_mode("smart_solver"))
 
-        switch_row.addWidget(switch_lbl)
-        switch_row.addWidget(self.btn_mode_curves)
-        switch_row.addWidget(self.btn_mode_metrics)
-        switch_row.addWidget(self.btn_mode_perf)
-        switch_row.addWidget(self.btn_mode_solver)
-        switch_row.addStretch(1)
-        left_layout.addLayout(switch_row)
+        switch_layout = QtWidgets.QVBoxLayout()
+        switch_layout.setSpacing(6)
+        switch_layout.addWidget(switch_lbl)
+        switch_grid = QtWidgets.QGridLayout()
+        switch_grid.setHorizontalSpacing(8)
+        switch_grid.setVerticalSpacing(8)
+        switch_grid.addWidget(self.btn_mode_curves, 0, 0)
+        switch_grid.addWidget(self.btn_mode_metrics, 0, 1)
+        switch_grid.addWidget(self.btn_mode_perf, 1, 0)
+        switch_grid.addWidget(self.btn_mode_solver, 1, 1)
+        switch_layout.addLayout(switch_grid)
+        left_layout.addLayout(switch_layout)
 
-        cache_row = QtWidgets.QHBoxLayout()
+        cache_actions = QtWidgets.QGridLayout()
+        cache_actions.setHorizontalSpacing(8)
+        cache_actions.setVerticalSpacing(8)
         self.btn_refresh_cache = QtWidgets.QPushButton("Build / Refresh Cache")
         self.btn_refresh_cache.setMinimumHeight(40)
         self.btn_refresh_cache.clicked.connect(lambda: self._load_cache(rebuild=True))
@@ -3467,13 +3474,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self.lbl_cache = QtWidgets.QLabel("")
         self.lbl_cache.setStyleSheet("color: #64748b; font-size: 11px;")
         self.lbl_cache.setWordWrap(True)
-        cache_row.addWidget(self.btn_refresh_cache)
-        cache_row.addWidget(self.btn_open_support)
-        cache_row.addWidget(self.btn_export_debug_excels)
-        cache_row.addWidget(self.btn_plot)
-        cache_row.addWidget(self.btn_plot_perf_cached)
-        cache_row.addStretch(1)
-        left_layout.addLayout(cache_row)
+        cache_actions.addWidget(self.btn_refresh_cache, 0, 0)
+        cache_actions.addWidget(self.btn_open_support, 0, 1)
+        cache_actions.addWidget(self.btn_export_debug_excels, 1, 0)
+        cache_actions.addWidget(self.btn_plot, 1, 1)
+        cache_actions.addWidget(self.btn_plot_perf_cached, 2, 0, 1, 2)
+        left_layout.addLayout(cache_actions)
         left_layout.addWidget(self.lbl_cache)
 
         self._runs_ex: list[dict] = []
@@ -3631,6 +3637,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
         lbl_perf = QtWidgets.QLabel("Performance equations and plots (all runs, all serials)")
         lbl_perf.setStyleSheet("font-size: 12px; font-weight: 800; color: #0f172a;")
+        lbl_perf.setWordWrap(True)
         perf_layout.addWidget(lbl_perf)
 
         perf_panel = QtWidgets.QFrame()
@@ -3682,30 +3689,37 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         mode_row.addStretch(1)
         perf_plot_layout.addLayout(mode_row)
 
-        filter_row = QtWidgets.QHBoxLayout()
+        filter_row = QtWidgets.QVBoxLayout()
+        filter_row.setSpacing(6)
+        filter_mode_row = QtWidgets.QHBoxLayout()
         self.lbl_perf_filter_mode = QtWidgets.QLabel("Pulsed-mode control-period filter:")
         self.lbl_perf_filter_mode.setToolTip(
             "Applies only when Condition family is Pulsed mode. Steady-state conditions remain available via the selector above."
         )
-        filter_row.addWidget(self.lbl_perf_filter_mode)
+        filter_mode_row.addWidget(self.lbl_perf_filter_mode)
         self.cb_perf_filter_mode = QtWidgets.QComboBox()
         self.cb_perf_filter_mode.addItem("All PM control periods", "all_conditions")
         self.cb_perf_filter_mode.addItem("Match control period", "match_control_period")
         self.cb_perf_filter_mode.setToolTip(
             "Filters pulsed-mode rows by control period. Steady-state rows are selected with Condition family."
         )
-        filter_row.addWidget(self.cb_perf_filter_mode, 1)
+        filter_mode_row.addWidget(self.cb_perf_filter_mode, 1)
+        filter_row.addLayout(filter_mode_row)
+        filter_cp_row = QtWidgets.QHBoxLayout()
         self.lbl_perf_control_period = QtWidgets.QLabel("Control period:")
         self.lbl_perf_control_period.setToolTip(
             "Select the pulsed-mode control period to match when the filter mode requires it."
         )
-        filter_row.addWidget(self.lbl_perf_control_period)
+        filter_cp_row.addWidget(self.lbl_perf_control_period)
         self.cb_perf_control_period = QtWidgets.QComboBox()
         self.cb_perf_control_period.setEnabled(False)
-        filter_row.addWidget(self.cb_perf_control_period, 1)
+        filter_cp_row.addWidget(self.cb_perf_control_period, 1)
+        filter_cp_row.addStretch(1)
+        filter_row.addLayout(filter_cp_row)
         perf_plot_layout.addLayout(filter_row)
 
-        fit_row = QtWidgets.QHBoxLayout()
+        fit_row = QtWidgets.QVBoxLayout()
+        fit_row.setSpacing(6)
         self.cb_perf_fit = QtWidgets.QCheckBox("Fit equation")
         self.cb_perf_fit.setChecked(True)
         self.cb_perf_fit_model = QtWidgets.QComboBox()
@@ -3729,15 +3743,21 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self.cb_perf_surface_model.addItem("Quadratic Surface", "quadratic_surface")
         self.cb_perf_surface_model.addItem("Quadratic Surface + Control Period", "quadratic_surface_control_period")
         self.cb_perf_surface_model.addItem("Plane", "plane")
-        fit_row.addWidget(self.cb_perf_fit)
-        fit_row.addWidget(QtWidgets.QLabel("Model:"))
-        fit_row.addWidget(self.cb_perf_fit_model)
-        fit_row.addWidget(QtWidgets.QLabel("3D Model:"))
-        fit_row.addWidget(self.cb_perf_surface_model)
-        fit_row.addWidget(QtWidgets.QLabel("Degree:"))
-        fit_row.addWidget(self.sp_perf_degree)
-        fit_row.addWidget(self.cb_perf_norm_x)
-        fit_row.addStretch(1)
+        fit_primary_row = QtWidgets.QHBoxLayout()
+        fit_primary_row.addWidget(self.cb_perf_fit)
+        fit_primary_row.addWidget(QtWidgets.QLabel("Model:"))
+        fit_primary_row.addWidget(self.cb_perf_fit_model, 1)
+        fit_row.addLayout(fit_primary_row)
+        fit_surface_row = QtWidgets.QHBoxLayout()
+        fit_surface_row.addWidget(QtWidgets.QLabel("3D Model:"))
+        fit_surface_row.addWidget(self.cb_perf_surface_model, 1)
+        fit_row.addLayout(fit_surface_row)
+        fit_options_row = QtWidgets.QHBoxLayout()
+        fit_options_row.addWidget(QtWidgets.QLabel("Degree:"))
+        fit_options_row.addWidget(self.sp_perf_degree)
+        fit_options_row.addWidget(self.cb_perf_norm_x)
+        fit_options_row.addStretch(1)
+        fit_row.addLayout(fit_options_row)
         perf_plot_layout.addLayout(fit_row)
 
         # Runs are always all runs in the cache (no selector).
@@ -3768,27 +3788,28 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         perf_eq_layout.setContentsMargins(0, 0, 0, 0)
         perf_eq_layout.setSpacing(8)
 
-        eq_row = QtWidgets.QHBoxLayout()
         lbl_eq = QtWidgets.QLabel("Equations (per stat)")
         lbl_eq.setStyleSheet("font-size: 12px; font-weight: 700; color: #0f172a;")
-        eq_row.addWidget(lbl_eq)
-        eq_row.addStretch(1)
+        perf_eq_layout.addWidget(lbl_eq)
+        eq_actions = QtWidgets.QGridLayout()
+        eq_actions.setHorizontalSpacing(8)
+        eq_actions.setVerticalSpacing(8)
         self.btn_perf_save_equation = QtWidgets.QPushButton("Save Performance Equation")
         self.btn_perf_save_equation.setEnabled(False)
-        eq_row.addWidget(self.btn_perf_save_equation)
+        eq_actions.addWidget(self.btn_perf_save_equation, 0, 0)
         self.btn_perf_saved_equations = QtWidgets.QPushButton("Saved Performance Equations")
         self.btn_perf_saved_equations.setEnabled(True)
-        eq_row.addWidget(self.btn_perf_saved_equations)
+        eq_actions.addWidget(self.btn_perf_saved_equations, 0, 1)
         self.cb_perf_include_reg_checker = QtWidgets.QCheckBox("Include Mean Regression Checker")
         self.cb_perf_include_reg_checker.setChecked(True)
-        eq_row.addWidget(self.cb_perf_include_reg_checker)
+        eq_actions.addWidget(self.cb_perf_include_reg_checker, 1, 0, 1, 2)
         self.btn_perf_export_interactive = QtWidgets.QPushButton("Export Interactive Workbook")
         self.btn_perf_export_interactive.setEnabled(False)
-        eq_row.addWidget(self.btn_perf_export_interactive)
+        eq_actions.addWidget(self.btn_perf_export_interactive, 2, 0)
         self.btn_perf_export_equations = QtWidgets.QPushButton("Export Equation to Excel")
         self.btn_perf_export_equations.setEnabled(False)
-        eq_row.addWidget(self.btn_perf_export_equations)
-        perf_eq_layout.addLayout(eq_row)
+        eq_actions.addWidget(self.btn_perf_export_equations, 2, 1)
+        perf_eq_layout.addLayout(eq_actions)
 
         self.tbl_perf_equations = QtWidgets.QTableWidget(0, 9)
         self.tbl_perf_equations.setHorizontalHeaderLabels(
@@ -4322,27 +4343,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             pass
 
         width_candidates: list[int] = []
-        for candidate in (
-            getattr(panel_widget, "sizeHint", None),
-            getattr(panel_widget, "minimumSizeHint", None),
-        ):
-            if callable(candidate):
-                try:
-                    width_candidates.append(int(candidate().width()))
-                except Exception:
-                    pass
 
         try:
-            for child in panel_widget.findChildren(QtWidgets.QWidget):
-                if not child.isVisibleTo(panel_widget):
-                    continue
-                pos = child.mapTo(panel_widget, QtCore.QPoint(0, 0))
-                child_width = max(
-                    int(child.sizeHint().width()),
-                    int(child.minimumSizeHint().width()),
-                    int(child.minimumWidth()),
-                )
-                width_candidates.append(int(pos.x()) + child_width)
+            layout = panel_widget.layout()
+            if layout is not None:
+                width_candidates.append(int(layout.minimumSize().width()))
+                width_candidates.append(int(layout.sizeHint().width()))
         except Exception:
             pass
 
@@ -4350,6 +4356,17 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             width_candidates.append(panel.frameWidth() * 2)
         except Exception:
             pass
+
+        if not width_candidates:
+            for candidate in (
+                getattr(panel_widget, "sizeHint", None),
+                getattr(panel_widget, "minimumSizeHint", None),
+            ):
+                if callable(candidate):
+                    try:
+                        width_candidates.append(int(candidate().width()))
+                    except Exception:
+                        pass
 
         preferred = max(width_candidates or [0])
         if preferred <= 0:
@@ -4363,10 +4380,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         splitter = getattr(self, "main_splitter", None)
         if panel is None or splitter is None:
             return
-        width = max(panel.width(), self._preferred_left_panel_width())
+        width = self._preferred_left_panel_width()
         if width <= 0:
             try:
-                width = max(panel.sizeHint().width(), panel.minimumSizeHint().width())
+                width = max(panel.width(), panel.sizeHint().width(), panel.minimumSizeHint().width())
             except Exception:
                 width = 0
         if width <= 0:
