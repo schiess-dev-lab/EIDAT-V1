@@ -11767,12 +11767,16 @@ TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE = "quadratic_surface"
 TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD = "quadratic_surface_control_period"
 TD_PERF_FIT_FAMILY_QUADRATIC_CURVE_CONTROL_PERIOD = "quadratic_curve_control_period"
 TD_PERF_FIT_FAMILY_HYBRID_QUADRATIC_RESIDUAL_CONTROL_PERIOD = "hybrid_quadratic_residual_control_period"
+TD_PERF_FIT_FAMILY_QUADRATIC_3INPUT_CONTROL_PERIOD = "quadratic_3input_control_period"
+TD_PERF_FIT_FAMILY_STAGED_MEDIATOR_CONTROL_PERIOD = "staged_mediator_control_period"
 TD_PERF_CURVE_CONTROL_PERIOD_FAMILIES = {
     TD_PERF_FIT_FAMILY_QUADRATIC_CURVE_CONTROL_PERIOD,
     TD_PERF_FIT_FAMILY_HYBRID_QUADRATIC_RESIDUAL_CONTROL_PERIOD,
 }
 TD_PERF_ANY_CONTROL_PERIOD_FAMILIES = {
     TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD,
+    TD_PERF_FIT_FAMILY_QUADRATIC_3INPUT_CONTROL_PERIOD,
+    TD_PERF_FIT_FAMILY_STAGED_MEDIATOR_CONTROL_PERIOD,
     *TD_PERF_CURVE_CONTROL_PERIOD_FAMILIES,
 }
 TD_PERF_PIECEWISE_MAX_BREAK_CANDIDATES_2 = 64
@@ -11795,6 +11799,8 @@ TD_PERF_FIT_MODES = {
     TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD,
     TD_PERF_FIT_FAMILY_QUADRATIC_CURVE_CONTROL_PERIOD,
     TD_PERF_FIT_FAMILY_HYBRID_QUADRATIC_RESIDUAL_CONTROL_PERIOD,
+    TD_PERF_FIT_FAMILY_QUADRATIC_3INPUT_CONTROL_PERIOD,
+    TD_PERF_FIT_FAMILY_STAGED_MEDIATOR_CONTROL_PERIOD,
 }
 TD_PERF_FIT_COMPLEXITY_PENALTIES = {
     TD_PERF_FIT_MODE_POLYNOMIAL: 0.0,
@@ -11821,6 +11827,23 @@ TD_PERF_FIT_FAMILY_PRIORITY = {
     TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD: 10,
     TD_PERF_FIT_FAMILY_HYBRID_QUADRATIC_RESIDUAL_CONTROL_PERIOD: 11,
     TD_PERF_FIT_FAMILY_QUADRATIC_CURVE_CONTROL_PERIOD: 12,
+    TD_PERF_FIT_FAMILY_QUADRATIC_3INPUT_CONTROL_PERIOD: 13,
+    TD_PERF_FIT_FAMILY_STAGED_MEDIATOR_CONTROL_PERIOD: 14,
+}
+TD_PERF_EXPORTABLE_FIT_FAMILIES = {
+    TD_PERF_FIT_MODE_POLYNOMIAL,
+    TD_PERF_FIT_MODE_LOGARITHMIC,
+    TD_PERF_FIT_MODE_SATURATING_EXPONENTIAL,
+    TD_PERF_FIT_MODE_HYBRID_SATURATING_LINEAR,
+    TD_PERF_FIT_MODE_HYBRID_QUADRATIC_RESIDUAL,
+    TD_PERF_FIT_MODE_MONOTONE_PCHIP,
+    TD_PERF_FIT_MODE_PIECEWISE_2,
+    TD_PERF_FIT_MODE_PIECEWISE_3,
+    TD_PERF_FIT_FAMILY_PLANE,
+    TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE,
+    TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD,
+    TD_PERF_FIT_FAMILY_QUADRATIC_CURVE_CONTROL_PERIOD,
+    TD_PERF_FIT_FAMILY_HYBRID_QUADRATIC_RESIDUAL_CONTROL_PERIOD,
 }
 TD_PERF_EXPORT_STATS_ORDER = ["mean", "min", "max", "std", "min_3sigma", "max_3sigma"]
 
@@ -11864,6 +11887,10 @@ def td_perf_fit_family_label(value: object) -> str:
         return "Quadratic Curve + Control Period"
     if fam == TD_PERF_FIT_FAMILY_HYBRID_QUADRATIC_RESIDUAL_CONTROL_PERIOD:
         return "Hybrid + CP Residual"
+    if fam == TD_PERF_FIT_FAMILY_QUADRATIC_3INPUT_CONTROL_PERIOD:
+        return "Quadratic 3-Input + Control Period"
+    if fam == TD_PERF_FIT_FAMILY_STAGED_MEDIATOR_CONTROL_PERIOD:
+        return "Staged Mediator + Control Period"
     return "Auto"
 
 
@@ -11981,6 +12008,19 @@ def _td_perf_fmt_surface_control_period_equation(coeff_cp_models: Sequence[Seque
     return f"y = {expr}" if expr else ""
 
 
+def _td_perf_fmt_3input_control_period_equation(coeff_cp_models: Sequence[Sequence[object]]) -> str:
+    labels = ["", "x1'", "x2'", "x3'", "x1'^2", "x2'^2", "x3'^2", "x1'*x2'", "x1'*x3'", "x2'*x3'"]
+    parts: list[str] = []
+    for coeffs, label in zip(coeff_cp_models, labels):
+        coeff_expr = _td_perf_fmt_variable_poly_expr(coeffs, "cp'")
+        if not label:
+            parts.append(f"({coeff_expr})")
+        else:
+            parts.append(f"({coeff_expr})*{label}")
+    expr = " + ".join(part for part in parts if part.strip())
+    return f"y = {expr}" if expr else ""
+
+
 def _td_perf_fmt_surface_control_period_normalization(
     x1_center: float,
     x1_scale: float,
@@ -11991,6 +12031,23 @@ def _td_perf_fmt_surface_control_period_normalization(
 ) -> str:
     return (
         f"{_td_perf_fmt_surface_normalization(x1_center, x1_scale, x2_center, x2_scale)} ; "
+        f"cp' = (control_period - {_td_perf_fmt_num(cp_center)}) / {_td_perf_fmt_num(cp_scale)}"
+    )
+
+
+def _td_perf_fmt_3input_control_period_normalization(
+    x1_center: float,
+    x1_scale: float,
+    x2_center: float,
+    x2_scale: float,
+    x3_center: float,
+    x3_scale: float,
+    cp_center: float,
+    cp_scale: float,
+) -> str:
+    return (
+        f"{_td_perf_fmt_surface_normalization(x1_center, x1_scale, x2_center, x2_scale)} ; "
+        f"x3' = (x3 - {_td_perf_fmt_num(x3_center)}) / {_td_perf_fmt_num(x3_scale)} ; "
         f"cp' = (control_period - {_td_perf_fmt_num(cp_center)}) / {_td_perf_fmt_num(cp_scale)}"
     )
 
@@ -12039,6 +12096,47 @@ def _td_perf_fmt_hybrid_curve_control_period_equation(
     return ""
 
 
+def _td_perf_fmt_staged_mediator_control_period_equation(
+    stage1_equation: object,
+    stage2_equation: object,
+    *,
+    mediator_target: object,
+) -> str:
+    mediator_name = str(mediator_target or "input3").strip() or "input3"
+    stage1_expr = str(stage1_equation or "").strip()
+    stage2_expr = str(stage2_equation or "").strip()
+    if stage1_expr.lower().startswith("y ="):
+        stage1_expr = stage1_expr[3:].strip()
+    if stage2_expr.lower().startswith("y ="):
+        stage2_expr = stage2_expr[3:].strip()
+    if not stage1_expr and not stage2_expr:
+        return ""
+    if not stage1_expr:
+        return f"y = {stage2_expr}"
+    if not stage2_expr:
+        return f"{mediator_name} = {stage1_expr}"
+    return f"{mediator_name} = {stage1_expr} ; y = {stage2_expr}"
+
+
+def _td_perf_fmt_staged_mediator_control_period_normalization(
+    stage1_norm: object,
+    stage2_model: Mapping[str, object],
+    *,
+    mediator_target: object,
+) -> str:
+    mediator_name = str(mediator_target or "input3").strip() or "input3"
+    stage1_text = str(stage1_norm or "").strip()
+    stage2_text = _td_perf_fmt_curve_control_period_normalization(
+        float(stage2_model.get("x_center") or 0.0),
+        float(stage2_model.get("x_scale") or 1.0),
+        float(stage2_model.get("cp_center") or 0.0),
+        float(stage2_model.get("cp_scale") or 1.0),
+    ).replace("x'", f"{mediator_name}'").replace("(x -", f"({mediator_name} -")
+    if stage1_text and stage2_text:
+        return f"Stage 1: {stage1_text} ; Stage 2: {stage2_text}"
+    return stage1_text or stage2_text
+
+
 def _td_perf_surface_control_period_label(value: object) -> str:
     try:
         numeric = float(value)
@@ -12074,6 +12172,28 @@ def _td_perf_curve_control_period_reason(*, point_count: int, distinct_x1: int, 
     return "; ".join(reasons)
 
 
+def _td_perf_three_input_control_period_reason(
+    *,
+    point_count: int,
+    distinct_x1: int,
+    distinct_x2: int,
+    distinct_x3: int,
+    fit_failed: bool = False,
+) -> str:
+    reasons: list[str] = []
+    if point_count < 10:
+        reasons.append(f"{int(point_count)} points (<10)")
+    if distinct_x1 < 2:
+        reasons.append(f"{int(distinct_x1)} distinct x1 (<2)")
+    if distinct_x2 < 2:
+        reasons.append(f"{int(distinct_x2)} distinct x2 (<2)")
+    if distinct_x3 < 2:
+        reasons.append(f"{int(distinct_x3)} distinct x3 (<2)")
+    if fit_failed:
+        reasons.append("quadratic 3-input slice fit failed")
+    return "; ".join(reasons)
+
+
 def _td_perf_surface_control_period_entry_text(entry: Mapping[str, object]) -> str:
     cp_text = _td_perf_surface_control_period_label(entry.get("control_period"))
     point_count = int(entry.get("point_count") or 0)
@@ -12090,6 +12210,20 @@ def _td_perf_curve_control_period_entry_text(entry: Mapping[str, object]) -> str
     distinct_x1 = int(entry.get("distinct_x1") or 0)
     reason = str(entry.get("reason") or "").strip()
     detail = f"CP {cp_text}: {point_count} points, {distinct_x1} distinct x1"
+    return f"{detail} ({reason})" if reason else detail
+
+
+def _td_perf_three_input_control_period_entry_text(entry: Mapping[str, object]) -> str:
+    cp_text = _td_perf_surface_control_period_label(entry.get("control_period"))
+    point_count = int(entry.get("point_count") or 0)
+    distinct_x1 = int(entry.get("distinct_x1") or 0)
+    distinct_x2 = int(entry.get("distinct_x2") or 0)
+    distinct_x3 = int(entry.get("distinct_x3") or 0)
+    reason = str(entry.get("reason") or "").strip()
+    detail = (
+        f"CP {cp_text}: {point_count} points, {distinct_x1} distinct x1, "
+        f"{distinct_x2} distinct x2, {distinct_x3} distinct x3"
+    )
     return f"{detail} ({reason})" if reason else detail
 
 
@@ -12136,6 +12270,30 @@ def _td_perf_format_curve_control_period_failure(
         if isinstance(entry, Mapping)
     )
     prefix = "Quadratic Curve + Control Period requires at least two distinct control periods with valid curve coverage."
+    if details:
+        return f"{prefix} Eligible periods: {int(eligible_count)}. {details}"
+    return prefix
+
+
+def _td_perf_format_three_input_control_period_warning(ignored_periods: Sequence[Mapping[str, object]]) -> str:
+    ignored = [dict(entry) for entry in (ignored_periods or []) if isinstance(entry, Mapping)]
+    if not ignored:
+        return ""
+    details = "; ".join(_td_perf_three_input_control_period_entry_text(entry) for entry in ignored)
+    return f"Ignored control periods for 3-input CP fit: {details}"
+
+
+def _td_perf_format_three_input_control_period_failure(
+    ignored_periods: Sequence[Mapping[str, object]],
+    *,
+    eligible_count: int,
+) -> str:
+    details = "; ".join(
+        _td_perf_three_input_control_period_entry_text(entry)
+        for entry in (ignored_periods or [])
+        if isinstance(entry, Mapping)
+    )
+    prefix = "3-input control-period solver requires at least two distinct control periods with valid quadratic 3-input coverage."
     if details:
         return f"{prefix} Eligible periods: {int(eligible_count)}. {details}"
     return prefix
@@ -12812,6 +12970,45 @@ def _td_perf_surface_normalize_axes(x1_values, x2_values, *, centers: tuple[floa
     return (x1 - x1_center) / x1_scale, (x2 - x2_center) / x2_scale, x1_center, x1_scale, x2_center, x2_scale
 
 
+def _td_perf_surface_normalize_three_axes(
+    x1_values,
+    x2_values,
+    x3_values,
+    *,
+    centers: tuple[float, float, float] | None = None,
+    scales: tuple[float, float, float] | None = None,
+):
+    np = _td_perf_import_numpy()
+    x1 = np.asarray(x1_values, dtype=float)
+    x2 = np.asarray(x2_values, dtype=float)
+    x3 = np.asarray(x3_values, dtype=float)
+    if centers is None:
+        x1_center = float(np.mean(x1))
+        x2_center = float(np.mean(x2))
+        x3_center = float(np.mean(x3))
+    else:
+        x1_center, x2_center, x3_center = float(centers[0]), float(centers[1]), float(centers[2])
+    if scales is None:
+        x1_scale = float(np.std(x1)) or 1.0
+        x2_scale = float(np.std(x2)) or 1.0
+        x3_scale = float(np.std(x3)) or 1.0
+    else:
+        x1_scale = float(scales[0]) or 1.0
+        x2_scale = float(scales[1]) or 1.0
+        x3_scale = float(scales[2]) or 1.0
+    return (
+        (x1 - x1_center) / x1_scale,
+        (x2 - x2_center) / x2_scale,
+        (x3 - x3_center) / x3_scale,
+        x1_center,
+        x1_scale,
+        x2_center,
+        x2_scale,
+        x3_center,
+        x3_scale,
+    )
+
+
 def _td_perf_surface_design_matrix(x1_values, x2_values, family: str):
     np = _td_perf_import_numpy()
     x1 = np.asarray(x1_values, dtype=float)
@@ -12822,6 +13019,27 @@ def _td_perf_surface_design_matrix(x1_values, x2_values, family: str):
     if raw == TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE:
         return np.column_stack([np.ones_like(x1), x1, x2, x1**2, x1 * x2, x2**2])
     raise ValueError(f"Unsupported surface family: {family}")
+
+
+def _td_perf_three_input_design_matrix(x1_values, x2_values, x3_values):
+    np = _td_perf_import_numpy()
+    x1 = np.asarray(x1_values, dtype=float)
+    x2 = np.asarray(x2_values, dtype=float)
+    x3 = np.asarray(x3_values, dtype=float)
+    return np.column_stack(
+        [
+            np.ones_like(x1),
+            x1,
+            x2,
+            x3,
+            x1**2,
+            x2**2,
+            x3**2,
+            x1 * x2,
+            x1 * x3,
+            x2 * x3,
+        ]
+    )
 
 
 def _td_perf_surface_normalize_control_period(values, *, center: float | None = None, scale: float | None = None):
@@ -12856,6 +13074,42 @@ def _td_perf_surface_control_period_coeffs(model: Mapping[str, object], control_
     for coeffs in coeff_cp_models:
         coeff_matrix.append(np.poly1d(coeffs)(cp_norm))
     return np.vstack(coeff_matrix).T
+
+
+def _td_perf_predict_quadratic_3input_control_period(
+    model: Mapping[str, object],
+    x1_values: Iterable[float],
+    x2_values: Iterable[float],
+    x3_values: Iterable[float],
+    control_period,
+) -> list[float]:
+    np = _td_perf_import_numpy()
+    x1_list = [float(v) for v in x1_values]
+    x2_list = [float(v) for v in x2_values]
+    x3_list = [float(v) for v in x3_values]
+    if not x1_list or len(x1_list) != len(x2_list) or len(x1_list) != len(x3_list):
+        return []
+    x1n, x2n, x3n, _x1_center, _x1_scale, _x2_center, _x2_scale, _x3_center, _x3_scale = _td_perf_surface_normalize_three_axes(
+        x1_list,
+        x2_list,
+        x3_list,
+        centers=(
+            float(model.get("x1_center") or 0.0),
+            float(model.get("x2_center") or 0.0),
+            float(model.get("x3_center") or 0.0),
+        ),
+        scales=(
+            float(model.get("x1_scale") or 1.0),
+            float(model.get("x2_scale") or 1.0),
+            float(model.get("x3_scale") or 1.0),
+        ),
+    )
+    design = _td_perf_three_input_design_matrix(x1n, x2n, x3n)
+    coeff_matrix = _td_perf_surface_control_period_coeffs(model, control_period, len(x1_list))
+    if coeff_matrix.size <= 0 or coeff_matrix.shape[1] != int(design.shape[1]):
+        return []
+    y_hat = np.sum(design * coeff_matrix, axis=1)
+    return [float(v) for v in y_hat.tolist()]
 
 
 def td_perf_predict_surface(
