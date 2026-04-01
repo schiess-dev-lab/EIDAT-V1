@@ -5295,6 +5295,75 @@ class TestTDSupportWorkbook(unittest.TestCase):
             self.assertEqual(curves[0].get("y"), [10, 20, 30])
             self.assertTrue(str(curves[0].get("observation_id") or "").strip())
 
+    def test_td_load_curves_reads_impl_curve_plotter_tables_with_filters(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            impl_db = root / "implementation_trending.sqlite3"
+            with sqlite3.connect(str(impl_db)) as conn:
+                be._ensure_test_data_impl_tables(conn)
+                conn.execute(
+                    f"""
+                    INSERT OR REPLACE INTO {be.TD_PLOTTER_SEQUENCES_TABLE}
+                    (run_name, display_name, x_axis_kind, source_run_name, pulse_width, run_type, control_period, computed_epoch_ns)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    ("RunA", "Run A", "Time", "RunA", 5.0, "pulsed mode", 60.0, 1),
+                )
+                conn.execute(
+                    f"""
+                    INSERT OR REPLACE INTO {be.TD_PLOTTER_CURVE_CATALOG_TABLE}
+                    (run_name, parameter_name, units, x_axis_kind, display_name, source_kind, computed_epoch_ns)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    ("RunA", "thrust", "lbf", "Time", "Thrust", "source_sqlite", 1),
+                )
+                conn.executemany(
+                    f"""
+                    INSERT OR REPLACE INTO {be.TD_PLOTTER_OBSERVATIONS_TABLE}
+                    (observation_id, run_name, serial, program_title, source_run_name, run_type, pulse_width, control_period, suppression_voltage, source_mtime_ns, computed_epoch_ns)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        ("obs_a", "RunA", "SN1", "Program A", "RunA", "pulsed mode", 5.0, 60.0, 24.0, 1, 1),
+                        ("obs_b", "RunA", "SN2", "Program B", "RunA", "pulsed mode", 5.0, 120.0, 28.0, 1, 1),
+                    ],
+                )
+                conn.executemany(
+                    f"""
+                    INSERT OR REPLACE INTO {be.TD_PLOTTER_CURVES_TABLE}
+                    (run_name, y_name, x_name, observation_id, serial, x_json, y_json, n_points, source_mtime_ns, computed_epoch_ns, program_title, source_run_name)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        ("RunA", "thrust", "Time", "obs_a", "SN1", "[0,1,2]", "[10,20,30]", 3, 1, 1, "Program A", "RunA"),
+                        ("RunA", "thrust", "Time", "obs_b", "SN2", "[0,1,2]", "[15,25,35]", 3, 1, 1, "Program B", "RunA"),
+                    ],
+                )
+                conn.commit()
+
+            self.assertFalse((root / "test_data_raw_cache.sqlite3").exists())
+            self.assertEqual(be.td_list_x_columns(impl_db, "RunA"), ["Time"])
+            self.assertEqual(be.td_list_curve_y_columns(impl_db, "RunA", "Time"), [{"name": "thrust", "units": "lbf"}])
+
+            curves = be.td_load_curves(
+                impl_db,
+                "RunA",
+                "thrust",
+                "Time",
+                serials=["SN1"],
+                program_title="Program A",
+                source_run_name="RunA",
+                control_period_filter=60,
+            )
+            self.assertEqual(len(curves), 1)
+            self.assertEqual(curves[0].get("serial"), "SN1")
+            self.assertEqual(curves[0].get("x"), [0, 1, 2])
+            self.assertEqual(curves[0].get("y"), [10, 20, 30])
+            self.assertEqual(float(curves[0].get("control_period") or 0.0), 60.0)
+            self.assertEqual(float(curves[0].get("suppression_voltage") or 0.0), 24.0)
+
     def test_td_curve_selectors_fall_back_to_legacy_impl_curves_when_raw_cache_missing(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
 
@@ -5502,6 +5571,246 @@ class TestTDSupportWorkbook(unittest.TestCase):
             self.assertEqual([row.get("control_period") for row in curves], [60.0])
             self.assertEqual([row.get("suppression_voltage") for row in curves], [24.0])
 
+    def test_rebuild_populates_impl_curve_plotter_tables_and_curves_survive_raw_cache_removal(self) -> None:
+        from openpyxl import load_workbook  # type: ignore
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            src_db = root / "src.sqlite3"
+            self._make_source_sqlite(src_db)
+
+            wb_path = root / "project.xlsx"
+            be._write_test_data_trending_workbook(
+                wb_path,
+                global_repo=root,
+                serials=["SN1"],
+                docs=[{"serial_number": "SN1", "excel_sqlite_rel": str(src_db), "program_title": be.TD_SUPPORT_DEFAULT_PROGRAM_TITLE}],
+                config=self._make_config(),
+            )
+            support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+            be._write_td_support_workbook(
+                support_path,
+                sequence_names=["RunA"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+            )
+
+            wb = load_workbook(str(support_path))
+            try:
+                ws_prog = wb[self._default_program_sheet_name(be)]
+                self._set_sheet_row(
+                    ws_prog,
+                    2,
+                    {
+                        "condition_key": "RunA",
+                        "source_run_name": "RunA",
+                        "feed_pressure": 100,
+                        "feed_pressure_units": "psia",
+                        "run_type": "pulsed mode",
+                        "control_period": 60,
+                        "suppression_voltage": 24,
+                    },
+                )
+                wb.save(str(support_path))
+            finally:
+                wb.close()
+            self._refresh_support_conditions(be, wb_path, root)
+
+            impl_db = root / "implementation_trending.sqlite3"
+            be.rebuild_test_data_project_cache(impl_db, wb_path)
+
+            with sqlite3.connect(str(impl_db)) as conn:
+                tables = {
+                    str(row[0] or "").strip()
+                    for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+                }
+                self.assertIn(be.TD_PLOTTER_SEQUENCES_TABLE, tables)
+                self.assertIn(be.TD_PLOTTER_CURVE_CATALOG_TABLE, tables)
+                self.assertIn(be.TD_PLOTTER_OBSERVATIONS_TABLE, tables)
+                self.assertIn(be.TD_PLOTTER_CURVES_TABLE, tables)
+                plotter_obs = conn.execute(
+                    f"SELECT control_period, suppression_voltage FROM {be.TD_PLOTTER_OBSERVATIONS_TABLE} WHERE serial=? AND run_name=?",
+                    ("SN1", "RunA"),
+                ).fetchone()
+                self.assertIsNotNone(plotter_obs)
+                self.assertEqual(float(plotter_obs[0]), 60.0)
+                self.assertEqual(float(plotter_obs[1]), 24.0)
+                plotter_curve = conn.execute(
+                    f"SELECT y_name, x_name FROM {be.TD_PLOTTER_CURVES_TABLE} WHERE run_name=? AND serial=?",
+                    ("RunA", "SN1"),
+                ).fetchone()
+                self.assertEqual(plotter_curve, ("thrust", "Time"))
+
+            raw_db = root / "test_data_raw_cache.sqlite3"
+            self.assertTrue(raw_db.exists())
+            raw_db.unlink()
+
+            validated = be.validate_test_data_project_cache_for_open(root, wb_path)
+            self.assertEqual(validated, impl_db)
+            self.assertEqual(be.td_list_x_columns(impl_db, "RunA"), ["Time"])
+            self.assertEqual(be.td_list_curve_y_columns(impl_db, "RunA", "Time"), [{"name": "thrust", "units": "lbf"}])
+
+            metric_rows = be.td_load_metric_series(impl_db, "RunA", "thrust", "mean")
+            self.assertEqual([row.get("control_period") for row in metric_rows], [60.0])
+            self.assertEqual([row.get("suppression_voltage") for row in metric_rows], [24.0])
+
+            curves = be.td_load_curves(
+                impl_db,
+                "RunA",
+                "thrust",
+                "Time",
+                serials=["SN1"],
+                program_title=be.TD_SUPPORT_DEFAULT_PROGRAM_TITLE,
+                source_run_name="RunA",
+                control_period_filter=60,
+            )
+            self.assertEqual(len(curves), 1)
+            self.assertEqual(curves[0].get("x"), [0, 1, 2, 3, 4, 5])
+            self.assertEqual(curves[0].get("y"), [10, 20, 30, 40, 50, 60])
+            self.assertEqual(float(curves[0].get("control_period") or 0.0), 60.0)
+            self.assertEqual(float(curves[0].get("suppression_voltage") or 0.0), 24.0)
+
+    def test_validate_open_allows_older_impl_cache_without_raw_or_plotter_tables(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            impl_db = root / "implementation_trending.sqlite3"
+            with sqlite3.connect(str(impl_db)) as conn:
+                conn.execute("CREATE TABLE td_sources (serial TEXT PRIMARY KEY)")
+                conn.execute(
+                    """
+                    CREATE TABLE td_runs (
+                        run_name TEXT PRIMARY KEY,
+                        default_x TEXT,
+                        display_name TEXT
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE td_columns_calc (
+                        run_name TEXT NOT NULL,
+                        name TEXT NOT NULL,
+                        units TEXT,
+                        kind TEXT NOT NULL,
+                        PRIMARY KEY (run_name, name)
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE td_metrics_calc (
+                        observation_id TEXT NOT NULL,
+                        serial TEXT NOT NULL,
+                        run_name TEXT NOT NULL,
+                        column_name TEXT NOT NULL,
+                        stat TEXT NOT NULL,
+                        value_num REAL
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE td_condition_observations_sequences (
+                        observation_id TEXT PRIMARY KEY,
+                        serial TEXT NOT NULL,
+                        run_name TEXT NOT NULL,
+                        program_title TEXT,
+                        source_run_name TEXT,
+                        run_type TEXT,
+                        pulse_width REAL,
+                        control_period REAL,
+                        suppression_voltage REAL,
+                        source_mtime_ns INTEGER,
+                        computed_epoch_ns INTEGER NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE td_metrics_calc_sequences (
+                        observation_id TEXT NOT NULL,
+                        serial TEXT NOT NULL,
+                        run_name TEXT NOT NULL,
+                        column_name TEXT NOT NULL,
+                        stat TEXT NOT NULL,
+                        value_num REAL,
+                        computed_epoch_ns INTEGER NOT NULL,
+                        source_mtime_ns INTEGER,
+                        program_title TEXT,
+                        source_run_name TEXT,
+                        PRIMARY KEY (observation_id, column_name, stat)
+                    )
+                    """
+                )
+                conn.execute("INSERT INTO td_sources(serial) VALUES (?)", ("SN1",))
+                conn.execute("INSERT INTO td_runs(run_name, default_x, display_name) VALUES (?, ?, ?)", ("RunA", "Time", "Run A"))
+                conn.execute(
+                    "INSERT INTO td_columns_calc(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
+                    ("RunA", "thrust", "lbf", "y"),
+                )
+                conn.execute(
+                    "INSERT INTO td_metrics_calc(observation_id, serial, run_name, column_name, stat, value_num) VALUES (?, ?, ?, ?, ?, ?)",
+                    ("obs_a", "SN1", "RunA", "thrust", "mean", 10.0),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO td_condition_observations_sequences(
+                        observation_id, serial, run_name, program_title, source_run_name, run_type, pulse_width, control_period, suppression_voltage, source_mtime_ns, computed_epoch_ns
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    ("obs_a", "SN1", "RunA", "Program A", "RunA", "steady state", None, None, None, 0, 1),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO td_metrics_calc_sequences(
+                        observation_id, serial, run_name, column_name, stat, value_num, computed_epoch_ns, source_mtime_ns, program_title, source_run_name
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    ("obs_a", "SN1", "RunA", "thrust", "mean", 10.0, 1, 0, "Program A", "RunA"),
+                )
+                conn.commit()
+
+            validated = be.validate_test_data_project_cache_for_open(root, root / "project.xlsx")
+            self.assertEqual(validated, impl_db)
+            with self.assertRaisesRegex(RuntimeError, "Curve plot cache is not available"):
+                be.td_load_curves(impl_db, "RunA", "thrust", "Time")
+
+    def test_performance_candidate_discovery_still_works_after_rebuild_and_raw_cache_removal(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            db_path = self._seed_perf_candidate_db(
+                root,
+                rows=[
+                    ("SN1", "Seq1", 3.0, 10.0),
+                    ("SN1", "Seq2", 4.0, 20.0),
+                    ("SN1", "Seq3", 5.0, 30.0),
+                ],
+            )
+            self.assertFalse((root / "test_data_raw_cache.sqlite3").exists())
+            with sqlite3.connect(str(db_path)) as conn:
+                tables = {
+                    str(row[0] or "").strip()
+                    for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+                }
+                self.assertIn(be.TD_PLOTTER_CURVES_TABLE, tables)
+                self.assertIn(be.TD_PLOTTER_CURVE_CATALOG_TABLE, tables)
+
+            candidates = be.td_discover_performance_candidates(db_path)
+            match = next(
+                (
+                    item
+                    for item in candidates
+                    if str(item.get("display_name") or "") == "thrust vs impulse bit"
+                ),
+                None,
+            )
+            self.assertIsNotNone(match)
+            self.assertGreater(int((match or {}).get("qualifying_serial_count") or 0), 0)
+
     def test_debug_export_writes_excel_mirror_for_project_cache(self) -> None:
         from openpyxl import load_workbook  # type: ignore
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
@@ -5545,6 +5854,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
             wb = load_workbook(str(impl_mirror_path), read_only=True, data_only=True)
             try:
                 self.assertIn("td_metrics_calc", wb.sheetnames)
+                self.assertIn("td_plotter_curves_raw", wb.sheetnames)
             finally:
                 wb.close()
             wb = load_workbook(str(raw_mirror_path), read_only=True, data_only=True)
@@ -8937,6 +9247,14 @@ class TestTDSupportWorkbook(unittest.TestCase):
         self.assertEqual(load_mock.call_args.kwargs.get("control_period_filter"), "60")
         self.assertEqual([row.get("serial") for row in result], ["SN1"])
         self.assertEqual([row.get("observation_id") for row in result], ["obs_a"])
+
+    def test_curve_loader_propagates_backend_errors(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        harness = _GlobalFilterHarness()
+        with mock.patch.object(be, "td_load_curves", side_effect=RuntimeError("curve cache missing")):
+            with self.assertRaisesRegex(RuntimeError, "curve cache missing"):
+                harness._load_curves_for_selection("RunA", "thrust", "Time")
 
     def test_selected_perf_serials_and_highlight_use_active_filter_intersection(self) -> None:
         harness = _GlobalFilterHarness()

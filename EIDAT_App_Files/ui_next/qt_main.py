@@ -7846,20 +7846,17 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             return []
         program_title, source_run_name = self._selection_observation_filters(selection)
         active_serials = [str(value).strip() for value in (serials or self._active_serials()) if str(value).strip()]
-        try:
-            rows = be.td_load_curves(
-                self._db_path,
-                run_name,
-                y_name,
-                x_name,
-                serials=active_serials,
-                program_title=(program_title or None),
-                source_run_name=(source_run_name or None),
-                control_period_filter=self._single_active_control_period_filter_value(),
-            )
-            return self._filter_rows_for_global_selection(rows)
-        except Exception:
-            return []
+        rows = be.td_load_curves(
+            self._db_path,
+            run_name,
+            y_name,
+            x_name,
+            serials=active_serials,
+            program_title=(program_title or None),
+            source_run_name=(source_run_name or None),
+            control_period_filter=self._single_active_control_period_filter_value(),
+        )
+        return self._filter_rows_for_global_selection(rows)
 
     def _select_run_by_id(self, selection_id: str) -> None:
         key = str(selection_id or "").strip()

@@ -2509,7 +2509,11 @@ GLOBAL_RUN_MIRROR_DIRNAME = "global_run_mirror"
 LOCAL_PROJECTS_MIRROR_DIRNAME = "projects"
 PROJECT_UPDATE_DEBUG_JSON = "update_debug.json"
 TD_CACHE_DEBUG_JSON = "td_cache_debug.json"
-TD_PROJECT_CACHE_SCHEMA_VERSION = "3"
+TD_PROJECT_CACHE_SCHEMA_VERSION = "4"
+TD_PLOTTER_SEQUENCES_TABLE = "td_plotter_sequences"
+TD_PLOTTER_CURVE_CATALOG_TABLE = "td_plotter_curve_catalog"
+TD_PLOTTER_OBSERVATIONS_TABLE = "td_plotter_condition_observations"
+TD_PLOTTER_CURVES_TABLE = "td_plotter_curves_raw"
 
 # Central runtime config used to define Test Data trending workbooks (independent of node-local DATA_ROOT).
 CENTRAL_EXCEL_TREND_CONFIG = ROOT / "user_inputs" / "excel_trend_config.json"
@@ -3383,6 +3387,7 @@ def _ensure_test_data_impl_tables(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    _ensure_test_data_curve_plotter_tables(conn)
 
 
 def _td_metric_source_table_name(metric_source: object) -> str:
@@ -3426,6 +3431,95 @@ def _td_preferred_sequence_observation_table(conn: sqlite3.Connection) -> str:
     except Exception:
         count = 0
     return "td_condition_observations_sequences" if count > 0 else "td_condition_observations"
+
+
+def _ensure_test_data_curve_plotter_tables(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {TD_PLOTTER_SEQUENCES_TABLE} (
+            run_name TEXT PRIMARY KEY,
+            display_name TEXT,
+            x_axis_kind TEXT NOT NULL,
+            source_run_name TEXT,
+            pulse_width REAL,
+            run_type TEXT,
+            control_period REAL,
+            computed_epoch_ns INTEGER NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {TD_PLOTTER_CURVE_CATALOG_TABLE} (
+            run_name TEXT NOT NULL,
+            parameter_name TEXT NOT NULL,
+            units TEXT,
+            x_axis_kind TEXT NOT NULL,
+            display_name TEXT,
+            source_kind TEXT,
+            computed_epoch_ns INTEGER NOT NULL,
+            PRIMARY KEY (run_name, parameter_name)
+        )
+        """
+    )
+    conn.execute(
+        f"""
+        CREATE INDEX IF NOT EXISTS td_plotter_curve_catalog_run_idx
+        ON {TD_PLOTTER_CURVE_CATALOG_TABLE} (run_name, parameter_name)
+        """
+    )
+    conn.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {TD_PLOTTER_OBSERVATIONS_TABLE} (
+            observation_id TEXT PRIMARY KEY,
+            run_name TEXT NOT NULL,
+            serial TEXT NOT NULL,
+            program_title TEXT,
+            source_run_name TEXT,
+            run_type TEXT,
+            pulse_width REAL,
+            control_period REAL,
+            suppression_voltage REAL,
+            source_mtime_ns INTEGER,
+            computed_epoch_ns INTEGER NOT NULL
+        )
+        """
+    )
+    try:
+        conn.execute(f"ALTER TABLE {TD_PLOTTER_OBSERVATIONS_TABLE} ADD COLUMN suppression_voltage REAL")
+    except Exception:
+        pass
+    conn.execute(
+        f"""
+        CREATE INDEX IF NOT EXISTS td_plotter_condition_observations_lookup
+        ON {TD_PLOTTER_OBSERVATIONS_TABLE} (run_name, serial, observation_id)
+        """
+    )
+    conn.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {TD_PLOTTER_CURVES_TABLE} (
+            run_name TEXT NOT NULL,
+            y_name TEXT NOT NULL,
+            x_name TEXT NOT NULL,
+            observation_id TEXT NOT NULL,
+            serial TEXT NOT NULL,
+            x_json TEXT NOT NULL,
+            y_json TEXT NOT NULL,
+            n_points INTEGER NOT NULL,
+            source_mtime_ns INTEGER,
+            computed_epoch_ns INTEGER NOT NULL,
+            program_title TEXT,
+            source_run_name TEXT,
+            PRIMARY KEY (run_name, y_name, x_name, observation_id)
+        )
+        """
+    )
+    conn.execute(
+        f"""
+        CREATE INDEX IF NOT EXISTS td_plotter_curves_raw_lookup
+        ON {TD_PLOTTER_CURVES_TABLE} (run_name, y_name, x_name, serial)
+        """
+    )
 
 
 def _ensure_test_data_tables(conn: sqlite3.Connection) -> None:
@@ -8255,6 +8349,178 @@ def _write_test_data_project_calc_cache_from_aggregates(
     except Exception:
         support_mtime_ns = 0
 
+    plotter_sequence_rows: list[tuple[object, ...]] = []
+    plotter_catalog_rows_to_write: list[tuple[object, ...]] = []
+    plotter_obs_rows_by_id: dict[str, tuple[object, ...]] = {}
+    plotter_curve_rows_to_write: list[tuple[object, ...]] = []
+    raw_db_path = _td_resolve_raw_cache_db_path(db_path)
+    if raw_db_path.exists() and raw_db_path.is_file():
+        with sqlite3.connect(str(raw_db_path)) as raw_conn:
+            _ensure_test_data_raw_cache_tables(raw_conn)
+            raw_runs = raw_conn.execute(
+                """
+                SELECT
+                    run_name,
+                    COALESCE(display_name, ''),
+                    COALESCE(x_axis_kind, ''),
+                    COALESCE(source_run_name, ''),
+                    pulse_width,
+                    COALESCE(run_type, ''),
+                    control_period,
+                    computed_epoch_ns
+                FROM td_raw_sequences
+                ORDER BY run_name
+                """
+            ).fetchall()
+            for run_name, display_name, x_axis_kind, source_run_name, pulse_width, run_type, control_period, row_epoch_ns in raw_runs:
+                run = str(run_name or "").strip()
+                x_axis = str(x_axis_kind or "").strip()
+                if not run or not x_axis:
+                    continue
+                plotter_sequence_rows.append(
+                    (
+                        run,
+                        str(display_name or "").strip(),
+                        x_axis,
+                        str(source_run_name or "").strip(),
+                        pulse_width,
+                        str(run_type or "").strip(),
+                        control_period,
+                        int(row_epoch_ns or computed_epoch_ns),
+                    )
+                )
+            raw_catalog_rows = raw_conn.execute(
+                """
+                SELECT
+                    run_name,
+                    parameter_name,
+                    COALESCE(units, ''),
+                    COALESCE(x_axis_kind, ''),
+                    COALESCE(display_name, ''),
+                    COALESCE(source_kind, ''),
+                    computed_epoch_ns
+                FROM td_raw_curve_catalog
+                ORDER BY run_name, parameter_name
+                """
+            ).fetchall()
+            for run_name, parameter_name, units, x_axis_kind, display_name, source_kind, row_epoch_ns in raw_catalog_rows:
+                run = str(run_name or "").strip()
+                parameter = str(parameter_name or "").strip()
+                x_axis = str(x_axis_kind or "").strip()
+                if not run or not parameter or not x_axis:
+                    continue
+                plotter_catalog_rows_to_write.append(
+                    (
+                        run,
+                        parameter,
+                        str(units or "").strip(),
+                        x_axis,
+                        str(display_name or "").strip(),
+                        str(source_kind or "").strip(),
+                        int(row_epoch_ns or computed_epoch_ns),
+                    )
+                )
+            raw_obs_rows = raw_conn.execute(
+                """
+                SELECT
+                    observation_id,
+                    run_name,
+                    serial,
+                    COALESCE(program_title, ''),
+                    COALESCE(source_run_name, ''),
+                    COALESCE(run_type, ''),
+                    pulse_width,
+                    control_period,
+                    suppression_voltage,
+                    source_mtime_ns,
+                    computed_epoch_ns
+                FROM td_raw_condition_observations
+                ORDER BY run_name, serial, observation_id
+                """
+            ).fetchall()
+            for observation_id, run_name, serial, program_title, source_run_name, run_type, pulse_width, control_period, suppression_voltage, source_mtime_ns, row_epoch_ns in raw_obs_rows:
+                obs_id = str(observation_id or "").strip()
+                if not obs_id:
+                    continue
+                plotter_obs_rows_by_id[obs_id] = (
+                    obs_id,
+                    str(run_name or "").strip(),
+                    str(serial or "").strip(),
+                    str(program_title or "").strip(),
+                    str(source_run_name or "").strip(),
+                    str(run_type or "").strip(),
+                    pulse_width,
+                    control_period,
+                    suppression_voltage,
+                    source_mtime_ns,
+                    int(row_epoch_ns or computed_epoch_ns),
+                )
+            raw_curve_rows = raw_conn.execute(
+                """
+                SELECT
+                    run_name,
+                    y_name,
+                    x_name,
+                    observation_id,
+                    serial,
+                    COALESCE(program_title, ''),
+                    COALESCE(source_run_name, ''),
+                    x_json,
+                    y_json,
+                    n_points,
+                    source_mtime_ns,
+                    computed_epoch_ns
+                FROM td_curves_raw
+                ORDER BY run_name, serial, y_name, observation_id
+                """
+            ).fetchall()
+            for run_name, y_name, x_name, observation_id, serial, program_title, source_run_name, x_json, y_json, n_points, source_mtime_ns, row_epoch_ns in raw_curve_rows:
+                run = str(run_name or "").strip()
+                y_col = str(y_name or "").strip()
+                x_col = str(x_name or "").strip()
+                obs_id = str(observation_id or "").strip()
+                serial_txt = str(serial or "").strip()
+                source_run_txt = str(source_run_name or run).strip() or run
+                if not run or not y_col or not x_col or not obs_id or not serial_txt:
+                    continue
+                if obs_id not in plotter_obs_rows_by_id:
+                    plotter_obs_rows_by_id[obs_id] = (
+                        obs_id,
+                        run,
+                        serial_txt,
+                        str(program_title or "").strip(),
+                        source_run_txt,
+                        "",
+                        None,
+                        None,
+                        None,
+                        source_mtime_ns,
+                        int(row_epoch_ns or computed_epoch_ns),
+                    )
+                try:
+                    n_points_int = int(n_points)
+                except Exception:
+                    try:
+                        n_points_int = max(len(json.loads(x_json or "[]")), len(json.loads(y_json or "[]")))
+                    except Exception:
+                        n_points_int = 0
+                plotter_curve_rows_to_write.append(
+                    (
+                        run,
+                        y_col,
+                        x_col,
+                        obs_id,
+                        serial_txt,
+                        x_json or "[]",
+                        y_json or "[]",
+                        max(0, int(n_points_int)),
+                        source_mtime_ns,
+                        int(row_epoch_ns or computed_epoch_ns),
+                        str(program_title or "").strip(),
+                        source_run_txt,
+                    )
+                )
+
     _td_emit_progress(progress_cb, "Writing calculated Test Data cache")
     t0 = time.perf_counter()
     with sqlite3.connect(str(db_path)) as conn:
@@ -8266,6 +8532,10 @@ def _write_test_data_project_calc_cache_from_aggregates(
         conn.execute("DELETE FROM td_condition_observations")
         conn.execute("DELETE FROM td_metrics_calc_sequences")
         conn.execute("DELETE FROM td_condition_observations_sequences")
+        conn.execute(f"DELETE FROM {TD_PLOTTER_SEQUENCES_TABLE}")
+        conn.execute(f"DELETE FROM {TD_PLOTTER_CURVE_CATALOG_TABLE}")
+        conn.execute(f"DELETE FROM {TD_PLOTTER_OBSERVATIONS_TABLE}")
+        conn.execute(f"DELETE FROM {TD_PLOTTER_CURVES_TABLE}")
         if run_rows_to_write:
             conn.executemany(
                 "INSERT OR REPLACE INTO td_runs(run_name, default_x, display_name, run_type, control_period, pulse_width) VALUES (?, ?, ?, ?, ?, ?)",
@@ -8293,6 +8563,43 @@ def _write_test_data_project_calc_cache_from_aggregates(
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 metric_rows_to_write,
+            )
+        if plotter_sequence_rows:
+            conn.executemany(
+                f"""
+                INSERT OR REPLACE INTO {TD_PLOTTER_SEQUENCES_TABLE}
+                (run_name, display_name, x_axis_kind, source_run_name, pulse_width, run_type, control_period, computed_epoch_ns)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                plotter_sequence_rows,
+            )
+        if plotter_catalog_rows_to_write:
+            conn.executemany(
+                f"""
+                INSERT OR REPLACE INTO {TD_PLOTTER_CURVE_CATALOG_TABLE}
+                (run_name, parameter_name, units, x_axis_kind, display_name, source_kind, computed_epoch_ns)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                plotter_catalog_rows_to_write,
+            )
+        plotter_obs_rows_to_write = list(plotter_obs_rows_by_id.values())
+        if plotter_obs_rows_to_write:
+            conn.executemany(
+                f"""
+                INSERT OR REPLACE INTO {TD_PLOTTER_OBSERVATIONS_TABLE}
+                (observation_id, run_name, serial, program_title, source_run_name, run_type, pulse_width, control_period, suppression_voltage, source_mtime_ns, computed_epoch_ns)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                plotter_obs_rows_to_write,
+            )
+        if plotter_curve_rows_to_write:
+            conn.executemany(
+                f"""
+                INSERT OR REPLACE INTO {TD_PLOTTER_CURVES_TABLE}
+                (run_name, y_name, x_name, observation_id, serial, x_json, y_json, n_points, source_mtime_ns, computed_epoch_ns, program_title, source_run_name)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                plotter_curve_rows_to_write,
             )
         sequence_obs_rows_list = list(sequence_obs_rows or [])
         sequence_metric_rows_list = list(sequence_metric_rows or [])
@@ -8480,7 +8787,33 @@ def _rebuild_test_data_project_calc_cache_from_raw(
     with sqlite3.connect(str(raw_db_path)) as raw_conn:
         _ensure_test_data_raw_cache_tables(raw_conn)
         raw_runs = raw_conn.execute(
-            "SELECT run_name, COALESCE(display_name, ''), COALESCE(x_axis_kind, ''), pulse_width, COALESCE(run_type, ''), control_period FROM td_raw_sequences ORDER BY run_name"
+            """
+            SELECT
+                run_name,
+                COALESCE(display_name, ''),
+                COALESCE(x_axis_kind, ''),
+                COALESCE(source_run_name, ''),
+                pulse_width,
+                COALESCE(run_type, ''),
+                control_period,
+                computed_epoch_ns
+            FROM td_raw_sequences
+            ORDER BY run_name
+            """
+        ).fetchall()
+        raw_curve_catalog_rows = raw_conn.execute(
+            """
+            SELECT
+                run_name,
+                parameter_name,
+                COALESCE(units, ''),
+                COALESCE(x_axis_kind, ''),
+                COALESCE(display_name, ''),
+                COALESCE(source_kind, ''),
+                computed_epoch_ns
+            FROM td_raw_curve_catalog
+            ORDER BY run_name, parameter_name
+            """
         ).fetchall()
         raw_x_cols = raw_conn.execute(
             "SELECT run_name, name FROM td_columns_raw WHERE kind='x' ORDER BY run_name, name"
@@ -8491,7 +8824,19 @@ def _rebuild_test_data_project_calc_cache_from_raw(
         try:
             raw_curve_rows = raw_conn.execute(
                 """
-                SELECT run_name, y_name, x_name, observation_id, serial, COALESCE(program_title, ''), COALESCE(source_run_name, ''), x_json, y_json, source_mtime_ns
+                SELECT
+                    run_name,
+                    y_name,
+                    x_name,
+                    observation_id,
+                    serial,
+                    COALESCE(program_title, ''),
+                    COALESCE(source_run_name, ''),
+                    x_json,
+                    y_json,
+                    n_points,
+                    source_mtime_ns,
+                    computed_epoch_ns
                 FROM td_curves_raw
                 ORDER BY run_name, serial, y_name, observation_id
                 """
@@ -8508,11 +8853,13 @@ def _rebuild_test_data_project_calc_cache_from_raw(
                     run_name,
                     x_json,
                     y_json,
+                    n_points,
                     source_mtime_ns,
+                    computed_epoch_ns,
                 )
-                for run_name, y_name, x_name, serial, x_json, y_json, source_mtime_ns in raw_conn.execute(
+                for run_name, y_name, x_name, serial, x_json, y_json, n_points, source_mtime_ns, computed_epoch_ns in raw_conn.execute(
                     """
-                    SELECT run_name, y_name, x_name, serial, x_json, y_json, source_mtime_ns
+                    SELECT run_name, y_name, x_name, serial, x_json, y_json, n_points, source_mtime_ns, computed_epoch_ns
                     FROM td_curves_raw
                     ORDER BY run_name, serial, y_name
                     """
@@ -8521,7 +8868,18 @@ def _rebuild_test_data_project_calc_cache_from_raw(
         try:
             raw_obs_rows = raw_conn.execute(
                 """
-                SELECT observation_id, run_name, serial, COALESCE(program_title, ''), COALESCE(source_run_name, ''), COALESCE(run_type, ''), pulse_width, control_period, suppression_voltage, source_mtime_ns
+                SELECT
+                    observation_id,
+                    run_name,
+                    serial,
+                    COALESCE(program_title, ''),
+                    COALESCE(source_run_name, ''),
+                    COALESCE(run_type, ''),
+                    pulse_width,
+                    control_period,
+                    suppression_voltage,
+                    source_mtime_ns,
+                    computed_epoch_ns
                 FROM td_raw_condition_observations
                 ORDER BY run_name, serial, observation_id
                 """
@@ -8555,6 +8913,12 @@ def _rebuild_test_data_project_calc_cache_from_raw(
         conn.execute("DELETE FROM td_columns_calc")
         conn.execute("DELETE FROM td_metrics_calc")
         conn.execute("DELETE FROM td_condition_observations")
+        conn.execute("DELETE FROM td_metrics_calc_sequences")
+        conn.execute("DELETE FROM td_condition_observations_sequences")
+        conn.execute(f"DELETE FROM {TD_PLOTTER_SEQUENCES_TABLE}")
+        conn.execute(f"DELETE FROM {TD_PLOTTER_CURVE_CATALOG_TABLE}")
+        conn.execute(f"DELETE FROM {TD_PLOTTER_OBSERVATIONS_TABLE}")
+        conn.execute(f"DELETE FROM {TD_PLOTTER_CURVES_TABLE}")
 
         raw_x_by_run: dict[str, list[str]] = {}
         raw_y_by_run: dict[str, set[str]] = {}
@@ -8569,50 +8933,147 @@ def _rebuild_test_data_project_calc_cache_from_raw(
             y = str(y_name or "").strip()
             if run and y:
                 raw_y_by_run.setdefault(run, set()).add(y)
-        for run_name, display_name_raw, default_x_raw, raw_pulse_width, raw_run_type, raw_control_period in raw_runs:
+        plotter_sequence_rows: list[tuple[object, ...]] = []
+        for run_name, display_name_raw, default_x_raw, source_run_name_raw, raw_pulse_width, raw_run_type, raw_control_period, raw_run_computed_epoch_ns in raw_runs:
             run = str(run_name or "").strip()
             if not run:
                 continue
+            source_run_name_txt = str(source_run_name_raw or "").strip()
             raw_run_defaults[run] = {
                 "display_name": str(display_name_raw or "").strip(),
                 "default_x": str(default_x_raw or "").strip(),
+                "source_run_name": source_run_name_txt,
                 "pulse_width": raw_pulse_width,
                 "run_type": str(raw_run_type or "").strip(),
                 "control_period": raw_control_period,
             }
+            plotter_sequence_rows.append(
+                (
+                    run,
+                    str(display_name_raw or "").strip(),
+                    str(default_x_raw or "").strip(),
+                    source_run_name_txt,
+                    raw_pulse_width,
+                    str(raw_run_type or "").strip(),
+                    raw_control_period,
+                    int(raw_run_computed_epoch_ns or computed_epoch_ns),
+                )
+            )
+
+        plotter_catalog_rows_to_write: list[tuple[object, ...]] = []
+        for run_name, parameter_name, units, x_axis_kind, display_name, source_kind, catalog_computed_epoch_ns in raw_curve_catalog_rows:
+            run = str(run_name or "").strip()
+            parameter = str(parameter_name or "").strip()
+            x_axis = str(x_axis_kind or "").strip()
+            if not run or not parameter or not x_axis:
+                continue
+            plotter_catalog_rows_to_write.append(
+                (
+                    run,
+                    parameter,
+                    str(units or "").strip(),
+                    x_axis,
+                    str(display_name or "").strip(),
+                    str(source_kind or "").strip(),
+                    int(catalog_computed_epoch_ns or computed_epoch_ns),
+                )
+            )
 
         raw_obs_by_id: dict[str, dict[str, object]] = {}
-        for observation_id, run_name, serial, program_title, source_run_name, run_type, pulse_width, control_period, suppression_voltage, source_mtime_ns in raw_obs_rows:
+        plotter_obs_rows_by_id: dict[str, tuple[object, ...]] = {}
+        for observation_id, run_name, serial, program_title, source_run_name, run_type, pulse_width, control_period, suppression_voltage, source_mtime_ns, obs_computed_epoch_ns in raw_obs_rows:
             obs_id = str(observation_id or "").strip()
             if not obs_id:
                 continue
+            run_txt = str(run_name or "").strip()
+            serial_txt = str(serial or "").strip()
+            program_txt = str(program_title or "").strip()
+            source_run_txt = str(source_run_name or "").strip()
             raw_obs_by_id[obs_id] = {
                 "observation_id": obs_id,
-                "run_name": str(run_name or "").strip(),
-                "serial": str(serial or "").strip(),
-                "program_title": str(program_title or "").strip(),
-                "source_run_name": str(source_run_name or "").strip(),
+                "run_name": run_txt,
+                "serial": serial_txt,
+                "program_title": program_txt,
+                "source_run_name": source_run_txt,
                 "run_type": str(run_type or "").strip(),
                 "pulse_width": pulse_width,
                 "control_period": control_period,
                 "suppression_voltage": suppression_voltage,
                 "source_mtime_ns": source_mtime_ns,
             }
-        for run_name, _y_name, _x_name, observation_id, serial, program_title, source_run_name, _x_json, _y_json, source_mtime_ns in raw_curve_rows:
+            plotter_obs_rows_by_id[obs_id] = (
+                obs_id,
+                run_txt,
+                serial_txt,
+                program_txt,
+                source_run_txt,
+                str(run_type or "").strip(),
+                pulse_width,
+                control_period,
+                suppression_voltage,
+                source_mtime_ns,
+                int(obs_computed_epoch_ns or computed_epoch_ns),
+            )
+        plotter_curve_rows_to_write: list[tuple[object, ...]] = []
+        for run_name, y_name, x_name, observation_id, serial, program_title, source_run_name, x_json, y_json, n_points, source_mtime_ns, curve_computed_epoch_ns in raw_curve_rows:
             obs_id = str(observation_id or "").strip()
+            run_txt = str(run_name or "").strip()
+            serial_txt = str(serial or "").strip()
+            program_txt = str(program_title or "").strip()
+            source_run_txt = str(source_run_name or run_txt).strip() or run_txt
+            y_name_txt = str(y_name or "").strip()
+            x_name_txt = str(x_name or "").strip()
             if obs_id and obs_id not in raw_obs_by_id:
                 raw_obs_by_id[obs_id] = {
                     "observation_id": obs_id,
-                    "run_name": str(run_name or "").strip(),
-                    "serial": str(serial or "").strip(),
-                    "program_title": str(program_title or "").strip(),
-                    "source_run_name": str(source_run_name or "").strip(),
+                    "run_name": run_txt,
+                    "serial": serial_txt,
+                    "program_title": program_txt,
+                    "source_run_name": source_run_txt,
                     "run_type": "",
                     "pulse_width": None,
                     "control_period": None,
                     "suppression_voltage": None,
                     "source_mtime_ns": source_mtime_ns,
                 }
+                plotter_obs_rows_by_id[obs_id] = (
+                    obs_id,
+                    run_txt,
+                    serial_txt,
+                    program_txt,
+                    source_run_txt,
+                    "",
+                    None,
+                    None,
+                    None,
+                    source_mtime_ns,
+                    int(curve_computed_epoch_ns or computed_epoch_ns),
+                )
+            if not run_txt or not y_name_txt or not x_name_txt or not obs_id or not serial_txt:
+                continue
+            try:
+                n_points_int = int(n_points)
+            except Exception:
+                try:
+                    n_points_int = max(len(json.loads(x_json or "[]")), len(json.loads(y_json or "[]")))
+                except Exception:
+                    n_points_int = 0
+            plotter_curve_rows_to_write.append(
+                (
+                    run_txt,
+                    y_name_txt,
+                    x_name_txt,
+                    obs_id,
+                    serial_txt,
+                    x_json or "[]",
+                    y_json or "[]",
+                    max(0, int(n_points_int)),
+                    source_mtime_ns,
+                    int(curve_computed_epoch_ns or computed_epoch_ns),
+                    program_txt,
+                    source_run_txt,
+                )
+            )
         support_rows = [
             dict(row)
             for row in ((support_cfg.get("sequences") or []))
@@ -8641,7 +9102,7 @@ def _rebuild_test_data_project_calc_cache_from_raw(
         sequence_obs_rows_by_id: dict[str, tuple[object, ...]] = {}
         sequence_metric_rows_by_key: dict[tuple[str, str, str], tuple[object, ...]] = {}
         t0 = time.perf_counter()
-        for run_name_raw, y_name_raw, x_name_raw, observation_id, serial, program_title, source_run_name_raw, x_json, y_json, source_mtime_ns in raw_curve_rows:
+        for run_name_raw, y_name_raw, x_name_raw, observation_id, serial, program_title, source_run_name_raw, x_json, y_json, _n_points, source_mtime_ns, _curve_computed_epoch_ns in raw_curve_rows:
             raw_run = str(run_name_raw or "").strip()
             y_name = str(y_name_raw or "").strip()
             obs_id = str(observation_id or "").strip()
@@ -8911,6 +9372,43 @@ def _rebuild_test_data_project_calc_cache_from_raw(
                 """,
                 metric_rows_to_write,
             )
+        if plotter_sequence_rows:
+            conn.executemany(
+                f"""
+                INSERT OR REPLACE INTO {TD_PLOTTER_SEQUENCES_TABLE}
+                (run_name, display_name, x_axis_kind, source_run_name, pulse_width, run_type, control_period, computed_epoch_ns)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                plotter_sequence_rows,
+            )
+        if plotter_catalog_rows_to_write:
+            conn.executemany(
+                f"""
+                INSERT OR REPLACE INTO {TD_PLOTTER_CURVE_CATALOG_TABLE}
+                (run_name, parameter_name, units, x_axis_kind, display_name, source_kind, computed_epoch_ns)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                plotter_catalog_rows_to_write,
+            )
+        plotter_obs_rows_to_write = list(plotter_obs_rows_by_id.values())
+        if plotter_obs_rows_to_write:
+            conn.executemany(
+                f"""
+                INSERT OR REPLACE INTO {TD_PLOTTER_OBSERVATIONS_TABLE}
+                (observation_id, run_name, serial, program_title, source_run_name, run_type, pulse_width, control_period, suppression_voltage, source_mtime_ns, computed_epoch_ns)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                plotter_obs_rows_to_write,
+            )
+        if plotter_curve_rows_to_write:
+            conn.executemany(
+                f"""
+                INSERT OR REPLACE INTO {TD_PLOTTER_CURVES_TABLE}
+                (run_name, y_name, x_name, observation_id, serial, x_json, y_json, n_points, source_mtime_ns, computed_epoch_ns, program_title, source_run_name)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                plotter_curve_rows_to_write,
+            )
         sequence_obs_rows_to_write = list(sequence_obs_rows_by_id.values())
         sequence_metric_rows_to_write = list(sequence_metric_rows_by_key.values())
         if sequence_obs_rows_to_write:
@@ -9000,13 +9498,10 @@ def validate_test_data_project_cache_for_open(project_dir: Path, workbook_path: 
     del workbook_path
     proj_dir = Path(project_dir).expanduser()
     db_path = proj_dir / EIDAT_PROJECT_IMPLEMENTATION_DB
-    raw_db_path = td_raw_cache_db_path_for(proj_dir)
     guidance = "Run 'Update Project' to rebuild the project cache before opening Trend / Analyze."
 
     if not db_path.exists() or not db_path.is_file():
         raise RuntimeError(f"Project cache DB not found: {db_path}. {guidance}")
-    if not raw_db_path.exists() or not raw_db_path.is_file():
-        raise RuntimeError(f"Project raw cache DB not found: {raw_db_path}. {guidance}")
 
     def _check_required_tables(conn: sqlite3.Connection, table_names: Sequence[str]) -> list[str]:
         rows = conn.execute(
@@ -9053,27 +9548,6 @@ def validate_test_data_project_cache_for_open(project_dir: Path, workbook_path: 
         or sequence_metrics_count <= 0
     ):
         raise RuntimeError(f"Project cache DB is incomplete: {db_path}. {guidance}")
-
-    try:
-        with closing(sqlite3.connect(str(raw_db_path))) as conn:
-            missing_raw_tables = _check_required_tables(
-                conn,
-                ("td_raw_sequences", "td_columns_raw", "td_curves_raw"),
-            )
-            if missing_raw_tables:
-                raise RuntimeError(
-                    f"Project raw cache DB is missing required tables ({', '.join(missing_raw_tables)}): {raw_db_path}. {guidance}"
-                )
-            raw_runs_count = int(conn.execute("SELECT COUNT(*) FROM td_raw_sequences").fetchone()[0] or 0)
-            raw_y_count = int(conn.execute("SELECT COUNT(*) FROM td_columns_raw WHERE kind='y'").fetchone()[0] or 0)
-            raw_curve_count = int(conn.execute("SELECT COUNT(*) FROM td_curves_raw").fetchone()[0] or 0)
-    except RuntimeError:
-        raise
-    except Exception as exc:
-        raise RuntimeError(f"Project raw cache DB is unreadable: {raw_db_path}. {guidance}") from exc
-
-    if raw_runs_count <= 0 or raw_y_count <= 0 or raw_curve_count <= 0:
-        raise RuntimeError(f"Project raw cache DB is incomplete: {raw_db_path}. {guidance}")
 
     return db_path
 
@@ -11287,6 +11761,231 @@ def _td_table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
     return {str(row[1] or "").strip() for row in rows if str(row[1] or "").strip()}
 
 
+def _td_impl_curve_plotter_table_specs() -> dict[str, set[str]]:
+    return {
+        TD_PLOTTER_SEQUENCES_TABLE: {"run_name", "x_axis_kind"},
+        TD_PLOTTER_CURVE_CATALOG_TABLE: {"run_name", "parameter_name", "x_axis_kind"},
+        TD_PLOTTER_OBSERVATIONS_TABLE: {"observation_id", "run_name", "serial", "control_period"},
+        TD_PLOTTER_CURVES_TABLE: {"run_name", "y_name", "x_name", "observation_id", "serial", "x_json", "y_json"},
+    }
+
+
+def _td_impl_curve_plotter_cache_ready(conn: sqlite3.Connection, *, require_rows: bool = False) -> bool:
+    _ensure_test_data_impl_tables(conn)
+    for table_name, required_cols in _td_impl_curve_plotter_table_specs().items():
+        if not required_cols.issubset(_td_table_columns(conn, table_name)):
+            return False
+    if not require_rows:
+        return True
+    try:
+        sequence_count = int(conn.execute(f"SELECT COUNT(*) FROM {TD_PLOTTER_SEQUENCES_TABLE}").fetchone()[0] or 0)
+        catalog_count = int(conn.execute(f"SELECT COUNT(*) FROM {TD_PLOTTER_CURVE_CATALOG_TABLE}").fetchone()[0] or 0)
+        curve_count = int(conn.execute(f"SELECT COUNT(*) FROM {TD_PLOTTER_CURVES_TABLE}").fetchone()[0] or 0)
+    except Exception:
+        return False
+    return bool(sequence_count > 0 and catalog_count > 0 and curve_count > 0)
+
+
+def _td_curve_plotter_cache_available(path: Path) -> bool:
+    db_path = Path(path).expanduser()
+    if not db_path.exists() or not db_path.is_file():
+        return False
+    try:
+        with sqlite3.connect(str(db_path)) as conn:
+            return _td_impl_curve_plotter_cache_ready(conn, require_rows=True)
+    except Exception:
+        return False
+
+
+def _td_curve_plotter_cache_rebuild_message(db_path: Path) -> str:
+    return (
+        f"Curve plot cache is not available in {Path(db_path).expanduser()}. "
+        "Run 'Update Project' to rebuild the implementation curve plotter cache."
+    )
+
+
+def _td_curve_schema_fallback_allowed(exc: BaseException | str) -> bool:
+    message = str(exc or "").strip().lower()
+    if not message:
+        return False
+    return ("no such column" in message) or ("no such table" in message)
+
+
+def _td_try_list_plotter_x_columns(path: Path, run_name: str) -> tuple[bool, list[str]]:
+    if not path.exists():
+        return False, []
+    with sqlite3.connect(str(path)) as conn:
+        if not _td_impl_curve_plotter_cache_ready(conn):
+            return False, []
+        row = conn.execute(
+            f"SELECT x_axis_kind FROM {TD_PLOTTER_SEQUENCES_TABLE} WHERE run_name=?",
+            (run_name,),
+        ).fetchone()
+        default_x = str(row[0] or "").strip() if row else ""
+        rows = conn.execute(
+            f"""
+            SELECT DISTINCT x_axis_kind
+            FROM {TD_PLOTTER_CURVE_CATALOG_TABLE}
+            WHERE run_name=? AND x_axis_kind IS NOT NULL AND TRIM(x_axis_kind) <> ''
+            ORDER BY x_axis_kind
+            """,
+            (run_name,),
+        ).fetchall()
+    out = [str(r[0] or "").strip() for r in rows if str(r[0] or "").strip()]
+    if default_x and default_x in out:
+        out = [default_x] + [xv for xv in out if xv != default_x]
+    elif default_x:
+        out = [default_x] + out
+    return bool(default_x or out), out
+
+
+def _td_try_list_plotter_curve_y_columns(path: Path, run_name: str, x_name: str | None = None) -> tuple[bool, list[dict]]:
+    if not path.exists():
+        return False, []
+    x = str(x_name or "").strip()
+    with sqlite3.connect(str(path)) as conn:
+        if not _td_impl_curve_plotter_cache_ready(conn):
+            return False, []
+        if x:
+            rows = conn.execute(
+                f"""
+                SELECT parameter_name, COALESCE(units, '')
+                FROM {TD_PLOTTER_CURVE_CATALOG_TABLE}
+                WHERE run_name=? AND x_axis_kind=?
+                ORDER BY parameter_name
+                """,
+                (run_name, x),
+            ).fetchall()
+            found = bool(
+                rows
+                or conn.execute(
+                    f"SELECT 1 FROM {TD_PLOTTER_CURVE_CATALOG_TABLE} WHERE run_name=? LIMIT 1",
+                    (run_name,),
+                ).fetchone()
+            )
+        else:
+            rows = conn.execute(
+                f"""
+                SELECT parameter_name, COALESCE(units, '')
+                FROM {TD_PLOTTER_CURVE_CATALOG_TABLE}
+                WHERE run_name=?
+                ORDER BY parameter_name
+                """,
+                (run_name,),
+            ).fetchall()
+            found = bool(rows)
+    out = [
+        {"name": str(r[0] or "").strip(), "units": str(r[1] or "").strip()}
+        for r in rows
+        if str(r[0] or "").strip()
+    ]
+    return found, out
+
+
+def _td_try_load_plotter_curves(
+    path: Path,
+    run_name: str,
+    y_name: str,
+    x_name: str,
+    serials: list[str] | None = None,
+    *,
+    program_title: str | None = None,
+    source_run_name: str | None = None,
+    control_period_filter: object = None,
+) -> tuple[bool, list[dict]]:
+    if not path.exists():
+        return False, []
+    want = [str(s or "").strip() for s in (serials or []) if str(s or "").strip()]
+    prog = str(program_title or "").strip()
+    src_run = str(source_run_name or "").strip()
+    with sqlite3.connect(str(path)) as conn:
+        if not _td_impl_curve_plotter_cache_ready(conn):
+            return False, []
+        row = conn.execute(
+            f"""
+            SELECT x_axis_kind
+            FROM {TD_PLOTTER_CURVE_CATALOG_TABLE}
+            WHERE run_name=? AND parameter_name=?
+            LIMIT 1
+            """,
+            (run_name, y_name),
+        ).fetchone()
+        if not row:
+            found = bool(
+                conn.execute(
+                    f"SELECT 1 FROM {TD_PLOTTER_CURVE_CATALOG_TABLE} WHERE run_name=? LIMIT 1",
+                    (run_name,),
+                ).fetchone()
+            )
+            return found, []
+        axis_kind = str(row[0] or "").strip()
+        if x_name and axis_kind and x_name != axis_kind:
+            return True, []
+        curve_sql = [
+            f"""
+            SELECT
+                c.observation_id,
+                c.serial,
+                COALESCE(c.program_title, ''),
+                COALESCE(c.source_run_name, ''),
+                o.control_period,
+                o.suppression_voltage,
+                c.x_json,
+                c.y_json
+            FROM {TD_PLOTTER_CURVES_TABLE} c
+            LEFT JOIN {TD_PLOTTER_OBSERVATIONS_TABLE} o
+              ON o.observation_id = c.observation_id
+            WHERE c.run_name=? AND c.y_name=? AND c.x_name=?
+            """
+        ]
+        curve_params: list[object] = [run_name, y_name, x_name]
+        if want:
+            q = ",".join(["?"] * len(want))
+            curve_sql.append(f" AND c.serial IN ({q})")
+            curve_params.extend(want)
+        if prog:
+            curve_sql.append(" AND lower(COALESCE(c.program_title, '')) = lower(?)")
+            curve_params.append(prog)
+        if src_run:
+            curve_sql.append(" AND lower(COALESCE(c.source_run_name, '')) = lower(?)")
+            curve_params.append(src_run)
+        if control_period_filter not in (None, ""):
+            cp_filter_num = _to_support_number(control_period_filter)
+            if cp_filter_num is not None:
+                curve_sql.append(" AND ABS(COALESCE(o.control_period, 0) - ?) <= 1e-9")
+                curve_params.append(cp_filter_num)
+            else:
+                curve_sql.append(
+                    " AND lower(TRIM(CAST(o.control_period AS TEXT))) = lower(TRIM(CAST(? AS TEXT)))"
+                )
+                curve_params.append(str(control_period_filter))
+        curve_sql.append(" ORDER BY c.serial, c.observation_id")
+        rows = conn.execute("".join(curve_sql), tuple(curve_params)).fetchall()
+    out: list[dict] = []
+    for observation_id, sn, program_txt, source_run_txt, control_period, suppression_voltage, xj, yj in rows:
+        try:
+            xs = json.loads(xj or "[]")
+            ys = json.loads(yj or "[]")
+        except Exception:
+            xs, ys = [], []
+        obs_id = str(observation_id or "").strip()
+        if not obs_id:
+            obs_id = f"{run_name}|{y_name}|{x_name}|{str(sn or '').strip()}"
+        out.append(
+            {
+                "observation_id": obs_id,
+                "serial": str(sn or "").strip(),
+                "program_title": str(program_txt or "").strip(),
+                "source_run_name": str(source_run_txt or "").strip(),
+                "control_period": control_period,
+                "suppression_voltage": suppression_voltage,
+                "x": xs,
+                "y": ys,
+            }
+        )
+    return True, out
+
+
 def _td_try_list_raw_x_columns(path: Path, run_name: str) -> tuple[bool, list[str]]:
     if not path.exists():
         return False, []
@@ -11588,13 +12287,13 @@ def _td_try_load_raw_curves(
         curve_params: list[object] = []
         if want:
             q = ",".join(["?"] * len(want))
-            curve_sql.append(f" AND serial IN ({q})")
+            curve_sql.append(f" AND c.serial IN ({q})")
             curve_params.extend(want)
         if prog:
-            curve_sql.append(" AND lower(COALESCE(program_title, '')) = lower(?)")
+            curve_sql.append(" AND lower(COALESCE(c.program_title, '')) = lower(?)")
             curve_params.append(prog)
         if src_run:
-            curve_sql.append(" AND lower(COALESCE(source_run_name, '')) = lower(?)")
+            curve_sql.append(" AND lower(COALESCE(c.source_run_name, '')) = lower(?)")
             curve_params.append(src_run)
         if control_period_filter not in (None, ""):
             cp_filter_num = _to_support_number(control_period_filter)
@@ -11609,7 +12308,9 @@ def _td_try_load_raw_curves(
         curve_sql.append(" ORDER BY c.serial, c.observation_id")
         try:
             rows = conn.execute("".join(curve_sql), tuple(curve_params)).fetchall()
-        except sqlite3.OperationalError:
+        except sqlite3.OperationalError as exc:
+            if not _td_curve_schema_fallback_allowed(exc):
+                raise
             legacy_sql = [
                 f"SELECT '' AS observation_id, serial, '' AS program_title, '' AS source_run_name, NULL AS control_period, NULL AS suppression_voltage, x_json, y_json FROM {_quote_ident(table_name)} WHERE 1=1"
             ]
@@ -11651,6 +12352,10 @@ def td_list_curve_y_columns(db_path: Path, run_name: str, x_name: str | None = N
     if not run:
         return []
     original_path = Path(db_path).expanduser()
+    if original_path.name.lower() != EIDAT_PROJECT_TD_RAW_CACHE_DB.lower():
+        found_plotter, out = _td_try_list_plotter_curve_y_columns(original_path, run, x)
+        if found_plotter:
+            return out
     raw_path = _td_resolve_raw_cache_db_path(original_path)
     found_raw, out = _td_try_list_raw_curve_y_columns(raw_path, run, x)
     if found_raw or original_path == raw_path:
@@ -11730,6 +12435,10 @@ def td_list_x_columns(db_path: Path, run_name: str) -> list[str]:
     if not run:
         return []
     original_path = Path(db_path).expanduser()
+    if original_path.name.lower() != EIDAT_PROJECT_TD_RAW_CACHE_DB.lower():
+        found_plotter, out = _td_try_list_plotter_x_columns(original_path, run)
+        if found_plotter:
+            return out
     raw_path = _td_resolve_raw_cache_db_path(original_path)
     found_raw, out = _td_try_list_raw_x_columns(raw_path, run)
     if found_raw or original_path == raw_path:
@@ -22742,7 +23451,8 @@ def _td_smart_solver_matlab_validation_example_lines(
     if example_row.get("actual_mean") not in (None, ""):
         lines.append(f"    actual_mean = {_td_smart_solver_matlab_example_literal(example_row.get('actual_mean'))};")
     lines.append("    fprintf('Equation: %s\\n', meta.equation_text);")
-    lines.append(f"    fprintf('Predicted {output_label}: %.12g\\n', pred);")
+    predicted_format = _td_perf_matlab_quote(f"Predicted {output_label}: %.12g\\n")
+    lines.append(f"    fprintf({predicted_format}, pred);")
     if example_row.get("pred_mean") not in (None, ""):
         lines.append("    fprintf('Cached exported pred_mean: %.12g\\n', cached_pred_mean);")
         lines.append("    fprintf('Absolute delta vs cached pred_mean: %.12g\\n', abs(pred - cached_pred_mean));")
@@ -23351,6 +24061,19 @@ def td_load_curves(
     if not run or not y or not x:
         return []
     original_path = Path(db_path).expanduser()
+    if original_path.name.lower() != EIDAT_PROJECT_TD_RAW_CACHE_DB.lower():
+        found_plotter, out = _td_try_load_plotter_curves(
+            original_path,
+            run,
+            y,
+            x,
+            serials=serials,
+            program_title=program_title,
+            source_run_name=source_run_name,
+            control_period_filter=control_period_filter,
+        )
+        if found_plotter:
+            return out
     raw_path = _td_resolve_raw_cache_db_path(original_path)
     found_raw, out = _td_try_load_raw_curves(
         raw_path,
@@ -23364,7 +24087,7 @@ def td_load_curves(
     )
     if found_raw or original_path == raw_path:
         return out
-    return _td_load_legacy_curves(
+    legacy_out = _td_load_legacy_curves(
         original_path,
         run,
         y,
@@ -23374,6 +24097,13 @@ def td_load_curves(
         source_run_name=source_run_name,
         control_period_filter=control_period_filter,
     )
+    if legacy_out:
+        return legacy_out
+    if original_path.name.lower() != EIDAT_PROJECT_TD_RAW_CACHE_DB.lower():
+        raw_exists = raw_path.exists() and raw_path.is_file()
+        if (not raw_exists) and (not _td_curve_plotter_cache_available(original_path)):
+            raise RuntimeError(_td_curve_plotter_cache_rebuild_message(original_path))
+    return legacy_out
 
 
 def _td_emit_progress(progress_cb: Callable[[str], None] | None, message: str) -> None:

@@ -1799,6 +1799,48 @@ class TestBackendTdSmartSolver(unittest.TestCase):
         self.assertNotIn("OLD CONTENT", text)
         self.assertIn("function out = smart_solver_overwrite(varargin)", text)
 
+    def test_smart_solver_export_equation_matlab_escapes_apostrophes_in_validation_labels(self) -> None:
+        result = {
+            "fit_family": backend.TD_PERF_FIT_MODE_POLYNOMIAL,
+            "master_model": {
+                "fit_family": backend.TD_PERF_FIT_MODE_POLYNOMIAL,
+                "coeffs": [2.0, 1.0],
+            },
+            "equation": "y = 2*x + 1",
+            "x_norm_equation": "",
+            "solver_branch": backend.TD_PERF_FIT_MODE_POLYNOMIAL,
+            "selection_reason": "Simple line.",
+            "uses_control_period": False,
+            "uses_staged_mediator": False,
+            "output_target": "Thruster's Output",
+            "output_units": "u",
+            "solver_variables": [
+                {"key": "input_1", "target": "Input1", "units": "u", "role": "Primary"},
+            ],
+            "fit_points": [
+                {
+                    "run_name": "CondA",
+                    "display_name": "CondA",
+                    "serial": "SN-001",
+                    "observation_id": "obs-1",
+                    "program_title": "Program Alpha",
+                    "source_run_name": "Seq-1",
+                    "suppression_voltage": 5.0,
+                    "condition_label": "CondA",
+                    "input_1": 1.0,
+                    "actual_mean": 3.0,
+                    "sample_count": 1,
+                }
+            ],
+        }
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            out_path = Path(tmpdir) / "smart_solver_apostrophe.m"
+            backend.td_smart_solver_export_equation_matlab(out_path, result=result, plot_metadata={})
+            text = out_path.read_text(encoding="utf-8")
+
+        self.assertIn("fprintf('Predicted Thruster''s Output: %.12g\\n', pred);", text)
+
 
 if __name__ == "__main__":
     unittest.main()
