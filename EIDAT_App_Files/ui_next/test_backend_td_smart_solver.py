@@ -77,9 +77,26 @@ def _create_smart_solver_db(tmpdir: str, rows: list[dict[str, object]]) -> Path:
     has_input3 = any("input_3" in row for row in rows)
     with closing(sqlite3.connect(str(db_path))) as conn:
         backend._ensure_test_data_impl_tables(conn)
+        run_defaults: dict[str, tuple[str, object]] = {}
+        for row in rows:
+            run_name = str(row.get("run_name") or "").strip()
+            if not run_name or run_name in run_defaults:
+                continue
+            run_type = backend.td_normalize_run_type(row.get("run_type") or "PM") or "PM"
+            run_defaults[run_name] = (run_type, row.get("control_period"))
         conn.executemany(
             "INSERT OR REPLACE INTO td_runs(run_name, default_x, display_name, run_type, control_period, pulse_width) VALUES (?, ?, ?, ?, ?, ?)",
-            [(run_name, "time", run_name, "PM", None, 0.5) for run_name in runs],
+            [
+                (
+                    run_name,
+                    "time",
+                    run_name,
+                    str((run_defaults.get(run_name) or ("PM", None))[0] or "PM"),
+                    (run_defaults.get(run_name) or ("PM", None))[1],
+                    0.5,
+                )
+                for run_name in runs
+            ],
         )
         column_rows: list[tuple[str, str, str, str]] = []
         for run_name in runs:
@@ -105,7 +122,13 @@ def _create_smart_solver_db(tmpdir: str, rows: list[dict[str, object]]) -> Path:
             run_name = str(row.get("run_name") or "").strip()
             program_title = str(row.get("program_title") or "").strip()
             source_run_name = str(row.get("source_run_name") or "")
-            control_period = float(row.get("control_period") or 0.0)
+            run_type = backend.td_normalize_run_type(row.get("run_type") or "PM") or "PM"
+            control_period_raw = row.get("control_period")
+            control_period = (
+                float(control_period_raw)
+                if isinstance(control_period_raw, (int, float))
+                else (float(control_period_raw) if str(control_period_raw or "").strip() else None)
+            )
             suppression_voltage = float(row.get("suppression_voltage") or 5.0)
             input_1 = float(row.get("input_1") or 0.0)
             input_2 = float(row.get("input_2") or 0.0) if "input_2" in row else None
@@ -118,7 +141,7 @@ def _create_smart_solver_db(tmpdir: str, rows: list[dict[str, object]]) -> Path:
                     run_name,
                     program_title,
                     source_run_name,
-                    "PM",
+                    run_type,
                     0.5,
                     control_period,
                     suppression_voltage,
@@ -209,6 +232,7 @@ def _run_solver_with_captures(
     db_path: Path,
     *,
     keep_first_sequences_per_serial: int = 0,
+    run_type_mode: str = "pulsed_mode",
     runs: list[str],
     serials: list[str],
     program_filters: list[str] | None = None,
@@ -285,6 +309,7 @@ def _run_solver_with_captures(
             db_path,
             output_target="Output",
             input1_target="Input1",
+            run_type_mode=run_type_mode,
             keep_first_sequences_per_serial=keep_first_sequences_per_serial,
             runs=runs,
             serials=serials,
@@ -1151,6 +1176,373 @@ class TestBackendTdSmartSolver(unittest.TestCase):
         )
         self.assertEqual(len(predictions), len(x_values))
         self.assertTrue(all(math.isfinite(float(value)) for value in predictions))
+
+    def test_steady_state_1d_ignores_control_period_filters_and_returns_non_cp_model(self) -> None:
+        rows = [
+            {
+                "observation_id": f"obs-{idx}",
+                "serial": "SN-001",
+                "run_name": "CondSS",
+                "program_title": "Program Alpha",
+                "source_run_name": f"Seq-{idx}",
+                "run_type": "SS",
+                "control_period": None,
+                "input_1": float(idx),
+                "output": float(idx * 2),
+            }
+            for idx in range(1, 5)
+        ]
+        captured: dict[str, object] = {}
+
+        def _fake_fit(xs, ys, *, fit_mode=None, **_kwargs):
+            captured["fit_mode"] = fit_mode
+            captured["fit_xs"] = list(xs)
+            return {
+                "fit_family": backend.TD_PERF_FIT_MODE_POLYNOMIAL,
+                "equation": "y = x",
+                "x_norm_equation": "x' = x",
+                "coeffs": [0.0, 1.0],
+                "normalize_x": False,
+                "rmse": 0.0,
+                "fit_domain": [min(xs), max(xs)],
+            }
+
+        def _fake_predict(_model, xs, *, control_period=None):
+            captured["predict_cps"] = list(control_period or [])
+            return [float(x) for x in xs]
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            db_path = _create_smart_solver_db(tmpdir, rows)
+            with patch.object(backend, "td_perf_fit_model", side_effect=_fake_fit), patch.object(
+                backend,
+                "td_perf_predict_model",
+                side_effect=_fake_predict,
+            ), patch.object(backend, "_td_perf_import_numpy", return_value=_FakeNumpy):
+                result = backend.td_smart_solver_run(
+                    db_path,
+                    output_target="Output",
+                    input1_target="Input1",
+                    run_type_mode="steady_state",
+                    runs=["CondSS"],
+                    serials=["SN-001"],
+                    control_period_filters=[30.0],
+                )
+
+        self.assertEqual(captured["fit_mode"], backend.TD_PERF_FIT_MODE_AUTO)
+        self.assertEqual(captured["predict_cps"], [])
+        self.assertEqual(result["run_type_mode"], "steady_state")
+        self.assertFalse(bool(result["uses_control_period"]))
+        self.assertEqual(result["control_period_domain"], [])
+        self.assertEqual(result["ignored_control_periods"], [])
+        self.assertEqual(result["slice_rows"][0]["scope"], "steady_state")
+
+    def test_steady_state_2d_uses_auto_surface_selection(self) -> None:
+        rows = [
+            {
+                "observation_id": f"obs-{idx}",
+                "serial": "SN-001",
+                "run_name": "CondSS2D",
+                "program_title": "Program Alpha",
+                "source_run_name": f"Seq-{idx}",
+                "run_type": "SS",
+                "control_period": None,
+                "input_1": float(idx),
+                "input_2": float(idx + 1),
+                "output": float((idx * 3) + 1),
+            }
+            for idx in range(1, 5)
+        ]
+        captured: dict[str, object] = {}
+
+        def _fake_fit_surface(x1s, x2s, ys, *, auto_surface_families=False, surface_family=None, control_periods=None):
+            captured["auto_surface_families"] = auto_surface_families
+            captured["surface_family"] = surface_family
+            captured["control_periods"] = control_periods
+            return {
+                "fit_family": backend.TD_PERF_FIT_FAMILY_PLANE,
+                "equation": "y = a + bx + cy",
+                "x_norm_equation": "x1' = x1 ; x2' = x2",
+                "coeffs": [1.0, 2.0, 3.0],
+                "x1_center": 0.0,
+                "x1_scale": 1.0,
+                "x2_center": 0.0,
+                "x2_scale": 1.0,
+                "rmse": 0.0,
+            }
+
+        def _fake_predict_surface(_model, x1s, x2s, *, control_period=None):
+            captured["predict_control_period"] = control_period
+            return [float(x1 + x2) for x1, x2 in zip(x1s, x2s)]
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            db_path = _create_smart_solver_db(tmpdir, rows)
+            with patch.object(backend, "td_perf_fit_surface_model", side_effect=_fake_fit_surface), patch.object(
+                backend,
+                "td_perf_predict_surface",
+                side_effect=_fake_predict_surface,
+            ), patch.object(backend, "_td_perf_import_numpy", return_value=_FakeNumpy):
+                result = backend.td_smart_solver_run(
+                    db_path,
+                    output_target="Output",
+                    input1_target="Input1",
+                    input2_target="Input2",
+                    run_type_mode="steady_state",
+                    runs=["CondSS2D"],
+                    serials=["SN-001"],
+                    control_period_filters=[40.0],
+                )
+
+        self.assertEqual(result["fit_family"], backend.TD_PERF_FIT_FAMILY_PLANE)
+        self.assertFalse(bool(result["uses_control_period"]))
+        self.assertTrue(bool(captured["auto_surface_families"]))
+        self.assertEqual(captured["surface_family"], backend.TD_PERF_FIT_MODE_AUTO_SURFACE)
+        self.assertIsNone(captured["control_periods"])
+        self.assertIsNone(captured["predict_control_period"])
+        self.assertEqual(result["slice_rows"][0]["scope"], "steady_state")
+
+    def test_steady_state_3d_prefers_staged_model_when_direct_is_not_5_percent_better(self) -> None:
+        rows = [
+            {
+                "observation_id": f"obs-{idx}",
+                "serial": "SN-001",
+                "run_name": "CondSS3D",
+                "program_title": "Program Alpha",
+                "source_run_name": f"Seq-{idx}",
+                "run_type": "SS",
+                "control_period": None,
+                "input_1": float(idx),
+                "input_2": float(idx + 1),
+                "input_3": float(idx + 2),
+                "output": float(value),
+            }
+            for idx, value in enumerate([10.0, 20.0, 30.0], start=1)
+        ]
+
+        direct_model = {
+            "fit_family": backend.TD_PERF_FIT_FAMILY_QUADRATIC_3INPUT,
+            "equation": "direct",
+            "x_norm_equation": "norm",
+            "coeffs": [0.0] * 10,
+            "x1_center": 0.0,
+            "x1_scale": 1.0,
+            "x2_center": 0.0,
+            "x2_scale": 1.0,
+            "x3_center": 0.0,
+            "x3_scale": 1.0,
+            "rmse": 0.0,
+        }
+        staged_model = {
+            "fit_family": backend.TD_PERF_FIT_FAMILY_STAGED_MEDIATOR,
+            "equation": "staged",
+            "x_norm_equation": "norm",
+            "stage1_model": {
+                "fit_family": backend.TD_PERF_FIT_FAMILY_PLANE,
+                "coeffs": [1.0, 0.0, 0.0],
+                "x1_center": 0.0,
+                "x1_scale": 1.0,
+                "x2_center": 0.0,
+                "x2_scale": 1.0,
+            },
+            "stage2_model": {
+                "fit_family": backend.TD_PERF_FIT_MODE_POLYNOMIAL,
+                "coeffs": [0.0, 1.0],
+                "normalize_x": False,
+            },
+            "stage2_input_domain": [0.0, 10.0],
+            "stage2_fit_source": "actual_input_3",
+            "stage1_rmse": 0.1,
+            "mediator_clamp_count": 0,
+            "rmse": 0.0,
+        }
+
+        def _fake_direct_predict(_model, _x1s, _x2s, _x3s):
+            return [10.0, 20.0, 30.10]
+
+        def _fake_surface_predict(model, x1s, x2s, *, control_period=None):
+            self.assertIsNone(control_period)
+            if str(model.get("fit_family") or "") == backend.TD_PERF_FIT_FAMILY_PLANE:
+                return [float(x1 + x2) for x1, x2 in zip(x1s, x2s)]
+            return [0.0 for _ in x1s]
+
+        def _fake_model_predict(model, xs, *, control_period=None):
+            self.assertIsNone(control_period)
+            if str(model.get("fit_family") or "") == backend.TD_PERF_FIT_MODE_POLYNOMIAL:
+                return [10.0, 20.0, 30.095]
+            return [float(x) for x in xs]
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            db_path = _create_smart_solver_db(tmpdir, rows)
+            with patch.object(backend, "_td_perf_fit_quadratic_3input_model", return_value=direct_model), patch.object(
+                backend,
+                "_td_perf_fit_staged_mediator_model",
+                return_value=staged_model,
+            ), patch.object(
+                backend,
+                "_td_perf_predict_quadratic_3input",
+                side_effect=_fake_direct_predict,
+            ), patch.object(
+                backend,
+                "td_perf_predict_surface",
+                side_effect=_fake_surface_predict,
+            ), patch.object(
+                backend,
+                "td_perf_predict_model",
+                side_effect=_fake_model_predict,
+            ), patch.object(backend, "_td_perf_import_numpy", return_value=_FakeNumpy):
+                result = backend.td_smart_solver_run(
+                    db_path,
+                    output_target="Output",
+                    input1_target="Input1",
+                    input2_target="Input2",
+                    input3_target="Input3",
+                    run_type_mode="steady_state",
+                    runs=["CondSS3D"],
+                    serials=["SN-001"],
+                )
+
+        self.assertEqual(result["fit_family"], backend.TD_PERF_FIT_FAMILY_STAGED_MEDIATOR)
+        self.assertTrue(bool(result["uses_staged_mediator"]))
+        self.assertFalse(bool(result["uses_control_period"]))
+        self.assertIn("did not improve final RMSE by more than 5%", result["selection_reason"])
+        self.assertEqual(result["slice_rows"][0]["scope"], "steady_state")
+
+    def test_smart_solver_exportable_model_accepts_new_steady_state_families(self) -> None:
+        self.assertIsNotNone(
+            backend.td_smart_solver_exportable_model({"master_model": {"fit_family": backend.TD_PERF_FIT_FAMILY_QUADRATIC_3INPUT}})
+        )
+        self.assertIsNotNone(
+            backend.td_smart_solver_exportable_model({"master_model": {"fit_family": backend.TD_PERF_FIT_FAMILY_STAGED_MEDIATOR}})
+        )
+
+    def test_smart_solver_workbook_omits_control_period_for_steady_state_and_keeps_it_for_pulsed(self) -> None:
+        try:
+            from openpyxl import load_workbook  # type: ignore
+        except Exception as exc:  # pragma: no cover - optional dependency
+            self.skipTest(f"openpyxl unavailable: {exc}")
+
+        steady_result = {
+            "fit_family": backend.TD_PERF_FIT_FAMILY_PLANE,
+            "master_model": {
+                "fit_family": backend.TD_PERF_FIT_FAMILY_PLANE,
+                "coeffs": [1.0, 2.0, 3.0],
+                "x1_center": 0.0,
+                "x1_scale": 1.0,
+                "x2_center": 0.0,
+                "x2_scale": 1.0,
+            },
+            "fit_points": [
+                {
+                    "run_name": "CondSS2D",
+                    "display_name": "CondSS2D",
+                    "serial": "SN-001",
+                    "observation_id": "obs-1",
+                    "program_title": "Program Alpha",
+                    "source_run_name": "Seq-1",
+                    "suppression_voltage": 5.0,
+                    "condition_label": "CondSS2D",
+                    "input_1": 1.0,
+                    "input_2": 2.0,
+                    "actual_mean": 9.0,
+                    "sample_count": 1,
+                }
+            ],
+            "solver_variables": [
+                {"key": "input_1", "target": "Input1", "units": "u", "role": "Primary"},
+                {"key": "input_2", "target": "Input2", "units": "u", "role": "Secondary"},
+            ],
+            "output_target": "Output",
+            "output_units": "u",
+            "input1_target": "Input1",
+            "input1_units": "u",
+            "input2_target": "Input2",
+            "input2_units": "u",
+            "input3_target": "",
+            "input3_units": "",
+            "equation": "y = a + bx + cy",
+            "x_norm_equation": "x1' = x1 ; x2' = x2",
+            "solver_branch": backend.TD_PERF_FIT_FAMILY_PLANE,
+            "selection_reason": "steady",
+            "uses_control_period": False,
+            "run_type_mode": "steady_state",
+        }
+        pulsed_result = {
+            **steady_result,
+            "fit_family": backend.TD_PERF_FIT_FAMILY_QUADRATIC_CURVE_CONTROL_PERIOD,
+            "master_model": {
+                "fit_family": backend.TD_PERF_FIT_FAMILY_QUADRATIC_CURVE_CONTROL_PERIOD,
+                "coeff_cp_models": [[1.0], [2.0], [3.0]],
+                "x_center": 0.0,
+                "x_scale": 1.0,
+                "cp_center": 0.0,
+                "cp_scale": 1.0,
+            },
+            "fit_points": [
+                {
+                    "run_name": "CondPM",
+                    "display_name": "CondPM",
+                    "serial": "SN-001",
+                    "observation_id": "obs-1",
+                    "program_title": "Program Alpha",
+                    "source_run_name": "Seq-1",
+                    "suppression_voltage": 5.0,
+                    "control_period": 30.0,
+                    "condition_label": "CondPM",
+                    "input_1": 1.0,
+                    "actual_mean": 9.0,
+                    "sample_count": 1,
+                }
+            ],
+            "solver_variables": [
+                {"key": "input_1", "target": "Input1", "units": "u", "role": "Primary"},
+            ],
+            "input2_target": "",
+            "input2_units": "",
+            "uses_control_period": True,
+            "run_type_mode": "pulsed_mode",
+            "solver_branch": backend.TD_PERF_FIT_FAMILY_QUADRATIC_CURVE_CONTROL_PERIOD,
+        }
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            tmp_path = Path(tmpdir)
+            dummy_db = tmp_path / "dummy.sqlite3"
+            dummy_db.write_text("", encoding="utf-8")
+            steady_path = tmp_path / "steady.xlsx"
+            pulsed_path = tmp_path / "pulsed.xlsx"
+            backend.td_smart_solver_export_equation_workbook(
+                dummy_db,
+                steady_path,
+                result=steady_result,
+                plot_metadata={"run_type_mode": "steady_state"},
+            )
+            backend.td_smart_solver_export_equation_workbook(
+                dummy_db,
+                pulsed_path,
+                result=pulsed_result,
+                plot_metadata={"run_type_mode": "pulsed_mode"},
+            )
+
+            steady_wb = load_workbook(str(steady_path), data_only=False)
+            pulsed_wb = load_workbook(str(pulsed_path), data_only=False)
+            try:
+                def _row_values_by_anchor(sheet, anchor: str) -> list[object]:
+                    for row_idx in range(1, sheet.max_row + 1):
+                        values = [sheet.cell(row_idx, col_idx).value for col_idx in range(1, sheet.max_column + 1)]
+                        if anchor in values:
+                            return values
+                    return []
+
+                steady_headers = _row_values_by_anchor(steady_wb["Smart Solver Export"], "run_name")
+                steady_scenario_headers = _row_values_by_anchor(steady_wb["Scenario Calculator"], "scenario_id")
+                pulsed_headers = _row_values_by_anchor(pulsed_wb["Smart Solver Export"], "run_name")
+                pulsed_scenario_headers = _row_values_by_anchor(pulsed_wb["Scenario Calculator"], "scenario_id")
+            finally:
+                steady_wb.close()
+                pulsed_wb.close()
+
+        self.assertNotIn("control_period", steady_headers)
+        self.assertNotIn("control_period", steady_scenario_headers)
+        self.assertIn("control_period", pulsed_headers)
+        self.assertIn("control_period", pulsed_scenario_headers)
 
 
 if __name__ == "__main__":

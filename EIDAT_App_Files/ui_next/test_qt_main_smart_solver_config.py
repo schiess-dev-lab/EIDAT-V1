@@ -50,6 +50,7 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
                 db_path.write_text("", encoding="utf-8")
                 window._db_path = db_path
                 window._smart_solver_config = {
+                    "run_type_mode": "pulsed_mode",
                     "output_target": "Output",
                     "input1_target": "Input1",
                     "input2_target": "",
@@ -57,6 +58,7 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
                     "control_period_hard_input": True,
                     "keep_first_sequences_per_serial": 0,
                 }
+                self.assertIn("Condition Family = Pulsed mode", window._smart_solver_config_text())
                 self.assertIn("Seq cap = Unlimited", window._smart_solver_config_text())
 
                 window._smart_solver_config["keep_first_sequences_per_serial"] = 3
@@ -109,6 +111,7 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
                 self.assertEqual(len(solver_calls), 1)
                 self.assertEqual(solver_calls[0]["keep_first_sequences_per_serial"], 3)
                 self.assertEqual(solver_calls[0]["input3_target"], "")
+                self.assertEqual(solver_calls[0]["run_type_mode"], "pulsed_mode")
                 self.assertIn("Dropped: 1 seq / 2 pts", window.lbl_smart_solver_summary.text())
         finally:
             window.close()
@@ -133,6 +136,9 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
 
                 def _inspect_dialog():
                     dialog = window._smart_solver_popup
+                    captured["condition_family"] = dialog.findChild(
+                        QtWidgets.QComboBox, "smart_solver_combo_condition_family"
+                    ).currentData()
                     captured["guide"] = dialog.findChild(QtWidgets.QLabel, "smart_solver_input_guide").text()
                     captured["output"] = dialog.findChild(QtWidgets.QLabel, "smart_solver_help_output").text()
                     captured["input3"] = dialog.findChild(QtWidgets.QLabel, "smart_solver_help_input3").text()
@@ -148,10 +154,58 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
                 ):
                     window._open_smart_solver_config_popup()
 
+                self.assertEqual(captured["condition_family"], "pulsed_mode")
                 self.assertIn("direct 3D solve", captured["guide"])
                 self.assertEqual(captured["output"], "Metric the solver predicts.")
                 self.assertIn("Correlation helper", captured["input3"])
                 self.assertIn("remains unchanged", captured["control_period"])
+        finally:
+            window.close()
+            tmpdir = getattr(window, "_test_tmpdir", "")
+            if tmpdir:
+                shutil.rmtree(str(tmpdir), ignore_errors=True)
+
+    def test_smart_solver_config_popup_steady_state_hides_cp_controls_and_updates_copy(self) -> None:
+        window = self._make_window()
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                db_path = Path(tmpdir) / "cache.sqlite3"
+                db_path.write_text("", encoding="utf-8")
+                window._db_path = db_path
+                window._perf_available_columns = [
+                    {"name": "Output"},
+                    {"name": "Input1"},
+                    {"name": "Input2"},
+                    {"name": "Input3"},
+                ]
+                captured: dict[str, object] = {}
+
+                def _run_dialog():
+                    dialog = window._smart_solver_popup
+                    combo = dialog.findChild(QtWidgets.QComboBox, "smart_solver_combo_condition_family")
+                    combo.setCurrentIndex(1)
+                    self._app.processEvents()
+                    captured["guide"] = dialog.findChild(QtWidgets.QLabel, "smart_solver_input_guide").text()
+                    captured["cp_help_visible"] = dialog.findChild(
+                        QtWidgets.QLabel, "smart_solver_help_control_period"
+                    ).isVisible()
+                    captured["cp_filters"] = [
+                        label.text()
+                        for label in dialog.findChildren(QtWidgets.QLabel)
+                        if "Ignored in steady-state mode." in str(label.text() or "")
+                    ]
+                    dialog.reject()
+                    return 0
+
+                with patch(
+                    "ui_next.qt_main.QtWidgets.QDialog.exec",
+                    side_effect=_run_dialog,
+                ):
+                    window._open_smart_solver_config_popup()
+
+                self.assertIn("steady-state 3D solve", str(captured["guide"]))
+                self.assertFalse(bool(captured["cp_help_visible"]))
+                self.assertTrue(bool(captured["cp_filters"]))
         finally:
             window.close()
             tmpdir = getattr(window, "_test_tmpdir", "")
@@ -171,10 +225,11 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
                     "fell_out_count": 2,
                     "sample_count": 10,
                     "warning_text": "",
-                    "slice_rows": [],
+                    "slice_rows": [{"scope": "steady_state", "point_count": 10, "distinct_input_1": 3, "eligible": True, "reason": ""}],
                     "solver_branch": "staged_mediator_control_period",
                     "selection_reason": "Test stability summary.",
                     "uses_staged_mediator": True,
+                    "uses_control_period": False,
                     "stability_ok": False,
                     "stage2_fit_source": "stage1_pred_input_3",
                     "mediator_clamp_count": 3,
@@ -185,6 +240,7 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
             self.assertIn("Mediator clamps: 3", window.lbl_smart_solver_summary.text())
             self.assertIn("stage1_pred_input_3", window.lbl_smart_solver_warning.text())
             self.assertIn("Mediator clamp hits: 3.", window.lbl_smart_solver_warning.text())
+            self.assertEqual(window.tbl_smart_solver_diagnostics.horizontalHeaderItem(0).text(), "scope")
         finally:
             window.close()
             tmpdir = getattr(window, "_test_tmpdir", "")
@@ -247,7 +303,7 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
         try:
             window._smart_solver_result = {
                 "master_model": {
-                    "fit_family": "quadratic_3input_control_period",
+                    "fit_family": "quadratic_3input",
                 }
             }
             self.assertTrue(window._smart_solver_has_exportable_model())
@@ -267,6 +323,7 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
                 window._db_path = db_path
                 window._run_display_by_name = {"CondA": "Condition A"}
                 window._smart_solver_config = {
+                    "run_type_mode": "pulsed_mode",
                     "output_target": "Output",
                     "input1_target": "Input1",
                     "input2_target": "",
@@ -276,6 +333,8 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
                 }
                 window._smart_solver_result = {
                     "fit_family": "quadratic_curve_control_period",
+                    "run_type_mode": "pulsed_mode",
+                    "uses_control_period": True,
                     "master_model": {
                         "fit_family": "quadratic_curve_control_period",
                         "coeff_cp_models": [[1.0], [2.0], [3.0]],
@@ -359,6 +418,115 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
                 self.assertEqual(call["plot_metadata"]["solver_variables"][0]["target"], "Input1")
                 self.assertTrue(dialog_defaults)
                 self.assertIn("Output_vs_Input1", dialog_defaults[0])
+        finally:
+            window.close()
+            tmpdir = getattr(window, "_test_tmpdir", "")
+            if tmpdir:
+                shutil.rmtree(str(tmpdir), ignore_errors=True)
+
+    def test_export_smart_solver_equations_to_excel_omits_selected_control_period_for_steady_state(self) -> None:
+        window = self._make_window()
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                db_path = Path(tmpdir) / "cache.sqlite3"
+                db_path.write_text("", encoding="utf-8")
+                out_path = Path(tmpdir) / "smart_solver_export.xlsx"
+                window._db_path = db_path
+                window._smart_solver_config = {
+                    "run_type_mode": "steady_state",
+                    "output_target": "Output",
+                    "input1_target": "Input1",
+                    "input2_target": "Input2",
+                    "input3_target": "Input3",
+                    "control_period_hard_input": True,
+                    "keep_first_sequences_per_serial": 0,
+                }
+                window._smart_solver_result = {
+                    "fit_family": "quadratic_3input",
+                    "run_type_mode": "steady_state",
+                    "uses_control_period": False,
+                    "master_model": {
+                        "fit_family": "quadratic_3input",
+                        "coeffs": [0.0] * 10,
+                        "x1_center": 0.0,
+                        "x1_scale": 1.0,
+                        "x2_center": 0.0,
+                        "x2_scale": 1.0,
+                        "x3_center": 0.0,
+                        "x3_scale": 1.0,
+                    },
+                    "fit_points": [
+                        {
+                            "run_name": "CondSS",
+                            "serial": "SN-001",
+                            "observation_id": "obs-1",
+                            "program_title": "Program Alpha",
+                            "source_run_name": "Seq-1",
+                            "suppression_voltage": 5.0,
+                            "condition_label": "Condition A",
+                            "input_1": 1.0,
+                            "input_2": 2.0,
+                            "input_3": 3.0,
+                            "actual_mean": 11.0,
+                            "sample_count": 1,
+                        }
+                    ],
+                    "solver_variables": [
+                        {
+                            "key": "input_1",
+                            "target": "Input1",
+                            "units": "u",
+                            "role": "Primary",
+                            "is_optional": False,
+                        },
+                        {
+                            "key": "input_2",
+                            "target": "Input2",
+                            "units": "u",
+                            "role": "Secondary",
+                            "is_optional": True,
+                        },
+                        {
+                            "key": "input_3",
+                            "target": "Input3",
+                            "units": "u",
+                            "role": "Helper",
+                            "is_optional": True,
+                        }
+                    ],
+                    "output_target": "Output",
+                    "output_units": "u",
+                    "input1_target": "Input1",
+                    "input1_units": "u",
+                    "input2_target": "Input2",
+                    "input2_units": "u",
+                    "input3_target": "Input3",
+                    "input3_units": "u",
+                }
+                export_calls: list[dict[str, object]] = []
+
+                def _capture_start(output_path: Path, **kwargs):
+                    export_calls.append({"output_path": Path(output_path), **kwargs})
+
+                with patch.object(
+                    TestDataTrendDialog,
+                    "_active_control_period_filter_values",
+                    return_value=[30.0],
+                ), patch.object(
+                    TestDataTrendDialog,
+                    "_start_smart_solver_equation_excel_export",
+                    side_effect=_capture_start,
+                ), patch(
+                    "ui_next.qt_main.be.td_perf_collect_asset_metadata",
+                    return_value={},
+                ), patch(
+                    "ui_next.qt_main.QtWidgets.QFileDialog.getSaveFileName",
+                    return_value=(str(out_path), "Excel Files (*.xlsx)"),
+                ):
+                    window._export_smart_solver_equations_to_excel()
+
+                self.assertEqual(export_calls[0]["plot_metadata"]["selected_control_period"], None)
+                self.assertEqual(export_calls[0]["plot_metadata"]["run_type_mode"], "steady_state")
         finally:
             window.close()
             tmpdir = getattr(window, "_test_tmpdir", "")

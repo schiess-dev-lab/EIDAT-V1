@@ -5295,6 +5295,134 @@ class TestTDSupportWorkbook(unittest.TestCase):
             self.assertEqual(curves[0].get("y"), [10, 20, 30])
             self.assertTrue(str(curves[0].get("observation_id") or "").strip())
 
+    def test_td_curve_selectors_fall_back_to_legacy_impl_curves_when_raw_cache_missing(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            impl_db = root / "implementation_trending.sqlite3"
+            with sqlite3.connect(str(impl_db)) as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE td_runs (
+                        run_name TEXT PRIMARY KEY,
+                        default_x TEXT,
+                        display_name TEXT
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE td_columns (
+                        run_name TEXT NOT NULL,
+                        name TEXT NOT NULL,
+                        units TEXT,
+                        kind TEXT NOT NULL,
+                        PRIMARY KEY (run_name, name)
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE td_curves (
+                        run_name TEXT NOT NULL,
+                        y_name TEXT NOT NULL,
+                        x_name TEXT NOT NULL,
+                        serial TEXT NOT NULL,
+                        x_json TEXT NOT NULL,
+                        y_json TEXT NOT NULL,
+                        n_points INTEGER NOT NULL,
+                        source_mtime_ns INTEGER,
+                        computed_epoch_ns INTEGER NOT NULL,
+                        PRIMARY KEY (run_name, y_name, x_name, serial)
+                    )
+                    """
+                )
+                conn.execute("INSERT INTO td_runs(run_name, default_x, display_name) VALUES (?, ?, ?)", ("RunA", "time_s", "Run A"))
+                conn.executemany(
+                    "INSERT INTO td_columns(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
+                    [
+                        ("RunA", "time_s", "", "x"),
+                        ("RunA", "excel_row", "", "x"),
+                        ("RunA", "thrust", "lbf", "y"),
+                    ],
+                )
+                conn.execute(
+                    """
+                    INSERT INTO td_curves(run_name, y_name, x_name, serial, x_json, y_json, n_points, source_mtime_ns, computed_epoch_ns)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    ("RunA", "thrust", "time_s", "SN1", "[0,1,2]", "[10,20,30]", 3, 1, 1),
+                )
+                conn.commit()
+
+            self.assertFalse((root / "test_data_raw_cache.sqlite3").exists())
+            self.assertEqual(be.td_list_x_columns(impl_db, "RunA"), ["time_s", "excel_row"])
+            self.assertEqual(be.td_list_curve_y_columns(impl_db, "RunA", "time_s"), [{"name": "thrust", "units": "lbf"}])
+
+    def test_td_load_curves_falls_back_to_legacy_impl_curves_when_raw_cache_missing(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            impl_db = root / "implementation_trending.sqlite3"
+            with sqlite3.connect(str(impl_db)) as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE td_runs (
+                        run_name TEXT PRIMARY KEY,
+                        default_x TEXT,
+                        display_name TEXT
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE td_columns (
+                        run_name TEXT NOT NULL,
+                        name TEXT NOT NULL,
+                        units TEXT,
+                        kind TEXT NOT NULL,
+                        PRIMARY KEY (run_name, name)
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE td_curves (
+                        run_name TEXT NOT NULL,
+                        y_name TEXT NOT NULL,
+                        x_name TEXT NOT NULL,
+                        serial TEXT NOT NULL,
+                        x_json TEXT NOT NULL,
+                        y_json TEXT NOT NULL,
+                        n_points INTEGER NOT NULL,
+                        source_mtime_ns INTEGER,
+                        computed_epoch_ns INTEGER NOT NULL,
+                        PRIMARY KEY (run_name, y_name, x_name, serial)
+                    )
+                    """
+                )
+                conn.execute("INSERT INTO td_runs(run_name, default_x, display_name) VALUES (?, ?, ?)", ("RunA", "time_s", "Run A"))
+                conn.execute("INSERT INTO td_columns(run_name, name, units, kind) VALUES (?, ?, ?, ?)", ("RunA", "thrust", "lbf", "y"))
+                conn.execute(
+                    """
+                    INSERT INTO td_curves(run_name, y_name, x_name, serial, x_json, y_json, n_points, source_mtime_ns, computed_epoch_ns)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    ("RunA", "thrust", "time_s", "SN1", "[0,1,2]", "[10,20,30]", 3, 1, 1),
+                )
+                conn.commit()
+
+            curves = be.td_load_curves(impl_db, "RunA", "thrust", "time_s")
+            self.assertEqual(len(curves), 1)
+            self.assertEqual(curves[0].get("serial"), "SN1")
+            self.assertEqual(curves[0].get("x"), [0, 1, 2])
+            self.assertEqual(curves[0].get("y"), [10, 20, 30])
+            self.assertEqual(curves[0].get("program_title"), "")
+            self.assertEqual(curves[0].get("source_run_name"), "")
+            self.assertTrue(str(curves[0].get("observation_id") or "").strip())
+
     def test_rebuild_uses_support_workbook_suppression_voltage_for_cache_and_gui_filters(self) -> None:
         from openpyxl import load_workbook  # type: ignore
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore

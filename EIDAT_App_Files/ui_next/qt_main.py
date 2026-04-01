@@ -3856,7 +3856,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         solver_tab_layout.setSpacing(8)
 
         solver_intro = QtWidgets.QLabel(
-            "Compute-only control-period-aware equation solving from sequence-level mean data."
+            "Compute-only equation solving from sequence-level mean data for pulsed-mode or steady-state conditions."
         )
         solver_intro.setWordWrap(True)
         solver_intro.setStyleSheet("color: #334155; font-size: 11px;")
@@ -8646,11 +8646,28 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         input3_name = str(cfg.get("input3_target") or "").strip()
         if not output_name or not input1_name:
             return "Config: -"
-        cp_mode = "Hard Input" if bool(cfg.get("control_period_hard_input", True)) else "Swept Input"
+        normalize_run_type = getattr(be, "td_perf_normalize_run_type_mode", None)
+        run_type_mode = (
+            normalize_run_type(cfg.get("run_type_mode") or "pulsed_mode")
+            if callable(normalize_run_type)
+            else str(cfg.get("run_type_mode") or "pulsed_mode").strip().lower()
+        )
+        run_type_label = getattr(be, "td_perf_run_type_mode_label", None)
+        condition_family = (
+            run_type_label(run_type_mode)
+            if callable(run_type_label)
+            else ("Steady-state" if run_type_mode == "steady_state" else "Pulsed mode")
+        )
+        cp_mode = (
+            "Not used"
+            if run_type_mode == "steady_state"
+            else ("Hard Input" if bool(cfg.get("control_period_hard_input", True)) else "Swept Input")
+        )
         seq_cap_raw = getattr(be, "_td_smart_solver_sequence_cap_value", None)
         seq_cap_value = seq_cap_raw(cfg.get("keep_first_sequences_per_serial")) if callable(seq_cap_raw) else 0
         seq_cap_text = "Unlimited" if seq_cap_value <= 0 else f"first {seq_cap_value} / serial"
         parts = [
+            f"Condition Family = {condition_family}",
             f"Output = {output_name} (predicts)",
             f"Input 1 = {input1_name} (primary)",
         ]
@@ -8710,6 +8727,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         return rows
 
     def _smart_solver_filter_summary_text(self) -> str:
+        normalize_run_type = getattr(be, "td_perf_normalize_run_type_mode", None)
+        run_type_mode = (
+            normalize_run_type((self._smart_solver_config or {}).get("run_type_mode") or "pulsed_mode")
+            if callable(normalize_run_type)
+            else str((self._smart_solver_config or {}).get("run_type_mode") or "pulsed_mode").strip().lower()
+        )
         parts = [
             str(getattr(getattr(self, "lbl_program_filter_summary", None), "text", lambda: "")() or "").strip(),
             str(getattr(getattr(self, "lbl_serial_filter_summary", None), "text", lambda: "")() or "").strip(),
@@ -8717,6 +8740,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             str(getattr(getattr(self, "lbl_control_period_filter_summary", None), "text", lambda: "")() or "").strip(),
         ]
         parts = [part for part in parts if part]
+        if run_type_mode == "steady_state":
+            parts.append("CP filters ignored in steady-state mode")
         return "Active filters: " + (" | ".join(parts) if parts else "-")
 
     @staticmethod
@@ -8875,6 +8900,18 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 combo.addItem(name, name)
             return combo
 
+        normalize_run_type = getattr(be, "td_perf_normalize_run_type_mode", None)
+        current_run_type_mode = (
+            normalize_run_type((self._smart_solver_config or {}).get("run_type_mode") or "pulsed_mode")
+            if callable(normalize_run_type)
+            else str((self._smart_solver_config or {}).get("run_type_mode") or "pulsed_mode").strip().lower()
+        )
+        combo_condition_family = QtWidgets.QComboBox()
+        combo_condition_family.setObjectName("smart_solver_combo_condition_family")
+        combo_condition_family.addItem("Pulsed mode", "pulsed_mode")
+        combo_condition_family.addItem("Steady-state", "steady_state")
+        combo_condition_family.setCurrentIndex(1 if current_run_type_mode == "steady_state" else 0)
+
         combo_output = _build_combo()
         combo_output.setObjectName("smart_solver_combo_output")
         combo_input1 = _build_combo()
@@ -8896,6 +8933,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 if self._perf_norm_name(combo.itemText(idx)) == self._perf_norm_name(wanted):
                     combo.setCurrentIndex(idx)
                     break
+        form.addRow("Condition Family:", combo_condition_family)
         form.addRow("Output:", combo_output)
         lbl_output_help = QtWidgets.QLabel("Metric the solver predicts.")
         lbl_output_help.setObjectName("smart_solver_help_output")
@@ -8922,9 +8960,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         lbl_input3_help.setWordWrap(True)
         lbl_input3_help.setStyleSheet("color: #64748b; font-size: 10px;")
         form.addRow("", lbl_input3_help)
+        lbl_cp_field = QtWidgets.QLabel("Control Period:")
         cb_cp_hard_input = QtWidgets.QCheckBox("Treat Control Period as hard input")
         cb_cp_hard_input.setChecked(bool((self._smart_solver_config or {}).get("control_period_hard_input", True)))
-        form.addRow("Control Period:", cb_cp_hard_input)
+        form.addRow(lbl_cp_field, cb_cp_hard_input)
         lbl_cp_help = QtWidgets.QLabel("Control-period behavior remains unchanged in this solver pass.")
         lbl_cp_help.setObjectName("smart_solver_help_control_period")
         lbl_cp_help.setWordWrap(True)
@@ -8944,7 +8983,6 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         )
         sp_keep_sequences.setValue(int(seq_cap_value))
         form.addRow("Keep first N sequences / serial:", sp_keep_sequences)
-        form.addRow("Condition Family:", QtWidgets.QLabel("Pulsed mode only"))
         form.addRow("Data Source:", QtWidgets.QLabel("td_metrics_calc_sequences"))
         form.addRow(
             "Program Filters:",
@@ -8968,17 +9006,51 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 )
             ),
         )
-        form.addRow(
-            "CP Filters:",
-            QtWidgets.QLabel(
-                str(
+        lbl_cp_filters_value = QtWidgets.QLabel(
+            str(
+                getattr(self, "lbl_control_period_filter_summary", None).text()
+                if hasattr(self, "lbl_control_period_filter_summary")
+                else "-"
+            )
+        )
+        form.addRow("CP Filters:", lbl_cp_filters_value)
+        layout.addLayout(form)
+
+        def _selected_run_type_mode() -> str:
+            value = self._smart_solver_combo_value(combo_condition_family)
+            return (
+                normalize_run_type(value) if callable(normalize_run_type) else str(value or "pulsed_mode").strip().lower()
+            )
+
+        def _update_mode_copy() -> None:
+            run_type_mode = _selected_run_type_mode()
+            is_steady = run_type_mode == "steady_state"
+            intro.setText(
+                "Configure the sequence-level steady-state solve. Smart Equation Solver uses steady-state mean rows and does not use control period."
+                if is_steady
+                else "Configure the sequence-level control-period-aware solve. Smart Equation Solver uses pulsed-mode mean rows."
+            )
+            guide.setText(
+                "Use Input 2 for a direct steady-state 3D solve. Use Input 3 when another metric helps connect the inputs to the output in harder regions. Control Period is ignored in steady-state mode."
+                if is_steady
+                else "Use Input 2 for a direct 3D solve. Use Input 3 when another metric helps connect the inputs to the output in harder regions."
+            )
+            lbl_cp_field.setVisible(not is_steady)
+            cb_cp_hard_input.setVisible(not is_steady)
+            cb_cp_hard_input.setEnabled(not is_steady)
+            lbl_cp_help.setVisible(not is_steady)
+            lbl_cp_filters_value.setText(
+                "Ignored in steady-state mode."
+                if is_steady
+                else str(
                     getattr(self, "lbl_control_period_filter_summary", None).text()
                     if hasattr(self, "lbl_control_period_filter_summary")
                     else "-"
                 )
-            ),
-        )
-        layout.addLayout(form)
+            )
+
+        combo_condition_family.currentIndexChanged.connect(lambda *_: _update_mode_copy())
+        _update_mode_copy()
 
         btn_row = QtWidgets.QHBoxLayout()
         btn_row.addStretch(1)
@@ -8991,6 +9063,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         layout.addLayout(btn_row)
 
         def _solve() -> None:
+            run_type_mode = _selected_run_type_mode()
             output_name = self._smart_solver_combo_value(combo_output)
             input1_name = self._smart_solver_combo_value(combo_input1)
             input2_name = self._smart_solver_combo_value(combo_input2)
@@ -9023,6 +9096,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 )
                 return
             self._smart_solver_config = {
+                "run_type_mode": run_type_mode if run_type_mode in {"steady_state", "pulsed_mode"} else "pulsed_mode",
                 "output_target": output_name,
                 "input1_target": input1_name,
                 "input2_target": input2_name,
@@ -9113,6 +9187,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 input1_target=str(config.get("input1_target") or "").strip(),
                 input2_target=str(config.get("input2_target") or "").strip(),
                 input3_target=str(config.get("input3_target") or "").strip(),
+                run_type_mode=str(config.get("run_type_mode") or "pulsed_mode").strip(),
                 control_period_hard_input=bool(config.get("control_period_hard_input", True)),
                 keep_first_sequences_per_serial=int(config.get("keep_first_sequences_per_serial") or 0),
                 runs=runs,
@@ -9245,11 +9320,23 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             self.lbl_smart_solver_warning.setVisible(bool(warning_text))
 
         rows = [dict(row) for row in ((result or {}).get("slice_rows") or []) if isinstance(row, dict)]
+        uses_control_period = bool((result or {}).get("uses_control_period", True))
         if hasattr(self, "tbl_smart_solver_diagnostics"):
+            self.tbl_smart_solver_diagnostics.setHorizontalHeaderLabels(
+                [
+                    "control_period" if uses_control_period else "scope",
+                    "point_count",
+                    "distinct_input_1",
+                    "distinct_input_2",
+                    "distinct_input_3",
+                    "eligible",
+                    "reason",
+                ]
+            )
             self.tbl_smart_solver_diagnostics.setRowCount(len(rows))
             for row_idx, row in enumerate(rows):
                 values = [
-                    self._smart_solver_display_value(row.get("control_period")),
+                    self._smart_solver_display_value(row.get("control_period") if uses_control_period else row.get("scope")),
                     self._smart_solver_display_value(row.get("point_count")),
                     self._smart_solver_display_value(row.get("distinct_input_1")),
                     self._smart_solver_display_value(row.get("distinct_input_2")),
@@ -12381,7 +12468,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         run_names = sorted({str(row.get("run_name") or "").strip() for row in fit_points if str(row.get("run_name") or "").strip()})
 
         control_period_filters = list(self._active_control_period_filter_values() or [])
-        selected_control_period = control_period_filters[0] if len(control_period_filters) == 1 else None
+        uses_control_period = bool(result.get("uses_control_period", True))
+        selected_control_period = (
+            control_period_filters[0]
+            if uses_control_period and len(control_period_filters) == 1
+            else None
+        )
 
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         default_name = (
@@ -12405,6 +12497,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             "run_selection_label": "Smart Equation Solver",
             "member_runs": list(run_names),
             "selected_control_period": selected_control_period,
+            "run_type_mode": str(result.get("run_type_mode") or config.get("run_type_mode") or "pulsed_mode").strip(),
             "filter_summary": self._smart_solver_filter_summary_text(),
             "config_text": self._smart_solver_config_text(),
             "solver_branch": str(result.get("solver_branch") or ""),
