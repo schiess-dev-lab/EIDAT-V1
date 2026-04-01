@@ -22678,6 +22678,81 @@ def _td_smart_solver_matlab_metadata_lines(
     ]
 
 
+def _td_smart_solver_matlab_example_literal(value: object) -> str:
+    if value in (None, ""):
+        return "[]"
+    if isinstance(value, bool):
+        return _td_perf_matlab_bool(value)
+    try:
+        return _td_perf_matlab_num(float(value))
+    except Exception:
+        return _td_perf_matlab_quote(value)
+
+
+def _td_smart_solver_matlab_validation_example_lines(
+    *,
+    func_name: str,
+    result: Mapping[str, object],
+    export_rows: Sequence[Mapping[str, object]],
+    argument_specs: Sequence[Mapping[str, object]],
+) -> list[str]:
+    if not export_rows:
+        return []
+    required_keys = [
+        ("control_period" if bool(spec.get("is_control_period")) else str(spec.get("key") or "").strip())
+        for spec in argument_specs
+    ]
+    example_row = next(
+        (
+            dict(row)
+            for row in export_rows
+            if all(row.get(key) not in (None, "") for key in required_keys)
+        ),
+        dict(export_rows[0]),
+    )
+    if not example_row:
+        return []
+
+    output_label = _td_perf_matlab_input_label(result.get("output_target"), fallback="output")
+    run_name = str(example_row.get("run_name") or "").strip()
+    serial = str(example_row.get("serial") or "").strip()
+    observation_id = str(example_row.get("observation_id") or "").strip()
+    lines: list[str] = [
+        "% Validation example from one cached EIDAT fit point.",
+        "% Copy the lines inside the `if false` block into the MATLAB Command Window or a script to validate the export.",
+        "if false",
+    ]
+    if run_name or serial or observation_id:
+        lines.append(
+            "    % Cached fit point: "
+            f"run={run_name or '-'}, serial={serial or '-'}, observation={observation_id or '-'}"
+        )
+    lines.append(f"    meta = {func_name}('metadata');")
+    call_args: list[str] = []
+    for spec in argument_specs:
+        name = str(spec.get("name") or "").strip()
+        row_key = "control_period" if bool(spec.get("is_control_period")) else str(spec.get("key") or "").strip()
+        if not name or not row_key:
+            continue
+        lines.append(f"    {name} = {_td_smart_solver_matlab_example_literal(example_row.get(row_key))};")
+        call_args.append(name)
+    lines.append(f"    pred = {func_name}({', '.join(call_args)});")
+    if example_row.get("pred_mean") not in (None, ""):
+        lines.append(f"    cached_pred_mean = {_td_smart_solver_matlab_example_literal(example_row.get('pred_mean'))};")
+    if example_row.get("actual_mean") not in (None, ""):
+        lines.append(f"    actual_mean = {_td_smart_solver_matlab_example_literal(example_row.get('actual_mean'))};")
+    lines.append("    fprintf('Equation: %s\\n', meta.equation_text);")
+    lines.append(f"    fprintf('Predicted {output_label}: %.12g\\n', pred);")
+    if example_row.get("pred_mean") not in (None, ""):
+        lines.append("    fprintf('Cached exported pred_mean: %.12g\\n', cached_pred_mean);")
+        lines.append("    fprintf('Absolute delta vs cached pred_mean: %.12g\\n', abs(pred - cached_pred_mean));")
+    if example_row.get("actual_mean") not in (None, ""):
+        lines.append("    fprintf('Cached actual_mean: %.12g\\n', actual_mean);")
+        lines.append("    fprintf('Absolute delta vs actual_mean: %.12g\\n', abs(pred - actual_mean));")
+    lines.extend(["end", ""])
+    return lines
+
+
 def td_smart_solver_export_equation_matlab(
     output_path: Path,
     *,
@@ -22756,17 +22831,29 @@ def td_smart_solver_export_equation_matlab(
         f"% Output: y is predicted {output_label}; scalar and array inputs are evaluated element-wise.",
         "% Call with 'metadata' to inspect equation text, normalization, solver stats, and imported variable definitions.",
         "",
-        "if nargin == 1",
-        "    request = varargin{1};",
-        "    if (ischar(request) || (isstring(request) && isscalar(request))) && strcmpi(char(request), 'metadata')",
-        "        out = local_metadata();",
-        "        return;",
-        "    end",
-        "end",
-        f"if nargin ~= {len(predict_args)}",
-        f"    error('{func_name}:Usage', 'Usage: {predict_usage}; meta = {func_name}(''metadata'');');",
-        "end",
     ]
+    lines.extend(
+        _td_smart_solver_matlab_validation_example_lines(
+            func_name=func_name,
+            result=solver_result,
+            export_rows=export_rows,
+            argument_specs=argument_specs,
+        )
+    )
+    lines.extend(
+        [
+            "if nargin == 1",
+            "    request = varargin{1};",
+            "    if (ischar(request) || (isstring(request) && isscalar(request))) && strcmpi(char(request), 'metadata')",
+            "        out = local_metadata();",
+            "        return;",
+            "    end",
+            "end",
+            f"if nargin ~= {len(predict_args)}",
+            f"    error('{func_name}:Usage', 'Usage: {predict_usage}; meta = {func_name}(''metadata'');');",
+            "end",
+        ]
+    )
     for idx, spec in enumerate(argument_specs, start=1):
         arg_name = str(spec.get("name") or "").strip()
         lines.append(f"{arg_name} = varargin{{{idx}}};")
