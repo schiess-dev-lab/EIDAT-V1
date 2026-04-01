@@ -4047,10 +4047,14 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self.btn_solver_export_equations = QtWidgets.QPushButton("Export Equation to Excel")
         self.btn_solver_export_equations.setEnabled(False)
         self.btn_solver_export_equations.clicked.connect(self._export_smart_solver_equations_to_excel)
+        self.btn_solver_export_matlab = QtWidgets.QPushButton("Export Equation to MATLAB")
+        self.btn_solver_export_matlab.setEnabled(False)
+        self.btn_solver_export_matlab.clicked.connect(self._export_smart_solver_equations_to_matlab)
         smart_solver_action_row.addWidget(self.btn_solver_config)
         smart_solver_action_row.addWidget(self.btn_solver_run)
         smart_solver_action_row.addWidget(self.btn_solver_resolve)
         smart_solver_action_row.addWidget(self.btn_solver_export_equations)
+        smart_solver_action_row.addWidget(self.btn_solver_export_matlab)
         smart_solver_action_row.addStretch(1)
         smart_solver_layout.addLayout(smart_solver_action_row)
 
@@ -8818,6 +8822,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             self.btn_solver_resolve.setEnabled(has_result and not busy)
         if hasattr(self, "btn_solver_export_equations"):
             self.btn_solver_export_equations.setEnabled(self._smart_solver_has_exportable_model() and not busy and not export_busy)
+        if hasattr(self, "btn_solver_export_matlab"):
+            self.btn_solver_export_matlab.setEnabled(self._smart_solver_has_exportable_model() and not busy and not export_busy)
         if hasattr(self, "btn_plot"):
             if is_solver:
                 self.btn_plot.setEnabled(bool(getattr(self, "_db_path", None)) and not busy)
@@ -12052,6 +12058,16 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._open_spreadsheet_path(exported_path)
         return f"{heading} complete: {exported_path.name}"
 
+    def _handle_path_export_success(self, payload: object, *, heading: str) -> str:
+        exported_path = Path(payload).expanduser() if isinstance(payload, (str, Path)) else None
+        if exported_path is None:
+            raise RuntimeError(f"{heading} returned an invalid output path.")
+        try:
+            be.open_path(exported_path)
+        except Exception:
+            pass
+        return f"{heading} complete: {exported_path.name}"
+
     def _start_perf_export_task(
         self,
         *,
@@ -12064,10 +12080,11 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.information(self, heading, "Wait for the cache task to finish first.")
             return
         if self._export_worker is not None and self._export_worker.isRunning():
-            QtWidgets.QMessageBox.information(self, heading, "An Excel export is already running.")
+            QtWidgets.QMessageBox.information(self, heading, "An export is already running.")
             return
 
         self._update_perf_export_button_state()
+        self._refresh_smart_solver_ui()
         self._export_progress_visible = False
         try:
             self._report_progress.lbl_heading.setText(heading)
@@ -12079,6 +12096,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
         self._export_worker = ProjectTaskWorker(task_factory, parent=self)
         self._update_perf_export_button_state()
+        self._refresh_smart_solver_ui()
         self._export_worker.progress.connect(self._on_perf_export_task_progress)
         self._export_worker.completed.connect(lambda payload: self._on_perf_export_task_done(payload, on_success, heading))
         self._export_worker.failed.connect(lambda message: self._on_perf_export_task_error(message, heading))
@@ -12096,6 +12114,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
     def _on_perf_export_task_done(self, payload: object, on_success, heading: str) -> None:
         self._export_worker = None
         self._update_perf_export_button_state()
+        self._refresh_smart_solver_ui()
         try:
             msg = on_success(payload)
         except Exception as exc:
@@ -12117,6 +12136,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
     def _on_perf_export_task_error(self, message: str, heading: str) -> None:
         self._export_worker = None
         self._update_perf_export_button_state()
+        self._refresh_smart_solver_ui()
         msg = str(message or "").strip() or f"{heading} failed."
         QtWidgets.QMessageBox.warning(self, heading, msg)
         if self._export_progress_visible:
@@ -12219,6 +12239,30 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             status_text=f"Exporting equation workbook to {output.name}",
             task_factory=_task,
             on_success=lambda payload: self._handle_perf_excel_export_success(payload, heading="Export Equation to Excel"),
+        )
+
+    def _start_smart_solver_equation_matlab_export(
+        self,
+        output_path: Path,
+        *,
+        result: dict[str, object],
+        plot_metadata: dict[str, object],
+    ) -> None:
+        output = Path(output_path).expanduser()
+
+        def _task(report):
+            return be.td_smart_solver_export_equation_matlab(
+                output,
+                result=result,
+                plot_metadata=plot_metadata,
+                progress_cb=report,
+            )
+
+        self._start_perf_export_task(
+            heading="Export Equation to MATLAB",
+            status_text=f"Exporting MATLAB equation file to {output.name}",
+            task_factory=_task,
+            on_success=lambda payload: self._handle_path_export_success(payload, heading="Export Equation to MATLAB"),
         )
 
     def _start_saved_perf_equations_excel_export(
@@ -12520,6 +12564,108 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             )
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "Export Equation to Excel", str(exc))
+
+    def _export_smart_solver_equations_to_matlab(self) -> None:
+        if not getattr(self, "_db_path", None):
+            QtWidgets.QMessageBox.information(self, "Export Equation to MATLAB", "Build/refresh cache first.")
+            return
+        if not self._smart_solver_has_exportable_model():
+            QtWidgets.QMessageBox.information(
+                self,
+                "Export Equation to MATLAB",
+                "Run Smart Equation Solver before exporting its MATLAB file.",
+            )
+            return
+
+        result = dict(getattr(self, "_smart_solver_result", {}) or {})
+        config = dict(getattr(self, "_smart_solver_config", {}) or {})
+        fit_points = [dict(row) for row in (result.get("fit_points") or []) if isinstance(row, dict)]
+        if not fit_points:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Export Equation to MATLAB",
+                "No Smart Equation Solver fit points are available to export.",
+            )
+            return
+
+        output_target = str(result.get("output_target") or config.get("output_target") or "").strip()
+        solver_variables = [dict(item) for item in (result.get("solver_variables") or []) if isinstance(item, dict)]
+        if not solver_variables:
+            variable_helper = getattr(be, "_td_smart_solver_export_variables", None)
+            if callable(variable_helper):
+                solver_variables = variable_helper(
+                    input1_target=str(result.get("input1_target") or config.get("input1_target") or "").strip(),
+                    input1_units=str(result.get("input1_units") or "").strip(),
+                    input2_target=str(result.get("input2_target") or config.get("input2_target") or "").strip(),
+                    input2_units=str(result.get("input2_units") or "").strip(),
+                    input3_target=str(result.get("input3_target") or config.get("input3_target") or "").strip(),
+                    input3_units=str(result.get("input3_units") or "").strip(),
+                    variable_descriptors=(result.get("variable_descriptors") or {}),
+                )
+        variable_targets = [str(item.get("target") or "").strip() for item in solver_variables if str(item.get("target") or "").strip()]
+        if not output_target or not variable_targets:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Export Equation to MATLAB",
+                "Smart Equation Solver output/input targets are incomplete.",
+            )
+            return
+
+        run_names = sorted({str(row.get("run_name") or "").strip() for row in fit_points if str(row.get("run_name") or "").strip()})
+
+        control_period_filters = list(self._active_control_period_filter_values() or [])
+        uses_control_period = bool(result.get("uses_control_period", True))
+        selected_control_period = (
+            control_period_filters[0]
+            if uses_control_period and len(control_period_filters) == 1
+            else None
+        )
+
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_name = (
+            f"smart_solver_equation_export_run_conditions_{self._perf_export_slug(output_target)}_vs_"
+            f"{'_'.join(self._perf_export_slug(name) for name in variable_targets)}"
+        )
+        default_name += f"_{timestamp}.m"
+        out_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Export Equation to MATLAB",
+            str(self._project_dir / default_name),
+            "MATLAB Files (*.m)",
+        )
+        if not out_path:
+            return
+
+        plot_metadata = {
+            "output_target": output_target,
+            "output_units": str(result.get("output_units") or "").strip(),
+            "solver_variables": solver_variables,
+            "run_selection_label": "Smart Equation Solver",
+            "member_runs": list(run_names),
+            "selected_control_period": selected_control_period,
+            "run_type_mode": str(result.get("run_type_mode") or config.get("run_type_mode") or "pulsed_mode").strip(),
+            "filter_summary": self._smart_solver_filter_summary_text(),
+            "config_text": self._smart_solver_config_text(),
+            "solver_branch": str(result.get("solver_branch") or ""),
+            "selection_reason": str(result.get("selection_reason") or ""),
+        }
+        try:
+            asset_serials = sorted({str(row.get("serial") or "").strip() for row in fit_points if str(row.get("serial") or "").strip()})
+            asset_metadata = be.td_perf_collect_asset_metadata(self._db_path, asset_serials)
+        except Exception:
+            asset_metadata = {}
+        if isinstance(asset_metadata, dict):
+            plot_metadata["asset_type"] = str(asset_metadata.get("primary_asset_type") or "").strip()
+            plot_metadata["asset_specific_type"] = str(asset_metadata.get("primary_asset_specific_type") or "").strip()
+
+        try:
+            self._start_smart_solver_equation_matlab_export(
+                Path(out_path),
+                result=result,
+                plot_metadata=plot_metadata,
+            )
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Export Equation to MATLAB", str(exc))
 
     def _open_performance_equations_popup(self) -> None:
         dlg = getattr(self, "_perf_equations_popup", None)

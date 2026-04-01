@@ -22213,6 +22213,39 @@ def _td_perf_matlab_input_label(value: object, *, fallback: str) -> str:
     return text if text else fallback
 
 
+def _td_perf_matlab_bool(value: object) -> str:
+    return "true" if bool(value) else "false"
+
+
+def _td_perf_matlab_optional_num(value: object, *, empty: str = "[]") -> str:
+    if value in (None, ""):
+        return empty
+    try:
+        num = float(value)
+    except Exception:
+        return empty
+    if not math.isfinite(num):
+        return empty
+    return _td_perf_matlab_num(num)
+
+
+def _td_perf_matlab_clamp_expr(expr: str, domain: Sequence[object]) -> str:
+    raw = str(expr or "").strip()
+    if not raw:
+        return ""
+    if not isinstance(domain, Sequence) or isinstance(domain, (str, bytes)) or len(domain) < 2:
+        return raw
+    try:
+        lo = float(domain[0])
+        hi = float(domain[1])
+    except Exception:
+        return raw
+    if not (math.isfinite(lo) and math.isfinite(hi)):
+        return raw
+    lo, hi = min(lo, hi), max(lo, hi)
+    return f"eidat_perf_clamp({raw}, {_td_perf_matlab_num(lo)}, {_td_perf_matlab_num(hi)})"
+
+
 def _td_perf_matlab_signature_parts(
     plot_metadata: Mapping[str, object],
     model: Mapping[str, object],
@@ -22220,11 +22253,37 @@ def _td_perf_matlab_signature_parts(
     x_var: str,
     x1_var: str,
     x2_var: str,
+    x3_var: str,
     cp_var: str,
 ) -> tuple[list[str], list[tuple[str, str]]]:
     input1_label = _td_perf_matlab_input_label(plot_metadata.get("input1_target"), fallback="input 1")
     input2_label = _td_perf_matlab_input_label(plot_metadata.get("input2_target"), fallback="input 2")
+    input3_label = _td_perf_matlab_input_label(plot_metadata.get("input3_target"), fallback="input 3")
     family = td_perf_normalize_fit_mode(model.get("fit_family"))
+    if family == TD_PERF_FIT_FAMILY_QUADRATIC_3INPUT_CONTROL_PERIOD:
+        return [x1_var, x2_var, x3_var, cp_var], [
+            (x1_var, input1_label),
+            (x2_var, input2_label),
+            (x3_var, input3_label),
+            (cp_var, "control period"),
+        ]
+    if family == TD_PERF_FIT_FAMILY_QUADRATIC_3INPUT:
+        return [x1_var, x2_var, x3_var], [
+            (x1_var, input1_label),
+            (x2_var, input2_label),
+            (x3_var, input3_label),
+        ]
+    if family == TD_PERF_FIT_FAMILY_STAGED_MEDIATOR_CONTROL_PERIOD:
+        return [x1_var, x2_var, cp_var], [
+            (x1_var, input1_label),
+            (x2_var, input2_label),
+            (cp_var, "control period"),
+        ]
+    if family == TD_PERF_FIT_FAMILY_STAGED_MEDIATOR:
+        return [x1_var, x2_var], [
+            (x1_var, input1_label),
+            (x2_var, input2_label),
+        ]
     if family == TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD:
         return [x1_var, x2_var, cp_var], [
             (x1_var, input1_label),
@@ -22273,6 +22332,7 @@ def _td_perf_matlab_function_expr(
     x_var: str,
     x1_var: str,
     x2_var: str,
+    x3_var: str,
     cp_var: str,
 ) -> str:
     family = td_perf_normalize_fit_mode(model.get("fit_family"))
@@ -22346,8 +22406,9 @@ def _td_perf_matlab_function_expr(
     if family == TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD:
         coeff_cp_models = [_td_perf_matlab_vector(coeffs) for coeffs in (model.get("coeff_cp_models") or [])]
         coeff_matrix = "{" + ", ".join(coeff_cp_models) + "}"
+        clamped_cp_var = _td_perf_matlab_clamp_expr(cp_var, model.get("fit_domain_control_period") or [])
         return (
-            f"eidat_perf_surface_cp_predict({x1_var}, {x2_var}, {cp_var}, {coeff_matrix}, "
+            f"eidat_perf_surface_cp_predict({x1_var}, {x2_var}, {clamped_cp_var}, {coeff_matrix}, "
             f"{_td_perf_matlab_num(model.get('x1_center'))}, {_td_perf_matlab_num(model.get('x1_scale') or 1.0)}, "
             f"{_td_perf_matlab_num(model.get('x2_center'))}, {_td_perf_matlab_num(model.get('x2_scale') or 1.0)}, "
             f"{_td_perf_matlab_num(model.get('cp_center'))}, {_td_perf_matlab_num(model.get('cp_scale') or 1.0)})"
@@ -22355,8 +22416,9 @@ def _td_perf_matlab_function_expr(
     if family == TD_PERF_FIT_FAMILY_QUADRATIC_CURVE_CONTROL_PERIOD:
         coeff_cp_models = [_td_perf_matlab_vector(coeffs) for coeffs in (model.get("coeff_cp_models") or [])]
         coeff_matrix = "{" + ", ".join(coeff_cp_models) + "}"
+        clamped_cp_var = _td_perf_matlab_clamp_expr(cp_var, model.get("fit_domain_control_period") or [])
         return (
-            f"eidat_perf_curve_cp_predict({x_var}, {cp_var}, {coeff_matrix}, "
+            f"eidat_perf_curve_cp_predict({x_var}, {clamped_cp_var}, {coeff_matrix}, "
             f"{_td_perf_matlab_num(model.get('x_center'))}, {_td_perf_matlab_num(model.get('x_scale') or 1.0)}, "
             f"{_td_perf_matlab_num(model.get('cp_center'))}, {_td_perf_matlab_num(model.get('cp_scale') or 1.0)})"
         )
@@ -22364,17 +22426,370 @@ def _td_perf_matlab_function_expr(
         residual_cp_models = [_td_perf_matlab_vector(coeffs) for coeffs in (model.get("residual_cp_models") or model.get("coeff_cp_models") or [])]
         coeff_matrix = "{" + ", ".join(residual_cp_models) + "}"
         base_params = dict(model.get("base_params") or (params or {}).get("base_params") or {})
+        clamped_cp_var = _td_perf_matlab_clamp_expr(cp_var, model.get("fit_domain_control_period") or [])
         base_expr = (
             f"({_td_perf_matlab_num(base_params.get('b'))} + "
             f"({_td_perf_matlab_num(base_params.get('m'))}.*{x_var}) + "
             f"({_td_perf_matlab_num(base_params.get('A'))}.*(1 - exp(-{_td_perf_matlab_num(base_params.get('k'))}.*{x_var}))))"
         )
         return (
-            f"({base_expr} + eidat_perf_curve_cp_predict({x_var}, {cp_var}, {coeff_matrix}, "
+            f"({base_expr} + eidat_perf_curve_cp_predict({x_var}, {clamped_cp_var}, {coeff_matrix}, "
             f"{_td_perf_matlab_num(model.get('x_center'))}, {_td_perf_matlab_num(model.get('x_scale') or 1.0)}, "
             f"{_td_perf_matlab_num(model.get('cp_center'))}, {_td_perf_matlab_num(model.get('cp_scale') or 1.0)}))"
         )
+    if family == TD_PERF_FIT_FAMILY_QUADRATIC_3INPUT:
+        coeffs = _td_perf_matlab_vector(model.get("coeffs") or [])
+        return (
+            f"eidat_perf_three_input_predict({x1_var}, {x2_var}, {x3_var}, {coeffs}, "
+            f"{_td_perf_matlab_num(model.get('x1_center'))}, {_td_perf_matlab_num(model.get('x1_scale') or 1.0)}, "
+            f"{_td_perf_matlab_num(model.get('x2_center'))}, {_td_perf_matlab_num(model.get('x2_scale') or 1.0)}, "
+            f"{_td_perf_matlab_num(model.get('x3_center'))}, {_td_perf_matlab_num(model.get('x3_scale') or 1.0)})"
+        )
+    if family == TD_PERF_FIT_FAMILY_QUADRATIC_3INPUT_CONTROL_PERIOD:
+        coeff_cp_models = [_td_perf_matlab_vector(coeffs) for coeffs in (model.get("coeff_cp_models") or [])]
+        coeff_matrix = "{" + ", ".join(coeff_cp_models) + "}"
+        clamped_cp_var = _td_perf_matlab_clamp_expr(cp_var, model.get("fit_domain_control_period") or [])
+        return (
+            f"eidat_perf_three_input_cp_predict({x1_var}, {x2_var}, {x3_var}, {clamped_cp_var}, {coeff_matrix}, "
+            f"{_td_perf_matlab_num(model.get('x1_center'))}, {_td_perf_matlab_num(model.get('x1_scale') or 1.0)}, "
+            f"{_td_perf_matlab_num(model.get('x2_center'))}, {_td_perf_matlab_num(model.get('x2_scale') or 1.0)}, "
+            f"{_td_perf_matlab_num(model.get('x3_center'))}, {_td_perf_matlab_num(model.get('x3_scale') or 1.0)}, "
+            f"{_td_perf_matlab_num(model.get('cp_center'))}, {_td_perf_matlab_num(model.get('cp_scale') or 1.0)})"
+        )
+    if family in {TD_PERF_FIT_FAMILY_STAGED_MEDIATOR, TD_PERF_FIT_FAMILY_STAGED_MEDIATOR_CONTROL_PERIOD}:
+        stage1_model = dict(model.get("stage1_model") or {})
+        stage2_model = dict(model.get("stage2_model") or {})
+        if not stage1_model or not stage2_model:
+            return "[]"
+        stage1_expr = _td_perf_matlab_function_expr(
+            stage1_model,
+            x_var=x1_var,
+            x1_var=x1_var,
+            x2_var=x2_var,
+            x3_var=x3_var,
+            cp_var=cp_var,
+        )
+        if stage1_expr == "[]":
+            return "[]"
+        stage2_input_expr = _td_perf_matlab_clamp_expr(
+            stage1_expr,
+            model.get("stage2_input_domain") or stage2_model.get("fit_domain") or [],
+        )
+        return _td_perf_matlab_function_expr(
+            stage2_model,
+            x_var=stage2_input_expr,
+            x1_var=x1_var,
+            x2_var=x2_var,
+            x3_var=x3_var,
+            cp_var=cp_var if family == TD_PERF_FIT_FAMILY_STAGED_MEDIATOR_CONTROL_PERIOD else "",
+        )
     return "[]"
+
+
+def _td_perf_matlab_helper_lines() -> list[str]:
+    return [
+        "% Piecewise linear predictor used by exported piecewise performance equations.",
+        "% Inputs: x values, coefficient vector, and breakpoint vector.",
+        "% Output: y predictions with hinge terms applied element-wise.",
+        "function y = eidat_perf_piecewise_predict(x, coeffs, breakpoints)",
+        "x = double(x);",
+        "y = coeffs(1) + coeffs(2).*x;",
+        "for idx = 1:numel(breakpoints)",
+        "    y = y + coeffs(idx + 2).*max(0, x - breakpoints(idx));",
+        "end",
+        "end",
+        "",
+        "% Monotone PCHIP predictor used by exported monotone performance equations.",
+        "% Inputs: x values, knot locations, knot values, and left/right clamp values.",
+        "% Output: y predictions with PCHIP interpolation and end clamping.",
+        "function y = eidat_perf_pchip_predict(x, knots, knot_values, left_y, right_y)",
+        "x = double(x);",
+        "y = interp1(knots, knot_values, x, 'pchip');",
+        "y(x < knots(1)) = left_y;",
+        "y(x > knots(end)) = right_y;",
+        "end",
+        "",
+        "% Control-period-aware quadratic curve predictor used by exported 2D CP equations.",
+        "% Inputs: x, control_period, coefficient polynomials, and normalization terms.",
+        "% Output: y predictions evaluated element-wise over the normalized 2D curve basis terms.",
+        "function y = eidat_perf_curve_cp_predict(x, control_period, coeff_cp_models, x_center, x_scale, cp_center, cp_scale)",
+        "xn = (double(x) - x_center) ./ x_scale;",
+        "cpn = (double(control_period) - cp_center) ./ cp_scale;",
+        "basis = {xn.^2, xn, ones(size(xn))};",
+        "y = zeros(size(xn));",
+        "for idx = 1:min(numel(coeff_cp_models), numel(basis))",
+        "    coeffs = coeff_cp_models{idx};",
+        "    y = y + polyval(coeffs, cpn) .* basis{idx};",
+        "end",
+        "end",
+        "",
+        "% Control-period-aware quadratic surface predictor for exported 3D equations.",
+        "% Inputs: x1, x2, control_period, coefficient polynomials, and normalization terms.",
+        "% Output: y predictions evaluated element-wise over the normalized basis terms.",
+        "function y = eidat_perf_surface_cp_predict(x1, x2, control_period, coeff_cp_models, x1_center, x1_scale, x2_center, x2_scale, cp_center, cp_scale)",
+        "x1n = (double(x1) - x1_center) ./ x1_scale;",
+        "x2n = (double(x2) - x2_center) ./ x2_scale;",
+        "cpn = (double(control_period) - cp_center) ./ cp_scale;",
+        "basis = {ones(size(x1n)), x1n, x2n, x1n.^2, x1n.*x2n, x2n.^2};",
+        "y = zeros(size(x1n));",
+        "for idx = 1:min(numel(coeff_cp_models), numel(basis))",
+        "    coeffs = coeff_cp_models{idx};",
+        "    y = y + polyval(coeffs, cpn) .* basis{idx};",
+        "end",
+        "end",
+        "",
+        "% Quadratic 3-input predictor used by exported Smart Solver equations.",
+        "% Inputs: x1, x2, x3, coefficient vector, and normalization terms.",
+        "% Output: y predictions evaluated element-wise over the normalized 3-input basis terms.",
+        "function y = eidat_perf_three_input_predict(x1, x2, x3, coeffs, x1_center, x1_scale, x2_center, x2_scale, x3_center, x3_scale)",
+        "x1n = (double(x1) - x1_center) ./ x1_scale;",
+        "x2n = (double(x2) - x2_center) ./ x2_scale;",
+        "x3n = (double(x3) - x3_center) ./ x3_scale;",
+        "basis = {ones(size(x1n)), x1n, x2n, x3n, x1n.^2, x2n.^2, x3n.^2, x1n.*x2n, x1n.*x3n, x2n.*x3n};",
+        "y = zeros(size(x1n));",
+        "coeffs = double(coeffs);",
+        "for idx = 1:min(numel(coeffs), numel(basis))",
+        "    y = y + coeffs(idx) .* basis{idx};",
+        "end",
+        "end",
+        "",
+        "% Control-period-aware quadratic 3-input predictor used by exported Smart Solver equations.",
+        "% Inputs: x1, x2, x3, control_period, coefficient polynomials, and normalization terms.",
+        "% Output: y predictions evaluated element-wise over the normalized 3-input basis terms.",
+        "function y = eidat_perf_three_input_cp_predict(x1, x2, x3, control_period, coeff_cp_models, x1_center, x1_scale, x2_center, x2_scale, x3_center, x3_scale, cp_center, cp_scale)",
+        "x1n = (double(x1) - x1_center) ./ x1_scale;",
+        "x2n = (double(x2) - x2_center) ./ x2_scale;",
+        "x3n = (double(x3) - x3_center) ./ x3_scale;",
+        "cpn = (double(control_period) - cp_center) ./ cp_scale;",
+        "basis = {ones(size(x1n)), x1n, x2n, x3n, x1n.^2, x2n.^2, x3n.^2, x1n.*x2n, x1n.*x3n, x2n.*x3n};",
+        "y = zeros(size(x1n));",
+        "for idx = 1:min(numel(coeff_cp_models), numel(basis))",
+        "    coeffs = coeff_cp_models{idx};",
+        "    y = y + polyval(coeffs, cpn) .* basis{idx};",
+        "end",
+        "end",
+        "",
+        "% Clamp helper used by exported staged Smart Solver equations.",
+        "% Inputs: x values and lower/upper bounds.",
+        "% Output: x clamped element-wise to the provided bounds.",
+        "function y = eidat_perf_clamp(x, lower_bound, upper_bound)",
+        "y = min(max(double(x), lower_bound), upper_bound);",
+        "end",
+        "",
+    ]
+
+
+def _td_smart_solver_matlab_argument_specs(
+    solver_variables: Sequence[Mapping[str, object]],
+    *,
+    uses_control_period: bool,
+) -> list[dict[str, object]]:
+    specs: list[dict[str, object]] = []
+    used_names: set[str] = set()
+
+    def _unique_name(base_value: object, *, prefix: str) -> str:
+        base = _td_perf_matlab_identifier(base_value, prefix=prefix)
+        candidate = base
+        suffix = 2
+        while candidate.casefold() in used_names:
+            candidate = f"{base}_{suffix}"
+            suffix += 1
+        used_names.add(candidate.casefold())
+        return candidate
+
+    for index, variable in enumerate(solver_variables, start=1):
+        key = str(variable.get("key") or f"input_{index}").strip()
+        specs.append(
+            {
+                "key": key,
+                "name": _unique_name(variable.get("target") or key, prefix=f"input{index}"),
+                "label": str(variable.get("target") or key).strip(),
+                "units": str(variable.get("units") or "").strip(),
+                "role": str(variable.get("role") or "").strip(),
+                "is_control_period": False,
+            }
+        )
+    if uses_control_period:
+        specs.append(
+            {
+                "key": "control_period",
+                "name": _unique_name("control_period", prefix="control_period"),
+                "label": "control period",
+                "units": "",
+                "role": "Control Period",
+                "is_control_period": True,
+            }
+        )
+    return specs
+
+
+def _td_smart_solver_matlab_metadata_lines(
+    *,
+    result: Mapping[str, object],
+    plot_metadata: Mapping[str, object],
+    solver_variables: Sequence[Mapping[str, object]],
+    argument_specs: Sequence[Mapping[str, object]],
+) -> list[str]:
+    fit_family = str(result.get("fit_family") or ((result.get("master_model") or {}).get("fit_family") if isinstance(result.get("master_model"), Mapping) else "") or "").strip()
+    sample_count = int(result.get("sample_count") or 0)
+    fell_out_count = int(result.get("fell_out_count") or 0)
+    fell_out_percent = float((100.0 * fell_out_count / sample_count) if sample_count > 0 else 0.0)
+    selected_control_period = plot_metadata.get("selected_control_period")
+    input_targets = [str(variable.get("target") or "").strip() for variable in solver_variables]
+    input_units = [str(variable.get("units") or "").strip() for variable in solver_variables]
+    input_roles = [str(variable.get("role") or "").strip() for variable in solver_variables]
+    argument_names = [str(spec.get("name") or "").strip() for spec in argument_specs if str(spec.get("name") or "").strip()]
+    return [
+        "function meta = local_metadata()",
+        "meta = struct();",
+        f"meta.output_target = {_td_perf_matlab_quote(result.get('output_target') or plot_metadata.get('output_target') or '')};",
+        f"meta.output_units = {_td_perf_matlab_quote(result.get('output_units') or plot_metadata.get('output_units') or '')};",
+        f"meta.input_targets = {_td_perf_matlab_cellstr(input_targets)};",
+        f"meta.input_units = {_td_perf_matlab_cellstr(input_units)};",
+        f"meta.input_roles = {_td_perf_matlab_cellstr(input_roles)};",
+        f"meta.argument_names = {_td_perf_matlab_cellstr(argument_names)};",
+        f"meta.equation_text = {_td_perf_matlab_quote(result.get('equation') or '')};",
+        f"meta.normalization_text = {_td_perf_matlab_quote(result.get('x_norm_equation') or '')};",
+        f"meta.fit_family = {_td_perf_matlab_quote(fit_family)};",
+        f"meta.fit_family_label = {_td_perf_matlab_quote(td_perf_fit_family_label(fit_family))};",
+        f"meta.solver_branch = {_td_perf_matlab_quote(result.get('solver_branch') or '')};",
+        f"meta.selection_reason = {_td_perf_matlab_quote(result.get('selection_reason') or '')};",
+        f"meta.uses_control_period = {_td_perf_matlab_bool(result.get('uses_control_period'))};",
+        f"meta.uses_staged_mediator = {_td_perf_matlab_bool(result.get('uses_staged_mediator'))};",
+        f"meta.selected_control_period = {_td_perf_matlab_optional_num(selected_control_period)};",
+        f"meta.rmse = {_td_perf_matlab_num(result.get('rmse'))};",
+        f"meta.residual_threshold = {_td_perf_matlab_num(result.get('residual_threshold'))};",
+        f"meta.in_fit_percent = {_td_perf_matlab_num(result.get('in_fit_percent'))};",
+        f"meta.in_fit_count = {_td_perf_matlab_num(result.get('in_fit_count'))};",
+        f"meta.fell_out_count = {_td_perf_matlab_num(fell_out_count)};",
+        f"meta.fell_out_percent = {_td_perf_matlab_num(fell_out_percent)};",
+        f"meta.sample_count = {_td_perf_matlab_num(sample_count)};",
+        f"meta.warning_text = {_td_perf_matlab_quote(result.get('warning_text') or '')};",
+        f"meta.run_count = {_td_perf_matlab_num(result.get('run_count'))};",
+        f"meta.serial_count = {_td_perf_matlab_num(result.get('serial_count'))};",
+        f"meta.stage2_fit_source = {_td_perf_matlab_quote(result.get('stage2_fit_source') or '')};",
+        f"meta.mediator_clamp_count = {_td_perf_matlab_num(result.get('mediator_clamp_count'))};",
+        f"meta.asset_type = {_td_perf_matlab_quote(plot_metadata.get('asset_type') or '')};",
+        f"meta.asset_specific_type = {_td_perf_matlab_quote(plot_metadata.get('asset_specific_type') or '')};",
+        f"meta.filter_summary = {_td_perf_matlab_quote(plot_metadata.get('filter_summary') or '')};",
+        f"meta.config_text = {_td_perf_matlab_quote(plot_metadata.get('config_text') or '')};",
+        "end",
+        "",
+    ]
+
+
+def td_smart_solver_export_equation_matlab(
+    output_path: Path,
+    *,
+    result: Mapping[str, object],
+    plot_metadata: Mapping[str, object] | None = None,
+    progress_cb: Callable[[str], None] | None = None,
+) -> Path:
+    export_model = td_smart_solver_exportable_model(result)
+    if export_model is None:
+        raise RuntimeError("No exportable Smart Solver model is available.")
+
+    solver_result = dict(result or {})
+    metadata = dict(plot_metadata or {})
+    solver_variables = _td_smart_solver_export_variables_from_result(solver_result)
+    export_rows = _td_smart_solver_export_rows_from_result(solver_result)
+    if not export_rows:
+        raise RuntimeError("No Smart Solver fit points are available to export.")
+    if not solver_variables:
+        raise RuntimeError("Smart Solver variables are incomplete.")
+    output_target = str(solver_result.get("output_target") or metadata.get("output_target") or "").strip()
+    if not output_target:
+        raise RuntimeError("Smart Solver output target is incomplete.")
+
+    path = Path(output_path).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    func_name = _td_perf_matlab_identifier(path.stem, prefix="eidat_smart_solver")
+    uses_control_period = bool(solver_result.get("uses_control_period", True))
+    argument_specs = _td_smart_solver_matlab_argument_specs(solver_variables, uses_control_period=uses_control_period)
+    variable_arg_map = {
+        str(spec.get("key") or "").strip(): str(spec.get("name") or "").strip()
+        for spec in argument_specs
+        if not bool(spec.get("is_control_period"))
+    }
+    cp_arg_name = next(
+        (str(spec.get("name") or "").strip() for spec in argument_specs if bool(spec.get("is_control_period"))),
+        "",
+    )
+    x_var = str(variable_arg_map.get("input_1") or "input1")
+    x1_var = x_var
+    x2_var = str(variable_arg_map.get("input_2") or "input2")
+    x3_var = str(variable_arg_map.get("input_3") or "input3")
+    expr = _td_perf_matlab_function_expr(
+        export_model,
+        x_var=x_var,
+        x1_var=x1_var,
+        x2_var=x2_var,
+        x3_var=x3_var,
+        cp_var=cp_arg_name,
+    )
+    if expr == "[]":
+        raise RuntimeError(
+            f"Smart Solver MATLAB export does not support fit family: {td_perf_fit_family_label(export_model.get('fit_family'))}."
+        )
+
+    predict_args = [str(spec.get("name") or "").strip() for spec in argument_specs if str(spec.get("name") or "").strip()]
+    input_descriptions: list[str] = []
+    for spec in argument_specs:
+        label = str(spec.get("label") or spec.get("name") or "").strip()
+        name = str(spec.get("name") or "").strip()
+        units = str(spec.get("units") or "").strip()
+        text = f"{label} ({name})"
+        if units:
+            text += f" [{units}]"
+        input_descriptions.append(text)
+    predict_usage = f"y = {func_name}({', '.join(predict_args)})"
+    metadata_usage = f"meta = {func_name}('metadata')"
+    output_label = _td_perf_matlab_input_label(output_target, fallback="output")
+
+    _td_emit_progress(progress_cb, "Building Smart Solver MATLAB file")
+    lines: list[str] = [
+        f"function out = {func_name}(varargin)",
+        "% Auto-generated by EIDAT Smart Solver MATLAB export.",
+        f"% Prediction usage: {predict_usage}",
+        f"% Metadata usage: {metadata_usage}",
+        f"% Inputs: {', '.join(input_descriptions)}",
+        f"% Output: y is predicted {output_label}; scalar and array inputs are evaluated element-wise.",
+        "% Call with 'metadata' to inspect equation text, normalization, solver stats, and imported variable definitions.",
+        "",
+        "if nargin == 1",
+        "    request = varargin{1};",
+        "    if (ischar(request) || (isstring(request) && isscalar(request))) && strcmpi(char(request), 'metadata')",
+        "        out = local_metadata();",
+        "        return;",
+        "    end",
+        "end",
+        f"if nargin ~= {len(predict_args)}",
+        f"    error('{func_name}:Usage', 'Usage: {predict_usage}; meta = {func_name}(''metadata'');');",
+        "end",
+    ]
+    for idx, spec in enumerate(argument_specs, start=1):
+        arg_name = str(spec.get("name") or "").strip()
+        lines.append(f"{arg_name} = varargin{{{idx}}};")
+    lines.extend(
+        [
+            f"out = {expr};",
+            "end",
+            "",
+        ]
+    )
+    lines.extend(
+        _td_smart_solver_matlab_metadata_lines(
+            result=solver_result,
+            plot_metadata=metadata,
+            solver_variables=solver_variables,
+            argument_specs=argument_specs,
+        )
+    )
+    lines.extend(_td_perf_matlab_helper_lines())
+    _td_emit_progress(progress_cb, "Saving Smart Solver MATLAB file")
+    path.write_text("\n".join(lines), encoding="utf-8")
+    _td_emit_progress(progress_cb, f"MATLAB export ready: {path.name}")
+    return path
 
 
 def td_perf_export_saved_equations_matlab(
@@ -22425,6 +22840,7 @@ def td_perf_export_saved_equations_matlab(
         x_var = _td_perf_matlab_identifier(plot_metadata.get("input1_target") or "input1", prefix="input1")
         x1_var = x_var
         x2_var = _td_perf_matlab_identifier(plot_metadata.get("input2_target") or "input2", prefix="input2")
+        x3_var = _td_perf_matlab_identifier(plot_metadata.get("input3_target") or "input3", prefix="input3")
         cp_var = "control_period"
         for stat in TD_PERF_EXPORT_STATS_ORDER:
             result = dict(results_by_stat.get(stat) or {})
@@ -22434,19 +22850,28 @@ def td_perf_export_saved_equations_matlab(
             field_key = _td_perf_matlab_identifier(stat, prefix="stat")
             family = td_perf_normalize_fit_mode(model.get("fit_family"))
             if family == TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD:
-                handle = f"@({x1_var}, {x2_var}, {cp_var}) {_td_perf_matlab_function_expr(model, x_var=x_var, x1_var=x1_var, x2_var=x2_var, cp_var=cp_var)}"
+                handle = f"@({x1_var}, {x2_var}, {cp_var}) {_td_perf_matlab_function_expr(model, x_var=x_var, x1_var=x1_var, x2_var=x2_var, x3_var=x3_var, cp_var=cp_var)}"
             elif family in TD_PERF_CURVE_CONTROL_PERIOD_FAMILIES:
-                handle = f"@({x_var}, {cp_var}) {_td_perf_matlab_function_expr(model, x_var=x_var, x1_var=x1_var, x2_var=x2_var, cp_var=cp_var)}"
+                handle = f"@({x_var}, {cp_var}) {_td_perf_matlab_function_expr(model, x_var=x_var, x1_var=x1_var, x2_var=x2_var, x3_var=x3_var, cp_var=cp_var)}"
+            elif family == TD_PERF_FIT_FAMILY_QUADRATIC_3INPUT_CONTROL_PERIOD:
+                handle = f"@({x1_var}, {x2_var}, {x3_var}, {cp_var}) {_td_perf_matlab_function_expr(model, x_var=x_var, x1_var=x1_var, x2_var=x2_var, x3_var=x3_var, cp_var=cp_var)}"
+            elif family == TD_PERF_FIT_FAMILY_QUADRATIC_3INPUT:
+                handle = f"@({x1_var}, {x2_var}, {x3_var}) {_td_perf_matlab_function_expr(model, x_var=x_var, x1_var=x1_var, x2_var=x2_var, x3_var=x3_var, cp_var=cp_var)}"
+            elif family == TD_PERF_FIT_FAMILY_STAGED_MEDIATOR_CONTROL_PERIOD:
+                handle = f"@({x1_var}, {x2_var}, {cp_var}) {_td_perf_matlab_function_expr(model, x_var=x_var, x1_var=x1_var, x2_var=x2_var, x3_var=x3_var, cp_var=cp_var)}"
+            elif family == TD_PERF_FIT_FAMILY_STAGED_MEDIATOR:
+                handle = f"@({x1_var}, {x2_var}) {_td_perf_matlab_function_expr(model, x_var=x_var, x1_var=x1_var, x2_var=x2_var, x3_var=x3_var, cp_var=cp_var)}"
             elif str(plot_metadata.get("plot_dimension") or "").strip().lower() == "3d" or str(plot_metadata.get("input2_target") or "").strip():
-                handle = f"@({x1_var}, {x2_var}) {_td_perf_matlab_function_expr(model, x_var=x_var, x1_var=x1_var, x2_var=x2_var, cp_var=cp_var)}"
+                handle = f"@({x1_var}, {x2_var}) {_td_perf_matlab_function_expr(model, x_var=x_var, x1_var=x1_var, x2_var=x2_var, x3_var=x3_var, cp_var=cp_var)}"
             else:
-                handle = f"@({x_var}) {_td_perf_matlab_function_expr(model, x_var=x_var, x1_var=x1_var, x2_var=x2_var, cp_var=cp_var)}"
+                handle = f"@({x_var}) {_td_perf_matlab_function_expr(model, x_var=x_var, x1_var=x1_var, x2_var=x2_var, x3_var=x3_var, cp_var=cp_var)}"
             args, inputs = _td_perf_matlab_signature_parts(
                 plot_metadata,
                 model,
                 x_var=x_var,
                 x1_var=x1_var,
                 x2_var=x2_var,
+                x3_var=x3_var,
                 cp_var=cp_var,
             )
             lines.extend(
@@ -22464,62 +22889,8 @@ def td_perf_export_saved_equations_matlab(
             lines.append(f"{prefix}.equation_text_{field_key} = {_td_perf_matlab_quote(model.get('equation') or '')};")
         lines.append("")
 
-    lines.extend(
-        [
-            "end",
-            "",
-            "% Piecewise linear predictor used by exported piecewise performance equations.",
-            "% Inputs: x values, coefficient vector, and breakpoint vector.",
-            "% Output: y predictions with hinge terms applied element-wise.",
-            "function y = eidat_perf_piecewise_predict(x, coeffs, breakpoints)",
-            "x = double(x);",
-            "y = coeffs(1) + coeffs(2).*x;",
-            "for idx = 1:numel(breakpoints)",
-            "    y = y + coeffs(idx + 2).*max(0, x - breakpoints(idx));",
-            "end",
-            "end",
-            "",
-            "% Monotone PCHIP predictor used by exported monotone performance equations.",
-            "% Inputs: x values, knot locations, knot values, and left/right clamp values.",
-            "% Output: y predictions with PCHIP interpolation and end clamping.",
-            "function y = eidat_perf_pchip_predict(x, knots, knot_values, left_y, right_y)",
-            "x = double(x);",
-            "y = interp1(knots, knot_values, x, 'pchip');",
-            "y(x < knots(1)) = left_y;",
-            "y(x > knots(end)) = right_y;",
-            "end",
-            "",
-            "% Control-period-aware quadratic curve predictor used by exported 2D CP equations.",
-            "% Inputs: x, control_period, coefficient polynomials, and normalization terms.",
-            "% Output: y predictions evaluated element-wise over the normalized 2D curve basis terms.",
-            "function y = eidat_perf_curve_cp_predict(x, control_period, coeff_cp_models, x_center, x_scale, cp_center, cp_scale)",
-            "xn = (double(x) - x_center) ./ x_scale;",
-            "cpn = (double(control_period) - cp_center) ./ cp_scale;",
-            "basis = {xn.^2, xn, ones(size(xn))};",
-            "y = zeros(size(xn));",
-            "for idx = 1:min(numel(coeff_cp_models), numel(basis))",
-            "    coeffs = coeff_cp_models{idx};",
-            "    y = y + polyval(coeffs, cpn) .* basis{idx};",
-            "end",
-            "end",
-            "",
-            "% Control-period-aware quadratic surface predictor for exported 3D equations.",
-            "% Inputs: x1, x2, control_period, coefficient polynomials, and normalization terms.",
-            "% Output: y predictions evaluated element-wise over the normalized basis terms.",
-            "function y = eidat_perf_surface_cp_predict(x1, x2, control_period, coeff_cp_models, x1_center, x1_scale, x2_center, x2_scale, cp_center, cp_scale)",
-            "x1n = (double(x1) - x1_center) ./ x1_scale;",
-            "x2n = (double(x2) - x2_center) ./ x2_scale;",
-            "cpn = (double(control_period) - cp_center) ./ cp_scale;",
-            "basis = {ones(size(x1n)), x1n, x2n, x1n.^2, x1n.*x2n, x2n.^2};",
-            "y = zeros(size(x1n));",
-            "for idx = 1:min(numel(coeff_cp_models), numel(basis))",
-            "    coeffs = coeff_cp_models{idx};",
-            "    y = y + polyval(coeffs, cpn) .* basis{idx};",
-            "end",
-            "end",
-            "",
-        ]
-    )
+    lines.extend(["end", ""])
+    lines.extend(_td_perf_matlab_helper_lines())
     path.write_text("\n".join(lines), encoding="utf-8")
     return path
 

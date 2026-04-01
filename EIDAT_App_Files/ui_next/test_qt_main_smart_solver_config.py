@@ -313,6 +313,41 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
             if tmpdir:
                 shutil.rmtree(str(tmpdir), ignore_errors=True)
 
+    def test_smart_solver_matlab_export_button_tracks_exportable_state(self) -> None:
+        class _Worker:
+            def __init__(self, running: bool) -> None:
+                self._running = running
+
+            def isRunning(self) -> bool:
+                return self._running
+
+        window = self._make_window()
+        try:
+            window._mode = "smart_solver"
+            window._db_path = Path("C:/temp/cache.sqlite3")
+            window._smart_solver_result = {
+                "master_model": {
+                    "fit_family": "quadratic_3input",
+                }
+            }
+
+            self.assertEqual(window.btn_solver_export_matlab.text(), "Export Equation to MATLAB")
+
+            window._export_worker = None
+            window._refresh_smart_solver_ui()
+            self.assertTrue(window.btn_solver_export_equations.isEnabled())
+            self.assertTrue(window.btn_solver_export_matlab.isEnabled())
+
+            window._export_worker = _Worker(True)
+            window._refresh_smart_solver_ui()
+            self.assertFalse(window.btn_solver_export_equations.isEnabled())
+            self.assertFalse(window.btn_solver_export_matlab.isEnabled())
+        finally:
+            window.close()
+            tmpdir = getattr(window, "_test_tmpdir", "")
+            if tmpdir:
+                shutil.rmtree(str(tmpdir), ignore_errors=True)
+
     def test_export_smart_solver_equations_to_excel_uses_dedicated_solver_export_path(self) -> None:
         window = self._make_window()
         try:
@@ -424,6 +459,118 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
             if tmpdir:
                 shutil.rmtree(str(tmpdir), ignore_errors=True)
 
+    def test_export_smart_solver_equations_to_matlab_uses_dedicated_solver_export_path(self) -> None:
+        window = self._make_window()
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                db_path = Path(tmpdir) / "cache.sqlite3"
+                db_path.write_text("", encoding="utf-8")
+                out_path = Path(tmpdir) / "smart_solver_export.m"
+                window._db_path = db_path
+                window._run_display_by_name = {"CondA": "Condition A"}
+                window._smart_solver_config = {
+                    "run_type_mode": "pulsed_mode",
+                    "output_target": "Output",
+                    "input1_target": "Input1",
+                    "input2_target": "",
+                    "input3_target": "",
+                    "control_period_hard_input": True,
+                    "keep_first_sequences_per_serial": 2,
+                }
+                window._smart_solver_result = {
+                    "fit_family": "quadratic_curve_control_period",
+                    "run_type_mode": "pulsed_mode",
+                    "uses_control_period": True,
+                    "master_model": {
+                        "fit_family": "quadratic_curve_control_period",
+                        "coeff_cp_models": [[1.0], [2.0], [3.0]],
+                        "x_center": 0.0,
+                        "x_scale": 1.0,
+                        "cp_center": 0.0,
+                        "cp_scale": 1.0,
+                    },
+                    "fit_points": [
+                        {
+                            "run_name": "CondA",
+                            "serial": "SN-001",
+                            "observation_id": "obs-1",
+                            "program_title": "Program Alpha",
+                            "source_run_name": "Seq-1",
+                            "suppression_voltage": 5.0,
+                            "control_period": 30.0,
+                            "condition_label": "Condition A",
+                            "input_1": 1.0,
+                            "input_2": None,
+                            "actual_mean": 11.0,
+                            "sample_count": 1,
+                        }
+                    ],
+                    "solver_variables": [
+                        {
+                            "key": "input_1",
+                            "target": "Input1",
+                            "units": "u",
+                            "role": "Primary",
+                            "is_optional": False,
+                        }
+                    ],
+                    "output_target": "Output",
+                    "output_units": "u",
+                    "input1_target": "Input1",
+                    "input1_units": "u",
+                    "input2_target": "",
+                    "input2_units": "",
+                    "input3_target": "",
+                    "input3_units": "",
+                }
+                export_calls: list[dict[str, object]] = []
+                dialog_defaults: list[str] = []
+
+                def _capture_start(output_path: Path, **kwargs):
+                    export_calls.append({"output_path": Path(output_path), **kwargs})
+
+                def _capture_save_dialog(*args, **kwargs):
+                    dialog_defaults.append(str(args[2]))
+                    return (str(out_path), "MATLAB Files (*.m)")
+
+                with patch.object(
+                    TestDataTrendDialog,
+                    "_active_control_period_filter_values",
+                    return_value=[30.0],
+                ), patch.object(
+                    TestDataTrendDialog,
+                    "_start_smart_solver_equation_matlab_export",
+                    side_effect=_capture_start,
+                ), patch(
+                    "ui_next.qt_main.be.td_perf_collect_asset_metadata",
+                    return_value={},
+                ), patch(
+                    "ui_next.qt_main.QtWidgets.QFileDialog.getSaveFileName",
+                    side_effect=_capture_save_dialog,
+                ), patch(
+                    "ui_next.qt_main.QtWidgets.QMessageBox.information"
+                ) as info_mock, patch(
+                    "ui_next.qt_main.QtWidgets.QMessageBox.warning"
+                ) as warning_mock:
+                    window._export_smart_solver_equations_to_matlab()
+
+                info_mock.assert_not_called()
+                warning_mock.assert_not_called()
+                self.assertEqual(len(export_calls), 1)
+                call = export_calls[0]
+                self.assertEqual(call["output_path"], out_path)
+                self.assertEqual(call["plot_metadata"]["selected_control_period"], 30.0)
+                self.assertEqual(call["result"]["master_model"]["fit_family"], "quadratic_curve_control_period")
+                self.assertEqual(call["plot_metadata"]["solver_variables"][0]["target"], "Input1")
+                self.assertTrue(dialog_defaults)
+                self.assertTrue(dialog_defaults[0].endswith(".m"))
+                self.assertIn("Output_vs_Input1", dialog_defaults[0])
+        finally:
+            window.close()
+            tmpdir = getattr(window, "_test_tmpdir", "")
+            if tmpdir:
+                shutil.rmtree(str(tmpdir), ignore_errors=True)
+
     def test_export_smart_solver_equations_to_excel_omits_selected_control_period_for_steady_state(self) -> None:
         window = self._make_window()
         try:
@@ -524,6 +671,115 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
                     return_value=(str(out_path), "Excel Files (*.xlsx)"),
                 ):
                     window._export_smart_solver_equations_to_excel()
+
+                self.assertEqual(export_calls[0]["plot_metadata"]["selected_control_period"], None)
+                self.assertEqual(export_calls[0]["plot_metadata"]["run_type_mode"], "steady_state")
+        finally:
+            window.close()
+            tmpdir = getattr(window, "_test_tmpdir", "")
+            if tmpdir:
+                shutil.rmtree(str(tmpdir), ignore_errors=True)
+
+    def test_export_smart_solver_equations_to_matlab_omits_selected_control_period_for_steady_state(self) -> None:
+        window = self._make_window()
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                db_path = Path(tmpdir) / "cache.sqlite3"
+                db_path.write_text("", encoding="utf-8")
+                out_path = Path(tmpdir) / "smart_solver_export.m"
+                window._db_path = db_path
+                window._smart_solver_config = {
+                    "run_type_mode": "steady_state",
+                    "output_target": "Output",
+                    "input1_target": "Input1",
+                    "input2_target": "Input2",
+                    "input3_target": "Input3",
+                    "control_period_hard_input": True,
+                    "keep_first_sequences_per_serial": 0,
+                }
+                window._smart_solver_result = {
+                    "fit_family": "quadratic_3input",
+                    "run_type_mode": "steady_state",
+                    "uses_control_period": False,
+                    "master_model": {
+                        "fit_family": "quadratic_3input",
+                        "coeffs": [0.0] * 10,
+                        "x1_center": 0.0,
+                        "x1_scale": 1.0,
+                        "x2_center": 0.0,
+                        "x2_scale": 1.0,
+                        "x3_center": 0.0,
+                        "x3_scale": 1.0,
+                    },
+                    "fit_points": [
+                        {
+                            "run_name": "CondSS",
+                            "serial": "SN-001",
+                            "observation_id": "obs-1",
+                            "program_title": "Program Alpha",
+                            "source_run_name": "Seq-1",
+                            "suppression_voltage": 5.0,
+                            "condition_label": "Condition A",
+                            "input_1": 1.0,
+                            "input_2": 2.0,
+                            "input_3": 3.0,
+                            "actual_mean": 11.0,
+                            "sample_count": 1,
+                        }
+                    ],
+                    "solver_variables": [
+                        {
+                            "key": "input_1",
+                            "target": "Input1",
+                            "units": "u",
+                            "role": "Primary",
+                            "is_optional": False,
+                        },
+                        {
+                            "key": "input_2",
+                            "target": "Input2",
+                            "units": "u",
+                            "role": "Secondary",
+                            "is_optional": True,
+                        },
+                        {
+                            "key": "input_3",
+                            "target": "Input3",
+                            "units": "u",
+                            "role": "Helper",
+                            "is_optional": True,
+                        }
+                    ],
+                    "output_target": "Output",
+                    "output_units": "u",
+                    "input1_target": "Input1",
+                    "input1_units": "u",
+                    "input2_target": "Input2",
+                    "input2_units": "u",
+                    "input3_target": "Input3",
+                    "input3_units": "u",
+                }
+                export_calls: list[dict[str, object]] = []
+
+                def _capture_start(output_path: Path, **kwargs):
+                    export_calls.append({"output_path": Path(output_path), **kwargs})
+
+                with patch.object(
+                    TestDataTrendDialog,
+                    "_active_control_period_filter_values",
+                    return_value=[30.0],
+                ), patch.object(
+                    TestDataTrendDialog,
+                    "_start_smart_solver_equation_matlab_export",
+                    side_effect=_capture_start,
+                ), patch(
+                    "ui_next.qt_main.be.td_perf_collect_asset_metadata",
+                    return_value={},
+                ), patch(
+                    "ui_next.qt_main.QtWidgets.QFileDialog.getSaveFileName",
+                    return_value=(str(out_path), "MATLAB Files (*.m)"),
+                ):
+                    window._export_smart_solver_equations_to_matlab()
 
                 self.assertEqual(export_calls[0]["plot_metadata"]["selected_control_period"], None)
                 self.assertEqual(export_calls[0]["plot_metadata"]["run_type_mode"], "steady_state")

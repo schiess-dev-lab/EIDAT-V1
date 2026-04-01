@@ -1544,6 +1544,254 @@ class TestBackendTdSmartSolver(unittest.TestCase):
         self.assertIn("control_period", pulsed_headers)
         self.assertIn("control_period", pulsed_scenario_headers)
 
+    def test_smart_solver_export_equation_matlab_writes_metadata_mode_and_fallout_percent(self) -> None:
+        result = {
+            "fit_family": backend.TD_PERF_FIT_FAMILY_QUADRATIC_CURVE_CONTROL_PERIOD,
+            "master_model": {
+                "fit_family": backend.TD_PERF_FIT_FAMILY_QUADRATIC_CURVE_CONTROL_PERIOD,
+                "coeff_cp_models": [[0.0, 1.0], [0.0, 2.0], [3.0]],
+                "x_center": 0.0,
+                "x_scale": 1.0,
+                "cp_center": 0.0,
+                "cp_scale": 1.0,
+                "fit_domain_control_period": [10.0, 50.0],
+            },
+            "equation": "y = curve_cp(x, cp)",
+            "x_norm_equation": "x' = (x - 0) / 1 ; cp' = (cp - 0) / 1",
+            "solver_branch": backend.TD_PERF_FIT_FAMILY_QUADRATIC_CURVE_CONTROL_PERIOD,
+            "selection_reason": "Curve CP selected.",
+            "uses_control_period": True,
+            "uses_staged_mediator": False,
+            "output_target": "Output",
+            "output_units": "u",
+            "solver_variables": [
+                {"key": "input_1", "target": "Input1", "units": "u", "role": "Primary"},
+            ],
+            "fit_points": [
+                {
+                    "run_name": "CondA",
+                    "display_name": "CondA",
+                    "serial": "SN-001",
+                    "observation_id": "obs-1",
+                    "program_title": "Program Alpha",
+                    "source_run_name": "Seq-1",
+                    "suppression_voltage": 5.0,
+                    "control_period": 30.0,
+                    "condition_label": "CondA",
+                    "input_1": 1.0,
+                    "actual_mean": 11.0,
+                    "sample_count": 1,
+                }
+            ],
+            "rmse": 1.5,
+            "residual_threshold": 3.0,
+            "in_fit_percent": 80.0,
+            "in_fit_count": 8,
+            "fell_out_count": 2,
+            "sample_count": 10,
+            "warning_text": "Check support slices.",
+            "run_count": 1,
+            "serial_count": 1,
+            "stage2_fit_source": "",
+            "mediator_clamp_count": 0,
+        }
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            out_path = Path(tmpdir) / "smart_solver_curve_cp.m"
+            backend.td_smart_solver_export_equation_matlab(
+                out_path,
+                result=result,
+                plot_metadata={
+                    "selected_control_period": 30.0,
+                    "asset_type": "Thruster",
+                    "asset_specific_type": "Hall_A",
+                    "filter_summary": "Runs: CondA",
+                    "config_text": "Config: Pulsed",
+                },
+            )
+            text = out_path.read_text(encoding="utf-8")
+
+        self.assertIn("function out = smart_solver_curve_cp(varargin)", text)
+        self.assertIn("% Prediction usage: y = smart_solver_curve_cp(Input1, control_period)", text)
+        self.assertIn("% Metadata usage: meta = smart_solver_curve_cp('metadata')", text)
+        self.assertIn("meta.fell_out_percent = 20;", text)
+        self.assertIn("meta.selected_control_period = 30;", text)
+        self.assertIn("meta.input_targets = {'Input1'};", text)
+        self.assertIn("meta.input_roles = {'Primary'};", text)
+        self.assertIn("meta.equation_text = 'y = curve_cp(x, cp)';", text)
+        self.assertIn("function y = eidat_perf_curve_cp_predict", text)
+
+    def test_smart_solver_export_equation_matlab_steady_state_three_input_omits_control_period(self) -> None:
+        result = {
+            "fit_family": backend.TD_PERF_FIT_FAMILY_QUADRATIC_3INPUT,
+            "master_model": {
+                "fit_family": backend.TD_PERF_FIT_FAMILY_QUADRATIC_3INPUT,
+                "coeffs": [1.0, 0.5, -0.25, 0.75, 0.1, 0.05, 0.02, 0.03, 0.04, 0.06],
+                "x1_center": 0.0,
+                "x1_scale": 1.0,
+                "x2_center": 0.0,
+                "x2_scale": 1.0,
+                "x3_center": 0.0,
+                "x3_scale": 1.0,
+            },
+            "equation": "y = direct_3input(x1, x2, x3)",
+            "x_norm_equation": "x1', x2', x3'",
+            "solver_branch": backend.TD_PERF_FIT_FAMILY_QUADRATIC_3INPUT,
+            "selection_reason": "Stable 3-input fit.",
+            "uses_control_period": False,
+            "uses_staged_mediator": False,
+            "output_target": "Output",
+            "output_units": "u",
+            "solver_variables": [
+                {"key": "input_1", "target": "Input1", "units": "u", "role": "Primary"},
+                {"key": "input_2", "target": "Input2", "units": "u", "role": "Secondary"},
+                {"key": "input_3", "target": "Input3", "units": "u", "role": "Helper"},
+            ],
+            "fit_points": [
+                {
+                    "run_name": "CondSS",
+                    "display_name": "CondSS",
+                    "serial": "SN-001",
+                    "observation_id": "obs-1",
+                    "program_title": "Program Alpha",
+                    "source_run_name": "Seq-1",
+                    "suppression_voltage": 5.0,
+                    "condition_label": "CondSS",
+                    "input_1": 1.0,
+                    "input_2": 2.0,
+                    "input_3": 3.0,
+                    "actual_mean": 11.0,
+                    "sample_count": 1,
+                }
+            ],
+        }
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            out_path = Path(tmpdir) / "smart_solver_three_input.m"
+            backend.td_smart_solver_export_equation_matlab(out_path, result=result, plot_metadata={})
+            text = out_path.read_text(encoding="utf-8")
+
+        self.assertIn("% Prediction usage: y = smart_solver_three_input(Input1, Input2, Input3)", text)
+        self.assertNotIn("% Prediction usage: y = smart_solver_three_input(Input1, Input2, Input3, control_period)", text)
+        self.assertIn("meta.selected_control_period = [];", text)
+        self.assertIn("function y = eidat_perf_three_input_predict", text)
+
+    def test_smart_solver_export_equation_matlab_staged_mediator_includes_clamp_and_stage_metadata(self) -> None:
+        result = {
+            "fit_family": backend.TD_PERF_FIT_FAMILY_STAGED_MEDIATOR_CONTROL_PERIOD,
+            "master_model": {
+                "fit_family": backend.TD_PERF_FIT_FAMILY_STAGED_MEDIATOR_CONTROL_PERIOD,
+                "stage1_model": {
+                    "fit_family": backend.TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD,
+                    "coeff_cp_models": [[1.0], [0.5], [0.25], [0.0], [0.0], [0.0]],
+                    "x1_center": 0.0,
+                    "x1_scale": 1.0,
+                    "x2_center": 0.0,
+                    "x2_scale": 1.0,
+                    "cp_center": 0.0,
+                    "cp_scale": 1.0,
+                    "fit_domain_control_period": [10.0, 50.0],
+                },
+                "stage2_model": {
+                    "fit_family": backend.TD_PERF_FIT_FAMILY_QUADRATIC_CURVE_CONTROL_PERIOD,
+                    "coeff_cp_models": [[0.0, 1.0], [0.0, 2.0], [3.0]],
+                    "x_center": 0.0,
+                    "x_scale": 1.0,
+                    "cp_center": 0.0,
+                    "cp_scale": 1.0,
+                    "fit_domain_control_period": [10.0, 50.0],
+                    "fit_domain": [0.0, 5.0],
+                },
+                "stage2_input_domain": [0.5, 4.0],
+            },
+            "equation": "y = staged(x1, x2, cp)",
+            "x_norm_equation": "stage1 -> stage2",
+            "solver_branch": backend.TD_PERF_FIT_FAMILY_STAGED_MEDIATOR_CONTROL_PERIOD,
+            "selection_reason": "Staged mediator selected.",
+            "uses_control_period": True,
+            "uses_staged_mediator": True,
+            "output_target": "Output",
+            "output_units": "u",
+            "solver_variables": [
+                {"key": "input_1", "target": "Input1", "units": "u", "role": "Primary"},
+                {"key": "input_2", "target": "Input2", "units": "u", "role": "Secondary"},
+            ],
+            "fit_points": [
+                {
+                    "run_name": "CondPM",
+                    "display_name": "CondPM",
+                    "serial": "SN-001",
+                    "observation_id": "obs-1",
+                    "program_title": "Program Alpha",
+                    "source_run_name": "Seq-1",
+                    "suppression_voltage": 5.0,
+                    "control_period": 30.0,
+                    "condition_label": "CondPM",
+                    "input_1": 1.0,
+                    "input_2": 2.0,
+                    "actual_mean": 11.0,
+                    "sample_count": 1,
+                }
+            ],
+            "stage2_fit_source": "stage1_pred_input_3",
+            "mediator_clamp_count": 3,
+        }
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            out_path = Path(tmpdir) / "smart_solver_staged_cp.m"
+            backend.td_smart_solver_export_equation_matlab(out_path, result=result, plot_metadata={})
+            text = out_path.read_text(encoding="utf-8")
+
+        self.assertIn("eidat_perf_surface_cp_predict(", text)
+        self.assertIn("eidat_perf_curve_cp_predict(", text)
+        self.assertIn("eidat_perf_clamp(", text)
+        self.assertIn("meta.uses_staged_mediator = true;", text)
+        self.assertIn("meta.stage2_fit_source = 'stage1_pred_input_3';", text)
+
+    def test_smart_solver_export_equation_matlab_overwrites_existing_file(self) -> None:
+        result = {
+            "fit_family": backend.TD_PERF_FIT_MODE_POLYNOMIAL,
+            "master_model": {
+                "fit_family": backend.TD_PERF_FIT_MODE_POLYNOMIAL,
+                "coeffs": [2.0, 1.0],
+            },
+            "equation": "y = 2*x + 1",
+            "x_norm_equation": "",
+            "solver_branch": backend.TD_PERF_FIT_MODE_POLYNOMIAL,
+            "selection_reason": "Simple line.",
+            "uses_control_period": False,
+            "uses_staged_mediator": False,
+            "output_target": "Output",
+            "output_units": "u",
+            "solver_variables": [
+                {"key": "input_1", "target": "Input1", "units": "u", "role": "Primary"},
+            ],
+            "fit_points": [
+                {
+                    "run_name": "CondA",
+                    "display_name": "CondA",
+                    "serial": "SN-001",
+                    "observation_id": "obs-1",
+                    "program_title": "Program Alpha",
+                    "source_run_name": "Seq-1",
+                    "suppression_voltage": 5.0,
+                    "condition_label": "CondA",
+                    "input_1": 1.0,
+                    "actual_mean": 3.0,
+                    "sample_count": 1,
+                }
+            ],
+        }
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            out_path = Path(tmpdir) / "smart_solver_overwrite.m"
+            out_path.write_text("OLD CONTENT", encoding="utf-8")
+            backend.td_smart_solver_export_equation_matlab(out_path, result=result, plot_metadata={})
+            text = out_path.read_text(encoding="utf-8")
+
+        self.assertNotIn("OLD CONTENT", text)
+        self.assertIn("function out = smart_solver_overwrite(varargin)", text)
+
 
 if __name__ == "__main__":
     unittest.main()

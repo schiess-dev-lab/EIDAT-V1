@@ -383,3 +383,53 @@ class TestProjectTaskWorker(unittest.TestCase):
             result = on_success(payload)
             self.assertEqual(dummy.opened, [out_path])
             self.assertIn("Export Saved Performance Equations to Excel complete", result)
+
+    def test_start_smart_solver_equation_matlab_export_uses_project_task(self) -> None:
+        class _DummyExportWindow:
+            def __init__(self) -> None:
+                self._db_path = Path("C:/temp/cache.sqlite3")
+                self._project_dir = Path("C:/temp/project")
+                self.started: dict[str, object] | None = None
+
+            def _start_perf_export_task(self, **kwargs) -> None:
+                self.started = dict(kwargs)
+
+            def _handle_path_export_success(self, payload: object, *, heading: str) -> str:
+                return TestDataTrendDialog._handle_path_export_success(self, payload, heading=heading)
+
+        dummy = _DummyExportWindow()
+        out_path = Path("C:/temp/smart_solver_equation.m")
+        result_payload = {"equation": "y = x"}
+        plot_metadata = {"output_target": "Output"}
+
+        with patch("ui_next.qt_main.be.td_smart_solver_export_equation_matlab", return_value=out_path) as export_mock, patch(
+            "ui_next.qt_main.be.open_path"
+        ) as open_mock:
+            TestDataTrendDialog._start_smart_solver_equation_matlab_export(
+                dummy,
+                out_path,
+                result=result_payload,
+                plot_metadata=plot_metadata,
+            )
+
+            self.assertIsNotNone(dummy.started)
+            task_factory = dummy.started["task_factory"]
+            on_success = dummy.started["on_success"]
+            self.assertEqual(dummy.started["heading"], "Export Equation to MATLAB")
+            self.assertEqual(dummy.started["status_text"], "Exporting MATLAB equation file to smart_solver_equation.m")
+
+            progress_messages: list[str] = []
+            payload = task_factory(progress_messages.append)
+            export_mock.assert_called_once_with(
+                out_path,
+                result=result_payload,
+                plot_metadata=plot_metadata,
+                progress_cb=export_mock.call_args.kwargs["progress_cb"],
+            )
+            export_mock.call_args.kwargs["progress_cb"]("step one")
+            self.assertEqual(progress_messages, ["step one"])
+            self.assertEqual(payload, out_path)
+
+            result = on_success(payload)
+            open_mock.assert_called_once_with(out_path)
+            self.assertIn("Export Equation to MATLAB complete", result)
