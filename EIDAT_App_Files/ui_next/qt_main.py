@@ -8666,7 +8666,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
     def _smart_solver_has_exportable_model(self) -> bool:
         result = dict(getattr(self, "_smart_solver_result", {}) or {})
-        exportable = getattr(be, "_td_perf_exportable_model", None)
+        exportable = getattr(be, "td_smart_solver_exportable_model", None)
         return bool(callable(exportable) and exportable(result))
 
     def _smart_solver_export_rows(self, result: dict[str, object] | None = None) -> list[dict[str, object]]:
@@ -12093,6 +12093,31 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             on_success=lambda payload: self._handle_perf_excel_export_success(payload, heading="Export Interactive Workbook"),
         )
 
+    def _start_smart_solver_equation_excel_export(
+        self,
+        output_path: Path,
+        *,
+        result: dict[str, object],
+        plot_metadata: dict[str, object],
+    ) -> None:
+        output = Path(output_path).expanduser()
+
+        def _task(report):
+            return be.td_smart_solver_export_equation_workbook(
+                self._db_path,
+                output,
+                result=result,
+                plot_metadata=plot_metadata,
+                progress_cb=report,
+            )
+
+        self._start_perf_export_task(
+            heading="Export Equation to Excel",
+            status_text=f"Exporting equation workbook to {output.name}",
+            task_factory=_task,
+            on_success=lambda payload: self._handle_perf_excel_export_success(payload, heading="Export Equation to Excel"),
+        )
+
     def _start_saved_perf_equations_excel_export(
         self,
         output_path: Path,
@@ -12305,8 +12330,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
         result = dict(getattr(self, "_smart_solver_result", {}) or {})
         config = dict(getattr(self, "_smart_solver_config", {}) or {})
-        export_rows = self._smart_solver_export_rows(result)
-        if not export_rows:
+        fit_points = [dict(row) for row in (result.get("fit_points") or []) if isinstance(row, dict)]
+        if not fit_points:
             QtWidgets.QMessageBox.information(
                 self,
                 "Export Equation to Excel",
@@ -12315,9 +12340,21 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             return
 
         output_target = str(result.get("output_target") or config.get("output_target") or "").strip()
-        input1_target = str(result.get("input1_target") or config.get("input1_target") or "").strip()
-        input2_target = str(result.get("input2_target") or config.get("input2_target") or "").strip()
-        if not output_target or not input1_target:
+        solver_variables = [dict(item) for item in (result.get("solver_variables") or []) if isinstance(item, dict)]
+        if not solver_variables:
+            variable_helper = getattr(be, "_td_smart_solver_export_variables", None)
+            if callable(variable_helper):
+                solver_variables = variable_helper(
+                    input1_target=str(result.get("input1_target") or config.get("input1_target") or "").strip(),
+                    input1_units=str(result.get("input1_units") or "").strip(),
+                    input2_target=str(result.get("input2_target") or config.get("input2_target") or "").strip(),
+                    input2_units=str(result.get("input2_units") or "").strip(),
+                    input3_target=str(result.get("input3_target") or config.get("input3_target") or "").strip(),
+                    input3_units=str(result.get("input3_units") or "").strip(),
+                    variable_descriptors=(result.get("variable_descriptors") or {}),
+                )
+        variable_targets = [str(item.get("target") or "").strip() for item in solver_variables if str(item.get("target") or "").strip()]
+        if not output_target or not variable_targets:
             QtWidgets.QMessageBox.information(
                 self,
                 "Export Equation to Excel",
@@ -12325,27 +12362,16 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             )
             return
 
-        run_names = sorted({str(row.get("run_name") or "").strip() for row in export_rows if str(row.get("run_name") or "").strip()})
-        run_specs = self._perf_export_run_specs(run_names, output_target, input1_target, input2_target)
-        if not run_specs:
-            QtWidgets.QMessageBox.information(
-                self,
-                "Export Equation to Excel",
-                "No qualifying run-condition mappings are available for the Smart Equation Solver export.",
-            )
-            return
+        run_names = sorted({str(row.get("run_name") or "").strip() for row in fit_points if str(row.get("run_name") or "").strip()})
 
         control_period_filters = list(self._active_control_period_filter_values() or [])
         selected_control_period = control_period_filters[0] if len(control_period_filters) == 1 else None
-        performance_filter_mode = "match_control_period" if selected_control_period not in (None, "") else "all_conditions"
 
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         default_name = (
             f"smart_solver_equation_export_run_conditions_{self._perf_export_slug(output_target)}_vs_"
-            f"{self._perf_export_slug(input1_target)}"
+            f"{'_'.join(self._perf_export_slug(name) for name in variable_targets)}"
         )
-        if str(input2_target or "").strip():
-            default_name += f"_{self._perf_export_slug(input2_target)}"
         default_name += f"_{timestamp}.xlsx"
         out_path, _ = QtWidgets.QFileDialog.getSaveFileName(
             self,
@@ -12356,28 +12382,20 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         if not out_path:
             return
 
-        results_by_stat = {
-            "mean": {
-                "master_model": dict(result.get("master_model") or {}),
-            }
-        }
         plot_metadata = {
-            "plot_dimension": str(result.get("plot_dimension") or ("3d" if str(input2_target or "").strip() else "2d")).strip().lower(),
             "output_target": output_target,
             "output_units": str(result.get("output_units") or "").strip(),
-            "input1_target": input1_target,
-            "input1_units": str(result.get("input1_units") or "").strip(),
-            "input2_target": input2_target,
-            "input2_units": str(result.get("input2_units") or "").strip(),
+            "solver_variables": solver_variables,
             "run_selection_label": "Smart Equation Solver",
             "member_runs": list(run_names),
-            "performance_run_type_mode": "pulsed_mode",
-            "performance_filter_mode": performance_filter_mode,
             "selected_control_period": selected_control_period,
-            "performance_plot_method": "cached_condition_means",
+            "filter_summary": self._smart_solver_filter_summary_text(),
+            "config_text": self._smart_solver_config_text(),
+            "solver_branch": str(result.get("solver_branch") or ""),
+            "selection_reason": str(result.get("selection_reason") or ""),
         }
         try:
-            asset_serials = sorted({str(row.get("serial") or "").strip() for row in export_rows if str(row.get("serial") or "").strip()})
+            asset_serials = sorted({str(row.get("serial") or "").strip() for row in fit_points if str(row.get("serial") or "").strip()})
             asset_metadata = be.td_perf_collect_asset_metadata(self._db_path, asset_serials)
         except Exception:
             asset_metadata = {}
@@ -12386,14 +12404,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             plot_metadata["asset_specific_type"] = str(asset_metadata.get("primary_asset_specific_type") or "").strip()
 
         try:
-            self._start_perf_equation_excel_export(
+            self._start_smart_solver_equation_excel_export(
                 Path(out_path),
+                result=result,
                 plot_metadata=plot_metadata,
-                results_by_stat=results_by_stat,
-                run_specs=run_specs,
-                control_period_filter=selected_control_period,
-                run_type_filter="pulsed_mode",
-                export_rows_override=export_rows,
             )
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "Export Equation to Excel", str(exc))

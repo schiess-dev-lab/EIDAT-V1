@@ -2432,6 +2432,101 @@ class TestTDSupportWorkbook(unittest.TestCase):
             conn.commit()
         return db_path
 
+    def _seed_smart_solver_db_three_input(self, root: Path) -> Path:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        db_path = root / "implementation_trending_3input.sqlite3"
+        with sqlite3.connect(str(db_path)) as conn:
+            be._ensure_test_data_impl_tables(conn)
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO td_runs
+                (run_name, default_x, display_name, run_type, control_period, pulse_width)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                ("Run3", "Time", "Run3", "pulsed mode", 60.0, None),
+            )
+            for name, units in (
+                ("input_1_metric", "u1"),
+                ("input_2_metric", "u2"),
+                ("input_3_metric", "u3"),
+                ("output_metric", "uo"),
+            ):
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO td_columns_calc(run_name, name, units, kind)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    ("Run3", name, units, "y"),
+                )
+
+            point_idx = 0
+            lattice = [
+                (0.8, 1.0),
+                (1.2, 1.3),
+                (1.6, 1.6),
+                (2.0, 1.9),
+                (2.4, 2.2),
+                (2.8, 2.5),
+                (3.2, 2.8),
+                (3.6, 3.1),
+                (4.0, 3.4),
+                (4.4, 3.7),
+            ]
+            for cp_value in (40.0, 80.0):
+                for input_1, input_2 in lattice:
+                    point_idx += 1
+                    observation_id = f"obs3_{point_idx}"
+                    input_3 = (0.6 * input_1) + (1.1 * input_2) + (0.015 * cp_value)
+                    actual = (2.8 * input_1) - (1.4 * input_2) + (0.9 * input_3) + (0.08 * cp_value)
+                    conn.execute(
+                        """
+                        INSERT OR REPLACE INTO td_condition_observations_sequences
+                        (observation_id, serial, run_name, program_title, source_run_name, run_type, pulse_width, control_period, suppression_voltage, source_mtime_ns, computed_epoch_ns)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            observation_id,
+                            "SN3",
+                            "Run3",
+                            "Program 3",
+                            f"Run3_{point_idx}",
+                            "pulsed mode",
+                            None,
+                            cp_value,
+                            24.0,
+                            0,
+                            0,
+                        ),
+                    )
+                    for column_name, value_num in (
+                        ("input_1_metric", input_1),
+                        ("input_2_metric", input_2),
+                        ("input_3_metric", input_3),
+                        ("output_metric", actual),
+                    ):
+                        conn.execute(
+                            """
+                            INSERT OR REPLACE INTO td_metrics_calc_sequences
+                            (observation_id, serial, run_name, column_name, stat, value_num, computed_epoch_ns, source_mtime_ns, program_title, source_run_name)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                observation_id,
+                                "SN3",
+                                "Run3",
+                                column_name,
+                                "mean",
+                                value_num,
+                                0,
+                                0,
+                                "Program 3",
+                                f"Run3_{point_idx}",
+                            ),
+                        )
+            conn.commit()
+        return db_path
+
     def _seed_perf_export_db_2d(
         self,
         root: Path,
@@ -8822,6 +8917,303 @@ class TestTDSupportWorkbook(unittest.TestCase):
                     program_filters=["Program A"],
                     control_period_filters=["0.2"],
                 )
+
+    @unittest.skipUnless(_have_openpyxl(), "openpyxl not installed")
+    def test_smart_solver_export_equation_workbook_writes_single_input_workbook(self) -> None:
+        from openpyxl import load_workbook  # type: ignore
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            db_path = self._seed_smart_solver_db(root)
+            result = be.td_smart_solver_run(
+                db_path,
+                output_target="isp",
+                input1_target="prop_per_pulse",
+                runs=["RunA"],
+                serials=["SN1"],
+                program_filters=["Program A"],
+            )
+            out_path = root / "smart_solver_single.xlsx"
+            be.td_smart_solver_export_equation_workbook(
+                db_path,
+                out_path,
+                result=result,
+                plot_metadata={"run_selection_label": "Smart Equation Solver", "member_runs": ["RunA"]},
+            )
+
+            wb = load_workbook(str(out_path), read_only=False, data_only=False)
+            try:
+                self.assertEqual(
+                    wb.sheetnames[:3],
+                    ["Smart Solver Export", "Scenario Calculator", "Fit Point Checker"],
+                )
+                self.assertEqual(wb["Model Parameters"].sheet_state, "hidden")
+                self.assertEqual(wb["Model Support"].sheet_state, "hidden")
+                ws = wb["Smart Solver Export"]
+                header_row = next(r for r in range(1, ws.max_row + 1) if str(ws.cell(r, 1).value or "").strip() == "run_name")
+                headers = [str(ws.cell(header_row, c).value or "").strip() for c in range(1, ws.max_column + 1)]
+                self.assertIn("input_1", headers)
+                self.assertIn("pred_mean", headers)
+                self.assertIn("residual_mean", headers)
+                pred_formula = str(ws.cell(header_row + 1, headers.index("pred_mean") + 1).value or "")
+                self.assertTrue(pred_formula.startswith("="))
+                scenario_ws = wb["Scenario Calculator"]
+                scenario_header_row = next(r for r in range(1, scenario_ws.max_row + 1) if str(scenario_ws.cell(r, 1).value or "").strip() == "scenario_id")
+                scenario_headers = [str(scenario_ws.cell(scenario_header_row, c).value or "").strip() for c in range(1, scenario_ws.max_column + 1)]
+                self.assertEqual(scenario_headers[:4], ["scenario_id", "input_1", "control_period", "pred_mean"])
+            finally:
+                wb.close()
+
+    @unittest.skipUnless(_have_openpyxl(), "openpyxl not installed")
+    def test_smart_solver_export_equation_workbook_writes_two_input_workbook(self) -> None:
+        from openpyxl import load_workbook  # type: ignore
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            db_path = self._seed_smart_solver_db(root)
+            result = be.td_smart_solver_run(
+                db_path,
+                output_target="isp",
+                input1_target="prop_per_pulse",
+                input2_target="duty_cycle",
+                runs=["RunA"],
+                serials=["SN1"],
+                program_filters=["Program A"],
+            )
+            out_path = root / "smart_solver_two_input.xlsx"
+            be.td_smart_solver_export_equation_workbook(
+                db_path,
+                out_path,
+                result=result,
+                plot_metadata={"run_selection_label": "Smart Equation Solver", "member_runs": ["RunA"]},
+            )
+
+            wb = load_workbook(str(out_path), read_only=False, data_only=False)
+            try:
+                ws = wb["Smart Solver Export"]
+                header_row = next(r for r in range(1, ws.max_row + 1) if str(ws.cell(r, 1).value or "").strip() == "run_name")
+                headers = [str(ws.cell(header_row, c).value or "").strip() for c in range(1, ws.max_column + 1)]
+                self.assertIn("input_2", headers)
+                formula = str(ws.cell(header_row + 1, headers.index("pred_mean") + 1).value or "")
+                self.assertTrue(formula.startswith("="))
+                self.assertIn("*", formula)
+                scenario_ws = wb["Scenario Calculator"]
+                scenario_header_row = next(r for r in range(1, scenario_ws.max_row + 1) if str(scenario_ws.cell(r, 1).value or "").strip() == "scenario_id")
+                scenario_headers = [str(scenario_ws.cell(scenario_header_row, c).value or "").strip() for c in range(1, scenario_ws.max_column + 1)]
+                self.assertEqual(scenario_headers[:5], ["scenario_id", "input_1", "input_2", "control_period", "pred_mean"])
+            finally:
+                wb.close()
+
+    @unittest.skipUnless(_have_openpyxl(), "openpyxl not installed")
+    def test_smart_solver_export_equation_workbook_writes_three_input_direct_workbook(self) -> None:
+        from openpyxl import load_workbook  # type: ignore
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            db_path = self._seed_smart_solver_db_three_input(root)
+            result = be.td_smart_solver_run(
+                db_path,
+                output_target="output_metric",
+                input1_target="input_1_metric",
+                input2_target="input_2_metric",
+                input3_target="input_3_metric",
+                runs=["Run3"],
+                serials=["SN3"],
+                program_filters=["Program 3"],
+            )
+            fit_points = [dict(row) for row in (result.get("fit_points") or []) if isinstance(row, dict)]
+            direct_model = {
+                "fit_family": be.TD_PERF_FIT_FAMILY_QUADRATIC_3INPUT_CONTROL_PERIOD,
+                "equation": "y = direct_3input(cp, x1, x2, x3)",
+                "x_norm_equation": "x1', x2', x3', cp'",
+                "x1_center": 2.6,
+                "x1_scale": 1.2,
+                "x2_center": 2.35,
+                "x2_scale": 0.9,
+                "x3_center": 4.2,
+                "x3_scale": 1.6,
+                "cp_center": 60.0,
+                "cp_scale": 20.0,
+                "coeff_cp_models": [
+                    [0.01, 0.5],
+                    [0.0, 0.8],
+                    [0.0, -0.3],
+                    [0.0, 0.6],
+                    [0.0, 0.04],
+                    [0.0, 0.03],
+                    [0.0, 0.02],
+                    [0.0, 0.01],
+                    [0.0, 0.015],
+                    [0.0, 0.012],
+                ],
+                "control_period_values": [40.0, 80.0],
+                "params": {"control_period_degree": 1},
+            }
+            result["fit_family"] = be.TD_PERF_FIT_FAMILY_QUADRATIC_3INPUT_CONTROL_PERIOD
+            result["master_model"] = dict(direct_model or {})
+            result["solver_branch"] = be.TD_PERF_FIT_FAMILY_QUADRATIC_3INPUT_CONTROL_PERIOD
+            result["uses_staged_mediator"] = False
+            result["selection_reason"] = "Forced direct export branch for workbook coverage."
+            result["equation"] = str((direct_model or {}).get("equation") or "")
+            result["x_norm_equation"] = str((direct_model or {}).get("x_norm_equation") or "")
+            result["stage_export_spec"] = {}
+            out_path = root / "smart_solver_three_input.xlsx"
+            be.td_smart_solver_export_equation_workbook(
+                db_path,
+                out_path,
+                result=result,
+                plot_metadata={"run_selection_label": "Smart Equation Solver", "member_runs": ["Run3"]},
+            )
+
+            wb = load_workbook(str(out_path), read_only=False, data_only=False)
+            try:
+                ws = wb["Smart Solver Export"]
+                header_row = next(r for r in range(1, ws.max_row + 1) if str(ws.cell(r, 1).value or "").strip() == "run_name")
+                headers = [str(ws.cell(header_row, c).value or "").strip() for c in range(1, ws.max_column + 1)]
+                self.assertIn("input_3", headers)
+                formula = str(ws.cell(header_row + 1, headers.index("pred_mean") + 1).value or "")
+                self.assertTrue(formula.startswith("="))
+                self.assertIn("^2", formula)
+                scenario_ws = wb["Scenario Calculator"]
+                scenario_header_row = next(r for r in range(1, scenario_ws.max_row + 1) if str(scenario_ws.cell(r, 1).value or "").strip() == "scenario_id")
+                scenario_headers = [str(scenario_ws.cell(scenario_header_row, c).value or "").strip() for c in range(1, scenario_ws.max_column + 1)]
+                self.assertEqual(scenario_headers[:6], ["scenario_id", "input_1", "input_2", "input_3", "control_period", "pred_mean"])
+                self.assertGreater(wb["Model Support"].max_row, 1)
+            finally:
+                wb.close()
+
+    @unittest.skipUnless(_have_openpyxl(), "openpyxl not installed")
+    def test_smart_solver_export_equation_workbook_writes_staged_mediator_columns(self) -> None:
+        from openpyxl import load_workbook  # type: ignore
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            x1s: list[float] = []
+            x2s: list[float] = []
+            x3s: list[float] = []
+            ys: list[float] = []
+            cps: list[float] = []
+            fit_points: list[dict[str, object]] = []
+            point_idx = 0
+            lattice = [
+                (0.8, 1.0),
+                (1.2, 1.3),
+                (1.6, 1.6),
+                (2.0, 1.9),
+                (2.4, 2.2),
+                (2.8, 2.5),
+                (3.2, 2.8),
+                (3.6, 3.1),
+                (4.0, 3.4),
+                (4.4, 3.7),
+            ]
+            for cp_value in (40.0, 80.0):
+                for input_1, input_2 in lattice:
+                    point_idx += 1
+                    input_3 = (0.6 * input_1) + (1.1 * input_2) + (0.015 * cp_value)
+                    actual = (2.8 * input_1) - (1.4 * input_2) + (0.9 * input_3) + (0.08 * cp_value)
+                    x1s.append(input_1)
+                    x2s.append(input_2)
+                    x3s.append(input_3)
+                    ys.append(actual)
+                    cps.append(cp_value)
+                    fit_points.append(
+                        {
+                            "run_name": "RunStage",
+                            "display_name": "RunStage",
+                            "serial": "SNS",
+                            "observation_id": f"stage_{point_idx}",
+                            "condition_label": "RunStage",
+                            "program_title": "Program S",
+                            "source_run_name": f"RunStage_{point_idx}",
+                            "suppression_voltage": 24.0,
+                            "control_period": cp_value,
+                            "input_1": input_1,
+                            "input_2": input_2,
+                            "input_3": input_3,
+                            "actual_mean": actual,
+                            "sample_count": 1,
+                        }
+                    )
+            stage1_model = be._td_perf_fit_quadratic_surface_control_period_model(
+                x1s,
+                x2s,
+                x3s,
+                cps,
+                fit_mode=be.TD_PERF_FIT_MODE_POLYNOMIAL_SURFACE,
+            )
+            stage2_model = be._td_perf_fit_quadratic_curve_control_period_model(x3s, ys, cps)
+            self.assertIsNotNone(stage1_model)
+            self.assertIsNotNone(stage2_model)
+            result = {
+                "fit_family": be.TD_PERF_FIT_FAMILY_STAGED_MEDIATOR_CONTROL_PERIOD,
+                "master_model": {
+                    "fit_family": be.TD_PERF_FIT_FAMILY_STAGED_MEDIATOR_CONTROL_PERIOD,
+                    "stage1_model": dict(stage1_model or {}),
+                    "stage2_model": dict(stage2_model or {}),
+                    "params": {"mediator_target": "input_3_metric"},
+                },
+                "fit_points": fit_points,
+                "output_target": "output_metric",
+                "output_units": "uo",
+                "input1_target": "input_1_metric",
+                "input1_units": "u1",
+                "input2_target": "input_2_metric",
+                "input2_units": "u2",
+                "input3_target": "input_3_metric",
+                "input3_units": "u3",
+                "equation": "x3_hat = f(...); y = g(...)",
+                "x_norm_equation": "x1', x2', x3', cp'",
+                "solver_branch": be.TD_PERF_FIT_FAMILY_STAGED_MEDIATOR_CONTROL_PERIOD,
+                "selection_reason": "Test staged export.",
+                "uses_control_period": True,
+                "uses_staged_mediator": True,
+                "solver_variables": be._td_smart_solver_export_variables(
+                    input1_target="input_1_metric",
+                    input1_units="u1",
+                    input2_target="input_2_metric",
+                    input2_units="u2",
+                    input3_target="input_3_metric",
+                    input3_units="u3",
+                    variable_descriptors=be.td_smart_solver_variable_descriptors(),
+                ),
+                "stage_export_spec": {
+                    "stage1_output_key": "stage1_pred_input_3",
+                    "stage1_output_target": "input_3_metric",
+                    "stage1_output_units": "u3",
+                    "stage1_input_keys": ["input_1", "input_2"],
+                    "stage2_input_key": "stage1_pred_input_3",
+                },
+                "sample_count": len(fit_points),
+            }
+            out_path = root / "smart_solver_staged.xlsx"
+            be.td_smart_solver_export_equation_workbook(
+                root / "dummy.sqlite3",
+                out_path,
+                result=result,
+                plot_metadata={"run_selection_label": "Smart Equation Solver", "member_runs": ["RunStage"]},
+            )
+
+            wb = load_workbook(str(out_path), read_only=False, data_only=False)
+            try:
+                self.assertIn("Scenario Calculator", wb.sheetnames)
+                scenario_ws = wb["Scenario Calculator"]
+                scenario_header_row = next(r for r in range(1, scenario_ws.max_row + 1) if str(scenario_ws.cell(r, 1).value or "").strip() == "scenario_id")
+                scenario_headers = [str(scenario_ws.cell(scenario_header_row, c).value or "").strip() for c in range(1, scenario_ws.max_column + 1)]
+                self.assertIn("stage1_pred_input_3", scenario_headers)
+                stage_formula = str(scenario_ws.cell(scenario_header_row + 1, scenario_headers.index("stage1_pred_input_3") + 1).value or "")
+                pred_formula = str(scenario_ws.cell(scenario_header_row + 1, scenario_headers.index("pred_mean") + 1).value or "")
+                self.assertTrue(stage_formula.startswith("="))
+                self.assertTrue(pred_formula.startswith("="))
+                checker_ws = wb["Fit Point Checker"]
+                checker_headers = [str(checker_ws.cell(1, c).value or "").strip() for c in range(1, checker_ws.max_column + 1)]
+                self.assertIn("stage1_pred_input_3", checker_headers)
+            finally:
+                wb.close()
 
     def test_perf_candidate_discovery_accepts_separated_x(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore

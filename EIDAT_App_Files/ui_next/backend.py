@@ -11845,6 +11845,13 @@ TD_PERF_EXPORTABLE_FIT_FAMILIES = {
     TD_PERF_FIT_FAMILY_QUADRATIC_CURVE_CONTROL_PERIOD,
     TD_PERF_FIT_FAMILY_HYBRID_QUADRATIC_RESIDUAL_CONTROL_PERIOD,
 }
+TD_SMART_SOLVER_EXPORTABLE_FIT_FAMILIES = {
+    TD_PERF_FIT_FAMILY_QUADRATIC_CURVE_CONTROL_PERIOD,
+    TD_PERF_FIT_FAMILY_HYBRID_QUADRATIC_RESIDUAL_CONTROL_PERIOD,
+    TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD,
+    TD_PERF_FIT_FAMILY_QUADRATIC_3INPUT_CONTROL_PERIOD,
+    TD_PERF_FIT_FAMILY_STAGED_MEDIATOR_CONTROL_PERIOD,
+}
 TD_PERF_EXPORT_STATS_ORDER = ["mean", "min", "max", "std", "min_3sigma", "max_3sigma"]
 
 
@@ -16423,6 +16430,63 @@ def td_smart_solver_variable_descriptors() -> dict[str, str]:
     return dict(TD_SMART_SOLVER_VARIABLE_DESCRIPTORS)
 
 
+def _td_smart_solver_export_variables(
+    *,
+    input1_target: str,
+    input1_units: str,
+    input2_target: str,
+    input2_units: str,
+    input3_target: str,
+    input3_units: str,
+    variable_descriptors: Mapping[str, object] | None = None,
+) -> list[dict[str, object]]:
+    descriptors = {
+        str(key or "").strip().lower(): str(value or "").strip()
+        for key, value in dict(variable_descriptors or td_smart_solver_variable_descriptors()).items()
+        if str(key or "").strip()
+    }
+    variables: list[dict[str, object]] = [
+        {
+            "key": "input_1",
+            "target": str(input1_target or "").strip(),
+            "units": str(input1_units or "").strip(),
+            "role": str(descriptors.get("input1") or ""),
+            "is_optional": False,
+        }
+    ]
+    if str(input2_target or "").strip():
+        variables.append(
+            {
+                "key": "input_2",
+                "target": str(input2_target or "").strip(),
+                "units": str(input2_units or "").strip(),
+                "role": str(descriptors.get("input2") or ""),
+                "is_optional": True,
+            }
+        )
+    if str(input3_target or "").strip():
+        variables.append(
+            {
+                "key": "input_3",
+                "target": str(input3_target or "").strip(),
+                "units": str(input3_units or "").strip(),
+                "role": str(descriptors.get("input3") or ""),
+                "is_optional": True,
+            }
+        )
+    return variables
+
+
+def td_smart_solver_exportable_model(result: Mapping[str, object]) -> dict[str, object] | None:
+    model = (result or {}).get("master_model") if isinstance(result, Mapping) else None
+    if not isinstance(model, Mapping):
+        return None
+    family = td_perf_normalize_fit_mode(model.get("fit_family"))
+    if family not in TD_SMART_SOLVER_EXPORTABLE_FIT_FAMILIES:
+        return None
+    return dict(model)
+
+
 def _td_smart_solver_sequence_cap_value(value: object) -> int:
     try:
         limit = int(value)
@@ -17050,8 +17114,29 @@ def td_smart_solver_run(
                 f"Sequence cap kept the first {keep_sequence_limit} sequence(s) per serial; no later sequences were present after filtering."
             )
 
+    solver_variables = _td_smart_solver_export_variables(
+        input1_target=input1_name,
+        input1_units=input1_units,
+        input2_target=input2_name,
+        input2_units=input2_units,
+        input3_target=input3_name,
+        input3_units=input3_units,
+        variable_descriptors=variable_descriptors,
+    )
+    selected_family = str(model.get("fit_family") or "")
+    uses_staged_mediator = selected_family == TD_PERF_FIT_FAMILY_STAGED_MEDIATOR_CONTROL_PERIOD
+    stage_export_spec: dict[str, object] = {}
+    if uses_staged_mediator:
+        stage_export_spec = {
+            "stage1_output_key": "stage1_pred_input_3",
+            "stage1_output_target": input3_name,
+            "stage1_output_units": input3_units,
+            "stage1_input_keys": ["input_1", "input_2"],
+            "stage2_input_key": "stage1_pred_input_3",
+        }
+
     return {
-        "fit_family": str(model.get("fit_family") or ""),
+        "fit_family": selected_family,
         "equation": str(model.get("equation") or "").strip(),
         "x_norm_equation": str(model.get("x_norm_equation") or "").strip(),
         "master_model": dict(model),
@@ -17097,10 +17182,19 @@ def td_smart_solver_run(
         "input2_units": input2_units,
         "input3_target": input3_name,
         "input3_units": input3_units,
-        "solver_branch": str(model.get("fit_family") or ""),
+        "solver_branch": selected_family,
         "selection_reason": selection_reason,
         "candidate_scores": dict(candidate_scores),
         "variable_descriptors": variable_descriptors,
+        "solver_variables": solver_variables,
+        "uses_control_period": True,
+        "uses_staged_mediator": uses_staged_mediator,
+        "stage_export_spec": stage_export_spec,
+        "stage1_output_key": str(stage_export_spec.get("stage1_output_key") or ""),
+        "stage1_output_target": str(stage_export_spec.get("stage1_output_target") or ""),
+        "stage1_output_units": str(stage_export_spec.get("stage1_output_units") or ""),
+        "stage1_input_keys": list(stage_export_spec.get("stage1_input_keys") or []),
+        "stage2_input_key": str(stage_export_spec.get("stage2_input_key") or ""),
         "run_count": int(len({str(point.get('run_name') or '').strip() for point in points if str(point.get('run_name') or '').strip()})),
         "serial_count": int(len({str(point.get('serial') or '').strip() for point in points if str(point.get('serial') or '').strip()})),
     }
@@ -18758,6 +18852,614 @@ def td_perf_export_equation_workbook(
         ws_support.column_dimensions[get_column_letter(col_idx)].width = width
 
     _td_emit_progress(progress_cb, "Saving Excel workbook")
+    wb.save(str(path))
+    wb.close()
+    _td_emit_progress(progress_cb, f"Excel export ready: {path.name}")
+    return path
+
+
+def _td_smart_solver_export_variables_from_result(result: Mapping[str, object]) -> list[dict[str, object]]:
+    raw_variables = result.get("solver_variables") if isinstance(result, Mapping) else None
+    variables: list[dict[str, object]] = []
+    for raw in (raw_variables or []):
+        if not isinstance(raw, Mapping):
+            continue
+        key = str(raw.get("key") or "").strip()
+        if not key:
+            continue
+        variables.append(
+            {
+                "key": key,
+                "target": str(raw.get("target") or "").strip(),
+                "units": str(raw.get("units") or "").strip(),
+                "role": str(raw.get("role") or "").strip(),
+                "is_optional": bool(raw.get("is_optional")),
+            }
+        )
+    if variables:
+        return variables
+    return _td_smart_solver_export_variables(
+        input1_target=str(result.get("input1_target") or "").strip(),
+        input1_units=str(result.get("input1_units") or "").strip(),
+        input2_target=str(result.get("input2_target") or "").strip(),
+        input2_units=str(result.get("input2_units") or "").strip(),
+        input3_target=str(result.get("input3_target") or "").strip(),
+        input3_units=str(result.get("input3_units") or "").strip(),
+        variable_descriptors=(result.get("variable_descriptors") or {}),
+    )
+
+
+def _td_smart_solver_stage_export_spec(result: Mapping[str, object]) -> dict[str, object]:
+    raw = result.get("stage_export_spec") if isinstance(result, Mapping) else None
+    if isinstance(raw, Mapping) and raw:
+        return {
+            "stage1_output_key": str(raw.get("stage1_output_key") or "").strip(),
+            "stage1_output_target": str(raw.get("stage1_output_target") or "").strip(),
+            "stage1_output_units": str(raw.get("stage1_output_units") or "").strip(),
+            "stage1_input_keys": [str(value or "").strip() for value in (raw.get("stage1_input_keys") or []) if str(value or "").strip()],
+            "stage2_input_key": str(raw.get("stage2_input_key") or "").strip(),
+        }
+    return {
+        "stage1_output_key": str(result.get("stage1_output_key") or "").strip(),
+        "stage1_output_target": str(result.get("stage1_output_target") or "").strip(),
+        "stage1_output_units": str(result.get("stage1_output_units") or "").strip(),
+        "stage1_input_keys": [str(value or "").strip() for value in (result.get("stage1_input_keys") or []) if str(value or "").strip()],
+        "stage2_input_key": str(result.get("stage2_input_key") or "").strip(),
+    }
+
+
+def _td_smart_solver_export_rows_from_result(result: Mapping[str, object]) -> list[dict[str, object]]:
+    variables = _td_smart_solver_export_variables_from_result(result)
+    variable_keys = [str(variable.get("key") or "").strip() for variable in variables if str(variable.get("key") or "").strip()]
+    rows: list[dict[str, object]] = []
+    for raw_point in (result.get("fit_points") or []):
+        if not isinstance(raw_point, Mapping):
+            continue
+        row = dict(raw_point)
+        row["display_name"] = str(row.get("display_name") or row.get("condition_label") or row.get("run_name") or "").strip()
+        for key in variable_keys:
+            row[key] = raw_point.get(key)
+        rows.append(row)
+    rows.sort(
+        key=lambda row: (
+            str(row.get("run_name") or "").lower(),
+            *[
+                (float(row.get(key) or 0.0) if row.get(key) not in (None, "") else float("-inf"))
+                for key in variable_keys
+            ],
+            str(row.get("condition_label") or "").lower(),
+            str(row.get("serial") or "").lower(),
+            str(row.get("observation_id") or "").lower(),
+        )
+    )
+    return rows
+
+
+def _td_smart_solver_excel_formula_for_quadratic_3input_control_period(
+    model: Mapping[str, object],
+    *,
+    x1_ref: str,
+    x2_ref: str,
+    x3_ref: str,
+    cp_ref: str,
+) -> str:
+    coeff_cp_models = [[float(v) for v in coeffs] for coeffs in (model.get("coeff_cp_models") or [])]
+    if len(coeff_cp_models) != 10 or not x1_ref or not x2_ref or not x3_ref or not cp_ref:
+        return ""
+    x1_norm = _td_perf_excel_norm_expr(x1_ref, model.get("x1_center"), model.get("x1_scale"))
+    x2_norm = _td_perf_excel_norm_expr(x2_ref, model.get("x2_center"), model.get("x2_scale"))
+    x3_norm = _td_perf_excel_norm_expr(x3_ref, model.get("x3_center"), model.get("x3_scale"))
+    cp_norm = _td_perf_excel_norm_expr(cp_ref, model.get("cp_center"), model.get("cp_scale"))
+    basis_terms = [
+        "",
+        x1_norm,
+        x2_norm,
+        x3_norm,
+        f"({x1_norm}^2)",
+        f"({x2_norm}^2)",
+        f"({x3_norm}^2)",
+        f"({x1_norm}*{x2_norm})",
+        f"({x1_norm}*{x3_norm})",
+        f"({x2_norm}*{x3_norm})",
+    ]
+    expr_terms: list[str] = []
+    for coeffs, basis in zip(coeff_cp_models, basis_terms):
+        cp_expr = _td_perf_excel_polynomial_expr(coeffs, cp_norm)
+        if not basis:
+            expr_terms.append(cp_expr)
+        else:
+            expr_terms.append(f"({cp_expr}*{basis})")
+    return "=" + "+".join(expr_terms)
+
+
+def _td_smart_solver_excel_formula_for_model(
+    model: Mapping[str, object],
+    *,
+    variable_refs: Mapping[str, str],
+    control_period_ref: str,
+) -> str:
+    family = td_perf_normalize_fit_mode(model.get("fit_family"))
+    if family == TD_PERF_FIT_FAMILY_QUADRATIC_3INPUT_CONTROL_PERIOD:
+        return _td_smart_solver_excel_formula_for_quadratic_3input_control_period(
+            model,
+            x1_ref=str(variable_refs.get("input_1") or ""),
+            x2_ref=str(variable_refs.get("input_2") or ""),
+            x3_ref=str(variable_refs.get("input_3") or ""),
+            cp_ref=str(control_period_ref or ""),
+        )
+    if family in {
+        TD_PERF_FIT_FAMILY_QUADRATIC_CURVE_CONTROL_PERIOD,
+        TD_PERF_FIT_FAMILY_HYBRID_QUADRATIC_RESIDUAL_CONTROL_PERIOD,
+    }:
+        raw_x_ref = str(variable_refs.get("input_1") or "")
+        if not raw_x_ref or not control_period_ref:
+            return ""
+        return _td_perf_excel_formula_for_model(
+            model,
+            raw_x_ref=raw_x_ref,
+            norm_x_ref=_td_perf_excel_norm_expr(raw_x_ref, model.get("x_center"), model.get("x_scale")),
+            raw_x1_ref=raw_x_ref,
+            raw_x2_ref="",
+            norm_x1_ref="",
+            norm_x2_ref="",
+            raw_cp_ref=str(control_period_ref or ""),
+            norm_cp_ref=_td_perf_excel_norm_expr(control_period_ref, model.get("cp_center"), model.get("cp_scale")),
+        )
+    if family == TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD:
+        raw_x1_ref = str(variable_refs.get("input_1") or "")
+        raw_x2_ref = str(variable_refs.get("input_2") or "")
+        if not raw_x1_ref or not raw_x2_ref or not control_period_ref:
+            return ""
+        return _td_perf_excel_formula_for_model(
+            model,
+            raw_x_ref=raw_x1_ref,
+            norm_x_ref="",
+            raw_x1_ref=raw_x1_ref,
+            raw_x2_ref=raw_x2_ref,
+            norm_x1_ref=_td_perf_excel_norm_expr(raw_x1_ref, model.get("x1_center"), model.get("x1_scale")),
+            norm_x2_ref=_td_perf_excel_norm_expr(raw_x2_ref, model.get("x2_center"), model.get("x2_scale")),
+            raw_cp_ref=str(control_period_ref or ""),
+            norm_cp_ref=_td_perf_excel_norm_expr(control_period_ref, model.get("cp_center"), model.get("cp_scale")),
+        )
+    return ""
+
+
+def _td_smart_solver_formula_specs(
+    result: Mapping[str, object],
+    *,
+    variable_refs: Mapping[str, str],
+    control_period_ref: str,
+    stage1_output_ref: str = "",
+) -> dict[str, str]:
+    model = td_smart_solver_exportable_model(result) or {}
+    family = td_perf_normalize_fit_mode(model.get("fit_family"))
+    if family == TD_PERF_FIT_FAMILY_STAGED_MEDIATOR_CONTROL_PERIOD:
+        stage_spec = _td_smart_solver_stage_export_spec(result)
+        stage_key = str(stage_spec.get("stage1_output_key") or "stage1_pred_input_3").strip()
+        stage1_model = dict(model.get("stage1_model") or {})
+        stage2_model = dict(model.get("stage2_model") or {})
+        stage1_formula = _td_smart_solver_excel_formula_for_model(
+            stage1_model,
+            variable_refs=variable_refs,
+            control_period_ref=control_period_ref,
+        )
+        stage2_formula = _td_smart_solver_excel_formula_for_model(
+            stage2_model,
+            variable_refs={"input_1": str(stage1_output_ref or "")},
+            control_period_ref=control_period_ref,
+        )
+        return {
+            stage_key: _td_perf_excel_guarded_formula(
+                stage1_formula,
+                [variable_refs.get("input_1"), variable_refs.get("input_2"), control_period_ref],
+            ),
+            "pred_mean": _td_perf_excel_guarded_formula(stage2_formula, [stage1_output_ref, control_period_ref]),
+        }
+    direct_formula = _td_smart_solver_excel_formula_for_model(
+        model,
+        variable_refs=variable_refs,
+        control_period_ref=control_period_ref,
+    )
+    required_refs = [variable_refs.get("input_1"), control_period_ref]
+    if family == TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD:
+        required_refs.insert(1, variable_refs.get("input_2"))
+    elif family == TD_PERF_FIT_FAMILY_QUADRATIC_3INPUT_CONTROL_PERIOD:
+        required_refs = [variable_refs.get("input_1"), variable_refs.get("input_2"), variable_refs.get("input_3"), control_period_ref]
+    return {
+        "pred_mean": _td_perf_excel_guarded_formula(direct_formula, required_refs),
+    }
+
+
+def _td_smart_solver_write_prediction_table(
+    ws,
+    *,
+    start_row: int,
+    result: Mapping[str, object],
+    rows: Sequence[Mapping[str, object]],
+    solver_variables: Sequence[Mapping[str, object]],
+    include_residual_columns: bool,
+    header_font,
+    header_fill,
+) -> tuple[int, dict[str, int]]:
+    from openpyxl.styles import Alignment  # type: ignore
+    from openpyxl.utils import get_column_letter  # type: ignore
+
+    stage_spec = _td_smart_solver_stage_export_spec(result)
+    stage_key = str(stage_spec.get("stage1_output_key") or "").strip()
+    headers = ["run_name", "display_name", "serial", "observation_id", "condition_label", "program_title", "source_run_name", "suppression_voltage", "control_period"]
+    headers.extend([str(variable.get("key") or "").strip() for variable in solver_variables if str(variable.get("key") or "").strip()])
+    if bool(result.get("uses_staged_mediator")) and stage_key:
+        headers.append(stage_key)
+    headers.extend(["pred_mean", "actual_mean"])
+    if include_residual_columns:
+        headers.extend(["residual_mean", "pct_delta_mean"])
+    headers.append("sample_count")
+    col_by_name = {name: idx for idx, name in enumerate(headers, start=1)}
+    for col_idx, name in enumerate(headers, start=1):
+        cell = ws.cell(start_row, col_idx)
+        cell.value = name
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center")
+
+    for row_idx, row in enumerate(rows, start=start_row + 1):
+        for name in ("run_name", "display_name", "serial", "observation_id", "condition_label", "program_title", "source_run_name", "suppression_voltage", "control_period", "actual_mean", "sample_count"):
+            if name in col_by_name:
+                ws.cell(row_idx, col_by_name[name]).value = row.get(name)
+        variable_refs: dict[str, str] = {}
+        for variable in solver_variables:
+            key = str(variable.get("key") or "").strip()
+            if not key or key not in col_by_name:
+                continue
+            ws.cell(row_idx, col_by_name[key]).value = row.get(key)
+            variable_refs[key] = _td_perf_excel_ref(col_by_name[key], row_idx)
+        stage_ref = _td_perf_excel_ref(col_by_name[stage_key], row_idx) if stage_key and stage_key in col_by_name else ""
+        control_period_ref = _td_perf_excel_ref(col_by_name["control_period"], row_idx)
+        formula_specs = _td_smart_solver_formula_specs(
+            result,
+            variable_refs=variable_refs,
+            control_period_ref=control_period_ref,
+            stage1_output_ref=stage_ref,
+        )
+        if stage_key and stage_key in formula_specs and stage_key in col_by_name:
+            ws.cell(row_idx, col_by_name[stage_key]).value = formula_specs[stage_key]
+        ws.cell(row_idx, col_by_name["pred_mean"]).value = formula_specs.get("pred_mean", "")
+        if include_residual_columns:
+            pred_ref = _td_perf_excel_ref(col_by_name["pred_mean"], row_idx)
+            actual_ref = _td_perf_excel_ref(col_by_name["actual_mean"], row_idx)
+            ws.cell(row_idx, col_by_name["residual_mean"]).value = f'=IF(OR({pred_ref}="",{actual_ref}=""),"",{pred_ref}-{actual_ref})'
+            ws.cell(row_idx, col_by_name["pct_delta_mean"]).value = (
+                f'=IF(OR({pred_ref}="",{actual_ref}="",{actual_ref}=0),"",({pred_ref}-{actual_ref})/{actual_ref})'
+            )
+
+    for name, col_idx in col_by_name.items():
+        width = 16
+        if name in {"run_name", "display_name", "program_title", "source_run_name"}:
+            width = 24
+        elif name == "condition_label":
+            width = 28
+        elif name in {"observation_id", "serial"}:
+            width = 20
+        elif name in {"pred_mean", "actual_mean", "residual_mean", "pct_delta_mean"} or name.startswith("stage1_pred_"):
+            width = 20
+        ws.column_dimensions[get_column_letter(col_idx)].width = width
+    return start_row, col_by_name
+
+
+def _td_smart_solver_write_model_detail_sheets(
+    *,
+    workbook,
+    result: Mapping[str, object],
+    solver_variables: Sequence[Mapping[str, object]],
+) -> tuple[object, object]:
+    from openpyxl.styles import Font, PatternFill  # type: ignore
+    from openpyxl.utils import get_column_letter  # type: ignore
+
+    header_font = Font(bold=True)
+    header_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+    ws_params = workbook.create_sheet("Model Parameters")
+    ws_support = workbook.create_sheet("Model Support")
+    ws_params.sheet_state = "hidden"
+    ws_support.sheet_state = "hidden"
+
+    for col_idx, value in enumerate(["model_path", "fit_family", "field", "value"], start=1):
+        cell = ws_params.cell(1, col_idx)
+        cell.value = value
+        cell.font = header_font
+        cell.fill = header_fill
+    for col_idx, value in enumerate(["model_path", "fit_family", "basis_index", "cp_min", "cp_max", "v1", "v2", "v3", "v4"], start=1):
+        cell = ws_support.cell(1, col_idx)
+        cell.value = value
+        cell.font = header_font
+        cell.fill = header_fill
+
+    model_rows: list[tuple[str, dict[str, object]]] = [("selected", dict(result.get("master_model") or {}))]
+    selected = model_rows[0][1]
+    if td_perf_normalize_fit_mode(selected.get("fit_family")) == TD_PERF_FIT_FAMILY_STAGED_MEDIATOR_CONTROL_PERIOD:
+        stage1_model = dict(selected.get("stage1_model") or {})
+        stage2_model = dict(selected.get("stage2_model") or {})
+        if stage1_model:
+            model_rows.append(("stage1", stage1_model))
+        if stage2_model:
+            model_rows.append(("stage2", stage2_model))
+
+    param_row = 2
+    support_row = 2
+    for model_path, model in model_rows:
+        family = td_perf_normalize_fit_mode(model.get("fit_family"))
+        for field, value in (
+            ("equation", model.get("equation")),
+            ("x_norm_equation", model.get("x_norm_equation")),
+            ("rmse", model.get("rmse")),
+            ("solver_variables", solver_variables if model_path == "selected" else None),
+        ):
+            if value in (None, ""):
+                continue
+            ws_params.cell(param_row, 1).value = model_path
+            ws_params.cell(param_row, 2).value = family
+            ws_params.cell(param_row, 3).value = field
+            ws_params.cell(param_row, 4).value = json.dumps(_td_perf_json_safe(value)) if isinstance(value, (dict, list, tuple)) else value
+            param_row += 1
+        for field, value in sorted((model.get("params") or {}).items(), key=lambda item: str(item[0])):
+            ws_params.cell(param_row, 1).value = model_path
+            ws_params.cell(param_row, 2).value = family
+            ws_params.cell(param_row, 3).value = str(field)
+            ws_params.cell(param_row, 4).value = json.dumps(_td_perf_json_safe(value)) if isinstance(value, (dict, list, tuple)) else value
+            param_row += 1
+
+        coeff_source = None
+        if family in {
+            TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD,
+            TD_PERF_FIT_FAMILY_QUADRATIC_3INPUT_CONTROL_PERIOD,
+        }:
+            coeff_source = model.get("coeff_cp_models") or []
+        elif family in TD_PERF_CURVE_CONTROL_PERIOD_FAMILIES:
+            coeff_source = model.get("residual_cp_models") or model.get("coeff_cp_models") or []
+        cp_values = [float(v) for v in (model.get("control_period_values") or []) if isinstance(v, (int, float))]
+        cp_min = float(min(cp_values)) if cp_values else None
+        cp_max = float(max(cp_values)) if cp_values else None
+        for basis_idx, coeffs in enumerate(coeff_source or []):
+            coeff_list = [float(v) for v in coeffs]
+            padded = coeff_list + [""] * max(0, 4 - len(coeff_list))
+            ws_support.cell(support_row, 1).value = model_path
+            ws_support.cell(support_row, 2).value = family
+            ws_support.cell(support_row, 3).value = basis_idx
+            ws_support.cell(support_row, 4).value = cp_min
+            ws_support.cell(support_row, 5).value = cp_max
+            ws_support.cell(support_row, 6).value = padded[0] if len(padded) > 0 else ""
+            ws_support.cell(support_row, 7).value = padded[1] if len(padded) > 1 else ""
+            ws_support.cell(support_row, 8).value = padded[2] if len(padded) > 2 else ""
+            ws_support.cell(support_row, 9).value = padded[3] if len(padded) > 3 else ""
+            support_row += 1
+
+    for col_idx, width in {1: 18, 2: 28, 3: 28, 4: 40}.items():
+        ws_params.column_dimensions[get_column_letter(col_idx)].width = width
+    for col_idx, width in {1: 18, 2: 28, 3: 14, 4: 14, 5: 14, 6: 14, 7: 14, 8: 14, 9: 14}.items():
+        ws_support.column_dimensions[get_column_letter(col_idx)].width = width
+    return ws_params, ws_support
+
+
+def td_smart_solver_export_equation_workbook(
+    db_path: Path,
+    output_path: Path,
+    *,
+    result: Mapping[str, object],
+    plot_metadata: Mapping[str, object] | None = None,
+    progress_cb: Callable[[str], None] | None = None,
+) -> Path:
+    try:
+        from openpyxl import Workbook  # type: ignore
+        from openpyxl.styles import Alignment, Font, PatternFill  # type: ignore
+        from openpyxl.utils import get_column_letter  # type: ignore
+    except Exception as exc:  # pragma: no cover - depends on optional dep
+        raise RuntimeError(
+            "openpyxl is required to export Smart Solver equations to Excel. "
+            "Install it with `py -m pip install openpyxl` within the project environment."
+        ) from exc
+
+    export_model = td_smart_solver_exportable_model(result)
+    if export_model is None:
+        raise RuntimeError("No exportable Smart Solver model is available.")
+
+    path = Path(output_path).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    solver_result = dict(result or {})
+    metadata = dict(plot_metadata or {})
+    solver_variables = _td_smart_solver_export_variables_from_result(solver_result)
+    export_rows = _td_smart_solver_export_rows_from_result(solver_result)
+    if not export_rows:
+        raise RuntimeError("No Smart Solver fit points are available to export.")
+
+    _td_emit_progress(progress_cb, "Building Smart Solver Excel workbook")
+    wb = Workbook()
+    ws = wb.active
+    if ws is None:
+        ws = wb.create_sheet("Smart Solver Export")
+    ws.title = "Smart Solver Export"
+    ws_scenarios = wb.create_sheet("Scenario Calculator")
+    ws_checker = wb.create_sheet("Fit Point Checker")
+    _td_smart_solver_write_model_detail_sheets(workbook=wb, result=solver_result, solver_variables=solver_variables)
+
+    header_font = Font(bold=True)
+    header_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+    section_fill = PatternFill(start_color="E2F0D9", end_color="E2F0D9", fill_type="solid")
+    editable_fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+
+    metadata_rows: list[tuple[object, object]] = [
+        ("Export Timestamp", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+        ("Export Mode", "Smart Solver"),
+        ("Output Target", str(solver_result.get("output_target") or "").strip()),
+        ("Output Units", str(solver_result.get("output_units") or "").strip()),
+        ("Solver Branch", td_perf_fit_family_label(solver_result.get("solver_branch") or export_model.get("fit_family"))),
+        ("Selection Reason", str(solver_result.get("selection_reason") or "").strip()),
+        ("Uses Control Period", "Yes" if bool(solver_result.get("uses_control_period", True)) else "No"),
+        ("Uses Staged Mediator", "Yes" if bool(solver_result.get("uses_staged_mediator")) else "No"),
+        ("Run Count", int(solver_result.get("run_count") or 0)),
+        ("Serial Count", int(solver_result.get("serial_count") or 0)),
+        ("Sample Count", int(solver_result.get("sample_count") or 0)),
+        ("Asset Type", str(metadata.get("asset_type") or "").strip()),
+        ("Asset Specific Type", str(metadata.get("asset_specific_type") or "").strip()),
+        ("Run Selection", str(metadata.get("run_selection_label") or "Smart Equation Solver").strip()),
+        ("Member Runs", ", ".join(str(value).strip() for value in (metadata.get("member_runs") or []) if str(value).strip())),
+        ("Filter Summary", str(metadata.get("filter_summary") or "").strip()),
+        ("Configuration", str(metadata.get("config_text") or "").strip()),
+    ]
+    for row_idx, (label, value) in enumerate(metadata_rows, start=1):
+        ws.cell(row_idx, 1).value = label
+        ws.cell(row_idx, 2).value = value
+        ws.cell(row_idx, 1).font = header_font
+
+    variable_header_row = len(metadata_rows) + 2
+    for col_idx, value in enumerate(["Variable Key", "Target", "Units", "Role"], start=1):
+        cell = ws.cell(variable_header_row, col_idx)
+        cell.value = value
+        cell.font = header_font
+        cell.fill = section_fill
+    variable_row = variable_header_row + 1
+    for variable in solver_variables:
+        ws.cell(variable_row, 1).value = str(variable.get("key") or "")
+        ws.cell(variable_row, 2).value = str(variable.get("target") or "")
+        ws.cell(variable_row, 3).value = str(variable.get("units") or "")
+        ws.cell(variable_row, 4).value = str(variable.get("role") or "")
+        variable_row += 1
+
+    equation_header_row = variable_row + 1
+    for col_idx, value in enumerate(["Branch", "Equation", "Normalization"], start=1):
+        cell = ws.cell(equation_header_row, col_idx)
+        cell.value = value
+        cell.font = header_font
+        cell.fill = section_fill
+    ws.cell(equation_header_row + 1, 1).value = td_perf_fit_family_label(export_model.get("fit_family"))
+    ws.cell(equation_header_row + 1, 2).value = str(solver_result.get("equation") or "")
+    ws.cell(equation_header_row + 1, 3).value = str(solver_result.get("x_norm_equation") or "")
+
+    fit_table_row = equation_header_row + 4
+    _td_smart_solver_write_prediction_table(
+        ws,
+        start_row=fit_table_row,
+        result=solver_result,
+        rows=export_rows,
+        solver_variables=solver_variables,
+        include_residual_columns=True,
+        header_font=header_font,
+        header_fill=header_fill,
+    )
+    ws.freeze_panes = ws.cell(fit_table_row + 1, 1)
+    for col_idx, width in {1: 20, 2: 36, 3: 18, 4: 18}.items():
+        ws.column_dimensions[get_column_letter(col_idx)].width = max(width, float(ws.column_dimensions[get_column_letter(col_idx)].width or 0))
+
+    ws_scenarios.cell(1, 1).value = "Smart Solver Scenario Calculator"
+    ws_scenarios.cell(1, 1).font = header_font
+    ws_scenarios.cell(2, 1).value = "Edit the highlighted input cells to evaluate scenarios."
+    panel_row = 4
+    scenario_defined_refs: dict[str, str] = {}
+    for idx, variable in enumerate(solver_variables, start=0):
+        row_idx = panel_row + idx
+        key = str(variable.get("key") or "")
+        target = str(variable.get("target") or key)
+        units = str(variable.get("units") or "")
+        role = str(variable.get("role") or "")
+        ws_scenarios.cell(row_idx, 1).value = key
+        ws_scenarios.cell(row_idx, 1).font = header_font
+        input_cell = ws_scenarios.cell(row_idx, 2)
+        input_cell.fill = editable_fill
+        input_cell.alignment = Alignment(horizontal="center")
+        ws_scenarios.cell(row_idx, 3).value = " ".join(part for part in [target, f"({units})" if units else "", role] if str(part).strip()).strip()
+        defined_name = f"SmartSolver_{str(key).replace('-', '_')}"
+        _td_perf_add_defined_name(wb, name=defined_name, sheet_name=ws_scenarios.title, cell_ref=_td_perf_excel_ref(2, row_idx, absolute=True))
+        scenario_defined_refs[key] = defined_name
+    control_row = panel_row + len(solver_variables)
+    ws_scenarios.cell(control_row, 1).value = "control_period"
+    ws_scenarios.cell(control_row, 1).font = header_font
+    control_cell = ws_scenarios.cell(control_row, 2)
+    control_cell.fill = editable_fill
+    control_cell.alignment = Alignment(horizontal="center")
+    _td_perf_add_defined_name(wb, name="SmartSolver_Control_Period", sheet_name=ws_scenarios.title, cell_ref=_td_perf_excel_ref(2, control_row, absolute=True))
+    stage_spec = _td_smart_solver_stage_export_spec(solver_result)
+    stage_key = str(stage_spec.get("stage1_output_key") or "").strip()
+    stage_target = str(stage_spec.get("stage1_output_target") or "").strip()
+    stage_units = str(stage_spec.get("stage1_output_units") or "").strip()
+    output_row = control_row + 2
+    if bool(solver_result.get("uses_staged_mediator")) and stage_key:
+        ws_scenarios.cell(output_row, 4).value = stage_key
+        ws_scenarios.cell(output_row, 4).font = header_font
+        ws_scenarios.cell(output_row, 6).value = " ".join(part for part in [stage_target, f"({stage_units})" if stage_units else ""] if str(part).strip()).strip()
+    ws_scenarios.cell(output_row + 1, 4).value = "pred_mean"
+    ws_scenarios.cell(output_row + 1, 4).font = header_font
+    ws_scenarios.cell(output_row + 1, 6).value = str(solver_result.get("output_units") or "").strip()
+
+    calc_variable_refs = {key: name for key, name in scenario_defined_refs.items()}
+    calc_formula_specs = _td_smart_solver_formula_specs(
+        solver_result,
+        variable_refs=calc_variable_refs,
+        control_period_ref="SmartSolver_Control_Period",
+        stage1_output_ref=_td_perf_excel_ref(5, output_row) if bool(solver_result.get("uses_staged_mediator")) and stage_key else "",
+    )
+    if stage_key and stage_key in calc_formula_specs:
+        ws_scenarios.cell(output_row, 5).value = calc_formula_specs[stage_key]
+    ws_scenarios.cell(output_row + 1, 5).value = calc_formula_specs.get("pred_mean", "")
+
+    scenario_header_row = output_row + 4
+    scenario_headers = ["scenario_id"]
+    scenario_headers.extend([str(variable.get("key") or "").strip() for variable in solver_variables if str(variable.get("key") or "").strip()])
+    scenario_headers.append("control_period")
+    if bool(solver_result.get("uses_staged_mediator")) and stage_key:
+        scenario_headers.append(stage_key)
+    scenario_headers.append("pred_mean")
+    scenario_col_by_name = {name: idx for idx, name in enumerate(scenario_headers, start=1)}
+    for col_idx, name in enumerate(scenario_headers, start=1):
+        cell = ws_scenarios.cell(scenario_header_row, col_idx)
+        cell.value = name
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center")
+
+    for offset in range(50):
+        row_idx = scenario_header_row + 1 + offset
+        ws_scenarios.cell(row_idx, scenario_col_by_name["scenario_id"]).value = offset + 1
+        scenario_variable_refs: dict[str, str] = {}
+        for variable in solver_variables:
+            key = str(variable.get("key") or "").strip()
+            if not key:
+                continue
+            cell = ws_scenarios.cell(row_idx, scenario_col_by_name[key])
+            cell.fill = editable_fill
+            scenario_variable_refs[key] = _td_perf_excel_ref(scenario_col_by_name[key], row_idx)
+        control_period_ref = _td_perf_excel_ref(scenario_col_by_name["control_period"], row_idx)
+        ws_scenarios.cell(row_idx, scenario_col_by_name["control_period"]).fill = editable_fill
+        stage_ref = _td_perf_excel_ref(scenario_col_by_name[stage_key], row_idx) if stage_key and stage_key in scenario_col_by_name else ""
+        formula_specs = _td_smart_solver_formula_specs(
+            solver_result,
+            variable_refs=scenario_variable_refs,
+            control_period_ref=control_period_ref,
+            stage1_output_ref=stage_ref,
+        )
+        if stage_key and stage_key in formula_specs:
+            ws_scenarios.cell(row_idx, scenario_col_by_name[stage_key]).value = formula_specs[stage_key]
+        ws_scenarios.cell(row_idx, scenario_col_by_name["pred_mean"]).value = formula_specs.get("pred_mean", "")
+
+    for name, col_idx in scenario_col_by_name.items():
+        width = 16
+        if name == "scenario_id":
+            width = 12
+        elif name == "pred_mean" or name.startswith("stage1_pred_"):
+            width = 20
+        ws_scenarios.column_dimensions[get_column_letter(col_idx)].width = width
+    ws_scenarios.freeze_panes = ws_scenarios.cell(scenario_header_row + 1, 1)
+
+    _td_smart_solver_write_prediction_table(
+        ws_checker,
+        start_row=1,
+        result=solver_result,
+        rows=export_rows,
+        solver_variables=solver_variables,
+        include_residual_columns=True,
+        header_font=header_font,
+        header_fill=header_fill,
+    )
+    ws_checker.freeze_panes = "A2"
+
+    _td_emit_progress(progress_cb, "Saving Smart Solver Excel workbook")
     wb.save(str(path))
     wb.close()
     _td_emit_progress(progress_cb, f"Excel export ready: {path.name}")

@@ -209,7 +209,7 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
             if tmpdir:
                 shutil.rmtree(str(tmpdir), ignore_errors=True)
 
-    def test_smart_solver_exportability_ignores_solver_only_fit_families(self) -> None:
+    def test_smart_solver_exportability_accepts_supported_solver_families(self) -> None:
         window = self._make_window()
         try:
             window._smart_solver_result = {
@@ -217,14 +217,14 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
                     "fit_family": "quadratic_3input_control_period",
                 }
             }
-            self.assertFalse(window._smart_solver_has_exportable_model())
+            self.assertTrue(window._smart_solver_has_exportable_model())
         finally:
             window.close()
             tmpdir = getattr(window, "_test_tmpdir", "")
             if tmpdir:
                 shutil.rmtree(str(tmpdir), ignore_errors=True)
 
-    def test_export_smart_solver_equations_to_excel_reuses_performance_export_path(self) -> None:
+    def test_export_smart_solver_equations_to_excel_uses_dedicated_solver_export_path(self) -> None:
         window = self._make_window()
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
@@ -267,6 +267,15 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
                             "sample_count": 1,
                         }
                     ],
+                    "solver_variables": [
+                        {
+                            "key": "input_1",
+                            "target": "Input1",
+                            "units": "u",
+                            "role": "Primary",
+                            "is_optional": False,
+                        }
+                    ],
                     "output_target": "Output",
                     "output_units": "u",
                     "input1_target": "Input1",
@@ -277,9 +286,14 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
                     "input3_units": "",
                 }
                 export_calls: list[dict[str, object]] = []
+                dialog_defaults: list[str] = []
 
                 def _capture_start(output_path: Path, **kwargs):
                     export_calls.append({"output_path": Path(output_path), **kwargs})
+
+                def _capture_save_dialog(*args, **kwargs):
+                    dialog_defaults.append(str(args[2]))
+                    return (str(out_path), "Excel Files (*.xlsx)")
 
                 with patch.object(
                     TestDataTrendDialog,
@@ -287,14 +301,14 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
                     return_value=[30.0],
                 ), patch.object(
                     TestDataTrendDialog,
-                    "_start_perf_equation_excel_export",
+                    "_start_smart_solver_equation_excel_export",
                     side_effect=_capture_start,
                 ), patch(
                     "ui_next.qt_main.be.td_perf_collect_asset_metadata",
                     return_value={},
                 ), patch(
                     "ui_next.qt_main.QtWidgets.QFileDialog.getSaveFileName",
-                    return_value=(str(out_path), "Excel Files (*.xlsx)"),
+                    side_effect=_capture_save_dialog,
                 ), patch(
                     "ui_next.qt_main.QtWidgets.QMessageBox.information"
                 ) as info_mock, patch(
@@ -307,14 +321,11 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
                 self.assertEqual(len(export_calls), 1)
                 call = export_calls[0]
                 self.assertEqual(call["output_path"], out_path)
-                self.assertEqual(call["run_type_filter"], "pulsed_mode")
-                self.assertEqual(call["control_period_filter"], 30.0)
-                self.assertEqual(call["plot_metadata"]["performance_plot_method"], "cached_condition_means")
                 self.assertEqual(call["plot_metadata"]["selected_control_period"], 30.0)
-                self.assertEqual(call["results_by_stat"]["mean"]["master_model"]["fit_family"], "quadratic_curve_control_period")
-                self.assertEqual(call["run_specs"][0]["run_name"], "CondA")
-                self.assertEqual(call["export_rows_override"][0]["display_name"], "Condition A")
-                self.assertEqual(call["export_rows_override"][0]["serial"], "SN-001")
+                self.assertEqual(call["result"]["master_model"]["fit_family"], "quadratic_curve_control_period")
+                self.assertEqual(call["plot_metadata"]["solver_variables"][0]["target"], "Input1")
+                self.assertTrue(dialog_defaults)
+                self.assertIn("Output_vs_Input1", dialog_defaults[0])
         finally:
             window.close()
             tmpdir = getattr(window, "_test_tmpdir", "")
