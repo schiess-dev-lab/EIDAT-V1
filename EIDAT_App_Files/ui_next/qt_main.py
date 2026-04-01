@@ -9184,6 +9184,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         dropped_point_count = int((result or {}).get("dropped_point_count") or 0)
         solver_branch = str((result or {}).get("solver_branch") or "").strip()
         selection_reason = str((result or {}).get("selection_reason") or "").strip()
+        stability_ok = bool((result or {}).get("stability_ok"))
+        stage2_fit_source = str((result or {}).get("stage2_fit_source") or "").strip()
+        mediator_clamp_count = int((result or {}).get("mediator_clamp_count") or 0)
         summary_text = (
             "In-fit: "
             f"{float(in_fit_percent):.2f}% | Fell out: {fell_out_count} / {sample_count} | "
@@ -9202,6 +9205,11 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             solver_label = getattr(be, "td_perf_fit_family_label", None)
             solver_branch_text = solver_label(solver_branch) if callable(solver_label) else solver_branch
             summary_text = f"{summary_text} | Branch: {solver_branch_text}" if summary_text else f"Branch: {solver_branch_text}"
+        if stage2_fit_source:
+            summary_text = f"{summary_text} | Stage 2 source: {stage2_fit_source}" if summary_text else f"Stage 2 source: {stage2_fit_source}"
+        summary_text = f"{summary_text} | Stability: {'OK' if stability_ok else 'Review'}" if summary_text else f"Stability: {'OK' if stability_ok else 'Review'}"
+        if mediator_clamp_count > 0:
+            summary_text = f"{summary_text} | Mediator clamps: {mediator_clamp_count}" if summary_text else f"Mediator clamps: {mediator_clamp_count}"
         if selection_reason:
             summary_text = f"{summary_text} | {selection_reason}" if summary_text else selection_reason
         if hasattr(self, "lbl_smart_solver_equation"):
@@ -9224,6 +9232,14 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             )
             if seq_cap_warning not in warning_text:
                 warning_text = "\n".join([part for part in [warning_text, seq_cap_warning] if str(part).strip()])
+        if mediator_clamp_count > 0:
+            clamp_warning = f"Mediator clamp hits: {mediator_clamp_count}."
+            if clamp_warning not in warning_text:
+                warning_text = "\n".join([part for part in [warning_text, clamp_warning] if str(part).strip()])
+        if (result or {}).get("uses_staged_mediator") and stage2_fit_source:
+            stage_source_warning = f"Stage 2 fit source: {stage2_fit_source}."
+            if stage_source_warning not in warning_text:
+                warning_text = "\n".join([part for part in [warning_text, stage_source_warning] if str(part).strip()])
         if hasattr(self, "lbl_smart_solver_warning"):
             self.lbl_smart_solver_warning.setText(warning_text)
             self.lbl_smart_solver_warning.setVisible(bool(warning_text))

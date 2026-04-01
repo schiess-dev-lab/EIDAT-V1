@@ -9187,8 +9187,12 @@ class TestTDSupportWorkbook(unittest.TestCase):
                     "stage1_output_units": "u3",
                     "stage1_input_keys": ["input_1", "input_2"],
                     "stage2_input_key": "stage1_pred_input_3",
+                    "stage2_input_domain": [2.2, 6.6],
                 },
                 "sample_count": len(fit_points),
+                "stability_ok": True,
+                "stage2_fit_source": "actual_input_3",
+                "mediator_clamp_count": 2,
             }
             out_path = root / "smart_solver_staged.xlsx"
             be.td_smart_solver_export_equation_workbook(
@@ -9209,9 +9213,12 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 pred_formula = str(scenario_ws.cell(scenario_header_row + 1, scenario_headers.index("pred_mean") + 1).value or "")
                 self.assertTrue(stage_formula.startswith("="))
                 self.assertTrue(pred_formula.startswith("="))
+                self.assertIn("MIN(MAX(", pred_formula)
                 checker_ws = wb["Fit Point Checker"]
                 checker_headers = [str(checker_ws.cell(1, c).value or "").strip() for c in range(1, checker_ws.max_column + 1)]
                 self.assertIn("stage1_pred_input_3", checker_headers)
+                self.assertIn("stage1_clamped_input_3", checker_headers)
+                self.assertIn("stage1_residual_input_3", checker_headers)
             finally:
                 wb.close()
 

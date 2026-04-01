@@ -32,6 +32,12 @@ class _FakeArray(list):
     def tolist(self) -> list[float]:
         return list(self)
 
+    def __sub__(self, other):  # noqa: ANN001
+        return _FakeArray(float(a) - float(b) for a, b in zip(self, other))
+
+    def __pow__(self, power, modulo=None):  # noqa: ANN001
+        return _FakeArray(float(value) ** float(power) for value in self)
+
 
 class _FakeNumpy:
     @staticmethod
@@ -47,6 +53,21 @@ class _FakeNumpy:
         if len(ordered) % 2:
             return float(ordered[mid])
         return float((ordered[mid - 1] + ordered[mid]) / 2.0)
+
+    @staticmethod
+    def mean(values) -> float:  # noqa: ANN001
+        ordered = [float(value) for value in values]
+        if not ordered:
+            return 0.0
+        return float(sum(ordered) / len(ordered))
+
+    @staticmethod
+    def sqrt(value):  # noqa: ANN001
+        return math.sqrt(float(value))
+
+    @staticmethod
+    def abs(values):  # noqa: ANN001
+        return _FakeArray(abs(float(value)) for value in values)
 
 
 def _create_smart_solver_db(tmpdir: str, rows: list[dict[str, object]]) -> Path:
@@ -564,7 +585,7 @@ class TestBackendTdSmartSolver(unittest.TestCase):
         self.assertNotIn(1.0, captured["fit_xs"])
         self.assertNotIn(10.0, captured["fit_xs"])
 
-    def test_three_input_solver_prefers_direct_branch_when_staged_is_not_materially_better(self) -> None:
+    def test_three_input_solver_prefers_staged_branch_when_direct_is_not_materially_better(self) -> None:
         rows = _build_three_input_rows(control_periods=[40.0, 80.0])
         ordered_rows = sorted(rows, key=lambda row: str(row["observation_id"]))
         direct_support = {
@@ -599,9 +620,18 @@ class TestBackendTdSmartSolver(unittest.TestCase):
         }
         staged_model = {
             "fit_family": backend.TD_PERF_FIT_FAMILY_STAGED_MEDIATOR_CONTROL_PERIOD,
-            "equation": "y = staged",
-            "x_norm_equation": "x' = staged",
-            "rmse": 0.99,
+            "equation": "x3_hat = f(...); y = g(...)",
+            "x_norm_equation": "x3' = f(...); y' = g(...)",
+            "rmse": 1.0,
+            "stage1_model": {
+                "fit_family": backend.TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD,
+            },
+            "stage2_model": {
+                "fit_family": backend.TD_PERF_FIT_FAMILY_QUADRATIC_CURVE_CONTROL_PERIOD,
+            },
+            "stage2_fit_source": "actual_input_3",
+            "mediator_clamp_count": 0,
+            "stage1_rmse": 0.0,
         }
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             db_path = _create_smart_solver_db(tmpdir, rows)
@@ -623,6 +653,14 @@ class TestBackendTdSmartSolver(unittest.TestCase):
                 return_value=[float(row["output"]) for row in ordered_rows],
             ), patch.object(
                 backend,
+                "td_perf_predict_surface",
+                return_value=[float(row["input_3"]) for row in ordered_rows],
+            ), patch.object(
+                backend,
+                "td_perf_predict_model",
+                return_value=[float(row["output"]) for row in ordered_rows],
+            ), patch.object(
+                backend,
                 "_td_perf_import_numpy",
                 return_value=_FakeNumpy,
             ):
@@ -636,16 +674,16 @@ class TestBackendTdSmartSolver(unittest.TestCase):
                     serials=["SN-001"],
                 )
 
-        self.assertEqual(result["fit_family"], backend.TD_PERF_FIT_FAMILY_QUADRATIC_3INPUT_CONTROL_PERIOD)
-        self.assertEqual(result["solver_branch"], backend.TD_PERF_FIT_FAMILY_QUADRATIC_3INPUT_CONTROL_PERIOD)
+        self.assertEqual(result["fit_family"], backend.TD_PERF_FIT_FAMILY_STAGED_MEDIATOR_CONTROL_PERIOD)
+        self.assertEqual(result["solver_branch"], backend.TD_PERF_FIT_FAMILY_STAGED_MEDIATOR_CONTROL_PERIOD)
         self.assertEqual(result["input3_target"], "Input3")
-        self.assertEqual(result["candidate_scores"]["selected"], backend.TD_PERF_FIT_FAMILY_QUADRATIC_3INPUT_CONTROL_PERIOD)
-        self.assertIn("did not improve RMSE by at least 5%", result["selection_reason"])
+        self.assertEqual(result["candidate_scores"]["selected"], backend.TD_PERF_FIT_FAMILY_STAGED_MEDIATOR_CONTROL_PERIOD)
+        self.assertIn("did not improve final RMSE by more than 5%", result["selection_reason"])
         self.assertEqual(result["slice_rows"][0]["distinct_input_3"], 10)
         self.assertIn("Correlation helper", result["variable_descriptors"]["input3"])
         self.assertTrue(all("input_3" in point for point in result["fit_points"]))
 
-    def test_three_input_solver_uses_staged_branch_when_it_beats_direct_by_five_percent(self) -> None:
+    def test_three_input_solver_prefers_direct_branch_when_it_improves_final_rmse_by_more_than_five_percent(self) -> None:
         rows = _build_three_input_rows(control_periods=[40.0, 80.0])
         ordered_rows = sorted(rows, key=lambda row: str(row["observation_id"]))
         direct_support = {
@@ -672,6 +710,8 @@ class TestBackendTdSmartSolver(unittest.TestCase):
                 },
             ],
         }
+        direct_predictions = [float(row["output"]) for row in ordered_rows]
+        staged_predictions = [float(row["output"]) + 15.0 for row in ordered_rows]
         staged_model = {
             "fit_family": backend.TD_PERF_FIT_FAMILY_STAGED_MEDIATOR_CONTROL_PERIOD,
             "equation": "x3_hat = f(...); y = g(...)",
@@ -683,6 +723,9 @@ class TestBackendTdSmartSolver(unittest.TestCase):
             "stage2_model": {
                 "fit_family": backend.TD_PERF_FIT_FAMILY_QUADRATIC_CURVE_CONTROL_PERIOD,
             },
+            "stage2_fit_source": "actual_input_3",
+            "mediator_clamp_count": 0,
+            "stage1_rmse": 0.0,
             "stage1_slice_rows": [
                 {"control_period": 40.0, "eligible": True, "reason": ""},
                 {"control_period": 80.0, "eligible": True, "reason": ""},
@@ -713,6 +756,113 @@ class TestBackendTdSmartSolver(unittest.TestCase):
                 return_value=staged_model,
             ), patch.object(
                 backend,
+                "_td_perf_predict_quadratic_3input_control_period",
+                return_value=direct_predictions,
+            ), patch.object(
+                backend,
+                "td_perf_predict_surface",
+                return_value=[float(row["input_3"]) for row in ordered_rows],
+            ), patch.object(
+                backend,
+                "td_perf_predict_model",
+                return_value=staged_predictions,
+            ), patch.object(
+                backend,
+                "_td_perf_import_numpy",
+                return_value=_FakeNumpy,
+            ):
+                result = backend.td_smart_solver_run(
+                    db_path,
+                    output_target="Output",
+                    input1_target="Input1",
+                    input2_target="Input2",
+                    input3_target="Input3",
+                    runs=["CondA"],
+                    serials=["SN-001"],
+                )
+
+        self.assertEqual(result["fit_family"], backend.TD_PERF_FIT_FAMILY_QUADRATIC_3INPUT_CONTROL_PERIOD)
+        self.assertEqual(result["candidate_scores"]["selected"], backend.TD_PERF_FIT_FAMILY_QUADRATIC_3INPUT_CONTROL_PERIOD)
+        self.assertIn("improved final RMSE by more than 5%", result["selection_reason"])
+        self.assertEqual(result["slice_rows"][0]["distinct_input_3"], 10)
+        self.assertEqual(result["solver_branch"], backend.TD_PERF_FIT_FAMILY_QUADRATIC_3INPUT_CONTROL_PERIOD)
+
+    def test_three_input_solver_prefers_stable_staged_branch_over_unstable_direct_candidate(self) -> None:
+        rows = _build_three_input_rows(control_periods=[40.0, 80.0])
+        ordered_rows = sorted(rows, key=lambda row: str(row["observation_id"]))
+        direct_support = {
+            "eligible_control_period_values": [40.0, 80.0],
+            "ignored_control_periods": [
+                {
+                    "control_period": 120.0,
+                    "point_count": 10,
+                    "distinct_x1": 10,
+                    "distinct_x2": 10,
+                    "distinct_x3": 10,
+                    "eligible": False,
+                    "reason": "12 points (<12)",
+                }
+            ],
+            "slice_rows": [
+                {
+                    "control_period": 40.0,
+                    "point_count": 10,
+                    "distinct_x1": 10,
+                    "distinct_x2": 10,
+                    "distinct_x3": 10,
+                    "eligible": True,
+                    "reason": "",
+                },
+                {
+                    "control_period": 80.0,
+                    "point_count": 10,
+                    "distinct_x1": 10,
+                    "distinct_x2": 10,
+                    "distinct_x3": 10,
+                    "eligible": True,
+                    "reason": "",
+                },
+            ],
+        }
+        staged_model = {
+            "fit_family": backend.TD_PERF_FIT_FAMILY_STAGED_MEDIATOR_CONTROL_PERIOD,
+            "equation": "x3_hat = f(...); y = g(...)",
+            "x_norm_equation": "x3' = f(...); y' = g(...)",
+            "stage1_model": {
+                "fit_family": backend.TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD,
+            },
+            "stage2_model": {
+                "fit_family": backend.TD_PERF_FIT_FAMILY_QUADRATIC_CURVE_CONTROL_PERIOD,
+            },
+            "stage2_fit_source": "stage1_pred_input_3",
+            "mediator_clamp_count": 0,
+            "stage1_rmse": 0.0,
+        }
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            db_path = _create_smart_solver_db(tmpdir, rows)
+            with patch.object(
+                backend,
+                "_td_perf_analyze_quadratic_3input_control_period_fit_support",
+                return_value=direct_support,
+            ), patch.object(
+                backend,
+                "_td_perf_fit_quadratic_3input_control_period_model",
+                return_value={
+                    "fit_family": backend.TD_PERF_FIT_FAMILY_QUADRATIC_3INPUT_CONTROL_PERIOD,
+                    "equation": "y = direct",
+                    "x_norm_equation": "x' = direct",
+                    "rmse": 0.1,
+                },
+            ), patch.object(
+                backend,
+                "_td_perf_fit_staged_mediator_control_period_model",
+                return_value=staged_model,
+            ), patch.object(
+                backend,
+                "_td_perf_predict_quadratic_3input_control_period",
+                return_value=[float(row["output"]) for row in ordered_rows],
+            ), patch.object(
+                backend,
                 "td_perf_predict_surface",
                 return_value=[float(row["input_3"]) for row in ordered_rows],
             ), patch.object(
@@ -735,11 +885,160 @@ class TestBackendTdSmartSolver(unittest.TestCase):
                 )
 
         self.assertEqual(result["fit_family"], backend.TD_PERF_FIT_FAMILY_STAGED_MEDIATOR_CONTROL_PERIOD)
-        self.assertEqual(result["candidate_scores"]["selected"], backend.TD_PERF_FIT_FAMILY_STAGED_MEDIATOR_CONTROL_PERIOD)
-        self.assertIn("improved RMSE by at least 5%", result["selection_reason"])
-        self.assertEqual(result["slice_rows"][0]["distinct_input_3"], 10)
-        self.assertEqual(result["master_model"]["stage1_model"]["fit_family"], backend.TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD)
-        self.assertEqual(result["master_model"]["stage2_model"]["fit_family"], backend.TD_PERF_FIT_FAMILY_QUADRATIC_CURVE_CONTROL_PERIOD)
+        self.assertTrue(bool(result["candidate_scores"]["staged"]["stability_ok"]))
+        self.assertFalse(bool(result["candidate_scores"]["direct"]["stability_ok"]))
+        self.assertIn("stable while the direct 3-input branch was not", result["selection_reason"])
+
+    def test_three_input_support_rejects_under_supported_slices_with_tighter_thresholds(self) -> None:
+        rows = _build_three_input_rows(control_periods=[40.0, 80.0])
+        x1_values = [float(row["input_1"]) for row in rows]
+        x2_values = [float(row["input_2"]) for row in rows]
+        x3_values = [float(row["input_3"]) for row in rows]
+        y_values = [float(row["output"]) for row in rows]
+        cp_values = [float(row["control_period"]) for row in rows]
+
+        support = backend._td_perf_analyze_quadratic_3input_control_period_fit_support(
+            x1_values,
+            x2_values,
+            x3_values,
+            y_values,
+            cp_values,
+            min_points=backend.TD_SMART_SOLVER_DIRECT_3INPUT_MIN_POINTS,
+            min_distinct_x1=backend.TD_SMART_SOLVER_DIRECT_3INPUT_MIN_DISTINCT_X,
+            min_distinct_x2=backend.TD_SMART_SOLVER_DIRECT_3INPUT_MIN_DISTINCT_X,
+            min_distinct_x3=backend.TD_SMART_SOLVER_DIRECT_3INPUT_MIN_DISTINCT_X,
+        )
+
+        self.assertEqual(support["eligible_control_period_values"], [])
+        self.assertIn("(<12)", str(support["ignored_control_periods"][0]["reason"]))
+
+    def test_staged_mediator_model_can_choose_stage1_pred_source_when_it_reduces_fallout(self) -> None:
+        x1s = [0.8, 1.2, 1.6, 2.0]
+        x2s = [1.0, 1.3, 1.6, 1.9]
+        x3s = [2.0, 2.4, 2.8, 3.2]
+        ys = [120.0, 130.0, 140.0, 150.0]
+        cps = [40.0, 40.0, 80.0, 80.0]
+        stage1_model = {
+            "fit_family": backend.TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD,
+            "ignored_control_periods": [],
+        }
+        stage2_actual = {
+            "fit_family": backend.TD_PERF_FIT_FAMILY_HYBRID_QUADRATIC_RESIDUAL_CONTROL_PERIOD,
+            "fit_domain": [2.0, 3.2],
+            "ignored_control_periods": [],
+            "fallback_used": False,
+        }
+        stage2_pred = {
+            "fit_family": backend.TD_PERF_FIT_FAMILY_HYBRID_QUADRATIC_RESIDUAL_CONTROL_PERIOD,
+            "fit_domain": [1.5, 3.5],
+            "ignored_control_periods": [],
+            "fallback_used": False,
+        }
+        with patch.object(
+            backend,
+            "_td_perf_analyze_quadratic_surface_control_period_fit_support",
+            return_value={"slice_rows": []},
+        ), patch.object(
+            backend,
+            "_td_perf_fit_quadratic_surface_control_period_model",
+            return_value=stage1_model,
+        ), patch.object(
+            backend,
+            "_td_perf_analyze_quadratic_curve_control_period_fit_support",
+            return_value={"slice_rows": [], "ignored_control_periods": []},
+        ), patch.object(
+            backend,
+            "_td_perf_fit_quadratic_curve_control_period_model",
+            return_value={"fit_family": backend.TD_PERF_FIT_FAMILY_QUADRATIC_CURVE_CONTROL_PERIOD},
+        ), patch.object(
+            backend,
+            "_td_perf_fit_hybrid_quadratic_residual_control_period_model",
+            side_effect=[stage2_actual, stage2_pred],
+        ), patch.object(
+            backend,
+            "td_perf_predict_surface",
+            return_value=[1.8, 2.2, 2.6, 3.0],
+        ), patch.object(
+            backend,
+            "td_perf_predict_model",
+            side_effect=[
+                [95.0, 98.0, 101.0, 104.0],
+                [120.0, 130.0, 140.0, 150.0],
+            ],
+        ):
+            model = backend._td_perf_fit_staged_mediator_control_period_model(
+                x1s,
+                x2s,
+                x3s,
+                ys,
+                cps,
+                mediator_target="Input3",
+                fit_mode=backend.TD_PERF_FIT_MODE_POLYNOMIAL_SURFACE,
+            )
+
+        self.assertIsNotNone(model)
+        assert model is not None
+        self.assertEqual(model["stage2_fit_source"], "stage1_pred_input_3")
+        self.assertEqual(int(model["mediator_clamp_count"] or 0), 0)
+
+    def test_staged_solver_surfaces_mediator_clamp_counts_in_result_and_warning(self) -> None:
+        rows = _build_three_input_rows(control_periods=[40.0, 80.0])
+        ordered_rows = sorted(rows, key=lambda row: str(row["observation_id"]))
+        staged_model = {
+            "fit_family": backend.TD_PERF_FIT_FAMILY_STAGED_MEDIATOR_CONTROL_PERIOD,
+            "equation": "x3_hat = f(...); y = g(...)",
+            "x_norm_equation": "x3' = f(...); y' = g(...)",
+            "stage1_model": {
+                "fit_family": backend.TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD,
+            },
+            "stage2_model": {
+                "fit_family": backend.TD_PERF_FIT_FAMILY_QUADRATIC_CURVE_CONTROL_PERIOD,
+            },
+            "stage2_fit_source": "actual_input_3",
+            "stage2_input_domain": [0.0, 1.0],
+            "mediator_clamp_count": 2,
+            "stage1_rmse": 0.5,
+        }
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            db_path = _create_smart_solver_db(tmpdir, rows)
+            with patch.object(
+                backend,
+                "_td_perf_analyze_quadratic_3input_control_period_fit_support",
+                return_value={"eligible_control_period_values": [], "ignored_control_periods": []},
+            ), patch.object(
+                backend,
+                "_td_perf_fit_quadratic_3input_control_period_model",
+                return_value=None,
+            ), patch.object(
+                backend,
+                "_td_perf_fit_staged_mediator_control_period_model",
+                return_value=staged_model,
+            ), patch.object(
+                backend,
+                "td_perf_predict_surface",
+                return_value=[2.0 for _row in ordered_rows],
+            ), patch.object(
+                backend,
+                "td_perf_predict_model",
+                return_value=[float(row["output"]) for row in ordered_rows],
+            ), patch.object(
+                backend,
+                "_td_perf_import_numpy",
+                return_value=_FakeNumpy,
+            ):
+                result = backend.td_smart_solver_run(
+                    db_path,
+                    output_target="Output",
+                    input1_target="Input1",
+                    input2_target="Input2",
+                    input3_target="Input3",
+                    runs=["CondA"],
+                    serials=["SN-001"],
+                )
+
+        self.assertEqual(int(result["mediator_clamp_count"] or 0), 2)
+        self.assertIn("Mediator clamp hits: 2.", str(result["warning_text"] or ""))
+        self.assertTrue(any("stage1_clamped_input_3" in row for row in (result.get("fit_points") or [])))
 
     def test_three_input_solver_requires_input2_before_input3(self) -> None:
         rows = _build_three_input_rows(control_periods=[40.0, 80.0])

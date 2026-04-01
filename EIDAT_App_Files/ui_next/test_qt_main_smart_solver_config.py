@@ -158,6 +158,39 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
             if tmpdir:
                 shutil.rmtree(str(tmpdir), ignore_errors=True)
 
+    def test_render_smart_solver_result_shows_stability_and_clamp_details(self) -> None:
+        window = self._make_window()
+        try:
+            window._render_smart_solver_result(
+                {
+                    "equation": "y = x",
+                    "x_norm_equation": "x' = x",
+                    "rmse": 1.5,
+                    "residual_threshold": 3.0,
+                    "in_fit_percent": 80.0,
+                    "fell_out_count": 2,
+                    "sample_count": 10,
+                    "warning_text": "",
+                    "slice_rows": [],
+                    "solver_branch": "staged_mediator_control_period",
+                    "selection_reason": "Test stability summary.",
+                    "uses_staged_mediator": True,
+                    "stability_ok": False,
+                    "stage2_fit_source": "stage1_pred_input_3",
+                    "mediator_clamp_count": 3,
+                }
+            )
+
+            self.assertIn("Stability: Review", window.lbl_smart_solver_summary.text())
+            self.assertIn("Mediator clamps: 3", window.lbl_smart_solver_summary.text())
+            self.assertIn("stage1_pred_input_3", window.lbl_smart_solver_warning.text())
+            self.assertIn("Mediator clamp hits: 3.", window.lbl_smart_solver_warning.text())
+        finally:
+            window.close()
+            tmpdir = getattr(window, "_test_tmpdir", "")
+            if tmpdir:
+                shutil.rmtree(str(tmpdir), ignore_errors=True)
+
     def test_smart_solver_config_popup_rejects_duplicate_input3_selection(self) -> None:
         window = self._make_window()
         try:
