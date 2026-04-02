@@ -22926,6 +22926,11 @@ def _td_perf_matlab_bool(value: object) -> str:
     return "true" if bool(value) else "false"
 
 
+def _td_perf_matlab_bool_vector(values: Sequence[object]) -> str:
+    items = [_td_perf_matlab_bool(value) for value in (values or [])]
+    return "[" + " ".join(items) + "]" if items else "[]"
+
+
 def _td_perf_matlab_optional_num(value: object, *, empty: str = "[]") -> str:
     if value in (None, ""):
         return empty
@@ -23334,6 +23339,7 @@ def _td_smart_solver_matlab_argument_specs(
 
 def _td_smart_solver_matlab_metadata_lines(
     *,
+    func_name: str,
     result: Mapping[str, object],
     plot_metadata: Mapping[str, object],
     solver_variables: Sequence[Mapping[str, object]],
@@ -23344,18 +23350,34 @@ def _td_smart_solver_matlab_metadata_lines(
     fell_out_count = int(result.get("fell_out_count") or 0)
     fell_out_percent = float((100.0 * fell_out_count / sample_count) if sample_count > 0 else 0.0)
     selected_control_period = plot_metadata.get("selected_control_period")
+    if selected_control_period in (None, ""):
+        selected_control_period = result.get("selected_control_period")
+    stage_spec = _td_smart_solver_stage_export_spec(result)
+    argument_names = [str(spec.get("name") or "").strip() for spec in argument_specs if str(spec.get("name") or "").strip()]
+    prediction_usage = f"y = {func_name}({', '.join(argument_names)})" if argument_names else f"y = {func_name}()"
+    metadata_usage = f"meta = {func_name}('metadata')"
+    member_runs = [str(value or "").strip() for value in (plot_metadata.get("member_runs") or []) if str(value or "").strip()]
+    run_selection_label = str(plot_metadata.get("run_selection_label") or "").strip()
+    run_type_mode = str(plot_metadata.get("run_type_mode") or result.get("run_type_mode") or "").strip()
+    input_keys = [str(variable.get("key") or "").strip() for variable in solver_variables]
+    input_is_optional = [bool(variable.get("is_optional")) for variable in solver_variables]
     input_targets = [str(variable.get("target") or "").strip() for variable in solver_variables]
     input_units = [str(variable.get("units") or "").strip() for variable in solver_variables]
     input_roles = [str(variable.get("role") or "").strip() for variable in solver_variables]
-    argument_names = [str(spec.get("name") or "").strip() for spec in argument_specs if str(spec.get("name") or "").strip()]
+    stage2_input_domain = stage_spec.get("stage2_input_domain") or []
     return [
         "function meta = local_metadata()",
         "meta = struct();",
+        f"meta.function_name = {_td_perf_matlab_quote(func_name)};",
+        f"meta.prediction_usage = {_td_perf_matlab_quote(prediction_usage)};",
+        f"meta.metadata_usage = {_td_perf_matlab_quote(metadata_usage)};",
         f"meta.output_target = {_td_perf_matlab_quote(result.get('output_target') or plot_metadata.get('output_target') or '')};",
         f"meta.output_units = {_td_perf_matlab_quote(result.get('output_units') or plot_metadata.get('output_units') or '')};",
+        f"meta.input_keys = {_td_perf_matlab_cellstr(input_keys)};",
         f"meta.input_targets = {_td_perf_matlab_cellstr(input_targets)};",
         f"meta.input_units = {_td_perf_matlab_cellstr(input_units)};",
         f"meta.input_roles = {_td_perf_matlab_cellstr(input_roles)};",
+        f"meta.input_is_optional = {_td_perf_matlab_bool_vector(input_is_optional)};",
         f"meta.argument_names = {_td_perf_matlab_cellstr(argument_names)};",
         f"meta.equation_text = {_td_perf_matlab_quote(result.get('equation') or '')};",
         f"meta.normalization_text = {_td_perf_matlab_quote(result.get('x_norm_equation') or '')};",
@@ -23378,6 +23400,15 @@ def _td_smart_solver_matlab_metadata_lines(
         f"meta.serial_count = {_td_perf_matlab_num(result.get('serial_count'))};",
         f"meta.stage2_fit_source = {_td_perf_matlab_quote(result.get('stage2_fit_source') or '')};",
         f"meta.mediator_clamp_count = {_td_perf_matlab_num(result.get('mediator_clamp_count'))};",
+        f"meta.run_selection_label = {_td_perf_matlab_quote(run_selection_label)};",
+        f"meta.member_runs = {_td_perf_matlab_cellstr(member_runs)};",
+        f"meta.run_type_mode = {_td_perf_matlab_quote(run_type_mode)};",
+        f"meta.stage1_output_key = {_td_perf_matlab_quote(stage_spec.get('stage1_output_key') or '')};",
+        f"meta.stage1_output_target = {_td_perf_matlab_quote(stage_spec.get('stage1_output_target') or '')};",
+        f"meta.stage1_output_units = {_td_perf_matlab_quote(stage_spec.get('stage1_output_units') or '')};",
+        f"meta.stage1_input_keys = {_td_perf_matlab_cellstr(stage_spec.get('stage1_input_keys') or [])};",
+        f"meta.stage2_input_key = {_td_perf_matlab_quote(stage_spec.get('stage2_input_key') or '')};",
+        f"meta.stage2_input_domain = {_td_perf_matlab_vector(stage2_input_domain)};",
         f"meta.asset_type = {_td_perf_matlab_quote(plot_metadata.get('asset_type') or '')};",
         f"meta.asset_specific_type = {_td_perf_matlab_quote(plot_metadata.get('asset_specific_type') or '')};",
         f"meta.filter_summary = {_td_perf_matlab_quote(plot_metadata.get('filter_summary') or '')};",
@@ -23398,15 +23429,30 @@ def _td_smart_solver_matlab_example_literal(value: object) -> str:
         return _td_perf_matlab_quote(value)
 
 
-def _td_smart_solver_matlab_validation_example_lines(
+TD_SMART_SOLVER_MATLAB_EXPORT_MODE_CLEAN = "clean"
+TD_SMART_SOLVER_MATLAB_EXPORT_MODE_REGRESSION_CHECKS = "regression_checks"
+
+
+def _td_smart_solver_normalize_matlab_export_mode(value: object) -> str:
+    text = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if text in {"clean", "clean_export"}:
+        return TD_SMART_SOLVER_MATLAB_EXPORT_MODE_CLEAN
+    if text in {
+        "regression_checks",
+        "with_regression_checks",
+        "export_with_regression_checks",
+    }:
+        return TD_SMART_SOLVER_MATLAB_EXPORT_MODE_REGRESSION_CHECKS
+    return TD_SMART_SOLVER_MATLAB_EXPORT_MODE_REGRESSION_CHECKS
+
+
+def _td_smart_solver_matlab_example_row(
     *,
-    func_name: str,
-    result: Mapping[str, object],
     export_rows: Sequence[Mapping[str, object]],
     argument_specs: Sequence[Mapping[str, object]],
-) -> list[str]:
+) -> dict[str, object]:
     if not export_rows:
-        return []
+        return {}
     required_keys = [
         ("control_period" if bool(spec.get("is_control_period")) else str(spec.get("key") or "").strip())
         for spec in argument_specs
@@ -23419,6 +23465,45 @@ def _td_smart_solver_matlab_validation_example_lines(
         ),
         dict(export_rows[0]),
     )
+    return example_row if example_row else {}
+
+
+def _td_smart_solver_matlab_clean_example_lines(
+    *,
+    func_name: str,
+    export_rows: Sequence[Mapping[str, object]],
+    argument_specs: Sequence[Mapping[str, object]],
+) -> list[str]:
+    example_row = _td_smart_solver_matlab_example_row(export_rows=export_rows, argument_specs=argument_specs)
+    if not example_row:
+        return []
+
+    lines: list[str] = [
+        "% Example inputs to paste into MATLAB.",
+        "if false",
+    ]
+    call_args: list[str] = []
+    for spec in argument_specs:
+        name = str(spec.get("name") or "").strip()
+        row_key = "control_period" if bool(spec.get("is_control_period")) else str(spec.get("key") or "").strip()
+        if not name or not row_key:
+            continue
+        lines.append(f"    {name} = {_td_smart_solver_matlab_example_literal(example_row.get(row_key))};")
+        call_args.append(name)
+    call_expr = f"{func_name}({', '.join(call_args)})" if call_args else f"{func_name}()"
+    lines.append(f"    y = {call_expr};")
+    lines.extend(["end", ""])
+    return lines
+
+
+def _td_smart_solver_matlab_validation_example_lines(
+    *,
+    func_name: str,
+    result: Mapping[str, object],
+    export_rows: Sequence[Mapping[str, object]],
+    argument_specs: Sequence[Mapping[str, object]],
+) -> list[str]:
+    example_row = _td_smart_solver_matlab_example_row(export_rows=export_rows, argument_specs=argument_specs)
     if not example_row:
         return []
 
@@ -23468,6 +23553,7 @@ def td_smart_solver_export_equation_matlab(
     *,
     result: Mapping[str, object],
     plot_metadata: Mapping[str, object] | None = None,
+    export_mode: object = TD_SMART_SOLVER_MATLAB_EXPORT_MODE_REGRESSION_CHECKS,
     progress_cb: Callable[[str], None] | None = None,
 ) -> Path:
     export_model = td_smart_solver_exportable_model(result)
@@ -23489,6 +23575,8 @@ def td_smart_solver_export_equation_matlab(
     path = Path(output_path).expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
     func_name = _td_perf_matlab_identifier(path.stem, prefix="eidat_smart_solver")
+    matlab_export_mode = _td_smart_solver_normalize_matlab_export_mode(export_mode)
+    include_regression_checks = matlab_export_mode == TD_SMART_SOLVER_MATLAB_EXPORT_MODE_REGRESSION_CHECKS
     uses_control_period = bool(solver_result.get("uses_control_period", True))
     argument_specs = _td_smart_solver_matlab_argument_specs(solver_variables, uses_control_period=uses_control_period)
     variable_arg_map = {
@@ -23530,40 +23618,67 @@ def td_smart_solver_export_equation_matlab(
     predict_usage = f"y = {func_name}({', '.join(predict_args)})"
     metadata_usage = f"meta = {func_name}('metadata')"
     output_label = _td_perf_matlab_input_label(output_target, fallback="output")
+    input_names_text = ", ".join(predict_args)
 
-    _td_emit_progress(progress_cb, "Building Smart Solver MATLAB file")
-    lines: list[str] = [
-        f"function out = {func_name}(varargin)",
-        "% Auto-generated by EIDAT Smart Solver MATLAB export.",
-        f"% Prediction usage: {predict_usage}",
-        f"% Metadata usage: {metadata_usage}",
-        f"% Inputs: {', '.join(input_descriptions)}",
-        f"% Output: y is predicted {output_label}; scalar and array inputs are evaluated element-wise.",
-        "% Call with 'metadata' to inspect equation text, normalization, solver stats, and imported variable definitions.",
-        "",
-    ]
-    lines.extend(
-        _td_smart_solver_matlab_validation_example_lines(
-            func_name=func_name,
-            result=solver_result,
-            export_rows=export_rows,
-            argument_specs=argument_specs,
-        )
-    )
-    lines.extend(
-        [
-            "if nargin == 1",
-            "    request = varargin{1};",
-            "    if (ischar(request) || (isstring(request) && isscalar(request))) && strcmpi(char(request), 'metadata')",
-            "        out = local_metadata();",
-            "        return;",
-            "    end",
-            "end",
-            f"if nargin ~= {len(predict_args)}",
-            f"    error('{func_name}:Usage', 'Usage: {predict_usage}; meta = {func_name}(''metadata'');');",
-            "end",
+    progress_label = "Building Smart Solver MATLAB file"
+    if matlab_export_mode == TD_SMART_SOLVER_MATLAB_EXPORT_MODE_CLEAN:
+        progress_label = "Building clean Smart Solver MATLAB file"
+    _td_emit_progress(progress_cb, progress_label)
+    if include_regression_checks:
+        lines: list[str] = [
+            f"function out = {func_name}(varargin)",
+            "% Auto-generated by EIDAT Smart Solver MATLAB export.",
+            f"% Prediction usage: {predict_usage}",
+            f"% Metadata usage: {metadata_usage}",
+            f"% Inputs: {', '.join(input_descriptions)}",
+            f"% Output: y is predicted {output_label}; scalar and array inputs are evaluated element-wise.",
+            "% Call with 'metadata' to inspect equation text, normalization, solver stats, and imported variable definitions.",
+            "",
         ]
-    )
+        lines.extend(
+            _td_smart_solver_matlab_validation_example_lines(
+                func_name=func_name,
+                result=solver_result,
+                export_rows=export_rows,
+                argument_specs=argument_specs,
+            )
+        )
+        lines.extend(
+            [
+                "if nargin == 1",
+                "    request = varargin{1};",
+                "    if (ischar(request) || (isstring(request) && isscalar(request))) && strcmpi(char(request), 'metadata')",
+                "        out = local_metadata();",
+                "        return;",
+                "    end",
+                "end",
+                f"if nargin ~= {len(predict_args)}",
+                f"    error('{func_name}:Usage', 'Usage: {predict_usage}; meta = {func_name}(''metadata'');');",
+                "end",
+            ]
+        )
+    else:
+        lines = [
+            f"function out = {func_name}(varargin)",
+            "% Auto-generated by EIDAT Smart Solver MATLAB export.",
+            f"% Usage: {predict_usage}",
+            f"% Inputs: {input_names_text}",
+            "",
+        ]
+        lines.extend(
+            _td_smart_solver_matlab_clean_example_lines(
+                func_name=func_name,
+                export_rows=export_rows,
+                argument_specs=argument_specs,
+            )
+        )
+        lines.extend(
+            [
+                f"if nargin ~= {len(predict_args)}",
+                f"    error('{func_name}:Usage', 'Usage: {predict_usage};');",
+                "end",
+            ]
+        )
     for idx, spec in enumerate(argument_specs, start=1):
         arg_name = str(spec.get("name") or "").strip()
         lines.append(f"{arg_name} = varargin{{{idx}}};")
@@ -23574,14 +23689,16 @@ def td_smart_solver_export_equation_matlab(
             "",
         ]
     )
-    lines.extend(
-        _td_smart_solver_matlab_metadata_lines(
-            result=solver_result,
-            plot_metadata=metadata,
-            solver_variables=solver_variables,
-            argument_specs=argument_specs,
+    if include_regression_checks:
+        lines.extend(
+            _td_smart_solver_matlab_metadata_lines(
+                func_name=func_name,
+                result=solver_result,
+                plot_metadata=metadata,
+                solver_variables=solver_variables,
+                argument_specs=argument_specs,
+            )
         )
-    )
     lines.extend(_td_perf_matlab_helper_lines())
     _td_emit_progress(progress_cb, "Saving Smart Solver MATLAB file")
     path.write_text("\n".join(lines), encoding="utf-8")

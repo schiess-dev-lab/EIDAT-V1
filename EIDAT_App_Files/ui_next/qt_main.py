@@ -12244,23 +12244,49 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         *,
         result: dict[str, object],
         plot_metadata: dict[str, object],
+        export_mode: str = be.TD_SMART_SOLVER_MATLAB_EXPORT_MODE_REGRESSION_CHECKS,
     ) -> None:
         output = Path(output_path).expanduser()
+        matlab_export_mode = be._td_smart_solver_normalize_matlab_export_mode(export_mode)
 
         def _task(report):
             return be.td_smart_solver_export_equation_matlab(
                 output,
                 result=result,
                 plot_metadata=plot_metadata,
+                export_mode=matlab_export_mode,
                 progress_cb=report,
             )
 
+        status_text = f"Exporting MATLAB equation file to {output.name}"
+        if matlab_export_mode == be.TD_SMART_SOLVER_MATLAB_EXPORT_MODE_CLEAN:
+            status_text = f"Exporting clean MATLAB equation file to {output.name}"
         self._start_perf_export_task(
             heading="Export Equation to MATLAB",
-            status_text=f"Exporting MATLAB equation file to {output.name}",
+            status_text=status_text,
             task_factory=_task,
             on_success=lambda payload: self._handle_path_export_success(payload, heading="Export Equation to MATLAB"),
         )
+
+    def _prompt_smart_solver_matlab_export_mode(self) -> str | None:
+        labels = [
+            "Clean export",
+            "Export with regression checks",
+        ]
+        selection, accepted = QtWidgets.QInputDialog.getItem(
+            self,
+            "Export Equation to MATLAB",
+            "Select MATLAB export type:",
+            labels,
+            0,
+            False,
+        )
+        if not accepted:
+            return None
+        selected_text = str(selection or "").strip()
+        if selected_text == labels[0]:
+            return be.TD_SMART_SOLVER_MATLAB_EXPORT_MODE_CLEAN
+        return be.TD_SMART_SOLVER_MATLAB_EXPORT_MODE_REGRESSION_CHECKS
 
     def _start_saved_perf_equations_excel_export(
         self,
@@ -12608,6 +12634,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             )
             return
 
+        export_mode = self._prompt_smart_solver_matlab_export_mode()
+        if not export_mode:
+            return
+
         run_names = sorted({str(row.get("run_name") or "").strip() for row in fit_points if str(row.get("run_name") or "").strip()})
 
         control_period_filters = list(self._active_control_period_filter_values() or [])
@@ -12660,6 +12690,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 Path(out_path),
                 result=result,
                 plot_metadata=plot_metadata,
+                export_mode=export_mode,
             )
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "Export Equation to MATLAB", str(exc))

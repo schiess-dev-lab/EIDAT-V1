@@ -1607,6 +1607,9 @@ class TestBackendTdSmartSolver(unittest.TestCase):
                     "asset_specific_type": "Hall_A",
                     "filter_summary": "Runs: CondA",
                     "config_text": "Config: Pulsed",
+                    "run_selection_label": "Smart Equation Solver",
+                    "member_runs": ["CondA"],
+                    "run_type_mode": "pulsed_mode",
                 },
             )
             text = out_path.read_text(encoding="utf-8")
@@ -1622,9 +1625,17 @@ class TestBackendTdSmartSolver(unittest.TestCase):
         self.assertIn("    actual_mean = 11;", text)
         self.assertIn("    fprintf('Cached actual_mean: %.12g\\n', actual_mean);", text)
         self.assertIn("meta.fell_out_percent = 20;", text)
+        self.assertIn("meta.function_name = 'smart_solver_curve_cp';", text)
+        self.assertIn("meta.prediction_usage = 'y = smart_solver_curve_cp(Input1, control_period)';", text)
+        self.assertIn("meta.metadata_usage = 'meta = smart_solver_curve_cp(''metadata'')';", text)
+        self.assertIn("meta.input_keys = {'input_1'};", text)
+        self.assertIn("meta.input_is_optional = [false];", text)
         self.assertIn("meta.selected_control_period = 30;", text)
         self.assertIn("meta.input_targets = {'Input1'};", text)
         self.assertIn("meta.input_roles = {'Primary'};", text)
+        self.assertIn("meta.run_selection_label = 'Smart Equation Solver';", text)
+        self.assertIn("meta.member_runs = {'CondA'};", text)
+        self.assertIn("meta.run_type_mode = 'pulsed_mode';", text)
         self.assertIn("meta.equation_text = 'y = curve_cp(x, cp)';", text)
         self.assertIn("function y = eidat_perf_curve_cp_predict", text)
 
@@ -1742,6 +1753,20 @@ class TestBackendTdSmartSolver(unittest.TestCase):
             ],
             "stage2_fit_source": "stage1_pred_input_3",
             "mediator_clamp_count": 3,
+            "stage_export_spec": {
+                "stage1_output_key": "stage1_pred_input_3",
+                "stage1_output_target": "Input3",
+                "stage1_output_units": "u",
+                "stage1_input_keys": ["input_1", "input_2"],
+                "stage2_input_key": "stage1_pred_input_3",
+                "stage2_input_domain": [0.5, 4.0],
+            },
+            "stage1_output_key": "stage1_pred_input_3",
+            "stage1_output_target": "Input3",
+            "stage1_output_units": "u",
+            "stage1_input_keys": ["input_1", "input_2"],
+            "stage2_input_key": "stage1_pred_input_3",
+            "stage2_input_domain": [0.5, 4.0],
         }
 
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
@@ -1754,6 +1779,12 @@ class TestBackendTdSmartSolver(unittest.TestCase):
         self.assertIn("eidat_perf_clamp(", text)
         self.assertIn("meta.uses_staged_mediator = true;", text)
         self.assertIn("meta.stage2_fit_source = 'stage1_pred_input_3';", text)
+        self.assertIn("meta.stage1_output_key = 'stage1_pred_input_3';", text)
+        self.assertIn("meta.stage1_output_target = 'Input3';", text)
+        self.assertIn("meta.stage1_output_units = 'u';", text)
+        self.assertIn("meta.stage1_input_keys = {'input_1', 'input_2'};", text)
+        self.assertIn("meta.stage2_input_key = 'stage1_pred_input_3';", text)
+        self.assertIn("meta.stage2_input_domain = [0.5 4];", text)
 
     def test_smart_solver_export_equation_matlab_overwrites_existing_file(self) -> None:
         result = {
