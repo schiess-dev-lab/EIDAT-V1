@@ -16138,9 +16138,17 @@ def _td_perf_fit_staged_mediator_control_period_model(
             stage2_model = stage2_legacy
         if not isinstance(stage2_model, dict):
             continue
+        stage2_model = _td_smart_solver_attach_curve_cp_boundary_metadata(
+            stage2_model,
+            stage2_xs,
+            ys,
+            control_periods,
+        ) or {}
+        if not stage2_model:
+            continue
         mediator_domain = _td_smart_solver_numeric_domain(stage2_model.get("fit_domain") or stage2_xs)
         clamped_mediator, clamp_hits = _td_smart_solver_clamp_values(x3_hat_list, mediator_domain)
-        y_hat = td_perf_predict_model(stage2_model, clamped_mediator, control_period=control_periods)
+        y_hat = _td_smart_solver_predict_model(stage2_model, clamped_mediator, control_period=control_periods)
         if len(y_hat) != len(ys):
             continue
         stage2_ignored = [dict(entry) for entry in (stage2_model.get("ignored_control_periods") or []) if isinstance(entry, Mapping)]
@@ -18067,6 +18075,7 @@ TD_SMART_SOLVER_STAGE1_SURFACE_MIN_POINTS = 8
 TD_SMART_SOLVER_STAGE1_SURFACE_MIN_DISTINCT_X = 3
 TD_SMART_SOLVER_DIRECT_3INPUT_MIN_POINTS = 12
 TD_SMART_SOLVER_DIRECT_3INPUT_MIN_DISTINCT_X = 3
+TD_SMART_SOLVER_BOUNDARY_POLICY_BOUNDED_CURVE_CP_V1 = "bounded_curve_cp_v1"
 
 
 def _td_smart_solver_numeric_domain(values: Sequence[object]) -> list[float]:
@@ -18096,6 +18105,467 @@ def _td_smart_solver_clamp_values(values: Sequence[float], domain: Sequence[obje
             hit_count += 1
         out.append(float(clamped))
     return out, int(hit_count)
+
+
+def _td_smart_solver_clamp_scalar(value: float, domain: Sequence[object]) -> float:
+    try:
+        numeric = float(value)
+    except Exception:
+        return float(value)
+    if not isinstance(domain, Sequence) or isinstance(domain, (str, bytes)) or len(domain) < 2:
+        return float(numeric)
+    try:
+        lo = float(domain[0])
+        hi = float(domain[1])
+    except Exception:
+        return float(numeric)
+    if not (math.isfinite(lo) and math.isfinite(hi)):
+        return float(numeric)
+    return float(min(max(numeric, min(lo, hi)), max(lo, hi)))
+
+
+def _td_smart_solver_curve_cp_support_key(value: object) -> float | None:
+    numeric = _td_finite_float(value)
+    if numeric is None:
+        return None
+    return round(float(numeric), 12)
+
+
+def _td_smart_solver_curve_cp_find_partner_index(
+    support_rows: Sequence[Mapping[str, object]],
+    index: int,
+    *,
+    side: str,
+) -> int | None:
+    if not isinstance(support_rows, Sequence) or index < 0 or index >= len(support_rows):
+        return None
+    current = support_rows[index]
+    current_cp = float(current.get("control_period") or 0.0)
+    current_x = (
+        _td_finite_float(current.get("x_min"))
+        if side == "left"
+        else _td_finite_float(current.get("x_max"))
+    )
+    if current_x is None:
+        return None
+    for offset in range(1, len(support_rows)):
+        candidates: list[tuple[float, int]] = []
+        for neighbor_index in (index - offset, index + offset):
+            if neighbor_index < 0 or neighbor_index >= len(support_rows):
+                continue
+            row = support_rows[neighbor_index]
+            neighbor_x = (
+                _td_finite_float(row.get("x_min"))
+                if side == "left"
+                else _td_finite_float(row.get("x_max"))
+            )
+            if neighbor_x is None:
+                continue
+            if side == "left" and float(neighbor_x) >= (float(current_x) - 1e-12):
+                continue
+            if side == "right" and float(neighbor_x) <= (float(current_x) + 1e-12):
+                continue
+            candidates.append((abs(float(row.get("control_period") or 0.0) - current_cp), neighbor_index))
+        if candidates:
+            candidates.sort(key=lambda item: (item[0], item[1]))
+            return int(candidates[0][1])
+    return None
+
+
+def _td_smart_solver_curve_cp_boundary_support(
+    xs: Sequence[float],
+    ys: Sequence[float],
+    control_periods: Sequence[float],
+    *,
+    eligible_control_period_values: Sequence[float],
+) -> tuple[list[dict[str, object]], list[dict[str, object]], list[float]]:
+    eligible_keys = {
+        round(float(value), 12)
+        for value in (eligible_control_period_values or [])
+        if isinstance(value, (int, float)) and math.isfinite(float(value))
+    }
+    groups: dict[float, list[tuple[float, float]]] = {}
+    for x_value, y_value, cp_value in zip(xs, ys, control_periods):
+        cp_key = _td_smart_solver_curve_cp_support_key(cp_value)
+        if cp_key is None or cp_key not in eligible_keys:
+            continue
+        x_num = _td_finite_float(x_value)
+        y_num = _td_finite_float(y_value)
+        if x_num is None or y_num is None:
+            continue
+        groups.setdefault(cp_key, []).append((float(x_num), float(y_num)))
+
+    support_rows: list[dict[str, object]] = []
+    for cp_key in sorted(groups.keys()):
+        pts = sorted(groups.get(cp_key, []), key=lambda item: item[0])
+        if not pts:
+            continue
+        x_min = float(pts[0][0])
+        x_max = float(pts[-1][0])
+        left_vals = [float(y_val) for x_val, y_val in pts if abs(float(x_val) - x_min) <= 1e-12]
+        right_vals = [float(y_val) for x_val, y_val in pts if abs(float(x_val) - x_max) <= 1e-12]
+        support_rows.append(
+            {
+                "control_period": float(cp_key),
+                "point_count": int(len(pts)),
+                "x_min": float(x_min),
+                "x_max": float(x_max),
+                "left_x": float(x_min),
+                "left_y": float(sum(left_vals) / len(left_vals)) if left_vals else float(pts[0][1]),
+                "right_x": float(x_max),
+                "right_y": float(sum(right_vals) / len(right_vals)) if right_vals else float(pts[-1][1]),
+            }
+        )
+
+    if not support_rows:
+        return [], [], []
+
+    updated_rows: list[dict[str, object]] = []
+    for index, row in enumerate(support_rows):
+        entry = dict(row)
+        left_partner_index = _td_smart_solver_curve_cp_find_partner_index(support_rows, index, side="left")
+        right_partner_index = _td_smart_solver_curve_cp_find_partner_index(support_rows, index, side="right")
+        if left_partner_index is not None:
+            entry["left_partner_control_period"] = float(support_rows[left_partner_index].get("control_period") or 0.0)
+        if right_partner_index is not None:
+            entry["right_partner_control_period"] = float(support_rows[right_partner_index].get("control_period") or 0.0)
+        updated_rows.append(entry)
+    support_rows = updated_rows
+
+    bridge_pairs: list[dict[str, object]] = []
+    for index in range(len(support_rows) - 1):
+        lower = support_rows[index]
+        upper = support_rows[index + 1]
+        pair: dict[str, object] = {
+            "lower_control_period": float(lower.get("control_period") or 0.0),
+            "upper_control_period": float(upper.get("control_period") or 0.0),
+        }
+        lower_x_min = float(lower.get("x_min") or 0.0)
+        lower_x_max = float(lower.get("x_max") or 0.0)
+        upper_x_min = float(upper.get("x_min") or 0.0)
+        upper_x_max = float(upper.get("x_max") or 0.0)
+        if abs(lower_x_min - upper_x_min) > 1e-12:
+            if lower_x_min < upper_x_min:
+                pair["left_bridge"] = {
+                    "from_control_period": float(upper.get("control_period") or 0.0),
+                    "to_control_period": float(lower.get("control_period") or 0.0),
+                    "x0": float(lower.get("left_x") or lower_x_min),
+                    "y0": float(lower.get("left_y") or 0.0),
+                    "x1": float(upper.get("left_x") or upper_x_min),
+                    "y1": float(upper.get("left_y") or 0.0),
+                }
+            else:
+                pair["left_bridge"] = {
+                    "from_control_period": float(lower.get("control_period") or 0.0),
+                    "to_control_period": float(upper.get("control_period") or 0.0),
+                    "x0": float(upper.get("left_x") or upper_x_min),
+                    "y0": float(upper.get("left_y") or 0.0),
+                    "x1": float(lower.get("left_x") or lower_x_min),
+                    "y1": float(lower.get("left_y") or 0.0),
+                }
+        if abs(lower_x_max - upper_x_max) > 1e-12:
+            if lower_x_max < upper_x_max:
+                pair["right_bridge"] = {
+                    "from_control_period": float(lower.get("control_period") or 0.0),
+                    "to_control_period": float(upper.get("control_period") or 0.0),
+                    "x0": float(lower.get("right_x") or lower_x_max),
+                    "y0": float(lower.get("right_y") or 0.0),
+                    "x1": float(upper.get("right_x") or upper_x_max),
+                    "y1": float(upper.get("right_y") or 0.0),
+                }
+            else:
+                pair["right_bridge"] = {
+                    "from_control_period": float(upper.get("control_period") or 0.0),
+                    "to_control_period": float(lower.get("control_period") or 0.0),
+                    "x0": float(upper.get("right_x") or upper_x_max),
+                    "y0": float(upper.get("right_y") or 0.0),
+                    "x1": float(lower.get("right_x") or lower_x_max),
+                    "y1": float(lower.get("right_y") or 0.0),
+                }
+        bridge_pairs.append(pair)
+
+    global_domain = [
+        float(min(float(row.get("x_min") or 0.0) for row in support_rows)),
+        float(max(float(row.get("x_max") or 0.0) for row in support_rows)),
+    ]
+    return support_rows, bridge_pairs, global_domain
+
+
+def _td_smart_solver_attach_curve_cp_boundary_metadata(
+    model: Mapping[str, object] | None,
+    xs: Sequence[float],
+    ys: Sequence[float],
+    control_periods: Sequence[float],
+) -> dict[str, object] | None:
+    if not isinstance(model, Mapping):
+        return None
+    family = td_perf_normalize_fit_mode(model.get("fit_family"))
+    if family not in TD_PERF_CURVE_CONTROL_PERIOD_FAMILIES:
+        return dict(model)
+    eligible_values = [
+        float(value)
+        for value in (model.get("eligible_control_period_values") or model.get("control_period_values") or [])
+        if isinstance(value, (int, float)) and math.isfinite(float(value))
+    ]
+    support_rows, bridge_pairs, global_domain = _td_smart_solver_curve_cp_boundary_support(
+        xs,
+        ys,
+        control_periods,
+        eligible_control_period_values=eligible_values,
+    )
+    out = dict(model)
+    out["smart_solver_scope"] = "solver_tab"
+    out["smart_solver_boundary_policy"] = TD_SMART_SOLVER_BOUNDARY_POLICY_BOUNDED_CURVE_CP_V1
+    out["curve_cp_slice_support"] = [dict(row) for row in support_rows]
+    out["curve_cp_bridge_pairs"] = [dict(row) for row in bridge_pairs]
+    out["curve_cp_global_domain"] = [float(value) for value in global_domain[:2]]
+    if len(global_domain) >= 2:
+        out["fit_domain"] = [float(value) for value in global_domain[:2]]
+    return out
+
+
+def _td_smart_solver_curve_cp_slice_raw_value(
+    model: Mapping[str, object],
+    slice_row: Mapping[str, object],
+    x_value: float,
+) -> float:
+    family = td_perf_normalize_fit_mode(model.get("fit_family"))
+    x_num = float(x_value)
+    x_center = float(model.get("x_center") or 0.0)
+    x_scale = float(model.get("x_scale") or 1.0) or 1.0
+    x_norm = (x_num - x_center) / x_scale
+    if family == TD_PERF_FIT_FAMILY_QUADRATIC_CURVE_CONTROL_PERIOD:
+        coeffs = [float(value) for value in (slice_row.get("coeffs") or [])]
+        if len(coeffs) == 3:
+            return float((coeffs[0] * (x_norm ** 2)) + (coeffs[1] * x_norm) + coeffs[2])
+    if family == TD_PERF_FIT_FAMILY_HYBRID_QUADRATIC_RESIDUAL_CONTROL_PERIOD:
+        residual_coeffs = [float(value) for value in (slice_row.get("residual_coeffs") or [])]
+        base_params = dict(model.get("base_params") or (model.get("params") or {}).get("base_params") or {})
+        base_value = (
+            float(base_params.get("b") or 0.0)
+            + (float(base_params.get("m") or 0.0) * x_num)
+            + (
+                float(base_params.get("A") or 0.0)
+                * (1.0 - math.exp(-float(base_params.get("k") or 0.0) * x_num))
+            )
+        )
+        if len(residual_coeffs) == 3:
+            return float(
+                base_value
+                + (residual_coeffs[0] * (x_norm ** 2))
+                + (residual_coeffs[1] * x_norm)
+                + residual_coeffs[2]
+            )
+    cp_value = _td_finite_float(slice_row.get("control_period"))
+    if cp_value is None:
+        return float("nan")
+    fallback = td_perf_predict_model(model, [x_num], control_period=[float(cp_value)])
+    if not fallback:
+        return float("nan")
+    return float(fallback[0])
+
+
+def _td_smart_solver_curve_cp_line_value(
+    x_value: float,
+    x0: float,
+    y0: float,
+    x1: float,
+    y1: float,
+) -> float:
+    lo = min(float(x0), float(x1))
+    hi = max(float(x0), float(x1))
+    x_clamped = min(max(float(x_value), lo), hi)
+    if abs(float(x1) - float(x0)) <= 1e-12:
+        return float(y1)
+    weight = (x_clamped - float(x0)) / (float(x1) - float(x0))
+    return float(float(y0) + (weight * (float(y1) - float(y0))))
+
+
+def _td_smart_solver_curve_cp_pair_value(
+    model: Mapping[str, object],
+    base_row: Mapping[str, object],
+    other_row: Mapping[str, object],
+    x_value: float,
+) -> float:
+    x_num = float(x_value)
+    x_min = float(base_row.get("x_min") or 0.0)
+    x_max = float(base_row.get("x_max") or 0.0)
+    if x_num < x_min:
+        other_x_min = float(other_row.get("x_min") or 0.0)
+        if other_x_min < (x_min - 1e-12):
+            return _td_smart_solver_curve_cp_line_value(
+                x_num,
+                float(other_row.get("left_x") or other_x_min),
+                float(other_row.get("left_y") or 0.0),
+                float(base_row.get("left_x") or x_min),
+                float(base_row.get("left_y") or 0.0),
+            )
+        return float(base_row.get("left_y") or 0.0)
+    if x_num > x_max:
+        other_x_max = float(other_row.get("x_max") or 0.0)
+        if other_x_max > (x_max + 1e-12):
+            return _td_smart_solver_curve_cp_line_value(
+                x_num,
+                float(base_row.get("right_x") or x_max),
+                float(base_row.get("right_y") or 0.0),
+                float(other_row.get("right_x") or other_x_max),
+                float(other_row.get("right_y") or 0.0),
+            )
+        return float(base_row.get("right_y") or 0.0)
+    return _td_smart_solver_curve_cp_slice_raw_value(model, base_row, x_num)
+
+
+def _td_smart_solver_curve_cp_exact_value(
+    model: Mapping[str, object],
+    support_rows: Sequence[Mapping[str, object]],
+    support_by_key: Mapping[float, Mapping[str, object]],
+    slice_row: Mapping[str, object],
+    x_value: float,
+) -> float:
+    x_num = float(x_value)
+    x_min = float(slice_row.get("x_min") or 0.0)
+    x_max = float(slice_row.get("x_max") or 0.0)
+    if x_num < x_min:
+        partner_key = _td_smart_solver_curve_cp_support_key(slice_row.get("left_partner_control_period"))
+        partner = support_by_key.get(partner_key) if partner_key is not None else None
+        if isinstance(partner, Mapping):
+            return _td_smart_solver_curve_cp_line_value(
+                x_num,
+                float(partner.get("left_x") or partner.get("x_min") or 0.0),
+                float(partner.get("left_y") or 0.0),
+                float(slice_row.get("left_x") or x_min),
+                float(slice_row.get("left_y") or 0.0),
+            )
+        return float(slice_row.get("left_y") or 0.0)
+    if x_num > x_max:
+        partner_key = _td_smart_solver_curve_cp_support_key(slice_row.get("right_partner_control_period"))
+        partner = support_by_key.get(partner_key) if partner_key is not None else None
+        if isinstance(partner, Mapping):
+            return _td_smart_solver_curve_cp_line_value(
+                x_num,
+                float(slice_row.get("right_x") or x_max),
+                float(slice_row.get("right_y") or 0.0),
+                float(partner.get("right_x") or partner.get("x_max") or 0.0),
+                float(partner.get("right_y") or 0.0),
+            )
+        return float(slice_row.get("right_y") or 0.0)
+    return _td_smart_solver_curve_cp_slice_raw_value(model, slice_row, x_num)
+
+
+def _td_smart_solver_predict_curve_cp_bounded(
+    model: Mapping[str, object],
+    x_values: Iterable[float],
+    control_period,
+) -> list[float]:
+    x_list = [float(value) for value in x_values]
+    count = len(x_list)
+    if count <= 0:
+        return []
+    if control_period is None:
+        raise ValueError("Control-period-aware Smart Solver prediction requires control_period.")
+    if isinstance(control_period, Iterable) and not isinstance(control_period, (str, bytes)):
+        cp_values = [float(value) for value in control_period]
+        if len(cp_values) != count:
+            raise ValueError("control_period iterable length must match x inputs.")
+    else:
+        cp_values = [float(control_period)] * count
+
+    support_rows = [
+        dict(row)
+        for row in (model.get("curve_cp_slice_support") or [])
+        if isinstance(row, Mapping)
+    ]
+    if not support_rows:
+        return td_perf_predict_model(model, x_list, control_period=cp_values)
+    support_rows.sort(key=lambda row: float(row.get("control_period") or 0.0))
+    support_by_key = {
+        round(float(row.get("control_period") or 0.0), 12): row
+        for row in support_rows
+    }
+    cp_domain = (
+        [float(value) for value in (model.get("fit_domain_control_period") or []) if isinstance(value, (int, float))]
+        or [float(support_rows[0].get("control_period") or 0.0), float(support_rows[-1].get("control_period") or 0.0)]
+    )
+    global_domain = (
+        [float(value) for value in (model.get("curve_cp_global_domain") or []) if isinstance(value, (int, float))]
+        or [float(support_rows[0].get("x_min") or 0.0), float(support_rows[-1].get("x_max") or 0.0)]
+    )
+
+    out: list[float] = []
+    control_period_values = [float(row.get("control_period") or 0.0) for row in support_rows]
+    for raw_x, raw_cp in zip(x_list, cp_values):
+        x_num = _td_smart_solver_clamp_scalar(float(raw_x), global_domain)
+        cp_num = _td_smart_solver_clamp_scalar(float(raw_cp), cp_domain)
+        exact_row = next(
+            (
+                row
+                for row in support_rows
+                if abs(float(row.get("control_period") or 0.0) - cp_num) <= 1e-9
+            ),
+            None,
+        )
+        if isinstance(exact_row, Mapping):
+            out.append(
+                float(
+                    _td_smart_solver_curve_cp_exact_value(
+                        model,
+                        support_rows,
+                        support_by_key,
+                        exact_row,
+                        x_num,
+                    )
+                )
+            )
+            continue
+
+        upper_index = next(
+            (idx for idx, cp_value in enumerate(control_period_values) if cp_num < float(cp_value)),
+            len(control_period_values) - 1,
+        )
+        lower_index = max(0, upper_index - 1)
+        if upper_index <= lower_index:
+            row = support_rows[lower_index]
+            out.append(
+                float(
+                    _td_smart_solver_curve_cp_exact_value(
+                        model,
+                        support_rows,
+                        support_by_key,
+                        row,
+                        x_num,
+                    )
+                )
+            )
+            continue
+        lower_row = support_rows[lower_index]
+        upper_row = support_rows[upper_index]
+        center_values = td_perf_predict_model(model, [x_num], control_period=[cp_num])
+        if not center_values:
+            out.append(float("nan"))
+            continue
+        center_value = float(center_values[0])
+        lower_value = _td_smart_solver_curve_cp_pair_value(model, lower_row, upper_row, x_num)
+        upper_value = _td_smart_solver_curve_cp_pair_value(model, upper_row, lower_row, x_num)
+        lo = min(lower_value, upper_value)
+        hi = max(lower_value, upper_value)
+        out.append(float(min(max(center_value, lo), hi)))
+    return out
+
+
+def _td_smart_solver_predict_model(
+    model: Mapping[str, object],
+    x_values: Iterable[float],
+    *,
+    control_period=None,
+) -> list[float]:
+    family = td_perf_normalize_fit_mode(model.get("fit_family"))
+    if (
+        family in TD_PERF_CURVE_CONTROL_PERIOD_FAMILIES
+        and str(model.get("smart_solver_boundary_policy") or "").strip().lower()
+        == TD_SMART_SOLVER_BOUNDARY_POLICY_BOUNDED_CURVE_CP_V1
+    ):
+        return _td_smart_solver_predict_curve_cp_bounded(model, x_values, control_period)
+    return td_perf_predict_model(model, x_values, control_period=control_period)
 
 
 def _td_smart_solver_score_predictions(
@@ -19144,10 +19614,21 @@ def td_smart_solver_run(
             raise RuntimeError(
                 "Smart Equation Solver could not fit a control-period-aware model for the filtered sequence rows."
             )
+        if not input2_name:
+            model = _td_smart_solver_attach_curve_cp_boundary_metadata(
+                model,
+                x1_values,
+                y_values,
+                cp_values,
+            ) or {}
+            if not model:
+                raise RuntimeError(
+                    "Smart Equation Solver could not apply bounded control-period support to the fitted curve model."
+                )
         selected_predictions = (
             td_perf_predict_surface(model, x1_values, x2_values, control_period=cp_values)
             if input2_name
-            else td_perf_predict_model(model, x1_values, control_period=cp_values)
+            else _td_smart_solver_predict_model(model, x1_values, control_period=cp_values)
         )
         selected_candidate_summary = _td_smart_solver_candidate_summary(
             model=model,
@@ -19204,7 +19685,7 @@ def td_smart_solver_run(
         )
         stage1_clamped_predictions, _mediator_clamp_hits = _td_smart_solver_clamp_values(mediator_predictions, mediator_domain)
         predictions = (
-            td_perf_predict_model(stage2_model, stage1_clamped_predictions, control_period=cp_values)
+            _td_smart_solver_predict_model(stage2_model, stage1_clamped_predictions, control_period=cp_values)
             if selected_family == TD_PERF_FIT_FAMILY_STAGED_MEDIATOR_CONTROL_PERIOD
             else td_perf_predict_model(stage2_model, stage1_clamped_predictions)
         )
@@ -19217,7 +19698,7 @@ def td_smart_solver_run(
                 control_period=cp_values if selected_family in TD_PERF_ANY_CONTROL_PERIOD_FAMILIES else None,
             )
             if input2_name
-            else td_perf_predict_model(
+            else _td_smart_solver_predict_model(
                 model,
                 x1_values,
                 control_period=cp_values if selected_family in TD_PERF_ANY_CONTROL_PERIOD_FAMILIES else None,
@@ -21158,6 +21639,233 @@ def _td_smart_solver_excel_clamp_expr(value_expr: str, domain: Sequence[object])
     return f"MIN(MAX({raw},{_td_perf_excel_num(lo)}),{_td_perf_excel_num(hi)})"
 
 
+def _td_smart_solver_excel_formula_body(formula: str) -> str:
+    text = str(formula or "").strip()
+    if text.startswith("="):
+        return text[1:]
+    return text
+
+
+def _td_smart_solver_excel_dynamic_clamp_expr(value_expr: str, lo_expr: str, hi_expr: str) -> str:
+    value = str(value_expr or "").strip()
+    lo = str(lo_expr or "").strip()
+    hi = str(hi_expr or "").strip()
+    if not value or not lo or not hi:
+        return value
+    return f"MIN(MAX(({value}),MIN(({lo}),({hi}))),MAX(({lo}),({hi})))"
+
+
+def _td_smart_solver_excel_curve_cp_slice_raw_expr(
+    model: Mapping[str, object],
+    slice_row: Mapping[str, object],
+    *,
+    x_expr: str,
+) -> str:
+    family = td_perf_normalize_fit_mode(model.get("fit_family"))
+    x_norm = _td_perf_excel_norm_expr(x_expr, model.get("x_center"), model.get("x_scale"))
+    if family == TD_PERF_FIT_FAMILY_QUADRATIC_CURVE_CONTROL_PERIOD:
+        coeffs = [float(value) for value in (slice_row.get("coeffs") or [])]
+        if len(coeffs) == 3 and x_norm:
+            return (
+                f"({_td_perf_excel_num(coeffs[0])}*({x_norm}^2))"
+                f"+({_td_perf_excel_num(coeffs[1])}*{x_norm})"
+                f"+{_td_perf_excel_num(coeffs[2])}"
+            )
+    if family == TD_PERF_FIT_FAMILY_HYBRID_QUADRATIC_RESIDUAL_CONTROL_PERIOD:
+        residual_coeffs = [float(value) for value in (slice_row.get("residual_coeffs") or [])]
+        base_params = dict(model.get("base_params") or (model.get("params") or {}).get("base_params") or {})
+        if len(residual_coeffs) == 3 and x_norm:
+            base_expr = (
+                f"{_td_perf_excel_num(base_params.get('b'))}"
+                f"+({_td_perf_excel_num(base_params.get('m'))}*{x_expr})"
+                f"+({_td_perf_excel_num(base_params.get('A'))}*(1-EXP(-{_td_perf_excel_num(base_params.get('k'))}*{x_expr})))"
+            )
+            residual_expr = (
+                f"({_td_perf_excel_num(residual_coeffs[0])}*({x_norm}^2))"
+                f"+({_td_perf_excel_num(residual_coeffs[1])}*{x_norm})"
+                f"+{_td_perf_excel_num(residual_coeffs[2])}"
+            )
+            return f"({base_expr})+({residual_expr})"
+    cp_value = _td_finite_float(slice_row.get("control_period"))
+    if cp_value is None:
+        return ""
+    raw_cp_expr = _td_perf_excel_num(cp_value)
+    return _td_smart_solver_excel_formula_body(
+        _td_perf_excel_formula_for_model(
+            model,
+            raw_x_ref=x_expr,
+            norm_x_ref=_td_perf_excel_norm_expr(x_expr, model.get("x_center"), model.get("x_scale")),
+            raw_x1_ref=x_expr,
+            raw_x2_ref="",
+            norm_x1_ref="",
+            norm_x2_ref="",
+            raw_cp_ref=raw_cp_expr,
+            norm_cp_ref=_td_perf_excel_norm_expr(raw_cp_expr, model.get("cp_center"), model.get("cp_scale")),
+        )
+    )
+
+
+def _td_smart_solver_excel_curve_cp_line_expr(
+    x_expr: str,
+    *,
+    x0: float,
+    y0: float,
+    x1: float,
+    y1: float,
+) -> str:
+    if abs(float(x1) - float(x0)) <= 1e-12:
+        return _td_perf_excel_num(y1)
+    x_clamped = _td_smart_solver_excel_clamp_expr(x_expr, [float(x0), float(x1)])
+    return (
+        f"({_td_perf_excel_num(y0)}"
+        f"+((({x_clamped})-{_td_perf_excel_num(x0)})"
+        f"*({_td_perf_excel_num(y1)}-{_td_perf_excel_num(y0)})"
+        f"/({_td_perf_excel_num(x1)}-{_td_perf_excel_num(x0)})))"
+    )
+
+
+def _td_smart_solver_excel_curve_cp_pair_expr(
+    model: Mapping[str, object],
+    base_row: Mapping[str, object],
+    other_row: Mapping[str, object],
+    *,
+    x_expr: str,
+) -> str:
+    x_min = float(base_row.get("x_min") or 0.0)
+    x_max = float(base_row.get("x_max") or 0.0)
+    raw_expr = _td_smart_solver_excel_curve_cp_slice_raw_expr(model, base_row, x_expr=x_expr)
+    other_x_min = float(other_row.get("x_min") or 0.0)
+    other_x_max = float(other_row.get("x_max") or 0.0)
+    if other_x_min < (x_min - 1e-12):
+        left_expr = _td_smart_solver_excel_curve_cp_line_expr(
+            x_expr,
+            x0=float(other_row.get("left_x") or other_x_min),
+            y0=float(other_row.get("left_y") or 0.0),
+            x1=float(base_row.get("left_x") or x_min),
+            y1=float(base_row.get("left_y") or 0.0),
+        )
+    else:
+        left_expr = _td_perf_excel_num(base_row.get("left_y") or 0.0)
+    if other_x_max > (x_max + 1e-12):
+        right_expr = _td_smart_solver_excel_curve_cp_line_expr(
+            x_expr,
+            x0=float(base_row.get("right_x") or x_max),
+            y0=float(base_row.get("right_y") or 0.0),
+            x1=float(other_row.get("right_x") or other_x_max),
+            y1=float(other_row.get("right_y") or 0.0),
+        )
+    else:
+        right_expr = _td_perf_excel_num(base_row.get("right_y") or 0.0)
+    return (
+        f"IF(({x_expr})<{_td_perf_excel_num(x_min)},{left_expr},"
+        f"IF(({x_expr})>{_td_perf_excel_num(x_max)},{right_expr},{raw_expr}))"
+    )
+
+
+def _td_smart_solver_excel_curve_cp_exact_expr(
+    model: Mapping[str, object],
+    support_by_key: Mapping[float, Mapping[str, object]],
+    slice_row: Mapping[str, object],
+    *,
+    x_expr: str,
+) -> str:
+    x_min = float(slice_row.get("x_min") or 0.0)
+    x_max = float(slice_row.get("x_max") or 0.0)
+    raw_expr = _td_smart_solver_excel_curve_cp_slice_raw_expr(model, slice_row, x_expr=x_expr)
+
+    left_expr = _td_perf_excel_num(slice_row.get("left_y") or 0.0)
+    left_partner_key = _td_smart_solver_curve_cp_support_key(slice_row.get("left_partner_control_period"))
+    if left_partner_key is not None and isinstance(support_by_key.get(left_partner_key), Mapping):
+        left_partner = dict(support_by_key.get(left_partner_key) or {})
+        left_expr = _td_smart_solver_excel_curve_cp_line_expr(
+            x_expr,
+            x0=float(left_partner.get("left_x") or left_partner.get("x_min") or 0.0),
+            y0=float(left_partner.get("left_y") or 0.0),
+            x1=float(slice_row.get("left_x") or x_min),
+            y1=float(slice_row.get("left_y") or 0.0),
+        )
+
+    right_expr = _td_perf_excel_num(slice_row.get("right_y") or 0.0)
+    right_partner_key = _td_smart_solver_curve_cp_support_key(slice_row.get("right_partner_control_period"))
+    if right_partner_key is not None and isinstance(support_by_key.get(right_partner_key), Mapping):
+        right_partner = dict(support_by_key.get(right_partner_key) or {})
+        right_expr = _td_smart_solver_excel_curve_cp_line_expr(
+            x_expr,
+            x0=float(slice_row.get("right_x") or x_max),
+            y0=float(slice_row.get("right_y") or 0.0),
+            x1=float(right_partner.get("right_x") or right_partner.get("x_max") or 0.0),
+            y1=float(right_partner.get("right_y") or 0.0),
+        )
+
+    return (
+        f"IF(({x_expr})<{_td_perf_excel_num(x_min)},{left_expr},"
+        f"IF(({x_expr})>{_td_perf_excel_num(x_max)},{right_expr},{raw_expr}))"
+    )
+
+
+def _td_smart_solver_excel_formula_for_bounded_curve_cp(
+    model: Mapping[str, object],
+    *,
+    x_ref: str,
+    cp_ref: str,
+) -> str:
+    support_rows = [
+        dict(row)
+        for row in (model.get("curve_cp_slice_support") or [])
+        if isinstance(row, Mapping)
+    ]
+    if not x_ref or not cp_ref or not support_rows:
+        return ""
+    support_rows.sort(key=lambda row: float(row.get("control_period") or 0.0))
+    support_by_key = {
+        round(float(row.get("control_period") or 0.0), 12): row
+        for row in support_rows
+    }
+    x_expr = _td_smart_solver_excel_clamp_expr(
+        x_ref,
+        model.get("curve_cp_global_domain") or model.get("fit_domain") or [],
+    )
+    cp_expr = _td_smart_solver_excel_clamp_expr(cp_ref, model.get("fit_domain_control_period") or [])
+    center_expr = _td_smart_solver_excel_formula_body(
+        _td_perf_excel_formula_for_model(
+            model,
+            raw_x_ref=x_expr,
+            norm_x_ref=_td_perf_excel_norm_expr(x_expr, model.get("x_center"), model.get("x_scale")),
+            raw_x1_ref=x_expr,
+            raw_x2_ref="",
+            norm_x1_ref="",
+            norm_x2_ref="",
+            raw_cp_ref=cp_expr,
+            norm_cp_ref=_td_perf_excel_norm_expr(cp_expr, model.get("cp_center"), model.get("cp_scale")),
+        )
+    )
+    if not center_expr:
+        return ""
+
+    exact_exprs = [
+        _td_smart_solver_excel_curve_cp_exact_expr(model, support_by_key, row, x_expr=x_expr)
+        for row in support_rows
+    ]
+
+    def _build_expr(index: int) -> str:
+        if index >= len(support_rows) - 1:
+            return exact_exprs[-1]
+        lower = support_rows[index]
+        upper = support_rows[index + 1]
+        lower_expr = _td_smart_solver_excel_curve_cp_pair_expr(model, lower, upper, x_expr=x_expr)
+        upper_expr = _td_smart_solver_excel_curve_cp_pair_expr(model, upper, lower, x_expr=x_expr)
+        interval_expr = _td_smart_solver_excel_dynamic_clamp_expr(center_expr, lower_expr, upper_expr)
+        return (
+            f"IF(ABS(({cp_expr})-{_td_perf_excel_num(lower.get('control_period') or 0.0)})<=1E-9,"
+            f"{exact_exprs[index]},"
+            f"IF(({cp_expr})<{_td_perf_excel_num(upper.get('control_period') or 0.0)},"
+            f"{interval_expr},"
+            f"{_build_expr(index + 1)}))"
+        )
+
+    return "=" + _build_expr(0)
+
+
 def _td_smart_solver_excel_formula_for_quadratic_3input_control_period(
     model: Mapping[str, object],
     *,
@@ -21241,6 +21949,16 @@ def _td_smart_solver_excel_formula_for_model(
     control_period_ref: str,
 ) -> str:
     family = td_perf_normalize_fit_mode(model.get("fit_family"))
+    if (
+        family in TD_PERF_CURVE_CONTROL_PERIOD_FAMILIES
+        and str(model.get("smart_solver_boundary_policy") or "").strip().lower()
+        == TD_SMART_SOLVER_BOUNDARY_POLICY_BOUNDED_CURVE_CP_V1
+    ):
+        return _td_smart_solver_excel_formula_for_bounded_curve_cp(
+            model,
+            x_ref=str(variable_refs.get("input_1") or ""),
+            cp_ref=str(control_period_ref or ""),
+        )
     if family == TD_PERF_FIT_FAMILY_QUADRATIC_3INPUT_CONTROL_PERIOD:
         return _td_smart_solver_excel_formula_for_quadratic_3input_control_period(
             model,
@@ -22912,6 +23630,72 @@ def _td_perf_matlab_vector(values: Sequence[object]) -> str:
     return "[" + " ".join(_td_perf_matlab_num(value) for value in (values or [])) + "]"
 
 
+def _td_smart_solver_matlab_num_or_nan(value: object) -> str:
+    try:
+        numeric = float(value)
+    except Exception:
+        return "NaN"
+    if not math.isfinite(numeric):
+        return "NaN"
+    return f"{numeric:.15g}"
+
+
+def _td_smart_solver_matlab_matrix(rows: Sequence[Sequence[object]]) -> str:
+    formatted_rows: list[str] = []
+    for row in rows or []:
+        formatted_rows.append(" ".join(_td_smart_solver_matlab_num_or_nan(value) for value in (row or [])))
+    return "[" + "; ".join(formatted_rows) + "]"
+
+
+def _td_smart_solver_curve_cp_support_rows(model: Mapping[str, object]) -> list[dict[str, object]]:
+    rows = [
+        dict(row)
+        for row in (model.get("curve_cp_slice_support") or [])
+        if isinstance(row, Mapping)
+    ]
+    rows.sort(key=lambda row: float(row.get("control_period") or 0.0))
+    return rows
+
+
+def _td_smart_solver_matlab_curve_cp_support_matrix(model: Mapping[str, object]) -> str:
+    rows = _td_smart_solver_curve_cp_support_rows(model)
+    return _td_smart_solver_matlab_matrix(
+        [
+            [
+                row.get("control_period"),
+                row.get("x_min"),
+                row.get("x_max"),
+                row.get("left_y"),
+                row.get("right_y"),
+                row.get("left_partner_control_period"),
+                row.get("right_partner_control_period"),
+            ]
+            for row in rows
+        ]
+    )
+
+
+def _td_smart_solver_matlab_curve_cp_slice_coeff_matrix(
+    model: Mapping[str, object],
+    *,
+    coeff_field: str,
+) -> str:
+    support_rows = _td_smart_solver_curve_cp_support_rows(model)
+    slice_models = {
+        round(float(entry.get("control_period") or 0.0), 12): dict(entry)
+        for entry in (model.get("slice_models") or [])
+        if isinstance(entry, Mapping)
+    }
+    rows: list[list[object]] = []
+    for support_row in support_rows:
+        cp_key = round(float(support_row.get("control_period") or 0.0), 12)
+        slice_row = slice_models.get(cp_key, {})
+        coeffs = [float(value) for value in (slice_row.get(coeff_field) or [])]
+        padded = coeffs[:3] + [float("nan")] * max(0, 3 - len(coeffs[:3]))
+        rows.append([padded[0], padded[1], padded[2]])
+    return _td_smart_solver_matlab_matrix(rows)
+
+
 def _td_perf_matlab_cellstr(values: Sequence[object]) -> str:
     return "{" + ", ".join(_td_perf_matlab_quote(value) for value in (values or [])) + "}"
 
@@ -23147,6 +23931,18 @@ def _td_perf_matlab_function_expr(
         coeff_cp_models = [_td_perf_matlab_vector(coeffs) for coeffs in (model.get("coeff_cp_models") or [])]
         coeff_matrix = "{" + ", ".join(coeff_cp_models) + "}"
         clamped_cp_var = _td_perf_matlab_clamp_expr(cp_var, model.get("fit_domain_control_period") or [])
+        if (
+            str(model.get("smart_solver_boundary_policy") or "").strip().lower()
+            == TD_SMART_SOLVER_BOUNDARY_POLICY_BOUNDED_CURVE_CP_V1
+        ):
+            slice_support = _td_smart_solver_matlab_curve_cp_support_matrix(model)
+            slice_coeffs = _td_smart_solver_matlab_curve_cp_slice_coeff_matrix(model, coeff_field="coeffs")
+            return (
+                f"eidat_smart_solver_curve_cp_bounded_predict({x_var}, {clamped_cp_var}, {coeff_matrix}, "
+                f"{slice_support}, {slice_coeffs}, "
+                f"{_td_perf_matlab_num(model.get('x_center'))}, {_td_perf_matlab_num(model.get('x_scale') or 1.0)}, "
+                f"{_td_perf_matlab_num(model.get('cp_center'))}, {_td_perf_matlab_num(model.get('cp_scale') or 1.0)})"
+            )
         return (
             f"eidat_perf_curve_cp_predict({x_var}, {clamped_cp_var}, {coeff_matrix}, "
             f"{_td_perf_matlab_num(model.get('x_center'))}, {_td_perf_matlab_num(model.get('x_scale') or 1.0)}, "
@@ -23157,6 +23953,19 @@ def _td_perf_matlab_function_expr(
         coeff_matrix = "{" + ", ".join(residual_cp_models) + "}"
         base_params = dict(model.get("base_params") or (params or {}).get("base_params") or {})
         clamped_cp_var = _td_perf_matlab_clamp_expr(cp_var, model.get("fit_domain_control_period") or [])
+        if (
+            str(model.get("smart_solver_boundary_policy") or "").strip().lower()
+            == TD_SMART_SOLVER_BOUNDARY_POLICY_BOUNDED_CURVE_CP_V1
+        ):
+            slice_support = _td_smart_solver_matlab_curve_cp_support_matrix(model)
+            slice_coeffs = _td_smart_solver_matlab_curve_cp_slice_coeff_matrix(model, coeff_field="residual_coeffs")
+            return (
+                f"eidat_smart_solver_hybrid_curve_cp_bounded_predict({x_var}, {clamped_cp_var}, "
+                f"{_td_perf_matlab_vector([base_params.get('b'), base_params.get('m'), base_params.get('A'), base_params.get('k')])}, "
+                f"{coeff_matrix}, {slice_support}, {slice_coeffs}, "
+                f"{_td_perf_matlab_num(model.get('x_center'))}, {_td_perf_matlab_num(model.get('x_scale') or 1.0)}, "
+                f"{_td_perf_matlab_num(model.get('cp_center'))}, {_td_perf_matlab_num(model.get('cp_scale') or 1.0)})"
+            )
         base_expr = (
             f"({_td_perf_matlab_num(base_params.get('b'))} + "
             f"({_td_perf_matlab_num(base_params.get('m'))}.*{x_var}) + "
@@ -23250,6 +24059,192 @@ def _td_perf_matlab_helper_lines() -> list[str]:
         "for idx = 1:min(numel(coeff_cp_models), numel(basis))",
         "    coeffs = coeff_cp_models{idx};",
         "    y = y + polyval(coeffs, cpn) .* basis{idx};",
+        "end",
+        "end",
+        "",
+        "% Smart Solver bounded line helper used by exported bounded CP curve equations.",
+        "function y = eidat_smart_solver_curve_cp_line_value(x, x0, y0, x1, y1)",
+        "x = min(max(double(x), min(double(x0), double(x1))), max(double(x0), double(x1)));",
+        "if abs(double(x1) - double(x0)) <= 1e-12",
+        "    y = double(y1);",
+        "    return;",
+        "end",
+        "weight = (x - double(x0)) ./ (double(x1) - double(x0));",
+        "y = double(y0) + weight .* (double(y1) - double(y0));",
+        "end",
+        "",
+        "% Smart Solver support-row lookup used by exported bounded CP curve equations.",
+        "function idx = eidat_smart_solver_curve_cp_find_index(slice_support, control_period)",
+        "idx = [];",
+        "if isempty(slice_support)",
+        "    return;",
+        "end",
+        "matches = find(abs(slice_support(:, 1) - double(control_period)) <= 1e-9, 1);",
+        "if ~isempty(matches)",
+        "    idx = matches;",
+        "end",
+        "end",
+        "",
+        "% Smart Solver exact-slice predictor used by exported bounded CP curve equations.",
+        "function y = eidat_smart_solver_curve_cp_slice_raw_predict(x, slice_coeffs, x_center, x_scale, base_params)",
+        "xn = (double(x) - double(x_center)) ./ double(x_scale);",
+        "coeffs = double(slice_coeffs);",
+        "if numel(coeffs) < 3",
+        "    coeffs = [0 0 0];",
+        "end",
+        "if isempty(base_params)",
+        "    y = coeffs(1) .* (xn.^2) + coeffs(2) .* xn + coeffs(3);",
+        "    return;",
+        "end",
+        "base_params = double(base_params);",
+        "b = base_params(1);",
+        "m = base_params(2);",
+        "A = base_params(3);",
+        "k = base_params(4);",
+        "base = b + (m .* double(x)) + (A .* (1 - exp(-k .* double(x))));",
+        "y = base + coeffs(1) .* (xn.^2) + coeffs(2) .* xn + coeffs(3);",
+        "end",
+        "",
+        "% Smart Solver pair-bounded slice evaluator used by exported bounded CP curve equations.",
+        "function y = eidat_smart_solver_curve_cp_pair_value(x, slice_support, slice_coeffs, base_idx, other_idx, x_center, x_scale, base_params)",
+        "x = double(x);",
+        "base = double(slice_support(base_idx, :));",
+        "other = double(slice_support(other_idx, :));",
+        "x_min = base(2);",
+        "x_max = base(3);",
+        "left_y = base(4);",
+        "right_y = base(5);",
+        "if x < x_min",
+        "    if other(2) < (x_min - 1e-12)",
+        "        y = eidat_smart_solver_curve_cp_line_value(x, other(2), other(4), x_min, left_y);",
+        "    else",
+        "        y = left_y;",
+        "    end",
+        "    return;",
+        "end",
+        "if x > x_max",
+        "    if other(3) > (x_max + 1e-12)",
+        "        y = eidat_smart_solver_curve_cp_line_value(x, x_max, right_y, other(3), other(5));",
+        "    else",
+        "        y = right_y;",
+        "    end",
+        "    return;",
+        "end",
+        "y = eidat_smart_solver_curve_cp_slice_raw_predict(x, slice_coeffs(base_idx, :), x_center, x_scale, base_params);",
+        "end",
+        "",
+        "% Smart Solver exact bounded slice evaluator used by exported bounded CP curve equations.",
+        "function y = eidat_smart_solver_curve_cp_exact_value(x, slice_support, slice_coeffs, idx, x_center, x_scale, base_params)",
+        "x = double(x);",
+        "row = double(slice_support(idx, :));",
+        "x_min = row(2);",
+        "x_max = row(3);",
+        "left_y = row(4);",
+        "right_y = row(5);",
+        "if x < x_min",
+        "    partner_idx = eidat_smart_solver_curve_cp_find_index(slice_support, row(6));",
+        "    if ~isempty(partner_idx)",
+        "        partner = double(slice_support(partner_idx, :));",
+        "        y = eidat_smart_solver_curve_cp_line_value(x, partner(2), partner(4), x_min, left_y);",
+        "    else",
+        "        y = left_y;",
+        "    end",
+        "    return;",
+        "end",
+        "if x > x_max",
+        "    partner_idx = eidat_smart_solver_curve_cp_find_index(slice_support, row(7));",
+        "    if ~isempty(partner_idx)",
+        "        partner = double(slice_support(partner_idx, :));",
+        "        y = eidat_smart_solver_curve_cp_line_value(x, x_max, right_y, partner(3), partner(5));",
+        "    else",
+        "        y = right_y;",
+        "    end",
+        "    return;",
+        "end",
+        "y = eidat_smart_solver_curve_cp_slice_raw_predict(x, slice_coeffs(idx, :), x_center, x_scale, base_params);",
+        "end",
+        "",
+        "% Smart Solver bounded quadratic CP predictor used by exported bounded CP curve equations.",
+        "function y = eidat_smart_solver_curve_cp_bounded_predict(x, control_period, coeff_cp_models, slice_support, slice_coeffs, x_center, x_scale, cp_center, cp_scale)",
+        "x = double(x);",
+        "control_period = double(control_period);",
+        "if isscalar(control_period)",
+        "    control_period = repmat(control_period, size(x));",
+        "end",
+        "if isempty(slice_support) || size(slice_support, 1) ~= size(slice_coeffs, 1)",
+        "    y = eidat_perf_curve_cp_predict(x, control_period, coeff_cp_models, x_center, x_scale, cp_center, cp_scale);",
+        "    return;",
+        "end",
+        "global_x_min = min(slice_support(:, 2));",
+        "global_x_max = max(slice_support(:, 3));",
+        "x = min(max(x, global_x_min), global_x_max);",
+        "slice_cp = double(slice_support(:, 1));",
+        "y = zeros(size(x));",
+        "for idx = 1:numel(x)",
+        "    xv = x(idx);",
+        "    cpv = control_period(idx);",
+        "    exact_idx = find(abs(slice_cp - cpv) <= 1e-9, 1);",
+        "    if ~isempty(exact_idx)",
+        "        y(idx) = eidat_smart_solver_curve_cp_exact_value(xv, slice_support, slice_coeffs, exact_idx, x_center, x_scale, []);",
+        "        continue;",
+        "    end",
+        "    upper_idx = find(cpv < slice_cp, 1);",
+        "    if isempty(upper_idx)",
+        "        upper_idx = numel(slice_cp);",
+        "    end",
+        "    lower_idx = max(1, upper_idx - 1);",
+        "    if upper_idx <= lower_idx",
+        "        y(idx) = eidat_smart_solver_curve_cp_exact_value(xv, slice_support, slice_coeffs, lower_idx, x_center, x_scale, []);",
+        "        continue;",
+        "    end",
+        "    center = eidat_perf_curve_cp_predict(xv, cpv, coeff_cp_models, x_center, x_scale, cp_center, cp_scale);",
+        "    low = eidat_smart_solver_curve_cp_pair_value(xv, slice_support, slice_coeffs, lower_idx, upper_idx, x_center, x_scale, []);",
+        "    high = eidat_smart_solver_curve_cp_pair_value(xv, slice_support, slice_coeffs, upper_idx, lower_idx, x_center, x_scale, []);",
+        "    y(idx) = min(max(center, min(low, high)), max(low, high));",
+        "end",
+        "end",
+        "",
+        "% Smart Solver bounded hybrid CP predictor used by exported bounded CP curve equations.",
+        "function y = eidat_smart_solver_hybrid_curve_cp_bounded_predict(x, control_period, base_params, residual_cp_models, slice_support, slice_coeffs, x_center, x_scale, cp_center, cp_scale)",
+        "x = double(x);",
+        "control_period = double(control_period);",
+        "if isscalar(control_period)",
+        "    control_period = repmat(control_period, size(x));",
+        "end",
+        "if isempty(slice_support) || size(slice_support, 1) ~= size(slice_coeffs, 1)",
+        "    base_params = double(base_params);",
+        "    base = base_params(1) + (base_params(2) .* x) + (base_params(3) .* (1 - exp(-base_params(4) .* x)));",
+        "    y = base + eidat_perf_curve_cp_predict(x, control_period, residual_cp_models, x_center, x_scale, cp_center, cp_scale);",
+        "    return;",
+        "end",
+        "global_x_min = min(slice_support(:, 2));",
+        "global_x_max = max(slice_support(:, 3));",
+        "x = min(max(x, global_x_min), global_x_max);",
+        "slice_cp = double(slice_support(:, 1));",
+        "base_params = double(base_params);",
+        "y = zeros(size(x));",
+        "for idx = 1:numel(x)",
+        "    xv = x(idx);",
+        "    cpv = control_period(idx);",
+        "    exact_idx = find(abs(slice_cp - cpv) <= 1e-9, 1);",
+        "    if ~isempty(exact_idx)",
+        "        y(idx) = eidat_smart_solver_curve_cp_exact_value(xv, slice_support, slice_coeffs, exact_idx, x_center, x_scale, base_params);",
+        "        continue;",
+        "    end",
+        "    upper_idx = find(cpv < slice_cp, 1);",
+        "    if isempty(upper_idx)",
+        "        upper_idx = numel(slice_cp);",
+        "    end",
+        "    lower_idx = max(1, upper_idx - 1);",
+        "    if upper_idx <= lower_idx",
+        "        y(idx) = eidat_smart_solver_curve_cp_exact_value(xv, slice_support, slice_coeffs, lower_idx, x_center, x_scale, base_params);",
+        "        continue;",
+        "    end",
+        "    base = base_params(1) + (base_params(2) .* xv) + (base_params(3) .* (1 - exp(-base_params(4) .* xv)));",
+        "    center = base + eidat_perf_curve_cp_predict(xv, cpv, residual_cp_models, x_center, x_scale, cp_center, cp_scale);",
+        "    low = eidat_smart_solver_curve_cp_pair_value(xv, slice_support, slice_coeffs, lower_idx, upper_idx, x_center, x_scale, base_params);",
+        "    high = eidat_smart_solver_curve_cp_pair_value(xv, slice_support, slice_coeffs, upper_idx, lower_idx, x_center, x_scale, base_params);",
+        "    y(idx) = min(max(center, min(low, high)), max(low, high));",
         "end",
         "end",
         "",

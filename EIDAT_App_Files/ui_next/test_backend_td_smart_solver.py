@@ -351,6 +351,34 @@ def _build_curve_cp_rows(
     return rows
 
 
+def _build_staggered_curve_cp_rows(
+    *,
+    serial: str = "SN-001",
+    run_name: str = "CondA",
+) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    support_by_cp = {
+        50.0: [100.0, 150.0, 200.0],
+        100.0: [100.0, 200.0, 300.0, 350.0],
+    }
+    for cp_index, (control_period, xs) in enumerate(sorted(support_by_cp.items())):
+        for point_index, x_value in enumerate(xs):
+            y_value = 90.0 + (0.42 * x_value) - (0.00045 * (x_value ** 2)) + (0.08 * control_period)
+            rows.append(
+                {
+                    "observation_id": f"{serial}-{run_name}-{int(control_period)}-{point_index}",
+                    "serial": serial,
+                    "run_name": run_name,
+                    "program_title": "Program Alpha",
+                    "source_run_name": f"Seq-{cp_index + 1}-{point_index + 1}",
+                    "control_period": float(control_period),
+                    "input_1": float(x_value),
+                    "output": float(y_value),
+                }
+            )
+    return rows
+
+
 def _negative_interval_count(xs: list[float], ys: list[float], *, breakpoint: float | None) -> int:
     intervals = 0
     in_interval = False
@@ -1177,6 +1205,50 @@ class TestBackendTdSmartSolver(unittest.TestCase):
         self.assertEqual(len(predictions), len(x_values))
         self.assertTrue(all(math.isfinite(float(value)) for value in predictions))
 
+    def test_smart_solver_curve_cp_bounds_predictions_to_terminal_bridge_and_global_domain(self) -> None:
+        rows = _build_staggered_curve_cp_rows()
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            db_path = _create_smart_solver_db(tmpdir, rows)
+            result = backend.td_smart_solver_run(
+                db_path,
+                output_target="Output",
+                input1_target="Input1",
+                runs=["CondA"],
+                serials=["SN-001"],
+            )
+
+        self.assertIn(
+            result["fit_family"],
+            {
+                backend.TD_PERF_FIT_FAMILY_QUADRATIC_CURVE_CONTROL_PERIOD,
+                backend.TD_PERF_FIT_FAMILY_HYBRID_QUADRATIC_RESIDUAL_CONTROL_PERIOD,
+            },
+        )
+        model = dict(result.get("master_model") or {})
+        self.assertEqual(
+            str(model.get("smart_solver_boundary_policy") or ""),
+            backend.TD_SMART_SOLVER_BOUNDARY_POLICY_BOUNDED_CURVE_CP_V1,
+        )
+        self.assertEqual(
+            [float(value) for value in (model.get("curve_cp_global_domain") or [])],
+            [100.0, 350.0],
+        )
+
+        y_50_200 = 90.0 + (0.42 * 200.0) - (0.00045 * (200.0 ** 2)) + (0.08 * 50.0)
+        y_100_350 = 90.0 + (0.42 * 350.0) - (0.00045 * (350.0 ** 2)) + (0.08 * 100.0)
+        expected_bridge_275 = y_50_200 + ((275.0 - 200.0) * (y_100_350 - y_50_200) / (350.0 - 200.0))
+
+        exact_short = backend._td_smart_solver_predict_model(model, [275.0], control_period=[50.0])
+        exact_long = backend._td_smart_solver_predict_model(model, [275.0], control_period=[100.0])
+        mid_pred = backend._td_smart_solver_predict_model(model, [275.0], control_period=[75.0])
+        edge_pred = backend._td_smart_solver_predict_model(model, [350.0], control_period=[75.0])
+        outside_pred = backend._td_smart_solver_predict_model(model, [400.0], control_period=[75.0])
+
+        self.assertAlmostEqual(float(exact_short[0]), float(expected_bridge_275), places=6)
+        self.assertGreaterEqual(float(mid_pred[0]), min(float(exact_short[0]), float(exact_long[0])) - 1e-9)
+        self.assertLessEqual(float(mid_pred[0]), max(float(exact_short[0]), float(exact_long[0])) + 1e-9)
+        self.assertAlmostEqual(float(outside_pred[0]), float(edge_pred[0]), places=6)
+
     def test_steady_state_1d_ignores_control_period_filters_and_returns_non_cp_model(self) -> None:
         rows = [
             {
@@ -1544,6 +1616,41 @@ class TestBackendTdSmartSolver(unittest.TestCase):
         self.assertIn("control_period", pulsed_headers)
         self.assertIn("control_period", pulsed_scenario_headers)
 
+    def test_smart_solver_export_equation_workbook_uses_bounded_curve_cp_formula_when_boundary_policy_is_present(self) -> None:
+        from openpyxl import load_workbook  # type: ignore
+
+        rows = _build_staggered_curve_cp_rows()
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            tmp_path = Path(tmpdir)
+            db_path = _create_smart_solver_db(tmpdir, rows)
+            result = backend.td_smart_solver_run(
+                db_path,
+                output_target="Output",
+                input1_target="Input1",
+                runs=["CondA"],
+                serials=["SN-001"],
+            )
+            out_path = tmp_path / "bounded_curve_cp.xlsx"
+            backend.td_smart_solver_export_equation_workbook(
+                db_path,
+                out_path,
+                result=result,
+                plot_metadata={"run_type_mode": "pulsed_mode"},
+            )
+            wb = load_workbook(str(out_path), data_only=False)
+            try:
+                formulas = [
+                    str(cell.value)
+                    for sheet_name in ("Smart Solver Export", "Scenario Calculator")
+                    for row in wb[sheet_name].iter_rows()
+                    for cell in row
+                    if isinstance(cell.value, str) and cell.value.startswith("=")
+                ]
+            finally:
+                wb.close()
+
+        self.assertTrue(any("1E-9" in formula and "MIN(MAX((" in formula for formula in formulas))
+
     def test_smart_solver_export_equation_matlab_writes_metadata_mode_and_fallout_percent(self) -> None:
         result = {
             "fit_family": backend.TD_PERF_FIT_FAMILY_QUADRATIC_CURVE_CONTROL_PERIOD,
@@ -1638,6 +1745,28 @@ class TestBackendTdSmartSolver(unittest.TestCase):
         self.assertIn("meta.run_type_mode = 'pulsed_mode';", text)
         self.assertIn("meta.equation_text = 'y = curve_cp(x, cp)';", text)
         self.assertIn("function y = eidat_perf_curve_cp_predict", text)
+
+    def test_smart_solver_export_equation_matlab_uses_bounded_curve_cp_helper_when_boundary_policy_is_present(self) -> None:
+        rows = _build_staggered_curve_cp_rows()
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            db_path = _create_smart_solver_db(tmpdir, rows)
+            result = backend.td_smart_solver_run(
+                db_path,
+                output_target="Output",
+                input1_target="Input1",
+                runs=["CondA"],
+                serials=["SN-001"],
+            )
+            out_path = Path(tmpdir) / "smart_solver_bounded_curve_cp.m"
+            backend.td_smart_solver_export_equation_matlab(
+                out_path,
+                result=result,
+                plot_metadata={"run_type_mode": "pulsed_mode"},
+            )
+            text = out_path.read_text(encoding="utf-8")
+
+        self.assertIn("eidat_smart_solver_curve_cp_bounded_predict(", text)
+        self.assertIn("function y = eidat_smart_solver_curve_cp_bounded_predict", text)
 
     def test_smart_solver_export_equation_matlab_steady_state_three_input_omits_control_period(self) -> None:
         result = {
