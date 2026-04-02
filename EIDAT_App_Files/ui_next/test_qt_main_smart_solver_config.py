@@ -537,6 +537,9 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
                     TestDataTrendDialog,
                     "_active_control_period_filter_values",
                     return_value=[30.0],
+                ), patch(
+                    "ui_next.qt_main.QtWidgets.QInputDialog.getItem",
+                    return_value=("Clean export", True),
                 ), patch.object(
                     TestDataTrendDialog,
                     "_start_smart_solver_equation_matlab_export",
@@ -559,6 +562,7 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
                 self.assertEqual(len(export_calls), 1)
                 call = export_calls[0]
                 self.assertEqual(call["output_path"], out_path)
+                self.assertEqual(call["export_mode"], "clean")
                 self.assertEqual(call["plot_metadata"]["selected_control_period"], 30.0)
                 self.assertEqual(call["result"]["master_model"]["fit_family"], "quadratic_curve_control_period")
                 self.assertEqual(call["plot_metadata"]["solver_variables"][0]["target"], "Input1")
@@ -768,6 +772,9 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
                     TestDataTrendDialog,
                     "_active_control_period_filter_values",
                     return_value=[30.0],
+                ), patch(
+                    "ui_next.qt_main.QtWidgets.QInputDialog.getItem",
+                    return_value=("Export with regression checks", True),
                 ), patch.object(
                     TestDataTrendDialog,
                     "_start_smart_solver_equation_matlab_export",
@@ -783,6 +790,7 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
 
                 self.assertEqual(export_calls[0]["plot_metadata"]["selected_control_period"], None)
                 self.assertEqual(export_calls[0]["plot_metadata"]["run_type_mode"], "steady_state")
+                self.assertEqual(export_calls[0]["export_mode"], "regression_checks")
         finally:
             window.close()
             tmpdir = getattr(window, "_test_tmpdir", "")

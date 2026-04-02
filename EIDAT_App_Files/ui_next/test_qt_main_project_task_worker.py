@@ -410,13 +410,14 @@ class TestProjectTaskWorker(unittest.TestCase):
                 out_path,
                 result=result_payload,
                 plot_metadata=plot_metadata,
+                export_mode="clean",
             )
 
             self.assertIsNotNone(dummy.started)
             task_factory = dummy.started["task_factory"]
             on_success = dummy.started["on_success"]
             self.assertEqual(dummy.started["heading"], "Export Equation to MATLAB")
-            self.assertEqual(dummy.started["status_text"], "Exporting MATLAB equation file to smart_solver_equation.m")
+            self.assertEqual(dummy.started["status_text"], "Exporting clean MATLAB equation file to smart_solver_equation.m")
 
             progress_messages: list[str] = []
             payload = task_factory(progress_messages.append)
@@ -424,6 +425,7 @@ class TestProjectTaskWorker(unittest.TestCase):
                 out_path,
                 result=result_payload,
                 plot_metadata=plot_metadata,
+                export_mode="clean",
                 progress_cb=export_mock.call_args.kwargs["progress_cb"],
             )
             export_mock.call_args.kwargs["progress_cb"]("step one")

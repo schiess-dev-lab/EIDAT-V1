@@ -1830,6 +1830,50 @@ class TestBackendTdSmartSolver(unittest.TestCase):
         self.assertNotIn("OLD CONTENT", text)
         self.assertIn("function out = smart_solver_overwrite(varargin)", text)
 
+    def test_smart_solver_export_equation_matlab_sanitizes_invalid_output_filename(self) -> None:
+        result = {
+            "fit_family": backend.TD_PERF_FIT_MODE_POLYNOMIAL,
+            "master_model": {
+                "fit_family": backend.TD_PERF_FIT_MODE_POLYNOMIAL,
+                "coeffs": [2.0, 1.0],
+            },
+            "equation": "y = 2*x + 1",
+            "x_norm_equation": "",
+            "solver_branch": backend.TD_PERF_FIT_MODE_POLYNOMIAL,
+            "selection_reason": "Simple line.",
+            "uses_control_period": False,
+            "uses_staged_mediator": False,
+            "output_target": "Output",
+            "output_units": "u",
+            "solver_variables": [
+                {"key": "input_1", "target": "Input1", "units": "u", "role": "Primary"},
+            ],
+            "fit_points": [
+                {
+                    "run_name": "CondA",
+                    "display_name": "CondA",
+                    "serial": "SN-001",
+                    "observation_id": "obs-1",
+                    "program_title": "Program Alpha",
+                    "source_run_name": "Seq-1",
+                    "suppression_voltage": 5.0,
+                    "condition_label": "CondA",
+                    "input_1": 1.0,
+                    "actual_mean": 3.0,
+                    "sample_count": 1,
+                }
+            ],
+        }
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            requested_path = Path(tmpdir) / "MR-106L_PM_ISP_EDINEXP040126.m"
+            actual_path = backend.td_smart_solver_export_equation_matlab(requested_path, result=result, plot_metadata={})
+            text = actual_path.read_text(encoding="utf-8")
+            self.assertFalse(requested_path.exists())
+
+        self.assertEqual(actual_path.name, "MR_106L_PM_ISP_EDINEXP040126.m")
+        self.assertIn("function out = MR_106L_PM_ISP_EDINEXP040126(varargin)", text)
+
     def test_smart_solver_export_equation_matlab_escapes_apostrophes_in_validation_labels(self) -> None:
         result = {
             "fit_family": backend.TD_PERF_FIT_MODE_POLYNOMIAL,
@@ -1871,6 +1915,62 @@ class TestBackendTdSmartSolver(unittest.TestCase):
             text = out_path.read_text(encoding="utf-8")
 
         self.assertIn("fprintf('Predicted Thruster''s Output: %.12g\\n', pred);", text)
+
+    def test_smart_solver_export_equation_matlab_clean_export_omits_metadata_and_regression_checks(self) -> None:
+        result = {
+            "fit_family": backend.TD_PERF_FIT_MODE_POLYNOMIAL,
+            "master_model": {
+                "fit_family": backend.TD_PERF_FIT_MODE_POLYNOMIAL,
+                "coeffs": [2.0, 1.0],
+            },
+            "equation": "y = 2*x + 1",
+            "x_norm_equation": "",
+            "solver_branch": backend.TD_PERF_FIT_MODE_POLYNOMIAL,
+            "selection_reason": "Simple line.",
+            "uses_control_period": False,
+            "uses_staged_mediator": False,
+            "output_target": "Output",
+            "output_units": "u",
+            "solver_variables": [
+                {"key": "input_1", "target": "Input1", "units": "u", "role": "Primary"},
+            ],
+            "fit_points": [
+                {
+                    "run_name": "CondA",
+                    "display_name": "CondA",
+                    "serial": "SN-001",
+                    "observation_id": "obs-1",
+                    "program_title": "Program Alpha",
+                    "source_run_name": "Seq-1",
+                    "suppression_voltage": 5.0,
+                    "condition_label": "CondA",
+                    "input_1": 1.0,
+                    "actual_mean": 3.0,
+                    "sample_count": 1,
+                }
+            ],
+        }
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            out_path = Path(tmpdir) / "smart_solver_clean.m"
+            backend.td_smart_solver_export_equation_matlab(
+                out_path,
+                result=result,
+                plot_metadata={},
+                export_mode=backend.TD_SMART_SOLVER_MATLAB_EXPORT_MODE_CLEAN,
+            )
+            text = out_path.read_text(encoding="utf-8")
+
+        self.assertIn("% Usage: y = smart_solver_clean(Input1)", text)
+        self.assertIn("% Inputs: Input1", text)
+        self.assertIn("% Example inputs to paste into MATLAB.", text)
+        self.assertIn("    Input1 = 1;", text)
+        self.assertIn("    y = smart_solver_clean(Input1)", text)
+        self.assertIn("error('smart_solver_clean:Usage', 'Usage: y = smart_solver_clean(Input1);');", text)
+        self.assertNotIn("meta = smart_solver_clean('metadata')", text)
+        self.assertNotIn("function meta = local_metadata()", text)
+        self.assertNotIn("Cached actual_mean", text)
+        self.assertNotIn("fprintf(", text)
 
 
 if __name__ == "__main__":
