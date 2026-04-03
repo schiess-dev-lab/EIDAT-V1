@@ -6662,6 +6662,104 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             out.append(dict(item))
         return out
 
+    def _selection_matches_observation_row(
+        self,
+        selection: Mapping[str, object] | None,
+        row: Mapping[str, object] | None,
+    ) -> bool:
+        if not isinstance(selection, Mapping) or not isinstance(row, Mapping):
+            return False
+
+        sequence_values: list[str] = []
+        raw_sequences = selection.get("member_sequences") or []
+        if isinstance(raw_sequences, list):
+            sequence_values = [str(value).strip() for value in raw_sequences if str(value).strip()]
+        if not sequence_values:
+            for candidate in (
+                selection.get("source_run_name"),
+                selection.get("sequence_name"),
+                selection.get("run_name"),
+            ):
+                text = str(candidate or "").strip()
+                if text:
+                    sequence_values = [text]
+                    break
+        sequence_set = {value.casefold() for value in sequence_values if value}
+        row_sequence = str(row.get("source_run_name") or "").strip()
+        if sequence_set:
+            if not row_sequence or row_sequence.casefold() not in sequence_set:
+                return False
+
+        member_programs: list[str] = []
+        seen_programs: set[str] = set()
+        raw_programs = selection.get("member_programs") or []
+        if isinstance(raw_programs, list):
+            for value in raw_programs:
+                label = _td_display_program_title(value)
+                if not label or label.casefold() in seen_programs:
+                    continue
+                seen_programs.add(label.casefold())
+                member_programs.append(label)
+        if not member_programs and "program_title" in selection:
+            member_programs = [_td_display_program_title(selection.get("program_title"))]
+        if member_programs:
+            row_program = _td_display_program_title(row.get("program_title"))
+            if row_program not in set(member_programs):
+                return False
+        return True
+
+    def _visible_run_selection_items_for_filter_state(
+        self,
+        mode: str,
+        *,
+        filter_state: Mapping[str, object] | None = None,
+        require_active_serial_match: bool = False,
+    ) -> list[dict]:
+        items = self._visible_run_selection_items(mode, filter_state=filter_state)
+        if not require_active_serial_match or not self._global_filter_rows:
+            return items
+        filtered_rows = self._filter_rows_for_global_selection(
+            [dict(row) for row in (self._global_filter_rows or []) if isinstance(row, dict)],
+            filter_state=filter_state,
+        )
+        if not filtered_rows:
+            return []
+        out: list[dict] = []
+        for item in items:
+            if any(self._selection_matches_observation_row(item, row) for row in filtered_rows):
+                out.append(dict(item))
+        return out
+
+    def _serial_rows_for_run_selections(
+        self,
+        run_selections: list[dict] | tuple[dict, ...] | None,
+        *,
+        filter_state: Mapping[str, object] | None = None,
+    ) -> list[dict]:
+        serial_rows = [
+            dict(row)
+            for row in self._active_serial_rows(filter_state=filter_state)
+            if isinstance(row, dict)
+        ]
+        selections = [dict(selection) for selection in (run_selections or []) if isinstance(selection, dict)]
+        if not serial_rows or not selections or not self._global_filter_rows:
+            return serial_rows
+
+        filtered_rows = self._filter_rows_for_global_selection(
+            [dict(row) for row in (self._global_filter_rows or []) if isinstance(row, dict)],
+            filter_state=filter_state,
+        )
+        matched_serials: set[str] = set()
+        for row in filtered_rows:
+            if not any(self._selection_matches_observation_row(selection, row) for selection in selections):
+                continue
+            serial = _td_serial_value(row)
+            if serial:
+                matched_serials.add(serial)
+        if not matched_serials:
+            return []
+        return [dict(row) for row in serial_rows if _td_serial_value(row) in matched_serials]
+
     def _sync_run_mode_availability(self) -> None:
         if not hasattr(self, "cb_run_mode"):
             return
@@ -6951,6 +7049,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             cfg = be.load_trend_auto_report_config(self._project_dir)
         except Exception:
             cfg = {}
+        report_filter_state = self._normalize_auto_plot_filter_state(
+            self._current_auto_plot_filter_state(),
+            default_to_current=True,
+        )
 
         # Output path
         row_out = QtWidgets.QHBoxLayout()
@@ -7001,6 +7103,52 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         note.setWordWrap(True)
         layout.addWidget(note)
 
+        report_filter_frame = QtWidgets.QFrame()
+        report_filter_frame.setStyleSheet("QFrame { background: #ffffff; border: 1px solid #d1d5db; border-radius: 10px; }")
+        report_filter_layout = QtWidgets.QHBoxLayout(report_filter_frame)
+        report_filter_layout.setContentsMargins(12, 10, 12, 10)
+        report_filter_layout.setSpacing(10)
+
+        report_filter_text = QtWidgets.QVBoxLayout()
+        report_filter_text.setContentsMargins(0, 0, 0, 0)
+        report_filter_text.setSpacing(2)
+        lbl_report_filter_title = QtWidgets.QLabel("Report Filters")
+        lbl_report_filter_title.setStyleSheet("font-size: 12px; font-weight: 800; color: #000000;")
+        lbl_report_filter_hint = QtWidgets.QLabel("Local to this exporter. These do not change the main Trend / Analyze filters.")
+        lbl_report_filter_hint.setStyleSheet("color: #4b5563; font-size: 11px;")
+        lbl_report_filter_hint.setWordWrap(True)
+        lbl_report_program_filters = QtWidgets.QLabel("Programs: -")
+        lbl_report_program_filters.setStyleSheet("color: #374151; font-size: 11px;")
+        lbl_report_serial_filters = QtWidgets.QLabel("Serials: -")
+        lbl_report_serial_filters.setStyleSheet("color: #374151; font-size: 11px;")
+        lbl_report_suppression_filters = QtWidgets.QLabel("Suppression Voltage: -")
+        lbl_report_suppression_filters.setStyleSheet("color: #374151; font-size: 11px;")
+        lbl_report_control_filters = QtWidgets.QLabel("Control Period: -")
+        lbl_report_control_filters.setStyleSheet("color: #374151; font-size: 11px;")
+        report_filter_text.addWidget(lbl_report_filter_title)
+        report_filter_text.addWidget(lbl_report_filter_hint)
+        report_filter_text.addWidget(lbl_report_program_filters)
+        report_filter_text.addWidget(lbl_report_serial_filters)
+        report_filter_text.addWidget(lbl_report_suppression_filters)
+        report_filter_text.addWidget(lbl_report_control_filters)
+        report_filter_layout.addLayout(report_filter_text, 1)
+
+        btn_report_program_filters = QtWidgets.QPushButton("Programs...")
+        btn_report_serial_filters = QtWidgets.QPushButton("Serials...")
+        btn_report_suppression_filters = QtWidgets.QPushButton("Suppression Voltage...")
+        btn_report_control_filters = QtWidgets.QPushButton("Control Period...")
+        btn_report_reset_filters = QtWidgets.QPushButton("Reset Filters")
+        for btn in (
+            btn_report_program_filters,
+            btn_report_serial_filters,
+            btn_report_suppression_filters,
+            btn_report_control_filters,
+            btn_report_reset_filters,
+        ):
+            btn.setMinimumHeight(34)
+            report_filter_layout.addWidget(btn)
+        layout.addWidget(report_filter_frame)
+
         splitter = QtWidgets.QSplitter()
         splitter.setOrientation(QtCore.Qt.Orientation.Horizontal)
         layout.addWidget(splitter, 1)
@@ -7018,25 +7166,13 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         list_sn.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
         left_l.addWidget(list_sn, 1)
 
-        serials = []
-        try:
-            serials = be.td_list_serials(self._db_path) if self._db_path else []
-        except Exception:
-            serials = []
-        for sn in serials:
-            list_sn.addItem(QtWidgets.QListWidgetItem(str(sn)))
-
         default_hi = []
         try:
             default_hi = (cfg.get("highlight") or {}).get("default_serials") if isinstance(cfg, dict) else []
         except Exception:
             default_hi = []
         want_hi = {str(s).strip() for s in (default_hi or []) if str(s).strip()}
-        if want_hi:
-            for i in range(list_sn.count()):
-                it = list_sn.item(i)
-                if it and it.text().strip() in want_hi:
-                    it.setSelected(True)
+        applied_default_hi = False
 
         def _apply_sn_filter():
             needle = (ed_sn_filter.text() or "").strip().lower()
@@ -7068,6 +7204,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         idx_scope = cb_run_scope.findData(cur_scope)
         if idx_scope >= 0:
             cb_run_scope.setCurrentIndex(idx_scope)
+        run_selection_check_states: dict[str, dict[str, bool]] = {"sequence": {}, "condition": {}}
+        current_run_list_mode = str(cb_run_scope.currentData() or "sequence").strip().lower()
 
         ed_param_filter = QtWidgets.QLineEdit()
 
@@ -7225,9 +7363,48 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         def _selection_label(selection: dict) -> str:
             return self._selection_display_text(selection) or str(selection.get("sequence_name") or selection.get("run_name") or "").strip()
 
+        def _run_selection_key(selection: dict | None) -> str:
+            if not isinstance(selection, dict):
+                return ""
+            return str(selection.get("id") or "").strip()
+
+        def _filtered_run_selection_items(mode: str) -> list[dict]:
+            return self._visible_run_selection_items_for_filter_state(
+                mode,
+                filter_state=report_filter_state,
+                require_active_serial_match=True,
+            )
+
+        def _capture_run_selection_states() -> None:
+            nonlocal current_run_list_mode
+            state_bucket = run_selection_check_states.setdefault(current_run_list_mode, {})
+            state_bucket.clear()
+            for i in range(list_runs.count()):
+                it = list_runs.item(i)
+                data = it.data(QtCore.Qt.ItemDataRole.UserRole) if it is not None else None
+                key = _run_selection_key(data if isinstance(data, dict) else None)
+                if key:
+                    state_bucket[key] = bool(it and it.checkState() == QtCore.Qt.CheckState.Checked)
+
+        def _sync_report_run_scope_availability() -> None:
+            has_conditions = bool(_filtered_run_selection_items("condition"))
+            idx_condition = cb_run_scope.findData("condition")
+            if idx_condition >= 0:
+                try:
+                    cb_run_scope.model().item(idx_condition).setEnabled(has_conditions)
+                except Exception:
+                    pass
+            if str(cb_run_scope.currentData() or "sequence").strip().lower() == "condition" and not has_conditions:
+                idx_sequence = cb_run_scope.findData("sequence")
+                if idx_sequence >= 0:
+                    cb_run_scope.setCurrentIndex(idx_sequence)
+
         def _populate_run_selections() -> None:
+            nonlocal current_run_list_mode
+            _capture_run_selection_states()
             mode = str(cb_run_scope.currentData() or "sequence").strip().lower()
-            items = [dict(d) for d in (run_selection_views.get(mode) or []) if isinstance(d, dict)]
+            items = _filtered_run_selection_items(mode)
+            saved_states = dict(run_selection_check_states.get(mode) or {})
             list_runs.blockSignals(True)
             list_runs.clear()
             for selection in items:
@@ -7236,10 +7413,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     continue
                 it = QtWidgets.QListWidgetItem(label)
                 it.setFlags(it.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
-                it.setCheckState(QtCore.Qt.CheckState.Checked)
+                checked = saved_states.get(_run_selection_key(selection), True)
+                it.setCheckState(QtCore.Qt.CheckState.Checked if checked else QtCore.Qt.CheckState.Unchecked)
                 it.setData(QtCore.Qt.ItemDataRole.UserRole, selection)
                 list_runs.addItem(it)
             list_runs.blockSignals(False)
+            current_run_list_mode = mode
 
         def _collect_checked_run_selections() -> list[dict]:
             out: list[dict] = []
@@ -7272,7 +7451,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
         def _update_runs_label() -> None:
             sel = [_selection_label(d) for d in _collect_checked_run_selections() if _selection_label(d)]
-            lbl_runs_auto.setText(f"Selected runs: {_selection_summary(sel, list_runs.count())}")
+            scope_label = "run conditions" if str(cb_run_scope.currentData() or "sequence").strip().lower() == "condition" else "sequences"
+            lbl_runs_auto.setText(f"Selected {scope_label}: {_selection_summary(sel, list_runs.count())}")
 
         def _update_params_label():
             sel = _collect_checked(list_params)
@@ -7285,6 +7465,109 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             lbl_metrics_auto.setText(
                 f"Selected metric params: {_selection_summary(params_sel, list_metric_params.count())} | Stats: {stats_text}"
             )
+
+        def _refresh_serials_from_runs() -> None:
+            nonlocal applied_default_hi
+            selected_before = {
+                it.text().strip()
+                for it in list_sn.selectedItems()
+                if it is not None and it.text().strip()
+            }
+            serial_rows = self._serial_rows_for_run_selections(
+                _collect_checked_run_selections(),
+                filter_state=report_filter_state,
+            )
+            serial_values = [_td_serial_value(row) for row in serial_rows if _td_serial_value(row)]
+            list_sn.blockSignals(True)
+            list_sn.clear()
+            for serial in serial_values:
+                list_sn.addItem(QtWidgets.QListWidgetItem(serial))
+            desired = selected_before
+            if not desired and not applied_default_hi:
+                desired = set(want_hi)
+            for i in range(list_sn.count()):
+                it = list_sn.item(i)
+                if it and it.text().strip() in desired:
+                    it.setSelected(True)
+            list_sn.blockSignals(False)
+            applied_default_hi = True
+            _apply_sn_filter()
+
+        def _report_filter_summary(
+            prefix: str,
+            active_values: list[str],
+            total: int,
+            *,
+            tooltip_label: QtWidgets.QLabel | None = None,
+        ) -> str:
+            if total <= 0:
+                text = f"{prefix}: -"
+            elif len(active_values) >= total:
+                text = f"{prefix}: All ({total})"
+            elif not active_values:
+                text = f"{prefix}: None active (0/{total})"
+            elif len(active_values) <= 3:
+                text = f"{prefix}: " + ", ".join(active_values)
+            else:
+                text = f"{prefix}: {len(active_values)} of {total} active"
+            if tooltip_label is not None:
+                tooltip_label.setToolTip(", ".join(active_values))
+            return text
+
+        def _refresh_report_filter_summaries() -> None:
+            programs_active = self._active_program_filter_values(filter_state=report_filter_state)
+            serials_active = self._active_serials(filter_state=report_filter_state)
+            suppression_active = self._active_suppression_voltage_filter_values(filter_state=report_filter_state)
+            control_active = self._active_control_period_filter_values(filter_state=report_filter_state)
+            lbl_report_program_filters.setText(
+                _report_filter_summary(
+                    "Programs",
+                    programs_active,
+                    len(self._available_program_filters or []),
+                    tooltip_label=lbl_report_program_filters,
+                )
+            )
+            lbl_report_serial_filters.setText(
+                _report_filter_summary(
+                    "Serials",
+                    serials_active,
+                    len(self._available_serial_filter_rows or []),
+                    tooltip_label=lbl_report_serial_filters,
+                )
+            )
+            lbl_report_suppression_filters.setText(
+                _report_filter_summary(
+                    "Suppression Voltage",
+                    suppression_active,
+                    len(self._available_suppression_voltage_filters or []),
+                    tooltip_label=lbl_report_suppression_filters,
+                )
+            )
+            lbl_report_control_filters.setText(
+                _report_filter_summary(
+                    "Control Period",
+                    control_active,
+                    len(self._available_control_period_filters or []),
+                    tooltip_label=lbl_report_control_filters,
+                )
+            )
+            btn_report_program_filters.setEnabled(bool(self._available_program_filters))
+            btn_report_serial_filters.setEnabled(bool(self._available_serial_filter_rows))
+            btn_report_suppression_filters.setEnabled(bool(self._available_suppression_voltage_filters))
+            btn_report_control_filters.setEnabled(bool(self._available_control_period_filters))
+            btn_report_reset_filters.setEnabled(
+                bool(self._available_program_filters)
+                or bool(self._available_serial_filter_rows)
+                or bool(self._available_suppression_voltage_filters)
+                or bool(self._available_control_period_filters)
+            )
+
+        def _apply_report_filter_change() -> None:
+            _refresh_report_filter_summaries()
+            _sync_report_run_scope_availability()
+            _populate_run_selections()
+            _refresh_serials_from_runs()
+            _refresh_params_from_runs()
 
         def _refresh_params_from_runs():
             runs_sel = _selected_member_runs()
@@ -7378,7 +7661,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 title_text="Runs Included",
                 target_list=list_runs,
                 filter_placeholder="Filter runs...",
-                extra_apply=lambda _ctx: (_update_runs_label(), _refresh_params_from_runs()),
+                extra_apply=lambda _ctx: (_refresh_serials_from_runs(), _refresh_params_from_runs()),
             )
 
         def _open_params_popup() -> None:
@@ -7426,17 +7709,109 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 extra_apply=_metrics_extra_apply,
             )
 
+        def _set_report_filter_values(key: str, values: list[str], available_values: list[str]) -> None:
+            allowed = set(available_values)
+            report_filter_state[key] = [value for value in available_values if value in allowed and value in set(values)]
+            _apply_report_filter_change()
+
+        def _open_report_program_filters_popup() -> None:
+            entries = [
+                {"value": value, "label": value, "search": value.lower()}
+                for value in (self._available_program_filters or [])
+                if str(value).strip()
+            ]
+            chosen = self._show_filter_checklist_popup(
+                title="Report Programs",
+                entries=entries,
+                selected_values=list(report_filter_state.get("programs") or []),
+            )
+            if chosen is None:
+                return
+            _set_report_filter_values("programs", chosen, list(self._available_program_filters or []))
+
+        def _open_report_serial_filters_popup() -> None:
+            entries: list[dict] = []
+            for row in (self._available_serial_filter_rows or []):
+                serial = _td_serial_value(row)
+                if not serial:
+                    continue
+                program = _td_display_program_title((row or {}).get("program_title"))
+                doc_type = str((row or {}).get("document_type") or "").strip()
+                parts = [serial, program]
+                if doc_type:
+                    parts.append(doc_type)
+                entries.append(
+                    {
+                        "value": serial,
+                        "label": " | ".join(parts),
+                        "search": self._serial_row_filter_text(row),
+                    }
+                )
+            chosen = self._show_filter_checklist_popup(
+                title="Report Serials",
+                entries=entries,
+                selected_values=list(report_filter_state.get("serials") or []),
+            )
+            if chosen is None:
+                return
+            _set_report_filter_values("serials", chosen, self._auto_plot_available_serial_values())
+
+        def _open_report_suppression_filters_popup() -> None:
+            entries = [
+                {"value": value, "label": value, "search": value.lower()}
+                for value in (self._available_suppression_voltage_filters or [])
+                if str(value).strip()
+            ]
+            chosen = self._show_filter_checklist_popup(
+                title="Report Suppression Voltages",
+                entries=entries,
+                selected_values=list(report_filter_state.get("suppression_voltages") or []),
+            )
+            if chosen is None:
+                return
+            _set_report_filter_values(
+                "suppression_voltages",
+                chosen,
+                list(self._available_suppression_voltage_filters or []),
+            )
+
+        def _open_report_control_period_filters_popup() -> None:
+            entries = [
+                {"value": value, "label": value, "search": value.lower()}
+                for value in (self._available_control_period_filters or [])
+                if str(value).strip()
+            ]
+            chosen = self._show_filter_checklist_popup(
+                title="Report Control Periods",
+                entries=entries,
+                selected_values=list(report_filter_state.get("control_periods") or []),
+            )
+            if chosen is None:
+                return
+            _set_report_filter_values("control_periods", chosen, list(self._available_control_period_filters or []))
+
+        def _reset_report_filters() -> None:
+            report_filter_state["programs"] = list(self._available_program_filters or [])
+            report_filter_state["serials"] = self._auto_plot_available_serial_values()
+            report_filter_state["control_periods"] = list(self._available_control_period_filters or [])
+            report_filter_state["suppression_voltages"] = list(self._available_suppression_voltage_filters or [])
+            _apply_report_filter_change()
+
         btn_runs_popup.clicked.connect(_open_runs_popup)
         btn_params_popup.clicked.connect(_open_params_popup)
         btn_metrics_popup.clicked.connect(_open_metrics_popup)
+        btn_report_program_filters.clicked.connect(_open_report_program_filters_popup)
+        btn_report_serial_filters.clicked.connect(_open_report_serial_filters_popup)
+        btn_report_suppression_filters.clicked.connect(_open_report_suppression_filters_popup)
+        btn_report_control_filters.clicked.connect(_open_report_control_period_filters_popup)
+        btn_report_reset_filters.clicked.connect(_reset_report_filters)
 
-        cb_run_scope.currentIndexChanged.connect(lambda *_: (_populate_run_selections(), _refresh_params_from_runs()))
-        list_runs.itemChanged.connect(lambda *_: _refresh_params_from_runs())
+        cb_run_scope.currentIndexChanged.connect(lambda *_: (_populate_run_selections(), _refresh_serials_from_runs(), _refresh_params_from_runs()))
+        list_runs.itemChanged.connect(lambda *_: (_refresh_serials_from_runs(), _refresh_params_from_runs()))
         list_params.itemChanged.connect(lambda *_: _update_params_label())
         list_metric_params.itemChanged.connect(lambda *_: _update_metric_params_label())
         list_metric_stats.itemChanged.connect(lambda *_: _update_metric_params_label())
-        _populate_run_selections()
-        _refresh_params_from_runs()
+        _apply_report_filter_change()
 
         splitter.addWidget(right)
         splitter.setStretchFactor(0, 1)
@@ -7617,9 +7992,17 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 return
             run_selections_sel = _collect_checked_run_selections()
             runs_sel = _selected_member_runs()
+            filtered_serials = [
+                list_sn.item(i).text().strip()
+                for i in range(list_sn.count())
+                if list_sn.item(i) is not None and list_sn.item(i).text().strip()
+            ]
             hi_sel = [it.text().strip() for it in list_sn.selectedItems() if it and it.text().strip()]
             if not runs_sel:
                 QtWidgets.QMessageBox.information(dlg, "Auto Report", "Select at least one run.")
+                return
+            if not filtered_serials:
+                QtWidgets.QMessageBox.information(dlg, "Auto Report", "The active report filters exclude all serials.")
                 return
             if not hi_sel:
                 QtWidgets.QMessageBox.information(dlg, "Auto Report", "Select at least one serial under certification.")
@@ -7720,6 +8103,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 "runs": runs_sel,
                 "run_selections": run_selections_sel,
                 "run_selection_labels": [_selection_label(d) for d in run_selections_sel if _selection_label(d)],
+                "filter_state": dict(report_filter_state),
+                "filtered_serials": filtered_serials,
                 "highlighted_serials": hi_sel,
                 "params": params_sel,
                 "metric_params": metric_params_sel,
@@ -7761,6 +8146,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             "runs": runs,
             "run_selections": payload.get("run_selections") or [],
             "run_selection_labels": payload.get("run_selection_labels") or [],
+            "filter_state": dict(payload.get("filter_state") or {}),
+            "filtered_serials": payload.get("filtered_serials") or [],
             "params": payload.get("params") or [],
             "metric_params": payload.get("metric_params") or [],
             "metric_stats": payload.get("metric_stats") or [],

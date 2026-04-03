@@ -1708,6 +1708,8 @@ class TestBackendTdSmartSolver(unittest.TestCase):
             ],
             "input2_target": "",
             "input2_units": "",
+            "equation": "y = curve_cp(x, cp)",
+            "x_norm_equation": "x' = (x - 0) / 1 ; cp' = (cp - 0) / 1",
             "uses_control_period": True,
             "run_type_mode": "pulsed_mode",
             "solver_branch": backend.TD_PERF_FIT_FAMILY_QUADRATIC_CURVE_CONTROL_PERIOD,
@@ -1753,6 +1755,18 @@ class TestBackendTdSmartSolver(unittest.TestCase):
                 pulsed_headers = _row_values_by_anchor(pulsed_wb["Smart Solver Export"], "run_name")
                 pulsed_checker_headers = _row_values_by_anchor(pulsed_wb["Fit Point Checker"], "run_name")
                 pulsed_scenario_headers = _row_values_by_anchor(pulsed_wb["Scenario Calculator"], "scenario_id")
+                steady_export_text = "\n".join(
+                    str(cell.value)
+                    for row in steady_wb["Smart Solver Export"].iter_rows()
+                    for cell in row
+                    if isinstance(cell.value, str) and str(cell.value).strip()
+                )
+                pulsed_export_text = "\n".join(
+                    str(cell.value)
+                    for row in pulsed_wb["Smart Solver Export"].iter_rows()
+                    for cell in row
+                    if isinstance(cell.value, str) and str(cell.value).strip()
+                )
                 pulsed_scenario_sheet = pulsed_wb["Scenario Calculator"]
                 pulsed_scenario_header_row = next(
                     row_idx
@@ -1795,6 +1809,16 @@ class TestBackendTdSmartSolver(unittest.TestCase):
         )
         self.assertIn(pulsed_control_ref, pulsed_pred_min_formula)
         self.assertIn("1E-9", pulsed_pred_min_formula)
+        self.assertIn("three_sigma_offset = 1.5", steady_export_text)
+        self.assertIn("pred_min_3sigma = (a + bx + cy) - (three_sigma_offset)", steady_export_text)
+        self.assertIn(
+            "three_sigma_offset(control_period) = interp_clamp(control_period, [20, 40], [1.5, 3])",
+            pulsed_export_text,
+        )
+        self.assertIn(
+            "pred_min_3sigma = (curve_cp(x, cp)) - (three_sigma_offset(control_period))",
+            pulsed_export_text,
+        )
 
     def test_smart_solver_export_equation_workbook_uses_bounded_curve_cp_formula_when_boundary_policy_is_present(self) -> None:
         from openpyxl import load_workbook  # type: ignore
@@ -1915,6 +1939,18 @@ class TestBackendTdSmartSolver(unittest.TestCase):
         self.assertIn("% Metadata usage: meta = smart_solver_curve_cp('metadata')", text)
         self.assertIn("% Validation example from one cached EIDAT fit point.", text)
         self.assertIn("if false", text)
+        self.assertIn(
+            "% 3-sigma offset equation: three_sigma_offset(control_period) = interp_clamp(control_period, [20, 40], [1.5, 3])",
+            text,
+        )
+        self.assertIn(
+            "% 3-sigma min equation: pred_min_3sigma = (curve_cp(x, cp)) - (three_sigma_offset(control_period))",
+            text,
+        )
+        self.assertIn(
+            "% 3-sigma max equation: pred_max_3sigma = (curve_cp(x, cp)) + (three_sigma_offset(control_period))",
+            text,
+        )
         self.assertIn("    Input1 = 1;", text)
         self.assertIn("    control_period = 30;", text)
         self.assertIn("    pred = smart_solver_curve_cp(Input1, control_period);", text)
@@ -1937,6 +1973,18 @@ class TestBackendTdSmartSolver(unittest.TestCase):
         self.assertIn("meta.three_sigma_cp_policy = 'interpolate_clamp';", text)
         self.assertIn("meta.three_sigma_support_control_periods = [20 40];", text)
         self.assertIn("meta.three_sigma_support_offsets = [1.5 3];", text)
+        self.assertIn(
+            "meta.three_sigma_offset_equation_text = 'three_sigma_offset(control_period) = interp_clamp(control_period, [20, 40], [1.5, 3])';",
+            text,
+        )
+        self.assertIn(
+            "meta.pred_min_3sigma_equation_text = 'pred_min_3sigma = (curve_cp(x, cp)) - (three_sigma_offset(control_period))';",
+            text,
+        )
+        self.assertIn(
+            "meta.pred_max_3sigma_equation_text = 'pred_max_3sigma = (curve_cp(x, cp)) + (three_sigma_offset(control_period))';",
+            text,
+        )
         self.assertIn("meta.three_sigma_offset = @local_three_sigma_offset;", text)
         self.assertIn("meta.pred_min_3sigma = @local_predict_min_3sigma;", text)
         self.assertIn("meta.pred_max_3sigma = @local_predict_max_3sigma;", text)
@@ -2295,6 +2343,9 @@ class TestBackendTdSmartSolver(unittest.TestCase):
         self.assertIn("% Usage: y = smart_solver_clean(Input1)", text)
         self.assertIn("% Inputs: Input1", text)
         self.assertIn("% Example inputs to paste into MATLAB.", text)
+        self.assertIn("% 3-sigma offset equation: three_sigma_offset = 0", text)
+        self.assertIn("% 3-sigma min equation: pred_min_3sigma = (2*x + 1) - (three_sigma_offset)", text)
+        self.assertIn("% 3-sigma max equation: pred_max_3sigma = (2*x + 1) + (three_sigma_offset)", text)
         self.assertIn("    Input1 = 1;", text)
         self.assertIn("    y = smart_solver_clean(Input1)", text)
         self.assertIn("error('smart_solver_clean:Usage', 'Usage: y = smart_solver_clean(Input1);');", text)

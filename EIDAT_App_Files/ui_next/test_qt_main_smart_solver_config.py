@@ -844,6 +844,79 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
             if tmpdir:
                 shutil.rmtree(str(tmpdir), ignore_errors=True)
 
+    def test_auto_report_filter_helpers_limit_sequences_and_serials_to_matching_scope(self) -> None:
+        window = self._make_window()
+        try:
+            window._available_program_filters = ["Program A", "Program B"]
+            window._available_control_period_filters = ["10", "20"]
+            window._available_suppression_voltage_filters = ["5", "7"]
+            window._available_serial_filter_rows = [
+                {"serial": "SN-001", "program_title": "Program A"},
+                {"serial": "SN-002", "program_title": "Program B"},
+            ]
+            window._global_filter_rows = [
+                {
+                    "serial": "SN-001",
+                    "program_title": "Program A",
+                    "source_run_name": "Seq A",
+                    "control_period": 10.0,
+                    "suppression_voltage": 5.0,
+                },
+                {
+                    "serial": "SN-002",
+                    "program_title": "Program B",
+                    "source_run_name": "Seq B",
+                    "control_period": 20.0,
+                    "suppression_voltage": 7.0,
+                },
+            ]
+            window._run_selection_views = {
+                "sequence": [
+                    {
+                        "mode": "sequence",
+                        "id": "sequence:run_a|Program A|Seq A",
+                        "run_name": "run_a",
+                        "program_title": "Program A",
+                        "member_programs": ["Program A"],
+                        "member_sequences": ["Seq A"],
+                        "member_control_periods": ["10"],
+                        "member_suppression_voltages": ["5"],
+                    },
+                    {
+                        "mode": "sequence",
+                        "id": "sequence:run_b|Program B|Seq B",
+                        "run_name": "run_b",
+                        "program_title": "Program B",
+                        "member_programs": ["Program B"],
+                        "member_sequences": ["Seq B"],
+                        "member_control_periods": ["20"],
+                        "member_suppression_voltages": ["7"],
+                    },
+                ],
+                "condition": [],
+            }
+            filter_state = {
+                "programs": ["Program A"],
+                "serials": ["SN-001"],
+                "control_periods": ["10"],
+                "suppression_voltages": ["5"],
+            }
+
+            items = window._visible_run_selection_items_for_filter_state(
+                "sequence",
+                filter_state=filter_state,
+                require_active_serial_match=True,
+            )
+            self.assertEqual([item["id"] for item in items], ["sequence:run_a|Program A|Seq A"])
+
+            serial_rows = window._serial_rows_for_run_selections(items, filter_state=filter_state)
+            self.assertEqual([row["serial"] for row in serial_rows], ["SN-001"])
+        finally:
+            window.close()
+            tmpdir = getattr(window, "_test_tmpdir", "")
+            if tmpdir:
+                shutil.rmtree(str(tmpdir), ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()

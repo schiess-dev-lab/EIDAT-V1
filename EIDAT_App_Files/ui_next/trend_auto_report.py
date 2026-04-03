@@ -9,7 +9,7 @@ on optional plotting/scientific libraries (matplotlib, numpy).
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import json
 import math
@@ -62,6 +62,186 @@ def _fmt_num(v: object, *, sig: int = 4) -> str:
 
 def _norm_key(s: str) -> str:
     return "".join(ch.lower() for ch in str(s or "").strip() if ch.isalnum())
+
+
+def _td_display_program_title(value: object) -> str:
+    return str(value or "").strip() or "Unknown Program"
+
+
+def _td_serial_value(row: Mapping[str, object] | None) -> str:
+    if not isinstance(row, Mapping):
+        return ""
+    return str(row.get("serial") or row.get("serial_number") or "").strip()
+
+
+def _td_compact_filter_value(value: object) -> str:
+    if value is None or isinstance(value, bool):
+        return ""
+    if isinstance(value, (int, float)):
+        try:
+            num = float(value)
+        except Exception:
+            return ""
+        if not math.isfinite(num):
+            return ""
+        return f"{num:g}"
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        num = float(raw)
+    except Exception:
+        return raw
+    if not math.isfinite(num):
+        return raw
+    return f"{num:g}"
+
+
+def _td_control_period_filter_value(row: Mapping[str, object] | None) -> str:
+    if not isinstance(row, Mapping):
+        return ""
+    return _td_compact_filter_value(row.get("control_period"))
+
+
+def _td_suppression_voltage_filter_value(row: Mapping[str, object] | None) -> str:
+    if not isinstance(row, Mapping):
+        return ""
+    return _td_compact_filter_value(row.get("suppression_voltage"))
+
+
+def _filter_state_values(filter_state: Mapping[str, object] | None, key: str) -> list[str]:
+    if not isinstance(filter_state, Mapping):
+        return []
+    raw_values = filter_state.get(key) or []
+    if not isinstance(raw_values, list):
+        return []
+    return [str(value).strip() for value in raw_values if str(value).strip()]
+
+
+def _filter_state_has_key(filter_state: Mapping[str, object] | None, key: str) -> bool:
+    return isinstance(filter_state, Mapping) and key in filter_state
+
+
+def _row_matches_filter_state(row: Mapping[str, object] | None, filter_state: Mapping[str, object] | None) -> bool:
+    if not isinstance(row, Mapping):
+        return False
+    selected_programs = set(_filter_state_values(filter_state, "programs"))
+    if _filter_state_has_key(filter_state, "programs"):
+        if _td_display_program_title(row.get("program_title")) not in selected_programs:
+            return False
+    selected_serials = set(_filter_state_values(filter_state, "serials"))
+    if _filter_state_has_key(filter_state, "serials"):
+        serial = _td_serial_value(row)
+        if not serial or serial not in selected_serials:
+            return False
+    selected_control_periods = set(_filter_state_values(filter_state, "control_periods"))
+    if _filter_state_has_key(filter_state, "control_periods"):
+        control_period = _td_control_period_filter_value(row)
+        if not control_period or control_period not in selected_control_periods:
+            return False
+    selected_suppression = set(_filter_state_values(filter_state, "suppression_voltages"))
+    if _filter_state_has_key(filter_state, "suppression_voltages"):
+        suppression_voltage = _td_suppression_voltage_filter_value(row)
+        if not suppression_voltage or suppression_voltage not in selected_suppression:
+            return False
+    return True
+
+
+def _filter_rows_for_filter_state(
+    rows: list[dict],
+    filter_state: Mapping[str, object] | None,
+) -> list[dict]:
+    if not isinstance(filter_state, Mapping) or not filter_state:
+        return [dict(row) for row in (rows or []) if isinstance(row, dict)]
+    return [dict(row) for row in (rows or []) if _row_matches_filter_state(row, filter_state)]
+
+
+def _selection_matches_observation_row(
+    selection: Mapping[str, object] | None,
+    row: Mapping[str, object] | None,
+) -> bool:
+    if not isinstance(selection, Mapping) or not isinstance(row, Mapping):
+        return False
+    sequence_values: list[str] = []
+    raw_sequences = selection.get("member_sequences") or []
+    if isinstance(raw_sequences, list):
+        sequence_values = [str(value).strip() for value in raw_sequences if str(value).strip()]
+    if not sequence_values:
+        for candidate in (
+            selection.get("source_run_name"),
+            selection.get("sequence_name"),
+            selection.get("run_name"),
+        ):
+            text = str(candidate or "").strip()
+            if text:
+                sequence_values = [text]
+                break
+    sequence_set = {value.casefold() for value in sequence_values if value}
+    row_sequence = str(row.get("source_run_name") or "").strip()
+    if sequence_set:
+        if not row_sequence or row_sequence.casefold() not in sequence_set:
+            return False
+
+    member_programs: list[str] = []
+    seen_programs: set[str] = set()
+    raw_programs = selection.get("member_programs") or []
+    if isinstance(raw_programs, list):
+        for value in raw_programs:
+            label = _td_display_program_title(value)
+            if not label or label.casefold() in seen_programs:
+                continue
+            seen_programs.add(label.casefold())
+            member_programs.append(label)
+    if not member_programs and "program_title" in selection:
+        member_programs = [_td_display_program_title(selection.get("program_title"))]
+    if member_programs:
+        if _td_display_program_title(row.get("program_title")) not in set(member_programs):
+            return False
+    return True
+
+
+def _resolve_filtered_serials(
+    be: Any,
+    db_path: Path,
+    ordered_serials: list[str],
+    options: dict,
+) -> list[str]:
+    provided = options.get("filtered_serials") or []
+    if isinstance(provided, list):
+        chosen = {str(value).strip() for value in provided if str(value).strip()}
+        if chosen:
+            return [serial for serial in ordered_serials if serial in chosen]
+
+    filter_state = options.get("filter_state")
+    run_selections = options.get("run_selections") or []
+    if not isinstance(filter_state, Mapping):
+        filter_state = {}
+    if not isinstance(run_selections, list):
+        run_selections = []
+    if not filter_state and not run_selections:
+        return list(ordered_serials)
+
+    try:
+        filter_rows = be.td_read_observation_filter_rows_from_cache(db_path)
+    except Exception:
+        filter_rows = []
+    if not isinstance(filter_rows, list) or not filter_rows:
+        selected_serials = set(_filter_state_values(filter_state, "serials"))
+        if _filter_state_has_key(filter_state, "serials"):
+            return [serial for serial in ordered_serials if serial in selected_serials]
+        return list(ordered_serials)
+
+    matched_serials: set[str] = set()
+    valid_run_selections = [selection for selection in run_selections if isinstance(selection, Mapping)]
+    for row in filter_rows:
+        if not _row_matches_filter_state(row, filter_state):
+            continue
+        if valid_run_selections and not any(_selection_matches_observation_row(selection, row) for selection in valid_run_selections):
+            continue
+        serial = _td_serial_value(row)
+        if serial:
+            matched_serials.add(serial)
+    return [serial for serial in ordered_serials if serial in matched_serials]
 
 
 def _ceil_div(a: int, b: int) -> int:
@@ -397,10 +577,11 @@ def _load_metric_series_for_selection(
     *,
     selection: dict | None = None,
     control_period_filter: object = None,
+    filter_state: Mapping[str, object] | None = None,
 ) -> list[dict]:
     program_title, source_run_name = _selection_observation_filters(selection)
     try:
-        return be.td_load_metric_series(
+        rows = be.td_load_metric_series(
             db_path,
             run_name,
             column_name,
@@ -410,7 +591,8 @@ def _load_metric_series_for_selection(
             control_period_filter=control_period_filter,
         )
     except Exception:
-        return []
+        rows = []
+    return _filter_rows_for_filter_state(rows, filter_state)
 
 
 def _load_metric_map_for_selection(
@@ -422,6 +604,7 @@ def _load_metric_map_for_selection(
     *,
     selection: dict | None = None,
     control_period_filter: object = None,
+    filter_state: Mapping[str, object] | None = None,
 ) -> dict[str, float]:
     rows = _load_metric_series_for_selection(
         be,
@@ -431,6 +614,7 @@ def _load_metric_map_for_selection(
         stat,
         selection=selection,
         control_period_filter=control_period_filter,
+        filter_state=filter_state,
     )
     return _series_rows_to_metric_map(rows)
 
@@ -444,6 +628,7 @@ def _load_perf_equation_metric_series(
     *,
     selection: dict | None = None,
     control_period_filter: object = None,
+    filter_state: Mapping[str, object] | None = None,
 ) -> list[dict]:
     st = str(stat or "").strip().lower()
     if not st:
@@ -460,6 +645,7 @@ def _load_perf_equation_metric_series(
             "mean",
             selection=selection,
             control_period_filter=control_period_filter,
+            filter_state=filter_state,
         )
         std_rows = _load_metric_series_for_selection(
             be,
@@ -469,6 +655,7 @@ def _load_perf_equation_metric_series(
             "std",
             selection=selection,
             control_period_filter=control_period_filter,
+            filter_state=filter_state,
         )
         mean_by_obs = {
             str(row.get("observation_id") or "").strip(): dict(row)
@@ -508,6 +695,7 @@ def _load_perf_equation_metric_series(
         st,
         selection=selection,
         control_period_filter=control_period_filter,
+        filter_state=filter_state,
     )
 
 
@@ -546,6 +734,7 @@ def _load_curves_for_selection(
     *,
     selection: dict | None = None,
     serials: list[str] | None = None,
+    filter_state: Mapping[str, object] | None = None,
 ) -> list[CurveSeries]:
     program_title, source_run_name = _selection_observation_filters(selection)
     try:
@@ -560,7 +749,7 @@ def _load_curves_for_selection(
         )
     except Exception:
         rows = []
-    return _curve_rows_to_series(rows)
+    return _curve_rows_to_series(_filter_rows_for_filter_state(rows, filter_state))
 
 
 def _read_gui_source_metadata(be: Any, workbook_path: Path) -> tuple[dict[str, dict[str, str]], str]:
@@ -651,6 +840,7 @@ def _collect_performance_curves_for_stat(
     options: dict,
     require_min_points: int,
     control_period_filter: object = None,
+    filter_state: Mapping[str, object] | None = None,
 ) -> tuple[dict[str, list[tuple[float, float, str]]], list[float], list[float], str, str]:
     serial_set = {str(sn).strip() for sn in serials if str(sn).strip()}
     per_run: list[tuple[str, str, dict[str, dict], dict[str, dict], str, str]] = []
@@ -675,6 +865,7 @@ def _collect_performance_curves_for_stat(
             stat,
             selection=run_selection,
             control_period_filter=control_period_filter,
+            filter_state=filter_state,
         )
         y_rows = _load_perf_equation_metric_series(
             be,
@@ -684,6 +875,7 @@ def _collect_performance_curves_for_stat(
             stat,
             selection=run_selection,
             control_period_filter=control_period_filter,
+            filter_state=filter_state,
         )
         x_map = _series_by_observation(x_rows, serial_set)
         y_map = _series_by_observation(y_rows, serial_set)
@@ -1906,11 +2098,17 @@ def generate_test_data_auto_report(
             source_rows = be.td_read_sources_metadata(wb)
         except Exception:
             source_rows = []
-        all_serials = _td_order_metric_serials(be.td_list_serials(db_path), source_rows) or _td_list_serials(conn)
+        ordered_serials = _td_order_metric_serials(be.td_list_serials(db_path), source_rows) or _td_list_serials(conn)
+        filter_state = options.get("filter_state")
+        if not isinstance(filter_state, Mapping):
+            filter_state = {}
+        all_serials = _resolve_filtered_serials(be, db_path, ordered_serials, options)
         run_rows = _td_list_runs(conn)
         run_by_name = {str(r.get("run_name") or "").strip(): r for r in (run_rows or []) if str(r.get("run_name") or "").strip()}
 
         if not all_serials:
+            if filter_state:
+                raise RuntimeError("Auto Report filters excluded all serials in the current project cache.")
             raise RuntimeError(
                 "Auto Report found no usable Test Data sources in the current project cache. "
                 "Build / Refresh Cache again and verify the workbook Sources sheet points at the active node path."
@@ -1996,6 +2194,7 @@ def generate_test_data_auto_report(
                     y_name,
                     x_name,
                     selection=run_selection,
+                    filter_state=filter_state,
                 )
                 if not series:
                     continue
@@ -2151,6 +2350,7 @@ def generate_test_data_auto_report(
                 stat,
                 selection=selection,
                 control_period_filter=control_period_filter,
+                filter_state=filter_state,
             )
 
         grade_map: dict[tuple[str, str, str], str] = {}
@@ -2604,6 +2804,7 @@ def generate_test_data_auto_report(
                         stat=st,
                         options=options,
                         require_min_points=require_min_points,
+                        filter_state=filter_state,
                     )
                     if not curves:
                         continue
@@ -2800,6 +3001,7 @@ def generate_test_data_auto_report(
                     param_name,
                     x_name,
                     selection=run_selection,
+                    filter_state=filter_state,
                 )
                 if not series:
                     continue
@@ -3000,6 +3202,7 @@ def generate_test_data_auto_report(
                             stat=st,
                             options=options,
                             require_min_points=require_min_points,
+                            filter_state=filter_state,
                         )
                         if not curves:
                             continue

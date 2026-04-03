@@ -18736,6 +18736,62 @@ def _td_smart_solver_resolve_three_sigma_offset(
     return float(offset)
 
 
+def _td_smart_solver_equation_rhs(equation_text: object) -> str:
+    text = str(equation_text or "").strip()
+    if not text:
+        return ""
+    final_y_match = re.search(r"(?:^|;\s*)y\s*=\s*(.+)$", text, flags=re.IGNORECASE)
+    if final_y_match:
+        return str(final_y_match.group(1) or "").strip()
+    generic_match = re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=\s*(.+)$", text)
+    if generic_match:
+        return str(generic_match.group(1) or "").strip()
+    return text
+
+
+def _td_smart_solver_three_sigma_vector_text(values: Sequence[object]) -> str:
+    formatted = [
+        _td_perf_excel_num(value)
+        for value in (values or [])
+        if isinstance(value, (int, float)) and math.isfinite(float(value))
+    ]
+    return "[" + ", ".join(formatted) + "]"
+
+
+def _td_smart_solver_three_sigma_equation_texts(result: Mapping[str, object]) -> dict[str, str]:
+    nominal_equation = str(result.get("equation") or "").strip()
+    nominal_rhs = _td_smart_solver_equation_rhs(nominal_equation)
+    normalization_text = str(result.get("x_norm_equation") or "").strip()
+    support_rows = _td_smart_solver_three_sigma_support_rows(result)
+    if support_rows:
+        cp_text = _td_smart_solver_three_sigma_vector_text([row.get("control_period") for row in support_rows])
+        offset_text = _td_smart_solver_three_sigma_vector_text([row.get("three_sigma_offset") for row in support_rows])
+        offset_ref = "three_sigma_offset(control_period)"
+        offset_equation = (
+            f"{offset_ref} = interp_clamp(control_period, {cp_text}, {offset_text})"
+        )
+    else:
+        offset_value = _td_smart_solver_resolve_three_sigma_offset(result)
+        offset_ref = "three_sigma_offset"
+        offset_equation = f"{offset_ref} = {_td_perf_excel_num(offset_value)}"
+    min_equation = (
+        f"pred_min_3sigma = ({nominal_rhs}) - ({offset_ref})"
+        if nominal_rhs
+        else ""
+    )
+    max_equation = (
+        f"pred_max_3sigma = ({nominal_rhs}) + ({offset_ref})"
+        if nominal_rhs
+        else ""
+    )
+    return {
+        "offset_equation": offset_equation,
+        "pred_min_3sigma_equation": min_equation,
+        "pred_max_3sigma_equation": max_equation,
+        "normalization_text": normalization_text,
+    }
+
+
 def _td_smart_solver_candidate_summary(
     *,
     model: Mapping[str, object] | None,
@@ -19946,6 +20002,14 @@ def td_smart_solver_run(
                 for value in (model.get("stage2_input_domain") or [])
                 if isinstance(value, (int, float))
             ][:2]
+    three_sigma_equation_texts = _td_smart_solver_three_sigma_equation_texts(
+        {
+            "equation": str(model.get("equation") or "").strip(),
+            "x_norm_equation": str(model.get("x_norm_equation") or "").strip(),
+            "three_sigma_offset": _td_finite_float(three_sigma_support.get("three_sigma_offset")),
+            "three_sigma_support_rows": _td_smart_solver_three_sigma_support_rows(three_sigma_support),
+        }
+    )
 
     return {
         "fit_family": selected_family,
@@ -19964,6 +20028,9 @@ def td_smart_solver_run(
         "three_sigma_cp_policy": str(three_sigma_support.get("three_sigma_cp_policy") or ""),
         "three_sigma_offset": _td_finite_float(three_sigma_support.get("three_sigma_offset")),
         "three_sigma_support_rows": _td_smart_solver_three_sigma_support_rows(three_sigma_support),
+        "three_sigma_offset_equation": str(three_sigma_equation_texts.get("offset_equation") or ""),
+        "pred_min_3sigma_equation": str(three_sigma_equation_texts.get("pred_min_3sigma_equation") or ""),
+        "pred_max_3sigma_equation": str(three_sigma_equation_texts.get("pred_max_3sigma_equation") or ""),
         "in_fit_count": int(in_fit_count),
         "fell_out_count": int(fell_out_count),
         "sample_count": int(sample_count),
@@ -22644,17 +22711,50 @@ def td_smart_solver_export_equation_workbook(
         ws.cell(variable_row, 4).value = str(variable.get("role") or "")
         variable_row += 1
 
+    three_sigma_equation_texts = _td_smart_solver_three_sigma_equation_texts(solver_result)
     equation_header_row = variable_row + 1
     for col_idx, value in enumerate(["Branch", "Equation", "Normalization"], start=1):
         cell = ws.cell(equation_header_row, col_idx)
         cell.value = value
         cell.font = header_font
         cell.fill = section_fill
-    ws.cell(equation_header_row + 1, 1).value = td_perf_fit_family_label(export_model.get("fit_family"))
-    ws.cell(equation_header_row + 1, 2).value = str(solver_result.get("equation") or "")
-    ws.cell(equation_header_row + 1, 3).value = str(solver_result.get("x_norm_equation") or "")
+    equation_rows = [
+        (
+            td_perf_fit_family_label(export_model.get("fit_family")),
+            str(solver_result.get("equation") or ""),
+            str(solver_result.get("x_norm_equation") or ""),
+        )
+    ]
+    if str(three_sigma_equation_texts.get("offset_equation") or "").strip():
+        equation_rows.append(
+            (
+                "3-Sigma Offset",
+                str(three_sigma_equation_texts.get("offset_equation") or ""),
+                str(three_sigma_equation_texts.get("normalization_text") or ""),
+            )
+        )
+    if str(three_sigma_equation_texts.get("pred_min_3sigma_equation") or "").strip():
+        equation_rows.append(
+            (
+                "3-Sigma Min",
+                str(three_sigma_equation_texts.get("pred_min_3sigma_equation") or ""),
+                str(three_sigma_equation_texts.get("normalization_text") or ""),
+            )
+        )
+    if str(three_sigma_equation_texts.get("pred_max_3sigma_equation") or "").strip():
+        equation_rows.append(
+            (
+                "3-Sigma Max",
+                str(three_sigma_equation_texts.get("pred_max_3sigma_equation") or ""),
+                str(three_sigma_equation_texts.get("normalization_text") or ""),
+            )
+        )
+    for row_offset, (branch_text, equation_text, normalization_text) in enumerate(equation_rows, start=1):
+        ws.cell(equation_header_row + row_offset, 1).value = branch_text
+        ws.cell(equation_header_row + row_offset, 2).value = equation_text
+        ws.cell(equation_header_row + row_offset, 3).value = normalization_text
 
-    fit_table_row = equation_header_row + 4
+    fit_table_row = equation_header_row + len(equation_rows) + 3
     _td_smart_solver_write_prediction_table(
         ws,
         start_row=fit_table_row,
@@ -24697,6 +24797,7 @@ def _td_smart_solver_matlab_metadata_lines(
     three_sigma_support_residual_std = [float(row.get("residual_std") or 0.0) for row in three_sigma_support_rows]
     three_sigma_support_offsets = [float(row.get("three_sigma_offset") or 0.0) for row in three_sigma_support_rows]
     three_sigma_offset = _td_finite_float(result.get("three_sigma_offset"))
+    three_sigma_equation_texts = _td_smart_solver_three_sigma_equation_texts(result)
     return [
         "function meta = local_metadata()",
         "meta = struct();",
@@ -24733,6 +24834,10 @@ def _td_smart_solver_matlab_metadata_lines(
         f"meta.three_sigma_support_control_periods = {_td_perf_matlab_vector(three_sigma_support_control_periods)};",
         f"meta.three_sigma_support_residual_std = {_td_perf_matlab_vector(three_sigma_support_residual_std)};",
         f"meta.three_sigma_support_offsets = {_td_perf_matlab_vector(three_sigma_support_offsets)};",
+        f"meta.three_sigma_offset_equation_text = {_td_perf_matlab_quote(three_sigma_equation_texts.get('offset_equation') or '')};",
+        f"meta.pred_min_3sigma_equation_text = {_td_perf_matlab_quote(three_sigma_equation_texts.get('pred_min_3sigma_equation') or '')};",
+        f"meta.pred_max_3sigma_equation_text = {_td_perf_matlab_quote(three_sigma_equation_texts.get('pred_max_3sigma_equation') or '')};",
+        f"meta.three_sigma_normalization_text = {_td_perf_matlab_quote(three_sigma_equation_texts.get('normalization_text') or '')};",
         "meta.three_sigma_offset = @local_three_sigma_offset;",
         "meta.pred_min_3sigma = @local_predict_min_3sigma;",
         "meta.pred_max_3sigma = @local_predict_max_3sigma;",
@@ -25052,6 +25157,7 @@ def td_smart_solver_export_equation_matlab(
     metadata_usage = f"meta = {func_name}('metadata')"
     output_label = _td_perf_matlab_input_label(output_target, fallback="output")
     input_names_text = ", ".join(predict_args)
+    three_sigma_equation_texts = _td_smart_solver_three_sigma_equation_texts(solver_result)
 
     progress_label = "Building Smart Solver MATLAB file"
     if matlab_export_mode == TD_SMART_SOLVER_MATLAB_EXPORT_MODE_CLEAN:
@@ -25065,6 +25171,9 @@ def td_smart_solver_export_equation_matlab(
             f"% Metadata usage: {metadata_usage}",
             f"% Inputs: {', '.join(input_descriptions)}",
             f"% Output: y is predicted {output_label}; scalar and array inputs are evaluated element-wise.",
+            f"% 3-sigma offset equation: {str(three_sigma_equation_texts.get('offset_equation') or '').strip()}",
+            f"% 3-sigma min equation: {str(three_sigma_equation_texts.get('pred_min_3sigma_equation') or '').strip()}",
+            f"% 3-sigma max equation: {str(three_sigma_equation_texts.get('pred_max_3sigma_equation') or '').strip()}",
             "% Call with 'metadata' to inspect equation text, normalization, solver stats, and imported variable definitions.",
             "",
         ]
@@ -25096,6 +25205,9 @@ def td_smart_solver_export_equation_matlab(
             "% Auto-generated by EIDAT Smart Solver MATLAB export.",
             f"% Usage: {predict_usage}",
             f"% Inputs: {input_names_text}",
+            f"% 3-sigma offset equation: {str(three_sigma_equation_texts.get('offset_equation') or '').strip()}",
+            f"% 3-sigma min equation: {str(three_sigma_equation_texts.get('pred_min_3sigma_equation') or '').strip()}",
+            f"% 3-sigma max equation: {str(three_sigma_equation_texts.get('pred_max_3sigma_equation') or '').strip()}",
             "",
         ]
         lines.extend(
