@@ -177,6 +177,10 @@ class _PerfControlPeriodHarness:
         self._checked_suppression_voltage_filters = ["24", "28"]
 
         for name in (
+            "_auto_plot_available_serial_values",
+            "_auto_plot_selected_filter_values",
+            "_current_auto_plot_filter_state",
+            "_normalize_auto_plot_filter_state",
             "_active_control_period_filter_values",
             "_active_program_filter_values",
             "_active_suppression_voltage_filter_values",
@@ -605,6 +609,14 @@ class _RenderPlotDefHarness:
         self._run_name_by_display = {}
         self._perf_all_runs = ["RunA"]
         self._perf_require_min_points = 2
+        self._available_program_filters = ["Program A"]
+        self._available_control_period_filters = ["60"]
+        self._available_suppression_voltage_filters = ["24"]
+        self._available_serial_filter_rows = [{"serial": "SN1"}]
+        self._checked_program_filters = ["Program A"]
+        self._checked_serial_filters = ["SN1"]
+        self._checked_control_period_filters = ["60"]
+        self._checked_suppression_voltage_filters = ["24"]
         self.collect_calls: list[dict] = []
         self.cached_collect_calls: list[dict] = []
 
@@ -621,6 +633,7 @@ class _RenderPlotDefHarness:
             control_period_filter=None,
             display_control_period=None,
             run_type_filter=None,
+            filter_state=None,
         ):
             self.collect_calls.append(
                 {
@@ -635,6 +648,7 @@ class _RenderPlotDefHarness:
                     "control_period_filter": control_period_filter,
                     "display_control_period": display_control_period,
                     "run_type_filter": run_type_filter,
+                    "filter_state": dict(filter_state or {}) if isinstance(filter_state, dict) else filter_state,
                 }
             )
             return ({"mean": {"plot_dimension": "2d"}}, ["mean"], "")
@@ -652,6 +666,7 @@ class _RenderPlotDefHarness:
             control_period_filter=None,
             display_control_period=None,
             run_type_filter=None,
+            filter_state=None,
         ):
             self.cached_collect_calls.append(
                 {
@@ -666,19 +681,32 @@ class _RenderPlotDefHarness:
                     "control_period_filter": control_period_filter,
                     "display_control_period": display_control_period,
                     "run_type_filter": run_type_filter,
+                    "filter_state": dict(filter_state or {}) if isinstance(filter_state, dict) else filter_state,
                 }
             )
             return ({"mean": {"plot_dimension": "2d", "performance_plot_method": "cached_condition_means"}}, ["mean"], "")
 
         self._selection_from_plot_def = lambda d: {"member_runs": ["RunA"]}
         self._selected_perf_runs = lambda: ["RunA"]
-        self._selected_perf_serials = lambda: ["SN1"]
+        self._selected_perf_serials = lambda filter_state=None: ["SN1"]
         self._selected_perf_run_type_mode = lambda: "steady_state"
         self._common_runs_for_perf_vars = lambda output, input1, input2: ["RunA"]
         self._perf_collect_results = _collect_results
         self._perf_collect_cached_condition_mean_results = _collect_cached_results
         self._perf_normalize_plot_method = getattr(
             TestDataTrendDialog, "_perf_normalize_plot_method"
+        ).__get__(self, _RenderPlotDefHarness)
+        self._auto_plot_available_serial_values = getattr(
+            TestDataTrendDialog, "_auto_plot_available_serial_values"
+        ).__get__(self, _RenderPlotDefHarness)
+        self._auto_plot_selected_filter_values = getattr(
+            TestDataTrendDialog, "_auto_plot_selected_filter_values"
+        ).__get__(self, _RenderPlotDefHarness)
+        self._current_auto_plot_filter_state = getattr(
+            TestDataTrendDialog, "_current_auto_plot_filter_state"
+        ).__get__(self, _RenderPlotDefHarness)
+        self._normalize_auto_plot_filter_state = getattr(
+            TestDataTrendDialog, "_normalize_auto_plot_filter_state"
         ).__get__(self, _RenderPlotDefHarness)
         self._render_performance_result = lambda ax, result, **kwargs: ax.plot([0.0, 1.0], [0.0, 1.0])
 
@@ -711,28 +739,46 @@ class _RunSelectionHarness:
         self.list_auto_plots = QtWidgets.QListWidget()
         self.btn_open_auto = QtWidgets.QPushButton()
         self.btn_open_all_auto = QtWidgets.QPushButton()
+        self.btn_edit_auto = QtWidgets.QPushButton()
         self.btn_delete_auto = QtWidgets.QPushButton()
+        self.btn_save_selected_auto = QtWidgets.QPushButton()
         self.btn_save_all_auto = QtWidgets.QPushButton()
         self.btn_view_auto_plots = QtWidgets.QPushButton()
         self._plot_ready = True
         self._db_path = "db.sqlite3"
+        self._project_dir = Path(tempfile.mkdtemp())
         self._auto_plots = []
         self._auto_plot_path = Path(tempfile.mkdtemp()) / "auto_plots_test_data.json"
         self._run_selection_views = {"sequence": [], "condition": []}
         self._run_display_by_name = {}
         self._run_name_by_display = {}
         self._available_program_filters = ["Program A", "Program B", "Unknown Program"]
+        self._available_serial_filter_rows = [{"serial": "SN1"}, {"serial": "SN2"}]
         self._available_control_period_filters = []
         self._available_suppression_voltage_filters = ["24", "28"]
         self._checked_program_filters = list(self._available_program_filters)
+        self._checked_serial_filters = ["SN1", "SN2"]
         self._checked_control_period_filters = []
         self._checked_suppression_voltage_filters = list(self._available_suppression_voltage_filters)
         self._is_internal_run_label = TestDataTrendDialog._is_internal_run_label
         self._metric_title_suffix = TestDataTrendDialog._metric_title_suffix
         self._selection_summary_text = TestDataTrendDialog._selection_summary_text
+        self._popup_selection_summary = TestDataTrendDialog._popup_selection_summary
         self._plot_metrics_called = False
+        self._opened_auto_plot_entries: list[dict[str, object]] = []
 
         for name in (
+            "_auto_plot_available_serial_values",
+            "_auto_plot_selected_filter_values",
+            "_current_auto_plot_filter_state",
+            "_normalize_auto_plot_filter_state",
+            "_auto_plot_entry_plot_definition",
+            "_normalize_auto_plot_entry",
+            "_normalized_auto_plot_entries",
+            "_auto_plot_store_payload",
+            "_save_auto_plots_store",
+            "_auto_plot_filter_summary_text",
+            "_auto_plot_entry_filter_state",
             "_current_run_selector_mode",
             "_metrics_condition_multiselect_active",
             "_checked_metric_condition_selections",
@@ -751,6 +797,9 @@ class _RunSelectionHarness:
             "_populate_metric_condition_list",
             "_sync_main_auto_plot_actions",
             "_auto_plot_display_name",
+            "_auto_plot_mode_label",
+            "_auto_plot_list_item_text",
+            "_auto_plot_entry_tooltip",
             "_selected_auto_plot_definitions",
             "_active_control_period_filter_values",
             "_active_program_filter_values",
@@ -762,7 +811,6 @@ class _RunSelectionHarness:
             "_refresh_run_dropdown",
             "_refresh_auto_plots_list",
             "_update_auto_actions",
-            "_open_selected_auto_plot",
             "_delete_selected_auto_plots",
         ):
             setattr(self, name, getattr(TestDataTrendDialog, name).__get__(self, _RunSelectionHarness))
@@ -775,6 +823,14 @@ class _RunSelectionHarness:
         self._refresh_performance_ui = lambda: None
         self._set_combo_to_value = lambda *args, **kwargs: None
         self._on_perf_axis_changed = lambda *args, **kwargs: None
+        self._open_auto_plot_entries_panel = lambda entries, *, title: setattr(
+            self,
+            "_opened_auto_plot_entries",
+            [dict(entry) for entry in entries],
+        )
+        self._open_selected_auto_plot = getattr(
+            TestDataTrendDialog, "_open_selected_auto_plot"
+        ).__get__(self, _RunSelectionHarness)
         self.cb_run_mode.currentIndexChanged.connect(lambda *_: self._refresh_run_dropdown())
 
     def checked_condition_ids(self) -> list[str]:
@@ -1720,16 +1776,13 @@ class TestTDTrendDialogLayout(unittest.TestCase):
 
         harness._open_selected_auto_plot(list_widget=popup_list)
 
-        self.assertEqual(harness.checked_condition_ids(), ["condition:seq1", "condition:seq3"])
-        self.assertTrue(harness._plot_metrics_called)
+        self.assertEqual(len(harness._opened_auto_plot_entries), 1)
         self.assertEqual(
-            [item.text() for item in harness.list_y_metrics.selectedItems()],
-            ["thrust"],
+            harness._opened_auto_plot_entries[0].get("plot_definition", {}).get("selection_ids"),
+            ["condition:seq1", "condition:seq3"],
         )
-        self.assertEqual(
-            [item.text() for item in harness.list_stats.selectedItems()],
-            ["mean"],
-        )
+        self.assertEqual(harness.checked_condition_ids(), [])
+        self.assertFalse(harness._plot_metrics_called)
 
     def test_popup_auto_plot_delete_updates_saved_definitions_and_list(self) -> None:
         _qt_app()
@@ -1749,7 +1802,7 @@ class TestTDTrendDialogLayout(unittest.TestCase):
 
         self.assertEqual([d.get("name") for d in harness._auto_plots], ["Plot 2"])
         self.assertEqual(popup_list.count(), 1)
-        self.assertEqual(popup_list.item(0).text(), "Plot 2")
+        self.assertIn("Plot 2", popup_list.item(0).text())
 
     @unittest.skipUnless(_have_matplotlib(), "matplotlib not installed")
     def test_open_all_auto_plots_panel_still_opens(self) -> None:
@@ -1774,7 +1827,7 @@ class TestTDTrendDialogLayout(unittest.TestCase):
             dlg._db_path = Path(tempfile.mkdtemp()) / "cache.sqlite3"
             dlg._auto_plots = [{"name": "Plot 1", "mode": "metrics", "stats": ["mean"], "y": ["thrust"]}]
 
-            with mock.patch.object(dlg, "_render_plot_def_to_figure", return_value=Figure()):
+            with mock.patch.object(dlg, "_render_auto_plot_entry_figure", return_value=(Figure(), "")):
                 with mock.patch("matplotlib.backends.backend_qtagg.FigureCanvasQTAgg", _DummyCanvas):
                     with mock.patch("PySide6.QtWidgets.QDialog.exec", return_value=0) as exec_mock:
                         dlg._open_all_auto_plots_panel()
@@ -1808,8 +1861,85 @@ class TestTDTrendDialogLayout(unittest.TestCase):
 
             with mock.patch("PySide6.QtWidgets.QFileDialog.getSaveFileName", return_value=("C:/tmp/auto.pdf", "PDF")):
                 with mock.patch("matplotlib.backends.backend_pdf.PdfPages", _DummyPdfPages):
-                    with mock.patch.object(dlg, "_render_plot_def_to_figure", return_value=object()) as render_mock:
+                    with mock.patch.object(dlg, "_render_auto_plot_entry_figure", return_value=(object(), "")) as render_mock:
                         dlg._save_all_auto_plots_pdf()
+
+            render_mock.assert_called_once()
+            self.assertEqual(len(saved_figures), 1)
+        finally:
+            dlg.close()
+
+    def test_auto_plot_store_loads_legacy_entries_with_live_filter_fallback(self) -> None:
+        harness = _RunSelectionHarness()
+        legacy_payload = [
+            {"name": "Plot 1", "mode": "metrics", "stats": ["mean"], "y": ["thrust"]},
+        ]
+        harness._auto_plot_path.write_text(json.dumps(legacy_payload), encoding="utf-8")
+
+        from EIDAT_App_Files.ui_next.qt_main import TestDataTrendDialog  # type: ignore
+
+        TestDataTrendDialog._load_auto_plots(harness)
+
+        entries = harness._normalized_auto_plot_entries()
+        self.assertEqual(len(entries), 1)
+        self.assertTrue(bool(entries[0].get("uses_live_filters")))
+        self.assertEqual(entries[0].get("plot_definition", {}).get("mode"), "metrics")
+
+    def test_auto_plot_store_saves_versioned_entries_with_filter_state(self) -> None:
+        harness = _RunSelectionHarness()
+        harness._auto_plots = [
+            {
+                "id": "plot-1",
+                "name": "Plot 1",
+                "plot_definition": {"mode": "metrics", "stats": ["mean"], "y": ["thrust"]},
+                "filter_state": {
+                    "programs": ["Program A"],
+                    "serials": ["SN1"],
+                    "control_periods": [],
+                    "suppression_voltages": ["24"],
+                },
+            }
+        ]
+
+        harness._save_auto_plots_store()
+        payload = json.loads(harness._auto_plot_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload.get("version"), 1)
+        self.assertEqual(len(payload.get("entries") or []), 1)
+        self.assertEqual(payload["entries"][0]["filter_state"]["serials"], ["SN1"])
+
+    @unittest.skipUnless(_have_matplotlib(), "matplotlib not installed")
+    def test_save_selected_auto_plots_pdf_exports_only_selected_saved_plots(self) -> None:
+        saved_figures: list[object] = []
+
+        class _DummyPdfPages:
+            def __init__(self, _path: str) -> None:
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> None:
+                return None
+
+            def savefig(self, fig) -> None:
+                saved_figures.append(fig)
+
+        dlg = _build_test_data_dialog()
+        try:
+            dlg._plot_ready = True
+            dlg._db_path = Path(tempfile.mkdtemp()) / "cache.sqlite3"
+            dlg._auto_plots = [
+                {"name": "Plot 1", "mode": "metrics", "stats": ["mean"], "y": ["thrust"]},
+                {"name": "Plot 2", "mode": "curves", "y": ["current"], "x": "Time"},
+            ]
+            dlg._refresh_auto_plots_list()
+            dlg.list_auto_plots.item(1).setSelected(True)
+
+            with mock.patch("PySide6.QtWidgets.QFileDialog.getSaveFileName", return_value=("C:/tmp/selected.pdf", "PDF")):
+                with mock.patch("matplotlib.backends.backend_pdf.PdfPages", _DummyPdfPages):
+                    with mock.patch.object(dlg, "_render_auto_plot_entry_figure", return_value=(object(), "")) as render_mock:
+                        dlg._save_selected_auto_plots_pdf()
 
             render_mock.assert_called_once()
             self.assertEqual(len(saved_figures), 1)
@@ -7025,7 +7155,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
         )
 
     @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
-    def test_open_selected_auto_plot_restores_multi_condition_checks(self) -> None:
+    def test_open_selected_auto_plot_uses_popup_panel_without_mutating_main_selection(self) -> None:
         harness = _RunSelectionHarness()
         harness._run_selection_views["condition"] = [
             {
@@ -7068,12 +7198,19 @@ class TestTDSupportWorkbook(unittest.TestCase):
 
         harness._open_selected_auto_plot()
 
-        self.assertEqual(harness.checked_condition_ids(), ["condition:seq1", "condition:seq3"])
-        self.assertTrue(harness._plot_metrics_called)
+        self.assertEqual(len(harness._opened_auto_plot_entries), 1)
+        self.assertEqual(
+            harness._opened_auto_plot_entries[0].get("plot_definition", {}).get("selection_ids"),
+            ["condition:seq1", "condition:seq3"],
+        )
+        self.assertEqual(harness.checked_condition_ids(), [])
+        self.assertFalse(harness._plot_metrics_called)
 
     @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
-    def test_open_selected_auto_plot_keeps_single_condition_for_legacy_payload(self) -> None:
+    def test_open_selected_auto_plot_keeps_live_filters_for_legacy_payload(self) -> None:
         harness = _RunSelectionHarness()
+        harness._checked_program_filters = ["Program A"]
+        harness._checked_serial_filters = ["SN1"]
         harness._run_selection_views["condition"] = [
             {
                 "mode": "condition",
@@ -7115,8 +7252,11 @@ class TestTDSupportWorkbook(unittest.TestCase):
 
         harness._open_selected_auto_plot()
 
-        self.assertEqual(harness.checked_condition_ids(), ["condition:seq3"])
-        self.assertTrue(harness._plot_metrics_called)
+        self.assertEqual(len(harness._opened_auto_plot_entries), 1)
+        self.assertTrue(bool(harness._opened_auto_plot_entries[0].get("uses_live_filters")))
+        self.assertEqual(harness._checked_program_filters, ["Program A"])
+        self.assertEqual(harness._checked_serial_filters, ["SN1"])
+        self.assertFalse(harness._plot_metrics_called)
 
     @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
     def test_perf_axis_selecting_third_parameter_does_not_recurse(self) -> None:
@@ -9206,6 +9346,38 @@ class TestTDSupportWorkbook(unittest.TestCase):
         self.assertEqual(len(harness.collect_calls), 0)
         self.assertEqual(len(harness.cached_collect_calls), 1)
         self.assertEqual(harness.cached_collect_calls[0]["plot_stats"], ["mean"])
+
+    @unittest.skipUnless(_have_matplotlib(), "matplotlib not installed")
+    def test_render_plot_def_passes_saved_filter_state_to_performance_collectors(self) -> None:
+        harness = _RenderPlotDefHarness()
+        fig = harness._render_plot_def_to_figure(
+            {
+                "mode": "performance",
+                "output": "output",
+                "input1": "input1",
+                "input2": "",
+                "stats": ["mean"],
+                "view_stat": "mean",
+                "fit_enabled": False,
+            },
+            filter_state={
+                "programs": ["Program A"],
+                "serials": ["SN1"],
+                "control_periods": ["60"],
+                "suppression_voltages": ["24"],
+            },
+        )
+        self.assertIsNotNone(fig)
+        self.assertEqual(len(harness.collect_calls), 1)
+        self.assertEqual(
+            harness.collect_calls[0]["filter_state"],
+            {
+                "programs": ["Program A"],
+                "serials": ["SN1"],
+                "control_periods": ["60"],
+                "suppression_voltages": ["24"],
+            },
+        )
 
     def test_metric_series_loader_filters_programs_serials_suppression_and_control_period(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore

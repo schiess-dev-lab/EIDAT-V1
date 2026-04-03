@@ -820,6 +820,30 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
             if tmpdir:
                 shutil.rmtree(str(tmpdir), ignore_errors=True)
 
+    def test_top_auto_report_button_is_placed_under_global_filters(self) -> None:
+        window = self._make_window()
+        try:
+            self.assertEqual(window.btn_auto_report.text(), "Auto Report...")
+            self.assertFalse(window.btn_auto_report.isEnabled())
+
+            root_layout = window.layout()
+            self.assertIsNotNone(root_layout)
+            self.assertLess(root_layout.indexOf(window.filter_frame), root_layout.indexOf(window.auto_report_frame))
+            self.assertLess(root_layout.indexOf(window.auto_report_frame), root_layout.indexOf(window.main_splitter))
+
+            with tempfile.TemporaryDirectory() as tmpdir:
+                db_path = Path(tmpdir) / "cache.sqlite3"
+                db_path.write_text("", encoding="utf-8")
+                window._db_path = db_path
+                window._plot_ready = True
+                window._sync_main_auto_plot_actions()
+                self.assertTrue(window.btn_auto_report.isEnabled())
+        finally:
+            window.close()
+            tmpdir = getattr(window, "_test_tmpdir", "")
+            if tmpdir:
+                shutil.rmtree(str(tmpdir), ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -5,13 +5,14 @@ import html
 import json
 import time
 import shutil
+import hashlib
 import sys
 import threading
 import math
 import statistics
 import datetime
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Mapping
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
@@ -120,6 +121,31 @@ def _td_serial_metadata_by_serial(rows: list[dict]) -> dict[str, dict]:
 
 
 TD_UNKNOWN_PROGRAM_LABEL = "Unknown Program"
+TD_AUTO_PLOT_STORE_VERSION = 1
+TD_AUTO_PLOT_FILTER_KEYS = (
+    "programs",
+    "serials",
+    "control_periods",
+    "suppression_voltages",
+)
+
+
+def _td_auto_plot_timestamp_text() -> str:
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _td_auto_plot_slug(value: object, *, fallback: str = "auto_graph") -> str:
+    text = re.sub(r"[^A-Za-z0-9]+", "_", str(value or "").strip().lower()).strip("_")
+    return text or fallback
+
+
+def _td_auto_plot_entry_id(name: object, plot_definition: Mapping[str, object] | None) -> str:
+    try:
+        payload = json.dumps(dict(plot_definition or {}), sort_keys=True, separators=(",", ":"))
+    except Exception:
+        payload = json.dumps(str(dict(plot_definition or {})), sort_keys=True)
+    digest = hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
+    return f"{_td_auto_plot_slug(name)}_{digest}"
 
 
 def _td_display_program_title(value: object) -> str:
@@ -3342,6 +3368,49 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             filter_layout.addWidget(btn)
         root.addWidget(filter_frame, 0)
 
+        auto_report_frame = QtWidgets.QFrame()
+        self.auto_report_frame = auto_report_frame
+        auto_report_frame.setStyleSheet(
+            "QFrame { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 10px; }"
+        )
+        auto_report_layout = QtWidgets.QHBoxLayout(auto_report_frame)
+        auto_report_layout.setContentsMargins(12, 10, 12, 10)
+        auto_report_layout.setSpacing(12)
+
+        auto_report_text_layout = QtWidgets.QVBoxLayout()
+        auto_report_text_layout.setContentsMargins(0, 0, 0, 0)
+        auto_report_text_layout.setSpacing(2)
+        auto_report_title = QtWidgets.QLabel("Auto Report")
+        auto_report_title.setStyleSheet("font-size: 12px; font-weight: 800; color: #0f172a;")
+        auto_report_hint = QtWidgets.QLabel("Generate the certification-style PDF report for the current test-data project.")
+        auto_report_hint.setStyleSheet("color: #334155; font-size: 11px;")
+        auto_report_hint.setWordWrap(True)
+        auto_report_text_layout.addWidget(auto_report_title)
+        auto_report_text_layout.addWidget(auto_report_hint)
+        auto_report_layout.addLayout(auto_report_text_layout, 1)
+
+        self.btn_auto_report = QtWidgets.QPushButton("Auto Report...")
+        self.btn_auto_report.setMinimumHeight(36)
+        self.btn_auto_report.setStyleSheet(
+            """
+            QPushButton {
+                padding: 8px 16px;
+                border-radius: 8px;
+                background: #ffffff;
+                border: 1px solid #cbd5e1;
+                font-size: 12px;
+                font-weight: 700;
+                color: #0f172a;
+            }
+            QPushButton:hover { background: #f8fafc; }
+            QPushButton:disabled { color: #94a3b8; border-color: #e2e8f0; }
+            """
+        )
+        self.btn_auto_report.setEnabled(bool(self._plot_ready and self._db_path))
+        self.btn_auto_report.clicked.connect(self._open_auto_report_options)
+        auto_report_layout.addWidget(self.btn_auto_report)
+        root.addWidget(auto_report_frame, 0)
+
         splitter = QtWidgets.QSplitter()
         self.main_splitter = splitter
         splitter.setOrientation(QtCore.Qt.Orientation.Horizontal)
@@ -4269,13 +4338,13 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         _toggle_stats(False)
 
         # Bottom actions: saving + auto-plots
-        self.btn_add_auto_plot = QtWidgets.QPushButton("Add to Auto-Plots")
+        self.btn_add_auto_plot = QtWidgets.QPushButton("Add to Auto-Graphs")
         self.btn_add_auto_plot.setEnabled(False)
         self.btn_add_auto_plot.clicked.connect(self._add_current_plot_to_autoplots)
         self.btn_save_plot_pdf = QtWidgets.QPushButton("Save Plot PDF")
         self.btn_save_plot_pdf.setEnabled(False)
         self.btn_save_plot_pdf.clicked.connect(self._save_plot_pdf)
-        self.btn_view_auto_plots = QtWidgets.QPushButton("View Auto-Plots...")
+        self.btn_view_auto_plots = QtWidgets.QPushButton("View Auto-Graphs...")
         self.btn_view_auto_plots.setEnabled(False)
         self.btn_view_auto_plots.clicked.connect(self._open_auto_plots_popup)
         self.lbl_source = QtWidgets.QLabel("")
@@ -4973,48 +5042,251 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         popup.raise_()
         popup.activateWindow()
 
+    def _auto_plot_available_serial_values(self) -> list[str]:
+        return [
+            _td_serial_value(row)
+            for row in (self._available_serial_filter_rows or [])
+            if _td_serial_value(row)
+        ]
+
+    def _auto_plot_selected_filter_values(
+        self,
+        *,
+        filter_state: Mapping[str, object] | None,
+        key: str,
+        available_values: list[str],
+        live_values: list[str],
+    ) -> list[str]:
+        if isinstance(filter_state, Mapping) and key in filter_state:
+            raw_values = filter_state.get(key) or []
+            selected_values = (
+                [str(value).strip() for value in raw_values if str(value).strip()]
+                if isinstance(raw_values, list)
+                else []
+            )
+        else:
+            selected_values = [str(value).strip() for value in (live_values or []) if str(value).strip()]
+        selected_set = {value for value in selected_values if value in set(available_values)}
+        return [value for value in available_values if value in selected_set]
+
+    def _current_auto_plot_filter_state(self) -> dict[str, list[str]]:
+        return {
+            "programs": self._auto_plot_selected_filter_values(
+                filter_state=None,
+                key="programs",
+                available_values=list(self._available_program_filters or []),
+                live_values=[str(value).strip() for value in (self._checked_program_filters or []) if str(value).strip()],
+            ),
+            "serials": self._auto_plot_selected_filter_values(
+                filter_state=None,
+                key="serials",
+                available_values=self._auto_plot_available_serial_values(),
+                live_values=[str(value).strip() for value in (self._checked_serial_filters or []) if str(value).strip()],
+            ),
+            "control_periods": self._auto_plot_selected_filter_values(
+                filter_state=None,
+                key="control_periods",
+                available_values=list(self._available_control_period_filters or []),
+                live_values=[
+                    str(value).strip()
+                    for value in (self._checked_control_period_filters or [])
+                    if str(value).strip()
+                ],
+            ),
+            "suppression_voltages": self._auto_plot_selected_filter_values(
+                filter_state=None,
+                key="suppression_voltages",
+                available_values=list(self._available_suppression_voltage_filters or []),
+                live_values=[
+                    str(value).strip()
+                    for value in (self._checked_suppression_voltage_filters or [])
+                    if str(value).strip()
+                ],
+            ),
+        }
+
+    def _normalize_auto_plot_filter_state(
+        self,
+        raw: object,
+        *,
+        default_to_current: bool = False,
+    ) -> dict[str, list[str]]:
+        if not isinstance(raw, Mapping):
+            return self._current_auto_plot_filter_state() if default_to_current else {}
+        out: dict[str, list[str]] = {}
+        current_state = self._current_auto_plot_filter_state() if default_to_current else {}
+        for key, available_values in (
+            ("programs", list(self._available_program_filters or [])),
+            ("serials", self._auto_plot_available_serial_values()),
+            ("control_periods", list(self._available_control_period_filters or [])),
+            ("suppression_voltages", list(self._available_suppression_voltage_filters or [])),
+        ):
+            if key not in raw and not default_to_current:
+                continue
+            live_values = list(current_state.get(key) or [])
+            out[key] = self._auto_plot_selected_filter_values(
+                filter_state=raw,
+                key=key,
+                available_values=available_values,
+                live_values=live_values,
+            )
+        return out
+
+    def _auto_plot_entry_plot_definition(self, entry: Mapping[str, object] | None) -> dict[str, object]:
+        if not isinstance(entry, Mapping):
+            return {}
+        plot_definition = entry.get("plot_definition")
+        if isinstance(plot_definition, Mapping):
+            return dict(plot_definition)
+        excluded = {"id", "name", "saved_at", "updated_at", "plot_definition", "filter_state"}
+        return {str(key): value for key, value in entry.items() if str(key) not in excluded}
+
+    def _normalize_auto_plot_entry(self, raw: object) -> dict[str, object] | None:
+        if not isinstance(raw, Mapping):
+            return None
+        plot_definition = self._auto_plot_entry_plot_definition(raw)
+        mode = str(plot_definition.get("mode") or raw.get("mode") or "").strip().lower()
+        if mode not in {"curves", "metrics", "performance"}:
+            if str(plot_definition.get("output") or "").strip() and str(plot_definition.get("input1") or "").strip():
+                mode = "performance"
+            elif any(str(plot_definition.get(key) or "").strip() for key in ("metric_plot_source", "plot_bounds")) or isinstance(plot_definition.get("stats"), list):
+                mode = "metrics"
+            elif str(plot_definition.get("x") or "").strip() or isinstance(plot_definition.get("y"), list):
+                mode = "curves"
+        if mode not in {"curves", "metrics", "performance"}:
+            return None
+        plot_definition["mode"] = mode
+        has_filter_state = "filter_state" in raw and isinstance(raw.get("filter_state"), Mapping)
+        filter_state_raw = raw.get("filter_state") if has_filter_state else {}
+        filter_state = self._normalize_auto_plot_filter_state(filter_state_raw, default_to_current=False)
+        saved_at = str(raw.get("saved_at") or "").strip()
+        updated_at = str(raw.get("updated_at") or saved_at or "").strip() or _td_auto_plot_timestamp_text()
+        entry: dict[str, object] = {
+            "id": str(raw.get("id") or "").strip(),
+            "name": str(raw.get("name") or plot_definition.get("name") or "").strip(),
+            "saved_at": saved_at or updated_at,
+            "updated_at": updated_at,
+            "plot_definition": plot_definition,
+            "filter_state": filter_state,
+        }
+        if bool(raw.get("uses_live_filters")) or not has_filter_state:
+            entry["uses_live_filters"] = True
+        if not str(entry.get("name") or "").strip():
+            entry["name"] = self._auto_plot_display_name(entry)
+        if not str(entry.get("id") or "").strip():
+            entry["id"] = _td_auto_plot_entry_id(entry.get("name") or mode, plot_definition)
+        return entry
+
+    def _normalized_auto_plot_entries(self) -> list[dict[str, object]]:
+        normalized: list[dict[str, object]] = []
+        for entry in (self._auto_plots or []):
+            item = self._normalize_auto_plot_entry(entry)
+            if item is not None:
+                normalized.append(item)
+        self._auto_plots = normalized
+        return [dict(entry) for entry in normalized]
+
+    def _auto_plot_store_payload(self) -> dict[str, object]:
+        return {
+            "version": TD_AUTO_PLOT_STORE_VERSION,
+            "entries": [dict(entry) for entry in self._normalized_auto_plot_entries()],
+        }
+
+    def _save_auto_plots_store(self) -> None:
+        payload = self._auto_plot_store_payload()
+        self._auto_plot_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    def _auto_plot_filter_summary_text(self, filter_state: Mapping[str, object] | None) -> str:
+        available = {
+            "programs": list(self._available_program_filters or []),
+            "serials": self._auto_plot_available_serial_values(),
+            "control_periods": list(self._available_control_period_filters or []),
+            "suppression_voltages": list(self._available_suppression_voltage_filters or []),
+        }
+        labels = {
+            "programs": "Programs",
+            "serials": "Serials",
+            "control_periods": "Control Period",
+            "suppression_voltages": "Suppression Voltage",
+        }
+        current_state = self._current_auto_plot_filter_state()
+        parts: list[str] = []
+        for key in TD_AUTO_PLOT_FILTER_KEYS:
+            selected = self._auto_plot_selected_filter_values(
+                filter_state=filter_state,
+                key=key,
+                available_values=list(available.get(key) or []),
+                live_values=list(current_state.get(key) or []),
+            )
+            total = len(available.get(key) or [])
+            if total <= 0:
+                parts.append(f"{labels[key]}: -")
+            elif len(selected) >= total:
+                parts.append(f"{labels[key]}: All ({total})")
+            elif not selected:
+                parts.append(f"{labels[key]}: None")
+            elif len(selected) <= 2:
+                parts.append(f"{labels[key]}: {', '.join(selected)}")
+            else:
+                parts.append(f"{labels[key]}: {len(selected)} of {total}")
+        return " | ".join(parts)
+
+    def _auto_plot_entry_filter_state(self, entry: Mapping[str, object] | None) -> dict[str, list[str]] | None:
+        if not isinstance(entry, Mapping):
+            return None
+        if bool(entry.get("uses_live_filters")):
+            return None
+        raw = entry.get("filter_state")
+        if not isinstance(raw, Mapping):
+            return self._normalize_auto_plot_filter_state({}, default_to_current=True)
+        return self._normalize_auto_plot_filter_state(raw, default_to_current=True)
+
     def _sync_main_auto_plot_actions(self) -> None:
         enabled = (
-            bool(self._auto_plots)
+            bool(self._normalized_auto_plot_entries())
             and self._plot_ready
             and bool(self._db_path)
             and str(getattr(self, "_mode", "") or "").strip().lower() != "smart_solver"
         )
         if hasattr(self, "btn_view_auto_plots"):
             self.btn_view_auto_plots.setEnabled(enabled)
+        if hasattr(self, "btn_auto_report"):
+            self.btn_auto_report.setEnabled(bool(self._plot_ready and self._db_path))
 
     def _auto_plot_display_name(self, plot_def: dict) -> str:
-        name = str((plot_def or {}).get("name") or "").strip()
+        entry = dict(plot_def or {})
+        plot_definition = self._auto_plot_entry_plot_definition(entry)
+        name = str(entry.get("name") or plot_definition.get("name") or "").strip()
         if name:
             return name
-        mode = str((plot_def or {}).get("mode") or "").strip().lower()
-        selection = self._selection_from_plot_def(plot_def or {})
-        run_disp = self._selection_display_text(selection) or str((plot_def or {}).get("run") or "").strip()
+        mode = str((plot_definition or {}).get("mode") or "").strip().lower()
+        selection = self._selection_from_plot_def(plot_definition or {})
+        run_disp = self._selection_display_text(selection) or str((plot_definition or {}).get("run") or "").strip()
         if mode == "curves":
-            y = ", ".join([str(x) for x in ((plot_def or {}).get("y") or []) if str(x).strip()])
-            x = str((plot_def or {}).get("x") or "").strip()
+            y = ", ".join([str(x) for x in ((plot_definition or {}).get("y") or []) if str(x).strip()])
+            x = str((plot_definition or {}).get("x") or "").strip()
             return f"Curves: {run_disp} {y} vs {x}".strip()
         if mode == "performance":
-            output = str((plot_def or {}).get("output") or "").strip()
-            input1 = str((plot_def or {}).get("input1") or "").strip()
-            input2 = str((plot_def or {}).get("input2") or "").strip()
+            output = str((plot_definition or {}).get("output") or "").strip()
+            input1 = str((plot_definition or {}).get("input1") or "").strip()
+            input2 = str((plot_definition or {}).get("input2") or "").strip()
             prefix = "Performance"
-            if self._perf_normalize_plot_method((plot_def or {}).get("performance_plot_method")) == "cached_condition_means":
+            if self._perf_normalize_plot_method((plot_definition or {}).get("performance_plot_method")) == "cached_condition_means":
                 prefix = "Performance (Run Conditions)"
             return (
                 f"{prefix}: {output} vs {input1},{input2}".strip()
                 if input2
                 else f"{prefix}: {output} vs {input1}".strip()
             )
-        y = ", ".join([str(x) for x in ((plot_def or {}).get("y") or []) if str(x).strip()])
-        stats_val = (plot_def or {}).get("stats")
+        y = ", ".join([str(x) for x in ((plot_definition or {}).get("y") or []) if str(x).strip()])
+        stats_val = (plot_definition or {}).get("stats")
         stats = (
             [str(x).strip() for x in stats_val if str(x).strip()]
             if isinstance(stats_val, list)
             else []
         )
         if not stats:
-            st = str((plot_def or {}).get("stat") or "").strip()
+            st = str((plot_definition or {}).get("stat") or "").strip()
             if st:
                 stats = [st]
         stats_label = self._metric_title_suffix(stats) or "metrics"
@@ -5031,8 +5303,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         out: list[dict] = []
         for item in widget.selectedItems():
             data = item.data(QtCore.Qt.ItemDataRole.UserRole)
-            if isinstance(data, dict):
-                out.append(dict(data))
+            normalized = self._normalize_auto_plot_entry(data)
+            if normalized is not None:
+                out.append(normalized)
         return out
 
     def _init_plot_area(self, layout: QtWidgets.QVBoxLayout) -> None:
@@ -6190,30 +6463,63 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         if hasattr(self, "btn_reset_global_filters"):
             self.btn_reset_global_filters.setEnabled(has_programs or has_serials or has_control_periods or has_suppression)
 
-    def _active_program_filter_values(self) -> list[str]:
-        selected = [value for value in (self._checked_program_filters or []) if str(value).strip()]
-        valid = {value for value in (self._available_program_filters or []) if str(value).strip()}
-        return [value for value in selected if value in valid]
+    def _active_program_filter_values(self, filter_state: Mapping[str, object] | None = None) -> list[str]:
+        return self._auto_plot_selected_filter_values(
+            filter_state=filter_state,
+            key="programs",
+            available_values=list(self._available_program_filters or []),
+            live_values=[str(value).strip() for value in (self._checked_program_filters or []) if str(value).strip()],
+        )
 
-    def _active_suppression_voltage_filter_values(self) -> list[str]:
-        selected = [value for value in (self._checked_suppression_voltage_filters or []) if str(value).strip()]
-        valid = {value for value in (self._available_suppression_voltage_filters or []) if str(value).strip()}
-        return [value for value in selected if value in valid]
+    def _active_suppression_voltage_filter_values(
+        self,
+        filter_state: Mapping[str, object] | None = None,
+    ) -> list[str]:
+        return self._auto_plot_selected_filter_values(
+            filter_state=filter_state,
+            key="suppression_voltages",
+            available_values=list(self._available_suppression_voltage_filters or []),
+            live_values=[
+                str(value).strip()
+                for value in (self._checked_suppression_voltage_filters or [])
+                if str(value).strip()
+            ],
+        )
 
-    def _active_control_period_filter_values(self) -> list[str]:
-        selected = [value for value in (self._checked_control_period_filters or []) if str(value).strip()]
-        valid = {value for value in (self._available_control_period_filters or []) if str(value).strip()}
-        return [value for value in selected if value in valid]
+    def _active_control_period_filter_values(
+        self,
+        filter_state: Mapping[str, object] | None = None,
+    ) -> list[str]:
+        return self._auto_plot_selected_filter_values(
+            filter_state=filter_state,
+            key="control_periods",
+            available_values=list(self._available_control_period_filters or []),
+            live_values=[
+                str(value).strip()
+                for value in (self._checked_control_period_filters or [])
+                if str(value).strip()
+            ],
+        )
 
-    def _single_active_control_period_filter_value(self) -> object | None:
-        active = self._active_control_period_filter_values()
+    def _single_active_control_period_filter_value(
+        self,
+        filter_state: Mapping[str, object] | None = None,
+    ) -> object | None:
+        active = self._active_control_period_filter_values(filter_state=filter_state)
         return active[0] if len(active) == 1 else None
 
-    def _active_serial_rows(self) -> list[dict]:
-        selected_programs = set(self._active_program_filter_values())
-        selected_serials = {str(serial).strip() for serial in (self._checked_serial_filters or []) if str(serial).strip()}
-        selected_control_periods = set(self._active_control_period_filter_values())
-        selected_suppression = set(self._active_suppression_voltage_filter_values())
+    def _active_serial_rows(self, filter_state: Mapping[str, object] | None = None) -> list[dict]:
+        selected_programs = set(self._active_program_filter_values(filter_state=filter_state))
+        selected_serials = set(
+            self._auto_plot_selected_filter_values(
+                filter_state=filter_state,
+                key="serials",
+                available_values=self._auto_plot_available_serial_values(),
+                live_values=[str(serial).strip() for serial in (self._checked_serial_filters or []) if str(serial).strip()],
+            )
+        )
+        selected_control_periods = set(self._active_control_period_filter_values(filter_state=filter_state))
+        selected_suppression = set(self._active_suppression_voltage_filter_values(filter_state=filter_state))
         if not self._global_filter_rows:
             out: list[dict] = []
             for row in (self._available_serial_filter_rows or []):
@@ -6248,8 +6554,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 out.append(dict(row))
         return out
 
-    def _active_serials(self) -> list[str]:
-        return [_td_serial_value(row) for row in self._active_serial_rows() if _td_serial_value(row)]
+    def _active_serials(self, filter_state: Mapping[str, object] | None = None) -> list[str]:
+        return [
+            _td_serial_value(row)
+            for row in self._active_serial_rows(filter_state=filter_state)
+            if _td_serial_value(row)
+        ]
 
     def _row_program_label(self, row: dict | None) -> str:
         if not isinstance(row, dict):
@@ -6261,36 +6571,55 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         source_row = (self._serial_source_by_serial or {}).get(serial) or {}
         return _td_display_program_title(source_row.get("program_title"))
 
-    def _row_matches_global_filters(self, row: dict | None) -> bool:
+    def _row_matches_global_filters(
+        self,
+        row: dict | None,
+        *,
+        filter_state: Mapping[str, object] | None = None,
+    ) -> bool:
         if not isinstance(row, dict):
             return False
         program_label = self._row_program_label(row)
-        if program_label not in set(self._active_program_filter_values()):
+        if program_label not in set(self._active_program_filter_values(filter_state=filter_state)):
             return False
-        selected_control_periods = set(self._active_control_period_filter_values())
+        selected_control_periods = set(self._active_control_period_filter_values(filter_state=filter_state))
         if selected_control_periods:
             control_period = _td_control_period_filter_value(row)
             if not control_period or control_period not in selected_control_periods:
                 return False
-        selected_suppression = set(self._active_suppression_voltage_filter_values())
+        selected_suppression = set(self._active_suppression_voltage_filter_values(filter_state=filter_state))
         if selected_suppression:
             suppression_voltage = _td_suppression_voltage_filter_value(row)
             if not suppression_voltage or suppression_voltage not in selected_suppression:
                 return False
         serial = _td_serial_value(row)
         if serial:
-            active_serials = set(self._active_serials())
+            active_serials = set(self._active_serials(filter_state=filter_state))
             if serial not in active_serials:
                 return False
         return True
 
-    def _filter_rows_for_global_selection(self, rows: list[dict]) -> list[dict]:
-        return [dict(row) for row in (rows or []) if self._row_matches_global_filters(row)]
+    def _filter_rows_for_global_selection(
+        self,
+        rows: list[dict],
+        *,
+        filter_state: Mapping[str, object] | None = None,
+    ) -> list[dict]:
+        return [
+            dict(row)
+            for row in (rows or [])
+            if self._row_matches_global_filters(row, filter_state=filter_state)
+        ]
 
-    def _visible_run_selection_items(self, mode: str) -> list[dict]:
-        selected_programs = set(self._active_program_filter_values())
-        selected_control_periods = set(self._active_control_period_filter_values())
-        selected_suppression = set(self._active_suppression_voltage_filter_values())
+    def _visible_run_selection_items(
+        self,
+        mode: str,
+        *,
+        filter_state: Mapping[str, object] | None = None,
+    ) -> list[dict]:
+        selected_programs = set(self._active_program_filter_values(filter_state=filter_state))
+        selected_control_periods = set(self._active_control_period_filter_values(filter_state=filter_state))
+        selected_suppression = set(self._active_suppression_voltage_filter_values(filter_state=filter_state))
         out: list[dict] = []
         for item in (self._run_selection_views.get(mode) or []):
             if not isinstance(item, dict):
@@ -7793,6 +8122,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         control_period_filter: object = None,
         run_type_filter: object = None,
         metric_source: object = None,
+        filter_state: Mapping[str, object] | None = None,
     ) -> list[dict]:
         if not getattr(self, "_db_path", None):
             return []
@@ -7815,7 +8145,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         loader_control_period_filter = (
             control_period_filter
             if control_period_filter not in (None, "")
-            else self._single_active_control_period_filter_value()
+            else self._single_active_control_period_filter_value(filter_state=filter_state)
         )
         try:
             rows = be.td_load_metric_series(
@@ -7829,7 +8159,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 run_type_filter=run_type_filter,
                 metric_source=metric_source_norm,
             )
-            return self._filter_rows_for_global_selection(rows)
+            return self._filter_rows_for_global_selection(rows, filter_state=filter_state)
         except Exception:
             return []
 
@@ -7841,11 +8171,16 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         *,
         selection: dict | None = None,
         serials: list[str] | None = None,
+        filter_state: Mapping[str, object] | None = None,
     ) -> list[dict]:
         if not getattr(self, "_db_path", None):
             return []
         program_title, source_run_name = self._selection_observation_filters(selection)
-        active_serials = [str(value).strip() for value in (serials or self._active_serials()) if str(value).strip()]
+        active_serials = [
+            str(value).strip()
+            for value in (serials or self._active_serials(filter_state=filter_state))
+            if str(value).strip()
+        ]
         rows = be.td_load_curves(
             self._db_path,
             run_name,
@@ -7854,9 +8189,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             serials=active_serials,
             program_title=(program_title or None),
             source_run_name=(source_run_name or None),
-            control_period_filter=self._single_active_control_period_filter_value(),
+            control_period_filter=self._single_active_control_period_filter_value(filter_state=filter_state),
         )
-        return self._filter_rows_for_global_selection(rows)
+        return self._filter_rows_for_global_selection(rows, filter_state=filter_state)
 
     def _select_run_by_id(self, selection_id: str) -> None:
         key = str(selection_id or "").strip()
@@ -8065,7 +8400,13 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             except Exception:
                 continue
 
-    def _apply_metric_program_segments(self, axes, labels: list[str]) -> None:
+    def _apply_metric_program_segments(
+        self,
+        axes,
+        labels: list[str],
+        *,
+        filter_state: Mapping[str, object] | None = None,
+    ) -> None:
         if axes is None or not labels:
             return
         try:
@@ -8073,7 +8414,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             from matplotlib.transforms import blended_transform_factory
         except Exception:
             return
-        segments = _td_metric_program_segments(labels, self._active_serial_rows())
+        segments = _td_metric_program_segments(labels, self._active_serial_rows(filter_state=filter_state))
         if not segments:
             return
         palette = ["#1d4ed8", "#0f766e", "#b45309", "#7c3aed", "#be123c", "#334155"]
@@ -9696,10 +10037,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         except Exception:
             return []
 
-    def _selected_perf_serials(self) -> list[str]:
+    def _selected_perf_serials(self, *, filter_state: Mapping[str, object] | None = None) -> list[str]:
         if not getattr(self, "_db_path", None):
             return []
-        return self._active_serials()
+        return self._active_serials(filter_state=filter_state)
 
     def _selected_perf_filter_mode(self) -> str:
         if not hasattr(self, "cb_perf_filter_mode"):
@@ -10386,6 +10727,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         control_period_filter: object = None,
         display_control_period: object = None,
         run_type_filter: object = None,
+        filter_state: Mapping[str, object] | None = None,
     ) -> tuple[dict[str, dict], list[str], str]:
         is_surface = bool(str(input2_name or "").strip())
         surface_family = self._perf_requested_surface_family() if is_surface else ""
@@ -10457,6 +10799,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                             st,
                             control_period_filter=control_period_filter,
                             run_type_filter=run_type_filter,
+                            filter_state=filter_state,
                         )
                     )
                     input2_map = _series_by_observation(
@@ -10466,6 +10809,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                             st,
                             control_period_filter=control_period_filter,
                             run_type_filter=run_type_filter,
+                            filter_state=filter_state,
                         )
                     )
                     output_map = _series_by_observation(
@@ -10475,6 +10819,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                             st,
                             control_period_filter=control_period_filter,
                             run_type_filter=run_type_filter,
+                            filter_state=filter_state,
                         )
                     )
                     if not input1_map or not input2_map or not output_map:
@@ -10663,6 +11008,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                             st,
                             control_period_filter=control_period_filter,
                             run_type_filter=run_type_filter,
+                            filter_state=filter_state,
                         )
                     )
                     output_map = _series_by_observation(
@@ -10672,6 +11018,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                             st,
                             control_period_filter=control_period_filter,
                             run_type_filter=run_type_filter,
+                            filter_state=filter_state,
                         )
                     )
                     if not input1_map or not output_map:
@@ -10779,6 +11126,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         control_period_filter: object = None,
         display_control_period: object = None,
         run_type_filter: object = None,
+        filter_state: Mapping[str, object] | None = None,
     ) -> tuple[dict[str, dict], list[str], str]:
         is_surface = bool(str(input2_name or "").strip())
         surface_family = self._perf_requested_surface_family() if is_surface else ""
@@ -10852,6 +11200,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                             "mean",
                             control_period_filter=control_period_filter,
                             run_type_filter=run_type_filter,
+                            filter_state=filter_state,
                         )
                     )
                     input2_map = _series_by_observation(
@@ -10861,6 +11210,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                             "mean",
                             control_period_filter=control_period_filter,
                             run_type_filter=run_type_filter,
+                            filter_state=filter_state,
                         )
                     )
                     output_map = _series_by_observation(
@@ -10870,6 +11220,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                             st,
                             control_period_filter=control_period_filter,
                             run_type_filter=run_type_filter,
+                            filter_state=filter_state,
                         )
                     )
                     if not input1_map or not input2_map or not output_map:
@@ -11062,6 +11413,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                             "mean",
                             control_period_filter=control_period_filter,
                             run_type_filter=run_type_filter,
+                            filter_state=filter_state,
                         )
                     )
                     output_map = _series_by_observation(
@@ -11071,6 +11423,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                             st,
                             control_period_filter=control_period_filter,
                             run_type_filter=run_type_filter,
+                            filter_state=filter_state,
                         )
                     )
                     if not input1_map or not output_map:
@@ -11576,6 +11929,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         *,
         control_period_filter: object = None,
         run_type_filter: object = None,
+        filter_state: Mapping[str, object] | None = None,
     ) -> list[dict]:
         st = str(stat or "").strip().lower()
         if not st:
@@ -11590,6 +11944,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 "mean",
                 control_period_filter=control_period_filter,
                 run_type_filter=run_type_filter,
+                filter_state=filter_state,
             )
             std_rows = self._load_metric_series_for_selection(
                 run_name,
@@ -11597,6 +11952,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 "std",
                 control_period_filter=control_period_filter,
                 run_type_filter=run_type_filter,
+                filter_state=filter_state,
             )
             mean_by_obs = {
                 str(row.get("observation_id") or "").strip(): dict(row)
@@ -11634,6 +11990,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             st,
             control_period_filter=control_period_filter,
             run_type_filter=run_type_filter,
+            filter_state=filter_state,
         )
 
     def _resolve_td_y_col_units(self, run_name: str, target: str) -> tuple[str, str]:
@@ -11900,6 +12257,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         *,
         control_period_filter: object = None,
         run_type_filter: object = None,
+        filter_state: Mapping[str, object] | None = None,
     ) -> list[dict[str, object]]:
         results = getattr(self, "_perf_results_by_stat", {}) or {}
         mean_result = (results.get("mean") or next((r for r in results.values() if isinstance(r, dict)), {})) or {}
@@ -11935,7 +12293,11 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     if str(serial).strip() and isinstance(points, list) and points
                 }
         if not qualifying_serials:
-            qualifying_serials = {str(serial).strip() for serial in self._selected_perf_serials() if str(serial).strip()}
+            qualifying_serials = {
+                str(serial).strip()
+                for serial in self._selected_perf_serials(filter_state=filter_state)
+                if str(serial).strip()
+            }
 
         out: list[dict[str, object]] = []
         for spec in run_specs or []:
@@ -11955,6 +12317,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 "mean",
                 control_period_filter=control_period_filter,
                 run_type_filter=run_type_filter,
+                filter_state=filter_state,
             )
             y_rows = self._load_perf_equation_metric_series(
                 run_name,
@@ -11962,6 +12325,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 "mean",
                 control_period_filter=control_period_filter,
                 run_type_filter=run_type_filter,
+                filter_state=filter_state,
             )
             if not x1_rows or not y_rows:
                 continue
@@ -11984,6 +12348,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     "mean",
                     control_period_filter=control_period_filter,
                     run_type_filter=run_type_filter,
+                    filter_state=filter_state,
                 )
                 x2_map = {
                     str(row.get("observation_id") or "").strip(): dict(row)
@@ -14596,6 +14961,995 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     pdf.savefig(fig)
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "Save All Auto-Plots", str(exc))
+
+    def _load_auto_plots(self) -> None:
+        self._auto_plots = []
+        try:
+            if self._auto_plot_path.exists():
+                data = json.loads(self._auto_plot_path.read_text(encoding="utf-8"))
+                raw_entries: list[object] = []
+                if isinstance(data, list):
+                    raw_entries = list(data)
+                elif isinstance(data, Mapping):
+                    entries = data.get("entries")
+                    if isinstance(entries, list):
+                        raw_entries = list(entries)
+                self._auto_plots = [dict(entry) for entry in raw_entries if isinstance(entry, Mapping)]
+        except Exception:
+            self._auto_plots = []
+        self._normalized_auto_plot_entries()
+        self._sync_main_auto_plot_actions()
+        self._refresh_auto_plots_list()
+
+    def _auto_plot_mode_label(self, entry: Mapping[str, object] | None) -> str:
+        plot_definition = self._auto_plot_entry_plot_definition(entry)
+        mode = str(plot_definition.get("mode") or "").strip().lower()
+        if mode == "curves":
+            return "Plot Curves"
+        if mode == "performance":
+            if self._perf_normalize_plot_method(plot_definition.get("performance_plot_method")) == "cached_condition_means":
+                return "Performance Curves (Run Conditions)"
+            return "Performance Curves"
+        return "Plot Metric"
+
+    def _auto_plot_list_item_text(self, entry: Mapping[str, object] | None) -> str:
+        name = self._auto_plot_display_name(dict(entry or {})) or "Auto-Graph"
+        mode = str(self._auto_plot_entry_plot_definition(entry).get("mode") or "").strip().lower()
+        normalized = name.strip().lower()
+        mode_prefixes = {
+            "curves": ("curves:", "plot curve:", "plot curves:"),
+            "metrics": ("metrics:", "plot metric:", "plot metrics:"),
+            "performance": ("performance:", "performance curves:"),
+        }
+        if normalized.startswith(mode_prefixes.get(mode, tuple())):
+            return name
+        return f"{self._auto_plot_mode_label(entry)} | {name}"
+
+    def _auto_plot_entry_tooltip(self, entry: Mapping[str, object] | None) -> str:
+        if not isinstance(entry, Mapping):
+            return ""
+        lines = [
+            self._auto_plot_display_name(dict(entry)),
+            f"Type: {self._auto_plot_mode_label(entry)}",
+        ]
+        filter_state = self._auto_plot_entry_filter_state(entry)
+        if filter_state is None and bool(entry.get("uses_live_filters")):
+            lines.append("Filters: Uses current live global filters")
+        else:
+            lines.append(f"Filters: {self._auto_plot_filter_summary_text(filter_state)}")
+        saved_at = str(entry.get("saved_at") or "").strip()
+        updated_at = str(entry.get("updated_at") or "").strip()
+        if saved_at:
+            lines.append(f"Saved: {saved_at}")
+        if updated_at and updated_at != saved_at:
+            lines.append(f"Updated: {updated_at}")
+        return "\n".join([line for line in lines if str(line).strip()])
+
+    def _refresh_auto_plots_list(self, list_widget: QtWidgets.QListWidget | None = None) -> None:
+        widget = list_widget if list_widget is not None else getattr(self, "list_auto_plots", None)
+        if widget is None:
+            return
+        widget.clear()
+        for entry in self._normalized_auto_plot_entries():
+            item = QtWidgets.QListWidgetItem(self._auto_plot_list_item_text(entry))
+            item.setData(QtCore.Qt.ItemDataRole.UserRole, entry)
+            item.setToolTip(self._auto_plot_entry_tooltip(entry))
+            widget.addItem(item)
+        self._update_auto_actions(list_widget=widget)
+
+    def _update_auto_actions(
+        self,
+        *,
+        list_widget: QtWidgets.QListWidget | None = None,
+        btn_open: QtWidgets.QPushButton | None = None,
+        btn_open_all: QtWidgets.QPushButton | None = None,
+        btn_edit: QtWidgets.QPushButton | None = None,
+        btn_delete: QtWidgets.QPushButton | None = None,
+        btn_save_selected: QtWidgets.QPushButton | None = None,
+        btn_save_all: QtWidgets.QPushButton | None = None,
+        btn_auto_report: QtWidgets.QPushButton | None = None,
+    ) -> None:
+        widget = list_widget if list_widget is not None else getattr(self, "list_auto_plots", None)
+        selected = widget.selectedItems() if widget is not None else []
+        selected_count = len(selected)
+        has_selection = selected_count > 0
+        has_entries = bool(self._normalized_auto_plot_entries())
+        open_btn = btn_open if btn_open is not None else getattr(self, "btn_open_auto", None)
+        open_all_btn = btn_open_all if btn_open_all is not None else getattr(self, "btn_open_all_auto", None)
+        edit_btn = btn_edit if btn_edit is not None else getattr(self, "btn_edit_auto", None)
+        delete_btn = btn_delete if btn_delete is not None else getattr(self, "btn_delete_auto", None)
+        save_selected_btn = (
+            btn_save_selected if btn_save_selected is not None else getattr(self, "btn_save_selected_auto", None)
+        )
+        save_all_btn = btn_save_all if btn_save_all is not None else getattr(self, "btn_save_all_auto", None)
+        auto_report_btn = btn_auto_report if btn_auto_report is not None else getattr(self, "btn_auto_report", None)
+        if open_btn is not None:
+            open_btn.setEnabled(has_selection and self._plot_ready and bool(self._db_path))
+        if open_all_btn is not None:
+            open_all_btn.setEnabled(has_entries and self._plot_ready and bool(self._db_path))
+        if edit_btn is not None:
+            edit_btn.setEnabled(selected_count == 1)
+        if delete_btn is not None:
+            delete_btn.setEnabled(has_selection)
+        if save_selected_btn is not None:
+            save_selected_btn.setEnabled(has_selection and self._plot_ready and bool(self._db_path))
+        if save_all_btn is not None:
+            save_all_btn.setEnabled(has_entries and self._plot_ready and bool(self._db_path))
+        if auto_report_btn is not None:
+            auto_report_btn.setEnabled(bool(self._plot_ready and self._db_path))
+        self._sync_main_auto_plot_actions()
+
+    def _upsert_auto_plot_entry(
+        self,
+        entry: Mapping[str, object] | None,
+        *,
+        list_widget: QtWidgets.QListWidget | None = None,
+    ) -> dict[str, object] | None:
+        normalized = self._normalize_auto_plot_entry(entry)
+        if normalized is None:
+            return None
+        entries = self._normalized_auto_plot_entries()
+        entry_id = str(normalized.get("id") or "").strip()
+        replaced = False
+        for idx, existing in enumerate(entries):
+            if entry_id and str(existing.get("id") or "").strip() == entry_id:
+                entries[idx] = normalized
+                replaced = True
+                break
+        if not replaced:
+            entries.append(normalized)
+        self._auto_plots = entries
+        try:
+            self._save_auto_plots_store()
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Auto-Graphs", str(exc))
+            return None
+        self._sync_main_auto_plot_actions()
+        self._refresh_auto_plots_list(list_widget=list_widget)
+        return normalized
+
+    def _open_auto_plot_editor(
+        self,
+        entry: Mapping[str, object] | None = None,
+    ) -> dict[str, object] | None:
+        if not self._last_plot_def and not isinstance(entry, Mapping):
+            return None
+        plot_definition = (
+            self._auto_plot_entry_plot_definition(entry)
+            if isinstance(entry, Mapping)
+            else dict(self._last_plot_def or {})
+        )
+        if not plot_definition:
+            return None
+        seed_name = str(
+            (entry or {}).get("name") if isinstance(entry, Mapping) else ""
+            or plot_definition.get("name")
+            or self._auto_plot_display_name({"plot_definition": plot_definition})
+        ).strip()
+        if isinstance(entry, Mapping) and not bool(entry.get("uses_live_filters")):
+            seed_filters = self._auto_plot_entry_filter_state(entry) or self._current_auto_plot_filter_state()
+        else:
+            seed_filters = self._current_auto_plot_filter_state()
+        filter_state = {
+            key: [str(value).strip() for value in (seed_filters.get(key) or []) if str(value).strip()]
+            for key in TD_AUTO_PLOT_FILTER_KEYS
+        }
+
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Edit Auto-Graph" if isinstance(entry, Mapping) else "Save Auto-Graph")
+        dlg.resize(760, 560)
+        dlg.setStyleSheet(
+            """
+            QDialog { background: #ffffff; color: #0f172a; }
+            QLabel { color: #0f172a; }
+            QLineEdit {
+                background: #ffffff;
+                border: 1px solid #cbd5e1;
+                border-radius: 8px;
+                padding: 8px 10px;
+            }
+            QPushButton {
+                padding: 8px 12px;
+                border-radius: 8px;
+            }
+            """
+        )
+        layout = QtWidgets.QVBoxLayout(dlg)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+
+        title = QtWidgets.QLabel("Auto-Graph Preset")
+        title.setStyleSheet("font-size: 14px; font-weight: 800;")
+        layout.addWidget(title)
+
+        subtitle = QtWidgets.QLabel(
+            "Save the current graph definition together with a popup/export-only global filter snapshot."
+        )
+        subtitle.setWordWrap(True)
+        subtitle.setStyleSheet("color: #64748b; font-size: 11px;")
+        layout.addWidget(subtitle)
+
+        form = QtWidgets.QFormLayout()
+        form.setLabelAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
+        form.setFormAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(10)
+
+        ed_name = QtWidgets.QLineEdit(seed_name)
+        ed_name.setPlaceholderText("Preset name")
+        form.addRow("Name:", ed_name)
+
+        lbl_type = QtWidgets.QLabel(self._auto_plot_mode_label({"plot_definition": plot_definition}))
+        lbl_type.setWordWrap(True)
+        form.addRow("Type:", lbl_type)
+
+        lbl_graph = QtWidgets.QLabel(self._auto_plot_display_name({"plot_definition": plot_definition}))
+        lbl_graph.setWordWrap(True)
+        lbl_graph.setStyleSheet("color: #334155;")
+        form.addRow("Graph:", lbl_graph)
+        layout.addLayout(form)
+
+        filter_frame = QtWidgets.QFrame()
+        filter_frame.setStyleSheet(
+            "QFrame { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; }"
+        )
+        filter_layout = QtWidgets.QVBoxLayout(filter_frame)
+        filter_layout.setContentsMargins(12, 12, 12, 12)
+        filter_layout.setSpacing(10)
+
+        filter_title = QtWidgets.QLabel("Saved Global Filters")
+        filter_title.setStyleSheet("font-size: 12px; font-weight: 700;")
+        filter_layout.addWidget(filter_title)
+
+        lbl_filter_summary = QtWidgets.QLabel("")
+        lbl_filter_summary.setWordWrap(True)
+        lbl_filter_summary.setStyleSheet("color: #475569; font-size: 11px;")
+        filter_layout.addWidget(lbl_filter_summary)
+
+        row_labels: dict[str, QtWidgets.QLabel] = {}
+
+        def _filter_values_for_key(key: str) -> list[str]:
+            if key == "programs":
+                return list(self._available_program_filters or [])
+            if key == "serials":
+                return self._auto_plot_available_serial_values()
+            if key == "control_periods":
+                return list(self._available_control_period_filters or [])
+            if key == "suppression_voltages":
+                return list(self._available_suppression_voltage_filters or [])
+            return []
+
+        def _refresh_filter_labels() -> None:
+            label_map = {
+                "programs": "Programs",
+                "serials": "Serials",
+                "control_periods": "Control Period",
+                "suppression_voltages": "Suppression Voltage",
+            }
+            for key in TD_AUTO_PLOT_FILTER_KEYS:
+                selected_values = [str(value).strip() for value in (filter_state.get(key) or []) if str(value).strip()]
+                total = len(_filter_values_for_key(key))
+                summary = self._popup_selection_summary(selected_values, total_count=total, empty_text="-")
+                row_labels[key].setText(f"{label_map[key]}: {summary}")
+                row_labels[key].setToolTip(", ".join(selected_values))
+            lbl_filter_summary.setText(self._auto_plot_filter_summary_text(filter_state))
+
+        def _edit_filter_values(key: str, title_text: str) -> None:
+            values = _filter_values_for_key(key)
+            if not values:
+                QtWidgets.QMessageBox.information(
+                    dlg,
+                    "Auto-Graphs",
+                    f"No {title_text.lower()} are available in the current cache.",
+                )
+                return
+            entries = [
+                {"value": value, "label": value, "search": value.lower()}
+                for value in values
+                if str(value).strip()
+            ]
+            chosen = self._show_filter_checklist_popup(
+                title=title_text,
+                entries=entries,
+                selected_values=list(filter_state.get(key) or []),
+            )
+            if chosen is None:
+                return
+            chosen_set = {str(value).strip() for value in chosen if str(value).strip()}
+            filter_state[key] = [value for value in values if value in chosen_set]
+            _refresh_filter_labels()
+
+        for key, label_text in (
+            ("programs", "Programs"),
+            ("serials", "Serials"),
+            ("control_periods", "Control Period"),
+            ("suppression_voltages", "Suppression Voltage"),
+        ):
+            row = QtWidgets.QHBoxLayout()
+            row.setSpacing(8)
+            btn = QtWidgets.QPushButton(f"{label_text}...")
+            btn.clicked.connect(
+                lambda _checked=False, key=key, label_text=label_text: _edit_filter_values(
+                    key, f"Saved {label_text}"
+                )
+            )
+            lbl = QtWidgets.QLabel("")
+            lbl.setWordWrap(True)
+            row_labels[key] = lbl
+            row.addWidget(btn, 0)
+            row.addWidget(lbl, 1)
+            filter_layout.addLayout(row)
+
+        btn_use_current = QtWidgets.QPushButton("Use Current Global Filters")
+
+        def _reset_to_current_filters() -> None:
+            current = self._current_auto_plot_filter_state()
+            for key in TD_AUTO_PLOT_FILTER_KEYS:
+                filter_state[key] = [str(value).strip() for value in (current.get(key) or []) if str(value).strip()]
+            _refresh_filter_labels()
+
+        btn_use_current.clicked.connect(_reset_to_current_filters)
+        filter_layout.addWidget(btn_use_current, 0, QtCore.Qt.AlignmentFlag.AlignLeft)
+        layout.addWidget(filter_frame, 1)
+        _refresh_filter_labels()
+
+        chosen_entry: dict[str, object] = {}
+
+        def _save() -> None:
+            name = str(ed_name.text() or "").strip() or self._auto_plot_display_name({"plot_definition": plot_definition})
+            now_text = _td_auto_plot_timestamp_text()
+            payload = {
+                "id": str((entry or {}).get("id") or "").strip() if isinstance(entry, Mapping) else "",
+                "name": name,
+                "saved_at": str((entry or {}).get("saved_at") or "").strip() if isinstance(entry, Mapping) else now_text,
+                "updated_at": now_text,
+                "plot_definition": dict(plot_definition),
+                "filter_state": {key: list(filter_state.get(key) or []) for key in TD_AUTO_PLOT_FILTER_KEYS},
+            }
+            normalized = self._normalize_auto_plot_entry(payload)
+            if normalized is None:
+                QtWidgets.QMessageBox.warning(dlg, "Auto-Graphs", "Unable to save the Auto-Graph preset.")
+                return
+            normalized.pop("uses_live_filters", None)
+            chosen_entry.clear()
+            chosen_entry.update(normalized)
+            dlg.accept()
+
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_row.addStretch(1)
+        btn_save = QtWidgets.QPushButton("Save")
+        btn_cancel = QtWidgets.QPushButton("Cancel")
+        btn_row.addWidget(btn_save)
+        btn_row.addWidget(btn_cancel)
+        layout.addLayout(btn_row)
+
+        btn_save.clicked.connect(_save)
+        btn_cancel.clicked.connect(dlg.reject)
+        _fit_widget_to_screen(dlg)
+        if dlg.exec() != int(QtWidgets.QDialog.DialogCode.Accepted):
+            return None
+        return dict(chosen_entry)
+
+    def _add_current_plot_to_autoplots(self) -> None:
+        if not self._last_plot_def:
+            return
+        seed_entry = {
+            "name": self._auto_plot_display_name({"plot_definition": dict(self._last_plot_def)}),
+            "plot_definition": dict(self._last_plot_def),
+            "filter_state": self._current_auto_plot_filter_state(),
+        }
+        edited = self._open_auto_plot_editor(seed_entry)
+        if edited is None:
+            return
+        self._upsert_auto_plot_entry(edited)
+
+    def _open_selected_auto_plot(
+        self,
+        plot_def: dict | None = None,
+        *,
+        list_widget: QtWidgets.QListWidget | None = None,
+    ) -> None:
+        if not self._db_path or not self._plot_ready:
+            return
+        entries: list[dict[str, object]] = []
+        if isinstance(plot_def, dict):
+            normalized = self._normalize_auto_plot_entry(plot_def)
+            if normalized is None:
+                normalized = self._normalize_auto_plot_entry({"plot_definition": dict(plot_def)})
+            if normalized is not None:
+                entries = [normalized]
+        else:
+            entries = self._selected_auto_plot_definitions(list_widget=list_widget)
+        if not entries:
+            return
+        self._open_auto_plot_entries_panel(entries, title="Auto-Graphs")
+
+    def _edit_selected_auto_plot(
+        self,
+        *,
+        list_widget: QtWidgets.QListWidget | None = None,
+    ) -> None:
+        selected = self._selected_auto_plot_definitions(list_widget=list_widget)
+        if len(selected) != 1:
+            return
+        edited = self._open_auto_plot_editor(selected[0])
+        if edited is None:
+            return
+        saved = self._upsert_auto_plot_entry(edited, list_widget=list_widget)
+        if saved is None:
+            return
+        widget = list_widget if list_widget is not None else getattr(self, "list_auto_plots", None)
+        saved_id = str(saved.get("id") or "").strip()
+        if widget is None or not saved_id:
+            return
+        widget.clearSelection()
+        for idx in range(widget.count()):
+            item = widget.item(idx)
+            payload = item.data(QtCore.Qt.ItemDataRole.UserRole) if item is not None else None
+            normalized = self._normalize_auto_plot_entry(payload)
+            if normalized is not None and str(normalized.get("id") or "").strip() == saved_id:
+                item.setSelected(True)
+                widget.scrollToItem(item)
+                break
+
+    def _open_auto_plots_popup(self) -> None:
+        if not self._plot_ready or not self._db_path:
+            QtWidgets.QMessageBox.information(self, "Auto-Graphs", "Plotting is unavailable.")
+            return
+        entries = self._normalized_auto_plot_entries()
+        if not entries:
+            QtWidgets.QMessageBox.information(self, "Auto-Graphs", "No Auto-Graphs are available.")
+            return
+
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Auto-Graphs")
+        dlg.resize(760, 560)
+        dlg.setStyleSheet(
+            """
+            QDialog { background: #ffffff; color: #0f172a; }
+            QLabel { color: #0f172a; }
+            QListWidget {
+                background: #ffffff;
+                border: 1px solid #e2e8f0;
+                border-radius: 8px;
+                padding: 6px;
+            }
+            QListWidget::item { padding: 4px 6px; }
+            QListWidget::item:selected { background: #dbeafe; color: #1e3a8a; }
+            """
+        )
+        layout = QtWidgets.QVBoxLayout(dlg)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
+        title = QtWidgets.QLabel("Saved Auto-Graphs")
+        title.setStyleSheet("font-size: 13px; font-weight: 800;")
+        layout.addWidget(title)
+
+        hint = QtWidgets.QLabel(
+            "Open saved graphs in popup tabs, edit saved filters, delete presets, or export PDF batches."
+        )
+        hint.setStyleSheet("color: #64748b; font-size: 11px;")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        list_widget = QtWidgets.QListWidget()
+        list_widget.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        layout.addWidget(list_widget, 1)
+
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_row.setSpacing(8)
+        btn_open = QtWidgets.QPushButton("Open")
+        btn_open_all = QtWidgets.QPushButton("Open All")
+        btn_edit = QtWidgets.QPushButton("Edit")
+        btn_delete = QtWidgets.QPushButton("Delete")
+        btn_save_selected = QtWidgets.QPushButton("Save Selected PDF")
+        btn_save_all = QtWidgets.QPushButton("Save All PDF")
+        btn_close = QtWidgets.QPushButton("Close")
+        for btn in (btn_open, btn_open_all, btn_edit, btn_delete, btn_save_selected, btn_save_all):
+            btn_row.addWidget(btn)
+        btn_row.addStretch(1)
+        btn_row.addWidget(btn_close)
+        layout.addLayout(btn_row)
+
+        def _sync_buttons() -> None:
+            self._update_auto_actions(
+                list_widget=list_widget,
+                btn_open=btn_open,
+                btn_open_all=btn_open_all,
+                btn_edit=btn_edit,
+                btn_delete=btn_delete,
+                btn_save_selected=btn_save_selected,
+                btn_save_all=btn_save_all,
+            )
+
+        self._refresh_auto_plots_list(list_widget)
+        _sync_buttons()
+
+        list_widget.itemDoubleClicked.connect(lambda *_: self._open_selected_auto_plot(list_widget=list_widget))
+        list_widget.itemSelectionChanged.connect(_sync_buttons)
+        btn_open.clicked.connect(lambda: self._open_selected_auto_plot(list_widget=list_widget))
+        btn_open_all.clicked.connect(self._open_all_auto_plots_panel)
+        btn_edit.clicked.connect(lambda: self._edit_selected_auto_plot(list_widget=list_widget))
+        btn_delete.clicked.connect(lambda: (self._delete_selected_auto_plots(list_widget=list_widget), _sync_buttons()))
+        btn_save_selected.clicked.connect(lambda: self._save_selected_auto_plots_pdf(list_widget=list_widget))
+        btn_save_all.clicked.connect(self._save_all_auto_plots_pdf)
+        btn_close.clicked.connect(dlg.accept)
+
+        _fit_widget_to_screen(dlg)
+        dlg.exec()
+
+    def _open_all_auto_plots_panel(self) -> None:
+        if not self._plot_ready or not self._db_path:
+            QtWidgets.QMessageBox.information(self, "Auto-Graphs", "Plotting is unavailable.")
+            return
+        entries = self._normalized_auto_plot_entries()
+        if not entries:
+            QtWidgets.QMessageBox.information(self, "Auto-Graphs", "No Auto-Graphs are available.")
+            return
+        self._open_auto_plot_entries_panel(entries, title="Auto-Graphs")
+
+    def _delete_selected_auto_plots(
+        self,
+        *,
+        list_widget: QtWidgets.QListWidget | None = None,
+    ) -> None:
+        selected = self._selected_auto_plot_definitions(list_widget=list_widget)
+        delete_ids = {str(entry.get("id") or "").strip() for entry in selected if str(entry.get("id") or "").strip()}
+        if not delete_ids:
+            return
+        self._auto_plots = [
+            entry
+            for entry in self._normalized_auto_plot_entries()
+            if str(entry.get("id") or "").strip() not in delete_ids
+        ]
+        try:
+            self._save_auto_plots_store()
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Auto-Graphs", str(exc))
+            return
+        self._sync_main_auto_plot_actions()
+        self._refresh_auto_plots_list(list_widget=list_widget)
+
+    def _auto_plot_warning_figure(self, *, title: str, message: str):
+        from matplotlib.figure import Figure
+
+        fig = Figure(figsize=(8, 4), dpi=100)
+        ax = fig.add_subplot(111)
+        ax.set_axis_off()
+        ax.text(
+            0.5,
+            0.62,
+            title or "Auto-Graph",
+            ha="center",
+            va="center",
+            fontsize=13,
+            fontweight="bold",
+            color="#0f172a",
+            wrap=True,
+            transform=ax.transAxes,
+        )
+        ax.text(
+            0.5,
+            0.42,
+            message or "Unable to render this Auto-Graph preset.",
+            ha="center",
+            va="center",
+            fontsize=10,
+            color="#991b1b",
+            wrap=True,
+            transform=ax.transAxes,
+        )
+        try:
+            fig.tight_layout()
+        except Exception:
+            pass
+        return fig
+
+    def _render_auto_plot_entry_figure(self, entry: Mapping[str, object]) -> tuple[object, str]:
+        plot_definition = self._auto_plot_entry_plot_definition(entry)
+        title = self._auto_plot_display_name(dict(entry))
+        try:
+            fig = self._render_plot_def_to_figure(
+                plot_definition,
+                filter_state=self._auto_plot_entry_filter_state(entry),
+                title_override=title,
+            )
+            return fig, ""
+        except Exception as exc:
+            message = str(exc or "Unable to render this Auto-Graph preset.")
+            return self._auto_plot_warning_figure(title=title or "Auto-Graph", message=message), message
+
+    def _open_auto_plot_entries_panel(
+        self,
+        entries: list[dict[str, object]],
+        *,
+        title: str,
+    ) -> None:
+        normalized_entries = [entry for entry in entries if isinstance(entry, dict)]
+        if not normalized_entries:
+            QtWidgets.QMessageBox.information(self, "Auto-Graphs", "No Auto-Graphs are available.")
+            return
+        try:
+            from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Auto-Graphs", f"Plotting unavailable: {exc}")
+            return
+
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle(title)
+        dlg.resize(1020, 760)
+        dlg.setStyleSheet(
+            """
+            QDialog { background: #ffffff; color: #1f2937; }
+            QLabel { color: #1f2937; }
+            QTabWidget::pane { border: 1px solid #e2e8f0; }
+            QTabBar::tab {
+                background: #f8fafc;
+                border: 1px solid #e2e8f0;
+                color: #0f172a;
+                padding: 6px 10px;
+                margin-right: 4px;
+            }
+            QTabBar::tab:selected {
+                background: #ffffff;
+                color: #0f172a;
+                border-bottom-color: #ffffff;
+            }
+            """
+        )
+        layout = QtWidgets.QVBoxLayout(dlg)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
+        tabs = QtWidgets.QTabWidget()
+        layout.addWidget(tabs, 1)
+
+        for entry in normalized_entries:
+            tab = QtWidgets.QWidget()
+            tab_layout = QtWidgets.QVBoxLayout(tab)
+            tab_layout.setContentsMargins(8, 8, 8, 8)
+            tab_layout.setSpacing(8)
+
+            filter_text = (
+                "Filters: Uses current live global filters"
+                if bool(entry.get("uses_live_filters"))
+                else self._auto_plot_filter_summary_text(self._auto_plot_entry_filter_state(entry))
+            )
+            info_label = QtWidgets.QLabel(filter_text)
+            info_label.setWordWrap(True)
+            info_label.setStyleSheet("color: #64748b; font-size: 11px;")
+            tab_layout.addWidget(info_label)
+
+            fig, warning_text = self._render_auto_plot_entry_figure(entry)
+            if warning_text:
+                warning_label = QtWidgets.QLabel(warning_text)
+                warning_label.setWordWrap(True)
+                warning_label.setStyleSheet(
+                    "QLabel { background: #fef2f2; border: 1px solid #fecaca; border-radius: 8px; "
+                    "padding: 8px 10px; color: #991b1b; font-size: 11px; }"
+                )
+                tab_layout.addWidget(warning_label)
+
+            canvas = FigureCanvas(fig)
+            tab_layout.addWidget(canvas, 1)
+            tabs.addTab(tab, self._auto_plot_display_name(entry) or "Auto-Graph")
+            tabs.setTabToolTip(tabs.count() - 1, self._auto_plot_entry_tooltip(entry))
+
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_row.addStretch(1)
+        btn_close = QtWidgets.QPushButton("Close")
+        btn_close.clicked.connect(dlg.accept)
+        btn_row.addWidget(btn_close)
+        layout.addLayout(btn_row)
+
+        _fit_widget_to_screen(dlg)
+        dlg.exec()
+
+    def _render_plot_def_to_figure(
+        self,
+        d: dict,
+        *,
+        filter_state: Mapping[str, object] | None = None,
+        title_override: str = "",
+    ):
+        from matplotlib.figure import Figure
+
+        mode = str(d.get("mode") or "").strip().lower()
+        selection = self._selection_from_plot_def(d)
+        runs = [str(v).strip() for v in (selection.get("member_runs") or d.get("member_runs") or []) if str(v).strip()]
+        if not runs:
+            run_ref = str(d.get("run") or "").strip()
+            if run_ref:
+                runs = [self._run_name_by_display.get(run_ref, run_ref)]
+        render_filter_state = (
+            self._normalize_auto_plot_filter_state(filter_state, default_to_current=True)
+            if isinstance(filter_state, Mapping)
+            else None
+        )
+        plot_dimension = "3d" if mode == "performance" and str(d.get("input2") or "").strip() else "2d"
+        fig = Figure(figsize=(8, 4), dpi=100)
+        ax = fig.add_subplot(111, projection="3d") if plot_dimension == "3d" else fig.add_subplot(111)
+
+        if mode == "curves":
+            ys = d.get("y") or []
+            y = str(ys[0] if isinstance(ys, list) and ys else "").strip()
+            x_label = str(d.get("x") or "").strip()
+            if not y or not x_label:
+                raise RuntimeError("The saved curve graph is missing its X or Y axis definition.")
+            if not runs:
+                raise RuntimeError("No runs remain for this saved curve graph.")
+            ax.set_title(title_override or str(d.get("name") or "") or self._compose_run_title(selection, f"{y} vs {x_label}"))
+            ax.set_xlabel(x_label)
+            ax.set_ylabel(y)
+            active_serials = self._active_serials(filter_state=render_filter_state)
+            if not active_serials:
+                raise RuntimeError("No serials remain after applying the saved global filters.")
+            plotted_any = False
+            multi_run = len(runs) > 1
+            for run in runs:
+                x_key = self._resolve_curve_x_key(run, x_label)
+                curves = self._load_curves_for_selection(
+                    run,
+                    y,
+                    x_key,
+                    selection=selection,
+                    serials=active_serials,
+                    filter_state=render_filter_state,
+                )  # type: ignore[arg-type]
+                for series in curves:
+                    xs = series.get("x") or []
+                    ys2 = series.get("y") or []
+                    if not isinstance(xs, list) or not isinstance(ys2, list) or not xs or not ys2:
+                        continue
+                    plotted_any = True
+                    ax.plot(
+                        xs,
+                        ys2,
+                        linewidth=1.1,
+                        alpha=0.85,
+                        label=self._curve_trace_label(run, series, multi_run=multi_run),
+                    )
+            if not plotted_any:
+                raise RuntimeError("No curve data matched this saved graph after applying the saved global filters.")
+            ax.grid(True, alpha=0.25)
+            handles, labels = ax.get_legend_handles_labels()
+            if handles and labels:
+                ax.legend(fontsize=8, loc="best")
+        elif mode == "metrics":
+            stats_val = d.get("stats")
+            stats = (
+                [str(value).strip().lower() for value in stats_val if str(value).strip()]
+                if isinstance(stats_val, list)
+                else []
+            )
+            if not stats:
+                stat_value = str(d.get("stat") or "").strip().lower()
+                if stat_value:
+                    stats = [stat_value]
+            if not stats:
+                stats = ["mean"]
+            y_cols = [str(value).strip() for value in (d.get("y") or []) if str(value).strip()]
+            if not y_cols:
+                raise RuntimeError("The saved metric graph has no selected Y columns.")
+            if not runs:
+                raise RuntimeError("No runs remain for this saved metric graph.")
+            metric_source = getattr(be, "TD_METRIC_PLOT_SOURCE_AGGREGATE", "aggregate")
+            normalizer = getattr(be, "td_metric_normalize_plot_source", None)
+            if callable(normalizer):
+                try:
+                    metric_source = str(normalizer(d.get("metric_plot_source"))).strip().lower()
+                except Exception:
+                    metric_source = str(d.get("metric_plot_source") or metric_source).strip().lower() or str(metric_source)
+            else:
+                metric_source = str(d.get("metric_plot_source") or metric_source).strip().lower() or str(metric_source)
+            stats_label = self._metric_title_suffix(stats)
+            plot_bounds = bool(d.get("plot_bounds"))
+            ax.set_title(title_override or str(d.get("name") or "") or self._compose_run_title(selection, stats_label))
+            ax.set_xlabel("Serial Number")
+            ax.set_ylabel(stats[0] if len(stats) == 1 else "Metric value")
+            serial_rows = self._active_serial_rows(filter_state=render_filter_state)
+            serial_labels = _td_order_metric_serials(
+                [_td_serial_value(row) for row in serial_rows if _td_serial_value(row)],
+                serial_rows,
+            )
+            if not serial_labels:
+                raise RuntimeError("No serials remain after applying the saved global filters.")
+            x_idx = list(range(len(serial_labels)))
+            plotted_any = False
+            multi_run = len(runs) > 1
+            for run in runs:
+                metric_bounds = self._metric_bounds_for_run(run) if plot_bounds else {}
+                for y_col in y_cols:
+                    for stat in stats:
+                        source_stat = "mean" if str(stat).strip().lower() == "average" else stat
+                        series = self._load_metric_series_for_selection(
+                            run,
+                            y_col,
+                            source_stat,
+                            selection=selection,
+                            metric_source=metric_source,
+                            filter_state=render_filter_state,
+                        )  # type: ignore[arg-type]
+                        if str(stat).strip().lower() == "average":
+                            avg_values = be.td_metric_average_plot_values(series, serial_labels)  # type: ignore[arg-type]
+                            if any(value is not None for value in (avg_values or [])):
+                                plotted_any = True
+                            ax.plot(
+                                x_idx,
+                                avg_values,
+                                marker=None,
+                                linewidth=1.2,
+                                label=(f"{run}.{y_col}.{stat}" if multi_run else f"{y_col}.{stat}"),
+                            )
+                        else:
+                            points = self._metric_points_for_serial_labels(series, serial_labels)
+                            if not points:
+                                continue
+                            plotted_any = True
+                            ax.plot(
+                                [float(point.get("x") or 0.0) for point in points],
+                                [float(point.get("y") or 0.0) for point in points],
+                                linestyle="",
+                                marker="o",
+                                markersize=5.0,
+                                alpha=0.88,
+                                label=(f"{run}.{y_col}.{stat}" if multi_run else f"{y_col}.{stat}"),
+                            )
+                        bound = dict(metric_bounds.get(str(y_col)) or {})
+                        self._plot_metric_bound_lines(ax, bound)
+            if not plotted_any:
+                raise RuntimeError("No metric data matched this saved graph after applying the saved global filters.")
+            self._apply_metric_program_segments(ax, serial_labels, filter_state=render_filter_state)
+            ax.set_xlim(-0.5, max(len(serial_labels) - 0.5, 0.5))
+            ax.set_xticks(x_idx)
+            ax.set_xticklabels(serial_labels, rotation=45, ha="right", fontsize=8)
+            ax.grid(True, alpha=0.25)
+            handles, labels = ax.get_legend_handles_labels()
+            if handles and labels:
+                ax.legend(fontsize=8, loc="best")
+        else:
+            output = str(d.get("output") or "").strip()
+            input1 = str(d.get("input1") or "").strip()
+            input2 = str(d.get("input2") or "").strip()
+            if not output or not input1:
+                raise RuntimeError("The saved performance graph is missing Output or Input selections.")
+            stats_val = d.get("stats")
+            plot_stats = (
+                [str(value).strip().lower() for value in stats_val if str(value).strip()]
+                if isinstance(stats_val, list)
+                else []
+            )
+            if not plot_stats:
+                view_stat = str(d.get("view_stat") or "").strip().lower()
+                plot_stats = [view_stat] if view_stat else ["mean"]
+            if not runs:
+                runs = self._selected_perf_runs()
+            if not runs:
+                raise RuntimeError("No runs remain for this saved performance graph.")
+            serials = self._selected_perf_serials(filter_state=render_filter_state)
+            if not serials:
+                raise RuntimeError("No serials remain after applying the saved global filters.")
+            fit_enabled = bool(d.get("fit_enabled", True))
+            require_min_points = max(2, int(getattr(self, "_perf_require_min_points", 2) or 2))
+            run_type_mode = str(d.get("performance_run_type_mode") or self._selected_perf_run_type_mode()).strip().lower()
+            perf_filter_mode = str(d.get("performance_filter_mode") or "all_conditions").strip().lower()
+            control_period_filter = d.get("selected_control_period")
+            common_runs = self._common_runs_for_perf_vars(output, input1, input2)
+            if common_runs:
+                common_set = set(common_runs)
+                run_order = {run: i for i, run in enumerate(getattr(self, "_perf_all_runs", runs) or [])}
+                runs = sorted([run for run in runs if run in common_set], key=lambda run: run_order.get(run, 10**9))
+            if not runs:
+                raise RuntimeError("The saved performance variables no longer share a common run selection.")
+            collect_fn = (
+                self._perf_collect_cached_condition_mean_results
+                if self._perf_normalize_plot_method(d.get("performance_plot_method")) == "cached_condition_means"
+                else self._perf_collect_results
+            )
+            results, plot_view_stats, _fit_error = collect_fn(
+                output,
+                input1,
+                input2,
+                plot_stats,
+                runs,
+                serials,
+                fit_enabled=fit_enabled,
+                require_min_points=require_min_points,
+                run_type_filter=run_type_mode,
+                control_period_filter=(
+                    control_period_filter
+                    if run_type_mode == "pulsed_mode" and perf_filter_mode == "match_control_period"
+                    else None
+                ),
+                display_control_period=control_period_filter,
+                filter_state=render_filter_state,
+            )
+            if not plot_view_stats:
+                raise RuntimeError("No qualifying performance data matched this saved graph.")
+            view_stat = str(d.get("view_stat") or "").strip().lower()
+            if not view_stat or view_stat not in results:
+                view_stat = plot_view_stats[0] if plot_view_stats else ""
+            result = (results or {}).get(view_stat) or {}
+            if not isinstance(result, dict) or not result:
+                raise RuntimeError("The saved performance stat is no longer available.")
+            self._render_performance_result(
+                ax,
+                result,
+                highlight_serial=str(d.get("highlight_serial") or "").strip(),
+                title_override=title_override or str(d.get("name") or "").strip(),
+            )
+
+        try:
+            fig.tight_layout()
+        except Exception:
+            pass
+        return fig
+
+    def _save_auto_plot_entries_pdf(
+        self,
+        entries: list[dict[str, object]],
+        *,
+        dialog_title: str,
+        default_filename: str,
+    ) -> None:
+        if not self._plot_ready or not self._db_path:
+            return
+        normalized_entries = [entry for entry in entries if isinstance(entry, dict)]
+        if not normalized_entries:
+            QtWidgets.QMessageBox.information(self, "Auto-Graphs", "No Auto-Graphs are available.")
+            return
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            dialog_title,
+            str(self._project_dir / default_filename),
+            "PDF Files (*.pdf)",
+        )
+        if not path:
+            return
+        warning_count = 0
+        try:
+            from matplotlib.backends.backend_pdf import PdfPages
+
+            with PdfPages(path) as pdf:
+                for entry in normalized_entries:
+                    fig, warning_text = self._render_auto_plot_entry_figure(entry)
+                    if warning_text:
+                        warning_count += 1
+                    pdf.savefig(fig)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, dialog_title, str(exc))
+            return
+        if warning_count:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Auto-Graphs",
+                f"Saved PDF with {warning_count} warning page{'s' if warning_count != 1 else ''}.",
+            )
+
+    def _save_selected_auto_plots_pdf(
+        self,
+        *,
+        list_widget: QtWidgets.QListWidget | None = None,
+    ) -> None:
+        selected = self._selected_auto_plot_definitions(list_widget=list_widget)
+        if not selected:
+            return
+        self._save_auto_plot_entries_pdf(
+            selected,
+            dialog_title="Save Selected Auto-Graphs",
+            default_filename="auto_graphs_selected_test_data.pdf",
+        )
+
+    def _save_all_auto_plots_pdf(self) -> None:
+        entries = self._normalized_auto_plot_entries()
+        if not entries:
+            return
+        self._save_auto_plot_entries_pdf(
+            entries,
+            dialog_title="Save All Auto-Graphs",
+            default_filename="auto_graphs_test_data.pdf",
+        )
 
 
 class ProjectEnvDialog(QtWidgets.QDialog):

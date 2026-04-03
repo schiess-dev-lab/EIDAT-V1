@@ -1307,6 +1307,139 @@ class TestBackendTdSmartSolver(unittest.TestCase):
         self.assertEqual(result["control_period_domain"], [])
         self.assertEqual(result["ignored_control_periods"], [])
         self.assertEqual(result["slice_rows"][0]["scope"], "steady_state")
+        self.assertEqual(result["three_sigma_basis"], "residual_std")
+        self.assertEqual(result["three_sigma_cp_policy"], "constant")
+        self.assertEqual(result["three_sigma_support_rows"], [])
+        expected_offset = 3.0 * math.sqrt(1.25)
+        self.assertAlmostEqual(float(result["three_sigma_offset"]), expected_offset, places=9)
+        first_point = dict(result["fit_points"][0])
+        self.assertAlmostEqual(float(first_point["pred_mean"]), 1.0, places=9)
+        self.assertAlmostEqual(float(first_point["pred_min_3sigma"]), 1.0 - expected_offset, places=9)
+        self.assertAlmostEqual(float(first_point["pred_max_3sigma"]), 1.0 + expected_offset, places=9)
+
+    def test_pulsed_1d_builds_control_period_aware_three_sigma_support(self) -> None:
+        rows = [
+            {
+                "observation_id": "obs-10-1",
+                "serial": "SN-001",
+                "run_name": "CondPM",
+                "program_title": "Program Alpha",
+                "source_run_name": "Seq-1",
+                "run_type": "PM",
+                "control_period": 10.0,
+                "input_1": 1.0,
+                "output": 12.0,
+            },
+            {
+                "observation_id": "obs-10-2",
+                "serial": "SN-001",
+                "run_name": "CondPM",
+                "program_title": "Program Alpha",
+                "source_run_name": "Seq-2",
+                "run_type": "PM",
+                "control_period": 10.0,
+                "input_1": 2.0,
+                "output": 15.0,
+            },
+            {
+                "observation_id": "obs-20-1",
+                "serial": "SN-001",
+                "run_name": "CondPM",
+                "program_title": "Program Alpha",
+                "source_run_name": "Seq-3",
+                "run_type": "PM",
+                "control_period": 20.0,
+                "input_1": 1.0,
+                "output": 23.0,
+            },
+            {
+                "observation_id": "obs-20-2",
+                "serial": "SN-001",
+                "run_name": "CondPM",
+                "program_title": "Program Alpha",
+                "source_run_name": "Seq-4",
+                "run_type": "PM",
+                "control_period": 20.0,
+                "input_1": 2.0,
+                "output": 28.0,
+            },
+        ]
+
+        def _fake_support(_xs, _ys, _cps):
+            return {
+                "eligible_control_period_values": [10.0, 20.0],
+                "ignored_control_periods": [],
+                "slice_rows": [],
+            }
+
+        fake_model = {
+            "fit_family": backend.TD_PERF_FIT_FAMILY_QUADRATIC_CURVE_CONTROL_PERIOD,
+            "equation": "y = x + cp",
+            "x_norm_equation": "x' = x ; cp' = cp",
+            "coeff_cp_models": [[0.0], [1.0], [0.0]],
+            "x_center": 0.0,
+            "x_scale": 1.0,
+            "cp_center": 0.0,
+            "cp_scale": 1.0,
+            "fit_domain_control_period": [10.0, 20.0],
+        }
+
+        def _fake_predict(_model, xs, *, control_period=None):
+            return [float(x) + float(cp) for x, cp in zip(xs, control_period or [])]
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            db_path = _create_smart_solver_db(tmpdir, rows)
+            with patch.object(
+                backend,
+                "_td_perf_analyze_quadratic_curve_control_period_fit_support",
+                side_effect=_fake_support,
+            ), patch.object(
+                backend,
+                "_td_perf_fit_quadratic_curve_control_period_model",
+                return_value=dict(fake_model),
+            ), patch.object(
+                backend,
+                "_td_perf_fit_hybrid_quadratic_residual_control_period_model",
+                return_value=None,
+            ), patch.object(
+                backend,
+                "_td_smart_solver_attach_curve_cp_boundary_metadata",
+                side_effect=lambda model, *_args, **_kwargs: model,
+            ), patch.object(
+                backend,
+                "td_perf_predict_model",
+                side_effect=_fake_predict,
+            ), patch.object(backend, "_td_perf_import_numpy", return_value=_FakeNumpy):
+                result = backend.td_smart_solver_run(
+                    db_path,
+                    output_target="Output",
+                    input1_target="Input1",
+                    runs=["CondPM"],
+                    serials=["SN-001"],
+                )
+
+        self.assertEqual(result["three_sigma_basis"], "residual_std")
+        self.assertEqual(result["three_sigma_cp_policy"], "interpolate_clamp")
+        support_rows = result["three_sigma_support_rows"]
+        self.assertEqual([float(row["control_period"]) for row in support_rows], [10.0, 20.0])
+        self.assertAlmostEqual(float(support_rows[0]["three_sigma_offset"]), 3.0, places=9)
+        self.assertAlmostEqual(float(support_rows[1]["three_sigma_offset"]), 6.0, places=9)
+        self.assertAlmostEqual(
+            backend._td_smart_solver_resolve_three_sigma_offset(result, control_period=15.0),
+            4.5,
+            places=9,
+        )
+        point_by_cp = {
+            float(point["control_period"]): dict(point)
+            for point in result["fit_points"]
+            if point.get("input_1") == 1.0
+        }
+        self.assertAlmostEqual(float(point_by_cp[10.0]["pred_mean"]), 11.0, places=9)
+        self.assertAlmostEqual(float(point_by_cp[10.0]["pred_min_3sigma"]), 8.0, places=9)
+        self.assertAlmostEqual(float(point_by_cp[10.0]["pred_max_3sigma"]), 14.0, places=9)
+        self.assertAlmostEqual(float(point_by_cp[20.0]["pred_mean"]), 21.0, places=9)
+        self.assertAlmostEqual(float(point_by_cp[20.0]["pred_min_3sigma"]), 15.0, places=9)
+        self.assertAlmostEqual(float(point_by_cp[20.0]["pred_max_3sigma"]), 27.0, places=9)
 
     def test_steady_state_2d_uses_auto_surface_selection(self) -> None:
         rows = [
@@ -1536,6 +1669,9 @@ class TestBackendTdSmartSolver(unittest.TestCase):
             "selection_reason": "steady",
             "uses_control_period": False,
             "run_type_mode": "steady_state",
+            "three_sigma_basis": "residual_std",
+            "three_sigma_cp_policy": "constant",
+            "three_sigma_offset": 1.5,
         }
         pulsed_result = {
             **steady_result,
@@ -1560,6 +1696,9 @@ class TestBackendTdSmartSolver(unittest.TestCase):
                     "control_period": 30.0,
                     "condition_label": "CondPM",
                     "input_1": 1.0,
+                    "pred_mean": 8.5,
+                    "pred_min_3sigma": 7.0,
+                    "pred_max_3sigma": 10.0,
                     "actual_mean": 9.0,
                     "sample_count": 1,
                 }
@@ -1572,6 +1711,11 @@ class TestBackendTdSmartSolver(unittest.TestCase):
             "uses_control_period": True,
             "run_type_mode": "pulsed_mode",
             "solver_branch": backend.TD_PERF_FIT_FAMILY_QUADRATIC_CURVE_CONTROL_PERIOD,
+            "three_sigma_cp_policy": "interpolate_clamp",
+            "three_sigma_support_rows": [
+                {"control_period": 20.0, "sample_count": 2, "residual_std": 0.5, "three_sigma_offset": 1.5},
+                {"control_period": 40.0, "sample_count": 2, "residual_std": 1.0, "three_sigma_offset": 3.0},
+            ],
         }
 
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
@@ -1604,9 +1748,29 @@ class TestBackendTdSmartSolver(unittest.TestCase):
                     return []
 
                 steady_headers = _row_values_by_anchor(steady_wb["Smart Solver Export"], "run_name")
+                steady_checker_headers = _row_values_by_anchor(steady_wb["Fit Point Checker"], "run_name")
                 steady_scenario_headers = _row_values_by_anchor(steady_wb["Scenario Calculator"], "scenario_id")
                 pulsed_headers = _row_values_by_anchor(pulsed_wb["Smart Solver Export"], "run_name")
+                pulsed_checker_headers = _row_values_by_anchor(pulsed_wb["Fit Point Checker"], "run_name")
                 pulsed_scenario_headers = _row_values_by_anchor(pulsed_wb["Scenario Calculator"], "scenario_id")
+                pulsed_scenario_sheet = pulsed_wb["Scenario Calculator"]
+                pulsed_scenario_header_row = next(
+                    row_idx
+                    for row_idx in range(1, pulsed_scenario_sheet.max_row + 1)
+                    if pulsed_scenario_sheet.cell(row_idx, 1).value == "scenario_id"
+                )
+                pulsed_scenario_col_by_name = {
+                    str(pulsed_scenario_sheet.cell(pulsed_scenario_header_row, col_idx).value or ""): col_idx
+                    for col_idx in range(1, pulsed_scenario_sheet.max_column + 1)
+                }
+                pulsed_formula_row = pulsed_scenario_header_row + 1
+                pulsed_pred_min_formula = str(
+                    pulsed_scenario_sheet.cell(
+                        pulsed_formula_row,
+                        pulsed_scenario_col_by_name["pred_min_3sigma"],
+                    ).value
+                    or ""
+                )
             finally:
                 steady_wb.close()
                 pulsed_wb.close()
@@ -1615,6 +1779,22 @@ class TestBackendTdSmartSolver(unittest.TestCase):
         self.assertNotIn("control_period", steady_scenario_headers)
         self.assertIn("control_period", pulsed_headers)
         self.assertIn("control_period", pulsed_scenario_headers)
+        for headers in (
+            steady_headers,
+            steady_checker_headers,
+            steady_scenario_headers,
+            pulsed_headers,
+            pulsed_checker_headers,
+            pulsed_scenario_headers,
+        ):
+            self.assertIn("pred_min_3sigma", headers)
+            self.assertIn("pred_max_3sigma", headers)
+        pulsed_control_ref = backend._td_perf_excel_ref(
+            pulsed_scenario_col_by_name["control_period"],
+            pulsed_formula_row,
+        )
+        self.assertIn(pulsed_control_ref, pulsed_pred_min_formula)
+        self.assertIn("1E-9", pulsed_pred_min_formula)
 
     def test_smart_solver_export_equation_workbook_uses_bounded_curve_cp_formula_when_boundary_policy_is_present(self) -> None:
         from openpyxl import load_workbook  # type: ignore
@@ -1686,12 +1866,21 @@ class TestBackendTdSmartSolver(unittest.TestCase):
                     "control_period": 30.0,
                     "condition_label": "CondA",
                     "input_1": 1.0,
+                    "pred_mean": 12.0,
+                    "pred_min_3sigma": 10.5,
+                    "pred_max_3sigma": 13.5,
                     "actual_mean": 11.0,
                     "sample_count": 1,
                 }
             ],
             "rmse": 1.5,
             "residual_threshold": 3.0,
+            "three_sigma_basis": "residual_std",
+            "three_sigma_cp_policy": "interpolate_clamp",
+            "three_sigma_support_rows": [
+                {"control_period": 20.0, "sample_count": 2, "residual_std": 0.5, "three_sigma_offset": 1.5},
+                {"control_period": 40.0, "sample_count": 2, "residual_std": 1.0, "three_sigma_offset": 3.0},
+            ],
             "in_fit_percent": 80.0,
             "in_fit_count": 8,
             "fell_out_count": 2,
@@ -1729,8 +1918,14 @@ class TestBackendTdSmartSolver(unittest.TestCase):
         self.assertIn("    Input1 = 1;", text)
         self.assertIn("    control_period = 30;", text)
         self.assertIn("    pred = smart_solver_curve_cp(Input1, control_period);", text)
+        self.assertIn("    pred_min_3sigma = meta.pred_min_3sigma(Input1, control_period);", text)
+        self.assertIn("    pred_max_3sigma = meta.pred_max_3sigma(Input1, control_period);", text)
+        self.assertIn("    cached_pred_min_3sigma = 10.5;", text)
+        self.assertIn("    cached_pred_max_3sigma = 13.5;", text)
         self.assertIn("    actual_mean = 11;", text)
         self.assertIn("    fprintf('Cached actual_mean: %.12g\\n', actual_mean);", text)
+        self.assertIn("    fprintf('Cached exported pred_min_3sigma: %.12g\\n', cached_pred_min_3sigma);", text)
+        self.assertIn("    fprintf('Cached exported pred_max_3sigma: %.12g\\n', cached_pred_max_3sigma);", text)
         self.assertIn("meta.fell_out_percent = 20;", text)
         self.assertIn("meta.function_name = 'smart_solver_curve_cp';", text)
         self.assertIn("meta.prediction_usage = 'y = smart_solver_curve_cp(Input1, control_period)';", text)
@@ -1738,6 +1933,13 @@ class TestBackendTdSmartSolver(unittest.TestCase):
         self.assertIn("meta.input_keys = {'input_1'};", text)
         self.assertIn("meta.input_is_optional = [false];", text)
         self.assertIn("meta.selected_control_period = 30;", text)
+        self.assertIn("meta.three_sigma_basis = 'residual_std';", text)
+        self.assertIn("meta.three_sigma_cp_policy = 'interpolate_clamp';", text)
+        self.assertIn("meta.three_sigma_support_control_periods = [20 40];", text)
+        self.assertIn("meta.three_sigma_support_offsets = [1.5 3];", text)
+        self.assertIn("meta.three_sigma_offset = @local_three_sigma_offset;", text)
+        self.assertIn("meta.pred_min_3sigma = @local_predict_min_3sigma;", text)
+        self.assertIn("meta.pred_max_3sigma = @local_predict_max_3sigma;", text)
         self.assertIn("meta.input_targets = {'Input1'};", text)
         self.assertIn("meta.input_roles = {'Primary'};", text)
         self.assertIn("meta.run_selection_label = 'Smart Equation Solver';", text)

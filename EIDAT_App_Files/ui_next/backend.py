@@ -18601,6 +18601,141 @@ def _td_smart_solver_score_predictions(
     }
 
 
+def _td_smart_solver_residual_std(residual_values: Sequence[object]) -> float:
+    residuals = [
+        float(value)
+        for value in (residual_values or [])
+        if isinstance(value, (int, float)) and math.isfinite(float(value))
+    ]
+    if len(residuals) < 2:
+        return 0.0
+    mean_value = float(sum(residuals) / len(residuals))
+    variance = float(sum((value - mean_value) ** 2 for value in residuals) / len(residuals))
+    if not math.isfinite(variance) or variance <= 0.0:
+        return 0.0
+    std_value = float(math.sqrt(variance))
+    return std_value if math.isfinite(std_value) else 0.0
+
+
+def _td_smart_solver_three_sigma_support_rows(result: Mapping[str, object]) -> list[dict[str, object]]:
+    support_rows: list[dict[str, object]] = []
+    for raw_row in (result.get("three_sigma_support_rows") or []):
+        if not isinstance(raw_row, Mapping):
+            continue
+        control_period = _td_finite_float(raw_row.get("control_period"))
+        if control_period is None:
+            continue
+        residual_std = _td_finite_float(raw_row.get("residual_std"))
+        residual_std = float(residual_std) if residual_std is not None and math.isfinite(float(residual_std)) else 0.0
+        offset = _td_finite_float(raw_row.get("three_sigma_offset"))
+        if offset is None or not math.isfinite(float(offset)):
+            offset = float(3.0 * residual_std)
+        support_rows.append(
+            {
+                "control_period": float(control_period),
+                "sample_count": int(raw_row.get("sample_count") or 0),
+                "residual_std": float(residual_std),
+                "three_sigma_offset": float(offset),
+            }
+        )
+    support_rows.sort(key=lambda row: float(row.get("control_period") or 0.0))
+    return support_rows
+
+
+def _td_smart_solver_build_three_sigma_support(
+    points: Sequence[Mapping[str, object]],
+    predicted_values: Sequence[object],
+    *,
+    uses_control_period: bool,
+) -> dict[str, object]:
+    materialized_points = [dict(point) for point in (points or []) if isinstance(point, Mapping)]
+    residual_pairs: list[tuple[dict[str, object], float]] = []
+    for index, point in enumerate(materialized_points):
+        if index >= len(predicted_values or []):
+            break
+        actual_value = _td_finite_float(point.get("actual_mean"))
+        predicted_value = _td_finite_float(predicted_values[index])
+        if actual_value is None or predicted_value is None:
+            continue
+        residual_pairs.append((point, float(actual_value - predicted_value)))
+
+    if uses_control_period:
+        grouped: dict[float, list[float]] = {}
+        for point, residual_value in residual_pairs:
+            control_period = _td_finite_float(point.get("control_period"))
+            if control_period is None:
+                continue
+            grouped.setdefault(float(control_period), []).append(float(residual_value))
+        support_rows: list[dict[str, object]] = []
+        for control_period in sorted(grouped):
+            residuals = list(grouped.get(control_period) or [])
+            residual_std = _td_smart_solver_residual_std(residuals)
+            support_rows.append(
+                {
+                    "control_period": float(control_period),
+                    "sample_count": int(len(residuals)),
+                    "residual_std": float(residual_std),
+                    "three_sigma_offset": float(3.0 * residual_std),
+                }
+            )
+        return {
+            "three_sigma_basis": "residual_std",
+            "three_sigma_cp_policy": "interpolate_clamp",
+            "three_sigma_support_rows": support_rows,
+        }
+
+    residual_std = _td_smart_solver_residual_std([value for _point, value in residual_pairs])
+    return {
+        "three_sigma_basis": "residual_std",
+        "three_sigma_cp_policy": "constant",
+        "three_sigma_offset": float(3.0 * residual_std),
+        "three_sigma_support_rows": [],
+    }
+
+
+def _td_smart_solver_resolve_three_sigma_offset(
+    result: Mapping[str, object],
+    *,
+    control_period: object = None,
+) -> float:
+    support_rows = _td_smart_solver_three_sigma_support_rows(result)
+    if support_rows:
+        if len(support_rows) == 1:
+            return float(support_rows[0].get("three_sigma_offset") or 0.0)
+        cp_value = _td_finite_float(control_period)
+        if cp_value is None:
+            return float(support_rows[0].get("three_sigma_offset") or 0.0)
+        cp_value = float(cp_value)
+        first_row = support_rows[0]
+        last_row = support_rows[-1]
+        first_cp = float(first_row.get("control_period") or 0.0)
+        last_cp = float(last_row.get("control_period") or 0.0)
+        if cp_value <= first_cp + 1e-9:
+            return float(first_row.get("three_sigma_offset") or 0.0)
+        if cp_value >= last_cp - 1e-9:
+            return float(last_row.get("three_sigma_offset") or 0.0)
+        for lower, upper in zip(support_rows, support_rows[1:]):
+            lower_cp = float(lower.get("control_period") or 0.0)
+            upper_cp = float(upper.get("control_period") or 0.0)
+            lower_offset = float(lower.get("three_sigma_offset") or 0.0)
+            upper_offset = float(upper.get("three_sigma_offset") or 0.0)
+            if abs(cp_value - lower_cp) <= 1e-9:
+                return lower_offset
+            if abs(cp_value - upper_cp) <= 1e-9:
+                return upper_offset
+            if cp_value < upper_cp:
+                if abs(upper_cp - lower_cp) <= 1e-12:
+                    return upper_offset
+                weight = float((cp_value - lower_cp) / (upper_cp - lower_cp))
+                return float(lower_offset + (weight * (upper_offset - lower_offset)))
+        return float(last_row.get("three_sigma_offset") or 0.0)
+
+    offset = _td_finite_float(result.get("three_sigma_offset"))
+    if offset is None or not math.isfinite(float(offset)):
+        return 0.0
+    return float(offset)
+
+
 def _td_smart_solver_candidate_summary(
     *,
     model: Mapping[str, object] | None,
@@ -19730,8 +19865,20 @@ def td_smart_solver_run(
             stage2_fit_source=str(model.get("stage2_fit_source") or ""),
             stage1_rmse=_td_finite_float(model.get("stage1_rmse")),
         )
+    three_sigma_support = _td_smart_solver_build_three_sigma_support(
+        points,
+        predictions,
+        uses_control_period=uses_control_period,
+    )
     for idx, point in enumerate(points):
-        point["pred_mean"] = float(predictions[idx])
+        pred_mean = float(predictions[idx])
+        three_sigma_offset = _td_smart_solver_resolve_three_sigma_offset(
+            three_sigma_support,
+            control_period=point.get("control_period"),
+        )
+        point["pred_mean"] = float(pred_mean)
+        point["pred_min_3sigma"] = float(pred_mean - three_sigma_offset)
+        point["pred_max_3sigma"] = float(pred_mean + three_sigma_offset)
         if stage1_residuals and idx < len(stage1_residuals) and idx < len(mediator_predictions):
             point["stage1_pred_input_3"] = float(mediator_predictions[idx])
             point["stage1_residual_input_3"] = float(stage1_residuals[idx])
@@ -19813,6 +19960,10 @@ def td_smart_solver_run(
         "run_type_mode": solver_run_type_mode,
         "rmse": float(rmse),
         "residual_threshold": float(residual_threshold),
+        "three_sigma_basis": str(three_sigma_support.get("three_sigma_basis") or ""),
+        "three_sigma_cp_policy": str(three_sigma_support.get("three_sigma_cp_policy") or ""),
+        "three_sigma_offset": _td_finite_float(three_sigma_support.get("three_sigma_offset")),
+        "three_sigma_support_rows": _td_smart_solver_three_sigma_support_rows(three_sigma_support),
         "in_fit_count": int(in_fit_count),
         "fell_out_count": int(fell_out_count),
         "sample_count": int(sample_count),
@@ -21622,6 +21773,50 @@ def _td_smart_solver_export_rows_from_result(result: Mapping[str, object]) -> li
     return rows
 
 
+def _td_smart_solver_excel_three_sigma_offset_expr(
+    result: Mapping[str, object],
+    *,
+    control_period_ref: str,
+) -> str:
+    support_rows = _td_smart_solver_three_sigma_support_rows(result)
+    if not support_rows:
+        return _td_perf_excel_num(_td_smart_solver_resolve_three_sigma_offset(result))
+    if len(support_rows) == 1 or not str(control_period_ref or "").strip():
+        return _td_perf_excel_num(support_rows[0].get("three_sigma_offset") or 0.0)
+
+    first_cp = float(support_rows[0].get("control_period") or 0.0)
+    last_cp = float(support_rows[-1].get("control_period") or 0.0)
+    cp_expr = _td_smart_solver_excel_clamp_expr(control_period_ref, [first_cp, last_cp])
+
+    def _build_expr(index: int) -> str:
+        if index >= len(support_rows) - 1:
+            return _td_perf_excel_num(support_rows[-1].get("three_sigma_offset") or 0.0)
+        lower = support_rows[index]
+        upper = support_rows[index + 1]
+        lower_cp = float(lower.get("control_period") or 0.0)
+        upper_cp = float(upper.get("control_period") or 0.0)
+        lower_offset = float(lower.get("three_sigma_offset") or 0.0)
+        upper_offset = float(upper.get("three_sigma_offset") or 0.0)
+        if abs(upper_cp - lower_cp) <= 1e-12:
+            interval_expr = _td_perf_excel_num(upper_offset)
+        else:
+            interval_expr = (
+                f"({_td_perf_excel_num(lower_offset)}"
+                f"+((({cp_expr})-{_td_perf_excel_num(lower_cp)})"
+                f"*({_td_perf_excel_num(upper_offset)}-{_td_perf_excel_num(lower_offset)})"
+                f"/({_td_perf_excel_num(upper_cp)}-{_td_perf_excel_num(lower_cp)})))"
+            )
+        return (
+            f"IF(ABS(({cp_expr})-{_td_perf_excel_num(lower_cp)})<=1E-9,"
+            f"{_td_perf_excel_num(lower_offset)},"
+            f"IF(({cp_expr})<{_td_perf_excel_num(upper_cp)},"
+            f"{interval_expr},"
+            f"{_build_expr(index + 1)}))"
+        )
+
+    return _build_expr(0)
+
+
 def _td_smart_solver_excel_clamp_expr(value_expr: str, domain: Sequence[object]) -> str:
     raw = str(value_expr or "").strip()
     if not raw:
@@ -22030,7 +22225,24 @@ def _td_smart_solver_formula_specs(
     variable_refs: Mapping[str, str],
     control_period_ref: str,
     stage1_output_ref: str = "",
+    pred_mean_ref: str = "",
 ) -> dict[str, str]:
+    def _append_three_sigma(out: dict[str, str]) -> dict[str, str]:
+        offset_expr = _td_smart_solver_excel_three_sigma_offset_expr(
+            result,
+            control_period_ref=control_period_ref,
+        )
+        if pred_mean_ref and offset_expr:
+            out["pred_min_3sigma"] = _td_perf_excel_guarded_formula(
+                f"{pred_mean_ref}-({offset_expr})",
+                [pred_mean_ref],
+            )
+            out["pred_max_3sigma"] = _td_perf_excel_guarded_formula(
+                f"{pred_mean_ref}+({offset_expr})",
+                [pred_mean_ref],
+            )
+        return out
+
     model = td_smart_solver_exportable_model(result) or {}
     family = td_perf_normalize_fit_mode(model.get("fit_family"))
     if family == TD_PERF_FIT_FAMILY_STAGED_MEDIATOR_CONTROL_PERIOD:
@@ -22062,7 +22274,7 @@ def _td_smart_solver_formula_specs(
         }
         if clamped_stage1_ref:
             out[stage_clamped_key] = _td_perf_excel_guarded_formula(clamped_stage1_ref, [stage1_output_ref])
-        return out
+        return _append_three_sigma(out)
     if family == TD_PERF_FIT_FAMILY_STAGED_MEDIATOR:
         stage_spec = _td_smart_solver_stage_export_spec(result)
         stage_key = str(stage_spec.get("stage1_output_key") or "stage1_pred_input_3").strip()
@@ -22092,7 +22304,7 @@ def _td_smart_solver_formula_specs(
         }
         if clamped_stage1_ref:
             out[stage_clamped_key] = _td_perf_excel_guarded_formula(clamped_stage1_ref, [stage1_output_ref])
-        return out
+        return _append_three_sigma(out)
     direct_formula = _td_smart_solver_excel_formula_for_model(
         model,
         variable_refs=variable_refs,
@@ -22110,9 +22322,11 @@ def _td_smart_solver_formula_specs(
         TD_PERF_FIT_FAMILY_QUADRATIC_3INPUT_CONTROL_PERIOD,
     }:
         required_refs.append(control_period_ref)
-    return {
-        "pred_mean": _td_perf_excel_guarded_formula(direct_formula, required_refs),
-    }
+    return _append_three_sigma(
+        {
+            "pred_mean": _td_perf_excel_guarded_formula(direct_formula, required_refs),
+        }
+    )
 
 
 def _td_smart_solver_write_prediction_table(
@@ -22141,7 +22355,7 @@ def _td_smart_solver_write_prediction_table(
         headers.append(stage_key)
         if include_stage_diagnostic_columns:
             headers.extend(["stage1_clamped_input_3", "stage1_residual_input_3"])
-    headers.extend(["pred_mean", "actual_mean"])
+    headers.extend(["pred_mean", "pred_min_3sigma", "pred_max_3sigma", "actual_mean"])
     if include_residual_columns:
         headers.extend(["residual_mean", "pct_delta_mean"])
     headers.append("sample_count")
@@ -22179,6 +22393,7 @@ def _td_smart_solver_write_prediction_table(
             ws.cell(row_idx, col_by_name[key]).value = row.get(key)
             variable_refs[key] = _td_perf_excel_ref(col_by_name[key], row_idx)
         stage_ref = _td_perf_excel_ref(col_by_name[stage_key], row_idx) if stage_key and stage_key in col_by_name else ""
+        pred_mean_ref = _td_perf_excel_ref(col_by_name["pred_mean"], row_idx) if "pred_mean" in col_by_name else ""
         control_period_ref = (
             _td_perf_excel_ref(col_by_name["control_period"], row_idx)
             if uses_control_period and "control_period" in col_by_name
@@ -22189,6 +22404,7 @@ def _td_smart_solver_write_prediction_table(
             variable_refs=variable_refs,
             control_period_ref=control_period_ref,
             stage1_output_ref=stage_ref,
+            pred_mean_ref=pred_mean_ref,
         )
         if stage_key and stage_key in formula_specs and stage_key in col_by_name:
             ws.cell(row_idx, col_by_name[stage_key]).value = formula_specs[stage_key]
@@ -22202,6 +22418,10 @@ def _td_smart_solver_write_prediction_table(
                 residual_formula = _td_perf_excel_guarded_formula(f"{stage_pred_ref}-{stage_actual_ref}", [stage_pred_ref, stage_actual_ref])
             ws.cell(row_idx, col_by_name["stage1_residual_input_3"]).value = residual_formula
         ws.cell(row_idx, col_by_name["pred_mean"]).value = formula_specs.get("pred_mean", "")
+        if "pred_min_3sigma" in col_by_name:
+            ws.cell(row_idx, col_by_name["pred_min_3sigma"]).value = formula_specs.get("pred_min_3sigma", "")
+        if "pred_max_3sigma" in col_by_name:
+            ws.cell(row_idx, col_by_name["pred_max_3sigma"]).value = formula_specs.get("pred_max_3sigma", "")
         if include_residual_columns:
             pred_ref = _td_perf_excel_ref(col_by_name["pred_mean"], row_idx)
             actual_ref = _td_perf_excel_ref(col_by_name["actual_mean"], row_idx)
@@ -22218,7 +22438,16 @@ def _td_smart_solver_write_prediction_table(
             width = 28
         elif name in {"observation_id", "serial"}:
             width = 20
-        elif name in {"pred_mean", "actual_mean", "residual_mean", "pct_delta_mean", "stage1_clamped_input_3", "stage1_residual_input_3"} or name.startswith("stage1_pred_"):
+        elif name in {
+            "pred_mean",
+            "pred_min_3sigma",
+            "pred_max_3sigma",
+            "actual_mean",
+            "residual_mean",
+            "pct_delta_mean",
+            "stage1_clamped_input_3",
+            "stage1_residual_input_3",
+        } or name.startswith("stage1_pred_"):
             width = 20
         ws.column_dimensions[get_column_letter(col_idx)].width = width
     return start_row, col_by_name
@@ -22382,6 +22611,10 @@ def td_smart_solver_export_equation_workbook(
         ("Mediator Clamp Count", int(solver_result.get("mediator_clamp_count") or 0)),
         ("Uses Control Period", "Yes" if bool(solver_result.get("uses_control_period", True)) else "No"),
         ("Uses Staged Mediator", "Yes" if bool(solver_result.get("uses_staged_mediator")) else "No"),
+        ("Three Sigma Basis", str(solver_result.get("three_sigma_basis") or "").strip()),
+        ("Three Sigma CP Policy", str(solver_result.get("three_sigma_cp_policy") or "").strip()),
+        ("Three Sigma Offset", _td_finite_float(solver_result.get("three_sigma_offset"))),
+        ("Three Sigma Support Rows", int(len(_td_smart_solver_three_sigma_support_rows(solver_result)))),
         ("Run Count", int(solver_result.get("run_count") or 0)),
         ("Serial Count", int(solver_result.get("serial_count") or 0)),
         ("Sample Count", int(solver_result.get("sample_count") or 0)),
@@ -22475,33 +22708,59 @@ def td_smart_solver_export_equation_workbook(
     stage_target = str(stage_spec.get("stage1_output_target") or "").strip()
     stage_units = str(stage_spec.get("stage1_output_units") or "").strip()
     output_row = (control_row + 2) if uses_control_period else (panel_row + len(solver_variables) + 1)
+    output_specs: list[tuple[str, str]] = []
     if bool(solver_result.get("uses_staged_mediator")) and stage_key:
-        ws_scenarios.cell(output_row, 4).value = stage_key
-        ws_scenarios.cell(output_row, 4).font = header_font
-        ws_scenarios.cell(output_row, 6).value = " ".join(part for part in [stage_target, f"({stage_units})" if stage_units else ""] if str(part).strip()).strip()
-    ws_scenarios.cell(output_row + 1, 4).value = "pred_mean"
-    ws_scenarios.cell(output_row + 1, 4).font = header_font
-    ws_scenarios.cell(output_row + 1, 6).value = str(solver_result.get("output_units") or "").strip()
+        output_specs.append(
+            (
+                stage_key,
+                " ".join(part for part in [stage_target, f"({stage_units})" if stage_units else ""] if str(part).strip()).strip(),
+            )
+        )
+    output_specs.extend(
+        [
+            ("pred_mean", str(solver_result.get("output_units") or "").strip()),
+            ("pred_min_3sigma", str(solver_result.get("output_units") or "").strip()),
+            ("pred_max_3sigma", str(solver_result.get("output_units") or "").strip()),
+        ]
+    )
+    output_row_by_name: dict[str, int] = {}
+    for row_offset, (output_name, output_units_text) in enumerate(output_specs):
+        row_idx = output_row + row_offset
+        output_row_by_name[output_name] = row_idx
+        ws_scenarios.cell(row_idx, 4).value = output_name
+        ws_scenarios.cell(row_idx, 4).font = header_font
+        ws_scenarios.cell(row_idx, 6).value = output_units_text
 
     calc_variable_refs = {key: name for key, name in scenario_defined_refs.items()}
     calc_formula_specs = _td_smart_solver_formula_specs(
         solver_result,
         variable_refs=calc_variable_refs,
         control_period_ref=("SmartSolver_Control_Period" if uses_control_period else ""),
-        stage1_output_ref=_td_perf_excel_ref(5, output_row) if bool(solver_result.get("uses_staged_mediator")) and stage_key else "",
+        stage1_output_ref=(
+            _td_perf_excel_ref(5, output_row_by_name[stage_key])
+            if bool(solver_result.get("uses_staged_mediator")) and stage_key and stage_key in output_row_by_name
+            else ""
+        ),
+        pred_mean_ref=(
+            _td_perf_excel_ref(5, output_row_by_name["pred_mean"])
+            if "pred_mean" in output_row_by_name
+            else ""
+        ),
     )
     if stage_key and stage_key in calc_formula_specs:
-        ws_scenarios.cell(output_row, 5).value = calc_formula_specs[stage_key]
-    ws_scenarios.cell(output_row + 1, 5).value = calc_formula_specs.get("pred_mean", "")
+        ws_scenarios.cell(output_row_by_name[stage_key], 5).value = calc_formula_specs[stage_key]
+    for output_name in ("pred_mean", "pred_min_3sigma", "pred_max_3sigma"):
+        if output_name in output_row_by_name:
+            ws_scenarios.cell(output_row_by_name[output_name], 5).value = calc_formula_specs.get(output_name, "")
 
-    scenario_header_row = output_row + 4
+    scenario_header_row = output_row + len(output_specs) + 3
     scenario_headers = ["scenario_id"]
     scenario_headers.extend([str(variable.get("key") or "").strip() for variable in solver_variables if str(variable.get("key") or "").strip()])
     if uses_control_period:
         scenario_headers.append("control_period")
     if bool(solver_result.get("uses_staged_mediator")) and stage_key:
         scenario_headers.append(stage_key)
-    scenario_headers.append("pred_mean")
+    scenario_headers.extend(["pred_mean", "pred_min_3sigma", "pred_max_3sigma"])
     scenario_col_by_name = {name: idx for idx, name in enumerate(scenario_headers, start=1)}
     for col_idx, name in enumerate(scenario_headers, start=1):
         cell = ws_scenarios.cell(scenario_header_row, col_idx)
@@ -22531,16 +22790,23 @@ def td_smart_solver_export_equation_workbook(
             variable_refs=scenario_variable_refs,
             control_period_ref=control_period_ref,
             stage1_output_ref=stage_ref,
+            pred_mean_ref=(
+                _td_perf_excel_ref(scenario_col_by_name["pred_mean"], row_idx)
+                if "pred_mean" in scenario_col_by_name
+                else ""
+            ),
         )
         if stage_key and stage_key in formula_specs:
             ws_scenarios.cell(row_idx, scenario_col_by_name[stage_key]).value = formula_specs[stage_key]
-        ws_scenarios.cell(row_idx, scenario_col_by_name["pred_mean"]).value = formula_specs.get("pred_mean", "")
+        for output_name in ("pred_mean", "pred_min_3sigma", "pred_max_3sigma"):
+            if output_name in scenario_col_by_name:
+                ws_scenarios.cell(row_idx, scenario_col_by_name[output_name]).value = formula_specs.get(output_name, "")
 
     for name, col_idx in scenario_col_by_name.items():
         width = 16
         if name == "scenario_id":
             width = 12
-        elif name == "pred_mean" or name.startswith("stage1_pred_"):
+        elif name in {"pred_mean", "pred_min_3sigma", "pred_max_3sigma"} or name.startswith("stage1_pred_"):
             width = 20
         ws_scenarios.column_dimensions[get_column_letter(col_idx)].width = width
     ws_scenarios.freeze_panes = ws_scenarios.cell(scenario_header_row + 1, 1)
@@ -24301,6 +24567,56 @@ def _td_perf_matlab_helper_lines() -> list[str]:
         "y = min(max(double(x), lower_bound), upper_bound);",
         "end",
         "",
+        "% Smart Solver 3-sigma offset helper used by exported Smart Solver equations.",
+        "% Inputs: control_period-like anchor values, support control periods, and 3-sigma offsets.",
+        "% Output: control-period-aware 3-sigma offsets with interpolation and end clamping.",
+        "function y = eidat_smart_solver_three_sigma_offset(control_period, support_control_periods, support_offsets)",
+        "anchor = double(control_period);",
+        "offsets = double(support_offsets(:));",
+        "if isempty(offsets)",
+        "    y = zeros(size(anchor));",
+        "    return;",
+        "end",
+        "if isempty(support_control_periods)",
+        "    y = zeros(size(anchor)) + offsets(1);",
+        "    return;",
+        "end",
+        "cp_support = double(support_control_periods(:));",
+        "if numel(cp_support) ~= numel(offsets)",
+        "    y = zeros(size(anchor)) + offsets(1);",
+        "    return;",
+        "end",
+        "y = zeros(size(anchor));",
+        "for idx = 1:numel(anchor)",
+        "    cpv = anchor(idx);",
+        "    if cpv <= cp_support(1) + 1e-9",
+        "        y(idx) = offsets(1);",
+        "        continue;",
+        "    end",
+        "    if cpv >= cp_support(end) - 1e-9",
+        "        y(idx) = offsets(end);",
+        "        continue;",
+        "    end",
+        "    exact_idx = find(abs(cp_support - cpv) <= 1e-9, 1);",
+        "    if ~isempty(exact_idx)",
+        "        y(idx) = offsets(exact_idx);",
+        "        continue;",
+        "    end",
+        "    upper_idx = find(cpv < cp_support, 1);",
+        "    if isempty(upper_idx)",
+        "        y(idx) = offsets(end);",
+        "        continue;",
+        "    end",
+        "    lower_idx = max(1, upper_idx - 1);",
+        "    if upper_idx <= lower_idx || abs(cp_support(upper_idx) - cp_support(lower_idx)) <= 1e-12",
+        "        y(idx) = offsets(upper_idx);",
+        "        continue;",
+        "    end",
+        "    weight = (cpv - cp_support(lower_idx)) ./ (cp_support(upper_idx) - cp_support(lower_idx));",
+        "    y(idx) = offsets(lower_idx) + weight .* (offsets(upper_idx) - offsets(lower_idx));",
+        "end",
+        "end",
+        "",
     ]
 
 
@@ -24376,6 +24692,11 @@ def _td_smart_solver_matlab_metadata_lines(
     input_units = [str(variable.get("units") or "").strip() for variable in solver_variables]
     input_roles = [str(variable.get("role") or "").strip() for variable in solver_variables]
     stage2_input_domain = stage_spec.get("stage2_input_domain") or []
+    three_sigma_support_rows = _td_smart_solver_three_sigma_support_rows(result)
+    three_sigma_support_control_periods = [float(row.get("control_period") or 0.0) for row in three_sigma_support_rows]
+    three_sigma_support_residual_std = [float(row.get("residual_std") or 0.0) for row in three_sigma_support_rows]
+    three_sigma_support_offsets = [float(row.get("three_sigma_offset") or 0.0) for row in three_sigma_support_rows]
+    three_sigma_offset = _td_finite_float(result.get("three_sigma_offset"))
     return [
         "function meta = local_metadata()",
         "meta = struct();",
@@ -24406,6 +24727,15 @@ def _td_smart_solver_matlab_metadata_lines(
         f"meta.fell_out_count = {_td_perf_matlab_num(fell_out_count)};",
         f"meta.fell_out_percent = {_td_perf_matlab_num(fell_out_percent)};",
         f"meta.sample_count = {_td_perf_matlab_num(sample_count)};",
+        f"meta.three_sigma_basis = {_td_perf_matlab_quote(result.get('three_sigma_basis') or '')};",
+        f"meta.three_sigma_cp_policy = {_td_perf_matlab_quote(result.get('three_sigma_cp_policy') or '')};",
+        f"meta.three_sigma_offset_constant = {_td_perf_matlab_optional_num(three_sigma_offset)};",
+        f"meta.three_sigma_support_control_periods = {_td_perf_matlab_vector(three_sigma_support_control_periods)};",
+        f"meta.three_sigma_support_residual_std = {_td_perf_matlab_vector(three_sigma_support_residual_std)};",
+        f"meta.three_sigma_support_offsets = {_td_perf_matlab_vector(three_sigma_support_offsets)};",
+        "meta.three_sigma_offset = @local_three_sigma_offset;",
+        "meta.pred_min_3sigma = @local_predict_min_3sigma;",
+        "meta.pred_max_3sigma = @local_predict_max_3sigma;",
         f"meta.warning_text = {_td_perf_matlab_quote(result.get('warning_text') or '')};",
         f"meta.run_count = {_td_perf_matlab_num(result.get('run_count'))};",
         f"meta.serial_count = {_td_perf_matlab_num(result.get('serial_count'))};",
@@ -24507,6 +24837,84 @@ def _td_smart_solver_matlab_clean_example_lines(
     return lines
 
 
+def _td_smart_solver_matlab_local_predict_lines(
+    *,
+    func_name: str,
+    expr: str,
+    result: Mapping[str, object],
+    argument_specs: Sequence[Mapping[str, object]],
+    include_three_sigma: bool,
+) -> list[str]:
+    predict_args = [str(spec.get("name") or "").strip() for spec in argument_specs if str(spec.get("name") or "").strip()]
+    support_rows = _td_smart_solver_three_sigma_support_rows(result)
+    support_control_periods = [float(row.get("control_period") or 0.0) for row in support_rows]
+    support_offsets = [float(row.get("three_sigma_offset") or 0.0) for row in support_rows]
+    constant_offset = _td_smart_solver_resolve_three_sigma_offset(result)
+    cp_arg_index = next(
+        (index for index, spec in enumerate(argument_specs, start=1) if bool(spec.get("is_control_period"))),
+        0,
+    )
+
+    lines: list[str] = [
+        "function y = local_predict_nominal(varargin)",
+        f"if nargin ~= {len(predict_args)}",
+        f"    error('{func_name}:Usage', 'Usage: y = {func_name}({', '.join(predict_args)});');",
+        "end",
+    ]
+    for idx, spec in enumerate(argument_specs, start=1):
+        arg_name = str(spec.get("name") or "").strip()
+        lines.append(f"{arg_name} = varargin{{{idx}}};")
+    lines.extend(
+        [
+            f"y = {expr};",
+            "end",
+            "",
+        ]
+    )
+    if not include_three_sigma:
+        return lines
+
+    lines.extend(
+        [
+            "function y = local_three_sigma_offset(varargin)",
+            f"if nargin ~= {len(predict_args)}",
+            f"    error('{func_name}:Usage', 'Usage: y = {func_name}({', '.join(predict_args)});');",
+            "end",
+        ]
+    )
+    if cp_arg_index > 0 and support_rows:
+        lines.append(
+            "y = eidat_smart_solver_three_sigma_offset("
+            f"varargin{{{cp_arg_index}}}, "
+            f"{_td_perf_matlab_vector(support_control_periods)}, "
+            f"{_td_perf_matlab_vector(support_offsets)});"
+        )
+    elif predict_args:
+        lines.append(
+            "y = eidat_smart_solver_three_sigma_offset("
+            "varargin{1}, "
+            "[], "
+            f"{_td_perf_matlab_vector([constant_offset])});"
+        )
+    else:
+        lines.append(f"y = {_td_perf_matlab_num(constant_offset)};")
+    lines.extend(
+        [
+            "end",
+            "",
+            "function y = local_predict_min_3sigma(varargin)",
+            "y = local_predict_nominal(varargin{:}) - local_three_sigma_offset(varargin{:});",
+            "end",
+            "",
+            "function y = local_predict_max_3sigma(varargin)",
+            "y = local_predict_nominal(varargin{:}) + local_three_sigma_offset(varargin{:});",
+            "end",
+            "",
+        ]
+    )
+    return lines
+
+
 def _td_smart_solver_matlab_validation_example_lines(
     *,
     func_name: str,
@@ -24542,16 +24950,30 @@ def _td_smart_solver_matlab_validation_example_lines(
         lines.append(f"    {name} = {_td_smart_solver_matlab_example_literal(example_row.get(row_key))};")
         call_args.append(name)
     lines.append(f"    pred = {func_name}({', '.join(call_args)});")
+    lines.append(f"    pred_min_3sigma = meta.pred_min_3sigma({', '.join(call_args)});")
+    lines.append(f"    pred_max_3sigma = meta.pred_max_3sigma({', '.join(call_args)});")
     if example_row.get("pred_mean") not in (None, ""):
         lines.append(f"    cached_pred_mean = {_td_smart_solver_matlab_example_literal(example_row.get('pred_mean'))};")
+    if example_row.get("pred_min_3sigma") not in (None, ""):
+        lines.append(f"    cached_pred_min_3sigma = {_td_smart_solver_matlab_example_literal(example_row.get('pred_min_3sigma'))};")
+    if example_row.get("pred_max_3sigma") not in (None, ""):
+        lines.append(f"    cached_pred_max_3sigma = {_td_smart_solver_matlab_example_literal(example_row.get('pred_max_3sigma'))};")
     if example_row.get("actual_mean") not in (None, ""):
         lines.append(f"    actual_mean = {_td_smart_solver_matlab_example_literal(example_row.get('actual_mean'))};")
     lines.append("    fprintf('Equation: %s\\n', meta.equation_text);")
     predicted_format = _td_perf_matlab_quote(f"Predicted {output_label}: %.12g\\n")
     lines.append(f"    fprintf({predicted_format}, pred);")
+    lines.append("    fprintf('Predicted pred_min_3sigma: %.12g\\n', pred_min_3sigma);")
+    lines.append("    fprintf('Predicted pred_max_3sigma: %.12g\\n', pred_max_3sigma);")
     if example_row.get("pred_mean") not in (None, ""):
         lines.append("    fprintf('Cached exported pred_mean: %.12g\\n', cached_pred_mean);")
         lines.append("    fprintf('Absolute delta vs cached pred_mean: %.12g\\n', abs(pred - cached_pred_mean));")
+    if example_row.get("pred_min_3sigma") not in (None, ""):
+        lines.append("    fprintf('Cached exported pred_min_3sigma: %.12g\\n', cached_pred_min_3sigma);")
+        lines.append("    fprintf('Absolute delta vs cached pred_min_3sigma: %.12g\\n', abs(pred_min_3sigma - cached_pred_min_3sigma));")
+    if example_row.get("pred_max_3sigma") not in (None, ""):
+        lines.append("    fprintf('Cached exported pred_max_3sigma: %.12g\\n', cached_pred_max_3sigma);")
+        lines.append("    fprintf('Absolute delta vs cached pred_max_3sigma: %.12g\\n', abs(pred_max_3sigma - cached_pred_max_3sigma));")
     if example_row.get("actual_mean") not in (None, ""):
         lines.append("    fprintf('Cached actual_mean: %.12g\\n', actual_mean);")
         lines.append("    fprintf('Absolute delta vs actual_mean: %.12g\\n', abs(pred - actual_mean));")
@@ -24690,15 +25112,21 @@ def td_smart_solver_export_equation_matlab(
                 "end",
             ]
         )
-    for idx, spec in enumerate(argument_specs, start=1):
-        arg_name = str(spec.get("name") or "").strip()
-        lines.append(f"{arg_name} = varargin{{{idx}}};")
     lines.extend(
         [
-            f"out = {expr};",
+            "out = local_predict_nominal(varargin{:});",
             "end",
             "",
         ]
+    )
+    lines.extend(
+        _td_smart_solver_matlab_local_predict_lines(
+            func_name=func_name,
+            expr=expr,
+            result=solver_result,
+            argument_specs=argument_specs,
+            include_three_sigma=include_regression_checks,
+        )
     )
     if include_regression_checks:
         lines.extend(
