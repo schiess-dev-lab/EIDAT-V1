@@ -185,7 +185,7 @@ class AdminWindow(QtWidgets.QMainWindow):
         self._registry_path = _as_abs(registry_path)
         self._conn = admin_db.connect_registry(self._registry_path)
 
-        self.setWindowTitle("EIDAT Admin Dashboard (Nodes)")
+        self.setWindowTitle("EDAT Admin Dashboard (Nodes)")
         self.resize(1200, 780)
 
         root = QtWidgets.QWidget()
@@ -207,9 +207,9 @@ class AdminWindow(QtWidgets.QMainWindow):
         self.btn_add = QtWidgets.QPushButton("Add/Deploy Node…")
         self.btn_refresh = QtWidgets.QPushButton("Refresh")
         self.btn_remove = QtWidgets.QPushButton("Remove From List")
-        self.lbl_proc_cfg = QtWidgets.QLabel("Process config: Node .env (EIDAT_PROCESS_FORCE/LIMIT/DPI)")
+        self.lbl_proc_cfg = QtWidgets.QLabel("Process config: Node .env overrides (force / limit / DPI)")
         self.lbl_proc_cfg.setStyleSheet("color:#475569;")
-        self.lbl_proc_cfg.setToolTip("Open Node .env to set EIDAT_PROCESS_FORCE, EIDAT_PROCESS_LIMIT, EIDAT_PROCESS_DPI.")
+        self.lbl_proc_cfg.setToolTip("Open Node .env to set process force, limit, and DPI overrides.")
         actions.addWidget(self.btn_add)
         actions.addWidget(self.btn_refresh)
         actions.addWidget(self.btn_remove)

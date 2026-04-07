@@ -7,4 +7,5 @@ xlrd
 XlsxWriter
 matplotlib
 opencv-python-headless
+reportlab
 

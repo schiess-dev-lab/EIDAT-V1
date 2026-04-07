@@ -744,14 +744,18 @@ class _RunSelectionHarness:
         self.btn_save_selected_auto = QtWidgets.QPushButton()
         self.btn_save_all_auto = QtWidgets.QPushButton()
         self.btn_view_auto_plots = QtWidgets.QPushButton()
+        self.btn_auto_graphs = QtWidgets.QPushButton()
+        self.btn_auto_report = QtWidgets.QPushButton()
         self._plot_ready = True
         self._db_path = "db.sqlite3"
         self._project_dir = Path(tempfile.mkdtemp())
         self._auto_plots = []
+        self._auto_plot_global_selection = {}
         self._auto_plot_path = Path(tempfile.mkdtemp()) / "auto_plots_test_data.json"
         self._run_selection_views = {"sequence": [], "condition": []}
         self._run_display_by_name = {}
         self._run_name_by_display = {}
+        self._global_filter_rows = []
         self._available_program_filters = ["Program A", "Program B", "Unknown Program"]
         self._available_serial_filter_rows = [{"serial": "SN1"}, {"serial": "SN2"}]
         self._available_control_period_filters = []
@@ -769,9 +773,21 @@ class _RunSelectionHarness:
 
         for name in (
             "_auto_plot_available_serial_values",
+            "_auto_plot_available_filter_values",
             "_auto_plot_selected_filter_values",
             "_current_auto_plot_filter_state",
             "_normalize_auto_plot_filter_state",
+            "_default_auto_plot_global_selection",
+            "_available_auto_plot_selection_items",
+            "_derive_auto_plot_global_selection_from_entries",
+            "_normalize_auto_plot_global_selection",
+            "_current_auto_plot_global_selection",
+            "_auto_plot_filters_from_global_selection",
+            "_selected_auto_plot_run_selections",
+            "_selected_auto_plot_member_runs",
+            "_combined_auto_plot_selection",
+            "_auto_plot_run_selection_summary_text",
+            "_auto_plot_global_selection_details_text",
             "_auto_plot_entry_plot_definition",
             "_normalize_auto_plot_entry",
             "_normalized_auto_plot_entries",
@@ -805,6 +821,7 @@ class _RunSelectionHarness:
             "_active_program_filter_values",
             "_active_suppression_voltage_filter_values",
             "_visible_run_selection_items",
+            "_visible_run_selection_items_for_filter_state",
             "_sync_run_mode_availability",
             "_refresh_run_selection_visibility",
             "_on_metric_condition_selection_changed",
@@ -1696,18 +1713,17 @@ class TestTDTrendDialogLayout(unittest.TestCase):
         finally:
             dlg.close()
 
-    def test_view_auto_plots_button_tracks_saved_plot_availability_and_opens_popup(self) -> None:
+    def test_auto_graphs_button_opens_builder_and_footer_buttons_stay_hidden(self) -> None:
         dlg = _build_test_data_dialog()
         try:
             dlg._plot_ready = True
             dlg._db_path = Path(tempfile.mkdtemp()) / "cache.sqlite3"
-            dlg._auto_plots = []
             dlg._sync_main_auto_plot_actions()
-            self.assertFalse(dlg.btn_view_auto_plots.isEnabled())
-
-            dlg._auto_plots = [{"name": "Plot 1", "mode": "curves", "y": ["thrust"], "x": "Time"}]
-            dlg._sync_main_auto_plot_actions()
-            self.assertTrue(dlg.btn_view_auto_plots.isEnabled())
+            self.assertTrue(dlg.btn_auto_graphs.isEnabled())
+            self.assertTrue(dlg.btn_add_auto_plot.isHidden())
+            self.assertTrue(dlg.btn_view_auto_plots.isHidden())
+            self.assertIs(dlg.btn_auto_graphs.parentWidget(), dlg.auto_report_frame)
+            self.assertIs(dlg.btn_auto_report.parentWidget(), dlg.auto_report_frame)
 
             with mock.patch("PySide6.QtWidgets.QDialog.exec", return_value=0) as exec_mock:
                 dlg._open_auto_plots_popup()
@@ -1755,16 +1771,19 @@ class TestTDTrendDialogLayout(unittest.TestCase):
                 "details_text": "Source Sequences: Seq3",
             },
         ]
+        harness._auto_plot_global_selection = {
+            "run_scope": "condition",
+            "selected_selection_ids": ["condition:seq1", "condition:seq3"],
+            "filters": {
+                "programs": list(harness._available_program_filters),
+                "serials": ["SN1", "SN2"],
+                "control_periods": [],
+                "suppression_voltages": list(harness._available_suppression_voltage_filters),
+            },
+        }
         harness._auto_plots = [
             {
                 "mode": "metrics",
-                "selector_mode": "condition",
-                "selection_id": "condition:multi:condition:seq1|condition:seq3",
-                "selection_ids": ["condition:seq1", "condition:seq3"],
-                "selection_labels": ["350 psia, SS", "410 psia, PM"],
-                "run_conditions": ["350 psia, SS", "410 psia, PM"],
-                "member_runs": ["Seq1", "Seq3"],
-                "member_sequences": ["Seq1", "Seq2", "Seq3"],
                 "stats": ["mean"],
                 "y": ["thrust"],
             }
@@ -1777,8 +1796,9 @@ class TestTDTrendDialogLayout(unittest.TestCase):
         harness._open_selected_auto_plot(list_widget=popup_list)
 
         self.assertEqual(len(harness._opened_auto_plot_entries), 1)
+        self.assertEqual(harness._opened_auto_plot_entries[0].get("plot_definition", {}).get("mode"), "metrics")
         self.assertEqual(
-            harness._opened_auto_plot_entries[0].get("plot_definition", {}).get("selection_ids"),
+            harness._current_auto_plot_global_selection().get("selected_selection_ids"),
             ["condition:seq1", "condition:seq3"],
         )
         self.assertEqual(harness.checked_condition_ids(), [])
@@ -1882,31 +1902,89 @@ class TestTDTrendDialogLayout(unittest.TestCase):
 
         entries = harness._normalized_auto_plot_entries()
         self.assertEqual(len(entries), 1)
-        self.assertTrue(bool(entries[0].get("uses_live_filters")))
         self.assertEqual(entries[0].get("plot_definition", {}).get("mode"), "metrics")
+        self.assertEqual(
+            harness._current_auto_plot_global_selection().get("filters", {}).get("serials"),
+            ["SN1", "SN2"],
+        )
 
-    def test_auto_plot_store_saves_versioned_entries_with_filter_state(self) -> None:
+    def test_auto_plot_store_loads_versioned_entries_and_derives_global_selection(self) -> None:
         harness = _RunSelectionHarness()
+        harness._run_selection_views["condition"] = [
+            {
+                "mode": "condition",
+                "id": "condition:seq3",
+                "run_name": "Seq3",
+                "display_text": "410 psia, PM",
+                "run_condition": "410 psia, PM",
+                "member_programs": ["Program B"],
+                "member_suppression_voltages": [24],
+                "member_runs": ["Seq3"],
+                "member_sequences": ["Seq3"],
+                "details_text": "Source Sequences: Seq3",
+            }
+        ]
+        payload = {
+            "version": 1,
+            "entries": [
+                {
+                    "name": "Plot 1",
+                    "plot_definition": {
+                        "mode": "metrics",
+                        "selector_mode": "condition",
+                        "selection_id": "condition:seq3",
+                        "selection_ids": ["condition:seq3"],
+                        "stats": ["mean"],
+                        "y": ["thrust"],
+                    },
+                    "filter_state": {
+                        "programs": ["Program B"],
+                        "serials": ["SN2"],
+                        "control_periods": [],
+                        "suppression_voltages": ["24"],
+                    },
+                }
+            ],
+        }
+        harness._auto_plot_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        from EIDAT_App_Files.ui_next.qt_main import TestDataTrendDialog  # type: ignore
+
+        TestDataTrendDialog._load_auto_plots(harness)
+
+        selection = harness._current_auto_plot_global_selection()
+        self.assertEqual(selection.get("run_scope"), "condition")
+        self.assertEqual(selection.get("selected_selection_ids"), ["condition:seq3"])
+        self.assertEqual(selection.get("filters", {}).get("programs"), ["Program B"])
+        self.assertEqual(selection.get("filters", {}).get("serials"), ["SN2"])
+
+    def test_auto_plot_store_saves_versioned_entries_with_global_selection(self) -> None:
+        harness = _RunSelectionHarness()
+        harness._auto_plot_global_selection = {
+            "run_scope": "sequence",
+            "selected_selection_ids": [],
+            "filters": {
+                "programs": ["Program A"],
+                "serials": ["SN1"],
+                "control_periods": [],
+                "suppression_voltages": ["24"],
+            },
+        }
         harness._auto_plots = [
             {
                 "id": "plot-1",
                 "name": "Plot 1",
                 "plot_definition": {"mode": "metrics", "stats": ["mean"], "y": ["thrust"]},
-                "filter_state": {
-                    "programs": ["Program A"],
-                    "serials": ["SN1"],
-                    "control_periods": [],
-                    "suppression_voltages": ["24"],
-                },
             }
         ]
 
         harness._save_auto_plots_store()
         payload = json.loads(harness._auto_plot_path.read_text(encoding="utf-8"))
 
-        self.assertEqual(payload.get("version"), 1)
+        self.assertEqual(payload.get("version"), 2)
         self.assertEqual(len(payload.get("entries") or []), 1)
-        self.assertEqual(payload["entries"][0]["filter_state"]["serials"], ["SN1"])
+        self.assertEqual(payload["global_selection"]["filters"]["serials"], ["SN1"])
+        self.assertNotIn("filter_state", payload["entries"][0])
 
     @unittest.skipUnless(_have_matplotlib(), "matplotlib not installed")
     def test_save_selected_auto_plots_pdf_exports_only_selected_saved_plots(self) -> None:
@@ -6800,7 +6878,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
 
         self.assertEqual(
             harness.list_auto_plots.item(0).text(),
-            "Metrics: 350 psia, PM, 60 Sec ON / 120 Sec OFF mean (thrust)",
+            "Plot Metric | Metrics: mean (thrust)",
         )
 
     @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
@@ -7134,14 +7212,6 @@ class TestTDSupportWorkbook(unittest.TestCase):
         harness._auto_plots = [
             {
                 "mode": "metrics",
-                "selector_mode": "condition",
-                "selection_id": "condition:multi:condition:seq1|condition:seq3",
-                "selection_ids": ["condition:seq1", "condition:seq3"],
-                "selection_labels": ["350 psia, SS", "410 psia, PM"],
-                "run_conditions": ["350 psia, SS", "410 psia, PM"],
-                "run_condition": "350 psia, SS, 410 psia, PM",
-                "member_runs": ["Seq1", "Seq3"],
-                "member_sequences": ["Seq1", "Seq2", "Seq3"],
                 "stats": ["mean"],
                 "y": ["thrust"],
             }
@@ -7151,7 +7221,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
 
         self.assertEqual(
             harness.list_auto_plots.item(0).text(),
-            "Metrics: 350 psia, SS, 410 psia, PM mean (thrust)",
+            "Plot Metric | Metrics: mean (thrust)",
         )
 
     @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
@@ -7179,16 +7249,19 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 "details_text": "Source Sequences: Seq3",
             },
         ]
+        harness._auto_plot_global_selection = {
+            "run_scope": "condition",
+            "selected_selection_ids": ["condition:seq1", "condition:seq3"],
+            "filters": {
+                "programs": list(harness._available_program_filters),
+                "serials": ["SN1", "SN2"],
+                "control_periods": [],
+                "suppression_voltages": list(harness._available_suppression_voltage_filters),
+            },
+        }
         harness._auto_plots = [
             {
                 "mode": "metrics",
-                "selector_mode": "condition",
-                "selection_id": "condition:multi:condition:seq1|condition:seq3",
-                "selection_ids": ["condition:seq1", "condition:seq3"],
-                "selection_labels": ["350 psia, SS", "410 psia, PM"],
-                "run_conditions": ["350 psia, SS", "410 psia, PM"],
-                "member_runs": ["Seq1", "Seq3"],
-                "member_sequences": ["Seq1", "Seq2", "Seq3"],
                 "stats": ["mean"],
                 "y": ["thrust"],
             }
@@ -7199,15 +7272,16 @@ class TestTDSupportWorkbook(unittest.TestCase):
         harness._open_selected_auto_plot()
 
         self.assertEqual(len(harness._opened_auto_plot_entries), 1)
+        self.assertEqual(harness._opened_auto_plot_entries[0].get("plot_definition", {}).get("mode"), "metrics")
         self.assertEqual(
-            harness._opened_auto_plot_entries[0].get("plot_definition", {}).get("selection_ids"),
+            harness._current_auto_plot_global_selection().get("selected_selection_ids"),
             ["condition:seq1", "condition:seq3"],
         )
         self.assertEqual(harness.checked_condition_ids(), [])
         self.assertFalse(harness._plot_metrics_called)
 
     @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
-    def test_open_selected_auto_plot_keeps_live_filters_for_legacy_payload(self) -> None:
+    def test_open_selected_auto_plot_keeps_live_filters_separate_from_auto_graph_filters(self) -> None:
         harness = _RunSelectionHarness()
         harness._checked_program_filters = ["Program A"]
         harness._checked_serial_filters = ["SN1"]
@@ -7233,16 +7307,19 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 "details_text": "Source Sequences: Seq3",
             },
         ]
+        harness._auto_plot_global_selection = {
+            "run_scope": "condition",
+            "selected_selection_ids": ["condition:seq3"],
+            "filters": {
+                "programs": ["Program B"],
+                "serials": ["SN2"],
+                "control_periods": [],
+                "suppression_voltages": list(harness._available_suppression_voltage_filters),
+            },
+        }
         harness._auto_plots = [
             {
                 "mode": "metrics",
-                "selector_mode": "condition",
-                "selection_id": "condition:seq3",
-                "run": "Seq3",
-                "run_condition": "410 psia, PM",
-                "display_text": "410 psia, PM",
-                "member_runs": ["Seq3"],
-                "member_sequences": ["Seq3"],
                 "stats": ["mean"],
                 "y": ["thrust"],
             }
@@ -7253,7 +7330,14 @@ class TestTDSupportWorkbook(unittest.TestCase):
         harness._open_selected_auto_plot()
 
         self.assertEqual(len(harness._opened_auto_plot_entries), 1)
-        self.assertTrue(bool(harness._opened_auto_plot_entries[0].get("uses_live_filters")))
+        self.assertEqual(
+            harness._current_auto_plot_global_selection().get("filters", {}).get("programs"),
+            ["Program B"],
+        )
+        self.assertEqual(
+            harness._current_auto_plot_global_selection().get("filters", {}).get("serials"),
+            ["SN2"],
+        )
         self.assertEqual(harness._checked_program_filters, ["Program A"])
         self.assertEqual(harness._checked_serial_filters, ["SN1"])
         self.assertFalse(harness._plot_metrics_called)

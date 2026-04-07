@@ -114,7 +114,7 @@ def _run_manager(
 ) -> dict[str, object]:
     script = _eidat_manager_path(runtime_root)
     if not script.exists():
-        raise RuntimeError(f"EIDAT Manager not found: {script}")
+        raise RuntimeError(f"EDAT Manager not found: {script}")
     argv = [py, str(script), "--global-repo", str(node_root), cmd]
     if extra:
         argv.extend(extra)
@@ -237,7 +237,7 @@ def run_pipeline(
             raise RuntimeError(f"Runtime root does not contain EIDAT_App_Files: {runtime}")
         manager = _eidat_manager_path(runtime)
         if not manager.exists():
-            raise RuntimeError(f"EIDAT Manager not found: {manager}")
+            raise RuntimeError(f"EDAT Manager not found: {manager}")
 
         if on_log is not None:
             on_log(f"[NODE] {node}")

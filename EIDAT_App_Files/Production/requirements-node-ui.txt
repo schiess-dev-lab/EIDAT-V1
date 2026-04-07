@@ -13,3 +13,4 @@ scipy
 
 # PDF rendering + token embedding (PyMuPDF provides `fitz`)
 pymupdf
+reportlab

@@ -497,7 +497,7 @@ def _run_eidat_manager(global_repo: Path, cmd: str, extra_args: Optional[list[st
     if not target.exists():
         raise RuntimeError(f"Global repo does not exist: {target}")
     if not EIDAT_MANAGER_ENTRY.exists():
-        raise RuntimeError(f"EIDAT Manager not found: {EIDAT_MANAGER_ENTRY}")
+        raise RuntimeError(f"EDAT Manager not found: {EIDAT_MANAGER_ENTRY}")
     argv = [sys.executable, str(EIDAT_MANAGER_ENTRY), "--global-repo", str(target), cmd]
     if extra_args:
         argv.extend([str(a) for a in extra_args if str(a).strip()])
@@ -511,12 +511,12 @@ def _run_eidat_manager(global_repo: Path, cmd: str, extra_args: Optional[list[st
     )
     if proc.returncode != 0:
         err = (proc.stderr or proc.stdout or "").strip()
-        raise RuntimeError(err or f"EIDAT Manager failed with exit code {proc.returncode}")
+        raise RuntimeError(err or f"EDAT Manager failed with exit code {proc.returncode}")
     out = (proc.stdout or "").strip()
     try:
         payload = json.loads(out) if out else {}
         if not isinstance(payload, dict):
-            raise RuntimeError("EIDAT Manager output was not an object")
+            raise RuntimeError("EDAT Manager output was not an object")
         if cmd in ("scan", "process"):
             try:
                 mirror = mirror_global_debug_ocr_to_local(target)
@@ -526,7 +526,7 @@ def _run_eidat_manager(global_repo: Path, cmd: str, extra_args: Optional[list[st
                 pass
         return payload
     except Exception as exc:
-        raise RuntimeError(f"Unable to parse EIDAT Manager output as JSON: {exc}") from exc
+        raise RuntimeError(f"Unable to parse EDAT Manager output as JSON: {exc}") from exc
 
 
 def eidat_manager_init(global_repo: Path) -> Dict[str, object]:

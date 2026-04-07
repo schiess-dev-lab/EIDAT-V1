@@ -8,13 +8,16 @@ on optional plotting/scientific libraries (matplotlib, numpy).
 """
 
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping
 
+import html
 import json
 import math
 import sqlite3
 import statistics
+import tempfile
 import textwrap
 import time
 
@@ -24,6 +27,29 @@ def _now_datestr() -> str:
         return time.strftime("%Y-%m-%d")
     except Exception:
         return "unknown-date"
+
+
+REPORT_TITLE = "Acceptance Test Certification Report"
+REPORT_SUBTITLE_DEFAULT = "EDAT Test Data Trend / Analyze Auto Report"
+
+
+@dataclass(frozen=True)
+class PrintContext:
+    printed_at: str
+    printed_timezone: str
+    report_title: str
+    report_subtitle: str
+
+
+def _capture_print_context(*, report_title: str = REPORT_TITLE, report_subtitle: str = REPORT_SUBTITLE_DEFAULT) -> PrintContext:
+    now = datetime.now().astimezone()
+    tz_name = str(now.tzname() or "").strip() or "LOCAL"
+    return PrintContext(
+        printed_at=now.strftime("%Y-%m-%d %H:%M ") + tz_name,
+        printed_timezone=tz_name,
+        report_title=str(report_title or REPORT_TITLE).strip() or REPORT_TITLE,
+        report_subtitle=str(report_subtitle or REPORT_SUBTITLE_DEFAULT).strip() or REPORT_SUBTITLE_DEFAULT,
+    )
 
 
 def _safe_float(v: object) -> float | None:
@@ -456,6 +482,117 @@ def _selection_for_run(run_name: str, options: dict) -> dict:
         if not best:
             best = dict(selection)
     return best
+
+
+def _run_display_text(run_name: str, run_by_name: Mapping[str, dict] | None = None) -> str:
+    run = str(run_name or "").strip()
+    if not run:
+        return ""
+    row = dict((run_by_name or {}).get(run) or {})
+    display = str(row.get("display_name") or "").strip()
+    return display or run
+
+
+def _selection_sequence_text(selection: Mapping[str, object] | None, run_by_name: Mapping[str, dict] | None = None) -> str:
+    if not isinstance(selection, Mapping):
+        return ""
+    seen: set[str] = set()
+    values: list[str] = []
+    raw_members = selection.get("member_sequences") or []
+    if isinstance(raw_members, list):
+        for value in raw_members:
+            text = str(value or "").strip()
+            if not text or text.casefold() in seen:
+                continue
+            seen.add(text.casefold())
+            values.append(text)
+    if not values:
+        for candidate in (
+            selection.get("sequence_name"),
+            selection.get("source_run_name"),
+            selection.get("run_name"),
+        ):
+            text = str(candidate or "").strip()
+            if text:
+                values = [_run_display_text(text, run_by_name)]
+                break
+    return ", ".join([value for value in values if str(value).strip()])
+
+
+def _selection_condition_text(selection: Mapping[str, object] | None, run_by_name: Mapping[str, dict] | None = None) -> str:
+    if not isinstance(selection, Mapping):
+        return ""
+    labels = selection.get("run_conditions") or selection.get("selection_labels") or []
+    if isinstance(labels, list):
+        cleaned = [str(value or "").strip() for value in labels if str(value or "").strip()]
+        if cleaned:
+            return ", ".join(cleaned)
+    for candidate in (
+        selection.get("run_condition"),
+        selection.get("display_text"),
+    ):
+        text = str(candidate or "").strip()
+        if text and text.casefold() not in {"sequence", "condition"}:
+            return text
+    return _run_display_text(str(selection.get("run_name") or "").strip(), run_by_name)
+
+
+def _selection_display_fields(selection: Mapping[str, object] | None, run_by_name: Mapping[str, dict] | None = None) -> dict[str, str]:
+    run_text = _run_display_text(str((selection or {}).get("run_name") or "").strip(), run_by_name)
+    if not isinstance(selection, Mapping):
+        return {
+            "mode": "sequence",
+            "run": run_text,
+            "sequence_text": run_text,
+            "condition_text": "",
+            "display_text": run_text,
+        }
+    mode = str(selection.get("mode") or "sequence").strip().lower() or "sequence"
+    sequence_text = _selection_sequence_text(selection, run_by_name) or run_text
+    condition_text = _selection_condition_text(selection, run_by_name)
+    if mode == "condition":
+        display_text = condition_text or sequence_text or run_text
+    else:
+        display_text = sequence_text or run_text or condition_text
+    return {
+        "mode": mode,
+        "run": run_text,
+        "sequence_text": sequence_text,
+        "condition_text": condition_text,
+        "display_text": display_text,
+    }
+
+
+def _selection_title_text(
+    selection: Mapping[str, object] | None,
+    run_by_name: Mapping[str, dict] | None = None,
+    *,
+    suffix: str = "",
+) -> str:
+    fields = _selection_display_fields(selection, run_by_name)
+    parts: list[str] = []
+    if fields.get("mode") == "condition":
+        if fields.get("condition_text"):
+            parts.append(f"Run Condition: {fields['condition_text']}")
+        if fields.get("sequence_text"):
+            parts.append(f"Sequences: {fields['sequence_text']}")
+    else:
+        if fields.get("sequence_text"):
+            parts.append(f"Sequence: {fields['sequence_text']}")
+        if fields.get("condition_text"):
+            parts.append(f"Run Condition: {fields['condition_text']}")
+    if suffix:
+        parts.append(str(suffix).strip())
+    return " | ".join([part for part in parts if str(part).strip()])
+
+
+def _grade_token_for_summary(grades: list[str]) -> str:
+    status = _overall_cert_status(grades)
+    if status == "CERTIFIED":
+        return "PASS"
+    if status == "FAILED":
+        return "FAIL"
+    return status
 
 
 def _td_serial_metadata_by_serial(rows: list[dict]) -> dict[str, dict]:
@@ -2020,6 +2157,323 @@ def _figure_grade_matrix_page(
     return fig
 
 
+def _paragraph_markup(text: object) -> str:
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    return "<br/>".join(html.escape(line) for line in raw.splitlines())
+
+
+def _reportlab_imports() -> dict[str, Any]:
+    try:
+        from reportlab.lib import colors  # type: ignore
+        from reportlab.lib.enums import TA_CENTER, TA_LEFT  # type: ignore
+        from reportlab.lib.pagesizes import letter  # type: ignore
+        from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet  # type: ignore
+        from reportlab.lib.units import inch  # type: ignore
+        from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle  # type: ignore
+    except Exception as exc:
+        raise RuntimeError("reportlab is required to build formatted portrait report pages.") from exc
+    return {
+        "colors": colors,
+        "TA_CENTER": TA_CENTER,
+        "TA_LEFT": TA_LEFT,
+        "letter": letter,
+        "ParagraphStyle": ParagraphStyle,
+        "getSampleStyleSheet": getSampleStyleSheet,
+        "inch": inch,
+        "PageBreak": PageBreak,
+        "Paragraph": Paragraph,
+        "SimpleDocTemplate": SimpleDocTemplate,
+        "Spacer": Spacer,
+        "Table": Table,
+        "TableStyle": TableStyle,
+    }
+
+
+def _build_portrait_styles(rl: Mapping[str, Any]) -> dict[str, Any]:
+    styles = rl["getSampleStyleSheet"]()
+    ParagraphStyle = rl["ParagraphStyle"]
+    TA_LEFT = rl["TA_LEFT"]
+    TA_CENTER = rl["TA_CENTER"]
+    return {
+        "body": ParagraphStyle(
+            "EdatBody",
+            parent=styles["BodyText"],
+            fontName="Helvetica",
+            fontSize=9,
+            leading=11,
+            alignment=TA_LEFT,
+            textColor="#0f172a",
+            spaceAfter=4,
+        ),
+        "small": ParagraphStyle(
+            "EdatSmall",
+            parent=styles["BodyText"],
+            fontName="Helvetica",
+            fontSize=8,
+            leading=10,
+            alignment=TA_LEFT,
+            textColor="#334155",
+            spaceAfter=2,
+        ),
+        "section": ParagraphStyle(
+            "EdatSection",
+            parent=styles["Heading2"],
+            fontName="Helvetica-Bold",
+            fontSize=13,
+            leading=15,
+            alignment=TA_LEFT,
+            textColor="#0f172a",
+            spaceAfter=6,
+            spaceBefore=4,
+        ),
+        "card_title": ParagraphStyle(
+            "EdatCardTitle",
+            parent=styles["Heading3"],
+            fontName="Helvetica-Bold",
+            fontSize=10,
+            leading=12,
+            alignment=TA_LEFT,
+            textColor="#0f172a",
+            spaceAfter=2,
+        ),
+        "cover_title": ParagraphStyle(
+            "EdatCoverTitle",
+            parent=styles["Heading1"],
+            fontName="Helvetica-Bold",
+            fontSize=18,
+            leading=22,
+            alignment=TA_LEFT,
+            textColor="#0f172a",
+            spaceAfter=8,
+        ),
+        "cover_subtitle": ParagraphStyle(
+            "EdatCoverSubtitle",
+            parent=styles["Heading2"],
+            fontName="Helvetica",
+            fontSize=11,
+            leading=14,
+            alignment=TA_LEFT,
+            textColor="#334155",
+            spaceAfter=8,
+        ),
+        "hero_value": ParagraphStyle(
+            "EdatHeroValue",
+            parent=styles["Heading2"],
+            fontName="Helvetica-Bold",
+            fontSize=16,
+            leading=18,
+            alignment=TA_CENTER,
+            textColor="#0f172a",
+            spaceAfter=1,
+        ),
+        "hero_label": ParagraphStyle(
+            "EdatHeroLabel",
+            parent=styles["BodyText"],
+            fontName="Helvetica",
+            fontSize=8,
+            leading=9,
+            alignment=TA_CENTER,
+            textColor="#475569",
+            spaceAfter=0,
+        ),
+    }
+
+
+def _portrait_paragraph(text: object, style: Any, rl: Mapping[str, Any]) -> Any:
+    return rl["Paragraph"](_paragraph_markup(text), style)
+
+
+def _portrait_box_table(
+    rows: list[list[object]],
+    *,
+    col_widths: list[float] | None,
+    styles: Mapping[str, Any],
+    rl: Mapping[str, Any],
+    repeat_rows: int = 1,
+    compact: bool = False,
+    boxed: bool = True,
+) -> Any:
+    colors = rl["colors"]
+    Table = rl["Table"]
+    TableStyle = rl["TableStyle"]
+    style_body = styles["small"] if compact else styles["body"]
+    cell_text = [[_portrait_paragraph(value, style_body, rl) for value in row] for row in rows]
+    table = Table(cell_text, colWidths=col_widths, repeatRows=repeat_rows, hAlign="LEFT")
+    style_cmds: list[tuple] = [
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e2e8f0")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#0f172a")),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("ALIGN", (0, 0), (-1, 0), "LEFT"),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LINEBELOW", (0, 0), (-1, 0), 1, colors.HexColor("#94a3b8")),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f8fafc")]),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+        ("TOPPADDING", (0, 0), (-1, -1), 5 if compact else 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5 if compact else 6),
+    ]
+    if boxed:
+        style_cmds.append(("BOX", (0, 0), (-1, -1), 1, colors.HexColor("#94a3b8")))
+        style_cmds.append(("INNERGRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")))
+    table.setStyle(TableStyle(style_cmds))
+    return table
+
+
+def _portrait_card(title: str, body_lines: list[str], *, styles: Mapping[str, Any], rl: Mapping[str, Any]) -> Any:
+    colors = rl["colors"]
+    Table = rl["Table"]
+    TableStyle = rl["TableStyle"]
+    content = [
+        [_portrait_paragraph(title, styles["card_title"], rl)],
+        [_portrait_paragraph("\n".join(body_lines), styles["small"], rl)],
+    ]
+    table = Table(content, colWidths=[6.9 * rl["inch"]], hAlign="LEFT")
+    table.setStyle(
+        TableStyle(
+            [
+                ("BOX", (0, 0), (-1, -1), 1, colors.HexColor("#94a3b8")),
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e2e8f0")),
+                ("BACKGROUND", (0, 1), (-1, -1), colors.HexColor("#f8fafc")),
+                ("LEFTPADDING", (0, 0), (-1, -1), 8),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+                ("TOPPADDING", (0, 0), (-1, -1), 7),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+            ]
+        )
+    )
+    return table
+
+
+def _draw_portrait_page_header(canvas: Any, doc: Any, print_ctx: PrintContext, *, page_number_offset: int = 0) -> None:
+    colors = _reportlab_imports()["colors"]
+    width, height = doc.pagesize
+    page_number = int(canvas.getPageNumber() or 1) + int(page_number_offset)
+    canvas.saveState()
+    canvas.setFillColor(colors.HexColor("#0f172a"))
+    canvas.rect(0, height - 54, width, 54, fill=1, stroke=0)
+    canvas.setFillColor(colors.white)
+    canvas.setFont("Helvetica-Bold", 13)
+    canvas.drawString(36, height - 22, "EDAT Engineering Data Analysis Tool")
+    canvas.setFont("Helvetica", 9)
+    canvas.drawString(36, height - 36, print_ctx.report_title)
+    canvas.drawRightString(width - 36, height - 22, f"Page {page_number}")
+    canvas.drawRightString(width - 36, height - 36, f"Printed: {print_ctx.printed_at}")
+    canvas.setFillColor(colors.HexColor("#e2e8f0"))
+    canvas.rect(0, height - 56, width, 2, fill=1, stroke=0)
+    canvas.restoreState()
+
+
+def _render_portrait_story_pdf(
+    out_path: Path,
+    *,
+    story: list[Any],
+    print_ctx: PrintContext,
+    page_number_offset: int = 0,
+) -> int:
+    rl = _reportlab_imports()
+    doc = rl["SimpleDocTemplate"](
+        str(Path(out_path).expanduser()),
+        pagesize=rl["letter"],
+        leftMargin=36,
+        rightMargin=36,
+        topMargin=72,
+        bottomMargin=36,
+        title=print_ctx.report_title,
+    )
+
+    def _on_page(canvas: Any, _doc: Any) -> None:
+        _draw_portrait_page_header(canvas, _doc, print_ctx, page_number_offset=page_number_offset)
+
+    doc.build(list(story), onFirstPage=_on_page, onLaterPages=_on_page)
+    try:
+        import fitz  # type: ignore
+    except Exception as exc:
+        raise RuntimeError("PyMuPDF is required to finalize portrait report pages.") from exc
+    doc_pdf = fitz.open(str(Path(out_path).expanduser()))
+    try:
+        return int(doc_pdf.page_count)
+    finally:
+        doc_pdf.close()
+
+
+def _merge_report_pdfs(output_pdf: Path, parts: list[Path]) -> None:
+    try:
+        import fitz  # type: ignore
+    except Exception as exc:
+        raise RuntimeError("PyMuPDF is required to merge auto-report pages.") from exc
+    merged = fitz.open()
+    try:
+        for part in parts:
+            p = Path(part).expanduser()
+            if not p.exists():
+                continue
+            doc = fitz.open(str(p))
+            try:
+                if doc.page_count:
+                    merged.insert_pdf(doc)
+            finally:
+                doc.close()
+        merged.save(str(Path(output_pdf).expanduser()))
+    finally:
+        merged.close()
+
+
+def _apply_plot_page_header(
+    fig: Any,
+    *,
+    print_ctx: PrintContext,
+    page_number: int,
+    section_title: str,
+    section_subtitle: str = "",
+) -> None:
+    from matplotlib.patches import Rectangle  # type: ignore
+
+    fig.patch.set_facecolor("white")
+    header_height = 0.13
+    fig.add_artist(
+        Rectangle(
+            (0.0, 1.0 - header_height),
+            1.0,
+            header_height,
+            transform=fig.transFigure,
+            facecolor="#0f172a",
+            edgecolor="none",
+            zorder=0,
+        )
+    )
+    fig.text(0.04, 0.965, "EDAT Engineering Data Analysis Tool", color="white", fontsize=14, fontweight="bold", va="top")
+    fig.text(0.04, 0.935, print_ctx.report_title, color="white", fontsize=9, va="top")
+    if section_title:
+        fig.text(0.04, 0.885, str(section_title), color="#0f172a", fontsize=16, fontweight="bold", va="top")
+    if section_subtitle:
+        fig.text(0.04, 0.858, str(section_subtitle), color="#334155", fontsize=10, va="top")
+    fig.text(0.96, 0.965, f"Page {int(page_number)}", color="white", fontsize=11, fontweight="bold", va="top", ha="right")
+    fig.text(0.96, 0.935, f"Printed: {print_ctx.printed_at}", color="white", fontsize=9, va="top", ha="right")
+
+
+def _create_landscape_plot_page(
+    *,
+    print_ctx: PrintContext,
+    page_number: int,
+    section_title: str,
+    section_subtitle: str = "",
+) -> tuple[Any, Any]:
+    import matplotlib.pyplot as plt  # type: ignore
+
+    fig = plt.figure(figsize=(17.0, 11.0), dpi=120)
+    _apply_plot_page_header(
+        fig,
+        print_ctx=print_ctx,
+        page_number=page_number,
+        section_title=section_title,
+        section_subtitle=section_subtitle,
+    )
+    ax = fig.add_axes([0.06, 0.10, 0.90, 0.70])
+    return fig, ax
+
+
 def generate_test_data_auto_report(
     project_dir: Path,
     workbook_path: Path,
@@ -3392,3 +3846,1533 @@ def generate_test_data_auto_report(
         "highlighted_serials": hi,
         "watch_items": len(watch_items),
     }
+
+
+def _tar_grade_color(grade: object, *, default: str = "#2563eb") -> str:
+    token = str(grade or "").strip().upper()
+    if token == "FAIL":
+        return "#dc2626"
+    if token == "WATCH":
+        return "#f59e0b"
+    if token in {"PASS", "CERTIFIED"}:
+        return "#2563eb"
+    return default
+
+
+def _tar_join_limited(values: list[object], *, max_items: int = 5, empty: str = "All") -> str:
+    items = [str(value).strip() for value in values if str(value).strip()]
+    if not items:
+        return empty
+    if len(items) <= max_items:
+        return ", ".join(items)
+    return ", ".join(items[:max_items]) + f", +{len(items) - max_items} more"
+
+
+def _tar_subtitle_text(text: object) -> str:
+    raw = str(text or "").replace("\n", " | ").strip()
+    if not raw:
+        return ""
+    return textwrap.shorten(raw, width=180, placeholder="...")
+
+
+def _tar_metric_map_for_run(ctx: Mapping[str, Any], run_name: str, column_name: str, stat: str) -> dict[str, float]:
+    be = ctx["be"]
+    selection = _selection_for_run(run_name, ctx["options"])
+    return _load_metric_map_for_selection(
+        be,
+        ctx["db_path"],
+        run_name,
+        column_name,
+        stat,
+        selection=selection,
+        filter_state=ctx["filter_state"],
+    )
+
+
+def _tar_finite_mean_for_serials(vmap: Mapping[str, object], serials: list[str]) -> float | None:
+    values: list[float] = []
+    for serial in serials:
+        value = vmap.get(serial)
+        if isinstance(value, (int, float)) and math.isfinite(float(value)):
+            values.append(float(value))
+    if not values:
+        return None
+    try:
+        return float(statistics.mean(values))
+    except Exception:
+        return None
+
+
+def _tar_meta(ctx: Mapping[str, Any], serial: str, key: str) -> str:
+    try:
+        return str((ctx.get("meta_by_sn") or {}).get(serial, {}).get(key) or "").strip()
+    except Exception:
+        return ""
+
+
+def _tar_metric_tick_label(ctx: Mapping[str, Any], serial: str) -> str:
+    program = _tar_meta(ctx, serial, "program_title")
+    return f"{program}\n{serial}" if program else serial
+
+
+def _tar_filter_summary_line(ctx: Mapping[str, Any], key: str, label: str) -> str:
+    filter_state = ctx.get("filter_state")
+    if not _filter_state_has_key(filter_state, key):
+        return f"{label}: All"
+    values = _filter_state_values(filter_state, key)
+    if not values:
+        return f"{label}: None"
+    return f"{label}: {_tar_join_limited(values, max_items=4, empty='None')}"
+
+
+def _tar_meta_summary_line(ctx: Mapping[str, Any], key: str, label: str) -> str:
+    highlighted = ctx.get("hi") or []
+    values = sorted({_tar_meta(ctx, serial, key) for serial in highlighted if _tar_meta(ctx, serial, key)})
+    if not values:
+        return f"{label}: (unknown)"
+    return f"{label}: {_tar_join_limited(values, max_items=4, empty='(unknown)')}"
+
+
+def _tar_prepare_base(
+    project_dir: Path,
+    workbook_path: Path,
+    output_pdf: Path,
+    *,
+    highlighted_serials: list[str],
+    options: dict,
+) -> dict[str, Any]:
+    from . import backend as be
+
+    print_ctx = _capture_print_context()
+    proj = Path(project_dir).expanduser()
+    wb = Path(workbook_path).expanduser()
+    out_pdf = Path(output_pdf).expanduser()
+    out_pdf.parent.mkdir(parents=True, exist_ok=True)
+
+    cfg_excel_path = Path(options.get("excel_trend_config_path") or be.DEFAULT_EXCEL_TREND_CONFIG).expanduser()
+    try:
+        if getattr(be, "DATA_ROOT", None) != getattr(be, "ROOT", None):
+            runtime_user_inputs = Path(getattr(be, "ROOT")) / "user_inputs"
+            node_user_inputs = Path(getattr(be, "DATA_ROOT")) / "user_inputs"
+
+            def _seed_user_input_if_missing(dst: Path) -> None:
+                try:
+                    p = Path(dst).expanduser()
+                    if p.exists():
+                        return
+                    if not p.is_relative_to(node_user_inputs):
+                        return
+                    src = runtime_user_inputs / p.name
+                    if not src.exists():
+                        return
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                    p.write_bytes(src.read_bytes())
+                except Exception:
+                    return
+
+            _seed_user_input_if_missing(cfg_excel_path)
+            _seed_user_input_if_missing(Path(be.DEFAULT_TREND_AUTO_REPORT_CONFIG).expanduser())
+    except Exception:
+        pass
+
+    excel_cfg = be.load_excel_trend_config(cfg_excel_path)
+    report_cfg = be.load_trend_auto_report_config(proj)
+    model_cfg = report_cfg.get("model") or {}
+    watch_cfg = (report_cfg.get("watch") or {}).get("curve_deviation") or {}
+    grade_cfg = report_cfg.get("grading") or {}
+    report_opts = report_cfg.get("report") or {}
+    hi_cfg = report_cfg.get("highlight") or {}
+
+    rebuild = bool(options.get("rebuild_cache"))
+    db_path = be.ensure_test_data_project_cache(proj, wb, rebuild=rebuild)
+    if bool(options.get("update_excel_trend_config", True)):
+        _, change_summary = be.autofill_excel_trend_config_from_td_cache(
+            db_path,
+            cfg_excel_path,
+            fill_units=True,
+            fill_ranges=True,
+            add_missing_columns=bool(options.get("add_missing_columns")),
+        )
+    else:
+        change_summary = "excel_trend_config.json update disabled."
+
+    conn = sqlite3.connect(str(Path(db_path).expanduser()))
+    source_rows = []
+    try:
+        source_rows = be.td_read_sources_metadata(wb)
+    except Exception:
+        source_rows = []
+    ordered_serials = _td_order_metric_serials(be.td_list_serials(db_path), source_rows) or _td_list_serials(conn)
+    filter_state = options.get("filter_state")
+    if not isinstance(filter_state, Mapping):
+        filter_state = {}
+    all_serials = _resolve_filtered_serials(be, db_path, ordered_serials, options)
+    run_rows = _td_list_runs(conn)
+    run_by_name = {
+        str(row.get("run_name") or "").strip(): row
+        for row in (run_rows or [])
+        if str(row.get("run_name") or "").strip()
+    }
+    if not all_serials:
+        if filter_state:
+            raise RuntimeError("Auto Report filters excluded all serials in the current project cache.")
+        raise RuntimeError(
+            "Auto Report found no usable Test Data sources in the current project cache. "
+            "Build / Refresh Cache again and verify the workbook Sources sheet points at the active node path."
+        )
+
+    runs = _resolve_selected_runs(run_rows, options)
+    if not runs:
+        raise RuntimeError(
+            "Auto Report found no usable Test Data runs in the current project cache. "
+            "Build / Refresh Cache again and verify TD source resolution for this project."
+        )
+
+    params = _resolve_selected_params(be, db_path, conn, runs=runs, options=options)
+    if not params:
+        raise RuntimeError(
+            "Auto Report found no reportable Test Data parameters in the current project cache. "
+            "Check the workbook Sources sheet, cache diagnostics, and configured TD columns."
+        )
+
+    hi = [serial for serial in highlighted_serials if serial in all_serials]
+    if not hi:
+        raise RuntimeError("Auto Report requires at least one highlighted serial under certification.")
+
+    stats = excel_cfg.get("statistics") or ["mean", "min", "max", "std", "median", "count"]
+    stats = [str(stat).strip().lower() for stat in stats if str(stat).strip()]
+    if not stats:
+        stats = ["mean", "min", "max", "std", "median", "count"]
+
+    metrics_stats_cfg = options.get("metric_stats")
+    if not isinstance(metrics_stats_cfg, list) or not metrics_stats_cfg:
+        metrics_stats_cfg = report_opts.get("metrics_stats")
+    metric_stats: list[str] = []
+    if isinstance(metrics_stats_cfg, list):
+        for stat in metrics_stats_cfg:
+            normalized = str(stat or "").strip().lower()
+            if normalized and normalized not in metric_stats:
+                metric_stats.append(normalized)
+    elif isinstance(metrics_stats_cfg, str) and metrics_stats_cfg.strip():
+        metric_stats.append(metrics_stats_cfg.strip().lower())
+    if not metric_stats:
+        metric_stats = ["median"]
+
+    include_metrics = bool(options.get("include_metrics", bool(report_opts.get("include_metrics", True))))
+    grid_points = int(model_cfg.get("grid_points") or 200) or 200
+    degree = int(model_cfg.get("degree") or 3) or 3
+    normalize_x = bool(model_cfg.get("normalize_x", True))
+    max_abs_thr = _safe_float(watch_cfg.get("max_abs"))
+    max_pct_thr = _safe_float(watch_cfg.get("max_pct"))
+    rms_pct_thr = _safe_float(watch_cfg.get("rms_pct"))
+    z_pass = float(grade_cfg.get("zscore_pass_max") or 2.0)
+    z_watch = float(grade_cfg.get("zscore_watch_max") or 3.0)
+    colors = hi_cfg.get("colors") or ["#ef4444", "#3b82f6", "#22c55e", "#a855f7", "#f97316"]
+    colors = [str(color) for color in colors if str(color).strip()] or ["#ef4444"]
+
+    curves_summary: dict[str, dict[str, dict]] = {}
+    watch_items: list[dict] = []
+    grading_rows: list[dict] = []
+    for run in runs:
+        run_meta = run_by_name.get(run) or {}
+        run_selection = _selection_for_run(run, options)
+        x_name = _resolve_curve_x_key(be, db_path, run, str(run_meta.get("default_x") or "").strip() or "Time")
+        y_cols = []
+        try:
+            y_cols = be.td_list_curve_y_columns(db_path, run, x_name)
+        except Exception:
+            y_cols = []
+        if not y_cols:
+            try:
+                y_cols = be.td_list_raw_y_columns(db_path, run)
+            except Exception:
+                y_cols = []
+        if not y_cols:
+            y_cols = _td_list_y_columns(conn, run)
+        y_by_norm = {
+            _norm_key(str(col.get("name") or "")): col
+            for col in y_cols
+            if str(col.get("name") or "").strip()
+        }
+        for target_param in params:
+            actual_col = y_by_norm.get(_norm_key(target_param))
+            if not actual_col:
+                continue
+            y_name = str(actual_col.get("name") or "").strip()
+            units = str(actual_col.get("units") or "").strip()
+            series = _load_curves_for_selection(
+                be,
+                db_path,
+                run,
+                y_name,
+                x_name,
+                selection=run_selection,
+                filter_state=filter_state,
+            )
+            if not series:
+                continue
+            mins = [min(s.x) for s in series if s.x]
+            maxs = [max(s.x) for s in series if s.x]
+            if not mins or not maxs:
+                continue
+            overlap_lo = max(mins)
+            overlap_hi = min(maxs)
+            global_lo = min(mins)
+            global_hi = max(maxs)
+            lo = overlap_lo
+            hi_dom = overlap_hi
+            if not (math.isfinite(lo) and math.isfinite(hi_dom)) or (hi_dom - lo) <= 1e-12:
+                lo = global_lo
+                hi_dom = global_hi
+            if not (math.isfinite(lo) and math.isfinite(hi_dom)) or (hi_dom - lo) <= 1e-12:
+                continue
+
+            x_grid = [lo + (hi_dom - lo) * (idx / (grid_points - 1)) for idx in range(grid_points)]
+            y_resampled_by_sn = {s.serial: _interp_linear(s.x, s.y, x_grid) for s in series}
+            y_matrix = list(y_resampled_by_sn.values())
+            master_y = _nan_median(y_matrix)
+
+            fit_x: list[float] = []
+            fit_y: list[float] = []
+            for xv, yv in zip(x_grid, master_y):
+                if isinstance(yv, (int, float)) and not math.isnan(float(yv)):
+                    fit_x.append(float(xv))
+                    fit_y.append(float(yv))
+            poly = (
+                _poly_fit(fit_x, fit_y, degree, normalize_x=normalize_x)
+                if fit_x
+                else {"degree": degree, "coeffs": [], "rmse": None, "x0": None, "sx": None}
+            )
+            eqn = _fmt_equation(poly)
+            denom = max(
+                (
+                    abs(value)
+                    for value in master_y
+                    if isinstance(value, (int, float)) and not math.isnan(float(value))
+                ),
+                default=0.0,
+            )
+            denom = float(denom) if denom > 0 else 1.0
+
+            score_by_sn: dict[str, float] = {}
+            dev_by_sn: dict[str, dict] = {}
+            for serial, yv in y_resampled_by_sn.items():
+                residual: list[float] = []
+                for actual, baseline in zip(yv, master_y):
+                    if not (isinstance(actual, (int, float)) and not math.isnan(float(actual))):
+                        continue
+                    if not (isinstance(baseline, (int, float)) and not math.isnan(float(baseline))):
+                        continue
+                    residual.append(float(actual) - float(baseline))
+                if not residual:
+                    continue
+                max_abs = max(abs(value) for value in residual)
+                rms = math.sqrt(sum(value * value for value in residual) / max(1, len(residual)))
+                max_pct = (max_abs / denom) * 100.0
+                rms_pct = (rms / denom) * 100.0
+                peak_idx = 0
+                peak_abs = -1.0
+                for idx, (actual, baseline) in enumerate(zip(yv, master_y)):
+                    if not (isinstance(actual, (int, float)) and not math.isnan(float(actual))):
+                        continue
+                    if not (isinstance(baseline, (int, float)) and not math.isnan(float(baseline))):
+                        continue
+                    value_abs = abs(float(actual) - float(baseline))
+                    if value_abs > peak_abs:
+                        peak_abs = value_abs
+                        peak_idx = idx
+                x_at = float(x_grid[peak_idx]) if 0 <= peak_idx < len(x_grid) else None
+                score_by_sn[serial] = float(max_abs)
+                dev_by_sn[serial] = {
+                    "max_abs": float(max_abs),
+                    "rms": float(rms),
+                    "max_pct": float(max_pct),
+                    "rms_pct": float(rms_pct),
+                    "x_at_max_abs": x_at,
+                }
+
+            scores = [value for value in score_by_sn.values() if isinstance(value, (int, float)) and math.isfinite(float(value))]
+            mean_score = float(statistics.mean(scores)) if scores else 0.0
+            std_score = float(statistics.pstdev(scores)) if len(scores) > 1 else 1.0
+            if std_score == 0.0:
+                std_score = 1.0
+            for serial in hi:
+                dev = dev_by_sn.get(serial)
+                if not dev:
+                    continue
+                z_score = (float(dev.get("max_abs") or 0.0) - mean_score) / std_score if std_score else 0.0
+                grade = _grade_from_z(z_score, z_pass, z_watch)
+                grading_rows.append(
+                    {
+                        "serial": serial,
+                        "run": run,
+                        "param": y_name,
+                        "units": units,
+                        "max_abs": dev.get("max_abs"),
+                        "rms": dev.get("rms"),
+                        "max_pct": dev.get("max_pct"),
+                        "rms_pct": dev.get("rms_pct"),
+                        "x_at_max_abs": dev.get("x_at_max_abs"),
+                        "z": float(z_score),
+                        "grade": grade,
+                        "poly_rmse": poly.get("rmse"),
+                    }
+                )
+                watch = False
+                if max_abs_thr is not None and float(dev.get("max_abs") or 0.0) >= float(max_abs_thr):
+                    watch = True
+                if max_pct_thr is not None and float(dev.get("max_pct") or 0.0) >= float(max_pct_thr):
+                    watch = True
+                if rms_pct_thr is not None and float(dev.get("rms_pct") or 0.0) >= float(rms_pct_thr):
+                    watch = True
+                if watch:
+                    watch_items.append({"serial": serial, "run": run, "param": y_name, "units": units, **dev, "z": float(z_score), "grade": grade})
+
+            curves_summary.setdefault(run, {})[y_name] = {
+                "x_name": x_name,
+                "units": units,
+                "domain": [float(lo), float(hi_dom)],
+                "grid_points": int(grid_points),
+                "poly": poly,
+                "equation": eqn,
+                "watch_any": any(item.get("run") == run and item.get("param") == y_name for item in watch_items),
+            }
+
+    cache_meta_by_sn, cache_meta_note = _read_cached_source_metadata(conn)
+    workbook_meta_by_sn, workbook_meta_note = _read_workbook_metadata(wb)
+    gui_meta_by_sn, gui_meta_note = _read_gui_source_metadata(be, wb)
+    meta_by_sn: dict[str, dict[str, str]] = {}
+    for serial in sorted(set(cache_meta_by_sn.keys()) | set(workbook_meta_by_sn.keys()) | set(gui_meta_by_sn.keys())):
+        merged = dict(workbook_meta_by_sn.get(serial) or {})
+        for key, value in (cache_meta_by_sn.get(serial) or {}).items():
+            if str(value or "").strip():
+                merged[key] = str(value).strip()
+        for key, value in (gui_meta_by_sn.get(serial) or {}).items():
+            if str(value or "").strip():
+                merged[key] = str(value).strip()
+        meta_by_sn[serial] = merged
+    meta_note = ""
+    if not meta_by_sn:
+        meta_note = gui_meta_note or cache_meta_note or workbook_meta_note
+
+    ctx: dict[str, Any] = {
+        "be": be,
+        "print_ctx": print_ctx,
+        "proj": proj,
+        "wb": wb,
+        "out_pdf": out_pdf,
+        "db_path": db_path,
+        "excel_cfg": excel_cfg,
+        "report_cfg": report_cfg,
+        "report_opts": report_opts,
+        "options": options,
+        "conn": conn,
+        "run_rows": run_rows,
+        "run_by_name": run_by_name,
+        "runs": runs,
+        "params": params,
+        "all_serials": all_serials,
+        "hi": hi,
+        "filter_state": filter_state,
+        "metric_stats": metric_stats,
+        "include_metrics": include_metrics,
+        "grid_points": grid_points,
+        "colors": colors,
+        "meta_by_sn": meta_by_sn,
+        "meta_note": meta_note,
+        "change_summary": change_summary,
+        "curves_summary": curves_summary,
+        "watch_items": watch_items,
+        "grading_rows": grading_rows,
+        "report_title": print_ctx.report_title,
+        "report_subtitle": print_ctx.report_subtitle,
+    }
+
+    grade_map: dict[tuple[str, str, str], str] = {}
+    finding_by_key: dict[tuple[str, str, str], dict] = {}
+    for row in grading_rows:
+        serial = str(row.get("serial") or "").strip()
+        run_name = str(row.get("run") or "").strip()
+        param_name = str(row.get("param") or "").strip()
+        grade = str(row.get("grade") or "").strip().upper()
+        if serial and run_name and param_name and grade:
+            grade_map[(run_name, param_name, serial)] = grade
+            finding_by_key[(run_name, param_name, serial)] = dict(row)
+    ctx["grade_map"] = grade_map
+    ctx["finding_by_key"] = finding_by_key
+
+    comparison_rows: list[dict] = []
+    pair_specs: list[dict] = []
+    for run in runs:
+        run_selection = _selection_for_run(run, options)
+        run_fields = _selection_display_fields(run_selection, run_by_name)
+        run_title = _run_display_text(run, run_by_name) or run
+        params_run = curves_summary.get(run, {}) or {}
+        by_norm = {_norm_key(name): name for name in params_run.keys()}
+        for target_param in params:
+            actual = by_norm.get(_norm_key(target_param))
+            if not actual:
+                continue
+            model = params_run.get(actual) or {}
+            units = str(model.get("units") or "").strip()
+            vmap = _tar_metric_map_for_run(ctx, run, actual, "mean")
+            atp_mean = _tar_finite_mean_for_serials(vmap, all_serials)
+            actual_mean = _tar_finite_mean_for_serials(vmap, hi)
+            delta = float(actual_mean) - float(atp_mean) if atp_mean is not None and actual_mean is not None else None
+            row_grades = [grade_map.get((run, actual, serial), "NO_DATA") for serial in hi]
+            comparison_rows.append(
+                {
+                    "run": run,
+                    "run_title": run_title,
+                    "run_condition": run_fields.get("condition_text") or run_title,
+                    "sequence_text": run_fields.get("sequence_text") or run_title,
+                    "parameter": actual,
+                    "units": units,
+                    "atp_mean": atp_mean,
+                    "actual_mean": actual_mean,
+                    "delta": delta,
+                    "grade": _grade_token_for_summary(row_grades),
+                    "selection_mode": run_fields.get("mode") or "sequence",
+                }
+            )
+            pair_specs.append(
+                {
+                    "run": run,
+                    "run_title": run_title,
+                    "selection": dict(run_selection or {}),
+                    "selection_fields": run_fields,
+                    "param": actual,
+                    "units": units,
+                    "model": dict(model),
+                }
+            )
+
+    if not pair_specs:
+        raise RuntimeError("Auto Report could not find reportable curve data for the selected runs, parameters, and filters.")
+
+    run_param_pairs = [(str(spec.get("run") or ""), str(spec.get("param") or "")) for spec in pair_specs]
+    overall_by_sn = {
+        serial: _overall_cert_status([grade_map.get((run_name, param_name, serial), "NO_DATA") for run_name, param_name in run_param_pairs])
+        for serial in hi
+    }
+    nonpass_findings = [
+        row
+        for row in grading_rows
+        if str(row.get("grade") or "").strip().upper() in {"WATCH", "FAIL"}
+    ]
+    nonpass_findings = sorted(nonpass_findings, key=_finding_sort_key)
+    watch_chart_specs = _build_chart_specs(run_param_pairs=run_param_pairs, nonpass_findings=nonpass_findings, max_plots=None)
+
+    ctx["comparison_rows"] = comparison_rows
+    ctx["pair_specs"] = pair_specs
+    ctx["pair_by_key"] = {(str(spec.get("run") or ""), str(spec.get("param") or "")): spec for spec in pair_specs}
+    ctx["run_param_pairs"] = run_param_pairs
+    ctx["overall_by_sn"] = overall_by_sn
+    ctx["nonpass_findings"] = nonpass_findings
+    ctx["watch_pair_keys"] = [(run_name, param_name) for _score, run_name, param_name in watch_chart_specs]
+    return ctx
+
+
+def _tar_prepare_performance_models(ctx: dict[str, Any]) -> None:
+    excel_cfg = ctx["excel_cfg"]
+    options = ctx["options"]
+    conn = ctx["conn"]
+    be = ctx["be"]
+    raw_perf_opt = options.get("performance_plotters")
+    raw_perf = raw_perf_opt if isinstance(raw_perf_opt, list) else (excel_cfg.get("performance_plotters") if isinstance(excel_cfg, dict) else [])
+    performance_models: list[dict] = []
+    performance_plot_specs: list[dict] = []
+    equation_cards: list[dict] = []
+
+    if isinstance(raw_perf, list):
+        for perf_def in raw_perf:
+            if not isinstance(perf_def, dict):
+                continue
+            name = str(perf_def.get("name") or "Performance").strip() or "Performance"
+            x_spec = perf_def.get("x") or {}
+            y_spec = perf_def.get("y") or {}
+            x_target = str((x_spec.get("column") if isinstance(x_spec, dict) else "") or "").strip()
+            y_target = str((y_spec.get("column") if isinstance(y_spec, dict) else "") or "").strip()
+            if not x_target or not y_target:
+                continue
+            stats_list = perf_def.get("stats")
+            if isinstance(stats_list, list):
+                perf_stats = [str(value).strip().lower() for value in stats_list if str(value).strip()]
+            else:
+                legacy_stat = str((x_spec.get("stat") if isinstance(x_spec, dict) else "mean") or "mean").strip().lower()
+                perf_stats = [legacy_stat] if legacy_stat else ["mean"]
+            if not perf_stats:
+                perf_stats = ["mean"]
+            require_min_points = max(2, int(perf_def.get("require_min_points") or 2))
+            fit_cfg = perf_def.get("fit") or {}
+            fit_degree = max(0, int((fit_cfg.get("degree") if isinstance(fit_cfg, dict) else 0) or 0))
+            fit_norm = bool((fit_cfg.get("normalize_x") if isinstance(fit_cfg, dict) else True))
+
+            for perf_stat in perf_stats:
+                curves, pooled_x, pooled_y, x_units, y_units = _collect_performance_curves_for_stat(
+                    be=be,
+                    db_path=ctx["db_path"],
+                    conn=conn,
+                    run_by_name=ctx["run_by_name"],
+                    runs=ctx["runs"],
+                    serials=ctx["all_serials"],
+                    x_target=x_target,
+                    y_target=y_target,
+                    stat=perf_stat,
+                    options=options,
+                    require_min_points=require_min_points,
+                    filter_state=ctx["filter_state"],
+                )
+                if not curves:
+                    continue
+
+                master_poly: dict = {"degree": int(fit_degree), "coeffs": [], "rmse": None, "x0": None, "sx": None}
+                master_eqn = ""
+                if fit_degree > 0 and pooled_x:
+                    try:
+                        master_poly = _poly_fit(pooled_x, pooled_y, int(fit_degree), normalize_x=fit_norm)
+                        master_eqn = _fmt_equation(master_poly)
+                    except Exception:
+                        master_poly = {"degree": int(fit_degree), "coeffs": [], "rmse": None, "x0": None, "sx": None}
+                        master_eqn = ""
+
+                highlighted_models: dict[str, dict] = {}
+                if fit_degree > 0:
+                    for serial in ctx["hi"]:
+                        pts = curves.get(serial)
+                        if not pts:
+                            continue
+                        try:
+                            xs = [point[0] for point in pts]
+                            ys = [point[1] for point in pts]
+                            poly = _poly_fit(xs, ys, int(fit_degree), normalize_x=fit_norm)
+                            highlighted_models[serial] = {
+                                "poly": poly,
+                                "equation": _fmt_equation(poly),
+                                "rmse": poly.get("rmse"),
+                            }
+                        except Exception:
+                            continue
+
+                model_row = {
+                    "name": name,
+                    "x": {"column": x_target, "units": x_units},
+                    "y": {"column": y_target, "units": y_units},
+                    "stat": perf_stat,
+                    "fit": {"degree": int(fit_degree), "normalize_x": bool(fit_norm)},
+                    "require_min_points": int(require_min_points),
+                    "points_total": int(len(pooled_x)),
+                    "serials_curves": int(len(curves)),
+                    "master": {"poly": master_poly, "equation": master_eqn, "rmse": master_poly.get("rmse")},
+                    "highlighted": highlighted_models,
+                }
+                performance_models.append(model_row)
+                performance_plot_specs.append(
+                    {
+                        **model_row,
+                        "curves": curves,
+                        "pooled_x": list(pooled_x),
+                        "highlighted_serials": [serial for serial in ctx["hi"] if serial in curves],
+                    }
+                )
+
+                if master_eqn:
+                    equation_cards.append(
+                        {
+                            "kind": "family",
+                            "title": f"{name} | Family Fit",
+                            "lines": [
+                                f"Parameters: {y_target} vs {x_target}",
+                                f"Statistic: {perf_stat}",
+                                f"Equation: {master_eqn}",
+                                f"RMSE: {_fmt_num(master_poly.get('rmse'), sig=5)}",
+                                f"Curves included: {len(curves)}",
+                            ],
+                        }
+                    )
+                for serial in ctx["hi"]:
+                    highlighted = highlighted_models.get(serial)
+                    if not isinstance(highlighted, dict):
+                        continue
+                    equation = str(highlighted.get("equation") or "").strip()
+                    if not equation:
+                        continue
+                    equation_cards.append(
+                        {
+                            "kind": "serial",
+                            "title": f"{name} | {serial}",
+                            "lines": [
+                                f"Parameters: {y_target} vs {x_target}",
+                                f"Statistic: {perf_stat}",
+                                f"Equation: {equation}",
+                                f"RMSE: {_fmt_num(highlighted.get('rmse'), sig=5)}",
+                            ],
+                        }
+                    )
+
+    ctx["performance_models"] = performance_models
+    ctx["performance_plot_specs"] = performance_plot_specs
+    ctx["equation_cards"] = equation_cards
+
+
+def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
+    rl = _reportlab_imports()
+    styles = _build_portrait_styles(rl)
+    Spacer = rl["Spacer"]
+    PageBreak = rl["PageBreak"]
+    inch = rl["inch"]
+
+    scope_modes = {
+        str(spec.get("selection_fields", {}).get("mode") or "sequence").strip().lower()
+        for spec in (ctx.get("pair_specs") or [])
+    }
+    if scope_modes == {"condition"}:
+        scope_mode_label = "Run Condition"
+    elif scope_modes == {"sequence"}:
+        scope_mode_label = "Sequence"
+    else:
+        scope_mode_label = "Mixed"
+
+    selection_labels = ctx.get("options", {}).get("run_selection_labels")
+    if isinstance(selection_labels, list):
+        selected_scope_items = [str(value).strip() for value in selection_labels if str(value).strip()]
+    else:
+        selected_scope_items = [
+            str(spec.get("selection_fields", {}).get("display_text") or "").strip()
+            for spec in (ctx.get("pair_specs") or [])
+            if str(spec.get("selection_fields", {}).get("display_text") or "").strip()
+        ]
+
+    status_counts = {
+        "CERTIFIED": sum(1 for status in (ctx.get("overall_by_sn") or {}).values() if status == "CERTIFIED"),
+        "WATCH": sum(1 for status in (ctx.get("overall_by_sn") or {}).values() if status == "WATCH"),
+        "FAILED": sum(1 for status in (ctx.get("overall_by_sn") or {}).values() if status == "FAILED"),
+        "NO_DATA": sum(1 for status in (ctx.get("overall_by_sn") or {}).values() if status == "NO_DATA"),
+    }
+    highlight_lines = []
+    nonpass_findings = list(ctx.get("nonpass_findings") or [])
+    pair_by_key = ctx.get("pair_by_key") or {}
+    if nonpass_findings:
+        for finding in nonpass_findings[:8]:
+            run_name = str(finding.get("run") or "").strip()
+            param_name = str(finding.get("param") or "").strip()
+            pair = pair_by_key.get((run_name, param_name)) or {}
+            display_text = str((pair.get("selection_fields") or {}).get("display_text") or "").strip() or run_name
+            highlight_lines.append(
+                f"{finding.get('serial')} | {display_text} | {param_name} | {finding.get('grade')} | "
+                f"Max % {_fmt_num(finding.get('max_pct'))} | z {_fmt_num(finding.get('z'), sig=4)}"
+            )
+        if len(nonpass_findings) > len(highlight_lines):
+            highlight_lines.append(f"+{len(nonpass_findings) - len(highlight_lines)} more WATCH / FAIL findings")
+    else:
+        highlight_lines = ["No WATCH or FAIL curve findings for the selected certification serials."]
+
+    story: list[Any] = []
+    print_ctx = ctx["print_ctx"]
+    story.append(_portrait_paragraph(print_ctx.report_title, styles["cover_title"], rl))
+    story.append(_portrait_paragraph(print_ctx.report_subtitle, styles["cover_subtitle"], rl))
+    story.append(
+        _portrait_paragraph(
+            "This report validates ATP run criteria against family data and compares the selected certification serials "
+            "to the compiled family baseline for the chosen run scope.",
+            styles["body"],
+            rl,
+        )
+    )
+    story.append(Spacer(1, 0.14 * inch))
+    story.append(
+        _portrait_box_table(
+            [
+                ["Serials Under Certification", "Runs Included", "Parameters Included", "Watch / Non-PASS Curves"],
+                [str(len(ctx.get("hi") or [])), str(len(ctx.get("runs") or [])), str(len(ctx.get("params") or [])), str(len(ctx.get("watch_pair_keys") or []))],
+            ],
+            col_widths=[1.7 * inch, 1.45 * inch, 1.45 * inch, 2.3 * inch],
+            styles=styles,
+            rl=rl,
+            repeat_rows=1,
+        )
+    )
+    story.append(Spacer(1, 0.12 * inch))
+    story.append(
+        _portrait_card(
+            "Certification Scope",
+            [
+                f"Scope mode: {scope_mode_label}",
+                f"Selected scope items: {_tar_join_limited(selected_scope_items, max_items=6, empty='(none)')}",
+                f"Selected serials: {_tar_join_limited(ctx.get('hi') or [], max_items=8, empty='(none)')}",
+                f"Metrics pages follow report analysis params: {_tar_join_limited(ctx.get('params') or [], max_items=8, empty='(none)')}",
+                f"Metrics statistics: {_tar_join_limited(ctx.get('metric_stats') or [], max_items=5, empty='(none)')}"
+                if ctx.get("include_metrics")
+                else "Metrics pages: disabled",
+                _tar_filter_summary_line(ctx, "programs", "Programs"),
+                _tar_filter_summary_line(ctx, "serials", "Serial filter"),
+                _tar_filter_summary_line(ctx, "control_periods", "Control Period"),
+                _tar_filter_summary_line(ctx, "suppression_voltages", "Suppression Voltage"),
+            ],
+            styles=styles,
+            rl=rl,
+        )
+    )
+    story.append(Spacer(1, 0.10 * inch))
+    story.append(
+        _portrait_card(
+            "Metadata Snapshot",
+            [
+                _tar_meta_summary_line(ctx, "program_title", "Program"),
+                _tar_meta_summary_line(ctx, "similarity_group", "Similarity Group"),
+                _tar_meta_summary_line(ctx, "acceptance_test_plan_number", "Acceptance Test Plan"),
+                _tar_meta_summary_line(ctx, "asset_type", "Asset Type"),
+                _tar_meta_summary_line(ctx, "vendor", "Vendor"),
+                _tar_meta_summary_line(ctx, "part_number", "Part Number"),
+                _tar_meta_summary_line(ctx, "revision", "Revision"),
+            ]
+            + ([f"Metadata note: {ctx.get('meta_note')}"] if str(ctx.get("meta_note") or "").strip() else []),
+            styles=styles,
+            rl=rl,
+        )
+    )
+    story.append(Spacer(1, 0.10 * inch))
+    story.append(
+        _portrait_card(
+            "Build Notes",
+            [
+                f"Printed: {print_ctx.printed_at}",
+                str(ctx.get("change_summary") or "").splitlines()[0] if str(ctx.get("change_summary") or "").strip() else "No config update summary available.",
+                "Legacy page caps and appendix trimming are disabled for this report layout.",
+            ],
+            styles=styles,
+            rl=rl,
+        )
+    )
+    story.append(PageBreak())
+
+    story.append(_portrait_paragraph("Executive Summary", styles["section"], rl))
+    story.append(
+        _portrait_card(
+            "Disposition",
+            [
+                f"CERTIFIED: {status_counts['CERTIFIED']}",
+                f"WATCH: {status_counts['WATCH']}",
+                f"FAILED: {status_counts['FAILED']}",
+                f"NO_DATA: {status_counts['NO_DATA']}",
+                f"Curves evaluated: {len(ctx.get('pair_specs') or [])}",
+                f"Performance plots configured: {len(ctx.get('performance_plot_specs') or [])}",
+            ],
+            styles=styles,
+            rl=rl,
+        )
+    )
+    story.append(Spacer(1, 0.10 * inch))
+    story.append(_portrait_card("Watch / Review Highlights", highlight_lines, styles=styles, rl=rl))
+    story.append(Spacer(1, 0.10 * inch))
+
+    exec_rows = [
+        [
+            serial,
+            (ctx.get("overall_by_sn") or {}).get(serial, "NO_DATA"),
+            _tar_meta(ctx, serial, "program_title"),
+            _tar_meta(ctx, serial, "part_number"),
+            _tar_meta(ctx, serial, "revision"),
+            _tar_meta(ctx, serial, "acceptance_test_plan_number"),
+            _tar_meta(ctx, serial, "similarity_group"),
+        ]
+        for serial in (ctx.get("hi") or [])
+    ]
+    for start in range(0, len(exec_rows), 14):
+        if start:
+            story.append(PageBreak())
+            story.append(_portrait_paragraph("Executive Summary (Continued)", styles["section"], rl))
+        story.append(
+            _portrait_box_table(
+                [["Serial", "Overall", "Program", "Part #", "Rev", "ATP", "Similarity Group"], *exec_rows[start : start + 14]],
+                col_widths=[0.78 * inch, 0.78 * inch, 1.25 * inch, 1.00 * inch, 0.48 * inch, 1.05 * inch, 1.36 * inch],
+                styles=styles,
+                rl=rl,
+                repeat_rows=1,
+                compact=True,
+            )
+        )
+
+    story.append(PageBreak())
+    story.append(_portrait_paragraph("Run Comparison", styles["section"], rl))
+    story.append(
+        _portrait_paragraph(
+            "Each row compares the ATP family mean to the actual mean of the selected certification serials for the same run scope and parameter.",
+            styles["body"],
+            rl,
+        )
+    )
+    comparison_rows = [
+        [
+            row.get("run_condition") or "",
+            row.get("sequence_text") or "",
+            row.get("parameter") or "",
+            row.get("units") or "",
+            _fmt_num(row.get("atp_mean"), sig=5),
+            _fmt_num(row.get("actual_mean"), sig=5),
+            _fmt_num(row.get("delta"), sig=5),
+            row.get("grade") or "",
+        ]
+        for row in (ctx.get("comparison_rows") or [])
+    ]
+    for start in range(0, len(comparison_rows), 16):
+        if start:
+            story.append(PageBreak())
+            story.append(_portrait_paragraph("Run Comparison (Continued)", styles["section"], rl))
+        story.append(
+            _portrait_box_table(
+                [["Run Condition", "Sequence(s)", "Parameter", "Units", "ATP Mean", "Actual Mean", "Delta", "Grade"], *comparison_rows[start : start + 16]],
+                col_widths=[1.12 * inch, 1.70 * inch, 0.88 * inch, 0.62 * inch, 0.82 * inch, 0.92 * inch, 0.72 * inch, 0.68 * inch],
+                styles=styles,
+                rl=rl,
+                repeat_rows=1,
+                compact=True,
+            )
+        )
+
+    story.append(PageBreak())
+    story.append(_portrait_paragraph("Performance Equations", styles["section"], rl))
+    story.append(
+        _portrait_paragraph(
+            "Performance equations are shown as wrapped callouts so long expressions do not overflow table cells.",
+            styles["body"],
+            rl,
+        )
+    )
+    equation_cards = list(ctx.get("equation_cards") or [])
+    if equation_cards:
+        for card in equation_cards:
+            story.append(_portrait_card(str(card.get("title") or "Equation"), list(card.get("lines") or []), styles=styles, rl=rl))
+            story.append(Spacer(1, 0.08 * inch))
+    else:
+        story.append(
+            _portrait_card(
+                "Performance Equations",
+                ["No configured performance plots produced reportable equation fits for the current report selection."],
+                styles=styles,
+                rl=rl,
+            )
+        )
+    return story
+
+
+def _tar_render_plot_sections(ctx: Mapping[str, Any], *, intro_pages: int, plots_pdf: Path) -> dict[str, Any]:
+    from matplotlib.backends.backend_pdf import PdfPages  # type: ignore
+    import matplotlib.pyplot as plt  # type: ignore
+
+    plot_page_count = 0
+    metric_plot_count = 0
+    curve_plot_count = 0
+    performance_plot_count = 0
+    watch_plot_count = 0
+    plot_specs: list[dict] = []
+
+    metric_page_specs = (
+        [(spec, stat) for spec in (ctx.get("pair_specs") or []) for stat in (ctx.get("metric_stats") or [])]
+        if ctx.get("include_metrics")
+        else []
+    )
+    if not (metric_page_specs or ctx.get("pair_specs") or ctx.get("performance_plot_specs") or ctx.get("watch_pair_keys")):
+        return {
+            "plot_page_count": 0,
+            "metric_plot_count": 0,
+            "curve_plot_count": 0,
+            "performance_plot_count": 0,
+            "watch_plot_count": 0,
+            "plot_specs": [],
+        }
+
+    with PdfPages(plots_pdf) as pdf:
+        for pair_spec, metric_stat in metric_page_specs:
+            run_name = str(pair_spec.get("run") or "").strip()
+            param_name = str(pair_spec.get("param") or "").strip()
+            units = str(pair_spec.get("units") or "").strip()
+            selection = pair_spec.get("selection") or {}
+            page_number = intro_pages + plot_page_count + 1
+            fig, ax = _create_landscape_plot_page(
+                print_ctx=ctx["print_ctx"],
+                page_number=page_number,
+                section_title="Plot Metrics",
+                section_subtitle=_tar_subtitle_text(
+                    _selection_title_text(selection, ctx["run_by_name"], suffix=f"Parameter: {param_name} | Statistic: {metric_stat}")
+                ),
+            )
+            run_title = str(pair_spec.get("run_title") or run_name).strip() or run_name
+            vmap = _tar_metric_map_for_run(ctx, run_name, param_name, metric_stat)
+            serials = list(ctx.get("all_serials") or [])
+            x_idx = list(range(len(serials)))
+            yv = [
+                float(vmap.get(serial))
+                if isinstance(vmap.get(serial), (int, float)) and math.isfinite(float(vmap.get(serial)))
+                else float("nan")
+                for serial in serials
+            ]
+            if any(isinstance(value, float) and not math.isnan(value) for value in yv):
+                ax.set_title(f"{run_title} - {param_name} ({metric_stat})", loc="left", fontsize=13, fontweight="bold", pad=10)
+                ax.set_xlabel("Program + Serial Number")
+                ax.set_ylabel(f"{param_name} ({units})" if units else param_name)
+                ax.plot(x_idx, yv, marker="o", linewidth=1.0, alpha=0.35, color="#64748b")
+                finite_vals = [float(value) for value in yv if isinstance(value, float) and not math.isnan(value)]
+                if finite_vals:
+                    ax.axhline(float(statistics.mean(finite_vals)), color="#0f172a", linestyle="--", linewidth=1.2, alpha=0.65, label="Family mean")
+                for serial in (ctx.get("hi") or []):
+                    if serial not in serials:
+                        continue
+                    xi = serials.index(serial)
+                    y_val = yv[xi]
+                    if math.isnan(y_val):
+                        continue
+                    grade = (ctx.get("grade_map") or {}).get((run_name, param_name, serial), "NO_DATA")
+                    color = _tar_grade_color(grade)
+                    ax.scatter([xi], [y_val], s=44, color=color, zorder=5, label=f"{serial} ({grade})")
+                    ax.axvline(xi, color=color, linewidth=0.9, alpha=0.10)
+                tick_labels = [_tar_metric_tick_label(ctx, serial) for serial in serials]
+                tick_step = max(1, int(math.ceil(len(serials) / 18.0)))
+                tick_idx = x_idx[::tick_step]
+                ax.set_xticks(tick_idx)
+                ax.set_xticklabels([tick_labels[idx] for idx in tick_idx], rotation=45, ha="right", fontsize=7)
+                ax.set_xlim(-0.5, len(serials) - 0.5)
+                ax.grid(True, axis="y", alpha=0.25)
+                try:
+                    handles, labels = ax.get_legend_handles_labels()
+                    uniq: dict[str, Any] = {}
+                    for handle, label in zip(handles, labels):
+                        if label not in uniq:
+                            uniq[label] = handle
+                    if uniq:
+                        ax.legend(list(uniq.values()), list(uniq.keys()), fontsize=8, loc="best")
+                except Exception:
+                    pass
+                pdf.savefig(fig)
+                plot_page_count += 1
+                metric_plot_count += 1
+                plot_specs.append({"section": "plot_metrics", "run": run_name, "param": param_name, "stat": metric_stat, "page_number": intro_pages + plot_page_count})
+            plt.close(fig)
+
+        for pair_spec in (ctx.get("pair_specs") or []):
+            run_name = str(pair_spec.get("run") or "").strip()
+            param_name = str(pair_spec.get("param") or "").strip()
+            selection = pair_spec.get("selection") or {}
+            run_meta = (ctx.get("run_by_name") or {}).get(run_name) or {}
+            x_name = _resolve_curve_x_key(ctx["be"], ctx["db_path"], run_name, str(run_meta.get("default_x") or "").strip() or "Time")
+            series = _load_curves_for_selection(
+                ctx["be"],
+                ctx["db_path"],
+                run_name,
+                param_name,
+                x_name,
+                selection=selection,
+                filter_state=ctx["filter_state"],
+            )
+            model = pair_spec.get("model") or {}
+            domain = model.get("domain") or []
+            if not series or not isinstance(domain, list) or len(domain) < 2:
+                continue
+            lo = float(domain[0])
+            hi_dom = float(domain[1])
+            x_grid = [lo + (hi_dom - lo) * (idx / (ctx["grid_points"] - 1)) for idx in range(ctx["grid_points"])]
+            y_resampled_by_sn = {curve.serial: _interp_linear(curve.x, curve.y, x_grid) for curve in series}
+            y_matrix = list(y_resampled_by_sn.values())
+            master_y = _nan_median(y_matrix)
+            std_y = _nan_std(y_matrix)
+            page_number = intro_pages + plot_page_count + 1
+            fig, ax = _create_landscape_plot_page(
+                print_ctx=ctx["print_ctx"],
+                page_number=page_number,
+                section_title="Curve Overlay",
+                section_subtitle=_tar_subtitle_text(_selection_title_text(selection, ctx["run_by_name"], suffix=f"Parameter: {param_name}")),
+            )
+            ax.set_position([0.06, 0.10, 0.66, 0.68])
+            ax_side = fig.add_axes([0.76, 0.12, 0.20, 0.64])
+            ax_side.axis("off")
+            run_title = str(pair_spec.get("run_title") or run_name).strip() or run_name
+            units = str(pair_spec.get("units") or "").strip()
+            ax.set_title(f"{run_title} - {param_name}", loc="left", fontsize=13, fontweight="bold", pad=10)
+            ax.set_xlabel(x_name)
+            ax.set_ylabel(f"{param_name} ({units})" if units else param_name)
+            for curve in series:
+                if curve.serial in (ctx.get("hi") or []):
+                    continue
+                y_curve = y_resampled_by_sn.get(curve.serial)
+                if y_curve:
+                    ax.plot(x_grid, y_curve, linewidth=0.8, alpha=0.09, color="#94a3b8")
+            ax.plot(x_grid, master_y, linewidth=2.1, color="#0f172a", label="Family median")
+            try:
+                band_lo = [a - b if (isinstance(a, (int, float)) and not math.isnan(float(a)) and isinstance(b, (int, float)) and not math.isnan(float(b))) else float("nan") for a, b in zip(master_y, std_y)]
+                band_hi = [a + b if (isinstance(a, (int, float)) and not math.isnan(float(a)) and isinstance(b, (int, float)) and not math.isnan(float(b))) else float("nan") for a, b in zip(master_y, std_y)]
+                ax.fill_between(x_grid, band_lo, band_hi, color="#93c5fd", alpha=0.22, label="Family +/-1 sigma")
+            except Exception:
+                pass
+            note_lines: list[str] = []
+            family_equation = str((model.get("equation") or "")).strip()
+            if family_equation:
+                note_lines.append("Family equation")
+                note_lines.extend(textwrap.wrap(family_equation, width=30) or [family_equation])
+                note_lines.append(f"RMSE: {_fmt_num((model.get('poly') or {}).get('rmse'), sig=5)}")
+                note_lines.append("")
+            for idx, serial in enumerate(ctx.get("hi") or []):
+                y_curve = y_resampled_by_sn.get(serial)
+                if not y_curve:
+                    continue
+                grade = (ctx.get("grade_map") or {}).get((run_name, param_name, serial), "NO_DATA")
+                color = ctx["colors"][idx % len(ctx["colors"])] if grade not in {"WATCH", "FAIL"} else _tar_grade_color(grade)
+                ax.plot(x_grid, y_curve, linewidth=1.8, color=color, label=f"{serial} ({grade})")
+                finding = (ctx.get("finding_by_key") or {}).get((run_name, param_name, serial)) or {}
+                if finding:
+                    note_lines.append(f"{serial} ({grade}) | Max % {_fmt_num(finding.get('max_pct'))} | z {_fmt_num(finding.get('z'), sig=4)}")
+            ax.grid(True, alpha=0.25)
+            try:
+                handles, labels = ax.get_legend_handles_labels()
+                uniq = {}
+                for handle, label in zip(handles, labels):
+                    if label not in uniq:
+                        uniq[label] = handle
+                if uniq:
+                    ax.legend(list(uniq.values()), list(uniq.keys()), fontsize=8, loc="best")
+            except Exception:
+                pass
+            ax_side.text(0.0, 1.0, "\n".join(note_lines[:18]), va="top", ha="left", fontsize=8, color="#0f172a")
+            pdf.savefig(fig)
+            plot_page_count += 1
+            curve_plot_count += 1
+            plot_specs.append({"section": "curve_overlays", "run": run_name, "param": param_name, "page_number": intro_pages + plot_page_count})
+            plt.close(fig)
+
+        for perf_spec in (ctx.get("performance_plot_specs") or []):
+            name = str(perf_spec.get("name") or "Performance").strip() or "Performance"
+            x_target = str(((perf_spec.get("x") or {}).get("column") or "")).strip()
+            y_target = str(((perf_spec.get("y") or {}).get("column") or "")).strip()
+            perf_stat = str(perf_spec.get("stat") or "").strip()
+            curves = perf_spec.get("curves") or {}
+            if not isinstance(curves, dict) or not curves:
+                continue
+            page_number = intro_pages + plot_page_count + 1
+            fig, ax = _create_landscape_plot_page(
+                print_ctx=ctx["print_ctx"],
+                page_number=page_number,
+                section_title="Performance Plot",
+                section_subtitle=_tar_subtitle_text(f"{name} | {y_target} vs {x_target} | Statistic: {perf_stat}"),
+            )
+            ax.set_position([0.06, 0.10, 0.66, 0.68])
+            ax_side = fig.add_axes([0.76, 0.12, 0.20, 0.64])
+            ax_side.axis("off")
+            x_units = str(((perf_spec.get("x") or {}).get("units") or "")).strip()
+            y_units = str(((perf_spec.get("y") or {}).get("units") or "")).strip()
+            ax.set_title(f"{name} - {perf_stat}", loc="left", fontsize=13, fontweight="bold", pad=10)
+            ax.set_xlabel(f"{x_target}.{perf_stat}" + (f" ({x_units})" if x_units else ""))
+            ax.set_ylabel(f"{y_target}.{perf_stat}" + (f" ({y_units})" if y_units else ""))
+            highlighted_models = perf_spec.get("highlighted") or {}
+            highlighted_serials = [serial for serial in (ctx.get("hi") or []) if serial in curves]
+            for serial, pts in curves.items():
+                if serial in highlighted_serials:
+                    continue
+                xs = [point[0] for point in pts]
+                ys = [point[1] for point in pts]
+                ax.plot(xs, ys, linewidth=0.9, alpha=0.10, color="#64748b")
+            master_poly = (perf_spec.get("master") or {}).get("poly") or {}
+            if master_poly.get("coeffs") and perf_spec.get("pooled_x"):
+                try:
+                    import numpy as np  # type: ignore
+                    pooled_x = perf_spec.get("pooled_x") or []
+                    xfit = np.linspace(float(min(pooled_x)), float(max(pooled_x)), 240)
+                    pfit = np.poly1d(master_poly.get("coeffs") or [])
+                    fit_norm = bool((perf_spec.get("fit") or {}).get("normalize_x"))
+                    xfit_n = (xfit - float(master_poly.get("x0") or 0.0)) / (float(master_poly.get("sx") or 1.0) or 1.0) if fit_norm else xfit
+                    yfit = pfit(xfit_n)
+                    ax.plot(xfit.tolist(), yfit.tolist(), linestyle="--", linewidth=1.7, alpha=0.70, color="#0f172a", label="Family fit")
+                except Exception:
+                    pass
+            note_lines: list[str] = []
+            master_eqn = str((perf_spec.get("master") or {}).get("equation") or "").strip()
+            if master_eqn:
+                note_lines.append("Family equation")
+                note_lines.extend(textwrap.wrap(master_eqn, width=30) or [master_eqn])
+                note_lines.append(f"RMSE: {_fmt_num((perf_spec.get('master') or {}).get('rmse'), sig=5)}")
+                note_lines.append("")
+            for idx, serial in enumerate(highlighted_serials):
+                pts = curves.get(serial)
+                if not pts:
+                    continue
+                xs = [point[0] for point in pts]
+                ys = [point[1] for point in pts]
+                color = ctx["colors"][idx % len(ctx["colors"])]
+                ax.plot(xs, ys, marker="o", linewidth=2.1, alpha=0.95, color=color, label=serial)
+                for x_val, y_val, run_label in pts:
+                    ax.annotate(str(run_label), (x_val, y_val), textcoords="offset points", xytext=(4, 4), fontsize=7, alpha=0.75, color=color)
+                highlighted_model = highlighted_models.get(serial) if isinstance(highlighted_models, dict) else None
+                poly = highlighted_model.get("poly") if isinstance(highlighted_model, dict) else None
+                fit_norm = bool((perf_spec.get("fit") or {}).get("normalize_x"))
+                if isinstance(poly, dict) and poly.get("coeffs"):
+                    try:
+                        import numpy as np  # type: ignore
+                        xfit = np.linspace(float(min(xs)), float(max(xs)), 200)
+                        pfit = np.poly1d(poly.get("coeffs") or [])
+                        xfit_n = (xfit - float(poly.get("x0") or 0.0)) / (float(poly.get("sx") or 1.0) or 1.0) if fit_norm else xfit
+                        yfit = pfit(xfit_n)
+                        ax.plot(xfit.tolist(), yfit.tolist(), linestyle="--", linewidth=1.3, alpha=0.75, color=color)
+                    except Exception:
+                        pass
+                if isinstance(highlighted_model, dict):
+                    eqn = str(highlighted_model.get("equation") or "").strip()
+                    if eqn:
+                        note_lines.append(f"{serial}")
+                        note_lines.extend(textwrap.wrap(eqn, width=30) or [eqn])
+                        note_lines.append(f"RMSE: {_fmt_num(highlighted_model.get('rmse'), sig=5)}")
+                        note_lines.append("")
+            ax.grid(True, alpha=0.25)
+            try:
+                handles, labels = ax.get_legend_handles_labels()
+                uniq = {}
+                for handle, label in zip(handles, labels):
+                    if label not in uniq:
+                        uniq[label] = handle
+                if uniq:
+                    ax.legend(list(uniq.values()), list(uniq.keys()), fontsize=8, loc="best")
+            except Exception:
+                pass
+            ax_side.text(0.0, 1.0, "\n".join(note_lines[:28]), va="top", ha="left", fontsize=8, color="#0f172a")
+            pdf.savefig(fig)
+            plot_page_count += 1
+            performance_plot_count += 1
+            plot_specs.append({"section": "performance_plots", "name": name, "x": x_target, "y": y_target, "stat": perf_stat, "page_number": intro_pages + plot_page_count})
+            plt.close(fig)
+
+        for run_name, param_name in (ctx.get("watch_pair_keys") or []):
+            pair_spec = (ctx.get("pair_by_key") or {}).get((run_name, param_name))
+            if not pair_spec:
+                continue
+            selection = pair_spec.get("selection") or {}
+            run_meta = (ctx.get("run_by_name") or {}).get(run_name) or {}
+            x_name = _resolve_curve_x_key(ctx["be"], ctx["db_path"], run_name, str(run_meta.get("default_x") or "").strip() or "Time")
+            series = _load_curves_for_selection(
+                ctx["be"],
+                ctx["db_path"],
+                run_name,
+                param_name,
+                x_name,
+                selection=selection,
+                filter_state=ctx["filter_state"],
+            )
+            model = pair_spec.get("model") or {}
+            domain = model.get("domain") or []
+            if not series or not isinstance(domain, list) or len(domain) < 2:
+                continue
+            focus_serials = [serial for serial in (ctx.get("hi") or []) if (ctx.get("grade_map") or {}).get((run_name, param_name, serial), "NO_DATA") in {"WATCH", "FAIL"}]
+            if not focus_serials:
+                continue
+            lo = float(domain[0])
+            hi_dom = float(domain[1])
+            x_grid = [lo + (hi_dom - lo) * (idx / (ctx["grid_points"] - 1)) for idx in range(ctx["grid_points"])]
+            y_resampled_by_sn = {curve.serial: _interp_linear(curve.x, curve.y, x_grid) for curve in series}
+            y_matrix = list(y_resampled_by_sn.values())
+            master_y = _nan_median(y_matrix)
+            std_y = _nan_std(y_matrix)
+            page_number = intro_pages + plot_page_count + 1
+            fig, ax = _create_landscape_plot_page(
+                print_ctx=ctx["print_ctx"],
+                page_number=page_number,
+                section_title="Watch / Non-PASS Curves",
+                section_subtitle=_tar_subtitle_text(_selection_title_text(selection, ctx["run_by_name"], suffix=f"Parameter: {param_name}")),
+            )
+            ax.set_position([0.06, 0.10, 0.66, 0.68])
+            ax_side = fig.add_axes([0.76, 0.12, 0.20, 0.64])
+            ax_side.axis("off")
+            units = str(pair_spec.get("units") or "").strip()
+            run_title = str(pair_spec.get("run_title") or run_name).strip() or run_name
+            ax.set_title(f"{run_title} - {param_name}", loc="left", fontsize=13, fontweight="bold", pad=10)
+            ax.set_xlabel(x_name)
+            ax.set_ylabel(f"{param_name} ({units})" if units else param_name)
+            for curve in series:
+                if curve.serial in focus_serials:
+                    continue
+                y_curve = y_resampled_by_sn.get(curve.serial)
+                if y_curve:
+                    ax.plot(x_grid, y_curve, linewidth=0.8, alpha=0.08, color="#94a3b8")
+            ax.plot(x_grid, master_y, linewidth=2.1, color="#0f172a", label="Family median")
+            try:
+                band_lo = [a - b if (isinstance(a, (int, float)) and not math.isnan(float(a)) and isinstance(b, (int, float)) and not math.isnan(float(b))) else float("nan") for a, b in zip(master_y, std_y)]
+                band_hi = [a + b if (isinstance(a, (int, float)) and not math.isnan(float(a)) and isinstance(b, (int, float)) and not math.isnan(float(b))) else float("nan") for a, b in zip(master_y, std_y)]
+                ax.fill_between(x_grid, band_lo, band_hi, color="#fed7aa", alpha=0.18, label="Family +/-1 sigma")
+            except Exception:
+                pass
+            note_lines: list[str] = []
+            for idx, serial in enumerate(focus_serials):
+                y_curve = y_resampled_by_sn.get(serial)
+                if not y_curve:
+                    continue
+                grade = (ctx.get("grade_map") or {}).get((run_name, param_name, serial), "NO_DATA")
+                color = _tar_grade_color(grade, default=ctx["colors"][idx % len(ctx["colors"])])
+                ax.plot(x_grid, y_curve, linewidth=1.9, color=color, label=f"{serial} ({grade})")
+                finding = (ctx.get("finding_by_key") or {}).get((run_name, param_name, serial)) or {}
+                note_lines.append(f"{serial} ({grade})")
+                note_lines.append(f"Max %: {_fmt_num(finding.get('max_pct'))}")
+                note_lines.append(f"RMS %: {_fmt_num(finding.get('rms_pct'))}")
+                note_lines.append(f"z: {_fmt_num(finding.get('z'), sig=4)}")
+                note_lines.append("")
+            ax.grid(True, alpha=0.25)
+            try:
+                handles, labels = ax.get_legend_handles_labels()
+                uniq = {}
+                for handle, label in zip(handles, labels):
+                    if label not in uniq:
+                        uniq[label] = handle
+                if uniq:
+                    ax.legend(list(uniq.values()), list(uniq.keys()), fontsize=8, loc="best")
+            except Exception:
+                pass
+            ax_side.text(0.0, 1.0, "\n".join(note_lines[:24]), va="top", ha="left", fontsize=8, color="#0f172a")
+            pdf.savefig(fig)
+            plot_page_count += 1
+            watch_plot_count += 1
+            plot_specs.append({"section": "watch_nonpass_curves", "run": run_name, "param": param_name, "serials": list(focus_serials), "page_number": intro_pages + plot_page_count})
+            plt.close(fig)
+
+    return {
+        "plot_page_count": plot_page_count,
+        "metric_plot_count": metric_plot_count,
+        "curve_plot_count": curve_plot_count,
+        "performance_plot_count": performance_plot_count,
+        "watch_plot_count": watch_plot_count,
+        "plot_specs": plot_specs,
+    }
+
+
+def _tar_build_closing_story(ctx: Mapping[str, Any], *, counts: Mapping[str, int]) -> list[Any]:
+    rl = _reportlab_imports()
+    styles = _build_portrait_styles(rl)
+    Spacer = rl["Spacer"]
+    inch = rl["inch"]
+
+    overall_by_sn = ctx.get("overall_by_sn") or {}
+    nonpass_by_sn: dict[str, list[dict]] = {}
+    for row in (ctx.get("nonpass_findings") or []):
+        serial = str(row.get("serial") or "").strip()
+        if serial:
+            nonpass_by_sn.setdefault(serial, []).append(row)
+
+    status_counts = {
+        "CERTIFIED": sum(1 for status in overall_by_sn.values() if status == "CERTIFIED"),
+        "WATCH": sum(1 for status in overall_by_sn.values() if status == "WATCH"),
+        "FAILED": sum(1 for status in overall_by_sn.values() if status == "FAILED"),
+        "NO_DATA": sum(1 for status in overall_by_sn.values() if status == "NO_DATA"),
+    }
+
+    story: list[Any] = []
+    story.append(_portrait_paragraph("Closing Summary", styles["section"], rl))
+    story.append(
+        _portrait_card(
+            "Report Inventory",
+            [
+                f"Printed: {ctx['print_ctx'].printed_at}",
+                f"Metric plot pages: {int(counts.get('metric_plot_count') or 0)}",
+                f"Curve overlay pages: {int(counts.get('curve_plot_count') or 0)}",
+                f"Performance plot pages: {int(counts.get('performance_plot_count') or 0)}",
+                f"Watch / Non-PASS curve pages: {int(counts.get('watch_plot_count') or 0)}",
+            ],
+            styles=styles,
+            rl=rl,
+        )
+    )
+    story.append(Spacer(1, 0.10 * inch))
+    story.append(
+        _portrait_card(
+            "Disposition Recap",
+            [
+                f"CERTIFIED serials: {status_counts['CERTIFIED']}",
+                f"WATCH serials: {status_counts['WATCH']}",
+                f"FAILED serials: {status_counts['FAILED']}",
+                f"NO_DATA serials: {status_counts['NO_DATA']}",
+            ],
+            styles=styles,
+            rl=rl,
+        )
+    )
+    story.append(Spacer(1, 0.10 * inch))
+    story.append(
+        _portrait_card(
+            "Family Data Summary",
+            [
+                _tar_meta_summary_line(ctx, "program_title", "Program"),
+                _tar_meta_summary_line(ctx, "similarity_group", "Similarity Group"),
+                _tar_meta_summary_line(ctx, "acceptance_test_plan_number", "Acceptance Test Plan"),
+                f"Certification serials: {_tar_join_limited(ctx.get('hi') or [], max_items=8, empty='(none)')}",
+                f"Selected scope items: {_tar_join_limited(ctx.get('options', {}).get('run_selection_labels') or [], max_items=6, empty='(none)')}",
+            ],
+            styles=styles,
+            rl=rl,
+        )
+    )
+    story.append(Spacer(1, 0.10 * inch))
+    outcome_rows = [
+        [
+            serial,
+            overall_by_sn.get(serial, "NO_DATA"),
+            str(len(nonpass_by_sn.get(serial) or [])),
+            _tar_meta(ctx, serial, "program_title"),
+            _tar_meta(ctx, serial, "acceptance_test_plan_number"),
+        ]
+        for serial in (ctx.get("hi") or [])
+    ]
+    story.append(
+        _portrait_box_table(
+            [["Serial", "Overall", "Watch/Fail Findings", "Program", "ATP"], *outcome_rows],
+            col_widths=[1.00 * inch, 1.00 * inch, 1.35 * inch, 2.20 * inch, 1.45 * inch],
+            styles=styles,
+            rl=rl,
+            repeat_rows=1,
+            compact=True,
+        )
+    )
+    nonpass_findings = list(ctx.get("nonpass_findings") or [])
+    if nonpass_findings:
+        story.append(Spacer(1, 0.12 * inch))
+        review_rows = [
+            [
+                str(row.get("serial") or ""),
+                str(row.get("run") or ""),
+                str(row.get("param") or ""),
+                str(row.get("grade") or ""),
+                _fmt_num(row.get("max_pct")),
+                _fmt_num(row.get("z"), sig=4),
+            ]
+            for row in nonpass_findings[:18]
+        ]
+        story.append(
+            _portrait_box_table(
+                [["Serial", "Run", "Parameter", "Grade", "Max %", "z"], *review_rows],
+                col_widths=[0.95 * inch, 1.35 * inch, 1.45 * inch, 0.80 * inch, 0.85 * inch, 0.80 * inch],
+                styles=styles,
+                rl=rl,
+                repeat_rows=1,
+                compact=True,
+            )
+        )
+        if len(nonpass_findings) > len(review_rows):
+            story.append(Spacer(1, 0.08 * inch))
+            story.append(
+                _portrait_paragraph(
+                    f"Additional WATCH / FAIL findings not shown in the closing table: {len(nonpass_findings) - len(review_rows)}",
+                    styles["small"],
+                    rl,
+                )
+            )
+    return story
+
+
+def generate_test_data_auto_report(
+    project_dir: Path,
+    workbook_path: Path,
+    output_pdf: Path,
+    *,
+    highlighted_serials: list[str],
+    options: dict,
+) -> dict:
+    try:
+        _ = _reportlab_imports()
+    except Exception:
+        raise
+
+    ctx = _tar_prepare_base(
+        project_dir,
+        workbook_path,
+        output_pdf,
+        highlighted_serials=highlighted_serials,
+        options=options,
+    )
+    try:
+        _tar_prepare_performance_models(ctx)
+        intro_story = _tar_build_intro_story(ctx)
+        out_pdf = Path(ctx["out_pdf"]).expanduser()
+        sidecar_path = out_pdf.with_suffix(".summary.json")
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp_dir:
+            tmp_root = Path(tmp_dir)
+            intro_pdf = tmp_root / "01_intro.pdf"
+            plots_pdf = tmp_root / "02_plots.pdf"
+            closing_pdf = tmp_root / "03_closing.pdf"
+
+            intro_pages = _render_portrait_story_pdf(intro_pdf, story=intro_story, print_ctx=ctx["print_ctx"], page_number_offset=0)
+            plot_counts = _tar_render_plot_sections(ctx, intro_pages=intro_pages, plots_pdf=plots_pdf)
+            section_order = ["cover", "executive_summary", "comparison_table", "performance_equations"]
+            if plot_counts["metric_plot_count"]:
+                section_order.append("plot_metrics")
+            if plot_counts["curve_plot_count"]:
+                section_order.append("curve_overlays")
+            if plot_counts["performance_plot_count"]:
+                section_order.append("performance_plots")
+            if plot_counts["watch_plot_count"]:
+                section_order.append("watch_nonpass_curves")
+            section_order.append("closing_summary")
+
+            closing_story = _tar_build_closing_story(ctx, counts=plot_counts)
+            closing_pages = _render_portrait_story_pdf(
+                closing_pdf,
+                story=closing_story,
+                print_ctx=ctx["print_ctx"],
+                page_number_offset=intro_pages + plot_counts["plot_page_count"],
+            )
+
+            merge_parts = [intro_pdf]
+            if plot_counts["plot_page_count"] and plots_pdf.exists():
+                merge_parts.append(plots_pdf)
+            merge_parts.append(closing_pdf)
+            try:
+                if out_pdf.exists():
+                    out_pdf.unlink()
+            except Exception:
+                pass
+            _merge_report_pdfs(out_pdf, merge_parts)
+            total_pages = intro_pages + plot_counts["plot_page_count"] + closing_pages
+
+        sidecar = {
+            "version": 3,
+            "generated_date": _now_datestr(),
+            "printed_at": ctx["print_ctx"].printed_at,
+            "printed_timezone": ctx["print_ctx"].printed_timezone,
+            "report_title": ctx["print_ctx"].report_title,
+            "report_subtitle": ctx["print_ctx"].report_subtitle,
+            "section_order": section_order,
+            "project_dir": str(ctx["proj"]),
+            "workbook_path": str(ctx["wb"]),
+            "db_path": str(ctx["db_path"]),
+            "output_pdf": str(out_pdf),
+            "total_pages": int(total_pages),
+            "report_config": ctx["report_cfg"],
+            "options": ctx["options"],
+            "investigated_serials": ctx["hi"],
+            "metadata_by_serial": {serial: (ctx["meta_by_sn"].get(serial) or {}) for serial in ctx["hi"]},
+            "overall_results_by_serial": ctx["overall_by_sn"],
+            "non_pass_findings": ctx["nonpass_findings"],
+            "runs": ctx["runs"],
+            "params": ctx["params"],
+            "metric_stats": ctx["metric_stats"],
+            "curve_models": ctx["curves_summary"],
+            "watch_items": ctx["watch_items"],
+            "grading": ctx["grading_rows"],
+            "comparison_rows": ctx["comparison_rows"],
+            "equation_cards": ctx["equation_cards"],
+            "plot_specs": plot_counts["plot_specs"],
+            "performance_models": ctx["performance_models"],
+            "page_cap": None,
+            "omitted_items": [],
+            "deprecated_report_options_ignored": [
+                key
+                for key in ("max_pages", "appendix_include_grade_matrix", "appendix_include_pass_details", "max_plots")
+                if key in (ctx.get("report_opts") or {})
+            ],
+        }
+        _write_json(sidecar_path, sidecar)
+        return {
+            "output_pdf": str(out_pdf),
+            "summary_json": str(sidecar_path),
+            "db_path": str(ctx["db_path"]),
+            "runs": ctx["runs"],
+            "params": ctx["params"],
+            "highlighted_serials": ctx["hi"],
+            "watch_items": len(ctx["watch_items"]),
+        }
+    finally:
+        try:
+            ctx["conn"].close()
+        except Exception:
+            pass

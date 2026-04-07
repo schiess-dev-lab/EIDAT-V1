@@ -41,6 +41,7 @@ echo [SETUP] Installing required Python packages (minimal + UI)...
   XlsxWriter ^
   matplotlib ^
   opencv-python-headless ^
+  reportlab ^
   PySide6
 if errorlevel 1 (
   echo [ERROR] Package install failed.
@@ -76,9 +77,9 @@ rem Also vendor runtime deps into repo-local Lib\site-packages (for non-venv run
 set "LOCAL_SITE=%APP_ROOT%Lib\site-packages"
 if not exist "%LOCAL_SITE%" mkdir "%LOCAL_SITE%"
 echo [SETUP] Vendoring Python deps to Lib\site-packages (minimal):
-echo         pymupdf, pandas, openpyxl, xlrd, XlsxWriter, matplotlib, opencv-python-headless, PySide6
+echo         pymupdf, pandas, openpyxl, xlrd, XlsxWriter, matplotlib, opencv-python-headless, reportlab, PySide6
 "%VPY%" -m pip install --upgrade --no-warn-script-location --target "%LOCAL_SITE%" ^
-  pymupdf pandas openpyxl xlrd XlsxWriter matplotlib opencv-python-headless PySide6
+  pymupdf pandas openpyxl xlrd XlsxWriter matplotlib opencv-python-headless reportlab PySide6
 if errorlevel 1 (
   echo [WARN] Vendoring had warnings/failures. Non-venv runs may miss some features.
 )

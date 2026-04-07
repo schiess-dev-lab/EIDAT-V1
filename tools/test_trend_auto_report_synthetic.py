@@ -1,5 +1,6 @@
 import json
 import math
+import re
 import sys
 import tempfile
 import unittest
@@ -359,6 +360,47 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         self.assertEqual(tar._overall_cert_status(["WATCH", "FAIL"]), "FAILED")
         self.assertEqual(tar._overall_cert_status(["NO_DATA", "PASS"]), "NO_DATA")
         self.assertEqual(tar._overall_cert_status([]), "NO_DATA")
+
+    def test_capture_print_context_contains_single_formatted_timestamp(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        ctx = tar._capture_print_context()
+        self.assertEqual(ctx.report_title, tar.REPORT_TITLE)
+        self.assertEqual(ctx.report_subtitle, tar.REPORT_SUBTITLE_DEFAULT)
+        self.assertTrue(ctx.printed_timezone)
+        self.assertRegex(ctx.printed_at, r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2} .+$")
+
+    def test_selection_display_fields_condition_mode_keeps_condition_and_sequences(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        selection = {
+            "mode": "condition",
+            "run_name": "Run1",
+            "run_conditions": ["Condition A"],
+            "member_sequences": ["Seq 1", "Seq 2"],
+        }
+        fields = tar._selection_display_fields(selection, {"Run1": {"display_name": "Run 1"}})
+        self.assertEqual(fields["condition_text"], "Condition A")
+        self.assertEqual(fields["sequence_text"], "Seq 1, Seq 2")
+        title = tar._selection_title_text(selection, {"Run1": {"display_name": "Run 1"}})
+        self.assertIn("Run Condition: Condition A", title)
+        self.assertIn("Sequences: Seq 1, Seq 2", title)
+
+    def test_selection_display_fields_sequence_mode_backfills_run_condition(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        selection = {
+            "mode": "sequence",
+            "run_name": "Run1",
+            "sequence_name": "Seq 9",
+            "run_condition": "Condition B",
+        }
+        fields = tar._selection_display_fields(selection, {"Run1": {"display_name": "Run 1"}})
+        self.assertEqual(fields["sequence_text"], "Seq 9")
+        self.assertEqual(fields["condition_text"], "Condition B")
+        title = tar._selection_title_text(selection, {"Run1": {"display_name": "Run 1"}})
+        self.assertTrue(title.startswith("Sequence: Seq 9"))
+        self.assertIn("Run Condition: Condition B", title)
 
     def test_fmt_num_is_defined_and_safe(self):
         from EIDAT_App_Files.ui_next import trend_auto_report as tar
