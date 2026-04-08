@@ -5006,6 +5006,7 @@ def _tar_render_plot_sections(
             plot_payload = _tar_curve_plot_payload_for_pair(ctx, run_name, param_name, pair_spec=pair_spec)
             if not plot_payload:
                 continue
+            model = dict(pair_spec.get("model") or {})
             selection = plot_payload.get("selection") or {}
             x_name = str(plot_payload.get("x_name") or "")
             x_grid = list(plot_payload.get("x_grid") or [])

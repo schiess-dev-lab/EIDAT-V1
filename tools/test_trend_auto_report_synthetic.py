@@ -3,6 +3,7 @@ import math
 import re
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -453,6 +454,114 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         self.assertEqual(first["x_name"], "Time")
         self.assertEqual(first["x_grid"], [0.0, 1.0, 2.0, 3.0, 4.0])
         self.assertIn("SN1", first["y_resampled_by_sn"])
+
+    def test_render_plot_sections_curve_overlay_uses_pair_model(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        class _FakeAxis:
+            def set_position(self, *_args, **_kwargs):
+                return None
+
+            def axis(self, *_args, **_kwargs):
+                return None
+
+            def set_title(self, *_args, **_kwargs):
+                return None
+
+            def set_xlabel(self, *_args, **_kwargs):
+                return None
+
+            def set_ylabel(self, *_args, **_kwargs):
+                return None
+
+            def plot(self, *_args, **_kwargs):
+                return None
+
+            def fill_between(self, *_args, **_kwargs):
+                return None
+
+            def grid(self, *_args, **_kwargs):
+                return None
+
+            def get_legend_handles_labels(self):
+                return ([], [])
+
+            def legend(self, *_args, **_kwargs):
+                return None
+
+            def text(self, *_args, **_kwargs):
+                return None
+
+        class _FakeFigure:
+            def add_axes(self, *_args, **_kwargs):
+                return _FakeAxis()
+
+        class _FakePdfPages:
+            def __init__(self, *_args, **_kwargs):
+                self.saved = []
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def savefig(self, fig):
+                self.saved.append(fig)
+
+        fake_matplotlib = types.ModuleType("matplotlib")
+        fake_backends = types.ModuleType("matplotlib.backends")
+        fake_backend_pdf = types.ModuleType("matplotlib.backends.backend_pdf")
+        fake_backend_pdf.PdfPages = _FakePdfPages
+        fake_pyplot = types.ModuleType("matplotlib.pyplot")
+        fake_pyplot.close = lambda _fig: None
+        pair_spec = {
+            "run": "Run1",
+            "run_title": "Run 1",
+            "param": "thrust",
+            "units": "lbf",
+            "selection": {},
+            "model": {
+                "equation": "y = 1.0x + 0.0",
+                "poly": {"rmse": 0.01},
+            },
+        }
+        ctx = {
+            "print_ctx": tar._capture_print_context(),
+            "include_metrics": False,
+            "pair_specs": [pair_spec],
+            "performance_plot_specs": [],
+            "watch_pair_keys": [],
+            "run_by_name": {"Run1": {"display_name": "Run 1"}},
+            "hi": ["SN1"],
+            "colors": ["#ef4444"],
+            "grade_map": {("Run1", "thrust", "SN1"): "PASS"},
+            "finding_by_key": {("Run1", "thrust", "SN1"): {"max_pct": 1.0, "z": 0.2}},
+        }
+        payload = {
+            "selection": {},
+            "x_name": "Time",
+            "x_grid": [0.0, 1.0, 2.0],
+            "y_resampled_by_sn": {"SN1": [0.0, 1.0, 2.0], "SN2": [0.0, 0.8, 1.6]},
+            "master_y": [0.0, 0.9, 1.8],
+            "std_y": [0.0, 0.1, 0.2],
+        }
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "matplotlib": fake_matplotlib,
+                "matplotlib.backends": fake_backends,
+                "matplotlib.backends.backend_pdf": fake_backend_pdf,
+                "matplotlib.pyplot": fake_pyplot,
+            },
+        ), mock.patch.object(tar, "_create_landscape_plot_page", return_value=(_FakeFigure(), _FakeAxis())), mock.patch.object(
+            tar,
+            "_tar_curve_plot_payload_for_pair",
+            return_value=payload,
+        ):
+            result = tar._tar_render_plot_sections(ctx, intro_pages=2, plots_pdf=Path("fake.pdf"))
+        self.assertEqual(result["curve_plot_count"], 1)
+        self.assertEqual(result["plot_specs"][0]["section"], "curve_overlays")
 
     def test_fmt_num_is_defined_and_safe(self):
         from EIDAT_App_Files.ui_next import trend_auto_report as tar
