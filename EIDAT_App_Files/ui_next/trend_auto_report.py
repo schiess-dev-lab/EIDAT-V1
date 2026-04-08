@@ -4079,7 +4079,7 @@ def _tar_prepare_base(
 
     rebuild = bool(options.get("rebuild_cache"))
     _tar_emit_progress(progress_cb, "Ensuring project cache")
-    db_path = be.ensure_test_data_project_cache(proj, wb, rebuild=rebuild)
+    db_path = be.ensure_test_data_project_cache(proj, wb, rebuild=rebuild, progress_cb=progress_cb)
     if bool(options.get("update_excel_trend_config", True)):
         _tar_emit_progress(progress_cb, "Syncing Excel trend configuration")
         _, change_summary = be.autofill_excel_trend_config_from_td_cache(
