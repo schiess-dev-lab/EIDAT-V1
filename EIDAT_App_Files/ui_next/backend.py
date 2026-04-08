@@ -1206,6 +1206,7 @@ def generate_test_data_auto_report(
     output_pdf: Path,
     highlighted_serials: list[str] | None = None,
     options: dict | None = None,
+    progress_cb: Callable[[str], None] | None = None,
 ) -> dict:
     from . import trend_auto_report as tar  # local import (optional deps)
 
@@ -1214,7 +1215,7 @@ def generate_test_data_auto_report(
     out = Path(output_pdf).expanduser()
     hi = [str(s).strip() for s in (highlighted_serials or []) if str(s).strip()]
     opts = dict(options or {})
-    return tar.generate_test_data_auto_report(proj, wb, out, highlighted_serials=hi, options=opts)
+    return tar.generate_test_data_auto_report(proj, wb, out, highlighted_serials=hi, options=opts, progress_cb=progress_cb)
 
 
 def run_excel_to_sqlite_scanner(data_dir: Path, *, overwrite: bool = True) -> subprocess.Popen:

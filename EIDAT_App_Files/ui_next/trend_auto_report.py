@@ -10,7 +10,7 @@ on optional plotting/scientific libraries (matplotlib, numpy).
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 import html
 import json
@@ -50,6 +50,18 @@ def _capture_print_context(*, report_title: str = REPORT_TITLE, report_subtitle:
         report_title=str(report_title or REPORT_TITLE).strip() or REPORT_TITLE,
         report_subtitle=str(report_subtitle or REPORT_SUBTITLE_DEFAULT).strip() or REPORT_SUBTITLE_DEFAULT,
     )
+
+
+def _tar_emit_progress(progress_cb: Callable[[str], None] | None, message: object) -> None:
+    if progress_cb is None:
+        return
+    text = str(message or "").strip()
+    if not text:
+        return
+    try:
+        progress_cb(text)
+    except Exception:
+        pass
 
 
 def _safe_float(v: object) -> float | None:
@@ -978,6 +990,7 @@ def _collect_performance_curves_for_stat(
     require_min_points: int,
     control_period_filter: object = None,
     filter_state: Mapping[str, object] | None = None,
+    metric_series_cache: dict[tuple[str, str, str, str, str, str], list[dict]] | None = None,
 ) -> tuple[dict[str, list[tuple[float, float, str]]], list[float], list[float], str, str]:
     serial_set = {str(sn).strip() for sn in serials if str(sn).strip()}
     per_run: list[tuple[str, str, dict[str, dict], dict[str, dict], str, str]] = []
@@ -994,26 +1007,35 @@ def _collect_performance_curves_for_stat(
         y_col, y_units = _resolve_td_y_col_from_rows(metric_cols, y_target)
         if not x_col or not y_col:
             continue
-        x_rows = _load_perf_equation_metric_series(
-            be,
-            db_path,
-            rn,
-            x_col,
-            stat,
-            selection=run_selection,
-            control_period_filter=control_period_filter,
-            filter_state=filter_state,
-        )
-        y_rows = _load_perf_equation_metric_series(
-            be,
-            db_path,
-            rn,
-            y_col,
-            stat,
-            selection=run_selection,
-            control_period_filter=control_period_filter,
-            filter_state=filter_state,
-        )
+        program_title, source_run_name = _selection_observation_filters(run_selection)
+
+        def _metric_rows_cached(column_name: str) -> list[dict]:
+            cache_key = (
+                str(rn or "").strip(),
+                str(column_name or "").strip(),
+                str(stat or "").strip().lower(),
+                str(program_title or "").strip(),
+                str(source_run_name or "").strip(),
+                "" if control_period_filter is None else str(control_period_filter),
+            )
+            if metric_series_cache is not None and cache_key in metric_series_cache:
+                return list(metric_series_cache.get(cache_key) or [])
+            rows = _load_perf_equation_metric_series(
+                be,
+                db_path,
+                rn,
+                column_name,
+                stat,
+                selection=run_selection,
+                control_period_filter=control_period_filter,
+                filter_state=filter_state,
+            )
+            if metric_series_cache is not None:
+                metric_series_cache[cache_key] = list(rows)
+            return list(rows)
+
+        x_rows = _metric_rows_cached(x_col)
+        y_rows = _metric_rows_cached(y_col)
         x_map = _series_by_observation(x_rows, serial_set)
         y_map = _series_by_observation(y_rows, serial_set)
         if not x_map or not y_map:
@@ -3876,9 +3898,15 @@ def _tar_subtitle_text(text: object) -> str:
 
 
 def _tar_metric_map_for_run(ctx: Mapping[str, Any], run_name: str, column_name: str, stat: str) -> dict[str, float]:
+    cache = ctx.setdefault("metric_map_cache", {})
+    key = (str(run_name or "").strip(), str(column_name or "").strip(), str(stat or "").strip().lower())
+    if key in cache:
+        cached = cache.get(key)
+        return dict(cached) if isinstance(cached, dict) else {}
+
     be = ctx["be"]
     selection = _selection_for_run(run_name, ctx["options"])
-    return _load_metric_map_for_selection(
+    loaded = _load_metric_map_for_selection(
         be,
         ctx["db_path"],
         run_name,
@@ -3887,6 +3915,71 @@ def _tar_metric_map_for_run(ctx: Mapping[str, Any], run_name: str, column_name: 
         selection=selection,
         filter_state=ctx["filter_state"],
     )
+    cache[key] = dict(loaded)
+    return dict(loaded)
+
+
+def _tar_curve_plot_payload_for_pair(
+    ctx: Mapping[str, Any],
+    run_name: str,
+    param_name: str,
+    *,
+    pair_spec: Mapping[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    cache = ctx.setdefault("curve_plot_cache", {})
+    key = (str(run_name or "").strip(), str(param_name or "").strip())
+    if key in cache:
+        cached = cache.get(key)
+        return dict(cached) if isinstance(cached, dict) else None
+
+    spec = dict(pair_spec or ((ctx.get("pair_by_key") or {}).get(key) or {}))
+    if not spec:
+        cache[key] = None
+        return None
+
+    model = dict(spec.get("model") or {})
+    domain = model.get("domain") or []
+    if not isinstance(domain, list) or len(domain) < 2:
+        cache[key] = None
+        return None
+
+    selection = spec.get("selection") or _selection_for_run(run_name, ctx["options"])
+    run_meta = (ctx.get("run_by_name") or {}).get(run_name) or {}
+    x_name = str(model.get("x_name") or "").strip()
+    if not x_name:
+        x_name = _resolve_curve_x_key(ctx["be"], ctx["db_path"], run_name, str(run_meta.get("default_x") or "").strip() or "Time")
+    series = _load_curves_for_selection(
+        ctx["be"],
+        ctx["db_path"],
+        run_name,
+        param_name,
+        x_name,
+        selection=selection,
+        filter_state=ctx["filter_state"],
+    )
+    if not series:
+        cache[key] = None
+        return None
+
+    lo = float(domain[0])
+    hi_dom = float(domain[1])
+    grid_points = max(2, int(ctx.get("grid_points") or 200))
+    x_grid = [lo + (hi_dom - lo) * (idx / (grid_points - 1)) for idx in range(grid_points)]
+    y_resampled_by_sn = {curve.serial: _interp_linear(curve.x, curve.y, x_grid) for curve in series}
+    y_matrix = list(y_resampled_by_sn.values())
+    payload = {
+        "run": run_name,
+        "param": param_name,
+        "units": str(spec.get("units") or "").strip(),
+        "selection": dict(selection or {}),
+        "x_name": x_name,
+        "x_grid": list(x_grid),
+        "y_resampled_by_sn": y_resampled_by_sn,
+        "master_y": _nan_median(y_matrix),
+        "std_y": _nan_std(y_matrix),
+    }
+    cache[key] = payload
+    return dict(payload)
 
 
 def _tar_finite_mean_for_serials(vmap: Mapping[str, object], serials: list[str]) -> float | None:
@@ -3940,6 +4033,7 @@ def _tar_prepare_base(
     *,
     highlighted_serials: list[str],
     options: dict,
+    progress_cb: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     from . import backend as be
 
@@ -3984,8 +4078,10 @@ def _tar_prepare_base(
     hi_cfg = report_cfg.get("highlight") or {}
 
     rebuild = bool(options.get("rebuild_cache"))
+    _tar_emit_progress(progress_cb, "Ensuring project cache")
     db_path = be.ensure_test_data_project_cache(proj, wb, rebuild=rebuild)
     if bool(options.get("update_excel_trend_config", True)):
+        _tar_emit_progress(progress_cb, "Syncing Excel trend configuration")
         _, change_summary = be.autofill_excel_trend_config_from_td_cache(
             db_path,
             cfg_excel_path,
@@ -4071,8 +4167,12 @@ def _tar_prepare_base(
     colors = [str(color) for color in colors if str(color).strip()] or ["#ef4444"]
 
     curves_summary: dict[str, dict[str, dict]] = {}
+    curve_plot_cache: dict[tuple[str, str], dict[str, Any] | None] = {}
     watch_items: list[dict] = []
     grading_rows: list[dict] = []
+    _tar_emit_progress(progress_cb, f"Preparing curve comparisons for {len(runs)} run(s) and {len(params)} parameter(s)")
+    total_curve_pairs = max(1, len(runs) * len(params))
+    curve_pair_index = 0
     for run in runs:
         run_meta = run_by_name.get(run) or {}
         run_selection = _selection_for_run(run, options)
@@ -4095,11 +4195,13 @@ def _tar_prepare_base(
             if str(col.get("name") or "").strip()
         }
         for target_param in params:
+            curve_pair_index += 1
             actual_col = y_by_norm.get(_norm_key(target_param))
             if not actual_col:
                 continue
             y_name = str(actual_col.get("name") or "").strip()
             units = str(actual_col.get("units") or "").strip()
+            _tar_emit_progress(progress_cb, f"Analyzing curves {curve_pair_index}/{total_curve_pairs}: {run} | {y_name}")
             series = _load_curves_for_selection(
                 be,
                 db_path,
@@ -4131,6 +4233,7 @@ def _tar_prepare_base(
             y_resampled_by_sn = {s.serial: _interp_linear(s.x, s.y, x_grid) for s in series}
             y_matrix = list(y_resampled_by_sn.values())
             master_y = _nan_median(y_matrix)
+            std_y = _nan_std(y_matrix)
 
             fit_x: list[float] = []
             fit_y: list[float] = []
@@ -4237,6 +4340,17 @@ def _tar_prepare_base(
                 "equation": eqn,
                 "watch_any": any(item.get("run") == run and item.get("param") == y_name for item in watch_items),
             }
+            curve_plot_cache[(run, y_name)] = {
+                "run": run,
+                "param": y_name,
+                "units": units,
+                "selection": dict(run_selection or {}),
+                "x_name": x_name,
+                "x_grid": list(x_grid),
+                "y_resampled_by_sn": y_resampled_by_sn,
+                "master_y": master_y,
+                "std_y": std_y,
+            }
 
     cache_meta_by_sn, cache_meta_note = _read_cached_source_metadata(conn)
     workbook_meta_by_sn, workbook_meta_note = _read_workbook_metadata(wb)
@@ -4286,6 +4400,10 @@ def _tar_prepare_base(
         "grading_rows": grading_rows,
         "report_title": print_ctx.report_title,
         "report_subtitle": print_ctx.report_subtitle,
+        "curve_plot_cache": curve_plot_cache,
+        "metric_map_cache": {},
+        "performance_metric_series_cache": {},
+        "progress_cb": progress_cb,
     }
 
     grade_map: dict[tuple[str, str, str], str] = {}
@@ -4378,11 +4496,24 @@ def _tar_prepare_performance_models(ctx: dict[str, Any]) -> None:
     options = ctx["options"]
     conn = ctx["conn"]
     be = ctx["be"]
+    progress_cb = ctx.get("progress_cb")
     raw_perf_opt = options.get("performance_plotters")
     raw_perf = raw_perf_opt if isinstance(raw_perf_opt, list) else (excel_cfg.get("performance_plotters") if isinstance(excel_cfg, dict) else [])
     performance_models: list[dict] = []
     performance_plot_specs: list[dict] = []
     equation_cards: list[dict] = []
+    metric_series_cache = ctx.setdefault("performance_metric_series_cache", {})
+    total_perf_specs = 0
+    if isinstance(raw_perf, list):
+        for perf_def in raw_perf:
+            if not isinstance(perf_def, dict):
+                continue
+            stats_list = perf_def.get("stats")
+            if isinstance(stats_list, list) and stats_list:
+                total_perf_specs += len([value for value in stats_list if str(value).strip()])
+            else:
+                total_perf_specs += 1
+    perf_spec_index = 0
 
     if isinstance(raw_perf, list):
         for perf_def in raw_perf:
@@ -4409,6 +4540,11 @@ def _tar_prepare_performance_models(ctx: dict[str, Any]) -> None:
             fit_norm = bool((fit_cfg.get("normalize_x") if isinstance(fit_cfg, dict) else True))
 
             for perf_stat in perf_stats:
+                perf_spec_index += 1
+                _tar_emit_progress(
+                    progress_cb,
+                    f"Preparing performance model {perf_spec_index}/{max(1, total_perf_specs)}: {name} | {y_target} vs {x_target} | {perf_stat}",
+                )
                 curves, pooled_x, pooled_y, x_units, y_units = _collect_performance_curves_for_stat(
                     be=be,
                     db_path=ctx["db_path"],
@@ -4422,6 +4558,7 @@ def _tar_prepare_performance_models(ctx: dict[str, Any]) -> None:
                     options=options,
                     require_min_points=require_min_points,
                     filter_state=ctx["filter_state"],
+                    metric_series_cache=metric_series_cache,
                 )
                 if not curves:
                     continue
@@ -4756,7 +4893,13 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
     return story
 
 
-def _tar_render_plot_sections(ctx: Mapping[str, Any], *, intro_pages: int, plots_pdf: Path) -> dict[str, Any]:
+def _tar_render_plot_sections(
+    ctx: Mapping[str, Any],
+    *,
+    intro_pages: int,
+    plots_pdf: Path,
+    progress_cb: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
     from matplotlib.backends.backend_pdf import PdfPages  # type: ignore
     import matplotlib.pyplot as plt  # type: ignore
 
@@ -4783,11 +4926,14 @@ def _tar_render_plot_sections(ctx: Mapping[str, Any], *, intro_pages: int, plots
         }
 
     with PdfPages(plots_pdf) as pdf:
-        for pair_spec, metric_stat in metric_page_specs:
+        if metric_page_specs:
+            _tar_emit_progress(progress_cb, f"Rendering plot metrics pages ({len(metric_page_specs)} planned)")
+        for metric_index, (pair_spec, metric_stat) in enumerate(metric_page_specs, start=1):
             run_name = str(pair_spec.get("run") or "").strip()
             param_name = str(pair_spec.get("param") or "").strip()
             units = str(pair_spec.get("units") or "").strip()
             selection = pair_spec.get("selection") or {}
+            _tar_emit_progress(progress_cb, f"Plot metrics {metric_index}/{len(metric_page_specs)}: {run_name} | {param_name} | {metric_stat}")
             page_number = intro_pages + plot_page_count + 1
             fig, ax = _create_landscape_plot_page(
                 print_ctx=ctx["print_ctx"],
@@ -4800,6 +4946,7 @@ def _tar_render_plot_sections(ctx: Mapping[str, Any], *, intro_pages: int, plots
             run_title = str(pair_spec.get("run_title") or run_name).strip() or run_name
             vmap = _tar_metric_map_for_run(ctx, run_name, param_name, metric_stat)
             serials = list(ctx.get("all_serials") or [])
+            serial_index = {serial: idx for idx, serial in enumerate(serials)}
             x_idx = list(range(len(serials)))
             yv = [
                 float(vmap.get(serial))
@@ -4816,9 +4963,9 @@ def _tar_render_plot_sections(ctx: Mapping[str, Any], *, intro_pages: int, plots
                 if finite_vals:
                     ax.axhline(float(statistics.mean(finite_vals)), color="#0f172a", linestyle="--", linewidth=1.2, alpha=0.65, label="Family mean")
                 for serial in (ctx.get("hi") or []):
-                    if serial not in serials:
+                    xi = serial_index.get(serial)
+                    if xi is None:
                         continue
-                    xi = serials.index(serial)
                     y_val = yv[xi]
                     if math.isnan(y_val):
                         continue
@@ -4849,32 +4996,22 @@ def _tar_render_plot_sections(ctx: Mapping[str, Any], *, intro_pages: int, plots
                 plot_specs.append({"section": "plot_metrics", "run": run_name, "param": param_name, "stat": metric_stat, "page_number": intro_pages + plot_page_count})
             plt.close(fig)
 
-        for pair_spec in (ctx.get("pair_specs") or []):
+        pair_specs = list(ctx.get("pair_specs") or [])
+        if pair_specs:
+            _tar_emit_progress(progress_cb, f"Rendering curve overlay pages ({len(pair_specs)} planned)")
+        for curve_index, pair_spec in enumerate(pair_specs, start=1):
             run_name = str(pair_spec.get("run") or "").strip()
             param_name = str(pair_spec.get("param") or "").strip()
-            selection = pair_spec.get("selection") or {}
-            run_meta = (ctx.get("run_by_name") or {}).get(run_name) or {}
-            x_name = _resolve_curve_x_key(ctx["be"], ctx["db_path"], run_name, str(run_meta.get("default_x") or "").strip() or "Time")
-            series = _load_curves_for_selection(
-                ctx["be"],
-                ctx["db_path"],
-                run_name,
-                param_name,
-                x_name,
-                selection=selection,
-                filter_state=ctx["filter_state"],
-            )
-            model = pair_spec.get("model") or {}
-            domain = model.get("domain") or []
-            if not series or not isinstance(domain, list) or len(domain) < 2:
+            _tar_emit_progress(progress_cb, f"Curve overlay {curve_index}/{len(pair_specs)}: {run_name} | {param_name}")
+            plot_payload = _tar_curve_plot_payload_for_pair(ctx, run_name, param_name, pair_spec=pair_spec)
+            if not plot_payload:
                 continue
-            lo = float(domain[0])
-            hi_dom = float(domain[1])
-            x_grid = [lo + (hi_dom - lo) * (idx / (ctx["grid_points"] - 1)) for idx in range(ctx["grid_points"])]
-            y_resampled_by_sn = {curve.serial: _interp_linear(curve.x, curve.y, x_grid) for curve in series}
-            y_matrix = list(y_resampled_by_sn.values())
-            master_y = _nan_median(y_matrix)
-            std_y = _nan_std(y_matrix)
+            selection = plot_payload.get("selection") or {}
+            x_name = str(plot_payload.get("x_name") or "")
+            x_grid = list(plot_payload.get("x_grid") or [])
+            y_resampled_by_sn = dict(plot_payload.get("y_resampled_by_sn") or {})
+            master_y = list(plot_payload.get("master_y") or [])
+            std_y = list(plot_payload.get("std_y") or [])
             page_number = intro_pages + plot_page_count + 1
             fig, ax = _create_landscape_plot_page(
                 print_ctx=ctx["print_ctx"],
@@ -4890,10 +5027,9 @@ def _tar_render_plot_sections(ctx: Mapping[str, Any], *, intro_pages: int, plots
             ax.set_title(f"{run_title} - {param_name}", loc="left", fontsize=13, fontweight="bold", pad=10)
             ax.set_xlabel(x_name)
             ax.set_ylabel(f"{param_name} ({units})" if units else param_name)
-            for curve in series:
-                if curve.serial in (ctx.get("hi") or []):
+            for serial, y_curve in y_resampled_by_sn.items():
+                if serial in (ctx.get("hi") or []):
                     continue
-                y_curve = y_resampled_by_sn.get(curve.serial)
                 if y_curve:
                     ax.plot(x_grid, y_curve, linewidth=0.8, alpha=0.09, color="#94a3b8")
             ax.plot(x_grid, master_y, linewidth=2.1, color="#0f172a", label="Family median")
@@ -4938,7 +5074,10 @@ def _tar_render_plot_sections(ctx: Mapping[str, Any], *, intro_pages: int, plots
             plot_specs.append({"section": "curve_overlays", "run": run_name, "param": param_name, "page_number": intro_pages + plot_page_count})
             plt.close(fig)
 
-        for perf_spec in (ctx.get("performance_plot_specs") or []):
+        performance_plot_specs = list(ctx.get("performance_plot_specs") or [])
+        if performance_plot_specs:
+            _tar_emit_progress(progress_cb, f"Rendering performance plot pages ({len(performance_plot_specs)} planned)")
+        for perf_index, perf_spec in enumerate(performance_plot_specs, start=1):
             name = str(perf_spec.get("name") or "Performance").strip() or "Performance"
             x_target = str(((perf_spec.get("x") or {}).get("column") or "")).strip()
             y_target = str(((perf_spec.get("y") or {}).get("column") or "")).strip()
@@ -4946,6 +5085,7 @@ def _tar_render_plot_sections(ctx: Mapping[str, Any], *, intro_pages: int, plots
             curves = perf_spec.get("curves") or {}
             if not isinstance(curves, dict) or not curves:
                 continue
+            _tar_emit_progress(progress_cb, f"Performance plot {perf_index}/{len(performance_plot_specs)}: {name} | {y_target} vs {x_target} | {perf_stat}")
             page_number = intro_pages + plot_page_count + 1
             fig, ax = _create_landscape_plot_page(
                 print_ctx=ctx["print_ctx"],
@@ -5037,36 +5177,26 @@ def _tar_render_plot_sections(ctx: Mapping[str, Any], *, intro_pages: int, plots
             plot_specs.append({"section": "performance_plots", "name": name, "x": x_target, "y": y_target, "stat": perf_stat, "page_number": intro_pages + plot_page_count})
             plt.close(fig)
 
-        for run_name, param_name in (ctx.get("watch_pair_keys") or []):
+        watch_pair_keys = list(ctx.get("watch_pair_keys") or [])
+        if watch_pair_keys:
+            _tar_emit_progress(progress_cb, f"Rendering watch / non-pass curve pages ({len(watch_pair_keys)} planned)")
+        for watch_index, (run_name, param_name) in enumerate(watch_pair_keys, start=1):
+            _tar_emit_progress(progress_cb, f"Watch / non-pass page {watch_index}/{len(watch_pair_keys)}: {run_name} | {param_name}")
             pair_spec = (ctx.get("pair_by_key") or {}).get((run_name, param_name))
             if not pair_spec:
                 continue
-            selection = pair_spec.get("selection") or {}
-            run_meta = (ctx.get("run_by_name") or {}).get(run_name) or {}
-            x_name = _resolve_curve_x_key(ctx["be"], ctx["db_path"], run_name, str(run_meta.get("default_x") or "").strip() or "Time")
-            series = _load_curves_for_selection(
-                ctx["be"],
-                ctx["db_path"],
-                run_name,
-                param_name,
-                x_name,
-                selection=selection,
-                filter_state=ctx["filter_state"],
-            )
-            model = pair_spec.get("model") or {}
-            domain = model.get("domain") or []
-            if not series or not isinstance(domain, list) or len(domain) < 2:
+            plot_payload = _tar_curve_plot_payload_for_pair(ctx, run_name, param_name, pair_spec=pair_spec)
+            if not plot_payload:
                 continue
             focus_serials = [serial for serial in (ctx.get("hi") or []) if (ctx.get("grade_map") or {}).get((run_name, param_name, serial), "NO_DATA") in {"WATCH", "FAIL"}]
             if not focus_serials:
                 continue
-            lo = float(domain[0])
-            hi_dom = float(domain[1])
-            x_grid = [lo + (hi_dom - lo) * (idx / (ctx["grid_points"] - 1)) for idx in range(ctx["grid_points"])]
-            y_resampled_by_sn = {curve.serial: _interp_linear(curve.x, curve.y, x_grid) for curve in series}
-            y_matrix = list(y_resampled_by_sn.values())
-            master_y = _nan_median(y_matrix)
-            std_y = _nan_std(y_matrix)
+            selection = plot_payload.get("selection") or {}
+            x_name = str(plot_payload.get("x_name") or "")
+            x_grid = list(plot_payload.get("x_grid") or [])
+            y_resampled_by_sn = dict(plot_payload.get("y_resampled_by_sn") or {})
+            master_y = list(plot_payload.get("master_y") or [])
+            std_y = list(plot_payload.get("std_y") or [])
             page_number = intro_pages + plot_page_count + 1
             fig, ax = _create_landscape_plot_page(
                 print_ctx=ctx["print_ctx"],
@@ -5082,10 +5212,9 @@ def _tar_render_plot_sections(ctx: Mapping[str, Any], *, intro_pages: int, plots
             ax.set_title(f"{run_title} - {param_name}", loc="left", fontsize=13, fontweight="bold", pad=10)
             ax.set_xlabel(x_name)
             ax.set_ylabel(f"{param_name} ({units})" if units else param_name)
-            for curve in series:
-                if curve.serial in focus_serials:
+            for serial, y_curve in y_resampled_by_sn.items():
+                if serial in focus_serials:
                     continue
-                y_curve = y_resampled_by_sn.get(curve.serial)
                 if y_curve:
                     ax.plot(x_grid, y_curve, linewidth=0.8, alpha=0.08, color="#94a3b8")
             ax.plot(x_grid, master_y, linewidth=2.1, color="#0f172a", label="Family median")
@@ -5266,22 +5395,36 @@ def generate_test_data_auto_report(
     *,
     highlighted_serials: list[str],
     options: dict,
+    progress_cb: Callable[[str], None] | None = None,
 ) -> dict:
     try:
         _ = _reportlab_imports()
     except Exception:
         raise
 
+    timings: dict[str, float] = {}
+    t0 = time.perf_counter()
+    prep_start = time.perf_counter()
+    _tar_emit_progress(progress_cb, "Preparing report inputs")
     ctx = _tar_prepare_base(
         project_dir,
         workbook_path,
         output_pdf,
         highlighted_serials=highlighted_serials,
         options=options,
+        progress_cb=progress_cb,
     )
+    timings["prepare_base_seconds"] = round(time.perf_counter() - prep_start, 3)
     try:
+        perf_start = time.perf_counter()
+        _tar_emit_progress(progress_cb, "Preparing performance equations")
         _tar_prepare_performance_models(ctx)
+        timings["prepare_performance_models_seconds"] = round(time.perf_counter() - perf_start, 3)
+
+        intro_story_start = time.perf_counter()
+        _tar_emit_progress(progress_cb, "Building summary pages")
         intro_story = _tar_build_intro_story(ctx)
+        timings["build_intro_story_seconds"] = round(time.perf_counter() - intro_story_start, 3)
         out_pdf = Path(ctx["out_pdf"]).expanduser()
         sidecar_path = out_pdf.with_suffix(".summary.json")
 
@@ -5291,8 +5434,15 @@ def generate_test_data_auto_report(
             plots_pdf = tmp_root / "02_plots.pdf"
             closing_pdf = tmp_root / "03_closing.pdf"
 
+            intro_render_start = time.perf_counter()
+            _tar_emit_progress(progress_cb, "Rendering cover and summary pages")
             intro_pages = _render_portrait_story_pdf(intro_pdf, story=intro_story, print_ctx=ctx["print_ctx"], page_number_offset=0)
-            plot_counts = _tar_render_plot_sections(ctx, intro_pages=intro_pages, plots_pdf=plots_pdf)
+            timings["render_intro_pages_seconds"] = round(time.perf_counter() - intro_render_start, 3)
+
+            plot_render_start = time.perf_counter()
+            _tar_emit_progress(progress_cb, "Rendering plot pages")
+            plot_counts = _tar_render_plot_sections(ctx, intro_pages=intro_pages, plots_pdf=plots_pdf, progress_cb=progress_cb)
+            timings["render_plot_pages_seconds"] = round(time.perf_counter() - plot_render_start, 3)
             section_order = ["cover", "executive_summary", "comparison_table", "performance_equations"]
             if plot_counts["metric_plot_count"]:
                 section_order.append("plot_metrics")
@@ -5304,13 +5454,20 @@ def generate_test_data_auto_report(
                 section_order.append("watch_nonpass_curves")
             section_order.append("closing_summary")
 
+            closing_story_start = time.perf_counter()
+            _tar_emit_progress(progress_cb, "Building closing summary")
             closing_story = _tar_build_closing_story(ctx, counts=plot_counts)
+            timings["build_closing_story_seconds"] = round(time.perf_counter() - closing_story_start, 3)
+
+            closing_render_start = time.perf_counter()
+            _tar_emit_progress(progress_cb, "Rendering closing pages")
             closing_pages = _render_portrait_story_pdf(
                 closing_pdf,
                 story=closing_story,
                 print_ctx=ctx["print_ctx"],
                 page_number_offset=intro_pages + plot_counts["plot_page_count"],
             )
+            timings["render_closing_pages_seconds"] = round(time.perf_counter() - closing_render_start, 3)
 
             merge_parts = [intro_pdf]
             if plot_counts["plot_page_count"] and plots_pdf.exists():
@@ -5321,7 +5478,10 @@ def generate_test_data_auto_report(
                     out_pdf.unlink()
             except Exception:
                 pass
+            merge_start = time.perf_counter()
+            _tar_emit_progress(progress_cb, "Merging report PDF")
             _merge_report_pdfs(out_pdf, merge_parts)
+            timings["merge_pdf_seconds"] = round(time.perf_counter() - merge_start, 3)
             total_pages = intro_pages + plot_counts["plot_page_count"] + closing_pages
 
         sidecar = {
@@ -5353,6 +5513,7 @@ def generate_test_data_auto_report(
             "equation_cards": ctx["equation_cards"],
             "plot_specs": plot_counts["plot_specs"],
             "performance_models": ctx["performance_models"],
+            "timings": timings,
             "page_cap": None,
             "omitted_items": [],
             "deprecated_report_options_ignored": [
@@ -5361,7 +5522,10 @@ def generate_test_data_auto_report(
                 if key in (ctx.get("report_opts") or {})
             ],
         }
+        timings["total_seconds"] = round(time.perf_counter() - t0, 3)
+        _tar_emit_progress(progress_cb, "Writing summary JSON")
         _write_json(sidecar_path, sidecar)
+        _tar_emit_progress(progress_cb, f"Auto report ready: {int(total_pages)} page(s) in {timings['total_seconds']:.3f}s")
         return {
             "output_pdf": str(out_pdf),
             "summary_json": str(sidecar_path),
@@ -5370,6 +5534,7 @@ def generate_test_data_auto_report(
             "params": ctx["params"],
             "highlighted_serials": ctx["hi"],
             "watch_items": len(ctx["watch_items"]),
+            "timings": timings,
         }
     finally:
         try:

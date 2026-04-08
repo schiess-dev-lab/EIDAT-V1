@@ -402,6 +402,58 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         self.assertTrue(title.startswith("Sequence: Seq 9"))
         self.assertIn("Run Condition: Condition B", title)
 
+    def test_metric_map_cache_reuses_loaded_series_within_report(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        ctx = {
+            "be": object(),
+            "db_path": Path("fake.sqlite3"),
+            "options": {},
+            "filter_state": {},
+            "metric_map_cache": {},
+        }
+        with mock.patch.object(tar, "_load_metric_map_for_selection", return_value={"SN1": 1.23}) as loader:
+            first = tar._tar_metric_map_for_run(ctx, "Run1", "thrust", "mean")
+            second = tar._tar_metric_map_for_run(ctx, "Run1", "thrust", "mean")
+        self.assertEqual(first, {"SN1": 1.23})
+        self.assertEqual(second, {"SN1": 1.23})
+        self.assertEqual(loader.call_count, 1)
+
+    def test_curve_plot_payload_cache_reuses_loaded_curves_within_report(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        ctx = {
+            "be": object(),
+            "db_path": Path("fake.sqlite3"),
+            "options": {},
+            "filter_state": {},
+            "grid_points": 5,
+            "run_by_name": {"Run1": {"default_x": "Time", "display_name": "Run 1"}},
+            "curve_plot_cache": {},
+            "pair_by_key": {
+                ("Run1", "thrust"): {
+                    "run": "Run1",
+                    "param": "thrust",
+                    "units": "lbf",
+                    "selection": {},
+                    "model": {"domain": [0.0, 4.0], "x_name": "Time"},
+                }
+            },
+        }
+        curves = [
+            tar.CurveSeries(serial="SN1", x=[0.0, 2.0, 4.0], y=[0.0, 1.0, 2.0]),
+            tar.CurveSeries(serial="SN2", x=[0.0, 2.0, 4.0], y=[0.0, 2.0, 4.0]),
+        ]
+        with mock.patch.object(tar, "_load_curves_for_selection", return_value=curves) as loader:
+            first = tar._tar_curve_plot_payload_for_pair(ctx, "Run1", "thrust")
+            second = tar._tar_curve_plot_payload_for_pair(ctx, "Run1", "thrust")
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        self.assertEqual(loader.call_count, 1)
+        self.assertEqual(first["x_name"], "Time")
+        self.assertEqual(first["x_grid"], [0.0, 1.0, 2.0, 3.0, 4.0])
+        self.assertIn("SN1", first["y_resampled_by_sn"])
+
     def test_fmt_num_is_defined_and_safe(self):
         from EIDAT_App_Files.ui_next import trend_auto_report as tar
 

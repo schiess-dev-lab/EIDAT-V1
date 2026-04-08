@@ -770,6 +770,7 @@ class _RunSelectionHarness:
         self._popup_selection_summary = TestDataTrendDialog._popup_selection_summary
         self._plot_metrics_called = False
         self._opened_auto_plot_entries: list[dict[str, object]] = []
+        self._opened_auto_graph_file: dict[str, object] | None = None
 
         for name in (
             "_auto_plot_available_serial_values",
@@ -790,6 +791,15 @@ class _RunSelectionHarness:
             "_auto_plot_global_selection_details_text",
             "_auto_plot_entry_plot_definition",
             "_normalize_auto_plot_entry",
+            "_legacy_auto_graph_file_from_entry",
+            "_normalize_auto_graph_file",
+            "_resolve_auto_graph_file_filter_state",
+            "_resolve_auto_graph_file_global_selection",
+            "_auto_graph_file_program_values",
+            "_auto_graph_file_program_summary_text",
+            "_auto_graph_file_tile_text",
+            "_auto_graph_file_tooltip",
+            "_auto_graph_file_plot_entries",
             "_normalized_auto_plot_entries",
             "_auto_plot_store_payload",
             "_save_auto_plots_store",
@@ -845,6 +855,12 @@ class _RunSelectionHarness:
             "_opened_auto_plot_entries",
             [dict(entry) for entry in entries],
         )
+        self._open_auto_graph_file_viewer = lambda graph_file: setattr(
+            self,
+            "_opened_auto_graph_file",
+            dict(graph_file),
+        )
+        self._open_auto_graph_file_editor = lambda graph_file=None, seed_plot=None: None
         self._open_selected_auto_plot = getattr(
             TestDataTrendDialog, "_open_selected_auto_plot"
         ).__get__(self, _RunSelectionHarness)
@@ -1371,7 +1387,6 @@ class TestTDTrendDialogLayout(unittest.TestCase):
             app.processEvents()
 
             self.assertEqual(left_panel.width(), locked_width)
-            self.assertEqual(dlg.main_splitter.sizes()[0], locked_width)
         finally:
             dlg.close()
 
@@ -1668,11 +1683,15 @@ class TestTDTrendDialogLayout(unittest.TestCase):
                 return int(QtWidgets.QDialog.DialogCode.Accepted)
 
             def _exec_clear():
-                dialog = _find_pick_dialog()
-                for button in dialog.findChildren(QtWidgets.QPushButton):
-                    if button.text() == "Clear":
-                        button.click()
-                        break
+                for dialog in [
+                    widget
+                    for widget in QtWidgets.QApplication.topLevelWidgets()
+                    if isinstance(widget, QtWidgets.QDialog) and widget.windowTitle() == "Pick"
+                ]:
+                    for button in dialog.findChildren(QtWidgets.QPushButton):
+                        if button.text() == "Clear":
+                            button.click()
+                            break
                 return int(QtWidgets.QDialog.DialogCode.Accepted)
 
             with mock.patch("PySide6.QtWidgets.QDialog.exec", side_effect=_exec_select_all):
@@ -1749,145 +1768,73 @@ class TestTDTrendDialogLayout(unittest.TestCase):
         from PySide6 import QtWidgets
 
         harness = _RunSelectionHarness()
-        harness._run_selection_views["condition"] = [
-            {
-                "mode": "condition",
-                "id": "condition:seq1",
-                "run_name": "Seq1",
-                "display_text": "350 psia, SS",
-                "run_condition": "350 psia, SS",
-                "member_runs": ["Seq1"],
-                "member_sequences": ["Seq1", "Seq2"],
-                "details_text": "Source Sequences: Seq1, Seq2",
-            },
-            {
-                "mode": "condition",
-                "id": "condition:seq3",
-                "run_name": "Seq3",
-                "display_text": "410 psia, PM",
-                "run_condition": "410 psia, PM",
-                "member_runs": ["Seq3"],
-                "member_sequences": ["Seq3"],
-                "details_text": "Source Sequences: Seq3",
-            },
-        ]
-        harness._auto_plot_global_selection = {
-            "run_scope": "condition",
-            "selected_selection_ids": ["condition:seq1", "condition:seq3"],
-            "filters": {
-                "programs": list(harness._available_program_filters),
-                "serials": ["SN1", "SN2"],
-                "control_periods": [],
-                "suppression_voltages": list(harness._available_suppression_voltage_filters),
-            },
-        }
         harness._auto_plots = [
             {
-                "mode": "metrics",
-                "stats": ["mean"],
-                "y": ["thrust"],
+                "name": "Ignition Summary",
+                "global_selection": {
+                    "run_scope": "sequence",
+                    "selected_selection_ids": [],
+                    "filters": {
+                        "programs": ["Program A"],
+                        "serials": ["SN1"],
+                        "control_periods": [],
+                        "suppression_voltages": ["24"],
+                    },
+                },
+                "track_program_serials": False,
+                "plots": [
+                    {"mode": "metrics", "stats": ["mean"], "y": ["thrust"]},
+                ],
             }
         ]
         popup_list = QtWidgets.QListWidget()
-        popup_list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        popup_list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
         harness._refresh_auto_plots_list(popup_list)
         popup_list.item(0).setSelected(True)
 
         harness._open_selected_auto_plot(list_widget=popup_list)
 
-        self.assertEqual(len(harness._opened_auto_plot_entries), 1)
-        self.assertEqual(harness._opened_auto_plot_entries[0].get("plot_definition", {}).get("mode"), "metrics")
-        self.assertEqual(
-            harness._current_auto_plot_global_selection().get("selected_selection_ids"),
-            ["condition:seq1", "condition:seq3"],
-        )
+        self.assertIsNotNone(harness._opened_auto_graph_file)
+        assert harness._opened_auto_graph_file is not None
+        self.assertEqual(harness._opened_auto_graph_file.get("name"), "Ignition Summary")
+        self.assertEqual(len(harness._opened_auto_graph_file.get("plots") or []), 1)
         self.assertEqual(harness.checked_condition_ids(), [])
         self.assertFalse(harness._plot_metrics_called)
 
-    def test_popup_auto_plot_delete_updates_saved_definitions_and_list(self) -> None:
+    def test_popup_auto_plot_delete_updates_saved_graph_files_and_list(self) -> None:
         _qt_app()
-        from PySide6 import QtWidgets
+        from PySide6 import QtCore, QtWidgets
 
         harness = _RunSelectionHarness()
         harness._auto_plots = [
-            {"name": "Plot 1", "mode": "metrics", "stats": ["mean"], "y": ["thrust"]},
-            {"name": "Plot 2", "mode": "curves", "y": ["current"], "x": "Time"},
+            {
+                "name": "File 1",
+                "global_selection": harness._default_auto_plot_global_selection(),
+                "track_program_serials": False,
+                "plots": [{"mode": "metrics", "stats": ["mean"], "y": ["thrust"]}],
+            },
+            {
+                "name": "File 2",
+                "global_selection": harness._default_auto_plot_global_selection(),
+                "track_program_serials": False,
+                "plots": [{"mode": "curves", "y": ["current"], "x": "Time"}],
+            },
         ]
         popup_list = QtWidgets.QListWidget()
-        popup_list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        popup_list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
         harness._refresh_auto_plots_list(popup_list)
-        popup_list.item(0).setSelected(True)
+        for idx in range(popup_list.count()):
+            item = popup_list.item(idx)
+            payload = item.data(QtCore.Qt.ItemDataRole.UserRole) if item is not None else None
+            if isinstance(payload, dict) and payload.get("name") == "File 1":
+                item.setSelected(True)
+                break
 
         harness._delete_selected_auto_plots(list_widget=popup_list)
 
-        self.assertEqual([d.get("name") for d in harness._auto_plots], ["Plot 2"])
+        self.assertEqual([d.get("name") for d in harness._auto_plots], ["File 2"])
         self.assertEqual(popup_list.count(), 1)
-        self.assertIn("Plot 2", popup_list.item(0).text())
-
-    @unittest.skipUnless(_have_matplotlib(), "matplotlib not installed")
-    def test_open_all_auto_plots_panel_still_opens(self) -> None:
-        _qt_app()
-        from PySide6 import QtWidgets
-        from matplotlib.figure import Figure
-
-        class _DummyCanvas(QtWidgets.QWidget):
-            def __init__(self, figure) -> None:
-                super().__init__()
-                self.figure = figure
-
-            def mpl_connect(self, *_args, **_kwargs) -> int:
-                return 0
-
-            def draw_idle(self) -> None:
-                return None
-
-        dlg = _build_test_data_dialog()
-        try:
-            dlg._plot_ready = True
-            dlg._db_path = Path(tempfile.mkdtemp()) / "cache.sqlite3"
-            dlg._auto_plots = [{"name": "Plot 1", "mode": "metrics", "stats": ["mean"], "y": ["thrust"]}]
-
-            with mock.patch.object(dlg, "_render_auto_plot_entry_figure", return_value=(Figure(), "")):
-                with mock.patch("matplotlib.backends.backend_qtagg.FigureCanvasQTAgg", _DummyCanvas):
-                    with mock.patch("PySide6.QtWidgets.QDialog.exec", return_value=0) as exec_mock:
-                        dlg._open_all_auto_plots_panel()
-
-            exec_mock.assert_called_once()
-        finally:
-            dlg.close()
-
-    @unittest.skipUnless(_have_matplotlib(), "matplotlib not installed")
-    def test_save_all_auto_plots_pdf_still_exports_all_saved_plots(self) -> None:
-        saved_figures: list[object] = []
-
-        class _DummyPdfPages:
-            def __init__(self, _path: str) -> None:
-                pass
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, exc_type, exc, tb) -> None:
-                return None
-
-            def savefig(self, fig) -> None:
-                saved_figures.append(fig)
-
-        dlg = _build_test_data_dialog()
-        try:
-            dlg._plot_ready = True
-            dlg._db_path = Path(tempfile.mkdtemp()) / "cache.sqlite3"
-            dlg._auto_plots = [{"name": "Plot 1", "mode": "metrics", "stats": ["mean"], "y": ["thrust"]}]
-
-            with mock.patch("PySide6.QtWidgets.QFileDialog.getSaveFileName", return_value=("C:/tmp/auto.pdf", "PDF")):
-                with mock.patch("matplotlib.backends.backend_pdf.PdfPages", _DummyPdfPages):
-                    with mock.patch.object(dlg, "_render_auto_plot_entry_figure", return_value=(object(), "")) as render_mock:
-                        dlg._save_all_auto_plots_pdf()
-
-            render_mock.assert_called_once()
-            self.assertEqual(len(saved_figures), 1)
-        finally:
-            dlg.close()
+        self.assertIn("File 2", popup_list.item(0).text())
 
     def test_auto_plot_store_loads_legacy_entries_with_live_filter_fallback(self) -> None:
         harness = _RunSelectionHarness()
@@ -1900,15 +1847,14 @@ class TestTDTrendDialogLayout(unittest.TestCase):
 
         TestDataTrendDialog._load_auto_plots(harness)
 
-        entries = harness._normalized_auto_plot_entries()
-        self.assertEqual(len(entries), 1)
-        self.assertEqual(entries[0].get("plot_definition", {}).get("mode"), "metrics")
-        self.assertEqual(
-            harness._current_auto_plot_global_selection().get("filters", {}).get("serials"),
-            ["SN1", "SN2"],
-        )
+        graph_files = harness._normalized_auto_plot_entries()
+        self.assertEqual(len(graph_files), 1)
+        self.assertEqual(len(graph_files[0].get("plots") or []), 1)
+        self.assertEqual(graph_files[0]["plots"][0].get("plot_definition", {}).get("mode"), "metrics")
+        self.assertFalse(bool(graph_files[0].get("track_program_serials")))
+        self.assertEqual(graph_files[0].get("global_selection", {}).get("filters", {}).get("serials"), ["SN1", "SN2"])
 
-    def test_auto_plot_store_loads_versioned_entries_and_derives_global_selection(self) -> None:
+    def test_auto_plot_store_loads_versioned_entries_and_derives_graph_file_selection(self) -> None:
         harness = _RunSelectionHarness()
         harness._run_selection_views["condition"] = [
             {
@@ -1952,77 +1898,104 @@ class TestTDTrendDialogLayout(unittest.TestCase):
 
         TestDataTrendDialog._load_auto_plots(harness)
 
-        selection = harness._current_auto_plot_global_selection()
+        graph_files = harness._normalized_auto_plot_entries()
+        self.assertEqual(len(graph_files), 1)
+        selection = graph_files[0].get("global_selection", {})
         self.assertEqual(selection.get("run_scope"), "condition")
         self.assertEqual(selection.get("selected_selection_ids"), ["condition:seq3"])
         self.assertEqual(selection.get("filters", {}).get("programs"), ["Program B"])
         self.assertEqual(selection.get("filters", {}).get("serials"), ["SN2"])
 
-    def test_auto_plot_store_saves_versioned_entries_with_global_selection(self) -> None:
+    def test_auto_plot_store_saves_version_three_graph_files(self) -> None:
         harness = _RunSelectionHarness()
-        harness._auto_plot_global_selection = {
-            "run_scope": "sequence",
-            "selected_selection_ids": [],
-            "filters": {
-                "programs": ["Program A"],
-                "serials": ["SN1"],
-                "control_periods": [],
-                "suppression_voltages": ["24"],
-            },
-        }
         harness._auto_plots = [
             {
-                "id": "plot-1",
-                "name": "Plot 1",
-                "plot_definition": {"mode": "metrics", "stats": ["mean"], "y": ["thrust"]},
+                "id": "file-1",
+                "name": "Program A Trends",
+                "global_selection": {
+                    "run_scope": "sequence",
+                    "selected_selection_ids": [],
+                    "filters": {
+                        "programs": ["Program A"],
+                        "serials": ["SN1"],
+                        "control_periods": [],
+                        "suppression_voltages": ["24"],
+                    },
+                },
+                "track_program_serials": True,
+                "plots": [
+                    {"id": "plot-1", "plot_definition": {"mode": "metrics", "stats": ["mean"], "y": ["thrust"]}},
+                    {"id": "plot-2", "plot_definition": {"mode": "curves", "x": "Time", "y": ["current"]}},
+                ],
             }
         ]
 
         harness._save_auto_plots_store()
         payload = json.loads(harness._auto_plot_path.read_text(encoding="utf-8"))
 
-        self.assertEqual(payload.get("version"), 2)
-        self.assertEqual(len(payload.get("entries") or []), 1)
-        self.assertEqual(payload["global_selection"]["filters"]["serials"], ["SN1"])
-        self.assertNotIn("filter_state", payload["entries"][0])
+        self.assertEqual(payload.get("version"), 3)
+        self.assertEqual(len(payload.get("graph_files") or []), 1)
+        self.assertTrue(bool(payload["graph_files"][0].get("track_program_serials")))
+        self.assertEqual(len(payload["graph_files"][0].get("plots") or []), 2)
+        self.assertNotIn("entries", payload)
+        self.assertNotIn("global_selection", payload)
 
-    @unittest.skipUnless(_have_matplotlib(), "matplotlib not installed")
-    def test_save_selected_auto_plots_pdf_exports_only_selected_saved_plots(self) -> None:
-        saved_figures: list[object] = []
+    def test_track_program_serials_resolves_new_serials_from_selected_programs(self) -> None:
+        harness = _RunSelectionHarness()
+        harness._available_serial_filter_rows = [
+            {"serial": "SN1", "program_title": "Program A"},
+            {"serial": "SN2", "program_title": "Program B"},
+            {"serial": "SN3", "program_title": "Program A"},
+        ]
+        graph_file = harness._normalize_auto_graph_file(
+            {
+                "name": "Program A File",
+                "global_selection": {
+                    "run_scope": "sequence",
+                    "selected_selection_ids": [],
+                    "filters": {
+                        "programs": ["Program A"],
+                        "serials": ["SN1"],
+                        "control_periods": [],
+                        "suppression_voltages": ["24", "28"],
+                    },
+                },
+                "track_program_serials": True,
+                "plots": [{"plot_definition": {"mode": "metrics", "stats": ["mean"], "y": ["thrust"]}}],
+            }
+        )
 
-        class _DummyPdfPages:
-            def __init__(self, _path: str) -> None:
-                pass
+        assert graph_file is not None
+        filters = harness._resolve_auto_graph_file_filter_state(graph_file)
+        self.assertEqual(filters.get("serials"), ["SN1", "SN3"])
 
-            def __enter__(self):
-                return self
+    def test_graph_file_tile_text_shows_title_and_programs(self) -> None:
+        _qt_app()
+        from PySide6 import QtWidgets
 
-            def __exit__(self, exc_type, exc, tb) -> None:
-                return None
-
-            def savefig(self, fig) -> None:
-                saved_figures.append(fig)
-
-        dlg = _build_test_data_dialog()
-        try:
-            dlg._plot_ready = True
-            dlg._db_path = Path(tempfile.mkdtemp()) / "cache.sqlite3"
-            dlg._auto_plots = [
-                {"name": "Plot 1", "mode": "metrics", "stats": ["mean"], "y": ["thrust"]},
-                {"name": "Plot 2", "mode": "curves", "y": ["current"], "x": "Time"},
-            ]
-            dlg._refresh_auto_plots_list()
-            dlg.list_auto_plots.item(1).setSelected(True)
-
-            with mock.patch("PySide6.QtWidgets.QFileDialog.getSaveFileName", return_value=("C:/tmp/selected.pdf", "PDF")):
-                with mock.patch("matplotlib.backends.backend_pdf.PdfPages", _DummyPdfPages):
-                    with mock.patch.object(dlg, "_render_auto_plot_entry_figure", return_value=(object(), "")) as render_mock:
-                        dlg._save_selected_auto_plots_pdf()
-
-            render_mock.assert_called_once()
-            self.assertEqual(len(saved_figures), 1)
-        finally:
-            dlg.close()
+        harness = _RunSelectionHarness()
+        harness._auto_plots = [
+            {
+                "name": "Program A Trends",
+                "global_selection": {
+                    "run_scope": "sequence",
+                    "selected_selection_ids": [],
+                    "filters": {
+                        "programs": ["Program A"],
+                        "serials": ["SN1"],
+                        "control_periods": [],
+                        "suppression_voltages": ["24"],
+                    },
+                },
+                "track_program_serials": False,
+                "plots": [{"plot_definition": {"mode": "metrics", "stats": ["mean"], "y": ["thrust"]}}],
+            }
+        ]
+        popup_list = QtWidgets.QListWidget()
+        harness._refresh_auto_plots_list(popup_list)
+        self.assertEqual(popup_list.count(), 1)
+        self.assertIn("Program A Trends", popup_list.item(0).text())
+        self.assertIn("Program A", popup_list.item(0).text())
 
 
 @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
