@@ -403,6 +403,38 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         self.assertTrue(title.startswith("Sequence: Seq 9"))
         self.assertIn("Run Condition: Condition B", title)
 
+    def test_td_cached_statistics_reads_existing_cache_meta(self):
+        from EIDAT_App_Files.ui_next import backend as be
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            db = Path(td) / "cache.sqlite3"
+            with sqlite3.connect(str(db)) as conn:
+                be._ensure_test_data_impl_tables(conn)
+                conn.execute("INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)", ("statistics", "mean,std"))
+                conn.commit()
+            self.assertEqual(be.td_cached_statistics(db), ["mean", "std"])
+
+    def test_tar_resolve_report_db_path_uses_existing_cache_for_stats_only_mismatch(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        be = types.SimpleNamespace(
+            inspect_test_data_project_cache_state=mock.Mock(return_value={"mode": "calc", "reason": "selected statistics changed"}),
+            validate_test_data_project_cache_for_open=mock.Mock(return_value=Path("validated.sqlite3")),
+            ensure_test_data_project_cache=mock.Mock(return_value=Path("ensured.sqlite3")),
+        )
+        progress: list[str] = []
+        db_path = tar._tar_resolve_report_db_path(
+            be,
+            Path("project"),
+            Path("workbook.xlsx"),
+            rebuild=False,
+            progress_cb=progress.append,
+        )
+        self.assertEqual(db_path, Path("validated.sqlite3"))
+        be.validate_test_data_project_cache_for_open.assert_called_once()
+        be.ensure_test_data_project_cache.assert_not_called()
+        self.assertTrue(any("Using existing cached statistics" in msg for msg in progress))
+
     def test_metric_map_cache_reuses_loaded_series_within_report(self):
         from EIDAT_App_Files.ui_next import trend_auto_report as tar
 

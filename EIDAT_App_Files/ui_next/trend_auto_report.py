@@ -64,6 +64,30 @@ def _tar_emit_progress(progress_cb: Callable[[str], None] | None, message: objec
         pass
 
 
+def _tar_resolve_report_db_path(
+    be: Any,
+    project_dir: Path,
+    workbook_path: Path,
+    *,
+    rebuild: bool,
+    progress_cb: Callable[[str], None] | None = None,
+) -> Path:
+    proj = Path(project_dir).expanduser()
+    wb = Path(workbook_path).expanduser()
+    if rebuild:
+        return Path(be.ensure_test_data_project_cache(proj, wb, rebuild=True, progress_cb=progress_cb)).expanduser()
+    try:
+        state = be.inspect_test_data_project_cache_state(proj, wb)
+    except Exception:
+        state = {}
+    refresh_mode = str((state or {}).get("mode") or "").strip().lower()
+    refresh_reason = str((state or {}).get("reason") or "").strip().lower()
+    if refresh_mode == "calc" and refresh_reason == "selected statistics changed":
+        _tar_emit_progress(progress_cb, "Using existing cached statistics for Auto Report")
+        return Path(be.validate_test_data_project_cache_for_open(proj, wb)).expanduser()
+    return Path(be.ensure_test_data_project_cache(proj, wb, rebuild=False, progress_cb=progress_cb)).expanduser()
+
+
 def _safe_float(v: object) -> float | None:
     if v is None:
         return None
@@ -4079,7 +4103,7 @@ def _tar_prepare_base(
 
     rebuild = bool(options.get("rebuild_cache"))
     _tar_emit_progress(progress_cb, "Ensuring project cache")
-    db_path = be.ensure_test_data_project_cache(proj, wb, rebuild=rebuild, progress_cb=progress_cb)
+    db_path = _tar_resolve_report_db_path(be, proj, wb, rebuild=rebuild, progress_cb=progress_cb)
     if bool(options.get("update_excel_trend_config", True)):
         _tar_emit_progress(progress_cb, "Syncing Excel trend configuration")
         _, change_summary = be.autofill_excel_trend_config_from_td_cache(
@@ -4135,10 +4159,22 @@ def _tar_prepare_base(
     if not hi:
         raise RuntimeError("Auto Report requires at least one highlighted serial under certification.")
 
-    stats = excel_cfg.get("statistics") or ["mean", "min", "max", "std", "median", "count"]
-    stats = [str(stat).strip().lower() for stat in stats if str(stat).strip()]
-    if not stats:
-        stats = ["mean", "min", "max", "std", "median", "count"]
+    try:
+        available_metric_stats = [
+            str(stat).strip().lower()
+            for stat in (be.td_cached_statistics(db_path) or [])
+            if str(stat).strip()
+        ]
+    except Exception:
+        available_metric_stats = []
+    if not available_metric_stats:
+        available_metric_stats = [
+            str(stat).strip().lower()
+            for stat in (excel_cfg.get("statistics") or ["mean", "min", "max", "std", "median", "count"])
+            if str(stat).strip()
+        ]
+    if not available_metric_stats:
+        available_metric_stats = ["mean"]
 
     metrics_stats_cfg = options.get("metric_stats")
     if not isinstance(metrics_stats_cfg, list) or not metrics_stats_cfg:
@@ -4147,12 +4183,14 @@ def _tar_prepare_base(
     if isinstance(metrics_stats_cfg, list):
         for stat in metrics_stats_cfg:
             normalized = str(stat or "").strip().lower()
-            if normalized and normalized not in metric_stats:
+            if normalized and normalized in available_metric_stats and normalized not in metric_stats:
                 metric_stats.append(normalized)
     elif isinstance(metrics_stats_cfg, str) and metrics_stats_cfg.strip():
-        metric_stats.append(metrics_stats_cfg.strip().lower())
+        normalized = metrics_stats_cfg.strip().lower()
+        if normalized in available_metric_stats:
+            metric_stats.append(normalized)
     if not metric_stats:
-        metric_stats = ["median"]
+        metric_stats = [available_metric_stats[0]]
 
     include_metrics = bool(options.get("include_metrics", bool(report_opts.get("include_metrics", True))))
     grid_points = int(model_cfg.get("grid_points") or 200) or 200
@@ -4403,6 +4441,7 @@ def _tar_prepare_base(
         "curve_plot_cache": curve_plot_cache,
         "metric_map_cache": {},
         "performance_metric_series_cache": {},
+        "available_metric_stats": available_metric_stats,
         "progress_cb": progress_cb,
     }
 

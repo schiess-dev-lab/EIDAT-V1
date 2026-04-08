@@ -7423,6 +7423,31 @@ def _td_expected_metric_labels_from_cache(conn: sqlite3.Connection) -> list[str]
     return labels
 
 
+def td_cached_statistics(db_path: Path) -> list[str]:
+    path = Path(db_path).expanduser()
+    if not path.exists() or not path.is_file():
+        return []
+    with sqlite3.connect(str(path)) as conn:
+        _ensure_test_data_impl_tables(conn)
+        stats_csv = str(_td_meta_value(conn, "statistics") or "").strip()
+        stats = [part.strip().lower() for part in stats_csv.split(",") if part.strip()]
+        available = {stat for stat in stats if stat in TD_ALLOWED_STATS}
+        if not available:
+            rows = conn.execute(
+                """
+                SELECT lower(stat) FROM td_metrics_calc
+                UNION
+                SELECT lower(stat) FROM td_metrics_calc_sequences
+                """
+            ).fetchall()
+            available = {
+                str(row[0] or "").strip().lower()
+                for row in rows
+                if str(row[0] or "").strip().lower() in TD_ALLOWED_STATS
+            }
+    return [stat for stat in TD_ALLOWED_STATS_ORDER if stat in available]
+
+
 def _td_validate_generated_workbook_outputs(
     workbook_path: Path,
     *,

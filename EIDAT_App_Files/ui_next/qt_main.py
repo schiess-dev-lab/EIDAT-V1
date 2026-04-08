@@ -7108,6 +7108,22 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             cfg = be.load_trend_auto_report_config(self._project_dir)
         except Exception:
             cfg = {}
+        cached_metric_stats: list[str] = []
+        try:
+            cached_metric_stats = [
+                str(stat).strip().lower()
+                for stat in (be.td_cached_statistics(self._db_path) or [])
+                if str(stat).strip()
+            ]
+        except Exception:
+            cached_metric_stats = []
+        if not cached_metric_stats:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Auto Report",
+                "No cached metric statistics are available in the current project cache. Update Project / Build Refresh Cache first.",
+            )
+            return
         report_filter_state = self._normalize_auto_plot_filter_state(
             self._current_auto_plot_filter_state(),
             default_to_current=True,
@@ -7298,7 +7314,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         metrics_pick_l = QtWidgets.QVBoxLayout(gb_metrics)
         metrics_pick_l.setContentsMargins(10, 10, 10, 10)
         metrics_pick_l.setSpacing(6)
-        lbl_metrics_note = QtWidgets.QLabel("Choose which metric pages to include before WATCH plots.")
+        lbl_metrics_note = QtWidgets.QLabel("Choose which metric pages to include before WATCH plots. Stats are limited to those already built in the current cache.")
         lbl_metrics_note.setWordWrap(True)
         lbl_metrics_note.setStyleSheet("color: #64748b; font-size: 11px; font-weight: 400;")
         metrics_pick_l.addWidget(lbl_metrics_note)
@@ -7312,10 +7328,11 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         metrics_pick_l.addWidget(btn_metrics_popup)
         metrics_pick_l.addWidget(lbl_metrics_auto)
         list_metric_stats = QtWidgets.QListWidget()
-        for st in ("mean", "min", "max", "median", "std"):
+        for st in cached_metric_stats:
             it = QtWidgets.QListWidgetItem(st)
             it.setFlags(it.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
-            it.setCheckState(QtCore.Qt.CheckState.Checked if st == "mean" else QtCore.Qt.CheckState.Unchecked)
+            default_checked = st == "mean" or (st == cached_metric_stats[0] and "mean" not in cached_metric_stats)
+            it.setCheckState(QtCore.Qt.CheckState.Checked if default_checked else QtCore.Qt.CheckState.Unchecked)
             list_metric_stats.addItem(it)
         right_l.addWidget(gb_metrics)
 
@@ -8080,16 +8097,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             # Performance plotters (optional override; if empty, backend falls back to excel_trend_config presets)
             perf_plotters = []
             try:
-                perf_stat = "mean"
-                try:
-                    xl_cfg2 = be.load_excel_trend_config(Path(be.DEFAULT_EXCEL_TREND_CONFIG).expanduser())
-                    st_list = xl_cfg2.get("statistics") if isinstance(xl_cfg2, dict) else None
-                    if isinstance(st_list, list) and st_list:
-                        perf_stat = str(st_list[0] or "").strip().lower() or "mean"
-                except Exception:
-                    perf_stat = "mean"
-                if perf_stat not in {"mean", "min", "max", "std"}:
-                    perf_stat = "mean"
+                perf_stat = cached_metric_stats[0] if cached_metric_stats else "mean"
 
                 # Build a quick per-run availability map (normed names) to validate "same run" constraint.
                 by_run_norm: dict[str, set[str]] = {}
