@@ -1189,6 +1189,98 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
             if tmpdir:
                 shutil.rmtree(str(tmpdir), ignore_errors=True)
 
+    def test_auto_report_certification_run_selection_visibility_tracks_selected_serials(self) -> None:
+        window = self._make_window()
+        try:
+            window._available_program_filters = ["Program Alpha", "Program Beta"]
+            window._available_control_period_filters = ["10"]
+            window._available_suppression_voltage_filters = ["5", "10"]
+            window._available_serial_filter_rows = [
+                {"serial": "SN-001", "program_title": "Program Alpha"},
+                {"serial": "SN-002", "program_title": "Program Alpha"},
+                {"serial": "SN-101", "program_title": "Program Beta"},
+            ]
+            window._global_filter_rows = [
+                {
+                    "serial": "SN-001",
+                    "program_title": "Program Alpha",
+                    "source_run_name": "Seq Alpha 1",
+                    "control_period": 10.0,
+                    "suppression_voltage": 5.0,
+                },
+                {
+                    "serial": "SN-002",
+                    "program_title": "Program Alpha",
+                    "source_run_name": "Seq Alpha 2",
+                    "control_period": 10.0,
+                    "suppression_voltage": 10.0,
+                },
+                {
+                    "serial": "SN-101",
+                    "program_title": "Program Beta",
+                    "source_run_name": "Seq Beta 1",
+                    "control_period": 10.0,
+                    "suppression_voltage": 5.0,
+                },
+            ]
+            window._run_selection_views = {
+                "sequence": [
+                    {
+                        "mode": "sequence",
+                        "id": "sequence:alpha1",
+                        "run_name": "run_alpha_1",
+                        "program_title": "Program Alpha",
+                        "member_programs": ["Program Alpha"],
+                        "member_sequences": ["Seq Alpha 1"],
+                        "member_control_periods": ["10"],
+                        "member_suppression_voltages": ["5"],
+                        "member_run_type_modes": ["pulsed_mode"],
+                    },
+                    {
+                        "mode": "sequence",
+                        "id": "sequence:alpha2",
+                        "run_name": "run_alpha_2",
+                        "program_title": "Program Alpha",
+                        "member_programs": ["Program Alpha"],
+                        "member_sequences": ["Seq Alpha 2"],
+                        "member_control_periods": ["10"],
+                        "member_suppression_voltages": ["10"],
+                        "member_run_type_modes": ["pulsed_mode"],
+                    },
+                    {
+                        "mode": "sequence",
+                        "id": "sequence:beta1",
+                        "run_name": "run_beta_1",
+                        "program_title": "Program Beta",
+                        "member_programs": ["Program Beta"],
+                        "member_sequences": ["Seq Beta 1"],
+                        "member_control_periods": ["10"],
+                        "member_suppression_voltages": ["5"],
+                        "member_run_type_modes": ["pulsed_mode"],
+                    },
+                ],
+                "condition": [],
+            }
+            filter_state = {
+                "programs": ["Program Alpha", "Program Beta"],
+                "serials": ["SN-001", "SN-002", "SN-101"],
+                "control_periods": ["10"],
+                "suppression_voltages": ["5"],
+            }
+
+            items = window._visible_auto_report_certification_run_selection_items_for_filter_state(
+                "sequence",
+                certifying_program="Program Alpha",
+                certification_serials=["SN-002"],
+                filter_state=filter_state,
+            )
+            self.assertEqual([item["id"] for item in items], ["sequence:alpha2"])
+        finally:
+            window.close()
+            tmpdir = getattr(window, "_test_tmpdir", "")
+            if tmpdir:
+                shutil.rmtree(str(tmpdir), ignore_errors=True)
+
     def test_auto_report_dialog_emits_certification_payload_and_default_output(self) -> None:
         window = self._make_window()
         try:
@@ -1255,27 +1347,52 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
                 captured: dict[str, object] = {}
 
                 def _run_dialog() -> int:
+                    cert_popup = next(
+                        (
+                            widget
+                            for widget in self._app.topLevelWidgets()
+                            if isinstance(widget, QtWidgets.QDialog) and widget.windowTitle() == "Certification Specifics"
+                        ),
+                        None,
+                    )
+                    if cert_popup is not None:
+                        popup_program = cert_popup.findChild(QtWidgets.QComboBox, "auto_report_cert_popup_program")
+                        popup_serials = cert_popup.findChild(QtWidgets.QListWidget, "auto_report_cert_popup_serials")
+                        popup_runs = cert_popup.findChild(QtWidgets.QListWidget, "auto_report_cert_popup_runs")
+                        self.assertIsNotNone(popup_program)
+                        self.assertIsNotNone(popup_serials)
+                        self.assertIsNotNone(popup_runs)
+                        popup_program.setCurrentText("Program Alpha")
+                        self._app.processEvents()
+                        self.assertEqual(
+                            [popup_serials.item(i).text() for i in range(popup_serials.count())],
+                            ["SN-001", "SN-002"],
+                        )
+                        popup_serials.item(1).setSelected(True)
+                        self._app.processEvents()
+                        self.assertGreaterEqual(popup_runs.count(), 1)
+                        apply_btn = next(
+                            btn for btn in cert_popup.findChildren(QtWidgets.QPushButton) if btn.text() == "Apply"
+                        )
+                        apply_btn.click()
+                        return int(QtWidgets.QDialog.DialogCode.Accepted)
+
                     dialog = next(
                         widget
                         for widget in self._app.topLevelWidgets()
                         if isinstance(widget, QtWidgets.QDialog) and widget.windowTitle() == "Auto Report Options"
                     )
-                    cert_program = dialog.findChild(QtWidgets.QComboBox, "auto_report_certifying_program")
-                    cert_serials = dialog.findChild(QtWidgets.QListWidget, "auto_report_certification_serials")
+                    cert_button = dialog.findChild(
+                        QtWidgets.QPushButton, "auto_report_certification_popup_button"
+                    )
                     report_name = dialog.findChild(QtWidgets.QLineEdit, "auto_report_report_name")
                     output_dir = dialog.findChild(QtWidgets.QLineEdit, "auto_report_output_dir")
-                    self.assertIsNotNone(cert_program)
-                    self.assertIsNotNone(cert_serials)
+                    self.assertIsNotNone(cert_button)
                     self.assertIsNotNone(report_name)
                     self.assertIsNotNone(output_dir)
                     self.assertIn("Family Serials...", [btn.text() for btn in dialog.findChildren(QtWidgets.QPushButton)])
-                    cert_program.setCurrentText("Program Alpha")
-                    self._app.processEvents()
-                    self.assertEqual(
-                        [cert_serials.item(i).text() for i in range(cert_serials.count())],
-                        ["SN-001", "SN-002"],
-                    )
-                    cert_serials.item(1).setSelected(True)
+                    self.assertIn("Certification Specifics...", [btn.text() for btn in dialog.findChildren(QtWidgets.QPushButton)])
+                    cert_button.click()
                     self._app.processEvents()
                     self.assertIn("Program Alpha", report_name.text())
                     self.assertIn("SN-002", report_name.text())

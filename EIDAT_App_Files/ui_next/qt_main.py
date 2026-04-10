@@ -6694,6 +6694,27 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             filter_state=cert_state,
         )
 
+    def _auto_report_filter_state_for_certification_scope(
+        self,
+        *,
+        certifying_program: object = None,
+        certification_serials: Sequence[object] | None = None,
+        filter_state: Mapping[str, object] | None = None,
+    ) -> dict[str, list[str]]:
+        state = self._auto_report_filter_state_without_suppression(filter_state)
+        want_program = _td_display_program_title(certifying_program)
+        if want_program:
+            state["programs"] = [want_program]
+        serial_values = [str(value).strip() for value in (certification_serials or []) if str(value).strip()]
+        if serial_values:
+            wanted_serials = {value for value in serial_values if value}
+            state["serials"] = [
+                value
+                for value in self._auto_plot_available_serial_values()
+                if value in wanted_serials
+            ] or list(serial_values)
+        return state
+
     def _auto_report_certifying_program_options(
         self,
         *,
@@ -7021,6 +7042,25 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             if any(self._selection_matches_observation_row(item, row) for row in candidate_rows):
                 out.append(dict(item))
         return out
+
+    def _visible_auto_report_certification_run_selection_items_for_filter_state(
+        self,
+        mode: str,
+        *,
+        certifying_program: object = None,
+        certification_serials: Sequence[object] | None = None,
+        filter_state: Mapping[str, object] | None = None,
+    ) -> list[dict]:
+        cert_state = self._auto_report_filter_state_for_certification_scope(
+            certifying_program=certifying_program,
+            certification_serials=certification_serials,
+            filter_state=filter_state,
+        )
+        return self._visible_auto_report_run_selection_items_for_filter_state(
+            mode,
+            filter_state=cert_state,
+            require_active_serial_match=True,
+        )
 
     def _serial_rows_for_run_selections(
         self,
@@ -7522,8 +7562,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         splitter.setOrientation(QtCore.Qt.Orientation.Horizontal)
         layout.addWidget(splitter, 1)
 
-        list_runs = QtWidgets.QListWidget()
-        cb_run_scope = QtWidgets.QComboBox()
+        list_runs = QtWidgets.QListWidget(dlg)
+        list_runs.hide()
+        cb_run_scope = QtWidgets.QComboBox(dlg)
         cb_run_scope.addItem("Sequence", "sequence")
         run_selection_views = {
             "sequence": [dict(d) for d in (self._run_selection_views.get("sequence") or []) if isinstance(d, dict)],
@@ -7535,10 +7576,23 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         idx_scope = cb_run_scope.findData(cur_scope)
         if idx_scope >= 0:
             cb_run_scope.setCurrentIndex(idx_scope)
+        cb_run_scope.hide()
         run_selection_check_states: dict[str, dict[str, bool]] = {"sequence": {}, "condition": {}}
         current_run_list_mode = str(cb_run_scope.currentData() or "sequence").strip().lower()
 
-        # Left: Certification specifics
+        cb_cert_program = QtWidgets.QComboBox(dlg)
+        cb_cert_program.setObjectName("auto_report_certifying_program")
+        cb_cert_program.hide()
+        ed_sn_filter = QtWidgets.QLineEdit(dlg)
+        ed_sn_filter.setObjectName("auto_report_cert_serial_filter")
+        ed_sn_filter.setPlaceholderText("Filter certification serials...")
+        ed_sn_filter.hide()
+        list_sn = QtWidgets.QListWidget(dlg)
+        list_sn.setObjectName("auto_report_certification_serials")
+        list_sn.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        list_sn.hide()
+
+        # Left: Certification specifics summary
         left = QtWidgets.QFrame()
         left_l = QtWidgets.QVBoxLayout(left)
         left_l.setContentsMargins(10, 10, 10, 10)
@@ -7547,37 +7601,28 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         lbl_certification_title.setStyleSheet("font-size: 12px; font-weight: 800; color: #000000;")
         left_l.addWidget(lbl_certification_title)
         lbl_certification_hint = QtWidgets.QLabel(
-            "Pick the certifying program, the certification serials under that program, and the exact run scope. Suppression voltage remains part of analysis filters but does not narrow these certification choices."
+            "Use the popup to pick the certifying program, certification serials, and run scope. "
+            "Suppression voltage still applies to the report analysis path, but it does not narrow certification choices."
         )
         lbl_certification_hint.setWordWrap(True)
         lbl_certification_hint.setStyleSheet("color: #4b5563; font-size: 11px;")
         left_l.addWidget(lbl_certification_hint)
-        row_cert_program = QtWidgets.QHBoxLayout()
-        row_cert_program.addWidget(QtWidgets.QLabel("Certifying Program"))
-        cb_cert_program = QtWidgets.QComboBox()
-        cb_cert_program.setObjectName("auto_report_certifying_program")
-        row_cert_program.addWidget(cb_cert_program, 1)
-        left_l.addLayout(row_cert_program)
-        left_l.addWidget(QtWidgets.QLabel("Certification Serials (required)"))
-        ed_sn_filter = QtWidgets.QLineEdit()
-        ed_sn_filter.setObjectName("auto_report_cert_serial_filter")
-        ed_sn_filter.setPlaceholderText("Filter certification serials...")
-        left_l.addWidget(ed_sn_filter)
-        list_sn = QtWidgets.QListWidget()
-        list_sn.setObjectName("auto_report_certification_serials")
-        list_sn.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
-        left_l.addWidget(list_sn, 1)
-        lbl_runs_auto = QtWidgets.QLabel("Selected runs: -")
+        lbl_cert_program_auto = QtWidgets.QLabel("Certifying Program: -")
+        lbl_cert_program_auto.setStyleSheet("color: #374151; font-size: 11px;")
+        lbl_cert_program_auto.setWordWrap(True)
+        left_l.addWidget(lbl_cert_program_auto)
+        lbl_cert_serials_auto = QtWidgets.QLabel("Certification Serials: -")
+        lbl_cert_serials_auto.setStyleSheet("color: #374151; font-size: 11px;")
+        lbl_cert_serials_auto.setWordWrap(True)
+        left_l.addWidget(lbl_cert_serials_auto)
+        lbl_runs_auto = QtWidgets.QLabel("Runs Included: -")
         lbl_runs_auto.setStyleSheet("color: #64748b; font-size: 11px;")
         lbl_runs_auto.setWordWrap(True)
-        row_runs = QtWidgets.QHBoxLayout()
-        row_runs.addWidget(QtWidgets.QLabel("Runs included"))
-        row_runs.addWidget(cb_run_scope)
-        btn_runs_popup = QtWidgets.QPushButton("Select Runs...")
-        row_runs.addWidget(btn_runs_popup)
-        row_runs.addStretch(1)
-        left_l.addLayout(row_runs)
         left_l.addWidget(lbl_runs_auto)
+        btn_cert_popup = QtWidgets.QPushButton("Certification Specifics...")
+        btn_cert_popup.setObjectName("auto_report_certification_popup_button")
+        left_l.addWidget(btn_cert_popup)
+        left_l.addStretch(1)
 
         default_hi = []
         try:
@@ -7586,15 +7631,6 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             default_hi = []
         want_hi = {str(s).strip() for s in (default_hi or []) if str(s).strip()}
         applied_default_hi = False
-
-        def _apply_sn_filter():
-            needle = (ed_sn_filter.text() or "").strip().lower()
-            for i in range(list_sn.count()):
-                it = list_sn.item(i)
-                if not it:
-                    continue
-                it.setHidden(bool(needle) and needle not in it.text().lower())
-        ed_sn_filter.textChanged.connect(_apply_sn_filter)
 
         splitter.addWidget(left)
 
@@ -7812,10 +7848,11 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             return str(selection.get("id") or "").strip()
 
         def _filtered_run_selection_items(mode: str) -> list[dict]:
-            return self._visible_auto_report_run_selection_items_for_filter_state(
+            return self._visible_auto_report_certification_run_selection_items_for_filter_state(
                 mode,
+                certifying_program=str(cb_cert_program.currentText() or "").strip(),
+                certification_serials=_selected_certification_serials(),
                 filter_state=report_filter_state,
-                require_active_serial_match=True,
             )
 
         def _capture_run_selection_states() -> None:
@@ -7842,9 +7879,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 if idx_sequence >= 0:
                     cb_run_scope.setCurrentIndex(idx_sequence)
 
-        def _populate_run_selections() -> None:
+        def _populate_run_selections(*, capture_current: bool = True) -> None:
             nonlocal current_run_list_mode
-            _capture_run_selection_states()
+            if capture_current:
+                _capture_run_selection_states()
             mode = str(cb_run_scope.currentData() or "sequence").strip().lower()
             items = _filtered_run_selection_items(mode)
             saved_states = dict(run_selection_check_states.get(mode) or {})
@@ -7892,10 +7930,18 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     out.append(rn)
             return out
 
+        def _set_selected_serial_values(values: Sequence[object] | None) -> None:
+            wanted = {str(value).strip() for value in (values or []) if str(value).strip()}
+            for i in range(list_sn.count()):
+                it = list_sn.item(i)
+                if it is not None:
+                    it.setSelected(it.text().strip() in wanted)
+
         def _update_runs_label() -> None:
             sel = [_selection_label(d) for d in _collect_checked_run_selections() if _selection_label(d)]
             scope_label = "run conditions" if str(cb_run_scope.currentData() or "sequence").strip().lower() == "condition" else "sequences"
-            lbl_runs_auto.setText(f"Selected {scope_label}: {_selection_summary(sel, list_runs.count())}")
+            lbl_runs_auto.setText(f"Runs Included ({scope_label}): {_selection_summary(sel, list_runs.count())}")
+            lbl_runs_auto.setToolTip(", ".join(sel))
 
         def _update_params_label():
             sel = _collect_checked(list_params)
@@ -7924,13 +7970,17 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 cb_cert_program.setCurrentIndex(0)
             cb_cert_program.blockSignals(False)
 
-        def _refresh_certification_serials() -> None:
+        def _refresh_certification_serials(*, selected_values: Sequence[object] | None = None) -> None:
             nonlocal applied_default_hi
-            selected_before = {
-                it.text().strip()
-                for it in list_sn.selectedItems()
-                if it is not None and it.text().strip()
-            }
+            selected_before = (
+                {str(value).strip() for value in (selected_values or []) if str(value).strip()}
+                if selected_values is not None
+                else {
+                    it.text().strip()
+                    for it in list_sn.selectedItems()
+                    if it is not None and it.text().strip()
+                }
+            )
             certifying_program = str(cb_cert_program.currentText() or "").strip()
             serial_rows = self._auto_report_serial_rows_for_certifying_program(
                 certifying_program,
@@ -7944,14 +7994,336 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             desired = selected_before
             if not desired and not applied_default_hi:
                 desired = set(want_hi)
-            for i in range(list_sn.count()):
-                it = list_sn.item(i)
-                if it and it.text().strip() in desired:
-                    it.setSelected(True)
+            _set_selected_serial_values(sorted(desired))
             list_sn.blockSignals(False)
             applied_default_hi = True
-            _apply_sn_filter()
+
+        def _refresh_certification_summary() -> None:
+            program = str(cb_cert_program.currentText() or "").strip()
+            serials = _selected_certification_serials()
+            lbl_cert_program_auto.setText(f"Certifying Program: {program or '-'}")
+            lbl_cert_program_auto.setToolTip(program)
+            lbl_cert_serials_auto.setText(f"Certification Serials: {_selection_summary(serials, list_sn.count())}")
+            lbl_cert_serials_auto.setToolTip(", ".join(serials))
+            _update_runs_label()
+
+        def _apply_certification_scope_change(
+            *,
+            refresh_serials: bool = False,
+            selected_serials: Sequence[object] | None = None,
+            capture_run_states: bool = True,
+        ) -> None:
+            if refresh_serials:
+                _refresh_certification_serials(selected_values=selected_serials)
+            _sync_report_run_scope_availability()
+            _populate_run_selections(capture_current=capture_run_states)
+            _refresh_params_from_runs()
             _refresh_output_path_preview()
+            _refresh_certification_summary()
+
+        def _open_certification_popup() -> None:
+            pop = QtWidgets.QDialog(dlg)
+            pop.setWindowTitle("Certification Specifics")
+            pop.resize(920, 640)
+            pop_l = QtWidgets.QVBoxLayout(pop)
+            pop_l.setContentsMargins(12, 12, 12, 12)
+            pop_l.setSpacing(10)
+
+            lbl_popup_hint = QtWidgets.QLabel(
+                "Choose the certifying program, certification serials, and runs included in certification. "
+                "These certification choices intentionally ignore suppression voltage so serials and run conditions stay visible within the chosen program."
+            )
+            lbl_popup_hint.setWordWrap(True)
+            lbl_popup_hint.setStyleSheet("color: #4b5563; font-size: 11px;")
+            pop_l.addWidget(lbl_popup_hint)
+
+            row_program = QtWidgets.QHBoxLayout()
+            row_program.addWidget(QtWidgets.QLabel("Certifying Program"))
+            local_program = QtWidgets.QComboBox()
+            local_program.setObjectName("auto_report_cert_popup_program")
+            for i in range(cb_cert_program.count()):
+                local_program.addItem(cb_cert_program.itemText(i), cb_cert_program.itemData(i))
+            current_program = str(cb_cert_program.currentText() or "").strip()
+            if current_program:
+                idx_local_program = local_program.findData(current_program)
+                if idx_local_program >= 0:
+                    local_program.setCurrentIndex(idx_local_program)
+            row_program.addWidget(local_program, 1)
+            pop_l.addLayout(row_program)
+
+            local_splitter = QtWidgets.QSplitter()
+            local_splitter.setOrientation(QtCore.Qt.Orientation.Horizontal)
+            pop_l.addWidget(local_splitter, 1)
+
+            serial_frame = QtWidgets.QFrame()
+            serial_layout = QtWidgets.QVBoxLayout(serial_frame)
+            serial_layout.setContentsMargins(0, 0, 0, 0)
+            serial_layout.setSpacing(8)
+            serial_title = QtWidgets.QLabel("Certification Serials")
+            serial_title.setStyleSheet("font-size: 12px; font-weight: 700; color: #000000;")
+            serial_layout.addWidget(serial_title)
+            local_serial_filter = QtWidgets.QLineEdit()
+            local_serial_filter.setPlaceholderText("Filter certification serials...")
+            serial_layout.addWidget(local_serial_filter)
+            local_serials = QtWidgets.QListWidget()
+            local_serials.setObjectName("auto_report_cert_popup_serials")
+            local_serials.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+            serial_layout.addWidget(local_serials, 1)
+            serial_btns = QtWidgets.QHBoxLayout()
+            btn_local_serials_all = QtWidgets.QPushButton("Select All")
+            btn_local_serials_clear = QtWidgets.QPushButton("Clear")
+            serial_btns.addWidget(btn_local_serials_all)
+            serial_btns.addWidget(btn_local_serials_clear)
+            serial_btns.addStretch(1)
+            serial_layout.addLayout(serial_btns)
+            local_splitter.addWidget(serial_frame)
+
+            runs_frame = QtWidgets.QFrame()
+            runs_layout = QtWidgets.QVBoxLayout(runs_frame)
+            runs_layout.setContentsMargins(0, 0, 0, 0)
+            runs_layout.setSpacing(8)
+            row_runs_title = QtWidgets.QHBoxLayout()
+            runs_title = QtWidgets.QLabel("Runs Included")
+            runs_title.setStyleSheet("font-size: 12px; font-weight: 700; color: #000000;")
+            row_runs_title.addWidget(runs_title)
+            row_runs_title.addStretch(1)
+            local_run_scope = QtWidgets.QComboBox()
+            local_run_scope.setObjectName("auto_report_cert_popup_scope")
+            for i in range(cb_run_scope.count()):
+                local_run_scope.addItem(cb_run_scope.itemText(i), cb_run_scope.itemData(i))
+                try:
+                    enabled = bool(cb_run_scope.model().item(i).isEnabled())
+                    local_run_scope.model().item(i).setEnabled(enabled)
+                except Exception:
+                    pass
+            idx_local_scope = local_run_scope.findData(cb_run_scope.currentData())
+            if idx_local_scope >= 0:
+                local_run_scope.setCurrentIndex(idx_local_scope)
+            row_runs_title.addWidget(local_run_scope)
+            runs_layout.addLayout(row_runs_title)
+            local_run_filter = QtWidgets.QLineEdit()
+            local_run_filter.setPlaceholderText("Filter runs...")
+            runs_layout.addWidget(local_run_filter)
+            local_runs = QtWidgets.QListWidget()
+            local_runs.setObjectName("auto_report_cert_popup_runs")
+            local_runs.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
+            runs_layout.addWidget(local_runs, 1)
+            local_runs_summary = QtWidgets.QLabel("Runs Included: -")
+            local_runs_summary.setStyleSheet("color: #64748b; font-size: 11px;")
+            local_runs_summary.setWordWrap(True)
+            runs_layout.addWidget(local_runs_summary)
+            run_btns = QtWidgets.QHBoxLayout()
+            btn_local_runs_all = QtWidgets.QPushButton("Select All")
+            btn_local_runs_clear = QtWidgets.QPushButton("Clear")
+            run_btns.addWidget(btn_local_runs_all)
+            run_btns.addWidget(btn_local_runs_clear)
+            run_btns.addStretch(1)
+            runs_layout.addLayout(run_btns)
+            local_splitter.addWidget(runs_frame)
+            local_splitter.setStretchFactor(0, 1)
+            local_splitter.setStretchFactor(1, 1)
+
+            local_run_states: dict[str, dict[str, bool]] = {
+                "sequence": dict(run_selection_check_states.get("sequence") or {}),
+                "condition": dict(run_selection_check_states.get("condition") or {}),
+            }
+            local_current_run_mode = str(local_run_scope.currentData() or "sequence").strip().lower()
+
+            def _local_selected_serials() -> list[str]:
+                return [it.text().strip() for it in local_serials.selectedItems() if it and it.text().strip()]
+
+            def _local_capture_run_states() -> None:
+                nonlocal local_current_run_mode
+                bucket = local_run_states.setdefault(local_current_run_mode, {})
+                bucket.clear()
+                for i in range(local_runs.count()):
+                    it = local_runs.item(i)
+                    data = it.data(QtCore.Qt.ItemDataRole.UserRole) if it is not None else None
+                    key = _run_selection_key(data if isinstance(data, dict) else None)
+                    if key:
+                        bucket[key] = bool(it and it.checkState() == QtCore.Qt.CheckState.Checked)
+
+            def _local_update_runs_summary() -> None:
+                labels: list[str] = []
+                for i in range(local_runs.count()):
+                    it = local_runs.item(i)
+                    if not it or it.checkState() != QtCore.Qt.CheckState.Checked:
+                        continue
+                    data = it.data(QtCore.Qt.ItemDataRole.UserRole)
+                    if isinstance(data, dict):
+                        label = _selection_label(data)
+                        if label:
+                            labels.append(label)
+                scope_label = (
+                    "run conditions"
+                    if str(local_run_scope.currentData() or "sequence").strip().lower() == "condition"
+                    else "sequences"
+                )
+                local_runs_summary.setText(
+                    f"Runs Included ({scope_label}): {_selection_summary(labels, local_runs.count())}"
+                )
+                local_runs_summary.setToolTip(", ".join(labels))
+
+            def _local_refresh_serials(*, selected_values: Sequence[object] | None = None) -> None:
+                if selected_values is not None:
+                    desired = {str(value).strip() for value in (selected_values or []) if str(value).strip()}
+                else:
+                    desired = set(_local_selected_serials()) or set(_selected_certification_serials())
+                serial_rows = self._auto_report_serial_rows_for_certifying_program(
+                    str(local_program.currentText() or "").strip(),
+                    filter_state=report_filter_state,
+                )
+                serial_values = [_td_serial_value(row) for row in serial_rows if _td_serial_value(row)]
+                local_serials.blockSignals(True)
+                try:
+                    local_serials.clear()
+                    for serial in serial_values:
+                        local_serials.addItem(QtWidgets.QListWidgetItem(serial))
+                    for i in range(local_serials.count()):
+                        it = local_serials.item(i)
+                        if it is not None and it.text().strip() in desired:
+                            it.setSelected(True)
+                finally:
+                    local_serials.blockSignals(False)
+
+            def _local_filtered_run_items(mode: str) -> list[dict]:
+                return self._visible_auto_report_certification_run_selection_items_for_filter_state(
+                    mode,
+                    certifying_program=str(local_program.currentText() or "").strip(),
+                    certification_serials=_local_selected_serials(),
+                    filter_state=report_filter_state,
+                )
+
+            def _local_sync_run_scope_availability() -> None:
+                has_conditions = bool(_local_filtered_run_items("condition"))
+                idx_condition_local = local_run_scope.findData("condition")
+                if idx_condition_local >= 0:
+                    try:
+                        local_run_scope.model().item(idx_condition_local).setEnabled(has_conditions)
+                    except Exception:
+                        pass
+                if str(local_run_scope.currentData() or "sequence").strip().lower() == "condition" and not has_conditions:
+                    idx_sequence_local = local_run_scope.findData("sequence")
+                    if idx_sequence_local >= 0:
+                        local_run_scope.setCurrentIndex(idx_sequence_local)
+
+            def _local_populate_runs(*, capture_current: bool = True) -> None:
+                nonlocal local_current_run_mode
+                if capture_current:
+                    _local_capture_run_states()
+                mode = str(local_run_scope.currentData() or "sequence").strip().lower()
+                items = _local_filtered_run_items(mode)
+                saved_states = dict(local_run_states.get(mode) or {})
+                local_runs.blockSignals(True)
+                try:
+                    local_runs.clear()
+                    for selection in items:
+                        label = _selection_label(selection)
+                        if not label:
+                            continue
+                        it = QtWidgets.QListWidgetItem(label)
+                        it.setFlags(it.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+                        checked = saved_states.get(_run_selection_key(selection), True)
+                        it.setCheckState(QtCore.Qt.CheckState.Checked if checked else QtCore.Qt.CheckState.Unchecked)
+                        it.setData(QtCore.Qt.ItemDataRole.UserRole, selection)
+                        local_runs.addItem(it)
+                finally:
+                    local_runs.blockSignals(False)
+                local_current_run_mode = mode
+                _local_update_runs_summary()
+
+            def _local_select_all_serials() -> None:
+                local_serials.blockSignals(True)
+                try:
+                    for i in range(local_serials.count()):
+                        it = local_serials.item(i)
+                        if it is not None and not it.isHidden():
+                            it.setSelected(True)
+                finally:
+                    local_serials.blockSignals(False)
+                _local_sync_run_scope_availability()
+                _local_populate_runs()
+
+            def _local_clear_serials() -> None:
+                local_serials.blockSignals(True)
+                try:
+                    local_serials.clearSelection()
+                finally:
+                    local_serials.blockSignals(False)
+                _local_sync_run_scope_availability()
+                _local_populate_runs()
+
+            def _local_set_run_checks(checked: bool) -> None:
+                local_runs.blockSignals(True)
+                try:
+                    for i in range(local_runs.count()):
+                        it = local_runs.item(i)
+                        if it is not None and not it.isHidden():
+                            it.setCheckState(QtCore.Qt.CheckState.Checked if checked else QtCore.Qt.CheckState.Unchecked)
+                finally:
+                    local_runs.blockSignals(False)
+                _local_update_runs_summary()
+
+            btn_local_serials_all.clicked.connect(_local_select_all_serials)
+            btn_local_serials_clear.clicked.connect(_local_clear_serials)
+            btn_local_runs_all.clicked.connect(lambda *_: _local_set_run_checks(True))
+            btn_local_runs_clear.clicked.connect(lambda *_: _local_set_run_checks(False))
+            local_serial_filter.textChanged.connect(lambda text: _set_filtered_hidden(local_serials, text))
+            local_run_filter.textChanged.connect(lambda text: _set_filtered_hidden(local_runs, text))
+            local_program.currentIndexChanged.connect(
+                lambda *_: (_local_refresh_serials(), _local_sync_run_scope_availability(), _local_populate_runs())
+            )
+            local_serials.itemSelectionChanged.connect(
+                lambda: (_local_sync_run_scope_availability(), _local_populate_runs())
+            )
+            local_run_scope.currentIndexChanged.connect(lambda *_: _local_populate_runs())
+            local_runs.itemChanged.connect(lambda *_: _local_update_runs_summary())
+
+            _local_refresh_serials()
+            _local_sync_run_scope_availability()
+            _local_populate_runs(capture_current=False)
+
+            btns = QtWidgets.QHBoxLayout()
+            btns.addStretch(1)
+            btn_apply = QtWidgets.QPushButton("Apply")
+            btn_cancel2 = QtWidgets.QPushButton("Cancel")
+            btns.addWidget(btn_apply)
+            btns.addWidget(btn_cancel2)
+            pop_l.addLayout(btns)
+
+            def _apply_local_certification() -> None:
+                _local_capture_run_states()
+                chosen_program = str(local_program.currentText() or "").strip()
+                chosen_serials = _local_selected_serials()
+                run_selection_check_states["sequence"] = dict(local_run_states.get("sequence") or {})
+                run_selection_check_states["condition"] = dict(local_run_states.get("condition") or {})
+                cb_cert_program.blockSignals(True)
+                try:
+                    idx_hidden_program = cb_cert_program.findData(chosen_program)
+                    if idx_hidden_program >= 0:
+                        cb_cert_program.setCurrentIndex(idx_hidden_program)
+                    elif cb_cert_program.count() > 0:
+                        cb_cert_program.setCurrentIndex(0)
+                finally:
+                    cb_cert_program.blockSignals(False)
+                cb_run_scope.blockSignals(True)
+                try:
+                    idx_hidden_scope = cb_run_scope.findData(local_run_scope.currentData())
+                    if idx_hidden_scope >= 0:
+                        cb_run_scope.setCurrentIndex(idx_hidden_scope)
+                finally:
+                    cb_run_scope.blockSignals(False)
+                _apply_certification_scope_change(
+                    refresh_serials=True,
+                    selected_serials=chosen_serials,
+                    capture_run_states=False,
+                )
+                pop.accept()
+
+            btn_apply.clicked.connect(_apply_local_certification)
+            btn_cancel2.clicked.connect(pop.reject)
+            _fit_widget_to_screen(pop)
+            pop.exec()
 
         def _report_filter_summary(
             prefix: str,
@@ -8025,10 +8397,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         def _apply_report_filter_change() -> None:
             _refresh_report_filter_summaries()
             _refresh_certifying_program_options()
-            _refresh_certification_serials()
-            _sync_report_run_scope_availability()
-            _populate_run_selections()
-            _refresh_params_from_runs()
+            _apply_certification_scope_change(refresh_serials=True)
 
         def _refresh_params_from_runs():
             runs_sel = _selected_member_runs()
@@ -8271,7 +8640,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             output_dir_auto["enabled"] = True
             _refresh_output_path_preview(force_dir=True)
 
-        btn_runs_popup.clicked.connect(_open_runs_popup)
+        btn_cert_popup.clicked.connect(_open_certification_popup)
         btn_params_popup.clicked.connect(_open_params_popup)
         btn_metrics_popup.clicked.connect(_open_metrics_popup)
         btn_report_program_filters.clicked.connect(_open_report_program_filters_popup)
@@ -8282,10 +8651,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         btn_output_default.clicked.connect(_use_default_output_dir)
         btn_output_browse.clicked.connect(_browse_output_dir)
 
-        cb_cert_program.currentIndexChanged.connect(lambda *_: _refresh_certification_serials())
-        list_sn.itemSelectionChanged.connect(lambda: _refresh_output_path_preview())
-        cb_run_scope.currentIndexChanged.connect(lambda *_: (_populate_run_selections(), _refresh_params_from_runs()))
-        list_runs.itemChanged.connect(lambda *_: _refresh_params_from_runs())
+        cb_cert_program.currentIndexChanged.connect(lambda *_: _apply_certification_scope_change(refresh_serials=True))
+        list_sn.itemSelectionChanged.connect(lambda: _apply_certification_scope_change())
+        cb_run_scope.currentIndexChanged.connect(lambda *_: _apply_certification_scope_change(capture_run_states=False))
+        list_runs.itemChanged.connect(lambda *_: (_refresh_params_from_runs(), _refresh_certification_summary()))
         list_params.itemChanged.connect(lambda *_: _update_params_label())
         list_metric_params.itemChanged.connect(lambda *_: _update_metric_params_label())
         list_metric_stats.itemChanged.connect(lambda *_: _update_metric_params_label())
