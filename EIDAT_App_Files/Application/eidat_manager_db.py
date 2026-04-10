@@ -5,6 +5,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+_EIDAT_CONTAINER_DIR_NAMES = ("EIDAT", "EDAT")
+_EIDAT_SUPPORT_DIR_NAMES = ("EIDAT Support", "EDAT Support")
+_EIDAT_SUPPORT_MAX_DEPTH = 5
+
+
 @dataclass(frozen=True)
 class SupportPaths:
     global_repo: Path
@@ -14,14 +19,86 @@ class SupportPaths:
     staging_dir: Path
 
 
+def _candidate_support_dirs(global_repo: Path) -> list[Path]:
+    repo = Path(global_repo).expanduser()
+    candidates: list[Path] = []
+    seen: set[str] = set()
+
+    def _append(path: Path) -> None:
+        key = str(path).casefold()
+        if key in seen:
+            return
+        seen.add(key)
+        candidates.append(path)
+
+    for support_name in _EIDAT_SUPPORT_DIR_NAMES:
+        _append(repo / support_name)
+
+    chain_bases = [repo]
+    for _ in range(_EIDAT_SUPPORT_MAX_DEPTH):
+        next_bases: list[Path] = []
+        for base in chain_bases:
+            for dirname in _EIDAT_CONTAINER_DIR_NAMES:
+                child = base / dirname
+                next_bases.append(child)
+                for support_name in _EIDAT_SUPPORT_DIR_NAMES:
+                    _append(child / support_name)
+        chain_bases = next_bases
+    return candidates
+
+
+def _default_support_dir(global_repo: Path) -> Path:
+    repo = Path(global_repo).expanduser()
+    deepest_base = repo
+    chain_bases = [repo]
+    for _ in range(_EIDAT_SUPPORT_MAX_DEPTH):
+        next_bases: list[Path] = []
+        for base in chain_bases:
+            for dirname in _EIDAT_CONTAINER_DIR_NAMES:
+                child = base / dirname
+                try:
+                    if child.is_dir():
+                        next_bases.append(child)
+                except Exception:
+                    continue
+        if not next_bases:
+            break
+        deepest_base = max(next_bases, key=lambda path: (len(path.parts), str(path).casefold()))
+        chain_bases = next_bases
+    return deepest_base / _EIDAT_SUPPORT_DIR_NAMES[0]
+
+
+def _support_dir_score(path: Path) -> tuple[int, int]:
+    score = 0
+    markers = (
+        ("eidat_index.sqlite3", 12),
+        ("eidat_support.sqlite3", 12),
+        ("projects/projects_registry.sqlite3", 10),
+        ("projects", 3),
+        ("debug/ocr", 3),
+        ("excel_sqlite", 2),
+        ("logs", 1),
+        ("staging", 1),
+    )
+    for rel_path, weight in markers:
+        try:
+            if (path / rel_path).exists():
+                score += weight
+        except Exception:
+            continue
+    return score, len(path.parts)
+
+
 def support_paths(global_repo: Path) -> SupportPaths:
     repo = Path(global_repo).expanduser()
-    new = repo / "EIDAT" / "EIDAT Support"
-    legacy = repo / "EIDAT Support"
-    try:
-        support_dir = new if new.is_dir() else (legacy if legacy.is_dir() else new)
-    except Exception:
-        support_dir = new
+    existing: list[Path] = []
+    for candidate in _candidate_support_dirs(repo):
+        try:
+            if candidate.is_dir():
+                existing.append(candidate)
+        except Exception:
+            continue
+    support_dir = max(existing, key=_support_dir_score) if existing else _default_support_dir(repo)
     return SupportPaths(
         global_repo=repo,
         support_dir=support_dir,

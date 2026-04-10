@@ -7,9 +7,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 try:
-    from eidat_manager_db import SupportPaths, connect_db, ensure_schema, get_meta_int, set_meta
+    from eidat_manager_db import SupportPaths, connect_db, ensure_schema, get_meta_int, set_meta, support_paths
 except Exception:  # pragma: no cover
-    from .eidat_manager_db import SupportPaths, connect_db, ensure_schema, get_meta_int, set_meta  # type: ignore
+    from .eidat_manager_db import SupportPaths, connect_db, ensure_schema, get_meta_int, set_meta, support_paths  # type: ignore
 
 try:
     from eidat_manager_embed import extract_pointer_token
@@ -37,6 +37,15 @@ except Exception:  # pragma: no cover
 # Supported file extensions for scanning
 SUPPORTED_EXTENSIONS = {".pdf", ".xlsx", ".xls", ".xlsm", ".mat"}
 EXCEL_ARTIFACT_SUFFIX = "__excel"
+
+
+def _node_root_from_support_dir(support_dir: Path) -> Path:
+    cur = Path(support_dir).expanduser()
+    if cur.name.strip().casefold() in {"eidat support", "edat support"}:
+        cur = cur.parent
+    while cur.name.strip().casefold() in {"eidat", "edat"}:
+        cur = cur.parent
+    return cur
 
 # Ignore generated artifacts and support folders anywhere in the repo tree.
 # These are not "source" PDFs/Excels and should not be tracked as inputs.
@@ -248,21 +257,7 @@ def _pointer_artifacts_exist(global_repo: Path, file_path: Path) -> bool:
         return False
 
     repo = Path(global_repo).expanduser()
-    new_support_dir = repo / "EIDAT" / "EIDAT Support"
-    legacy_support_dir = repo / "EIDAT Support"
-
-    def _support_dir() -> Path:
-        try:
-            if new_support_dir.is_dir():
-                return new_support_dir
-        except Exception:
-            pass
-        try:
-            if legacy_support_dir.is_dir():
-                return legacy_support_dir
-        except Exception:
-            pass
-        return new_support_dir
+    support_dir = support_paths(repo).support_dir
 
     def _resolve(rel_or_abs: object) -> Path | None:
         try:
@@ -278,10 +273,15 @@ def _pointer_artifacts_exist(global_repo: Path, file_path: Path) -> bool:
         # Back-compat: older pointer tokens stored paths rooted at "EIDAT Support\..."
         # even when support is now nested under "EIDAT\EIDAT Support".
         parts = list(p.parts)
-        if parts and str(parts[0]).strip().casefold() == "eidat support":
-            return _support_dir() / Path(*parts[1:])
-        if len(parts) >= 2 and str(parts[0]).strip().casefold() == "eidat" and str(parts[1]).strip().casefold() == "eidat support":
-            return repo / p
+        if parts and str(parts[0]).strip().casefold() in {"eidat support", "edat support"}:
+            return support_dir / Path(*parts[1:])
+        for idx, part in enumerate(parts):
+            if str(part).strip().casefold() not in {"eidat support", "edat support"}:
+                continue
+            prefix = [str(item).strip().casefold() for item in parts[:idx]]
+            if prefix and all(item in {"eidat", "edat"} for item in prefix):
+                return repo / Path(*parts)
+            break
 
         return repo / p
 
@@ -329,7 +329,7 @@ def _expected_artifacts_dir(support_dir: Path, file_path: Path) -> Path:
     """
     ext = str(file_path.suffix or "").lower()
     if ext == ".mat" and detect_mat_bundle_member is not None and mat_bundle_artifacts_dir is not None:
-        repo_root = support_dir.parent.parent if support_dir.parent.name == "EIDAT" else support_dir.parent
+        repo_root = _node_root_from_support_dir(support_dir)
         try:
             bundle = detect_mat_bundle_member(file_path, repo_root=repo_root)
         except Exception:

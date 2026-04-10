@@ -1,4 +1,5 @@
 import json
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -15,16 +16,37 @@ from ui_next import backend  # noqa: E402
 
 
 class TestBackendEdinProgramFolders(unittest.TestCase):
+    def test_eidat_support_dir_prefers_deepest_populated_support_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            shallow = repo / "EIDAT" / "EIDAT Support"
+            deep = repo / "EIDAT" / "EIDAT" / "EIDAT Support"
+            shallow.mkdir(parents=True, exist_ok=True)
+            deep.mkdir(parents=True, exist_ok=True)
+            (shallow / "logs").mkdir(parents=True, exist_ok=True)
+            (deep / "eidat_support.sqlite3").write_text("", encoding="utf-8")
+            (deep / "projects").mkdir(parents=True, exist_ok=True)
+            (deep / "projects" / "projects_registry.sqlite3").write_text("", encoding="utf-8")
+
+            resolved = backend.eidat_support_dir(repo)
+
+            self.assertEqual(resolved, deep)
+
+    def test_eidat_support_dir_defaults_to_lowest_existing_eidat_chain(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            (repo / "EIDAT" / "EIDAT").mkdir(parents=True, exist_ok=True)
+
+            resolved = backend.eidat_support_dir(repo)
+
+            self.assertEqual(resolved, repo / "EIDAT" / "EIDAT" / "EIDAT Support")
+
     def test_sync_edin_program_folders_creates_program_and_report_dirs(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             repo = Path(td) / "repo"
             repo.mkdir(parents=True, exist_ok=True)
-            docs = [
-                {"program_title": "Program Alpha"},
-                {"program_title": "Program Beta/One"},
-                {"program_title": "Program Alpha"},
-            ]
-            with patch.object(backend, "read_eidat_index_documents", return_value=docs):
+            titles = ["Program Alpha", "Program Beta/One"]
+            with patch.object(backend, "list_eidat_program_titles", return_value=titles):
                 result = backend.sync_edin_program_folders(repo)
 
             root = repo / backend.EDIN_PROGRAM_FOLDERS_DIRNAME
@@ -51,6 +73,32 @@ class TestBackendEdinProgramFolders(unittest.TestCase):
             titles = backend.list_eidat_program_titles(repo)
 
             self.assertEqual(titles, ["Program Gamma"])
+
+    def test_list_eidat_program_titles_reads_distinct_titles_from_index_db(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            support = repo / "EIDAT" / "EIDAT" / "EIDAT Support"
+            support.mkdir(parents=True, exist_ok=True)
+            db_path = support / "eidat_index.sqlite3"
+            conn = sqlite3.connect(str(db_path))
+            try:
+                conn.execute("CREATE TABLE documents (program_title TEXT)")
+                conn.executemany(
+                    "INSERT INTO documents(program_title) VALUES(?)",
+                    [
+                        ("Program Beta",),
+                        ("Program Alpha",),
+                        ("Program Beta",),
+                        (" ",),
+                    ],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            titles = backend.list_eidat_program_titles(repo)
+
+            self.assertEqual(titles, ["Program Alpha", "Program Beta"])
 
     def test_td_auto_report_default_filename_uses_program_and_certification_serials(self) -> None:
         name = backend.td_auto_report_default_filename(

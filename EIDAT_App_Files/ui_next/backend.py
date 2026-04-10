@@ -524,24 +524,150 @@ def edin_program_folders_root(global_repo: Path | None = None) -> Path:
     return repo / EDIN_PROGRAM_FOLDERS_DIRNAME
 
 
+_EIDAT_CONTAINER_DIR_NAMES = ("EIDAT", "EDAT")
+_EIDAT_SUPPORT_DIR_NAMES = ("EIDAT Support", "EDAT Support")
+_EIDAT_SUPPORT_MAX_DEPTH = 5
+
+
+def _candidate_eidat_support_dirs(global_repo: Path) -> list[Path]:
+    repo = Path(global_repo).expanduser()
+    candidates: list[Path] = []
+    seen: set[str] = set()
+
+    def _append(path: Path) -> None:
+        key = str(path).casefold()
+        if key in seen:
+            return
+        seen.add(key)
+        candidates.append(path)
+
+    for support_name in _EIDAT_SUPPORT_DIR_NAMES:
+        _append(repo / support_name)
+
+    chain_bases = [repo]
+    for _ in range(_EIDAT_SUPPORT_MAX_DEPTH):
+        next_bases: list[Path] = []
+        for base in chain_bases:
+            for dirname in _EIDAT_CONTAINER_DIR_NAMES:
+                child = base / dirname
+                next_bases.append(child)
+                for support_name in _EIDAT_SUPPORT_DIR_NAMES:
+                    _append(child / support_name)
+        chain_bases = next_bases
+    return candidates
+
+
+def _default_eidat_support_dir(global_repo: Path) -> Path:
+    repo = Path(global_repo).expanduser()
+    deepest_base = repo
+    chain_bases = [repo]
+    for _ in range(_EIDAT_SUPPORT_MAX_DEPTH):
+        next_bases: list[Path] = []
+        for base in chain_bases:
+            for dirname in _EIDAT_CONTAINER_DIR_NAMES:
+                child = base / dirname
+                try:
+                    if child.is_dir():
+                        next_bases.append(child)
+                except Exception:
+                    continue
+        if not next_bases:
+            break
+        deepest_base = max(next_bases, key=lambda path: (len(path.parts), str(path).casefold()))
+        chain_bases = next_bases
+    return deepest_base / _EIDAT_SUPPORT_DIR_NAMES[0]
+
+
+def _eidat_support_dir_score(path: Path) -> tuple[int, int]:
+    score = 0
+    markers = (
+        ("eidat_index.sqlite3", 12),
+        ("eidat_support.sqlite3", 12),
+        ("projects/projects_registry.sqlite3", 10),
+        ("projects", 3),
+        ("debug/ocr", 3),
+        ("excel_sqlite", 2),
+        ("logs", 1),
+        ("staging", 1),
+    )
+    for rel_path, weight in markers:
+        try:
+            if (path / rel_path).exists():
+                score += weight
+        except Exception:
+            continue
+    return score, len(path.parts)
+
+
+def _first_support_segment_index(parts: Sequence[object]) -> int | None:
+    names = {name.casefold() for name in _EIDAT_SUPPORT_DIR_NAMES}
+    for idx, part in enumerate(parts):
+        if str(part or "").strip().casefold() in names:
+            return idx
+    return None
+
+
+def _node_root_from_support_dir(support_dir: Path) -> Path:
+    cur = Path(support_dir).expanduser()
+    if cur.name.strip().casefold() in {name.casefold() for name in _EIDAT_SUPPORT_DIR_NAMES}:
+        cur = cur.parent
+    while cur.name.strip().casefold() in {name.casefold() for name in _EIDAT_CONTAINER_DIR_NAMES}:
+        cur = cur.parent
+    return cur
+
+
+def _read_index_program_titles(global_repo: Path) -> list[str]:
+    repo = Path(global_repo).expanduser()
+    db_path = eidat_support_dir(repo) / "eidat_index.sqlite3"
+    if not db_path.exists():
+        return []
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        conn.row_factory = sqlite3.Row
+        docs_table = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='documents'"
+        ).fetchone()
+        if docs_table is None:
+            return []
+        rows = conn.execute(
+            """
+            SELECT DISTINCT TRIM(program_title) AS program_title
+            FROM documents
+            WHERE TRIM(COALESCE(program_title, '')) <> ''
+            ORDER BY LOWER(TRIM(program_title)), TRIM(program_title)
+            """
+        ).fetchall()
+    return [str(row["program_title"]).strip() for row in rows if str(row["program_title"] or "").strip()]
+
+
 def _fallback_eidat_program_titles(global_repo: Path) -> list[str]:
     support_dir = eidat_support_dir(global_repo)
-    roots = [
-        support_dir / "debug" / "ocr",
-        support_dir / "projects",
-    ]
     titles: list[str] = []
     seen: set[str] = set()
-    for root in roots:
+    candidate_patterns: list[tuple[Path, tuple[str, ...]]] = [
+        (
+            support_dir / "debug" / "ocr",
+            (
+                "*/*_metadata.json",
+                "*/*.metadata.json",
+                "*/metadata.json",
+            ),
+        ),
+        (
+            support_dir / "projects",
+            (
+                "*/project.json",
+            ),
+        ),
+    ]
+    for root, patterns in candidate_patterns:
         try:
             if not root.exists():
                 continue
         except Exception:
             continue
-        patterns = ("*_metadata.json", "*.metadata.json", "*.json")
         for pattern in patterns:
             try:
-                paths = sorted(root.rglob(pattern))
+                paths = sorted(root.glob(pattern))
             except Exception:
                 paths = []
             for path in paths:
@@ -562,17 +688,9 @@ def _fallback_eidat_program_titles(global_repo: Path) -> list[str]:
 def list_eidat_program_titles(global_repo: Path | None = None) -> list[str]:
     repo = Path(global_repo or get_repo_root()).expanduser()
     try:
-        docs = read_eidat_index_documents(repo)
+        titles = _read_index_program_titles(repo)
     except Exception:
-        docs = []
-    titles = sorted(
-        {
-            str(doc.get("program_title") or "").strip()
-            for doc in (docs or [])
-            if isinstance(doc, dict) and str(doc.get("program_title") or "").strip()
-        },
-        key=lambda value: value.casefold(),
-    )
+        titles = []
     if titles:
         return titles
     return _fallback_eidat_program_titles(repo)
@@ -2830,20 +2948,16 @@ def _ensure_test_data_raw_cache_tables(conn: sqlite3.Connection) -> None:
 
 def eidat_support_dir(global_repo: Path) -> Path:
     repo = Path(global_repo).expanduser()
-    # New node layout: support lives under the deposited EIDAT folder.
-    new = repo / "EIDAT" / "EIDAT Support"
-    legacy = repo / "EIDAT Support"
-    try:
-        if new.is_dir():
-            return new
-    except Exception:
-        pass
-    try:
-        if legacy.is_dir():
-            return legacy
-    except Exception:
-        pass
-    return new
+    existing: list[Path] = []
+    for candidate in _candidate_eidat_support_dirs(repo):
+        try:
+            if candidate.is_dir():
+                existing.append(candidate)
+        except Exception:
+            continue
+    if existing:
+        return max(existing, key=_eidat_support_dir_score)
+    return _default_eidat_support_dir(repo)
 
 
 def eidat_projects_root(global_repo: Path) -> Path:
@@ -3209,7 +3323,7 @@ def _infer_node_root_from_workbook_path(workbook_path: Path) -> Path:
     """
     Best-effort: if workbook lives under:
       - `<node_root>/EIDAT Support/...` (legacy), or
-      - `<node_root>/EIDAT/EIDAT Support/...` (current),
+      - `<node_root>/EIDAT/.../EIDAT Support/...` (current/nested),
     return `<node_root>`.
     Otherwise, return workbook parent.
     """
@@ -3220,12 +3334,11 @@ def _infer_node_root_from_workbook_path(workbook_path: Path) -> Path:
         p = p.absolute()
     cur = p.parent
     for _ in range(12):
-        if cur.name.strip().lower() == "eidat support":
-            # Legacy layout: <node_root>/EIDAT Support/...
-            # Current layout: <node_root>/EIDAT/EIDAT Support/...
-            if cur.parent.name.strip().lower() == "eidat":
-                return cur.parent.parent
-            return cur.parent
+        if cur.name.strip().casefold() in {name.casefold() for name in _EIDAT_SUPPORT_DIR_NAMES}:
+            base = cur.parent
+            while base.name.strip().casefold() in {name.casefold() for name in _EIDAT_CONTAINER_DIR_NAMES}:
+                base = base.parent
+            return base
         if cur == cur.parent:
             break
         cur = cur.parent
@@ -3256,7 +3369,7 @@ def _resolve_excel_sqlite_path_from_workbook(workbook_path: Path, excel_sqlite_r
     Supports:
     - absolute paths
     - paths starting with `EIDAT Support\\...` (legacy; relative to support dir)
-    - paths starting with `EIDAT\\EIDAT Support\\...` (current; relative to node root)
+    - paths starting with `EIDAT\\...\\EIDAT Support\\...` (current/nested; relative to node root)
     - paths starting with `debug\\...` (relative to the node's support dir)
     - other relative paths (relative to workbook folder)
     """
@@ -3271,12 +3384,16 @@ def _resolve_excel_sqlite_path_from_workbook(workbook_path: Path, excel_sqlite_r
     support_dir = eidat_support_dir(node_root)
     norm = raw.replace("/", "\\").lstrip("\\")
     low = norm.lower()
+    parts = list(Path(norm).parts)
+    support_idx = _first_support_segment_index(parts)
 
-    if low.startswith("eidat support\\"):
-        rest = norm[len("EIDAT Support\\") :]
-        return (support_dir / Path(rest)).expanduser()
-    if low.startswith("eidat\\eidat support\\"):
-        return (node_root / Path(norm)).expanduser()
+    if support_idx == 0:
+        rest = Path(*parts[1:]) if len(parts) > 1 else Path()
+        return (support_dir / rest).expanduser()
+    if support_idx is not None:
+        prefix = [str(part or "").strip().casefold() for part in parts[:support_idx]]
+        if prefix and all(part in {name.casefold() for name in _EIDAT_CONTAINER_DIR_NAMES} for part in prefix):
+            return (node_root / Path(*parts)).expanduser()
     if low.startswith("debug\\") or low.startswith("projects\\") or low.startswith("cache\\"):
         return (support_dir / Path(norm)).expanduser()
 
@@ -28170,24 +28287,22 @@ def _resolve_support_path(support_dir: Path, maybe_rel: str | None) -> Path | No
         return p
     norm = str(maybe_rel).replace("/", "\\").lstrip("\\")
     low = norm.lower()
+    parts = list(Path(norm).parts)
+    support_idx = _first_support_segment_index(parts)
     try:
         support = Path(support_dir).expanduser()
-        if support.name.strip().lower() == "eidat support":
-            if support.parent.name.strip().lower() == "eidat":
-                node_root = support.parent.parent
-            else:
-                node_root = support.parent
-        else:
-            node_root = support.parent
+        node_root = _node_root_from_support_dir(support)
     except Exception:
         support = Path(support_dir).expanduser()
         node_root = support.parent
 
-    if low.startswith("eidat support\\"):
-        rest = norm[len("EIDAT Support\\") :]
-        return support / Path(rest)
-    if low.startswith("eidat\\eidat support\\"):
-        return node_root / Path(norm)
+    if support_idx == 0:
+        rest = Path(*parts[1:]) if len(parts) > 1 else Path()
+        return support / rest
+    if support_idx is not None:
+        prefix = [str(part or "").strip().casefold() for part in parts[:support_idx]]
+        if prefix and all(part in {name.casefold() for name in _EIDAT_CONTAINER_DIR_NAMES} for part in prefix):
+            return node_root / Path(*parts)
     if low.startswith("debug\\") or low.startswith("projects\\") or low.startswith("logs\\") or low.startswith("staging\\"):
         return support / Path(norm)
     return support / p
