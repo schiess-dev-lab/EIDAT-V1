@@ -453,9 +453,17 @@ def save_project_scanner_env(env_map: Dict[str, str], project_dir: Path) -> Path
 
 
 def get_repo_root() -> Path:
-    """Return repository root from scanner.env or DEFAULT_REPO_ROOT."""
+    """Return repository root from node env, scanner env, or DEFAULT_REPO_ROOT."""
     ensure_repo_root_name_file()
     node_root = (os.environ.get("EIDAT_NODE_ROOT") or "").strip()
+    if node_root:
+        # In node mode the active repository is always the node root. Node-local
+        # `.env` files may be seeded from a shared runtime config and can contain
+        # a stale REPO_ROOT that must not override the live node binding.
+        try:
+            return Path(node_root).expanduser().resolve()
+        except Exception:
+            return Path(node_root).expanduser().absolute()
     # Repo root is a global setting, not tied to any specific workbook/project.
     env = load_scanner_env()
     val = env.get("REPO_ROOT", "").strip()
@@ -467,11 +475,6 @@ def get_repo_root() -> Path:
             return p
     except Exception:
         pass
-    if node_root:
-        try:
-            return Path(node_root).expanduser().resolve()
-        except Exception:
-            return Path(node_root).expanduser().absolute()
     return DEFAULT_REPO_ROOT
 
 

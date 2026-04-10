@@ -33,6 +33,23 @@ def _write_text(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
+def _sanitize_node_env_text(text: str) -> str:
+    lines: list[str] = []
+    for raw in str(text or "").splitlines():
+        stripped = raw.strip()
+        if stripped and not stripped.startswith("#") and not stripped.startswith(";") and "=" in raw:
+            key = raw.split("=", 1)[0].strip().upper()
+            # Node deployments always bind repo root to the live node root.
+            # Copying a shared runtime REPO_ROOT into the node .env can point the
+            # Files/Projects UI at the wrong machine/path.
+            if key == "REPO_ROOT":
+                continue
+        lines.append(raw)
+    if not lines:
+        return ""
+    return "\n".join(lines).rstrip() + "\n"
+
+
 def _safe_rmtree_if_present(path: Path) -> None:
     if not path.exists():
         return
@@ -427,7 +444,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if default_env.exists():
             node_env.parent.mkdir(parents=True, exist_ok=True)
-            new_bytes = default_env.read_bytes()
+            new_text = _sanitize_node_env_text(default_env.read_text(encoding="utf-8", errors="ignore"))
+            new_bytes = new_text.encode("utf-8")
             if node_env.exists():
                 try:
                     old_bytes = node_env.read_bytes()

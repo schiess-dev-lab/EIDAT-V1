@@ -1,4 +1,5 @@
 import json
+import os
 import sqlite3
 import sys
 import tempfile
@@ -110,6 +111,30 @@ class TestBackendEdinProgramFolders(unittest.TestCase):
             name,
             "Program Alpha__SN-001__SN-002__SN-003__plus_1_more__TD_Auto_Report__2026-04-09.pdf",
         )
+
+    def test_get_repo_root_prefers_active_node_root_over_configured_repo_root(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            data_root = root / "data"
+            user_inputs = data_root / "user_inputs"
+            node_root = root / "node_root"
+            node_root.mkdir(parents=True, exist_ok=True)
+            user_inputs.mkdir(parents=True, exist_ok=True)
+            scanner_env = user_inputs / "scanner.env"
+            scanner_local = user_inputs / "scanner.local.env"
+            dot_env = data_root / ".env"
+            scanner_env.write_text("REPO_ROOT=C:\\shared\\runtime\\repo\n", encoding="utf-8")
+            scanner_local.write_text("REPO_ROOT=C:\\node\\override\\repo\n", encoding="utf-8")
+            dot_env.write_text("REPO_ROOT=C:\\stale\\dotenv\\repo\n", encoding="utf-8")
+
+            with patch.dict(os.environ, {"EIDAT_NODE_ROOT": str(node_root)}, clear=False), patch.object(
+                backend, "SCANNER_ENV", scanner_env
+            ), patch.object(backend, "SCANNER_ENV_LOCAL", scanner_local), patch.object(
+                backend, "DOTENV_FILES", [dot_env]
+            ), patch.object(
+                backend, "ensure_repo_root_name_file", return_value=""
+            ):
+                self.assertEqual(backend.get_repo_root(), node_root.resolve())
 
 
 if __name__ == "__main__":
