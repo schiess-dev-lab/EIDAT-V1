@@ -15,6 +15,7 @@ from typing import Any, Callable, Mapping
 import html
 import json
 import math
+import re
 import sqlite3
 import statistics
 import tempfile
@@ -3921,15 +3922,165 @@ def _tar_subtitle_text(text: object) -> str:
     return textwrap.shorten(raw, width=180, placeholder="...")
 
 
-def _tar_metric_map_for_run(ctx: Mapping[str, Any], run_name: str, column_name: str, stat: str) -> dict[str, float]:
+def _tar_unique_text_values(values: list[object]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values or []:
+        text = str(value or "").strip()
+        if not text or text.casefold() in seen:
+            continue
+        seen.add(text.casefold())
+        out.append(text)
+    return out
+
+
+def _tar_grade_rank(grade: object) -> int:
+    token = str(grade or "").strip().upper()
+    if token == "FAIL":
+        return 3
+    if token == "WATCH":
+        return 2
+    if token in {"PASS", "CERTIFIED"}:
+        return 1
+    return 0
+
+
+def _tar_pick_worst_grade(grades: list[object]) -> str:
+    ranked = [
+        str(grade or "").strip().upper()
+        for grade in grades or []
+        if str(grade or "").strip()
+    ]
+    if not ranked:
+        return "NO_DATA"
+    return max(ranked, key=_tar_grade_rank)
+
+
+def _tar_stacked_grade_text(initial_grade: object, final_grade: object) -> str:
+    initial = str(initial_grade or "NO_DATA").strip().upper() or "NO_DATA"
+    final = str(final_grade or initial).strip().upper() or initial
+    return f"Initial: {initial}\nFinal: {final}"
+
+
+def _tar_selection_suppression_values_from_rows(
+    selection: Mapping[str, object] | None,
+    rows: list[dict] | None,
+    *,
+    filter_state: Mapping[str, object] | None = None,
+) -> list[str]:
+    if not isinstance(selection, Mapping):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        if not _row_matches_filter_state(row, filter_state):
+            continue
+        if not _selection_matches_observation_row(selection, row):
+            continue
+        label = _td_suppression_voltage_filter_value(row)
+        if not label or label.casefold() in seen:
+            continue
+        seen.add(label.casefold())
+        out.append(label)
+    return out
+
+
+def _tar_selection_suppression_values(
+    selection: Mapping[str, object] | None,
+    *,
+    filter_rows: list[dict] | None = None,
+    filter_state: Mapping[str, object] | None = None,
+) -> list[str]:
+    if not isinstance(selection, Mapping):
+        return []
+    values: list[str] = []
+    raw_values = selection.get("member_suppression_voltages") or []
+    if isinstance(raw_values, list):
+        values.extend([_td_compact_filter_value(value) for value in raw_values])
+    if not any(values):
+        single = _td_compact_filter_value(selection.get("suppression_voltage"))
+        if single:
+            values.append(single)
+    values = _tar_unique_text_values([value for value in values if str(value or "").strip()])
+    if values:
+        return values
+    from_rows = _tar_selection_suppression_values_from_rows(selection, filter_rows, filter_state=filter_state)
+    if from_rows:
+        return from_rows
+    if _filter_state_has_key(filter_state, "suppression_voltages"):
+        return _tar_unique_text_values(_filter_state_values(filter_state, "suppression_voltages"))
+    return []
+
+
+def _tar_selection_report_label(
+    selection: Mapping[str, object] | None,
+    run_by_name: Mapping[str, dict] | None = None,
+) -> str:
+    if not isinstance(selection, Mapping):
+        return ""
+    mode = str(selection.get("mode") or "sequence").strip().lower()
+    if mode == "condition":
+        condition_text = _selection_condition_text(selection, run_by_name)
+        suppression_values = _tar_selection_suppression_values(selection)
+        if condition_text and suppression_values:
+            return f"{condition_text} | Supp {'/'.join(suppression_values)}"
+        return condition_text or _selection_display_fields(selection, run_by_name).get("display_text") or ""
+    return _selection_display_fields(selection, run_by_name).get("display_text") or ""
+
+
+def _tar_base_condition_label(
+    selection: Mapping[str, object] | None,
+    run_by_name: Mapping[str, dict] | None = None,
+) -> str:
+    raw = _selection_condition_text(selection, run_by_name)
+    base = re.sub(r"\s+\|\s+Supp\s+.+$", "", str(raw or "").strip(), flags=re.IGNORECASE).strip()
+    if base:
+        return base
+    fields = _selection_display_fields(selection, run_by_name)
+    return str(fields.get("condition_text") or fields.get("display_text") or fields.get("run") or "").strip()
+
+
+def _tar_clone_filter_state(
+    filter_state: Mapping[str, object] | None,
+    *,
+    suppression_voltage: str | None = None,
+) -> dict[str, list[str]]:
+    out: dict[str, list[str]] = {}
+    if isinstance(filter_state, Mapping):
+        for key, value in filter_state.items():
+            if isinstance(value, list):
+                out[str(key)] = [str(item).strip() for item in value if str(item).strip()]
+    if suppression_voltage is not None:
+        text = str(suppression_voltage or "").strip()
+        out["suppression_voltages"] = ([text] if text else [])
+    return out
+
+
+def _tar_metric_map_for_pair(
+    ctx: Mapping[str, Any],
+    pair_spec: Mapping[str, Any],
+    stat: str,
+    *,
+    filter_state_override: Mapping[str, object] | None = None,
+) -> dict[str, float]:
     cache = ctx.setdefault("metric_map_cache", {})
-    key = (str(run_name or "").strip(), str(column_name or "").strip(), str(stat or "").strip().lower())
+    pair_id = str(pair_spec.get("pair_id") or "").strip()
+    run_name = str(pair_spec.get("run") or "").strip()
+    column_name = str(pair_spec.get("param") or "").strip()
+    key = (
+        pair_id or run_name,
+        column_name,
+        str(stat or "").strip().lower(),
+        json.dumps(_tar_clone_filter_state(filter_state_override), sort_keys=True) if filter_state_override is not None else "",
+    )
     if key in cache:
         cached = cache.get(key)
         return dict(cached) if isinstance(cached, dict) else {}
 
     be = ctx["be"]
-    selection = _selection_for_run(run_name, ctx["options"])
+    selection = pair_spec.get("selection") or _selection_for_run(run_name, ctx["options"])
     loaded = _load_metric_map_for_selection(
         be,
         ctx["db_path"],
@@ -3937,10 +4088,23 @@ def _tar_metric_map_for_run(ctx: Mapping[str, Any], run_name: str, column_name: 
         column_name,
         stat,
         selection=selection,
-        filter_state=ctx["filter_state"],
+        filter_state=(filter_state_override if filter_state_override is not None else ctx["filter_state"]),
     )
     cache[key] = dict(loaded)
     return dict(loaded)
+
+
+def _tar_metric_map_for_run(ctx: Mapping[str, Any], run_name: str, column_name: str, stat: str) -> dict[str, float]:
+    return _tar_metric_map_for_pair(
+        ctx,
+        {
+            "pair_id": f"{str(run_name or '').strip()}::{str(column_name or '').strip()}",
+            "run": run_name,
+            "param": column_name,
+            "selection": _selection_for_run(run_name, ctx["options"]),
+        },
+        stat,
+    )
 
 
 def _tar_curve_plot_payload_for_pair(
@@ -3951,20 +4115,31 @@ def _tar_curve_plot_payload_for_pair(
     pair_spec: Mapping[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     cache = ctx.setdefault("curve_plot_cache", {})
-    key = (str(run_name or "").strip(), str(param_name or "").strip())
-    if key in cache:
-        cached = cache.get(key)
+    spec = dict(pair_spec or {})
+    pair_id = str(spec.get("pair_id") or "").strip()
+    cache_key = pair_id or (str(run_name or "").strip(), str(param_name or "").strip())
+    if cache_key in cache:
+        cached = cache.get(cache_key)
         return dict(cached) if isinstance(cached, dict) else None
 
-    spec = dict(pair_spec or ((ctx.get("pair_by_key") or {}).get(key) or {}))
+    if isinstance(spec.get("plot_payload"), dict):
+        payload = dict(spec.get("plot_payload") or {})
+        cache[cache_key] = payload
+        return dict(payload)
+
+    key = (str(run_name or "").strip(), str(param_name or "").strip())
     if not spec:
-        cache[key] = None
+        spec = dict(((ctx.get("pair_by_key") or {}).get(key) or {}))
+    if not spec and pair_id:
+        spec = dict(((ctx.get("pair_by_id") or {}).get(pair_id) or {}))
+    if not spec:
+        cache[cache_key] = None
         return None
 
     model = dict(spec.get("model") or {})
     domain = model.get("domain") or []
     if not isinstance(domain, list) or len(domain) < 2:
-        cache[key] = None
+        cache[cache_key] = None
         return None
 
     selection = spec.get("selection") or _selection_for_run(run_name, ctx["options"])
@@ -3979,10 +4154,10 @@ def _tar_curve_plot_payload_for_pair(
         param_name,
         x_name,
         selection=selection,
-        filter_state=ctx["filter_state"],
+        filter_state=(spec.get("filter_state_override") if isinstance(spec.get("filter_state_override"), Mapping) else ctx["filter_state"]),
     )
     if not series:
-        cache[key] = None
+        cache[cache_key] = None
         return None
 
     lo = float(domain[0])
@@ -4002,7 +4177,7 @@ def _tar_curve_plot_payload_for_pair(
         "master_y": _nan_median(y_matrix),
         "std_y": _nan_std(y_matrix),
     }
-    cache[key] = payload
+    cache[cache_key] = payload
     return dict(payload)
 
 
@@ -4048,6 +4223,722 @@ def _tar_meta_summary_line(ctx: Mapping[str, Any], key: str, label: str) -> str:
     if not values:
         return f"{label}: (unknown)"
     return f"{label}: {_tar_join_limited(values, max_items=4, empty='(unknown)')}"
+
+
+def _tar_compute_curve_deviation(
+    y_curve: list[float],
+    master_y: list[float],
+    x_grid: list[float],
+    *,
+    denom: float,
+) -> dict[str, float] | None:
+    residual: list[float] = []
+    peak_idx = 0
+    peak_abs = -1.0
+    for idx, (actual, baseline) in enumerate(zip(y_curve, master_y)):
+        if not (isinstance(actual, (int, float)) and not math.isnan(float(actual))):
+            continue
+        if not (isinstance(baseline, (int, float)) and not math.isnan(float(baseline))):
+            continue
+        value_abs = abs(float(actual) - float(baseline))
+        residual.append(float(actual) - float(baseline))
+        if value_abs > peak_abs:
+            peak_abs = value_abs
+            peak_idx = idx
+    if not residual:
+        return None
+    max_abs = max(abs(value) for value in residual)
+    rms = math.sqrt(sum(value * value for value in residual) / max(1, len(residual)))
+    safe_denom = float(denom) if isinstance(denom, (int, float)) and math.isfinite(float(denom)) and float(denom) > 0 else 1.0
+    return {
+        "max_abs": float(max_abs),
+        "rms": float(rms),
+        "max_pct": float((max_abs / safe_denom) * 100.0),
+        "rms_pct": float((rms / safe_denom) * 100.0),
+        "x_at_max_abs": float(x_grid[peak_idx]) if 0 <= peak_idx < len(x_grid) else None,
+    }
+
+
+def _tar_worst_candidate_sort_key(row: Mapping[str, object] | None) -> tuple[int, float, float]:
+    if not isinstance(row, Mapping):
+        return (0, 0.0, 0.0)
+    return (
+        _tar_grade_rank(row.get("regrade_grade") or row.get("final_grade") or row.get("grade")),
+        abs(float(row.get("regrade_z") or row.get("final_z") or row.get("z") or 0.0)),
+        float(row.get("regrade_max_pct") or row.get("final_max_pct") or row.get("max_pct") or 0.0),
+    )
+
+
+def _tar_curve_y_columns_for_run(
+    be: Any,
+    db_path: Path,
+    conn: sqlite3.Connection,
+    run_name: str,
+    x_name: str,
+) -> list[dict]:
+    y_cols = []
+    try:
+        y_cols = be.td_list_curve_y_columns(db_path, run_name, x_name)
+    except Exception:
+        y_cols = []
+    if not y_cols:
+        try:
+            y_cols = be.td_list_raw_y_columns(db_path, run_name)
+        except Exception:
+            y_cols = []
+    if not y_cols:
+        y_cols = _td_list_y_columns(conn, run_name)
+    return [dict(col) for col in (y_cols or []) if isinstance(col, dict)]
+
+
+def _tar_resolve_report_selections(
+    run_by_name: Mapping[str, dict],
+    runs: list[str],
+    options: Mapping[str, object],
+) -> list[dict]:
+    selected_runs = {str(run).strip() for run in (runs or []) if str(run).strip()}
+    out: list[dict] = []
+    raw = options.get("run_selections") or []
+    if isinstance(raw, list):
+        for idx, item in enumerate(raw):
+            if not isinstance(item, Mapping):
+                continue
+            selection = dict(item)
+            members = _tar_unique_text_values(selection.get("member_runs") or [])
+            run_name = str(selection.get("run_name") or "").strip()
+            if not members and run_name:
+                members = [run_name]
+            if selected_runs and members and not any(member in selected_runs for member in members):
+                continue
+            if not run_name and members:
+                run_name = members[0]
+            if not run_name:
+                continue
+            selection["member_runs"] = list(members or [run_name])
+            selection["run_name"] = run_name
+            if not str(selection.get("id") or "").strip():
+                selection["id"] = f"{str(selection.get('mode') or 'selection').strip().lower() or 'selection'}:{idx}:{run_name}"
+            out.append(selection)
+    if out:
+        return out
+
+    fallback: list[dict] = []
+    for idx, run_name in enumerate(runs or []):
+        run = str(run_name or "").strip()
+        if not run:
+            continue
+        selection = dict(_selection_for_run(run, dict(options)) or {})
+        if not selection:
+            display_text = _run_display_text(run, run_by_name) or run
+            selection = {
+                "mode": "sequence",
+                "id": f"sequence:{idx}:{run}",
+                "run_name": run,
+                "sequence_name": run,
+                "display_text": display_text,
+                "member_runs": [run],
+                "member_sequences": [run],
+            }
+        fallback.append(selection)
+    return fallback
+
+
+def _tar_build_curve_model_for_series(
+    series: list[CurveSeries],
+    *,
+    x_name: str,
+    units: str,
+    grid_points: int,
+    degree: int,
+    normalize_x: bool,
+) -> dict[str, Any] | None:
+    if not series:
+        return None
+    mins = [min(curve.x) for curve in series if curve.x]
+    maxs = [max(curve.x) for curve in series if curve.x]
+    if not mins or not maxs:
+        return None
+    overlap_lo = max(mins)
+    overlap_hi = min(maxs)
+    global_lo = min(mins)
+    global_hi = max(maxs)
+    lo = overlap_lo
+    hi_dom = overlap_hi
+    if not (math.isfinite(lo) and math.isfinite(hi_dom)) or (hi_dom - lo) <= 1e-12:
+        lo = global_lo
+        hi_dom = global_hi
+    if not (math.isfinite(lo) and math.isfinite(hi_dom)) or (hi_dom - lo) <= 1e-12:
+        return None
+
+    point_count = max(2, int(grid_points or 200))
+    x_grid = [lo + (hi_dom - lo) * (idx / (point_count - 1)) for idx in range(point_count)]
+    y_resampled = [_interp_linear(curve.x, curve.y, x_grid) for curve in series]
+    master_y = _nan_median(y_resampled)
+    std_y = _nan_std(y_resampled)
+    fit_x: list[float] = []
+    fit_y: list[float] = []
+    for xv, yv in zip(x_grid, master_y):
+        if isinstance(yv, (int, float)) and not math.isnan(float(yv)):
+            fit_x.append(float(xv))
+            fit_y.append(float(yv))
+    poly = (
+        _poly_fit(fit_x, fit_y, degree, normalize_x=normalize_x)
+        if fit_x
+        else {"degree": degree, "coeffs": [], "rmse": None, "x0": None, "sx": None}
+    )
+    denom = max(
+        (
+            abs(value)
+            for value in master_y
+            if isinstance(value, (int, float)) and not math.isnan(float(value))
+        ),
+        default=0.0,
+    )
+    return {
+        "x_name": str(x_name or "").strip(),
+        "units": str(units or "").strip(),
+        "domain": [float(lo), float(hi_dom)],
+        "grid_points": int(point_count),
+        "x_grid": list(x_grid),
+        "master_y": list(master_y),
+        "std_y": list(std_y),
+        "poly": poly,
+        "equation": _fmt_equation(poly),
+        "denom": float(denom) if denom > 0 else 1.0,
+    }
+
+
+def _tar_prepare_row_specs(
+    *,
+    be: Any,
+    db_path: Path,
+    conn: sqlite3.Connection,
+    run_by_name: Mapping[str, dict],
+    selections: list[dict],
+    params: list[str],
+    filter_rows: list[dict],
+    filter_state: Mapping[str, object] | None,
+    progress_cb: Callable[[str], None] | None = None,
+) -> list[dict]:
+    row_specs: list[dict] = []
+    total_pairs = max(1, len(selections) * max(1, len(params)))
+    pair_index = 0
+    for selection_index, selection in enumerate(selections, start=1):
+        run_name = str(selection.get("run_name") or "").strip()
+        member_runs = _tar_unique_text_values(selection.get("member_runs") or [])
+        if not run_name and member_runs:
+            run_name = member_runs[0]
+        if not run_name:
+            continue
+        run_meta = run_by_name.get(run_name) or {}
+        x_name = _resolve_curve_x_key(be, db_path, run_name, str(run_meta.get("default_x") or "").strip() or "Time")
+        y_cols = _tar_curve_y_columns_for_run(be, db_path, conn, run_name, x_name)
+        y_by_norm = {_norm_key(str(col.get("name") or "")): dict(col) for col in y_cols if str(col.get("name") or "").strip()}
+        selection_fields = _selection_display_fields(selection, run_by_name)
+        suppression_values = _tar_selection_suppression_values(selection, filter_rows=filter_rows, filter_state=filter_state)
+        base_condition_label = _tar_base_condition_label(selection, run_by_name) or (_run_display_text(run_name, run_by_name) or run_name)
+        selection_label = _tar_selection_report_label(selection, run_by_name)
+        if not selection_label:
+            selection_label = str(selection_fields.get("display_text") or base_condition_label or run_name).strip()
+        if str(selection.get("mode") or "sequence").strip().lower() == "condition" and suppression_values and " | Supp " not in selection_label:
+            selection_label = f"{base_condition_label} | Supp {'/'.join(suppression_values)}"
+        selection_id = str(selection.get("id") or f"{selection.get('mode') or 'selection'}:{selection_index}:{run_name}").strip()
+
+        for target_param in params:
+            pair_index += 1
+            actual_col = y_by_norm.get(_norm_key(target_param))
+            if not actual_col:
+                continue
+            param_name = str(actual_col.get("name") or "").strip()
+            units = str(actual_col.get("units") or "").strip()
+            _tar_emit_progress(progress_cb, f"Analyzing curves {pair_index}/{total_pairs}: {selection_label} | {param_name}")
+            series = _load_curves_for_selection(
+                be,
+                db_path,
+                run_name,
+                param_name,
+                x_name,
+                selection=selection,
+                filter_state=filter_state,
+            )
+            if not series:
+                continue
+            series_by_suppression: dict[str, list[CurveSeries]] = {}
+            for suppression_value in suppression_values:
+                filtered_state = _tar_clone_filter_state(filter_state, suppression_voltage=suppression_value)
+                filtered_series = _load_curves_for_selection(
+                    be,
+                    db_path,
+                    run_name,
+                    param_name,
+                    x_name,
+                    selection=selection,
+                    filter_state=filtered_state,
+                )
+                if filtered_series:
+                    series_by_suppression[suppression_value] = filtered_series
+            row_specs.append(
+                {
+                    "pair_id": f"{selection_id}::{run_name}::{param_name}",
+                    "selection_id": selection_id,
+                    "run": run_name,
+                    "run_title": _run_display_text(run_name, run_by_name) or run_name,
+                    "selection": dict(selection),
+                    "selection_fields": dict(selection_fields),
+                    "selection_label": selection_label,
+                    "base_condition_label": base_condition_label,
+                    "suppression_values": list(suppression_values),
+                    "suppression_voltage_label": (suppression_values[0] if len(suppression_values) == 1 else ""),
+                    "param": param_name,
+                    "units": units,
+                    "x_name": x_name,
+                    "series": list(series),
+                    "series_by_suppression": dict(series_by_suppression),
+                    "initial_model": {},
+                    "initial_plot_payload": {},
+                    "regrade_models": {},
+                    "regrade_plot_payloads": {},
+                }
+            )
+    return row_specs
+
+
+def _tar_analyze_curve_groups(
+    row_specs: list[dict],
+    *,
+    hi: list[str],
+    grid_points: int,
+    degree: int,
+    normalize_x: bool,
+    z_pass: float,
+    z_watch: float,
+    max_abs_thr: float | None,
+    max_pct_thr: float | None,
+    rms_pct_thr: float | None,
+) -> dict[str, Any]:
+    specs = [dict(spec) for spec in (row_specs or []) if isinstance(spec, dict) and list(spec.get("series") or [])]
+    hi_set = {str(serial).strip() for serial in (hi or []) if str(serial).strip()}
+    initial_rows: dict[tuple[str, str], dict] = {}
+    regrade_candidates: dict[tuple[str, str], list[dict]] = {}
+    initial_watch_items: list[dict] = []
+    final_watch_items: list[dict] = []
+    initial_cohort_specs: list[dict] = []
+    regrade_cohort_specs: list[dict] = []
+
+    initial_groups: dict[tuple[str, str], list[dict]] = {}
+    for spec in specs:
+        key = (_norm_key(spec.get("param") or ""), _norm_key(spec.get("x_name") or ""))
+        initial_groups.setdefault(key, []).append(spec)
+
+    for group_index, members in enumerate(initial_groups.values(), start=1):
+        pooled_series: list[CurveSeries] = []
+        for spec in members:
+            pooled_series.extend(list(spec.get("series") or []))
+        model = _tar_build_curve_model_for_series(
+            pooled_series,
+            x_name=str(members[0].get("x_name") or ""),
+            units=str(members[0].get("units") or ""),
+            grid_points=grid_points,
+            degree=degree,
+            normalize_x=normalize_x,
+        )
+        if not isinstance(model, dict):
+            continue
+        x_grid = list(model.get("x_grid") or [])
+        master_y = list(model.get("master_y") or [])
+        std_y = list(model.get("std_y") or [])
+        denom = float(model.get("denom") or 1.0)
+        all_entries: list[tuple[dict, str, dict]] = []
+        trace_curves: list[dict] = []
+        for spec in members:
+            y_resampled_by_sn = {
+                curve.serial: _interp_linear(curve.x, curve.y, x_grid)
+                for curve in (spec.get("series") or [])
+            }
+            spec["initial_model"] = {
+                "x_name": str(model.get("x_name") or ""),
+                "units": str(spec.get("units") or model.get("units") or ""),
+                "domain": list(model.get("domain") or []),
+                "grid_points": int(model.get("grid_points") or len(x_grid)),
+                "poly": dict(model.get("poly") or {}),
+                "equation": str(model.get("equation") or ""),
+            }
+            spec["initial_plot_payload"] = {
+                "run": spec.get("run"),
+                "param": spec.get("param"),
+                "units": str(spec.get("units") or ""),
+                "selection": dict(spec.get("selection") or {}),
+                "x_name": str(model.get("x_name") or ""),
+                "x_grid": list(x_grid),
+                "y_resampled_by_sn": dict(y_resampled_by_sn),
+                "master_y": list(master_y),
+                "std_y": list(std_y),
+            }
+            for serial, y_curve in y_resampled_by_sn.items():
+                trace_curves.append(
+                    {
+                        "pair_id": str(spec.get("pair_id") or ""),
+                        "selection_label": str(spec.get("selection_label") or ""),
+                        "serial": serial,
+                        "y_curve": list(y_curve),
+                    }
+                )
+                dev = _tar_compute_curve_deviation(y_curve, master_y, x_grid, denom=denom)
+                if dev is not None:
+                    all_entries.append((spec, serial, dev))
+        scores = [float(dev.get("max_abs") or 0.0) for _spec, _serial, dev in all_entries]
+        mean_score = float(statistics.mean(scores)) if scores else 0.0
+        std_score = float(statistics.pstdev(scores)) if len(scores) > 1 else 1.0
+        if std_score == 0.0:
+            std_score = 1.0
+
+        for spec, serial, dev in all_entries:
+            z_score = (float(dev.get("max_abs") or 0.0) - mean_score) / std_score if std_score else 0.0
+            grade = _grade_from_z(z_score, z_pass, z_watch)
+            if serial not in hi:
+                continue
+            row = {
+                "pair_id": str(spec.get("pair_id") or ""),
+                "selection_id": str(spec.get("selection_id") or ""),
+                "selection_label": str(spec.get("selection_label") or ""),
+                "serial": serial,
+                "run": str(spec.get("run") or ""),
+                "param": str(spec.get("param") or ""),
+                "units": str(spec.get("units") or ""),
+                "x_name": str(spec.get("x_name") or ""),
+                "base_condition_label": str(spec.get("base_condition_label") or ""),
+                "suppression_voltage_label": str(spec.get("suppression_voltage_label") or ""),
+                "initial_max_abs": dev.get("max_abs"),
+                "initial_rms": dev.get("rms"),
+                "initial_max_pct": dev.get("max_pct"),
+                "initial_rms_pct": dev.get("rms_pct"),
+                "initial_x_at_max_abs": dev.get("x_at_max_abs"),
+                "initial_z": float(z_score),
+                "initial_grade": grade,
+                "initial_poly_rmse": (model.get("poly") or {}).get("rmse"),
+            }
+            initial_rows[(str(spec.get("pair_id") or ""), serial)] = row
+            watch = False
+            if max_abs_thr is not None and float(dev.get("max_abs") or 0.0) >= float(max_abs_thr):
+                watch = True
+            if max_pct_thr is not None and float(dev.get("max_pct") or 0.0) >= float(max_pct_thr):
+                watch = True
+            if rms_pct_thr is not None and float(dev.get("rms_pct") or 0.0) >= float(rms_pct_thr):
+                watch = True
+            if watch:
+                initial_watch_items.append({**row, "grade": grade, "z": float(z_score), "max_pct": dev.get("max_pct")})
+
+        initial_cohort_specs.append(
+            {
+                "cohort_id": f"initial:{group_index}:{_norm_key(members[0].get('param') or '')}:{_norm_key(members[0].get('x_name') or '')}",
+                "cohort_type": "initial",
+                "param": str(members[0].get("param") or ""),
+                "units": str(members[0].get("units") or ""),
+                "x_name": str(model.get("x_name") or ""),
+                "base_condition_label": "",
+                "suppression_voltage_label": "",
+                "selection_labels": [str(spec.get("selection_label") or "") for spec in members if str(spec.get("selection_label") or "").strip()],
+                "member_pair_ids": [str(spec.get("pair_id") or "") for spec in members if str(spec.get("pair_id") or "").strip()],
+                "model": {
+                    "x_name": str(model.get("x_name") or ""),
+                    "units": str(model.get("units") or ""),
+                    "domain": list(model.get("domain") or []),
+                    "grid_points": int(model.get("grid_points") or len(x_grid)),
+                    "poly": dict(model.get("poly") or {}),
+                    "equation": str(model.get("equation") or ""),
+                },
+                "x_grid": list(x_grid),
+                "master_y": list(master_y),
+                "std_y": list(std_y),
+                "trace_curves": trace_curves,
+            }
+        )
+
+    family_groups: dict[tuple[str, str, str], list[dict]] = {}
+    for spec in specs:
+        key = (
+            _norm_key(spec.get("base_condition_label") or ""),
+            _norm_key(spec.get("param") or ""),
+            _norm_key(spec.get("x_name") or ""),
+        )
+        family_groups.setdefault(key, []).append(spec)
+
+    for family_index, members in enumerate(family_groups.values(), start=1):
+        family_suppression_values_all = _tar_unique_text_values(
+            [
+                suppression
+                for spec in members
+                for suppression in (spec.get("suppression_values") or [])
+                if str(suppression or "").strip()
+            ]
+        )
+        family_suppression_values_hi = _tar_unique_text_values(
+            [
+                str(suppression_value or "").strip()
+                for spec in members
+                for suppression_value, suppression_series in ((spec.get("series_by_suppression") or {}).items())
+                if str(suppression_value or "").strip()
+                and any(str(getattr(curve, "serial", "") or "").strip() in hi_set for curve in (suppression_series or []))
+            ]
+        )
+        family_suppression_values = list(family_suppression_values_hi or family_suppression_values_all)
+        if len(family_suppression_values_all) <= 1 or not family_suppression_values:
+            continue
+        for suppression_value in family_suppression_values:
+            pooled_series: list[CurveSeries] = []
+            member_specs: list[dict] = []
+            for spec in members:
+                suppression_series = list(((spec.get("series_by_suppression") or {}).get(suppression_value) or []))
+                if not suppression_series:
+                    continue
+                pooled_series.extend(suppression_series)
+                member_specs.append(spec)
+            model = _tar_build_curve_model_for_series(
+                pooled_series,
+                x_name=str(members[0].get("x_name") or ""),
+                units=str(members[0].get("units") or ""),
+                grid_points=grid_points,
+                degree=degree,
+                normalize_x=normalize_x,
+            )
+            if not isinstance(model, dict):
+                continue
+            x_grid = list(model.get("x_grid") or [])
+            master_y = list(model.get("master_y") or [])
+            std_y = list(model.get("std_y") or [])
+            denom = float(model.get("denom") or 1.0)
+            all_entries: list[tuple[dict, str, dict]] = []
+            trace_curves: list[dict] = []
+            for spec in member_specs:
+                y_resampled_by_sn = {
+                    curve.serial: _interp_linear(curve.x, curve.y, x_grid)
+                    for curve in (((spec.get("series_by_suppression") or {}).get(suppression_value) or []))
+                }
+                spec.setdefault("regrade_models", {})[suppression_value] = {
+                    "x_name": str(model.get("x_name") or ""),
+                    "units": str(spec.get("units") or model.get("units") or ""),
+                    "domain": list(model.get("domain") or []),
+                    "grid_points": int(model.get("grid_points") or len(x_grid)),
+                    "poly": dict(model.get("poly") or {}),
+                    "equation": str(model.get("equation") or ""),
+                }
+                spec.setdefault("regrade_plot_payloads", {})[suppression_value] = {
+                    "run": spec.get("run"),
+                    "param": spec.get("param"),
+                    "units": str(spec.get("units") or ""),
+                    "selection": dict(spec.get("selection") or {}),
+                    "x_name": str(model.get("x_name") or ""),
+                    "x_grid": list(x_grid),
+                    "y_resampled_by_sn": dict(y_resampled_by_sn),
+                    "master_y": list(master_y),
+                    "std_y": list(std_y),
+                }
+                for serial, y_curve in y_resampled_by_sn.items():
+                    trace_curves.append(
+                        {
+                            "pair_id": str(spec.get("pair_id") or ""),
+                            "selection_label": str(spec.get("selection_label") or ""),
+                            "serial": serial,
+                            "y_curve": list(y_curve),
+                        }
+                    )
+                    dev = _tar_compute_curve_deviation(y_curve, master_y, x_grid, denom=denom)
+                    if dev is not None:
+                        all_entries.append((spec, serial, dev))
+            scores = [float(dev.get("max_abs") or 0.0) for _spec, _serial, dev in all_entries]
+            mean_score = float(statistics.mean(scores)) if scores else 0.0
+            std_score = float(statistics.pstdev(scores)) if len(scores) > 1 else 1.0
+            if std_score == 0.0:
+                std_score = 1.0
+
+            for spec, serial, dev in all_entries:
+                z_score = (float(dev.get("max_abs") or 0.0) - mean_score) / std_score if std_score else 0.0
+                grade = _grade_from_z(z_score, z_pass, z_watch)
+                if serial not in hi:
+                    continue
+                regrade_candidates.setdefault((str(spec.get("pair_id") or ""), serial), []).append(
+                    {
+                        "pair_id": str(spec.get("pair_id") or ""),
+                        "selection_id": str(spec.get("selection_id") or ""),
+                        "selection_label": str(spec.get("selection_label") or ""),
+                        "serial": serial,
+                        "run": str(spec.get("run") or ""),
+                        "param": str(spec.get("param") or ""),
+                        "units": str(spec.get("units") or ""),
+                        "x_name": str(spec.get("x_name") or ""),
+                        "base_condition_label": str(spec.get("base_condition_label") or ""),
+                        "suppression_voltage_label": suppression_value,
+                        "regrade_max_abs": dev.get("max_abs"),
+                        "regrade_rms": dev.get("rms"),
+                        "regrade_max_pct": dev.get("max_pct"),
+                        "regrade_rms_pct": dev.get("rms_pct"),
+                        "regrade_x_at_max_abs": dev.get("x_at_max_abs"),
+                        "regrade_z": float(z_score),
+                        "regrade_grade": grade,
+                        "regrade_poly_rmse": (model.get("poly") or {}).get("rmse"),
+                        "regrade_cohort_id": f"regrade:{family_index}:{_norm_key(str(spec.get('base_condition_label') or ''))}:{_norm_key(suppression_value)}:{_norm_key(str(spec.get('param') or ''))}:{_norm_key(str(spec.get('x_name') or ''))}",
+                    }
+                )
+            regrade_cohort_specs.append(
+                {
+                    "cohort_id": f"regrade:{family_index}:{_norm_key(str(members[0].get('base_condition_label') or ''))}:{_norm_key(suppression_value)}:{_norm_key(str(members[0].get('param') or ''))}:{_norm_key(str(members[0].get('x_name') or ''))}",
+                    "cohort_type": "regrade",
+                    "param": str(members[0].get("param") or ""),
+                    "units": str(members[0].get("units") or ""),
+                    "x_name": str(model.get("x_name") or ""),
+                    "base_condition_label": str(members[0].get("base_condition_label") or ""),
+                    "suppression_voltage_label": suppression_value,
+                    "selection_labels": [str(spec.get("selection_label") or "") for spec in member_specs if str(spec.get("selection_label") or "").strip()],
+                    "member_pair_ids": [str(spec.get("pair_id") or "") for spec in member_specs if str(spec.get("pair_id") or "").strip()],
+                    "model": {
+                        "x_name": str(model.get("x_name") or ""),
+                        "units": str(model.get("units") or ""),
+                        "domain": list(model.get("domain") or []),
+                        "grid_points": int(model.get("grid_points") or len(x_grid)),
+                        "poly": dict(model.get("poly") or {}),
+                        "equation": str(model.get("equation") or ""),
+                    },
+                    "x_grid": list(x_grid),
+                    "master_y": list(master_y),
+                    "std_y": list(std_y),
+                    "trace_curves": trace_curves,
+                }
+            )
+
+    grading_rows: list[dict] = []
+    initial_grade_map_by_pair_serial: dict[tuple[str, str], str] = {}
+    final_grade_map_by_pair_serial: dict[tuple[str, str], str] = {}
+    finding_by_pair_serial: dict[tuple[str, str], dict] = {}
+    pair_regrade_candidates: dict[str, list[dict]] = {}
+
+    for spec in specs:
+        pair_id = str(spec.get("pair_id") or "")
+        pair_candidates = [
+            candidate
+            for (candidate_pair_id, _serial), rows in regrade_candidates.items()
+            if candidate_pair_id == pair_id
+            for candidate in rows
+        ]
+        if pair_candidates:
+            pair_regrade_candidates[pair_id] = list(pair_candidates)
+
+    for spec in specs:
+        pair_id = str(spec.get("pair_id") or "")
+        per_pair_candidates = list(pair_regrade_candidates.get(pair_id) or [])
+        if per_pair_candidates:
+            pair_worst = max(per_pair_candidates, key=_tar_worst_candidate_sort_key)
+            pair_suppression = str(pair_worst.get("suppression_voltage_label") or "").strip()
+            spec["model"] = dict((spec.get("regrade_models") or {}).get(pair_suppression) or spec.get("initial_model") or {})
+            spec["plot_payload"] = dict((spec.get("regrade_plot_payloads") or {}).get(pair_suppression) or spec.get("initial_plot_payload") or {})
+            spec["filter_state_override"] = _tar_clone_filter_state({}, suppression_voltage=pair_suppression) if pair_suppression else {}
+        else:
+            spec["model"] = dict(spec.get("initial_model") or {})
+            spec["plot_payload"] = dict(spec.get("initial_plot_payload") or {})
+            spec["filter_state_override"] = {}
+
+        for serial in hi:
+            initial_row = dict(initial_rows.get((pair_id, serial)) or {})
+            if not initial_row:
+                continue
+            candidates = list(regrade_candidates.get((pair_id, serial)) or [])
+            if candidates:
+                regrade_row = max(candidates, key=_tar_worst_candidate_sort_key)
+                final_grade = str(regrade_row.get("regrade_grade") or initial_row.get("initial_grade") or "NO_DATA").strip().upper() or "NO_DATA"
+                final_source = regrade_row
+            else:
+                regrade_row = {}
+                final_grade = str(initial_row.get("initial_grade") or "NO_DATA").strip().upper() or "NO_DATA"
+                final_source = initial_row
+
+            row = dict(initial_row)
+            row.update(
+                {
+                    "regrade_max_abs": regrade_row.get("regrade_max_abs"),
+                    "regrade_rms": regrade_row.get("regrade_rms"),
+                    "regrade_max_pct": regrade_row.get("regrade_max_pct"),
+                    "regrade_rms_pct": regrade_row.get("regrade_rms_pct"),
+                    "regrade_x_at_max_abs": regrade_row.get("regrade_x_at_max_abs"),
+                    "regrade_z": regrade_row.get("regrade_z"),
+                    "regrade_grade": regrade_row.get("regrade_grade"),
+                    "regrade_poly_rmse": regrade_row.get("regrade_poly_rmse"),
+                    "regrade_cohort_id": regrade_row.get("regrade_cohort_id"),
+                    "regrade_applied": bool(regrade_row),
+                    "final_max_abs": final_source.get("regrade_max_abs", final_source.get("initial_max_abs")),
+                    "final_rms": final_source.get("regrade_rms", final_source.get("initial_rms")),
+                    "final_max_pct": final_source.get("regrade_max_pct", final_source.get("initial_max_pct")),
+                    "final_rms_pct": final_source.get("regrade_rms_pct", final_source.get("initial_rms_pct")),
+                    "final_x_at_max_abs": final_source.get("regrade_x_at_max_abs", final_source.get("initial_x_at_max_abs")),
+                    "final_z": final_source.get("regrade_z", final_source.get("initial_z")),
+                    "final_grade": final_grade,
+                    "grade": final_grade,
+                    "max_abs": final_source.get("regrade_max_abs", final_source.get("initial_max_abs")),
+                    "rms": final_source.get("regrade_rms", final_source.get("initial_rms")),
+                    "max_pct": final_source.get("regrade_max_pct", final_source.get("initial_max_pct")),
+                    "rms_pct": final_source.get("regrade_rms_pct", final_source.get("initial_rms_pct")),
+                    "x_at_max_abs": final_source.get("regrade_x_at_max_abs", final_source.get("initial_x_at_max_abs")),
+                    "z": final_source.get("regrade_z", final_source.get("initial_z")),
+                    "suppression_voltage_label": str(initial_row.get("suppression_voltage_label") or regrade_row.get("suppression_voltage_label") or ""),
+                    "regrade_suppression_voltage_label": str(regrade_row.get("suppression_voltage_label") or ""),
+                }
+            )
+            grading_rows.append(row)
+            initial_grade_map_by_pair_serial[(pair_id, serial)] = str(initial_row.get("initial_grade") or "NO_DATA").strip().upper() or "NO_DATA"
+            final_grade_map_by_pair_serial[(pair_id, serial)] = final_grade
+            finding_by_pair_serial[(pair_id, serial)] = dict(row)
+            watch = False
+            if max_abs_thr is not None and float(row.get("final_max_abs") or 0.0) >= float(max_abs_thr):
+                watch = True
+            if max_pct_thr is not None and float(row.get("final_max_pct") or 0.0) >= float(max_pct_thr):
+                watch = True
+            if rms_pct_thr is not None and float(row.get("final_rms_pct") or 0.0) >= float(rms_pct_thr):
+                watch = True
+            if watch:
+                final_watch_items.append(
+                    {
+                        **row,
+                        "grade": final_grade,
+                        "z": row.get("final_z"),
+                        "max_pct": row.get("final_max_pct"),
+                    }
+                )
+
+    nonpass_findings = sorted(
+        [row for row in grading_rows if str(row.get("final_grade") or "").strip().upper() in {"WATCH", "FAIL"}],
+        key=_finding_sort_key,
+    )
+    initial_nonpass_findings = sorted(
+        [row for row in grading_rows if str(row.get("initial_grade") or "").strip().upper() in {"WATCH", "FAIL"}],
+        key=lambda row: _finding_sort_key(
+            {
+                "grade": row.get("initial_grade"),
+                "z": row.get("initial_z"),
+                "max_pct": row.get("initial_max_pct"),
+            }
+        ),
+    )
+    watch_pair_ids: list[str] = []
+    by_pair: dict[str, list[dict]] = {}
+    for row in nonpass_findings:
+        pair_id = str(row.get("pair_id") or "").strip()
+        if pair_id:
+            by_pair.setdefault(pair_id, []).append(row)
+    for pair_id, rows in sorted(by_pair.items(), key=lambda item: _finding_sort_key(min(item[1], key=_finding_sort_key))):
+        watch_pair_ids.append(pair_id)
+
+    return {
+        "pair_specs": specs,
+        "grading_rows": grading_rows,
+        "initial_watch_items": initial_watch_items,
+        "watch_items": final_watch_items,
+        "initial_cohort_specs": initial_cohort_specs,
+        "regrade_cohort_specs": regrade_cohort_specs,
+        "initial_grade_map_by_pair_serial": initial_grade_map_by_pair_serial,
+        "final_grade_map_by_pair_serial": final_grade_map_by_pair_serial,
+        "finding_by_pair_serial": finding_by_pair_serial,
+        "nonpass_findings": nonpass_findings,
+        "initial_nonpass_findings": initial_nonpass_findings,
+        "watch_pair_ids": watch_pair_ids,
+    }
 
 
 def _tar_prepare_base(
@@ -4203,192 +5094,72 @@ def _tar_prepare_base(
     z_watch = float(grade_cfg.get("zscore_watch_max") or 3.0)
     colors = hi_cfg.get("colors") or ["#ef4444", "#3b82f6", "#22c55e", "#a855f7", "#f97316"]
     colors = [str(color) for color in colors if str(color).strip()] or ["#ef4444"]
+    try:
+        filter_rows = be.td_read_observation_filter_rows_from_cache(db_path)
+    except Exception:
+        filter_rows = []
+    if not isinstance(filter_rows, list):
+        filter_rows = []
 
-    curves_summary: dict[str, dict[str, dict]] = {}
-    curve_plot_cache: dict[tuple[str, str], dict[str, Any] | None] = {}
-    watch_items: list[dict] = []
-    grading_rows: list[dict] = []
-    _tar_emit_progress(progress_cb, f"Preparing curve comparisons for {len(runs)} run(s) and {len(params)} parameter(s)")
-    total_curve_pairs = max(1, len(runs) * len(params))
-    curve_pair_index = 0
-    for run in runs:
-        run_meta = run_by_name.get(run) or {}
-        run_selection = _selection_for_run(run, options)
-        x_name = _resolve_curve_x_key(be, db_path, run, str(run_meta.get("default_x") or "").strip() or "Time")
-        y_cols = []
-        try:
-            y_cols = be.td_list_curve_y_columns(db_path, run, x_name)
-        except Exception:
-            y_cols = []
-        if not y_cols:
-            try:
-                y_cols = be.td_list_raw_y_columns(db_path, run)
-            except Exception:
-                y_cols = []
-        if not y_cols:
-            y_cols = _td_list_y_columns(conn, run)
-        y_by_norm = {
-            _norm_key(str(col.get("name") or "")): col
-            for col in y_cols
-            if str(col.get("name") or "").strip()
+    report_selections = _tar_resolve_report_selections(run_by_name, runs, options)
+    _tar_emit_progress(progress_cb, f"Preparing curve comparisons for {len(report_selections)} selection(s) and {len(params)} parameter(s)")
+    pair_specs = _tar_prepare_row_specs(
+        be=be,
+        db_path=db_path,
+        conn=conn,
+        run_by_name=run_by_name,
+        selections=report_selections,
+        params=params,
+        filter_rows=filter_rows,
+        filter_state=filter_state,
+        progress_cb=progress_cb,
+    )
+    if not pair_specs:
+        raise RuntimeError("Auto Report could not find reportable curve data for the selected runs, parameters, and filters.")
+
+    analysis = _tar_analyze_curve_groups(
+        pair_specs,
+        hi=hi,
+        grid_points=grid_points,
+        degree=degree,
+        normalize_x=normalize_x,
+        z_pass=z_pass,
+        z_watch=z_watch,
+        max_abs_thr=max_abs_thr,
+        max_pct_thr=max_pct_thr,
+        rms_pct_thr=rms_pct_thr,
+    )
+
+    pair_specs = list(analysis.get("pair_specs") or [])
+    grading_rows = list(analysis.get("grading_rows") or [])
+    watch_items = list(analysis.get("watch_items") or [])
+    initial_watch_items = list(analysis.get("initial_watch_items") or [])
+    initial_cohort_specs = list(analysis.get("initial_cohort_specs") or [])
+    regrade_cohort_specs = list(analysis.get("regrade_cohort_specs") or [])
+    initial_grade_map_by_pair_serial = dict(analysis.get("initial_grade_map_by_pair_serial") or {})
+    final_grade_map_by_pair_serial = dict(analysis.get("final_grade_map_by_pair_serial") or {})
+    finding_by_pair_serial = dict(analysis.get("finding_by_pair_serial") or {})
+    nonpass_findings = list(analysis.get("nonpass_findings") or [])
+    initial_nonpass_findings = list(analysis.get("initial_nonpass_findings") or [])
+    watch_pair_ids = list(analysis.get("watch_pair_ids") or [])
+    curve_plot_cache: dict[object, dict[str, Any] | None] = {
+        str(spec.get("pair_id") or ""): dict(spec.get("plot_payload") or {})
+        for spec in pair_specs
+        if str(spec.get("pair_id") or "").strip()
+    }
+    curves_summary: dict[str, dict] = {
+        str(spec.get("pair_id") or ""): {
+            "run": str(spec.get("run") or ""),
+            "param": str(spec.get("param") or ""),
+            "selection_label": str(spec.get("selection_label") or ""),
+            "base_condition_label": str(spec.get("base_condition_label") or ""),
+            "suppression_voltage_label": str(spec.get("suppression_voltage_label") or ""),
+            "initial_model": dict(spec.get("initial_model") or {}),
+            "final_model": dict(spec.get("model") or {}),
         }
-        for target_param in params:
-            curve_pair_index += 1
-            actual_col = y_by_norm.get(_norm_key(target_param))
-            if not actual_col:
-                continue
-            y_name = str(actual_col.get("name") or "").strip()
-            units = str(actual_col.get("units") or "").strip()
-            _tar_emit_progress(progress_cb, f"Analyzing curves {curve_pair_index}/{total_curve_pairs}: {run} | {y_name}")
-            series = _load_curves_for_selection(
-                be,
-                db_path,
-                run,
-                y_name,
-                x_name,
-                selection=run_selection,
-                filter_state=filter_state,
-            )
-            if not series:
-                continue
-            mins = [min(s.x) for s in series if s.x]
-            maxs = [max(s.x) for s in series if s.x]
-            if not mins or not maxs:
-                continue
-            overlap_lo = max(mins)
-            overlap_hi = min(maxs)
-            global_lo = min(mins)
-            global_hi = max(maxs)
-            lo = overlap_lo
-            hi_dom = overlap_hi
-            if not (math.isfinite(lo) and math.isfinite(hi_dom)) or (hi_dom - lo) <= 1e-12:
-                lo = global_lo
-                hi_dom = global_hi
-            if not (math.isfinite(lo) and math.isfinite(hi_dom)) or (hi_dom - lo) <= 1e-12:
-                continue
-
-            x_grid = [lo + (hi_dom - lo) * (idx / (grid_points - 1)) for idx in range(grid_points)]
-            y_resampled_by_sn = {s.serial: _interp_linear(s.x, s.y, x_grid) for s in series}
-            y_matrix = list(y_resampled_by_sn.values())
-            master_y = _nan_median(y_matrix)
-            std_y = _nan_std(y_matrix)
-
-            fit_x: list[float] = []
-            fit_y: list[float] = []
-            for xv, yv in zip(x_grid, master_y):
-                if isinstance(yv, (int, float)) and not math.isnan(float(yv)):
-                    fit_x.append(float(xv))
-                    fit_y.append(float(yv))
-            poly = (
-                _poly_fit(fit_x, fit_y, degree, normalize_x=normalize_x)
-                if fit_x
-                else {"degree": degree, "coeffs": [], "rmse": None, "x0": None, "sx": None}
-            )
-            eqn = _fmt_equation(poly)
-            denom = max(
-                (
-                    abs(value)
-                    for value in master_y
-                    if isinstance(value, (int, float)) and not math.isnan(float(value))
-                ),
-                default=0.0,
-            )
-            denom = float(denom) if denom > 0 else 1.0
-
-            score_by_sn: dict[str, float] = {}
-            dev_by_sn: dict[str, dict] = {}
-            for serial, yv in y_resampled_by_sn.items():
-                residual: list[float] = []
-                for actual, baseline in zip(yv, master_y):
-                    if not (isinstance(actual, (int, float)) and not math.isnan(float(actual))):
-                        continue
-                    if not (isinstance(baseline, (int, float)) and not math.isnan(float(baseline))):
-                        continue
-                    residual.append(float(actual) - float(baseline))
-                if not residual:
-                    continue
-                max_abs = max(abs(value) for value in residual)
-                rms = math.sqrt(sum(value * value for value in residual) / max(1, len(residual)))
-                max_pct = (max_abs / denom) * 100.0
-                rms_pct = (rms / denom) * 100.0
-                peak_idx = 0
-                peak_abs = -1.0
-                for idx, (actual, baseline) in enumerate(zip(yv, master_y)):
-                    if not (isinstance(actual, (int, float)) and not math.isnan(float(actual))):
-                        continue
-                    if not (isinstance(baseline, (int, float)) and not math.isnan(float(baseline))):
-                        continue
-                    value_abs = abs(float(actual) - float(baseline))
-                    if value_abs > peak_abs:
-                        peak_abs = value_abs
-                        peak_idx = idx
-                x_at = float(x_grid[peak_idx]) if 0 <= peak_idx < len(x_grid) else None
-                score_by_sn[serial] = float(max_abs)
-                dev_by_sn[serial] = {
-                    "max_abs": float(max_abs),
-                    "rms": float(rms),
-                    "max_pct": float(max_pct),
-                    "rms_pct": float(rms_pct),
-                    "x_at_max_abs": x_at,
-                }
-
-            scores = [value for value in score_by_sn.values() if isinstance(value, (int, float)) and math.isfinite(float(value))]
-            mean_score = float(statistics.mean(scores)) if scores else 0.0
-            std_score = float(statistics.pstdev(scores)) if len(scores) > 1 else 1.0
-            if std_score == 0.0:
-                std_score = 1.0
-            for serial in hi:
-                dev = dev_by_sn.get(serial)
-                if not dev:
-                    continue
-                z_score = (float(dev.get("max_abs") or 0.0) - mean_score) / std_score if std_score else 0.0
-                grade = _grade_from_z(z_score, z_pass, z_watch)
-                grading_rows.append(
-                    {
-                        "serial": serial,
-                        "run": run,
-                        "param": y_name,
-                        "units": units,
-                        "max_abs": dev.get("max_abs"),
-                        "rms": dev.get("rms"),
-                        "max_pct": dev.get("max_pct"),
-                        "rms_pct": dev.get("rms_pct"),
-                        "x_at_max_abs": dev.get("x_at_max_abs"),
-                        "z": float(z_score),
-                        "grade": grade,
-                        "poly_rmse": poly.get("rmse"),
-                    }
-                )
-                watch = False
-                if max_abs_thr is not None and float(dev.get("max_abs") or 0.0) >= float(max_abs_thr):
-                    watch = True
-                if max_pct_thr is not None and float(dev.get("max_pct") or 0.0) >= float(max_pct_thr):
-                    watch = True
-                if rms_pct_thr is not None and float(dev.get("rms_pct") or 0.0) >= float(rms_pct_thr):
-                    watch = True
-                if watch:
-                    watch_items.append({"serial": serial, "run": run, "param": y_name, "units": units, **dev, "z": float(z_score), "grade": grade})
-
-            curves_summary.setdefault(run, {})[y_name] = {
-                "x_name": x_name,
-                "units": units,
-                "domain": [float(lo), float(hi_dom)],
-                "grid_points": int(grid_points),
-                "poly": poly,
-                "equation": eqn,
-                "watch_any": any(item.get("run") == run and item.get("param") == y_name for item in watch_items),
-            }
-            curve_plot_cache[(run, y_name)] = {
-                "run": run,
-                "param": y_name,
-                "units": units,
-                "selection": dict(run_selection or {}),
-                "x_name": x_name,
-                "x_grid": list(x_grid),
-                "y_resampled_by_sn": y_resampled_by_sn,
-                "master_y": master_y,
-                "std_y": std_y,
-            }
+        for spec in pair_specs
+        if str(spec.get("pair_id") or "").strip()
+    }
 
     cache_meta_by_sn, cache_meta_note = _read_cached_source_metadata(conn)
     workbook_meta_by_sn, workbook_meta_note = _read_workbook_metadata(wb)
@@ -4445,88 +5216,133 @@ def _tar_prepare_base(
         "progress_cb": progress_cb,
     }
 
+    pair_specs = [dict(spec) for spec in pair_specs]
+    pair_by_id: dict[str, dict] = {}
+    pair_by_key: dict[tuple[str, str], dict] = {}
+    run_param_pairs: list[tuple[str, str]] = []
+    initial_grade_map: dict[tuple[str, str, str], str] = {}
+    final_grade_map: dict[tuple[str, str, str], str] = {}
     grade_map: dict[tuple[str, str, str], str] = {}
     finding_by_key: dict[tuple[str, str, str], dict] = {}
-    for row in grading_rows:
-        serial = str(row.get("serial") or "").strip()
-        run_name = str(row.get("run") or "").strip()
-        param_name = str(row.get("param") or "").strip()
-        grade = str(row.get("grade") or "").strip().upper()
-        if serial and run_name and param_name and grade:
-            grade_map[(run_name, param_name, serial)] = grade
-            finding_by_key[(run_name, param_name, serial)] = dict(row)
-    ctx["grade_map"] = grade_map
-    ctx["finding_by_key"] = finding_by_key
+
+    for spec in pair_specs:
+        pair_id = str(spec.get("pair_id") or "").strip()
+        run_name = str(spec.get("run") or "").strip()
+        param_name = str(spec.get("param") or "").strip()
+        if pair_id:
+            pair_by_id[pair_id] = spec
+        if run_name and param_name and (run_name, param_name) not in pair_by_key:
+            pair_by_key[(run_name, param_name)] = spec
+            run_param_pairs.append((run_name, param_name))
+        for serial in hi:
+            initial_grade = str(initial_grade_map_by_pair_serial.get((pair_id, serial), "NO_DATA") or "NO_DATA").strip().upper() or "NO_DATA"
+            final_grade = str(final_grade_map_by_pair_serial.get((pair_id, serial), initial_grade) or initial_grade).strip().upper() or initial_grade
+            if run_name and param_name and serial:
+                initial_grade_map[(run_name, param_name, serial)] = initial_grade
+                final_grade_map[(run_name, param_name, serial)] = final_grade
+                grade_map[(run_name, param_name, serial)] = final_grade
+                finding = dict(finding_by_pair_serial.get((pair_id, serial)) or {})
+                if finding:
+                    finding_by_key[(run_name, param_name, serial)] = finding
 
     comparison_rows: list[dict] = []
-    pair_specs: list[dict] = []
-    for run in runs:
-        run_selection = _selection_for_run(run, options)
-        run_fields = _selection_display_fields(run_selection, run_by_name)
-        run_title = _run_display_text(run, run_by_name) or run
-        params_run = curves_summary.get(run, {}) or {}
-        by_norm = {_norm_key(name): name for name in params_run.keys()}
-        for target_param in params:
-            actual = by_norm.get(_norm_key(target_param))
-            if not actual:
-                continue
-            model = params_run.get(actual) or {}
-            units = str(model.get("units") or "").strip()
-            vmap = _tar_metric_map_for_run(ctx, run, actual, "mean")
-            atp_mean = _tar_finite_mean_for_serials(vmap, all_serials)
-            actual_mean = _tar_finite_mean_for_serials(vmap, hi)
-            delta = float(actual_mean) - float(atp_mean) if atp_mean is not None and actual_mean is not None else None
-            row_grades = [grade_map.get((run, actual, serial), "NO_DATA") for serial in hi]
-            comparison_rows.append(
-                {
-                    "run": run,
-                    "run_title": run_title,
-                    "run_condition": run_fields.get("condition_text") or run_title,
-                    "sequence_text": run_fields.get("sequence_text") or run_title,
-                    "parameter": actual,
-                    "units": units,
-                    "atp_mean": atp_mean,
-                    "actual_mean": actual_mean,
-                    "delta": delta,
-                    "grade": _grade_token_for_summary(row_grades),
-                    "selection_mode": run_fields.get("mode") or "sequence",
-                }
-            )
-            pair_specs.append(
-                {
-                    "run": run,
-                    "run_title": run_title,
-                    "selection": dict(run_selection or {}),
-                    "selection_fields": run_fields,
-                    "param": actual,
-                    "units": units,
-                    "model": dict(model),
-                }
-            )
+    for spec in pair_specs:
+        pair_id = str(spec.get("pair_id") or "").strip()
+        run_name = str(spec.get("run") or "").strip()
+        param_name = str(spec.get("param") or "").strip()
+        units = str(spec.get("units") or "").strip()
+        selection_fields = dict(spec.get("selection_fields") or {})
+        vmap = _tar_metric_map_for_pair(ctx, spec, "mean")
+        atp_mean = _tar_finite_mean_for_serials(vmap, all_serials)
+        actual_mean = _tar_finite_mean_for_serials(vmap, hi)
+        delta = float(actual_mean) - float(atp_mean) if atp_mean is not None and actual_mean is not None else None
+        initial_row_grades = [
+            str(initial_grade_map_by_pair_serial.get((pair_id, serial), "NO_DATA") or "NO_DATA").strip().upper() or "NO_DATA"
+            for serial in hi
+        ]
+        final_row_grades = [
+            str(final_grade_map_by_pair_serial.get((pair_id, serial), "NO_DATA") or "NO_DATA").strip().upper() or "NO_DATA"
+            for serial in hi
+        ]
+        comparison_rows.append(
+            {
+                "pair_id": pair_id,
+                "selection_id": str(spec.get("selection_id") or "").strip(),
+                "run": run_name,
+                "run_title": str(spec.get("run_title") or run_name).strip() or run_name,
+                "run_condition": str(spec.get("selection_label") or selection_fields.get("condition_text") or run_name).strip() or run_name,
+                "sequence_text": str(selection_fields.get("sequence_text") or spec.get("run_title") or run_name).strip() or run_name,
+                "parameter": param_name,
+                "units": units,
+                "atp_mean": atp_mean,
+                "actual_mean": actual_mean,
+                "delta": delta,
+                "initial_grade": _grade_token_for_summary(initial_row_grades),
+                "final_grade": _grade_token_for_summary(final_row_grades),
+                "grade": _grade_token_for_summary(final_row_grades),
+                "grade_text": _tar_stacked_grade_text(
+                    _grade_token_for_summary(initial_row_grades),
+                    _grade_token_for_summary(final_row_grades),
+                ),
+                "selection_mode": selection_fields.get("mode") or "sequence",
+                "base_condition_label": str(spec.get("base_condition_label") or "").strip(),
+                "suppression_voltage_label": str(spec.get("suppression_voltage_label") or "").strip(),
+                "regrade_applied": any(
+                    bool((finding_by_pair_serial.get((pair_id, serial)) or {}).get("regrade_applied"))
+                    for serial in hi
+                ),
+            }
+        )
 
-    if not pair_specs:
-        raise RuntimeError("Auto Report could not find reportable curve data for the selected runs, parameters, and filters.")
-
-    run_param_pairs = [(str(spec.get("run") or ""), str(spec.get("param") or "")) for spec in pair_specs]
-    overall_by_sn = {
-        serial: _overall_cert_status([grade_map.get((run_name, param_name, serial), "NO_DATA") for run_name, param_name in run_param_pairs])
+    pair_ids = [str(spec.get("pair_id") or "").strip() for spec in pair_specs if str(spec.get("pair_id") or "").strip()]
+    initial_overall_by_sn = {
+        serial: _overall_cert_status(
+            [
+                str(initial_grade_map_by_pair_serial.get((pair_id, serial), "NO_DATA") or "NO_DATA").strip().upper() or "NO_DATA"
+                for pair_id in pair_ids
+            ]
+        )
         for serial in hi
     }
-    nonpass_findings = [
-        row
-        for row in grading_rows
-        if str(row.get("grade") or "").strip().upper() in {"WATCH", "FAIL"}
-    ]
-    nonpass_findings = sorted(nonpass_findings, key=_finding_sort_key)
-    watch_chart_specs = _build_chart_specs(run_param_pairs=run_param_pairs, nonpass_findings=nonpass_findings, max_plots=None)
+    final_overall_by_sn = {
+        serial: _overall_cert_status(
+            [
+                str(final_grade_map_by_pair_serial.get((pair_id, serial), "NO_DATA") or "NO_DATA").strip().upper() or "NO_DATA"
+                for pair_id in pair_ids
+            ]
+        )
+        for serial in hi
+    }
 
+    ctx["initial_grade_map"] = initial_grade_map
+    ctx["final_grade_map"] = final_grade_map
+    ctx["grade_map"] = grade_map
+    ctx["finding_by_key"] = finding_by_key
+    ctx["initial_grade_map_by_pair_serial"] = initial_grade_map_by_pair_serial
+    ctx["final_grade_map_by_pair_serial"] = final_grade_map_by_pair_serial
+    ctx["finding_by_pair_serial"] = finding_by_pair_serial
     ctx["comparison_rows"] = comparison_rows
     ctx["pair_specs"] = pair_specs
-    ctx["pair_by_key"] = {(str(spec.get("run") or ""), str(spec.get("param") or "")): spec for spec in pair_specs}
+    ctx["pair_by_id"] = pair_by_id
+    ctx["pair_by_key"] = pair_by_key
     ctx["run_param_pairs"] = run_param_pairs
-    ctx["overall_by_sn"] = overall_by_sn
+    ctx["initial_overall_by_sn"] = initial_overall_by_sn
+    ctx["final_overall_by_sn"] = final_overall_by_sn
+    ctx["overall_by_sn"] = final_overall_by_sn
     ctx["nonpass_findings"] = nonpass_findings
-    ctx["watch_pair_keys"] = [(run_name, param_name) for _score, run_name, param_name in watch_chart_specs]
+    ctx["initial_nonpass_findings"] = initial_nonpass_findings
+    ctx["watch_pair_ids"] = watch_pair_ids
+    ctx["watch_pair_keys"] = [
+        (
+            str((pair_by_id.get(pair_id) or {}).get("run") or ""),
+            str((pair_by_id.get(pair_id) or {}).get("param") or ""),
+        )
+        for pair_id in watch_pair_ids
+        if pair_by_id.get(pair_id)
+    ]
+    ctx["initial_cohort_specs"] = initial_cohort_specs
+    ctx["regrade_cohort_specs"] = regrade_cohort_specs
+    ctx["initial_watch_items"] = initial_watch_items
     return ctx
 
 
@@ -4727,13 +5543,19 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
     }
     highlight_lines = []
     nonpass_findings = list(ctx.get("nonpass_findings") or [])
-    pair_by_key = ctx.get("pair_by_key") or {}
+    pair_by_id = ctx.get("pair_by_id") or {}
     if nonpass_findings:
         for finding in nonpass_findings[:8]:
+            pair_id = str(finding.get("pair_id") or "").strip()
+            pair = pair_by_id.get(pair_id) or {}
             run_name = str(finding.get("run") or "").strip()
             param_name = str(finding.get("param") or "").strip()
-            pair = pair_by_key.get((run_name, param_name)) or {}
-            display_text = str((pair.get("selection_fields") or {}).get("display_text") or "").strip() or run_name
+            display_text = (
+                str(finding.get("selection_label") or "").strip()
+                or str(pair.get("selection_label") or "").strip()
+                or str((pair.get("selection_fields") or {}).get("display_text") or "").strip()
+                or run_name
+            )
             highlight_lines.append(
                 f"{finding.get('serial')} | {display_text} | {param_name} | {finding.get('grade')} | "
                 f"Max % {_fmt_num(finding.get('max_pct'))} | z {_fmt_num(finding.get('z'), sig=4)}"
@@ -4750,7 +5572,8 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
     story.append(
         _portrait_paragraph(
             "This report validates ATP run criteria against family data and compares the selected certification serials "
-            "to the compiled family baseline for the chosen run scope.",
+            "to the compiled family baseline for the chosen run scope. Initial grading pools the selected TD conditions "
+            "by parameter and X axis before a suppression-voltage regrade pass is applied where needed.",
             styles["body"],
             rl,
         )
@@ -4760,7 +5583,7 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
         _portrait_box_table(
             [
                 ["Serials Under Certification", "Runs Included", "Parameters Included", "Watch / Non-PASS Curves"],
-                [str(len(ctx.get("hi") or [])), str(len(ctx.get("runs") or [])), str(len(ctx.get("params") or [])), str(len(ctx.get("watch_pair_keys") or []))],
+                [str(len(ctx.get("hi") or [])), str(len(ctx.get("runs") or [])), str(len(ctx.get("params") or [])), str(len(ctx.get("watch_pair_ids") or []))],
             ],
             col_widths=[1.7 * inch, 1.45 * inch, 1.45 * inch, 2.3 * inch],
             styles=styles,
@@ -4845,7 +5668,10 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
     exec_rows = [
         [
             serial,
-            (ctx.get("overall_by_sn") or {}).get(serial, "NO_DATA"),
+            _tar_stacked_grade_text(
+                (ctx.get("initial_overall_by_sn") or {}).get(serial, "NO_DATA"),
+                (ctx.get("final_overall_by_sn") or {}).get(serial, "NO_DATA"),
+            ),
             _tar_meta(ctx, serial, "program_title"),
             _tar_meta(ctx, serial, "part_number"),
             _tar_meta(ctx, serial, "revision"),
@@ -4861,7 +5687,7 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
         story.append(
             _portrait_box_table(
                 [["Serial", "Overall", "Program", "Part #", "Rev", "ATP", "Similarity Group"], *exec_rows[start : start + 14]],
-                col_widths=[0.78 * inch, 0.78 * inch, 1.25 * inch, 1.00 * inch, 0.48 * inch, 1.05 * inch, 1.36 * inch],
+                col_widths=[0.78 * inch, 1.18 * inch, 1.18 * inch, 1.00 * inch, 0.48 * inch, 1.00 * inch, 1.28 * inch],
                 styles=styles,
                 rl=rl,
                 repeat_rows=1,
@@ -4873,7 +5699,8 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
     story.append(_portrait_paragraph("Run Comparison", styles["section"], rl))
     story.append(
         _portrait_paragraph(
-            "Each row compares the ATP family mean to the actual mean of the selected certification serials for the same run scope and parameter.",
+            "Each row compares the ATP family mean to the actual mean of the selected certification serials for the same run scope and parameter. "
+            "Grades show the pooled initial pass and the suppression-voltage-aware final pass.",
             styles["body"],
             rl,
         )
@@ -4887,7 +5714,7 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
             _fmt_num(row.get("atp_mean"), sig=5),
             _fmt_num(row.get("actual_mean"), sig=5),
             _fmt_num(row.get("delta"), sig=5),
-            row.get("grade") or "",
+            row.get("grade_text") or "",
         ]
         for row in (ctx.get("comparison_rows") or [])
     ]
@@ -4898,19 +5725,27 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
         story.append(
             _portrait_box_table(
                 [["Run Condition", "Sequence(s)", "Parameter", "Units", "ATP Mean", "Actual Mean", "Delta", "Grade"], *comparison_rows[start : start + 16]],
-                col_widths=[1.12 * inch, 1.70 * inch, 0.88 * inch, 0.62 * inch, 0.82 * inch, 0.92 * inch, 0.72 * inch, 0.68 * inch],
+                col_widths=[1.24 * inch, 1.55 * inch, 0.82 * inch, 0.58 * inch, 0.78 * inch, 0.88 * inch, 0.68 * inch, 0.95 * inch],
                 styles=styles,
                 rl=rl,
                 repeat_rows=1,
                 compact=True,
             )
         )
+    return story
 
-    story.append(PageBreak())
+
+def _tar_build_equation_story(ctx: Mapping[str, Any]) -> list[Any]:
+    rl = _reportlab_imports()
+    styles = _build_portrait_styles(rl)
+    Spacer = rl["Spacer"]
+    inch = rl["inch"]
+
+    story: list[Any] = []
     story.append(_portrait_paragraph("Performance Equations", styles["section"], rl))
     story.append(
         _portrait_paragraph(
-            "Performance equations are shown as wrapped callouts so long expressions do not overflow table cells.",
+            "Performance equations are shown after the run-condition and regrade-pass charts so the fits remain informational, not grading inputs.",
             styles["body"],
             rl,
         )
@@ -4930,6 +5765,327 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
             )
         )
     return story
+
+
+def _tar_render_metric_cohort_page(
+    ctx: Mapping[str, Any],
+    pdf: Any,
+    *,
+    cohort_spec: Mapping[str, Any],
+    metric_stat: str,
+    page_number: int,
+    section_title: str,
+    section_key: str,
+    grade_map_by_pair_serial: Mapping[tuple[str, str], str],
+    filter_state_override: Mapping[str, object] | None = None,
+    family_mean_label: str,
+) -> dict[str, Any] | None:
+    import matplotlib.pyplot as plt  # type: ignore
+
+    param_name = str(cohort_spec.get("param") or "").strip()
+    units = str(cohort_spec.get("units") or "").strip()
+    x_name = str(cohort_spec.get("x_name") or "").strip()
+    selection_labels = _tar_unique_text_values(cohort_spec.get("selection_labels") or [])
+    fig, ax = _create_landscape_plot_page(
+        print_ctx=ctx["print_ctx"],
+        page_number=page_number,
+        section_title=section_title,
+        section_subtitle=_tar_subtitle_text(
+            f"Parameter: {param_name} | Statistic: {metric_stat} | X Axis: {x_name} | "
+            f"Selected: {_tar_join_limited(selection_labels, max_items=5, empty='(none)')}"
+        ),
+    )
+    serials = list(ctx.get("all_serials") or [])
+    serial_index = {serial: idx for idx, serial in enumerate(serials)}
+    x_idx = list(range(len(serials)))
+    colors = list(ctx.get("colors") or ["#ef4444"])
+    pair_by_id = ctx.get("pair_by_id") or {}
+
+    family_values: list[float] = []
+    plotted: list[tuple[dict, list[float], str]] = []
+    for member_index, pair_id in enumerate(cohort_spec.get("member_pair_ids") or []):
+        pair_spec = pair_by_id.get(str(pair_id or "").strip()) or {}
+        if not pair_spec:
+            continue
+        vmap = _tar_metric_map_for_pair(
+            ctx,
+            pair_spec,
+            metric_stat,
+            filter_state_override=filter_state_override,
+        )
+        yv = [
+            float(vmap.get(serial))
+            if isinstance(vmap.get(serial), (int, float)) and math.isfinite(float(vmap.get(serial)))
+            else float("nan")
+            for serial in serials
+        ]
+        finite_vals = [float(value) for value in yv if isinstance(value, float) and not math.isnan(value)]
+        if not finite_vals:
+            continue
+        color = colors[member_index % len(colors)]
+        family_values.extend(finite_vals)
+        plotted.append((pair_spec, yv, color))
+
+    if not plotted:
+        plt.close(fig)
+        return None
+
+    ax.set_title(f"{param_name} ({metric_stat})", loc="left", fontsize=13, fontweight="bold", pad=10)
+    ax.set_xlabel("Program + Serial Number")
+    ax.set_ylabel(f"{param_name} ({units})" if units else param_name)
+    for pair_spec, yv, color in plotted:
+        label = str(pair_spec.get("selection_label") or pair_spec.get("run_title") or pair_spec.get("run") or "").strip() or param_name
+        ax.plot(x_idx, yv, marker="o", linewidth=1.1, alpha=0.58, color=color, label=label)
+        pair_id = str(pair_spec.get("pair_id") or "").strip()
+        for serial in (ctx.get("hi") or []):
+            xi = serial_index.get(serial)
+            if xi is None:
+                continue
+            y_val = yv[xi]
+            if math.isnan(y_val):
+                continue
+            grade = str(grade_map_by_pair_serial.get((pair_id, serial), "NO_DATA") or "NO_DATA").strip().upper() or "NO_DATA"
+            ax.scatter([xi], [y_val], s=42, color=_tar_grade_color(grade, default=color), zorder=5)
+    if family_values:
+        ax.axhline(float(statistics.mean(family_values)), color="#0f172a", linestyle="--", linewidth=1.2, alpha=0.70, label=family_mean_label)
+    tick_labels = [_tar_metric_tick_label(ctx, serial) for serial in serials]
+    tick_step = max(1, int(math.ceil(len(serials) / 18.0)))
+    tick_idx = x_idx[::tick_step]
+    ax.set_xticks(tick_idx)
+    ax.set_xticklabels([tick_labels[idx] for idx in tick_idx], rotation=45, ha="right", fontsize=7)
+    ax.set_xlim(-0.5, len(serials) - 0.5)
+    ax.grid(True, axis="y", alpha=0.25)
+    try:
+        handles, labels = ax.get_legend_handles_labels()
+        uniq: dict[str, Any] = {}
+        for handle, label in zip(handles, labels):
+            if label not in uniq:
+                uniq[label] = handle
+        if uniq:
+            ax.legend(list(uniq.values()), list(uniq.keys()), fontsize=8, loc="best")
+    except Exception:
+        pass
+    pdf.savefig(fig)
+    plt.close(fig)
+    return {
+        "section": section_key,
+        "cohort_id": str(cohort_spec.get("cohort_id") or ""),
+        "param": param_name,
+        "stat": metric_stat,
+        "x_name": x_name,
+        "suppression_voltage_label": str(cohort_spec.get("suppression_voltage_label") or ""),
+        "page_number": page_number,
+    }
+
+
+def _tar_render_curve_cohort_page(
+    ctx: Mapping[str, Any],
+    pdf: Any,
+    *,
+    cohort_spec: Mapping[str, Any],
+    page_number: int,
+    section_title: str,
+    section_key: str,
+    subtitle: str,
+    grade_map_by_pair_serial: Mapping[tuple[str, str], str],
+    metric_prefix: str,
+    family_label: str,
+    band_label: str,
+    equation_label: str,
+) -> dict[str, Any] | None:
+    import matplotlib.pyplot as plt  # type: ignore
+
+    x_grid = list(cohort_spec.get("x_grid") or [])
+    master_y = list(cohort_spec.get("master_y") or [])
+    std_y = list(cohort_spec.get("std_y") or [])
+    trace_curves = list(cohort_spec.get("trace_curves") or [])
+    if not (x_grid and master_y and trace_curves):
+        return None
+
+    param_name = str(cohort_spec.get("param") or "").strip()
+    x_name = str(cohort_spec.get("x_name") or "").strip()
+    units = str(cohort_spec.get("units") or "").strip()
+    fig, ax = _create_landscape_plot_page(
+        print_ctx=ctx["print_ctx"],
+        page_number=page_number,
+        section_title=section_title,
+        section_subtitle=_tar_subtitle_text(subtitle),
+    )
+    ax.set_position([0.06, 0.10, 0.66, 0.68])
+    ax_side = fig.add_axes([0.76, 0.12, 0.20, 0.64])
+    ax_side.axis("off")
+    ax.set_title(f"{param_name}", loc="left", fontsize=13, fontweight="bold", pad=10)
+    ax.set_xlabel(x_name)
+    ax.set_ylabel(f"{param_name} ({units})" if units else param_name)
+
+    for trace in trace_curves:
+        serial = str(trace.get("serial") or "").strip()
+        y_curve = list(trace.get("y_curve") or [])
+        if serial in (ctx.get("hi") or []):
+            continue
+        if y_curve:
+            ax.plot(x_grid, y_curve, linewidth=0.8, alpha=0.09, color="#94a3b8")
+    ax.plot(x_grid, master_y, linewidth=2.1, color="#0f172a", label=family_label)
+    try:
+        band_lo = [a - b if (isinstance(a, (int, float)) and not math.isnan(float(a)) and isinstance(b, (int, float)) and not math.isnan(float(b))) else float("nan") for a, b in zip(master_y, std_y)]
+        band_hi = [a + b if (isinstance(a, (int, float)) and not math.isnan(float(a)) and isinstance(b, (int, float)) and not math.isnan(float(b))) else float("nan") for a, b in zip(master_y, std_y)]
+        ax.fill_between(x_grid, band_lo, band_hi, color="#93c5fd", alpha=0.22 if metric_prefix == "initial" else 0.18, label=band_label)
+    except Exception:
+        pass
+
+    note_lines: list[str] = []
+    family_equation = str(((cohort_spec.get("model") or {}).get("equation") or "")).strip()
+    if family_equation:
+        note_lines.append(equation_label)
+        note_lines.extend(textwrap.wrap(family_equation, width=30) or [family_equation])
+        note_lines.append(f"RMSE: {_fmt_num(((cohort_spec.get('model') or {}).get('poly') or {}).get('rmse'), sig=5)}")
+        note_lines.append("")
+
+    colors = list(ctx.get("colors") or ["#ef4444"])
+    finding_by_pair_serial = ctx.get("finding_by_pair_serial") or {}
+    highlighted_trace_index = 0
+    for trace in trace_curves:
+        serial = str(trace.get("serial") or "").strip()
+        if serial not in (ctx.get("hi") or []):
+            continue
+        y_curve = list(trace.get("y_curve") or [])
+        if not y_curve:
+            continue
+        pair_id = str(trace.get("pair_id") or "").strip()
+        selection_label = str(trace.get("selection_label") or "").strip()
+        grade = str(grade_map_by_pair_serial.get((pair_id, serial), "NO_DATA") or "NO_DATA").strip().upper() or "NO_DATA"
+        default_color = colors[highlighted_trace_index % len(colors)]
+        highlighted_trace_index += 1
+        color = default_color if grade not in {"WATCH", "FAIL"} else _tar_grade_color(grade, default=default_color)
+        label = f"{serial} | {selection_label} ({grade})" if selection_label else f"{serial} ({grade})"
+        ax.plot(x_grid, y_curve, linewidth=1.8, color=color, label=label)
+        finding = finding_by_pair_serial.get((pair_id, serial)) or {}
+        note_lines.append(
+            f"{serial} | {selection_label or param_name} | {grade} | "
+            f"Max % {_fmt_num(finding.get(f'{metric_prefix}_max_pct'))} | "
+            f"z {_fmt_num(finding.get(f'{metric_prefix}_z'), sig=4)}"
+        )
+    ax.grid(True, alpha=0.25)
+    try:
+        handles, labels = ax.get_legend_handles_labels()
+        uniq = {}
+        for handle, label in zip(handles, labels):
+            if label not in uniq:
+                uniq[label] = handle
+        if uniq:
+            ax.legend(list(uniq.values()), list(uniq.keys()), fontsize=8, loc="best")
+    except Exception:
+        pass
+    ax_side.text(0.0, 1.0, "\n".join(note_lines[:20]), va="top", ha="left", fontsize=8, color="#0f172a")
+    pdf.savefig(fig)
+    plt.close(fig)
+    return {
+        "section": section_key,
+        "cohort_id": str(cohort_spec.get("cohort_id") or ""),
+        "param": param_name,
+        "x_name": x_name,
+        "suppression_voltage_label": str(cohort_spec.get("suppression_voltage_label") or ""),
+        "page_number": page_number,
+    }
+
+
+def _tar_render_watch_curve_page(
+    ctx: Mapping[str, Any],
+    pdf: Any,
+    *,
+    pair_spec: Mapping[str, Any],
+    page_number: int,
+) -> dict[str, Any] | None:
+    import matplotlib.pyplot as plt  # type: ignore
+
+    pair_id = str(pair_spec.get("pair_id") or "").strip()
+    run_name = str(pair_spec.get("run") or "").strip()
+    param_name = str(pair_spec.get("param") or "").strip()
+    plot_payload = _tar_curve_plot_payload_for_pair(ctx, run_name, param_name, pair_spec=pair_spec)
+    if not plot_payload:
+        return None
+    final_grade_map = ctx.get("final_grade_map_by_pair_serial") or {}
+    finding_by_pair_serial = ctx.get("finding_by_pair_serial") or {}
+    focus_serials = [
+        serial
+        for serial in (ctx.get("hi") or [])
+        if str(final_grade_map.get((pair_id, serial), "NO_DATA") or "NO_DATA").strip().upper() in {"WATCH", "FAIL"}
+    ]
+    if not focus_serials:
+        return None
+
+    x_name = str(plot_payload.get("x_name") or "")
+    x_grid = list(plot_payload.get("x_grid") or [])
+    y_resampled_by_sn = dict(plot_payload.get("y_resampled_by_sn") or {})
+    master_y = list(plot_payload.get("master_y") or [])
+    std_y = list(plot_payload.get("std_y") or [])
+    fig, ax = _create_landscape_plot_page(
+        print_ctx=ctx["print_ctx"],
+        page_number=page_number,
+        section_title="Watch / Non-PASS Curves",
+        section_subtitle=_tar_subtitle_text(
+            f"{str(pair_spec.get('selection_label') or run_name).strip() or run_name} | Parameter: {param_name}"
+        ),
+    )
+    ax.set_position([0.06, 0.10, 0.66, 0.68])
+    ax_side = fig.add_axes([0.76, 0.12, 0.20, 0.64])
+    ax_side.axis("off")
+    units = str(pair_spec.get("units") or "").strip()
+    run_title = str(pair_spec.get("run_title") or run_name).strip() or run_name
+    ax.set_title(f"{run_title} - {param_name}", loc="left", fontsize=13, fontweight="bold", pad=10)
+    ax.set_xlabel(x_name)
+    ax.set_ylabel(f"{param_name} ({units})" if units else param_name)
+    for serial, y_curve in y_resampled_by_sn.items():
+        if serial in focus_serials:
+            continue
+        if y_curve:
+            ax.plot(x_grid, y_curve, linewidth=0.8, alpha=0.08, color="#94a3b8")
+    ax.plot(x_grid, master_y, linewidth=2.1, color="#0f172a", label="Family median")
+    try:
+        band_lo = [a - b if (isinstance(a, (int, float)) and not math.isnan(float(a)) and isinstance(b, (int, float)) and not math.isnan(float(b))) else float("nan") for a, b in zip(master_y, std_y)]
+        band_hi = [a + b if (isinstance(a, (int, float)) and not math.isnan(float(a)) and isinstance(b, (int, float)) and not math.isnan(float(b))) else float("nan") for a, b in zip(master_y, std_y)]
+        ax.fill_between(x_grid, band_lo, band_hi, color="#fed7aa", alpha=0.18, label="Family +/-1 sigma")
+    except Exception:
+        pass
+    colors = list(ctx.get("colors") or ["#ef4444"])
+    note_lines: list[str] = []
+    for idx, serial in enumerate(focus_serials):
+        y_curve = y_resampled_by_sn.get(serial)
+        if not y_curve:
+            continue
+        grade = str(final_grade_map.get((pair_id, serial), "NO_DATA") or "NO_DATA").strip().upper() or "NO_DATA"
+        color = _tar_grade_color(grade, default=colors[idx % len(colors)])
+        ax.plot(x_grid, y_curve, linewidth=1.9, color=color, label=f"{serial} ({grade})")
+        finding = finding_by_pair_serial.get((pair_id, serial)) or {}
+        note_lines.append(f"{serial} ({grade})")
+        note_lines.append(f"Max %: {_fmt_num(finding.get('final_max_pct'))}")
+        note_lines.append(f"RMS %: {_fmt_num(finding.get('final_rms_pct'))}")
+        note_lines.append(f"z: {_fmt_num(finding.get('final_z'), sig=4)}")
+        if bool(finding.get("regrade_applied")):
+            note_lines.append(f"Regrade: Supp {str(finding.get('regrade_suppression_voltage_label') or '').strip() or '(unknown)'}")
+        note_lines.append("")
+    ax.grid(True, alpha=0.25)
+    try:
+        handles, labels = ax.get_legend_handles_labels()
+        uniq = {}
+        for handle, label in zip(handles, labels):
+            if label not in uniq:
+                uniq[label] = handle
+        if uniq:
+            ax.legend(list(uniq.values()), list(uniq.keys()), fontsize=8, loc="best")
+    except Exception:
+        pass
+    ax_side.text(0.0, 1.0, "\n".join(note_lines[:24]), va="top", ha="left", fontsize=8, color="#0f172a")
+    pdf.savefig(fig)
+    plt.close(fig)
+    return {
+        "section": "watch_nonpass_curves",
+        "pair_id": pair_id,
+        "run": run_name,
+        "param": param_name,
+        "serials": list(focus_serials),
+        "page_number": page_number,
+    }
 
 
 def _tar_render_plot_sections(
@@ -5306,6 +6462,288 @@ def _tar_render_plot_sections(
     }
 
 
+def _tar_render_plot_sections(
+    ctx: Mapping[str, Any],
+    *,
+    intro_pages: int,
+    plots_pdf: Path,
+    progress_cb: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    from matplotlib.backends.backend_pdf import PdfPages  # type: ignore
+    import matplotlib.pyplot as plt  # type: ignore
+
+    plot_page_count = 0
+    run_condition_metric_plot_count = 0
+    run_condition_curve_plot_count = 0
+    regrade_metric_plot_count = 0
+    regrade_curve_plot_count = 0
+    performance_plot_count = 0
+    watch_plot_count = 0
+    plot_specs: list[dict] = []
+
+    initial_cohort_specs = list(ctx.get("initial_cohort_specs") or [])
+    regrade_cohort_specs = list(ctx.get("regrade_cohort_specs") or [])
+    performance_plot_specs = list(ctx.get("performance_plot_specs") or [])
+    watch_pair_ids = list(ctx.get("watch_pair_ids") or [])
+    metric_stats = list(ctx.get("metric_stats") or [])
+    initial_metric_specs = [(spec, stat) for spec in initial_cohort_specs for stat in metric_stats] if ctx.get("include_metrics") else []
+    regrade_metric_specs = [(spec, stat) for spec in regrade_cohort_specs for stat in metric_stats] if ctx.get("include_metrics") else []
+
+    if not (
+        initial_metric_specs
+        or initial_cohort_specs
+        or regrade_metric_specs
+        or regrade_cohort_specs
+        or performance_plot_specs
+        or watch_pair_ids
+    ):
+        return {
+            "plot_page_count": 0,
+            "metric_plot_count": 0,
+            "curve_plot_count": 0,
+            "run_condition_metric_plot_count": 0,
+            "run_condition_curve_plot_count": 0,
+            "regrade_metric_plot_count": 0,
+            "regrade_curve_plot_count": 0,
+            "performance_plot_count": 0,
+            "watch_plot_count": 0,
+            "plot_specs": [],
+        }
+
+    with PdfPages(plots_pdf) as pdf:
+        if initial_metric_specs:
+            _tar_emit_progress(progress_cb, f"Rendering pooled run-condition metric pages ({len(initial_metric_specs)} planned)")
+        for index, (cohort_spec, metric_stat) in enumerate(initial_metric_specs, start=1):
+            _tar_emit_progress(progress_cb, f"Pooled metric page {index}/{len(initial_metric_specs)}: {cohort_spec.get('param')} | {cohort_spec.get('x_name')} | {metric_stat}")
+            plot_spec = _tar_render_metric_cohort_page(
+                ctx,
+                pdf,
+                cohort_spec=cohort_spec,
+                metric_stat=metric_stat,
+                page_number=intro_pages + plot_page_count + 1,
+                section_title="Run Condition Metrics",
+                section_key="run_condition_plot_metrics",
+                grade_map_by_pair_serial=(ctx.get("initial_grade_map_by_pair_serial") or {}),
+                family_mean_label="Pooled family mean",
+            )
+            if plot_spec:
+                plot_specs.append(plot_spec)
+                plot_page_count += 1
+                run_condition_metric_plot_count += 1
+
+        if initial_cohort_specs:
+            _tar_emit_progress(progress_cb, f"Rendering pooled run-condition curve pages ({len(initial_cohort_specs)} planned)")
+        for index, cohort_spec in enumerate(initial_cohort_specs, start=1):
+            _tar_emit_progress(progress_cb, f"Pooled curve page {index}/{len(initial_cohort_specs)}: {cohort_spec.get('param')} | {cohort_spec.get('x_name')}")
+            plot_spec = _tar_render_curve_cohort_page(
+                ctx,
+                pdf,
+                cohort_spec=cohort_spec,
+                page_number=intro_pages + plot_page_count + 1,
+                section_title="Run Condition Curve Overlay",
+                section_key="run_condition_curve_overlays",
+                subtitle=(
+                    f"Parameter: {str(cohort_spec.get('param') or '').strip()} | "
+                    f"X Axis: {str(cohort_spec.get('x_name') or '').strip()} | "
+                    f"Selected: {_tar_join_limited(_tar_unique_text_values(cohort_spec.get('selection_labels') or []), max_items=5, empty='(none)')}"
+                ),
+                grade_map_by_pair_serial=(ctx.get("initial_grade_map_by_pair_serial") or {}),
+                metric_prefix="initial",
+                family_label="Pooled family median",
+                band_label="Pooled family +/-1 sigma",
+                equation_label="Pooled family equation",
+            )
+            if plot_spec:
+                plot_specs.append(plot_spec)
+                plot_page_count += 1
+                run_condition_curve_plot_count += 1
+
+        if regrade_metric_specs:
+            _tar_emit_progress(progress_cb, f"Rendering regrade-pass metric pages ({len(regrade_metric_specs)} planned)")
+        for index, (cohort_spec, metric_stat) in enumerate(regrade_metric_specs, start=1):
+            suppression_value = str(cohort_spec.get("suppression_voltage_label") or "").strip()
+            _tar_emit_progress(progress_cb, f"Regrade metric page {index}/{len(regrade_metric_specs)}: {cohort_spec.get('param')} | {suppression_value or 'suppression n/a'} | {metric_stat}")
+            filter_override = _tar_clone_filter_state(ctx.get("filter_state"), suppression_voltage=suppression_value) if suppression_value else {}
+            plot_spec = _tar_render_metric_cohort_page(
+                ctx,
+                pdf,
+                cohort_spec=cohort_spec,
+                metric_stat=metric_stat,
+                page_number=intro_pages + plot_page_count + 1,
+                section_title="Regrade Pass Metrics",
+                section_key="regrade_pass_plot_metrics",
+                grade_map_by_pair_serial=(ctx.get("final_grade_map_by_pair_serial") or {}),
+                filter_state_override=filter_override,
+                family_mean_label="Regrade family mean",
+            )
+            if plot_spec:
+                plot_specs.append(plot_spec)
+                plot_page_count += 1
+                regrade_metric_plot_count += 1
+
+        if regrade_cohort_specs:
+            _tar_emit_progress(progress_cb, f"Rendering regrade-pass curve pages ({len(regrade_cohort_specs)} planned)")
+        for index, cohort_spec in enumerate(regrade_cohort_specs, start=1):
+            suppression_value = str(cohort_spec.get("suppression_voltage_label") or "").strip()
+            _tar_emit_progress(progress_cb, f"Regrade curve page {index}/{len(regrade_cohort_specs)}: {cohort_spec.get('param')} | {suppression_value or 'suppression n/a'}")
+            plot_spec = _tar_render_curve_cohort_page(
+                ctx,
+                pdf,
+                cohort_spec=cohort_spec,
+                page_number=intro_pages + plot_page_count + 1,
+                section_title="Regrade Pass",
+                section_key="regrade_pass_curve_overlays",
+                subtitle=(
+                    f"Run Condition: {str(cohort_spec.get('base_condition_label') or '').strip() or '(unknown)'} | "
+                    f"Suppression Voltage: {suppression_value or '(unknown)'} | "
+                    f"Parameter: {str(cohort_spec.get('param') or '').strip()} | X Axis: {str(cohort_spec.get('x_name') or '').strip()}"
+                ),
+                grade_map_by_pair_serial=(ctx.get("final_grade_map_by_pair_serial") or {}),
+                metric_prefix="final",
+                family_label="Regrade family median",
+                band_label="Regrade family +/-1 sigma",
+                equation_label="Regrade family equation",
+            )
+            if plot_spec:
+                plot_specs.append(plot_spec)
+                plot_page_count += 1
+                regrade_curve_plot_count += 1
+
+        if performance_plot_specs:
+            _tar_emit_progress(progress_cb, f"Rendering performance plot pages ({len(performance_plot_specs)} planned)")
+        for perf_index, perf_spec in enumerate(performance_plot_specs, start=1):
+            name = str(perf_spec.get("name") or "Performance").strip() or "Performance"
+            x_target = str(((perf_spec.get("x") or {}).get("column") or "")).strip()
+            y_target = str(((perf_spec.get("y") or {}).get("column") or "")).strip()
+            perf_stat = str(perf_spec.get("stat") or "").strip()
+            curves = perf_spec.get("curves") or {}
+            if not isinstance(curves, dict) or not curves:
+                continue
+            _tar_emit_progress(progress_cb, f"Performance plot {perf_index}/{len(performance_plot_specs)}: {name} | {y_target} vs {x_target} | {perf_stat}")
+            page_number = intro_pages + plot_page_count + 1
+            fig, ax = _create_landscape_plot_page(
+                print_ctx=ctx["print_ctx"],
+                page_number=page_number,
+                section_title="Performance Plot",
+                section_subtitle=_tar_subtitle_text(f"{name} | {y_target} vs {x_target} | Statistic: {perf_stat}"),
+            )
+            ax.set_position([0.06, 0.10, 0.66, 0.68])
+            ax_side = fig.add_axes([0.76, 0.12, 0.20, 0.64])
+            ax_side.axis("off")
+            x_units = str(((perf_spec.get("x") or {}).get("units") or "")).strip()
+            y_units = str(((perf_spec.get("y") or {}).get("units") or "")).strip()
+            ax.set_title(f"{name} - {perf_stat}", loc="left", fontsize=13, fontweight="bold", pad=10)
+            ax.set_xlabel(f"{x_target}.{perf_stat}" + (f" ({x_units})" if x_units else ""))
+            ax.set_ylabel(f"{y_target}.{perf_stat}" + (f" ({y_units})" if y_units else ""))
+            highlighted_models = perf_spec.get("highlighted") or {}
+            highlighted_serials = [serial for serial in (ctx.get("hi") or []) if serial in curves]
+            for serial, pts in curves.items():
+                if serial in highlighted_serials:
+                    continue
+                xs = [point[0] for point in pts]
+                ys = [point[1] for point in pts]
+                ax.plot(xs, ys, linewidth=0.9, alpha=0.10, color="#64748b")
+            master_poly = (perf_spec.get("master") or {}).get("poly") or {}
+            if master_poly.get("coeffs") and perf_spec.get("pooled_x"):
+                try:
+                    import numpy as np  # type: ignore
+                    pooled_x = perf_spec.get("pooled_x") or []
+                    xfit = np.linspace(float(min(pooled_x)), float(max(pooled_x)), 240)
+                    pfit = np.poly1d(master_poly.get("coeffs") or [])
+                    fit_norm = bool((perf_spec.get("fit") or {}).get("normalize_x"))
+                    xfit_n = (xfit - float(master_poly.get("x0") or 0.0)) / (float(master_poly.get("sx") or 1.0) or 1.0) if fit_norm else xfit
+                    yfit = pfit(xfit_n)
+                    ax.plot(xfit.tolist(), yfit.tolist(), linestyle="--", linewidth=1.7, alpha=0.70, color="#0f172a", label="Family fit")
+                except Exception:
+                    pass
+            note_lines: list[str] = []
+            master_eqn = str((perf_spec.get("master") or {}).get("equation") or "").strip()
+            if master_eqn:
+                note_lines.append("Family equation")
+                note_lines.extend(textwrap.wrap(master_eqn, width=30) or [master_eqn])
+                note_lines.append(f"RMSE: {_fmt_num((perf_spec.get('master') or {}).get('rmse'), sig=5)}")
+                note_lines.append("")
+            for idx, serial in enumerate(highlighted_serials):
+                pts = curves.get(serial)
+                if not pts:
+                    continue
+                xs = [point[0] for point in pts]
+                ys = [point[1] for point in pts]
+                color = ctx["colors"][idx % len(ctx["colors"])]
+                ax.plot(xs, ys, marker="o", linewidth=2.1, alpha=0.95, color=color, label=serial)
+                for x_val, y_val, run_label in pts:
+                    ax.annotate(str(run_label), (x_val, y_val), textcoords="offset points", xytext=(4, 4), fontsize=7, alpha=0.75, color=color)
+                highlighted_model = highlighted_models.get(serial) if isinstance(highlighted_models, dict) else None
+                poly = highlighted_model.get("poly") if isinstance(highlighted_model, dict) else None
+                fit_norm = bool((perf_spec.get("fit") or {}).get("normalize_x"))
+                if isinstance(poly, dict) and poly.get("coeffs"):
+                    try:
+                        import numpy as np  # type: ignore
+                        xfit = np.linspace(float(min(xs)), float(max(xs)), 200)
+                        pfit = np.poly1d(poly.get("coeffs") or [])
+                        xfit_n = (xfit - float(poly.get("x0") or 0.0)) / (float(poly.get("sx") or 1.0) or 1.0) if fit_norm else xfit
+                        yfit = pfit(xfit_n)
+                        ax.plot(xfit.tolist(), yfit.tolist(), linestyle="--", linewidth=1.3, alpha=0.75, color=color)
+                    except Exception:
+                        pass
+                if isinstance(highlighted_model, dict):
+                    eqn = str(highlighted_model.get("equation") or "").strip()
+                    if eqn:
+                        note_lines.append(f"{serial}")
+                        note_lines.extend(textwrap.wrap(eqn, width=30) or [eqn])
+                        note_lines.append(f"RMSE: {_fmt_num(highlighted_model.get('rmse'), sig=5)}")
+                        note_lines.append("")
+            ax.grid(True, alpha=0.25)
+            try:
+                handles, labels = ax.get_legend_handles_labels()
+                uniq = {}
+                for handle, label in zip(handles, labels):
+                    if label not in uniq:
+                        uniq[label] = handle
+                if uniq:
+                    ax.legend(list(uniq.values()), list(uniq.keys()), fontsize=8, loc="best")
+            except Exception:
+                pass
+            ax_side.text(0.0, 1.0, "\n".join(note_lines[:28]), va="top", ha="left", fontsize=8, color="#0f172a")
+            pdf.savefig(fig)
+            plt.close(fig)
+            plot_page_count += 1
+            performance_plot_count += 1
+            plot_specs.append({"section": "performance_plots", "name": name, "x": x_target, "y": y_target, "stat": perf_stat, "page_number": intro_pages + plot_page_count})
+
+        if watch_pair_ids:
+            _tar_emit_progress(progress_cb, f"Rendering watch / non-pass curve pages ({len(watch_pair_ids)} planned)")
+        pair_by_id = ctx.get("pair_by_id") or {}
+        for watch_index, pair_id in enumerate(watch_pair_ids, start=1):
+            pair_spec = pair_by_id.get(str(pair_id or "").strip())
+            if not pair_spec:
+                continue
+            _tar_emit_progress(progress_cb, f"Watch / non-pass page {watch_index}/{len(watch_pair_ids)}: {pair_spec.get('run')} | {pair_spec.get('param')}")
+            plot_spec = _tar_render_watch_curve_page(
+                ctx,
+                pdf,
+                pair_spec=pair_spec,
+                page_number=intro_pages + plot_page_count + 1,
+            )
+            if plot_spec:
+                plot_specs.append(plot_spec)
+                plot_page_count += 1
+                watch_plot_count += 1
+
+    return {
+        "plot_page_count": plot_page_count,
+        "metric_plot_count": run_condition_metric_plot_count + regrade_metric_plot_count,
+        "curve_plot_count": run_condition_curve_plot_count + regrade_curve_plot_count,
+        "run_condition_metric_plot_count": run_condition_metric_plot_count,
+        "run_condition_curve_plot_count": run_condition_curve_plot_count,
+        "regrade_metric_plot_count": regrade_metric_plot_count,
+        "regrade_curve_plot_count": regrade_curve_plot_count,
+        "performance_plot_count": performance_plot_count,
+        "watch_plot_count": watch_plot_count,
+        "plot_specs": plot_specs,
+    }
+
+
 def _tar_build_closing_story(ctx: Mapping[str, Any], *, counts: Mapping[str, int]) -> list[Any]:
     rl = _reportlab_imports()
     styles = _build_portrait_styles(rl)
@@ -5333,8 +6771,11 @@ def _tar_build_closing_story(ctx: Mapping[str, Any], *, counts: Mapping[str, int
             "Report Inventory",
             [
                 f"Printed: {ctx['print_ctx'].printed_at}",
-                f"Metric plot pages: {int(counts.get('metric_plot_count') or 0)}",
-                f"Curve overlay pages: {int(counts.get('curve_plot_count') or 0)}",
+                f"Run-condition metric pages: {int(counts.get('run_condition_metric_plot_count') or 0)}",
+                f"Run-condition curve pages: {int(counts.get('run_condition_curve_plot_count') or 0)}",
+                f"Regrade metric pages: {int(counts.get('regrade_metric_plot_count') or 0)}",
+                f"Regrade curve pages: {int(counts.get('regrade_curve_plot_count') or 0)}",
+                f"Performance equation pages: {int(counts.get('equation_page_count') or 0)}",
                 f"Performance plot pages: {int(counts.get('performance_plot_count') or 0)}",
                 f"Watch / Non-PASS curve pages: {int(counts.get('watch_plot_count') or 0)}",
             ],
@@ -5465,6 +6906,11 @@ def generate_test_data_auto_report(
         _tar_emit_progress(progress_cb, "Building summary pages")
         intro_story = _tar_build_intro_story(ctx)
         timings["build_intro_story_seconds"] = round(time.perf_counter() - intro_story_start, 3)
+
+        equation_story_start = time.perf_counter()
+        _tar_emit_progress(progress_cb, "Building performance equation pages")
+        equation_story = _tar_build_equation_story(ctx)
+        timings["build_equation_story_seconds"] = round(time.perf_counter() - equation_story_start, 3)
         out_pdf = Path(ctx["out_pdf"]).expanduser()
         sidecar_path = out_pdf.with_suffix(".summary.json")
 
@@ -5472,7 +6918,8 @@ def generate_test_data_auto_report(
             tmp_root = Path(tmp_dir)
             intro_pdf = tmp_root / "01_intro.pdf"
             plots_pdf = tmp_root / "02_plots.pdf"
-            closing_pdf = tmp_root / "03_closing.pdf"
+            equations_pdf = tmp_root / "03_equations.pdf"
+            closing_pdf = tmp_root / "04_closing.pdf"
 
             intro_render_start = time.perf_counter()
             _tar_emit_progress(progress_cb, "Rendering cover and summary pages")
@@ -5483,11 +6930,30 @@ def generate_test_data_auto_report(
             _tar_emit_progress(progress_cb, "Rendering plot pages")
             plot_counts = _tar_render_plot_sections(ctx, intro_pages=intro_pages, plots_pdf=plots_pdf, progress_cb=progress_cb)
             timings["render_plot_pages_seconds"] = round(time.perf_counter() - plot_render_start, 3)
-            section_order = ["cover", "executive_summary", "comparison_table", "performance_equations"]
-            if plot_counts["metric_plot_count"]:
-                section_order.append("plot_metrics")
-            if plot_counts["curve_plot_count"]:
-                section_order.append("curve_overlays")
+
+            equation_render_start = time.perf_counter()
+            _tar_emit_progress(progress_cb, "Rendering performance equation pages")
+            equation_pages = _render_portrait_story_pdf(
+                equations_pdf,
+                story=equation_story,
+                print_ctx=ctx["print_ctx"],
+                page_number_offset=intro_pages + plot_counts["plot_page_count"],
+            )
+            timings["render_equation_pages_seconds"] = round(time.perf_counter() - equation_render_start, 3)
+            plot_counts = dict(plot_counts)
+            plot_counts["equation_page_count"] = int(equation_pages)
+
+            section_order = ["cover", "executive_summary", "comparison_table"]
+            if plot_counts["run_condition_metric_plot_count"]:
+                section_order.append("run_condition_plot_metrics")
+            if plot_counts["run_condition_curve_plot_count"]:
+                section_order.append("run_condition_curve_overlays")
+            if plot_counts["regrade_metric_plot_count"]:
+                section_order.append("regrade_pass_plot_metrics")
+            if plot_counts["regrade_curve_plot_count"]:
+                section_order.append("regrade_pass_curve_overlays")
+            if equation_pages:
+                section_order.append("performance_equations")
             if plot_counts["performance_plot_count"]:
                 section_order.append("performance_plots")
             if plot_counts["watch_plot_count"]:
@@ -5505,13 +6971,15 @@ def generate_test_data_auto_report(
                 closing_pdf,
                 story=closing_story,
                 print_ctx=ctx["print_ctx"],
-                page_number_offset=intro_pages + plot_counts["plot_page_count"],
+                page_number_offset=intro_pages + plot_counts["plot_page_count"] + equation_pages,
             )
             timings["render_closing_pages_seconds"] = round(time.perf_counter() - closing_render_start, 3)
 
             merge_parts = [intro_pdf]
             if plot_counts["plot_page_count"] and plots_pdf.exists():
                 merge_parts.append(plots_pdf)
+            if equation_pages and equations_pdf.exists():
+                merge_parts.append(equations_pdf)
             merge_parts.append(closing_pdf)
             try:
                 if out_pdf.exists():
@@ -5522,10 +6990,10 @@ def generate_test_data_auto_report(
             _tar_emit_progress(progress_cb, "Merging report PDF")
             _merge_report_pdfs(out_pdf, merge_parts)
             timings["merge_pdf_seconds"] = round(time.perf_counter() - merge_start, 3)
-            total_pages = intro_pages + plot_counts["plot_page_count"] + closing_pages
+            total_pages = intro_pages + plot_counts["plot_page_count"] + equation_pages + closing_pages
 
         sidecar = {
-            "version": 3,
+            "version": 4,
             "generated_date": _now_datestr(),
             "printed_at": ctx["print_ctx"].printed_at,
             "printed_timezone": ctx["print_ctx"].printed_timezone,
@@ -5541,15 +7009,21 @@ def generate_test_data_auto_report(
             "options": ctx["options"],
             "investigated_serials": ctx["hi"],
             "metadata_by_serial": {serial: (ctx["meta_by_sn"].get(serial) or {}) for serial in ctx["hi"]},
+            "initial_overall_results_by_serial": ctx.get("initial_overall_by_sn") or {},
+            "final_overall_results_by_serial": ctx.get("final_overall_by_sn") or {},
             "overall_results_by_serial": ctx["overall_by_sn"],
             "non_pass_findings": ctx["nonpass_findings"],
+            "initial_non_pass_findings": ctx.get("initial_nonpass_findings") or [],
             "runs": ctx["runs"],
             "params": ctx["params"],
             "metric_stats": ctx["metric_stats"],
             "curve_models": ctx["curves_summary"],
+            "initial_watch_items": ctx.get("initial_watch_items") or [],
             "watch_items": ctx["watch_items"],
             "grading": ctx["grading_rows"],
             "comparison_rows": ctx["comparison_rows"],
+            "initial_cohorts": ctx.get("initial_cohort_specs") or [],
+            "regrade_cohorts": ctx.get("regrade_cohort_specs") or [],
             "equation_cards": ctx["equation_cards"],
             "plot_specs": plot_counts["plot_specs"],
             "performance_models": ctx["performance_models"],

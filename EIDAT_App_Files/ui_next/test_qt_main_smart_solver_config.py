@@ -917,6 +917,418 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
             if tmpdir:
                 shutil.rmtree(str(tmpdir), ignore_errors=True)
 
+    def test_auto_report_control_period_filter_keeps_steady_state_sequences_visible(self) -> None:
+        window = self._make_window()
+        try:
+            window._available_program_filters = ["Program A"]
+            window._available_control_period_filters = ["10", "20"]
+            window._available_suppression_voltage_filters = ["5"]
+            window._available_serial_filter_rows = [{"serial": "SN-001", "program_title": "Program A"}]
+            window._global_filter_rows = [
+                {
+                    "serial": "SN-001",
+                    "program_title": "Program A",
+                    "source_run_name": "Seq Pulse",
+                    "control_period": 10.0,
+                    "suppression_voltage": 5.0,
+                },
+                {
+                    "serial": "SN-001",
+                    "program_title": "Program A",
+                    "source_run_name": "Seq Steady",
+                    "control_period": None,
+                    "suppression_voltage": 5.0,
+                },
+            ]
+            window._run_selection_views = {
+                "sequence": [
+                    {
+                        "mode": "sequence",
+                        "id": "sequence:pulse",
+                        "run_name": "run_pulse",
+                        "program_title": "Program A",
+                        "member_programs": ["Program A"],
+                        "member_sequences": ["Seq Pulse"],
+                        "member_control_periods": ["10"],
+                        "member_suppression_voltages": ["5"],
+                        "member_run_type_modes": ["pulsed_mode"],
+                    },
+                    {
+                        "mode": "sequence",
+                        "id": "sequence:steady",
+                        "run_name": "run_steady",
+                        "program_title": "Program A",
+                        "member_programs": ["Program A"],
+                        "member_sequences": ["Seq Steady"],
+                        "member_control_periods": [],
+                        "member_suppression_voltages": ["5"],
+                        "member_run_type_modes": ["steady_state"],
+                    },
+                    {
+                        "mode": "sequence",
+                        "id": "sequence:pulse-other",
+                        "run_name": "run_other",
+                        "program_title": "Program A",
+                        "member_programs": ["Program A"],
+                        "member_sequences": ["Seq Pulse Other"],
+                        "member_control_periods": ["20"],
+                        "member_suppression_voltages": ["5"],
+                        "member_run_type_modes": ["pulsed_mode"],
+                    },
+                ],
+                "condition": [],
+            }
+            filter_state = {
+                "programs": ["Program A"],
+                "serials": ["SN-001"],
+                "control_periods": ["10"],
+                "suppression_voltages": ["5"],
+            }
+
+            items = window._visible_auto_report_run_selection_items_for_filter_state(
+                "sequence",
+                filter_state=filter_state,
+                require_active_serial_match=True,
+            )
+            self.assertEqual(
+                [item["id"] for item in items],
+                ["sequence:pulse", "sequence:steady"],
+            )
+        finally:
+            window.close()
+            tmpdir = getattr(window, "_test_tmpdir", "")
+            if tmpdir:
+                shutil.rmtree(str(tmpdir), ignore_errors=True)
+
+    def test_auto_report_control_period_filter_keeps_steady_state_run_conditions_visible(self) -> None:
+        window = self._make_window()
+        try:
+            window._available_program_filters = ["Program A"]
+            window._available_control_period_filters = ["10", "20"]
+            window._available_suppression_voltage_filters = ["5"]
+            window._available_serial_filter_rows = [{"serial": "SN-001", "program_title": "Program A"}]
+            window._global_filter_rows = [
+                {
+                    "serial": "SN-001",
+                    "program_title": "Program A",
+                    "source_run_name": "Seq Pulse",
+                    "control_period": 10.0,
+                    "suppression_voltage": 5.0,
+                },
+                {
+                    "serial": "SN-001",
+                    "program_title": "Program A",
+                    "source_run_name": "Seq Steady",
+                    "control_period": None,
+                    "suppression_voltage": 5.0,
+                },
+            ]
+            window._run_selection_views = {
+                "sequence": [],
+                "condition": [
+                    {
+                        "mode": "condition",
+                        "id": "condition:pulse",
+                        "run_name": "run_pulse",
+                        "run_condition": "250 psia",
+                        "member_programs": ["Program A"],
+                        "member_runs": ["run_pulse"],
+                        "member_sequences": ["Seq Pulse"],
+                        "member_control_periods": ["10"],
+                        "member_suppression_voltages": ["5"],
+                        "member_run_type_modes": ["pulsed_mode"],
+                    },
+                    {
+                        "mode": "condition",
+                        "id": "condition:steady",
+                        "run_name": "run_steady",
+                        "run_condition": "250 psia",
+                        "member_programs": ["Program A"],
+                        "member_runs": ["run_steady"],
+                        "member_sequences": ["Seq Steady"],
+                        "member_control_periods": [],
+                        "member_suppression_voltages": ["5"],
+                        "member_run_type_modes": ["steady_state"],
+                    },
+                    {
+                        "mode": "condition",
+                        "id": "condition:pulse-other",
+                        "run_name": "run_other",
+                        "run_condition": "250 psia",
+                        "member_programs": ["Program A"],
+                        "member_runs": ["run_other"],
+                        "member_sequences": ["Seq Pulse Other"],
+                        "member_control_periods": ["20"],
+                        "member_suppression_voltages": ["5"],
+                        "member_run_type_modes": ["pulsed_mode"],
+                    },
+                ],
+            }
+            filter_state = {
+                "programs": ["Program A"],
+                "serials": ["SN-001"],
+                "control_periods": ["10"],
+                "suppression_voltages": ["5"],
+            }
+
+            items = window._visible_auto_report_run_selection_items_for_filter_state(
+                "condition",
+                filter_state=filter_state,
+                require_active_serial_match=True,
+            )
+            self.assertEqual(
+                [item["id"] for item in items],
+                ["condition:pulse", "condition:steady"],
+            )
+        finally:
+            window.close()
+            tmpdir = getattr(window, "_test_tmpdir", "")
+            if tmpdir:
+                shutil.rmtree(str(tmpdir), ignore_errors=True)
+
+    def test_auto_report_certification_helpers_ignore_suppression_but_keep_family_filter_scope(self) -> None:
+        window = self._make_window()
+        try:
+            window._available_program_filters = ["Program Alpha", "Program Beta"]
+            window._checked_program_filters = ["Program Alpha", "Program Beta"]
+            window._available_control_period_filters = ["10"]
+            window._checked_control_period_filters = ["10"]
+            window._available_suppression_voltage_filters = ["5", "10"]
+            window._checked_suppression_voltage_filters = ["5"]
+            window._available_serial_filter_rows = [
+                {"serial": "SN-002", "program_title": "Program Alpha"},
+                {"serial": "SN-101", "program_title": "Program Beta"},
+            ]
+            window._checked_serial_filters = ["SN-002", "SN-101"]
+            window._global_filter_rows = [
+                {
+                    "serial": "SN-002",
+                    "program_title": "Program Alpha",
+                    "source_run_name": "Seq 1",
+                    "control_period": 10.0,
+                    "suppression_voltage": 10.0,
+                },
+                {
+                    "serial": "SN-101",
+                    "program_title": "Program Beta",
+                    "source_run_name": "Seq 1",
+                    "control_period": 10.0,
+                    "suppression_voltage": 5.0,
+                },
+            ]
+            filter_state = {
+                "programs": ["Program Alpha", "Program Beta"],
+                "serials": ["SN-002", "SN-101"],
+                "control_periods": ["10"],
+                "suppression_voltages": ["5"],
+            }
+
+            self.assertEqual(window._active_serials(filter_state=filter_state), ["SN-101"])
+            self.assertEqual(
+                window._auto_report_certifying_program_options(filter_state=filter_state),
+                ["Program Alpha", "Program Beta"],
+            )
+            self.assertEqual(
+                [row["serial"] for row in window._auto_report_serial_rows_for_certifying_program("Program Alpha", filter_state=filter_state)],
+                ["SN-002"],
+            )
+        finally:
+            window.close()
+            tmpdir = getattr(window, "_test_tmpdir", "")
+            if tmpdir:
+                shutil.rmtree(str(tmpdir), ignore_errors=True)
+
+    def test_auto_report_run_selection_visibility_ignores_suppression_membership(self) -> None:
+        window = self._make_window()
+        try:
+            window._available_program_filters = ["Program Alpha"]
+            window._available_control_period_filters = ["10"]
+            window._available_suppression_voltage_filters = ["5", "10"]
+            window._available_serial_filter_rows = [{"serial": "SN-002", "program_title": "Program Alpha"}]
+            window._global_filter_rows = [
+                {
+                    "serial": "SN-002",
+                    "program_title": "Program Alpha",
+                    "source_run_name": "Seq 10V",
+                    "control_period": 10.0,
+                    "suppression_voltage": 10.0,
+                }
+            ]
+            window._run_selection_views = {
+                "sequence": [
+                    {
+                        "mode": "sequence",
+                        "id": "sequence:seq10v",
+                        "run_name": "run_seq10v",
+                        "program_title": "Program Alpha",
+                        "member_programs": ["Program Alpha"],
+                        "member_sequences": ["Seq 10V"],
+                        "member_control_periods": ["10"],
+                        "member_suppression_voltages": ["10"],
+                        "member_run_type_modes": ["pulsed_mode"],
+                    }
+                ],
+                "condition": [],
+            }
+            filter_state = {
+                "programs": ["Program Alpha"],
+                "serials": ["SN-002"],
+                "control_periods": ["10"],
+                "suppression_voltages": ["5"],
+            }
+
+            items = window._visible_auto_report_run_selection_items_for_filter_state(
+                "sequence",
+                filter_state=filter_state,
+                require_active_serial_match=True,
+            )
+            self.assertEqual([item["id"] for item in items], ["sequence:seq10v"])
+        finally:
+            window.close()
+            tmpdir = getattr(window, "_test_tmpdir", "")
+            if tmpdir:
+                shutil.rmtree(str(tmpdir), ignore_errors=True)
+
+    def test_auto_report_dialog_emits_certification_payload_and_default_output(self) -> None:
+        window = self._make_window()
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                repo = Path(td) / "repo"
+                repo.mkdir(parents=True, exist_ok=True)
+                db_path = Path(td) / "cache.sqlite3"
+                db_path.write_text("", encoding="utf-8")
+                window._plot_ready = True
+                window._db_path = db_path
+                window._available_program_filters = ["Program Alpha", "Program Beta"]
+                window._checked_program_filters = ["Program Alpha", "Program Beta"]
+                window._available_control_period_filters = ["10"]
+                window._checked_control_period_filters = ["10"]
+                window._available_suppression_voltage_filters = ["5", "10"]
+                window._checked_suppression_voltage_filters = ["5", "10"]
+                window._available_serial_filter_rows = [
+                    {"serial": "SN-001", "program_title": "Program Alpha"},
+                    {"serial": "SN-002", "program_title": "Program Alpha"},
+                    {"serial": "SN-101", "program_title": "Program Beta"},
+                ]
+                window._checked_serial_filters = ["SN-001", "SN-002", "SN-101"]
+                window._global_filter_rows = [
+                    {
+                        "serial": "SN-001",
+                        "program_title": "Program Alpha",
+                        "source_run_name": "Seq 1",
+                        "control_period": 10.0,
+                        "suppression_voltage": 5.0,
+                    },
+                    {
+                        "serial": "SN-002",
+                        "program_title": "Program Alpha",
+                        "source_run_name": "Seq 1",
+                        "control_period": 10.0,
+                        "suppression_voltage": 10.0,
+                    },
+                    {
+                        "serial": "SN-101",
+                        "program_title": "Program Beta",
+                        "source_run_name": "Seq 1",
+                        "control_period": 10.0,
+                        "suppression_voltage": 5.0,
+                    },
+                ]
+                window._run_selection_views = {
+                    "sequence": [
+                        {
+                            "mode": "sequence",
+                            "id": "sequence:seq1",
+                            "run_name": "run_seq1",
+                            "program_title": "Program Alpha",
+                            "member_programs": ["Program Alpha", "Program Beta"],
+                            "member_runs": ["run_seq1"],
+                            "member_sequences": ["Seq 1"],
+                            "member_control_periods": ["10"],
+                            "member_suppression_voltages": ["5", "10"],
+                            "member_run_type_modes": ["pulsed_mode"],
+                        }
+                    ],
+                    "condition": [],
+                }
+
+                captured: dict[str, object] = {}
+
+                def _run_dialog() -> int:
+                    dialog = next(
+                        widget
+                        for widget in self._app.topLevelWidgets()
+                        if isinstance(widget, QtWidgets.QDialog) and widget.windowTitle() == "Auto Report Options"
+                    )
+                    cert_program = dialog.findChild(QtWidgets.QComboBox, "auto_report_certifying_program")
+                    cert_serials = dialog.findChild(QtWidgets.QListWidget, "auto_report_certification_serials")
+                    report_name = dialog.findChild(QtWidgets.QLineEdit, "auto_report_report_name")
+                    output_dir = dialog.findChild(QtWidgets.QLineEdit, "auto_report_output_dir")
+                    self.assertIsNotNone(cert_program)
+                    self.assertIsNotNone(cert_serials)
+                    self.assertIsNotNone(report_name)
+                    self.assertIsNotNone(output_dir)
+                    self.assertIn("Family Serials...", [btn.text() for btn in dialog.findChildren(QtWidgets.QPushButton)])
+                    cert_program.setCurrentText("Program Alpha")
+                    self._app.processEvents()
+                    self.assertEqual(
+                        [cert_serials.item(i).text() for i in range(cert_serials.count())],
+                        ["SN-001", "SN-002"],
+                    )
+                    cert_serials.item(1).setSelected(True)
+                    self._app.processEvents()
+                    self.assertIn("Program Alpha", report_name.text())
+                    self.assertIn("SN-002", report_name.text())
+                    self.assertTrue(
+                        output_dir.text().endswith(
+                            str(Path("EDIN Program Folders") / "Program Alpha" / "EDAT reports")
+                        )
+                    )
+                    gen_btn = next(btn for btn in dialog.findChildren(QtWidgets.QPushButton) if btn.text() == "Generate Report")
+                    gen_btn.click()
+                    return int(QtWidgets.QDialog.DialogCode.Accepted)
+
+                def _capture_payload(*args, **_kwargs) -> None:
+                    payload = args[-1] if args else {}
+                    captured["payload"] = dict(payload)
+
+                with patch("ui_next.qt_main.be.get_repo_root", return_value=repo), patch(
+                    "ui_next.qt_main.be.td_cached_statistics", return_value=["mean"]
+                ), patch(
+                    "ui_next.qt_main.be.load_trend_auto_report_config", return_value={}
+                ), patch(
+                    "ui_next.qt_main.be.load_excel_trend_config", return_value={}
+                ), patch(
+                    "ui_next.qt_main.be.td_list_y_columns", return_value=[{"name": "Thrust"}]
+                ), patch.object(
+                    TestDataTrendDialog, "_run_auto_report", side_effect=_capture_payload
+                ), patch(
+                    "ui_next.qt_main.QtWidgets.QMessageBox.information"
+                ) as info_mock, patch(
+                    "ui_next.qt_main.QtWidgets.QMessageBox.warning"
+                ) as warn_mock, patch(
+                    "ui_next.qt_main.QtWidgets.QDialog.exec",
+                    side_effect=_run_dialog,
+                ), patch(
+                    "ui_next.qt_main._fit_widget_to_screen",
+                    lambda *_args, **_kwargs: None,
+                ):
+                    window._open_auto_report_options()
+                info_mock.assert_not_called()
+                warn_mock.assert_not_called()
+
+                payload = captured["payload"]
+                self.assertEqual(payload["certifying_program"], "Program Alpha")
+                self.assertEqual(payload["highlighted_serials"], ["SN-002"])
+                self.assertEqual(payload["filtered_serials"], ["SN-001", "SN-002", "SN-101"])
+                self.assertIn("Program Alpha", str(payload["output_pdf"]))
+                self.assertIn("EDAT reports", str(payload["output_pdf"]))
+        finally:
+            window.close()
+            tmpdir = getattr(window, "_test_tmpdir", "")
+            if tmpdir:
+                shutil.rmtree(str(tmpdir), ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()

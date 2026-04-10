@@ -6670,6 +6670,92 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             if self._row_matches_global_filters(row, filter_state=filter_state)
         ]
 
+    def _auto_report_filter_state_without_suppression(
+        self,
+        filter_state: Mapping[str, object] | None = None,
+    ) -> dict[str, list[str]]:
+        if isinstance(filter_state, Mapping):
+            state = self._normalize_auto_plot_filter_state(filter_state, default_to_current=False)
+        else:
+            state = self._current_auto_plot_filter_state()
+        state["suppression_voltages"] = []
+        return state
+
+    def _auto_report_rows_for_certification(
+        self,
+        *,
+        filter_state: Mapping[str, object] | None = None,
+    ) -> list[dict]:
+        if not self._global_filter_rows:
+            return []
+        cert_state = self._auto_report_filter_state_without_suppression(filter_state)
+        return self._filter_rows_for_global_selection(
+            [dict(row) for row in (self._global_filter_rows or []) if isinstance(row, dict)],
+            filter_state=cert_state,
+        )
+
+    def _auto_report_certifying_program_options(
+        self,
+        *,
+        filter_state: Mapping[str, object] | None = None,
+    ) -> list[str]:
+        rows = self._auto_report_rows_for_certification(filter_state=filter_state)
+        out: list[str] = []
+        seen: set[str] = set()
+        for row in rows:
+            program = self._row_program_label(row)
+            if not program or program.casefold() in seen:
+                continue
+            seen.add(program.casefold())
+            out.append(program)
+        if out:
+            return out
+        cert_state = self._auto_report_filter_state_without_suppression(filter_state)
+        active = self._active_program_filter_values(filter_state=cert_state)
+        return [value for value in active if str(value).strip()]
+
+    def _auto_report_serial_rows_for_certifying_program(
+        self,
+        certifying_program: object,
+        *,
+        filter_state: Mapping[str, object] | None = None,
+    ) -> list[dict]:
+        want_program = _td_display_program_title(certifying_program)
+        cert_state = self._auto_report_filter_state_without_suppression(filter_state)
+        serials_from_rows: set[str] = set()
+        for row in self._auto_report_rows_for_certification(filter_state=cert_state):
+            if want_program and self._row_program_label(row) != want_program:
+                continue
+            serial = _td_serial_value(row)
+            if serial:
+                serials_from_rows.add(serial)
+        if serials_from_rows:
+            return [
+                dict(row)
+                for row in (self._available_serial_filter_rows or [])
+                if isinstance(row, dict)
+                and _td_serial_value(row) in serials_from_rows
+                and (not want_program or _td_display_program_title((row or {}).get("program_title")) == want_program)
+            ]
+
+        selected_serials = set(self._active_serials(filter_state=cert_state))
+        selected_programs = set(self._active_program_filter_values(filter_state=cert_state))
+        out: list[dict] = []
+        for row in (self._available_serial_filter_rows or []):
+            if not isinstance(row, dict):
+                continue
+            serial = _td_serial_value(row)
+            program = _td_display_program_title((row or {}).get("program_title"))
+            if selected_serials and serial not in selected_serials:
+                continue
+            if want_program:
+                if program != want_program:
+                    continue
+            elif selected_programs and program not in selected_programs:
+                continue
+            out.append(dict(row))
+        return out
+
     def _visible_run_selection_items(
         self,
         mode: str,
@@ -6786,6 +6872,153 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         out: list[dict] = []
         for item in items:
             if any(self._selection_matches_observation_row(item, row) for row in filtered_rows):
+                out.append(dict(item))
+        return out
+
+    def _selection_member_control_periods(self, selection: Mapping[str, object] | None) -> list[str]:
+        if not isinstance(selection, Mapping):
+            return []
+        out: list[str] = []
+        seen: set[str] = set()
+        raw_values = selection.get("member_control_periods") or []
+        if isinstance(raw_values, list):
+            for value in raw_values:
+                label = _td_compact_filter_value(value)
+                if not label or label in seen:
+                    continue
+                seen.add(label)
+                out.append(label)
+        if out:
+            return out
+        single_value = _td_compact_filter_value(selection.get("control_period"))
+        if single_value:
+            return [single_value]
+        return []
+
+    def _selection_member_suppression_voltages(self, selection: Mapping[str, object] | None) -> list[str]:
+        if not isinstance(selection, Mapping):
+            return []
+        out: list[str] = []
+        seen: set[str] = set()
+        raw_values = selection.get("member_suppression_voltages") or []
+        if isinstance(raw_values, list):
+            for value in raw_values:
+                label = _td_compact_filter_value(value)
+                if not label or label in seen:
+                    continue
+                seen.add(label)
+                out.append(label)
+        if out:
+            return out
+        single_value = _td_compact_filter_value(selection.get("suppression_voltage"))
+        if single_value:
+            return [single_value]
+        return []
+
+    def _selection_run_type_modes(self, selection: Mapping[str, object] | None) -> list[str]:
+        if not isinstance(selection, Mapping):
+            return []
+        normalize_run_type_mode = getattr(be, "td_perf_normalize_run_type_mode", None)
+
+        def _normalize(value: object) -> str:
+            if callable(normalize_run_type_mode):
+                normalized = str(normalize_run_type_mode(value) or "").strip().lower()
+            else:
+                raw = str(value or "").strip().lower()
+                if raw in {"steady_state", "steady-state", "steadystate", "steady state", "ss"}:
+                    normalized = "steady_state"
+                elif raw in {"pulsed_mode", "pulsed-mode", "pulsedmode", "pulsed mode", "pm", "pulse"}:
+                    normalized = "pulsed_mode"
+                else:
+                    normalized = ""
+            return normalized if normalized in {"steady_state", "pulsed_mode"} else ""
+
+        out: list[str] = []
+        seen: set[str] = set()
+        for key in ("member_run_type_modes", "member_run_types"):
+            raw_values = selection.get(key) or []
+            if not isinstance(raw_values, list):
+                continue
+            for value in raw_values:
+                normalized = _normalize(value)
+                if not normalized or normalized in seen:
+                    continue
+                seen.add(normalized)
+                out.append(normalized)
+        if out:
+            return out
+        for value in (selection.get("run_type_mode"), selection.get("run_type")):
+            normalized = _normalize(value)
+            if normalized:
+                return [normalized]
+        return []
+
+    def _selection_is_auto_report_steady_state(self, selection: Mapping[str, object] | None) -> bool:
+        modes = self._selection_run_type_modes(selection)
+        if modes:
+            return all(mode == "steady_state" for mode in modes)
+        return not bool(self._selection_member_control_periods(selection))
+
+    def _selection_matches_auto_report_control_periods(
+        self,
+        selection: Mapping[str, object] | None,
+        selected_control_periods: set[str],
+    ) -> bool:
+        if not selected_control_periods:
+            return True
+        if self._selection_is_auto_report_steady_state(selection):
+            return True
+        member_control_periods = self._selection_member_control_periods(selection)
+        return any(value in selected_control_periods for value in member_control_periods)
+
+    def _visible_auto_report_run_selection_items_for_filter_state(
+        self,
+        mode: str,
+        *,
+        filter_state: Mapping[str, object] | None = None,
+        require_active_serial_match: bool = False,
+    ) -> list[dict]:
+        effective_filter_state = self._auto_report_filter_state_without_suppression(filter_state)
+        selected_programs = set(self._active_program_filter_values(filter_state=effective_filter_state))
+        selected_control_periods = set(self._active_control_period_filter_values(filter_state=effective_filter_state))
+        items: list[dict] = []
+        for raw_item in (self._run_selection_views.get(mode) or []):
+            if not isinstance(raw_item, dict):
+                continue
+            item = dict(raw_item)
+            raw_programs = item.get("member_programs") or []
+            if isinstance(raw_programs, list):
+                member_programs = [_td_display_program_title(value) for value in raw_programs if str(value).strip()]
+            else:
+                member_programs = []
+            if not member_programs:
+                member_programs = [_td_display_program_title(item.get("program_title"))]
+            if not any(program in selected_programs for program in member_programs):
+                continue
+            if not self._selection_matches_auto_report_control_periods(item, selected_control_periods):
+                continue
+            items.append(item)
+        if not require_active_serial_match or not self._global_filter_rows:
+            return items
+
+        without_control_periods = dict(effective_filter_state or {})
+        without_control_periods["control_periods"] = []
+        filtered_rows_with_cp = self._filter_rows_for_global_selection(
+            [dict(row) for row in (self._global_filter_rows or []) if isinstance(row, dict)],
+            filter_state=effective_filter_state,
+        )
+        filtered_rows_without_cp = self._filter_rows_for_global_selection(
+            [dict(row) for row in (self._global_filter_rows or []) if isinstance(row, dict)],
+            filter_state=without_control_periods,
+        )
+        out: list[dict] = []
+        for item in items:
+            candidate_rows = (
+                filtered_rows_without_cp
+                if self._selection_is_auto_report_steady_state(item)
+                else filtered_rows_with_cp
+            )
+            if any(self._selection_matches_observation_row(item, row) for row in candidate_rows):
                 out.append(dict(item))
         return out
 
@@ -7128,27 +7361,88 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             self._current_auto_plot_filter_state(),
             default_to_current=True,
         )
+        try:
+            global_repo_root = Path(getattr(be, "get_repo_root", lambda: be.DEFAULT_REPO_ROOT)()).expanduser()
+        except Exception:
+            global_repo_root = Path(self._project_dir).expanduser()
+        try:
+            sync_result = getattr(be, "sync_edin_program_folders", lambda repo: {"root": str(repo)})(global_repo_root)
+            edin_root_path = Path(
+                str(
+                    (sync_result or {}).get("root")
+                    or getattr(be, "edin_program_folders_root", lambda repo: repo)(global_repo_root)
+                )
+            ).expanduser()
+        except Exception:
+            edin_root_path = Path(
+                getattr(be, "edin_program_folders_root", lambda repo: repo)(global_repo_root)
+            ).expanduser()
 
         # Output path
         row_out = QtWidgets.QHBoxLayout()
         row_out.addWidget(QtWidgets.QLabel("Output PDF:"))
         ed_out = QtWidgets.QLineEdit()
-        default_name = f"auto_report_{time.strftime('%Y-%m-%d')}.pdf"
-        ed_out.setText(str(self._project_dir / default_name))
+        default_name = (
+            getattr(be, "td_auto_report_default_filename", None)("", [], when=datetime.datetime.now())
+            if callable(getattr(be, "td_auto_report_default_filename", None))
+            else f"TD_Auto_Report__{time.strftime('%Y-%m-%d')}.pdf"
+        )
+        ed_out.setObjectName("auto_report_output_pdf")
+        ed_out.setText(str(edin_root_path / default_name))
         btn_browse = QtWidgets.QPushButton("Browse…")
         def _browse():
             path, _ = QtWidgets.QFileDialog.getSaveFileName(
                 dlg,
                 "Save Auto Report",
-                ed_out.text().strip() or str(self._project_dir / default_name),
+                ed_out.text().strip() or str(edin_root_path / default_name),
                 "PDF Files (*.pdf)",
             )
             if path:
-                ed_out.setText(path)
+                picked = Path(path).expanduser()
+                output_dir_auto["enabled"] = False
+                report_name_auto["enabled"] = False
+                ed_output_dir.setText(str(picked.parent))
+                ed_report_name.setText(_normalize_pdf_name(picked.name))
+                ed_out.setText(str(picked))
         btn_browse.clicked.connect(_browse)
         row_out.addWidget(ed_out, 1)
         row_out.addWidget(btn_browse)
         layout.addLayout(row_out)
+
+        output_dir_auto = {"enabled": True}
+        output_frame = QtWidgets.QFrame()
+        output_frame.setStyleSheet("QFrame { background: #ffffff; border: 1px solid #d1d5db; border-radius: 10px; }")
+        output_layout = QtWidgets.QGridLayout(output_frame)
+        output_layout.setContentsMargins(12, 10, 12, 10)
+        output_layout.setHorizontalSpacing(10)
+        output_layout.setVerticalSpacing(8)
+        lbl_output_title = QtWidgets.QLabel("Output")
+        lbl_output_title.setStyleSheet("font-size: 12px; font-weight: 800; color: #000000;")
+        lbl_output_hint = QtWidgets.QLabel(
+            "Reports default into the selected certifying program folder under EDIN Program Folders. You can override the folder or edit the generated report name."
+        )
+        lbl_output_hint.setWordWrap(True)
+        lbl_output_hint.setStyleSheet("color: #4b5563; font-size: 11px;")
+        output_layout.addWidget(lbl_output_title, 0, 0, 1, 3)
+        output_layout.addWidget(lbl_output_hint, 1, 0, 1, 3)
+        output_layout.addWidget(QtWidgets.QLabel("EDIN Program Folders Root"), 2, 0)
+        ed_edin_root = QtWidgets.QLineEdit(str(edin_root_path))
+        ed_edin_root.setObjectName("auto_report_edin_root")
+        ed_edin_root.setReadOnly(True)
+        output_layout.addWidget(ed_edin_root, 2, 1, 1, 2)
+        output_layout.addWidget(QtWidgets.QLabel("Output Folder"), 3, 0)
+        ed_output_dir = QtWidgets.QLineEdit(str(edin_root_path))
+        ed_output_dir.setObjectName("auto_report_output_dir")
+        output_layout.addWidget(ed_output_dir, 3, 1)
+        btn_output_default = QtWidgets.QPushButton("Use Program Folder")
+        output_layout.addWidget(btn_output_default, 3, 2)
+        output_layout.addWidget(QtWidgets.QLabel("Report Name"), 4, 0)
+        ed_report_name = QtWidgets.QLineEdit(default_name)
+        ed_report_name.setObjectName("auto_report_report_name")
+        output_layout.addWidget(ed_report_name, 4, 1)
+        btn_output_browse = QtWidgets.QPushButton("Browse...")
+        output_layout.addWidget(btn_output_browse, 4, 2)
+        layout.addWidget(output_frame)
 
         # Options checkboxes
         opts_row = QtWidgets.QHBoxLayout()
@@ -7189,12 +7483,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         report_filter_text.setSpacing(2)
         lbl_report_filter_title = QtWidgets.QLabel("Report Filters")
         lbl_report_filter_title.setStyleSheet("font-size: 12px; font-weight: 800; color: #000000;")
-        lbl_report_filter_hint = QtWidgets.QLabel("Local to this exporter. These do not change the main Trend / Analyze filters.")
+        lbl_report_filter_hint = QtWidgets.QLabel("Local family-analysis filters for this exporter. These do not change the main Trend / Analyze filters.")
         lbl_report_filter_hint.setStyleSheet("color: #4b5563; font-size: 11px;")
         lbl_report_filter_hint.setWordWrap(True)
         lbl_report_program_filters = QtWidgets.QLabel("Programs: -")
         lbl_report_program_filters.setStyleSheet("color: #374151; font-size: 11px;")
-        lbl_report_serial_filters = QtWidgets.QLabel("Serials: -")
+        lbl_report_serial_filters = QtWidgets.QLabel("Family Serials: -")
         lbl_report_serial_filters.setStyleSheet("color: #374151; font-size: 11px;")
         lbl_report_suppression_filters = QtWidgets.QLabel("Suppression Voltage: -")
         lbl_report_suppression_filters.setStyleSheet("color: #374151; font-size: 11px;")
@@ -7209,7 +7503,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         report_filter_layout.addLayout(report_filter_text, 1)
 
         btn_report_program_filters = QtWidgets.QPushButton("Programs...")
-        btn_report_serial_filters = QtWidgets.QPushButton("Serials...")
+        btn_report_serial_filters = QtWidgets.QPushButton("Family Serials...")
         btn_report_suppression_filters = QtWidgets.QPushButton("Suppression Voltage...")
         btn_report_control_filters = QtWidgets.QPushButton("Control Period...")
         btn_report_reset_filters = QtWidgets.QPushButton("Reset Filters")
@@ -7228,18 +7522,62 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         splitter.setOrientation(QtCore.Qt.Orientation.Horizontal)
         layout.addWidget(splitter, 1)
 
-        # Left: Serials under certification
+        list_runs = QtWidgets.QListWidget()
+        cb_run_scope = QtWidgets.QComboBox()
+        cb_run_scope.addItem("Sequence", "sequence")
+        run_selection_views = {
+            "sequence": [dict(d) for d in (self._run_selection_views.get("sequence") or []) if isinstance(d, dict)],
+            "condition": [dict(d) for d in (self._run_selection_views.get("condition") or []) if isinstance(d, dict)],
+        }
+        if run_selection_views.get("condition"):
+            cb_run_scope.addItem("Run Conditions", "condition")
+        cur_scope = self._current_run_selector_mode()
+        idx_scope = cb_run_scope.findData(cur_scope)
+        if idx_scope >= 0:
+            cb_run_scope.setCurrentIndex(idx_scope)
+        run_selection_check_states: dict[str, dict[str, bool]] = {"sequence": {}, "condition": {}}
+        current_run_list_mode = str(cb_run_scope.currentData() or "sequence").strip().lower()
+
+        # Left: Certification specifics
         left = QtWidgets.QFrame()
         left_l = QtWidgets.QVBoxLayout(left)
         left_l.setContentsMargins(10, 10, 10, 10)
         left_l.setSpacing(8)
-        left_l.addWidget(QtWidgets.QLabel("Serials Under Certification (required)"))
+        lbl_certification_title = QtWidgets.QLabel("Certification Specifics")
+        lbl_certification_title.setStyleSheet("font-size: 12px; font-weight: 800; color: #000000;")
+        left_l.addWidget(lbl_certification_title)
+        lbl_certification_hint = QtWidgets.QLabel(
+            "Pick the certifying program, the certification serials under that program, and the exact run scope. Suppression voltage remains part of analysis filters but does not narrow these certification choices."
+        )
+        lbl_certification_hint.setWordWrap(True)
+        lbl_certification_hint.setStyleSheet("color: #4b5563; font-size: 11px;")
+        left_l.addWidget(lbl_certification_hint)
+        row_cert_program = QtWidgets.QHBoxLayout()
+        row_cert_program.addWidget(QtWidgets.QLabel("Certifying Program"))
+        cb_cert_program = QtWidgets.QComboBox()
+        cb_cert_program.setObjectName("auto_report_certifying_program")
+        row_cert_program.addWidget(cb_cert_program, 1)
+        left_l.addLayout(row_cert_program)
+        left_l.addWidget(QtWidgets.QLabel("Certification Serials (required)"))
         ed_sn_filter = QtWidgets.QLineEdit()
-        ed_sn_filter.setPlaceholderText("Filter serials…")
+        ed_sn_filter.setObjectName("auto_report_cert_serial_filter")
+        ed_sn_filter.setPlaceholderText("Filter certification serials...")
         left_l.addWidget(ed_sn_filter)
         list_sn = QtWidgets.QListWidget()
+        list_sn.setObjectName("auto_report_certification_serials")
         list_sn.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
         left_l.addWidget(list_sn, 1)
+        lbl_runs_auto = QtWidgets.QLabel("Selected runs: -")
+        lbl_runs_auto.setStyleSheet("color: #64748b; font-size: 11px;")
+        lbl_runs_auto.setWordWrap(True)
+        row_runs = QtWidgets.QHBoxLayout()
+        row_runs.addWidget(QtWidgets.QLabel("Runs included"))
+        row_runs.addWidget(cb_run_scope)
+        btn_runs_popup = QtWidgets.QPushButton("Select Runs...")
+        row_runs.addWidget(btn_runs_popup)
+        row_runs.addStretch(1)
+        left_l.addLayout(row_runs)
+        left_l.addWidget(lbl_runs_auto)
 
         default_hi = []
         try:
@@ -7260,43 +7598,19 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
         splitter.addWidget(left)
 
-        # Right: Runs + report analysis params (checkbox lists)
+        # Right: Report analysis params (checkbox lists)
         right = QtWidgets.QFrame()
         right_l = QtWidgets.QVBoxLayout(right)
         right_l.setContentsMargins(10, 10, 10, 10)
         right_l.setSpacing(10)
-
-        list_runs = QtWidgets.QListWidget()
-        cb_run_scope = QtWidgets.QComboBox()
-        cb_run_scope.addItem("Sequence", "sequence")
-        run_selection_views = {
-            "sequence": [dict(d) for d in (self._run_selection_views.get("sequence") or []) if isinstance(d, dict)],
-            "condition": [dict(d) for d in (self._run_selection_views.get("condition") or []) if isinstance(d, dict)],
-        }
-        if run_selection_views.get("condition"):
-            cb_run_scope.addItem("Run Conditions", "condition")
-        cur_scope = self._current_run_selector_mode()
-        idx_scope = cb_run_scope.findData(cur_scope)
-        if idx_scope >= 0:
-            cb_run_scope.setCurrentIndex(idx_scope)
-        run_selection_check_states: dict[str, dict[str, bool]] = {"sequence": {}, "condition": {}}
-        current_run_list_mode = str(cb_run_scope.currentData() or "sequence").strip().lower()
+        lbl_analysis_title = QtWidgets.QLabel("Analysis")
+        lbl_analysis_title.setStyleSheet("font-size: 12px; font-weight: 800; color: #000000;")
+        right_l.addWidget(lbl_analysis_title)
 
         ed_param_filter = QtWidgets.QLineEdit()
 
         ed_param_filter.setPlaceholderText("Filter params…")
         list_params = QtWidgets.QListWidget()
-        lbl_runs_auto = QtWidgets.QLabel("Selected runs: -")
-        lbl_runs_auto.setStyleSheet("color: #64748b; font-size: 11px;")
-        lbl_runs_auto.setWordWrap(True)
-        row_runs = QtWidgets.QHBoxLayout()
-        row_runs.addWidget(QtWidgets.QLabel("Runs included"))
-        row_runs.addWidget(cb_run_scope)
-        btn_runs_popup = QtWidgets.QPushButton("Select Runs...")
-        row_runs.addWidget(btn_runs_popup)
-        row_runs.addStretch(1)
-        right_l.addLayout(row_runs)
-        right_l.addWidget(lbl_runs_auto)
 
         lbl_params_auto = QtWidgets.QLabel("Selected params: —")
         lbl_params_auto.setStyleSheet("color: #64748b; font-size: 11px;")
@@ -7368,6 +7682,59 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             extra = "" if len(items) <= 3 else f" +{len(items) - 3} more"
             return f"{len(items)} / {total} ({preview}{extra})"
 
+        report_name_auto = {"enabled": True}
+
+        def _selected_certification_serials() -> list[str]:
+            return [it.text().strip() for it in list_sn.selectedItems() if it and it.text().strip()]
+
+        def _normalize_pdf_name(name: object) -> str:
+            raw = str(name or "").strip()
+            if not raw:
+                raw = default_name
+            if not raw.lower().endswith(".pdf"):
+                raw = f"{raw}.pdf"
+            return raw
+
+        def _default_output_dir_for_program(program_title: object) -> Path:
+            raw = str(program_title or "").strip()
+            helper = getattr(be, "edin_program_report_dir", None)
+            if callable(helper):
+                try:
+                    return Path(helper(global_repo_root, raw, create=False)).expanduser()
+                except Exception:
+                    pass
+            if raw:
+                folder_name = (
+                    getattr(be, "edin_program_folder_name", None)(raw)
+                    if callable(getattr(be, "edin_program_folder_name", None))
+                    else raw
+                )
+                return Path(edin_root_path) / str(folder_name).strip() / "EDAT reports"
+            return Path(edin_root_path)
+
+        def _default_report_name_for_selection(program_title: object, serials: list[str] | None = None) -> str:
+            helper = getattr(be, "td_auto_report_default_filename", None)
+            if callable(helper):
+                try:
+                    return str(helper(program_title, list(serials or []), when=datetime.datetime.now()) or "").strip() or default_name
+                except Exception:
+                    pass
+            return default_name
+
+        def _refresh_output_path_preview(*, force_dir: bool = False, force_name: bool = False) -> None:
+            program_title = str(cb_cert_program.currentText() or "").strip()
+            serials = _selected_certification_serials()
+            default_output_dir = str(_default_output_dir_for_program(program_title))
+            default_report_name = _default_report_name_for_selection(program_title, serials)
+            if force_dir or output_dir_auto["enabled"]:
+                if ed_output_dir.text() != default_output_dir:
+                    ed_output_dir.setText(default_output_dir)
+            if force_name or report_name_auto["enabled"]:
+                if ed_report_name.text() != default_report_name:
+                    ed_report_name.setText(default_report_name)
+            out_dir = Path((ed_output_dir.text() or "").strip() or default_output_dir).expanduser()
+            ed_out.setText(str(out_dir / _normalize_pdf_name(ed_report_name.text())))
+
         def _open_checklist_popup(
             *,
             title_text: str,
@@ -7437,7 +7804,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             pop.exec()
 
         def _selection_label(selection: dict) -> str:
-            return self._selection_display_text(selection) or str(selection.get("sequence_name") or selection.get("run_name") or "").strip()
+            return self._auto_report_selection_display_text(selection) or str(selection.get("sequence_name") or selection.get("run_name") or "").strip()
 
         def _run_selection_key(selection: dict | None) -> str:
             if not isinstance(selection, dict):
@@ -7445,7 +7812,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             return str(selection.get("id") or "").strip()
 
         def _filtered_run_selection_items(mode: str) -> list[dict]:
-            return self._visible_run_selection_items_for_filter_state(
+            return self._visible_auto_report_run_selection_items_for_filter_state(
                 mode,
                 filter_state=report_filter_state,
                 require_active_serial_match=True,
@@ -7542,15 +7909,31 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 f"Metric pages use report params: {_selection_summary(params_sel, list_params.count())} | Stats: {stats_text}"
             )
 
-        def _refresh_serials_from_runs() -> None:
+        def _refresh_certifying_program_options() -> None:
+            current = str(cb_cert_program.currentText() or "").strip()
+            program_values = self._auto_report_certifying_program_options(filter_state=report_filter_state)
+            cb_cert_program.blockSignals(True)
+            cb_cert_program.clear()
+            for value in program_values:
+                cb_cert_program.addItem(value, value)
+            if current:
+                idx = cb_cert_program.findData(current)
+                if idx >= 0:
+                    cb_cert_program.setCurrentIndex(idx)
+            if cb_cert_program.currentIndex() < 0 and cb_cert_program.count() > 0:
+                cb_cert_program.setCurrentIndex(0)
+            cb_cert_program.blockSignals(False)
+
+        def _refresh_certification_serials() -> None:
             nonlocal applied_default_hi
             selected_before = {
                 it.text().strip()
                 for it in list_sn.selectedItems()
                 if it is not None and it.text().strip()
             }
-            serial_rows = self._serial_rows_for_run_selections(
-                _collect_checked_run_selections(),
+            certifying_program = str(cb_cert_program.currentText() or "").strip()
+            serial_rows = self._auto_report_serial_rows_for_certifying_program(
+                certifying_program,
                 filter_state=report_filter_state,
             )
             serial_values = [_td_serial_value(row) for row in serial_rows if _td_serial_value(row)]
@@ -7568,6 +7951,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             list_sn.blockSignals(False)
             applied_default_hi = True
             _apply_sn_filter()
+            _refresh_output_path_preview()
 
         def _report_filter_summary(
             prefix: str,
@@ -7605,7 +7989,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             )
             lbl_report_serial_filters.setText(
                 _report_filter_summary(
-                    "Serials",
+                    "Family Serials",
                     serials_active,
                     len(self._available_serial_filter_rows or []),
                     tooltip_label=lbl_report_serial_filters,
@@ -7640,9 +8024,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
         def _apply_report_filter_change() -> None:
             _refresh_report_filter_summaries()
+            _refresh_certifying_program_options()
+            _refresh_certification_serials()
             _sync_report_run_scope_availability()
             _populate_run_selections()
-            _refresh_serials_from_runs()
             _refresh_params_from_runs()
 
         def _refresh_params_from_runs():
@@ -7737,7 +8122,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 title_text="Runs Included",
                 target_list=list_runs,
                 filter_placeholder="Filter runs...",
-                extra_apply=lambda _ctx: (_refresh_serials_from_runs(), _refresh_params_from_runs()),
+                extra_apply=lambda _ctx: _refresh_params_from_runs(),
             )
 
         def _open_params_popup() -> None:
@@ -7824,7 +8209,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     }
                 )
             chosen = self._show_filter_checklist_popup(
-                title="Report Serials",
+                title="Report Family Serials",
                 entries=entries,
                 selected_values=list(report_filter_state.get("serials") or []),
             )
@@ -7873,6 +8258,19 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             report_filter_state["suppression_voltages"] = list(self._available_suppression_voltage_filters or [])
             _apply_report_filter_change()
 
+        def _browse_output_dir() -> None:
+            start_dir = (ed_output_dir.text() or "").strip() or str(edin_root_path)
+            chosen = QtWidgets.QFileDialog.getExistingDirectory(dlg, "Select Output Folder", start_dir)
+            if not chosen:
+                return
+            output_dir_auto["enabled"] = False
+            ed_output_dir.setText(chosen)
+            _refresh_output_path_preview()
+
+        def _use_default_output_dir() -> None:
+            output_dir_auto["enabled"] = True
+            _refresh_output_path_preview(force_dir=True)
+
         btn_runs_popup.clicked.connect(_open_runs_popup)
         btn_params_popup.clicked.connect(_open_params_popup)
         btn_metrics_popup.clicked.connect(_open_metrics_popup)
@@ -7881,13 +8279,22 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         btn_report_suppression_filters.clicked.connect(_open_report_suppression_filters_popup)
         btn_report_control_filters.clicked.connect(_open_report_control_period_filters_popup)
         btn_report_reset_filters.clicked.connect(_reset_report_filters)
+        btn_output_default.clicked.connect(_use_default_output_dir)
+        btn_output_browse.clicked.connect(_browse_output_dir)
 
-        cb_run_scope.currentIndexChanged.connect(lambda *_: (_populate_run_selections(), _refresh_serials_from_runs(), _refresh_params_from_runs()))
-        list_runs.itemChanged.connect(lambda *_: (_refresh_serials_from_runs(), _refresh_params_from_runs()))
+        cb_cert_program.currentIndexChanged.connect(lambda *_: _refresh_certification_serials())
+        list_sn.itemSelectionChanged.connect(lambda: _refresh_output_path_preview())
+        cb_run_scope.currentIndexChanged.connect(lambda *_: (_populate_run_selections(), _refresh_params_from_runs()))
+        list_runs.itemChanged.connect(lambda *_: _refresh_params_from_runs())
         list_params.itemChanged.connect(lambda *_: _update_params_label())
         list_metric_params.itemChanged.connect(lambda *_: _update_metric_params_label())
         list_metric_stats.itemChanged.connect(lambda *_: _update_metric_params_label())
+        ed_output_dir.textEdited.connect(lambda *_: output_dir_auto.__setitem__("enabled", False))
+        ed_output_dir.textChanged.connect(lambda *_: _refresh_output_path_preview())
+        ed_report_name.textEdited.connect(lambda *_: report_name_auto.__setitem__("enabled", False))
+        ed_report_name.textChanged.connect(lambda *_: ed_out.setText(str(Path((ed_output_dir.text() or "").strip() or str(edin_root_path)).expanduser() / _normalize_pdf_name(ed_report_name.text()))))
         _apply_report_filter_change()
+        _refresh_output_path_preview(force_dir=True, force_name=True)
 
         splitter.addWidget(right)
         splitter.setStretchFactor(0, 1)
@@ -8066,22 +8473,23 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             if not out_path:
                 QtWidgets.QMessageBox.information(dlg, "Auto Report", "Select an output PDF path.")
                 return
+            certifying_program = str(cb_cert_program.currentText() or "").strip()
             run_selections_sel = _collect_checked_run_selections()
             runs_sel = _selected_member_runs()
-            filtered_serials = [
-                list_sn.item(i).text().strip()
-                for i in range(list_sn.count())
-                if list_sn.item(i) is not None and list_sn.item(i).text().strip()
-            ]
+            filtered_serials = self._active_serials(filter_state=report_filter_state)
             hi_sel = [it.text().strip() for it in list_sn.selectedItems() if it and it.text().strip()]
+            out_path = str(Path(out_path).expanduser())
             if not runs_sel:
                 QtWidgets.QMessageBox.information(dlg, "Auto Report", "Select at least one run.")
                 return
             if not filtered_serials:
                 QtWidgets.QMessageBox.information(dlg, "Auto Report", "The active report filters exclude all serials.")
                 return
+            if not certifying_program:
+                QtWidgets.QMessageBox.information(dlg, "Auto Report", "Select a certifying program.")
+                return
             if not hi_sel:
-                QtWidgets.QMessageBox.information(dlg, "Auto Report", "Select at least one serial under certification.")
+                QtWidgets.QMessageBox.information(dlg, "Auto Report", "Select at least one certification serial.")
                 return
             params_sel = _collect_checked(list_params)
             if not params_sel:
@@ -8169,6 +8577,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 "run_selection_labels": [_selection_label(d) for d in run_selections_sel if _selection_label(d)],
                 "filter_state": dict(report_filter_state),
                 "filtered_serials": filtered_serials,
+                "certifying_program": certifying_program,
                 "highlighted_serials": hi_sel,
                 "params": params_sel,
                 "metric_params": metric_params_sel,
@@ -8208,6 +8617,17 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
         runs = payload.get("runs") or []
         hi = payload.get("highlighted_serials") or []
+        certifying_program = str(payload.get("certifying_program") or "").strip()
+        try:
+            repo_root = Path(getattr(be, "get_repo_root", lambda: be.DEFAULT_REPO_ROOT)()).expanduser()
+            sync_helper = getattr(be, "sync_edin_program_folders", None)
+            if callable(sync_helper):
+                sync_helper(repo_root)
+            report_dir_helper = getattr(be, "edin_program_report_dir", None)
+            if certifying_program and callable(report_dir_helper):
+                report_dir_helper(repo_root, certifying_program, create=True)
+        except Exception:
+            pass
 
         options = {
             "runs": runs,
@@ -8215,6 +8635,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             "run_selection_labels": payload.get("run_selection_labels") or [],
             "filter_state": dict(payload.get("filter_state") or {}),
             "filtered_serials": payload.get("filtered_serials") or [],
+            "certifying_program": certifying_program,
             "params": payload.get("params") or [],
             "metric_params": payload.get("metric_params") or [],
             "metric_stats": payload.get("metric_stats") or [],
@@ -8514,6 +8935,17 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             return display_text
         run = str(selection.get("run_name") or "").strip()
         return self._run_display_text(run) or str(selection.get("sequence_name") or run).strip()
+
+    def _auto_report_condition_label(self, selection: dict | None) -> str:
+        return self._selection_condition_label(selection)
+
+    def _auto_report_selection_display_text(self, selection: dict | None) -> str:
+        if not isinstance(selection, dict):
+            return ""
+        mode = str(selection.get("mode") or "sequence").strip().lower()
+        if mode == "condition":
+            return self._auto_report_condition_label(selection)
+        return self._selection_display_text(selection)
 
     def _selection_title_parts(self, selection: dict | None) -> tuple[str, str]:
         if not isinstance(selection, dict):
@@ -21470,6 +21902,12 @@ class MainWindow(QtWidgets.QMainWindow):
         repo_row.addWidget(btn_repo)
         repo_layout.addLayout(repo_row)
 
+        edin_root_text = f"EDIN Program Folders: {getattr(be, 'edin_program_folders_root', lambda repo: Path(repo) / 'EDIN Program Folders')(getattr(be, 'get_repo_root', lambda: be.DEFAULT_REPO_ROOT)())}"
+        self.lbl_edin_program_root = QtWidgets.QLabel(edin_root_text)
+        self.lbl_edin_program_root.setWordWrap(True)
+        self.lbl_edin_program_root.setStyleSheet("color: #374151; font-size: 12px;")
+        repo_layout.addWidget(self.lbl_edin_program_root)
+
         self.lbl_support_status = QtWidgets.QLabel("Support: not initialized")
         self.lbl_support_status.setWordWrap(True)
         self.lbl_support_status.setStyleSheet("color: #374151; font-size: 12px;")
@@ -21967,6 +22405,11 @@ class MainWindow(QtWidgets.QMainWindow):
         repo_row.addWidget(self.ed_repo, 1)
         repo_row.addWidget(btn_repo)
         workspace_layout.addLayout(repo_row)
+        workspace_edin_text = f"EDIN Program Folders: {getattr(be, 'edin_program_folders_root', lambda repo: Path(repo) / 'EDIN Program Folders')(getattr(be, 'get_repo_root', lambda: be.DEFAULT_REPO_ROOT)())}"
+        self.lbl_workspace_edin_program_root = QtWidgets.QLabel(workspace_edin_text)
+        self.lbl_workspace_edin_program_root.setWordWrap(True)
+        self.lbl_workspace_edin_program_root.setStyleSheet("color: #374151; font-size: 11px;")
+        workspace_layout.addWidget(self.lbl_workspace_edin_program_root)
 
         self.btn_sync_workspace = QtWidgets.QPushButton("⭳  Sync Workspace Now")
         self.btn_sync_workspace.setMinimumHeight(button_min_h)
@@ -26696,6 +27139,20 @@ class MainWindow(QtWidgets.QMainWindow):
             edit.setText(path)
         self._scan_refresh()
 
+    def _refresh_edin_program_folder_labels(self) -> None:
+        try:
+            repo_root = Path(getattr(be, "get_repo_root", lambda: be.DEFAULT_REPO_ROOT)()).expanduser()
+            root = Path(
+                getattr(be, "edin_program_folders_root", lambda repo: Path(repo) / "EDIN Program Folders")(repo_root)
+            ).expanduser()
+            text = f"EDIN Program Folders: {root}"
+        except Exception as exc:
+            text = f"EDIN Program Folders: unavailable ({exc})"
+        for attr in ("lbl_edin_program_root", "lbl_workspace_edin_program_root"):
+            label = getattr(self, attr, None)
+            if isinstance(label, QtWidgets.QLabel):
+                label.setText(text)
+
     def _set_global_repo(self, path: Path) -> None:
         repo_path = Path(path).expanduser()
         be.set_repo_root(repo_path)
@@ -26706,10 +27163,22 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as exc:
             self.lbl_support_status.setText(f"Support: init failed ({exc})")
         try:
+            sync_helper = getattr(be, "sync_edin_program_folders", None)
+            if callable(sync_helper):
+                sync_helper(repo_path)
+        except Exception:
+            pass
+        try:
             if hasattr(self, "ed_repo") and self.ed_repo is not None:
                 self.ed_repo.setText(str(be.get_repo_root()))
         except Exception:
             pass
+        try:
+            if hasattr(self, "ed_global_repo") and self.ed_global_repo is not None:
+                self.ed_global_repo.setText(str(be.get_repo_root()))
+        except Exception:
+            pass
+        self._refresh_edin_program_folder_labels()
         # Node mode: auto-scan on launch so Files tab populates immediately (even if nothing is processed yet).
         try:
             if str(os.environ.get("EIDAT_UI_PROFILE") or "").strip().lower() == "node":

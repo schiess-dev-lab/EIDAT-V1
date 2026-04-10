@@ -830,12 +830,20 @@ class _RunSelectionHarness:
             "_active_control_period_filter_values",
             "_active_program_filter_values",
             "_active_suppression_voltage_filter_values",
+            "_selection_member_control_periods",
+            "_selection_member_suppression_voltages",
+            "_selection_run_type_modes",
+            "_selection_is_auto_report_steady_state",
+            "_selection_matches_auto_report_control_periods",
+            "_visible_auto_report_run_selection_items_for_filter_state",
             "_visible_run_selection_items",
             "_visible_run_selection_items_for_filter_state",
             "_sync_run_mode_availability",
             "_refresh_run_selection_visibility",
             "_on_metric_condition_selection_changed",
             "_refresh_run_dropdown",
+            "_auto_report_condition_label",
+            "_auto_report_selection_display_text",
             "_refresh_auto_plots_list",
             "_update_auto_actions",
             "_delete_selected_auto_plots",
@@ -4165,9 +4173,17 @@ class TestTDSupportWorkbook(unittest.TestCase):
             seq1 = next(item for item in seq_items if item.get("source_run_name") == "Seq1")
             self.assertEqual(seq1.get("member_control_periods"), ["60"])
             self.assertEqual(seq1.get("member_suppression_voltages"), ["24"])
+            self.assertEqual(seq1.get("run_type"), "PM")
+            self.assertEqual(seq1.get("run_type_mode"), "pulsed_mode")
+            self.assertEqual(seq1.get("member_run_types"), ["PM"])
+            self.assertEqual(seq1.get("member_run_type_modes"), ["pulsed_mode"])
             cond = next(item for item in cond_items if item.get("run_name") == "RunA")
             self.assertEqual(cond.get("member_control_periods"), ["60", "120"])
             self.assertEqual(cond.get("member_suppression_voltages"), ["24", "28"])
+            self.assertEqual(cond.get("run_type"), "PM")
+            self.assertEqual(cond.get("run_type_mode"), "pulsed_mode")
+            self.assertEqual(cond.get("member_run_types"), ["PM"])
+            self.assertEqual(cond.get("member_run_type_modes"), ["pulsed_mode"])
 
     def test_rebuild_prefers_workbook_config_columns_over_runtime_config(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
@@ -6816,6 +6832,58 @@ class TestTDSupportWorkbook(unittest.TestCase):
             title,
             "Run Condition: 350 psia, PM, 60 Sec ON / 120 Sec OFF | Sequences: Seq1, Seq2 | mean",
         )
+
+    @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
+    def test_auto_report_condition_label_appends_suppression_voltage(self) -> None:
+        harness = _RunSelectionHarness()
+        selection = {
+            "mode": "condition",
+            "id": "condition:seq1",
+            "run_name": "Seq1",
+            "display_text": "sequence",
+            "run_condition": "250 psia",
+            "suppression_voltage": 24.0,
+            "member_suppression_voltages": ["24"],
+        }
+
+        self.assertEqual(harness._selection_display_text(selection), "250 psia")
+        self.assertEqual(
+            harness._auto_report_selection_display_text(selection),
+            "250 psia | Supp 24",
+        )
+
+    @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
+    def test_auto_report_condition_label_joins_multiple_suppression_voltages(self) -> None:
+        harness = _RunSelectionHarness()
+        selection = {
+            "mode": "condition",
+            "id": "condition:seq1",
+            "run_name": "Seq1",
+            "display_text": "sequence",
+            "run_condition": "250 psia",
+            "member_suppression_voltages": ["24", "28"],
+        }
+
+        self.assertEqual(
+            harness._auto_report_selection_display_text(selection),
+            "250 psia | Supp 24/28",
+        )
+
+    @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
+    def test_auto_report_steady_state_fallback_uses_missing_control_periods(self) -> None:
+        harness = _RunSelectionHarness()
+        selection = {
+            "mode": "condition",
+            "id": "condition:seq1",
+            "run_name": "Seq1",
+            "run_condition": "250 psia",
+            "member_sequences": ["Seq1"],
+            "member_control_periods": [],
+            "member_suppression_voltages": ["24"],
+        }
+
+        self.assertTrue(harness._selection_is_auto_report_steady_state(selection))
+        self.assertTrue(harness._selection_matches_auto_report_control_periods(selection, {"60"}))
 
     @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
     def test_condition_auto_plot_name_uses_run_condition_label(self) -> None:

@@ -487,7 +487,7 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         self.assertEqual(first["x_grid"], [0.0, 1.0, 2.0, 3.0, 4.0])
         self.assertIn("SN1", first["y_resampled_by_sn"])
 
-    def test_render_plot_sections_curve_overlay_uses_pair_model(self):
+    def test_render_plot_sections_curve_overlay_uses_cohort_model(self):
         from EIDAT_App_Files.ui_next import trend_auto_report as tar
 
         class _FakeAxis:
@@ -510,6 +510,24 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
                 return None
 
             def fill_between(self, *_args, **_kwargs):
+                return None
+
+            def scatter(self, *_args, **_kwargs):
+                return None
+
+            def axhline(self, *_args, **_kwargs):
+                return None
+
+            def set_xticks(self, *_args, **_kwargs):
+                return None
+
+            def set_xticklabels(self, *_args, **_kwargs):
+                return None
+
+            def set_xlim(self, *_args, **_kwargs):
+                return None
+
+            def annotate(self, *_args, **_kwargs):
                 return None
 
             def grid(self, *_args, **_kwargs):
@@ -548,35 +566,45 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         fake_pyplot = types.ModuleType("matplotlib.pyplot")
         fake_pyplot.close = lambda _fig: None
         pair_spec = {
+            "pair_id": "pair-1",
             "run": "Run1",
             "run_title": "Run 1",
             "param": "thrust",
             "units": "lbf",
-            "selection": {},
+            "selection_label": "Condition A | Supp 100",
+        }
+        cohort_spec = {
+            "cohort_id": "initial:1:thrust:time",
+            "param": "thrust",
+            "units": "lbf",
+            "x_name": "Time",
+            "selection_labels": ["Condition A | Supp 100"],
+            "member_pair_ids": ["pair-1"],
             "model": {
                 "equation": "y = 1.0x + 0.0",
                 "poly": {"rmse": 0.01},
             },
+            "x_grid": [0.0, 1.0, 2.0],
+            "master_y": [0.0, 0.9, 1.8],
+            "std_y": [0.0, 0.1, 0.2],
+            "trace_curves": [
+                {"pair_id": "pair-1", "selection_label": "Condition A | Supp 100", "serial": "SN1", "y_curve": [0.0, 1.0, 2.0]},
+                {"pair_id": "pair-1", "selection_label": "Condition A | Supp 100", "serial": "SN2", "y_curve": [0.0, 0.8, 1.6]},
+            ],
         }
         ctx = {
             "print_ctx": tar._capture_print_context(),
             "include_metrics": False,
-            "pair_specs": [pair_spec],
+            "initial_cohort_specs": [cohort_spec],
+            "regrade_cohort_specs": [],
             "performance_plot_specs": [],
-            "watch_pair_keys": [],
-            "run_by_name": {"Run1": {"display_name": "Run 1"}},
+            "watch_pair_ids": [],
             "hi": ["SN1"],
             "colors": ["#ef4444"],
-            "grade_map": {("Run1", "thrust", "SN1"): "PASS"},
-            "finding_by_key": {("Run1", "thrust", "SN1"): {"max_pct": 1.0, "z": 0.2}},
-        }
-        payload = {
-            "selection": {},
-            "x_name": "Time",
-            "x_grid": [0.0, 1.0, 2.0],
-            "y_resampled_by_sn": {"SN1": [0.0, 1.0, 2.0], "SN2": [0.0, 0.8, 1.6]},
-            "master_y": [0.0, 0.9, 1.8],
-            "std_y": [0.0, 0.1, 0.2],
+            "pair_by_id": {"pair-1": pair_spec},
+            "initial_grade_map_by_pair_serial": {("pair-1", "SN1"): "PASS"},
+            "final_grade_map_by_pair_serial": {("pair-1", "SN1"): "PASS"},
+            "finding_by_pair_serial": {("pair-1", "SN1"): {"initial_max_pct": 1.0, "initial_z": 0.2}},
         }
         with mock.patch.dict(
             sys.modules,
@@ -586,14 +614,10 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
                 "matplotlib.backends.backend_pdf": fake_backend_pdf,
                 "matplotlib.pyplot": fake_pyplot,
             },
-        ), mock.patch.object(tar, "_create_landscape_plot_page", return_value=(_FakeFigure(), _FakeAxis())), mock.patch.object(
-            tar,
-            "_tar_curve_plot_payload_for_pair",
-            return_value=payload,
-        ):
+        ), mock.patch.object(tar, "_create_landscape_plot_page", return_value=(_FakeFigure(), _FakeAxis())):
             result = tar._tar_render_plot_sections(ctx, intro_pages=2, plots_pdf=Path("fake.pdf"))
         self.assertEqual(result["curve_plot_count"], 1)
-        self.assertEqual(result["plot_specs"][0]["section"], "curve_overlays")
+        self.assertEqual(result["plot_specs"][0]["section"], "run_condition_curve_overlays")
 
     def test_fmt_num_is_defined_and_safe(self):
         from EIDAT_App_Files.ui_next import trend_auto_report as tar
@@ -784,6 +808,338 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
                 self.assertEqual(len(poly.get("coeffs") or []), 3)
                 eqn = tar._fmt_equation(poly)
                 self.assertTrue(bool(eqn))
+
+    @unittest.skipUnless(_have_numpy(), "numpy not installed")
+    def test_analyze_curve_groups_regrades_mixed_suppression_and_final_watch_uses_final_grade(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        row_specs = [
+            self._row_spec(
+                tar,
+                pair_id="pair-100",
+                run="Run100",
+                selection_label="Condition A | Supp 100",
+                base_condition_label="Condition A",
+                suppression_value="100",
+                series=[tar.CurveSeries(serial="HI", x=[0.0, 1.0, 2.0], y=[0.0, 0.0, 0.0])],
+            ),
+            self._row_spec(
+                tar,
+                pair_id="pair-200",
+                run="Run200",
+                selection_label="Condition A | Supp 200",
+                base_condition_label="Condition A",
+                suppression_value="200",
+                series=[
+                    tar.CurveSeries(serial="ATP1", x=[0.0, 1.0, 2.0], y=[10.0, 10.0, 10.0]),
+                    tar.CurveSeries(serial="ATP2", x=[0.0, 1.0, 2.0], y=[10.0, 10.0, 10.0]),
+                    tar.CurveSeries(serial="ATP3", x=[0.0, 1.0, 2.0], y=[10.0, 10.0, 10.0]),
+                ],
+            ),
+        ]
+
+        analysis = tar._tar_analyze_curve_groups(
+            row_specs,
+            hi=["HI"],
+            grid_points=3,
+            degree=1,
+            normalize_x=False,
+            z_pass=0.5,
+            z_watch=1.0,
+            max_abs_thr=None,
+            max_pct_thr=None,
+            rms_pct_thr=None,
+        )
+
+        self.assertEqual(len(analysis["initial_cohort_specs"]), 1)
+        self.assertEqual({spec["suppression_voltage_label"] for spec in analysis["regrade_cohort_specs"]}, {"100"})
+        row = analysis["grading_rows"][0]
+        self.assertEqual(row["pair_id"], "pair-100")
+        self.assertEqual(row["initial_grade"], "FAIL")
+        self.assertEqual(row["final_grade"], "PASS")
+        self.assertTrue(row["regrade_applied"])
+        self.assertEqual(len(analysis["initial_nonpass_findings"]), 1)
+        self.assertEqual(analysis["nonpass_findings"], [])
+        self.assertEqual(analysis["watch_pair_ids"], [])
+
+    @unittest.skipUnless(_have_numpy(), "numpy not installed")
+    def test_analyze_curve_groups_skips_regrade_for_single_suppression(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        row_specs = [
+            self._row_spec(
+                tar,
+                pair_id="pair-100",
+                run="Run100",
+                selection_label="Condition A | Supp 100",
+                base_condition_label="Condition A",
+                suppression_value="100",
+                series=[
+                    tar.CurveSeries(serial="HI", x=[0.0, 1.0, 2.0], y=[1.0, 1.0, 1.0]),
+                    tar.CurveSeries(serial="ATP1", x=[0.0, 1.0, 2.0], y=[1.2, 1.2, 1.2]),
+                ],
+            )
+        ]
+
+        analysis = tar._tar_analyze_curve_groups(
+            row_specs,
+            hi=["HI"],
+            grid_points=3,
+            degree=1,
+            normalize_x=False,
+            z_pass=2.0,
+            z_watch=3.0,
+            max_abs_thr=None,
+            max_pct_thr=None,
+            rms_pct_thr=None,
+        )
+
+        self.assertEqual(analysis["regrade_cohort_specs"], [])
+        row = analysis["grading_rows"][0]
+        self.assertFalse(row["regrade_applied"])
+        self.assertEqual(row["final_grade"], row["initial_grade"])
+
+    @unittest.skipUnless(_have_numpy(), "numpy not installed")
+    def test_analyze_curve_groups_splits_incompatible_x_axes(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        row_specs = [
+            self._row_spec(
+                tar,
+                pair_id="pair-time",
+                run="RunTime",
+                selection_label="Condition A | Supp 100",
+                base_condition_label="Condition A",
+                suppression_value="100",
+                x_name="Time",
+                series=[
+                    tar.CurveSeries(serial="HI", x=[0.0, 1.0, 2.0], y=[1.0, 1.0, 1.0]),
+                    tar.CurveSeries(serial="ATP1", x=[0.0, 1.0, 2.0], y=[1.1, 1.1, 1.1]),
+                ],
+            ),
+            self._row_spec(
+                tar,
+                pair_id="pair-pulse",
+                run="RunPulse",
+                selection_label="Condition B | Supp 200",
+                base_condition_label="Condition B",
+                suppression_value="200",
+                x_name="Pulse Number",
+                series=[
+                    tar.CurveSeries(serial="HI", x=[1.0, 2.0, 3.0], y=[2.0, 2.0, 2.0]),
+                    tar.CurveSeries(serial="ATP2", x=[1.0, 2.0, 3.0], y=[2.1, 2.1, 2.1]),
+                ],
+            ),
+        ]
+
+        analysis = tar._tar_analyze_curve_groups(
+            row_specs,
+            hi=["HI"],
+            grid_points=3,
+            degree=1,
+            normalize_x=False,
+            z_pass=2.0,
+            z_watch=3.0,
+            max_abs_thr=None,
+            max_pct_thr=None,
+            rms_pct_thr=None,
+        )
+
+        self.assertEqual(len(analysis["initial_cohort_specs"]), 2)
+        self.assertEqual(sorted(spec["x_name"] for spec in analysis["initial_cohort_specs"]), ["Pulse Number", "Time"])
+
+    def test_build_intro_story_renders_stacked_initial_and_final_grade_cells(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        fake_rl = {
+            "Spacer": lambda *args, **kwargs: ("Spacer", args),
+            "PageBreak": lambda *args, **kwargs: ("PageBreak",),
+            "inch": 1.0,
+        }
+        fake_styles = {name: name for name in ("cover_title", "cover_subtitle", "body", "section", "small")}
+        ctx = {
+            "print_ctx": tar._capture_print_context(),
+            "pair_specs": [{"selection_fields": {"mode": "condition", "display_text": "Condition A | Supp 100"}}],
+            "options": {"run_selection_labels": ["Condition A | Supp 100"]},
+            "overall_by_sn": {"SN1": "WATCH"},
+            "initial_overall_by_sn": {"SN1": "FAILED"},
+            "final_overall_by_sn": {"SN1": "WATCH"},
+            "nonpass_findings": [],
+            "pair_by_id": {},
+            "hi": ["SN1"],
+            "runs": ["Run1"],
+            "params": ["thrust"],
+            "watch_pair_ids": [],
+            "metric_stats": ["mean"],
+            "include_metrics": True,
+            "filter_state": {},
+            "meta_by_sn": {"SN1": {}},
+            "meta_note": "",
+            "change_summary": "",
+            "performance_plot_specs": [],
+            "comparison_rows": [
+                {
+                    "run_condition": "Condition A | Supp 100",
+                    "sequence_text": "Seq 1",
+                    "parameter": "thrust",
+                    "units": "lbf",
+                    "atp_mean": 1.0,
+                    "actual_mean": 1.1,
+                    "delta": 0.1,
+                    "grade_text": "Initial: FAIL\nFinal: PASS",
+                }
+            ],
+        }
+
+        with mock.patch.object(tar, "_reportlab_imports", return_value=fake_rl), mock.patch.object(
+            tar, "_build_portrait_styles", return_value=fake_styles
+        ), mock.patch.object(tar, "_portrait_paragraph", side_effect=lambda text, style, _rl: ("Paragraph", text)), mock.patch.object(
+            tar, "_portrait_card", side_effect=lambda title, lines, **_kwargs: ("Card", title, list(lines))
+        ), mock.patch.object(
+            tar, "_portrait_box_table", side_effect=lambda rows, **_kwargs: ("Table", rows)
+        ):
+            story = tar._tar_build_intro_story(ctx)
+
+        tables = [item[1] for item in story if isinstance(item, tuple) and item and item[0] == "Table"]
+        exec_table = next(rows for rows in tables if rows and rows[0][0] == "Serial" and rows[0][1] == "Overall")
+        comparison_table = next(rows for rows in tables if rows and rows[0][0] == "Run Condition")
+        self.assertEqual(exec_table[1][1], "Initial: FAILED\nFinal: WATCH")
+        self.assertEqual(comparison_table[1][7], "Initial: FAIL\nFinal: PASS")
+
+    def test_generate_auto_report_sidecar_uses_regrade_section_order_and_split_overall_results(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        captured: dict[str, object] = {}
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            out_pdf = root / "report.pdf"
+            ctx = {
+                "out_pdf": out_pdf,
+                "print_ctx": tar._capture_print_context(),
+                "proj": root,
+                "wb": root / "project.xlsx",
+                "db_path": root / "cache.sqlite3",
+                "report_cfg": {},
+                "options": {},
+                "hi": ["SN1"],
+                "meta_by_sn": {"SN1": {}},
+                "overall_by_sn": {"SN1": "WATCH"},
+                "initial_overall_by_sn": {"SN1": "FAILED"},
+                "final_overall_by_sn": {"SN1": "WATCH"},
+                "nonpass_findings": [],
+                "initial_nonpass_findings": [],
+                "runs": ["Run1"],
+                "params": ["thrust"],
+                "metric_stats": ["mean"],
+                "curves_summary": {},
+                "initial_watch_items": [],
+                "watch_items": [],
+                "grading_rows": [],
+                "comparison_rows": [],
+                "initial_cohort_specs": [{"cohort_id": "initial:1"}],
+                "regrade_cohort_specs": [{"cohort_id": "regrade:1"}],
+                "equation_cards": [],
+                "performance_models": [],
+                "report_opts": {},
+                "conn": sqlite3.connect(":memory:"),
+            }
+
+            with mock.patch.object(tar, "_reportlab_imports", return_value={}), mock.patch.object(
+                tar, "_tar_prepare_base", return_value=ctx
+            ), mock.patch.object(
+                tar, "_tar_prepare_performance_models", side_effect=lambda _ctx: None
+            ), mock.patch.object(tar, "_tar_build_intro_story", return_value=["intro"]), mock.patch.object(
+                tar, "_tar_build_equation_story", return_value=["equations"]
+            ), mock.patch.object(
+                tar,
+                "_tar_render_plot_sections",
+                return_value={
+                    "plot_page_count": 5,
+                    "metric_plot_count": 2,
+                    "curve_plot_count": 2,
+                    "run_condition_metric_plot_count": 1,
+                    "run_condition_curve_plot_count": 1,
+                    "regrade_metric_plot_count": 1,
+                    "regrade_curve_plot_count": 1,
+                    "performance_plot_count": 1,
+                    "watch_plot_count": 1,
+                    "plot_specs": [],
+                },
+            ), mock.patch.object(tar, "_tar_build_closing_story", return_value=["closing"]), mock.patch.object(
+                tar, "_render_portrait_story_pdf", side_effect=[2, 1, 1]
+            ), mock.patch.object(tar, "_merge_report_pdfs", side_effect=lambda *_args, **_kwargs: None), mock.patch.object(
+                tar, "_write_json", side_effect=lambda path, payload: captured.update({"path": path, "payload": payload})
+            ):
+                tar.generate_test_data_auto_report(
+                    root,
+                    root / "project.xlsx",
+                    out_pdf,
+                    highlighted_serials=["SN1"],
+                    options={},
+                )
+
+        payload = captured["payload"]
+        self.assertEqual(payload["version"], 4)
+        self.assertEqual(
+            payload["section_order"],
+            [
+                "cover",
+                "executive_summary",
+                "comparison_table",
+                "run_condition_plot_metrics",
+                "run_condition_curve_overlays",
+                "regrade_pass_plot_metrics",
+                "regrade_pass_curve_overlays",
+                "performance_equations",
+                "performance_plots",
+                "watch_nonpass_curves",
+                "closing_summary",
+            ],
+        )
+        self.assertEqual(payload["initial_overall_results_by_serial"], {"SN1": "FAILED"})
+        self.assertEqual(payload["final_overall_results_by_serial"], {"SN1": "WATCH"})
+
+    def _row_spec(
+        self,
+        tar,
+        *,
+        pair_id: str,
+        run: str,
+        selection_label: str,
+        base_condition_label: str,
+        suppression_value: str,
+        series: list,
+        x_name: str = "Time",
+        param: str = "thrust",
+        units: str = "lbf",
+    ) -> dict:
+        return {
+            "pair_id": pair_id,
+            "selection_id": pair_id,
+            "run": run,
+            "run_title": run,
+            "selection": {"mode": "condition", "run_name": run},
+            "selection_fields": {
+                "mode": "condition",
+                "run": run,
+                "sequence_text": run,
+                "condition_text": base_condition_label,
+                "display_text": selection_label,
+            },
+            "selection_label": selection_label,
+            "base_condition_label": base_condition_label,
+            "suppression_values": [suppression_value] if suppression_value else [],
+            "suppression_voltage_label": suppression_value,
+            "param": param,
+            "units": units,
+            "x_name": x_name,
+            "series": list(series),
+            "series_by_suppression": {suppression_value: list(series)} if suppression_value else {},
+            "initial_model": {},
+            "initial_plot_payload": {},
+            "regrade_models": {},
+            "regrade_plot_payloads": {},
+        }
 
 
 if __name__ == "__main__":

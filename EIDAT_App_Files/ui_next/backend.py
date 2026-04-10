@@ -65,6 +65,8 @@ TD_METRIC_PLOT_SOURCE_ALL_SEQUENCES = "all_sequences"
 # Default repository root where PDFs may live (user-organized, nested or flat)
 DEFAULT_REPO_ROOT = ROOT / "Data Packages"
 DEFAULT_PDF_DIR = DEFAULT_REPO_ROOT
+EDIN_PROGRAM_FOLDERS_DIRNAME = "EDIN Program Folders"
+EDIN_PROGRAM_REPORTS_DIRNAME = "EDAT reports"
 SCANNER_ENV = DATA_ROOT / "user_inputs" / "scanner.env"
 SCANNER_ENV_LOCAL = DATA_ROOT / "user_inputs" / "scanner.local.env"
 OCR_FORCE_ENV = DATA_ROOT / "user_inputs" / "ocr_force.env"
@@ -488,6 +490,187 @@ def set_repo_root(p: Path) -> None:
     except Exception:
         env["REPO_ROOT"] = str(target)
     save_scanner_env(env, path=SCANNER_ENV_LOCAL)
+
+
+_WINDOWS_RESERVED_NAMES = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+
+
+def _safe_windows_path_name(value: object, *, fallback: str = "Untitled") -> str:
+    raw = str(value or "").replace("\t", " ").replace("\r", " ").replace("\n", " ").strip()
+    cleaned = "".join((" " if ch in '<>:"/\\|?*' else ch) for ch in raw)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
+    if not cleaned:
+        cleaned = str(fallback or "Untitled").strip() or "Untitled"
+    if cleaned.upper() in _WINDOWS_RESERVED_NAMES:
+        cleaned = f"{cleaned}_"
+    return cleaned
+
+
+def edin_program_folder_name(program_title: object, *, fallback: str = "Unknown Program") -> str:
+    return _safe_windows_path_name(program_title, fallback=fallback)
+
+
+def edin_program_folders_root(global_repo: Path | None = None) -> Path:
+    repo = Path(global_repo or get_repo_root()).expanduser()
+    if not repo.is_absolute():
+        repo = (ROOT / repo).expanduser()
+    return repo / EDIN_PROGRAM_FOLDERS_DIRNAME
+
+
+def _fallback_eidat_program_titles(global_repo: Path) -> list[str]:
+    support_dir = eidat_support_dir(global_repo)
+    roots = [
+        support_dir / "debug" / "ocr",
+        support_dir / "projects",
+    ]
+    titles: list[str] = []
+    seen: set[str] = set()
+    for root in roots:
+        try:
+            if not root.exists():
+                continue
+        except Exception:
+            continue
+        patterns = ("*_metadata.json", "*.metadata.json", "*.json")
+        for pattern in patterns:
+            try:
+                paths = sorted(root.rglob(pattern))
+            except Exception:
+                paths = []
+            for path in paths:
+                try:
+                    if not path.is_file():
+                        continue
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                title = str((payload or {}).get("program_title") or "").strip()
+                if not title or title.casefold() in seen:
+                    continue
+                seen.add(title.casefold())
+                titles.append(title)
+    return sorted(titles, key=lambda value: value.casefold())
+
+
+def list_eidat_program_titles(global_repo: Path | None = None) -> list[str]:
+    repo = Path(global_repo or get_repo_root()).expanduser()
+    try:
+        docs = read_eidat_index_documents(repo)
+    except Exception:
+        docs = []
+    titles = sorted(
+        {
+            str(doc.get("program_title") or "").strip()
+            for doc in (docs or [])
+            if isinstance(doc, dict) and str(doc.get("program_title") or "").strip()
+        },
+        key=lambda value: value.casefold(),
+    )
+    if titles:
+        return titles
+    return _fallback_eidat_program_titles(repo)
+
+
+def sync_edin_program_folders(global_repo: Path | None = None) -> dict[str, object]:
+    repo = Path(global_repo or get_repo_root()).expanduser()
+    root = edin_program_folders_root(repo)
+    root.mkdir(parents=True, exist_ok=True)
+
+    titles = list_eidat_program_titles(repo)
+    programs: list[dict[str, str]] = []
+    created_program_dirs = 0
+    created_report_dirs = 0
+    for title in titles:
+        folder_name = edin_program_folder_name(title)
+        program_dir = root / folder_name
+        reports_dir = program_dir / EDIN_PROGRAM_REPORTS_DIRNAME
+        if not program_dir.exists():
+            program_dir.mkdir(parents=True, exist_ok=True)
+            created_program_dirs += 1
+        if not reports_dir.exists():
+            reports_dir.mkdir(parents=True, exist_ok=True)
+            created_report_dirs += 1
+        programs.append(
+            {
+                "program_title": title,
+                "folder_name": folder_name,
+                "program_dir": str(program_dir),
+                "reports_dir": str(reports_dir),
+            }
+        )
+    return {
+        "root": str(root),
+        "programs": programs,
+        "created_program_dirs": created_program_dirs,
+        "created_report_dirs": created_report_dirs,
+    }
+
+
+def edin_program_report_dir(
+    global_repo: Path | None,
+    program_title: object,
+    *,
+    create: bool = False,
+) -> Path:
+    root = edin_program_folders_root(global_repo or get_repo_root())
+    title = str(program_title or "").strip()
+    if not title:
+        if create:
+            root.mkdir(parents=True, exist_ok=True)
+        return root
+    report_dir = root / edin_program_folder_name(title) / EDIN_PROGRAM_REPORTS_DIRNAME
+    if create:
+        report_dir.mkdir(parents=True, exist_ok=True)
+    return report_dir
+
+
+def td_auto_report_serial_token(serials: Sequence[object] | None) -> str:
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for value in (serials or []):
+        if not str(value or "").strip():
+            continue
+        serial = _safe_windows_path_name(value, fallback="")
+        if not serial or serial.casefold() in seen:
+            continue
+        seen.add(serial.casefold())
+        cleaned.append(serial)
+    if not cleaned:
+        return "No_Serials"
+    if len(cleaned) <= 3:
+        return "__".join(cleaned)
+    return "__".join(cleaned[:3]) + f"__plus_{len(cleaned) - 3}_more"
+
+
+def td_auto_report_default_filename(
+    program_title: object,
+    certification_serials: Sequence[object] | None,
+    *,
+    when: datetime | None = None,
+) -> str:
+    program_token = _safe_windows_path_name(program_title, fallback="Program")
+    serial_token = td_auto_report_serial_token(certification_serials)
+    date_token = (when or datetime.now()).strftime("%Y-%m-%d")
+    return f"{program_token}__{serial_token}__TD_Auto_Report__{date_token}.pdf"
+
+
+def td_auto_report_default_output_pdf(
+    global_repo: Path | None,
+    program_title: object,
+    certification_serials: Sequence[object] | None,
+    *,
+    when: datetime | None = None,
+    create: bool = False,
+) -> Path:
+    out_dir = edin_program_report_dir(global_repo or get_repo_root(), program_title, create=create)
+    return out_dir / td_auto_report_default_filename(program_title, certification_serials, when=when)
 
 
 def _run_eidat_manager(global_repo: Path, cmd: str, extra_args: Optional[list[str]] = None) -> Dict[str, object]:
@@ -6644,21 +6827,35 @@ def td_list_run_selection_views(db_path: Path, workbook_path: Path, *, project_d
         return {"sequence": [], "condition": []}
 
     observations_by_condition: dict[str, list[dict]] = {}
+    run_type_mode_by_run: dict[str, str] = {}
+    run_type_by_run: dict[str, str] = {}
     with closing(sqlite3.connect(str(Path(db_path).expanduser()))) as conn:
         _ensure_test_data_impl_tables(conn)
+        for run_name, run_type in conn.execute(
+            "SELECT run_name, COALESCE(run_type, '') FROM td_runs ORDER BY run_name"
+        ).fetchall():
+            run_key = str(run_name or "").strip()
+            if not run_key:
+                continue
+            run_type_label = td_normalize_run_type(run_type)
+            run_type_mode = td_perf_normalize_run_type_mode(run_type)
+            run_type_by_run[run_key] = run_type_label if run_type_label in {"SS", "PM"} else ""
+            run_type_mode_by_run[run_key] = run_type_mode if run_type_mode in {"steady_state", "pulsed_mode"} else ""
         obs_table = _td_preferred_sequence_observation_table(conn)
         rows = conn.execute(
             f"""
-            SELECT run_name, COALESCE(program_title, ''), COALESCE(source_run_name, ''), control_period, suppression_voltage
+            SELECT run_name, COALESCE(program_title, ''), COALESCE(source_run_name, ''), control_period, suppression_voltage, COALESCE(run_type, '')
             FROM {obs_table}
             ORDER BY run_name, program_title, source_run_name, observation_id
             """
         ).fetchall()
-    for run_name, program_title, source_run_name, control_period, suppression_voltage in rows:
+    for run_name, program_title, source_run_name, control_period, suppression_voltage, run_type in rows:
         run_key = str(run_name or "").strip()
         if not run_key:
             continue
         seq_name = str(source_run_name or "").strip() or run_key
+        run_type_label = td_normalize_run_type(run_type)
+        run_type_mode = td_perf_normalize_run_type_mode(run_type)
         observations_by_condition.setdefault(run_key, []).append(
             {
                 "program_title": str(program_title or "").strip(),
@@ -6668,6 +6865,8 @@ def td_list_run_selection_views(db_path: Path, workbook_path: Path, *, project_d
                 "control_period_label": _td_format_compact_value(control_period),
                 "suppression_voltage": suppression_voltage,
                 "suppression_voltage_label": _td_format_compact_value(suppression_voltage),
+                "run_type": run_type_label if run_type_label in {"SS", "PM"} else "",
+                "run_type_mode": run_type_mode if run_type_mode in {"steady_state", "pulsed_mode"} else "",
             }
         )
 
@@ -6683,11 +6882,15 @@ def td_list_run_selection_views(db_path: Path, workbook_path: Path, *, project_d
         member_programs: list[str] = []
         member_control_periods: list[str] = []
         member_suppression_voltages: list[str] = []
+        member_run_types: list[str] = []
+        member_run_type_modes: list[str] = []
         detail_rows: list[str] = []
         seen_sequence_labels: set[str] = set()
         seen_program_labels: set[str] = set()
         seen_control_period_labels: set[str] = set()
         seen_suppression_labels: set[str] = set()
+        seen_run_type_labels: set[str] = set()
+        seen_run_type_modes: set[str] = set()
         for obs in source_rows:
             program_title = str(obs.get("program_title") or "").strip()
             program_label = str(obs.get("program_label") or "").strip() or _td_display_program_title(program_title)
@@ -6696,6 +6899,8 @@ def td_list_run_selection_views(db_path: Path, workbook_path: Path, *, project_d
             control_period_label = str(obs.get("control_period_label") or "").strip()
             suppression_voltage = obs.get("suppression_voltage")
             suppression_voltage_label = str(obs.get("suppression_voltage_label") or "").strip()
+            run_type_label = str(obs.get("run_type") or "").strip()
+            run_type_mode = str(obs.get("run_type_mode") or "").strip()
             detail = source_run_name if not program_title else f"{program_title}: {source_run_name}"
             detail_rows.append(detail)
             if source_run_name.lower() not in seen_sequence_labels:
@@ -6710,6 +6915,12 @@ def td_list_run_selection_views(db_path: Path, workbook_path: Path, *, project_d
             if suppression_voltage_label and suppression_voltage_label.casefold() not in seen_suppression_labels:
                 seen_suppression_labels.add(suppression_voltage_label.casefold())
                 member_suppression_voltages.append(suppression_voltage_label)
+            if run_type_label and run_type_label not in seen_run_type_labels:
+                seen_run_type_labels.add(run_type_label)
+                member_run_types.append(run_type_label)
+            if run_type_mode and run_type_mode not in seen_run_type_modes:
+                seen_run_type_modes.add(run_type_mode)
+                member_run_type_modes.append(run_type_mode)
             sequence_items.append(
                 {
                     "mode": "sequence",
@@ -6727,6 +6938,10 @@ def td_list_run_selection_views(db_path: Path, workbook_path: Path, *, project_d
                     "member_control_periods": ([control_period_label] if control_period_label else []),
                     "suppression_voltage": suppression_voltage,
                     "member_suppression_voltages": ([suppression_voltage_label] if suppression_voltage_label else []),
+                    "run_type": run_type_label,
+                    "run_type_mode": run_type_mode,
+                    "member_run_types": ([run_type_label] if run_type_label else []),
+                    "member_run_type_modes": ([run_type_mode] if run_type_mode else []),
                     "details_text": (
                         f"Program: {program_title or TD_SUPPORT_DEFAULT_PROGRAM_TITLE} | "
                         f"Source Sequence: {source_run_name} | Run Condition: {run_display_name}"
@@ -6734,6 +6949,8 @@ def td_list_run_selection_views(db_path: Path, workbook_path: Path, *, project_d
                 }
             )
         if not source_rows:
+            fallback_run_type = str(run_type_by_run.get(run_name) or "").strip()
+            fallback_run_type_mode = str(run_type_mode_by_run.get(run_name) or "").strip()
             sequence_items.append(
                 {
                     "mode": "sequence",
@@ -6751,6 +6968,10 @@ def td_list_run_selection_views(db_path: Path, workbook_path: Path, *, project_d
                     "member_control_periods": [],
                     "suppression_voltage": None,
                     "member_suppression_voltages": [],
+                    "run_type": fallback_run_type,
+                    "run_type_mode": fallback_run_type_mode,
+                    "member_run_types": ([fallback_run_type] if fallback_run_type else []),
+                    "member_run_type_modes": ([fallback_run_type_mode] if fallback_run_type_mode else []),
                     "details_text": f"Run Condition: {run_display_name}",
                 }
             )
@@ -6758,6 +6979,8 @@ def td_list_run_selection_views(db_path: Path, workbook_path: Path, *, project_d
             member_programs = [_td_display_program_title("")]
             member_control_periods = []
             member_suppression_voltages = []
+            member_run_types = [fallback_run_type] if fallback_run_type else []
+            member_run_type_modes = [fallback_run_type_mode] if fallback_run_type_mode else []
             detail_rows = [run_name]
         condition_items.append(
             {
@@ -6773,6 +6996,10 @@ def td_list_run_selection_views(db_path: Path, workbook_path: Path, *, project_d
                 "member_control_periods": list(member_control_periods),
                 "suppression_voltage": (member_suppression_voltages[0] if len(member_suppression_voltages) == 1 else None),
                 "member_suppression_voltages": list(member_suppression_voltages),
+                "run_type": (member_run_types[0] if len(member_run_types) == 1 else ""),
+                "run_type_mode": (member_run_type_modes[0] if len(member_run_type_modes) == 1 else ""),
+                "member_run_types": list(member_run_types),
+                "member_run_type_modes": list(member_run_type_modes),
                 "details_text": "Source Sequences: " + ", ".join(detail_rows),
             }
         )
