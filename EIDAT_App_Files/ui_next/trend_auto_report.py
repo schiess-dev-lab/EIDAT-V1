@@ -2341,6 +2341,8 @@ def _portrait_box_table(
     repeat_rows: int = 1,
     compact: bool = False,
     boxed: bool = True,
+    header_rows: int = 1,
+    extra_style_commands: list[tuple] | None = None,
 ) -> Any:
     colors = rl["colors"]
     Table = rl["Table"]
@@ -2348,22 +2350,31 @@ def _portrait_box_table(
     style_body = styles["small"] if compact else styles["body"]
     cell_text = [[_portrait_paragraph(value, style_body, rl) for value in row] for row in rows]
     table = Table(cell_text, colWidths=col_widths, repeatRows=repeat_rows, hAlign="LEFT")
+    header_count = max(0, int(header_rows))
     style_cmds: list[tuple] = [
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e2e8f0")),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#0f172a")),
-        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("ALIGN", (0, 0), (-1, 0), "LEFT"),
         ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ("LINEBELOW", (0, 0), (-1, 0), 1, colors.HexColor("#94a3b8")),
-        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f8fafc")]),
         ("LEFTPADDING", (0, 0), (-1, -1), 6),
         ("RIGHTPADDING", (0, 0), (-1, -1), 6),
         ("TOPPADDING", (0, 0), (-1, -1), 5 if compact else 6),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 5 if compact else 6),
     ]
+    if header_count > 0:
+        style_cmds.extend(
+            [
+                ("BACKGROUND", (0, 0), (-1, header_count - 1), colors.HexColor("#e2e8f0")),
+                ("TEXTCOLOR", (0, 0), (-1, header_count - 1), colors.HexColor("#0f172a")),
+                ("FONTNAME", (0, 0), (-1, header_count - 1), "Helvetica-Bold"),
+                ("ALIGN", (0, 0), (-1, header_count - 1), "LEFT"),
+                ("LINEBELOW", (0, header_count - 1), (-1, header_count - 1), 1, colors.HexColor("#94a3b8")),
+            ]
+        )
+    if len(rows) > header_count:
+        style_cmds.append(("ROWBACKGROUNDS", (0, header_count), (-1, -1), [colors.white, colors.HexColor("#f8fafc")]))
     if boxed:
         style_cmds.append(("BOX", (0, 0), (-1, -1), 1, colors.HexColor("#94a3b8")))
         style_cmds.append(("INNERGRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")))
+    if extra_style_commands:
+        style_cmds.extend(list(extra_style_commands))
     table.setStyle(TableStyle(style_cmds))
     return table
 
@@ -4207,6 +4218,157 @@ def _tar_metric_tick_label(ctx: Mapping[str, Any], serial: str) -> str:
     return f"{program}\n{serial}" if program else serial
 
 
+_TAR_METRIC_PROGRAM_SEGMENT_PALETTE = ["#1d4ed8", "#0f766e", "#b45309", "#7c3aed", "#be123c", "#334155"]
+_TAR_METRIC_GUIDE_COLOR = "#cbd5e1"
+
+
+def _tar_metric_serial_tick_label(serial: object) -> str:
+    return str(serial or "").strip()
+
+
+def _tar_metric_program_segments(
+    serials: list[str],
+    meta_by_sn: Mapping[str, Mapping[str, object]] | None,
+) -> list[dict[str, Any]]:
+    segments: list[dict[str, Any]] = []
+    meta_lookup = meta_by_sn if isinstance(meta_by_sn, Mapping) else {}
+    for idx, raw_serial in enumerate(serials or []):
+        serial = str(raw_serial or "").strip()
+        if not serial:
+            continue
+        meta = meta_lookup.get(serial) if isinstance(meta_lookup, Mapping) else {}
+        program = _td_display_program_title((meta or {}).get("program_title"))
+        if segments and str(segments[-1].get("program") or "") == program:
+            segments[-1]["end"] = idx
+            serial_list = segments[-1].setdefault("serials", [])
+            if isinstance(serial_list, list):
+                serial_list.append(serial)
+        else:
+            segments.append(
+                {
+                    "program": program,
+                    "start": idx,
+                    "end": idx,
+                    "serials": [serial],
+                }
+            )
+    return segments
+
+
+def _tar_apply_metric_program_segments(
+    axes: Any,
+    serials: list[str],
+    meta_by_sn: Mapping[str, Mapping[str, object]] | None,
+) -> None:
+    if axes is None or not serials:
+        return
+    try:
+        from matplotlib.patches import Rectangle  # type: ignore
+        from matplotlib.transforms import blended_transform_factory  # type: ignore
+    except Exception:
+        return
+    segments = _tar_metric_program_segments(serials, meta_by_sn)
+    if not segments:
+        return
+    transform = blended_transform_factory(axes.transData, axes.transAxes)
+    for idx, segment in enumerate(segments):
+        try:
+            start = int(segment.get("start"))
+            end = int(segment.get("end"))
+        except Exception:
+            continue
+        color = _TAR_METRIC_PROGRAM_SEGMENT_PALETTE[idx % len(_TAR_METRIC_PROGRAM_SEGMENT_PALETTE)]
+        x0 = float(start) - 0.5
+        width = float(end - start + 1)
+        try:
+            axes.add_patch(
+                Rectangle(
+                    (x0, 0.0),
+                    width,
+                    1.0,
+                    transform=transform,
+                    fill=False,
+                    linewidth=1.4,
+                    linestyle="-",
+                    edgecolor=color,
+                    alpha=0.95,
+                    zorder=0.2,
+                )
+            )
+        except Exception:
+            continue
+        label = str(segment.get("program") or "Unknown Program")
+        span = end - start + 1
+        try:
+            axes.text(
+                (float(start) + float(end)) / 2.0,
+                0.985,
+                label,
+                transform=transform,
+                ha="center",
+                va="top",
+                fontsize=(7 if span >= 2 else 6),
+                fontweight="bold",
+                rotation=(90 if span == 1 and len(label) > 14 else 0),
+                color=color,
+                bbox={
+                    "boxstyle": "round,pad=0.22",
+                    "facecolor": "#ffffff",
+                    "edgecolor": color,
+                    "linewidth": 1.0,
+                    "alpha": 0.92,
+                },
+                clip_on=True,
+                zorder=4.0,
+            )
+        except Exception:
+            continue
+
+
+def _tar_apply_metric_axis_format(
+    fig: Any,
+    axes: Any,
+    *,
+    serials: list[str],
+    meta_by_sn: Mapping[str, Mapping[str, object]] | None,
+) -> None:
+    if axes is None:
+        return
+    serial_labels = [_tar_metric_serial_tick_label(serial) for serial in (serials or [])]
+    x_idx = list(range(len(serial_labels)))
+    tick_fontsize = 5 if len(serial_labels) > 48 else 6
+    try:
+        axes.set_position([0.06, 0.20, 0.90, 0.60])
+    except Exception:
+        pass
+    try:
+        axes.set_xlabel("Serial Number")
+    except Exception:
+        pass
+    for xi in x_idx:
+        try:
+            axes.axvline(float(xi), color=_TAR_METRIC_GUIDE_COLOR, linewidth=0.8, alpha=0.35, zorder=0.05)
+        except Exception:
+            continue
+    try:
+        axes.set_xticks(x_idx)
+    except Exception:
+        pass
+    try:
+        axes.set_xticklabels(serial_labels, rotation=90, ha="center", va="top", fontsize=tick_fontsize)
+    except Exception:
+        pass
+    try:
+        axes.set_xlim(-0.5, max(len(serial_labels) - 0.5, 0.5))
+    except Exception:
+        pass
+    try:
+        axes.grid(True, axis="y", alpha=0.25)
+    except Exception:
+        pass
+    _tar_apply_metric_program_segments(axes, list(serials or []), meta_by_sn)
+
+
 def _tar_filter_summary_line(ctx: Mapping[str, Any], key: str, label: str) -> str:
     filter_state = ctx.get("filter_state")
     if not _filter_state_has_key(filter_state, key):
@@ -4223,6 +4385,833 @@ def _tar_meta_summary_line(ctx: Mapping[str, Any], key: str, label: str) -> str:
     if not values:
         return f"{label}: (unknown)"
     return f"{label}: {_tar_join_limited(values, max_items=4, empty='(unknown)')}"
+
+
+def _tar_stacked_metric_text(initial_value: object, final_value: object, *, sig: int = 5) -> str:
+    return f"Initial: {_fmt_num(initial_value, sig=sig)}\nFinal: {_fmt_num(final_value, sig=sig)}"
+
+
+def _tar_filter_state_label(
+    filter_state: Mapping[str, object] | None,
+    key: str,
+    *,
+    all_text: str = "All",
+    none_text: str = "None",
+) -> str:
+    if not _filter_state_has_key(filter_state, key):
+        return all_text
+    values = _filter_state_values(filter_state, key)
+    if not values:
+        return none_text
+    return _tar_join_limited(values, max_items=6, empty=none_text)
+
+
+def _tar_metric_value_for_serial(vmap: Mapping[str, object], serial: str) -> float | None:
+    value = _safe_float(vmap.get(serial))
+    if value is None or not math.isfinite(value):
+        return None
+    return float(value)
+
+
+def _tar_meta_display_value(ctx: Mapping[str, Any], serial: str, key: str) -> str:
+    text = _tar_meta(ctx, serial, key)
+    return text or "(unknown)"
+
+
+def _tar_document_summary(ctx: Mapping[str, Any], serial: str) -> str:
+    document_type = _tar_meta(ctx, serial, "document_type")
+    document_acronym = _tar_meta(ctx, serial, "document_type_acronym")
+    if document_type and document_acronym and _norm_key(document_type) != _norm_key(document_acronym):
+        return f"{document_type} ({document_acronym})"
+    return document_type or document_acronym or "(unknown)"
+
+
+def _tar_build_quick_summary(ctx: Mapping[str, Any]) -> dict[str, object]:
+    highlighted = [str(serial).strip() for serial in (ctx.get("hi") or []) if str(serial).strip()]
+    pair_specs = [dict(spec) for spec in (ctx.get("pair_specs") or []) if isinstance(spec, Mapping)]
+    certifying_programs = _tar_unique_text_values([_tar_meta(ctx, serial, "program_title") for serial in highlighted])
+    selected_run_conditions = _tar_unique_text_values(
+        [
+            str(spec.get("base_condition_label") or "").strip()
+            or str((spec.get("selection_fields") or {}).get("condition_text") or "").strip()
+            or str((spec.get("selection_fields") or {}).get("display_text") or "").strip()
+            or str(spec.get("selection_label") or "").strip()
+            or str(spec.get("run_title") or spec.get("run") or "").strip()
+            for spec in pair_specs
+        ]
+    )
+    watch_parameters = _tar_unique_text_values(
+        [str(finding.get("param") or "").strip() for finding in (ctx.get("nonpass_findings") or []) if isinstance(finding, Mapping)]
+    )
+    if not watch_parameters:
+        pair_by_id = ctx.get("pair_by_id") or {}
+        watch_parameters = _tar_unique_text_values(
+            [
+                str((pair_by_id.get(pair_id) or {}).get("param") or "").strip()
+                for pair_id in (ctx.get("watch_pair_ids") or [])
+                if str((pair_by_id.get(pair_id) or {}).get("param") or "").strip()
+            ]
+        )
+
+    comparison_programs = _tar_unique_text_values(
+        [
+            _tar_meta(ctx, serial, "program_title")
+            for serial in (ctx.get("all_serials") or [])
+            if str(serial).strip() and str(serial).strip() not in set(highlighted)
+        ]
+    )
+    if not comparison_programs:
+        comparison_programs = list(certifying_programs)
+
+    initial_suppression = _tar_filter_state_label(ctx.get("filter_state"), "suppression_voltages", all_text="All", none_text="None")
+    final_suppression_values = _tar_unique_text_values(
+        [
+            str(row.get("final_suppression_voltage_label") or "").strip()
+            for row in (ctx.get("comparison_rows") or [])
+            if isinstance(row, Mapping)
+        ]
+    )
+    if not final_suppression_values:
+        final_suppression_values = _tar_unique_text_values(
+            [str(spec.get("suppression_voltage_label") or "").strip() for spec in pair_specs]
+        )
+    final_suppression = _tar_join_limited(final_suppression_values, max_items=6, empty=initial_suppression)
+
+    summary = {
+        "certifying_programs": list(certifying_programs),
+        "certified_serials": list(highlighted),
+        "selected_run_conditions": list(selected_run_conditions),
+        "watch_parameters": list(watch_parameters),
+        "comparison_programs": list(comparison_programs),
+        "initial_suppression_voltage": initial_suppression,
+        "final_suppression_voltage": final_suppression,
+        "p8_suppression_voltage": final_suppression,
+        "initial_bus_voltage": "",
+        "final_bus_voltage": "",
+        "p8_bus_voltage": "",
+    }
+    summary["lines"] = [
+        f"Certifying Program(s): {_tar_join_limited(summary['certifying_programs'], max_items=4, empty='(unknown)')}",
+        f"Certified Serial(s): {_tar_join_limited(summary['certified_serials'], max_items=8, empty='(none)')}",
+        f"Selected Run Condition(s): {_tar_join_limited(summary['selected_run_conditions'], max_items=6, empty='(none)')}",
+        f"Watch Parameter(s): {_tar_join_limited(summary['watch_parameters'], max_items=6, empty='None')}",
+        f"Programs Compared: {_tar_join_limited(summary['comparison_programs'], max_items=6, empty='(unknown)')}",
+        f"P8 Suppression Voltage: {summary['p8_suppression_voltage']}",
+        f"P8 Bus Voltage: {summary['p8_bus_voltage']}",
+    ]
+    return summary
+
+
+def _tar_metadata_snapshot_lines(ctx: Mapping[str, Any]) -> list[str]:
+    highlighted = [str(serial).strip() for serial in (ctx.get("hi") or []) if str(serial).strip()]
+    if not highlighted:
+        return ["No certification serials were selected for metadata review."]
+
+    lines: list[str] = []
+    for index, serial in enumerate(highlighted):
+        lines.append(
+            f"{serial} | Program: {_tar_meta_display_value(ctx, serial, 'program_title')} | "
+            f"Similarity Group: {_tar_meta_display_value(ctx, serial, 'similarity_group')} | "
+            f"Acceptance Test Plan: {_tar_meta_display_value(ctx, serial, 'acceptance_test_plan_number')}"
+        )
+        lines.append(
+            f"Asset Type: {_tar_meta_display_value(ctx, serial, 'asset_type')} | "
+            f"Asset Specific Type: {_tar_meta_display_value(ctx, serial, 'asset_specific_type')} | "
+            f"Vendor: {_tar_meta_display_value(ctx, serial, 'vendor')} | "
+            f"Part Number: {_tar_meta_display_value(ctx, serial, 'part_number')} | "
+            f"Revision: {_tar_meta_display_value(ctx, serial, 'revision')}"
+        )
+        lines.append(
+            f"Test Date: {_tar_meta_display_value(ctx, serial, 'test_date')} | "
+            f"Report Date: {_tar_meta_display_value(ctx, serial, 'report_date')} | "
+            f"Document: {_tar_document_summary(ctx, serial)}"
+        )
+        if index != len(highlighted) - 1:
+            lines.append("")
+
+    meta_note = str(ctx.get("meta_note") or "").strip()
+    if meta_note:
+        lines.append("")
+        lines.append(f"Metadata note: {meta_note}")
+    return lines
+
+
+def _tar_build_per_serial_comparison_rows(
+    ctx: Mapping[str, Any],
+    *,
+    pair_specs: list[dict],
+    all_serials: list[str],
+    hi: list[str],
+    initial_grade_map_by_pair_serial: Mapping[tuple[str, str], str],
+    final_grade_map_by_pair_serial: Mapping[tuple[str, str], str],
+) -> list[dict]:
+    comparison_rows: list[dict] = []
+    base_filter_state = ctx.get("filter_state")
+    initial_suppression = _tar_filter_state_label(base_filter_state, "suppression_voltages", all_text="All", none_text="None")
+
+    for spec in pair_specs:
+        pair_id = str(spec.get("pair_id") or "").strip()
+        run_name = str(spec.get("run") or "").strip()
+        param_name = str(spec.get("param") or "").strip()
+        units = str(spec.get("units") or "").strip()
+        selection_fields = dict(spec.get("selection_fields") or {})
+        initial_vmap = _tar_metric_map_for_pair(ctx, spec, "mean")
+        initial_atp_mean = _tar_finite_mean_for_serials(initial_vmap, all_serials)
+
+        final_override = spec.get("filter_state_override") if isinstance(spec.get("filter_state_override"), Mapping) else None
+        if final_override:
+            final_vmap = _tar_metric_map_for_pair(ctx, spec, "mean", filter_state_override=final_override)
+        else:
+            final_vmap = dict(initial_vmap)
+        final_atp_mean = _tar_finite_mean_for_serials(final_vmap, all_serials) if final_override else initial_atp_mean
+
+        final_suppression = (
+            str(spec.get("suppression_voltage_label") or "").strip()
+            or _tar_filter_state_label(final_override, "suppression_voltages", all_text=initial_suppression, none_text=initial_suppression)
+        )
+        if not final_suppression:
+            final_suppression = initial_suppression
+
+        run_condition = (
+            str(spec.get("base_condition_label") or "").strip()
+            or str(selection_fields.get("condition_text") or "").strip()
+            or str(selection_fields.get("display_text") or "").strip()
+            or str(spec.get("selection_label") or "").strip()
+            or run_name
+        )
+        sequence_text = str(selection_fields.get("sequence_text") or spec.get("run_title") or run_name).strip() or run_name
+
+        for serial in hi:
+            initial_actual_mean = _tar_metric_value_for_serial(initial_vmap, serial)
+            final_actual_mean = _tar_metric_value_for_serial(final_vmap, serial) if final_override else initial_actual_mean
+            initial_delta = (
+                float(initial_actual_mean) - float(initial_atp_mean)
+                if initial_atp_mean is not None and initial_actual_mean is not None
+                else None
+            )
+            final_delta = (
+                float(final_actual_mean) - float(final_atp_mean)
+                if final_atp_mean is not None and final_actual_mean is not None
+                else None
+            )
+            initial_grade = str(initial_grade_map_by_pair_serial.get((pair_id, serial), "NO_DATA") or "NO_DATA").strip().upper() or "NO_DATA"
+            final_grade = str(final_grade_map_by_pair_serial.get((pair_id, serial), initial_grade) or initial_grade).strip().upper() or initial_grade
+
+            comparison_rows.append(
+                {
+                    "pair_id": pair_id,
+                    "selection_id": str(spec.get("selection_id") or "").strip(),
+                    "run": run_name,
+                    "run_title": str(spec.get("run_title") or run_name).strip() or run_name,
+                    "run_condition": run_condition,
+                    "sequence_text": sequence_text,
+                    "serial": serial,
+                    "parameter": param_name,
+                    "units": units,
+                    "initial_atp_mean": initial_atp_mean,
+                    "final_atp_mean": final_atp_mean,
+                    "initial_actual_mean": initial_actual_mean,
+                    "final_actual_mean": final_actual_mean,
+                    "initial_delta": initial_delta,
+                    "final_delta": final_delta,
+                    "initial_grade": initial_grade,
+                    "final_grade": final_grade,
+                    "grade": final_grade,
+                    "grade_text": _tar_stacked_grade_text(initial_grade, final_grade),
+                    "selection_mode": selection_fields.get("mode") or "sequence",
+                    "base_condition_label": str(spec.get("base_condition_label") or "").strip(),
+                    "initial_suppression_voltage_label": initial_suppression,
+                    "final_suppression_voltage_label": final_suppression,
+                    "initial_bus_voltage_label": "",
+                    "final_bus_voltage_label": "",
+                    "regrade_applied": bool(final_override),
+                }
+            )
+    return comparison_rows
+
+
+def _tar_group_comparison_rows(rows: list[dict]) -> list[dict[str, Any]]:
+    grouped: dict[str, dict[str, Any]] = {}
+    group_order: list[str] = []
+    for row in rows or []:
+        if not isinstance(row, Mapping):
+            continue
+        run_condition = str(row.get("run_condition") or row.get("run") or "Unknown Run Condition").strip() or "Unknown Run Condition"
+        if run_condition not in grouped:
+            grouped[run_condition] = {
+                "run_condition": run_condition,
+                "rows": [],
+                "initial_suppression_values": [],
+                "final_suppression_values": [],
+                "initial_bus_values": [],
+                "final_bus_values": [],
+            }
+            group_order.append(run_condition)
+        group = grouped[run_condition]
+        group["rows"].append(dict(row))
+        for key, target in (
+            ("initial_suppression_voltage_label", "initial_suppression_values"),
+            ("final_suppression_voltage_label", "final_suppression_values"),
+            ("initial_bus_voltage_label", "initial_bus_values"),
+            ("final_bus_voltage_label", "final_bus_values"),
+        ):
+            text = str(row.get(key) or "").strip()
+            if text and text not in group[target]:
+                group[target].append(text)
+
+    out: list[dict[str, Any]] = []
+    for run_condition in group_order:
+        group = grouped[run_condition]
+        group["rows"] = sorted(
+            group["rows"],
+            key=lambda item: (
+                str(item.get("serial") or ""),
+                str(item.get("parameter") or ""),
+                str(item.get("sequence_text") or ""),
+            ),
+        )
+        group["initial_suppression_voltage_label"] = _tar_join_limited(group["initial_suppression_values"], max_items=6, empty="All")
+        group["final_suppression_voltage_label"] = _tar_join_limited(group["final_suppression_values"], max_items=6, empty=group["initial_suppression_voltage_label"])
+        group["initial_bus_voltage_label"] = _tar_join_limited(group["initial_bus_values"], max_items=6, empty="")
+        group["final_bus_voltage_label"] = _tar_join_limited(group["final_bus_values"], max_items=6, empty="")
+        out.append(group)
+    return out
+
+
+_TAR_PLOT_TOC_SECTION_ORDER = [
+    "run_condition_plot_metrics",
+    "run_condition_curve_overlays",
+    "regrade_pass_plot_metrics",
+    "regrade_pass_curve_overlays",
+    "performance_plots",
+    "watch_nonpass_curves",
+]
+
+_TAR_PLOT_TOC_SECTION_META = {
+    "run_condition_plot_metrics": {
+        "section_label": "Run Condition Metrics",
+        "navigator_label": "Run Metrics",
+    },
+    "run_condition_curve_overlays": {
+        "section_label": "Run Condition Curve Overlays",
+        "navigator_label": "Run Curves",
+    },
+    "regrade_pass_plot_metrics": {
+        "section_label": "Regrade Pass Metrics",
+        "navigator_label": "Regrade Metrics",
+    },
+    "regrade_pass_curve_overlays": {
+        "section_label": "Regrade Pass Curve Overlays",
+        "navigator_label": "Regrade Curves",
+    },
+    "performance_plots": {
+        "section_label": "Performance Plots",
+        "navigator_label": "Performance",
+    },
+    "watch_nonpass_curves": {
+        "section_label": "Watch / Non-PASS Curves",
+        "navigator_label": "Watch / Fail",
+    },
+}
+
+_TAR_PLOT_TOC_FIRST_PAGE_ROW_BUDGET = 12
+_TAR_PLOT_TOC_CONTINUATION_ROW_BUDGET = 24
+
+
+def _tar_plot_toc_section_rank(section_key: object) -> int:
+    key = str(section_key or "").strip()
+    try:
+        return _TAR_PLOT_TOC_SECTION_ORDER.index(key)
+    except ValueError:
+        return len(_TAR_PLOT_TOC_SECTION_ORDER)
+
+
+def _tar_plot_toc_section_meta(section_key: object) -> dict[str, str]:
+    key = str(section_key or "").strip()
+    return dict(_TAR_PLOT_TOC_SECTION_META.get(key) or {"section_label": key or "Plots", "navigator_label": key or "Plots"})
+
+
+def _tar_plot_toc_label(plot_spec: Mapping[str, object] | None) -> str:
+    spec = dict(plot_spec or {})
+    section_key = str(spec.get("section") or "").strip()
+    if section_key in {"run_condition_plot_metrics", "regrade_pass_plot_metrics"}:
+        param_name = str(spec.get("param") or "").strip()
+        x_name = str(spec.get("x_name") or "").strip()
+        metric_stat = str(spec.get("stat") or "").strip()
+        return " | ".join([value for value in (param_name, x_name, metric_stat) if value]) or "Metric Plot"
+    if section_key in {"run_condition_curve_overlays", "regrade_pass_curve_overlays"}:
+        param_name = str(spec.get("param") or "").strip()
+        x_name = str(spec.get("x_name") or "").strip()
+        return " | ".join([value for value in (param_name, x_name) if value]) or "Curve Overlay"
+    if section_key == "performance_plots":
+        name = str(spec.get("name") or "Performance").strip() or "Performance"
+        x_target = str(spec.get("x") or "").strip()
+        y_target = str(spec.get("y") or "").strip()
+        metric_stat = str(spec.get("stat") or "").strip()
+        compare_text = f"{y_target} vs {x_target}".strip(" |") if x_target or y_target else ""
+        return " | ".join([value for value in (name, compare_text, metric_stat) if value]) or "Performance Plot"
+    if section_key == "watch_nonpass_curves":
+        run_name = str(spec.get("run") or "").strip()
+        param_name = str(spec.get("param") or "").strip()
+        serial_count = len([serial for serial in (spec.get("serials") or []) if str(serial).strip()]) if isinstance(spec.get("serials"), list) else 0
+        serial_text = f"{serial_count} Serial" if serial_count == 1 else f"{serial_count} Serials"
+        return " | ".join([value for value in (run_name, param_name, serial_text) if value]) or "Watch / Non-PASS Curve"
+    return str(spec.get("title") or spec.get("label") or spec.get("param") or spec.get("run") or "Plot").strip() or "Plot"
+
+
+def _tar_metric_cohort_has_plot_data(
+    ctx: Mapping[str, Any],
+    cohort_spec: Mapping[str, object] | None,
+    metric_stat: str,
+    *,
+    filter_state_override: Mapping[str, object] | None = None,
+) -> bool:
+    spec = dict(cohort_spec or {})
+    pair_by_id = ctx.get("pair_by_id") or {}
+    serials = list(ctx.get("all_serials") or [])
+    for pair_id in (spec.get("member_pair_ids") or []):
+        pair_spec = pair_by_id.get(str(pair_id or "").strip()) or {}
+        if not pair_spec:
+            continue
+        vmap = _tar_metric_map_for_pair(ctx, pair_spec, metric_stat, filter_state_override=filter_state_override)
+        if any(isinstance(vmap.get(serial), (int, float)) and math.isfinite(float(vmap.get(serial))) for serial in serials):
+            return True
+    return False
+
+
+def _tar_curve_cohort_has_plot_data(cohort_spec: Mapping[str, object] | None) -> bool:
+    spec = dict(cohort_spec or {})
+    return bool(spec.get("x_grid") and spec.get("master_y") and spec.get("trace_curves"))
+
+
+def _tar_watch_plot_focus_serials(ctx: Mapping[str, Any], pair_spec: Mapping[str, object] | None) -> list[str]:
+    spec = dict(pair_spec or {})
+    pair_id = str(spec.get("pair_id") or "").strip()
+    if not pair_id:
+        return []
+    final_grade_map = ctx.get("final_grade_map_by_pair_serial") or {}
+    return [
+        serial
+        for serial in (ctx.get("hi") or [])
+        if str(final_grade_map.get((pair_id, serial), "NO_DATA") or "NO_DATA").strip().upper() in {"WATCH", "FAIL"}
+    ]
+
+
+def _tar_plan_plot_specs(ctx: Mapping[str, Any], *, intro_pages: int) -> list[dict]:
+    plot_specs: list[dict] = []
+    page_number = max(0, int(intro_pages))
+    initial_cohort_specs = list(ctx.get("initial_cohort_specs") or [])
+    regrade_cohort_specs = list(ctx.get("regrade_cohort_specs") or [])
+    performance_plot_specs = list(ctx.get("performance_plot_specs") or [])
+    watch_pair_ids = list(ctx.get("watch_pair_ids") or [])
+    metric_stats = list(ctx.get("metric_stats") or [])
+    initial_metric_specs = [(spec, stat) for spec in initial_cohort_specs for stat in metric_stats] if ctx.get("include_metrics") else []
+    regrade_metric_specs = [(spec, stat) for spec in regrade_cohort_specs for stat in metric_stats] if ctx.get("include_metrics") else []
+
+    for cohort_spec, metric_stat in initial_metric_specs:
+        if not _tar_metric_cohort_has_plot_data(ctx, cohort_spec, str(metric_stat or "")):
+            continue
+        page_number += 1
+        plot_specs.append(
+            {
+                "section": "run_condition_plot_metrics",
+                "cohort_id": str(cohort_spec.get("cohort_id") or ""),
+                "param": str(cohort_spec.get("param") or "").strip(),
+                "stat": str(metric_stat or "").strip(),
+                "x_name": str(cohort_spec.get("x_name") or "").strip(),
+                "suppression_voltage_label": str(cohort_spec.get("suppression_voltage_label") or ""),
+                "page_number": page_number,
+            }
+        )
+
+    for cohort_spec in initial_cohort_specs:
+        if not _tar_curve_cohort_has_plot_data(cohort_spec):
+            continue
+        page_number += 1
+        plot_specs.append(
+            {
+                "section": "run_condition_curve_overlays",
+                "cohort_id": str(cohort_spec.get("cohort_id") or ""),
+                "param": str(cohort_spec.get("param") or "").strip(),
+                "x_name": str(cohort_spec.get("x_name") or "").strip(),
+                "suppression_voltage_label": str(cohort_spec.get("suppression_voltage_label") or ""),
+                "page_number": page_number,
+            }
+        )
+
+    for cohort_spec, metric_stat in regrade_metric_specs:
+        suppression_value = str(cohort_spec.get("suppression_voltage_label") or "").strip()
+        filter_override = _tar_clone_filter_state(ctx.get("filter_state"), suppression_voltage=suppression_value) if suppression_value else {}
+        if not _tar_metric_cohort_has_plot_data(ctx, cohort_spec, str(metric_stat or ""), filter_state_override=filter_override):
+            continue
+        page_number += 1
+        plot_specs.append(
+            {
+                "section": "regrade_pass_plot_metrics",
+                "cohort_id": str(cohort_spec.get("cohort_id") or ""),
+                "param": str(cohort_spec.get("param") or "").strip(),
+                "stat": str(metric_stat or "").strip(),
+                "x_name": str(cohort_spec.get("x_name") or "").strip(),
+                "suppression_voltage_label": suppression_value,
+                "page_number": page_number,
+            }
+        )
+
+    for cohort_spec in regrade_cohort_specs:
+        if not _tar_curve_cohort_has_plot_data(cohort_spec):
+            continue
+        page_number += 1
+        plot_specs.append(
+            {
+                "section": "regrade_pass_curve_overlays",
+                "cohort_id": str(cohort_spec.get("cohort_id") or ""),
+                "param": str(cohort_spec.get("param") or "").strip(),
+                "x_name": str(cohort_spec.get("x_name") or "").strip(),
+                "suppression_voltage_label": str(cohort_spec.get("suppression_voltage_label") or ""),
+                "page_number": page_number,
+            }
+        )
+
+    for perf_spec in performance_plot_specs:
+        curves = perf_spec.get("curves") or {}
+        if not isinstance(curves, dict) or not curves:
+            continue
+        page_number += 1
+        plot_specs.append(
+            {
+                "section": "performance_plots",
+                "name": str(perf_spec.get("name") or "Performance").strip() or "Performance",
+                "x": str(((perf_spec.get("x") or {}).get("column") or "")).strip(),
+                "y": str(((perf_spec.get("y") or {}).get("column") or "")).strip(),
+                "stat": str(perf_spec.get("stat") or "").strip(),
+                "page_number": page_number,
+            }
+        )
+
+    pair_by_id = ctx.get("pair_by_id") or {}
+    for pair_id in watch_pair_ids:
+        pair_spec = dict(pair_by_id.get(str(pair_id or "").strip()) or {})
+        if not pair_spec:
+            continue
+        focus_serials = _tar_watch_plot_focus_serials(ctx, pair_spec)
+        if not focus_serials:
+            continue
+        plot_payload = _tar_curve_plot_payload_for_pair(
+            ctx,
+            str(pair_spec.get("run") or "").strip(),
+            str(pair_spec.get("param") or "").strip(),
+            pair_spec=pair_spec,
+        )
+        if not plot_payload:
+            continue
+        page_number += 1
+        plot_specs.append(
+            {
+                "section": "watch_nonpass_curves",
+                "pair_id": str(pair_spec.get("pair_id") or "").strip(),
+                "run": str(pair_spec.get("run") or "").strip(),
+                "param": str(pair_spec.get("param") or "").strip(),
+                "serials": list(focus_serials),
+                "page_number": page_number,
+            }
+        )
+    return plot_specs
+
+
+def _tar_build_plot_navigation(plot_specs: list[dict] | None) -> list[dict]:
+    navigation: list[dict] = []
+    for index, raw_spec in enumerate(plot_specs or [], start=1):
+        spec = dict(raw_spec or {})
+        section_key = str(spec.get("section") or "").strip()
+        if section_key not in _TAR_PLOT_TOC_SECTION_META:
+            continue
+        meta = _tar_plot_toc_section_meta(section_key)
+        page_number = int(spec.get("page_number") or 0)
+        plot_label = _tar_plot_toc_label(spec)
+        navigation.append(
+            {
+                **spec,
+                "nav_index": int(index),
+                "section_key": section_key,
+                "section_label": meta["section_label"],
+                "navigator_label": meta["navigator_label"],
+                "plot_label": plot_label,
+                "page_number": page_number,
+                "page_text": str(page_number) if page_number else "",
+                "destination_page_index": max(0, page_number - 1) if page_number else None,
+            }
+        )
+    return navigation
+
+
+def _tar_paginate_plot_navigation(plot_navigation: list[dict] | None) -> list[dict]:
+    entries = [dict(entry) for entry in (plot_navigation or []) if isinstance(entry, Mapping)]
+    if not entries:
+        return []
+
+    grouped_entries: dict[str, list[dict]] = {}
+    section_meta: dict[str, dict[str, str]] = {}
+    section_order: list[str] = []
+    for entry in sorted(entries, key=lambda item: (_tar_plot_toc_section_rank(item.get("section_key")), int(item.get("nav_index") or 0))):
+        section_key = str(entry.get("section_key") or "").strip()
+        if section_key not in grouped_entries:
+            grouped_entries[section_key] = []
+            section_order.append(section_key)
+            section_meta[section_key] = {
+                "section_label": str(entry.get("section_label") or section_key).strip() or section_key,
+                "navigator_label": str(entry.get("navigator_label") or entry.get("section_label") or section_key).strip() or section_key,
+            }
+        grouped_entries[section_key].append(entry)
+
+    pages: list[dict] = []
+    toc_page_number = 1
+    row_budget = _TAR_PLOT_TOC_FIRST_PAGE_ROW_BUDGET
+    navigator_sections_all: list[dict] = []
+    current_page = {
+        "toc_page_number": toc_page_number,
+        "show_navigator": True,
+        "navigator_sections": [],
+        "rows": [],
+    }
+    current_rows_used = 0
+
+    def _start_new_page() -> tuple[dict, int]:
+        next_page_number = len(pages) + 2
+        return (
+            {
+                "toc_page_number": next_page_number,
+                "show_navigator": False,
+                "navigator_sections": [],
+                "rows": [],
+            },
+            0,
+        )
+
+    for section_key in section_order:
+        entries_for_section = list(grouped_entries.get(section_key) or [])
+        if not entries_for_section:
+            continue
+        first_target = entries_for_section[0].get("destination_page_index")
+        navigator_sections_all.append(
+            {
+                "section_key": section_key,
+                "label": section_meta[section_key]["navigator_label"],
+                "target_page_index": first_target,
+            }
+        )
+        if current_rows_used >= row_budget:
+            pages.append(current_page)
+            current_page, current_rows_used = _start_new_page()
+            row_budget = _TAR_PLOT_TOC_CONTINUATION_ROW_BUDGET
+        section_header = {
+            "kind": "section",
+            "section_key": section_key,
+            "text": section_meta[section_key]["section_label"],
+            "page_text": "",
+            "target_page_index": first_target,
+        }
+        current_page["rows"].append(dict(section_header))
+        current_rows_used += 1
+
+        for entry in entries_for_section:
+            if current_rows_used >= row_budget:
+                pages.append(current_page)
+                current_page, current_rows_used = _start_new_page()
+                row_budget = _TAR_PLOT_TOC_CONTINUATION_ROW_BUDGET
+                current_page["rows"].append(dict(section_header))
+                current_rows_used += 1
+            current_page["rows"].append(
+                {
+                    "kind": "plot",
+                    "section_key": section_key,
+                    "text": str(entry.get("plot_label") or "").strip(),
+                    "page_text": str(entry.get("page_text") or "").strip(),
+                    "target_page_index": entry.get("destination_page_index"),
+                    "page_number": entry.get("page_number"),
+                    "nav_index": entry.get("nav_index"),
+                }
+            )
+            current_rows_used += 1
+
+    pages.append(current_page)
+    if pages:
+        pages[0]["navigator_sections"] = list(navigator_sections_all)
+    for page in pages:
+        text_counts: dict[str, int] = {}
+        for navigator in page.get("navigator_sections") or []:
+            text = str(navigator.get("label") or "").strip()
+            navigator["occurrence_index"] = int(text_counts.get(text, 0))
+            text_counts[text] = int(text_counts.get(text, 0)) + 1
+        for row in page.get("rows") or []:
+            text = str(row.get("text") or "").strip()
+            row["occurrence_index"] = int(text_counts.get(text, 0))
+            text_counts[text] = int(text_counts.get(text, 0)) + 1
+    return pages
+
+
+def _tar_build_plot_toc_story(ctx: Mapping[str, Any], *, styles: Mapping[str, Any], rl: Mapping[str, Any]) -> list[Any]:
+    pages = list(ctx.get("plot_toc_layout") or _tar_paginate_plot_navigation(list(ctx.get("plot_navigation") or [])))
+    if not pages:
+        return []
+
+    story: list[Any] = []
+    PageBreak = rl["PageBreak"]
+    Spacer = rl["Spacer"]
+    inch = rl["inch"]
+    colors = rl["colors"]
+
+    for page_index, toc_page in enumerate(pages):
+        if page_index:
+            story.append(PageBreak())
+            story.append(_portrait_paragraph("Plot Table of Contents (Continued)", styles["section"], rl))
+        else:
+            story.append(_portrait_paragraph("Plot Table of Contents", styles["section"], rl))
+
+        navigator_sections = list(toc_page.get("navigator_sections") or [])
+        if toc_page.get("show_navigator") and navigator_sections:
+            nav_labels = [str(section.get("label") or "").strip() for section in navigator_sections]
+            if nav_labels:
+                story.append(
+                    _portrait_box_table(
+                        [nav_labels],
+                        col_widths=[(6.9 * inch) / max(1, len(nav_labels))] * len(nav_labels),
+                        styles=styles,
+                        rl=rl,
+                        repeat_rows=0,
+                        compact=True,
+                        header_rows=0,
+                        extra_style_commands=[
+                            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#dbeafe")),
+                            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                            ("ALIGN", (0, 0), (-1, 0), "CENTER"),
+                        ],
+                    )
+                )
+                story.append(Spacer(1, 0.08 * inch))
+
+        rows = [["Plot / Section", "Page"]]
+        extra_styles: list[tuple] = []
+        for row_index, row in enumerate(toc_page.get("rows") or [], start=1):
+            rows.append([str(row.get("text") or "").strip(), str(row.get("page_text") or "").strip()])
+            if str(row.get("kind") or "").strip() == "section":
+                extra_styles.extend(
+                    [
+                        ("SPAN", (0, row_index), (-1, row_index)),
+                        ("BACKGROUND", (0, row_index), (-1, row_index), colors.HexColor("#e0f2fe")),
+                        ("FONTNAME", (0, row_index), (-1, row_index), "Helvetica-Bold"),
+                    ]
+                )
+        story.append(
+            _portrait_box_table(
+                rows,
+                col_widths=[6.15 * inch, 0.75 * inch],
+                styles=styles,
+                rl=rl,
+                repeat_rows=1,
+                compact=True,
+                header_rows=1,
+                extra_style_commands=extra_styles,
+            )
+        )
+        story.append(Spacer(1, 0.10 * inch))
+    return story
+
+
+def _tar_insert_page_link(page: Any, rect: Any, destination_page_index: object) -> None:
+    if destination_page_index is None:
+        return
+    try:
+        import fitz  # type: ignore
+    except Exception:
+        return
+    try:
+        page.insert_link(
+            {
+                "kind": fitz.LINK_GOTO,
+                "from": rect,
+                "page": int(destination_page_index),
+                "zoom": 0,
+            }
+        )
+    except Exception:
+        pass
+
+
+def _tar_apply_pdf_navigation(
+    output_pdf: Path,
+    *,
+    plot_navigation: list[dict] | None,
+    plot_toc_layout: list[dict] | None,
+) -> None:
+    try:
+        import fitz  # type: ignore
+    except Exception as exc:
+        raise RuntimeError("PyMuPDF is required to add plot table-of-contents navigation.") from exc
+
+    nav_entries = [dict(entry) for entry in (plot_navigation or []) if isinstance(entry, Mapping)]
+    toc_layout = [dict(page) for page in (plot_toc_layout or []) if isinstance(page, Mapping)]
+    if not (nav_entries or toc_layout):
+        return
+
+    doc = fitz.open(str(Path(output_pdf).expanduser()))
+    try:
+        if nav_entries:
+            grouped: dict[str, list[dict]] = {}
+            section_order: list[str] = []
+            for entry in nav_entries:
+                section_key = str(entry.get("section_key") or "").strip()
+                if section_key not in grouped:
+                    grouped[section_key] = []
+                    section_order.append(section_key)
+                grouped[section_key].append(entry)
+            toc_rows: list[list[object]] = []
+            for section_key in sorted(section_order, key=_tar_plot_toc_section_rank):
+                section_entries = list(grouped.get(section_key) or [])
+                if not section_entries:
+                    continue
+                toc_rows.append([1, str(section_entries[0].get("section_label") or section_key).strip() or section_key, int(section_entries[0].get("page_number") or 1)])
+                for entry in section_entries:
+                    toc_rows.append([2, str(entry.get("plot_label") or "").strip() or "Plot", int(entry.get("page_number") or 1)])
+            if toc_rows:
+                try:
+                    doc.set_toc(toc_rows)
+                except Exception:
+                    pass
+
+        for toc_page in toc_layout:
+            toc_page_number = int(toc_page.get("toc_page_number") or 0)
+            if toc_page_number <= 0 or toc_page_number > doc.page_count:
+                continue
+            page = doc.load_page(toc_page_number - 1)
+            text_occurrences: dict[str, int] = {}
+
+            for navigator in (toc_page.get("navigator_sections") or []):
+                label = str(navigator.get("label") or "").strip()
+                if not label:
+                    continue
+                match_index = int(text_occurrences.get(label, 0))
+                rects = list(page.search_for(label))
+                if match_index >= len(rects):
+                    continue
+                text_occurrences[label] = match_index + 1
+                _tar_insert_page_link(page, rects[match_index], navigator.get("target_page_index"))
+
+            for row in (toc_page.get("rows") or []):
+                label = str(row.get("text") or "").strip()
+                if not label:
+                    continue
+                match_index = int(text_occurrences.get(label, 0))
+                rects = list(page.search_for(label))
+                if match_index >= len(rects):
+                    continue
+                text_occurrences[label] = match_index + 1
+                label_rect = rects[match_index]
+                row_rect = fitz.Rect(36.0, max(0.0, label_rect.y0 - 1.0), max(36.0, float(page.rect.width) - 36.0), min(float(page.rect.height), label_rect.y1 + 1.0))
+                _tar_insert_page_link(page, row_rect, row.get("target_page_index"))
+
+        doc.saveIncr()
+    finally:
+        doc.close()
 
 
 def _tar_compute_curve_deviation(
@@ -5245,54 +6234,14 @@ def _tar_prepare_base(
                 if finding:
                     finding_by_key[(run_name, param_name, serial)] = finding
 
-    comparison_rows: list[dict] = []
-    for spec in pair_specs:
-        pair_id = str(spec.get("pair_id") or "").strip()
-        run_name = str(spec.get("run") or "").strip()
-        param_name = str(spec.get("param") or "").strip()
-        units = str(spec.get("units") or "").strip()
-        selection_fields = dict(spec.get("selection_fields") or {})
-        vmap = _tar_metric_map_for_pair(ctx, spec, "mean")
-        atp_mean = _tar_finite_mean_for_serials(vmap, all_serials)
-        actual_mean = _tar_finite_mean_for_serials(vmap, hi)
-        delta = float(actual_mean) - float(atp_mean) if atp_mean is not None and actual_mean is not None else None
-        initial_row_grades = [
-            str(initial_grade_map_by_pair_serial.get((pair_id, serial), "NO_DATA") or "NO_DATA").strip().upper() or "NO_DATA"
-            for serial in hi
-        ]
-        final_row_grades = [
-            str(final_grade_map_by_pair_serial.get((pair_id, serial), "NO_DATA") or "NO_DATA").strip().upper() or "NO_DATA"
-            for serial in hi
-        ]
-        comparison_rows.append(
-            {
-                "pair_id": pair_id,
-                "selection_id": str(spec.get("selection_id") or "").strip(),
-                "run": run_name,
-                "run_title": str(spec.get("run_title") or run_name).strip() or run_name,
-                "run_condition": str(spec.get("selection_label") or selection_fields.get("condition_text") or run_name).strip() or run_name,
-                "sequence_text": str(selection_fields.get("sequence_text") or spec.get("run_title") or run_name).strip() or run_name,
-                "parameter": param_name,
-                "units": units,
-                "atp_mean": atp_mean,
-                "actual_mean": actual_mean,
-                "delta": delta,
-                "initial_grade": _grade_token_for_summary(initial_row_grades),
-                "final_grade": _grade_token_for_summary(final_row_grades),
-                "grade": _grade_token_for_summary(final_row_grades),
-                "grade_text": _tar_stacked_grade_text(
-                    _grade_token_for_summary(initial_row_grades),
-                    _grade_token_for_summary(final_row_grades),
-                ),
-                "selection_mode": selection_fields.get("mode") or "sequence",
-                "base_condition_label": str(spec.get("base_condition_label") or "").strip(),
-                "suppression_voltage_label": str(spec.get("suppression_voltage_label") or "").strip(),
-                "regrade_applied": any(
-                    bool((finding_by_pair_serial.get((pair_id, serial)) or {}).get("regrade_applied"))
-                    for serial in hi
-                ),
-            }
-        )
+    comparison_rows = _tar_build_per_serial_comparison_rows(
+        ctx,
+        pair_specs=pair_specs,
+        all_serials=all_serials,
+        hi=hi,
+        initial_grade_map_by_pair_serial=initial_grade_map_by_pair_serial,
+        final_grade_map_by_pair_serial=final_grade_map_by_pair_serial,
+    )
 
     pair_ids = [str(spec.get("pair_id") or "").strip() for spec in pair_specs if str(spec.get("pair_id") or "").strip()]
     initial_overall_by_sn = {
@@ -5343,6 +6292,7 @@ def _tar_prepare_base(
     ctx["initial_cohort_specs"] = initial_cohort_specs
     ctx["regrade_cohort_specs"] = regrade_cohort_specs
     ctx["initial_watch_items"] = initial_watch_items
+    ctx["quick_summary"] = _tar_build_quick_summary(ctx)
     return ctx
 
 
@@ -5513,27 +6463,7 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
     Spacer = rl["Spacer"]
     PageBreak = rl["PageBreak"]
     inch = rl["inch"]
-
-    scope_modes = {
-        str(spec.get("selection_fields", {}).get("mode") or "sequence").strip().lower()
-        for spec in (ctx.get("pair_specs") or [])
-    }
-    if scope_modes == {"condition"}:
-        scope_mode_label = "Run Condition"
-    elif scope_modes == {"sequence"}:
-        scope_mode_label = "Sequence"
-    else:
-        scope_mode_label = "Mixed"
-
-    selection_labels = ctx.get("options", {}).get("run_selection_labels")
-    if isinstance(selection_labels, list):
-        selected_scope_items = [str(value).strip() for value in selection_labels if str(value).strip()]
-    else:
-        selected_scope_items = [
-            str(spec.get("selection_fields", {}).get("display_text") or "").strip()
-            for spec in (ctx.get("pair_specs") or [])
-            if str(spec.get("selection_fields", {}).get("display_text") or "").strip()
-        ]
+    colors = rl["colors"]
 
     status_counts = {
         "CERTIFIED": sum(1 for status in (ctx.get("overall_by_sn") or {}).values() if status == "CERTIFIED"),
@@ -5565,6 +6495,23 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
     else:
         highlight_lines = ["No WATCH or FAIL curve findings for the selected certification serials."]
 
+    quick_summary = dict(ctx.get("quick_summary") or _tar_build_quick_summary(ctx))
+    metadata_snapshot_lines = _tar_metadata_snapshot_lines(ctx)
+    comparison_groups = _tar_group_comparison_rows(list(ctx.get("comparison_rows") or []))
+    initial_vs_final_lines = [
+        (
+            "Initial Run: Base certification comparison before suppression-voltage-specific regrade. "
+            f"Suppression Voltage: {str(quick_summary.get('initial_suppression_voltage') or 'All').strip() or 'All'} | "
+            f"Bus Voltage: {str(quick_summary.get('initial_bus_voltage') or '').strip()}"
+        ),
+        (
+            "Final Run: Suppression-voltage-aware certification comparison after regrade. "
+            f"Suppression Voltage: {str(quick_summary.get('final_suppression_voltage') or quick_summary.get('p8_suppression_voltage') or 'All').strip() or 'All'} | "
+            f"Bus Voltage: {str(quick_summary.get('final_bus_voltage') or '').strip()}"
+        ),
+        "Bus voltage remains blank until that report field is defined.",
+    ]
+
     story: list[Any] = []
     print_ctx = ctx["print_ctx"]
     story.append(_portrait_paragraph(print_ctx.report_title, styles["cover_title"], rl))
@@ -5580,6 +6527,16 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
     )
     story.append(Spacer(1, 0.14 * inch))
     story.append(
+        _portrait_card(
+            "Quick Executive Summary",
+            list(quick_summary.get("lines") or []),
+            styles=styles,
+            rl=rl,
+        )
+    )
+    story.append(Spacer(1, 0.10 * inch))
+    story.extend(_tar_build_plot_toc_story(ctx, styles=styles, rl=rl))
+    story.append(
         _portrait_box_table(
             [
                 ["Serials Under Certification", "Runs Included", "Parameters Included", "Watch / Non-PASS Curves"],
@@ -5594,38 +6551,8 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
     story.append(Spacer(1, 0.12 * inch))
     story.append(
         _portrait_card(
-            "Certification Scope",
-            [
-                f"Scope mode: {scope_mode_label}",
-                f"Selected scope items: {_tar_join_limited(selected_scope_items, max_items=6, empty='(none)')}",
-                f"Selected serials: {_tar_join_limited(ctx.get('hi') or [], max_items=8, empty='(none)')}",
-                f"Metrics pages follow report analysis params: {_tar_join_limited(ctx.get('params') or [], max_items=8, empty='(none)')}",
-                f"Metrics statistics: {_tar_join_limited(ctx.get('metric_stats') or [], max_items=5, empty='(none)')}"
-                if ctx.get("include_metrics")
-                else "Metrics pages: disabled",
-                _tar_filter_summary_line(ctx, "programs", "Programs"),
-                _tar_filter_summary_line(ctx, "serials", "Serial filter"),
-                _tar_filter_summary_line(ctx, "control_periods", "Control Period"),
-                _tar_filter_summary_line(ctx, "suppression_voltages", "Suppression Voltage"),
-            ],
-            styles=styles,
-            rl=rl,
-        )
-    )
-    story.append(Spacer(1, 0.10 * inch))
-    story.append(
-        _portrait_card(
             "Metadata Snapshot",
-            [
-                _tar_meta_summary_line(ctx, "program_title", "Program"),
-                _tar_meta_summary_line(ctx, "similarity_group", "Similarity Group"),
-                _tar_meta_summary_line(ctx, "acceptance_test_plan_number", "Acceptance Test Plan"),
-                _tar_meta_summary_line(ctx, "asset_type", "Asset Type"),
-                _tar_meta_summary_line(ctx, "vendor", "Vendor"),
-                _tar_meta_summary_line(ctx, "part_number", "Part Number"),
-                _tar_meta_summary_line(ctx, "revision", "Revision"),
-            ]
-            + ([f"Metadata note: {ctx.get('meta_note')}"] if str(ctx.get("meta_note") or "").strip() else []),
+            metadata_snapshot_lines,
             styles=styles,
             rl=rl,
         )
@@ -5661,6 +6588,8 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
             rl=rl,
         )
     )
+    story.append(Spacer(1, 0.10 * inch))
+    story.append(_portrait_card("Initial vs Final Run", initial_vs_final_lines, styles=styles, rl=rl))
     story.append(Spacer(1, 0.10 * inch))
     story.append(_portrait_card("Watch / Review Highlights", highlight_lines, styles=styles, rl=rl))
     story.append(Spacer(1, 0.10 * inch))
@@ -5699,39 +6628,75 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
     story.append(_portrait_paragraph("Run Comparison", styles["section"], rl))
     story.append(
         _portrait_paragraph(
-            "Each row compares the ATP family mean to the actual mean of the selected certification serials for the same run scope and parameter. "
-            "Grades show the pooled initial pass and the suppression-voltage-aware final pass.",
+            "Each table groups one selected run condition. Rows compare the ATP family mean with each certified serial's "
+            "actual result for the same parameter. Initial values use the base certification scope, and final values use "
+            "the suppression-voltage-aware regrade path. Bus voltage remains blank until that field is defined.",
             styles["body"],
             rl,
         )
     )
-    comparison_rows = [
-        [
-            row.get("run_condition") or "",
-            row.get("sequence_text") or "",
-            row.get("parameter") or "",
-            row.get("units") or "",
-            _fmt_num(row.get("atp_mean"), sig=5),
-            _fmt_num(row.get("actual_mean"), sig=5),
-            _fmt_num(row.get("delta"), sig=5),
-            row.get("grade_text") or "",
-        ]
-        for row in (ctx.get("comparison_rows") or [])
-    ]
-    for start in range(0, len(comparison_rows), 16):
-        if start:
-            story.append(PageBreak())
-            story.append(_portrait_paragraph("Run Comparison (Continued)", styles["section"], rl))
+    if not comparison_groups:
         story.append(
-            _portrait_box_table(
-                [["Run Condition", "Sequence(s)", "Parameter", "Units", "ATP Mean", "Actual Mean", "Delta", "Grade"], *comparison_rows[start : start + 16]],
-                col_widths=[1.24 * inch, 1.55 * inch, 0.82 * inch, 0.58 * inch, 0.78 * inch, 0.88 * inch, 0.68 * inch, 0.95 * inch],
+            _portrait_card(
+                "Run Comparison Summary",
+                ["No run comparison rows were available for the selected certification scope."],
                 styles=styles,
                 rl=rl,
-                repeat_rows=1,
-                compact=True,
             )
         )
+        return story
+
+    for group_index, group in enumerate(comparison_groups):
+        group_header = (
+            f"Run Condition: {group['run_condition']}\n"
+            f"Initial Suppression Voltage: {group.get('initial_suppression_voltage_label') or 'All'} | "
+            f"Final Suppression Voltage: {group.get('final_suppression_voltage_label') or group.get('initial_suppression_voltage_label') or 'All'}\n"
+            f"Initial Bus Voltage: {group.get('initial_bus_voltage_label') or ''} | "
+            f"Final Bus Voltage: {group.get('final_bus_voltage_label') or ''}"
+        )
+        group_rows = [
+            [
+                group_header,
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+            ],
+            ["Serial", "Sequence(s)", "Parameter", "Units", "ATP Mean", "ATP Actual", "Delta", "Grade"],
+        ]
+        for row in group.get("rows") or []:
+            group_rows.append(
+                [
+                    row.get("serial") or "",
+                    row.get("sequence_text") or "",
+                    row.get("parameter") or "",
+                    row.get("units") or "",
+                    _tar_stacked_metric_text(row.get("initial_atp_mean"), row.get("final_atp_mean"), sig=5),
+                    _tar_stacked_metric_text(row.get("initial_actual_mean"), row.get("final_actual_mean"), sig=5),
+                    _tar_stacked_metric_text(row.get("initial_delta"), row.get("final_delta"), sig=5),
+                    _tar_stacked_grade_text(row.get("initial_grade"), row.get("final_grade")),
+                ]
+            )
+        story.append(
+            _portrait_box_table(
+                group_rows,
+                col_widths=[0.72 * inch, 1.18 * inch, 0.76 * inch, 0.48 * inch, 0.95 * inch, 0.95 * inch, 0.82 * inch, 1.04 * inch],
+                styles=styles,
+                rl=rl,
+                repeat_rows=2,
+                compact=True,
+                header_rows=2,
+                extra_style_commands=[
+                    ("SPAN", (0, 0), (-1, 0)),
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#cbd5e1")),
+                ],
+            )
+        )
+        if group_index != len(comparison_groups) - 1:
+            story.append(Spacer(1, 0.10 * inch))
     return story
 
 
@@ -5831,11 +6796,18 @@ def _tar_render_metric_cohort_page(
         return None
 
     ax.set_title(f"{param_name} ({metric_stat})", loc="left", fontsize=13, fontweight="bold", pad=10)
-    ax.set_xlabel("Program + Serial Number")
     ax.set_ylabel(f"{param_name} ({units})" if units else param_name)
     for pair_spec, yv, color in plotted:
         label = str(pair_spec.get("selection_label") or pair_spec.get("run_title") or pair_spec.get("run") or "").strip() or param_name
-        ax.plot(x_idx, yv, marker="o", linewidth=1.1, alpha=0.58, color=color, label=label)
+        points = [
+            (float(idx), float(value))
+            for idx, value in enumerate(yv)
+            if isinstance(value, float) and not math.isnan(value)
+        ]
+        if points:
+            xs = [point[0] for point in points]
+            ys = [point[1] for point in points]
+            ax.scatter(xs, ys, s=22, alpha=0.62, color=color, label=label, zorder=2.0)
         pair_id = str(pair_spec.get("pair_id") or "").strip()
         for serial in (ctx.get("hi") or []):
             xi = serial_index.get(serial)
@@ -5845,16 +6817,10 @@ def _tar_render_metric_cohort_page(
             if math.isnan(y_val):
                 continue
             grade = str(grade_map_by_pair_serial.get((pair_id, serial), "NO_DATA") or "NO_DATA").strip().upper() or "NO_DATA"
-            ax.scatter([xi], [y_val], s=42, color=_tar_grade_color(grade, default=color), zorder=5)
+            ax.scatter([xi], [y_val], s=48, color=_tar_grade_color(grade, default=color), zorder=5.0)
     if family_values:
         ax.axhline(float(statistics.mean(family_values)), color="#0f172a", linestyle="--", linewidth=1.2, alpha=0.70, label=family_mean_label)
-    tick_labels = [_tar_metric_tick_label(ctx, serial) for serial in serials]
-    tick_step = max(1, int(math.ceil(len(serials) / 18.0)))
-    tick_idx = x_idx[::tick_step]
-    ax.set_xticks(tick_idx)
-    ax.set_xticklabels([tick_labels[idx] for idx in tick_idx], rotation=45, ha="right", fontsize=7)
-    ax.set_xlim(-0.5, len(serials) - 0.5)
-    ax.grid(True, axis="y", alpha=0.25)
+    _tar_apply_metric_axis_format(fig, ax, serials=serials, meta_by_sn=(ctx.get("meta_by_sn") or {}))
     try:
         handles, labels = ax.get_legend_handles_labels()
         uniq: dict[str, Any] = {}
@@ -6869,6 +7835,37 @@ def _tar_build_closing_story(ctx: Mapping[str, Any], *, counts: Mapping[str, int
     return story
 
 
+def _tar_prepare_intro_story_with_navigation(ctx: dict[str, Any], *, intro_pages: int) -> list[Any]:
+    planned_plot_specs = _tar_plan_plot_specs(ctx, intro_pages=intro_pages)
+    plot_navigation = _tar_build_plot_navigation(planned_plot_specs)
+    ctx["planned_plot_specs"] = planned_plot_specs
+    ctx["plot_navigation"] = plot_navigation
+    ctx["plot_toc_layout"] = _tar_paginate_plot_navigation(plot_navigation)
+    return _tar_build_intro_story(ctx)
+
+
+def _tar_render_stabilized_intro_pdf(
+    intro_pdf: Path,
+    *,
+    ctx: dict[str, Any],
+    progress_cb: Callable[[str], None] | None = None,
+) -> tuple[int, list[Any]]:
+    guess = 0
+    story: list[Any] = []
+    for attempt in range(6):
+        story = _tar_prepare_intro_story_with_navigation(ctx, intro_pages=guess)
+        if attempt:
+            _tar_emit_progress(progress_cb, f"Re-rendering summary pages to stabilize plot TOC page references ({attempt + 1}/6)")
+        actual_pages = _render_portrait_story_pdf(intro_pdf, story=story, print_ctx=ctx["print_ctx"], page_number_offset=0)
+        if actual_pages == guess:
+            return int(actual_pages), story
+        guess = int(actual_pages)
+
+    story = _tar_prepare_intro_story_with_navigation(ctx, intro_pages=guess)
+    final_pages = _render_portrait_story_pdf(intro_pdf, story=story, print_ctx=ctx["print_ctx"], page_number_offset=0)
+    return int(final_pages), story
+
+
 def generate_test_data_auto_report(
     project_dir: Path,
     workbook_path: Path,
@@ -6904,7 +7901,7 @@ def generate_test_data_auto_report(
 
         intro_story_start = time.perf_counter()
         _tar_emit_progress(progress_cb, "Building summary pages")
-        intro_story = _tar_build_intro_story(ctx)
+        intro_story = _tar_prepare_intro_story_with_navigation(ctx, intro_pages=0)
         timings["build_intro_story_seconds"] = round(time.perf_counter() - intro_story_start, 3)
 
         equation_story_start = time.perf_counter()
@@ -6922,14 +7919,19 @@ def generate_test_data_auto_report(
             closing_pdf = tmp_root / "04_closing.pdf"
 
             intro_render_start = time.perf_counter()
-            _tar_emit_progress(progress_cb, "Rendering cover and summary pages")
-            intro_pages = _render_portrait_story_pdf(intro_pdf, story=intro_story, print_ctx=ctx["print_ctx"], page_number_offset=0)
+            _tar_emit_progress(progress_cb, "Rendering cover, TOC, and summary pages")
+            intro_pages, intro_story = _tar_render_stabilized_intro_pdf(intro_pdf, ctx=ctx, progress_cb=progress_cb)
             timings["render_intro_pages_seconds"] = round(time.perf_counter() - intro_render_start, 3)
 
             plot_render_start = time.perf_counter()
             _tar_emit_progress(progress_cb, "Rendering plot pages")
             plot_counts = _tar_render_plot_sections(ctx, intro_pages=intro_pages, plots_pdf=plots_pdf, progress_cb=progress_cb)
             timings["render_plot_pages_seconds"] = round(time.perf_counter() - plot_render_start, 3)
+            actual_plot_navigation = _tar_build_plot_navigation(list(plot_counts.get("plot_specs") or []))
+            plot_counts = dict(plot_counts)
+            plot_counts["plot_specs"] = actual_plot_navigation
+            ctx["plot_navigation"] = actual_plot_navigation
+            ctx["plot_toc_layout"] = _tar_paginate_plot_navigation(actual_plot_navigation)
 
             equation_render_start = time.perf_counter()
             _tar_emit_progress(progress_cb, "Rendering performance equation pages")
@@ -6940,10 +7942,12 @@ def generate_test_data_auto_report(
                 page_number_offset=intro_pages + plot_counts["plot_page_count"],
             )
             timings["render_equation_pages_seconds"] = round(time.perf_counter() - equation_render_start, 3)
-            plot_counts = dict(plot_counts)
             plot_counts["equation_page_count"] = int(equation_pages)
 
-            section_order = ["cover", "executive_summary", "comparison_table"]
+            section_order = ["cover"]
+            if ctx.get("plot_navigation"):
+                section_order.append("plot_toc")
+            section_order.extend(["executive_summary", "comparison_table"])
             if plot_counts["run_condition_metric_plot_count"]:
                 section_order.append("run_condition_plot_metrics")
             if plot_counts["run_condition_curve_plot_count"]:
@@ -6990,10 +7994,18 @@ def generate_test_data_auto_report(
             _tar_emit_progress(progress_cb, "Merging report PDF")
             _merge_report_pdfs(out_pdf, merge_parts)
             timings["merge_pdf_seconds"] = round(time.perf_counter() - merge_start, 3)
+            navigation_start = time.perf_counter()
+            _tar_emit_progress(progress_cb, "Adding plot TOC links and bookmarks")
+            _tar_apply_pdf_navigation(
+                out_pdf,
+                plot_navigation=list(ctx.get("plot_navigation") or []),
+                plot_toc_layout=list(ctx.get("plot_toc_layout") or []),
+            )
+            timings["apply_pdf_navigation_seconds"] = round(time.perf_counter() - navigation_start, 3)
             total_pages = intro_pages + plot_counts["plot_page_count"] + equation_pages + closing_pages
 
         sidecar = {
-            "version": 4,
+            "version": 6,
             "generated_date": _now_datestr(),
             "printed_at": ctx["print_ctx"].printed_at,
             "printed_timezone": ctx["print_ctx"].printed_timezone,
@@ -7017,6 +8029,7 @@ def generate_test_data_auto_report(
             "runs": ctx["runs"],
             "params": ctx["params"],
             "metric_stats": ctx["metric_stats"],
+            "quick_summary": ctx.get("quick_summary") or _tar_build_quick_summary(ctx),
             "curve_models": ctx["curves_summary"],
             "initial_watch_items": ctx.get("initial_watch_items") or [],
             "watch_items": ctx["watch_items"],
@@ -7026,6 +8039,7 @@ def generate_test_data_auto_report(
             "regrade_cohorts": ctx.get("regrade_cohort_specs") or [],
             "equation_cards": ctx["equation_cards"],
             "plot_specs": plot_counts["plot_specs"],
+            "plot_navigation": list(ctx.get("plot_navigation") or []),
             "performance_models": ctx["performance_models"],
             "timings": timings,
             "page_cap": None,
