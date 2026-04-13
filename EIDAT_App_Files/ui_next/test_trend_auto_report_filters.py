@@ -294,6 +294,9 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         self.assertEqual(summary["p8_suppression_voltage"], "5")
         self.assertEqual(summary["p8_bus_voltage"], "")
         self.assertTrue(any("Programs Compared: Program B, Program C" in line for line in summary["lines"]))
+        self.assertIn("Suppression Voltage: 5", summary["lines"])
+        self.assertIn("Bus Voltage: ", summary["lines"])
+        self.assertFalse(any(line.startswith("P8 ") for line in summary["lines"]))
 
     def test_metadata_snapshot_lines_include_each_certified_serial(self) -> None:
         ctx = {
@@ -338,6 +341,24 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         self.assertTrue(any("Document: Acceptance Test Plan (ATP)" in line for line in lines))
         self.assertTrue(any("Document: Certification Report (CR)" in line for line in lines))
         self.assertEqual(lines[-1], "Metadata note: Workbook metadata unavailable.")
+
+    def test_show_pooled_family_overlay_only_for_single_set(self) -> None:
+        self.assertFalse(
+            tar._tar_show_pooled_family_overlay(
+                {
+                    "member_pair_ids": ["pair-1", "pair-2"],
+                    "selection_labels": ["Condition A", "Condition B"],
+                }
+            )
+        )
+        self.assertTrue(
+            tar._tar_show_pooled_family_overlay(
+                {
+                    "member_pair_ids": ["pair-1"],
+                    "selection_labels": ["Condition A"],
+                }
+            )
+        )
 
     def test_build_per_serial_comparison_rows_tracks_initial_and_final_values(self) -> None:
         ctx = {"filter_state": {"suppression_voltages": ["3"]}}
@@ -547,7 +568,7 @@ class TestTrendAutoReportFilters(unittest.TestCase):
                 "matplotlib.patches": fake_patches,
                 "matplotlib.transforms": fake_transforms,
             },
-        ), mock.patch.object(tar, "_create_landscape_plot_page", return_value=(fig, axes)), mock.patch.object(
+        ), mock.patch.object(tar, "_create_landscape_plot_page", return_value=(fig, axes)) as create_page_mock, mock.patch.object(
             tar,
             "_tar_metric_map_for_pair",
             side_effect=_fake_metric_map,
@@ -569,13 +590,17 @@ class TestTrendAutoReportFilters(unittest.TestCase):
 
         self.assertEqual(run_condition_spec["section"], "run_condition_plot_metrics")
         self.assertEqual(run_condition_spec["page_number"], 4)
+        self.assertEqual(create_page_mock.call_args.kwargs["section_title"], "Run Condition Metrics | Condition A")
         self.assertEqual(len(axes.plot_calls), 0)
         self.assertEqual(len(axes.scatter_calls), 4)
         series_scatter_labels = [str(call[2].get("label") or "") for call in axes.scatter_calls if call[2].get("label")]
-        highlight_colors = [call[2]["color"] for call in axes.scatter_calls if not call[2].get("label")]
+        highlight_calls = [call for call in axes.scatter_calls if not call[2].get("label")]
+        highlight_colors = [call[2]["color"] for call in highlight_calls]
+        highlight_markers = [call[2].get("marker") for call in highlight_calls]
         self.assertIn([0.0, 1.0, 2.0], [call[0] for call in axes.scatter_calls if call[2].get("label")])
         self.assertEqual(series_scatter_labels, ["Run A", "Run B"])
-        self.assertIn(tar._tar_grade_color("WATCH", default="#ef4444"), highlight_colors)
+        self.assertEqual(set(highlight_colors), {"#ef4444", "#2563eb"})
+        self.assertEqual(highlight_markers, ["x", "x"])
         self.assertEqual(len(axes.axvline_calls), 3)
         self.assertTrue(all(call[1]["color"] == tar._TAR_METRIC_GUIDE_COLOR for call in axes.axvline_calls))
         self.assertEqual(axes.xticklabels, ["SN-001", "SN-002", "SN-003"])
@@ -583,11 +608,14 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         self.assertEqual(len(pdf.saved_figures), 1)
         self.assertEqual(fake_plt.closed, [fig])
         self.assertIsNotNone(axes.legend_call)
-        self.assertIn("Pooled family mean", axes.legend_call[1])
+        self.assertNotIn("Pooled family mean", axes.legend_call[1])
 
         axes_regrade = _FakePlotAxes()
         fig_regrade = _FakePlotFigure()
         pdf_regrade = _FakePlotPdf()
+        single_regrade_spec = dict(cohort_spec)
+        single_regrade_spec["member_pair_ids"] = ["pair-1"]
+        single_regrade_spec["selection_labels"] = ["Condition A"]
         with mock.patch.dict(
             sys.modules,
             {
@@ -596,7 +624,7 @@ class TestTrendAutoReportFilters(unittest.TestCase):
                 "matplotlib.patches": fake_patches,
                 "matplotlib.transforms": fake_transforms,
             },
-        ), mock.patch.object(tar, "_create_landscape_plot_page", return_value=(fig_regrade, axes_regrade)), mock.patch.object(
+        ), mock.patch.object(tar, "_create_landscape_plot_page", return_value=(fig_regrade, axes_regrade)) as create_regrade_page_mock, mock.patch.object(
             tar,
             "_tar_metric_map_for_pair",
             side_effect=_fake_metric_map,
@@ -604,7 +632,7 @@ class TestTrendAutoReportFilters(unittest.TestCase):
             regrade_spec = tar._tar_render_metric_cohort_page(
                 ctx,
                 pdf_regrade,
-                cohort_spec=cohort_spec,
+                cohort_spec=single_regrade_spec,
                 metric_stat="mean",
                 page_number=7,
                 section_title="Regrade Pass Metrics",
@@ -619,8 +647,11 @@ class TestTrendAutoReportFilters(unittest.TestCase):
 
         self.assertEqual(regrade_spec["section"], "regrade_pass_plot_metrics")
         self.assertEqual(regrade_spec["page_number"], 7)
+        self.assertEqual(create_regrade_page_mock.call_args.kwargs["section_title"], "Regrade Pass Metrics | Condition A")
         self.assertEqual(axes_regrade.xticklabels, ["SN-001", "SN-002", "SN-003"])
-        self.assertEqual(len(axes_regrade.scatter_calls), 4)
+        self.assertEqual(len(axes_regrade.scatter_calls), 2)
+        self.assertIsNotNone(axes_regrade.legend_call)
+        self.assertIn("Regrade family mean", axes_regrade.legend_call[1])
 
     def test_build_plot_navigation_creates_compact_labels_and_ignores_non_plot_sections(self) -> None:
         navigation = tar._tar_build_plot_navigation(
@@ -735,6 +766,78 @@ class TestTrendAutoReportFilters(unittest.TestCase):
             finally:
                 result.close()
 
+    def test_apply_pdf_navigation_resolves_shifted_toc_pages_from_headings(self) -> None:
+        fitz = __import__("fitz")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pdf_path = Path(tmp_dir) / "toc_navigation_shifted.pdf"
+            doc = fitz.open()
+            cover_page = doc.new_page()
+            cover_page.insert_text((72, 72), "Cover Page")
+            toc_page_1 = doc.new_page()
+            toc_page_1.insert_text((72, 72), "Plot Table of Contents")
+            toc_page_1.insert_text((72, 104), "Run Condition Metrics")
+            toc_page_1.insert_text((72, 136), "Pressure | Time | mean")
+            toc_page_2 = doc.new_page()
+            toc_page_2.insert_text((72, 72), "Plot Table of Contents (Continued)")
+            toc_page_2.insert_text((72, 104), "Regrade Pass Metrics")
+            toc_page_2.insert_text((72, 136), "Flow | Time | mean")
+            doc.new_page()
+            doc.new_page()
+            doc.save(str(pdf_path))
+            doc.close()
+
+            tar._tar_apply_pdf_navigation(
+                pdf_path,
+                plot_navigation=[
+                    {
+                        "section_key": "run_condition_plot_metrics",
+                        "section_label": "Run Condition Metrics",
+                        "navigator_label": "Run Metrics",
+                        "plot_label": "Pressure | Time | mean",
+                        "page_number": 4,
+                        "destination_page_index": 3,
+                    },
+                    {
+                        "section_key": "regrade_pass_plot_metrics",
+                        "section_label": "Regrade Pass Metrics",
+                        "navigator_label": "Regrade Metrics",
+                        "plot_label": "Flow | Time | mean",
+                        "page_number": 5,
+                        "destination_page_index": 4,
+                    },
+                ],
+                plot_toc_layout=[
+                    {
+                        "toc_page_number": 1,
+                        "navigator_sections": [{"label": "Run Metrics", "target_page_index": 3}],
+                        "rows": [
+                            {"kind": "section", "text": "Run Condition Metrics", "target_page_index": 3},
+                            {"kind": "plot", "text": "Pressure | Time | mean", "target_page_index": 3, "page_text": "4"},
+                        ],
+                    },
+                    {
+                        "toc_page_number": 2,
+                        "navigator_sections": [],
+                        "rows": [
+                            {"kind": "section", "text": "Regrade Pass Metrics", "target_page_index": 4},
+                            {"kind": "plot", "text": "Flow | Time | mean", "target_page_index": 4, "page_text": "5"},
+                        ],
+                    },
+                ],
+            )
+
+            result = fitz.open(str(pdf_path))
+            try:
+                self.assertEqual(result.load_page(0).get_links(), [])
+                page_2_links = result.load_page(1).get_links()
+                page_3_links = result.load_page(2).get_links()
+                self.assertGreaterEqual(len(page_2_links), 2)
+                self.assertGreaterEqual(len(page_3_links), 2)
+                self.assertTrue(all(link.get("page") == 3 for link in page_2_links))
+                self.assertTrue(all(link.get("page") == 4 for link in page_3_links))
+            finally:
+                result.close()
+
     def test_build_intro_story_places_quick_summary_before_counts_and_groups_run_tables(self) -> None:
         plot_navigation = tar._tar_build_plot_navigation(
             [
@@ -832,8 +935,8 @@ class TestTrendAutoReportFilters(unittest.TestCase):
                     "Selected Run Condition(s): Condition A",
                     "Watch Parameter(s): Pressure",
                     "Programs Compared: Program B",
-                    "P8 Suppression Voltage: 5",
-                    "P8 Bus Voltage: ",
+                    "Suppression Voltage: 5",
+                    "Bus Voltage: ",
                 ],
                 "initial_suppression_voltage": "All",
                 "final_suppression_voltage": "5",

@@ -1387,11 +1387,16 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
                     )
                     report_name = dialog.findChild(QtWidgets.QLineEdit, "auto_report_report_name")
                     output_dir = dialog.findChild(QtWidgets.QLineEdit, "auto_report_output_dir")
+                    grade_summary = dialog.findChild(QtWidgets.QLabel, "auto_report_grade_scoring_summary")
                     self.assertIsNotNone(cert_button)
                     self.assertIsNotNone(report_name)
                     self.assertIsNotNone(output_dir)
+                    self.assertIsNotNone(grade_summary)
                     self.assertIn("Family Serials...", [btn.text() for btn in dialog.findChildren(QtWidgets.QPushButton)])
                     self.assertIn("Certification Specifics...", [btn.text() for btn in dialog.findChildren(QtWidgets.QPushButton)])
+                    self.assertIn("z =", grade_summary.text())
+                    self.assertIn("PASS if |z| <= 1.5", grade_summary.text())
+                    self.assertIn("WATCH if |z| <= 2.5", grade_summary.text())
                     cert_button.click()
                     self._app.processEvents()
                     self.assertIn("Program Alpha", report_name.text())
@@ -1412,7 +1417,8 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
                 with patch("ui_next.qt_main.be.get_repo_root", return_value=repo), patch(
                     "ui_next.qt_main.be.td_cached_statistics", return_value=["mean"]
                 ), patch(
-                    "ui_next.qt_main.be.load_trend_auto_report_config", return_value={}
+                    "ui_next.qt_main.be.load_trend_auto_report_config",
+                    return_value={"grading": {"zscore_pass_max": 1.5, "zscore_watch_max": 2.5}},
                 ), patch(
                     "ui_next.qt_main.be.load_excel_trend_config", return_value={}
                 ), patch(

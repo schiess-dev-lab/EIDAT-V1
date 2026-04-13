@@ -7381,6 +7381,32 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             cfg = be.load_trend_auto_report_config(self._project_dir)
         except Exception:
             cfg = {}
+
+        def _auto_report_grade_scoring_summary_text() -> str:
+            grading_cfg = (cfg.get("grading") or {}) if isinstance(cfg, dict) else {}
+            try:
+                pass_max = float(grading_cfg.get("zscore_pass_max") or 2.0)
+            except Exception:
+                pass_max = 2.0
+            try:
+                watch_max = float(grading_cfg.get("zscore_watch_max") or 3.0)
+            except Exception:
+                watch_max = 3.0
+
+            def _fmt_threshold(value: float) -> str:
+                try:
+                    return f"{float(value):g}"
+                except Exception:
+                    return str(value)
+
+            return (
+                "z-score compares a serial's max deviation against the family for the selected cohort. "
+                "z = (serial max deviation - cohort mean max deviation) / cohort standard deviation. "
+                "z = 0 is typical family behavior; larger |z| means the serial is farther from the family. "
+                f"Current cutoffs: PASS if |z| <= {_fmt_threshold(pass_max)}, "
+                f"WATCH if |z| <= {_fmt_threshold(watch_max)}, "
+                f"FAIL if |z| > {_fmt_threshold(watch_max)}."
+            )
         cached_metric_stats: list[str] = []
         try:
             cached_metric_stats = [
@@ -7619,6 +7645,22 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         lbl_runs_auto.setStyleSheet("color: #64748b; font-size: 11px;")
         lbl_runs_auto.setWordWrap(True)
         left_l.addWidget(lbl_runs_auto)
+        grade_summary_box = QtWidgets.QFrame()
+        grade_summary_box.setStyleSheet(
+            "QFrame { background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 8px; }"
+        )
+        grade_summary_layout = QtWidgets.QVBoxLayout(grade_summary_box)
+        grade_summary_layout.setContentsMargins(10, 8, 10, 8)
+        grade_summary_layout.setSpacing(4)
+        lbl_grade_summary_title = QtWidgets.QLabel("Grade Scoring")
+        lbl_grade_summary_title.setStyleSheet("color: #0f172a; font-size: 11px; font-weight: 800;")
+        grade_summary_layout.addWidget(lbl_grade_summary_title)
+        lbl_grade_summary_auto = QtWidgets.QLabel(_auto_report_grade_scoring_summary_text())
+        lbl_grade_summary_auto.setObjectName("auto_report_grade_scoring_summary")
+        lbl_grade_summary_auto.setWordWrap(True)
+        lbl_grade_summary_auto.setStyleSheet("color: #475569; font-size: 10.5px;")
+        grade_summary_layout.addWidget(lbl_grade_summary_auto)
+        left_l.addWidget(grade_summary_box)
         btn_cert_popup = QtWidgets.QPushButton("Certification Specifics...")
         btn_cert_popup.setObjectName("auto_report_certification_popup_button")
         left_l.addWidget(btn_cert_popup)

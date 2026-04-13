@@ -2218,7 +2218,7 @@ def _reportlab_imports() -> dict[str, Any]:
         from reportlab.lib.pagesizes import letter  # type: ignore
         from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet  # type: ignore
         from reportlab.lib.units import inch  # type: ignore
-        from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle  # type: ignore
+        from reportlab.platypus import KeepTogether, PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle  # type: ignore
     except Exception as exc:
         raise RuntimeError("reportlab is required to build formatted portrait report pages.") from exc
     return {
@@ -2229,6 +2229,7 @@ def _reportlab_imports() -> dict[str, Any]:
         "ParagraphStyle": ParagraphStyle,
         "getSampleStyleSheet": getSampleStyleSheet,
         "inch": inch,
+        "KeepTogether": KeepTogether,
         "PageBreak": PageBreak,
         "Paragraph": Paragraph,
         "SimpleDocTemplate": SimpleDocTemplate,
@@ -2489,10 +2490,13 @@ def _apply_plot_page_header(
     from matplotlib.patches import Rectangle  # type: ignore
 
     fig.patch.set_facecolor("white")
-    header_height = 0.13
+    header_height = 0.09
+    header_bottom = 1.0 - header_height
+    title_y = header_bottom - 0.012
+    subtitle_y = title_y - 0.026
     fig.add_artist(
         Rectangle(
-            (0.0, 1.0 - header_height),
+            (0.0, header_bottom),
             1.0,
             header_height,
             transform=fig.transFigure,
@@ -2501,14 +2505,14 @@ def _apply_plot_page_header(
             zorder=0,
         )
     )
-    fig.text(0.04, 0.965, "EDAT Engineering Data Analysis Tool", color="white", fontsize=14, fontweight="bold", va="top")
-    fig.text(0.04, 0.935, print_ctx.report_title, color="white", fontsize=9, va="top")
+    fig.text(0.04, 0.972, "EDAT Engineering Data Analysis Tool", color="white", fontsize=13, fontweight="bold", va="top")
+    fig.text(0.04, 0.947, print_ctx.report_title, color="white", fontsize=8.5, va="top")
     if section_title:
-        fig.text(0.04, 0.885, str(section_title), color="#0f172a", fontsize=16, fontweight="bold", va="top")
+        fig.text(0.04, title_y, str(section_title), color="#0f172a", fontsize=14, fontweight="bold", va="top")
     if section_subtitle:
-        fig.text(0.04, 0.858, str(section_subtitle), color="#334155", fontsize=10, va="top")
-    fig.text(0.96, 0.965, f"Page {int(page_number)}", color="white", fontsize=11, fontweight="bold", va="top", ha="right")
-    fig.text(0.96, 0.935, f"Printed: {print_ctx.printed_at}", color="white", fontsize=9, va="top", ha="right")
+        fig.text(0.04, subtitle_y, str(section_subtitle), color="#334155", fontsize=9.5, va="top")
+    fig.text(0.96, 0.972, f"Page {int(page_number)}", color="white", fontsize=10, fontweight="bold", va="top", ha="right")
+    fig.text(0.96, 0.947, f"Printed: {print_ctx.printed_at}", color="white", fontsize=8.5, va="top", ha="right")
 
 
 def _create_landscape_plot_page(
@@ -2528,7 +2532,7 @@ def _create_landscape_plot_page(
         section_title=section_title,
         section_subtitle=section_subtitle,
     )
-    ax = fig.add_axes([0.06, 0.10, 0.90, 0.70])
+    ax = fig.add_axes([0.06, 0.09, 0.90, 0.73])
     return fig, ax
 
 
@@ -3933,6 +3937,96 @@ def _tar_subtitle_text(text: object) -> str:
     return textwrap.shorten(raw, width=180, placeholder="...")
 
 
+def _tar_plot_run_condition_label(
+    spec: Mapping[str, object] | None = None,
+    *,
+    selection: Mapping[str, object] | None = None,
+    run_by_name: Mapping[str, dict] | None = None,
+    fallback_values: list[object] | None = None,
+    max_items: int = 3,
+) -> str:
+    values: list[object] = []
+    if isinstance(spec, Mapping):
+        values.extend(
+            [
+                spec.get("base_condition_label"),
+                spec.get("selection_label"),
+            ]
+        )
+        selection_labels = spec.get("selection_labels") or []
+        if isinstance(selection_labels, list):
+            values.extend(selection_labels)
+        if selection is None and isinstance(spec.get("selection"), Mapping):
+            selection = spec.get("selection")
+    if isinstance(selection, Mapping):
+        fields = _selection_display_fields(selection, run_by_name)
+        values.extend(
+            [
+                fields.get("condition_text"),
+                fields.get("display_text"),
+            ]
+        )
+    if isinstance(fallback_values, list):
+        values.extend(fallback_values)
+    cleaned = _tar_unique_text_values(values)
+    if not cleaned:
+        return ""
+    return _tar_join_limited(cleaned, max_items=max_items, empty="")
+
+
+def _tar_context_run_condition_label(ctx: Mapping[str, Any], *, max_items: int = 3) -> str:
+    options = ctx.get("options") or {}
+    labels: list[object] = []
+    raw_labels = options.get("run_selection_labels") if isinstance(options, Mapping) else []
+    if isinstance(raw_labels, list):
+        labels.extend(raw_labels)
+    raw_selections = options.get("run_selections") if isinstance(options, Mapping) else []
+    if isinstance(raw_selections, list):
+        for selection in raw_selections:
+            if not isinstance(selection, Mapping):
+                continue
+            label = _tar_plot_run_condition_label(selection=selection, run_by_name=(ctx.get("run_by_name") or {}))
+            if label:
+                labels.append(label)
+    if not labels:
+        labels.extend(
+            [
+                _run_display_text(str(run).strip(), (ctx.get("run_by_name") or {})) or str(run).strip()
+                for run in (ctx.get("runs") or [])
+                if str(run).strip()
+            ]
+        )
+    cleaned = _tar_unique_text_values(labels)
+    if not cleaned:
+        return ""
+    return _tar_join_limited(cleaned, max_items=max_items, empty="")
+
+
+def _tar_compose_plot_section_title(section_title: object, run_condition_label: object) -> str:
+    title = str(section_title or "").strip()
+    condition = str(run_condition_label or "").strip()
+    if title and condition:
+        return textwrap.shorten(f"{title} | {condition}", width=132, placeholder="...")
+    return title or condition
+
+
+def _tar_cohort_member_count(cohort_spec: Mapping[str, object] | None) -> int:
+    if not isinstance(cohort_spec, Mapping):
+        return 0
+    pair_ids = _tar_unique_text_values(cohort_spec.get("member_pair_ids") or [])
+    if pair_ids:
+        return len(pair_ids)
+    selection_labels = _tar_unique_text_values(cohort_spec.get("selection_labels") or [])
+    if selection_labels:
+        return len(selection_labels)
+    return 1
+
+
+def _tar_show_pooled_family_overlay(cohort_spec: Mapping[str, object] | None) -> bool:
+    count = _tar_cohort_member_count(cohort_spec)
+    return count <= 1
+
+
 def _tar_unique_text_values(values: list[object]) -> list[str]:
     out: list[str] = []
     seen: set[str] = set()
@@ -4496,8 +4590,8 @@ def _tar_build_quick_summary(ctx: Mapping[str, Any]) -> dict[str, object]:
         f"Selected Run Condition(s): {_tar_join_limited(summary['selected_run_conditions'], max_items=6, empty='(none)')}",
         f"Watch Parameter(s): {_tar_join_limited(summary['watch_parameters'], max_items=6, empty='None')}",
         f"Programs Compared: {_tar_join_limited(summary['comparison_programs'], max_items=6, empty='(unknown)')}",
-        f"P8 Suppression Voltage: {summary['p8_suppression_voltage']}",
-        f"P8 Bus Voltage: {summary['p8_bus_voltage']}",
+        f"Suppression Voltage: {summary['p8_suppression_voltage']}",
+        f"Bus Voltage: {summary['p8_bus_voltage']}",
     ]
     return summary
 
@@ -5055,23 +5149,25 @@ def _tar_build_plot_toc_story(ctx: Mapping[str, Any], *, styles: Mapping[str, An
         return []
 
     story: list[Any] = []
+    KeepTogether = rl.get("KeepTogether")
     PageBreak = rl["PageBreak"]
     Spacer = rl["Spacer"]
     inch = rl["inch"]
     colors = rl["colors"]
 
     for page_index, toc_page in enumerate(pages):
+        page_story: list[Any] = []
         if page_index:
             story.append(PageBreak())
-            story.append(_portrait_paragraph("Plot Table of Contents (Continued)", styles["section"], rl))
+            page_story.append(_portrait_paragraph("Plot Table of Contents (Continued)", styles["section"], rl))
         else:
-            story.append(_portrait_paragraph("Plot Table of Contents", styles["section"], rl))
+            page_story.append(_portrait_paragraph("Plot Table of Contents", styles["section"], rl))
 
         navigator_sections = list(toc_page.get("navigator_sections") or [])
         if toc_page.get("show_navigator") and navigator_sections:
             nav_labels = [str(section.get("label") or "").strip() for section in navigator_sections]
             if nav_labels:
-                story.append(
+                page_story.append(
                     _portrait_box_table(
                         [nav_labels],
                         col_widths=[(6.9 * inch) / max(1, len(nav_labels))] * len(nav_labels),
@@ -5087,7 +5183,7 @@ def _tar_build_plot_toc_story(ctx: Mapping[str, Any], *, styles: Mapping[str, An
                         ],
                     )
                 )
-                story.append(Spacer(1, 0.08 * inch))
+                page_story.append(Spacer(1, 0.08 * inch))
 
         rows = [["Plot / Section", "Page"]]
         extra_styles: list[tuple] = []
@@ -5101,7 +5197,7 @@ def _tar_build_plot_toc_story(ctx: Mapping[str, Any], *, styles: Mapping[str, An
                         ("FONTNAME", (0, row_index), (-1, row_index), "Helvetica-Bold"),
                     ]
                 )
-        story.append(
+        page_story.append(
             _portrait_box_table(
                 rows,
                 col_widths=[6.15 * inch, 0.75 * inch],
@@ -5113,7 +5209,11 @@ def _tar_build_plot_toc_story(ctx: Mapping[str, Any], *, styles: Mapping[str, An
                 extra_style_commands=extra_styles,
             )
         )
-        story.append(Spacer(1, 0.10 * inch))
+        page_story.append(Spacer(1, 0.10 * inch))
+        if callable(KeepTogether):
+            story.append(KeepTogether(page_story))
+        else:
+            story.extend(page_story)
     return story
 
 
@@ -5135,6 +5235,32 @@ def _tar_insert_page_link(page: Any, rect: Any, destination_page_index: object) 
         )
     except Exception:
         pass
+
+
+def _tar_resolve_plot_toc_page_numbers(doc: Any, toc_layout: list[dict] | None) -> list[dict]:
+    pages = [dict(page) for page in (toc_layout or []) if isinstance(page, Mapping)]
+    if not pages:
+        return []
+
+    resolved_pages: list[dict] = []
+    search_start = 0
+    for page_index, toc_page in enumerate(pages):
+        heading = "Plot Table of Contents" if page_index == 0 else "Plot Table of Contents (Continued)"
+        resolved_page_number = 0
+        for doc_index in range(search_start, int(doc.page_count or 0)):
+            page = doc.load_page(doc_index)
+            lines = [str(line).strip() for line in str(page.get_text("text") or "").splitlines() if str(line).strip()]
+            if heading in lines:
+                resolved_page_number = doc_index + 1
+                search_start = doc_index + 1
+                break
+        fallback_page_number = int(toc_page.get("toc_page_number") or 0)
+        if not resolved_page_number and 0 < fallback_page_number <= int(doc.page_count or 0):
+            resolved_page_number = fallback_page_number
+            search_start = max(search_start, fallback_page_number)
+        toc_page["resolved_toc_page_number"] = resolved_page_number
+        resolved_pages.append(toc_page)
+    return resolved_pages
 
 
 def _tar_apply_pdf_navigation(
@@ -5178,8 +5304,9 @@ def _tar_apply_pdf_navigation(
                 except Exception:
                     pass
 
-        for toc_page in toc_layout:
-            toc_page_number = int(toc_page.get("toc_page_number") or 0)
+        resolved_toc_layout = _tar_resolve_plot_toc_page_numbers(doc, toc_layout)
+        for toc_page in resolved_toc_layout:
+            toc_page_number = int(toc_page.get("resolved_toc_page_number") or toc_page.get("toc_page_number") or 0)
             if toc_page_number <= 0 or toc_page_number > doc.page_count:
                 continue
             page = doc.load_page(toc_page_number - 1)
@@ -6751,10 +6878,15 @@ def _tar_render_metric_cohort_page(
     units = str(cohort_spec.get("units") or "").strip()
     x_name = str(cohort_spec.get("x_name") or "").strip()
     selection_labels = _tar_unique_text_values(cohort_spec.get("selection_labels") or [])
+    run_condition_label = _tar_plot_run_condition_label(
+        cohort_spec,
+        run_by_name=(ctx.get("run_by_name") or {}),
+    )
+    show_family_overlay = _tar_show_pooled_family_overlay(cohort_spec)
     fig, ax = _create_landscape_plot_page(
         print_ctx=ctx["print_ctx"],
         page_number=page_number,
-        section_title=section_title,
+        section_title=_tar_compose_plot_section_title(section_title, run_condition_label),
         section_subtitle=_tar_subtitle_text(
             f"Parameter: {param_name} | Statistic: {metric_stat} | X Axis: {x_name} | "
             f"Selected: {_tar_join_limited(selection_labels, max_items=5, empty='(none)')}"
@@ -6816,9 +6948,8 @@ def _tar_render_metric_cohort_page(
             y_val = yv[xi]
             if math.isnan(y_val):
                 continue
-            grade = str(grade_map_by_pair_serial.get((pair_id, serial), "NO_DATA") or "NO_DATA").strip().upper() or "NO_DATA"
-            ax.scatter([xi], [y_val], s=48, color=_tar_grade_color(grade, default=color), zorder=5.0)
-    if family_values:
+            ax.scatter([xi], [y_val], s=62, color=color, marker="x", linewidths=1.8, zorder=5.0)
+    if show_family_overlay and family_values:
         ax.axhline(float(statistics.mean(family_values)), color="#0f172a", linestyle="--", linewidth=1.2, alpha=0.70, label=family_mean_label)
     _tar_apply_metric_axis_format(fig, ax, serials=serials, meta_by_sn=(ctx.get("meta_by_sn") or {}))
     try:
@@ -6871,14 +7002,19 @@ def _tar_render_curve_cohort_page(
     param_name = str(cohort_spec.get("param") or "").strip()
     x_name = str(cohort_spec.get("x_name") or "").strip()
     units = str(cohort_spec.get("units") or "").strip()
+    run_condition_label = _tar_plot_run_condition_label(
+        cohort_spec,
+        run_by_name=(ctx.get("run_by_name") or {}),
+    )
+    show_family_overlay = _tar_show_pooled_family_overlay(cohort_spec)
     fig, ax = _create_landscape_plot_page(
         print_ctx=ctx["print_ctx"],
         page_number=page_number,
-        section_title=section_title,
+        section_title=_tar_compose_plot_section_title(section_title, run_condition_label),
         section_subtitle=_tar_subtitle_text(subtitle),
     )
-    ax.set_position([0.06, 0.10, 0.66, 0.68])
-    ax_side = fig.add_axes([0.76, 0.12, 0.20, 0.64])
+    ax.set_position([0.06, 0.09, 0.66, 0.70])
+    ax_side = fig.add_axes([0.76, 0.11, 0.20, 0.66])
     ax_side.axis("off")
     ax.set_title(f"{param_name}", loc="left", fontsize=13, fontweight="bold", pad=10)
     ax.set_xlabel(x_name)
@@ -6891,17 +7027,18 @@ def _tar_render_curve_cohort_page(
             continue
         if y_curve:
             ax.plot(x_grid, y_curve, linewidth=0.8, alpha=0.09, color="#94a3b8")
-    ax.plot(x_grid, master_y, linewidth=2.1, color="#0f172a", label=family_label)
-    try:
-        band_lo = [a - b if (isinstance(a, (int, float)) and not math.isnan(float(a)) and isinstance(b, (int, float)) and not math.isnan(float(b))) else float("nan") for a, b in zip(master_y, std_y)]
-        band_hi = [a + b if (isinstance(a, (int, float)) and not math.isnan(float(a)) and isinstance(b, (int, float)) and not math.isnan(float(b))) else float("nan") for a, b in zip(master_y, std_y)]
-        ax.fill_between(x_grid, band_lo, band_hi, color="#93c5fd", alpha=0.22 if metric_prefix == "initial" else 0.18, label=band_label)
-    except Exception:
-        pass
+    if show_family_overlay:
+        ax.plot(x_grid, master_y, linewidth=2.1, color="#0f172a", label=family_label)
+        try:
+            band_lo = [a - b if (isinstance(a, (int, float)) and not math.isnan(float(a)) and isinstance(b, (int, float)) and not math.isnan(float(b))) else float("nan") for a, b in zip(master_y, std_y)]
+            band_hi = [a + b if (isinstance(a, (int, float)) and not math.isnan(float(a)) and isinstance(b, (int, float)) and not math.isnan(float(b))) else float("nan") for a, b in zip(master_y, std_y)]
+            ax.fill_between(x_grid, band_lo, band_hi, color="#93c5fd", alpha=0.22 if metric_prefix == "initial" else 0.18, label=band_label)
+        except Exception:
+            pass
 
     note_lines: list[str] = []
     family_equation = str(((cohort_spec.get("model") or {}).get("equation") or "")).strip()
-    if family_equation:
+    if show_family_overlay and family_equation:
         note_lines.append(equation_label)
         note_lines.extend(textwrap.wrap(family_equation, width=30) or [family_equation])
         note_lines.append(f"RMSE: {_fmt_num(((cohort_spec.get('model') or {}).get('poly') or {}).get('rmse'), sig=5)}")
@@ -6985,16 +7122,21 @@ def _tar_render_watch_curve_page(
     y_resampled_by_sn = dict(plot_payload.get("y_resampled_by_sn") or {})
     master_y = list(plot_payload.get("master_y") or [])
     std_y = list(plot_payload.get("std_y") or [])
+    run_condition_label = _tar_plot_run_condition_label(
+        pair_spec,
+        selection=(pair_spec.get("selection") if isinstance(pair_spec.get("selection"), Mapping) else None),
+        run_by_name=(ctx.get("run_by_name") or {}),
+    )
     fig, ax = _create_landscape_plot_page(
         print_ctx=ctx["print_ctx"],
         page_number=page_number,
-        section_title="Watch / Non-PASS Curves",
+        section_title=_tar_compose_plot_section_title("Watch / Non-PASS Curves", run_condition_label),
         section_subtitle=_tar_subtitle_text(
             f"{str(pair_spec.get('selection_label') or run_name).strip() or run_name} | Parameter: {param_name}"
         ),
     )
-    ax.set_position([0.06, 0.10, 0.66, 0.68])
-    ax_side = fig.add_axes([0.76, 0.12, 0.20, 0.64])
+    ax.set_position([0.06, 0.09, 0.66, 0.70])
+    ax_side = fig.add_axes([0.76, 0.11, 0.20, 0.66])
     ax_side.axis("off")
     units = str(pair_spec.get("units") or "").strip()
     run_title = str(pair_spec.get("run_title") or run_name).strip() or run_name
@@ -7249,14 +7391,15 @@ def _tar_render_plot_sections(
                 continue
             _tar_emit_progress(progress_cb, f"Performance plot {perf_index}/{len(performance_plot_specs)}: {name} | {y_target} vs {x_target} | {perf_stat}")
             page_number = intro_pages + plot_page_count + 1
+            run_condition_label = _tar_context_run_condition_label(ctx)
             fig, ax = _create_landscape_plot_page(
                 print_ctx=ctx["print_ctx"],
                 page_number=page_number,
-                section_title="Performance Plot",
+                section_title=_tar_compose_plot_section_title("Performance Plot", run_condition_label),
                 section_subtitle=_tar_subtitle_text(f"{name} | {y_target} vs {x_target} | Statistic: {perf_stat}"),
             )
-            ax.set_position([0.06, 0.10, 0.66, 0.68])
-            ax_side = fig.add_axes([0.76, 0.12, 0.20, 0.64])
+            ax.set_position([0.06, 0.09, 0.66, 0.70])
+            ax_side = fig.add_axes([0.76, 0.11, 0.20, 0.66])
             ax_side.axis("off")
             x_units = str(((perf_spec.get("x") or {}).get("units") or "")).strip()
             y_units = str(((perf_spec.get("y") or {}).get("units") or "")).strip()
@@ -7587,14 +7730,15 @@ def _tar_render_plot_sections(
                 continue
             _tar_emit_progress(progress_cb, f"Performance plot {perf_index}/{len(performance_plot_specs)}: {name} | {y_target} vs {x_target} | {perf_stat}")
             page_number = intro_pages + plot_page_count + 1
+            run_condition_label = _tar_context_run_condition_label(ctx)
             fig, ax = _create_landscape_plot_page(
                 print_ctx=ctx["print_ctx"],
                 page_number=page_number,
-                section_title="Performance Plot",
+                section_title=_tar_compose_plot_section_title("Performance Plot", run_condition_label),
                 section_subtitle=_tar_subtitle_text(f"{name} | {y_target} vs {x_target} | Statistic: {perf_stat}"),
             )
-            ax.set_position([0.06, 0.10, 0.66, 0.68])
-            ax_side = fig.add_axes([0.76, 0.12, 0.20, 0.64])
+            ax.set_position([0.06, 0.09, 0.66, 0.70])
+            ax_side = fig.add_axes([0.76, 0.11, 0.20, 0.66])
             ax_side.axis("off")
             x_units = str(((perf_spec.get("x") or {}).get("units") or "")).strip()
             y_units = str(((perf_spec.get("y") or {}).get("units") or "")).strip()
