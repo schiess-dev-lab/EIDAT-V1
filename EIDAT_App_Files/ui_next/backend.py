@@ -5153,6 +5153,74 @@ TD_SUPPORT_RUN_CONDITION_BOUNDS_SHEET = "RunConditionBounds"
 TD_SUPPORT_DEFAULT_PROGRAM_TITLE = "Default Program"
 TD_SUPPORT_PROGRAM_SHEET_PREFIX = "Program_"
 TD_SUPPORT_CONDITION_SHEET_PREFIX = "Condition_"
+TD_PROGRAM_REQUIREMENTS_WORKBOOK_NAME = "ProgramRequirements.xlsx"
+TD_PROGRAM_REQUIREMENTS_INDEX_SHEET = "Index"
+TD_PROGRAM_REQUIREMENTS_VALIDATION_SHEET = "_validation"
+TD_PROGRAM_REQUIREMENTS_SUPPORT_INDEX_SHEET = "ProgramRequirements"
+TD_PROGRAM_REQUIREMENTS_SUPPORT_SHEET_PREFIX = "ProgramReq_"
+TD_PROGRAM_REQUIREMENTS_INDEX_HEADERS = [
+    "program_title",
+    "condition_key",
+    "display_name",
+    "sheet_name",
+    "run_type",
+    "pulse_width_on",
+    "control_period",
+    "suppression_voltage",
+    "member_sequences",
+    "last_refreshed",
+]
+TD_PROGRAM_REQUIREMENTS_SOURCE_HEADERS = [
+    "enabled",
+    "parameter_name",
+    "units",
+    "min_value",
+    "max_value",
+]
+TD_PROGRAM_REQUIREMENTS_SUPPORT_INDEX_HEADERS = [
+    "program_title",
+    "condition_key",
+    "display_name",
+    "sheet_name",
+    "run_type",
+    "pulse_width_on",
+    "control_period",
+    "suppression_voltage",
+    "member_sequences",
+    "source_workbook",
+    "source_sheet_name",
+    "requirements_count",
+]
+TD_PROGRAM_REQUIREMENTS_SUPPORT_HEADERS = [
+    "enabled",
+    "parameter_name",
+    "units",
+    "min_value",
+    "max_value",
+    "program_title",
+    "condition_key",
+    "display_name",
+    "run_type",
+    "pulse_width_on",
+    "control_period",
+    "suppression_voltage",
+    "member_sequences",
+    "source_workbook",
+    "source_sheet_name",
+]
+TD_PROGRAM_REQUIREMENTS_METADATA_KEYS = [
+    "program_title",
+    "condition_key",
+    "display_name",
+    "run_type",
+    "pulse_width_on",
+    "control_period",
+    "suppression_voltage",
+    "member_sequences",
+]
+TD_PROGRAM_REQUIREMENTS_TABLE_HEADER_ROW = 10
+TD_PROGRAM_REQUIREMENTS_TABLE_FIRST_DATA_ROW = TD_PROGRAM_REQUIREMENTS_TABLE_HEADER_ROW + 1
+TD_PROGRAM_REQUIREMENTS_VALIDATION_LAST_ROW = 200
 
 
 def _td_support_norm_name(value: object) -> str:
@@ -5200,6 +5268,1066 @@ def _td_safe_excel_sheet_title(title: object, used: set[str], *, fallback: str =
         suffix_idx += 1
     used.add(candidate.lower())
     return candidate
+
+
+def td_program_requirements_workbook_path_for(global_repo: Path | None, program_title: object) -> Path:
+    repo = Path(global_repo or get_repo_root()).expanduser()
+    return (
+        edin_program_folders_root(repo)
+        / edin_program_folder_name(program_title)
+        / TD_PROGRAM_REQUIREMENTS_WORKBOOK_NAME
+    )
+
+
+def _td_program_requirements_split_member_sequences(value: object) -> list[str]:
+    raw = str(value or "").replace("\n", ";")
+    out: list[str] = []
+    seen: set[str] = set()
+    for part in raw.split(";"):
+        text = str(part or "").strip()
+        key = text.casefold()
+        if not text or key in seen:
+            continue
+        seen.add(key)
+        out.append(text)
+    return out
+
+
+def _td_program_requirements_member_sequences_text(value: object) -> str:
+    return "; ".join(_td_program_requirements_split_member_sequences(value))
+
+
+def _td_program_requirements_parse_bool(value: object, *, default: bool = True) -> bool:
+    if isinstance(value, bool):
+        return bool(value)
+    text = str(value or "").strip().lower()
+    if not text:
+        return bool(default)
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return bool(default)
+
+
+def _td_program_requirements_condition_identity(value: object, *, fallback: object = "") -> str:
+    text = str(value or fallback or "").strip()
+    return _td_support_norm_name(text) or _td_norm_ident_token(text or fallback or "condition")
+
+
+def _td_program_requirements_existing_catalog(requirements: Sequence[Mapping[str, object]] | None) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for row in requirements or []:
+        if not isinstance(row, Mapping):
+            continue
+        name = str(row.get("parameter_name") or "").strip()
+        key = _td_support_norm_name(name)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append({"name": name, "units": str(row.get("units") or "").strip()})
+    return out
+
+
+def _td_program_requirements_merge_catalogs(*catalog_lists: Sequence[Mapping[str, object]] | None) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    by_key: dict[str, int] = {}
+    for catalog in catalog_lists:
+        for item in catalog or []:
+            if not isinstance(item, Mapping):
+                continue
+            name = str(item.get("name") or item.get("parameter_name") or "").strip()
+            key = _td_support_norm_name(name)
+            if not key:
+                continue
+            units = str(item.get("units") or "").strip()
+            idx = by_key.get(key)
+            if idx is None:
+                by_key[key] = len(out)
+                out.append({"name": name, "units": units})
+                continue
+            if units and not str(out[idx].get("units") or "").strip():
+                out[idx]["units"] = units
+    return out
+
+
+def _td_program_requirements_runtime_x_aliases() -> set[str]:
+    aliases = {"time", "pulse"}
+    try:
+        runtime_cfg = _load_runtime_td_trend_config()
+        x_cfg = dict((runtime_cfg.get("config") or {}).get("x_axis") or {})
+    except Exception:
+        x_cfg = {}
+    for value in (x_cfg.get("time_aliases") or []):
+        key = _td_support_norm_name(value)
+        if key:
+            aliases.add(key)
+    for value in (x_cfg.get("pulse_aliases") or []):
+        key = _td_support_norm_name(value)
+        if key:
+            aliases.add(key)
+    default_x = _td_support_norm_name(x_cfg.get("default_x"))
+    if default_x:
+        aliases.add(default_x)
+    return aliases
+
+
+def _td_program_requirements_param_def_map(param_defs: Sequence[Mapping[str, object]] | None) -> dict[str, dict[str, str]]:
+    defs = [
+        dict(item)
+        for item in (param_defs or [])
+        if isinstance(item, Mapping) and str(item.get("name") or "").strip()
+    ]
+    if not defs:
+        try:
+            defs = [
+                dict(item)
+                for item in (_load_runtime_td_trend_config().get("columns") or [])
+                if isinstance(item, Mapping) and str(item.get("name") or "").strip()
+            ]
+        except Exception:
+            defs = []
+    out: dict[str, dict[str, str]] = {}
+    for item in defs:
+        name = str(item.get("name") or "").strip()
+        units = str(item.get("units") or "").strip()
+        aliases = [name]
+        aliases.extend(
+            str(alias).strip()
+            for alias in (item.get("aliases") or [])
+            if str(alias).strip()
+        )
+        for alias in aliases:
+            key = _td_support_norm_name(alias)
+            if key and key not in out:
+                out[key] = {"name": name, "units": units}
+    return out
+
+
+def _td_program_requirements_is_parameter_column(column_name: object, *, x_aliases: set[str]) -> bool:
+    raw = str(column_name or "").strip()
+    if not raw or raw.startswith("__"):
+        return False
+    key = _td_support_norm_name(raw)
+    if not key or key in x_aliases:
+        return False
+    excluded = {
+        "excelrow",
+        "row",
+        "rowid",
+        "index",
+        "feedpressure",
+        "feedtemperature",
+        "feedtemp",
+        "runtype",
+        "pulsewidth",
+        "pulsewidthon",
+        "pulsewidthoff",
+        "pulseon",
+        "pulseoff",
+        "offtime",
+        "controlperiod",
+        "suppressionvoltage",
+        "suppressionv",
+        "nominalpfvalue",
+        "nominalpfunits",
+        "nominaltfvalue",
+        "nominaltfunits",
+        "sheetname",
+        "sourcesheetname",
+        "datamoderaw",
+        "extractionstatus",
+        "extractionreason",
+    }
+    return key not in excluded
+
+
+def _td_program_requirements_discover_run_parameters(
+    conn: sqlite3.Connection,
+    table_name: str,
+    *,
+    param_defs: Sequence[Mapping[str, object]] | None,
+) -> list[dict[str, str]]:
+    name = str(table_name or "").strip()
+    if not name or not _td_table_exists(conn, name):
+        return []
+    try:
+        rows = conn.execute(f"PRAGMA table_info({_quote_ident(name)})").fetchall()
+    except Exception:
+        rows = []
+    if not rows:
+        return []
+    x_aliases = _td_program_requirements_runtime_x_aliases()
+    param_map = _td_program_requirements_param_def_map(param_defs)
+    out: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for row in rows:
+        column_name = str(row[1] or "").strip()
+        if not _td_program_requirements_is_parameter_column(column_name, x_aliases=x_aliases):
+            continue
+        matched = param_map.get(_td_support_norm_name(column_name)) or {}
+        canonical_name = str(matched.get("name") or column_name).strip()
+        key = _td_support_norm_name(canonical_name)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(
+            {
+                "name": canonical_name,
+                "units": str(matched.get("units") or "").strip(),
+            }
+        )
+    return out
+
+
+def _td_program_requirements_discover_conditions_by_program(
+    global_repo: Path | None,
+    docs: Sequence[Mapping[str, object]] | None,
+    *,
+    param_defs: Sequence[Mapping[str, object]] | None,
+) -> dict[str, list[dict[str, object]]]:
+    repo = Path(global_repo).expanduser() if global_repo is not None else None
+    rows_by_program: dict[str, list[dict[str, object]]] = {}
+    parameters_by_program_run: dict[str, dict[str, list[dict[str, str]]]] = {}
+    refreshed_at = datetime.now().isoformat(timespec="seconds")
+    for doc in docs or []:
+        if repo is None or not isinstance(doc, Mapping):
+            continue
+        program_title = str(doc.get("program_title") or "").strip() or TD_SUPPORT_DEFAULT_PROGRAM_TITLE
+        resolved = _resolve_td_source_sqlite_for_node(
+            repo,
+            excel_sqlite_rel=str(doc.get("excel_sqlite_rel") or "").strip(),
+            artifacts_rel=str(doc.get("artifacts_rel") or "").strip(),
+        )
+        sqlite_path = resolved.get("path")
+        if not sqlite_path:
+            continue
+        path = Path(sqlite_path).expanduser()
+        if not path.exists() or not path.is_file():
+            continue
+        try:
+            with sqlite3.connect(str(path)) as conn:
+                try:
+                    runs = [str(row[0] or "").strip() for row in _ordered_td_sheet_info_rows(conn) if str(row[0] or "").strip()]
+                except Exception:
+                    rows = conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'sheet__%' ORDER BY name"
+                    ).fetchall()
+                    runs = [str(row[0] or "")[7:] for row in rows if str(row[0] or "").startswith("sheet__")]
+                sequence_context = _td_read_sequence_context_by_run(conn)
+                table_name_by_run: dict[str, str] = {}
+                if _td_table_exists(conn, "__sheet_info"):
+                    try:
+                        info_rows = conn.execute(
+                            "SELECT sheet_name, COALESCE(table_name, '') FROM __sheet_info ORDER BY rowid"
+                        ).fetchall()
+                    except Exception:
+                        info_rows = []
+                    for sheet_name, table_name in info_rows:
+                        run_name = str(sheet_name or "").strip()
+                        run_key = _td_support_norm_name(run_name)
+                        table = str(table_name or "").strip()
+                        if run_key and table:
+                            table_name_by_run[run_key] = table
+                for run_name in runs:
+                    clean_run = str(run_name or "").strip()
+                    if not clean_run:
+                        continue
+                    row = _td_support_program_row_defaults(clean_run, program_title=program_title)
+                    row = _td_prefill_support_row_from_sequence_context(
+                        row,
+                        sequence_context.get(_td_support_norm_name(clean_run)),
+                        blank_unusable_defaults=False,
+                    )
+                    rows_by_program.setdefault(program_title, []).append(row)
+                    table_name = table_name_by_run.get(_td_support_norm_name(clean_run)) or f"sheet__{clean_run}"
+                    catalog = _td_program_requirements_discover_run_parameters(
+                        conn,
+                        table_name,
+                        param_defs=param_defs,
+                    )
+                    if catalog:
+                        run_key = _td_support_norm_name(clean_run)
+                        merged = _td_program_requirements_merge_catalogs(
+                            (parameters_by_program_run.get(program_title) or {}).get(run_key),
+                            catalog,
+                        )
+                        parameters_by_program_run.setdefault(program_title, {})[run_key] = merged
+        except Exception:
+            continue
+
+    out: dict[str, list[dict[str, object]]] = {}
+    for program_title, rows in rows_by_program.items():
+        conditions = _td_group_program_rows_into_conditions(rows)
+        program_run_catalog = parameters_by_program_run.get(program_title) or {}
+        normalized_conditions: list[dict[str, object]] = []
+        for condition in conditions:
+            member_sequences = [
+                str(value).strip()
+                for value in (condition.get("member_sequences") or [])
+                if str(value).strip()
+            ]
+            member_catalog: list[dict[str, str]] = []
+            for member_sequence in member_sequences:
+                member_catalog = _td_program_requirements_merge_catalogs(
+                    member_catalog,
+                    program_run_catalog.get(_td_support_norm_name(member_sequence)),
+                )
+            normalized_conditions.append(
+                {
+                    "program_title": program_title,
+                    "condition_key": str(condition.get("condition_key") or "").strip(),
+                    "display_name": str(condition.get("display_name") or condition.get("condition_key") or "").strip(),
+                    "run_type": str(condition.get("run_type") or "").strip(),
+                    "pulse_width_on": condition.get("pulse_width_on", condition.get("pulse_width")),
+                    "control_period": condition.get("control_period"),
+                    "suppression_voltage": condition.get("suppression_voltage"),
+                    "member_sequences": member_sequences,
+                    "member_sequences_text": "; ".join(member_sequences),
+                    "parameter_catalog": member_catalog,
+                    "last_refreshed": refreshed_at,
+                }
+            )
+        out[program_title] = normalized_conditions
+    return out
+
+
+def _td_program_requirements_header_map(ws, *, row_idx: int) -> dict[str, int]:
+    return {
+        str(ws.cell(row_idx, col).value or "").strip().lower(): col
+        for col in range(1, (ws.max_column or 0) + 1)
+        if str(ws.cell(row_idx, col).value or "").strip()
+    }
+
+
+def _td_program_requirements_parse_condition_sheet(ws, *, fallback: Mapping[str, object] | None = None) -> dict[str, object]:
+    fallback = dict(fallback or {})
+    metadata: dict[str, object] = {}
+    for row_idx in range(1, TD_PROGRAM_REQUIREMENTS_TABLE_HEADER_ROW):
+        key = str(ws.cell(row_idx, 1).value or "").strip()
+        if key:
+            metadata[key] = ws.cell(row_idx, 2).value
+    for key in TD_PROGRAM_REQUIREMENTS_METADATA_KEYS:
+        if key not in metadata and key in fallback:
+            metadata[key] = fallback.get(key)
+    condition_key = str(metadata.get("condition_key") or fallback.get("condition_key") or ws.title).strip()
+    display_name = str(metadata.get("display_name") or fallback.get("display_name") or condition_key or ws.title).strip()
+    headers = _td_program_requirements_header_map(ws, row_idx=TD_PROGRAM_REQUIREMENTS_TABLE_HEADER_ROW)
+    requirements: list[dict[str, object]] = []
+    for row_idx in range(TD_PROGRAM_REQUIREMENTS_TABLE_FIRST_DATA_ROW, (ws.max_row or 0) + 1):
+        row_data = {
+            "enabled": ws.cell(row_idx, headers.get("enabled", 1)).value if headers else None,
+            "parameter_name": ws.cell(row_idx, headers.get("parameter_name", 2)).value if headers else None,
+            "units": ws.cell(row_idx, headers.get("units", 3)).value if headers else None,
+            "min_value": ws.cell(row_idx, headers.get("min_value", 4)).value if headers else None,
+            "max_value": ws.cell(row_idx, headers.get("max_value", 5)).value if headers else None,
+        }
+        if not any(value not in (None, "") for value in row_data.values()):
+            continue
+        requirements.append(
+            {
+                "enabled": _td_program_requirements_parse_bool(row_data.get("enabled"), default=True),
+                "parameter_name": str(row_data.get("parameter_name") or "").strip(),
+                "units": str(row_data.get("units") or "").strip(),
+                "min_value": row_data.get("min_value"),
+                "max_value": row_data.get("max_value"),
+            }
+        )
+    member_sequences = _td_program_requirements_split_member_sequences(
+        metadata.get("member_sequences") or fallback.get("member_sequences")
+    )
+    return {
+        "program_title": str(metadata.get("program_title") or fallback.get("program_title") or "").strip(),
+        "condition_key": condition_key,
+        "display_name": display_name or condition_key,
+        "sheet_name": str(fallback.get("sheet_name") or ws.title).strip() or ws.title,
+        "run_type": str(metadata.get("run_type") or fallback.get("run_type") or "").strip(),
+        "pulse_width_on": metadata.get("pulse_width_on", fallback.get("pulse_width_on")),
+        "control_period": metadata.get("control_period", fallback.get("control_period")),
+        "suppression_voltage": metadata.get("suppression_voltage", fallback.get("suppression_voltage")),
+        "member_sequences": member_sequences,
+        "member_sequences_text": "; ".join(member_sequences),
+        "last_refreshed": str(fallback.get("last_refreshed") or "").strip(),
+        "requirements": requirements,
+        "parameter_catalog": _td_program_requirements_existing_catalog(requirements),
+    }
+
+
+def _td_program_requirements_parse_workbook(wb) -> dict[str, object]:
+    reserved = {
+        TD_PROGRAM_REQUIREMENTS_INDEX_SHEET.lower(),
+        TD_PROGRAM_REQUIREMENTS_VALIDATION_SHEET.lower(),
+    }
+    index_rows: list[dict[str, object]] = []
+    if TD_PROGRAM_REQUIREMENTS_INDEX_SHEET in wb.sheetnames:
+        ws_index = wb[TD_PROGRAM_REQUIREMENTS_INDEX_SHEET]
+        headers = _td_program_requirements_header_map(ws_index, row_idx=1)
+        for row_idx in range(2, (ws_index.max_row or 0) + 1):
+            row = {
+                header: ws_index.cell(row_idx, col).value
+                for header, col in headers.items()
+            }
+            if not any(value not in (None, "") for value in row.values()):
+                continue
+            index_rows.append({str(key): value for key, value in row.items()})
+    ordered_conditions: list[dict[str, object]] = []
+    parsed_sheets: set[str] = set()
+    for row in index_rows:
+        sheet_name = str(row.get("sheet_name") or "").strip()
+        if not sheet_name or sheet_name not in wb.sheetnames:
+            continue
+        condition = _td_program_requirements_parse_condition_sheet(
+            wb[sheet_name],
+            fallback=row,
+        )
+        ordered_conditions.append(condition)
+        parsed_sheets.add(sheet_name.lower())
+    for sheet_name in wb.sheetnames:
+        if sheet_name.lower() in reserved or sheet_name.lower() in parsed_sheets:
+            continue
+        ws = wb[sheet_name]
+        headers = _td_program_requirements_header_map(ws, row_idx=TD_PROGRAM_REQUIREMENTS_TABLE_HEADER_ROW)
+        if "parameter_name" not in headers:
+            continue
+        condition = _td_program_requirements_parse_condition_sheet(
+            ws,
+            fallback={"sheet_name": sheet_name},
+        )
+        ordered_conditions.append(condition)
+    return {"conditions": ordered_conditions}
+
+
+def _td_program_requirements_apply_units(
+    requirements: Sequence[Mapping[str, object]] | None,
+    catalog: Sequence[Mapping[str, object]] | None,
+) -> list[dict[str, object]]:
+    catalog_map = {
+        _td_support_norm_name(item.get("name")): str(item.get("units") or "").strip()
+        for item in (catalog or [])
+        if isinstance(item, Mapping) and str(item.get("name") or "").strip()
+    }
+    out: list[dict[str, object]] = []
+    for row in requirements or []:
+        if not isinstance(row, Mapping):
+            continue
+        parameter_name = str(row.get("parameter_name") or "").strip()
+        units = str(row.get("units") or "").strip()
+        if parameter_name and not units:
+            units = str(catalog_map.get(_td_support_norm_name(parameter_name)) or "").strip()
+        out.append(
+            {
+                "enabled": _td_program_requirements_parse_bool(row.get("enabled"), default=True),
+                "parameter_name": parameter_name,
+                "units": units,
+                "min_value": row.get("min_value"),
+                "max_value": row.get("max_value"),
+            }
+        )
+    return out
+
+
+def _td_program_requirements_write_condition_sheet(ws, condition: Mapping[str, object], *, validation_formula: str = "") -> None:
+    try:
+        ws.delete_rows(1, ws.max_row or 1)
+    except Exception:
+        parent = ws.parent
+        title = ws.title
+        try:
+            parent.remove(ws)
+        except Exception:
+            pass
+        ws = parent.create_sheet(title)
+    for row_idx, key in enumerate(TD_PROGRAM_REQUIREMENTS_METADATA_KEYS, start=1):
+        ws.cell(row_idx, 1).value = key
+        value = condition.get(key)
+        if key == "member_sequences":
+            value = condition.get("member_sequences_text") or _td_program_requirements_member_sequences_text(value)
+        ws.cell(row_idx, 2).value = value
+    for col_idx, header in enumerate(TD_PROGRAM_REQUIREMENTS_SOURCE_HEADERS, start=1):
+        ws.cell(TD_PROGRAM_REQUIREMENTS_TABLE_HEADER_ROW, col_idx).value = header
+    requirements = _td_program_requirements_apply_units(
+        condition.get("requirements"),
+        condition.get("parameter_catalog"),
+    )
+    if not requirements:
+        requirements = [
+            {
+                "enabled": True,
+                "parameter_name": "",
+                "units": "",
+                "min_value": None,
+                "max_value": None,
+            }
+        ]
+    for row_idx, row in enumerate(requirements, start=TD_PROGRAM_REQUIREMENTS_TABLE_FIRST_DATA_ROW):
+        ws.cell(row_idx, 1).value = row.get("enabled")
+        ws.cell(row_idx, 2).value = row.get("parameter_name")
+        ws.cell(row_idx, 3).value = row.get("units")
+        ws.cell(row_idx, 4).value = row.get("min_value")
+        ws.cell(row_idx, 5).value = row.get("max_value")
+    try:
+        ws.freeze_panes = f"A{TD_PROGRAM_REQUIREMENTS_TABLE_FIRST_DATA_ROW}"
+    except Exception:
+        pass
+    if validation_formula:
+        try:
+            ws.data_validations.dataValidation = []
+        except Exception:
+            pass
+        _apply_list_validation(
+            ws,
+            formula_range=validation_formula,
+            sqref=f"B{TD_PROGRAM_REQUIREMENTS_TABLE_FIRST_DATA_ROW}:B{TD_PROGRAM_REQUIREMENTS_VALIDATION_LAST_ROW}",
+            title="ProgramRequirements",
+        )
+
+
+def _td_program_requirements_write_workbook(
+    workbook_path: Path,
+    *,
+    program_title: str,
+    discovered_conditions: Sequence[Mapping[str, object]] | None,
+) -> dict[str, object]:
+    try:
+        from openpyxl import Workbook  # type: ignore
+    except Exception as exc:
+        raise RuntimeError(
+            "openpyxl is required to update ProgramRequirements workbooks. "
+            "Install it with `py -m pip install openpyxl` within the project environment."
+        ) from exc
+
+    wb_path = Path(workbook_path).expanduser()
+    wb_path.parent.mkdir(parents=True, exist_ok=True)
+    created = False
+    if wb_path.exists():
+        wb = _td_load_workbook_ignore_long_title_warning(str(wb_path))
+    else:
+        wb = Workbook()
+        created = True
+    try:
+        existing_state = _td_program_requirements_parse_workbook(wb)
+        existing_conditions = [
+            dict(item)
+            for item in (existing_state.get("conditions") or [])
+            if isinstance(item, Mapping)
+        ]
+        existing_by_key = {
+            _td_program_requirements_condition_identity(item.get("condition_key"), fallback=item.get("sheet_name")): dict(item)
+            for item in existing_conditions
+        }
+        discovered = [
+            dict(item)
+            for item in (discovered_conditions or [])
+            if isinstance(item, Mapping) and str(item.get("condition_key") or "").strip()
+        ]
+        ordered_conditions: list[dict[str, object]] = []
+        seen: set[str] = set()
+        refreshed_at = datetime.now().isoformat(timespec="seconds")
+        for item in discovered:
+            key = _td_program_requirements_condition_identity(item.get("condition_key"), fallback=item.get("display_name"))
+            existing = dict(existing_by_key.get(key) or {})
+            merged_catalog = _td_program_requirements_merge_catalogs(
+                existing.get("parameter_catalog"),
+                _td_program_requirements_existing_catalog(existing.get("requirements")),
+                item.get("parameter_catalog"),
+            )
+            merged = {
+                **existing,
+                **item,
+                "program_title": program_title,
+                "member_sequences": list(item.get("member_sequences") or []),
+                "member_sequences_text": _td_program_requirements_member_sequences_text(item.get("member_sequences_text") or item.get("member_sequences")),
+                "parameter_catalog": merged_catalog,
+                "requirements": _td_program_requirements_apply_units(existing.get("requirements"), merged_catalog),
+                "last_refreshed": refreshed_at,
+            }
+            ordered_conditions.append(merged)
+            seen.add(key)
+        for item in existing_conditions:
+            key = _td_program_requirements_condition_identity(item.get("condition_key"), fallback=item.get("sheet_name"))
+            if key in seen:
+                continue
+            carry = dict(item)
+            carry["program_title"] = str(carry.get("program_title") or program_title).strip() or program_title
+            carry["member_sequences"] = list(carry.get("member_sequences") or [])
+            carry["member_sequences_text"] = _td_program_requirements_member_sequences_text(
+                carry.get("member_sequences_text") or carry.get("member_sequences")
+            )
+            carry["parameter_catalog"] = _td_program_requirements_merge_catalogs(
+                carry.get("parameter_catalog"),
+                _td_program_requirements_existing_catalog(carry.get("requirements")),
+            )
+            carry["requirements"] = _td_program_requirements_apply_units(
+                carry.get("requirements"),
+                carry.get("parameter_catalog"),
+            )
+            ordered_conditions.append(carry)
+
+        preserved_sheet_names = {
+            str(item.get("sheet_name") or "").strip().lower()
+            for item in existing_conditions
+            if str(item.get("sheet_name") or "").strip()
+        }
+        used_sheet_names = {
+            TD_PROGRAM_REQUIREMENTS_INDEX_SHEET.lower(),
+            TD_PROGRAM_REQUIREMENTS_VALIDATION_SHEET.lower(),
+        }
+        used_sheet_names.update(
+            str(sheet_name).strip().lower()
+            for sheet_name in wb.sheetnames
+            if str(sheet_name).strip().lower() not in preserved_sheet_names
+        )
+        for condition in ordered_conditions:
+            existing_sheet_name = str(condition.get("sheet_name") or "").strip()
+            if existing_sheet_name and existing_sheet_name.lower() in preserved_sheet_names and existing_sheet_name.lower() not in used_sheet_names:
+                condition["sheet_name"] = existing_sheet_name
+                used_sheet_names.add(existing_sheet_name.lower())
+                continue
+            preferred = str(condition.get("display_name") or condition.get("condition_key") or "").strip()
+            condition["sheet_name"] = _td_safe_excel_sheet_title(preferred, used_sheet_names, fallback="Condition")
+
+        ws_index = _td_reset_workbook_sheet(
+            wb,
+            TD_PROGRAM_REQUIREMENTS_INDEX_SHEET,
+            list(TD_PROGRAM_REQUIREMENTS_INDEX_HEADERS),
+        )
+        for condition in ordered_conditions:
+            ws_index.append(
+                [
+                    str(condition.get("program_title") or program_title).strip() or program_title,
+                    str(condition.get("condition_key") or "").strip(),
+                    str(condition.get("display_name") or condition.get("condition_key") or "").strip(),
+                    str(condition.get("sheet_name") or "").strip(),
+                    str(condition.get("run_type") or "").strip(),
+                    condition.get("pulse_width_on"),
+                    condition.get("control_period"),
+                    condition.get("suppression_voltage"),
+                    str(condition.get("member_sequences_text") or "").strip(),
+                    str(condition.get("last_refreshed") or refreshed_at).strip(),
+                ]
+            )
+
+        ws_validation = _ensure_validation_sheet(wb, sheet_name=TD_PROGRAM_REQUIREMENTS_VALIDATION_SHEET)
+        validation_ranges: dict[str, str] = {}
+        try:
+            from openpyxl.utils import get_column_letter  # type: ignore
+        except Exception:
+            get_column_letter = None  # type: ignore[assignment]
+        for col_idx, condition in enumerate(ordered_conditions, start=1):
+            ws_validation.cell(1, col_idx).value = str(condition.get("condition_key") or condition.get("sheet_name") or "")
+            catalog = _td_program_requirements_merge_catalogs(
+                condition.get("parameter_catalog"),
+                _td_program_requirements_existing_catalog(condition.get("requirements")),
+            )
+            for row_idx, item in enumerate(catalog, start=2):
+                ws_validation.cell(row_idx, col_idx).value = str(item.get("name") or "").strip()
+            if catalog and get_column_letter is not None:
+                col_letter = get_column_letter(col_idx)
+                validation_ranges[
+                    _td_program_requirements_condition_identity(
+                        condition.get("condition_key"),
+                        fallback=condition.get("sheet_name"),
+                    )
+                ] = f"='{ws_validation.title}'!${col_letter}$2:${col_letter}${len(catalog) + 1}"
+
+        for condition in ordered_conditions:
+            sheet_name = str(condition.get("sheet_name") or "").strip()
+            ws_condition = wb[sheet_name] if sheet_name in wb.sheetnames else wb.create_sheet(sheet_name)
+            validation_formula = validation_ranges.get(
+                _td_program_requirements_condition_identity(
+                    condition.get("condition_key"),
+                    fallback=sheet_name,
+                ),
+                "",
+            )
+            _td_program_requirements_write_condition_sheet(
+                ws_condition,
+                condition,
+                validation_formula=validation_formula,
+            )
+
+        if (
+            "Sheet" in wb.sheetnames
+            and "Sheet" not in {TD_PROGRAM_REQUIREMENTS_INDEX_SHEET, TD_PROGRAM_REQUIREMENTS_VALIDATION_SHEET}
+            and "sheet" not in {
+                str(condition.get("sheet_name") or "").strip().lower()
+                for condition in ordered_conditions
+            }
+        ):
+            try:
+                wb.remove(wb["Sheet"])
+            except Exception:
+                pass
+
+        wb.save(str(wb_path))
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
+    return {
+        "program_title": program_title,
+        "path": str(wb_path),
+        "created": bool(created),
+        "updated": True,
+        "condition_count": int(len(discovered_conditions or [])),
+    }
+
+
+def _sync_td_program_requirements_workbooks_for_docs(
+    global_repo: Path | None,
+    docs: Sequence[Mapping[str, object]] | None,
+    *,
+    param_defs: Sequence[Mapping[str, object]] | None,
+    create_missing: bool,
+) -> dict[str, object]:
+    repo = Path(global_repo).expanduser() if global_repo is not None else None
+    discovered = _td_program_requirements_discover_conditions_by_program(
+        repo,
+        docs,
+        param_defs=param_defs,
+    )
+    summaries: list[dict[str, object]] = []
+    warnings: list[str] = []
+    for program_title in sorted(discovered.keys(), key=lambda value: value.casefold()):
+        workbook_path = td_program_requirements_workbook_path_for(repo, program_title)
+        if not create_missing and not workbook_path.exists():
+            summaries.append(
+                {
+                    "program_title": program_title,
+                    "path": str(workbook_path),
+                    "created": False,
+                    "updated": False,
+                    "skipped_missing": True,
+                    "condition_count": int(len(discovered.get(program_title) or [])),
+                }
+            )
+            continue
+        try:
+            payload = _td_program_requirements_write_workbook(
+                workbook_path,
+                program_title=program_title,
+                discovered_conditions=discovered.get(program_title) or [],
+            )
+            payload["skipped_missing"] = False
+            summaries.append(payload)
+        except PermissionError:
+            message = f"ProgramRequirements workbook is not writable (close it in Excel first): {workbook_path}"
+            warnings.append(message)
+            summaries.append(
+                {
+                    "program_title": program_title,
+                    "path": str(workbook_path),
+                    "created": False,
+                    "updated": False,
+                    "skipped_missing": False,
+                    "condition_count": int(len(discovered.get(program_title) or [])),
+                    "warning": message,
+                }
+            )
+        except Exception as exc:
+            message = f"Failed to refresh ProgramRequirements workbook for '{program_title}': {exc}"
+            warnings.append(message)
+            summaries.append(
+                {
+                    "program_title": program_title,
+                    "path": str(workbook_path),
+                    "created": False,
+                    "updated": False,
+                    "skipped_missing": False,
+                    "condition_count": int(len(discovered.get(program_title) or [])),
+                    "warning": message,
+                }
+            )
+    return {
+        "workbooks": summaries,
+        "warnings": warnings,
+        "created_count": int(sum(1 for item in summaries if bool(item.get("created")))),
+        "updated_count": int(sum(1 for item in summaries if bool(item.get("updated")))),
+        "skipped_missing_count": int(sum(1 for item in summaries if bool(item.get("skipped_missing")))),
+    }
+
+
+def _td_program_requirements_read_source_workbook(path: Path) -> list[dict[str, object]]:
+    try:
+        from openpyxl import load_workbook  # type: ignore
+    except Exception as exc:
+        raise RuntimeError(
+            "openpyxl is required to read ProgramRequirements workbooks. "
+            "Install it with `py -m pip install openpyxl` within the project environment."
+        ) from exc
+    workbook_path = Path(path).expanduser()
+    wb = load_workbook(str(workbook_path), read_only=True, data_only=True)
+    try:
+        state = _td_program_requirements_parse_workbook(wb)
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
+    imported: list[dict[str, object]] = []
+    for condition in (state.get("conditions") or []):
+        if not isinstance(condition, Mapping):
+            continue
+        catalog = _td_program_requirements_merge_catalogs(
+            condition.get("parameter_catalog"),
+            _td_program_requirements_existing_catalog(condition.get("requirements")),
+        )
+        requirements = _td_program_requirements_apply_units(condition.get("requirements"), catalog)
+        requirements = [row for row in requirements if str(row.get("parameter_name") or "").strip()]
+        if not requirements:
+            continue
+        member_sequences = [
+            str(value).strip()
+            for value in (condition.get("member_sequences") or [])
+            if str(value).strip()
+        ]
+        imported.append(
+            {
+                "program_title": str(condition.get("program_title") or "").strip(),
+                "condition_key": str(condition.get("condition_key") or "").strip(),
+                "display_name": str(condition.get("display_name") or condition.get("condition_key") or "").strip(),
+                "sheet_name": str(condition.get("sheet_name") or "").strip(),
+                "run_type": str(condition.get("run_type") or "").strip(),
+                "pulse_width_on": condition.get("pulse_width_on"),
+                "control_period": condition.get("control_period"),
+                "suppression_voltage": condition.get("suppression_voltage"),
+                "member_sequences": member_sequences,
+                "member_sequences_text": "; ".join(member_sequences),
+                "source_workbook": str(workbook_path),
+                "source_sheet_name": str(condition.get("sheet_name") or "").strip(),
+                "requirements": requirements,
+            }
+        )
+    return imported
+
+
+def _td_program_requirements_read_support_state(wb) -> dict[str, list[dict[str, object]]]:
+    out: dict[str, list[dict[str, object]]] = {}
+    if TD_PROGRAM_REQUIREMENTS_SUPPORT_INDEX_SHEET not in wb.sheetnames:
+        return out
+    ws_index = wb[TD_PROGRAM_REQUIREMENTS_SUPPORT_INDEX_SHEET]
+    headers = _td_program_requirements_header_map(ws_index, row_idx=1)
+    for row_idx in range(2, (ws_index.max_row or 0) + 1):
+        row = {
+            header: ws_index.cell(row_idx, col).value
+            for header, col in headers.items()
+        }
+        if not any(value not in (None, "") for value in row.values()):
+            continue
+        program_title = str(row.get("program_title") or "").strip()
+        sheet_name = str(row.get("sheet_name") or "").strip()
+        if not program_title or not sheet_name or sheet_name not in wb.sheetnames:
+            continue
+        ws = wb[sheet_name]
+        tab_headers = _td_program_requirements_header_map(ws, row_idx=1)
+        requirements: list[dict[str, object]] = []
+        for tab_row_idx in range(2, (ws.max_row or 0) + 1):
+            parameter_name = str(ws.cell(tab_row_idx, tab_headers.get("parameter_name", 2)).value or "").strip()
+            if not parameter_name:
+                continue
+            requirements.append(
+                {
+                    "enabled": _td_program_requirements_parse_bool(
+                        ws.cell(tab_row_idx, tab_headers.get("enabled", 1)).value,
+                        default=True,
+                    ),
+                    "parameter_name": parameter_name,
+                    "units": str(ws.cell(tab_row_idx, tab_headers.get("units", 3)).value or "").strip(),
+                    "min_value": ws.cell(tab_row_idx, tab_headers.get("min_value", 4)).value,
+                    "max_value": ws.cell(tab_row_idx, tab_headers.get("max_value", 5)).value,
+                }
+            )
+        out.setdefault(program_title, []).append(
+            {
+                "program_title": program_title,
+                "condition_key": str(row.get("condition_key") or "").strip(),
+                "display_name": str(row.get("display_name") or row.get("condition_key") or "").strip(),
+                "sheet_name": sheet_name,
+                "run_type": str(row.get("run_type") or "").strip(),
+                "pulse_width_on": row.get("pulse_width_on"),
+                "control_period": row.get("control_period"),
+                "suppression_voltage": row.get("suppression_voltage"),
+                "member_sequences_text": str(row.get("member_sequences") or "").strip(),
+                "source_workbook": str(row.get("source_workbook") or "").strip(),
+                "source_sheet_name": str(row.get("source_sheet_name") or "").strip(),
+                "requirements": requirements,
+            }
+        )
+    return out
+
+
+def _sync_td_support_program_requirements_import(
+    workbook_path: Path,
+    *,
+    global_repo: Path | None,
+    project_dir: Path | None = None,
+    docs: Sequence[Mapping[str, object]] | None,
+) -> dict[str, object]:
+    support_path = td_support_workbook_path_for(workbook_path, project_dir=project_dir)
+    if not support_path.exists():
+        return {"path": str(support_path), "updated": False, "warnings": ["TD support workbook not found."]}
+    try:
+        from openpyxl import load_workbook  # type: ignore
+    except Exception as exc:
+        raise RuntimeError(
+            "openpyxl is required to import ProgramRequirements into the TD support workbook. "
+            "Install it with `py -m pip install openpyxl` within the project environment."
+        ) from exc
+
+    repo = Path(global_repo).expanduser() if global_repo is not None else None
+    warnings: list[str] = []
+    selected_programs: list[str] = []
+    seen_programs: set[str] = set()
+    for doc in docs or []:
+        if not isinstance(doc, Mapping):
+            continue
+        program_title = str(doc.get("program_title") or "").strip() or TD_SUPPORT_DEFAULT_PROGRAM_TITLE
+        key = _td_support_norm_name(program_title)
+        if key in seen_programs:
+            continue
+        seen_programs.add(key)
+        selected_programs.append(program_title)
+
+    wb = load_workbook(str(support_path))
+    try:
+        existing_by_program = _td_program_requirements_read_support_state(wb)
+        found_programs: set[str] = set()
+        for program_title in selected_programs:
+            workbook_file = td_program_requirements_workbook_path_for(repo, program_title)
+            if not workbook_file.exists():
+                continue
+            try:
+                imported_conditions = _td_program_requirements_read_source_workbook(workbook_file)
+                existing_by_program[program_title] = imported_conditions
+                found_programs.add(program_title)
+            except Exception as exc:
+                warnings.append(f"Failed to import ProgramRequirements workbook for '{program_title}': {exc}")
+
+        for sheet_name in list(wb.sheetnames):
+            if sheet_name == TD_PROGRAM_REQUIREMENTS_SUPPORT_INDEX_SHEET:
+                wb.remove(wb[sheet_name])
+                continue
+            if str(sheet_name).startswith(TD_PROGRAM_REQUIREMENTS_SUPPORT_SHEET_PREFIX):
+                wb.remove(wb[sheet_name])
+
+        combined_conditions: list[dict[str, object]] = []
+        for program_title in sorted(existing_by_program.keys(), key=lambda value: value.casefold()):
+            for condition in existing_by_program.get(program_title) or []:
+                if not isinstance(condition, Mapping):
+                    continue
+                requirements = [
+                    dict(row)
+                    for row in (condition.get("requirements") or [])
+                    if isinstance(row, Mapping) and str(row.get("parameter_name") or "").strip()
+                ]
+                if not requirements:
+                    continue
+                combined_conditions.append(
+                    {
+                        **dict(condition),
+                        "program_title": str(condition.get("program_title") or program_title).strip() or program_title,
+                        "requirements": requirements,
+                    }
+                )
+
+        if not combined_conditions:
+            wb.save(str(support_path))
+            return {
+                "path": str(support_path),
+                "updated": bool(found_programs),
+                "condition_count": 0,
+                "requirements_count": 0,
+                "warnings": warnings,
+            }
+
+        used_sheet_names = {
+            str(sheet_name).strip().lower()
+            for sheet_name in wb.sheetnames
+            if str(sheet_name).strip()
+        }
+        ws_index = _td_reset_workbook_sheet(
+            wb,
+            TD_PROGRAM_REQUIREMENTS_SUPPORT_INDEX_SHEET,
+            list(TD_PROGRAM_REQUIREMENTS_SUPPORT_INDEX_HEADERS),
+        )
+        requirement_count = 0
+        for idx, condition in enumerate(
+            sorted(
+                combined_conditions,
+                key=lambda item: (
+                    str(item.get("program_title") or "").casefold(),
+                    str(item.get("display_name") or item.get("condition_key") or "").casefold(),
+                ),
+            ),
+            start=1,
+        ):
+            preferred = (
+                f"{TD_PROGRAM_REQUIREMENTS_SUPPORT_SHEET_PREFIX}{idx:02d}_"
+                f"{str(condition.get('program_title') or '').strip()}_"
+                f"{str(condition.get('condition_key') or '').strip()}"
+            )
+            sheet_name = _td_safe_excel_sheet_title(
+                preferred,
+                used_sheet_names,
+                fallback=TD_PROGRAM_REQUIREMENTS_SUPPORT_SHEET_PREFIX.rstrip("_"),
+            )
+            ws_index.append(
+                [
+                    str(condition.get("program_title") or "").strip(),
+                    str(condition.get("condition_key") or "").strip(),
+                    str(condition.get("display_name") or condition.get("condition_key") or "").strip(),
+                    sheet_name,
+                    str(condition.get("run_type") or "").strip(),
+                    condition.get("pulse_width_on"),
+                    condition.get("control_period"),
+                    condition.get("suppression_voltage"),
+                    str(condition.get("member_sequences_text") or "").strip(),
+                    str(condition.get("source_workbook") or "").strip(),
+                    str(condition.get("source_sheet_name") or "").strip(),
+                    int(len(condition.get("requirements") or [])),
+                ]
+            )
+            ws_condition = _td_reset_workbook_sheet(
+                wb,
+                sheet_name,
+                list(TD_PROGRAM_REQUIREMENTS_SUPPORT_HEADERS),
+            )
+            for row in condition.get("requirements") or []:
+                requirement_count += 1
+                ws_condition.append(
+                    [
+                        _td_program_requirements_parse_bool(row.get("enabled"), default=True),
+                        str(row.get("parameter_name") or "").strip(),
+                        str(row.get("units") or "").strip(),
+                        row.get("min_value"),
+                        row.get("max_value"),
+                        str(condition.get("program_title") or "").strip(),
+                        str(condition.get("condition_key") or "").strip(),
+                        str(condition.get("display_name") or condition.get("condition_key") or "").strip(),
+                        str(condition.get("run_type") or "").strip(),
+                        condition.get("pulse_width_on"),
+                        condition.get("control_period"),
+                        condition.get("suppression_voltage"),
+                        str(condition.get("member_sequences_text") or "").strip(),
+                        str(condition.get("source_workbook") or "").strip(),
+                        str(condition.get("source_sheet_name") or "").strip(),
+                    ]
+                )
+        wb.save(str(support_path))
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
+    return {
+        "path": str(support_path),
+        "updated": True,
+        "condition_count": int(len(combined_conditions)),
+        "requirements_count": int(requirement_count),
+        "warnings": warnings,
+    }
 
 
 def _td_normalize_support_workbook_sheet_names(wb) -> bool:
@@ -26634,6 +27762,8 @@ def update_test_data_trending_project_workbook(
     project_dir = wb_path.parent
     db_path = project_dir / EIDAT_PROJECT_IMPLEMENTATION_DB
     source_refresh_payload: dict[str, object] = {}
+    program_requirements_sync_payload: dict[str, object] = {}
+    program_requirements_import_payload: dict[str, object] = {}
     source_refresh_mode_norm = str(source_refresh_mode or "none").strip().lower() or "none"
     if not dry_run and source_refresh_mode_norm == "smart":
         _td_emit_progress(progress_cb, "Scanning repository for changed TD source files")
@@ -27289,6 +28419,62 @@ def update_test_data_trending_project_workbook(
         if warning_summary:
             _td_emit_progress(progress_cb, warning_summary)
 
+    if not dry_run:
+        try:
+            selected_docs = read_eidat_index_documents(repo)
+            selected_rels = _project_selected_metadata_rels(project_dir)
+            chosen_docs = (
+                [
+                    doc
+                    for doc in selected_docs
+                    if isinstance(doc, Mapping) and str(doc.get("metadata_rel") or "").strip() in selected_rels
+                ]
+                if selected_rels
+                else []
+            )
+        except Exception:
+            chosen_docs = []
+        if chosen_docs:
+            try:
+                _td_emit_progress(progress_cb, "Refreshing ProgramRequirements workbooks")
+                program_requirements_sync_payload = _sync_td_program_requirements_workbooks_for_docs(
+                    repo,
+                    chosen_docs,
+                    param_defs=cfg_cols,
+                    create_missing=False,
+                )
+            except Exception as exc:
+                program_requirements_sync_payload = {
+                    "workbooks": [],
+                    "warnings": [str(exc)],
+                    "created_count": 0,
+                    "updated_count": 0,
+                    "skipped_missing_count": 0,
+                }
+            try:
+                _td_emit_progress(progress_cb, "Importing ProgramRequirements into support workbook")
+                program_requirements_import_payload = _sync_td_support_program_requirements_import(
+                    wb_path,
+                    global_repo=repo,
+                    project_dir=project_dir,
+                    docs=chosen_docs,
+                )
+            except Exception as exc:
+                program_requirements_import_payload = {
+                    "path": str(td_support_workbook_path_for(wb_path, project_dir=project_dir)),
+                    "updated": False,
+                    "condition_count": 0,
+                    "requirements_count": 0,
+                    "warnings": [str(exc)],
+                }
+            for warning in (
+                list(program_requirements_sync_payload.get("warnings") or [])
+                + list(program_requirements_import_payload.get("warnings") or [])
+            ):
+                text = str(warning or "").strip()
+                if text:
+                    _td_emit_progress(progress_cb, f"ProgramRequirements warning: {text}")
+
     timings["total_s"] = round(time.perf_counter() - total_started, 3)
     debug_payload = {
         "timings_s": dict(timings),
@@ -27304,6 +28490,8 @@ def update_test_data_trending_project_workbook(
         "excluded_sources_count": int(len(excluded_sources)),
         "warning_summary": warning_summary,
         "cache_validation_warnings": list(readiness_warnings),
+        "program_requirements_sync": dict(program_requirements_sync_payload),
+        "program_requirements_import": dict(program_requirements_import_payload),
     }
 
     return {
@@ -27337,6 +28525,8 @@ def update_test_data_trending_project_workbook(
         "cache_validation_warnings": list(readiness_warnings),
         "cache_debug_path": str(cache_debug_path or "").strip(),
         "backend_module_path": backend_module_path,
+        "program_requirements_sync": dict(program_requirements_sync_payload),
+        "program_requirements_import": dict(program_requirements_import_payload),
         "debug_json": json.dumps(debug_payload, separators=(",", ":")),
     }
 
@@ -33598,6 +34788,7 @@ def create_eidat_project(
     excel_trend_config_path = ""
     config_snapshot: dict | None = None
     support_workbook_path = None
+    program_requirements_sync: dict[str, object] = {}
 
     if project_type == EIDAT_PROJECT_TYPE_TRENDING:
         # Create workbook with header row, serial columns, and metadata sheet.
@@ -33691,6 +34882,21 @@ def create_eidat_project(
             param_defs=list(cfg.get("columns") or []),
         )
         try:
+            program_requirements_sync = _sync_td_program_requirements_workbooks_for_docs(
+                repo,
+                chosen_docs,
+                param_defs=list(cfg.get("columns") or []),
+                create_missing=True,
+            )
+        except Exception as exc:
+            program_requirements_sync = {
+                "workbooks": [],
+                "warnings": [str(exc)],
+                "created_count": 0,
+                "updated_count": 0,
+                "skipped_missing_count": 0,
+            }
+        try:
             cache_payload = sync_test_data_project_cache(
                 project_dir,
                 workbook_path,
@@ -33729,6 +34935,16 @@ def create_eidat_project(
         meta["config_snapshot"] = config_snapshot
     if project_type == EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING:
         meta.update(meta_cache_paths)
+        meta["program_requirements_sync"] = {
+            "created_count": int(program_requirements_sync.get("created_count") or 0),
+            "updated_count": int(program_requirements_sync.get("updated_count") or 0),
+            "skipped_missing_count": int(program_requirements_sync.get("skipped_missing_count") or 0),
+            "warnings": [
+                str(value).strip()
+                for value in (program_requirements_sync.get("warnings") or [])
+                if str(value).strip()
+            ],
+        }
     description = _format_continued_population_description(continued_population_clean)
     if description:
         meta["description"] = description

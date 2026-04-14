@@ -195,6 +195,28 @@ class _FakePlotFigure:
         self.transFigure = "transFigure"
 
 
+class _FakeHeaderPatch:
+    def __init__(self) -> None:
+        self.facecolors: list[str] = []
+
+    def set_facecolor(self, value: str) -> None:
+        self.facecolors.append(str(value))
+
+
+class _FakeHeaderFigure:
+    def __init__(self) -> None:
+        self.transFigure = "transFigure"
+        self.patch = _FakeHeaderPatch()
+        self.artists: list[object] = []
+        self.text_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def add_artist(self, artist: object) -> None:
+        self.artists.append(artist)
+
+    def text(self, *args: object, **kwargs: object) -> None:
+        self.text_calls.append((args, dict(kwargs)))
+
+
 class _FakePlotPdf:
     def __init__(self) -> None:
         self.saved_figures: list[object] = []
@@ -898,6 +920,71 @@ class TestTrendAutoReportFilters(unittest.TestCase):
                 self.assertTrue(all(link.get("page") == 4 for link in page_3_links))
             finally:
                 result.close()
+
+    def test_apply_pdf_navigation_adds_backlink_to_first_plot_toc_page(self) -> None:
+        fitz = __import__("fitz")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pdf_path = Path(tmp_dir) / "toc_navigation_backlink.pdf"
+            doc = fitz.open()
+            toc_page = doc.new_page()
+            toc_page.insert_text((72, 72), "Plot Table of Contents")
+            toc_page.insert_text((72, 104), "Run Condition Metrics")
+            plot_page = doc.new_page()
+            plot_page.insert_text((430, 82), tar._TAR_PLOT_TOC_BACKLINK_TEXT)
+            doc.save(str(pdf_path))
+            doc.close()
+
+            tar._tar_apply_pdf_navigation(
+                pdf_path,
+                plot_navigation=[
+                    {
+                        "section_key": "run_condition_plot_metrics",
+                        "section_label": "Run Condition Metrics",
+                        "navigator_label": "Run Metrics",
+                        "plot_label": "Pressure | Time | mean",
+                        "page_number": 2,
+                        "destination_page_index": 1,
+                    }
+                ],
+                plot_toc_layout=[
+                    {
+                        "toc_page_number": 1,
+                        "navigator_sections": [],
+                        "rows": [
+                            {"kind": "section", "text": "Run Condition Metrics", "target_page_index": 1},
+                        ],
+                    }
+                ],
+            )
+
+            result = fitz.open(str(pdf_path))
+            try:
+                links = result.load_page(1).get_links()
+                self.assertTrue(any(link.get("page") == 0 for link in links))
+            finally:
+                result.close()
+
+    def test_apply_plot_page_header_renders_plot_toc_backlink_text(self) -> None:
+        fig = _FakeHeaderFigure()
+        print_ctx = tar.PrintContext(
+            printed_at="2026-04-14 09:00 MDT",
+            printed_timezone="MDT",
+            report_title="Auto Report",
+            report_subtitle="Certification",
+        )
+        rectangle_mock = mock.Mock(side_effect=lambda *args, **kwargs: _FakeRectangle(*args, **kwargs))
+
+        with mock.patch.dict("sys.modules", {"matplotlib.patches": SimpleNamespace(Rectangle=rectangle_mock)}):
+            tar._apply_plot_page_header(
+                fig,
+                print_ctx=print_ctx,
+                page_number=7,
+                section_title="Run Condition Metrics | Condition A",
+                section_subtitle="Pressure | Time | mean",
+            )
+
+        rendered_text = [str(args[2]) for args, _kwargs in fig.text_calls if len(args) >= 3]
+        self.assertIn(tar._TAR_PLOT_TOC_BACKLINK_TEXT, rendered_text)
 
     def test_build_intro_story_places_quick_summary_before_counts_and_groups_run_tables(self) -> None:
         plot_navigation = tar._tar_build_plot_navigation(

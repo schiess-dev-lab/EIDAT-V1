@@ -360,6 +360,9 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         self.assertEqual(tar._overall_cert_status(["PASS", "WATCH"]), "WATCH")
         self.assertEqual(tar._overall_cert_status(["WATCH", "FAIL"]), "FAILED")
         self.assertEqual(tar._overall_cert_status(["NO_DATA", "PASS"]), "NO_DATA")
+        self.assertEqual(tar._overall_cert_status(["NO_DATA", "PASS"], ignore_no_data=True), "CERTIFIED")
+        self.assertEqual(tar._overall_cert_status(["NO_DATA", "WATCH"], ignore_no_data=True), "WATCH")
+        self.assertEqual(tar._overall_cert_status(["NO_DATA"], ignore_no_data=True), "NO_DATA")
         self.assertEqual(tar._overall_cert_status([]), "NO_DATA")
 
     def test_capture_print_context_contains_single_formatted_timestamp(self):
@@ -1077,7 +1080,64 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         self.assertEqual(len(analysis["initial_cohort_specs"]), 2)
         self.assertEqual(sorted(spec["x_name"] for spec in analysis["initial_cohort_specs"]), ["Pulse Number", "Time"])
 
-    def test_build_intro_story_renders_stacked_initial_and_final_grade_cells(self):
+    def test_build_per_serial_comparison_rows_uses_plot_payload_metrics(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        pair_spec = {
+            "pair_id": "pair-1",
+            "selection_id": "selection-1",
+            "run": "Run1",
+            "run_title": "Run 1",
+            "param": "thrust",
+            "units": "lbf",
+            "selection_fields": {
+                "mode": "condition",
+                "condition_text": "Condition A",
+                "sequence_text": "Seq 1",
+            },
+            "base_condition_label": "Condition A",
+            "suppression_voltage_label": "100",
+            "initial_plot_payload": {
+                "master_y": [1.0, 1.0, 1.0],
+                "y_resampled_by_sn": {"SN1": [1.5, 1.5, 1.5]},
+            },
+            "regrade_plot_payloads": {
+                "100": {
+                    "master_y": [4.0, 4.0, 4.0],
+                    "y_resampled_by_sn": {"SN1": [5.0, 5.0, 5.0]},
+                }
+            },
+            "filter_state_override": {"suppression_voltages": ["100"]},
+        }
+
+        rows = tar._tar_build_per_serial_comparison_rows(
+            {"filter_state": {}},
+            pair_specs=[pair_spec],
+            all_serials=["SN1"],
+            hi=["SN1"],
+            initial_grade_map_by_pair_serial={("pair-1", "SN1"): "FAIL"},
+            final_grade_map_by_pair_serial={("pair-1", "SN1"): "PASS"},
+            finding_by_pair_serial={
+                ("pair-1", "SN1"): {
+                    "regrade_applied": True,
+                    "regrade_suppression_voltage_label": "100",
+                    "regrade_cohort_id": "regrade:1",
+                }
+            },
+        )
+
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["initial_atp_mean"], 1.0)
+        self.assertEqual(row["initial_actual_mean"], 1.5)
+        self.assertEqual(row["initial_delta"], 0.5)
+        self.assertEqual(row["final_atp_mean"], 4.0)
+        self.assertEqual(row["final_actual_mean"], 5.0)
+        self.assertEqual(row["final_delta"], 1.0)
+        self.assertTrue(row["regrade_applied"])
+        self.assertEqual(row["regrade_cohort_id"], "regrade:1")
+
+    def test_build_intro_story_renders_outcome_mix_and_exception_rows(self):
         from EIDAT_App_Files.ui_next import trend_auto_report as tar
 
         fake_rl = {
@@ -1107,6 +1167,14 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
             "meta_note": "",
             "change_summary": "",
             "performance_plot_specs": [],
+            "plot_navigation": [
+                {
+                    "section_key": "regrade_pass_curve_overlays",
+                    "cohort_id": "regrade:1",
+                    "destination_page_index": 6,
+                    "page_number": 7,
+                }
+            ],
             "comparison_rows": [
                 {
                     "run_condition": "Condition A | Supp 100",
@@ -1127,7 +1195,50 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
                     "initial_bus_voltage_label": "",
                     "final_bus_voltage_label": "",
                     "regrade_applied": True,
-                }
+                    "regrade_cohort_id": "regrade:1",
+                },
+                {
+                    "run_condition": "Condition A | Supp 100",
+                    "serial": "SN1",
+                    "sequence_text": "Seq 2",
+                    "parameter": "torque",
+                    "units": "Nm",
+                    "initial_atp_mean": 2.0,
+                    "final_atp_mean": 2.1,
+                    "initial_actual_mean": 2.4,
+                    "final_actual_mean": 2.3,
+                    "initial_delta": 0.4,
+                    "final_delta": 0.2,
+                    "initial_grade": "FAIL",
+                    "final_grade": "WATCH",
+                    "initial_suppression_voltage_label": "All",
+                    "final_suppression_voltage_label": "100",
+                    "initial_bus_voltage_label": "",
+                    "final_bus_voltage_label": "",
+                    "regrade_applied": True,
+                    "regrade_cohort_id": "regrade:1",
+                },
+                {
+                    "run_condition": "Condition A | Supp 100",
+                    "serial": "SN1",
+                    "sequence_text": "Seq 3",
+                    "parameter": "flow",
+                    "units": "kg/s",
+                    "initial_atp_mean": None,
+                    "final_atp_mean": None,
+                    "initial_actual_mean": None,
+                    "final_actual_mean": None,
+                    "initial_delta": None,
+                    "final_delta": None,
+                    "initial_grade": "NO_DATA",
+                    "final_grade": "NO_DATA",
+                    "initial_suppression_voltage_label": "All",
+                    "final_suppression_voltage_label": "All",
+                    "initial_bus_voltage_label": "",
+                    "final_bus_voltage_label": "",
+                    "regrade_applied": False,
+                    "regrade_cohort_id": "",
+                },
             ],
         }
 
@@ -1142,9 +1253,57 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
 
         tables = [item[1] for item in story if isinstance(item, tuple) and item and item[0] == "Table"]
         exec_table = next(rows for rows in tables if rows and rows[0][0] == "Serial" and rows[0][1] == "Overall")
+        exception_table = next(rows for rows in tables if rows and rows[0][0] == "Serial" and rows[0][1] == "Run Condition")
         comparison_table = next(rows for rows in tables if rows and str(rows[0][0]).startswith("Run Condition:"))
         self.assertEqual(exec_table[1][1], "Initial: FAILED\nFinal: WATCH")
-        self.assertEqual(comparison_table[2][7], "Initial: FAIL\nFinal: PASS")
+        self.assertEqual(exec_table[0], ["Serial", "Overall", "Program", "Part #", "Rev", "Outcome Mix"])
+        self.assertEqual(exec_table[1][5], "PASS 50% | WATCH 50% | FAIL 0%")
+        self.assertEqual([row[4] for row in exception_table[1:]], ["WATCH", "NO_DATA"])
+        self.assertTrue(str(exception_table[1][5]).startswith("Chart "))
+        self.assertEqual(exception_table[2][5], "")
+        self.assertTrue(any(row[7] == "Initial: FAIL\nFinal: PASS" for row in comparison_table[2:]))
+
+    def test_build_exception_chart_links_targets_regrade_curve_pages(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        ctx = {
+            "plot_navigation": [
+                {
+                    "section_key": "regrade_pass_curve_overlays",
+                    "cohort_id": "regrade:cohort-1",
+                    "destination_page_index": 8,
+                }
+            ],
+            "comparison_rows": [
+                {
+                    "serial": "SN1",
+                    "run_condition": "Condition A",
+                    "sequence_text": "Seq 1",
+                    "parameter": "thrust",
+                    "final_grade": "WATCH",
+                    "regrade_cohort_id": "regrade:cohort-1",
+                },
+                {
+                    "serial": "SN1",
+                    "run_condition": "Condition A",
+                    "sequence_text": "Seq 2",
+                    "parameter": "torque",
+                    "final_grade": "PASS",
+                    "regrade_cohort_id": "regrade:cohort-1",
+                },
+            ],
+        }
+
+        exception_rows = tar._tar_build_exec_exception_rows(ctx)
+        self.assertEqual(len(exception_rows), 1)
+        self.assertEqual(exception_rows[0]["chart_target_page_index"], 8)
+        self.assertEqual(exception_rows[0]["regrade_cohort_id"], "regrade:cohort-1")
+        self.assertTrue(str(exception_rows[0]["chart_label"]).startswith("Chart "))
+
+        chart_links = tar._tar_build_exception_chart_links(ctx)
+        self.assertEqual(len(chart_links), 1)
+        self.assertEqual(chart_links[0]["destination_page_index"], 8)
+        self.assertEqual(chart_links[0]["regrade_cohort_id"], "regrade:cohort-1")
 
     def test_generate_auto_report_sidecar_uses_regrade_section_order_and_split_overall_results(self):
         from EIDAT_App_Files.ui_next import trend_auto_report as tar
@@ -1188,7 +1347,9 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
                 tar, "_tar_prepare_base", return_value=ctx
             ), mock.patch.object(
                 tar, "_tar_prepare_performance_models", side_effect=lambda _ctx: None
-            ), mock.patch.object(tar, "_tar_build_intro_story", return_value=["intro"]), mock.patch.object(
+            ), mock.patch.object(
+                tar, "_tar_prepare_intro_story_with_navigation", return_value=["intro"]
+            ), mock.patch.object(tar, "_tar_render_stabilized_intro_pdf", return_value=(2, ["intro"])), mock.patch.object(
                 tar, "_tar_build_equation_story", return_value=["equations"]
             ), mock.patch.object(
                 tar,
@@ -1206,7 +1367,7 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
                     "plot_specs": [],
                 },
             ), mock.patch.object(tar, "_tar_build_closing_story", return_value=["closing"]), mock.patch.object(
-                tar, "_render_portrait_story_pdf", side_effect=[2, 1, 1]
+                tar, "_render_portrait_story_pdf", side_effect=[1, 1]
             ), mock.patch.object(tar, "_merge_report_pdfs", side_effect=lambda *_args, **_kwargs: None), mock.patch.object(
                 tar, "_write_json", side_effect=lambda path, payload: captured.update({"path": path, "payload": payload})
             ):
@@ -1219,7 +1380,7 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
                 )
 
         payload = captured["payload"]
-        self.assertEqual(payload["version"], 4)
+        self.assertEqual(payload["version"], 6)
         self.assertEqual(
             payload["section_order"],
             [
@@ -1238,6 +1399,8 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         )
         self.assertEqual(payload["initial_overall_results_by_serial"], {"SN1": "FAILED"})
         self.assertEqual(payload["final_overall_results_by_serial"], {"SN1": "WATCH"})
+        self.assertEqual(payload["comparison_exception_rows"], [])
+        self.assertEqual(payload["exception_chart_links"], [])
 
     def _row_spec(
         self,

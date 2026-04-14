@@ -10,7 +10,7 @@ on optional plotting/scientific libraries (matplotlib, numpy).
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 import html
 import json
@@ -1399,15 +1399,32 @@ def _grade_from_z(z: float, pass_max: float, watch_max: float) -> str:
     return "FAIL"
 
 
-def _overall_cert_status(grades: list[str]) -> str:
-    gs = [str(g or "").strip().upper() for g in (grades or [])]
-    if any(g == "FAIL" for g in gs):
-        return "FAILED"
-    if any(g == "WATCH" for g in gs):
-        return "WATCH"
-    if any(g == "NO_DATA" for g in gs) or not gs:
+def _tar_normalize_grade_token(grade: object) -> str:
+    raw = str(grade or "").strip().upper()
+    if not raw:
+        return ""
+    normalized = raw.replace("-", "_").replace(" ", "_")
+    if normalized in {"NO_DATA", "NODATA"}:
         return "NO_DATA"
-    return "CERTIFIED"
+    if normalized == "FAILED":
+        return "FAIL"
+    if normalized == "CERTIFIED":
+        return "PASS"
+    return normalized
+
+
+def _overall_cert_status(grades: list[str], *, ignore_no_data: bool = False) -> str:
+    gs = [_tar_normalize_grade_token(g) for g in (grades or [])]
+    evaluable = [g for g in gs if g in {"PASS", "WATCH", "FAIL"}]
+    if any(g == "FAIL" for g in evaluable):
+        return "FAILED"
+    if any(g == "WATCH" for g in evaluable):
+        return "WATCH"
+    if not ignore_no_data and (any(g == "NO_DATA" for g in gs) or not gs):
+        return "NO_DATA"
+    if any(g == "PASS" for g in evaluable):
+        return "CERTIFIED"
+    return "NO_DATA"
 
 
 def _resolve_selected_runs(run_rows: list[dict], options: dict) -> list[str]:
@@ -2488,6 +2505,9 @@ def _merge_report_pdfs(output_pdf: Path, parts: list[Path]) -> None:
         merged.close()
 
 
+_TAR_PLOT_TOC_BACKLINK_TEXT = "Back to Plot TOC"
+
+
 def _apply_plot_page_header(
     fig: Any,
     *,
@@ -2495,6 +2515,7 @@ def _apply_plot_page_header(
     page_number: int,
     section_title: str,
     section_subtitle: str = "",
+    show_plot_toc_backlink: bool = True,
 ) -> None:
     from matplotlib.patches import Rectangle  # type: ignore
 
@@ -2520,6 +2541,17 @@ def _apply_plot_page_header(
         fig.text(0.04, title_y, str(section_title), color="#0f172a", fontsize=14, fontweight="bold", va="top")
     if section_subtitle:
         fig.text(0.04, subtitle_y, str(section_subtitle), color="#334155", fontsize=9.5, va="top")
+    if show_plot_toc_backlink:
+        fig.text(
+            0.96,
+            title_y,
+            _TAR_PLOT_TOC_BACKLINK_TEXT,
+            color="#1d4ed8",
+            fontsize=9.5,
+            fontweight="bold",
+            va="top",
+            ha="right",
+        )
     fig.text(0.96, 0.972, f"Page {int(page_number)}", color="white", fontsize=10, fontweight="bold", va="top", ha="right")
     fig.text(0.96, 0.947, f"Printed: {print_ctx.printed_at}", color="white", fontsize=8.5, va="top", ha="right")
 
@@ -2530,6 +2562,7 @@ def _create_landscape_plot_page(
     page_number: int,
     section_title: str,
     section_subtitle: str = "",
+    show_plot_toc_backlink: bool = True,
 ) -> tuple[Any, Any]:
     import matplotlib.pyplot as plt  # type: ignore
 
@@ -2540,6 +2573,7 @@ def _create_landscape_plot_page(
         page_number=page_number,
         section_title=section_title,
         section_subtitle=section_subtitle,
+        show_plot_toc_backlink=show_plot_toc_backlink,
     )
     ax = fig.add_axes([0.06, 0.09, 0.90, 0.73])
     return fig, ax
@@ -4326,10 +4360,9 @@ def _tar_curve_plot_payload_for_pair(
     return dict(payload)
 
 
-def _tar_finite_mean_for_serials(vmap: Mapping[str, object], serials: list[str]) -> float | None:
+def _tar_finite_mean(items: Iterable[object] | None) -> float | None:
     values: list[float] = []
-    for serial in serials:
-        value = vmap.get(serial)
+    for value in (items or []):
         if isinstance(value, (int, float)) and math.isfinite(float(value)):
             values.append(float(value))
     if not values:
@@ -4338,6 +4371,30 @@ def _tar_finite_mean_for_serials(vmap: Mapping[str, object], serials: list[str])
         return float(statistics.mean(values))
     except Exception:
         return None
+
+
+def _tar_finite_mean_for_serials(vmap: Mapping[str, object], serials: list[str]) -> float | None:
+    return _tar_finite_mean([vmap.get(serial) for serial in (serials or [])])
+
+
+def _tar_payload_metric_triplet(
+    payload: Mapping[str, Any] | None,
+    *,
+    serial: str,
+) -> tuple[float | None, float | None, float | None]:
+    spec = dict(payload or {})
+    master_y = spec.get("master_y") or []
+    if not isinstance(master_y, list):
+        master_y = []
+    curve_map = spec.get("y_resampled_by_sn") or {}
+    serial_curve = curve_map.get(serial) if isinstance(curve_map, Mapping) else None
+    if not isinstance(serial_curve, list):
+        serial_curve = []
+    atp_mean = _tar_finite_mean(master_y)
+    actual_mean = _tar_finite_mean(serial_curve)
+    if atp_mean is None or actual_mean is None:
+        return None, None, None
+    return atp_mean, actual_mean, float(actual_mean) - float(atp_mean)
 
 
 def _tar_meta(ctx: Mapping[str, Any], serial: str, key: str) -> str:
@@ -4684,6 +4741,7 @@ def _tar_build_per_serial_comparison_rows(
     hi: list[str],
     initial_grade_map_by_pair_serial: Mapping[tuple[str, str], str],
     final_grade_map_by_pair_serial: Mapping[tuple[str, str], str],
+    finding_by_pair_serial: Mapping[tuple[str, str], Mapping[str, Any]],
 ) -> list[dict]:
     comparison_rows: list[dict] = []
     base_filter_state = ctx.get("filter_state")
@@ -4695,15 +4753,9 @@ def _tar_build_per_serial_comparison_rows(
         param_name = str(spec.get("param") or "").strip()
         units = str(spec.get("units") or "").strip()
         selection_fields = dict(spec.get("selection_fields") or {})
-        initial_vmap = _tar_metric_map_for_pair(ctx, spec, "mean")
-        initial_atp_mean = _tar_finite_mean_for_serials(initial_vmap, all_serials)
-
+        initial_payload = spec.get("initial_plot_payload") if isinstance(spec.get("initial_plot_payload"), Mapping) else None
+        regrade_payloads = spec.get("regrade_plot_payloads") if isinstance(spec.get("regrade_plot_payloads"), Mapping) else {}
         final_override = spec.get("filter_state_override") if isinstance(spec.get("filter_state_override"), Mapping) else None
-        if final_override:
-            final_vmap = _tar_metric_map_for_pair(ctx, spec, "mean", filter_state_override=final_override)
-        else:
-            final_vmap = dict(initial_vmap)
-        final_atp_mean = _tar_finite_mean_for_serials(final_vmap, all_serials) if final_override else initial_atp_mean
 
         final_suppression = (
             str(spec.get("suppression_voltage_label") or "").strip()
@@ -4722,21 +4774,30 @@ def _tar_build_per_serial_comparison_rows(
         sequence_text = str(selection_fields.get("sequence_text") or spec.get("run_title") or run_name).strip() or run_name
 
         for serial in hi:
-            initial_actual_mean = _tar_metric_value_for_serial(initial_vmap, serial)
-            final_actual_mean = _tar_metric_value_for_serial(final_vmap, serial) if final_override else initial_actual_mean
-            initial_delta = (
-                float(initial_actual_mean) - float(initial_atp_mean)
-                if initial_atp_mean is not None and initial_actual_mean is not None
+            finding_row = dict(finding_by_pair_serial.get((pair_id, serial)) or {})
+            regrade_applied = bool(finding_row.get("regrade_applied"))
+            regrade_suppression = str(finding_row.get("regrade_suppression_voltage_label") or "").strip()
+            final_payload = (
+                (regrade_payloads.get(regrade_suppression) if regrade_suppression else None)
+                if isinstance(regrade_payloads, Mapping)
                 else None
             )
-            final_delta = (
-                float(final_actual_mean) - float(final_atp_mean)
-                if final_atp_mean is not None and final_actual_mean is not None
-                else None
-            )
-            initial_grade = str(initial_grade_map_by_pair_serial.get((pair_id, serial), "NO_DATA") or "NO_DATA").strip().upper() or "NO_DATA"
-            final_grade = str(final_grade_map_by_pair_serial.get((pair_id, serial), initial_grade) or initial_grade).strip().upper() or initial_grade
-            regrade_applied = bool(final_override)
+            if not isinstance(final_payload, Mapping):
+                final_payload = None
+
+            initial_atp_mean, initial_actual_mean, initial_delta = _tar_payload_metric_triplet(initial_payload, serial=serial)
+            if regrade_applied:
+                final_atp_mean, final_actual_mean, final_delta = _tar_payload_metric_triplet(final_payload, serial=serial)
+            else:
+                final_atp_mean, final_actual_mean, final_delta = initial_atp_mean, initial_actual_mean, initial_delta
+
+            initial_grade = _tar_normalize_grade_token(
+                initial_grade_map_by_pair_serial.get((pair_id, serial), "NO_DATA") or "NO_DATA"
+            ) or "NO_DATA"
+            final_grade = _tar_normalize_grade_token(
+                final_grade_map_by_pair_serial.get((pair_id, serial), initial_grade) or initial_grade
+            ) or initial_grade
+            row_final_suppression = regrade_suppression or final_suppression
 
             comparison_rows.append(
                 {
@@ -4762,10 +4823,12 @@ def _tar_build_per_serial_comparison_rows(
                     "selection_mode": selection_fields.get("mode") or "sequence",
                     "base_condition_label": str(spec.get("base_condition_label") or "").strip(),
                     "initial_suppression_voltage_label": initial_suppression,
-                    "final_suppression_voltage_label": final_suppression,
+                    "final_suppression_voltage_label": row_final_suppression,
                     "initial_bus_voltage_label": "",
                     "final_bus_voltage_label": "",
                     "regrade_applied": regrade_applied,
+                    "regrade_cohort_id": str(finding_row.get("regrade_cohort_id") or "").strip(),
+                    "regrade_suppression_voltage_label": regrade_suppression,
                 }
             )
     return comparison_rows
@@ -4817,6 +4880,126 @@ def _tar_group_comparison_rows(rows: list[dict]) -> list[dict[str, Any]]:
         group["final_bus_voltage_label"] = _tar_join_limited(group["final_bus_values"], max_items=6, empty="")
         out.append(group)
     return out
+
+
+def _tar_exec_exception_severity_rank(status: object) -> int:
+    token = _tar_normalize_grade_token(status)
+    if token == "FAIL":
+        return 0
+    if token == "WATCH":
+        return 1
+    if token == "NO_DATA":
+        return 2
+    return 3
+
+
+def _tar_percent_text(numerator: int, denominator: int) -> str:
+    try:
+        num = max(0, int(numerator))
+        den = max(0, int(denominator))
+    except Exception:
+        return "0%"
+    if den <= 0:
+        return "0%"
+    return f"{_fmt_num((100.0 * float(num)) / float(den), sig=4)}%"
+
+
+def _tar_outcome_mix_text(rows: list[Mapping[str, Any]] | None) -> str:
+    counts = {"PASS": 0, "WATCH": 0, "FAIL": 0}
+    for row in rows or []:
+        token = _tar_normalize_grade_token((row or {}).get("final_grade") or (row or {}).get("grade"))
+        if token in counts:
+            counts[token] += 1
+    total = sum(counts.values())
+    if total <= 0:
+        return "No evaluable data"
+    return " | ".join(
+        [
+            f"PASS {_tar_percent_text(counts['PASS'], total)}",
+            f"WATCH {_tar_percent_text(counts['WATCH'], total)}",
+            f"FAIL {_tar_percent_text(counts['FAIL'], total)}",
+        ]
+    )
+
+
+def _tar_regrade_curve_destinations(
+    plot_navigation: list[Mapping[str, Any]] | None,
+) -> dict[str, int]:
+    destinations: dict[str, int] = {}
+    for entry in plot_navigation or []:
+        if not isinstance(entry, Mapping):
+            continue
+        if str(entry.get("section_key") or entry.get("section") or "").strip() != "regrade_pass_curve_overlays":
+            continue
+        cohort_id = str(entry.get("cohort_id") or "").strip()
+        if not cohort_id or cohort_id in destinations:
+            continue
+        try:
+            destinations[cohort_id] = int(entry.get("destination_page_index"))
+        except Exception:
+            continue
+    return destinations
+
+
+def _tar_build_exec_exception_rows(ctx: Mapping[str, Any]) -> list[dict[str, Any]]:
+    destinations = _tar_regrade_curve_destinations(list(ctx.get("plot_navigation") or []))
+    rows: list[dict[str, Any]] = []
+    for raw_row in (ctx.get("comparison_rows") or []):
+        if not isinstance(raw_row, Mapping):
+            continue
+        final_status = _tar_normalize_grade_token(raw_row.get("final_grade") or raw_row.get("grade")) or "NO_DATA"
+        if final_status not in {"FAIL", "WATCH", "NO_DATA"}:
+            continue
+        cohort_id = str(raw_row.get("regrade_cohort_id") or "").strip()
+        rows.append(
+            {
+                "serial": str(raw_row.get("serial") or "").strip(),
+                "run_condition": str(raw_row.get("run_condition") or raw_row.get("run") or "").strip(),
+                "sequence_text": str(raw_row.get("sequence_text") or "").strip(),
+                "parameter": str(raw_row.get("parameter") or raw_row.get("param") or "").strip(),
+                "final_status": final_status,
+                "regrade_cohort_id": cohort_id,
+                "chart_target_page_index": destinations.get(cohort_id),
+            }
+        )
+    rows.sort(
+        key=lambda item: (
+            _tar_exec_exception_severity_rank(item.get("final_status")),
+            str(item.get("serial") or ""),
+            str(item.get("run_condition") or ""),
+            str(item.get("parameter") or ""),
+            str(item.get("sequence_text") or ""),
+        )
+    )
+    for index, row in enumerate(rows, start=1):
+        row["chart_label"] = (
+            f"Chart {index:03d}"
+            if row.get("chart_target_page_index") is not None
+            else ""
+        )
+    return rows
+
+
+def _tar_build_exception_chart_links(ctx: Mapping[str, Any]) -> list[dict[str, Any]]:
+    links: list[dict[str, Any]] = []
+    for row in _tar_build_exec_exception_rows(ctx):
+        label = str(row.get("chart_label") or "").strip()
+        if not label:
+            continue
+        target = row.get("chart_target_page_index")
+        if target is None:
+            continue
+        links.append(
+            {
+                "chart_label": label,
+                "destination_page_index": int(target),
+                "serial": str(row.get("serial") or "").strip(),
+                "run_condition": str(row.get("run_condition") or "").strip(),
+                "parameter": str(row.get("parameter") or "").strip(),
+                "regrade_cohort_id": str(row.get("regrade_cohort_id") or "").strip(),
+            }
+        )
+    return links
 
 
 _TAR_PLOT_TOC_SECTION_ORDER = [
@@ -5315,6 +5498,7 @@ def _tar_apply_pdf_navigation(
     *,
     plot_navigation: list[dict] | None,
     plot_toc_layout: list[dict] | None,
+    exception_chart_links: list[dict] | None = None,
 ) -> None:
     try:
         import fitz  # type: ignore
@@ -5323,7 +5507,8 @@ def _tar_apply_pdf_navigation(
 
     nav_entries = [dict(entry) for entry in (plot_navigation or []) if isinstance(entry, Mapping)]
     toc_layout = [dict(page) for page in (plot_toc_layout or []) if isinstance(page, Mapping)]
-    if not (nav_entries or toc_layout):
+    chart_links = [dict(entry) for entry in (exception_chart_links or []) if isinstance(entry, Mapping)]
+    if not (nav_entries or toc_layout or chart_links):
         return
 
     doc = fitz.open(str(Path(output_pdf).expanduser()))
@@ -5352,6 +5537,15 @@ def _tar_apply_pdf_navigation(
                     pass
 
         resolved_toc_layout = _tar_resolve_plot_toc_page_numbers(doc, toc_layout)
+        toc_target_page_index: int | None = None
+        if resolved_toc_layout:
+            toc_target_page_number = int(
+                resolved_toc_layout[0].get("resolved_toc_page_number")
+                or resolved_toc_layout[0].get("toc_page_number")
+                or 0
+            )
+            if 1 <= toc_target_page_number <= int(doc.page_count or 0):
+                toc_target_page_index = toc_target_page_number - 1
         for toc_page in resolved_toc_layout:
             toc_page_number = int(toc_page.get("resolved_toc_page_number") or toc_page.get("toc_page_number") or 0)
             if toc_page_number <= 0 or toc_page_number > doc.page_count:
@@ -5382,6 +5576,46 @@ def _tar_apply_pdf_navigation(
                 label_rect = rects[match_index]
                 row_rect = fitz.Rect(36.0, max(0.0, label_rect.y0 - 1.0), max(36.0, float(page.rect.width) - 36.0), min(float(page.rect.height), label_rect.y1 + 1.0))
                 _tar_insert_page_link(page, row_rect, row.get("target_page_index"))
+
+        if toc_target_page_index is not None:
+            linked_plot_pages: set[int] = set()
+            for entry in nav_entries:
+                try:
+                    page_index = int(entry.get("destination_page_index"))
+                except Exception:
+                    continue
+                if page_index in linked_plot_pages or page_index < 0 or page_index >= int(doc.page_count or 0):
+                    continue
+                linked_plot_pages.add(page_index)
+                page = doc.load_page(page_index)
+                backlink_rects = list(page.search_for(_TAR_PLOT_TOC_BACKLINK_TEXT))
+                if backlink_rects:
+                    _tar_insert_page_link(page, backlink_rects[0], toc_target_page_index)
+                    continue
+                fallback_rect = fitz.Rect(
+                    max(36.0, float(page.rect.width) - 190.0),
+                    70.0,
+                    max(36.0, float(page.rect.width) - 36.0),
+                    100.0,
+                )
+                _tar_insert_page_link(page, fallback_rect, toc_target_page_index)
+
+        for link in chart_links:
+            label = str(link.get("chart_label") or "").strip()
+            destination = link.get("destination_page_index")
+            if not label or destination is None:
+                continue
+            try:
+                target_page_index = int(destination)
+            except Exception:
+                continue
+            for page_index in range(int(doc.page_count or 0)):
+                page = doc.load_page(page_index)
+                rects = list(page.search_for(label))
+                if not rects:
+                    continue
+                _tar_insert_page_link(page, rects[0], target_page_index)
+                break
 
         doc.saveIncr()
     finally:
@@ -6434,6 +6668,7 @@ def _tar_prepare_base(
         hi=hi,
         initial_grade_map_by_pair_serial=initial_grade_map_by_pair_serial,
         final_grade_map_by_pair_serial=final_grade_map_by_pair_serial,
+        finding_by_pair_serial=finding_by_pair_serial,
     )
 
     pair_ids = [str(spec.get("pair_id") or "").strip() for spec in pair_specs if str(spec.get("pair_id") or "").strip()]
@@ -6451,7 +6686,8 @@ def _tar_prepare_base(
             [
                 str(final_grade_map_by_pair_serial.get((pair_id, serial), "NO_DATA") or "NO_DATA").strip().upper() or "NO_DATA"
                 for pair_id in pair_ids
-            ]
+            ],
+            ignore_no_data=True,
         )
         for serial in hi
     }
@@ -6691,6 +6927,14 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
     quick_summary = dict(ctx.get("quick_summary") or _tar_build_quick_summary(ctx))
     metadata_snapshot_lines = _tar_metadata_snapshot_lines(ctx)
     comparison_groups = _tar_group_comparison_rows(list(ctx.get("comparison_rows") or []))
+    exception_rows = _tar_build_exec_exception_rows(ctx)
+    comparison_rows_by_serial: dict[str, list[dict[str, Any]]] = {}
+    for row in (ctx.get("comparison_rows") or []):
+        if not isinstance(row, Mapping):
+            continue
+        serial = str(row.get("serial") or "").strip()
+        if serial:
+            comparison_rows_by_serial.setdefault(serial, []).append(dict(row))
     initial_vs_final_lines = [
         (
             "Initial Run: Base certification comparison before suppression-voltage-specific regrade. "
@@ -6797,8 +7041,7 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
             _tar_meta(ctx, serial, "program_title"),
             _tar_meta(ctx, serial, "part_number"),
             _tar_meta(ctx, serial, "revision"),
-            _tar_meta(ctx, serial, "acceptance_test_plan_number"),
-            _tar_meta(ctx, serial, "similarity_group"),
+            _tar_outcome_mix_text(comparison_rows_by_serial.get(serial) or []),
         ]
         for serial in (ctx.get("hi") or [])
     ]
@@ -6808,8 +7051,33 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
             story.append(_portrait_paragraph("Executive Summary (Continued)", styles["section"], rl))
         story.append(
             _portrait_box_table(
-                [["Serial", "Overall", "Program", "Part #", "Rev", "ATP", "Similarity Group"], *exec_rows[start : start + 14]],
-                col_widths=[0.78 * inch, 1.18 * inch, 1.18 * inch, 1.00 * inch, 0.48 * inch, 1.00 * inch, 1.28 * inch],
+                [["Serial", "Overall", "Program", "Part #", "Rev", "Outcome Mix"], *exec_rows[start : start + 14]],
+                col_widths=[0.78 * inch, 1.18 * inch, 1.12 * inch, 0.98 * inch, 0.48 * inch, 2.36 * inch],
+                styles=styles,
+                rl=rl,
+                repeat_rows=1,
+                compact=True,
+            )
+        )
+    if exception_rows:
+        story.append(Spacer(1, 0.10 * inch))
+        story.append(
+            _portrait_box_table(
+                [
+                    ["Serial", "Run Condition", "Sequence(s)", "Parameter", "Final Status", "Chart"],
+                    *[
+                        [
+                            str(row.get("serial") or ""),
+                            str(row.get("run_condition") or ""),
+                            str(row.get("sequence_text") or ""),
+                            str(row.get("parameter") or ""),
+                            str(row.get("final_status") or ""),
+                            str(row.get("chart_label") or ""),
+                        ]
+                        for row in exception_rows
+                    ],
+                ],
+                col_widths=[0.70 * inch, 1.65 * inch, 1.40 * inch, 1.05 * inch, 0.75 * inch, 1.35 * inch],
                 styles=styles,
                 rl=rl,
                 repeat_rows=1,
@@ -8166,6 +8434,8 @@ def generate_test_data_auto_report(
             plot_counts["plot_specs"] = actual_plot_navigation
             ctx["plot_navigation"] = actual_plot_navigation
             ctx["plot_toc_layout"] = _tar_paginate_plot_navigation(actual_plot_navigation)
+            ctx["comparison_exception_rows"] = _tar_build_exec_exception_rows(ctx)
+            ctx["exception_chart_links"] = _tar_build_exception_chart_links(ctx)
 
             equation_render_start = time.perf_counter()
             _tar_emit_progress(progress_cb, "Rendering performance equation pages")
@@ -8234,6 +8504,7 @@ def generate_test_data_auto_report(
                 out_pdf,
                 plot_navigation=list(ctx.get("plot_navigation") or []),
                 plot_toc_layout=list(ctx.get("plot_toc_layout") or []),
+                exception_chart_links=list(ctx.get("exception_chart_links") or []),
             )
             timings["apply_pdf_navigation_seconds"] = round(time.perf_counter() - navigation_start, 3)
             total_pages = intro_pages + plot_counts["plot_page_count"] + equation_pages + closing_pages
@@ -8274,6 +8545,8 @@ def generate_test_data_auto_report(
             "equation_cards": ctx["equation_cards"],
             "plot_specs": plot_counts["plot_specs"],
             "plot_navigation": list(ctx.get("plot_navigation") or []),
+            "comparison_exception_rows": ctx.get("comparison_exception_rows") or _tar_build_exec_exception_rows(ctx),
+            "exception_chart_links": list(ctx.get("exception_chart_links") or _tar_build_exception_chart_links(ctx)),
             "performance_models": ctx["performance_models"],
             "timings": timings,
             "page_cap": None,
