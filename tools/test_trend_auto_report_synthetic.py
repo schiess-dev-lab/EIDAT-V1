@@ -722,7 +722,7 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
                 "default_trend_auto_report_config",
                 return_value=tar.default_trend_auto_report_config(),
             ), mock.patch(
-                "EIDAT_App_Files.ui_next.backend.ensure_test_data_project_cache",
+                "EIDAT_App_Files.ui_next.backend.validate_test_data_project_cache_for_open",
                 return_value=db,
             ), mock.patch(
                 "EIDAT_App_Files.ui_next.backend.load_excel_trend_config",
@@ -837,6 +837,12 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
                 ],
             ),
         ]
+        for spec in row_specs:
+            spec["base_filter_state"] = {
+                "programs": ["Program A"],
+                "serials": ["HI", "ATP1", "ATP2", "ATP3"],
+                "control_periods": ["10"],
+            }
 
         analysis = tar._tar_analyze_curve_groups(
             row_specs,
@@ -858,9 +864,69 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         self.assertEqual(row["initial_grade"], "FAIL")
         self.assertEqual(row["final_grade"], "PASS")
         self.assertTrue(row["regrade_applied"])
+        pair_specs = {str(spec.get("pair_id") or ""): spec for spec in analysis["pair_specs"]}
+        self.assertEqual(
+            pair_specs["pair-100"]["filter_state_override"],
+            {
+                "programs": ["Program A"],
+                "serials": ["HI", "ATP1", "ATP2", "ATP3"],
+                "control_periods": ["10"],
+                "suppression_voltages": ["100"],
+            },
+        )
+        self.assertEqual(pair_specs["pair-200"]["filter_state_override"], {})
         self.assertEqual(len(analysis["initial_nonpass_findings"]), 1)
         self.assertEqual(analysis["nonpass_findings"], [])
         self.assertEqual(analysis["watch_pair_ids"], [])
+
+    @unittest.skipUnless(_have_numpy(), "numpy not installed")
+    def test_analyze_curve_groups_skips_regrade_when_initial_grade_passes_with_mixed_suppression(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        row_specs = [
+            self._row_spec(
+                tar,
+                pair_id="pair-100",
+                run="Run100",
+                selection_label="Condition A | Supp 100",
+                base_condition_label="Condition A",
+                suppression_value="100",
+                series=[tar.CurveSeries(serial="HI", x=[0.0, 1.0, 2.0], y=[10.0, 10.0, 10.0])],
+            ),
+            self._row_spec(
+                tar,
+                pair_id="pair-200",
+                run="Run200",
+                selection_label="Condition A | Supp 200",
+                base_condition_label="Condition A",
+                suppression_value="200",
+                series=[
+                    tar.CurveSeries(serial="ATP1", x=[0.0, 1.0, 2.0], y=[10.0, 10.0, 10.0]),
+                    tar.CurveSeries(serial="ATP2", x=[0.0, 1.0, 2.0], y=[10.0, 10.0, 10.0]),
+                ],
+            ),
+        ]
+
+        analysis = tar._tar_analyze_curve_groups(
+            row_specs,
+            hi=["HI"],
+            grid_points=3,
+            degree=1,
+            normalize_x=False,
+            z_pass=2.0,
+            z_watch=3.0,
+            max_abs_thr=None,
+            max_pct_thr=None,
+            rms_pct_thr=None,
+        )
+
+        row = analysis["grading_rows"][0]
+        pair_spec = next(spec for spec in analysis["pair_specs"] if str(spec.get("pair_id") or "") == "pair-100")
+        self.assertEqual(row["initial_grade"], "PASS")
+        self.assertEqual(row["final_grade"], "PASS")
+        self.assertFalse(row["regrade_applied"])
+        self.assertEqual(analysis["regrade_cohort_specs"], [])
+        self.assertEqual(pair_spec["filter_state_override"], {})
 
     @unittest.skipUnless(_have_numpy(), "numpy not installed")
     def test_analyze_curve_groups_skips_regrade_for_single_suppression(self):
@@ -898,6 +964,69 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         row = analysis["grading_rows"][0]
         self.assertFalse(row["regrade_applied"])
         self.assertEqual(row["final_grade"], row["initial_grade"])
+
+    @unittest.skipUnless(_have_numpy(), "numpy not installed")
+    def test_analyze_curve_groups_limits_regrade_cohort_to_targeted_suppression_members(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        row_specs = [
+            self._row_spec(
+                tar,
+                pair_id="pair-target",
+                run="RunTarget",
+                selection_label="Condition A | Supp 100 | Target",
+                base_condition_label="Condition A",
+                suppression_value="100",
+                series=[
+                    tar.CurveSeries(serial="HI", x=[0.0, 1.0, 2.0], y=[100.0, 100.0, 100.0]),
+                    tar.CurveSeries(serial="ATP1", x=[0.0, 1.0, 2.0], y=[10.0, 10.0, 10.0]),
+                    tar.CurveSeries(serial="ATP2", x=[0.0, 1.0, 2.0], y=[10.0, 10.0, 10.0]),
+                ],
+            ),
+            self._row_spec(
+                tar,
+                pair_id="pair-peer",
+                run="RunPeer",
+                selection_label="Condition A | Supp 100 | Peer",
+                base_condition_label="Condition A",
+                suppression_value="100",
+                series=[
+                    tar.CurveSeries(serial="ATP3", x=[0.0, 1.0, 2.0], y=[10.0, 10.0, 10.0]),
+                    tar.CurveSeries(serial="ATP4", x=[0.0, 1.0, 2.0], y=[10.0, 10.0, 10.0]),
+                ],
+            ),
+            self._row_spec(
+                tar,
+                pair_id="pair-200",
+                run="Run200",
+                selection_label="Condition A | Supp 200",
+                base_condition_label="Condition A",
+                suppression_value="200",
+                series=[
+                    tar.CurveSeries(serial="ATP5", x=[0.0, 1.0, 2.0], y=[10.0, 10.0, 10.0]),
+                    tar.CurveSeries(serial="ATP6", x=[0.0, 1.0, 2.0], y=[10.0, 10.0, 10.0]),
+                ],
+            ),
+        ]
+
+        analysis = tar._tar_analyze_curve_groups(
+            row_specs,
+            hi=["HI"],
+            grid_points=3,
+            degree=1,
+            normalize_x=False,
+            z_pass=0.5,
+            z_watch=1.0,
+            max_abs_thr=None,
+            max_pct_thr=None,
+            rms_pct_thr=None,
+        )
+
+        self.assertEqual(len(analysis["regrade_cohort_specs"]), 1)
+        regrade_spec = analysis["regrade_cohort_specs"][0]
+        self.assertEqual(regrade_spec["suppression_voltage_label"], "100")
+        self.assertEqual(regrade_spec["member_pair_ids"], ["pair-target"])
+        self.assertEqual({trace["pair_id"] for trace in regrade_spec["trace_curves"]}, {"pair-target"})
 
     @unittest.skipUnless(_have_numpy(), "numpy not installed")
     def test_analyze_curve_groups_splits_incompatible_x_axes(self):
@@ -955,6 +1084,7 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
             "Spacer": lambda *args, **kwargs: ("Spacer", args),
             "PageBreak": lambda *args, **kwargs: ("PageBreak",),
             "inch": 1.0,
+            "colors": types.SimpleNamespace(HexColor=lambda value: value, white="#ffffff"),
         }
         fake_styles = {name: name for name in ("cover_title", "cover_subtitle", "body", "section", "small")}
         ctx = {
@@ -980,13 +1110,23 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
             "comparison_rows": [
                 {
                     "run_condition": "Condition A | Supp 100",
+                    "serial": "SN1",
                     "sequence_text": "Seq 1",
                     "parameter": "thrust",
                     "units": "lbf",
-                    "atp_mean": 1.0,
-                    "actual_mean": 1.1,
-                    "delta": 0.1,
-                    "grade_text": "Initial: FAIL\nFinal: PASS",
+                    "initial_atp_mean": 1.0,
+                    "final_atp_mean": 1.2,
+                    "initial_actual_mean": 1.1,
+                    "final_actual_mean": 1.0,
+                    "initial_delta": 0.1,
+                    "final_delta": -0.2,
+                    "initial_grade": "FAIL",
+                    "final_grade": "PASS",
+                    "initial_suppression_voltage_label": "All",
+                    "final_suppression_voltage_label": "100",
+                    "initial_bus_voltage_label": "",
+                    "final_bus_voltage_label": "",
+                    "regrade_applied": True,
                 }
             ],
         }
@@ -1002,9 +1142,9 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
 
         tables = [item[1] for item in story if isinstance(item, tuple) and item and item[0] == "Table"]
         exec_table = next(rows for rows in tables if rows and rows[0][0] == "Serial" and rows[0][1] == "Overall")
-        comparison_table = next(rows for rows in tables if rows and rows[0][0] == "Run Condition")
+        comparison_table = next(rows for rows in tables if rows and str(rows[0][0]).startswith("Run Condition:"))
         self.assertEqual(exec_table[1][1], "Initial: FAILED\nFinal: WATCH")
-        self.assertEqual(comparison_table[1][7], "Initial: FAIL\nFinal: PASS")
+        self.assertEqual(comparison_table[2][7], "Initial: FAIL\nFinal: PASS")
 
     def test_generate_auto_report_sidecar_uses_regrade_section_order_and_split_overall_results(self):
         from EIDAT_App_Files.ui_next import trend_auto_report as tar

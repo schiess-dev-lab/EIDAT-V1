@@ -195,13 +195,54 @@ class TestProjectTaskWorker(unittest.TestCase):
         dummy = _DummyTrendDialog()
         expected_db = Path("C:/temp/project/implementation_trending.sqlite3")
 
-        with patch("ui_next.qt_main.be.validate_test_data_project_cache_for_open", return_value=expected_db) as open_validate_mock:
+        with patch("ui_next.qt_main.be.validate_test_data_project_cache_for_open", return_value=expected_db) as open_validate_mock, patch(
+            "ui_next.qt_main.be.inspect_test_data_project_cache_state",
+            return_value={"mode": "none", "reason": ""},
+        ) as inspect_mock:
             TestDataTrendDialog._load_cache(dummy, rebuild=False)
 
         open_validate_mock.assert_called_once_with(dummy._project_dir, dummy._workbook_path)
+        inspect_mock.assert_called_once_with(dummy._project_dir, dummy._workbook_path)
         self.assertEqual(dummy._db_path, expected_db)
         self.assertEqual(dummy.lbl_source.text(), str(expected_db))
         self.assertEqual(dummy.lbl_cache.text(), f"Cache DB: {expected_db}")
+        self.assertEqual(dummy.refresh_calls, 1)
+        self.assertEqual(dummy.zoom_calls, 1)
+
+    def test_test_data_trend_load_cache_rebuild_true_does_not_update_and_shows_stale_warning(self) -> None:
+        class _DummyTrendDialog:
+            def __init__(self) -> None:
+                self._project_dir = Path("C:/temp/project")
+                self._workbook_path = Path("C:/temp/project/project.xlsx")
+                self.lbl_source = QtWidgets.QLabel("")
+                self.lbl_cache = QtWidgets.QLabel("")
+                self._db_path = None
+                self.refresh_calls = 0
+                self.zoom_calls = 0
+
+            def _refresh_from_cache(self) -> None:
+                self.refresh_calls += 1
+
+            def _update_plot_zoom_actions(self) -> None:
+                self.zoom_calls += 1
+
+        dummy = _DummyTrendDialog()
+        expected_db = Path("C:/temp/project/implementation_trending.sqlite3")
+
+        with patch("ui_next.qt_main.be.validate_test_data_project_cache_for_open", return_value=expected_db) as open_validate_mock, patch(
+            "ui_next.qt_main.be.inspect_test_data_project_cache_state",
+            return_value={"mode": "calc", "reason": "support workbook calculation inputs changed"},
+        ) as inspect_mock, patch(
+            "ui_next.qt_main.be.update_test_data_trending_project_workbook"
+        ) as update_mock:
+            TestDataTrendDialog._load_cache(dummy, rebuild=True)
+
+        open_validate_mock.assert_called_once_with(dummy._project_dir, dummy._workbook_path)
+        inspect_mock.assert_called_once_with(dummy._project_dir, dummy._workbook_path)
+        update_mock.assert_not_called()
+        self.assertEqual(dummy._db_path, expected_db)
+        self.assertIn("support workbook calculation inputs changed", dummy.lbl_cache.text())
+        self.assertIn("Update Project", dummy.lbl_cache.text())
         self.assertEqual(dummy.refresh_calls, 1)
         self.assertEqual(dummy.zoom_calls, 1)
 

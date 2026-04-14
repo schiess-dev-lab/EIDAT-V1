@@ -1487,6 +1487,7 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
 
         title = QtWidgets.QLabel("New Project")
         title.setStyleSheet("font-size: 18px; font-weight: 700; color: #0f172a;")
+        self.lbl_title = title
         self.lbl_subtitle = QtWidgets.QLabel("Projects live inside the selected Global Repo and start as a project workbook.")
         self.lbl_subtitle.setStyleSheet("font-size: 12px; color: #475569;")
         v.addWidget(title)
@@ -1508,6 +1509,7 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
         self.btn_back = QtWidgets.QPushButton("Back")
         self.btn_next = QtWidgets.QPushButton("Next")
         self.btn_create = QtWidgets.QPushButton("Create Project")
+        self._buttons_layout = btns
         self.btn_back.clicked.connect(self._act_back)
         self.btn_next.clicked.connect(self._act_next)
         self.btn_create.clicked.connect(self._act_create)
@@ -2302,6 +2304,44 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
 
         return rules, missing
 
+    def _set_selected_metadata_rel(self, selected_metadata_rel: Iterable[str]) -> None:
+        selected = {
+            str(value).strip()
+            for value in (selected_metadata_rel or [])
+            if str(value).strip()
+        }
+        for r in range(self.tbl.rowCount()):
+            widget = self.tbl.cellWidget(r, 0)
+            cb = widget.findChild(QtWidgets.QCheckBox) if widget else None
+            item = self.tbl.item(r, 6)
+            if cb is None or item is None:
+                continue
+            cb.setChecked(str(item.text() or "").strip() in selected)
+        self._update_counts()
+        self._update_nav()
+
+    def _set_continued_population_selection(self, rules: Mapping[str, Iterable[str]] | None) -> None:
+        payload = rules if isinstance(rules, Mapping) else {}
+        mapping = (
+            ("program_title", self.cb_cont_program, self.list_cont_program),
+            ("part_number", self.cb_cont_part, self.list_cont_part),
+            ("vendor", self.cb_cont_vendor, self.list_cont_vendor),
+            ("asset_type", self.cb_cont_asset, self.list_cont_asset),
+            ("asset_specific_type", self.cb_cont_asset_specific, self.list_cont_asset_specific),
+            ("acceptance_test_plan_number", self.cb_cont_test_plan, self.list_cont_test_plan),
+        )
+        for field, cb, lst in mapping:
+            values = {
+                str(value).strip()
+                for value in (payload.get(field) or [])
+                if str(value).strip()
+            }
+            cb.setChecked(bool(values))
+            for idx in range(lst.count()):
+                item = lst.item(idx)
+                if item is not None:
+                    item.setSelected(str(item.text() or "").strip() in values)
+
     def _update_counts(self) -> None:
         selected = self._selected_metadata_rel()
         self.lbl_count.setText(f"{len(selected)} selected")
@@ -2376,6 +2416,109 @@ class NewProjectWizardDialog(QtWidgets.QDialog):
     def showEvent(self, event: QtGui.QShowEvent) -> None:  # type: ignore[override]
         super().showEvent(event)
         _fit_widget_to_screen(self)
+
+
+class TDProjectEditorDialog(NewProjectWizardDialog):
+    def __init__(self, global_repo: Path, project_dir: Path, workbook_path: Path, parent=None):
+        self._project_dir = Path(project_dir).expanduser()
+        self._workbook_path = Path(workbook_path).expanduser()
+        self.update_requested = False
+        self.force_project_rebuild = False
+        super().__init__(global_repo, parent)
+
+        self.setWindowTitle("Edit Test Data Project")
+        self.lbl_title.setText("Edit Test Data Project")
+        self.lbl_subtitle.setText(
+            "Save Changes updates project membership only. Use Update Project to rebuild TD caches and workbook outputs."
+        )
+        self.btn_create.setText("Save Changes")
+
+        self.cb_force_rebuild = QtWidgets.QCheckBox("Force full rebuild")
+        self.cb_force_rebuild.setStyleSheet("color:#0f172a; font-size: 12px;")
+        self.cb_force_rebuild.setToolTip(
+            "Recreate the Test Data project cache and SQLite outputs from scratch on the next Update Project run."
+        )
+        self.btn_update_project = QtWidgets.QPushButton("Update Project")
+        self.btn_update_project.clicked.connect(self._act_save_and_update)
+        self.btn_update_project.setStyleSheet(self.btn_create.styleSheet())
+        create_index = self._buttons_layout.indexOf(self.btn_create)
+        self._buttons_layout.insertWidget(create_index, self.cb_force_rebuild)
+        self._buttons_layout.insertWidget(create_index + 1, self.btn_update_project)
+
+        td_type = getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending")
+        idx = self.cb_type.findText(td_type)
+        if idx >= 0:
+            blocker = QtCore.QSignalBlocker(self.cb_type)
+            try:
+                self.cb_type.setCurrentIndex(idx)
+            finally:
+                del blocker
+        self._on_project_type_changed()
+
+        project_meta_reader = getattr(be, "_read_project_meta", None)
+        project_meta = project_meta_reader(self._project_dir) if callable(project_meta_reader) else {}
+        project_meta = project_meta if isinstance(project_meta, dict) else {}
+        self.ed_name.setText(str(project_meta.get("name") or self._project_dir.name).strip() or self._project_dir.name)
+        self.ed_name.setReadOnly(True)
+        self.cb_type.setEnabled(False)
+        self.ed_location.setText(str(self._project_dir.parent))
+        self.ed_location.setReadOnly(True)
+        self.btn_browse.setEnabled(False)
+        self.rb_auto_populate.setEnabled(False)
+        self.rb_blank.setEnabled(False)
+
+        self._refresh_filters()
+        self._apply_filter_and_refresh_table(select_all=False)
+        self._set_selected_metadata_rel(project_meta.get("selected_metadata_rel") or [])
+        self._set_continued_population_selection(project_meta.get("continued_population") or {})
+        excluded_serials = [
+            str(value).strip()
+            for value in (project_meta.get("excluded_serials") or [])
+            if str(value).strip()
+        ]
+        if excluded_serials:
+            self.lbl_select_hint_sub.setText(
+                f"{len(excluded_serials)} serial(s) are currently excluded from continued auto-add until you reselect them here."
+            )
+        self._stack.setCurrentIndex(1)
+        self._update_nav()
+
+    def _save_changes(self, *, request_update: bool) -> None:
+        try:
+            selected = self._selected_metadata_rel()
+            if not selected:
+                raise RuntimeError("Select at least one Test Data Excel document.")
+            continued_rules, missing = self._selected_continued_population()
+            if missing:
+                raise RuntimeError("Select at least one value for: " + ", ".join(missing))
+            meta = be.save_test_data_trending_project_editor_changes(
+                self._global_repo,
+                self._project_dir,
+                self._workbook_path,
+                selected_metadata_rel=selected,
+                continued_population=continued_rules,
+            )
+            self.project_meta = meta if isinstance(meta, dict) else {}
+            self.update_requested = bool(request_update)
+            self.force_project_rebuild = bool(request_update and self.cb_force_rebuild.isChecked())
+            self.accept()
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Edit Project", str(exc))
+
+    def _act_create(self) -> None:
+        self._save_changes(request_update=False)
+
+    def _act_save_and_update(self) -> None:
+        self._save_changes(request_update=True)
+
+    def _update_nav(self) -> None:
+        super()._update_nav()
+        visible = self._stack.currentIndex() == 1
+        if hasattr(self, "btn_update_project"):
+            self.btn_update_project.setVisible(visible)
+            self.btn_update_project.setEnabled(visible and bool(self._selected_metadata_rel()))
+        if hasattr(self, "cb_force_rebuild"):
+            self.cb_force_rebuild.setVisible(visible)
 
 
 class ImplementationTrendDialog(QtWidgets.QDialog):
@@ -3528,9 +3671,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         cache_actions = QtWidgets.QGridLayout()
         cache_actions.setHorizontalSpacing(8)
         cache_actions.setVerticalSpacing(8)
-        self.btn_refresh_cache = QtWidgets.QPushButton("Build / Refresh Cache")
+        self.btn_refresh_cache = QtWidgets.QPushButton("Check Cache Status")
         self.btn_refresh_cache.setMinimumHeight(40)
-        self.btn_refresh_cache.clicked.connect(lambda: self._load_cache(rebuild=True))
+        self.btn_refresh_cache.clicked.connect(lambda: self._load_cache(rebuild=False))
         self.btn_open_support = QtWidgets.QPushButton("Open Support Workbook")
         self.btn_open_support.setMinimumHeight(40)
         self.btn_open_support.clicked.connect(self._open_support_workbook)
@@ -6128,23 +6271,39 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         dlg.exec()
 
     def _load_cache(self, *, rebuild: bool) -> None:
+        def _load_payload() -> dict[str, object]:
+            db_path = be.validate_test_data_project_cache_for_open(
+                self._project_dir,
+                self._workbook_path,
+            )
+            stale_message = ""
+            try:
+                state = be.inspect_test_data_project_cache_state(self._project_dir, self._workbook_path)
+            except Exception:
+                state = {}
+            if isinstance(state, dict):
+                mode = str(state.get("mode") or "").strip()
+                reason = str(state.get("reason") or "").strip()
+                if mode and mode != "none":
+                    stale_message = (
+                        f"Cache is usable but stale ({reason or mode}). "
+                        "Use Update Project from the Projects tab to refresh it."
+                    )
+            return {
+                "db_path": str(db_path),
+                "stale_message": stale_message,
+            }
+
         if not hasattr(self, "_report_progress"):
             try:
-                if rebuild:
-                    repo = be.resolve_test_data_project_global_repo(self._project_dir, self._workbook_path)
-                    payload = be.update_test_data_trending_project_workbook(
-                        repo,
-                        self._workbook_path,
-                        overwrite=False,
-                    )
-                    self._db_path = Path(str(payload.get("db_path") or "")).expanduser()
-                else:
-                    self._db_path = be.validate_test_data_project_cache_for_open(
-                        self._project_dir,
-                        self._workbook_path,
-                    )
+                payload = _load_payload()
+                self._db_path = Path(str(payload.get("db_path") or "")).expanduser()
                 self.lbl_source.setText(str(self._db_path))
-                self.lbl_cache.setText(f"Cache DB: {self._db_path}")
+                cache_text = f"Cache DB: {self._db_path}"
+                stale_message = str(payload.get("stale_message") or "").strip()
+                if stale_message:
+                    cache_text += f"\nWarning: {stale_message}"
+                self.lbl_cache.setText(cache_text)
             except Exception as exc:
                 QtWidgets.QMessageBox.warning(self, "Test Data Cache", str(exc))
                 return
@@ -6155,27 +6314,15 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             return
         self._set_cache_controls_enabled(False)
         self._cache_progress_visible = False
-        self._cache_progress_heading = "Rebuilding Test Data Cache" if rebuild else "Loading Test Data Cache"
-        self._cache_progress_status = "Rebuilding raw cache" if rebuild else "Validating existing project cache"
+        self._cache_progress_heading = "Checking Test Data Cache"
+        self._cache_progress_status = "Validating existing project cache"
         self._cache_progress_detail = ""
-        self.lbl_cache.setText("Cache DB: loading...")
+        self.lbl_cache.setText("Cache DB: checking...")
         self._cache_progress_timer.start(150)
 
         def _task(report):
             report(self._cache_progress_status)
-            if rebuild:
-                repo = be.resolve_test_data_project_global_repo(self._project_dir, self._workbook_path)
-                payload = be.update_test_data_trending_project_workbook(
-                    repo,
-                    self._workbook_path,
-                    overwrite=False,
-                    progress_cb=report,
-                )
-                return Path(str(payload.get("db_path") or "")).expanduser()
-            return be.validate_test_data_project_cache_for_open(
-                self._project_dir,
-                self._workbook_path,
-            )
+            return _load_payload()
 
         self._cache_worker = ProjectTaskWorker(_task, parent=self)
         self._cache_worker.progress.connect(self._on_cache_task_progress)
@@ -6226,16 +6373,21 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._cache_progress_timer.stop()
         self._cache_worker = None
         self._set_cache_controls_enabled(True)
-        db_path = Path(str(payload)).expanduser() if payload is not None else None
+        payload_dict = payload if isinstance(payload, dict) else {"db_path": payload}
+        db_path = Path(str(payload_dict.get("db_path") or "")).expanduser() if payload_dict is not None else None
         if db_path is None:
-            QtWidgets.QMessageBox.warning(self, "Test Data Cache", "Cache build returned no database path.")
+            QtWidgets.QMessageBox.warning(self, "Test Data Cache", "Cache check returned no database path.")
             return
         self._db_path = db_path
         self.lbl_source.setText(str(self._db_path))
-        self.lbl_cache.setText(f"Cache DB: {self._db_path}")
+        cache_text = f"Cache DB: {self._db_path}"
+        stale_message = str(payload_dict.get("stale_message") or "").strip()
+        if stale_message:
+            cache_text += f"\nWarning: {stale_message}"
+        self.lbl_cache.setText(cache_text)
         if self._cache_progress_visible:
             try:
-                self._report_progress.finish("Cache ready", success=True)
+                self._report_progress.finish("Cache checked", success=True)
             except Exception:
                 pass
             self._cache_progress_visible = False
@@ -7420,12 +7572,11 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.information(
                 self,
                 "Auto Report",
-                "No cached metric statistics are available in the current project cache. Update Project / Build Refresh Cache first.",
+                "No cached metric statistics are available in the current project cache. Run Update Project first.",
             )
             return
-        report_filter_state = self._normalize_auto_plot_filter_state(
-            self._current_auto_plot_filter_state(),
-            default_to_current=True,
+        report_filter_state = self._auto_report_filter_state_without_suppression(
+            self._current_auto_plot_filter_state()
         )
         try:
             global_repo_root = Path(getattr(be, "get_repo_root", lambda: be.DEFAULT_REPO_ROOT)()).expanduser()
@@ -7512,8 +7663,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
         # Options checkboxes
         opts_row = QtWidgets.QHBoxLayout()
-        cb_rebuild = QtWidgets.QCheckBox("Rebuild cache before report")
+        cb_rebuild = QtWidgets.QCheckBox("Use current cache only (run Update Project to refresh)")
         cb_rebuild.setChecked(False)
+        cb_rebuild.setEnabled(False)
+        cb_rebuild.setToolTip(
+            "Auto Report uses the current project cache only. Update Project is the only action that refreshes TD cache data."
+        )
         cb_update_cfg = QtWidgets.QCheckBox("Update excel_trend_config.json (fill missing units/ranges)")
         cb_update_cfg.setChecked(True)
         cb_add_missing = QtWidgets.QCheckBox("Add missing columns to excel_trend_config.json")
@@ -7549,7 +7704,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         report_filter_text.setSpacing(2)
         lbl_report_filter_title = QtWidgets.QLabel("Report Filters")
         lbl_report_filter_title.setStyleSheet("font-size: 12px; font-weight: 800; color: #000000;")
-        lbl_report_filter_hint = QtWidgets.QLabel("Local family-analysis filters for this exporter. These do not change the main Trend / Analyze filters.")
+        lbl_report_filter_hint = QtWidgets.QLabel(
+            "Local family-analysis filters for this exporter. Initial auto-report grading always uses all suppression voltages in scope; regrade narrows to the certification-family suppression only when an initial WATCH or FAIL occurs."
+        )
         lbl_report_filter_hint.setStyleSheet("color: #4b5563; font-size: 11px;")
         lbl_report_filter_hint.setWordWrap(True)
         lbl_report_program_filters = QtWidgets.QLabel("Programs: -")
@@ -7570,7 +7727,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
         btn_report_program_filters = QtWidgets.QPushButton("Programs...")
         btn_report_serial_filters = QtWidgets.QPushButton("Family Serials...")
-        btn_report_suppression_filters = QtWidgets.QPushButton("Suppression Voltage...")
+        btn_report_suppression_filters = QtWidgets.QPushButton("Suppression Voltage (Auto)")
         btn_report_control_filters = QtWidgets.QPushButton("Control Period...")
         btn_report_reset_filters = QtWidgets.QPushButton("Reset Filters")
         for btn in (
@@ -7628,7 +7785,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         left_l.addWidget(lbl_certification_title)
         lbl_certification_hint = QtWidgets.QLabel(
             "Use the popup to pick the certifying program, certification serials, and run scope. "
-            "Suppression voltage still applies to the report analysis path, but it does not narrow certification choices."
+            "Initial grading uses all suppression voltages in scope, and regrade automatically narrows to the certification-family suppression only when needed."
         )
         lbl_certification_hint.setWordWrap(True)
         lbl_certification_hint.setStyleSheet("color: #4b5563; font-size: 11px;")
@@ -8073,7 +8230,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
             lbl_popup_hint = QtWidgets.QLabel(
                 "Choose the certifying program, certification serials, and runs included in certification. "
-                "These certification choices intentionally ignore suppression voltage so serials and run conditions stay visible within the chosen program."
+                "Initial grading always uses all suppression voltages in scope, and regrade automatically narrows to the certification-family suppression only when needed."
             )
             lbl_popup_hint.setWordWrap(True)
             lbl_popup_hint.setStyleSheet("color: #4b5563; font-size: 11px;")
@@ -8391,7 +8548,6 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         def _refresh_report_filter_summaries() -> None:
             programs_active = self._active_program_filter_values(filter_state=report_filter_state)
             serials_active = self._active_serials(filter_state=report_filter_state)
-            suppression_active = self._active_suppression_voltage_filter_values(filter_state=report_filter_state)
             control_active = self._active_control_period_filter_values(filter_state=report_filter_state)
             lbl_report_program_filters.setText(
                 _report_filter_summary(
@@ -8410,12 +8566,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 )
             )
             lbl_report_suppression_filters.setText(
-                _report_filter_summary(
-                    "Suppression Voltage",
-                    suppression_active,
-                    len(self._available_suppression_voltage_filters or []),
-                    tooltip_label=lbl_report_suppression_filters,
-                )
+                "Suppression Voltage: Auto (all for initial pass, family-specific only on WATCH/FAIL regrade)"
+            )
+            lbl_report_suppression_filters.setToolTip(
+                "Auto Report does not use a manual suppression filter. The initial pass pools all suppression voltages in scope, and regrade narrows to the certification-family suppression only when an initial WATCH or FAIL is found."
             )
             lbl_report_control_filters.setText(
                 _report_filter_summary(
@@ -8427,12 +8581,11 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             )
             btn_report_program_filters.setEnabled(bool(self._available_program_filters))
             btn_report_serial_filters.setEnabled(bool(self._available_serial_filter_rows))
-            btn_report_suppression_filters.setEnabled(bool(self._available_suppression_voltage_filters))
+            btn_report_suppression_filters.setEnabled(False)
             btn_report_control_filters.setEnabled(bool(self._available_control_period_filters))
             btn_report_reset_filters.setEnabled(
                 bool(self._available_program_filters)
                 or bool(self._available_serial_filter_rows)
-                or bool(self._available_suppression_voltage_filters)
                 or bool(self._available_control_period_filters)
             )
 
@@ -8666,7 +8819,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             report_filter_state["programs"] = list(self._available_program_filters or [])
             report_filter_state["serials"] = self._auto_plot_available_serial_values()
             report_filter_state["control_periods"] = list(self._available_control_period_filters or [])
-            report_filter_state["suppression_voltages"] = list(self._available_suppression_voltage_filters or [])
+            report_filter_state["suppression_voltages"] = []
             _apply_report_filter_change()
 
         def _browse_output_dir() -> None:
@@ -10512,7 +10665,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.information(
                 self,
                 "Smart Equation Solver",
-                "Build / Refresh Cache before configuring Smart Equation Solver.",
+                "Run Update Project before configuring Smart Equation Solver.",
             )
             return
 
@@ -10780,7 +10933,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 QtWidgets.QMessageBox.information(
                     self,
                     "Smart Equation Solver",
-                    "Build / Refresh Cache before running Smart Equation Solver.",
+                    "Run Update Project before running Smart Equation Solver.",
                 )
             return
         if self._cache_worker is not None and self._cache_worker.isRunning():
@@ -10807,7 +10960,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.warning(
                 self,
                 "Smart Equation Solver",
-                "Smart Equation Solver requires sequence-level metrics in td_metrics_calc_sequences. Build / Refresh Cache first.",
+                "Smart Equation Solver requires sequence-level metrics in td_metrics_calc_sequences. Run Update Project first.",
             )
             return
 
@@ -24121,6 +24274,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cb_project_overwrite = QtWidgets.QCheckBox("Overwrite existing cells")
         self.cb_project_overwrite.setChecked(False)
         self.cb_project_overwrite.setStyleSheet("color:#0f172a; font-size: 12px;")
+        self.cb_project_force_rebuild = QtWidgets.QCheckBox("Force full rebuild")
+        self.cb_project_force_rebuild.setChecked(False)
+        self.cb_project_force_rebuild.setStyleSheet("color:#0f172a; font-size: 12px;")
+        self.btn_project_edit = QtWidgets.QPushButton("Edit Project")
         self.btn_project_update = QtWidgets.QPushButton("Update Project")
         self.btn_project_perf_sheets = QtWidgets.QPushButton("Generate Performance Sheets")
         self.btn_project_debug_excels = QtWidgets.QPushButton("Generate Debug Excel Files")
@@ -24130,6 +24287,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_project_open_workbook = QtWidgets.QPushButton("Open Workbook")
         self.btn_project_open_support = QtWidgets.QPushButton("Open Support Workbook")
         for b in (
+            self.btn_project_edit,
             self.btn_project_update,
             self.btn_project_perf_sheets,
             self.btn_project_debug_excels,
@@ -24153,6 +24311,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 QPushButton:hover { background: #f9fafb; }
                 """
         )
+        self.btn_project_edit.clicked.connect(self._act_edit_project)
         self.btn_project_update.clicked.connect(self._act_update_project)
         self.btn_project_perf_sheets.clicked.connect(self._act_generate_project_performance_sheets)
         self.btn_project_debug_excels.clicked.connect(self._act_generate_project_debug_excels)
@@ -24162,6 +24321,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_project_open_workbook.clicked.connect(self._act_open_project_workbook)
         self.btn_project_open_support.clicked.connect(self._act_open_project_support_workbook)
         actions.addWidget(self.cb_project_overwrite)
+        actions.addWidget(self.cb_project_force_rebuild)
+        actions.addWidget(self.btn_project_edit)
         actions.addWidget(self.btn_project_update)
         actions.addWidget(self.btn_project_perf_sheets)
         actions.addWidget(self.btn_project_debug_excels)
@@ -24794,6 +24955,22 @@ class MainWindow(QtWidgets.QMainWindow):
             "workbook": str(item_workbook.data(QtCore.Qt.ItemDataRole.UserRole) or item_workbook.text() or "").strip(),
         }
 
+    def _select_project_by_dir(self, project_dir: Path) -> bool:
+        tbl = getattr(self, "tbl_projects", None)
+        if not tbl:
+            return False
+        wanted = self._normalize_project_dir_key(project_dir)
+        for row in range(tbl.rowCount()):
+            item_folder = tbl.item(row, 2)
+            if item_folder is None:
+                continue
+            current = str(item_folder.data(QtCore.Qt.ItemDataRole.UserRole) or item_folder.text() or "").strip()
+            if self._normalize_project_dir_key(current) != wanted:
+                continue
+            tbl.setCurrentCell(row, 0)
+            return True
+        return False
+
     def _update_project_actions(self) -> None:
         record = self._selected_project_record()
         project_busy = bool(getattr(self, "_project_worker", None) and self._project_worker.isRunning())
@@ -24811,6 +24988,14 @@ class MainWindow(QtWidgets.QMainWindow):
             is_td = ptype == getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending")
         if hasattr(self, "btn_project_implementation"):
             self.btn_project_implementation.setEnabled(bool(record) and is_impl_supported)
+        if hasattr(self, "cb_project_overwrite"):
+            self.cb_project_overwrite.setEnabled(bool(record) and is_update_supported and not project_busy)
+        if hasattr(self, "cb_project_force_rebuild"):
+            self.cb_project_force_rebuild.setEnabled(bool(record) and is_td and not project_busy)
+            if not is_td:
+                self.cb_project_force_rebuild.setChecked(False)
+        if hasattr(self, "btn_project_edit"):
+            self.btn_project_edit.setEnabled(bool(record) and is_td and not project_busy)
         if hasattr(self, "btn_project_update"):
             self.btn_project_update.setEnabled(bool(record) and is_update_supported and not project_busy)
         if hasattr(self, "btn_project_perf_sheets"):
@@ -24820,7 +25005,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, "btn_project_env"):
             self.btn_project_env.setEnabled(bool(record) and not project_busy)
         if hasattr(self, "btn_project_open_support"):
-            self.btn_project_open_support.setEnabled(bool(is_td))
+            self.btn_project_open_support.setEnabled(bool(record) and is_td and not project_busy)
 
     def _project_task_log_path(self, project_dir: Path, prefix: str) -> Path:
         stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -25244,7 +25429,54 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "Implementation", str(exc))
 
-    def _act_update_project(self) -> None:
+    def _run_project_update(self, record: dict, *, force_project_rebuild: bool = False) -> None:
+        repo_raw = (self.ed_global_repo.text() or "").strip()
+        if not repo_raw:
+            raise RuntimeError("Select a Global Repo first (Setup tab).")
+        repo = Path(repo_raw).expanduser()
+        if not record:
+            raise RuntimeError("Select a project in the list first.")
+        wb_path = Path(str(record.get("workbook") or "")).expanduser()
+        ptype = str(record.get("type") or "").strip()
+        overwrite = bool(getattr(self, "cb_project_overwrite", None) and self.cb_project_overwrite.isChecked())
+        is_td = ptype == getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending")
+        force_full = bool(force_project_rebuild and is_td)
+        project_name = str(record.get("name") or wb_path.stem or "").strip() or wb_path.stem
+        started = time.perf_counter()
+        self._append_log(f"[PROJECT UPDATE] Starting: {project_name}")
+        self._append_log(f"[PROJECT UPDATE] Workbook: {wb_path}")
+        if force_full:
+            self._append_log("[PROJECT UPDATE] Force full rebuild requested")
+
+        def _task(report):
+            if ptype == getattr(be, "EIDAT_PROJECT_TYPE_TRENDING", "EIDP Trending"):
+                report("Updating EIDP trending workbook")
+                return be.update_eidp_trending_project_workbook(repo, wb_path, overwrite=overwrite)
+            if ptype == getattr(be, "EIDAT_PROJECT_TYPE_RAW_TRENDING", "EIDP Raw File Trending"):
+                report("Updating raw-file trending workbook")
+                return be.update_eidp_raw_trending_project_workbook(repo, wb_path, overwrite=overwrite)
+            if ptype == getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending"):
+                return be.update_test_data_trending_project_workbook(
+                    repo,
+                    wb_path,
+                    overwrite=overwrite,
+                    include_performance_sheets=True,
+                    source_refresh_mode="smart",
+                    force_project_rebuild=force_full,
+                    progress_cb=report,
+                )
+            raise RuntimeError(f"Unsupported project type: {ptype}")
+
+        self._start_project_task(
+            heading="Update Project",
+            status_text=f"Updating {project_name}",
+            project_dir=wb_path.parent,
+            log_prefix="project_update",
+            task_factory=_task,
+            on_success=lambda payload: self._handle_project_update_success(payload, wb_path=wb_path, ptype=ptype, started=started),
+        )
+
+    def _act_edit_project(self) -> None:
         try:
             repo_raw = (self.ed_global_repo.text() or "").strip()
             if not repo_raw:
@@ -25253,39 +25485,35 @@ class MainWindow(QtWidgets.QMainWindow):
             record = self._selected_project_record()
             if not record:
                 raise RuntimeError("Select a project in the list first.")
-            wb_path = Path(str(record.get("workbook") or "")).expanduser()
             ptype = str(record.get("type") or "").strip()
-            overwrite = bool(getattr(self, "cb_project_overwrite", None) and self.cb_project_overwrite.isChecked())
-            project_name = str(record.get("name") or wb_path.stem or "").strip() or wb_path.stem
-            started = time.perf_counter()
-            self._append_log(f"[PROJECT UPDATE] Starting: {project_name}")
-            self._append_log(f"[PROJECT UPDATE] Workbook: {wb_path}")
+            if ptype != getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending"):
+                raise RuntimeError("Edit Project is available only for Test Data Trending projects.")
+            project_dir = Path(str(record.get("folder") or "")).expanduser()
+            workbook = Path(str(record.get("workbook") or "")).expanduser()
+            dlg = TDProjectEditorDialog(repo, project_dir, workbook, self)
+            self._prepare_dialog(dlg)
+            if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+                self._refresh_projects()
+                self._select_project_by_dir(project_dir)
+                if dlg.update_requested:
+                    self._run_project_update(self._selected_project_record() or record, force_project_rebuild=dlg.force_project_rebuild)
+                else:
+                    self._show_toast("Project changes saved")
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Edit Project", str(exc))
 
-            def _task(report):
-                if ptype == getattr(be, "EIDAT_PROJECT_TYPE_TRENDING", "EIDP Trending"):
-                    report("Updating EIDP trending workbook")
-                    return be.update_eidp_trending_project_workbook(repo, wb_path, overwrite=overwrite)
-                if ptype == getattr(be, "EIDAT_PROJECT_TYPE_RAW_TRENDING", "EIDP Raw File Trending"):
-                    report("Updating raw-file trending workbook")
-                    return be.update_eidp_raw_trending_project_workbook(repo, wb_path, overwrite=overwrite)
-                if ptype == getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending"):
-                    return be.update_test_data_trending_project_workbook(
-                        repo,
-                        wb_path,
-                        overwrite=overwrite,
-                        include_performance_sheets=True,
-                        progress_cb=report,
-                    )
-                raise RuntimeError(f"Unsupported project type: {ptype}")
-
-            self._start_project_task(
-                heading="Update Project",
-                status_text=f"Updating {project_name}",
-                project_dir=wb_path.parent,
-                log_prefix="project_update",
-                task_factory=_task,
-                on_success=lambda payload: self._handle_project_update_success(payload, wb_path=wb_path, ptype=ptype, started=started),
+    def _act_update_project(self) -> None:
+        try:
+            record = self._selected_project_record()
+            if not record:
+                raise RuntimeError("Select a project in the list first.")
+            ptype = str(record.get("type") or "").strip()
+            force_full = bool(
+                ptype == getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending")
+                and getattr(self, "cb_project_force_rebuild", None)
+                and self.cb_project_force_rebuild.isChecked()
             )
+            self._run_project_update(record, force_project_rebuild=force_full)
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "Update Project", str(exc))
 

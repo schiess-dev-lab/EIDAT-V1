@@ -841,7 +841,14 @@ def eidat_manager_scan(global_repo: Path) -> Dict[str, object]:
     return _run_eidat_manager(global_repo, "scan")
 
 
-def eidat_manager_process(global_repo: Path, *, limit: int = 0, dpi: int = 0, force: bool = False) -> Dict[str, object]:
+def eidat_manager_process(
+    global_repo: Path,
+    *,
+    limit: int = 0,
+    dpi: int = 0,
+    force: bool = False,
+    only_candidates: bool = False,
+) -> Dict[str, object]:
     args: list[str] = []
     if limit and int(limit) > 0:
         args.extend(["--limit", str(int(limit))])
@@ -849,6 +856,8 @@ def eidat_manager_process(global_repo: Path, *, limit: int = 0, dpi: int = 0, fo
         args.extend(["--dpi", str(int(dpi))])
     if force:
         args.append("--force")
+    if only_candidates:
+        args.append("--only-candidates")
     result = _run_eidat_manager(global_repo, "process", args)
     # Auto-rebuild index after processing
     if result.get("processed_ok", 0) > 0:
@@ -2814,7 +2823,7 @@ GLOBAL_RUN_MIRROR_DIRNAME = "global_run_mirror"
 LOCAL_PROJECTS_MIRROR_DIRNAME = "projects"
 PROJECT_UPDATE_DEBUG_JSON = "update_debug.json"
 TD_CACHE_DEBUG_JSON = "td_cache_debug.json"
-TD_PROJECT_CACHE_SCHEMA_VERSION = "4"
+TD_PROJECT_CACHE_SCHEMA_VERSION = "5"
 TD_PLOTTER_SEQUENCES_TABLE = "td_plotter_sequences"
 TD_PLOTTER_CURVE_CATALOG_TABLE = "td_plotter_curve_catalog"
 TD_PLOTTER_OBSERVATIONS_TABLE = "td_plotter_condition_observations"
@@ -2844,6 +2853,145 @@ def _td_stable_json(value: object) -> str:
 
 def _td_hash_payload(value: object) -> str:
     return hashlib.sha1(_td_stable_json(value).encode("utf-8")).hexdigest()
+
+
+@lru_cache(maxsize=1)
+def _td_builder_signature() -> str:
+    backend_path = Path(__file__).resolve()
+    try:
+        backend_sha1 = hashlib.sha1(backend_path.read_bytes()).hexdigest()
+    except Exception:
+        backend_sha1 = ""
+    return _td_hash_payload(
+        {
+            "backend_path": str(backend_path),
+            "backend_sha1": backend_sha1,
+            "cache_schema_version": TD_PROJECT_CACHE_SCHEMA_VERSION,
+        }
+    )
+
+
+def _td_support_signatures(support_cfg: Mapping[str, object] | None) -> dict[str, str]:
+    cfg = dict(support_cfg or {})
+
+    def _sorted_rows(rows: Iterable[object]) -> list[dict[str, object]]:
+        normalized = [dict(row) for row in rows if isinstance(row, Mapping)]
+        return sorted(normalized, key=_td_stable_json)
+
+    def _raw_mapping_rows() -> dict[str, list[dict[str, object]]]:
+        out: dict[str, list[dict[str, object]]] = {}
+        for program_title, rows in dict(cfg.get("program_mappings") or {}).items():
+            key = str(program_title or "").strip()
+            cleaned: list[dict[str, object]] = []
+            for row in rows or []:
+                if not isinstance(row, Mapping):
+                    continue
+                cleaned.append(
+                    {
+                        "program_title": key,
+                        "sheet_name": str(row.get("sheet_name") or "").strip(),
+                        "source_run_name": str(row.get("source_run_name") or "").strip(),
+                        "condition_key": str(row.get("condition_key") or "").strip(),
+                        "enabled": bool(row.get("enabled", True)),
+                        "display_name": str(row.get("display_name") or "").strip(),
+                        "run_type": str(row.get("run_type") or "").strip(),
+                        "pulse_width": row.get("pulse_width_on", row.get("pulse_width")),
+                        "control_period": row.get("control_period"),
+                        "suppression_voltage": row.get("suppression_voltage"),
+                    }
+                )
+            if cleaned:
+                out[key] = sorted(cleaned, key=_td_stable_json)
+        return out
+
+    def _calc_mapping_rows() -> dict[str, list[dict[str, object]]]:
+        out: dict[str, list[dict[str, object]]] = {}
+        for program_title, rows in dict(cfg.get("program_mappings") or {}).items():
+            key = str(program_title or "").strip()
+            cleaned: list[dict[str, object]] = []
+            for row in rows or []:
+                if not isinstance(row, Mapping):
+                    continue
+                cleaned.append(
+                    {
+                        "program_title": key,
+                        "sheet_name": str(row.get("sheet_name") or "").strip(),
+                        "source_run_name": str(row.get("source_run_name") or "").strip(),
+                        "condition_key": str(row.get("condition_key") or "").strip(),
+                        "exclude_first_n": row.get("exclude_first_n"),
+                        "last_n_rows": row.get("last_n_rows"),
+                    }
+                )
+            if cleaned:
+                out[key] = sorted(cleaned, key=_td_stable_json)
+        return out
+
+    raw_payload = {
+        "programs": _sorted_rows(cfg.get("programs") or []),
+        "program_mappings": _raw_mapping_rows(),
+        "run_conditions": _sorted_rows(cfg.get("run_conditions") or []),
+        "condition_groups": _sorted_rows(cfg.get("condition_groups") or []),
+        "condition_bounds": {
+            str(key or "").strip(): {
+                str(param or "").strip(): dict(value)
+                for param, value in dict(bounds or {}).items()
+                if str(param or "").strip() and isinstance(value, Mapping)
+            }
+            for key, bounds in dict(cfg.get("condition_bounds") or {}).items()
+            if str(key or "").strip() and isinstance(bounds, Mapping)
+        },
+        "bounds_by_sequence": {
+            str(key or "").strip(): {
+                str(param or "").strip(): dict(value)
+                for param, value in dict(bounds or {}).items()
+                if str(param or "").strip() and isinstance(value, Mapping)
+            }
+            for key, bounds in dict(cfg.get("bounds_by_sequence") or {}).items()
+            if str(key or "").strip() and isinstance(bounds, Mapping)
+        },
+        "sequences": sorted(
+            [
+                {
+                    "run_name": str(row.get("run_name") or "").strip(),
+                    "display_name": str(row.get("display_name") or "").strip(),
+                    "program_title": str(row.get("program_title") or "").strip(),
+                    "source_run_name": str(row.get("source_run_name") or "").strip(),
+                    "condition_key": str(row.get("condition_key") or "").strip(),
+                    "enabled": bool(row.get("enabled", True)),
+                    "run_type": str(row.get("run_type") or "").strip(),
+                    "pulse_width": row.get("pulse_width_on", row.get("pulse_width")),
+                    "control_period": row.get("control_period"),
+                    "suppression_voltage": row.get("suppression_voltage"),
+                }
+                for row in (cfg.get("sequences") or [])
+                if isinstance(row, Mapping)
+            ],
+            key=_td_stable_json,
+        ),
+    }
+    calc_payload = {
+        "settings": dict(cfg.get("settings") or {}),
+        "program_mappings": _calc_mapping_rows(),
+        "sequences": sorted(
+            [
+                {
+                    "run_name": str(row.get("run_name") or "").strip(),
+                    "program_title": str(row.get("program_title") or "").strip(),
+                    "source_run_name": str(row.get("source_run_name") or "").strip(),
+                    "condition_key": str(row.get("condition_key") or "").strip(),
+                    "exclude_first_n": row.get("exclude_first_n"),
+                    "last_n_rows": row.get("last_n_rows"),
+                }
+                for row in (cfg.get("sequences") or [])
+                if isinstance(row, Mapping)
+            ],
+            key=_td_stable_json,
+        ),
+    }
+    return {
+        "raw": _td_hash_payload(raw_payload),
+        "calc": _td_hash_payload(calc_payload),
+    }
 
 
 def _td_raw_cache_candidate_paths(db_path: Path) -> list[Path]:
@@ -3363,6 +3511,17 @@ def resolve_test_data_project_global_repo(project_dir: Path, workbook_path: Path
     if raw:
         return Path(raw).expanduser()
     return _infer_node_root_from_workbook_path(workbook_path)
+
+
+def _is_td_project_doc_eligible(global_repo: Path, doc: Mapping[str, object]) -> bool:
+    if not _is_confirmed_doc_type(doc, "TD"):
+        return False
+    resolved = _resolve_td_source_sqlite_for_node(
+        Path(global_repo).expanduser(),
+        excel_sqlite_rel=str(doc.get("excel_sqlite_rel") or "").strip(),
+        artifacts_rel=str(doc.get("artifacts_rel") or "").strip(),
+    )
+    return str(resolved.get("status") or "").strip().lower() == "ok"
 
 
 def _resolve_excel_sqlite_path_from_workbook(workbook_path: Path, excel_sqlite_rel: str) -> Path:
@@ -7182,18 +7341,26 @@ def _td_project_cache_refresh_mode(
     current_stats_csv: str,
     cached_raw_cols_csv: str,
     current_raw_cols_csv: str,
-    cached_support_mtime_ns: int,
-    support_mtime_ns: int,
+    cached_support_raw_signature: str,
+    support_raw_signature: str,
+    cached_support_calc_signature: str,
+    support_calc_signature: str,
+    cached_builder_signature: str,
+    builder_signature: str,
     source_state_stale: bool,
 ) -> tuple[str, str]:
     if stale_context:
         return "full", "context changed"
+    if cached_builder_signature and cached_builder_signature != builder_signature:
+        return "full", "TD builder logic changed"
     if not raw_complete and (expected_serials or cached_serials or curve_count > 0):
         return "full", "raw cache is incomplete"
     if curve_count <= 0 and expected_serials:
         return "full", "raw cache is empty"
     if cached_raw_cols_csv != current_raw_cols_csv:
         return "full", "configured raw columns changed"
+    if cached_support_raw_signature and cached_support_raw_signature != support_raw_signature:
+        return "full", "support workbook raw inputs changed"
     if source_state_stale:
         return "incremental_raw", "source SQLite inputs changed"
     if expected_serials and expected_serials != cached_serials:
@@ -7202,8 +7369,8 @@ def _td_project_cache_refresh_mode(
         return "calc", "implementation cache is incomplete"
     if cached_stats_csv != current_stats_csv:
         return "calc", "selected statistics changed"
-    if int(cached_support_mtime_ns) != int(support_mtime_ns):
-        return "calc", "support workbook changed"
+    if cached_support_calc_signature and cached_support_calc_signature != support_calc_signature:
+        return "calc", "support workbook calculation inputs changed"
     return "none", ""
 
 
@@ -7318,6 +7485,11 @@ def inspect_test_data_project_cache_state(project_dir: Path, workbook_path: Path
     current_raw_cols_csv = ",".join(
         [str(c.get("name") or "").strip() for c in (project_cfg.get("columns") or []) if str(c.get("name") or "").strip()]
     )
+    support_cfg = _read_td_support_workbook(wb_path, project_dir=proj_dir)
+    support_signatures = _td_support_signatures(support_cfg)
+    support_raw_signature = str(support_signatures.get("raw") or "").strip()
+    support_calc_signature = str(support_signatures.get("calc") or "").strip()
+    builder_signature = _td_builder_signature()
     project_raw_signature = _td_build_project_raw_signature(
         wb_path,
         raw_columns_csv=current_raw_cols_csv,
@@ -7357,7 +7529,9 @@ def inspect_test_data_project_cache_state(project_dir: Path, workbook_path: Path
         }
         cached_stats_csv = _td_meta_value(conn, "statistics")
         cached_raw_cols_csv = _td_meta_value(conn, "raw_columns")
-        cached_support_mtime_ns = int(_td_meta_value(conn, "support_workbook_mtime_ns") or 0)
+        cached_support_raw_signature = _td_meta_value(conn, "support_raw_signature")
+        cached_support_calc_signature = _td_meta_value(conn, "support_calc_signature")
+        cached_builder_signature = _td_meta_value(conn, "td_builder_signature")
         cached_workbook_path = _td_meta_value(conn, "workbook_path")
         cached_node_root = _td_meta_value(conn, "node_root")
         cached_project_raw_signature = _td_meta_value(conn, "project_raw_signature")
@@ -7437,8 +7611,12 @@ def inspect_test_data_project_cache_state(project_dir: Path, workbook_path: Path
         current_stats_csv=str(current_stats_csv),
         cached_raw_cols_csv=str(cached_raw_cols_csv),
         current_raw_cols_csv=str(current_raw_cols_csv),
-        cached_support_mtime_ns=int(cached_support_mtime_ns),
-        support_mtime_ns=int(support_mtime_ns),
+        cached_support_raw_signature=str(cached_support_raw_signature),
+        support_raw_signature=str(support_raw_signature),
+        cached_support_calc_signature=str(cached_support_calc_signature),
+        support_calc_signature=str(support_calc_signature),
+        cached_builder_signature=str(cached_builder_signature),
+        builder_signature=str(builder_signature),
         source_state_stale=bool(source_state_stale),
     )
     return {
@@ -7453,6 +7631,9 @@ def inspect_test_data_project_cache_state(project_dir: Path, workbook_path: Path
         "project_raw_signature": project_raw_signature,
         "current_stats_csv": current_stats_csv,
         "current_raw_cols_csv": current_raw_cols_csv,
+        "support_raw_signature": support_raw_signature,
+        "support_calc_signature": support_calc_signature,
+        "builder_signature": builder_signature,
         "support_mtime_ns": int(support_mtime_ns),
         "source_states": source_states,
         "source_state_by_serial": source_state_by_serial,
@@ -8239,30 +8420,16 @@ def export_test_data_project_debug_excels(
     progress_cb: Callable[[str], None] | None = None,
 ) -> dict[str, Path]:
     """
-    Ensure the TD cache exists, then export optional Excel debug files.
+    Export optional Excel debug files from the existing TD project cache only.
     """
     proj_dir = Path(project_dir).expanduser()
     db_path = proj_dir / EIDAT_PROJECT_IMPLEMENTATION_DB
     raw_db_path = td_raw_cache_db_path_for(proj_dir)
     cache_warning: Exception | None = None
     try:
-        _td_emit_progress(progress_cb, "Ensuring project cache")
-        payload = sync_test_data_project_cache(
-            proj_dir,
-            workbook_path,
-            rebuild=False,
-            progress_cb=progress_cb,
-        )
-        db_path = Path(str(payload.get("db_path") or db_path)).expanduser()
-        raw_db_path = Path(str(payload.get("raw_db_path") or raw_db_path)).expanduser()
-    except Exception as exc:
-        cache_warning = exc
-        _td_emit_progress(progress_cb, f"Cache refresh failed; exporting existing SQLite files anyway: {exc}")
-    try:
         validate_existing_test_data_project_cache(proj_dir, workbook_path)
     except Exception as exc:
-        if cache_warning is None:
-            cache_warning = exc
+        cache_warning = exc
         _td_emit_progress(progress_cb, f"Cache validation failed; exporting existing SQLite files anyway: {exc}")
 
     generated: dict[str, Path] = {}
@@ -9016,6 +9183,19 @@ def _write_test_data_project_calc_cache_from_aggregates(
             "INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)",
             ("support_workbook_mtime_ns", str(int(support_mtime_ns))),
         )
+        support_signatures = _td_support_signatures(support_cfg)
+        conn.execute(
+            "INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)",
+            ("support_raw_signature", str(support_signatures.get("raw") or "")),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)",
+            ("support_calc_signature", str(support_signatures.get("calc") or "")),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)",
+            ("td_builder_signature", _td_builder_signature()),
+        )
         conn.commit()
     timings["calc_write_s"] = round(time.perf_counter() - t0, 3)
     timings["total_s"] = round(time.perf_counter() - total_started, 3)
@@ -9127,7 +9307,7 @@ def _rebuild_test_data_project_calc_cache_from_raw(
     if not raw_db_path.exists() or not raw_db_path.is_file():
         raise RuntimeError(
             f"Project raw cache DB not found: {raw_db_path}. "
-            f"Run 'Build / Refresh Cache' first to create or refresh {EIDAT_PROJECT_TD_RAW_CACHE_DB}."
+            f"Run 'Update Project' first to create or refresh {EIDAT_PROJECT_TD_RAW_CACHE_DB}."
         )
 
     project_cfg = _load_project_td_trend_config(wb_path)
@@ -9263,7 +9443,7 @@ def _rebuild_test_data_project_calc_cache_from_raw(
     if not raw_runs or not raw_y_cols or not raw_curve_rows:
         raise RuntimeError(
             f"Project raw cache DB is incomplete: {raw_db_path}. "
-            f"Run 'Build / Refresh Cache' first to create or refresh {EIDAT_PROJECT_TD_RAW_CACHE_DB}."
+            f"Run 'Update Project' first to create or refresh {EIDAT_PROJECT_TD_RAW_CACHE_DB}."
         )
     _td_emit_progress(progress_cb, "Aggregating calculated metrics from raw cache")
     with sqlite3.connect(str(db_path)) as conn:
@@ -9822,6 +10002,19 @@ def _rebuild_test_data_project_calc_cache_from_raw(
             "INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)",
             ("support_workbook_mtime_ns", str(int(support_mtime_ns))),
         )
+        support_signatures = _td_support_signatures(support_cfg)
+        conn.execute(
+            "INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)",
+            ("support_raw_signature", str(support_signatures.get("raw") or "")),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)",
+            ("support_calc_signature", str(support_signatures.get("calc") or "")),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)",
+            ("td_builder_signature", _td_builder_signature()),
+        )
         conn.commit()
         timings["calc_write_s"] = round(time.perf_counter() - t0, 3)
 
@@ -10148,6 +10341,7 @@ def sync_test_data_project_cache(
         payload = rebuild_test_data_project_cache(db_path, wb_path, progress_cb=progress_cb)
         payload["mode"] = "full_rebuild"
         payload.setdefault("counts", {})
+        payload["reason"] = "forced full rebuild"
         return payload
 
     state = inspect_test_data_project_cache_state(proj_dir, wb_path)
@@ -10924,9 +11118,22 @@ def rebuild_test_data_project_cache(
             "INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)",
             ("support_workbook_mtime_ns", str(int(support_mtime_ns))),
         )
+        support_signatures = _td_support_signatures(support_cfg)
+        conn.execute(
+            "INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)",
+            ("support_raw_signature", str(support_signatures.get("raw") or "")),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)",
+            ("support_calc_signature", str(support_signatures.get("calc") or "")),
+        )
         conn.execute(
             "INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)",
             ("project_raw_signature", _td_build_project_raw_signature(wb_path, raw_columns_csv=",".join([str(c.get("name") or "").strip() for c in cfg_cols if str(c.get("name") or "").strip()]))),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)",
+            ("td_builder_signature", _td_builder_signature()),
         )
         conn.execute(
             "INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)",
@@ -10974,6 +11181,18 @@ def rebuild_test_data_project_cache(
         conn.execute(
             "INSERT OR REPLACE INTO td_raw_meta(key, value) VALUES (?, ?)",
             ("project_raw_signature", _td_build_project_raw_signature(wb_path, raw_columns_csv=",".join([str(c.get("name") or "").strip() for c in cfg_cols if str(c.get("name") or "").strip()]))),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO td_raw_meta(key, value) VALUES (?, ?)",
+            ("support_raw_signature", str(support_signatures.get("raw") or "")),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO td_raw_meta(key, value) VALUES (?, ?)",
+            ("support_calc_signature", str(support_signatures.get("calc") or "")),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO td_raw_meta(key, value) VALUES (?, ?)",
+            ("td_builder_signature", _td_builder_signature()),
         )
         conn.execute(
             "INSERT OR REPLACE INTO td_raw_meta(key, value) VALUES (?, ?)",
@@ -11818,7 +12037,7 @@ def rebuild_test_data_project_cache(
         debug_txt = f" Debug: {debug_path}." if debug_path is not None else ""
         raise RuntimeError(
             "No valid Test Data source SQLite files could be resolved for the active project node. "
-            "Check the workbook Sources sheet, current node/global repo path, and TD artifact folders, then run 'Build / Refresh Cache' again."
+            "Check the workbook Sources sheet, current node/global repo path, and TD artifact folders, then run 'Update Project' again."
             + reason_txt
             + debug_txt
             )
@@ -12033,20 +12252,20 @@ def rebuild_test_data_project_cache(
             raise RuntimeError(
                 "Test Data raw cache build produced no curves. "
                 f"Missing sources: {missing_sources}; invalid sources: {invalid_sources}. "
-                "Check the Sources sheet, source SQLite resolution, X-axis detection, and configured Y-column matches, then run 'Build / Refresh Cache' again."
+                "Check the Sources sheet, source SQLite resolution, X-axis detection, and configured Y-column matches, then run 'Update Project' again."
                 + reason_txt
                 + debug_txt
             )
         raise RuntimeError(
             "Test Data raw cache build produced no curves. "
-            "Check X-axis detection and configured Y-column matches, then run 'Build / Refresh Cache' again."
+            "Check X-axis detection and configured Y-column matches, then run 'Update Project' again."
             + reason_txt
             + debug_txt
         )
     if metrics_written <= 0:
         raise RuntimeError(
             "Test Data implementation cache build produced no calculated metrics. "
-            "Check the support workbook filters/bounds and run 'Build / Refresh Cache' again."
+            "Check the support workbook filters/bounds and run 'Update Project' again."
             + reason_txt
             + debug_txt
         )
@@ -12054,7 +12273,7 @@ def rebuild_test_data_project_cache(
         raise RuntimeError(
             "Test Data cache has no compiled sources after excluding corrupt or unusable inputs. "
             f"Missing sources: {missing_sources}; invalid sources: {invalid_sources}. "
-            "Fix at least one excluded source and run 'Build / Refresh Cache' again."
+            "Fix at least one excluded source and run 'Update Project' again."
             + reason_txt
             + debug_txt
         )
@@ -19384,11 +19603,11 @@ def td_smart_solver_run(
 ) -> dict[str, object]:
     path = Path(db_path).expanduser()
     if not path.exists():
-        raise RuntimeError("Build / Refresh Cache first.")
+        raise RuntimeError("Run 'Update Project' first.")
     if not td_smart_solver_has_sequence_rows(path):
         raise RuntimeError(
             "Smart Equation Solver requires sequence-level metrics in td_metrics_calc_sequences. "
-            "Build / Refresh Cache first."
+            "Run 'Update Project' first."
         )
 
     output_name = str(output_target or "").strip()
@@ -26322,11 +26541,9 @@ def generate_test_data_project_performance_sheets(
         except Exception:
             perf_cache_ready = False
     if not perf_cache_ready:
-        db_path = ensure_test_data_project_cache(
-            proj_dir,
-            wb_path,
-            rebuild=False,
-            progress_cb=progress_cb,
+        validate_existing_test_data_project_cache(proj_dir, wb_path)
+        raise RuntimeError(
+            "Performance sheets require a current TD project cache. Run 'Update Project' first."
         )
 
     timings: dict[str, float | int] = {
@@ -26379,6 +26596,8 @@ def update_test_data_trending_project_workbook(
     dry_run: bool = False,
     require_existing_cache: bool = True,
     include_performance_sheets: bool = False,
+    source_refresh_mode: str = "none",
+    force_project_rebuild: bool = False,
     progress_cb: Callable[[str], None] | None = None,
 ) -> dict:
     """
@@ -26414,6 +26633,18 @@ def update_test_data_trending_project_workbook(
     repo = Path(global_repo).expanduser()
     project_dir = wb_path.parent
     db_path = project_dir / EIDAT_PROJECT_IMPLEMENTATION_DB
+    source_refresh_payload: dict[str, object] = {}
+    source_refresh_mode_norm = str(source_refresh_mode or "none").strip().lower() or "none"
+    if not dry_run and source_refresh_mode_norm == "smart":
+        _td_emit_progress(progress_cb, "Scanning repository for changed TD source files")
+        scan_payload = eidat_manager_scan(repo)
+        _td_emit_progress(progress_cb, "Processing changed TD source files")
+        process_payload = eidat_manager_process(repo, force=True, only_candidates=True)
+        source_refresh_payload = {
+            "mode": "smart",
+            "scan": dict(scan_payload) if isinstance(scan_payload, Mapping) else {},
+            "process": dict(process_payload) if isinstance(process_payload, Mapping) else {},
+        }
     if require_existing_cache:
         try:
             validate_existing_test_data_project_cache(project_dir, wb_path)
@@ -26455,6 +26686,7 @@ def update_test_data_trending_project_workbook(
     project_meta: dict = {}
     project_meta_changed = False
     continued_rules: dict[str, set[str]] = {}
+    excluded_serials: set[str] = set()
     try:
         pj = project_dir / EIDAT_PROJECT_META
         if pj.exists():
@@ -26462,9 +26694,11 @@ def update_test_data_trending_project_workbook(
             if isinstance(raw, dict):
                 project_meta = raw
                 continued_rules = _extract_continued_population_rules(project_meta)
+                excluded_serials = {value for value in _sanitize_excluded_serials(project_meta.get("excluded_serials"))}
     except Exception:
         project_meta = {}
         continued_rules = {}
+        excluded_serials = set()
     if "serial_number" not in src_headers:
         raise RuntimeError("Sources sheet missing required column: serial_number")
 
@@ -26503,6 +26737,8 @@ def update_test_data_trending_project_workbook(
             for sn in sorted(docs_by_serial.keys()):
                 if sn in serials_set:
                     continue
+                if sn in excluded_serials:
+                    continue
                 doc = _best_doc_for_serial(support_dir, docs_by_serial.get(sn, [])) or {}
                 row = int((ws_src.max_row or 0) + 1)
                 ws_src.cell(row, int(src_headers["serial_number"])).value = str(sn)
@@ -26531,6 +26767,14 @@ def update_test_data_trending_project_workbook(
                         project_meta_changed = True
         except Exception:
             pass
+    if project_meta and excluded_serials:
+        remaining_excluded = sorted({value for value in excluded_serials if value not in serials_set}, key=lambda value: value.casefold())
+        if remaining_excluded != _sanitize_excluded_serials(project_meta.get("excluded_serials")):
+            if remaining_excluded:
+                project_meta["excluded_serials"] = remaining_excluded
+            else:
+                project_meta.pop("excluded_serials", None)
+            project_meta_changed = True
 
     project_cfg = _load_project_td_trend_config(wb_path)
     cfg_cols = [dict(c) for c in (project_cfg.get("columns") or []) if isinstance(c, dict)]
@@ -26608,26 +26852,17 @@ def update_test_data_trending_project_workbook(
         timings["pre_cache_workbook_save_s"] = round(time.perf_counter() - t0, 3)
         _td_emit_progress(progress_cb, "Ensuring project cache")
         t0 = time.perf_counter()
-        state_before_cache_sync = inspect_test_data_project_cache_state(project_dir, wb_path)
         try:
-            db_path = ensure_test_data_project_cache(
+            cache_sync_payload = sync_test_data_project_cache(
                 project_dir,
                 wb_path,
-                rebuild=False,
+                rebuild=bool(force_project_rebuild),
                 progress_cb=progress_cb,
             )
         except Exception as exc:
             _td_emit_progress(progress_cb, f"Project cache build failed: {exc}")
             raise
-        db_path = Path(db_path).expanduser()
-        cache_sync_payload = {
-            "db_path": str(db_path),
-            "raw_db_path": str(td_raw_cache_db_path_for(project_dir)),
-            "workbook": str(wb_path),
-            "mode": str(state_before_cache_sync.get("mode") or "noop").strip() or "noop",
-            "counts": dict(state_before_cache_sync.get("counts") or {}),
-            "reason": str(state_before_cache_sync.get("reason") or "").strip(),
-        }
+        db_path = Path(str(cache_sync_payload.get("db_path") or db_path)).expanduser()
         timings["cache_ensure_s"] = round(time.perf_counter() - t0, 3)
 
     _td_emit_progress(progress_cb, "Reading project cache")
@@ -26924,6 +27159,15 @@ def update_test_data_trending_project_workbook(
                 serials_now = sorted({str(s).strip() for s in serials if str(s).strip()})
                 project_meta["serials"] = serials_now
                 project_meta["serials_count"] = len(serials_now)
+                current_excluded = [
+                    value
+                    for value in _sanitize_excluded_serials(project_meta.get("excluded_serials"))
+                    if value not in set(serials_now)
+                ]
+                if current_excluded:
+                    project_meta["excluded_serials"] = current_excluded
+                else:
+                    project_meta.pop("excluded_serials", None)
                 if "selected_metadata_rel" in project_meta:
                     rels_now = sorted(
                         {
@@ -26937,6 +27181,8 @@ def update_test_data_trending_project_workbook(
                 desc = _format_continued_population_description(project_meta.get("continued_population") or {})
                 if desc:
                     project_meta["description"] = desc
+                else:
+                    project_meta.pop("description", None)
                 (project_dir / EIDAT_PROJECT_META).write_text(json.dumps(project_meta, indent=2), encoding="utf-8")
         except Exception:
             pass
@@ -27076,6 +27322,9 @@ def update_test_data_trending_project_workbook(
         "excluded_sources_count": int(len(excluded_sources)),
         "warning_summary": warning_summary,
         "dry_run": bool(dry_run),
+        "source_refresh_mode": source_refresh_mode_norm,
+        "source_refresh": dict(source_refresh_payload),
+        "force_project_rebuild": bool(force_project_rebuild),
         "cache_sync_mode": str(cache_sync_payload.get("mode") or ""),
         "cache_sync_counts": dict(cache_sync_payload.get("counts") or {}),
         "cache_sync_reason": str(cache_sync_payload.get("reason") or ""),
@@ -27942,6 +28191,12 @@ def _sanitize_continued_population(payload: Mapping[str, object] | None) -> dict
     return out
 
 
+def _sanitize_excluded_serials(values: object) -> list[str]:
+    if not isinstance(values, (list, tuple, set)):
+        return []
+    return sorted({str(value).strip() for value in values if str(value).strip()}, key=lambda value: value.casefold())
+
+
 def _extract_continued_population_rules(meta: Mapping[str, object]) -> dict[str, set[str]]:
     raw = meta.get("continued_population")
     if not isinstance(raw, Mapping):
@@ -28343,6 +28598,189 @@ def _project_selected_metadata_rels(project_dir: Path) -> set[str]:
         return {str(v).strip() for v in vals if str(v).strip()}
     except Exception:
         return set()
+
+
+def _project_excluded_serials(project_dir: Path) -> set[str]:
+    try:
+        raw = _read_project_meta(project_dir).get("excluded_serials")
+    except Exception:
+        raw = []
+    return {value for value in _sanitize_excluded_serials(raw)}
+
+
+def save_test_data_trending_project_editor_changes(
+    global_repo: Path,
+    project_dir: Path,
+    workbook_path: Path,
+    *,
+    selected_metadata_rel: Sequence[str],
+    continued_population: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    try:
+        from openpyxl import load_workbook  # type: ignore
+    except Exception as exc:
+        raise RuntimeError(
+            "openpyxl is required to edit Test Data Trending projects. "
+            "Install it with `py -m pip install openpyxl` within the project environment."
+        ) from exc
+
+    repo = Path(global_repo).expanduser()
+    proj_dir = Path(project_dir).expanduser()
+    wb_path = Path(workbook_path).expanduser()
+    if not wb_path.exists():
+        raise FileNotFoundError(f"Project workbook not found: {wb_path}")
+
+    selected_rels = _sanitize_excluded_serials(selected_metadata_rel)
+    if not selected_rels:
+        raise RuntimeError("Select at least one Test Data Excel document.")
+
+    docs = read_eidat_index_documents(repo)
+    docs_by_rel: dict[str, dict[str, object]] = {}
+    for raw_doc in docs:
+        if not isinstance(raw_doc, Mapping):
+            continue
+        metadata_rel = str(raw_doc.get("metadata_rel") or "").strip()
+        if not metadata_rel or metadata_rel in docs_by_rel:
+            continue
+        if not _is_td_project_doc_eligible(repo, raw_doc):
+            continue
+        docs_by_rel[metadata_rel] = dict(raw_doc)
+
+    missing = [rel for rel in selected_rels if rel not in docs_by_rel]
+    if missing:
+        preview = ", ".join(missing[:12])
+        extra = "" if len(missing) <= 12 else f" ... and {len(missing) - 12} more"
+        raise RuntimeError(
+            "Some selected Test Data documents are no longer available with extracted Excel data: "
+            f"{preview}{extra}"
+        )
+
+    chosen_docs = [dict(docs_by_rel[rel]) for rel in selected_rels]
+    serials = sorted(
+        {
+            str(doc.get("serial_number") or "").strip()
+            for doc in chosen_docs
+            if str(doc.get("serial_number") or "").strip()
+        },
+        key=lambda value: value.casefold(),
+    )
+    if not serials:
+        raise RuntimeError("Selected Test Data documents have no serial numbers in the index.")
+
+    continued_population_clean = _sanitize_continued_population(continued_population)
+    project_meta = _read_project_meta(proj_dir)
+    existing_excluded = _project_excluded_serials(proj_dir)
+    prior_serials = {
+        str(value).strip()
+        for value in (project_meta.get("serials") or [])
+        if str(value).strip()
+    }
+    removed_serials = {value for value in prior_serials if value not in set(serials)}
+    excluded_serials = sorted(
+        (existing_excluded | removed_serials) - set(serials),
+        key=lambda value: value.casefold(),
+    )
+
+    try:
+        wb = load_workbook(str(wb_path))
+    except PermissionError as exc:
+        raise RuntimeError(f"Workbook is not writable (close it in Excel first): {wb_path}") from exc
+
+    try:
+        ws_src = wb["Sources"] if "Sources" in wb.sheetnames else wb.create_sheet("Sources")
+        src_headers: dict[str, int] = {}
+        for col in range(1, (ws_src.max_column or 0) + 1):
+            key = str(ws_src.cell(1, col).value or "").strip().lower()
+            if key:
+                src_headers[key] = col
+        required_src_cols = [
+            "serial_number",
+            "program_title",
+            "document_type",
+            "metadata_rel",
+            "artifacts_rel",
+            "excel_sqlite_rel",
+        ]
+        for key in required_src_cols:
+            if key in src_headers:
+                continue
+            col = int((ws_src.max_column or 0) + 1)
+            ws_src.cell(1, col).value = key
+            src_headers[key] = col
+        if int(ws_src.max_row or 0) > 1:
+            ws_src.delete_rows(2, int(ws_src.max_row or 0) - 1)
+
+        support_dir = eidat_support_dir(repo)
+        docs_by_serial: dict[str, list[dict[str, object]]] = {}
+        for doc in chosen_docs:
+            serial = str(doc.get("serial_number") or "").strip()
+            if serial:
+                docs_by_serial.setdefault(serial, []).append(doc)
+        for row_idx, serial in enumerate(serials, start=2):
+            doc = _best_doc_for_serial(support_dir, cast(list[dict], docs_by_serial.get(serial, []))) or {}
+            resolved_sqlite_rel = str(doc.get("excel_sqlite_rel") or "").strip()
+            resolved = _resolve_td_source_sqlite_for_node(
+                repo,
+                excel_sqlite_rel=resolved_sqlite_rel,
+                artifacts_rel=str(doc.get("artifacts_rel") or "").strip(),
+            )
+            if str(resolved.get("status") or "").strip().lower() == "ok":
+                resolved_sqlite_rel = str(
+                    resolved.get("healed_excel_sqlite_rel")
+                    or resolved.get("workbook_excel_sqlite_rel")
+                    or resolved_sqlite_rel
+                ).strip()
+            ws_src.cell(row_idx, int(src_headers["serial_number"])).value = serial
+            ws_src.cell(row_idx, int(src_headers["program_title"])).value = str(doc.get("program_title") or "").strip()
+            ws_src.cell(row_idx, int(src_headers["document_type"])).value = str(doc.get("document_type") or "").strip()
+            ws_src.cell(row_idx, int(src_headers["metadata_rel"])).value = str(doc.get("metadata_rel") or "").strip()
+            ws_src.cell(row_idx, int(src_headers["artifacts_rel"])).value = str(doc.get("artifacts_rel") or "").strip()
+            ws_src.cell(row_idx, int(src_headers["excel_sqlite_rel"])).value = resolved_sqlite_rel
+        wb.save(str(wb_path))
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
+
+    updated_meta = dict(project_meta)
+    updated_meta["name"] = str(updated_meta.get("name") or proj_dir.name).strip() or proj_dir.name
+    updated_meta["type"] = (
+        str(updated_meta.get("type") or EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING).strip()
+        or EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING
+    )
+    updated_meta["global_repo"] = str(repo)
+    updated_meta["project_dir"] = str(proj_dir)
+    updated_meta["workbook"] = str(wb_path)
+    updated_meta["selected_metadata_rel"] = list(selected_rels)
+    updated_meta["selected_count"] = len(selected_rels)
+    updated_meta["serials"] = list(serials)
+    updated_meta["serials_count"] = len(serials)
+    updated_meta["continued_population"] = continued_population_clean
+    if excluded_serials:
+        updated_meta["excluded_serials"] = excluded_serials
+    else:
+        updated_meta.pop("excluded_serials", None)
+    description = _format_continued_population_description(continued_population_clean)
+    if description:
+        updated_meta["description"] = description
+    else:
+        updated_meta.pop("description", None)
+    (proj_dir / EIDAT_PROJECT_META).write_text(json.dumps(updated_meta, indent=2), encoding="utf-8")
+    try:
+        _mirror_project_to_local(proj_dir, project_name=str(updated_meta.get("name") or proj_dir.name))
+    except Exception:
+        pass
+    return {
+        "project_dir": str(proj_dir),
+        "workbook": str(wb_path),
+        "selected_metadata_rel": list(selected_rels),
+        "selected_count": len(selected_rels),
+        "serials": list(serials),
+        "serials_count": len(serials),
+        "excluded_serials": list(excluded_serials),
+        "continued_population": dict(continued_population_clean),
+    }
 
 
 def _sync_project_workbook_metadata_inplace(
@@ -33130,16 +33568,6 @@ def create_eidat_project(
     chosen_docs = [d for d in docs if str(d.get("metadata_rel") or "").strip() in selected]
     continued_population_clean = _sanitize_continued_population(continued_population)
 
-    def _is_test_data_eligible(d: dict) -> bool:
-        if not _is_confirmed_doc_type(d, "TD"):
-            return False
-        resolved = _resolve_td_source_sqlite_for_node(
-            repo,
-            excel_sqlite_rel=str(d.get("excel_sqlite_rel") or "").strip(),
-            artifacts_rel=str(d.get("artifacts_rel") or "").strip(),
-        )
-        return str(resolved.get("status") or "") == "ok"
-
     if project_type in (EIDAT_PROJECT_TYPE_TRENDING, EIDAT_PROJECT_TYPE_RAW_TRENDING):
         bad = [d for d in chosen_docs if isinstance(d, dict) and not _is_confirmed_doc_type(d, "EIDP")]
         if bad:
@@ -33150,7 +33578,7 @@ def create_eidat_project(
                 + (f"(Affected serials: {', '.join(bad_sn[:12])})" if bad_sn else "")
             )
     if project_type == EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING:
-        bad = [d for d in chosen_docs if isinstance(d, dict) and not _is_test_data_eligible(d)]
+        bad = [d for d in chosen_docs if isinstance(d, dict) and not _is_td_project_doc_eligible(repo, d)]
         if bad:
             bad_sn = sorted({str(d.get("serial_number") or "").strip() for d in bad if str(d.get("serial_number") or "").strip()})
             raise RuntimeError(

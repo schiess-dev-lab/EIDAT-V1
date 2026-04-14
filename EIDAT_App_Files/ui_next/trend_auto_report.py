@@ -75,18 +75,27 @@ def _tar_resolve_report_db_path(
 ) -> Path:
     proj = Path(project_dir).expanduser()
     wb = Path(workbook_path).expanduser()
-    if rebuild:
-        return Path(be.ensure_test_data_project_cache(proj, wb, rebuild=True, progress_cb=progress_cb)).expanduser()
     try:
         state = be.inspect_test_data_project_cache_state(proj, wb)
     except Exception:
         state = {}
     refresh_mode = str((state or {}).get("mode") or "").strip().lower()
-    refresh_reason = str((state or {}).get("reason") or "").strip().lower()
-    if refresh_mode == "calc" and refresh_reason == "selected statistics changed":
+    refresh_reason = str((state or {}).get("reason") or "").strip()
+    if rebuild:
+        _tar_emit_progress(
+            progress_cb,
+            "Auto Report uses the current cache only. Run Update Project first if you need a refresh.",
+        )
+    elif refresh_mode == "calc" and str(refresh_reason or "").strip().lower() == "selected statistics changed":
         _tar_emit_progress(progress_cb, "Using existing cached statistics for Auto Report")
-        return Path(be.validate_test_data_project_cache_for_open(proj, wb)).expanduser()
-    return Path(be.ensure_test_data_project_cache(proj, wb, rebuild=False, progress_cb=progress_cb)).expanduser()
+    elif refresh_mode and refresh_mode != "none":
+        _tar_emit_progress(
+            progress_cb,
+            f"Using existing cached data ({refresh_reason or refresh_mode}). Run Update Project to refresh it.",
+        )
+    else:
+        _tar_emit_progress(progress_cb, "Using existing project cache")
+    return Path(be.validate_test_data_project_cache_for_open(proj, wb)).expanduser()
 
 
 def _safe_float(v: object) -> float | None:
@@ -2594,7 +2603,7 @@ def generate_test_data_auto_report(
     hi_cfg = report_cfg.get("highlight") or {}
 
     rebuild = bool(options.get("rebuild_cache"))
-    db_path = be.ensure_test_data_project_cache(proj, wb, rebuild=rebuild)
+    db_path = _tar_resolve_report_db_path(be, proj, wb, rebuild=rebuild, progress_cb=None)
 
     if bool(options.get("update_excel_trend_config", True)):
         _, change_summary = be.autofill_excel_trend_config_from_td_cache(
@@ -2627,14 +2636,14 @@ def generate_test_data_auto_report(
                 raise RuntimeError("Auto Report filters excluded all serials in the current project cache.")
             raise RuntimeError(
                 "Auto Report found no usable Test Data sources in the current project cache. "
-                "Build / Refresh Cache again and verify the workbook Sources sheet points at the active node path."
+                "Update Project again and verify the workbook Sources sheet points at the active node path."
             )
 
         runs = _resolve_selected_runs(run_rows, options)
         if not runs:
             raise RuntimeError(
                 "Auto Report found no usable Test Data runs in the current project cache. "
-                "Build / Refresh Cache again and verify TD source resolution for this project."
+                "Update Project again and verify TD source resolution for this project."
             )
 
         excel_cols = excel_cfg.get("columns") or []
@@ -4067,6 +4076,12 @@ def _tar_stacked_grade_text(initial_grade: object, final_grade: object) -> str:
     return f"Initial: {initial}\nFinal: {final}"
 
 
+def _tar_comparison_grade_text(initial_grade: object, final_grade: object, *, regrade_applied: bool) -> str:
+    if regrade_applied:
+        return _tar_stacked_grade_text(initial_grade, final_grade)
+    return str(initial_grade or "NO_DATA").strip().upper() or "NO_DATA"
+
+
 def _tar_selection_suppression_values_from_rows(
     selection: Mapping[str, object] | None,
     rows: list[dict] | None,
@@ -4100,6 +4115,9 @@ def _tar_selection_suppression_values(
 ) -> list[str]:
     if not isinstance(selection, Mapping):
         return []
+    from_rows = _tar_selection_suppression_values_from_rows(selection, filter_rows, filter_state=filter_state)
+    if from_rows:
+        return from_rows
     values: list[str] = []
     raw_values = selection.get("member_suppression_voltages") or []
     if isinstance(raw_values, list):
@@ -4111,9 +4129,6 @@ def _tar_selection_suppression_values(
     values = _tar_unique_text_values([value for value in values if str(value or "").strip()])
     if values:
         return values
-    from_rows = _tar_selection_suppression_values_from_rows(selection, filter_rows, filter_state=filter_state)
-    if from_rows:
-        return from_rows
     if _filter_state_has_key(filter_state, "suppression_voltages"):
         return _tar_unique_text_values(_filter_state_values(filter_state, "suppression_voltages"))
     return []
@@ -4160,6 +4175,30 @@ def _tar_clone_filter_state(
     if suppression_voltage is not None:
         text = str(suppression_voltage or "").strip()
         out["suppression_voltages"] = ([text] if text else [])
+    return out
+
+
+def _tar_filter_state_without_suppression(
+    filter_state: Mapping[str, object] | None,
+) -> dict[str, list[str]]:
+    out: dict[str, list[str]] = {}
+    if not isinstance(filter_state, Mapping):
+        return out
+    for key, value in filter_state.items():
+        name = str(key)
+        if name == "suppression_voltages":
+            continue
+        if isinstance(value, list):
+            out[name] = [str(item).strip() for item in value if str(item).strip()]
+    return out
+
+
+def _tar_initial_analysis_options(options: Mapping[str, object] | None) -> dict[str, object]:
+    out = dict(options) if isinstance(options, Mapping) else {}
+    out["filter_state"] = _tar_filter_state_without_suppression(
+        (options.get("filter_state") if isinstance(options, Mapping) else None)
+    )
+    out.pop("filtered_serials", None)
     return out
 
 
@@ -4252,6 +4291,7 @@ def _tar_curve_plot_payload_for_pair(
     x_name = str(model.get("x_name") or "").strip()
     if not x_name:
         x_name = _resolve_curve_x_key(ctx["be"], ctx["db_path"], run_name, str(run_meta.get("default_x") or "").strip() or "Time")
+    override_filter_state = spec.get("filter_state_override")
     series = _load_curves_for_selection(
         ctx["be"],
         ctx["db_path"],
@@ -4259,7 +4299,7 @@ def _tar_curve_plot_payload_for_pair(
         param_name,
         x_name,
         selection=selection,
-        filter_state=(spec.get("filter_state_override") if isinstance(spec.get("filter_state_override"), Mapping) else ctx["filter_state"]),
+        filter_state=(override_filter_state if isinstance(override_filter_state, Mapping) and override_filter_state else ctx["filter_state"]),
     )
     if not series:
         cache[cache_key] = None
@@ -4485,6 +4525,12 @@ def _tar_stacked_metric_text(initial_value: object, final_value: object, *, sig:
     return f"Initial: {_fmt_num(initial_value, sig=sig)}\nFinal: {_fmt_num(final_value, sig=sig)}"
 
 
+def _tar_comparison_metric_text(initial_value: object, final_value: object, *, regrade_applied: bool, sig: int = 5) -> str:
+    if regrade_applied:
+        return _tar_stacked_metric_text(initial_value, final_value, sig=sig)
+    return _fmt_num(initial_value, sig=sig)
+
+
 def _tar_filter_state_label(
     filter_state: Mapping[str, object] | None,
     key: str,
@@ -4690,6 +4736,7 @@ def _tar_build_per_serial_comparison_rows(
             )
             initial_grade = str(initial_grade_map_by_pair_serial.get((pair_id, serial), "NO_DATA") or "NO_DATA").strip().upper() or "NO_DATA"
             final_grade = str(final_grade_map_by_pair_serial.get((pair_id, serial), initial_grade) or initial_grade).strip().upper() or initial_grade
+            regrade_applied = bool(final_override)
 
             comparison_rows.append(
                 {
@@ -4711,14 +4758,14 @@ def _tar_build_per_serial_comparison_rows(
                     "initial_grade": initial_grade,
                     "final_grade": final_grade,
                     "grade": final_grade,
-                    "grade_text": _tar_stacked_grade_text(initial_grade, final_grade),
+                    "grade_text": _tar_comparison_grade_text(initial_grade, final_grade, regrade_applied=regrade_applied),
                     "selection_mode": selection_fields.get("mode") or "sequence",
                     "base_condition_label": str(spec.get("base_condition_label") or "").strip(),
                     "initial_suppression_voltage_label": initial_suppression,
                     "final_suppression_voltage_label": final_suppression,
                     "initial_bus_voltage_label": "",
                     "final_bus_voltage_label": "",
-                    "regrade_applied": bool(final_override),
+                    "regrade_applied": regrade_applied,
                 }
             )
     return comparison_rows
@@ -5608,6 +5655,7 @@ def _tar_prepare_row_specs(
                     "param": param_name,
                     "units": units,
                     "x_name": x_name,
+                    "base_filter_state": _tar_clone_filter_state(filter_state),
                     "series": list(series),
                     "series_by_suppression": dict(series_by_suppression),
                     "initial_model": {},
@@ -5770,6 +5818,12 @@ def _tar_analyze_curve_groups(
             }
         )
 
+    initial_nonpass_targets = {
+        (pair_id, serial)
+        for (pair_id, serial), row in initial_rows.items()
+        if str((row or {}).get("initial_grade") or "").strip().upper() in {"WATCH", "FAIL"}
+    }
+
     family_groups: dict[tuple[str, str, str], list[dict]] = {}
     for spec in specs:
         key = (
@@ -5801,18 +5855,28 @@ def _tar_analyze_curve_groups(
         if len(family_suppression_values_all) <= 1 or not family_suppression_values:
             continue
         for suppression_value in family_suppression_values:
-            pooled_series: list[CurveSeries] = []
             member_specs: list[dict] = []
             for spec in members:
                 suppression_series = list(((spec.get("series_by_suppression") or {}).get(suppression_value) or []))
                 if not suppression_series:
                     continue
-                pooled_series.extend(suppression_series)
                 member_specs.append(spec)
+            if not member_specs:
+                continue
+            targeted_member_specs = [
+                spec
+                for spec in member_specs
+                if any((str(spec.get("pair_id") or ""), serial) in initial_nonpass_targets for serial in hi_set)
+            ]
+            if not targeted_member_specs:
+                continue
+            pooled_series: list[CurveSeries] = []
+            for spec in targeted_member_specs:
+                pooled_series.extend(list(((spec.get("series_by_suppression") or {}).get(suppression_value) or [])))
             model = _tar_build_curve_model_for_series(
                 pooled_series,
-                x_name=str(members[0].get("x_name") or ""),
-                units=str(members[0].get("units") or ""),
+                x_name=str(targeted_member_specs[0].get("x_name") or members[0].get("x_name") or ""),
+                units=str(targeted_member_specs[0].get("units") or members[0].get("units") or ""),
                 grid_points=grid_points,
                 degree=degree,
                 normalize_x=normalize_x,
@@ -5825,7 +5889,7 @@ def _tar_analyze_curve_groups(
             denom = float(model.get("denom") or 1.0)
             all_entries: list[tuple[dict, str, dict]] = []
             trace_curves: list[dict] = []
-            for spec in member_specs:
+            for spec in targeted_member_specs:
                 y_resampled_by_sn = {
                     curve.serial: _interp_linear(curve.x, curve.y, x_grid)
                     for curve in (((spec.get("series_by_suppression") or {}).get(suppression_value) or []))
@@ -5870,7 +5934,7 @@ def _tar_analyze_curve_groups(
             for spec, serial, dev in all_entries:
                 z_score = (float(dev.get("max_abs") or 0.0) - mean_score) / std_score if std_score else 0.0
                 grade = _grade_from_z(z_score, z_pass, z_watch)
-                if serial not in hi:
+                if serial not in hi or (str(spec.get("pair_id") or ""), serial) not in initial_nonpass_targets:
                     continue
                 regrade_candidates.setdefault((str(spec.get("pair_id") or ""), serial), []).append(
                     {
@@ -5897,15 +5961,15 @@ def _tar_analyze_curve_groups(
                 )
             regrade_cohort_specs.append(
                 {
-                    "cohort_id": f"regrade:{family_index}:{_norm_key(str(members[0].get('base_condition_label') or ''))}:{_norm_key(suppression_value)}:{_norm_key(str(members[0].get('param') or ''))}:{_norm_key(str(members[0].get('x_name') or ''))}",
+                    "cohort_id": f"regrade:{family_index}:{_norm_key(str(targeted_member_specs[0].get('base_condition_label') or members[0].get('base_condition_label') or ''))}:{_norm_key(suppression_value)}:{_norm_key(str(targeted_member_specs[0].get('param') or members[0].get('param') or ''))}:{_norm_key(str(targeted_member_specs[0].get('x_name') or members[0].get('x_name') or ''))}",
                     "cohort_type": "regrade",
-                    "param": str(members[0].get("param") or ""),
-                    "units": str(members[0].get("units") or ""),
+                    "param": str(targeted_member_specs[0].get("param") or members[0].get("param") or ""),
+                    "units": str(targeted_member_specs[0].get("units") or members[0].get("units") or ""),
                     "x_name": str(model.get("x_name") or ""),
-                    "base_condition_label": str(members[0].get("base_condition_label") or ""),
+                    "base_condition_label": str(targeted_member_specs[0].get("base_condition_label") or members[0].get("base_condition_label") or ""),
                     "suppression_voltage_label": suppression_value,
-                    "selection_labels": [str(spec.get("selection_label") or "") for spec in member_specs if str(spec.get("selection_label") or "").strip()],
-                    "member_pair_ids": [str(spec.get("pair_id") or "") for spec in member_specs if str(spec.get("pair_id") or "").strip()],
+                    "selection_labels": [str(spec.get("selection_label") or "") for spec in targeted_member_specs if str(spec.get("selection_label") or "").strip()],
+                    "member_pair_ids": [str(spec.get("pair_id") or "") for spec in targeted_member_specs if str(spec.get("pair_id") or "").strip()],
                     "model": {
                         "x_name": str(model.get("x_name") or ""),
                         "units": str(model.get("units") or ""),
@@ -5944,9 +6008,10 @@ def _tar_analyze_curve_groups(
         if per_pair_candidates:
             pair_worst = max(per_pair_candidates, key=_tar_worst_candidate_sort_key)
             pair_suppression = str(pair_worst.get("suppression_voltage_label") or "").strip()
+            override_base_state = spec.get("base_filter_state") if isinstance(spec.get("base_filter_state"), Mapping) else {}
             spec["model"] = dict((spec.get("regrade_models") or {}).get(pair_suppression) or spec.get("initial_model") or {})
             spec["plot_payload"] = dict((spec.get("regrade_plot_payloads") or {}).get(pair_suppression) or spec.get("initial_plot_payload") or {})
-            spec["filter_state_override"] = _tar_clone_filter_state({}, suppression_voltage=pair_suppression) if pair_suppression else {}
+            spec["filter_state_override"] = _tar_clone_filter_state(override_base_state, suppression_voltage=pair_suppression) if pair_suppression else {}
         else:
             spec["model"] = dict(spec.get("initial_model") or {})
             spec["plot_payload"] = dict(spec.get("initial_plot_payload") or {})
@@ -6109,7 +6174,7 @@ def _tar_prepare_base(
     hi_cfg = report_cfg.get("highlight") or {}
 
     rebuild = bool(options.get("rebuild_cache"))
-    _tar_emit_progress(progress_cb, "Ensuring project cache")
+    _tar_emit_progress(progress_cb, "Checking existing project cache")
     db_path = _tar_resolve_report_db_path(be, proj, wb, rebuild=rebuild, progress_cb=progress_cb)
     if bool(options.get("update_excel_trend_config", True)):
         _tar_emit_progress(progress_cb, "Syncing Excel trend configuration")
@@ -6130,10 +6195,11 @@ def _tar_prepare_base(
     except Exception:
         source_rows = []
     ordered_serials = _td_order_metric_serials(be.td_list_serials(db_path), source_rows) or _td_list_serials(conn)
-    filter_state = options.get("filter_state")
+    initial_options = _tar_initial_analysis_options(options)
+    filter_state = initial_options.get("filter_state")
     if not isinstance(filter_state, Mapping):
         filter_state = {}
-    all_serials = _resolve_filtered_serials(be, db_path, ordered_serials, options)
+    all_serials = _resolve_filtered_serials(be, db_path, ordered_serials, initial_options)
     run_rows = _td_list_runs(conn)
     run_by_name = {
         str(row.get("run_name") or "").strip(): row
@@ -6145,14 +6211,14 @@ def _tar_prepare_base(
             raise RuntimeError("Auto Report filters excluded all serials in the current project cache.")
         raise RuntimeError(
             "Auto Report found no usable Test Data sources in the current project cache. "
-            "Build / Refresh Cache again and verify the workbook Sources sheet points at the active node path."
+            "Update Project again and verify the workbook Sources sheet points at the active node path."
         )
 
     runs = _resolve_selected_runs(run_rows, options)
     if not runs:
         raise RuntimeError(
             "Auto Report found no usable Test Data runs in the current project cache. "
-            "Build / Refresh Cache again and verify TD source resolution for this project."
+            "Update Project again and verify TD source resolution for this project."
         )
 
     params = _resolve_selected_params(be, db_path, conn, runs=runs, options=options)
@@ -6217,7 +6283,7 @@ def _tar_prepare_base(
     if not isinstance(filter_rows, list):
         filter_rows = []
 
-    report_selections = _tar_resolve_report_selections(run_by_name, runs, options)
+    report_selections = _tar_resolve_report_selections(run_by_name, runs, initial_options)
     _tar_emit_progress(progress_cb, f"Preparing curve comparisons for {len(report_selections)} selection(s) and {len(params)} parameter(s)")
     pair_specs = _tar_prepare_row_specs(
         be=be,
@@ -6304,7 +6370,7 @@ def _tar_prepare_base(
         "excel_cfg": excel_cfg,
         "report_cfg": report_cfg,
         "report_opts": report_opts,
-        "options": options,
+        "options": initial_options,
         "conn": conn,
         "run_rows": run_rows,
         "run_by_name": run_by_name,
@@ -6794,19 +6860,46 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
             ],
             ["Serial", "Sequence(s)", "Parameter", "Units", "ATP Mean", "ATP Actual", "Delta", "Grade"],
         ]
+        extra_styles = [
+            ("SPAN", (0, 0), (-1, 0)),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#cbd5e1")),
+        ]
         for row in group.get("rows") or []:
+            regrade_applied = bool(row.get("regrade_applied"))
             group_rows.append(
                 [
                     row.get("serial") or "",
                     row.get("sequence_text") or "",
                     row.get("parameter") or "",
                     row.get("units") or "",
-                    _tar_stacked_metric_text(row.get("initial_atp_mean"), row.get("final_atp_mean"), sig=5),
-                    _tar_stacked_metric_text(row.get("initial_actual_mean"), row.get("final_actual_mean"), sig=5),
-                    _tar_stacked_metric_text(row.get("initial_delta"), row.get("final_delta"), sig=5),
-                    _tar_stacked_grade_text(row.get("initial_grade"), row.get("final_grade")),
+                    _tar_comparison_metric_text(
+                        row.get("initial_atp_mean"),
+                        row.get("final_atp_mean"),
+                        regrade_applied=regrade_applied,
+                        sig=5,
+                    ),
+                    _tar_comparison_metric_text(
+                        row.get("initial_actual_mean"),
+                        row.get("final_actual_mean"),
+                        regrade_applied=regrade_applied,
+                        sig=5,
+                    ),
+                    _tar_comparison_metric_text(
+                        row.get("initial_delta"),
+                        row.get("final_delta"),
+                        regrade_applied=regrade_applied,
+                        sig=5,
+                    ),
+                    _tar_comparison_grade_text(
+                        row.get("initial_grade"),
+                        row.get("final_grade"),
+                        regrade_applied=regrade_applied,
+                    ),
                 ]
             )
+            if regrade_applied:
+                data_row_index = len(group_rows) - 1
+                extra_styles.append(("BACKGROUND", (0, data_row_index), (-1, data_row_index), colors.HexColor("#fef3c7")))
         story.append(
             _portrait_box_table(
                 group_rows,
@@ -6816,10 +6909,7 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
                 repeat_rows=2,
                 compact=True,
                 header_rows=2,
-                extra_style_commands=[
-                    ("SPAN", (0, 0), (-1, 0)),
-                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#cbd5e1")),
-                ],
+                extra_style_commands=extra_styles,
             )
         )
         if group_index != len(comparison_groups) - 1:

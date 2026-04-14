@@ -4639,7 +4639,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
             self.assertEqual(str(validated), str(root / "implementation_trending.sqlite3"))
             self.assertEqual(readiness["problems"], [])
             self.assertTrue(
-                any("support workbook changed" in str(warning).lower() for warning in (readiness.get("warnings") or []))
+                any("support workbook calculation inputs changed" in str(warning).lower() for warning in (readiness.get("warnings") or []))
             )
 
     def test_ensure_cache_uses_calc_only_refresh_after_statistics_change(self) -> None:
@@ -5127,8 +5127,8 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 "post_cache_workbook_build_s",
             ):
                 self.assertIn(key, timings)
-            self.assertEqual(str(result.get("cache_sync_mode") or ""), "calc")
-            self.assertEqual(str(result.get("cache_sync_reason") or ""), "support workbook changed")
+            self.assertEqual(str(result.get("cache_sync_mode") or ""), "calc_only")
+            self.assertEqual(str(result.get("cache_sync_reason") or ""), "support workbook calculation inputs changed")
             self.assertEqual(int(timings.get("perf_candidates_cp_count") or 0), 0)
 
             wb = load_workbook(str(wb_path), read_only=True, data_only=True)
@@ -5159,6 +5159,242 @@ class TestTDSupportWorkbook(unittest.TestCase):
             ]
             indices = [next(i for i, msg in enumerate(progress) if stage in msg) for stage in expected_stages]
             self.assertEqual(indices, sorted(indices))
+
+    def test_update_workbook_uses_full_refresh_after_support_raw_change(self) -> None:
+        from openpyxl import load_workbook  # type: ignore
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            src_db = root / "src.sqlite3"
+            self._make_source_sqlite(src_db)
+
+            wb_path = root / "project.xlsx"
+            be._write_test_data_trending_workbook(
+                wb_path,
+                global_repo=root,
+                serials=["SN1"],
+                docs=[{"serial_number": "SN1", "excel_sqlite_rel": str(src_db)}],
+                config=self._make_config(),
+            )
+            support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+            be._write_td_support_workbook(
+                support_path,
+                sequence_names=["RunA"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+            )
+
+            wb = load_workbook(str(support_path))
+            try:
+                ws_prog = wb[self._default_program_sheet_name(be)]
+                self._set_sheet_row(
+                    ws_prog,
+                    2,
+                    {
+                        "condition_key": "RunA",
+                        "source_run_name": "RunA",
+                        "feed_pressure": 100,
+                        "feed_pressure_units": "psia",
+                        "run_type": "pulsed mode",
+                        "control_period": 60,
+                        "suppression_voltage": 24,
+                    },
+                )
+                wb.save(str(support_path))
+            finally:
+                wb.close()
+            self._refresh_support_conditions(be, wb_path, root)
+            be.update_test_data_trending_project_workbook(root, wb_path, overwrite=True)
+
+            time.sleep(0.05)
+            wb = load_workbook(str(support_path))
+            try:
+                ws_prog = wb[self._default_program_sheet_name(be)]
+                self._set_sheet_row(
+                    ws_prog,
+                    2,
+                    {
+                        "control_period": 120,
+                        "suppression_voltage": 28,
+                    },
+                )
+                wb.save(str(support_path))
+            finally:
+                wb.close()
+            self._refresh_support_conditions(be, wb_path, root)
+
+            result = be.update_test_data_trending_project_workbook(root, wb_path, overwrite=True)
+            self.assertEqual(str(result.get("cache_sync_mode") or ""), "full_rebuild")
+            self.assertEqual(str(result.get("cache_sync_reason") or ""), "support workbook raw inputs changed")
+
+    def test_update_workbook_runs_smart_source_refresh_only_when_requested(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            src_db = root / "src.sqlite3"
+            self._make_source_sqlite(src_db)
+
+            wb_path = root / "project.xlsx"
+            be._write_test_data_trending_workbook(
+                wb_path,
+                global_repo=root,
+                serials=["SN1"],
+                docs=[{"serial_number": "SN1", "excel_sqlite_rel": str(src_db)}],
+                config=self._make_config(),
+            )
+            support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+            be._write_td_support_workbook(
+                support_path,
+                sequence_names=["RunA"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+            )
+
+            with mock.patch.object(be, "eidat_manager_scan", return_value={"scanned": 1}) as scan_mock, mock.patch.object(
+                be,
+                "eidat_manager_process",
+                return_value={"processed_ok": 1},
+            ) as process_mock:
+                result = be.update_test_data_trending_project_workbook(
+                    root,
+                    wb_path,
+                    overwrite=True,
+                    source_refresh_mode="smart",
+                )
+
+            scan_mock.assert_called_once_with(root)
+            process_mock.assert_called_once_with(root, force=True, only_candidates=True)
+            self.assertEqual(str(result.get("source_refresh_mode") or ""), "smart")
+            self.assertEqual(str((result.get("source_refresh") or {}).get("mode") or ""), "smart")
+
+    def test_update_workbook_force_project_rebuild_uses_forced_full_rebuild_mode(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            src_db = root / "src.sqlite3"
+            self._make_source_sqlite(src_db)
+
+            wb_path = root / "project.xlsx"
+            be._write_test_data_trending_workbook(
+                wb_path,
+                global_repo=root,
+                serials=["SN1"],
+                docs=[{"serial_number": "SN1", "excel_sqlite_rel": str(src_db)}],
+                config=self._make_config(),
+            )
+            support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+            be._write_td_support_workbook(
+                support_path,
+                sequence_names=["RunA"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+            )
+
+            be.update_test_data_trending_project_workbook(root, wb_path, overwrite=True)
+            result = be.update_test_data_trending_project_workbook(
+                root,
+                wb_path,
+                overwrite=True,
+                force_project_rebuild=True,
+            )
+
+            self.assertTrue(bool(result.get("force_project_rebuild")))
+            self.assertEqual(str(result.get("cache_sync_mode") or ""), "full_rebuild")
+            self.assertEqual(str(result.get("cache_sync_reason") or ""), "forced full rebuild")
+
+    def test_save_td_project_editor_changes_updates_sources_and_sticky_exclusions_without_rebuild(self) -> None:
+        from openpyxl import load_workbook  # type: ignore
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            src_a = root / "src_a.sqlite3"
+            src_b = root / "src_b.sqlite3"
+            self._make_source_sqlite(src_a)
+            self._make_source_sqlite(src_b)
+
+            docs = [
+                {
+                    "serial_number": "SN1",
+                    "program_title": "Program A",
+                    "document_type": "TD",
+                    "document_type_acronym": "TD",
+                    "document_type_status": "confirmed",
+                    "document_type_review_required": False,
+                    "metadata_rel": "docs/SN1.json",
+                    "artifacts_rel": "debug/ocr/SN1",
+                    "excel_sqlite_rel": str(src_a.relative_to(root)),
+                },
+                {
+                    "serial_number": "SN2",
+                    "program_title": "Program A",
+                    "document_type": "TD",
+                    "document_type_acronym": "TD",
+                    "document_type_status": "confirmed",
+                    "document_type_review_required": False,
+                    "metadata_rel": "docs/SN2.json",
+                    "artifacts_rel": "debug/ocr/SN2",
+                    "excel_sqlite_rel": str(src_b.relative_to(root)),
+                },
+            ]
+
+            wb_path = root / "project.xlsx"
+            be._write_test_data_trending_workbook(
+                wb_path,
+                global_repo=root,
+                serials=["SN1", "SN2"],
+                docs=docs,
+                config=self._make_config(),
+            )
+            meta_path = root / be.EIDAT_PROJECT_META
+            meta_path.write_text(
+                json.dumps(
+                    {
+                        "name": "project",
+                        "type": be.EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING,
+                        "global_repo": str(root),
+                        "project_dir": str(root),
+                        "workbook": str(wb_path),
+                        "selected_metadata_rel": ["docs/SN1.json", "docs/SN2.json"],
+                        "selected_count": 2,
+                        "serials": ["SN1", "SN2"],
+                        "serials_count": 2,
+                        "continued_population": {"program_title": ["Program A"]},
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(be, "read_eidat_index_documents", return_value=docs):
+                result = be.save_test_data_trending_project_editor_changes(
+                    root,
+                    root,
+                    wb_path,
+                    selected_metadata_rel=["docs/SN1.json"],
+                    continued_population={"program_title": ["Program A"]},
+                )
+
+            self.assertEqual(result.get("serials"), ["SN1"])
+            self.assertEqual(result.get("excluded_serials"), ["SN2"])
+            self.assertFalse((root / "implementation_trending.sqlite3").exists())
+
+            saved_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved_meta.get("selected_metadata_rel"), ["docs/SN1.json"])
+            self.assertEqual(saved_meta.get("serials"), ["SN1"])
+            self.assertEqual(saved_meta.get("excluded_serials"), ["SN2"])
+
+            wb = load_workbook(str(wb_path), read_only=True, data_only=True)
+            try:
+                ws_src = wb["Sources"]
+                rows = [
+                    str(ws_src.cell(row, 1).value or "").strip()
+                    for row in range(2, (ws_src.max_row or 0) + 1)
+                    if str(ws_src.cell(row, 1).value or "").strip()
+                ]
+                self.assertEqual(rows, ["SN1"])
+            finally:
+                wb.close()
 
     def test_generate_performance_sheets_writes_main_and_cp_sheets(self) -> None:
         from openpyxl import load_workbook  # type: ignore
