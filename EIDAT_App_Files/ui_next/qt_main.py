@@ -127,6 +127,7 @@ TD_AUTO_PLOT_FILTER_KEYS = (
     "serials",
     "control_periods",
     "suppression_voltages",
+    "valve_voltages",
 )
 
 
@@ -214,6 +215,12 @@ def _td_suppression_voltage_filter_value(row: dict | None) -> str:
     if not isinstance(row, dict):
         return ""
     return _td_compact_filter_value(row.get("suppression_voltage"))
+
+
+def _td_valve_voltage_filter_value(row: dict | None) -> str:
+    if not isinstance(row, dict):
+        return ""
+    return _td_compact_filter_value(row.get("valve_voltage"))
 
 
 def _td_control_period_filter_value(row: dict | None) -> str:
@@ -3383,10 +3390,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._available_serial_filter_rows: list[dict] = []
         self._available_control_period_filters: list[str] = []
         self._available_suppression_voltage_filters: list[str] = []
+        self._available_valve_voltage_filters: list[str] = []
         self._checked_program_filters: list[str] = []
         self._checked_serial_filters: list[str] = []
         self._checked_control_period_filters: list[str] = []
         self._checked_suppression_voltage_filters: list[str] = []
+        self._checked_valve_voltage_filters: list[str] = []
         self._auto_plots: list[dict] = []
         self._auto_plot_global_selection: dict[str, object] = {}
         self._last_plot_def: dict | None = None
@@ -3493,6 +3502,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             QtWidgets.QSizePolicy.Policy.Expanding,
             QtWidgets.QSizePolicy.Policy.Fixed,
         )
+        self.lbl_valve_voltage_filter_summary = QtWidgets.QLabel("Valve Voltage: -")
+        self.lbl_valve_voltage_filter_summary.setStyleSheet("color: #334155; font-size: 11px;")
+        self.lbl_valve_voltage_filter_summary.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Fixed,
+        )
         self.lbl_control_period_filter_summary = QtWidgets.QLabel("Control Period: -")
         self.lbl_control_period_filter_summary.setStyleSheet("color: #334155; font-size: 11px;")
         self.lbl_control_period_filter_summary.setSizePolicy(
@@ -3503,6 +3518,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         filter_text_layout.addWidget(self.lbl_program_filter_summary)
         filter_text_layout.addWidget(self.lbl_serial_filter_summary)
         filter_text_layout.addWidget(self.lbl_suppression_voltage_filter_summary)
+        filter_text_layout.addWidget(self.lbl_valve_voltage_filter_summary)
         filter_text_layout.addWidget(self.lbl_control_period_filter_summary)
         filter_text_layout.addStretch(1)
         filter_layout.addLayout(filter_text_layout, 1)
@@ -3513,6 +3529,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self.btn_serial_filters.clicked.connect(self._open_serial_filter_popup)
         self.btn_suppression_voltage_filters = QtWidgets.QPushButton("Suppression Voltage...")
         self.btn_suppression_voltage_filters.clicked.connect(self._open_suppression_voltage_filter_popup)
+        self.btn_valve_voltage_filters = QtWidgets.QPushButton("Valve Voltage...")
+        self.btn_valve_voltage_filters.clicked.connect(self._open_valve_voltage_filter_popup)
         self.btn_control_period_filters = QtWidgets.QPushButton("Control Period...")
         self.btn_control_period_filters.clicked.connect(self._open_control_period_filter_popup)
         self.btn_reset_global_filters = QtWidgets.QPushButton("Reset Filters")
@@ -3521,6 +3539,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             self.btn_program_filters,
             self.btn_serial_filters,
             self.btn_suppression_voltage_filters,
+            self.btn_valve_voltage_filters,
             self.btn_control_period_filters,
             self.btn_reset_global_filters,
         ):
@@ -5305,6 +5324,16 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     if str(value).strip()
                 ],
             ),
+            "valve_voltages": self._auto_plot_selected_filter_values(
+                filter_state=None,
+                key="valve_voltages",
+                available_values=list(self._available_valve_voltage_filters or []),
+                live_values=[
+                    str(value).strip()
+                    for value in (self._checked_valve_voltage_filters or [])
+                    if str(value).strip()
+                ],
+            ),
         }
 
     def _normalize_auto_plot_filter_state(
@@ -5322,6 +5351,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             ("serials", self._auto_plot_available_serial_values()),
             ("control_periods", list(self._available_control_period_filters or [])),
             ("suppression_voltages", list(self._available_suppression_voltage_filters or [])),
+            ("valve_voltages", list(self._available_valve_voltage_filters or [])),
         ):
             if key not in raw and not default_to_current:
                 continue
@@ -5404,12 +5434,14 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             "serials": self._auto_plot_available_serial_values(),
             "control_periods": list(self._available_control_period_filters or []),
             "suppression_voltages": list(self._available_suppression_voltage_filters or []),
+            "valve_voltages": list(self._available_valve_voltage_filters or []),
         }
         labels = {
             "programs": "Programs",
             "serials": "Serials",
             "control_periods": "Control Period",
             "suppression_voltages": "Suppression Voltage",
+            "valve_voltages": "Valve Voltage",
         }
         current_state = self._current_auto_plot_filter_state()
         parts: list[str] = []
@@ -6539,6 +6571,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         prev_checked_control_periods = set(self._checked_control_period_filters or [])
         prev_suppression = set(self._available_suppression_voltage_filters or [])
         prev_checked_suppression = set(self._checked_suppression_voltage_filters or [])
+        prev_valve = set(self._available_valve_voltage_filters or [])
+        prev_checked_valve = set(self._checked_valve_voltage_filters or [])
 
         if not prev_programs:
             self._checked_program_filters = list(program_values)
@@ -6585,10 +6619,24 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 if value in prev_checked_suppression or value not in prev_suppression
             ]
 
+        valve_values = sorted(
+            {_td_valve_voltage_filter_value(row) for row in filter_rows if _td_valve_voltage_filter_value(row)},
+            key=_td_compact_filter_sort_key,
+        )
+        if not prev_valve:
+            self._checked_valve_voltage_filters = list(valve_values)
+        else:
+            self._checked_valve_voltage_filters = [
+                value
+                for value in valve_values
+                if value in prev_checked_valve or value not in prev_valve
+            ]
+
         self._available_program_filters = list(program_values)
         self._available_serial_filter_rows = list(serial_rows)
         self._available_control_period_filters = list(control_period_values)
         self._available_suppression_voltage_filters = list(suppression_values)
+        self._available_valve_voltage_filters = list(valve_values)
         self._refresh_global_filter_summaries()
 
     def _refresh_global_filter_summaries(self) -> None:
@@ -6601,6 +6649,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         active_control_periods = self._active_control_period_filter_values()
         total_suppression = len(self._available_suppression_voltage_filters or [])
         active_suppression = self._active_suppression_voltage_filter_values()
+        total_valve = len(self._available_valve_voltage_filters or [])
+        active_valve = self._active_valve_voltage_filter_values()
 
         if hasattr(self, "lbl_program_filter_summary"):
             if total_programs <= 0:
@@ -6659,10 +6709,25 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             self.lbl_suppression_voltage_filter_summary.setText(suppression_text)
             self.lbl_suppression_voltage_filter_summary.setToolTip(", ".join(active_suppression))
 
+        if hasattr(self, "lbl_valve_voltage_filter_summary"):
+            if total_valve <= 0:
+                valve_text = "Valve Voltage: -"
+            elif len(active_valve) >= total_valve:
+                valve_text = f"Valve Voltage: All ({total_valve})"
+            elif not active_valve:
+                valve_text = f"Valve Voltage: None active (0/{total_valve})"
+            elif len(active_valve) <= 3:
+                valve_text = "Valve Voltage: " + ", ".join(active_valve)
+            else:
+                valve_text = f"Valve Voltage: {len(active_valve)} of {total_valve} active"
+            self.lbl_valve_voltage_filter_summary.setText(valve_text)
+            self.lbl_valve_voltage_filter_summary.setToolTip(", ".join(active_valve))
+
         has_programs = bool(self._available_program_filters)
         has_serials = bool(self._available_serial_filter_rows)
         has_control_periods = bool(self._available_control_period_filters)
         has_suppression = bool(self._available_suppression_voltage_filters)
+        has_valve = bool(self._available_valve_voltage_filters)
         if hasattr(self, "btn_program_filters"):
             self.btn_program_filters.setEnabled(has_programs)
         if hasattr(self, "btn_serial_filters"):
@@ -6671,8 +6736,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             self.btn_control_period_filters.setEnabled(has_control_periods)
         if hasattr(self, "btn_suppression_voltage_filters"):
             self.btn_suppression_voltage_filters.setEnabled(has_suppression)
+        if hasattr(self, "btn_valve_voltage_filters"):
+            self.btn_valve_voltage_filters.setEnabled(has_valve)
         if hasattr(self, "btn_reset_global_filters"):
-            self.btn_reset_global_filters.setEnabled(has_programs or has_serials or has_control_periods or has_suppression)
+            self.btn_reset_global_filters.setEnabled(
+                has_programs or has_serials or has_control_periods or has_suppression or has_valve
+            )
 
     def _active_program_filter_values(self, filter_state: Mapping[str, object] | None = None) -> list[str]:
         return self._auto_plot_selected_filter_values(
@@ -6693,6 +6762,21 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             live_values=[
                 str(value).strip()
                 for value in (self._checked_suppression_voltage_filters or [])
+                if str(value).strip()
+            ],
+        )
+
+    def _active_valve_voltage_filter_values(
+        self,
+        filter_state: Mapping[str, object] | None = None,
+    ) -> list[str]:
+        return self._auto_plot_selected_filter_values(
+            filter_state=filter_state,
+            key="valve_voltages",
+            available_values=list(self._available_valve_voltage_filters or []),
+            live_values=[
+                str(value).strip()
+                for value in (self._checked_valve_voltage_filters or [])
                 if str(value).strip()
             ],
         )
@@ -6720,17 +6804,19 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         return active[0] if len(active) == 1 else None
 
     def _active_serial_rows(self, filter_state: Mapping[str, object] | None = None) -> list[dict]:
-        selected_programs = set(self._active_program_filter_values(filter_state=filter_state))
+        effective_filter_state = self._selection_filter_state(filter_state)
+        selected_programs = set(self._active_program_filter_values(filter_state=effective_filter_state))
         selected_serials = set(
             self._auto_plot_selected_filter_values(
-                filter_state=filter_state,
+                filter_state=effective_filter_state,
                 key="serials",
                 available_values=self._auto_plot_available_serial_values(),
                 live_values=[str(serial).strip() for serial in (self._checked_serial_filters or []) if str(serial).strip()],
             )
         )
-        selected_control_periods = set(self._active_control_period_filter_values(filter_state=filter_state))
-        selected_suppression = set(self._active_suppression_voltage_filter_values(filter_state=filter_state))
+        selected_control_periods = set(self._active_control_period_filter_values(filter_state=effective_filter_state))
+        selected_suppression = set(self._active_suppression_voltage_filter_values(filter_state=effective_filter_state))
+        selected_valves = set(self._active_valve_voltage_filter_values(filter_state=effective_filter_state))
         if not self._global_filter_rows:
             out: list[dict] = []
             for row in (self._available_serial_filter_rows or []):
@@ -6756,6 +6842,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 continue
             suppression_voltage = _td_suppression_voltage_filter_value(row)
             if selected_suppression and suppression_voltage not in selected_suppression:
+                continue
+            valve_voltage = _td_valve_voltage_filter_value(row)
+            if selected_valves and valve_voltage not in selected_valves:
                 continue
             matching_serials.add(serial)
         out = []
@@ -6788,24 +6877,30 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         *,
         filter_state: Mapping[str, object] | None = None,
     ) -> bool:
+        effective_filter_state = self._selection_filter_state(filter_state)
         if not isinstance(row, dict):
             return False
         program_label = self._row_program_label(row)
-        if program_label not in set(self._active_program_filter_values(filter_state=filter_state)):
+        if program_label not in set(self._active_program_filter_values(filter_state=effective_filter_state)):
             return False
-        selected_control_periods = set(self._active_control_period_filter_values(filter_state=filter_state))
+        selected_control_periods = set(self._active_control_period_filter_values(filter_state=effective_filter_state))
         if selected_control_periods:
             control_period = _td_control_period_filter_value(row)
             if not control_period or control_period not in selected_control_periods:
                 return False
-        selected_suppression = set(self._active_suppression_voltage_filter_values(filter_state=filter_state))
+        selected_suppression = set(self._active_suppression_voltage_filter_values(filter_state=effective_filter_state))
         if selected_suppression:
             suppression_voltage = _td_suppression_voltage_filter_value(row)
             if not suppression_voltage or suppression_voltage not in selected_suppression:
                 return False
+        selected_valves = set(self._active_valve_voltage_filter_values(filter_state=effective_filter_state))
+        if selected_valves:
+            valve_voltage = _td_valve_voltage_filter_value(row)
+            if not valve_voltage or valve_voltage not in selected_valves:
+                return False
         serial = _td_serial_value(row)
         if serial:
-            active_serials = set(self._active_serials(filter_state=filter_state))
+            active_serials = set(self._active_serials(filter_state=effective_filter_state))
             if serial not in active_serials:
                 return False
         return True
@@ -6832,6 +6927,28 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             state = self._current_auto_plot_filter_state()
         state["suppression_voltages"] = []
         return state
+
+    def _filter_state_without_valve_voltages(
+        self,
+        filter_state: Mapping[str, object] | None = None,
+    ) -> dict[str, list[str]]:
+        if isinstance(filter_state, Mapping):
+            state = self._normalize_auto_plot_filter_state(filter_state, default_to_current=False)
+        else:
+            state = self._current_auto_plot_filter_state()
+        state["valve_voltages"] = []
+        return state
+
+    def _selection_filter_state(
+        self,
+        filter_state: Mapping[str, object] | None = None,
+    ) -> Mapping[str, object] | None:
+        if isinstance(filter_state, Mapping):
+            return filter_state
+        current_mode = str(getattr(self, "_mode", "") or "").strip().lower()
+        if current_mode in {"performance", "smart_solver"}:
+            return self._filter_state_without_valve_voltages()
+        return None
 
     def _auto_report_rows_for_certification(
         self,
@@ -6935,9 +7052,11 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         *,
         filter_state: Mapping[str, object] | None = None,
     ) -> list[dict]:
-        selected_programs = set(self._active_program_filter_values(filter_state=filter_state))
-        selected_control_periods = set(self._active_control_period_filter_values(filter_state=filter_state))
-        selected_suppression = set(self._active_suppression_voltage_filter_values(filter_state=filter_state))
+        effective_filter_state = self._selection_filter_state(filter_state)
+        selected_programs = set(self._active_program_filter_values(filter_state=effective_filter_state))
+        selected_control_periods = set(self._active_control_period_filter_values(filter_state=effective_filter_state))
+        selected_suppression = set(self._active_suppression_voltage_filter_values(filter_state=effective_filter_state))
+        selected_valves = set(self._active_valve_voltage_filter_values(filter_state=effective_filter_state))
         out: list[dict] = []
         for item in (self._run_selection_views.get(mode) or []):
             if not isinstance(item, dict):
@@ -6976,6 +7095,17 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 if single_suppression:
                     member_suppression = [single_suppression]
             if selected_suppression and member_suppression and not any(value in selected_suppression for value in member_suppression):
+                continue
+            raw_valves = item.get("member_valve_voltages") or []
+            if isinstance(raw_valves, list):
+                member_valves = [_td_compact_filter_value(value) for value in raw_valves if _td_compact_filter_value(value)]
+            else:
+                member_valves = []
+            if not member_valves:
+                single_valve = _td_compact_filter_value(item.get("valve_voltage"))
+                if single_valve:
+                    member_valves = [single_valve]
+            if selected_valves and member_valves and not any(value in selected_valves for value in member_valves):
                 continue
             out.append(dict(item))
         return out
@@ -7023,6 +7153,11 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         if member_programs:
             row_program = _td_display_program_title(row.get("program_title"))
             if row_program not in set(member_programs):
+                return False
+        member_valves = self._selection_member_valve_voltages(selection)
+        if member_valves:
+            row_valve = _td_valve_voltage_filter_value(row)
+            if not row_valve or row_valve not in set(member_valves):
                 return False
         return True
 
@@ -7084,6 +7219,26 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         if out:
             return out
         single_value = _td_compact_filter_value(selection.get("suppression_voltage"))
+        if single_value:
+            return [single_value]
+        return []
+
+    def _selection_member_valve_voltages(self, selection: Mapping[str, object] | None) -> list[str]:
+        if not isinstance(selection, Mapping):
+            return []
+        out: list[str] = []
+        seen: set[str] = set()
+        raw_values = selection.get("member_valve_voltages") or []
+        if isinstance(raw_values, list):
+            for value in raw_values:
+                label = _td_compact_filter_value(value)
+                if not label or label in seen:
+                    continue
+                seen.add(label)
+                out.append(label)
+        if out:
+            return out
+        single_value = _td_compact_filter_value(selection.get("valve_voltage"))
         if single_value:
             return [single_value]
         return []
@@ -7154,6 +7309,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         effective_filter_state = self._auto_report_filter_state_without_suppression(filter_state)
         selected_programs = set(self._active_program_filter_values(filter_state=effective_filter_state))
         selected_control_periods = set(self._active_control_period_filter_values(filter_state=effective_filter_state))
+        selected_valves = set(self._active_valve_voltage_filter_values(filter_state=effective_filter_state))
         items: list[dict] = []
         for raw_item in (self._run_selection_views.get(mode) or []):
             if not isinstance(raw_item, dict):
@@ -7169,6 +7325,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             if not any(program in selected_programs for program in member_programs):
                 continue
             if not self._selection_matches_auto_report_control_periods(item, selected_control_periods):
+                continue
+            member_valves = self._selection_member_valve_voltages(item)
+            if selected_valves and member_valves and not any(value in selected_valves for value in member_valves):
                 continue
             items.append(item)
         if not require_active_serial_match or not self._global_filter_rows:
@@ -7411,6 +7570,24 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         ]
         self._on_global_filters_changed()
 
+    def _open_valve_voltage_filter_popup(self) -> None:
+        entries = [
+            {"value": value, "label": value, "search": value.lower()}
+            for value in (self._available_valve_voltage_filters or [])
+            if str(value).strip()
+        ]
+        chosen = self._show_filter_checklist_popup(
+            title="Visible Valve Voltages",
+            entries=entries,
+            selected_values=self._checked_valve_voltage_filters,
+        )
+        if chosen is None:
+            return
+        self._checked_valve_voltage_filters = [
+            value for value in (self._available_valve_voltage_filters or []) if value in set(chosen)
+        ]
+        self._on_global_filters_changed()
+
     def _open_control_period_filter_popup(self) -> None:
         entries = [
             {"value": value, "label": value, "search": value.lower()}
@@ -7438,6 +7615,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         ]
         self._checked_control_period_filters = list(self._available_control_period_filters or [])
         self._checked_suppression_voltage_filters = list(self._available_suppression_voltage_filters or [])
+        self._checked_valve_voltage_filters = list(self._available_valve_voltage_filters or [])
         self._on_global_filters_changed()
 
     def _on_global_filters_changed(self) -> None:
@@ -16688,6 +16866,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 return list(self._available_control_period_filters or [])
             if key == "suppression_voltages":
                 return list(self._available_suppression_voltage_filters or [])
+            if key == "valve_voltages":
+                return list(self._available_valve_voltage_filters or [])
             return []
 
         def _refresh_filter_labels() -> None:
@@ -16696,6 +16876,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 "serials": "Serials",
                 "control_periods": "Control Period",
                 "suppression_voltages": "Suppression Voltage",
+                "valve_voltages": "Valve Voltage",
             }
             for key in TD_AUTO_PLOT_FILTER_KEYS:
                 selected_values = [str(value).strip() for value in (filter_state.get(key) or []) if str(value).strip()]
@@ -16735,6 +16916,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             ("serials", "Serials"),
             ("control_periods", "Control Period"),
             ("suppression_voltages", "Suppression Voltage"),
+            ("valve_voltages", "Valve Voltage"),
         ):
             row = QtWidgets.QHBoxLayout()
             row.setSpacing(8)
@@ -17916,8 +18098,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         btn_serials = QtWidgets.QPushButton("Serials...")
         btn_control_periods = QtWidgets.QPushButton("Control Period...")
         btn_suppression = QtWidgets.QPushButton("Suppression Voltage...")
+        btn_valve = QtWidgets.QPushButton("Valve Voltage...")
         btn_reset_filters = QtWidgets.QPushButton("Reset Filters")
-        for button in (btn_programs, btn_serials, btn_control_periods, btn_suppression, btn_reset_filters):
+        for button in (btn_programs, btn_serials, btn_control_periods, btn_suppression, btn_valve, btn_reset_filters):
             filter_row.addWidget(button)
         filter_row.addStretch(1)
         selection_layout.addLayout(filter_row)
@@ -18097,6 +18280,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         btn_serials.clicked.connect(lambda: _edit_filter("serials", "Auto-Graphs Serials"))
         btn_control_periods.clicked.connect(lambda: _edit_filter("control_periods", "Auto-Graphs Control Period"))
         btn_suppression.clicked.connect(lambda: _edit_filter("suppression_voltages", "Auto-Graphs Suppression Voltage"))
+        btn_valve.clicked.connect(lambda: _edit_filter("valve_voltages", "Auto-Graphs Valve Voltage"))
         btn_reset_filters.clicked.connect(_reset_filters)
         list_widget.itemDoubleClicked.connect(lambda *_: self._open_selected_auto_plot(list_widget=list_widget))
         list_widget.itemSelectionChanged.connect(
@@ -18887,6 +19071,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             return [
                 str(value).strip()
                 for value in (self._available_suppression_voltage_filters or [])
+                if str(value).strip()
+            ]
+        if key == "valve_voltages":
+            return [
+                str(value).strip()
+                for value in (self._available_valve_voltage_filters or [])
                 if str(value).strip()
             ]
         return []
@@ -20648,7 +20838,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         btn_serials = QtWidgets.QPushButton("Serials...")
         btn_control_periods = QtWidgets.QPushButton("Control Period...")
         btn_suppression = QtWidgets.QPushButton("Suppression Voltage...")
-        for button in (btn_programs, btn_serials, btn_control_periods, btn_suppression):
+        btn_valve = QtWidgets.QPushButton("Valve Voltage...")
+        for button in (btn_programs, btn_serials, btn_control_periods, btn_suppression, btn_valve):
             filter_row.addWidget(button)
         filter_row.addStretch(1)
         selection_layout.addLayout(filter_row)
@@ -21220,6 +21411,16 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 _refresh_builder_sources(),
             ) if chosen is not None else None
         )(_pick_values("Graph File Suppression Voltage", self._auto_plot_available_filter_values("suppression_voltages"), list(self._resolve_auto_graph_file_filter_state(_draft_graph_file()).get("suppression_voltages") or []))))
+        btn_valve.clicked.connect(lambda: (
+            lambda chosen: (
+                state["global_selection"].__setitem__(
+                    "filters",
+                    {**self._normalize_auto_plot_filter_state((state.get("global_selection") or {}).get("filters"), default_to_current=True), "valve_voltages": [value for value in self._auto_plot_available_filter_values("valve_voltages") if value in {str(item).strip() for item in chosen}]},
+                ),
+                _refresh_selection_summary(),
+                _refresh_builder_sources(),
+            ) if chosen is not None else None
+        )(_pick_values("Graph File Valve Voltage", self._auto_plot_available_filter_values("valve_voltages"), list(self._resolve_auto_graph_file_filter_state(_draft_graph_file()).get("valve_voltages") or []))))
         btn_pick_runs.clicked.connect(lambda: (
             lambda current_file: (
                 lambda chosen: (

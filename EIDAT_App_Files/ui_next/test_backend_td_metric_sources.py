@@ -35,12 +35,12 @@ def _create_metric_source_db(tmpdir: str) -> Path:
         conn.executemany(
             """
             INSERT OR REPLACE INTO td_condition_observations(
-                observation_id, serial, run_name, program_title, source_run_name, run_type, pulse_width, control_period, suppression_voltage, source_mtime_ns, computed_epoch_ns
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                observation_id, serial, run_name, program_title, source_run_name, run_type, pulse_width, control_period, suppression_voltage, valve_voltage, source_mtime_ns, computed_epoch_ns
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
-                ("agg-1", "SN-001", "CondA", "Program Alpha", "Aggregate", "PM", 0.5, 10.0, 5.0, 1, 1),
-                ("agg-ss-1", "SN-002", "CondSS", "Program Beta", "Aggregate", "SS", None, None, None, 1, 1),
+                ("agg-1", "SN-001", "CondA", "Program Alpha", "Aggregate", "PM", 0.5, 10.0, 5.0, 28.0, 1, 1),
+                ("agg-ss-1", "SN-002", "CondSS", "Program Beta", "Aggregate", "SS", None, None, None, None, 1, 1),
             ],
         )
         conn.executemany(
@@ -57,13 +57,13 @@ def _create_metric_source_db(tmpdir: str) -> Path:
         conn.executemany(
             """
             INSERT OR REPLACE INTO td_condition_observations_sequences(
-                observation_id, serial, run_name, program_title, source_run_name, run_type, pulse_width, control_period, suppression_voltage, source_mtime_ns, computed_epoch_ns
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                observation_id, serial, run_name, program_title, source_run_name, run_type, pulse_width, control_period, suppression_voltage, valve_voltage, source_mtime_ns, computed_epoch_ns
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
-                ("seq-1", "SN-001", "CondA", "Program Alpha", "Seq-1", "PM", 0.5, 10.0, 5.0, 1, 1),
-                ("seq-2", "SN-001", "CondA", "Program Alpha", "Seq-2", "PM", 0.5, 10.0, 5.0, 1, 1),
-                ("seq-ss-1", "SN-002", "CondSS", "Program Beta", "Seq-SS-1", "SS", None, None, None, 1, 1),
+                ("seq-1", "SN-001", "CondA", "Program Alpha", "Seq-1", "PM", 0.5, 10.0, 5.0, 28.0, 1, 1),
+                ("seq-2", "SN-001", "CondA", "Program Alpha", "Seq-2", "PM", 0.5, 10.0, 5.0, 28.0, 1, 1),
+                ("seq-ss-1", "SN-002", "CondSS", "Program Beta", "Seq-SS-1", "SS", None, None, None, None, 1, 1),
             ],
         )
         conn.executemany(
@@ -132,11 +132,14 @@ class TestBackendTdMetricSources(unittest.TestCase):
             self.assertEqual([item["run_name"] for item in views["condition"]], ["CondA", "CondSS"])
             self.assertEqual(views["condition"][0]["display_text"], "Condition A")
             self.assertEqual(views["condition"][0]["member_sequences"], ["Seq-1", "Seq-2"])
+            self.assertEqual(views["condition"][0]["member_valve_voltages"], ["28"])
+            self.assertEqual(views["condition"][0]["valve_voltage"], "28")
             self.assertEqual(views["condition"][1]["display_text"], "Condition SS")
             self.assertEqual(views["condition"][1]["member_sequences"], ["Seq-SS-1"])
 
             filter_rows = backend.td_read_observation_filter_rows_from_cache(db_path)
             self.assertEqual([row["source_run_name"] for row in filter_rows], ["Seq-1", "Seq-2", "Seq-SS-1"])
+            self.assertEqual([row["valve_voltage"] for row in filter_rows], [28.0, 28.0, None])
 
     def test_steady_state_rows_remain_available_in_aggregate_and_sequence_metric_sources(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:

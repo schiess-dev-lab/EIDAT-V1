@@ -356,7 +356,7 @@ class TestTrendAutoReportFilters(unittest.TestCase):
                 "SN-003": {"program_title": "Program C"},
             },
             "nonpass_findings": [{"param": "Flow"}, {"param": "Pressure"}],
-            "comparison_rows": [{"final_suppression_voltage_label": "5"}],
+            "comparison_rows": [{"final_suppression_voltage_label": "5", "final_valve_voltage_label": "28"}],
             "filter_state": {},
         }
 
@@ -369,10 +369,10 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         self.assertEqual(summary["comparison_programs"], ["Program B", "Program C"])
         self.assertEqual(summary["initial_suppression_voltage"], "All")
         self.assertEqual(summary["p8_suppression_voltage"], "5")
-        self.assertEqual(summary["p8_bus_voltage"], "")
+        self.assertEqual(summary["p8_valve_voltage"], "28")
         self.assertTrue(any("Programs Compared: Program B, Program C" in line for line in summary["lines"]))
         self.assertIn("Suppression Voltage: 5", summary["lines"])
-        self.assertIn("Bus Voltage: ", summary["lines"])
+        self.assertIn("Valve Voltage: 28", summary["lines"])
         self.assertFalse(any(line.startswith("P8 ") for line in summary["lines"]))
 
     def test_metadata_snapshot_lines_include_each_certified_serial(self) -> None:
@@ -453,31 +453,49 @@ class TestTrendAutoReportFilters(unittest.TestCase):
                 },
                 "param": "Pressure",
                 "units": "psi",
-                "filter_state_override": {"suppression_voltages": ["5"]},
+                "initial_plot_payload": {
+                    "master_y": [10.0, 20.0],
+                    "y_resampled_by_sn": {
+                        "SN-001": [8.0, 12.0],
+                        "SN-002": [18.0, 22.0],
+                    },
+                },
+                "regrade_plot_payloads": {
+                    tar._tar_condition_combo_key("5", "28"): {
+                        "master_y": [14.0, 22.0],
+                        "y_resampled_by_sn": {
+                            "SN-001": [12.0, 16.0],
+                            "SN-002": [20.0, 24.0],
+                        },
+                    }
+                },
+                "filter_state_override": {"suppression_voltages": ["5"], "valve_voltages": ["28"]},
                 "suppression_voltage_label": "5",
+                "valve_voltage_label": "28",
             }
         ]
-
-        def _fake_metric_map(_ctx: object, _spec: object, _stat: str, *, filter_state_override: object = None) -> dict[str, float]:
-            if filter_state_override:
-                return {"SN-001": 14.0, "SN-002": 22.0}
-            return {"SN-001": 10.0, "SN-002": 20.0}
-
-        with mock.patch.object(tar, "_tar_metric_map_for_pair", side_effect=_fake_metric_map):
-            rows = tar._tar_build_per_serial_comparison_rows(
-                ctx,
-                pair_specs=pair_specs,
-                all_serials=["SN-001", "SN-002"],
-                hi=["SN-001", "SN-002"],
-                initial_grade_map_by_pair_serial={
-                    ("pair-1", "SN-001"): "PASS",
-                    ("pair-1", "SN-002"): "PASS",
-                },
-                final_grade_map_by_pair_serial={
-                    ("pair-1", "SN-001"): "WATCH",
-                    ("pair-1", "SN-002"): "PASS",
-                },
-            )
+        rows = tar._tar_build_per_serial_comparison_rows(
+            ctx,
+            pair_specs=pair_specs,
+            all_serials=["SN-001", "SN-002"],
+            hi=["SN-001", "SN-002"],
+            initial_grade_map_by_pair_serial={
+                ("pair-1", "SN-001"): "PASS",
+                ("pair-1", "SN-002"): "PASS",
+            },
+            final_grade_map_by_pair_serial={
+                ("pair-1", "SN-001"): "WATCH",
+                ("pair-1", "SN-002"): "PASS",
+            },
+            finding_by_pair_serial={
+                ("pair-1", "SN-001"): {
+                    "regrade_applied": True,
+                    "regrade_suppression_voltage_label": "5",
+                    "regrade_valve_voltage_label": "28",
+                    "regrade_condition_key": tar._tar_condition_combo_key("5", "28"),
+                }
+            },
+        )
 
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[0]["run_condition"], "Condition A")
@@ -492,8 +510,8 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         self.assertEqual(rows[0]["grade_text"], "Initial: PASS\nFinal: WATCH")
         self.assertEqual(rows[0]["initial_suppression_voltage_label"], "All")
         self.assertEqual(rows[0]["final_suppression_voltage_label"], "5")
-        self.assertEqual(rows[0]["initial_bus_voltage_label"], "")
-        self.assertEqual(rows[0]["final_bus_voltage_label"], "")
+        self.assertEqual(rows[0]["initial_valve_voltage_label"], "All")
+        self.assertEqual(rows[0]["final_valve_voltage_label"], "28")
         self.assertTrue(rows[0]["regrade_applied"])
 
     def test_build_per_serial_comparison_rows_falls_back_when_no_regrade_override_exists(self) -> None:
@@ -512,18 +530,24 @@ class TestTrendAutoReportFilters(unittest.TestCase):
                 },
                 "param": "Flow",
                 "units": "lpm",
+                "initial_plot_payload": {
+                    "master_y": [8.0, 12.0],
+                    "y_resampled_by_sn": {
+                        "SN-001": [7.0, 9.0],
+                        "SN-002": [11.0, 13.0],
+                    },
+                },
             }
         ]
-
-        with mock.patch.object(tar, "_tar_metric_map_for_pair", return_value={"SN-001": 8.0, "SN-002": 12.0}):
-            rows = tar._tar_build_per_serial_comparison_rows(
-                ctx,
-                pair_specs=pair_specs,
-                all_serials=["SN-001", "SN-002"],
-                hi=["SN-001"],
-                initial_grade_map_by_pair_serial={("pair-2", "SN-001"): "PASS"},
-                final_grade_map_by_pair_serial={("pair-2", "SN-001"): "PASS"},
-            )
+        rows = tar._tar_build_per_serial_comparison_rows(
+            ctx,
+            pair_specs=pair_specs,
+            all_serials=["SN-001", "SN-002"],
+            hi=["SN-001"],
+            initial_grade_map_by_pair_serial={("pair-2", "SN-001"): "PASS"},
+            final_grade_map_by_pair_serial={("pair-2", "SN-001"): "PASS"},
+            finding_by_pair_serial={},
+        )
 
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["initial_atp_mean"], 10.0)
@@ -671,7 +695,9 @@ class TestTrendAutoReportFilters(unittest.TestCase):
 
         self.assertEqual(run_condition_spec["section"], "run_condition_plot_metrics")
         self.assertEqual(run_condition_spec["page_number"], 4)
-        self.assertEqual(create_page_mock.call_args.kwargs["section_title"], "Run Condition Metrics | Condition A")
+        self.assertEqual(create_page_mock.call_args.kwargs["section_title"], "")
+        self.assertEqual(create_page_mock.call_args.kwargs["section_subtitle"], "")
+        self.assertFalse(create_page_mock.call_args.kwargs["show_plot_toc_backlink"])
         self.assertEqual(len(axes.plot_calls), 0)
         self.assertEqual(len(axes.scatter_calls), 4)
         series_scatter_labels = [str(call[2].get("label") or "") for call in axes.scatter_calls if call[2].get("label")]
@@ -735,6 +761,88 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         self.assertEqual(float(axes_regrade.axhline_calls[0][0][0]), 12.0)
         self.assertIsNotNone(axes_regrade.legend_call)
         self.assertIn("Regrade family mean", axes_regrade.legend_call[1])
+
+    def test_render_run_condition_curve_cohort_page_uses_full_width_without_side_panel(self) -> None:
+        fake_plt = _FakePyplot()
+        fake_matplotlib = SimpleNamespace(pyplot=fake_plt)
+        cohort_spec = {
+            "cohort_id": "curve-cohort-1",
+            "param": "Pressure",
+            "units": "psi",
+            "x_name": "Time",
+            "selection_labels": ["Condition A"],
+            "member_pair_ids": ["pair-1", "pair-2"],
+            "trace_curves": [
+                {
+                    "serial": "SN-010",
+                    "pair_id": "pair-1",
+                    "selection_label": "Condition A",
+                    "y_curve": [1.0, 1.1, 1.2],
+                },
+                {
+                    "serial": "SN-001",
+                    "pair_id": "pair-1",
+                    "selection_label": "Condition A",
+                    "y_curve": [1.3, 1.4, 1.5],
+                },
+            ],
+            "x_grid": [0.0, 1.0, 2.0],
+            "master_y": [1.1, 1.2, 1.3],
+            "std_y": [0.1, 0.1, 0.1],
+            "model": {},
+        }
+        ctx = {
+            "print_ctx": tar.PrintContext(
+                printed_at="2026-04-12 09:00 MDT",
+                printed_timezone="MDT",
+                report_title="EIDAT Test Trend Data Analyze Auto Report",
+                report_subtitle="Certification",
+            ),
+            "hi": ["SN-001"],
+            "colors": ["#ef4444", "#2563eb"],
+            "finding_by_pair_serial": {
+                ("pair-1", "SN-001"): {
+                    "initial_max_pct": 2.0,
+                    "initial_z": 1.5,
+                }
+            },
+        }
+        axes = _FakePlotAxes()
+        fig = _FakePlotFigure()
+        pdf = _FakePlotPdf()
+
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "matplotlib": fake_matplotlib,
+                "matplotlib.pyplot": fake_plt,
+            },
+        ), mock.patch.object(tar, "_create_landscape_plot_page", return_value=(fig, axes)) as create_page_mock:
+            plot_spec = tar._tar_render_curve_cohort_page(
+                ctx,
+                pdf,
+                cohort_spec=cohort_spec,
+                page_number=9,
+                section_title="Run Condition Curve Overlay",
+                section_key="run_condition_curve_overlays",
+                subtitle="Pressure | Time | Condition A",
+                grade_map_by_pair_serial={("pair-1", "SN-001"): "WATCH"},
+                metric_prefix="initial",
+                family_label="Pooled family median",
+                band_label="Pooled family +/-1 sigma",
+                equation_label="Pooled family equation",
+            )
+
+        self.assertEqual(plot_spec["section"], "run_condition_curve_overlays")
+        self.assertEqual(plot_spec["page_number"], 9)
+        self.assertEqual(create_page_mock.call_args.kwargs["section_title"], "")
+        self.assertEqual(create_page_mock.call_args.kwargs["section_subtitle"], "")
+        self.assertFalse(create_page_mock.call_args.kwargs["show_plot_toc_backlink"])
+        self.assertIsNone(axes.position)
+        self.assertEqual(len(pdf.saved_figures), 1)
+        self.assertEqual(fake_plt.closed, [fig])
+        self.assertGreaterEqual(len(axes.plot_calls), 2)
+        self.assertIsNotNone(axes.legend_call)
 
     def test_build_plot_navigation_creates_compact_labels_and_ignores_non_plot_sections(self) -> None:
         navigation = tar._tar_build_plot_navigation(
@@ -1050,8 +1158,8 @@ class TestTrendAutoReportFilters(unittest.TestCase):
                     "final_grade": "WATCH",
                     "initial_suppression_voltage_label": "All",
                     "final_suppression_voltage_label": "5",
-                    "initial_bus_voltage_label": "",
-                    "final_bus_voltage_label": "",
+                    "initial_valve_voltage_label": "All",
+                    "final_valve_voltage_label": "28",
                     "regrade_applied": False,
                 }
             ],
@@ -1085,14 +1193,14 @@ class TestTrendAutoReportFilters(unittest.TestCase):
                     "Watch Parameter(s): Pressure",
                     "Programs Compared: Program B",
                     "Suppression Voltage: 5",
-                    "Bus Voltage: ",
+                    "Valve Voltage: 28",
                 ],
                 "initial_suppression_voltage": "All",
                 "final_suppression_voltage": "5",
-                "initial_bus_voltage": "",
-                "final_bus_voltage": "",
+                "initial_valve_voltage": "All",
+                "final_valve_voltage": "28",
                 "p8_suppression_voltage": "5",
-                "p8_bus_voltage": "",
+                "p8_valve_voltage": "28",
             },
         }
 
@@ -1103,24 +1211,12 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         ):
             story = tar._tar_build_intro_story(ctx)
 
-        quick_summary_idx = next(
-            idx
-            for idx, item in enumerate(story)
-            if isinstance(item, _FakeTable) and _table_text(item)[0][0] == "Quick Executive Summary"
+        self.assertFalse(
+            any(
+                isinstance(item, _FakeTable) and _table_text(item)[0][0] == "Quick Executive Summary"
+                for item in story
+            )
         )
-        toc_idx = next(
-            idx
-            for idx, item in enumerate(story)
-            if isinstance(item, _FakeParagraph) and item.text == "Plot Table of Contents"
-        )
-        counts_idx = next(
-            idx
-            for idx, item in enumerate(story)
-            if isinstance(item, _FakeTable) and _table_text(item)[0][0] == "Serials Under Certification"
-        )
-        self.assertLess(quick_summary_idx, counts_idx)
-        self.assertGreater(toc_idx, quick_summary_idx)
-        self.assertLess(toc_idx, counts_idx)
         self.assertFalse(
             any(
                 "Certification Scope" in cell
@@ -1137,23 +1233,56 @@ class TestTrendAutoReportFilters(unittest.TestCase):
             for idx, item in enumerate(story)
             if isinstance(item, _FakeParagraph) and item.text == "Executive Summary"
         )
-        self.assertGreater(exec_idx, page_break_idx)
-
-        run_table = next(
-            item
-            for item in story
-            if isinstance(item, _FakeTable) and "Run Condition: Condition A" in _table_text(item)[0][0]
+        toc_idx = next(
+            idx
+            for idx, item in enumerate(story)
+            if isinstance(item, _FakeParagraph) and item.text == "Plot Table of Contents"
         )
-        run_rows = _table_text(run_table)
-        self.assertEqual(run_rows[1][0], "Serial")
-        self.assertEqual(run_rows[2][4], "10")
-        self.assertEqual(run_rows[2][5], "9")
-        self.assertEqual(run_rows[2][6], "-1")
-        self.assertEqual(run_rows[2][7], "PASS")
-        self.assertNotIn("Final:", run_rows[2][4])
-        self.assertNotIn("Final:", run_rows[2][7])
-        run_table_commands = [cmd for style in run_table.table_styles for cmd in getattr(style, "commands", [])]
-        self.assertNotIn(("BACKGROUND", (0, 2), (-1, 2), "#fef3c7"), run_table_commands)
+        counts_idx = next(
+            idx
+            for idx, item in enumerate(story)
+            if isinstance(item, _FakeTable) and _table_text(item)[0][0] == "Serials Under Certification"
+        )
+        exec_table_idx = next(
+            idx
+            for idx, item in enumerate(story)
+            if isinstance(item, _FakeTable) and _table_text(item)[0][0] == "Serial" and _table_text(item)[0][1] == "Overall"
+        )
+        exception_table_idx = next(
+            idx
+            for idx, item in enumerate(story)
+            if isinstance(item, _FakeTable) and _table_text(item)[0][0] == "Serial" and _table_text(item)[0][1] == "Run Condition"
+        )
+        disposition_idx = next(
+            idx
+            for idx, item in enumerate(story)
+            if isinstance(item, _FakeTable) and _table_text(item)[0][0] == "Disposition"
+        )
+        initial_vs_final_idx = next(
+            idx
+            for idx, item in enumerate(story)
+            if isinstance(item, _FakeTable) and _table_text(item)[0][0] == "Initial vs Final Run"
+        )
+        watch_idx = next(
+            idx
+            for idx, item in enumerate(story)
+            if isinstance(item, _FakeTable) and _table_text(item)[0][0] == "Watch / Review Highlights"
+        )
+        self.assertLess(exec_idx, page_break_idx)
+        self.assertGreater(toc_idx, page_break_idx)
+        self.assertLess(exec_table_idx, disposition_idx)
+        self.assertLess(exception_table_idx, disposition_idx)
+        self.assertLess(disposition_idx, initial_vs_final_idx)
+        self.assertLess(initial_vs_final_idx, watch_idx)
+        self.assertLess(watch_idx, counts_idx)
+        self.assertLess(counts_idx, toc_idx)
+
+        self.assertFalse(
+            any(
+                isinstance(item, _FakeTable) and _table_text(item) and "Run Condition: Condition A" in _table_text(item)[0][0]
+                for item in story
+            )
+        )
 
         toc_table = next(
             item
@@ -1165,7 +1294,7 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         self.assertEqual(toc_rows[2][0], "Pressure | Time | mean")
         self.assertEqual(toc_rows[3][0], "Performance Plots")
 
-    def test_build_intro_story_highlights_regraded_run_comparison_rows(self) -> None:
+    def test_build_intro_story_excludes_regraded_run_comparison_tables(self) -> None:
         ctx = {
             "print_ctx": tar.PrintContext(
                 printed_at="2026-04-12 09:00 MDT",
@@ -1204,8 +1333,8 @@ class TestTrendAutoReportFilters(unittest.TestCase):
                     "final_grade": "WATCH",
                     "initial_suppression_voltage_label": "All",
                     "final_suppression_voltage_label": "5",
-                    "initial_bus_voltage_label": "",
-                    "final_bus_voltage_label": "",
+                    "initial_valve_voltage_label": "All",
+                    "final_valve_voltage_label": "28",
                     "regrade_applied": True,
                 }
             ],
@@ -1219,10 +1348,10 @@ class TestTrendAutoReportFilters(unittest.TestCase):
                 "lines": [],
                 "initial_suppression_voltage": "All",
                 "final_suppression_voltage": "5",
-                "initial_bus_voltage": "",
-                "final_bus_voltage": "",
+                "initial_valve_voltage": "All",
+                "final_valve_voltage": "28",
                 "p8_suppression_voltage": "5",
-                "p8_bus_voltage": "",
+                "p8_valve_voltage": "28",
             },
         }
 
@@ -1233,18 +1362,12 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         ):
             story = tar._tar_build_intro_story(ctx)
 
-        run_table = next(
-            item
-            for item in story
-            if isinstance(item, _FakeTable) and "Run Condition: Condition A" in _table_text(item)[0][0]
+        self.assertFalse(
+            any(
+                isinstance(item, _FakeTable) and _table_text(item) and "Run Condition: Condition A" in _table_text(item)[0][0]
+                for item in story
+            )
         )
-        run_rows = _table_text(run_table)
-        self.assertIn("Initial: 10", run_rows[2][4])
-        self.assertIn("Final: 12", run_rows[2][4])
-        self.assertIn("Initial: PASS", run_rows[2][7])
-        self.assertIn("Final: WATCH", run_rows[2][7])
-        run_table_commands = [cmd for style in run_table.table_styles for cmd in getattr(style, "commands", [])]
-        self.assertIn(("BACKGROUND", (0, 2), (-1, 2), "#fef3c7"), run_table_commands)
 
 
 if __name__ == "__main__":

@@ -2898,6 +2898,7 @@ def _td_support_signatures(support_cfg: Mapping[str, object] | None) -> dict[str
                         "pulse_width": row.get("pulse_width_on", row.get("pulse_width")),
                         "control_period": row.get("control_period"),
                         "suppression_voltage": row.get("suppression_voltage"),
+                        "valve_voltage": row.get("valve_voltage"),
                     }
                 )
             if cleaned:
@@ -2962,6 +2963,7 @@ def _td_support_signatures(support_cfg: Mapping[str, object] | None) -> dict[str
                     "pulse_width": row.get("pulse_width_on", row.get("pulse_width")),
                     "control_period": row.get("control_period"),
                     "suppression_voltage": row.get("suppression_voltage"),
+                    "valve_voltage": row.get("valve_voltage"),
                 }
                 for row in (cfg.get("sequences") or [])
                 if isinstance(row, Mapping)
@@ -3061,6 +3063,7 @@ def _ensure_test_data_raw_cache_tables(conn: sqlite3.Connection) -> None:
             pulse_width REAL,
             control_period REAL,
             suppression_voltage REAL,
+            valve_voltage REAL,
             source_mtime_ns INTEGER,
             computed_epoch_ns INTEGER NOT NULL
         )
@@ -3068,6 +3071,10 @@ def _ensure_test_data_raw_cache_tables(conn: sqlite3.Connection) -> None:
     )
     try:
         conn.execute("ALTER TABLE td_raw_condition_observations ADD COLUMN suppression_voltage REAL")
+    except Exception:
+        pass
+    try:
+        conn.execute("ALTER TABLE td_raw_condition_observations ADD COLUMN valve_voltage REAL")
     except Exception:
         pass
     conn.execute(
@@ -3672,6 +3679,7 @@ def _ensure_test_data_impl_tables(conn: sqlite3.Connection) -> None:
             pulse_width REAL,
             control_period REAL,
             suppression_voltage REAL,
+            valve_voltage REAL,
             source_mtime_ns INTEGER,
             computed_epoch_ns INTEGER NOT NULL
         )
@@ -3679,6 +3687,10 @@ def _ensure_test_data_impl_tables(conn: sqlite3.Connection) -> None:
     )
     try:
         conn.execute("ALTER TABLE td_condition_observations ADD COLUMN suppression_voltage REAL")
+    except Exception:
+        pass
+    try:
+        conn.execute("ALTER TABLE td_condition_observations ADD COLUMN valve_voltage REAL")
     except Exception:
         pass
     conn.execute(
@@ -3693,6 +3705,7 @@ def _ensure_test_data_impl_tables(conn: sqlite3.Connection) -> None:
             pulse_width REAL,
             control_period REAL,
             suppression_voltage REAL,
+            valve_voltage REAL,
             source_mtime_ns INTEGER,
             computed_epoch_ns INTEGER NOT NULL
         )
@@ -3700,6 +3713,10 @@ def _ensure_test_data_impl_tables(conn: sqlite3.Connection) -> None:
     )
     try:
         conn.execute("ALTER TABLE td_condition_observations_sequences ADD COLUMN suppression_voltage REAL")
+    except Exception:
+        pass
+    try:
+        conn.execute("ALTER TABLE td_condition_observations_sequences ADD COLUMN valve_voltage REAL")
     except Exception:
         pass
     conn.execute(
@@ -3943,6 +3960,7 @@ def _ensure_test_data_curve_plotter_tables(conn: sqlite3.Connection) -> None:
             pulse_width REAL,
             control_period REAL,
             suppression_voltage REAL,
+            valve_voltage REAL,
             source_mtime_ns INTEGER,
             computed_epoch_ns INTEGER NOT NULL
         )
@@ -3950,6 +3968,10 @@ def _ensure_test_data_curve_plotter_tables(conn: sqlite3.Connection) -> None:
     )
     try:
         conn.execute(f"ALTER TABLE {TD_PLOTTER_OBSERVATIONS_TABLE} ADD COLUMN suppression_voltage REAL")
+    except Exception:
+        pass
+    try:
+        conn.execute(f"ALTER TABLE {TD_PLOTTER_OBSERVATIONS_TABLE} ADD COLUMN valve_voltage REAL")
     except Exception:
         pass
     conn.execute(
@@ -4928,6 +4950,8 @@ def _td_read_sequence_context_rows(conn: sqlite3.Connection) -> list[dict[str, o
                 nominal_tf_units,
                 suppression_voltage_value,
                 suppression_voltage_units,
+                valve_voltage_value,
+                valve_voltage_units,
                 extraction_status,
                 extraction_reason
             FROM __sequence_context
@@ -4993,6 +5017,7 @@ def _td_sequence_context_support_fields(row: Mapping[str, object] | None) -> dic
         "pulse_width_on": row.get("on_time_value"),
         "control_period": row.get("control_period", row.get("off_time_value")),
         "suppression_voltage": row.get("suppression_voltage_value"),
+        "valve_voltage": row.get("valve_voltage_value"),
     }
 
 
@@ -5019,6 +5044,7 @@ def _td_support_row_has_condition_values(row: Mapping[str, object] | None) -> bo
             "pulse_width",
             "control_period",
             "suppression_voltage",
+            "valve_voltage",
         )
     )
 
@@ -5167,6 +5193,7 @@ TD_PROGRAM_REQUIREMENTS_INDEX_HEADERS = [
     "pulse_width_on",
     "control_period",
     "suppression_voltage",
+    "valve_voltage",
     "member_sequences",
     "last_refreshed",
 ]
@@ -5186,6 +5213,7 @@ TD_PROGRAM_REQUIREMENTS_SUPPORT_INDEX_HEADERS = [
     "pulse_width_on",
     "control_period",
     "suppression_voltage",
+    "valve_voltage",
     "member_sequences",
     "source_workbook",
     "source_sheet_name",
@@ -5204,6 +5232,7 @@ TD_PROGRAM_REQUIREMENTS_SUPPORT_HEADERS = [
     "pulse_width_on",
     "control_period",
     "suppression_voltage",
+    "valve_voltage",
     "member_sequences",
     "source_workbook",
     "source_sheet_name",
@@ -5216,6 +5245,7 @@ TD_PROGRAM_REQUIREMENTS_METADATA_KEYS = [
     "pulse_width_on",
     "control_period",
     "suppression_voltage",
+    "valve_voltage",
     "member_sequences",
 ]
 TD_PROGRAM_REQUIREMENTS_TABLE_HEADER_ROW = 10
@@ -5583,6 +5613,7 @@ def _td_program_requirements_discover_conditions_by_program(
                     "pulse_width_on": condition.get("pulse_width_on", condition.get("pulse_width")),
                     "control_period": condition.get("control_period"),
                     "suppression_voltage": condition.get("suppression_voltage"),
+                    "valve_voltage": condition.get("valve_voltage"),
                     "member_sequences": member_sequences,
                     "member_sequences_text": "; ".join(member_sequences),
                     "parameter_catalog": member_catalog,
@@ -5646,6 +5677,7 @@ def _td_program_requirements_parse_condition_sheet(ws, *, fallback: Mapping[str,
         "pulse_width_on": metadata.get("pulse_width_on", fallback.get("pulse_width_on")),
         "control_period": metadata.get("control_period", fallback.get("control_period")),
         "suppression_voltage": metadata.get("suppression_voltage", fallback.get("suppression_voltage")),
+        "valve_voltage": metadata.get("valve_voltage", fallback.get("valve_voltage")),
         "member_sequences": member_sequences,
         "member_sequences_text": "; ".join(member_sequences),
         "last_refreshed": str(fallback.get("last_refreshed") or "").strip(),
@@ -5903,6 +5935,7 @@ def _td_program_requirements_write_workbook(
                     condition.get("pulse_width_on"),
                     condition.get("control_period"),
                     condition.get("suppression_voltage"),
+                    condition.get("valve_voltage"),
                     str(condition.get("member_sequences_text") or "").strip(),
                     str(condition.get("last_refreshed") or refreshed_at).strip(),
                 ]
@@ -6093,6 +6126,7 @@ def _td_program_requirements_read_source_workbook(path: Path) -> list[dict[str, 
                 "pulse_width_on": condition.get("pulse_width_on"),
                 "control_period": condition.get("control_period"),
                 "suppression_voltage": condition.get("suppression_voltage"),
+                "valve_voltage": condition.get("valve_voltage"),
                 "member_sequences": member_sequences,
                 "member_sequences_text": "; ".join(member_sequences),
                 "source_workbook": str(workbook_path),
@@ -6149,6 +6183,7 @@ def _td_program_requirements_read_support_state(wb) -> dict[str, list[dict[str, 
                 "pulse_width_on": row.get("pulse_width_on"),
                 "control_period": row.get("control_period"),
                 "suppression_voltage": row.get("suppression_voltage"),
+                "valve_voltage": row.get("valve_voltage"),
                 "member_sequences_text": str(row.get("member_sequences") or "").strip(),
                 "source_workbook": str(row.get("source_workbook") or "").strip(),
                 "source_sheet_name": str(row.get("source_sheet_name") or "").strip(),
@@ -6381,13 +6416,14 @@ def _td_support_program_row_defaults(source_run_name: object, *, program_title: 
         "pulse_width_on": None,
         "control_period": None,
         "suppression_voltage": None,
+        "valve_voltage": None,
         "exclude_first_n": None,
         "last_n_rows": None,
         "enabled": True,
     }
 
 
-def _td_condition_identity_parts(row: Mapping[str, object]) -> tuple[str, str, str, str, str, str, str, str]:
+def _td_condition_identity_parts(row: Mapping[str, object]) -> tuple[str, str, str, str, str, str, str, str, str]:
     return (
         _td_format_compact_value(row.get("feed_pressure")).lower(),
         str(row.get("feed_pressure_units") or "").strip().lower(),
@@ -6397,6 +6433,7 @@ def _td_condition_identity_parts(row: Mapping[str, object]) -> tuple[str, str, s
         _td_format_compact_value(row.get("pulse_width_on", row.get("pulse_width"))).lower(),
         _td_format_compact_value(row.get("control_period")).lower(),
         _td_format_compact_value(row.get("suppression_voltage")).lower(),
+        _td_format_compact_value(row.get("valve_voltage")).lower(),
     )
 
 
@@ -6429,7 +6466,7 @@ def _td_condition_base_key(row: Mapping[str, object]) -> str:
     return explicit or source_run_name
 
 
-def _td_support_condition_group_identity(row: Mapping[str, object]) -> tuple[str, str, str, str, str, str, str, str, str]:
+def _td_support_condition_group_identity(row: Mapping[str, object]) -> tuple[str, str, str, str, str, str, str, str, str, str]:
     condition_parts = _td_condition_identity_parts(row)
     if any(bool(part) for part in condition_parts):
         return ("",) + condition_parts
@@ -6437,7 +6474,7 @@ def _td_support_condition_group_identity(row: Mapping[str, object]) -> tuple[str
 
 
 def _td_group_program_rows_into_conditions(rows: Sequence[Mapping[str, object]]) -> list[dict]:
-    grouped: dict[tuple[str, str, str, str, str, str, str, str, str], dict] = {}
+    grouped: dict[tuple[str, str, str, str, str, str, str, str, str, str], dict] = {}
     for raw_row in rows or []:
         if not isinstance(raw_row, Mapping):
             continue
@@ -6468,6 +6505,7 @@ def _td_group_program_rows_into_conditions(rows: Sequence[Mapping[str, object]])
                 "pulse_width_on": raw_row.get("pulse_width_on", raw_row.get("pulse_width")),
                 "control_period": raw_row.get("control_period"),
                 "suppression_voltage": raw_row.get("suppression_voltage"),
+                "valve_voltage": raw_row.get("valve_voltage"),
                 "member_rows": [],
                 "member_sequences": [],
                 "member_programs": [],
@@ -6512,6 +6550,7 @@ def _td_group_program_rows_into_conditions(rows: Sequence[Mapping[str, object]])
                 _td_format_compact_value(group.get("pulse_width_on")),
                 _td_format_compact_value(group.get("control_period")),
                 _td_format_compact_value(group.get("suppression_voltage")),
+                _td_format_compact_value(group.get("valve_voltage")),
             ]
             suffix = re.sub(r"[^A-Za-z0-9]+", "_", "_".join([p for p in suffix_parts if str(p).strip()])).strip("_")
             group["condition_key"] = f"{base_key}_{suffix or str(dup_count + 1)}"
@@ -6641,6 +6680,7 @@ def _write_td_support_workbook(
                 "feed_temperature",
                 "feed_temperature_units",
                 "suppression_voltage",
+                "valve_voltage",
             ]
         )
         for seq_name in (program_sequence_map.get(title) or []):
@@ -6658,6 +6698,7 @@ def _write_td_support_workbook(
                     "",
                     "",
                     True,
+                    "",
                     "",
                     "",
                     "",
@@ -6731,6 +6772,7 @@ def _refresh_td_support_run_conditions_sheet(
         "feed_temperature",
         "feed_temperature_units",
         "suppression_voltage",
+        "valve_voltage",
     ]
     desired_rows: list[list[object]] = []
     rows_written = 0
@@ -6769,6 +6811,7 @@ def _refresh_td_support_run_conditions_sheet(
                     row.get("feed_temperature"),
                     str(row.get("feed_temperature_units") or "").strip(),
                     row.get("suppression_voltage"),
+                    row.get("valve_voltage"),
                 ]
             )
             rows_written += 1
@@ -7029,6 +7072,7 @@ def _sync_td_support_workbook_program_sheets(
             "feed_temperature",
             "feed_temperature_units",
             "suppression_voltage",
+            "valve_voltage",
         ]
         for title in desired_program_titles:
             sheet_name = desired_sheet_by_title[title]
@@ -7083,6 +7127,7 @@ def _sync_td_support_workbook_program_sheets(
                         row_data.get("feed_temperature"),
                         str(row_data.get("feed_temperature_units") or "").strip(),
                         row_data.get("suppression_voltage"),
+                        row_data.get("valve_voltage"),
                     ]
                 )
             for row in desired_rows:
@@ -7303,6 +7348,7 @@ def _read_td_support_workbook(workbook_path: Path, *, project_dir: Path | None =
                     "pulse_width_on": ws.cell(row, headers.get("pulse_width_on", 6)).value if headers.get("pulse_width_on") else None,
                     "control_period": ws.cell(row, headers.get("control_period", 7)).value if headers.get("control_period") else None,
                     "suppression_voltage": ws.cell(row, headers.get("suppression_voltage", 10)).value if headers.get("suppression_voltage") else None,
+                    "valve_voltage": ws.cell(row, headers.get("valve_voltage")).value if headers.get("valve_voltage") else None,
                     "sheet_name": str(ws.cell(row, headers.get("sheet_name", 8)).value or "").strip() if headers.get("sheet_name") else "",
                     "member_sequences_text": str(ws.cell(row, headers.get("member_sequences", 9)).value or "").strip() if headers.get("member_sequences") else "",
                     "member_programs_text": str(ws.cell(row, headers.get("member_programs", 10)).value or "").strip() if headers.get("member_programs") else "",
@@ -7384,6 +7430,7 @@ def _read_td_support_workbook(workbook_path: Path, *, project_dir: Path | None =
                     "pulse_width_on",
                     "control_period",
                     "suppression_voltage",
+                    "valve_voltage",
                 )
             )
             new_program_schema_detected = new_program_schema_detected or bool(has_full_condition_columns)
@@ -7417,6 +7464,7 @@ def _read_td_support_workbook(workbook_path: Path, *, project_dir: Path | None =
                             "pulse_width_on": ws.cell(row, headers.get("pulse_width_on")).value if headers.get("pulse_width_on") else None,
                             "control_period": ws.cell(row, headers.get("control_period")).value if headers.get("control_period") else None,
                             "suppression_voltage": ws.cell(row, headers.get("suppression_voltage")).value if headers.get("suppression_voltage") else None,
+                            "valve_voltage": ws.cell(row, headers.get("valve_voltage")).value if headers.get("valve_voltage") else None,
                         }
                     )
                     row_out["display_name"] = _td_effective_run_condition_label(
@@ -8132,6 +8180,7 @@ def _td_resolved_support_condition_payload(
         "pulse_width_on": condition.get("pulse_width_on", condition.get("pulse_width", (mapping or {}).get("pulse_width_on", (mapping or {}).get("pulse_width")))),
         "control_period": condition.get("control_period", (mapping or {}).get("control_period")),
         "suppression_voltage": condition.get("suppression_voltage", (mapping or {}).get("suppression_voltage")),
+        "valve_voltage": condition.get("valve_voltage", (mapping or {}).get("valve_voltage")),
         "exclude_first_n": (mapping or {}).get("exclude_first_n"),
         "last_n_rows": (mapping or {}).get("last_n_rows"),
         "matched_support": bool(mapping or condition),
@@ -8212,6 +8261,7 @@ def _td_resolve_support_condition_for_source(program_title: object, source_run_n
         "pulse_width_on": None,
         "control_period": None,
         "suppression_voltage": None,
+        "valve_voltage": None,
         "exclude_first_n": None,
         "last_n_rows": None,
         "matched_support": False,
@@ -8251,12 +8301,12 @@ def td_list_run_selection_views(db_path: Path, workbook_path: Path, *, project_d
         obs_table = _td_preferred_sequence_observation_table(conn)
         rows = conn.execute(
             f"""
-            SELECT run_name, COALESCE(program_title, ''), COALESCE(source_run_name, ''), control_period, suppression_voltage, COALESCE(run_type, '')
+            SELECT run_name, COALESCE(program_title, ''), COALESCE(source_run_name, ''), control_period, suppression_voltage, valve_voltage, COALESCE(run_type, '')
             FROM {obs_table}
             ORDER BY run_name, program_title, source_run_name, observation_id
             """
         ).fetchall()
-    for run_name, program_title, source_run_name, control_period, suppression_voltage, run_type in rows:
+    for run_name, program_title, source_run_name, control_period, suppression_voltage, valve_voltage, run_type in rows:
         run_key = str(run_name or "").strip()
         if not run_key:
             continue
@@ -8272,6 +8322,8 @@ def td_list_run_selection_views(db_path: Path, workbook_path: Path, *, project_d
                 "control_period_label": _td_format_compact_value(control_period),
                 "suppression_voltage": suppression_voltage,
                 "suppression_voltage_label": _td_format_compact_value(suppression_voltage),
+                "valve_voltage": valve_voltage,
+                "valve_voltage_label": _td_format_compact_value(valve_voltage),
                 "run_type": run_type_label if run_type_label in {"SS", "PM"} else "",
                 "run_type_mode": run_type_mode if run_type_mode in {"steady_state", "pulsed_mode"} else "",
             }
@@ -8289,6 +8341,7 @@ def td_list_run_selection_views(db_path: Path, workbook_path: Path, *, project_d
         member_programs: list[str] = []
         member_control_periods: list[str] = []
         member_suppression_voltages: list[str] = []
+        member_valve_voltages: list[str] = []
         member_run_types: list[str] = []
         member_run_type_modes: list[str] = []
         detail_rows: list[str] = []
@@ -8296,6 +8349,7 @@ def td_list_run_selection_views(db_path: Path, workbook_path: Path, *, project_d
         seen_program_labels: set[str] = set()
         seen_control_period_labels: set[str] = set()
         seen_suppression_labels: set[str] = set()
+        seen_valve_labels: set[str] = set()
         seen_run_type_labels: set[str] = set()
         seen_run_type_modes: set[str] = set()
         for obs in source_rows:
@@ -8306,6 +8360,8 @@ def td_list_run_selection_views(db_path: Path, workbook_path: Path, *, project_d
             control_period_label = str(obs.get("control_period_label") or "").strip()
             suppression_voltage = obs.get("suppression_voltage")
             suppression_voltage_label = str(obs.get("suppression_voltage_label") or "").strip()
+            valve_voltage = obs.get("valve_voltage")
+            valve_voltage_label = str(obs.get("valve_voltage_label") or "").strip()
             run_type_label = str(obs.get("run_type") or "").strip()
             run_type_mode = str(obs.get("run_type_mode") or "").strip()
             detail = source_run_name if not program_title else f"{program_title}: {source_run_name}"
@@ -8322,6 +8378,9 @@ def td_list_run_selection_views(db_path: Path, workbook_path: Path, *, project_d
             if suppression_voltage_label and suppression_voltage_label.casefold() not in seen_suppression_labels:
                 seen_suppression_labels.add(suppression_voltage_label.casefold())
                 member_suppression_voltages.append(suppression_voltage_label)
+            if valve_voltage_label and valve_voltage_label.casefold() not in seen_valve_labels:
+                seen_valve_labels.add(valve_voltage_label.casefold())
+                member_valve_voltages.append(valve_voltage_label)
             if run_type_label and run_type_label not in seen_run_type_labels:
                 seen_run_type_labels.add(run_type_label)
                 member_run_types.append(run_type_label)
@@ -8345,6 +8404,8 @@ def td_list_run_selection_views(db_path: Path, workbook_path: Path, *, project_d
                     "member_control_periods": ([control_period_label] if control_period_label else []),
                     "suppression_voltage": suppression_voltage,
                     "member_suppression_voltages": ([suppression_voltage_label] if suppression_voltage_label else []),
+                    "valve_voltage": valve_voltage,
+                    "member_valve_voltages": ([valve_voltage_label] if valve_voltage_label else []),
                     "run_type": run_type_label,
                     "run_type_mode": run_type_mode,
                     "member_run_types": ([run_type_label] if run_type_label else []),
@@ -8375,6 +8436,8 @@ def td_list_run_selection_views(db_path: Path, workbook_path: Path, *, project_d
                     "member_control_periods": [],
                     "suppression_voltage": None,
                     "member_suppression_voltages": [],
+                    "valve_voltage": None,
+                    "member_valve_voltages": [],
                     "run_type": fallback_run_type,
                     "run_type_mode": fallback_run_type_mode,
                     "member_run_types": ([fallback_run_type] if fallback_run_type else []),
@@ -8386,6 +8449,7 @@ def td_list_run_selection_views(db_path: Path, workbook_path: Path, *, project_d
             member_programs = [_td_display_program_title("")]
             member_control_periods = []
             member_suppression_voltages = []
+            member_valve_voltages = []
             member_run_types = [fallback_run_type] if fallback_run_type else []
             member_run_type_modes = [fallback_run_type_mode] if fallback_run_type_mode else []
             detail_rows = [run_name]
@@ -8403,6 +8467,8 @@ def td_list_run_selection_views(db_path: Path, workbook_path: Path, *, project_d
                 "member_control_periods": list(member_control_periods),
                 "suppression_voltage": (member_suppression_voltages[0] if len(member_suppression_voltages) == 1 else None),
                 "member_suppression_voltages": list(member_suppression_voltages),
+                "valve_voltage": (member_valve_voltages[0] if len(member_valve_voltages) == 1 else None),
+                "member_valve_voltages": list(member_valve_voltages),
                 "run_type": (member_run_types[0] if len(member_run_types) == 1 else ""),
                 "run_type_mode": (member_run_type_modes[0] if len(member_run_type_modes) == 1 else ""),
                 "member_run_types": list(member_run_types),
@@ -9909,6 +9975,9 @@ def _write_test_data_project_calc_cache_from_aggregates(
         suppression_voltage_value = _td_finite_float(
             condition_meta.get("suppression_voltage", run_defaults.get("suppression_voltage"))
         )
+        valve_voltage_value = _td_finite_float(
+            condition_meta.get("valve_voltage", run_defaults.get("valve_voltage"))
+        )
         run_type_text = str(condition_meta.get("run_type") or run_defaults.get("run_type") or "").strip()
         member_source_runs = sorted({str(v).strip() for v in (meta.get("source_run_names") or set()) if str(v).strip()})
 
@@ -9965,6 +10034,7 @@ def _write_test_data_project_calc_cache_from_aggregates(
                 pulse_width_value,
                 control_period_value,
                 suppression_voltage_value,
+                valve_voltage_value,
                 source_mtime_max,
                 int(computed_epoch_ns),
             )
@@ -10100,13 +10170,14 @@ def _write_test_data_project_calc_cache_from_aggregates(
                     pulse_width,
                     control_period,
                     suppression_voltage,
+                    valve_voltage,
                     source_mtime_ns,
                     computed_epoch_ns
                 FROM td_raw_condition_observations
                 ORDER BY run_name, serial, observation_id
                 """
             ).fetchall()
-            for observation_id, run_name, serial, program_title, source_run_name, run_type, pulse_width, control_period, suppression_voltage, source_mtime_ns, row_epoch_ns in raw_obs_rows:
+            for observation_id, run_name, serial, program_title, source_run_name, run_type, pulse_width, control_period, suppression_voltage, valve_voltage, source_mtime_ns, row_epoch_ns in raw_obs_rows:
                 obs_id = str(observation_id or "").strip()
                 if not obs_id:
                     continue
@@ -10120,6 +10191,7 @@ def _write_test_data_project_calc_cache_from_aggregates(
                     pulse_width,
                     control_period,
                     suppression_voltage,
+                    valve_voltage,
                     source_mtime_ns,
                     int(row_epoch_ns or computed_epoch_ns),
                 )
@@ -10159,6 +10231,7 @@ def _write_test_data_project_calc_cache_from_aggregates(
                         str(program_title or "").strip(),
                         source_run_txt,
                         "",
+                        None,
                         None,
                         None,
                         None,
@@ -10218,8 +10291,8 @@ def _write_test_data_project_calc_cache_from_aggregates(
             conn.executemany(
                 """
                 INSERT OR REPLACE INTO td_condition_observations(
-                    observation_id, serial, run_name, program_title, source_run_name, run_type, pulse_width, control_period, suppression_voltage, source_mtime_ns, computed_epoch_ns
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    observation_id, serial, run_name, program_title, source_run_name, run_type, pulse_width, control_period, suppression_voltage, valve_voltage, source_mtime_ns, computed_epoch_ns
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 obs_rows_to_write,
             )
@@ -10255,8 +10328,8 @@ def _write_test_data_project_calc_cache_from_aggregates(
             conn.executemany(
                 f"""
                 INSERT OR REPLACE INTO {TD_PLOTTER_OBSERVATIONS_TABLE}
-                (observation_id, run_name, serial, program_title, source_run_name, run_type, pulse_width, control_period, suppression_voltage, source_mtime_ns, computed_epoch_ns)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (observation_id, run_name, serial, program_title, source_run_name, run_type, pulse_width, control_period, suppression_voltage, valve_voltage, source_mtime_ns, computed_epoch_ns)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 plotter_obs_rows_to_write,
             )
@@ -10275,8 +10348,8 @@ def _write_test_data_project_calc_cache_from_aggregates(
             conn.executemany(
                 """
                 INSERT OR REPLACE INTO td_condition_observations_sequences(
-                    observation_id, serial, run_name, program_title, source_run_name, run_type, pulse_width, control_period, suppression_voltage, source_mtime_ns, computed_epoch_ns
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    observation_id, serial, run_name, program_title, source_run_name, run_type, pulse_width, control_period, suppression_voltage, valve_voltage, source_mtime_ns, computed_epoch_ns
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 sequence_obs_rows_list,
             )
@@ -10559,6 +10632,7 @@ def _rebuild_test_data_project_calc_cache_from_raw(
                     pulse_width,
                     control_period,
                     suppression_voltage,
+                    valve_voltage,
                     source_mtime_ns,
                     computed_epoch_ns
                 FROM td_raw_condition_observations
@@ -10662,7 +10736,7 @@ def _rebuild_test_data_project_calc_cache_from_raw(
 
         raw_obs_by_id: dict[str, dict[str, object]] = {}
         plotter_obs_rows_by_id: dict[str, tuple[object, ...]] = {}
-        for observation_id, run_name, serial, program_title, source_run_name, run_type, pulse_width, control_period, suppression_voltage, source_mtime_ns, obs_computed_epoch_ns in raw_obs_rows:
+        for observation_id, run_name, serial, program_title, source_run_name, run_type, pulse_width, control_period, suppression_voltage, valve_voltage, source_mtime_ns, obs_computed_epoch_ns in raw_obs_rows:
             obs_id = str(observation_id or "").strip()
             if not obs_id:
                 continue
@@ -10680,6 +10754,7 @@ def _rebuild_test_data_project_calc_cache_from_raw(
                 "pulse_width": pulse_width,
                 "control_period": control_period,
                 "suppression_voltage": suppression_voltage,
+                "valve_voltage": valve_voltage,
                 "source_mtime_ns": source_mtime_ns,
             }
             plotter_obs_rows_by_id[obs_id] = (
@@ -10692,6 +10767,7 @@ def _rebuild_test_data_project_calc_cache_from_raw(
                 pulse_width,
                 control_period,
                 suppression_voltage,
+                valve_voltage,
                 source_mtime_ns,
                 int(obs_computed_epoch_ns or computed_epoch_ns),
             )
@@ -10715,6 +10791,7 @@ def _rebuild_test_data_project_calc_cache_from_raw(
                     "pulse_width": None,
                     "control_period": None,
                     "suppression_voltage": None,
+                    "valve_voltage": None,
                     "source_mtime_ns": source_mtime_ns,
                 }
                 plotter_obs_rows_by_id[obs_id] = (
@@ -10724,6 +10801,7 @@ def _rebuild_test_data_project_calc_cache_from_raw(
                     program_txt,
                     source_run_txt,
                     "",
+                    None,
                     None,
                     None,
                     None,
@@ -10852,6 +10930,9 @@ def _rebuild_test_data_project_calc_cache_from_raw(
             sequence_suppression_voltage = _finite_float(
                 support_row.get("suppression_voltage", raw_obs_meta.get("suppression_voltage"))
             )
+            sequence_valve_voltage = _finite_float(
+                support_row.get("valve_voltage", raw_obs_meta.get("valve_voltage"))
+            )
             sequence_run_type = str(
                 support_row.get("run_type") or raw_obs_meta.get("run_type") or ""
             ).strip()
@@ -10866,6 +10947,7 @@ def _rebuild_test_data_project_calc_cache_from_raw(
                 sequence_pulse_width,
                 sequence_control_period,
                 sequence_suppression_voltage,
+                sequence_valve_voltage,
                 sequence_source_mtime,
                 computed_epoch_ns,
             )
@@ -10960,6 +11042,7 @@ def _rebuild_test_data_project_calc_cache_from_raw(
             source_mtime_max = max([int(v) for v in (meta.get("source_mtime_ns") or [])], default=0)
             pulse_width_value = _finite_float(condition_meta.get("pulse_width_on", condition_meta.get("pulse_width")))
             suppression_voltage_value = _finite_float(condition_meta.get("suppression_voltage"))
+            valve_voltage_value = _finite_float(condition_meta.get("valve_voltage"))
             obs_rows_to_write.append(
                 (
                     observation_id_calc,
@@ -10971,6 +11054,7 @@ def _rebuild_test_data_project_calc_cache_from_raw(
                     pulse_width_value,
                     _finite_float(condition_meta.get("control_period")),
                     suppression_voltage_value,
+                    valve_voltage_value,
                     source_mtime_max,
                     computed_epoch_ns,
                 )
@@ -11039,8 +11123,8 @@ def _rebuild_test_data_project_calc_cache_from_raw(
             conn.executemany(
                 """
                 INSERT OR REPLACE INTO td_condition_observations(
-                    observation_id, serial, run_name, program_title, source_run_name, run_type, pulse_width, control_period, suppression_voltage, source_mtime_ns, computed_epoch_ns
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    observation_id, serial, run_name, program_title, source_run_name, run_type, pulse_width, control_period, suppression_voltage, valve_voltage, source_mtime_ns, computed_epoch_ns
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 obs_rows_to_write,
             )
@@ -11076,8 +11160,8 @@ def _rebuild_test_data_project_calc_cache_from_raw(
             conn.executemany(
                 f"""
                 INSERT OR REPLACE INTO {TD_PLOTTER_OBSERVATIONS_TABLE}
-                (observation_id, run_name, serial, program_title, source_run_name, run_type, pulse_width, control_period, suppression_voltage, source_mtime_ns, computed_epoch_ns)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (observation_id, run_name, serial, program_title, source_run_name, run_type, pulse_width, control_period, suppression_voltage, valve_voltage, source_mtime_ns, computed_epoch_ns)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 plotter_obs_rows_to_write,
             )
@@ -11096,8 +11180,8 @@ def _rebuild_test_data_project_calc_cache_from_raw(
             conn.executemany(
                 """
                 INSERT OR REPLACE INTO td_condition_observations_sequences(
-                    observation_id, serial, run_name, program_title, source_run_name, run_type, pulse_width, control_period, suppression_voltage, source_mtime_ns, computed_epoch_ns
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    observation_id, serial, run_name, program_title, source_run_name, run_type, pulse_width, control_period, suppression_voltage, valve_voltage, source_mtime_ns, computed_epoch_ns
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 sequence_obs_rows_to_write,
             )
@@ -12080,6 +12164,7 @@ def rebuild_test_data_project_cache(
                     "run_type": str(seq.get("run_type") or effective.get("run_type") or "").strip(),
                     "control_period": seq.get("control_period", effective.get("control_period")),
                     "suppression_voltage": seq.get("suppression_voltage", effective.get("suppression_voltage")),
+                    "valve_voltage": seq.get("valve_voltage", effective.get("valve_voltage")),
                     "program_title": str(program_title or "").strip(),
                     "matched_support": False,
                 }
@@ -12113,6 +12198,7 @@ def rebuild_test_data_project_cache(
                 "run_type": str(seq.get("run_type") or effective.get("run_type") or "").strip(),
                 "control_period": seq.get("control_period", effective.get("control_period")),
                 "suppression_voltage": seq.get("suppression_voltage", effective.get("suppression_voltage")),
+                "valve_voltage": seq.get("valve_voltage", effective.get("valve_voltage")),
                 "program_title": str(program_title or "").strip(),
                 "matched_support": True,
             }
@@ -12604,6 +12690,7 @@ def rebuild_test_data_project_cache(
                             "control_period": run_info.get("control_period"),
                             "pulse_width": pulse_width_value,
                             "suppression_voltage": run_info.get("suppression_voltage"),
+                            "valve_voltage": run_info.get("valve_voltage"),
                         },
                     )
 
@@ -12737,6 +12824,7 @@ def rebuild_test_data_project_cache(
                         pulse_width_float = _finite_float(pulse_width_value)
                         control_period_float = _finite_float(run_info.get("control_period"))
                         suppression_voltage_float = _finite_float(run_info.get("suppression_voltage"))
+                        valve_voltage_float = _finite_float(run_info.get("valve_voltage"))
                         matched_y_actuals = {
                             str(y_name): str(y_actual_by_name.get(y_name) or "").strip()
                             for y_name in matched_y_names
@@ -12785,6 +12873,7 @@ def rebuild_test_data_project_cache(
                             )
                             sequence_control_period = _finite_float(run_info.get("control_period"))
                             sequence_suppression_voltage = _finite_float(run_info.get("suppression_voltage"))
+                            sequence_valve_voltage = _finite_float(run_info.get("valve_voltage"))
                             sequence_run_type = str(run_info.get("run_type") or "").strip()
                             sequence_source_mtime = int(mtime_ns or 0)
                             calc_sequence_obs_rows_by_id[str(observation_id)] = (
@@ -12797,6 +12886,7 @@ def rebuild_test_data_project_cache(
                                 sequence_pulse_width,
                                 sequence_control_period,
                                 sequence_suppression_voltage,
+                                sequence_valve_voltage,
                                 sequence_source_mtime,
                                 computed_epoch_ns,
                             )
@@ -12847,8 +12937,8 @@ def rebuild_test_data_project_cache(
                             raw_conn.execute(
                                 """
                                 INSERT OR REPLACE INTO td_raw_condition_observations(
-                                    observation_id, run_name, serial, program_title, source_run_name, run_type, pulse_width, control_period, suppression_voltage, source_mtime_ns, computed_epoch_ns
-                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                    observation_id, run_name, serial, program_title, source_run_name, run_type, pulse_width, control_period, suppression_voltage, valve_voltage, source_mtime_ns, computed_epoch_ns
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                                 """,
                                 (
                                     observation_id,
@@ -12860,6 +12950,7 @@ def rebuild_test_data_project_cache(
                                     pulse_width_float,
                                     control_period_float,
                                     suppression_voltage_float,
+                                    valve_voltage_float,
                                     mtime_ns,
                                     computed_epoch_ns,
                                 ),
@@ -13301,6 +13392,7 @@ def rebuild_test_data_project_cache(
                 "control_period": (run_meta_by_run.get(run) or {}).get("control_period"),
                 "pulse_width": (run_meta_by_run.get(run) or {}).get("pulse_width"),
                 "suppression_voltage": (run_meta_by_run.get(run) or {}).get("suppression_voltage"),
+                "valve_voltage": (run_meta_by_run.get(run) or {}).get("valve_voltage"),
             }
             for run in runs_all
             if str(run).strip()
@@ -14263,6 +14355,7 @@ def td_read_observation_filter_rows_from_cache(db_path: Path) -> list[dict]:
                 COALESCE(o.source_run_name, ''),
                 o.control_period,
                 o.suppression_voltage,
+                o.valve_voltage,
                 COALESCE(m.document_type, ''),
                 COALESCE(m.metadata_rel, ''),
                 COALESCE(m.artifacts_rel, ''),
@@ -14274,7 +14367,7 @@ def td_read_observation_filter_rows_from_cache(db_path: Path) -> list[dict]:
             """
         ).fetchall()
     out: list[dict] = []
-    for observation_id, serial, program_title, source_run_name, control_period, suppression_voltage, document_type, metadata_rel, artifacts_rel, excel_sqlite_rel in rows:
+    for observation_id, serial, program_title, source_run_name, control_period, suppression_voltage, valve_voltage, document_type, metadata_rel, artifacts_rel, excel_sqlite_rel in rows:
         sn = str(serial or "").strip()
         obs_id = str(observation_id or "").strip()
         if not sn or not obs_id:
@@ -14288,6 +14381,7 @@ def td_read_observation_filter_rows_from_cache(db_path: Path) -> list[dict]:
                 "source_run_name": str(source_run_name or "").strip(),
                 "control_period": control_period,
                 "suppression_voltage": suppression_voltage,
+                "valve_voltage": valve_voltage,
                 "document_type": str(document_type or "").strip(),
                 "metadata_rel": str(metadata_rel or "").strip(),
                 "artifacts_rel": str(artifacts_rel or "").strip(),

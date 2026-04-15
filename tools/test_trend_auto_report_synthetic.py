@@ -374,6 +374,27 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         self.assertTrue(ctx.printed_timezone)
         self.assertRegex(ctx.printed_at, r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2} .+$")
 
+    def test_default_report_subtitle_uses_asset_program_and_serial_metadata(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        subtitle = tar._tar_default_report_subtitle(
+            serials=["SN-001", "SN-002"],
+            meta_by_sn={
+                "SN-001": {
+                    "asset_type": "Valve",
+                    "asset_specific_type": "Main Fuel Valve",
+                    "program_title": "Program A",
+                },
+                "SN-002": {
+                    "asset_type": "Valve",
+                    "asset_specific_type": "Main Fuel Valve",
+                    "program_title": "Program A",
+                },
+            },
+        )
+
+        self.assertEqual(subtitle, "Hot Fire Test Data | Valve | Main Fuel Valve | Program A | SN-001, SN-002")
+
     def test_selection_display_fields_condition_mode_keeps_condition_and_sequences(self):
         from EIDAT_App_Files.ui_next import trend_auto_report as tar
 
@@ -1254,14 +1275,265 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         tables = [item[1] for item in story if isinstance(item, tuple) and item and item[0] == "Table"]
         exec_table = next(rows for rows in tables if rows and rows[0][0] == "Serial" and rows[0][1] == "Overall")
         exception_table = next(rows for rows in tables if rows and rows[0][0] == "Serial" and rows[0][1] == "Run Condition")
-        comparison_table = next(rows for rows in tables if rows and str(rows[0][0]).startswith("Run Condition:"))
         self.assertEqual(exec_table[1][1], "Initial: FAILED\nFinal: WATCH")
         self.assertEqual(exec_table[0], ["Serial", "Overall", "Program", "Part #", "Rev", "Outcome Mix"])
         self.assertEqual(exec_table[1][5], "PASS 50% | WATCH 50% | FAIL 0%")
         self.assertEqual([row[4] for row in exception_table[1:]], ["WATCH", "NO_DATA"])
         self.assertTrue(str(exception_table[1][5]).startswith("Chart "))
         self.assertEqual(exception_table[2][5], "")
-        self.assertTrue(any(row[7] == "Initial: FAIL\nFinal: PASS" for row in comparison_table[2:]))
+        self.assertFalse(any(rows and str(rows[0][0]).startswith("Run Condition:") for rows in tables))
+
+    def test_plan_comparison_pages_pivots_by_serial_and_splits_by_run_blocks(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        comparison_rows: list[dict[str, object]] = []
+        for block_index in range(18):
+            selection_id = f"sel-{block_index:02d}"
+            for param_name, units, initial_atp, final_atp, initial_actual, final_actual, initial_delta, final_delta, initial_grade, final_grade, regrade_applied in (
+                ("Pressure", "psi", 10.0 + block_index, 12.0 + block_index, 9.0 + block_index, 11.0 + block_index, -1.0, -1.0, "PASS", "WATCH", block_index == 0),
+                ("Flow", "kg/s", 20.0 + block_index, 20.0 + block_index, 19.0 + block_index, 19.0 + block_index, -1.0, -1.0, "PASS", "PASS", False),
+            ):
+                comparison_rows.append(
+                    {
+                        "selection_id": selection_id,
+                        "run_condition": f"Condition {block_index:02d}",
+                        "sequence_text": f"Seq {block_index:02d}",
+                        "serial": "SN1",
+                        "parameter": param_name,
+                        "units": units,
+                        "initial_atp_mean": initial_atp,
+                        "final_atp_mean": final_atp,
+                        "initial_actual_mean": initial_actual,
+                        "final_actual_mean": final_actual,
+                        "initial_delta": initial_delta,
+                        "final_delta": final_delta,
+                        "initial_grade": initial_grade,
+                        "final_grade": final_grade,
+                        "regrade_applied": regrade_applied,
+                    }
+                )
+        comparison_rows.extend(
+            [
+                {
+                    "selection_id": "sel-sn2",
+                    "run_condition": "Condition Z",
+                    "sequence_text": "Seq Z",
+                    "serial": "SN2",
+                    "parameter": "Pressure",
+                    "units": "psi",
+                    "initial_atp_mean": 33.0,
+                    "final_atp_mean": 33.0,
+                    "initial_actual_mean": 31.0,
+                    "final_actual_mean": 31.0,
+                    "initial_delta": -2.0,
+                    "final_delta": -2.0,
+                    "initial_grade": "WATCH",
+                    "final_grade": "WATCH",
+                    "regrade_applied": False,
+                },
+                {
+                    "selection_id": "sel-sn2",
+                    "run_condition": "Condition Z",
+                    "sequence_text": "Seq Z",
+                    "serial": "SN2",
+                    "parameter": "Flow",
+                    "units": "kg/s",
+                    "initial_atp_mean": 44.0,
+                    "final_atp_mean": 44.0,
+                    "initial_actual_mean": 42.0,
+                    "final_actual_mean": 42.0,
+                    "initial_delta": -2.0,
+                    "final_delta": -2.0,
+                    "initial_grade": "PASS",
+                    "final_grade": "PASS",
+                    "regrade_applied": False,
+                },
+            ]
+        )
+
+        with mock.patch.object(tar, "_reportlab_imports", return_value={}), mock.patch.object(
+            tar,
+            "_tar_measure_comparison_table_height",
+            side_effect=lambda page_spec, rl=None: 140.0 + 80.0 * len(page_spec.get("blocks") or []),
+        ):
+            page_specs = tar._tar_plan_comparison_pages({"hi": ["SN1", "SN2"], "comparison_rows": comparison_rows})
+
+        self.assertGreaterEqual(len([page for page in page_specs if page["serial"] == "SN1"]), 2)
+        sn1_page_count = len([page for page in page_specs if page["serial"] == "SN1"])
+        self.assertTrue(all(page["serial"] == "SN1" for page in page_specs[:sn1_page_count]))
+        self.assertEqual(page_specs[sn1_page_count]["serial"], "SN2")
+
+        first_page = page_specs[0]
+        matrix_rows, style_cmds = tar._tar_build_comparison_page_matrix(first_page)
+        self.assertEqual(matrix_rows[0][:5], ["Run Condition", "Sequence(s)", "Metric", "Pressure", "Flow"])
+        self.assertEqual(matrix_rows[1][:5], ["", "", "", "psi", "kg/s"])
+        self.assertEqual(matrix_rows[2][:5], ["Condition 00", "Seq 00", "ATP Mean", "Initial: 10\nFinal: 12", "20"])
+        self.assertEqual(matrix_rows[3][:5], ["", "", "ATP Actual", "Initial: 9\nFinal: 11", "19"])
+        self.assertEqual(matrix_rows[4][:5], ["", "", "Delta", "Initial: -1\nFinal: -1", "-1"])
+        self.assertEqual(matrix_rows[5][:5], ["", "", "Grade", "Initial: PASS\nFinal: WATCH", "PASS"])
+        self.assertIn(("SPAN", (0, 2), (0, 5)), style_cmds)
+        self.assertIn(("SPAN", (1, 2), (1, 5)), style_cmds)
+        self.assertIn(("BACKGROUND", (3, 2), (3, 5), "#fef3c7"), style_cmds)
+
+    def test_generate_auto_report_merges_tabloid_comparison_pages_before_plots(self):
+        fitz = __import__("fitz")
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        def _write_pdf(path: Path, sizes: list[tuple[float, float]]) -> None:
+            doc = fitz.open()
+            try:
+                for index, (width, height) in enumerate(sizes, start=1):
+                    page = doc.new_page(width=width, height=height)
+                    page.insert_text((72, 72), f"{path.stem}-{index}")
+                doc.save(str(path))
+            finally:
+                doc.close()
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            out_pdf = root / "report.pdf"
+            ctx = {
+                "out_pdf": out_pdf,
+                "print_ctx": tar._capture_print_context(),
+                "proj": root,
+                "wb": root / "project.xlsx",
+                "db_path": root / "cache.sqlite3",
+                "report_cfg": {},
+                "options": {},
+                "hi": ["SN1"],
+                "meta_by_sn": {"SN1": {}},
+                "overall_by_sn": {"SN1": "WATCH"},
+                "initial_overall_by_sn": {"SN1": "FAILED"},
+                "final_overall_by_sn": {"SN1": "WATCH"},
+                "nonpass_findings": [],
+                "initial_nonpass_findings": [],
+                "runs": ["Run1"],
+                "params": ["Pressure", "Flow"],
+                "metric_stats": ["mean"],
+                "curves_summary": {},
+                "initial_watch_items": [],
+                "watch_items": [],
+                "grading_rows": [],
+                "comparison_rows": [
+                    {
+                        "selection_id": "sel-1",
+                        "run_condition": "Condition A",
+                        "sequence_text": "Seq A",
+                        "serial": "SN1",
+                        "parameter": "Pressure",
+                        "units": "psi",
+                        "initial_atp_mean": 10.0,
+                        "final_atp_mean": 12.0,
+                        "initial_actual_mean": 9.0,
+                        "final_actual_mean": 11.0,
+                        "initial_delta": -1.0,
+                        "final_delta": -1.0,
+                        "initial_grade": "PASS",
+                        "final_grade": "WATCH",
+                        "regrade_applied": True,
+                    },
+                    {
+                        "selection_id": "sel-1",
+                        "run_condition": "Condition A",
+                        "sequence_text": "Seq A",
+                        "serial": "SN1",
+                        "parameter": "Flow",
+                        "units": "kg/s",
+                        "initial_atp_mean": 20.0,
+                        "final_atp_mean": 20.0,
+                        "initial_actual_mean": 19.0,
+                        "final_actual_mean": 19.0,
+                        "initial_delta": -1.0,
+                        "final_delta": -1.0,
+                        "initial_grade": "PASS",
+                        "final_grade": "PASS",
+                        "regrade_applied": False,
+                    },
+                ],
+                "initial_cohort_specs": [{"cohort_id": "initial:1"}],
+                "regrade_cohort_specs": [],
+                "equation_cards": [],
+                "performance_models": [],
+                "report_opts": {},
+                "conn": sqlite3.connect(":memory:"),
+            }
+            captured: dict[str, object] = {}
+
+            def _render_intro(intro_pdf: Path, *, ctx: dict[str, object], progress_cb: object = None) -> tuple[int, list[object]]:
+                _write_pdf(intro_pdf, [(612.0, 792.0), (612.0, 792.0)])
+                return 2, ["intro"]
+
+            def _render_plot_sections(_ctx: dict[str, object], *, intro_pages: int, plots_pdf: Path, progress_cb: object = None) -> dict[str, object]:
+                captured["plot_intro_pages"] = intro_pages
+                _write_pdf(plots_pdf, [(612.0, 792.0)])
+                return {
+                    "plot_page_count": 1,
+                    "metric_plot_count": 1,
+                    "curve_plot_count": 0,
+                    "run_condition_metric_plot_count": 1,
+                    "run_condition_curve_plot_count": 0,
+                    "regrade_metric_plot_count": 0,
+                    "regrade_curve_plot_count": 0,
+                    "performance_plot_count": 0,
+                    "watch_plot_count": 0,
+                    "plot_specs": [],
+                }
+
+            def _render_portrait(out_path: Path, *, story: list[object], print_ctx: object, page_number_offset: int = 0) -> int:
+                _write_pdf(out_path, [(612.0, 792.0)])
+                return 1
+
+            def _render_comparison(out_path: Path, *, story: list[object], print_ctx: object, page_number_offset: int = 0) -> int:
+                _write_pdf(out_path, [(1224.0, 792.0)])
+                return 1
+
+            with mock.patch.object(tar, "_reportlab_imports", return_value={}), mock.patch.object(
+                tar, "_tar_prepare_base", return_value=ctx
+            ), mock.patch.object(
+                tar, "_tar_prepare_performance_models", side_effect=lambda _ctx: None
+            ), mock.patch.object(
+                tar, "_tar_plan_comparison_pages", return_value=[{"serial": "SN1", "serial_page_index": 1, "serial_page_count": 1}]
+            ), mock.patch.object(
+                tar, "_tar_build_comparison_story", return_value=["comparison"]
+            ), mock.patch.object(
+                tar, "_tar_prepare_intro_story_with_navigation", return_value=["intro"]
+            ), mock.patch.object(
+                tar, "_tar_render_stabilized_intro_pdf", side_effect=_render_intro
+            ), mock.patch.object(
+                tar, "_tar_build_equation_story", return_value=["equations"]
+            ), mock.patch.object(
+                tar, "_tar_render_plot_sections", side_effect=_render_plot_sections
+            ), mock.patch.object(
+                tar, "_tar_build_closing_story", return_value=["closing"]
+            ), mock.patch.object(
+                tar, "_render_portrait_story_pdf", side_effect=_render_portrait
+            ), mock.patch.object(
+                tar, "_render_tabloid_landscape_story_pdf", side_effect=_render_comparison
+            ), mock.patch.object(
+                tar, "_tar_apply_pdf_navigation", side_effect=lambda *args, **kwargs: None
+            ), mock.patch.object(
+                tar, "_write_json", side_effect=lambda path, payload: captured.update({"path": path, "payload": payload})
+            ):
+                tar.generate_test_data_auto_report(
+                    root,
+                    root / "project.xlsx",
+                    out_pdf,
+                    highlighted_serials=["SN1"],
+                    options={},
+                )
+
+            result = fitz.open(str(out_pdf))
+            try:
+                self.assertEqual(result.page_count, 6)
+                self.assertEqual(int(round(result.load_page(0).rect.width)), 612)
+                self.assertEqual(int(round(result.load_page(1).rect.width)), 612)
+                self.assertEqual(int(round(result.load_page(2).rect.width)), 1224)
+                self.assertEqual(int(round(result.load_page(2).rect.height)), 792)
+                self.assertEqual(int(round(result.load_page(3).rect.width)), 612)
+            finally:
+                result.close()
+
+        self.assertEqual(captured["plot_intro_pages"], 3)
 
     def test_build_exception_chart_links_targets_regrade_curve_pages(self):
         from EIDAT_App_Files.ui_next import trend_auto_report as tar
@@ -1347,6 +1619,10 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
                 tar, "_tar_prepare_base", return_value=ctx
             ), mock.patch.object(
                 tar, "_tar_prepare_performance_models", side_effect=lambda _ctx: None
+            ), mock.patch.object(
+                tar, "_tar_plan_comparison_pages", return_value=[]
+            ), mock.patch.object(
+                tar, "_tar_build_comparison_story", return_value=[]
             ), mock.patch.object(
                 tar, "_tar_prepare_intro_story_with_navigation", return_value=["intro"]
             ), mock.patch.object(tar, "_tar_render_stabilized_intro_pdf", return_value=(2, ["intro"])), mock.patch.object(

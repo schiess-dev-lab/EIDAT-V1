@@ -31,7 +31,7 @@ def _now_datestr() -> str:
 
 
 REPORT_TITLE = "Acceptance Test Certification Report"
-REPORT_SUBTITLE_DEFAULT = "EDAT Test Data Trend / Analyze Auto Report"
+REPORT_SUBTITLE_DEFAULT = "Hot Fire Test Data"
 
 
 @dataclass(frozen=True)
@@ -181,6 +181,12 @@ def _td_suppression_voltage_filter_value(row: Mapping[str, object] | None) -> st
     return _td_compact_filter_value(row.get("suppression_voltage"))
 
 
+def _td_valve_voltage_filter_value(row: Mapping[str, object] | None) -> str:
+    if not isinstance(row, Mapping):
+        return ""
+    return _td_compact_filter_value(row.get("valve_voltage"))
+
+
 def _filter_state_values(filter_state: Mapping[str, object] | None, key: str) -> list[str]:
     if not isinstance(filter_state, Mapping):
         return []
@@ -215,6 +221,11 @@ def _row_matches_filter_state(row: Mapping[str, object] | None, filter_state: Ma
     if _filter_state_has_key(filter_state, "suppression_voltages"):
         suppression_voltage = _td_suppression_voltage_filter_value(row)
         if not suppression_voltage or suppression_voltage not in selected_suppression:
+            return False
+    selected_valves = set(_filter_state_values(filter_state, "valve_voltages"))
+    if _filter_state_has_key(filter_state, "valve_voltages"):
+        valve_voltage = _td_valve_voltage_filter_value(row)
+        if not valve_voltage or valve_voltage not in selected_valves:
             return False
     return True
 
@@ -268,6 +279,24 @@ def _selection_matches_observation_row(
         member_programs = [_td_display_program_title(selection.get("program_title"))]
     if member_programs:
         if _td_display_program_title(row.get("program_title")) not in set(member_programs):
+            return False
+    member_valves: list[str] = []
+    seen_valves: set[str] = set()
+    raw_valves = selection.get("member_valve_voltages") or []
+    if isinstance(raw_valves, list):
+        for value in raw_valves:
+            label = _td_compact_filter_value(value)
+            if not label or label in seen_valves:
+                continue
+            seen_valves.add(label)
+            member_valves.append(label)
+    if not member_valves:
+        single_valve = _td_compact_filter_value(selection.get("valve_voltage"))
+        if single_valve:
+            member_valves = [single_valve]
+    if member_valves:
+        row_valve = _td_valve_voltage_filter_value(row)
+        if not row_valve or row_valve not in set(member_valves):
             return False
     return True
 
@@ -2241,7 +2270,7 @@ def _reportlab_imports() -> dict[str, Any]:
     try:
         from reportlab.lib import colors  # type: ignore
         from reportlab.lib.enums import TA_CENTER, TA_LEFT  # type: ignore
-        from reportlab.lib.pagesizes import letter  # type: ignore
+        from reportlab.lib.pagesizes import landscape, letter, tabloid  # type: ignore
         from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet  # type: ignore
         from reportlab.lib.units import inch  # type: ignore
         from reportlab.platypus import KeepTogether, PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle  # type: ignore
@@ -2252,6 +2281,8 @@ def _reportlab_imports() -> dict[str, Any]:
         "TA_CENTER": TA_CENTER,
         "TA_LEFT": TA_LEFT,
         "letter": letter,
+        "landscape": landscape,
+        "tabloid": tabloid,
         "ParagraphStyle": ParagraphStyle,
         "getSampleStyleSheet": getSampleStyleSheet,
         "inch": inch,
@@ -2476,6 +2507,466 @@ def _render_portrait_story_pdf(
         import fitz  # type: ignore
     except Exception as exc:
         raise RuntimeError("PyMuPDF is required to finalize portrait report pages.") from exc
+    doc_pdf = fitz.open(str(Path(out_path).expanduser()))
+    try:
+        return int(doc_pdf.page_count)
+    finally:
+        doc_pdf.close()
+
+
+_TAR_COMPARISON_FONT_CHOICES = (9, 8)
+_TAR_COMPARISON_METRIC_ROWS = ("ATP Mean", "ATP Actual", "Delta", "Grade")
+_TAR_COMPARISON_PAGE_WIDTH = 17.0 * 72.0
+_TAR_COMPARISON_PAGE_HEIGHT = 11.0 * 72.0
+_TAR_COMPARISON_LEFT_MARGIN = 24.0
+_TAR_COMPARISON_RIGHT_MARGIN = 24.0
+_TAR_COMPARISON_TOP_MARGIN = 72.0
+_TAR_COMPARISON_BOTTOM_MARGIN = 24.0
+_TAR_COMPARISON_TABLE_HEIGHT_BUDGET = _TAR_COMPARISON_PAGE_HEIGHT - _TAR_COMPARISON_TOP_MARGIN - _TAR_COMPARISON_BOTTOM_MARGIN - 68.0
+
+
+def _tar_comparison_table_width_budget() -> float:
+    return float(_TAR_COMPARISON_PAGE_WIDTH - _TAR_COMPARISON_LEFT_MARGIN - _TAR_COMPARISON_RIGHT_MARGIN)
+
+
+def _tar_comparison_left_col_widths(font_size: int) -> list[float]:
+    if int(font_size) <= 8:
+        return [1.95 * 72.0, 1.60 * 72.0, 0.82 * 72.0]
+    return [2.05 * 72.0, 1.75 * 72.0, 0.90 * 72.0]
+
+
+def _tar_comparison_param_min_width(font_size: int) -> float:
+    return float((0.84 if int(font_size) <= 8 else 0.92) * 72.0)
+
+
+def _tar_comparison_block_key(row: Mapping[str, object]) -> str:
+    selection_id = str(row.get("selection_id") or "").strip()
+    if selection_id:
+        return f"selection:{selection_id}"
+    return "text:" + "|".join(
+        [
+            str(row.get("run_condition") or row.get("run") or "").strip(),
+            str(row.get("sequence_text") or "").strip(),
+        ]
+    )
+
+
+def _tar_group_comparison_rows_by_serial(
+    rows: list[dict] | None,
+    *,
+    serial_order: Iterable[object] | None = None,
+) -> list[dict[str, Any]]:
+    ordered_serials = [str(serial or "").strip() for serial in (serial_order or []) if str(serial or "").strip()]
+    grouped: dict[str, dict[str, Any]] = {}
+    serial_sequence: list[str] = []
+
+    def _ensure_serial(serial: str) -> dict[str, Any]:
+        if serial not in grouped:
+            grouped[serial] = {
+                "serial": serial,
+                "parameter_order": [],
+                "parameter_units": {},
+                "blocks": [],
+                "blocks_by_id": {},
+            }
+            serial_sequence.append(serial)
+        return grouped[serial]
+
+    for serial in ordered_serials:
+        _ensure_serial(serial)
+
+    for raw_row in rows or []:
+        if not isinstance(raw_row, Mapping):
+            continue
+        row = dict(raw_row)
+        serial = str(row.get("serial") or "").strip()
+        if not serial:
+            continue
+        serial_spec = _ensure_serial(serial)
+        parameter = str(row.get("parameter") or "").strip()
+        units = str(row.get("units") or "").strip()
+        if parameter and parameter not in serial_spec["parameter_order"]:
+            serial_spec["parameter_order"].append(parameter)
+        if parameter and units and not str(serial_spec["parameter_units"].get(parameter) or "").strip():
+            serial_spec["parameter_units"][parameter] = units
+        block_id = _tar_comparison_block_key(row)
+        if block_id not in serial_spec["blocks_by_id"]:
+            block = {
+                "block_id": block_id,
+                "selection_id": str(row.get("selection_id") or "").strip(),
+                "run_condition": str(row.get("run_condition") or row.get("run") or "Unknown Run Condition").strip() or "Unknown Run Condition",
+                "sequence_text": str(row.get("sequence_text") or "").strip(),
+                "rows_by_parameter": {},
+            }
+            serial_spec["blocks_by_id"][block_id] = block
+            serial_spec["blocks"].append(block)
+        serial_spec["blocks_by_id"][block_id]["rows_by_parameter"][parameter] = row
+
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for serial in ordered_serials + serial_sequence:
+        if serial in seen:
+            continue
+        seen.add(serial)
+        serial_spec = grouped.get(serial)
+        if not serial_spec:
+            continue
+        if not serial_spec["blocks"] or not serial_spec["parameter_order"]:
+            continue
+        out.append(
+            {
+                "serial": serial,
+                "parameter_order": list(serial_spec["parameter_order"]),
+                "parameter_units": dict(serial_spec["parameter_units"]),
+                "blocks": list(serial_spec["blocks"]),
+            }
+        )
+    return out
+
+
+def _tar_comparison_page_metric_value(row: Mapping[str, object] | None, metric_label: str) -> str:
+    if not isinstance(row, Mapping):
+        return ""
+    regrade_applied = bool(row.get("regrade_applied"))
+    if metric_label == "ATP Mean":
+        return _tar_comparison_metric_text(row.get("initial_atp_mean"), row.get("final_atp_mean"), regrade_applied=regrade_applied, sig=5)
+    if metric_label == "ATP Actual":
+        return _tar_comparison_metric_text(row.get("initial_actual_mean"), row.get("final_actual_mean"), regrade_applied=regrade_applied, sig=5)
+    if metric_label == "Delta":
+        return _tar_comparison_metric_text(row.get("initial_delta"), row.get("final_delta"), regrade_applied=regrade_applied, sig=5)
+    if metric_label == "Grade":
+        return _tar_comparison_grade_text(row.get("initial_grade"), row.get("final_grade"), regrade_applied=regrade_applied)
+    return ""
+
+
+def _tar_build_comparison_page_matrix(page_spec: Mapping[str, object]) -> tuple[list[list[str]], list[tuple]]:
+    param_names = [str(name or "").strip() for name in (page_spec.get("param_names") or []) if str(name or "").strip()]
+    param_units = dict(page_spec.get("param_units") or {})
+    rows: list[list[str]] = [
+        ["Run Condition", "Sequence(s)", "Metric", *param_names],
+        ["", "", "", *[str(param_units.get(name) or "") for name in param_names]],
+    ]
+    style_cmds: list[tuple] = [
+        ("SPAN", (0, 0), (0, 1)),
+        ("SPAN", (1, 0), (1, 1)),
+        ("SPAN", (2, 0), (2, 1)),
+    ]
+    blocks = list(page_spec.get("blocks") or [])
+    for block_index, raw_block in enumerate(blocks):
+        block = dict(raw_block or {})
+        start_row = len(rows)
+        by_parameter = dict(block.get("rows_by_parameter") or {})
+        for metric_index, metric_label in enumerate(_TAR_COMPARISON_METRIC_ROWS):
+            row_values = [
+                str(block.get("run_condition") or "") if metric_index == 0 else "",
+                str(block.get("sequence_text") or "") if metric_index == 0 else "",
+                metric_label,
+            ]
+            for param_name in param_names:
+                row_values.append(_tar_comparison_page_metric_value(by_parameter.get(param_name), metric_label))
+            rows.append(row_values)
+        style_cmds.extend(
+            [
+                ("SPAN", (0, start_row), (0, start_row + len(_TAR_COMPARISON_METRIC_ROWS) - 1)),
+                ("SPAN", (1, start_row), (1, start_row + len(_TAR_COMPARISON_METRIC_ROWS) - 1)),
+                ("LINEBELOW", (0, start_row + len(_TAR_COMPARISON_METRIC_ROWS) - 1), (-1, start_row + len(_TAR_COMPARISON_METRIC_ROWS) - 1), 0.75, "#94a3b8"),
+            ]
+        )
+        if block_index % 2 == 1:
+            style_cmds.append(("BACKGROUND", (0, start_row), (-1, start_row + len(_TAR_COMPARISON_METRIC_ROWS) - 1), "#f8fafc"))
+        for param_offset, param_name in enumerate(param_names):
+            data_row = by_parameter.get(param_name)
+            if isinstance(data_row, Mapping) and bool(data_row.get("regrade_applied")):
+                col_index = 3 + param_offset
+                style_cmds.append(("BACKGROUND", (col_index, start_row), (col_index, start_row + len(_TAR_COMPARISON_METRIC_ROWS) - 1), "#fef3c7"))
+    return rows, style_cmds
+
+
+def _tar_build_comparison_table_flowable(page_spec: Mapping[str, object], *, rl: Mapping[str, Any]) -> Any:
+    colors = rl["colors"]
+    Table = rl["Table"]
+    TableStyle = rl["TableStyle"]
+    ParagraphStyle = rl["ParagraphStyle"]
+    styles = rl["getSampleStyleSheet"]()
+    TA_LEFT = rl["TA_LEFT"]
+    TA_CENTER = rl["TA_CENTER"]
+    font_size = int(page_spec.get("font_size") or 8)
+    pad = 4 if font_size >= 9 else 3
+    leading = font_size + 2
+    rows, extra_style_commands = _tar_build_comparison_page_matrix(page_spec)
+
+    header_left_style = ParagraphStyle(
+        f"EdatComparisonHeaderLeft{font_size}",
+        parent=styles["BodyText"],
+        fontName="Helvetica-Bold",
+        fontSize=font_size,
+        leading=leading,
+        alignment=TA_LEFT,
+        textColor="#0f172a",
+        spaceAfter=0,
+    )
+    header_center_style = ParagraphStyle(
+        f"EdatComparisonHeaderCenter{font_size}",
+        parent=styles["BodyText"],
+        fontName="Helvetica-Bold",
+        fontSize=font_size,
+        leading=leading,
+        alignment=TA_CENTER,
+        textColor="#0f172a",
+        spaceAfter=0,
+    )
+    units_style = ParagraphStyle(
+        f"EdatComparisonUnits{font_size}",
+        parent=styles["BodyText"],
+        fontName="Helvetica",
+        fontSize=max(7, font_size - 1),
+        leading=max(8, font_size + 1),
+        alignment=TA_CENTER,
+        textColor="#475569",
+        spaceAfter=0,
+    )
+    body_left_style = ParagraphStyle(
+        f"EdatComparisonBodyLeft{font_size}",
+        parent=styles["BodyText"],
+        fontName="Helvetica",
+        fontSize=font_size,
+        leading=leading,
+        alignment=TA_LEFT,
+        textColor="#0f172a",
+        spaceAfter=0,
+    )
+    body_center_style = ParagraphStyle(
+        f"EdatComparisonBodyCenter{font_size}",
+        parent=styles["BodyText"],
+        fontName="Helvetica",
+        fontSize=font_size,
+        leading=leading,
+        alignment=TA_CENTER,
+        textColor="#0f172a",
+        spaceAfter=0,
+    )
+    metric_style = ParagraphStyle(
+        f"EdatComparisonMetric{font_size}",
+        parent=styles["BodyText"],
+        fontName="Helvetica-Bold",
+        fontSize=font_size,
+        leading=leading,
+        alignment=TA_LEFT,
+        textColor="#0f172a",
+        spaceAfter=0,
+    )
+
+    cell_text: list[list[Any]] = []
+    for row_index, row in enumerate(rows):
+        rendered_row: list[Any] = []
+        for col_index, value in enumerate(row):
+            if row_index == 0:
+                style = header_left_style if col_index < 3 else header_center_style
+            elif row_index == 1:
+                style = header_left_style if col_index < 3 else units_style
+            elif col_index == 2:
+                style = metric_style
+            elif col_index >= 3:
+                style = body_center_style
+            else:
+                style = body_left_style
+            rendered_row.append(rl["Paragraph"](_paragraph_markup(value), style))
+        cell_text.append(rendered_row)
+
+    table = Table(cell_text, colWidths=list(page_spec.get("col_widths") or []), repeatRows=2, hAlign="LEFT")
+    style_cmds: list[tuple] = [
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("ALIGN", (3, 0), (-1, -1), "CENTER"),
+        ("LEFTPADDING", (0, 0), (-1, -1), pad),
+        ("RIGHTPADDING", (0, 0), (-1, -1), pad),
+        ("TOPPADDING", (0, 0), (-1, -1), pad),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), pad),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e2e8f0")),
+        ("BACKGROUND", (0, 1), (-1, 1), colors.HexColor("#f8fafc")),
+        ("TEXTCOLOR", (0, 0), (-1, 1), colors.HexColor("#0f172a")),
+        ("LINEBELOW", (0, 1), (-1, 1), 1, colors.HexColor("#94a3b8")),
+        ("BOX", (0, 0), (-1, -1), 1, colors.HexColor("#94a3b8")),
+        ("INNERGRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")),
+    ]
+    for command in extra_style_commands:
+        cmd = list(command)
+        if cmd and isinstance(cmd[-1], str) and str(cmd[-1]).startswith("#"):
+            cmd[-1] = colors.HexColor(str(cmd[-1]))
+        style_cmds.append(tuple(cmd))
+    table.setStyle(TableStyle(style_cmds))
+    return table
+
+
+def _tar_measure_comparison_table_height(page_spec: Mapping[str, object], *, rl: Mapping[str, Any]) -> float:
+    table = _tar_build_comparison_table_flowable(page_spec, rl=rl)
+    _, height = table.wrap(_tar_comparison_table_width_budget(), 10000)
+    return float(height)
+
+
+def _tar_paginate_comparison_serial(
+    serial_spec: Mapping[str, object],
+    *,
+    font_size: int,
+    max_params_per_page: int,
+    rl: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    parameter_order = [str(name or "").strip() for name in (serial_spec.get("parameter_order") or []) if str(name or "").strip()]
+    parameter_units = dict(serial_spec.get("parameter_units") or {})
+    blocks = [dict(block) for block in (serial_spec.get("blocks") or []) if isinstance(block, Mapping)]
+    if not parameter_order or not blocks:
+        return []
+
+    slice_width = max(1, int(max_params_per_page))
+    param_slices = [parameter_order[index : index + slice_width] for index in range(0, len(parameter_order), slice_width)] or [parameter_order]
+    table_width_budget = _tar_comparison_table_width_budget()
+    left_col_widths = _tar_comparison_left_col_widths(font_size)
+    available_param_width = max(72.0, table_width_budget - sum(left_col_widths))
+    pages: list[dict[str, Any]] = []
+
+    for slice_index, param_slice in enumerate(param_slices, start=1):
+        col_width = available_param_width / max(1, len(param_slice))
+        col_widths = list(left_col_widths) + [col_width for _ in param_slice]
+        block_start = 0
+        while block_start < len(blocks):
+            best_end = block_start
+            for block_end in range(block_start + 1, len(blocks) + 1):
+                candidate_page = {
+                    "serial": serial_spec.get("serial"),
+                    "font_size": int(font_size),
+                    "param_names": list(param_slice),
+                    "param_units": {name: str(parameter_units.get(name) or "") for name in param_slice},
+                    "col_widths": list(col_widths),
+                    "blocks": [dict(block) for block in blocks[block_start:block_end]],
+                    "param_slice_index": slice_index,
+                    "param_slice_count": len(param_slices),
+                    "param_start_index": (slice_index - 1) * slice_width + 1,
+                    "param_end_index": (slice_index - 1) * slice_width + len(param_slice),
+                    "full_param_count": len(parameter_order),
+                }
+                if _tar_measure_comparison_table_height(candidate_page, rl=rl) <= _TAR_COMPARISON_TABLE_HEIGHT_BUDGET:
+                    best_end = block_end
+                    continue
+                break
+            if best_end == block_start:
+                best_end = min(block_start + 1, len(blocks))
+            pages.append(
+                {
+                    "serial": str(serial_spec.get("serial") or "").strip(),
+                    "font_size": int(font_size),
+                    "param_names": list(param_slice),
+                    "param_units": {name: str(parameter_units.get(name) or "") for name in param_slice},
+                    "col_widths": list(col_widths),
+                    "blocks": [dict(block) for block in blocks[block_start:best_end]],
+                    "param_slice_index": slice_index,
+                    "param_slice_count": len(param_slices),
+                    "param_start_index": (slice_index - 1) * slice_width + 1,
+                    "param_end_index": (slice_index - 1) * slice_width + len(param_slice),
+                    "full_param_count": len(parameter_order),
+                    "block_start_index": block_start + 1,
+                    "block_end_index": best_end,
+                    "full_block_count": len(blocks),
+                }
+            )
+            block_start = best_end
+    for page_index, page in enumerate(pages, start=1):
+        page["serial_page_index"] = page_index
+        page["serial_page_count"] = len(pages)
+        page["continued"] = page_index > 1
+    return pages
+
+
+def _tar_plan_comparison_pages(ctx: Mapping[str, Any]) -> list[dict[str, Any]]:
+    comparison_rows = [dict(row) for row in (ctx.get("comparison_rows") or []) if isinstance(row, Mapping)]
+    if not comparison_rows:
+        return []
+    rl = _reportlab_imports()
+    serial_specs = _tar_group_comparison_rows_by_serial(comparison_rows, serial_order=ctx.get("hi") or [])
+    planned_pages: list[dict[str, Any]] = []
+    for serial_spec in serial_specs:
+        candidates: list[tuple[int, int, list[dict[str, Any]]]] = []
+        param_count = len(serial_spec.get("parameter_order") or [])
+        for font_size in _TAR_COMPARISON_FONT_CHOICES:
+            left_col_widths = _tar_comparison_left_col_widths(int(font_size))
+            remaining_width = max(72.0, _tar_comparison_table_width_budget() - sum(left_col_widths))
+            max_params_per_page = max(1, int(remaining_width // _tar_comparison_param_min_width(int(font_size))))
+            if param_count:
+                max_params_per_page = min(param_count, max_params_per_page)
+            candidate_pages = _tar_paginate_comparison_serial(
+                serial_spec,
+                font_size=int(font_size),
+                max_params_per_page=max_params_per_page,
+                rl=rl,
+            )
+            candidates.append((len(candidate_pages), -int(font_size), candidate_pages))
+        best_candidate = min(candidates, key=lambda item: (item[0], item[1]))
+        planned_pages.extend(best_candidate[2])
+    for absolute_index, page in enumerate(planned_pages, start=1):
+        page["report_page_index"] = absolute_index
+    return planned_pages
+
+
+def _tar_build_comparison_story(ctx: Mapping[str, Any]) -> list[Any]:
+    rl = _reportlab_imports()
+    styles = _build_portrait_styles(rl)
+    Spacer = rl["Spacer"]
+    PageBreak = rl["PageBreak"]
+    inch = rl["inch"]
+    page_specs = [dict(page) for page in (ctx.get("comparison_page_specs") or _tar_plan_comparison_pages(ctx)) if isinstance(page, Mapping)]
+    if not page_specs:
+        return []
+
+    story: list[Any] = []
+    for page_index, page_spec in enumerate(page_specs):
+        serial = str(page_spec.get("serial") or "").strip() or "(unknown)"
+        title = f"Run Comparison - {serial}"
+        if bool(page_spec.get("continued")):
+            title += " (Continued)"
+        subtitle_parts: list[str] = []
+        if int(page_spec.get("serial_page_count") or 0) > 1:
+            subtitle_parts.append(
+                f"Serial page {int(page_spec.get('serial_page_index') or 1)} of {int(page_spec.get('serial_page_count') or 1)}"
+            )
+        if int(page_spec.get("param_slice_count") or 1) > 1:
+            subtitle_parts.append(
+                f"Parameters {int(page_spec.get('param_start_index') or 1)}-{int(page_spec.get('param_end_index') or 1)} of {int(page_spec.get('full_param_count') or 0)}"
+            )
+        else:
+            subtitle_parts.append(f"Parameters: {int(page_spec.get('full_param_count') or 0)}")
+        story.append(_portrait_paragraph(title, styles["section"], rl))
+        story.append(_portrait_paragraph(" | ".join(subtitle_parts), styles["small"], rl))
+        story.append(Spacer(1, 0.06 * inch))
+        story.append(_tar_build_comparison_table_flowable(page_spec, rl=rl))
+        if page_index != len(page_specs) - 1:
+            story.append(PageBreak())
+    return story
+
+
+def _render_tabloid_landscape_story_pdf(
+    out_path: Path,
+    *,
+    story: list[Any],
+    print_ctx: PrintContext,
+    page_number_offset: int = 0,
+) -> int:
+    rl = _reportlab_imports()
+    doc = rl["SimpleDocTemplate"](
+        str(Path(out_path).expanduser()),
+        pagesize=rl["landscape"](rl["tabloid"]),
+        leftMargin=_TAR_COMPARISON_LEFT_MARGIN,
+        rightMargin=_TAR_COMPARISON_RIGHT_MARGIN,
+        topMargin=_TAR_COMPARISON_TOP_MARGIN,
+        bottomMargin=_TAR_COMPARISON_BOTTOM_MARGIN,
+        title=print_ctx.report_title,
+    )
+
+    def _on_page(canvas: Any, _doc: Any) -> None:
+        _draw_portrait_page_header(canvas, _doc, print_ctx, page_number_offset=page_number_offset)
+
+    doc.build(list(story), onFirstPage=_on_page, onLaterPages=_on_page)
+    try:
+        import fitz  # type: ignore
+    except Exception as exc:
+        raise RuntimeError("PyMuPDF is required to finalize comparison report pages.") from exc
     doc_pdf = fitz.open(str(Path(out_path).expanduser()))
     try:
         return int(doc_pdf.page_count)
@@ -4082,6 +4573,25 @@ def _tar_unique_text_values(values: list[object]) -> list[str]:
     return out
 
 
+def _tar_default_report_subtitle(*, serials: list[str] | None, meta_by_sn: Mapping[str, Mapping[str, object]] | None) -> str:
+    serial_list = _tar_unique_text_values(list(serials or []))
+    metadata = meta_by_sn or {}
+    asset_types = _tar_unique_text_values([dict(metadata.get(serial) or {}).get("asset_type") for serial in serial_list])
+    asset_specific_types = _tar_unique_text_values([dict(metadata.get(serial) or {}).get("asset_specific_type") for serial in serial_list])
+    programs = _tar_unique_text_values([dict(metadata.get(serial) or {}).get("program_title") for serial in serial_list])
+
+    parts = [REPORT_SUBTITLE_DEFAULT]
+    if asset_types:
+        parts.append(_tar_join_limited(asset_types, max_items=4, empty=""))
+    if asset_specific_types:
+        parts.append(_tar_join_limited(asset_specific_types, max_items=4, empty=""))
+    if programs:
+        parts.append(_tar_join_limited(programs, max_items=4, empty=""))
+    if serial_list:
+        parts.append(_tar_join_limited(serial_list, max_items=8, empty=""))
+    return " | ".join([part for part in parts if str(part or "").strip()])
+
+
 def _tar_grade_rank(grade: object) -> int:
     token = str(grade or "").strip().upper()
     if token == "FAIL":
@@ -4168,6 +4678,58 @@ def _tar_selection_suppression_values(
     return []
 
 
+def _tar_selection_valve_values_from_rows(
+    selection: Mapping[str, object] | None,
+    rows: list[dict] | None,
+    *,
+    filter_state: Mapping[str, object] | None = None,
+) -> list[str]:
+    if not isinstance(selection, Mapping):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        if not _row_matches_filter_state(row, filter_state):
+            continue
+        if not _selection_matches_observation_row(selection, row):
+            continue
+        label = _td_valve_voltage_filter_value(row)
+        if not label or label.casefold() in seen:
+            continue
+        seen.add(label.casefold())
+        out.append(label)
+    return out
+
+
+def _tar_selection_valve_values(
+    selection: Mapping[str, object] | None,
+    *,
+    filter_rows: list[dict] | None = None,
+    filter_state: Mapping[str, object] | None = None,
+) -> list[str]:
+    if not isinstance(selection, Mapping):
+        return []
+    from_rows = _tar_selection_valve_values_from_rows(selection, filter_rows, filter_state=filter_state)
+    if from_rows:
+        return from_rows
+    values: list[str] = []
+    raw_values = selection.get("member_valve_voltages") or []
+    if isinstance(raw_values, list):
+        values.extend([_td_compact_filter_value(value) for value in raw_values])
+    if not any(values):
+        single = _td_compact_filter_value(selection.get("valve_voltage"))
+        if single:
+            values.append(single)
+    values = _tar_unique_text_values([value for value in values if str(value or "").strip()])
+    if values:
+        return values
+    if _filter_state_has_key(filter_state, "valve_voltages"):
+        return _tar_unique_text_values(_filter_state_values(filter_state, "valve_voltages"))
+    return []
+
+
 def _tar_selection_report_label(
     selection: Mapping[str, object] | None,
     run_by_name: Mapping[str, dict] | None = None,
@@ -4178,8 +4740,14 @@ def _tar_selection_report_label(
     if mode == "condition":
         condition_text = _selection_condition_text(selection, run_by_name)
         suppression_values = _tar_selection_suppression_values(selection)
-        if condition_text and suppression_values:
-            return f"{condition_text} | Supp {'/'.join(suppression_values)}"
+        valve_values = _tar_selection_valve_values(selection)
+        suffix_parts: list[str] = []
+        if suppression_values:
+            suffix_parts.append(f"Supp {'/'.join(suppression_values)}")
+        if valve_values:
+            suffix_parts.append(f"Valve {'/'.join(valve_values)}")
+        if condition_text and suffix_parts:
+            return f"{condition_text} | {' | '.join(suffix_parts)}"
         return condition_text or _selection_display_fields(selection, run_by_name).get("display_text") or ""
     return _selection_display_fields(selection, run_by_name).get("display_text") or ""
 
@@ -4189,7 +4757,7 @@ def _tar_base_condition_label(
     run_by_name: Mapping[str, dict] | None = None,
 ) -> str:
     raw = _selection_condition_text(selection, run_by_name)
-    base = re.sub(r"\s+\|\s+Supp\s+.+$", "", str(raw or "").strip(), flags=re.IGNORECASE).strip()
+    base = re.sub(r"\s+\|\s+(?:Supp|Valve)\s+.+$", "", str(raw or "").strip(), flags=re.IGNORECASE).strip()
     if base:
         return base
     fields = _selection_display_fields(selection, run_by_name)
@@ -4200,6 +4768,7 @@ def _tar_clone_filter_state(
     filter_state: Mapping[str, object] | None,
     *,
     suppression_voltage: str | None = None,
+    valve_voltage: str | None = None,
 ) -> dict[str, list[str]]:
     out: dict[str, list[str]] = {}
     if isinstance(filter_state, Mapping):
@@ -4209,6 +4778,9 @@ def _tar_clone_filter_state(
     if suppression_voltage is not None:
         text = str(suppression_voltage or "").strip()
         out["suppression_voltages"] = ([text] if text else [])
+    if valve_voltage is not None:
+        text = str(valve_voltage or "").strip()
+        out["valve_voltages"] = ([text] if text else [])
     return out
 
 
@@ -4283,6 +4855,12 @@ def _tar_metric_map_for_run(ctx: Mapping[str, Any], run_name: str, column_name: 
         },
         stat,
     )
+
+
+def _tar_condition_combo_key(suppression_voltage: object = None, valve_voltage: object = None) -> str:
+    suppression_text = str(suppression_voltage or "").strip()
+    valve_text = str(valve_voltage or "").strip()
+    return f"supp={suppression_text}|valve={valve_text}"
 
 
 def _tar_curve_plot_payload_for_pair(
@@ -4661,6 +5239,7 @@ def _tar_build_quick_summary(ctx: Mapping[str, Any]) -> dict[str, object]:
         comparison_programs = list(certifying_programs)
 
     initial_suppression = _tar_filter_state_label(ctx.get("filter_state"), "suppression_voltages", all_text="All", none_text="None")
+    initial_valve = _tar_filter_state_label(ctx.get("filter_state"), "valve_voltages", all_text="All", none_text="None")
     final_suppression_values = _tar_unique_text_values(
         [
             str(row.get("final_suppression_voltage_label") or "").strip()
@@ -4673,6 +5252,18 @@ def _tar_build_quick_summary(ctx: Mapping[str, Any]) -> dict[str, object]:
             [str(spec.get("suppression_voltage_label") or "").strip() for spec in pair_specs]
         )
     final_suppression = _tar_join_limited(final_suppression_values, max_items=6, empty=initial_suppression)
+    final_valve_values = _tar_unique_text_values(
+        [
+            str(row.get("final_valve_voltage_label") or "").strip()
+            for row in (ctx.get("comparison_rows") or [])
+            if isinstance(row, Mapping)
+        ]
+    )
+    if not final_valve_values:
+        final_valve_values = _tar_unique_text_values(
+            [str(spec.get("valve_voltage_label") or "").strip() for spec in pair_specs]
+        )
+    final_valve = _tar_join_limited(final_valve_values, max_items=6, empty=initial_valve)
 
     summary = {
         "certifying_programs": list(certifying_programs),
@@ -4683,9 +5274,9 @@ def _tar_build_quick_summary(ctx: Mapping[str, Any]) -> dict[str, object]:
         "initial_suppression_voltage": initial_suppression,
         "final_suppression_voltage": final_suppression,
         "p8_suppression_voltage": final_suppression,
-        "initial_bus_voltage": "",
-        "final_bus_voltage": "",
-        "p8_bus_voltage": "",
+        "initial_valve_voltage": initial_valve,
+        "final_valve_voltage": final_valve,
+        "p8_valve_voltage": final_valve,
     }
     summary["lines"] = [
         f"Certifying Program(s): {_tar_join_limited(summary['certifying_programs'], max_items=4, empty='(unknown)')}",
@@ -4694,7 +5285,7 @@ def _tar_build_quick_summary(ctx: Mapping[str, Any]) -> dict[str, object]:
         f"Watch Parameter(s): {_tar_join_limited(summary['watch_parameters'], max_items=6, empty='None')}",
         f"Programs Compared: {_tar_join_limited(summary['comparison_programs'], max_items=6, empty='(unknown)')}",
         f"Suppression Voltage: {summary['p8_suppression_voltage']}",
-        f"Bus Voltage: {summary['p8_bus_voltage']}",
+        f"Valve Voltage: {summary['p8_valve_voltage']}",
     ]
     return summary
 
@@ -4746,6 +5337,7 @@ def _tar_build_per_serial_comparison_rows(
     comparison_rows: list[dict] = []
     base_filter_state = ctx.get("filter_state")
     initial_suppression = _tar_filter_state_label(base_filter_state, "suppression_voltages", all_text="All", none_text="None")
+    initial_valve = _tar_filter_state_label(base_filter_state, "valve_voltages", all_text="All", none_text="None")
 
     for spec in pair_specs:
         pair_id = str(spec.get("pair_id") or "").strip()
@@ -4763,6 +5355,12 @@ def _tar_build_per_serial_comparison_rows(
         )
         if not final_suppression:
             final_suppression = initial_suppression
+        final_valve = (
+            str(spec.get("valve_voltage_label") or "").strip()
+            or _tar_filter_state_label(final_override, "valve_voltages", all_text=initial_valve, none_text=initial_valve)
+        )
+        if not final_valve:
+            final_valve = initial_valve
 
         run_condition = (
             str(spec.get("base_condition_label") or "").strip()
@@ -4777,8 +5375,10 @@ def _tar_build_per_serial_comparison_rows(
             finding_row = dict(finding_by_pair_serial.get((pair_id, serial)) or {})
             regrade_applied = bool(finding_row.get("regrade_applied"))
             regrade_suppression = str(finding_row.get("regrade_suppression_voltage_label") or "").strip()
+            regrade_valve = str(finding_row.get("regrade_valve_voltage_label") or "").strip()
+            regrade_condition_key = str(finding_row.get("regrade_condition_key") or "").strip()
             final_payload = (
-                (regrade_payloads.get(regrade_suppression) if regrade_suppression else None)
+                (regrade_payloads.get(regrade_condition_key) if regrade_condition_key else None)
                 if isinstance(regrade_payloads, Mapping)
                 else None
             )
@@ -4798,6 +5398,7 @@ def _tar_build_per_serial_comparison_rows(
                 final_grade_map_by_pair_serial.get((pair_id, serial), initial_grade) or initial_grade
             ) or initial_grade
             row_final_suppression = regrade_suppression or final_suppression
+            row_final_valve = regrade_valve or final_valve
 
             comparison_rows.append(
                 {
@@ -4824,11 +5425,12 @@ def _tar_build_per_serial_comparison_rows(
                     "base_condition_label": str(spec.get("base_condition_label") or "").strip(),
                     "initial_suppression_voltage_label": initial_suppression,
                     "final_suppression_voltage_label": row_final_suppression,
-                    "initial_bus_voltage_label": "",
-                    "final_bus_voltage_label": "",
+                    "initial_valve_voltage_label": initial_valve,
+                    "final_valve_voltage_label": row_final_valve,
                     "regrade_applied": regrade_applied,
                     "regrade_cohort_id": str(finding_row.get("regrade_cohort_id") or "").strip(),
                     "regrade_suppression_voltage_label": regrade_suppression,
+                    "regrade_valve_voltage_label": regrade_valve,
                 }
             )
     return comparison_rows
@@ -4847,8 +5449,8 @@ def _tar_group_comparison_rows(rows: list[dict]) -> list[dict[str, Any]]:
                 "rows": [],
                 "initial_suppression_values": [],
                 "final_suppression_values": [],
-                "initial_bus_values": [],
-                "final_bus_values": [],
+                "initial_valve_values": [],
+                "final_valve_values": [],
             }
             group_order.append(run_condition)
         group = grouped[run_condition]
@@ -4856,8 +5458,8 @@ def _tar_group_comparison_rows(rows: list[dict]) -> list[dict[str, Any]]:
         for key, target in (
             ("initial_suppression_voltage_label", "initial_suppression_values"),
             ("final_suppression_voltage_label", "final_suppression_values"),
-            ("initial_bus_voltage_label", "initial_bus_values"),
-            ("final_bus_voltage_label", "final_bus_values"),
+            ("initial_valve_voltage_label", "initial_valve_values"),
+            ("final_valve_voltage_label", "final_valve_values"),
         ):
             text = str(row.get(key) or "").strip()
             if text and text not in group[target]:
@@ -4876,8 +5478,8 @@ def _tar_group_comparison_rows(rows: list[dict]) -> list[dict[str, Any]]:
         )
         group["initial_suppression_voltage_label"] = _tar_join_limited(group["initial_suppression_values"], max_items=6, empty="All")
         group["final_suppression_voltage_label"] = _tar_join_limited(group["final_suppression_values"], max_items=6, empty=group["initial_suppression_voltage_label"])
-        group["initial_bus_voltage_label"] = _tar_join_limited(group["initial_bus_values"], max_items=6, empty="")
-        group["final_bus_voltage_label"] = _tar_join_limited(group["final_bus_values"], max_items=6, empty="")
+        group["initial_valve_voltage_label"] = _tar_join_limited(group["initial_valve_values"], max_items=6, empty="All")
+        group["final_valve_voltage_label"] = _tar_join_limited(group["final_valve_values"], max_items=6, empty=group["initial_valve_voltage_label"])
         out.append(group)
     return out
 
@@ -5144,6 +5746,7 @@ def _tar_plan_plot_specs(ctx: Mapping[str, Any], *, intro_pages: int) -> list[di
                 "stat": str(metric_stat or "").strip(),
                 "x_name": str(cohort_spec.get("x_name") or "").strip(),
                 "suppression_voltage_label": str(cohort_spec.get("suppression_voltage_label") or ""),
+                "valve_voltage_label": str(cohort_spec.get("valve_voltage_label") or ""),
                 "page_number": page_number,
             }
         )
@@ -5159,13 +5762,19 @@ def _tar_plan_plot_specs(ctx: Mapping[str, Any], *, intro_pages: int) -> list[di
                 "param": str(cohort_spec.get("param") or "").strip(),
                 "x_name": str(cohort_spec.get("x_name") or "").strip(),
                 "suppression_voltage_label": str(cohort_spec.get("suppression_voltage_label") or ""),
+                "valve_voltage_label": str(cohort_spec.get("valve_voltage_label") or ""),
                 "page_number": page_number,
             }
         )
 
     for cohort_spec, metric_stat in regrade_metric_specs:
         suppression_value = str(cohort_spec.get("suppression_voltage_label") or "").strip()
-        filter_override = _tar_clone_filter_state(ctx.get("filter_state"), suppression_voltage=suppression_value) if suppression_value else {}
+        valve_value = str(cohort_spec.get("valve_voltage_label") or "").strip()
+        filter_override = _tar_clone_filter_state(
+            ctx.get("filter_state"),
+            suppression_voltage=suppression_value,
+            valve_voltage=valve_value,
+        ) if (suppression_value or valve_value) else {}
         if not _tar_metric_cohort_has_plot_data(ctx, cohort_spec, str(metric_stat or ""), filter_state_override=filter_override):
             continue
         page_number += 1
@@ -5177,6 +5786,7 @@ def _tar_plan_plot_specs(ctx: Mapping[str, Any], *, intro_pages: int) -> list[di
                 "stat": str(metric_stat or "").strip(),
                 "x_name": str(cohort_spec.get("x_name") or "").strip(),
                 "suppression_voltage_label": suppression_value,
+                "valve_voltage_label": valve_value,
                 "page_number": page_number,
             }
         )
@@ -5192,6 +5802,7 @@ def _tar_plan_plot_specs(ctx: Mapping[str, Any], *, intro_pages: int) -> list[di
                 "param": str(cohort_spec.get("param") or "").strip(),
                 "x_name": str(cohort_spec.get("x_name") or "").strip(),
                 "suppression_voltage_label": str(cohort_spec.get("suppression_voltage_label") or ""),
+                "valve_voltage_label": str(cohort_spec.get("valve_voltage_label") or ""),
                 "page_number": page_number,
             }
         )
@@ -5833,12 +6444,18 @@ def _tar_prepare_row_specs(
         y_by_norm = {_norm_key(str(col.get("name") or "")): dict(col) for col in y_cols if str(col.get("name") or "").strip()}
         selection_fields = _selection_display_fields(selection, run_by_name)
         suppression_values = _tar_selection_suppression_values(selection, filter_rows=filter_rows, filter_state=filter_state)
+        valve_values = _tar_selection_valve_values(selection, filter_rows=filter_rows, filter_state=filter_state)
         base_condition_label = _tar_base_condition_label(selection, run_by_name) or (_run_display_text(run_name, run_by_name) or run_name)
         selection_label = _tar_selection_report_label(selection, run_by_name)
         if not selection_label:
             selection_label = str(selection_fields.get("display_text") or base_condition_label or run_name).strip()
-        if str(selection.get("mode") or "sequence").strip().lower() == "condition" and suppression_values and " | Supp " not in selection_label:
-            selection_label = f"{base_condition_label} | Supp {'/'.join(suppression_values)}"
+        if str(selection.get("mode") or "sequence").strip().lower() == "condition" and (suppression_values or valve_values):
+            label_parts: list[str] = []
+            if suppression_values:
+                label_parts.append(f"Supp {'/'.join(suppression_values)}")
+            if valve_values:
+                label_parts.append(f"Valve {'/'.join(valve_values)}")
+            selection_label = f"{base_condition_label} | {' | '.join(label_parts)}"
         selection_id = str(selection.get("id") or f"{selection.get('mode') or 'selection'}:{selection_index}:{run_name}").strip()
 
         for target_param in params:
@@ -5860,9 +6477,65 @@ def _tar_prepare_row_specs(
             )
             if not series:
                 continue
-            series_by_suppression: dict[str, list[CurveSeries]] = {}
-            for suppression_value in suppression_values:
-                filtered_state = _tar_clone_filter_state(filter_state, suppression_voltage=suppression_value)
+            raw_condition_pairs: list[dict[str, str]] = []
+            seen_condition_keys: set[str] = set()
+            for row in filter_rows or []:
+                if not isinstance(row, dict):
+                    continue
+                if not _row_matches_filter_state(row, filter_state):
+                    continue
+                if not _selection_matches_observation_row(selection, row):
+                    continue
+                suppression_value = _td_suppression_voltage_filter_value(row)
+                valve_value = _td_valve_voltage_filter_value(row)
+                condition_key = _tar_condition_combo_key(suppression_value, valve_value)
+                if condition_key in seen_condition_keys:
+                    continue
+                seen_condition_keys.add(condition_key)
+                raw_condition_pairs.append(
+                    {
+                        "key": condition_key,
+                        "suppression_voltage_label": suppression_value,
+                        "valve_voltage_label": valve_value,
+                    }
+                )
+            if not raw_condition_pairs and (suppression_values or valve_values):
+                if suppression_values and valve_values:
+                    for suppression_value in suppression_values:
+                        for valve_value in valve_values:
+                            raw_condition_pairs.append(
+                                {
+                                    "key": _tar_condition_combo_key(suppression_value, valve_value),
+                                    "suppression_voltage_label": suppression_value,
+                                    "valve_voltage_label": valve_value,
+                                }
+                            )
+                elif suppression_values:
+                    for suppression_value in suppression_values:
+                        raw_condition_pairs.append(
+                            {
+                                "key": _tar_condition_combo_key(suppression_value, ""),
+                                "suppression_voltage_label": suppression_value,
+                                "valve_voltage_label": "",
+                            }
+                        )
+                else:
+                    for valve_value in valve_values:
+                        raw_condition_pairs.append(
+                            {
+                                "key": _tar_condition_combo_key("", valve_value),
+                                "suppression_voltage_label": "",
+                                "valve_voltage_label": valve_value,
+                            }
+                        )
+            condition_pairs: list[dict[str, str]] = []
+            series_by_condition_key: dict[str, list[CurveSeries]] = {}
+            for condition_pair in raw_condition_pairs:
+                filtered_state = _tar_clone_filter_state(
+                    filter_state,
+                    suppression_voltage=str(condition_pair.get("suppression_voltage_label") or ""),
+                    valve_voltage=str(condition_pair.get("valve_voltage_label") or ""),
+                )
                 filtered_series = _load_curves_for_selection(
                     be,
                     db_path,
@@ -5873,7 +6546,8 @@ def _tar_prepare_row_specs(
                     filter_state=filtered_state,
                 )
                 if filtered_series:
-                    series_by_suppression[suppression_value] = filtered_series
+                    condition_pairs.append(dict(condition_pair))
+                    series_by_condition_key[str(condition_pair.get("key") or "")] = filtered_series
             row_specs.append(
                 {
                     "pair_id": f"{selection_id}::{run_name}::{param_name}",
@@ -5885,13 +6559,16 @@ def _tar_prepare_row_specs(
                     "selection_label": selection_label,
                     "base_condition_label": base_condition_label,
                     "suppression_values": list(suppression_values),
+                    "valve_values": list(valve_values),
+                    "condition_pairs": list(condition_pairs),
                     "suppression_voltage_label": (suppression_values[0] if len(suppression_values) == 1 else ""),
+                    "valve_voltage_label": (valve_values[0] if len(valve_values) == 1 else ""),
                     "param": param_name,
                     "units": units,
                     "x_name": x_name,
                     "base_filter_state": _tar_clone_filter_state(filter_state),
                     "series": list(series),
-                    "series_by_suppression": dict(series_by_suppression),
+                    "series_by_condition_key": dict(series_by_condition_key),
                     "initial_model": {},
                     "initial_plot_payload": {},
                     "regrade_models": {},
@@ -6006,6 +6683,7 @@ def _tar_analyze_curve_groups(
                 "x_name": str(spec.get("x_name") or ""),
                 "base_condition_label": str(spec.get("base_condition_label") or ""),
                 "suppression_voltage_label": str(spec.get("suppression_voltage_label") or ""),
+                "valve_voltage_label": str(spec.get("valve_voltage_label") or ""),
                 "initial_max_abs": dev.get("max_abs"),
                 "initial_rms": dev.get("rms"),
                 "initial_max_pct": dev.get("max_pct"),
@@ -6035,6 +6713,7 @@ def _tar_analyze_curve_groups(
                 "x_name": str(model.get("x_name") or ""),
                 "base_condition_label": "",
                 "suppression_voltage_label": "",
+                "valve_voltage_label": "",
                 "selection_labels": [str(spec.get("selection_label") or "") for spec in members if str(spec.get("selection_label") or "").strip()],
                 "member_pair_ids": [str(spec.get("pair_id") or "") for spec in members if str(spec.get("pair_id") or "").strip()],
                 "model": {
@@ -6068,31 +6747,57 @@ def _tar_analyze_curve_groups(
         family_groups.setdefault(key, []).append(spec)
 
     for family_index, members in enumerate(family_groups.values(), start=1):
-        family_suppression_values_all = _tar_unique_text_values(
-            [
-                suppression
-                for spec in members
-                for suppression in (spec.get("suppression_values") or [])
-                if str(suppression or "").strip()
-            ]
-        )
-        family_suppression_values_hi = _tar_unique_text_values(
-            [
-                str(suppression_value or "").strip()
-                for spec in members
-                for suppression_value, suppression_series in ((spec.get("series_by_suppression") or {}).items())
-                if str(suppression_value or "").strip()
-                and any(str(getattr(curve, "serial", "") or "").strip() in hi_set for curve in (suppression_series or []))
-            ]
-        )
-        family_suppression_values = list(family_suppression_values_hi or family_suppression_values_all)
-        if len(family_suppression_values_all) <= 1 or not family_suppression_values:
+        family_condition_pairs_all: list[dict[str, str]] = []
+        seen_condition_keys_all: set[str] = set()
+        for spec in members:
+            for condition_pair in (spec.get("condition_pairs") or []):
+                if not isinstance(condition_pair, Mapping):
+                    continue
+                condition_key = str(condition_pair.get("key") or "").strip()
+                if not condition_key or condition_key in seen_condition_keys_all:
+                    continue
+                seen_condition_keys_all.add(condition_key)
+                family_condition_pairs_all.append(
+                    {
+                        "key": condition_key,
+                        "suppression_voltage_label": str(condition_pair.get("suppression_voltage_label") or "").strip(),
+                        "valve_voltage_label": str(condition_pair.get("valve_voltage_label") or "").strip(),
+                    }
+                )
+        family_condition_pairs_hi: list[dict[str, str]] = []
+        seen_condition_keys_hi: set[str] = set()
+        for spec in members:
+            series_by_condition_key = spec.get("series_by_condition_key") or {}
+            if not isinstance(series_by_condition_key, Mapping):
+                continue
+            for condition_pair in (spec.get("condition_pairs") or []):
+                if not isinstance(condition_pair, Mapping):
+                    continue
+                condition_key = str(condition_pair.get("key") or "").strip()
+                condition_series = list(series_by_condition_key.get(condition_key) or [])
+                if not condition_key or condition_key in seen_condition_keys_hi:
+                    continue
+                if not any(str(getattr(curve, "serial", "") or "").strip() in hi_set for curve in condition_series):
+                    continue
+                seen_condition_keys_hi.add(condition_key)
+                family_condition_pairs_hi.append(
+                    {
+                        "key": condition_key,
+                        "suppression_voltage_label": str(condition_pair.get("suppression_voltage_label") or "").strip(),
+                        "valve_voltage_label": str(condition_pair.get("valve_voltage_label") or "").strip(),
+                    }
+                )
+        family_condition_pairs = list(family_condition_pairs_hi or family_condition_pairs_all)
+        if len(family_condition_pairs_all) <= 1 or not family_condition_pairs:
             continue
-        for suppression_value in family_suppression_values:
+        for condition_pair in family_condition_pairs:
+            condition_key = str(condition_pair.get("key") or "").strip()
+            suppression_value = str(condition_pair.get("suppression_voltage_label") or "").strip()
+            valve_value = str(condition_pair.get("valve_voltage_label") or "").strip()
             member_specs: list[dict] = []
             for spec in members:
-                suppression_series = list(((spec.get("series_by_suppression") or {}).get(suppression_value) or []))
-                if not suppression_series:
+                condition_series = list(((spec.get("series_by_condition_key") or {}).get(condition_key) or []))
+                if not condition_series:
                     continue
                 member_specs.append(spec)
             if not member_specs:
@@ -6106,7 +6811,7 @@ def _tar_analyze_curve_groups(
                 continue
             pooled_series: list[CurveSeries] = []
             for spec in targeted_member_specs:
-                pooled_series.extend(list(((spec.get("series_by_suppression") or {}).get(suppression_value) or [])))
+                pooled_series.extend(list(((spec.get("series_by_condition_key") or {}).get(condition_key) or [])))
             model = _tar_build_curve_model_for_series(
                 pooled_series,
                 x_name=str(targeted_member_specs[0].get("x_name") or members[0].get("x_name") or ""),
@@ -6126,9 +6831,9 @@ def _tar_analyze_curve_groups(
             for spec in targeted_member_specs:
                 y_resampled_by_sn = {
                     curve.serial: _interp_linear(curve.x, curve.y, x_grid)
-                    for curve in (((spec.get("series_by_suppression") or {}).get(suppression_value) or []))
+                    for curve in (((spec.get("series_by_condition_key") or {}).get(condition_key) or []))
                 }
-                spec.setdefault("regrade_models", {})[suppression_value] = {
+                spec.setdefault("regrade_models", {})[condition_key] = {
                     "x_name": str(model.get("x_name") or ""),
                     "units": str(spec.get("units") or model.get("units") or ""),
                     "domain": list(model.get("domain") or []),
@@ -6136,7 +6841,7 @@ def _tar_analyze_curve_groups(
                     "poly": dict(model.get("poly") or {}),
                     "equation": str(model.get("equation") or ""),
                 }
-                spec.setdefault("regrade_plot_payloads", {})[suppression_value] = {
+                spec.setdefault("regrade_plot_payloads", {})[condition_key] = {
                     "run": spec.get("run"),
                     "param": spec.get("param"),
                     "units": str(spec.get("units") or ""),
@@ -6182,6 +6887,8 @@ def _tar_analyze_curve_groups(
                         "x_name": str(spec.get("x_name") or ""),
                         "base_condition_label": str(spec.get("base_condition_label") or ""),
                         "suppression_voltage_label": suppression_value,
+                        "valve_voltage_label": valve_value,
+                        "condition_key": condition_key,
                         "regrade_max_abs": dev.get("max_abs"),
                         "regrade_rms": dev.get("rms"),
                         "regrade_max_pct": dev.get("max_pct"),
@@ -6190,18 +6897,19 @@ def _tar_analyze_curve_groups(
                         "regrade_z": float(z_score),
                         "regrade_grade": grade,
                         "regrade_poly_rmse": (model.get("poly") or {}).get("rmse"),
-                        "regrade_cohort_id": f"regrade:{family_index}:{_norm_key(str(spec.get('base_condition_label') or ''))}:{_norm_key(suppression_value)}:{_norm_key(str(spec.get('param') or ''))}:{_norm_key(str(spec.get('x_name') or ''))}",
+                        "regrade_cohort_id": f"regrade:{family_index}:{_norm_key(str(spec.get('base_condition_label') or ''))}:{_norm_key(suppression_value)}:{_norm_key(valve_value)}:{_norm_key(str(spec.get('param') or ''))}:{_norm_key(str(spec.get('x_name') or ''))}",
                     }
                 )
             regrade_cohort_specs.append(
                 {
-                    "cohort_id": f"regrade:{family_index}:{_norm_key(str(targeted_member_specs[0].get('base_condition_label') or members[0].get('base_condition_label') or ''))}:{_norm_key(suppression_value)}:{_norm_key(str(targeted_member_specs[0].get('param') or members[0].get('param') or ''))}:{_norm_key(str(targeted_member_specs[0].get('x_name') or members[0].get('x_name') or ''))}",
+                    "cohort_id": f"regrade:{family_index}:{_norm_key(str(targeted_member_specs[0].get('base_condition_label') or members[0].get('base_condition_label') or ''))}:{_norm_key(suppression_value)}:{_norm_key(valve_value)}:{_norm_key(str(targeted_member_specs[0].get('param') or members[0].get('param') or ''))}:{_norm_key(str(targeted_member_specs[0].get('x_name') or members[0].get('x_name') or ''))}",
                     "cohort_type": "regrade",
                     "param": str(targeted_member_specs[0].get("param") or members[0].get("param") or ""),
                     "units": str(targeted_member_specs[0].get("units") or members[0].get("units") or ""),
                     "x_name": str(model.get("x_name") or ""),
                     "base_condition_label": str(targeted_member_specs[0].get("base_condition_label") or members[0].get("base_condition_label") or ""),
                     "suppression_voltage_label": suppression_value,
+                    "valve_voltage_label": valve_value,
                     "selection_labels": [str(spec.get("selection_label") or "") for spec in targeted_member_specs if str(spec.get("selection_label") or "").strip()],
                     "member_pair_ids": [str(spec.get("pair_id") or "") for spec in targeted_member_specs if str(spec.get("pair_id") or "").strip()],
                     "model": {
@@ -6241,11 +6949,21 @@ def _tar_analyze_curve_groups(
         per_pair_candidates = list(pair_regrade_candidates.get(pair_id) or [])
         if per_pair_candidates:
             pair_worst = max(per_pair_candidates, key=_tar_worst_candidate_sort_key)
+            pair_condition_key = str(pair_worst.get("condition_key") or "").strip()
             pair_suppression = str(pair_worst.get("suppression_voltage_label") or "").strip()
+            pair_valve = str(pair_worst.get("valve_voltage_label") or "").strip()
             override_base_state = spec.get("base_filter_state") if isinstance(spec.get("base_filter_state"), Mapping) else {}
-            spec["model"] = dict((spec.get("regrade_models") or {}).get(pair_suppression) or spec.get("initial_model") or {})
-            spec["plot_payload"] = dict((spec.get("regrade_plot_payloads") or {}).get(pair_suppression) or spec.get("initial_plot_payload") or {})
-            spec["filter_state_override"] = _tar_clone_filter_state(override_base_state, suppression_voltage=pair_suppression) if pair_suppression else {}
+            spec["model"] = dict((spec.get("regrade_models") or {}).get(pair_condition_key) or spec.get("initial_model") or {})
+            spec["plot_payload"] = dict((spec.get("regrade_plot_payloads") or {}).get(pair_condition_key) or spec.get("initial_plot_payload") or {})
+            spec["filter_state_override"] = (
+                _tar_clone_filter_state(
+                    override_base_state,
+                    suppression_voltage=pair_suppression,
+                    valve_voltage=pair_valve,
+                )
+                if pair_condition_key
+                else {}
+            )
         else:
             spec["model"] = dict(spec.get("initial_model") or {})
             spec["plot_payload"] = dict(spec.get("initial_plot_payload") or {})
@@ -6277,6 +6995,7 @@ def _tar_analyze_curve_groups(
                     "regrade_grade": regrade_row.get("regrade_grade"),
                     "regrade_poly_rmse": regrade_row.get("regrade_poly_rmse"),
                     "regrade_cohort_id": regrade_row.get("regrade_cohort_id"),
+                    "regrade_condition_key": regrade_row.get("condition_key"),
                     "regrade_applied": bool(regrade_row),
                     "final_max_abs": final_source.get("regrade_max_abs", final_source.get("initial_max_abs")),
                     "final_rms": final_source.get("regrade_rms", final_source.get("initial_rms")),
@@ -6293,7 +7012,9 @@ def _tar_analyze_curve_groups(
                     "x_at_max_abs": final_source.get("regrade_x_at_max_abs", final_source.get("initial_x_at_max_abs")),
                     "z": final_source.get("regrade_z", final_source.get("initial_z")),
                     "suppression_voltage_label": str(initial_row.get("suppression_voltage_label") or regrade_row.get("suppression_voltage_label") or ""),
+                    "valve_voltage_label": str(initial_row.get("valve_voltage_label") or regrade_row.get("valve_voltage_label") or ""),
                     "regrade_suppression_voltage_label": str(regrade_row.get("suppression_voltage_label") or ""),
+                    "regrade_valve_voltage_label": str(regrade_row.get("valve_voltage_label") or ""),
                 }
             )
             grading_rows.append(row)
@@ -6367,7 +7088,6 @@ def _tar_prepare_base(
 ) -> dict[str, Any]:
     from . import backend as be
 
-    print_ctx = _capture_print_context()
     proj = Path(project_dir).expanduser()
     wb = Path(workbook_path).expanduser()
     out_pdf = Path(output_pdf).expanduser()
@@ -6570,6 +7290,7 @@ def _tar_prepare_base(
             "selection_label": str(spec.get("selection_label") or ""),
             "base_condition_label": str(spec.get("base_condition_label") or ""),
             "suppression_voltage_label": str(spec.get("suppression_voltage_label") or ""),
+            "valve_voltage_label": str(spec.get("valve_voltage_label") or ""),
             "initial_model": dict(spec.get("initial_model") or {}),
             "final_model": dict(spec.get("model") or {}),
         }
@@ -6593,6 +7314,7 @@ def _tar_prepare_base(
     meta_note = ""
     if not meta_by_sn:
         meta_note = gui_meta_note or cache_meta_note or workbook_meta_note
+    print_ctx = _capture_print_context(report_subtitle=_tar_default_report_subtitle(serials=hi, meta_by_sn=meta_by_sn))
 
     ctx: dict[str, Any] = {
         "be": be,
@@ -6926,27 +7648,24 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
 
     quick_summary = dict(ctx.get("quick_summary") or _tar_build_quick_summary(ctx))
     metadata_snapshot_lines = _tar_metadata_snapshot_lines(ctx)
-    comparison_groups = _tar_group_comparison_rows(list(ctx.get("comparison_rows") or []))
+    comparison_rows = [dict(row) for row in (ctx.get("comparison_rows") or []) if isinstance(row, Mapping)]
     exception_rows = _tar_build_exec_exception_rows(ctx)
     comparison_rows_by_serial: dict[str, list[dict[str, Any]]] = {}
-    for row in (ctx.get("comparison_rows") or []):
-        if not isinstance(row, Mapping):
-            continue
+    for row in comparison_rows:
         serial = str(row.get("serial") or "").strip()
         if serial:
             comparison_rows_by_serial.setdefault(serial, []).append(dict(row))
     initial_vs_final_lines = [
         (
-            "Initial Run: Base certification comparison before suppression-voltage-specific regrade. "
+            "Initial Run: Base certification comparison before suppression-and-valve-specific regrade. "
             f"Suppression Voltage: {str(quick_summary.get('initial_suppression_voltage') or 'All').strip() or 'All'} | "
-            f"Bus Voltage: {str(quick_summary.get('initial_bus_voltage') or '').strip()}"
+            f"Valve Voltage: {str(quick_summary.get('initial_valve_voltage') or 'All').strip() or 'All'}"
         ),
         (
-            "Final Run: Suppression-voltage-aware certification comparison after regrade. "
+            "Final Run: Suppression-and-valve-aware certification comparison after regrade. "
             f"Suppression Voltage: {str(quick_summary.get('final_suppression_voltage') or quick_summary.get('p8_suppression_voltage') or 'All').strip() or 'All'} | "
-            f"Bus Voltage: {str(quick_summary.get('final_bus_voltage') or '').strip()}"
+            f"Valve Voltage: {str(quick_summary.get('final_valve_voltage') or quick_summary.get('p8_valve_voltage') or 'All').strip() or 'All'}"
         ),
-        "Bus voltage remains blank until that report field is defined.",
     ]
 
     story: list[Any] = []
@@ -6957,79 +7676,13 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
         _portrait_paragraph(
             "This report validates ATP run criteria against family data and compares the selected certification serials "
             "to the compiled family baseline for the chosen run scope. Initial grading pools the selected TD conditions "
-            "by parameter and X axis before a suppression-voltage regrade pass is applied where needed.",
+            "by parameter and X axis before a suppression-and-valve regrade pass is applied where needed.",
             styles["body"],
             rl,
         )
     )
     story.append(Spacer(1, 0.14 * inch))
-    story.append(
-        _portrait_card(
-            "Quick Executive Summary",
-            list(quick_summary.get("lines") or []),
-            styles=styles,
-            rl=rl,
-        )
-    )
-    story.append(Spacer(1, 0.10 * inch))
-    story.extend(_tar_build_plot_toc_story(ctx, styles=styles, rl=rl))
-    story.append(
-        _portrait_box_table(
-            [
-                ["Serials Under Certification", "Runs Included", "Parameters Included", "Watch / Non-PASS Curves"],
-                [str(len(ctx.get("hi") or [])), str(len(ctx.get("runs") or [])), str(len(ctx.get("params") or [])), str(len(ctx.get("watch_pair_ids") or []))],
-            ],
-            col_widths=[1.7 * inch, 1.45 * inch, 1.45 * inch, 2.3 * inch],
-            styles=styles,
-            rl=rl,
-            repeat_rows=1,
-        )
-    )
-    story.append(Spacer(1, 0.12 * inch))
-    story.append(
-        _portrait_card(
-            "Metadata Snapshot",
-            metadata_snapshot_lines,
-            styles=styles,
-            rl=rl,
-        )
-    )
-    story.append(Spacer(1, 0.10 * inch))
-    story.append(
-        _portrait_card(
-            "Build Notes",
-            [
-                f"Printed: {print_ctx.printed_at}",
-                str(ctx.get("change_summary") or "").splitlines()[0] if str(ctx.get("change_summary") or "").strip() else "No config update summary available.",
-                "Legacy page caps and appendix trimming are disabled for this report layout.",
-            ],
-            styles=styles,
-            rl=rl,
-        )
-    )
-    story.append(PageBreak())
-
     story.append(_portrait_paragraph("Executive Summary", styles["section"], rl))
-    story.append(
-        _portrait_card(
-            "Disposition",
-            [
-                f"CERTIFIED: {status_counts['CERTIFIED']}",
-                f"WATCH: {status_counts['WATCH']}",
-                f"FAILED: {status_counts['FAILED']}",
-                f"NO_DATA: {status_counts['NO_DATA']}",
-                f"Curves evaluated: {len(ctx.get('pair_specs') or [])}",
-                f"Performance plots configured: {len(ctx.get('performance_plot_specs') or [])}",
-            ],
-            styles=styles,
-            rl=rl,
-        )
-    )
-    story.append(Spacer(1, 0.10 * inch))
-    story.append(_portrait_card("Initial vs Final Run", initial_vs_final_lines, styles=styles, rl=rl))
-    story.append(Spacer(1, 0.10 * inch))
-    story.append(_portrait_card("Watch / Review Highlights", highlight_lines, styles=styles, rl=rl))
-    story.append(Spacer(1, 0.10 * inch))
 
     exec_rows = [
         [
@@ -7085,18 +7738,79 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
             )
         )
 
-    story.append(PageBreak())
-    story.append(_portrait_paragraph("Run Comparison", styles["section"], rl))
+    story.append(Spacer(1, 0.10 * inch))
     story.append(
-        _portrait_paragraph(
-            "Each table groups one selected run condition. Rows compare the ATP family mean with each certified serial's "
-            "actual result for the same parameter. Initial values use the base certification scope, and final values use "
-            "the suppression-voltage-aware regrade path. Bus voltage remains blank until that field is defined.",
-            styles["body"],
-            rl,
+        _portrait_card(
+            "Disposition",
+            [
+                f"CERTIFIED: {status_counts['CERTIFIED']}",
+                f"WATCH: {status_counts['WATCH']}",
+                f"FAILED: {status_counts['FAILED']}",
+                f"NO_DATA: {status_counts['NO_DATA']}",
+                f"Curves evaluated: {len(ctx.get('pair_specs') or [])}",
+                f"Performance plots configured: {len(ctx.get('performance_plot_specs') or [])}",
+            ],
+            styles=styles,
+            rl=rl,
         )
     )
-    if not comparison_groups:
+    story.append(Spacer(1, 0.10 * inch))
+    story.append(_portrait_card("Initial vs Final Run", initial_vs_final_lines, styles=styles, rl=rl))
+    story.append(Spacer(1, 0.10 * inch))
+    story.append(_portrait_card("Watch / Review Highlights", highlight_lines, styles=styles, rl=rl))
+    story.append(Spacer(1, 0.10 * inch))
+    story.append(
+        _portrait_box_table(
+            [
+                ["Serials Under Certification", "Runs Included", "Parameters Included", "Watch / Non-PASS Curves"],
+                [str(len(ctx.get("hi") or [])), str(len(ctx.get("runs") or [])), str(len(ctx.get("params") or [])), str(len(ctx.get("watch_pair_ids") or []))],
+            ],
+            col_widths=[1.7 * inch, 1.45 * inch, 1.45 * inch, 2.3 * inch],
+            styles=styles,
+            rl=rl,
+            repeat_rows=1,
+        )
+    )
+    story.append(Spacer(1, 0.12 * inch))
+    story.append(
+        _portrait_card(
+            "Metadata Snapshot",
+            metadata_snapshot_lines,
+            styles=styles,
+            rl=rl,
+        )
+    )
+    story.append(Spacer(1, 0.10 * inch))
+    story.append(
+        _portrait_card(
+            "Build Notes",
+            [
+                f"Printed: {print_ctx.printed_at}",
+                str(ctx.get("change_summary") or "").splitlines()[0] if str(ctx.get("change_summary") or "").strip() else "No config update summary available.",
+                "Legacy page caps and appendix trimming are disabled for this report layout.",
+            ],
+            styles=styles,
+            rl=rl,
+        )
+    )
+
+    plot_toc_story = _tar_build_plot_toc_story(ctx, styles=styles, rl=rl)
+    if plot_toc_story:
+        story.append(PageBreak())
+        story.extend(plot_toc_story)
+
+    if not comparison_rows:
+        story.append(PageBreak())
+        story.append(_portrait_paragraph("Run Comparison", styles["section"], rl))
+        story.append(
+            _portrait_paragraph(
+                "Each table groups one selected run condition. Rows compare the ATP family mean with each certified serial's "
+                "actual result for the same parameter. Initial values use the base certification scope, and final values use "
+                "the suppression-and-valve-aware regrade path.",
+                styles["body"],
+                rl,
+            )
+        )
         story.append(
             _portrait_card(
                 "Run Comparison Summary",
@@ -7105,83 +7819,6 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
                 rl=rl,
             )
         )
-        return story
-
-    for group_index, group in enumerate(comparison_groups):
-        group_header = (
-            f"Run Condition: {group['run_condition']}\n"
-            f"Initial Suppression Voltage: {group.get('initial_suppression_voltage_label') or 'All'} | "
-            f"Final Suppression Voltage: {group.get('final_suppression_voltage_label') or group.get('initial_suppression_voltage_label') or 'All'}\n"
-            f"Initial Bus Voltage: {group.get('initial_bus_voltage_label') or ''} | "
-            f"Final Bus Voltage: {group.get('final_bus_voltage_label') or ''}"
-        )
-        group_rows = [
-            [
-                group_header,
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-            ],
-            ["Serial", "Sequence(s)", "Parameter", "Units", "ATP Mean", "ATP Actual", "Delta", "Grade"],
-        ]
-        extra_styles = [
-            ("SPAN", (0, 0), (-1, 0)),
-            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#cbd5e1")),
-        ]
-        for row in group.get("rows") or []:
-            regrade_applied = bool(row.get("regrade_applied"))
-            group_rows.append(
-                [
-                    row.get("serial") or "",
-                    row.get("sequence_text") or "",
-                    row.get("parameter") or "",
-                    row.get("units") or "",
-                    _tar_comparison_metric_text(
-                        row.get("initial_atp_mean"),
-                        row.get("final_atp_mean"),
-                        regrade_applied=regrade_applied,
-                        sig=5,
-                    ),
-                    _tar_comparison_metric_text(
-                        row.get("initial_actual_mean"),
-                        row.get("final_actual_mean"),
-                        regrade_applied=regrade_applied,
-                        sig=5,
-                    ),
-                    _tar_comparison_metric_text(
-                        row.get("initial_delta"),
-                        row.get("final_delta"),
-                        regrade_applied=regrade_applied,
-                        sig=5,
-                    ),
-                    _tar_comparison_grade_text(
-                        row.get("initial_grade"),
-                        row.get("final_grade"),
-                        regrade_applied=regrade_applied,
-                    ),
-                ]
-            )
-            if regrade_applied:
-                data_row_index = len(group_rows) - 1
-                extra_styles.append(("BACKGROUND", (0, data_row_index), (-1, data_row_index), colors.HexColor("#fef3c7")))
-        story.append(
-            _portrait_box_table(
-                group_rows,
-                col_widths=[0.72 * inch, 1.18 * inch, 0.76 * inch, 0.48 * inch, 0.95 * inch, 0.95 * inch, 0.82 * inch, 1.04 * inch],
-                styles=styles,
-                rl=rl,
-                repeat_rows=2,
-                compact=True,
-                header_rows=2,
-                extra_style_commands=extra_styles,
-            )
-        )
-        if group_index != len(comparison_groups) - 1:
-            story.append(Spacer(1, 0.10 * inch))
     return story
 
 
@@ -7240,15 +7877,17 @@ def _tar_render_metric_cohort_page(
         cohort_spec,
         run_by_name=(ctx.get("run_by_name") or {}),
     )
+    hide_header_details = str(section_key or "").strip() == "run_condition_plot_metrics"
     show_family_overlay = _tar_show_pooled_family_overlay(cohort_spec)
     fig, ax = _create_landscape_plot_page(
         print_ctx=ctx["print_ctx"],
         page_number=page_number,
-        section_title=_tar_compose_plot_section_title(section_title, run_condition_label),
-        section_subtitle=_tar_subtitle_text(
+        section_title="" if hide_header_details else _tar_compose_plot_section_title(section_title, run_condition_label),
+        section_subtitle="" if hide_header_details else _tar_subtitle_text(
             f"Parameter: {param_name} | Statistic: {metric_stat} | X Axis: {x_name} | "
             f"Selected: {_tar_join_limited(selection_labels, max_items=5, empty='(none)')}"
         ),
+        show_plot_toc_backlink=not hide_header_details,
     )
     serials = list(ctx.get("all_serials") or [])
     serial_index = {serial: idx for idx, serial in enumerate(serials)}
@@ -7329,6 +7968,7 @@ def _tar_render_metric_cohort_page(
         "stat": metric_stat,
         "x_name": x_name,
         "suppression_voltage_label": str(cohort_spec.get("suppression_voltage_label") or ""),
+        "valve_voltage_label": str(cohort_spec.get("valve_voltage_label") or ""),
         "page_number": page_number,
     }
 
@@ -7364,16 +8004,20 @@ def _tar_render_curve_cohort_page(
         cohort_spec,
         run_by_name=(ctx.get("run_by_name") or {}),
     )
+    full_width_layout = str(section_key or "").strip() == "run_condition_curve_overlays"
     show_family_overlay = _tar_show_pooled_family_overlay(cohort_spec)
     fig, ax = _create_landscape_plot_page(
         print_ctx=ctx["print_ctx"],
         page_number=page_number,
-        section_title=_tar_compose_plot_section_title(section_title, run_condition_label),
-        section_subtitle=_tar_subtitle_text(subtitle),
+        section_title="" if full_width_layout else _tar_compose_plot_section_title(section_title, run_condition_label),
+        section_subtitle="" if full_width_layout else _tar_subtitle_text(subtitle),
+        show_plot_toc_backlink=not full_width_layout,
     )
-    ax.set_position([0.06, 0.09, 0.66, 0.70])
-    ax_side = fig.add_axes([0.76, 0.11, 0.20, 0.66])
-    ax_side.axis("off")
+    ax_side = None
+    if not full_width_layout:
+        ax.set_position([0.06, 0.09, 0.66, 0.70])
+        ax_side = fig.add_axes([0.76, 0.11, 0.20, 0.66])
+        ax_side.axis("off")
     ax.set_title(f"{param_name}", loc="left", fontsize=13, fontweight="bold", pad=10)
     ax.set_xlabel(x_name)
     ax.set_ylabel(f"{param_name} ({units})" if units else param_name)
@@ -7437,7 +8081,8 @@ def _tar_render_curve_cohort_page(
             ax.legend(list(uniq.values()), list(uniq.keys()), fontsize=8, loc="best")
     except Exception:
         pass
-    ax_side.text(0.0, 1.0, "\n".join(note_lines[:20]), va="top", ha="left", fontsize=8, color="#0f172a")
+    if ax_side is not None:
+        ax_side.text(0.0, 1.0, "\n".join(note_lines[:20]), va="top", ha="left", fontsize=8, color="#0f172a")
     pdf.savefig(fig)
     plt.close(fig)
     return {
@@ -7446,6 +8091,7 @@ def _tar_render_curve_cohort_page(
         "param": param_name,
         "x_name": x_name,
         "suppression_voltage_label": str(cohort_spec.get("suppression_voltage_label") or ""),
+        "valve_voltage_label": str(cohort_spec.get("valve_voltage_label") or ""),
         "page_number": page_number,
     }
 
@@ -7528,7 +8174,11 @@ def _tar_render_watch_curve_page(
         note_lines.append(f"RMS %: {_fmt_num(finding.get('final_rms_pct'))}")
         note_lines.append(f"z: {_fmt_num(finding.get('final_z'), sig=4)}")
         if bool(finding.get("regrade_applied")):
-            note_lines.append(f"Regrade: Supp {str(finding.get('regrade_suppression_voltage_label') or '').strip() or '(unknown)'}")
+            note_lines.append(
+                "Regrade: "
+                f"Supp {str(finding.get('regrade_suppression_voltage_label') or '').strip() or '(unknown)'} | "
+                f"Valve {str(finding.get('regrade_valve_voltage_label') or '').strip() or '(unknown)'}"
+            )
         note_lines.append("")
     ax.grid(True, alpha=0.25)
     try:
@@ -8029,8 +8679,17 @@ def _tar_render_plot_sections(
             _tar_emit_progress(progress_cb, f"Rendering regrade-pass metric pages ({len(regrade_metric_specs)} planned)")
         for index, (cohort_spec, metric_stat) in enumerate(regrade_metric_specs, start=1):
             suppression_value = str(cohort_spec.get("suppression_voltage_label") or "").strip()
-            _tar_emit_progress(progress_cb, f"Regrade metric page {index}/{len(regrade_metric_specs)}: {cohort_spec.get('param')} | {suppression_value or 'suppression n/a'} | {metric_stat}")
-            filter_override = _tar_clone_filter_state(ctx.get("filter_state"), suppression_voltage=suppression_value) if suppression_value else {}
+            valve_value = str(cohort_spec.get("valve_voltage_label") or "").strip()
+            _tar_emit_progress(
+                progress_cb,
+                f"Regrade metric page {index}/{len(regrade_metric_specs)}: {cohort_spec.get('param')} | "
+                f"Supp {suppression_value or 'n/a'} | Valve {valve_value or 'n/a'} | {metric_stat}",
+            )
+            filter_override = _tar_clone_filter_state(
+                ctx.get("filter_state"),
+                suppression_voltage=suppression_value,
+                valve_voltage=valve_value,
+            ) if (suppression_value or valve_value) else {}
             plot_spec = _tar_render_metric_cohort_page(
                 ctx,
                 pdf,
@@ -8052,7 +8711,12 @@ def _tar_render_plot_sections(
             _tar_emit_progress(progress_cb, f"Rendering regrade-pass curve pages ({len(regrade_cohort_specs)} planned)")
         for index, cohort_spec in enumerate(regrade_cohort_specs, start=1):
             suppression_value = str(cohort_spec.get("suppression_voltage_label") or "").strip()
-            _tar_emit_progress(progress_cb, f"Regrade curve page {index}/{len(regrade_cohort_specs)}: {cohort_spec.get('param')} | {suppression_value or 'suppression n/a'}")
+            valve_value = str(cohort_spec.get("valve_voltage_label") or "").strip()
+            _tar_emit_progress(
+                progress_cb,
+                f"Regrade curve page {index}/{len(regrade_cohort_specs)}: {cohort_spec.get('param')} | "
+                f"Supp {suppression_value or 'n/a'} | Valve {valve_value or 'n/a'}",
+            )
             plot_spec = _tar_render_curve_cohort_page(
                 ctx,
                 pdf,
@@ -8063,6 +8727,7 @@ def _tar_render_plot_sections(
                 subtitle=(
                     f"Run Condition: {str(cohort_spec.get('base_condition_label') or '').strip() or '(unknown)'} | "
                     f"Suppression Voltage: {suppression_value or '(unknown)'} | "
+                    f"Valve Voltage: {valve_value or '(unknown)'} | "
                     f"Parameter: {str(cohort_spec.get('param') or '').strip()} | X Axis: {str(cohort_spec.get('x_name') or '').strip()}"
                 ),
                 grade_map_by_pair_serial=(ctx.get("final_grade_map_by_pair_serial") or {}),
@@ -8338,7 +9003,9 @@ def _tar_build_closing_story(ctx: Mapping[str, Any], *, counts: Mapping[str, int
 
 
 def _tar_prepare_intro_story_with_navigation(ctx: dict[str, Any], *, intro_pages: int) -> list[Any]:
-    planned_plot_specs = _tar_plan_plot_specs(ctx, intro_pages=intro_pages)
+    comparison_page_specs = [dict(page) for page in (ctx.get("comparison_page_specs") or _tar_plan_comparison_pages(ctx)) if isinstance(page, Mapping)]
+    ctx["comparison_page_specs"] = comparison_page_specs
+    planned_plot_specs = _tar_plan_plot_specs(ctx, intro_pages=intro_pages + len(comparison_page_specs))
     plot_navigation = _tar_build_plot_navigation(planned_plot_specs)
     ctx["planned_plot_specs"] = planned_plot_specs
     ctx["plot_navigation"] = plot_navigation
@@ -8400,6 +9067,10 @@ def generate_test_data_auto_report(
         _tar_emit_progress(progress_cb, "Preparing performance equations")
         _tar_prepare_performance_models(ctx)
         timings["prepare_performance_models_seconds"] = round(time.perf_counter() - perf_start, 3)
+        comparison_plan_start = time.perf_counter()
+        _tar_emit_progress(progress_cb, "Planning run comparison pages")
+        ctx["comparison_page_specs"] = _tar_plan_comparison_pages(ctx)
+        timings["plan_comparison_pages_seconds"] = round(time.perf_counter() - comparison_plan_start, 3)
 
         intro_story_start = time.perf_counter()
         _tar_emit_progress(progress_cb, "Building summary pages")
@@ -8416,18 +9087,37 @@ def generate_test_data_auto_report(
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp_dir:
             tmp_root = Path(tmp_dir)
             intro_pdf = tmp_root / "01_intro.pdf"
-            plots_pdf = tmp_root / "02_plots.pdf"
-            equations_pdf = tmp_root / "03_equations.pdf"
-            closing_pdf = tmp_root / "04_closing.pdf"
+            comparison_pdf = tmp_root / "02_comparison.pdf"
+            plots_pdf = tmp_root / "03_plots.pdf"
+            equations_pdf = tmp_root / "04_equations.pdf"
+            closing_pdf = tmp_root / "05_closing.pdf"
 
             intro_render_start = time.perf_counter()
             _tar_emit_progress(progress_cb, "Rendering cover, TOC, and summary pages")
             intro_pages, intro_story = _tar_render_stabilized_intro_pdf(intro_pdf, ctx=ctx, progress_cb=progress_cb)
             timings["render_intro_pages_seconds"] = round(time.perf_counter() - intro_render_start, 3)
 
+            comparison_render_start = time.perf_counter()
+            comparison_story = _tar_build_comparison_story(ctx)
+            comparison_pages = 0
+            if comparison_story:
+                _tar_emit_progress(progress_cb, "Rendering run comparison pages")
+                comparison_pages = _render_tabloid_landscape_story_pdf(
+                    comparison_pdf,
+                    story=comparison_story,
+                    print_ctx=ctx["print_ctx"],
+                    page_number_offset=intro_pages,
+                )
+            timings["render_comparison_pages_seconds"] = round(time.perf_counter() - comparison_render_start, 3)
+
             plot_render_start = time.perf_counter()
             _tar_emit_progress(progress_cb, "Rendering plot pages")
-            plot_counts = _tar_render_plot_sections(ctx, intro_pages=intro_pages, plots_pdf=plots_pdf, progress_cb=progress_cb)
+            plot_counts = _tar_render_plot_sections(
+                ctx,
+                intro_pages=intro_pages + comparison_pages,
+                plots_pdf=plots_pdf,
+                progress_cb=progress_cb,
+            )
             timings["render_plot_pages_seconds"] = round(time.perf_counter() - plot_render_start, 3)
             actual_plot_navigation = _tar_build_plot_navigation(list(plot_counts.get("plot_specs") or []))
             plot_counts = dict(plot_counts)
@@ -8443,7 +9133,7 @@ def generate_test_data_auto_report(
                 equations_pdf,
                 story=equation_story,
                 print_ctx=ctx["print_ctx"],
-                page_number_offset=intro_pages + plot_counts["plot_page_count"],
+                page_number_offset=intro_pages + comparison_pages + plot_counts["plot_page_count"],
             )
             timings["render_equation_pages_seconds"] = round(time.perf_counter() - equation_render_start, 3)
             plot_counts["equation_page_count"] = int(equation_pages)
@@ -8479,11 +9169,13 @@ def generate_test_data_auto_report(
                 closing_pdf,
                 story=closing_story,
                 print_ctx=ctx["print_ctx"],
-                page_number_offset=intro_pages + plot_counts["plot_page_count"] + equation_pages,
+                page_number_offset=intro_pages + comparison_pages + plot_counts["plot_page_count"] + equation_pages,
             )
             timings["render_closing_pages_seconds"] = round(time.perf_counter() - closing_render_start, 3)
 
             merge_parts = [intro_pdf]
+            if comparison_pages and comparison_pdf.exists():
+                merge_parts.append(comparison_pdf)
             if plot_counts["plot_page_count"] and plots_pdf.exists():
                 merge_parts.append(plots_pdf)
             if equation_pages and equations_pdf.exists():
@@ -8507,7 +9199,7 @@ def generate_test_data_auto_report(
                 exception_chart_links=list(ctx.get("exception_chart_links") or []),
             )
             timings["apply_pdf_navigation_seconds"] = round(time.perf_counter() - navigation_start, 3)
-            total_pages = intro_pages + plot_counts["plot_page_count"] + equation_pages + closing_pages
+            total_pages = intro_pages + comparison_pages + plot_counts["plot_page_count"] + equation_pages + closing_pages
 
         sidecar = {
             "version": 6,

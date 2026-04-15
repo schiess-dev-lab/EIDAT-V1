@@ -1452,6 +1452,207 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
             if tmpdir:
                 shutil.rmtree(str(tmpdir), ignore_errors=True)
 
+    def test_run_selection_items_honor_valve_voltage_filter_membership(self) -> None:
+        window = self._make_window()
+        try:
+            window._available_program_filters = ["Program A"]
+            window._available_control_period_filters = ["10"]
+            window._available_valve_voltage_filters = ["28", "32"]
+            window._run_selection_views = {
+                "sequence": [
+                    {
+                        "mode": "sequence",
+                        "id": "sequence:seq28",
+                        "run_name": "run_28",
+                        "program_title": "Program A",
+                        "member_programs": ["Program A"],
+                        "member_control_periods": ["10"],
+                        "member_valve_voltages": ["28"],
+                    },
+                    {
+                        "mode": "sequence",
+                        "id": "sequence:seq32",
+                        "run_name": "run_32",
+                        "program_title": "Program A",
+                        "member_programs": ["Program A"],
+                        "member_control_periods": ["10"],
+                        "member_valve_voltages": ["32"],
+                    },
+                ],
+                "condition": [],
+            }
+
+            items = window._visible_run_selection_items_for_filter_state(
+                "sequence",
+                filter_state={
+                    "programs": ["Program A"],
+                    "control_periods": ["10"],
+                    "valve_voltages": ["28"],
+                },
+            )
+
+            self.assertEqual([item["id"] for item in items], ["sequence:seq28"])
+        finally:
+            window.close()
+            tmpdir = getattr(window, "_test_tmpdir", "")
+            if tmpdir:
+                shutil.rmtree(str(tmpdir), ignore_errors=True)
+
+    def test_auto_report_visibility_ignores_suppression_but_keeps_valve_scope(self) -> None:
+        window = self._make_window()
+        try:
+            window._available_program_filters = ["Program Alpha"]
+            window._available_control_period_filters = ["10"]
+            window._available_suppression_voltage_filters = ["5", "10"]
+            window._available_valve_voltage_filters = ["28", "32"]
+            window._available_serial_filter_rows = [{"serial": "SN-002", "program_title": "Program Alpha"}]
+            window._global_filter_rows = [
+                {
+                    "serial": "SN-002",
+                    "program_title": "Program Alpha",
+                    "source_run_name": "Seq 32V",
+                    "control_period": 10.0,
+                    "suppression_voltage": 10.0,
+                    "valve_voltage": 32.0,
+                }
+            ]
+            window._run_selection_views = {
+                "sequence": [
+                    {
+                        "mode": "sequence",
+                        "id": "sequence:seq32v",
+                        "run_name": "run_seq32v",
+                        "program_title": "Program Alpha",
+                        "member_programs": ["Program Alpha"],
+                        "member_sequences": ["Seq 32V"],
+                        "member_control_periods": ["10"],
+                        "member_suppression_voltages": ["10"],
+                        "member_valve_voltages": ["32"],
+                        "member_run_type_modes": ["pulsed_mode"],
+                    }
+                ],
+                "condition": [],
+            }
+
+            visible = window._visible_auto_report_run_selection_items_for_filter_state(
+                "sequence",
+                filter_state={
+                    "programs": ["Program Alpha"],
+                    "serials": ["SN-002"],
+                    "control_periods": ["10"],
+                    "suppression_voltages": ["5"],
+                    "valve_voltages": ["32"],
+                },
+                require_active_serial_match=True,
+            )
+            hidden = window._visible_auto_report_run_selection_items_for_filter_state(
+                "sequence",
+                filter_state={
+                    "programs": ["Program Alpha"],
+                    "serials": ["SN-002"],
+                    "control_periods": ["10"],
+                    "suppression_voltages": ["5"],
+                    "valve_voltages": ["28"],
+                },
+                require_active_serial_match=True,
+            )
+
+            self.assertEqual([item["id"] for item in visible], ["sequence:seq32v"])
+            self.assertEqual(hidden, [])
+        finally:
+            window.close()
+            tmpdir = getattr(window, "_test_tmpdir", "")
+            if tmpdir:
+                shutil.rmtree(str(tmpdir), ignore_errors=True)
+
+    def test_performance_and_solver_modes_ignore_live_valve_filters(self) -> None:
+        window = self._make_window()
+        try:
+            window._available_program_filters = ["Program A"]
+            window._checked_program_filters = ["Program A"]
+            window._available_control_period_filters = ["10"]
+            window._checked_control_period_filters = ["10"]
+            window._available_suppression_voltage_filters = ["5"]
+            window._checked_suppression_voltage_filters = ["5"]
+            window._available_valve_voltage_filters = ["28", "32"]
+            window._checked_valve_voltage_filters = ["28"]
+            window._available_serial_filter_rows = [
+                {"serial": "SN-001", "program_title": "Program A"},
+                {"serial": "SN-002", "program_title": "Program A"},
+            ]
+            window._checked_serial_filters = ["SN-001", "SN-002"]
+            window._global_filter_rows = [
+                {
+                    "serial": "SN-001",
+                    "program_title": "Program A",
+                    "source_run_name": "Seq 28V",
+                    "control_period": 10.0,
+                    "suppression_voltage": 5.0,
+                    "valve_voltage": 28.0,
+                },
+                {
+                    "serial": "SN-002",
+                    "program_title": "Program A",
+                    "source_run_name": "Seq 32V",
+                    "control_period": 10.0,
+                    "suppression_voltage": 5.0,
+                    "valve_voltage": 32.0,
+                },
+            ]
+            window._run_selection_views = {
+                "sequence": [
+                    {
+                        "mode": "sequence",
+                        "id": "sequence:seq28",
+                        "run_name": "run_28",
+                        "program_title": "Program A",
+                        "member_programs": ["Program A"],
+                        "member_sequences": ["Seq 28V"],
+                        "member_control_periods": ["10"],
+                        "member_suppression_voltages": ["5"],
+                        "member_valve_voltages": ["28"],
+                    },
+                    {
+                        "mode": "sequence",
+                        "id": "sequence:seq32",
+                        "run_name": "run_32",
+                        "program_title": "Program A",
+                        "member_programs": ["Program A"],
+                        "member_sequences": ["Seq 32V"],
+                        "member_control_periods": ["10"],
+                        "member_suppression_voltages": ["5"],
+                        "member_valve_voltages": ["32"],
+                    },
+                ],
+                "condition": [],
+            }
+
+            window._mode = "curves"
+            self.assertEqual(window._active_serials(), ["SN-001"])
+            self.assertEqual(
+                [item["id"] for item in window._visible_run_selection_items("sequence")],
+                ["sequence:seq28"],
+            )
+
+            window._mode = "performance"
+            self.assertEqual(window._active_serials(), ["SN-001", "SN-002"])
+            self.assertEqual(
+                [item["id"] for item in window._visible_run_selection_items("sequence")],
+                ["sequence:seq28", "sequence:seq32"],
+            )
+
+            window._mode = "smart_solver"
+            self.assertEqual(window._active_serials(), ["SN-001", "SN-002"])
+            self.assertEqual(
+                [item["id"] for item in window._visible_run_selection_items("sequence")],
+                ["sequence:seq28", "sequence:seq32"],
+            )
+        finally:
+            window.close()
+            tmpdir = getattr(window, "_test_tmpdir", "")
+            if tmpdir:
+                shutil.rmtree(str(tmpdir), ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()
