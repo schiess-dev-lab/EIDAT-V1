@@ -437,7 +437,11 @@ class RunProgressDialog(QtWidgets.QDialog):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Running EIDP Scanner")
+        self._default_window_title = "Running EIDP Scanner"
+        self._default_detail_text = "Waiting for scanner progress…"
+        self._default_hint_text = "This window closes automatically when the run finishes."
+        self._default_cancel_text = "Abort Run"
+        self.setWindowTitle(self._default_window_title)
         self.setModal(True)
         self.setWindowModality(QtCore.Qt.WindowModality.ApplicationModal)
         self.setWindowFlag(QtCore.Qt.WindowType.WindowContextHelpButtonHint, False)
@@ -501,15 +505,15 @@ class RunProgressDialog(QtWidgets.QDialog):
         self.progress_bar.setTextVisible(True)
         self.progress_bar.setFormat("Working...")
 
-        self.detail_label = QtWidgets.QLabel("Waiting for scanner progress\u2026")
+        self.detail_label = QtWidgets.QLabel(self._default_detail_text)
         self.detail_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         self.detail_label.setStyleSheet("font-size: 12px; color: #e0e7f0;")
 
-        self.hint_label = QtWidgets.QLabel("This window closes automatically when the run finishes.")
+        self.hint_label = QtWidgets.QLabel(self._default_hint_text)
         self.hint_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         self.hint_label.setStyleSheet("color: #a5b8d6; font-size: 11px;")
 
-        self.btn_cancel = QtWidgets.QPushButton("Abort Run")
+        self.btn_cancel = QtWidgets.QPushButton(self._default_cancel_text)
         self.btn_cancel.setProperty("variant", "ghost")
         self.btn_cancel.clicked.connect(self._on_cancel_clicked)
 
@@ -534,17 +538,33 @@ class RunProgressDialog(QtWidgets.QDialog):
         # Base status text shown at the top of the dialog
         self._base_status_text: str = ""
 
-    def begin(self, status_text: str):
+    def begin(
+        self,
+        status_text: str,
+        *,
+        window_title: str | None = None,
+        detail_text: str | None = None,
+        hint_text: str | None = None,
+        cancel_text: str | None = None,
+    ):
+        self.setWindowTitle(str(window_title or self._default_window_title).strip() or self._default_window_title)
         self._base_status_text = status_text
         self.lbl_status.setText(status_text)
         self.progress_bar.setRange(0, 0)
         self.progress_bar.setFormat("Working...")
-        self.detail_label.setText("Waiting for scanner progress\u2026")
+        self.detail_label.setText(
+            self._default_detail_text if detail_text is None else str(detail_text or "").strip()
+        )
+        self.hint_label.setText(
+            self._default_hint_text if hint_text is None else str(hint_text or "").strip()
+        )
         self._spinner_index = 0
         self.spinner_label.setText(self._spinner_frames[0])
         self._anim_timer.start()
         self.btn_cancel.setEnabled(True)
-        self.btn_cancel.setText("Abort Run")
+        self.btn_cancel.setText(
+            self._default_cancel_text if cancel_text is None else str(cancel_text or "").strip()
+        )
         self.adjustSize()
         _fit_widget_to_screen(self)
         self.show()
@@ -3692,7 +3712,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         cache_actions.setVerticalSpacing(8)
         self.btn_refresh_cache = QtWidgets.QPushButton("Check Cache Status")
         self.btn_refresh_cache.setMinimumHeight(40)
-        self.btn_refresh_cache.clicked.connect(lambda: self._load_cache(rebuild=False))
+        self.btn_refresh_cache.setToolTip(
+            "Perform a deeper workbook/source cache inspection. This may take longer than opening Trend / Analyze."
+        )
+        self.btn_refresh_cache.clicked.connect(lambda: self._load_cache(rebuild=False, inspect_status=True))
         self.btn_open_support = QtWidgets.QPushButton("Open Support Workbook")
         self.btn_open_support.setMinimumHeight(40)
         self.btn_open_support.clicked.connect(self._open_support_workbook)
@@ -6302,45 +6325,90 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         _fit_widget_to_screen(dlg)
         dlg.exec()
 
-    def _load_cache(self, *, rebuild: bool) -> None:
-        def _load_payload() -> dict[str, object]:
-            db_path = be.validate_test_data_project_cache_for_open(
-                self._project_dir,
-                self._workbook_path,
-            )
-            stale_message = ""
+    def _compose_cache_label_text(self, db_path: Path | None, *messages: object) -> str:
+        lines = [f"Cache DB: {db_path}" if db_path else "Cache DB: unavailable"]
+        for raw in messages:
+            msg = str(raw or "").strip()
+            if not msg:
+                continue
+            lines.append(f"Warning: {msg}")
+        return "\n".join(lines)
+
+    def _build_cache_payload(
+        self,
+        *,
+        inspect_status: bool,
+        report: Callable[[str], None] | None = None,
+    ) -> dict[str, object]:
+        if callable(report):
+            report("Validating existing project cache")
+        db_path = be.validate_test_data_project_cache_for_open(
+            self._project_dir,
+            self._workbook_path,
+        )
+        stale_message = ""
+        status_warning = ""
+        if inspect_status:
+            if callable(report):
+                report("Inspecting cache freshness and source status")
             try:
                 state = be.inspect_test_data_project_cache_state(self._project_dir, self._workbook_path)
-            except Exception:
-                state = {}
-            if isinstance(state, dict):
-                mode = str(state.get("mode") or "").strip()
-                reason = str(state.get("reason") or "").strip()
-                if mode and mode != "none":
-                    stale_message = (
-                        f"Cache is usable but stale ({reason or mode}). "
-                        "Use Update Project from the Projects tab to refresh it."
-                    )
-            return {
-                "db_path": str(db_path),
-                "stale_message": stale_message,
-            }
-
-        if not hasattr(self, "_report_progress"):
-            try:
-                payload = _load_payload()
-                self._db_path = Path(str(payload.get("db_path") or "")).expanduser()
-                self.lbl_source.setText(str(self._db_path))
-                cache_text = f"Cache DB: {self._db_path}"
-                stale_message = str(payload.get("stale_message") or "").strip()
-                if stale_message:
-                    cache_text += f"\nWarning: {stale_message}"
-                self.lbl_cache.setText(cache_text)
             except Exception as exc:
-                QtWidgets.QMessageBox.warning(self, "Test Data Cache", str(exc))
-                return
+                status_warning = (
+                    "Deep cache status check failed; existing cache remains loaded. "
+                    f"{exc}"
+                )
+            else:
+                if isinstance(state, dict):
+                    mode = str(state.get("mode") or "").strip()
+                    reason = str(state.get("reason") or "").strip()
+                    if mode and mode != "none":
+                        stale_message = (
+                            f"Cache is usable but stale ({reason or mode}). "
+                            "Use Update Project from the Projects tab to refresh it."
+                        )
+        return {
+            "db_path": str(db_path),
+            "stale_message": stale_message,
+            "status_warning": status_warning,
+        }
+
+    def _apply_cache_payload(self, payload: object, *, refresh_ui: bool) -> None:
+        payload_dict = payload if isinstance(payload, dict) else {"db_path": payload}
+        db_raw = str(payload_dict.get("db_path") or "").strip()
+        if not db_raw:
+            raise RuntimeError("Cache check returned no database path.")
+        db_path = Path(db_raw).expanduser()
+        previous_db = self._db_path
+        self._db_path = db_path
+        self.lbl_source.setText(str(self._db_path))
+        self.lbl_cache.setText(
+            TestDataTrendDialog._compose_cache_label_text(
+                self,
+                self._db_path,
+                payload_dict.get("stale_message"),
+                payload_dict.get("status_warning"),
+            )
+        )
+        if refresh_ui or previous_db is None or previous_db != db_path:
             self._refresh_from_cache()
             self._update_plot_zoom_actions()
+
+    def _load_cache(self, *, rebuild: bool, inspect_status: bool = False) -> None:
+        del rebuild
+        if not inspect_status:
+            try:
+                payload = TestDataTrendDialog._build_cache_payload(self, inspect_status=False)
+                TestDataTrendDialog._apply_cache_payload(self, payload, refresh_ui=True)
+            except Exception as exc:
+                QtWidgets.QMessageBox.warning(self, "Test Data Cache", str(exc))
+            return
+        if not hasattr(self, "_report_progress"):
+            try:
+                payload = TestDataTrendDialog._build_cache_payload(self, inspect_status=True)
+                TestDataTrendDialog._apply_cache_payload(self, payload, refresh_ui=False)
+            except Exception as exc:
+                QtWidgets.QMessageBox.warning(self, "Test Data Cache", str(exc))
             return
         if self._cache_worker is not None and self._cache_worker.isRunning():
             return
@@ -6349,12 +6417,13 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._cache_progress_heading = "Checking Test Data Cache"
         self._cache_progress_status = "Validating existing project cache"
         self._cache_progress_detail = ""
-        self.lbl_cache.setText("Cache DB: checking...")
+        self.lbl_cache.setText(
+            TestDataTrendDialog._compose_cache_label_text(self, self._db_path, "Checking cache status...")
+        )
         self._cache_progress_timer.start(150)
 
         def _task(report):
-            report(self._cache_progress_status)
-            return _load_payload()
+            return TestDataTrendDialog._build_cache_payload(self, inspect_status=True, report=report)
 
         self._cache_worker = ProjectTaskWorker(_task, parent=self)
         self._cache_worker.progress.connect(self._on_cache_task_progress)
@@ -6382,9 +6451,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._cache_progress_visible = True
         try:
             self._report_progress.lbl_heading.setText(self._cache_progress_heading)
-            self._report_progress.begin(self._cache_progress_status)
-            if self._cache_progress_detail:
-                self._report_progress.detail_label.setText(self._cache_progress_detail)
+            self._report_progress.begin(
+                self._cache_progress_status,
+                window_title="Test Data Cache Status",
+                detail_text=self._cache_progress_detail or "Waiting for cache status progress…",
+                hint_text="This window closes automatically when the cache status check finishes.",
+            )
         except Exception:
             self._cache_progress_visible = False
 
@@ -6405,35 +6477,44 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._cache_progress_timer.stop()
         self._cache_worker = None
         self._set_cache_controls_enabled(True)
-        payload_dict = payload if isinstance(payload, dict) else {"db_path": payload}
-        db_path = Path(str(payload_dict.get("db_path") or "")).expanduser() if payload_dict is not None else None
-        if db_path is None:
-            QtWidgets.QMessageBox.warning(self, "Test Data Cache", "Cache check returned no database path.")
+        warning_present = False
+        try:
+            warning_present = bool(
+                isinstance(payload, dict) and str(payload.get("status_warning") or "").strip()
+            )
+            TestDataTrendDialog._apply_cache_payload(self, payload, refresh_ui=False)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Test Data Cache", str(exc))
             return
-        self._db_path = db_path
-        self.lbl_source.setText(str(self._db_path))
-        cache_text = f"Cache DB: {self._db_path}"
-        stale_message = str(payload_dict.get("stale_message") or "").strip()
-        if stale_message:
-            cache_text += f"\nWarning: {stale_message}"
-        self.lbl_cache.setText(cache_text)
         if self._cache_progress_visible:
             try:
-                self._report_progress.finish("Cache checked", success=True)
+                self._report_progress.finish(
+                    "Cache status checked with warning" if warning_present else "Cache status checked",
+                    success=True,
+                )
             except Exception:
                 pass
             self._cache_progress_visible = False
-        self._refresh_from_cache()
-        self._update_plot_zoom_actions()
 
     def _on_cache_task_error(self, message: str) -> None:
         self._cache_progress_timer.stop()
         self._cache_worker = None
         self._set_cache_controls_enabled(True)
-        self.lbl_cache.setText("Cache DB: unavailable")
+        if self._db_path:
+            self.lbl_source.setText(str(self._db_path))
+            self.lbl_cache.setText(
+                TestDataTrendDialog._compose_cache_label_text(
+                    self,
+                    self._db_path,
+                    "Cache status check failed; existing cache remains loaded.",
+                    message,
+                )
+            )
+        else:
+            self.lbl_cache.setText("Cache DB: unavailable")
         if self._cache_progress_visible:
             try:
-                self._report_progress.finish(f"Cache failed: {message}", success=False)
+                self._report_progress.finish("Cache status check failed", success=False)
             except Exception:
                 pass
             self._cache_progress_visible = False

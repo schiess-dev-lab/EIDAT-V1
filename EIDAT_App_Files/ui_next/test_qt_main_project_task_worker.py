@@ -15,12 +15,13 @@ if str(APP_ROOT) not in sys.path:
 
 try:
     from PySide6 import QtCore, QtWidgets
-    from ui_next.qt_main import MainWindow, ProjectTaskWorker, TestDataTrendDialog
+    from ui_next.qt_main import MainWindow, ProjectTaskWorker, RunProgressDialog, TestDataTrendDialog
 except Exception:  # pragma: no cover - optional dependency guard for local runs
     QtCore = None  # type: ignore[assignment]
     QtWidgets = None  # type: ignore[assignment]
     MainWindow = None  # type: ignore[assignment]
     ProjectTaskWorker = None  # type: ignore[assignment]
+    RunProgressDialog = None  # type: ignore[assignment]
     TestDataTrendDialog = None  # type: ignore[assignment]
 
 
@@ -196,20 +197,19 @@ class TestProjectTaskWorker(unittest.TestCase):
         expected_db = Path("C:/temp/project/implementation_trending.sqlite3")
 
         with patch("ui_next.qt_main.be.validate_test_data_project_cache_for_open", return_value=expected_db) as open_validate_mock, patch(
-            "ui_next.qt_main.be.inspect_test_data_project_cache_state",
-            return_value={"mode": "none", "reason": ""},
+            "ui_next.qt_main.be.inspect_test_data_project_cache_state"
         ) as inspect_mock:
             TestDataTrendDialog._load_cache(dummy, rebuild=False)
 
         open_validate_mock.assert_called_once_with(dummy._project_dir, dummy._workbook_path)
-        inspect_mock.assert_called_once_with(dummy._project_dir, dummy._workbook_path)
+        inspect_mock.assert_not_called()
         self.assertEqual(dummy._db_path, expected_db)
         self.assertEqual(dummy.lbl_source.text(), str(expected_db))
         self.assertEqual(dummy.lbl_cache.text(), f"Cache DB: {expected_db}")
         self.assertEqual(dummy.refresh_calls, 1)
         self.assertEqual(dummy.zoom_calls, 1)
 
-    def test_test_data_trend_load_cache_rebuild_true_does_not_update_and_shows_stale_warning(self) -> None:
+    def test_test_data_trend_manual_cache_status_check_shows_stale_warning(self) -> None:
         class _DummyTrendDialog:
             def __init__(self) -> None:
                 self._project_dir = Path("C:/temp/project")
@@ -235,7 +235,7 @@ class TestProjectTaskWorker(unittest.TestCase):
         ) as inspect_mock, patch(
             "ui_next.qt_main.be.update_test_data_trending_project_workbook"
         ) as update_mock:
-            TestDataTrendDialog._load_cache(dummy, rebuild=True)
+            TestDataTrendDialog._load_cache(dummy, rebuild=False, inspect_status=True)
 
         open_validate_mock.assert_called_once_with(dummy._project_dir, dummy._workbook_path)
         inspect_mock.assert_called_once_with(dummy._project_dir, dummy._workbook_path)
@@ -245,6 +245,64 @@ class TestProjectTaskWorker(unittest.TestCase):
         self.assertIn("Update Project", dummy.lbl_cache.text())
         self.assertEqual(dummy.refresh_calls, 1)
         self.assertEqual(dummy.zoom_calls, 1)
+
+    def test_test_data_trend_manual_cache_status_check_keeps_loaded_cache_when_inspection_fails(self) -> None:
+        class _DummyTrendDialog:
+            def __init__(self) -> None:
+                self._project_dir = Path("C:/temp/project")
+                self._workbook_path = Path("C:/temp/project/project.xlsx")
+                self.lbl_source = QtWidgets.QLabel("")
+                self.lbl_cache = QtWidgets.QLabel("")
+                self._db_path = Path("C:/temp/project/implementation_trending.sqlite3")
+                self.lbl_source.setText(str(self._db_path))
+                self.lbl_cache.setText(f"Cache DB: {self._db_path}")
+                self.refresh_calls = 0
+                self.zoom_calls = 0
+
+            def _refresh_from_cache(self) -> None:
+                self.refresh_calls += 1
+
+            def _update_plot_zoom_actions(self) -> None:
+                self.zoom_calls += 1
+
+        dummy = _DummyTrendDialog()
+        expected_db = dummy._db_path
+
+        with patch("ui_next.qt_main.be.validate_test_data_project_cache_for_open", return_value=expected_db) as open_validate_mock, patch(
+            "ui_next.qt_main.be.inspect_test_data_project_cache_state",
+            side_effect=RuntimeError("Timed out resolving source SQLite path"),
+        ) as inspect_mock:
+            TestDataTrendDialog._load_cache(dummy, rebuild=False, inspect_status=True)
+
+        open_validate_mock.assert_called_once_with(dummy._project_dir, dummy._workbook_path)
+        inspect_mock.assert_called_once_with(dummy._project_dir, dummy._workbook_path)
+        self.assertEqual(dummy._db_path, expected_db)
+        self.assertEqual(dummy.lbl_source.text(), str(expected_db))
+        self.assertIn("existing cache remains loaded", dummy.lbl_cache.text())
+        self.assertIn("Timed out resolving source SQLite path", dummy.lbl_cache.text())
+        self.assertEqual(dummy.refresh_calls, 0)
+        self.assertEqual(dummy.zoom_calls, 0)
+
+    @unittest.skipIf(RunProgressDialog is None, "PySide6 is required")
+    def test_run_progress_dialog_begin_supports_task_specific_copy(self) -> None:
+        dlg = RunProgressDialog()
+        try:
+            dlg.begin(
+                "Validating existing project cache",
+                window_title="Test Data Cache Status",
+                detail_text="Waiting for cache status progress...",
+                hint_text="This window closes automatically when the cache status check finishes.",
+                cancel_text="Cancel Check",
+            )
+            self.assertEqual(dlg.windowTitle(), "Test Data Cache Status")
+            self.assertEqual(dlg.detail_label.text(), "Waiting for cache status progress...")
+            self.assertEqual(
+                dlg.hint_label.text(),
+                "This window closes automatically when the cache status check finishes.",
+            )
+            self.assertEqual(dlg.btn_cancel.text(), "Cancel Check")
+        finally:
+            dlg.abort()
 
     def test_start_perf_equation_excel_export_uses_project_task(self) -> None:
         class _DummyExportWindow:
