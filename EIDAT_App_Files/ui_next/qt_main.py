@@ -8918,7 +8918,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 it.setFlags(it.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
                 checked = prev_checked.get(_norm_name(name))
                 if checked is None:
-                    checked = True
+                    checked = False
                 it.setCheckState(QtCore.Qt.CheckState.Checked if checked else QtCore.Qt.CheckState.Unchecked)
                 list_params.addItem(it)
             list_params.blockSignals(False)

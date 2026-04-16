@@ -438,11 +438,11 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
                 conn.commit()
             self.assertEqual(be.td_cached_statistics(db), ["mean", "std"])
 
-    def test_tar_resolve_report_db_path_uses_existing_cache_for_stats_only_mismatch(self):
+    def test_tar_resolve_report_db_path_skips_deep_cache_status_check(self):
         from EIDAT_App_Files.ui_next import trend_auto_report as tar
 
         be = types.SimpleNamespace(
-            inspect_test_data_project_cache_state=mock.Mock(return_value={"mode": "calc", "reason": "selected statistics changed"}),
+            inspect_test_data_project_cache_state=mock.Mock(side_effect=AssertionError("deep cache status check should be skipped")),
             validate_test_data_project_cache_for_open=mock.Mock(return_value=Path("validated.sqlite3")),
             ensure_test_data_project_cache=mock.Mock(return_value=Path("ensured.sqlite3")),
         )
@@ -455,9 +455,10 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
             progress_cb=progress.append,
         )
         self.assertEqual(db_path, Path("validated.sqlite3"))
+        be.inspect_test_data_project_cache_state.assert_not_called()
         be.validate_test_data_project_cache_for_open.assert_called_once()
         be.ensure_test_data_project_cache.assert_not_called()
-        self.assertTrue(any("Using existing cached statistics" in msg for msg in progress))
+        self.assertTrue(any("Using existing project cache" in msg for msg in progress))
 
     def test_metric_map_cache_reuses_loaded_series_within_report(self):
         from EIDAT_App_Files.ui_next import trend_auto_report as tar

@@ -1403,10 +1403,12 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
                     self.assertEqual(params_list.count(), 2)
                     self.assertTrue(
                         all(
-                            params_list.item(i).checkState() == QtCore.Qt.CheckState.Checked
+                            params_list.item(i).checkState() == QtCore.Qt.CheckState.Unchecked
                             for i in range(params_list.count())
                         )
                     )
+                    for i in range(params_list.count()):
+                        params_list.item(i).setCheckState(QtCore.Qt.CheckState.Checked)
                     self.assertIn("z =", grade_summary.text())
                     self.assertIn("PASS if |z| <= 1.5", grade_summary.text())
                     self.assertIn("WATCH if |z| <= 2.5", grade_summary.text())

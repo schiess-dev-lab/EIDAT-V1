@@ -77,23 +77,13 @@ def _tar_resolve_report_db_path(
 ) -> Path:
     proj = Path(project_dir).expanduser()
     wb = Path(workbook_path).expanduser()
-    try:
-        state = be.inspect_test_data_project_cache_state(proj, wb)
-    except Exception:
-        state = {}
-    refresh_mode = str((state or {}).get("mode") or "").strip().lower()
-    refresh_reason = str((state or {}).get("reason") or "").strip()
+    # Auto Report should not perform the deep cache-status inspection on entry.
+    # The GUI exposes that explicitly via "Check cache status"; here we only need
+    # the fast cache-open validation before reading cached data.
     if rebuild:
         _tar_emit_progress(
             progress_cb,
             "Auto Report uses the current cache only. Run Update Project first if you need a refresh.",
-        )
-    elif refresh_mode == "calc" and str(refresh_reason or "").strip().lower() == "selected statistics changed":
-        _tar_emit_progress(progress_cb, "Using existing cached statistics for Auto Report")
-    elif refresh_mode and refresh_mode != "none":
-        _tar_emit_progress(
-            progress_cb,
-            f"Using existing cached data ({refresh_reason or refresh_mode}). Run Update Project to refresh it.",
         )
     else:
         _tar_emit_progress(progress_cb, "Using existing project cache")
@@ -7297,7 +7287,6 @@ def _tar_prepare_base(
     hi_cfg = report_cfg.get("highlight") or {}
 
     rebuild = bool(options.get("rebuild_cache"))
-    _tar_emit_progress(progress_cb, "Checking existing project cache")
     db_path = _tar_resolve_report_db_path(be, proj, wb, rebuild=rebuild, progress_cb=progress_cb)
     if bool(options.get("update_excel_trend_config", True)):
         _tar_emit_progress(progress_cb, "Syncing Excel trend configuration")
