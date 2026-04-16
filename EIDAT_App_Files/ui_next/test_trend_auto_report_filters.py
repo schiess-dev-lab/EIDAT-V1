@@ -1369,6 +1369,48 @@ class TestTrendAutoReportFilters(unittest.TestCase):
             )
         )
 
+    def test_reportlab_imports_reports_active_python_when_package_is_missing(self) -> None:
+        def _raise_missing(_name: str):
+            exc = ModuleNotFoundError("No module named 'reportlab'")
+            exc.name = "reportlab"  # type: ignore[attr-defined]
+            raise exc
+
+        with mock.patch.object(tar.importlib, "import_module", side_effect=_raise_missing):
+            with self.assertRaises(RuntimeError) as ctx:
+                tar._reportlab_imports()
+
+        msg = str(ctx.exception)
+        self.assertIn("reportlab is required to build formatted portrait report pages.", msg)
+        self.assertIn(sys.executable, msg)
+
+    def test_reportlab_imports_surfaces_nested_dependency_failure(self) -> None:
+        fake_modules = {
+            "reportlab": SimpleNamespace(__file__="C:/fake/site-packages/reportlab/__init__.py"),
+            "reportlab.lib.colors": _FakeColors,
+            "reportlab.lib.enums": SimpleNamespace(TA_CENTER="CENTER", TA_LEFT="LEFT"),
+            "reportlab.lib.pagesizes": SimpleNamespace(landscape="landscape", letter=(1, 2), tabloid=(3, 4)),
+            "reportlab.lib.styles": SimpleNamespace(ParagraphStyle=object, getSampleStyleSheet=lambda: {}),
+            "reportlab.lib.units": SimpleNamespace(inch=1.0),
+        }
+
+        def _fake_import(name: str):
+            if name == "reportlab.platypus":
+                exc = ModuleNotFoundError("No module named 'PIL'")
+                exc.name = "PIL"  # type: ignore[attr-defined]
+                raise exc
+            if name in fake_modules:
+                return fake_modules[name]
+            raise AssertionError(f"Unexpected module import: {name}")
+
+        with mock.patch.object(tar.importlib, "import_module", side_effect=_fake_import):
+            with self.assertRaises(RuntimeError) as ctx:
+                tar._reportlab_imports()
+
+        msg = str(ctx.exception)
+        self.assertIn("reportlab is installed at 'C:/fake/site-packages/reportlab/__init__.py'", msg)
+        self.assertIn("PIL", msg)
+        self.assertIn(sys.executable, msg)
+
 
 if __name__ == "__main__":
     unittest.main()

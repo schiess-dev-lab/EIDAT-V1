@@ -13,11 +13,13 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
 import html
+import importlib
 import json
 import math
 import re
 import sqlite3
 import statistics
+import sys
 import tempfile
 import textwrap
 import time
@@ -2266,33 +2268,68 @@ def _paragraph_markup(text: object) -> str:
     return "<br/>".join(html.escape(line) for line in raw.splitlines())
 
 
+def _format_reportlab_import_failure(exc: BaseException, *, reportlab_path: str = "") -> str:
+    python_path = str(sys.executable or "").strip() or "unknown"
+    installed_at = str(reportlab_path or "").strip()
+    if isinstance(exc, ModuleNotFoundError):
+        missing_name = str(getattr(exc, "name", "") or "").strip()
+        if missing_name == "reportlab":
+            return (
+                "reportlab is required to build formatted portrait report pages. "
+                f"Active Python: {python_path}"
+            )
+        if installed_at:
+            return (
+                f"reportlab is installed at '{installed_at}', but a required import failed under "
+                f"'{python_path}': {exc.__class__.__name__}: {exc}"
+            )
+        return (
+            "A dependency required by reportlab is missing while building formatted portrait report pages. "
+            f"Active Python: {python_path}. {exc.__class__.__name__}: {exc}"
+        )
+    if installed_at:
+        return (
+            f"reportlab is installed at '{installed_at}', but portrait report imports failed under "
+            f"'{python_path}': {exc.__class__.__name__}: {exc}"
+        )
+    return (
+        "Portrait report imports failed while loading reportlab support. "
+        f"Active Python: {python_path}. {exc.__class__.__name__}: {exc}"
+    )
+
+
 def _reportlab_imports() -> dict[str, Any]:
     try:
-        from reportlab.lib import colors  # type: ignore
-        from reportlab.lib.enums import TA_CENTER, TA_LEFT  # type: ignore
-        from reportlab.lib.pagesizes import landscape, letter, tabloid  # type: ignore
-        from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet  # type: ignore
-        from reportlab.lib.units import inch  # type: ignore
-        from reportlab.platypus import KeepTogether, PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle  # type: ignore
+        reportlab = importlib.import_module("reportlab")  # type: ignore
     except Exception as exc:
-        raise RuntimeError("reportlab is required to build formatted portrait report pages.") from exc
+        raise RuntimeError(_format_reportlab_import_failure(exc)) from exc
+    reportlab_path = str(getattr(reportlab, "__file__", "") or "").strip()
+    try:
+        colors = importlib.import_module("reportlab.lib.colors")  # type: ignore
+        enums = importlib.import_module("reportlab.lib.enums")  # type: ignore
+        pagesizes = importlib.import_module("reportlab.lib.pagesizes")  # type: ignore
+        styles = importlib.import_module("reportlab.lib.styles")  # type: ignore
+        units = importlib.import_module("reportlab.lib.units")  # type: ignore
+        platypus = importlib.import_module("reportlab.platypus")  # type: ignore
+    except Exception as exc:
+        raise RuntimeError(_format_reportlab_import_failure(exc, reportlab_path=reportlab_path)) from exc
     return {
         "colors": colors,
-        "TA_CENTER": TA_CENTER,
-        "TA_LEFT": TA_LEFT,
-        "letter": letter,
-        "landscape": landscape,
-        "tabloid": tabloid,
-        "ParagraphStyle": ParagraphStyle,
-        "getSampleStyleSheet": getSampleStyleSheet,
-        "inch": inch,
-        "KeepTogether": KeepTogether,
-        "PageBreak": PageBreak,
-        "Paragraph": Paragraph,
-        "SimpleDocTemplate": SimpleDocTemplate,
-        "Spacer": Spacer,
-        "Table": Table,
-        "TableStyle": TableStyle,
+        "TA_CENTER": enums.TA_CENTER,
+        "TA_LEFT": enums.TA_LEFT,
+        "letter": pagesizes.letter,
+        "landscape": pagesizes.landscape,
+        "tabloid": pagesizes.tabloid,
+        "ParagraphStyle": styles.ParagraphStyle,
+        "getSampleStyleSheet": styles.getSampleStyleSheet,
+        "inch": units.inch,
+        "KeepTogether": platypus.KeepTogether,
+        "PageBreak": platypus.PageBreak,
+        "Paragraph": platypus.Paragraph,
+        "SimpleDocTemplate": platypus.SimpleDocTemplate,
+        "Spacer": platypus.Spacer,
+        "Table": platypus.Table,
+        "TableStyle": platypus.TableStyle,
     }
 
 
