@@ -1383,6 +1383,40 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         self.assertIn("reportlab is required to build formatted portrait report pages.", msg)
         self.assertIn(sys.executable, msg)
 
+    def test_reportlab_imports_accepts_uppercase_tabloid_pagesize(self) -> None:
+        fake_modules = {
+            "reportlab": SimpleNamespace(__file__="C:/fake/site-packages/reportlab/__init__.py"),
+            "reportlab.lib.colors": _FakeColors,
+            "reportlab.lib.enums": SimpleNamespace(TA_CENTER="CENTER", TA_LEFT="LEFT"),
+            "reportlab.lib.pagesizes": SimpleNamespace(
+                landscape=lambda value: ("landscape", value),
+                letter=(1, 2),
+                TABLOID=(3, 4),
+            ),
+            "reportlab.lib.styles": SimpleNamespace(ParagraphStyle=object, getSampleStyleSheet=lambda: {}),
+            "reportlab.lib.units": SimpleNamespace(inch=1.0),
+            "reportlab.platypus": SimpleNamespace(
+                KeepTogether=object,
+                PageBreak=object,
+                Paragraph=object,
+                SimpleDocTemplate=object,
+                Spacer=object,
+                Table=object,
+                TableStyle=object,
+            ),
+        }
+
+        def _fake_import(name: str):
+            if name in fake_modules:
+                return fake_modules[name]
+            raise AssertionError(f"Unexpected module import: {name}")
+
+        with mock.patch.object(tar.importlib, "import_module", side_effect=_fake_import):
+            rl = tar._reportlab_imports()
+
+        self.assertEqual((1, 2), rl["letter"])
+        self.assertEqual((3, 4), rl["tabloid"])
+
     def test_reportlab_imports_surfaces_nested_dependency_failure(self) -> None:
         fake_modules = {
             "reportlab": SimpleNamespace(__file__="C:/fake/site-packages/reportlab/__init__.py"),

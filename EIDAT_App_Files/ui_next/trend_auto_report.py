@@ -2299,6 +2299,13 @@ def _format_reportlab_import_failure(exc: BaseException, *, reportlab_path: str 
 
 
 def _reportlab_imports() -> dict[str, Any]:
+    def _page_size_attr(module: Any, *names: str) -> Any:
+        for name in names:
+            if hasattr(module, name):
+                return getattr(module, name)
+        joined = ", ".join(names)
+        raise AttributeError(f"reportlab.lib.pagesizes is missing all expected attributes: {joined}")
+
     try:
         reportlab = importlib.import_module("reportlab")  # type: ignore
     except Exception as exc:
@@ -2311,15 +2318,17 @@ def _reportlab_imports() -> dict[str, Any]:
         styles = importlib.import_module("reportlab.lib.styles")  # type: ignore
         units = importlib.import_module("reportlab.lib.units")  # type: ignore
         platypus = importlib.import_module("reportlab.platypus")  # type: ignore
+        letter = _page_size_attr(pagesizes, "letter", "LETTER")
+        tabloid = _page_size_attr(pagesizes, "tabloid", "TABLOID")
     except Exception as exc:
         raise RuntimeError(_format_reportlab_import_failure(exc, reportlab_path=reportlab_path)) from exc
     return {
         "colors": colors,
         "TA_CENTER": enums.TA_CENTER,
         "TA_LEFT": enums.TA_LEFT,
-        "letter": pagesizes.letter,
+        "letter": letter,
         "landscape": pagesizes.landscape,
-        "tabloid": pagesizes.tabloid,
+        "tabloid": tabloid,
         "ParagraphStyle": styles.ParagraphStyle,
         "getSampleStyleSheet": styles.getSampleStyleSheet,
         "inch": units.inch,
