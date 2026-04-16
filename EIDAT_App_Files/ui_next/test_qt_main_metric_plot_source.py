@@ -1,8 +1,11 @@
+import json
 import os
+import sqlite3
 import shutil
 import sys
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
@@ -16,13 +19,168 @@ if str(APP_ROOT) not in sys.path:
 
 try:
     from PySide6 import QtWidgets
+    from ui_next import backend
     from ui_next.qt_main import TestDataTrendDialog
 except Exception:  # pragma: no cover - optional dependency guard for local runs
     QtWidgets = None  # type: ignore[assignment]
+    backend = None  # type: ignore[assignment]
     TestDataTrendDialog = None  # type: ignore[assignment]
 
 
-@unittest.skipIf(QtWidgets is None or TestDataTrendDialog is None, "PySide6 is required")
+class _DummyLine:
+    def get_color(self) -> str:
+        return "#1f77b4"
+
+
+class _DummyAxes:
+    def __init__(self) -> None:
+        self.plot_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def clear(self) -> None:
+        return None
+
+    def set_title(self, _value: str) -> None:
+        return None
+
+    def set_xlabel(self, _value: str) -> None:
+        return None
+
+    def set_ylabel(self, _value: str) -> None:
+        return None
+
+    def plot(self, *args: object, **kwargs: object):
+        self.plot_calls.append((args, dict(kwargs)))
+        return [_DummyLine()]
+
+    def set_xlim(self, *_args) -> None:
+        return None
+
+    def set_xticks(self, *_args) -> None:
+        return None
+
+    def set_xticklabels(self, *_args, **_kwargs) -> None:
+        return None
+
+    def grid(self, *_args, **_kwargs) -> None:
+        return None
+
+
+class _DummyFigure:
+    def tight_layout(self) -> None:
+        return None
+
+
+class _DummyCanvas:
+    def draw(self) -> None:
+        return None
+
+
+class _DummyComboBox:
+    def findData(self, _value: object) -> int:
+        return -1
+
+    def setCurrentIndex(self, _index: int) -> None:
+        return None
+
+    def currentData(self) -> str:
+        return "sequence"
+
+    def currentText(self) -> str:
+        return "sequence"
+
+
+def _create_plot_filter_db(tmpdir: str) -> Path:
+    db_path = Path(tmpdir) / "plot_filter_cache.sqlite3"
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        backend._ensure_test_data_impl_tables(conn)
+        conn.execute(
+            "INSERT OR REPLACE INTO td_runs(run_name, default_x, display_name, run_type, control_period, pulse_width) VALUES (?, ?, ?, ?, ?, ?)",
+            ("CondA", "time", "Condition A", "PM", 10.0, 0.5),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO td_columns_calc(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
+            ("CondA", "Pressure", "psi", "y"),
+        )
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO td_condition_observations(
+                observation_id, serial, run_name, program_title, source_run_name, run_type, pulse_width,
+                control_period, suppression_voltage, valve_voltage, source_mtime_ns, computed_epoch_ns
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("agg-1", "SN-001", "CondA", "Program Alpha", "Aggregate", "PM", 0.5, 10.0, 5.0, 28.0, 1, 1),
+        )
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO td_metrics_calc(
+                observation_id, serial, run_name, column_name, stat, value_num, computed_epoch_ns, source_mtime_ns,
+                program_title, source_run_name
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("agg-1", "SN-001", "CondA", "Pressure", "mean", 1.5, 1, 1, "Program Alpha", "Aggregate"),
+        )
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO td_condition_observations_sequences(
+                observation_id, serial, run_name, program_title, source_run_name, run_type, pulse_width,
+                control_period, suppression_voltage, valve_voltage, source_mtime_ns, computed_epoch_ns
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("seq-1", "SN-001", "CondA", "Program Alpha", "Seq-1", "PM", 0.5, 10.0, 5.0, 28.0, 1, 1),
+        )
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO td_metrics_calc_sequences(
+                observation_id, serial, run_name, column_name, stat, value_num, computed_epoch_ns, source_mtime_ns,
+                program_title, source_run_name
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("seq-1", "SN-001", "CondA", "Pressure", "mean", 1.0, 1, 1, "Program Alpha", "Seq-1"),
+        )
+        conn.execute(
+            f"""
+            INSERT OR REPLACE INTO {backend.TD_PLOTTER_CURVE_CATALOG_TABLE}(
+                run_name, parameter_name, units, x_axis_kind, display_name, source_kind, computed_epoch_ns
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("CondA", "Pressure", "psi", "time", "Pressure", "raw_cache", 1),
+        )
+        conn.execute(
+            f"""
+            INSERT OR REPLACE INTO {backend.TD_PLOTTER_OBSERVATIONS_TABLE}(
+                observation_id, run_name, serial, program_title, source_run_name, run_type, pulse_width,
+                control_period, suppression_voltage, valve_voltage, source_mtime_ns, computed_epoch_ns
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("seq-1", "CondA", "SN-001", "Program Alpha", "Seq-1", "PM", 0.5, 10.0, 5.0, 28.0, 1, 1),
+        )
+        conn.execute(
+            f"""
+            INSERT OR REPLACE INTO {backend.TD_PLOTTER_CURVES_TABLE}(
+                run_name, y_name, x_name, observation_id, serial, x_json, y_json, n_points,
+                source_mtime_ns, computed_epoch_ns, program_title, source_run_name
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "CondA",
+                "Pressure",
+                "time",
+                "seq-1",
+                "SN-001",
+                json.dumps([0.0, 1.0, 2.0]),
+                json.dumps([1.0, 1.1, 1.2]),
+                3,
+                1,
+                1,
+                "Program Alpha",
+                "Seq-1",
+            ),
+        )
+        conn.commit()
+    return db_path
+
+
+@unittest.skipIf(QtWidgets is None or TestDataTrendDialog is None or backend is None, "PySide6 is required")
 class TestQtMainMetricPlotSource(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -59,50 +217,45 @@ class TestQtMainMetricPlotSource(unittest.TestCase):
         if matches:
             matches[0].setSelected(True)
 
+    @staticmethod
+    def _prepare_plot_window(window: TestDataTrendDialog, db_path: Path, *, mode: str) -> _DummyAxes:
+        axes = _DummyAxes()
+        window._db_path = db_path
+        window._plot_ready = True
+        window._figure = _DummyFigure()
+        window._axes = axes
+        window._canvas = _DummyCanvas()
+        window._mode = str(mode)
+        window._highlight_sns = []
+        window._highlight_sn = ""
+        window._available_program_filters = ["Program Alpha"]
+        window._checked_program_filters = ["Program Alpha"]
+        window._available_serial_filter_rows = [{"serial": "SN-001", "program_title": "Program Alpha"}]
+        window._checked_serial_filters = ["SN-001"]
+        window._available_control_period_filters = []
+        window._checked_control_period_filters = []
+        window._available_suppression_voltage_filters = []
+        window._checked_suppression_voltage_filters = []
+        window._available_valve_voltage_filters = ["28"]
+        window._checked_valve_voltage_filters = ["28"]
+        window._serial_source_rows = [{"serial": "SN-001", "program_title": "Program Alpha"}]
+        window._serial_source_by_serial = {"SN-001": {"serial": "SN-001", "program_title": "Program Alpha"}}
+        window._global_filter_rows = [
+            {
+                "serial": "SN-001",
+                "program_title": "Program Alpha",
+                "source_run_name": "Seq-1",
+                "control_period": 10.0,
+                "suppression_voltage": 5.0,
+                "valve_voltage": 28.0,
+            }
+        ]
+        return axes
+
     def test_plot_metrics_uses_selected_metric_source_and_persists_it(self) -> None:
         window = self._make_window()
         try:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                class _DummyLine:
-                    def get_color(self) -> str:
-                        return "#1f77b4"
-
-                class _DummyAxes:
-                    def clear(self) -> None:
-                        return None
-
-                    def set_title(self, _value: str) -> None:
-                        return None
-
-                    def set_xlabel(self, _value: str) -> None:
-                        return None
-
-                    def set_ylabel(self, _value: str) -> None:
-                        return None
-
-                    def plot(self, *_args, **_kwargs):
-                        return [_DummyLine()]
-
-                    def set_xlim(self, *_args) -> None:
-                        return None
-
-                    def set_xticks(self, *_args) -> None:
-                        return None
-
-                    def set_xticklabels(self, *_args, **_kwargs) -> None:
-                        return None
-
-                    def grid(self, *_args, **_kwargs) -> None:
-                        return None
-
-                class _DummyFigure:
-                    def tight_layout(self) -> None:
-                        return None
-
-                class _DummyCanvas:
-                    def draw(self) -> None:
-                        return None
-
+            with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
                 db_path = Path(tmpdir) / "cache.sqlite3"
                 db_path.write_text("", encoding="utf-8")
                 window._db_path = db_path
@@ -191,40 +344,169 @@ class TestQtMainMetricPlotSource(unittest.TestCase):
     def test_open_selected_auto_plot_restores_metric_source(self) -> None:
         window = self._make_window()
         try:
-            with tempfile.TemporaryDirectory() as tmpdir:
+            with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
                 db_path = Path(tmpdir) / "cache.sqlite3"
                 db_path.write_text("", encoding="utf-8")
                 window._db_path = db_path
                 window._plot_ready = True
-                self._ensure_selected_item(window.list_stats, "Mean")
-                self._ensure_selected_item(window.list_y_metrics, "Pressure")
-                plot_sources: list[str] = []
-                plot_def = {
-                    "mode": "metrics",
-                    "selector_mode": "sequence",
-                    "selection_id": "sequence:CondA|Program Alpha|Seq-1",
-                    "stats": ["mean"],
-                    "y": ["Pressure"],
-                    "plot_bounds": False,
-                    "metric_plot_source": "all_sequences",
+                opened_graph_files: list[dict[str, object]] = []
+                graph_file = {
+                    "name": "Metric Graph",
+                    "global_selection": {
+                        "run_scope": "sequence",
+                        "selection_ids": [],
+                        "selection_labels": [],
+                        "filters": {
+                            "programs": [],
+                            "serials": [],
+                            "control_periods": [],
+                            "suppression_voltages": [],
+                            "valve_voltages": [],
+                        },
+                    },
+                    "plots": [
+                        {
+                            "name": "Pressure Mean",
+                            "plot_definition": {
+                                "mode": "metrics",
+                                "selector_mode": "sequence",
+                                "selection_id": "sequence:CondA|Program Alpha|Seq-1",
+                                "stats": ["mean"],
+                                "y": ["Pressure"],
+                                "plot_bounds": False,
+                                "metric_plot_source": "all_sequences",
+                            },
+                        }
+                    ],
                 }
 
                 with patch.object(
                     window,
-                    "_selection_from_plot_def",
-                    return_value={"mode": "sequence", "id": "sequence:CondA|Program Alpha|Seq-1"},
+                    "_normalize_auto_plot_global_selection",
+                    side_effect=lambda selection, default_to_current=True: dict(selection or {}),
                 ), patch.object(
-                    window, "_select_run_by_id", return_value=None
+                    window,
+                    "_open_auto_graph_file_viewer",
+                    side_effect=lambda normalized: opened_graph_files.append(dict(normalized or {})),
                 ), patch.object(
-                    window, "_set_mode", side_effect=lambda mode: setattr(window, "_mode", str(mode))
-                ), patch.object(
-                    window, "_plot_metrics", side_effect=lambda: plot_sources.append(window._selected_metric_plot_source())
+                    window, "_refresh_auto_plots_list", return_value=None
                 ):
-                    window._set_metric_plot_source("aggregate")
-                    window._open_selected_auto_plot(plot_def=plot_def)
+                    window._open_selected_auto_plot(plot_def=graph_file)
 
-                self.assertEqual(plot_sources, ["all_sequences"])
-                self.assertEqual(window._selected_metric_plot_source(), "all_sequences")
+                self.assertEqual(len(opened_graph_files), 1)
+                opened_plots = opened_graph_files[0].get("plots") or []
+                self.assertEqual(len(opened_plots), 1)
+                plot_definition = dict((opened_plots[0] or {}).get("plot_definition") or {})
+                self.assertEqual(plot_definition.get("metric_plot_source"), "all_sequences")
+        finally:
+            window.close()
+            tmpdir = getattr(window, "_test_tmpdir", "")
+            if tmpdir:
+                shutil.rmtree(str(tmpdir), ignore_errors=True)
+
+    def test_plot_metrics_keeps_visible_rows_when_live_valve_filter_is_active(self) -> None:
+        window = self._make_window()
+        try:
+            with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+                db_path = _create_plot_filter_db(tmpdir)
+                axes = self._prepare_plot_window(window, db_path, mode="metrics")
+                self._ensure_selected_item(window.list_stats, "Mean")
+                self._ensure_selected_item(window.list_y_metrics, "Pressure")
+                selection = {
+                    "mode": "sequence",
+                    "id": "sequence:CondA|Program Alpha|Seq-1",
+                    "run_name": "CondA",
+                    "program_title": "Program Alpha",
+                    "source_run_name": "Seq-1",
+                    "member_runs": ["CondA"],
+                    "member_sequences": ["Seq-1"],
+                }
+
+                with patch.object(window, "_current_run_selection", return_value=selection), patch.object(
+                    window, "_current_run_selections", return_value=[selection]
+                ), patch.object(
+                    window, "_current_member_runs", return_value=["CondA"]
+                ), patch.object(
+                    window, "_ensure_main_axes", return_value=None
+                ), patch.object(
+                    window, "_metric_bounds_for_run", return_value={}
+                ), patch.object(
+                    window, "_compose_run_title", return_value="Metric Plot"
+                ), patch.object(
+                    window, "_apply_metric_program_segments", return_value=None
+                ), patch.object(
+                    window, "_apply_interactive_legend_policy", return_value=[]
+                ), patch.object(
+                    window, "_apply_plot_view_bands_to_axes", return_value=None
+                ), patch.object(
+                    window, "_refresh_plot_note", return_value=None
+                ), patch.object(
+                    window, "_capture_main_plot_base_view", return_value=None
+                ), patch.object(
+                    window, "_update_perf_primary_equation_banner", return_value=None
+                ), patch.object(
+                    window, "_refresh_stats_preview", return_value=None
+                ), patch(
+                    "ui_next.qt_main.QtWidgets.QMessageBox.information"
+                ) as info_mock:
+                    window._set_metric_plot_source("aggregate")
+                    window._plot_metrics()
+
+                info_mock.assert_not_called()
+                self.assertEqual(window._last_plot_def["mode"], "metrics")
+                self.assertTrue(axes.plot_calls)
+        finally:
+            window.close()
+            tmpdir = getattr(window, "_test_tmpdir", "")
+            if tmpdir:
+                shutil.rmtree(str(tmpdir), ignore_errors=True)
+
+    def test_plot_curves_keeps_visible_rows_when_live_valve_filter_is_active(self) -> None:
+        window = self._make_window()
+        try:
+            with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+                db_path = _create_plot_filter_db(tmpdir)
+                axes = self._prepare_plot_window(window, db_path, mode="curves")
+                selection = {
+                    "mode": "sequence",
+                    "id": "sequence:CondA|Program Alpha|Seq-1",
+                    "run_name": "CondA",
+                    "program_title": "Program Alpha",
+                    "source_run_name": "Seq-1",
+                    "member_runs": ["CondA"],
+                    "member_sequences": ["Seq-1"],
+                }
+
+                with patch.object(window, "_current_run_selection", return_value=selection), patch.object(
+                    window, "_current_member_runs", return_value=["CondA"]
+                ), patch.object(
+                    window, "_ensure_main_axes", return_value=None
+                ), patch.object(
+                    window, "_current_curve_y_name", return_value="Pressure"
+                ), patch.object(
+                    window, "_current_curve_x_key", return_value="time"
+                ), patch.object(
+                    window, "_current_curve_x_label", return_value="Time"
+                ), patch.object(
+                    window, "_resolve_curve_x_key", return_value="time"
+                ), patch.object(
+                    window, "_compose_run_title", return_value="Curve Plot"
+                ), patch.object(
+                    window, "_apply_interactive_legend_policy", return_value=[]
+                ), patch.object(
+                    window, "_apply_plot_view_bands_to_axes", return_value=None
+                ), patch.object(
+                    window, "_capture_main_plot_base_view", return_value=None
+                ), patch.object(
+                    window, "_populate_stats_table", return_value=None
+                ), patch(
+                    "ui_next.qt_main.QtWidgets.QMessageBox.information"
+                ) as info_mock:
+                    window._plot_curves()
+
+                info_mock.assert_not_called()
+                self.assertEqual(window._last_plot_def["mode"], "curves")
+                self.assertTrue(axes.plot_calls)
         finally:
             window.close()
             tmpdir = getattr(window, "_test_tmpdir", "")

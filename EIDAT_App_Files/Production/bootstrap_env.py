@@ -23,6 +23,7 @@ PROFILE_REQUIRED_IMPORTS: dict[str, list[str]] = {
         "xlsxwriter",  # XlsxWriter package
         "matplotlib",
         "scipy",
+        "reportlab",
     ],
     # Full environment (admin/extraction tooling).
     "full": [
@@ -34,6 +35,7 @@ PROFILE_REQUIRED_IMPORTS: dict[str, list[str]] = {
         "xlsxwriter",
         "matplotlib",
         "scipy",
+        "reportlab",
         "cv2",  # opencv-python-headless
     ],
 }

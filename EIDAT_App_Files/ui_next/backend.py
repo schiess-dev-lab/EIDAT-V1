@@ -13742,6 +13742,7 @@ def _td_try_load_plotter_curves(
                 COALESCE(c.source_run_name, ''),
                 o.control_period,
                 o.suppression_voltage,
+                o.valve_voltage,
                 c.x_json,
                 c.y_json
             FROM {TD_PLOTTER_CURVES_TABLE} c
@@ -13774,7 +13775,7 @@ def _td_try_load_plotter_curves(
         curve_sql.append(" ORDER BY c.serial, c.observation_id")
         rows = conn.execute("".join(curve_sql), tuple(curve_params)).fetchall()
     out: list[dict] = []
-    for observation_id, sn, program_txt, source_run_txt, control_period, suppression_voltage, xj, yj in rows:
+    for observation_id, sn, program_txt, source_run_txt, control_period, suppression_voltage, valve_voltage, xj, yj in rows:
         try:
             xs = json.loads(xj or "[]")
             ys = json.loads(yj or "[]")
@@ -13791,6 +13792,7 @@ def _td_try_load_plotter_curves(
                 "source_run_name": str(source_run_txt or "").strip(),
                 "control_period": control_period,
                 "suppression_voltage": suppression_voltage,
+                "valve_voltage": valve_voltage,
                 "x": xs,
                 "y": ys,
             }
@@ -13992,6 +13994,7 @@ def _td_load_legacy_curves(
             "COALESCE(c.source_run_name, '')" if has_src else "'' AS source_run_name",
             "o.control_period" if obs_table else "NULL AS control_period",
             "o.suppression_voltage" if obs_table and "suppression_voltage" in obs_cols else "NULL AS suppression_voltage",
+            "o.valve_voltage" if obs_table and "valve_voltage" in obs_cols else "NULL AS valve_voltage",
             "c.x_json",
             "c.y_json",
         ]
@@ -14023,7 +14026,7 @@ def _td_load_legacy_curves(
         sql.append(" ORDER BY c.serial")
         rows = conn.execute("".join(sql), tuple(params)).fetchall()
     out: list[dict] = []
-    for observation_id, sn, program_txt, source_run_txt, control_period, suppression_voltage, xj, yj in rows:
+    for observation_id, sn, program_txt, source_run_txt, control_period, suppression_voltage, valve_voltage, xj, yj in rows:
         try:
             xs = json.loads(xj or "[]")
             ys = json.loads(yj or "[]")
@@ -14039,6 +14042,7 @@ def _td_load_legacy_curves(
                 "source_run_name": str(source_run_txt or "").strip(),
                 "control_period": control_period,
                 "suppression_voltage": suppression_voltage,
+                "valve_voltage": valve_voltage,
                 "x": xs,
                 "y": ys,
             }
@@ -14088,6 +14092,7 @@ def _td_try_load_raw_curves(
                 COALESCE(c.source_run_name, ''),
                 o.control_period,
                 o.suppression_voltage,
+                o.valve_voltage,
                 c.x_json,
                 c.y_json
             FROM {_quote_ident(table_name)} c
@@ -14124,7 +14129,7 @@ def _td_try_load_raw_curves(
             if not _td_curve_schema_fallback_allowed(exc):
                 raise
             legacy_sql = [
-                f"SELECT '' AS observation_id, serial, '' AS program_title, '' AS source_run_name, NULL AS control_period, NULL AS suppression_voltage, x_json, y_json FROM {_quote_ident(table_name)} WHERE 1=1"
+                f"SELECT '' AS observation_id, serial, '' AS program_title, '' AS source_run_name, NULL AS control_period, NULL AS suppression_voltage, NULL AS valve_voltage, x_json, y_json FROM {_quote_ident(table_name)} WHERE 1=1"
             ]
             legacy_params: list[object] = []
             if want:
@@ -14134,7 +14139,7 @@ def _td_try_load_raw_curves(
             legacy_sql.append(" ORDER BY serial")
             rows = conn.execute("".join(legacy_sql), tuple(legacy_params)).fetchall()
     out: list[dict] = []
-    for observation_id, sn, program_txt, source_run_txt, control_period, suppression_voltage, xj, yj in rows:
+    for observation_id, sn, program_txt, source_run_txt, control_period, suppression_voltage, valve_voltage, xj, yj in rows:
         try:
             xs = json.loads(xj or "[]")
             ys = json.loads(yj or "[]")
@@ -14151,6 +14156,7 @@ def _td_try_load_raw_curves(
                 "source_run_name": str(source_run_txt or "").strip(),
                 "control_period": control_period,
                 "suppression_voltage": suppression_voltage,
+                "valve_voltage": valve_voltage,
                 "x": xs,
                 "y": ys,
             }
@@ -14424,7 +14430,8 @@ def td_load_metric_series(
             COALESCE(m.source_run_name, ''),
             COALESCE(o.run_type, ''),
             o.control_period,
-            o.suppression_voltage
+            o.suppression_voltage,
+            o.valve_voltage
         FROM {metrics_table} m
         LEFT JOIN {observations_table} o
           ON o.observation_id = m.observation_id
@@ -14471,6 +14478,7 @@ def td_load_metric_series(
             "run_type": str(r[5] or "").strip(),
             "control_period": r[6],
             "suppression_voltage": r[7],
+            "valve_voltage": r[8],
         }
         for r in rows
         if str(r[0] or "").strip() and str(r[1] or "").strip()

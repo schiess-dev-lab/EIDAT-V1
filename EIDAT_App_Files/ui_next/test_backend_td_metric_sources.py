@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import sys
 import tempfile
@@ -82,6 +83,139 @@ def _create_metric_source_db(tmpdir: str) -> Path:
     return db_path
 
 
+def _create_plotter_curve_db(tmpdir: str) -> Path:
+    db_path = Path(tmpdir) / "plotter_curves.sqlite3"
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        backend._ensure_test_data_impl_tables(conn)
+        conn.execute(
+            f"""
+            INSERT OR REPLACE INTO {backend.TD_PLOTTER_CURVE_CATALOG_TABLE}(
+                run_name, parameter_name, units, x_axis_kind, display_name, source_kind, computed_epoch_ns
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("CondA", "Pressure", "psi", "time", "Pressure", "raw_cache", 1),
+        )
+        conn.execute(
+            f"""
+            INSERT OR REPLACE INTO {backend.TD_PLOTTER_OBSERVATIONS_TABLE}(
+                observation_id, run_name, serial, program_title, source_run_name, run_type, pulse_width,
+                control_period, suppression_voltage, valve_voltage, source_mtime_ns, computed_epoch_ns
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("plot-obs-1", "CondA", "SN-001", "Program Alpha", "Seq-1", "PM", 0.5, 10.0, 5.0, 28.0, 1, 1),
+        )
+        conn.execute(
+            f"""
+            INSERT OR REPLACE INTO {backend.TD_PLOTTER_CURVES_TABLE}(
+                run_name, y_name, x_name, observation_id, serial, x_json, y_json, n_points,
+                source_mtime_ns, computed_epoch_ns, program_title, source_run_name
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "CondA",
+                "Pressure",
+                "time",
+                "plot-obs-1",
+                "SN-001",
+                json.dumps([0.0, 1.0, 2.0]),
+                json.dumps([1.0, 1.1, 1.2]),
+                3,
+                1,
+                1,
+                "Program Alpha",
+                "Seq-1",
+            ),
+        )
+        conn.commit()
+    return db_path
+
+
+def _create_raw_curve_db(tmpdir: str) -> Path:
+    db_path = Path(tmpdir) / "raw_curves.sqlite3"
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        backend._ensure_test_data_raw_cache_tables(conn)
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO td_raw_condition_observations(
+                observation_id, run_name, serial, program_title, source_run_name, run_type, pulse_width,
+                control_period, suppression_voltage, valve_voltage, source_mtime_ns, computed_epoch_ns
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("raw-obs-1", "CondA", "SN-001", "Program Alpha", "Seq-1", "PM", 0.5, 10.0, 5.0, 28.0, 1, 1),
+        )
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO td_raw_curve_catalog(
+                run_name, parameter_name, units, x_axis_kind, table_name, display_name, source_kind, computed_epoch_ns
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("CondA", "Pressure", "psi", "time", "td_curves_raw", "Pressure", "raw_cache", 1),
+        )
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO td_curves_raw(
+                run_name, y_name, x_name, observation_id, serial, x_json, y_json, n_points,
+                source_mtime_ns, computed_epoch_ns, program_title, source_run_name
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "CondA",
+                "Pressure",
+                "time",
+                "raw-obs-1",
+                "SN-001",
+                json.dumps([0.0, 1.0, 2.0]),
+                json.dumps([1.0, 1.1, 1.2]),
+                3,
+                1,
+                1,
+                "Program Alpha",
+                "Seq-1",
+            ),
+        )
+        conn.commit()
+    return db_path
+
+
+def _create_legacy_curve_db(tmpdir: str) -> Path:
+    db_path = Path(tmpdir) / "legacy_curves.sqlite3"
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        backend._ensure_test_data_tables(conn)
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO td_condition_observations(
+                observation_id, serial, run_name, program_title, source_run_name, run_type, pulse_width,
+                control_period, suppression_voltage, valve_voltage, source_mtime_ns, computed_epoch_ns
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("legacy-obs-1", "SN-001", "CondA", "Program Alpha", "Seq-1", "PM", 0.5, 10.0, 5.0, 28.0, 1, 1),
+        )
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO td_curves(
+                run_name, y_name, x_name, observation_id, serial, x_json, y_json, n_points,
+                source_mtime_ns, computed_epoch_ns, program_title, source_run_name
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "CondA",
+                "Pressure",
+                "time",
+                "legacy-obs-1",
+                "SN-001",
+                json.dumps([0.0, 1.0, 2.0]),
+                json.dumps([1.0, 1.1, 1.2]),
+                3,
+                1,
+                1,
+                "Program Alpha",
+                "Seq-1",
+            ),
+        )
+        conn.commit()
+    return db_path
+
+
 class TestBackendTdMetricSources(unittest.TestCase):
     def test_aggregate_metric_source_ignores_sequence_filters(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
@@ -98,6 +232,7 @@ class TestBackendTdMetricSources(unittest.TestCase):
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["observation_id"], "agg-1")
             self.assertEqual(rows[0]["source_run_name"], "Aggregate")
+            self.assertEqual(rows[0]["valve_voltage"], 28.0)
 
     def test_all_sequences_metric_source_returns_per_sequence_rows_and_filters(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
@@ -110,6 +245,7 @@ class TestBackendTdMetricSources(unittest.TestCase):
                 metric_source=backend.TD_METRIC_PLOT_SOURCE_ALL_SEQUENCES,
             )
             self.assertEqual([row["observation_id"] for row in rows], ["seq-1", "seq-2"])
+            self.assertEqual([row["valve_voltage"] for row in rows], [28.0, 28.0])
 
             filtered = backend.td_load_metric_series(
                 db_path,
@@ -123,6 +259,7 @@ class TestBackendTdMetricSources(unittest.TestCase):
             self.assertEqual(len(filtered), 1)
             self.assertEqual(filtered[0]["observation_id"], "seq-1")
             self.assertEqual(filtered[0]["source_run_name"], "Seq-1")
+            self.assertEqual(filtered[0]["valve_voltage"], 28.0)
 
     def test_run_selection_views_and_filter_rows_prefer_sequence_observations(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
@@ -156,6 +293,7 @@ class TestBackendTdMetricSources(unittest.TestCase):
             self.assertEqual(len(aggregate_rows), 1)
             self.assertEqual(aggregate_rows[0]["observation_id"], "agg-ss-1")
             self.assertEqual(aggregate_rows[0]["run_type"], "SS")
+            self.assertIsNone(aggregate_rows[0]["valve_voltage"])
 
             sequence_rows = backend.td_load_metric_series(
                 db_path,
@@ -169,6 +307,7 @@ class TestBackendTdMetricSources(unittest.TestCase):
             self.assertEqual(sequence_rows[0]["observation_id"], "seq-ss-1")
             self.assertEqual(sequence_rows[0]["source_run_name"], "Seq-SS-1")
             self.assertEqual(sequence_rows[0]["run_type"], "SS")
+            self.assertIsNone(sequence_rows[0]["valve_voltage"])
 
     def test_control_period_filter_does_not_exclude_steady_state_sequence_rows(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
@@ -183,6 +322,7 @@ class TestBackendTdMetricSources(unittest.TestCase):
             )
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["observation_id"], "seq-ss-1")
+            self.assertIsNone(rows[0]["valve_voltage"])
 
     def test_performance_run_type_modes_still_report_steady_state_and_pulsed_mode(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
@@ -191,6 +331,49 @@ class TestBackendTdMetricSources(unittest.TestCase):
                 backend.td_list_performance_run_type_modes(db_path),
                 ["steady_state", "pulsed_mode"],
             )
+
+    def test_curve_loaders_return_valve_voltage_across_plotter_raw_and_legacy_paths(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            plotter_db = _create_plotter_curve_db(tmpdir)
+            found_plotter, plotter_rows = backend._td_try_load_plotter_curves(
+                plotter_db,
+                "CondA",
+                "Pressure",
+                "time",
+                serials=["SN-001"],
+                program_title="Program Alpha",
+                source_run_name="Seq-1",
+            )
+            self.assertTrue(found_plotter)
+            self.assertEqual(len(plotter_rows), 1)
+            self.assertEqual(plotter_rows[0]["valve_voltage"], 28.0)
+
+            raw_db = _create_raw_curve_db(tmpdir)
+            found_raw, raw_rows = backend._td_try_load_raw_curves(
+                raw_db,
+                "CondA",
+                "Pressure",
+                "time",
+                serials=["SN-001"],
+                program_title="Program Alpha",
+                source_run_name="Seq-1",
+            )
+            self.assertTrue(found_raw)
+            self.assertEqual(len(raw_rows), 1)
+            self.assertEqual(raw_rows[0]["valve_voltage"], 28.0)
+
+            legacy_db = _create_legacy_curve_db(tmpdir)
+            legacy_rows = backend._td_load_legacy_curves(
+                legacy_db,
+                "CondA",
+                "Pressure",
+                "time",
+                serials=["SN-001"],
+                program_title="Program Alpha",
+                source_run_name="Seq-1",
+            )
+            self.assertEqual(len(legacy_rows), 1)
+            self.assertEqual(legacy_rows[0]["valve_voltage"], 28.0)
 
 
 if __name__ == "__main__":
