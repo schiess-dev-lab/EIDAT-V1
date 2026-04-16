@@ -8092,7 +8092,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
         splitter.addWidget(left)
 
-        # Right: Report analysis params (checkbox lists)
+        # Right: Certification parameter selection (checkbox lists)
         right = QtWidgets.QFrame()
         right_l = QtWidgets.QVBoxLayout(right)
         right_l.setContentsMargins(10, 10, 10, 10)
@@ -8101,17 +8101,21 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         lbl_analysis_title.setStyleSheet("font-size: 12px; font-weight: 800; color: #000000;")
         right_l.addWidget(lbl_analysis_title)
 
-        ed_param_filter = QtWidgets.QLineEdit()
+        ed_param_filter = QtWidgets.QLineEdit(dlg)
 
         ed_param_filter.setPlaceholderText("Filter params…")
-        list_params = QtWidgets.QListWidget()
+        list_params = QtWidgets.QListWidget(dlg)
+        list_params.setObjectName("auto_report_certification_params")
 
-        lbl_params_auto = QtWidgets.QLabel("Selected params: —")
+        lbl_params_auto = QtWidgets.QLabel("Selected certification params: —")
+        lbl_params_auto.setObjectName("auto_report_certification_params_summary")
         lbl_params_auto.setStyleSheet("color: #64748b; font-size: 11px;")
         lbl_params_auto.setWordWrap(True)
         row_params = QtWidgets.QHBoxLayout()
-        row_params.addWidget(QtWidgets.QLabel("Report Analysis Params (required)"))
-        btn_params_popup = QtWidgets.QPushButton("Select Params...")
+        lbl_params_title = QtWidgets.QLabel("Certification Parameter Selection (required)")
+        lbl_params_title.setObjectName("auto_report_certification_params_title")
+        row_params.addWidget(lbl_params_title)
+        btn_params_popup = QtWidgets.QPushButton("Select Certification Parameters...")
         row_params.addWidget(btn_params_popup)
         row_params.addStretch(1)
         right_l.addLayout(row_params)
@@ -8403,14 +8407,14 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
         def _update_params_label():
             sel = _collect_checked(list_params)
-            lbl_params_auto.setText(f"Selected params: {_selection_summary(sel, list_params.count())}")
+            lbl_params_auto.setText(f"Selected certification params: {_selection_summary(sel, list_params.count())}")
 
         def _update_metric_params_label():
             params_sel = _collect_checked(list_params)
             stats_sel = _collect_checked(list_metric_stats)
             stats_text = ", ".join(stats_sel) if stats_sel else "none"
             lbl_metrics_auto.setText(
-                f"Metric pages use report params: {_selection_summary(params_sel, list_params.count())} | Stats: {stats_text}"
+                f"Metric pages use certification params: {_selection_summary(params_sel, list_params.count())} | Stats: {stats_text}"
             )
 
         def _refresh_certifying_program_options() -> None:
@@ -8950,9 +8954,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
         def _open_params_popup() -> None:
             _open_checklist_popup(
-                title_text="Report Analysis Params",
+                title_text="Certification Parameter Selection",
                 target_list=list_params,
-                filter_placeholder="Filter params...",
+                filter_placeholder="Filter certification parameters...",
                 extra_apply=lambda _ctx: (_update_params_label(), _refresh_perf_eq_options()),
             )
 
@@ -9316,7 +9320,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 return
             params_sel = _collect_checked(list_params)
             if not params_sel:
-                QtWidgets.QMessageBox.information(dlg, "Auto Report", "Select at least one report analysis parameter.")
+                QtWidgets.QMessageBox.information(dlg, "Auto Report", "Select at least one certification parameter.")
                 return
             metric_params_sel = list(params_sel)
             metric_stats_sel = _collect_checked(list_metric_stats)

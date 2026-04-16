@@ -438,7 +438,7 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         )
 
     def test_build_per_serial_comparison_rows_tracks_initial_and_final_values(self) -> None:
-        ctx = {"filter_state": {}}
+        ctx = {"filter_state": {}, "be": object(), "db_path": Path("fake.sqlite3"), "options": {}}
         pair_specs = [
             {
                 "pair_id": "pair-1",
@@ -457,7 +457,7 @@ class TestTrendAutoReportFilters(unittest.TestCase):
                     "master_y": [10.0, 20.0],
                     "y_resampled_by_sn": {
                         "SN-001": [8.0, 12.0],
-                        "SN-002": [18.0, 22.0],
+                        "SN-002": [18.0, 42.0],
                     },
                 },
                 "regrade_plot_payloads": {
@@ -465,7 +465,7 @@ class TestTrendAutoReportFilters(unittest.TestCase):
                         "master_y": [14.0, 22.0],
                         "y_resampled_by_sn": {
                             "SN-001": [12.0, 16.0],
-                            "SN-002": [20.0, 24.0],
+                            "SN-002": [20.0, 32.0],
                         },
                     }
                 },
@@ -474,37 +474,49 @@ class TestTrendAutoReportFilters(unittest.TestCase):
                 "valve_voltage_label": "28",
             }
         ]
-        rows = tar._tar_build_per_serial_comparison_rows(
-            ctx,
-            pair_specs=pair_specs,
-            all_serials=["SN-001", "SN-002"],
-            hi=["SN-001", "SN-002"],
-            initial_grade_map_by_pair_serial={
-                ("pair-1", "SN-001"): "PASS",
-                ("pair-1", "SN-002"): "PASS",
-            },
-            final_grade_map_by_pair_serial={
-                ("pair-1", "SN-001"): "WATCH",
-                ("pair-1", "SN-002"): "PASS",
-            },
-            finding_by_pair_serial={
-                ("pair-1", "SN-001"): {
-                    "regrade_applied": True,
-                    "regrade_suppression_voltage_label": "5",
-                    "regrade_valve_voltage_label": "28",
-                    "regrade_condition_key": tar._tar_condition_combo_key("5", "28"),
-                }
-            },
-        )
+        def _metric_map_side_effect(_ctx, pair_spec, stat, *, filter_state_override=None):
+            self.assertEqual(stat, "mean")
+            self.assertEqual(str(pair_spec.get("pair_id") or ""), "pair-1")
+            suppression = tuple((filter_state_override or {}).get("suppression_voltages") or [])
+            valve = tuple((filter_state_override or {}).get("valve_voltages") or [])
+            if suppression == ("5",) and valve == ("28",):
+                return {"SN-001": 14.0, "SN-002": 26.0}
+            return {"SN-001": 10.0, "SN-002": 30.0}
+
+        with mock.patch.object(tar, "_tar_metric_map_for_pair", side_effect=_metric_map_side_effect):
+            rows = tar._tar_build_per_serial_comparison_rows(
+                ctx,
+                pair_specs=pair_specs,
+                all_serials=["SN-001", "SN-002"],
+                hi=["SN-001", "SN-002"],
+                initial_grade_map_by_pair_serial={
+                    ("pair-1", "SN-001"): "PASS",
+                    ("pair-1", "SN-002"): "PASS",
+                },
+                final_grade_map_by_pair_serial={
+                    ("pair-1", "SN-001"): "WATCH",
+                    ("pair-1", "SN-002"): "PASS",
+                },
+                finding_by_pair_serial={
+                    ("pair-1", "SN-001"): {
+                        "regrade_applied": True,
+                        "regrade_suppression_voltage_label": "5",
+                        "regrade_valve_voltage_label": "28",
+                        "regrade_condition_key": tar._tar_condition_combo_key("5", "28"),
+                        "initial_z": -0.75,
+                        "final_z": 1.25,
+                    }
+                },
+            )
 
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[0]["run_condition"], "Condition A")
-        self.assertEqual(rows[0]["initial_atp_mean"], 15.0)
-        self.assertEqual(rows[0]["final_atp_mean"], 18.0)
-        self.assertEqual(rows[0]["initial_actual_mean"], 10.0)
-        self.assertEqual(rows[0]["final_actual_mean"], 14.0)
-        self.assertEqual(rows[0]["initial_delta"], -5.0)
-        self.assertEqual(rows[0]["final_delta"], -4.0)
+        self.assertEqual(rows[0]["initial_family_mean"], 20.0)
+        self.assertEqual(rows[0]["final_family_mean"], 20.0)
+        self.assertEqual(rows[0]["initial_serial_mean"], 10.0)
+        self.assertEqual(rows[0]["final_serial_mean"], 14.0)
+        self.assertEqual(rows[0]["initial_zscore"], -0.75)
+        self.assertEqual(rows[0]["final_zscore"], 1.25)
         self.assertEqual(rows[0]["initial_grade"], "PASS")
         self.assertEqual(rows[0]["final_grade"], "WATCH")
         self.assertEqual(rows[0]["grade_text"], "Initial: PASS\nFinal: WATCH")
@@ -515,7 +527,7 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         self.assertTrue(rows[0]["regrade_applied"])
 
     def test_build_per_serial_comparison_rows_falls_back_when_no_regrade_override_exists(self) -> None:
-        ctx = {"filter_state": {}}
+        ctx = {"filter_state": {}, "be": object(), "db_path": Path("fake.sqlite3"), "options": {}}
         pair_specs = [
             {
                 "pair_id": "pair-2",
@@ -534,28 +546,29 @@ class TestTrendAutoReportFilters(unittest.TestCase):
                     "master_y": [8.0, 12.0],
                     "y_resampled_by_sn": {
                         "SN-001": [7.0, 9.0],
-                        "SN-002": [11.0, 13.0],
+                        "SN-002": [11.0, 21.0],
                     },
                 },
             }
         ]
-        rows = tar._tar_build_per_serial_comparison_rows(
-            ctx,
-            pair_specs=pair_specs,
-            all_serials=["SN-001", "SN-002"],
-            hi=["SN-001"],
-            initial_grade_map_by_pair_serial={("pair-2", "SN-001"): "PASS"},
-            final_grade_map_by_pair_serial={("pair-2", "SN-001"): "PASS"},
-            finding_by_pair_serial={},
-        )
+        with mock.patch.object(tar, "_tar_metric_map_for_pair", return_value={"SN-001": 8.0, "SN-002": 16.0}):
+            rows = tar._tar_build_per_serial_comparison_rows(
+                ctx,
+                pair_specs=pair_specs,
+                all_serials=["SN-001", "SN-002"],
+                hi=["SN-001"],
+                initial_grade_map_by_pair_serial={("pair-2", "SN-001"): "PASS"},
+                final_grade_map_by_pair_serial={("pair-2", "SN-001"): "PASS"},
+                finding_by_pair_serial={("pair-2", "SN-001"): {"initial_z": -0.5, "final_z": -0.5}},
+            )
 
         self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["initial_atp_mean"], 10.0)
-        self.assertEqual(rows[0]["final_atp_mean"], 10.0)
-        self.assertEqual(rows[0]["initial_actual_mean"], 8.0)
-        self.assertEqual(rows[0]["final_actual_mean"], 8.0)
-        self.assertEqual(rows[0]["initial_delta"], -2.0)
-        self.assertEqual(rows[0]["final_delta"], -2.0)
+        self.assertEqual(rows[0]["initial_family_mean"], 12.0)
+        self.assertEqual(rows[0]["final_family_mean"], 12.0)
+        self.assertEqual(rows[0]["initial_serial_mean"], 8.0)
+        self.assertEqual(rows[0]["final_serial_mean"], 8.0)
+        self.assertEqual(rows[0]["initial_zscore"], -0.5)
+        self.assertEqual(rows[0]["final_zscore"], -0.5)
         self.assertEqual(rows[0]["grade_text"], "PASS")
         self.assertEqual(rows[0]["final_suppression_voltage_label"], "All")
         self.assertFalse(rows[0]["regrade_applied"])
@@ -651,8 +664,20 @@ class TestTrendAutoReportFilters(unittest.TestCase):
                 "SN-003": {"program_title": "Program B"},
             },
             "pair_by_id": {
-                "pair-1": {"pair_id": "pair-1", "selection_label": "Run A"},
-                "pair-2": {"pair_id": "pair-2", "selection_label": "Run B"},
+                "pair-1": {
+                    "pair_id": "pair-1",
+                    "selection_label": "Run A",
+                    "run_title": "Run A",
+                    "base_condition_label": "Condition A",
+                    "selection_fields": {"sequence_text": "Run A", "condition_text": "Condition A"},
+                },
+                "pair-2": {
+                    "pair_id": "pair-2",
+                    "selection_label": "Run B",
+                    "run_title": "Run B",
+                    "base_condition_label": "Condition A",
+                    "selection_fields": {"sequence_text": "Run B", "condition_text": "Condition A"},
+                },
             },
         }
         axes = _FakePlotAxes()
@@ -705,7 +730,7 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         highlight_colors = [call[2]["color"] for call in highlight_calls]
         highlight_markers = [call[2].get("marker") for call in highlight_calls]
         self.assertIn([0.0, 1.0, 2.0], [call[0] for call in axes.scatter_calls if call[2].get("label")])
-        self.assertEqual(series_scatter_labels, ["Run A", "Run B"])
+        self.assertEqual(series_scatter_labels, ["Run A | Condition A", "Run B | Condition A"])
         self.assertEqual(set(highlight_colors), {"#ef4444", "#2563eb"})
         self.assertEqual(highlight_markers, ["x", "x"])
         self.assertEqual(len(axes.axvline_calls), 3)

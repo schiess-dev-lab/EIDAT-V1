@@ -15,9 +15,10 @@ if str(APP_ROOT) not in sys.path:
 
 
 try:
-    from PySide6 import QtWidgets
+    from PySide6 import QtCore, QtWidgets
     from ui_next.qt_main import ProjectTaskWorker, TestDataTrendDialog
 except Exception:  # pragma: no cover - optional dependency guard for local runs
+    QtCore = None  # type: ignore[assignment]
     QtWidgets = None  # type: ignore[assignment]
     ProjectTaskWorker = None  # type: ignore[assignment]
     TestDataTrendDialog = None  # type: ignore[assignment]
@@ -1388,12 +1389,24 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
                     report_name = dialog.findChild(QtWidgets.QLineEdit, "auto_report_report_name")
                     output_dir = dialog.findChild(QtWidgets.QLineEdit, "auto_report_output_dir")
                     grade_summary = dialog.findChild(QtWidgets.QLabel, "auto_report_grade_scoring_summary")
+                    params_title = dialog.findChild(QtWidgets.QLabel, "auto_report_certification_params_title")
+                    params_list = dialog.findChild(QtWidgets.QListWidget, "auto_report_certification_params")
                     self.assertIsNotNone(cert_button)
                     self.assertIsNotNone(report_name)
                     self.assertIsNotNone(output_dir)
                     self.assertIsNotNone(grade_summary)
+                    self.assertIsNotNone(params_title)
+                    self.assertIsNotNone(params_list)
                     self.assertIn("Family Serials...", [btn.text() for btn in dialog.findChildren(QtWidgets.QPushButton)])
                     self.assertIn("Certification Specifics...", [btn.text() for btn in dialog.findChildren(QtWidgets.QPushButton)])
+                    self.assertEqual(params_title.text(), "Certification Parameter Selection (required)")
+                    self.assertEqual(params_list.count(), 2)
+                    self.assertTrue(
+                        all(
+                            params_list.item(i).checkState() == QtCore.Qt.CheckState.Checked
+                            for i in range(params_list.count())
+                        )
+                    )
                     self.assertIn("z =", grade_summary.text())
                     self.assertIn("PASS if |z| <= 1.5", grade_summary.text())
                     self.assertIn("WATCH if |z| <= 2.5", grade_summary.text())
@@ -1422,7 +1435,7 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
                 ), patch(
                     "ui_next.qt_main.be.load_excel_trend_config", return_value={}
                 ), patch(
-                    "ui_next.qt_main.be.td_list_y_columns", return_value=[{"name": "Thrust"}]
+                    "ui_next.qt_main.be.td_list_y_columns", return_value=[{"name": "Thrust"}, {"name": "Flow"}]
                 ), patch.object(
                     TestDataTrendDialog, "_run_auto_report", side_effect=_capture_payload
                 ), patch(
@@ -1444,6 +1457,7 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
                 self.assertEqual(payload["certifying_program"], "Program Alpha")
                 self.assertEqual(payload["highlighted_serials"], ["SN-002"])
                 self.assertEqual(payload["filtered_serials"], ["SN-001", "SN-002", "SN-101"])
+                self.assertEqual(payload["params"], ["Flow", "Thrust"])
                 self.assertIn("Program Alpha", str(payload["output_pdf"]))
                 self.assertIn("EDAT reports", str(payload["output_pdf"]))
         finally:

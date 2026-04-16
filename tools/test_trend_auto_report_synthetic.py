@@ -1120,41 +1120,59 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
             "suppression_voltage_label": "100",
             "initial_plot_payload": {
                 "master_y": [1.0, 1.0, 1.0],
-                "y_resampled_by_sn": {"SN1": [1.5, 1.5, 1.5]},
+                "y_resampled_by_sn": {
+                    "SN1": [1.5, 1.5, 1.5],
+                    "SN2": [2.5, 2.5, 2.5],
+                },
             },
             "regrade_plot_payloads": {
-                "100": {
+                tar._tar_condition_combo_key("100", ""): {
                     "master_y": [4.0, 4.0, 4.0],
-                    "y_resampled_by_sn": {"SN1": [5.0, 5.0, 5.0]},
+                    "y_resampled_by_sn": {
+                        "SN1": [5.0, 5.0, 5.0],
+                        "SN2": [7.0, 7.0, 7.0],
+                    },
                 }
             },
             "filter_state_override": {"suppression_voltages": ["100"]},
         }
 
-        rows = tar._tar_build_per_serial_comparison_rows(
-            {"filter_state": {}},
-            pair_specs=[pair_spec],
-            all_serials=["SN1"],
-            hi=["SN1"],
-            initial_grade_map_by_pair_serial={("pair-1", "SN1"): "FAIL"},
-            final_grade_map_by_pair_serial={("pair-1", "SN1"): "PASS"},
-            finding_by_pair_serial={
-                ("pair-1", "SN1"): {
-                    "regrade_applied": True,
-                    "regrade_suppression_voltage_label": "100",
-                    "regrade_cohort_id": "regrade:1",
-                }
-            },
-        )
+        def _metric_map_side_effect(_ctx, pair_spec_arg, stat, *, filter_state_override=None):
+            self.assertEqual(stat, "mean")
+            self.assertEqual(str(pair_spec_arg.get("pair_id") or ""), "pair-1")
+            suppression = tuple((filter_state_override or {}).get("suppression_voltages") or [])
+            if suppression == ("100",):
+                return {"SN1": 5.0, "SN2": 7.0}
+            return {"SN1": 1.5, "SN2": 2.5}
+
+        with mock.patch.object(tar, "_tar_metric_map_for_pair", side_effect=_metric_map_side_effect):
+            rows = tar._tar_build_per_serial_comparison_rows(
+                {"filter_state": {}, "be": object(), "db_path": Path("fake.sqlite3"), "options": {}},
+                pair_specs=[pair_spec],
+                all_serials=["SN1"],
+                hi=["SN1"],
+                initial_grade_map_by_pair_serial={("pair-1", "SN1"): "FAIL"},
+                final_grade_map_by_pair_serial={("pair-1", "SN1"): "PASS"},
+                finding_by_pair_serial={
+                    ("pair-1", "SN1"): {
+                        "regrade_applied": True,
+                        "regrade_suppression_voltage_label": "100",
+                        "regrade_condition_key": tar._tar_condition_combo_key("100", ""),
+                        "regrade_cohort_id": "regrade:1",
+                        "initial_z": -0.5,
+                        "final_z": 1.25,
+                    }
+                },
+            )
 
         self.assertEqual(len(rows), 1)
         row = rows[0]
-        self.assertEqual(row["initial_atp_mean"], 1.0)
-        self.assertEqual(row["initial_actual_mean"], 1.5)
-        self.assertEqual(row["initial_delta"], 0.5)
-        self.assertEqual(row["final_atp_mean"], 4.0)
-        self.assertEqual(row["final_actual_mean"], 5.0)
-        self.assertEqual(row["final_delta"], 1.0)
+        self.assertEqual(row["initial_family_mean"], 2.0)
+        self.assertEqual(row["initial_serial_mean"], 1.5)
+        self.assertEqual(row["initial_zscore"], -0.5)
+        self.assertEqual(row["final_family_mean"], 6.0)
+        self.assertEqual(row["final_serial_mean"], 5.0)
+        self.assertEqual(row["final_zscore"], 1.25)
         self.assertTrue(row["regrade_applied"])
         self.assertEqual(row["regrade_cohort_id"], "regrade:1")
 
@@ -1367,9 +1385,9 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         matrix_rows, style_cmds = tar._tar_build_comparison_page_matrix(first_page)
         self.assertEqual(matrix_rows[0][:5], ["Run Condition", "Sequence(s)", "Metric", "Pressure", "Flow"])
         self.assertEqual(matrix_rows[1][:5], ["", "", "", "psi", "kg/s"])
-        self.assertEqual(matrix_rows[2][:5], ["Condition 00", "Seq 00", "ATP Mean", "Initial: 10\nFinal: 12", "20"])
-        self.assertEqual(matrix_rows[3][:5], ["", "", "ATP Actual", "Initial: 9\nFinal: 11", "19"])
-        self.assertEqual(matrix_rows[4][:5], ["", "", "Delta", "Initial: -1\nFinal: -1", "-1"])
+        self.assertEqual(matrix_rows[2][:5], ["Condition 00", "Seq 00", "Family Mean", "Initial: 10\nFinal: 12", "20"])
+        self.assertEqual(matrix_rows[3][:5], ["", "", "Serial Mean", "Initial: 9\nFinal: 11", "19"])
+        self.assertEqual(matrix_rows[4][:5], ["", "", "Z-Score", "Initial: -1\nFinal: -1", "-1"])
         self.assertEqual(matrix_rows[5][:5], ["", "", "Grade", "Initial: PASS\nFinal: WATCH", "PASS"])
         self.assertIn(("SPAN", (0, 2), (0, 5)), style_cmds)
         self.assertIn(("SPAN", (1, 2), (1, 5)), style_cmds)

@@ -2561,7 +2561,7 @@ def _render_portrait_story_pdf(
 
 
 _TAR_COMPARISON_FONT_CHOICES = (9, 8)
-_TAR_COMPARISON_METRIC_ROWS = ("ATP Mean", "ATP Actual", "Delta", "Grade")
+_TAR_COMPARISON_METRIC_ROWS = ("Family Mean", "Serial Mean", "Z-Score", "Grade")
 _TAR_COMPARISON_PAGE_WIDTH = 17.0 * 72.0
 _TAR_COMPARISON_PAGE_HEIGHT = 11.0 * 72.0
 _TAR_COMPARISON_LEFT_MARGIN = 24.0
@@ -2673,13 +2673,36 @@ def _tar_group_comparison_rows_by_serial(
 def _tar_comparison_page_metric_value(row: Mapping[str, object] | None, metric_label: str) -> str:
     if not isinstance(row, Mapping):
         return ""
+
+    def _pick(*keys: str) -> object:
+        for key in keys:
+            value = row.get(key)
+            if value is not None:
+                return value
+        return None
+
     regrade_applied = bool(row.get("regrade_applied"))
-    if metric_label == "ATP Mean":
-        return _tar_comparison_metric_text(row.get("initial_atp_mean"), row.get("final_atp_mean"), regrade_applied=regrade_applied, sig=5)
-    if metric_label == "ATP Actual":
-        return _tar_comparison_metric_text(row.get("initial_actual_mean"), row.get("final_actual_mean"), regrade_applied=regrade_applied, sig=5)
-    if metric_label == "Delta":
-        return _tar_comparison_metric_text(row.get("initial_delta"), row.get("final_delta"), regrade_applied=regrade_applied, sig=5)
+    if metric_label == "Family Mean":
+        return _tar_comparison_metric_text(
+            _pick("initial_family_mean", "initial_atp_mean"),
+            _pick("final_family_mean", "final_atp_mean"),
+            regrade_applied=regrade_applied,
+            sig=5,
+        )
+    if metric_label == "Serial Mean":
+        return _tar_comparison_metric_text(
+            _pick("initial_serial_mean", "initial_actual_mean"),
+            _pick("final_serial_mean", "final_actual_mean"),
+            regrade_applied=regrade_applied,
+            sig=5,
+        )
+    if metric_label == "Z-Score":
+        return _tar_comparison_metric_text(
+            _pick("initial_zscore", "initial_delta"),
+            _pick("final_zscore", "final_delta"),
+            regrade_applied=regrade_applied,
+            sig=4,
+        )
     if metric_label == "Grade":
         return _tar_comparison_grade_text(row.get("initial_grade"), row.get("final_grade"), regrade_applied=regrade_applied)
     return ""
@@ -4554,6 +4577,34 @@ def _tar_plot_run_condition_label(
     return _tar_join_limited(cleaned, max_items=max_items, empty="")
 
 
+def _tar_metric_pair_legend_label(
+    pair_spec: Mapping[str, object] | None,
+    *,
+    param_name: str,
+    run_by_name: Mapping[str, dict] | None = None,
+) -> str:
+    spec = dict(pair_spec or {})
+    fields: dict[str, str] = {}
+    if isinstance(spec.get("selection"), Mapping):
+        fields = _selection_display_fields(spec.get("selection"), run_by_name)
+    elif isinstance(spec.get("selection_fields"), Mapping):
+        raw_fields = spec.get("selection_fields") or {}
+        fields = {
+            "sequence_text": str(raw_fields.get("sequence_text") or "").strip(),
+            "condition_text": str(raw_fields.get("condition_text") or "").strip(),
+        }
+    sequence_text = str(fields.get("sequence_text") or spec.get("run_title") or spec.get("run") or "").strip()
+    condition_text = str(fields.get("condition_text") or spec.get("base_condition_label") or "").strip()
+    if not condition_text:
+        selection_label = str(spec.get("selection_label") or "").strip()
+        if selection_label and selection_label != sequence_text:
+            condition_text = selection_label
+    parts = _tar_unique_text_values([sequence_text, condition_text])
+    if parts:
+        return " | ".join(parts)
+    return str(spec.get("selection_label") or spec.get("run_title") or spec.get("run") or param_name).strip() or param_name
+
+
 def _tar_context_run_condition_label(ctx: Mapping[str, Any], *, max_items: int = 3) -> str:
     options = ctx.get("options") or {}
     labels: list[object] = []
@@ -5001,24 +5052,61 @@ def _tar_finite_mean_for_serials(vmap: Mapping[str, object], serials: list[str])
     return _tar_finite_mean([vmap.get(serial) for serial in (serials or [])])
 
 
-def _tar_payload_metric_triplet(
+def _tar_payload_metric_pair(
     payload: Mapping[str, Any] | None,
     *,
     serial: str,
-) -> tuple[float | None, float | None, float | None]:
+) -> tuple[float | None, float | None]:
     spec = dict(payload or {})
-    master_y = spec.get("master_y") or []
-    if not isinstance(master_y, list):
-        master_y = []
     curve_map = spec.get("y_resampled_by_sn") or {}
     serial_curve = curve_map.get(serial) if isinstance(curve_map, Mapping) else None
     if not isinstance(serial_curve, list):
         serial_curve = []
-    atp_mean = _tar_finite_mean(master_y)
-    actual_mean = _tar_finite_mean(serial_curve)
-    if atp_mean is None or actual_mean is None:
-        return None, None, None
-    return atp_mean, actual_mean, float(actual_mean) - float(atp_mean)
+    cohort_values: list[object] = []
+    if isinstance(curve_map, Mapping):
+        for curve in curve_map.values():
+            if isinstance(curve, list):
+                cohort_values.extend(curve)
+    family_mean = _tar_finite_mean(cohort_values)
+    serial_mean = _tar_finite_mean(serial_curve)
+    return family_mean, serial_mean
+
+
+def _tar_comparison_metric_pair(
+    ctx: Mapping[str, Any],
+    pair_spec: Mapping[str, Any],
+    *,
+    serial: str,
+    filter_state_override: Mapping[str, object] | None = None,
+    payload: Mapping[str, Any] | None = None,
+) -> tuple[float | None, float | None]:
+    metric_map: dict[str, float] = {}
+    if (
+        isinstance(ctx, Mapping)
+        and ctx.get("be") is not None
+        and ctx.get("db_path") is not None
+        and isinstance(ctx.get("options"), Mapping)
+    ):
+        try:
+            loaded = _tar_metric_map_for_pair(
+                ctx,
+                pair_spec,
+                "mean",
+                filter_state_override=filter_state_override,
+            )
+        except Exception:
+            loaded = {}
+        if isinstance(loaded, dict):
+            metric_map = {
+                str(key or "").strip(): float(value)
+                for key, value in loaded.items()
+                if str(key or "").strip() and isinstance(value, (int, float)) and math.isfinite(float(value))
+            }
+    if metric_map:
+        family_mean = _tar_finite_mean(metric_map.values())
+        serial_mean = _safe_float(metric_map.get(str(serial or "").strip()))
+        return family_mean, serial_mean
+    return _tar_payload_metric_pair(payload, serial=serial)
 
 
 def _tar_meta(ctx: Mapping[str, Any], serial: str, key: str) -> str:
@@ -5431,11 +5519,39 @@ def _tar_build_per_serial_comparison_rows(
             if not isinstance(final_payload, Mapping):
                 final_payload = None
 
-            initial_atp_mean, initial_actual_mean, initial_delta = _tar_payload_metric_triplet(initial_payload, serial=serial)
+            initial_family_mean, initial_serial_mean = _tar_comparison_metric_pair(
+                ctx,
+                spec,
+                serial=serial,
+                filter_state_override=base_filter_state if isinstance(base_filter_state, Mapping) else None,
+                payload=initial_payload,
+            )
             if regrade_applied:
-                final_atp_mean, final_actual_mean, final_delta = _tar_payload_metric_triplet(final_payload, serial=serial)
+                row_final_filter_state = (
+                    _tar_clone_filter_state(
+                        base_filter_state if isinstance(base_filter_state, Mapping) else None,
+                        suppression_voltage=regrade_suppression,
+                        valve_voltage=regrade_valve,
+                    )
+                    if (regrade_suppression or regrade_valve)
+                    else final_override
+                )
+                final_family_mean, final_serial_mean = _tar_comparison_metric_pair(
+                    ctx,
+                    spec,
+                    serial=serial,
+                    filter_state_override=row_final_filter_state,
+                    payload=final_payload,
+                )
             else:
-                final_atp_mean, final_actual_mean, final_delta = initial_atp_mean, initial_actual_mean, initial_delta
+                final_family_mean, final_serial_mean = initial_family_mean, initial_serial_mean
+
+            initial_zscore = _safe_float(finding_row.get("initial_z"))
+            if initial_zscore is None:
+                initial_zscore = _safe_float(finding_row.get("z"))
+            final_zscore = _safe_float(finding_row.get("final_z"))
+            if final_zscore is None:
+                final_zscore = initial_zscore
 
             initial_grade = _tar_normalize_grade_token(
                 initial_grade_map_by_pair_serial.get((pair_id, serial), "NO_DATA") or "NO_DATA"
@@ -5457,12 +5573,19 @@ def _tar_build_per_serial_comparison_rows(
                     "serial": serial,
                     "parameter": param_name,
                     "units": units,
-                    "initial_atp_mean": initial_atp_mean,
-                    "final_atp_mean": final_atp_mean,
-                    "initial_actual_mean": initial_actual_mean,
-                    "final_actual_mean": final_actual_mean,
-                    "initial_delta": initial_delta,
-                    "final_delta": final_delta,
+                    "initial_family_mean": initial_family_mean,
+                    "final_family_mean": final_family_mean,
+                    "initial_serial_mean": initial_serial_mean,
+                    "final_serial_mean": final_serial_mean,
+                    "initial_zscore": initial_zscore,
+                    "final_zscore": final_zscore,
+                    # Legacy aliases retained for older summary-json consumers.
+                    "initial_atp_mean": initial_family_mean,
+                    "final_atp_mean": final_family_mean,
+                    "initial_actual_mean": initial_serial_mean,
+                    "final_actual_mean": final_serial_mean,
+                    "initial_delta": initial_zscore,
+                    "final_delta": final_zscore,
                     "initial_grade": initial_grade,
                     "final_grade": final_grade,
                     "grade": final_grade,
@@ -7973,7 +8096,11 @@ def _tar_render_metric_cohort_page(
     ax.set_title(f"{param_name} ({metric_stat})", loc="left", fontsize=13, fontweight="bold", pad=10)
     ax.set_ylabel(f"{param_name} ({units})" if units else param_name)
     for pair_spec, yv, color in plotted:
-        label = str(pair_spec.get("selection_label") or pair_spec.get("run_title") or pair_spec.get("run") or "").strip() or param_name
+        label = _tar_metric_pair_legend_label(
+            pair_spec,
+            param_name=param_name,
+            run_by_name=(ctx.get("run_by_name") or {}),
+        )
         points = [
             (float(idx), float(value))
             for idx, value in enumerate(yv)
