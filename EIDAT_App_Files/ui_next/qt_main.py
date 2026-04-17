@@ -3504,65 +3504,23 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         filter_text_layout.setSpacing(2)
         filter_title = QtWidgets.QLabel("Global Filters")
         filter_title.setStyleSheet("font-size: 12px; font-weight: 800; color: #0f172a;")
-        self.lbl_program_filter_summary = QtWidgets.QLabel("Programs: -")
-        self.lbl_program_filter_summary.setStyleSheet("color: #334155; font-size: 11px;")
-        self.lbl_program_filter_summary.setSizePolicy(
-            QtWidgets.QSizePolicy.Policy.Expanding,
-            QtWidgets.QSizePolicy.Policy.Fixed,
-        )
-        self.lbl_serial_filter_summary = QtWidgets.QLabel("Serials: -")
-        self.lbl_serial_filter_summary.setStyleSheet("color: #334155; font-size: 11px;")
-        self.lbl_serial_filter_summary.setSizePolicy(
-            QtWidgets.QSizePolicy.Policy.Expanding,
-            QtWidgets.QSizePolicy.Policy.Fixed,
-        )
-        self.lbl_suppression_voltage_filter_summary = QtWidgets.QLabel("Suppression Voltage: -")
-        self.lbl_suppression_voltage_filter_summary.setStyleSheet("color: #334155; font-size: 11px;")
-        self.lbl_suppression_voltage_filter_summary.setSizePolicy(
-            QtWidgets.QSizePolicy.Policy.Expanding,
-            QtWidgets.QSizePolicy.Policy.Fixed,
-        )
-        self.lbl_valve_voltage_filter_summary = QtWidgets.QLabel("Valve Voltage: -")
-        self.lbl_valve_voltage_filter_summary.setStyleSheet("color: #334155; font-size: 11px;")
-        self.lbl_valve_voltage_filter_summary.setSizePolicy(
-            QtWidgets.QSizePolicy.Policy.Expanding,
-            QtWidgets.QSizePolicy.Policy.Fixed,
-        )
-        self.lbl_control_period_filter_summary = QtWidgets.QLabel("Control Period: -")
-        self.lbl_control_period_filter_summary.setStyleSheet("color: #334155; font-size: 11px;")
-        self.lbl_control_period_filter_summary.setSizePolicy(
+        self.lbl_global_filter_summary = QtWidgets.QLabel("Filters: -")
+        self.lbl_global_filter_summary.setObjectName("global_filters_summary_label")
+        self.lbl_global_filter_summary.setStyleSheet("color: #334155; font-size: 11px;")
+        self.lbl_global_filter_summary.setWordWrap(True)
+        self.lbl_global_filter_summary.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Expanding,
             QtWidgets.QSizePolicy.Policy.Fixed,
         )
         filter_text_layout.addWidget(filter_title)
-        filter_text_layout.addWidget(self.lbl_program_filter_summary)
-        filter_text_layout.addWidget(self.lbl_serial_filter_summary)
-        filter_text_layout.addWidget(self.lbl_suppression_voltage_filter_summary)
-        filter_text_layout.addWidget(self.lbl_valve_voltage_filter_summary)
-        filter_text_layout.addWidget(self.lbl_control_period_filter_summary)
+        filter_text_layout.addWidget(self.lbl_global_filter_summary)
         filter_text_layout.addStretch(1)
         filter_layout.addLayout(filter_text_layout, 1)
 
-        self.btn_program_filters = QtWidgets.QPushButton("Programs...")
-        self.btn_program_filters.clicked.connect(self._open_program_filter_popup)
-        self.btn_serial_filters = QtWidgets.QPushButton("Serials...")
-        self.btn_serial_filters.clicked.connect(self._open_serial_filter_popup)
-        self.btn_suppression_voltage_filters = QtWidgets.QPushButton("Suppression Voltage...")
-        self.btn_suppression_voltage_filters.clicked.connect(self._open_suppression_voltage_filter_popup)
-        self.btn_valve_voltage_filters = QtWidgets.QPushButton("Valve Voltage...")
-        self.btn_valve_voltage_filters.clicked.connect(self._open_valve_voltage_filter_popup)
-        self.btn_control_period_filters = QtWidgets.QPushButton("Control Period...")
-        self.btn_control_period_filters.clicked.connect(self._open_control_period_filter_popup)
-        self.btn_reset_global_filters = QtWidgets.QPushButton("Reset Filters")
-        self.btn_reset_global_filters.clicked.connect(self._reset_global_filters)
-        for btn in (
-            self.btn_program_filters,
-            self.btn_serial_filters,
-            self.btn_suppression_voltage_filters,
-            self.btn_valve_voltage_filters,
-            self.btn_control_period_filters,
-            self.btn_reset_global_filters,
-        ):
+        self.btn_global_filters_popup = QtWidgets.QPushButton("Global Filters...")
+        self.btn_global_filters_popup.setObjectName("global_filters_popup_button")
+        self.btn_global_filters_popup.clicked.connect(self._open_global_filters_popup)
+        for btn in (self.btn_global_filters_popup,):
             btn.setMinimumHeight(32)
             btn.setStyleSheet(
                 """
@@ -6721,107 +6679,14 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._refresh_global_filter_summaries()
 
     def _refresh_global_filter_summaries(self) -> None:
-        total_programs = len(self._available_program_filters or [])
-        active_programs = self._active_program_filter_values()
-        total_serials = len(self._available_serial_filter_rows or [])
-        active_serial_rows = self._active_serial_rows()
-        active_serials = [_td_serial_value(row) for row in active_serial_rows]
-        total_control_periods = len(self._available_control_period_filters or [])
-        active_control_periods = self._active_control_period_filter_values()
-        total_suppression = len(self._available_suppression_voltage_filters or [])
-        active_suppression = self._active_suppression_voltage_filter_values()
-        total_valve = len(self._available_valve_voltage_filters or [])
-        active_valve = self._active_valve_voltage_filter_values()
+        if hasattr(self, "lbl_global_filter_summary"):
+            summary_text = self._auto_plot_filter_summary_text(self._current_auto_plot_filter_state())
+            self.lbl_global_filter_summary.setText(f"Filters: {summary_text}")
+            self.lbl_global_filter_summary.setToolTip(summary_text)
 
-        if hasattr(self, "lbl_program_filter_summary"):
-            if total_programs <= 0:
-                program_text = "Programs: -"
-            elif len(active_programs) >= total_programs:
-                program_text = f"Programs: All ({total_programs})"
-            elif not active_programs:
-                program_text = f"Programs: None active (0/{total_programs})"
-            elif len(active_programs) <= 2:
-                program_text = "Programs: " + ", ".join(active_programs)
-            else:
-                program_text = f"Programs: {len(active_programs)} of {total_programs} active"
-            self.lbl_program_filter_summary.setText(program_text)
-            self.lbl_program_filter_summary.setToolTip(", ".join(active_programs))
-
-        if hasattr(self, "lbl_serial_filter_summary"):
-            if total_serials <= 0:
-                serial_text = "Serials: -"
-            elif len(active_serials) >= total_serials and len(self._checked_serial_filters or []) >= total_serials:
-                serial_text = f"Serials: All ({total_serials})"
-            elif not active_serials:
-                serial_text = f"Serials: None active (0/{total_serials})"
-            else:
-                serial_text = f"Serials: {len(active_serials)} of {total_serials} active"
-            self.lbl_serial_filter_summary.setText(serial_text)
-            shown = ", ".join(active_serials[:20])
-            if len(active_serials) > 20:
-                shown += f" (+{len(active_serials) - 20} more)"
-            self.lbl_serial_filter_summary.setToolTip(shown)
-
-        if hasattr(self, "lbl_control_period_filter_summary"):
-            if total_control_periods <= 0:
-                control_text = "Control Period: -"
-            elif len(active_control_periods) >= total_control_periods:
-                control_text = f"Control Period: All ({total_control_periods})"
-            elif not active_control_periods:
-                control_text = f"Control Period: None active (0/{total_control_periods})"
-            elif len(active_control_periods) <= 3:
-                control_text = "Control Period: " + ", ".join(active_control_periods)
-            else:
-                control_text = f"Control Period: {len(active_control_periods)} of {total_control_periods} active"
-            self.lbl_control_period_filter_summary.setText(control_text)
-            self.lbl_control_period_filter_summary.setToolTip(", ".join(active_control_periods))
-
-        if hasattr(self, "lbl_suppression_voltage_filter_summary"):
-            if total_suppression <= 0:
-                suppression_text = "Suppression Voltage: -"
-            elif len(active_suppression) >= total_suppression:
-                suppression_text = f"Suppression Voltage: All ({total_suppression})"
-            elif not active_suppression:
-                suppression_text = f"Suppression Voltage: None active (0/{total_suppression})"
-            elif len(active_suppression) <= 3:
-                suppression_text = "Suppression Voltage: " + ", ".join(active_suppression)
-            else:
-                suppression_text = f"Suppression Voltage: {len(active_suppression)} of {total_suppression} active"
-            self.lbl_suppression_voltage_filter_summary.setText(suppression_text)
-            self.lbl_suppression_voltage_filter_summary.setToolTip(", ".join(active_suppression))
-
-        if hasattr(self, "lbl_valve_voltage_filter_summary"):
-            if total_valve <= 0:
-                valve_text = "Valve Voltage: -"
-            elif len(active_valve) >= total_valve:
-                valve_text = f"Valve Voltage: All ({total_valve})"
-            elif not active_valve:
-                valve_text = f"Valve Voltage: None active (0/{total_valve})"
-            elif len(active_valve) <= 3:
-                valve_text = "Valve Voltage: " + ", ".join(active_valve)
-            else:
-                valve_text = f"Valve Voltage: {len(active_valve)} of {total_valve} active"
-            self.lbl_valve_voltage_filter_summary.setText(valve_text)
-            self.lbl_valve_voltage_filter_summary.setToolTip(", ".join(active_valve))
-
-        has_programs = bool(self._available_program_filters)
-        has_serials = bool(self._available_serial_filter_rows)
-        has_control_periods = bool(self._available_control_period_filters)
-        has_suppression = bool(self._available_suppression_voltage_filters)
-        has_valve = bool(self._available_valve_voltage_filters)
-        if hasattr(self, "btn_program_filters"):
-            self.btn_program_filters.setEnabled(has_programs)
-        if hasattr(self, "btn_serial_filters"):
-            self.btn_serial_filters.setEnabled(has_serials)
-        if hasattr(self, "btn_control_period_filters"):
-            self.btn_control_period_filters.setEnabled(has_control_periods)
-        if hasattr(self, "btn_suppression_voltage_filters"):
-            self.btn_suppression_voltage_filters.setEnabled(has_suppression)
-        if hasattr(self, "btn_valve_voltage_filters"):
-            self.btn_valve_voltage_filters.setEnabled(has_valve)
-        if hasattr(self, "btn_reset_global_filters"):
-            self.btn_reset_global_filters.setEnabled(
-                has_programs or has_serials or has_control_periods or has_suppression or has_valve
+        if hasattr(self, "btn_global_filters_popup"):
+            self.btn_global_filters_popup.setEnabled(
+                any(bool(self._auto_plot_available_filter_values(key)) for key in TD_AUTO_PLOT_FILTER_KEYS)
             )
 
     def _active_program_filter_values(self, filter_state: Mapping[str, object] | None = None) -> list[str]:
@@ -7003,11 +6868,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         filter_state: Mapping[str, object] | None = None,
     ) -> dict[str, list[str]]:
         if isinstance(filter_state, Mapping):
-            state = self._normalize_auto_plot_filter_state(filter_state, default_to_current=False)
-        else:
-            state = self._current_auto_plot_filter_state()
-        state["suppression_voltages"] = []
-        return state
+            return self._normalize_auto_plot_filter_state(filter_state, default_to_current=False)
+        return self._current_auto_plot_filter_state()
 
     def _filter_state_without_valve_voltages(
         self,
@@ -7390,6 +7252,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         effective_filter_state = self._auto_report_filter_state_without_suppression(filter_state)
         selected_programs = set(self._active_program_filter_values(filter_state=effective_filter_state))
         selected_control_periods = set(self._active_control_period_filter_values(filter_state=effective_filter_state))
+        selected_suppression = set(self._active_suppression_voltage_filter_values(filter_state=effective_filter_state))
         selected_valves = set(self._active_valve_voltage_filter_values(filter_state=effective_filter_state))
         items: list[dict] = []
         for raw_item in (self._run_selection_views.get(mode) or []):
@@ -7406,6 +7269,11 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             if not any(program in selected_programs for program in member_programs):
                 continue
             if not self._selection_matches_auto_report_control_periods(item, selected_control_periods):
+                continue
+            member_suppression = self._selection_member_suppression_voltages(item)
+            if selected_suppression and member_suppression and not any(
+                value in selected_suppression for value in member_suppression
+            ):
                 continue
             member_valves = self._selection_member_valve_voltages(item)
             if selected_valves and member_valves and not any(value in selected_valves for value in member_valves):
@@ -7584,6 +7452,281 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 if value:
                     chosen.append(value)
         return chosen
+
+    @staticmethod
+    def _filter_key_label(key: str) -> str:
+        return {
+            "programs": "Programs",
+            "serials": "Serials",
+            "control_periods": "Control Period",
+            "suppression_voltages": "Suppression Voltage",
+            "valve_voltages": "Valve Voltage",
+        }.get(str(key or "").strip(), str(key or "").strip().replace("_", " ").title())
+
+    def _filter_checklist_entries(self, key: str) -> list[dict]:
+        norm_key = str(key or "").strip()
+        if norm_key == "serials":
+            entries: list[dict] = []
+            for row in (self._available_serial_filter_rows or []):
+                serial = _td_serial_value(row)
+                if not serial:
+                    continue
+                program = _td_display_program_title((row or {}).get("program_title"))
+                doc_type = str((row or {}).get("document_type") or "").strip()
+                parts = [serial, program]
+                if doc_type:
+                    parts.append(doc_type)
+                entries.append(
+                    {
+                        "value": serial,
+                        "label": " | ".join([part for part in parts if part]),
+                        "search": self._serial_row_filter_text(row),
+                    }
+                )
+            return entries
+        return [
+            {"value": value, "label": value, "search": value.lower()}
+            for value in self._auto_plot_available_filter_values(norm_key)
+            if str(value).strip()
+        ]
+
+    def _selected_filter_values_for_key(
+        self,
+        key: str,
+        *,
+        filter_state: Mapping[str, object] | None = None,
+    ) -> list[str]:
+        available_values = self._auto_plot_available_filter_values(key)
+        current_state = self._current_auto_plot_filter_state()
+        return self._auto_plot_selected_filter_values(
+            filter_state=filter_state,
+            key=key,
+            available_values=available_values,
+            live_values=list(current_state.get(key) or []),
+        )
+
+    def _global_filter_summary_line(
+        self,
+        key: str,
+        *,
+        filter_state: Mapping[str, object] | None = None,
+    ) -> tuple[str, str]:
+        label = self._filter_key_label(key)
+        available_values = self._auto_plot_available_filter_values(key)
+        selected_values = self._selected_filter_values_for_key(key, filter_state=filter_state)
+        total = len(available_values)
+        if total <= 0:
+            text = f"{label}: -"
+        elif len(selected_values) >= total:
+            text = f"{label}: All ({total})"
+        elif not selected_values:
+            text = f"{label}: None active (0/{total})"
+        elif key == "serials":
+            text = f"{label}: {len(selected_values)} of {total} active"
+        else:
+            preview_limit = 2 if key == "programs" else 3
+            if len(selected_values) <= preview_limit:
+                text = f"{label}: {', '.join(selected_values)}"
+            else:
+                text = f"{label}: {len(selected_values)} of {total} active"
+        tooltip_items = selected_values[:20] if key == "serials" else selected_values
+        tooltip = ", ".join(tooltip_items)
+        if key == "serials" and len(selected_values) > 20:
+            tooltip += f" (+{len(selected_values) - 20} more)"
+        return text, tooltip
+
+    def _set_live_global_filter_state(self, filter_state: Mapping[str, object] | None) -> None:
+        state = self._normalize_auto_plot_filter_state(filter_state, default_to_current=True)
+        self._checked_program_filters = list(state.get("programs") or [])
+        self._checked_serial_filters = list(state.get("serials") or [])
+        self._checked_control_period_filters = list(state.get("control_periods") or [])
+        self._checked_suppression_voltage_filters = list(state.get("suppression_voltages") or [])
+        self._checked_valve_voltage_filters = list(state.get("valve_voltages") or [])
+        self._on_global_filters_changed()
+
+    def _show_grouped_filter_popup(
+        self,
+        *,
+        title: str,
+        filter_state: Mapping[str, object] | None,
+        dialog_object_name: str,
+        parent: QtWidgets.QWidget | None = None,
+        heading: str = "",
+        hint_text: str = "",
+        summary_prefix: str = "Filters",
+        summary_object_name: str = "",
+        key_object_name_prefix: str = "",
+        checklist_title_prefix: str = "",
+        disabled_reasons: Mapping[str, str] | None = None,
+        row_summary_overrides: Mapping[str, Callable[[dict[str, list[str]]], tuple[str, str] | str]] | None = None,
+        overall_summary_override: Callable[[dict[str, list[str]]], str] | None = None,
+        extra_actions: list[dict[str, object]] | None = None,
+    ) -> dict[str, list[str]] | None:
+        pop = QtWidgets.QDialog(parent or self)
+        pop.setObjectName(dialog_object_name)
+        pop.setWindowTitle(title)
+        pop.resize(760, 520)
+        pop_l = QtWidgets.QVBoxLayout(pop)
+        pop_l.setContentsMargins(12, 12, 12, 12)
+        pop_l.setSpacing(10)
+
+        heading_text = heading or title
+        if heading_text:
+            lbl_heading = QtWidgets.QLabel(heading_text)
+            lbl_heading.setStyleSheet("font-size: 13px; font-weight: 800; color: #0f172a;")
+            pop_l.addWidget(lbl_heading)
+        if hint_text:
+            lbl_hint = QtWidgets.QLabel(hint_text)
+            lbl_hint.setWordWrap(True)
+            lbl_hint.setStyleSheet("color: #4b5563; font-size: 11px;")
+            pop_l.addWidget(lbl_hint)
+
+        state = self._normalize_auto_plot_filter_state(filter_state, default_to_current=True)
+        row_labels: dict[str, QtWidgets.QLabel] = {}
+        row_buttons: dict[str, QtWidgets.QPushButton] = {}
+        summary_overrides = row_summary_overrides or {}
+        disabled_map = {str(key).strip(): str(value or "").strip() for key, value in (disabled_reasons or {}).items()}
+
+        lbl_summary = QtWidgets.QLabel("")
+        if summary_object_name:
+            lbl_summary.setObjectName(summary_object_name)
+        lbl_summary.setWordWrap(True)
+        lbl_summary.setStyleSheet("color: #334155; font-size: 11px;")
+        pop_l.addWidget(lbl_summary)
+
+        rows_frame = QtWidgets.QFrame()
+        rows_frame.setStyleSheet("QFrame { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 10px; }")
+        rows_layout = QtWidgets.QVBoxLayout(rows_frame)
+        rows_layout.setContentsMargins(12, 12, 12, 12)
+        rows_layout.setSpacing(8)
+        pop_l.addWidget(rows_frame, 1)
+
+        def _refresh_popup_summaries() -> None:
+            overall_text = (
+                overall_summary_override(state)
+                if callable(overall_summary_override)
+                else self._auto_plot_filter_summary_text(state)
+            )
+            lbl_summary.setText(f"{summary_prefix}: {overall_text}")
+            lbl_summary.setToolTip(overall_text)
+            for key in TD_AUTO_PLOT_FILTER_KEYS:
+                override = summary_overrides.get(key)
+                if callable(override):
+                    override_result = override(state)
+                    if isinstance(override_result, tuple):
+                        row_text, row_tooltip = override_result
+                    else:
+                        row_text = str(override_result or "").strip()
+                        row_tooltip = ""
+                else:
+                    selected_values = self._selected_filter_values_for_key(key, filter_state=state)
+                    row_text = (
+                        f"{self._filter_key_label(key)}: "
+                        f"{self._popup_selection_summary(selected_values, total_count=len(self._auto_plot_available_filter_values(key)), empty_text='-')}"
+                    )
+                    row_tooltip = ", ".join(selected_values)
+                row_labels[key].setText(row_text)
+                row_labels[key].setToolTip(row_tooltip)
+                row_buttons[key].setEnabled(
+                    bool(self._auto_plot_available_filter_values(key)) and key not in disabled_map
+                )
+                row_buttons[key].setToolTip(disabled_map.get(key, ""))
+
+        def _edit_key(key: str) -> None:
+            if key in disabled_map:
+                return
+            entries = self._filter_checklist_entries(key)
+            if not entries:
+                QtWidgets.QMessageBox.information(pop, title, f"No {self._filter_key_label(key).lower()} are available.")
+                return
+            item_title_prefix = checklist_title_prefix or title
+            chosen = self._show_filter_checklist_popup(
+                title=f"{item_title_prefix} {self._filter_key_label(key)}".strip(),
+                entries=entries,
+                selected_values=list(state.get(key) or []),
+            )
+            if chosen is None:
+                return
+            chosen_set = {str(value).strip() for value in chosen if str(value).strip()}
+            available_values = self._auto_plot_available_filter_values(key)
+            state[key] = [value for value in available_values if value in chosen_set]
+            _refresh_popup_summaries()
+
+        for key in TD_AUTO_PLOT_FILTER_KEYS:
+            row = QtWidgets.QHBoxLayout()
+            row.setSpacing(8)
+            button = QtWidgets.QPushButton(f"{self._filter_key_label(key)}...")
+            if key_object_name_prefix:
+                button.setObjectName(f"{key_object_name_prefix}_{key}_button")
+            button.clicked.connect(lambda _checked=False, key=key: _edit_key(key))
+            label = QtWidgets.QLabel("")
+            if key_object_name_prefix:
+                label.setObjectName(f"{key_object_name_prefix}_{key}_summary")
+            label.setWordWrap(True)
+            row_buttons[key] = button
+            row_labels[key] = label
+            row.addWidget(button, 0)
+            row.addWidget(label, 1)
+            rows_layout.addLayout(row)
+
+        action_row = QtWidgets.QHBoxLayout()
+        btn_reset = QtWidgets.QPushButton("Reset")
+        if key_object_name_prefix:
+            btn_reset.setObjectName(f"{key_object_name_prefix}_reset_button")
+        btn_reset.clicked.connect(
+            lambda: (
+                [
+                    state.__setitem__(key, self._auto_plot_available_filter_values(key))
+                    for key in TD_AUTO_PLOT_FILTER_KEYS
+                ],
+                _refresh_popup_summaries(),
+            )
+        )
+        action_row.addWidget(btn_reset)
+        for action in (extra_actions or []):
+            text = str((action or {}).get("text") or "").strip()
+            callback = (action or {}).get("callback")
+            if not text or not callable(callback):
+                continue
+            btn_action = QtWidgets.QPushButton(text)
+            object_name = str((action or {}).get("object_name") or "").strip()
+            if object_name:
+                btn_action.setObjectName(object_name)
+            btn_action.clicked.connect(lambda _checked=False, callback=callback: (callback(state), _refresh_popup_summaries()))
+            action_row.addWidget(btn_action)
+        action_row.addStretch(1)
+        btn_apply = QtWidgets.QPushButton("Apply")
+        btn_cancel = QtWidgets.QPushButton("Cancel")
+        if key_object_name_prefix:
+            btn_apply.setObjectName(f"{key_object_name_prefix}_apply_button")
+            btn_cancel.setObjectName(f"{key_object_name_prefix}_cancel_button")
+        btn_apply.clicked.connect(pop.accept)
+        btn_cancel.clicked.connect(pop.reject)
+        action_row.addWidget(btn_apply)
+        action_row.addWidget(btn_cancel)
+        pop_l.addLayout(action_row)
+
+        _refresh_popup_summaries()
+        _fit_widget_to_screen(pop)
+        if pop.exec() != int(QtWidgets.QDialog.DialogCode.Accepted):
+            return None
+        return self._normalize_auto_plot_filter_state(state, default_to_current=True)
+
+    def _open_global_filters_popup(self) -> None:
+        chosen = self._show_grouped_filter_popup(
+            title="Global Filters",
+            heading="Global Filters",
+            hint_text="Adjust the shared live Trend / Analyze filters without using page space for each individual selector.",
+            filter_state=self._current_auto_plot_filter_state(),
+            dialog_object_name="global_filters_popup",
+            summary_prefix="Active filters",
+            summary_object_name="global_filters_popup_summary_label",
+            key_object_name_prefix="global_filters_popup",
+            checklist_title_prefix="Visible",
+        )
+        if chosen is None:
+            return
+        self._set_live_global_filter_state(chosen)
 
     def _open_program_filter_popup(self) -> None:
         entries = [
@@ -7834,9 +7977,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 "No cached metric statistics are available in the current project cache. Run Update Project first.",
             )
             return
-        report_filter_state = self._auto_report_filter_state_without_suppression(
-            self._current_auto_plot_filter_state()
-        )
+        report_filter_state = self._current_auto_plot_filter_state()
         try:
             global_repo_root = Path(getattr(be, "get_repo_root", lambda: be.DEFAULT_REPO_ROOT)()).expanduser()
         except Exception:
@@ -7963,40 +8104,24 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         lbl_report_filter_title = QtWidgets.QLabel("Report Filters")
         lbl_report_filter_title.setStyleSheet("font-size: 12px; font-weight: 800; color: #000000;")
         lbl_report_filter_hint = QtWidgets.QLabel(
-            "Local family-analysis filters for this exporter. Initial auto-report grading always uses all suppression voltages in scope; regrade narrows to the certification-family suppression only when an initial WATCH or FAIL occurs."
+            "Use the popup to adjust the report-level global filters for this certification export. These filters control the programs, serials, suppression voltage, valve voltage, and control period included in the report scope."
         )
         lbl_report_filter_hint.setStyleSheet("color: #4b5563; font-size: 11px;")
         lbl_report_filter_hint.setWordWrap(True)
-        lbl_report_program_filters = QtWidgets.QLabel("Programs: -")
-        lbl_report_program_filters.setStyleSheet("color: #374151; font-size: 11px;")
-        lbl_report_serial_filters = QtWidgets.QLabel("Family Serials: -")
-        lbl_report_serial_filters.setStyleSheet("color: #374151; font-size: 11px;")
-        lbl_report_suppression_filters = QtWidgets.QLabel("Suppression Voltage: -")
-        lbl_report_suppression_filters.setStyleSheet("color: #374151; font-size: 11px;")
-        lbl_report_control_filters = QtWidgets.QLabel("Control Period: -")
-        lbl_report_control_filters.setStyleSheet("color: #374151; font-size: 11px;")
+        lbl_report_filters_summary = QtWidgets.QLabel("Filters: -")
+        lbl_report_filters_summary.setObjectName("auto_report_filters_summary_label")
+        lbl_report_filters_summary.setStyleSheet("color: #374151; font-size: 11px;")
+        lbl_report_filters_summary.setWordWrap(True)
         report_filter_text.addWidget(lbl_report_filter_title)
         report_filter_text.addWidget(lbl_report_filter_hint)
-        report_filter_text.addWidget(lbl_report_program_filters)
-        report_filter_text.addWidget(lbl_report_serial_filters)
-        report_filter_text.addWidget(lbl_report_suppression_filters)
-        report_filter_text.addWidget(lbl_report_control_filters)
+        report_filter_text.addWidget(lbl_report_filters_summary)
+        report_filter_text.addStretch(1)
         report_filter_layout.addLayout(report_filter_text, 1)
 
-        btn_report_program_filters = QtWidgets.QPushButton("Programs...")
-        btn_report_serial_filters = QtWidgets.QPushButton("Family Serials...")
-        btn_report_suppression_filters = QtWidgets.QPushButton("Suppression Voltage (Auto)")
-        btn_report_control_filters = QtWidgets.QPushButton("Control Period...")
-        btn_report_reset_filters = QtWidgets.QPushButton("Reset Filters")
-        for btn in (
-            btn_report_program_filters,
-            btn_report_serial_filters,
-            btn_report_suppression_filters,
-            btn_report_control_filters,
-            btn_report_reset_filters,
-        ):
-            btn.setMinimumHeight(34)
-            report_filter_layout.addWidget(btn)
+        btn_report_filters_popup = QtWidgets.QPushButton("Report Filters...")
+        btn_report_filters_popup.setObjectName("auto_report_filters_popup_button")
+        btn_report_filters_popup.setMinimumHeight(34)
+        report_filter_layout.addWidget(btn_report_filters_popup)
         layout.addWidget(report_filter_frame)
 
 
@@ -8042,48 +8167,19 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         left_l.addWidget(lbl_certification_title)
         lbl_certification_hint = QtWidgets.QLabel(
             "Use the popup to pick the certifying program, certification serials, certification parameters, and run scope. "
-            "Initial grading uses all suppression voltages in scope, and regrade automatically narrows to the certification-family suppression only when needed."
+            "The popup also shows the current certification summaries and grade-scoring reference text."
         )
         lbl_certification_hint.setWordWrap(True)
         lbl_certification_hint.setStyleSheet("color: #4b5563; font-size: 11px;")
         left_l.addWidget(lbl_certification_hint)
-        lbl_cert_program_auto = QtWidgets.QLabel("Certifying Program: -")
-        lbl_cert_program_auto.setStyleSheet("color: #374151; font-size: 11px;")
-        lbl_cert_program_auto.setWordWrap(True)
-        left_l.addWidget(lbl_cert_program_auto)
-        lbl_cert_serials_auto = QtWidgets.QLabel("Certification Serials: -")
-        lbl_cert_serials_auto.setStyleSheet("color: #374151; font-size: 11px;")
-        lbl_cert_serials_auto.setWordWrap(True)
-        left_l.addWidget(lbl_cert_serials_auto)
-        lbl_runs_auto = QtWidgets.QLabel("Runs Included: -")
-        lbl_runs_auto.setStyleSheet("color: #64748b; font-size: 11px;")
-        lbl_runs_auto.setWordWrap(True)
-        left_l.addWidget(lbl_runs_auto)
-        lbl_params_auto = QtWidgets.QLabel("Certification Parameters: -")
-        lbl_params_auto.setObjectName("auto_report_certification_params_summary")
-        lbl_params_auto.setStyleSheet("color: #64748b; font-size: 11px;")
-        lbl_params_auto.setWordWrap(True)
-        left_l.addWidget(lbl_params_auto)
-        grade_summary_box = QtWidgets.QFrame()
-        grade_summary_box.setStyleSheet(
-            "QFrame { background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 8px; }"
-        )
-        grade_summary_layout = QtWidgets.QVBoxLayout(grade_summary_box)
-        grade_summary_layout.setContentsMargins(10, 8, 10, 8)
-        grade_summary_layout.setSpacing(4)
-        lbl_grade_summary_title = QtWidgets.QLabel("Grade Scoring")
-        lbl_grade_summary_title.setStyleSheet("color: #0f172a; font-size: 11px; font-weight: 800;")
-        grade_summary_layout.addWidget(lbl_grade_summary_title)
-        lbl_grade_summary_auto = QtWidgets.QLabel(_auto_report_grade_scoring_summary_text())
-        lbl_grade_summary_auto.setObjectName("auto_report_grade_scoring_summary")
-        lbl_grade_summary_auto.setWordWrap(True)
-        lbl_grade_summary_auto.setStyleSheet("color: #475569; font-size: 10.5px;")
-        grade_summary_layout.addWidget(lbl_grade_summary_auto)
-        left_l.addWidget(grade_summary_box)
         btn_cert_popup = QtWidgets.QPushButton("Certification Specifics...")
         btn_cert_popup.setObjectName("auto_report_certification_popup_button")
         left_l.addWidget(btn_cert_popup)
         layout.addWidget(certification_frame)
+
+        lbl_cert_program_auto = QtWidgets.QLabel("Certifying Program: -")
+        lbl_cert_serials_auto = QtWidgets.QLabel("Certification Serials: -")
+        lbl_runs_auto = QtWidgets.QLabel("Runs Included: -")
 
         default_hi = []
         try:
@@ -8110,7 +8206,6 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         list_params.setObjectName("auto_report_certification_params")
 
         lbl_params_auto = QtWidgets.QLabel("Selected certification params: —")
-        lbl_params_auto.setObjectName("auto_report_certification_params_summary")
         lbl_params_auto.setStyleSheet("color: #64748b; font-size: 11px;")
         lbl_params_auto.setWordWrap(True)
         row_params = QtWidgets.QHBoxLayout()
@@ -8491,6 +8586,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
         def _open_certification_popup() -> None:
             pop = QtWidgets.QDialog(dlg)
+            pop.setObjectName("auto_report_certification_popup")
             pop.setWindowTitle("Certification Specifics")
             pop.resize(1140, 640)
             pop_l = QtWidgets.QVBoxLayout(pop)
@@ -8499,7 +8595,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
             lbl_popup_hint = QtWidgets.QLabel(
                 "Choose the certifying program, certification serials, certification parameters, and runs included in certification. "
-                "Initial grading always uses all suppression voltages in scope, and regrade automatically narrows to the certification-family suppression only when needed."
+                "The summary box below reflects the current certification scope and grading reference text."
             )
             lbl_popup_hint.setWordWrap(True)
             lbl_popup_hint.setStyleSheet("color: #4b5563; font-size: 11px;")
@@ -8518,6 +8614,52 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     local_program.setCurrentIndex(idx_local_program)
             row_program.addWidget(local_program, 1)
             pop_l.addLayout(row_program)
+
+            summary_frame = QtWidgets.QFrame()
+            summary_frame.setStyleSheet("QFrame { background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 10px; }")
+            summary_layout = QtWidgets.QVBoxLayout(summary_frame)
+            summary_layout.setContentsMargins(10, 8, 10, 8)
+            summary_layout.setSpacing(4)
+            lbl_popup_summary_title = QtWidgets.QLabel("Certification Summary")
+            lbl_popup_summary_title.setStyleSheet("color: #0f172a; font-size: 11px; font-weight: 800;")
+            summary_layout.addWidget(lbl_popup_summary_title)
+            lbl_popup_program_summary = QtWidgets.QLabel("Certifying Program: -")
+            lbl_popup_program_summary.setObjectName("auto_report_cert_popup_program_summary")
+            lbl_popup_program_summary.setWordWrap(True)
+            lbl_popup_program_summary.setStyleSheet("color: #374151; font-size: 11px;")
+            summary_layout.addWidget(lbl_popup_program_summary)
+            lbl_popup_serials_summary = QtWidgets.QLabel("Certification Serials: -")
+            lbl_popup_serials_summary.setObjectName("auto_report_cert_popup_serials_summary")
+            lbl_popup_serials_summary.setWordWrap(True)
+            lbl_popup_serials_summary.setStyleSheet("color: #374151; font-size: 11px;")
+            summary_layout.addWidget(lbl_popup_serials_summary)
+            lbl_popup_runs_summary = QtWidgets.QLabel("Runs Included: -")
+            lbl_popup_runs_summary.setObjectName("auto_report_cert_popup_runs_summary")
+            lbl_popup_runs_summary.setWordWrap(True)
+            lbl_popup_runs_summary.setStyleSheet("color: #64748b; font-size: 11px;")
+            summary_layout.addWidget(lbl_popup_runs_summary)
+            lbl_popup_params_summary = QtWidgets.QLabel("Certification Parameters: -")
+            lbl_popup_params_summary.setObjectName("auto_report_certification_params_summary")
+            lbl_popup_params_summary.setWordWrap(True)
+            lbl_popup_params_summary.setStyleSheet("color: #64748b; font-size: 11px;")
+            summary_layout.addWidget(lbl_popup_params_summary)
+            grade_summary_box = QtWidgets.QFrame()
+            grade_summary_box.setStyleSheet(
+                "QFrame { background: #ffffff; border: 1px solid #cbd5e1; border-radius: 8px; }"
+            )
+            grade_summary_layout = QtWidgets.QVBoxLayout(grade_summary_box)
+            grade_summary_layout.setContentsMargins(10, 8, 10, 8)
+            grade_summary_layout.setSpacing(4)
+            lbl_grade_summary_title = QtWidgets.QLabel("Grade Scoring")
+            lbl_grade_summary_title.setStyleSheet("color: #0f172a; font-size: 11px; font-weight: 800;")
+            grade_summary_layout.addWidget(lbl_grade_summary_title)
+            lbl_grade_summary_auto = QtWidgets.QLabel(_auto_report_grade_scoring_summary_text())
+            lbl_grade_summary_auto.setObjectName("auto_report_grade_scoring_summary")
+            lbl_grade_summary_auto.setWordWrap(True)
+            lbl_grade_summary_auto.setStyleSheet("color: #475569; font-size: 10.5px;")
+            grade_summary_layout.addWidget(lbl_grade_summary_auto)
+            summary_layout.addWidget(grade_summary_box)
+            pop_l.addWidget(summary_frame)
 
             local_splitter = QtWidgets.QSplitter()
             local_splitter.setOrientation(QtCore.Qt.Orientation.Horizontal)
@@ -8632,6 +8774,21 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             def _local_selected_serials() -> list[str]:
                 return [it.text().strip() for it in local_serials.selectedItems() if it and it.text().strip()]
 
+            def _local_refresh_popup_summary() -> None:
+                selected_serials = _local_selected_serials()
+                lbl_popup_program_summary.setText(
+                    f"Certifying Program: {str(local_program.currentText() or '').strip() or '-'}"
+                )
+                lbl_popup_program_summary.setToolTip(str(local_program.currentText() or "").strip())
+                lbl_popup_serials_summary.setText(
+                    f"Certification Serials: {_selection_summary(selected_serials, local_serials.count())}"
+                )
+                lbl_popup_serials_summary.setToolTip(", ".join(selected_serials))
+                lbl_popup_runs_summary.setText(local_runs_summary.text())
+                lbl_popup_runs_summary.setToolTip(local_runs_summary.toolTip())
+                lbl_popup_params_summary.setText(local_params_summary.text())
+                lbl_popup_params_summary.setToolTip(local_params_summary.toolTip())
+
             def _local_capture_run_states() -> None:
                 nonlocal local_current_run_mode
                 bucket = local_run_states.setdefault(local_current_run_mode, {})
@@ -8663,6 +8820,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     f"Runs Included ({scope_label}): {_selection_summary(labels, local_runs.count())}"
                 )
                 local_runs_summary.setToolTip(", ".join(labels))
+                _local_refresh_popup_summary()
 
             def _local_capture_param_states() -> None:
                 local_param_states.clear()
@@ -8709,6 +8867,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     f"Certification Parameters: {_selection_summary(labels, local_params.count())}"
                 )
                 local_params_summary.setToolTip(", ".join(labels))
+                _local_refresh_popup_summary()
 
             def _local_populate_params(*, capture_current: bool = True) -> None:
                 if capture_current:
@@ -8763,6 +8922,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                             it.setSelected(True)
                 finally:
                     local_serials.blockSignals(False)
+                _local_refresh_popup_summary()
 
             def _local_filtered_run_items(mode: str) -> list[dict]:
                 return self._visible_auto_report_certification_run_selection_items_for_filter_state(
@@ -8884,6 +9044,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             _local_sync_run_scope_availability()
             _local_populate_runs(capture_current=False)
             _local_populate_params(capture_current=False)
+            _local_refresh_popup_summary()
 
             btns = QtWidgets.QHBoxLayout()
             btns.addStretch(1)
@@ -8945,75 +9106,40 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             _fit_widget_to_screen(pop)
             pop.exec()
 
-        def _report_filter_summary(
-            prefix: str,
-            active_values: list[str],
-            total: int,
-            *,
-            tooltip_label: QtWidgets.QLabel | None = None,
-        ) -> str:
-            if total <= 0:
-                text = f"{prefix}: -"
-            elif len(active_values) >= total:
-                text = f"{prefix}: All ({total})"
-            elif not active_values:
-                text = f"{prefix}: None active (0/{total})"
-            elif len(active_values) <= 3:
-                text = f"{prefix}: " + ", ".join(active_values)
-            else:
-                text = f"{prefix}: {len(active_values)} of {total} active"
-            if tooltip_label is not None:
-                tooltip_label.setToolTip(", ".join(active_values))
-            return text
-
         def _refresh_report_filter_summaries() -> None:
-            programs_active = self._active_program_filter_values(filter_state=report_filter_state)
-            serials_active = self._active_serials(filter_state=report_filter_state)
-            control_active = self._active_control_period_filter_values(filter_state=report_filter_state)
-            lbl_report_program_filters.setText(
-                _report_filter_summary(
-                    "Programs",
-                    programs_active,
-                    len(self._available_program_filters or []),
-                    tooltip_label=lbl_report_program_filters,
-                )
-            )
-            lbl_report_serial_filters.setText(
-                _report_filter_summary(
-                    "Family Serials",
-                    serials_active,
-                    len(self._available_serial_filter_rows or []),
-                    tooltip_label=lbl_report_serial_filters,
-                )
-            )
-            lbl_report_suppression_filters.setText(
-                "Suppression Voltage: Auto (all for initial pass, family-specific only on WATCH/FAIL regrade)"
-            )
-            lbl_report_suppression_filters.setToolTip(
-                "Auto Report does not use a manual suppression filter. The initial pass pools all suppression voltages in scope, and regrade narrows to the certification-family suppression only when an initial WATCH or FAIL is found."
-            )
-            lbl_report_control_filters.setText(
-                _report_filter_summary(
-                    "Control Period",
-                    control_active,
-                    len(self._available_control_period_filters or []),
-                    tooltip_label=lbl_report_control_filters,
-                )
-            )
-            btn_report_program_filters.setEnabled(bool(self._available_program_filters))
-            btn_report_serial_filters.setEnabled(bool(self._available_serial_filter_rows))
-            btn_report_suppression_filters.setEnabled(False)
-            btn_report_control_filters.setEnabled(bool(self._available_control_period_filters))
-            btn_report_reset_filters.setEnabled(
-                bool(self._available_program_filters)
-                or bool(self._available_serial_filter_rows)
-                or bool(self._available_control_period_filters)
+            summary_text = self._auto_plot_filter_summary_text(report_filter_state)
+            lbl_report_filters_summary.setText(f"Filters: {summary_text}")
+            lbl_report_filters_summary.setToolTip(summary_text)
+            btn_report_filters_popup.setEnabled(
+                any(bool(self._auto_plot_available_filter_values(key)) for key in TD_AUTO_PLOT_FILTER_KEYS)
             )
 
         def _apply_report_filter_change() -> None:
             _refresh_report_filter_summaries()
             _refresh_certifying_program_options()
             _apply_certification_scope_change(refresh_serials=True)
+
+        def _open_report_filters_popup() -> None:
+            chosen = self._show_grouped_filter_popup(
+                title="Report Filters",
+                heading="Report Filters",
+                hint_text=(
+                    "Adjust the report-level global filters for this certification export. "
+                    "These filters control the programs, serials, suppression voltage, valve voltage, and control period in scope."
+                ),
+                filter_state=report_filter_state,
+                dialog_object_name="auto_report_filters_popup",
+                parent=dlg,
+                summary_prefix="Report scope",
+                summary_object_name="auto_report_filters_popup_summary_label",
+                key_object_name_prefix="auto_report_filters_popup",
+                checklist_title_prefix="Report",
+            )
+            if chosen is None:
+                return
+            report_filter_state.clear()
+            report_filter_state.update(chosen)
+            _apply_report_filter_change()
 
         def _refresh_params_from_runs():
             runs_sel = _selected_member_runs()
@@ -9155,94 +9281,6 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 extra_apply=_metrics_extra_apply,
             )
 
-        def _set_report_filter_values(key: str, values: list[str], available_values: list[str]) -> None:
-            allowed = set(available_values)
-            report_filter_state[key] = [value for value in available_values if value in allowed and value in set(values)]
-            _apply_report_filter_change()
-
-        def _open_report_program_filters_popup() -> None:
-            entries = [
-                {"value": value, "label": value, "search": value.lower()}
-                for value in (self._available_program_filters or [])
-                if str(value).strip()
-            ]
-            chosen = self._show_filter_checklist_popup(
-                title="Report Programs",
-                entries=entries,
-                selected_values=list(report_filter_state.get("programs") or []),
-            )
-            if chosen is None:
-                return
-            _set_report_filter_values("programs", chosen, list(self._available_program_filters or []))
-
-        def _open_report_serial_filters_popup() -> None:
-            entries: list[dict] = []
-            for row in (self._available_serial_filter_rows or []):
-                serial = _td_serial_value(row)
-                if not serial:
-                    continue
-                program = _td_display_program_title((row or {}).get("program_title"))
-                doc_type = str((row or {}).get("document_type") or "").strip()
-                parts = [serial, program]
-                if doc_type:
-                    parts.append(doc_type)
-                entries.append(
-                    {
-                        "value": serial,
-                        "label": " | ".join(parts),
-                        "search": self._serial_row_filter_text(row),
-                    }
-                )
-            chosen = self._show_filter_checklist_popup(
-                title="Report Family Serials",
-                entries=entries,
-                selected_values=list(report_filter_state.get("serials") or []),
-            )
-            if chosen is None:
-                return
-            _set_report_filter_values("serials", chosen, self._auto_plot_available_serial_values())
-
-        def _open_report_suppression_filters_popup() -> None:
-            entries = [
-                {"value": value, "label": value, "search": value.lower()}
-                for value in (self._available_suppression_voltage_filters or [])
-                if str(value).strip()
-            ]
-            chosen = self._show_filter_checklist_popup(
-                title="Report Suppression Voltages",
-                entries=entries,
-                selected_values=list(report_filter_state.get("suppression_voltages") or []),
-            )
-            if chosen is None:
-                return
-            _set_report_filter_values(
-                "suppression_voltages",
-                chosen,
-                list(self._available_suppression_voltage_filters or []),
-            )
-
-        def _open_report_control_period_filters_popup() -> None:
-            entries = [
-                {"value": value, "label": value, "search": value.lower()}
-                for value in (self._available_control_period_filters or [])
-                if str(value).strip()
-            ]
-            chosen = self._show_filter_checklist_popup(
-                title="Report Control Periods",
-                entries=entries,
-                selected_values=list(report_filter_state.get("control_periods") or []),
-            )
-            if chosen is None:
-                return
-            _set_report_filter_values("control_periods", chosen, list(self._available_control_period_filters or []))
-
-        def _reset_report_filters() -> None:
-            report_filter_state["programs"] = list(self._available_program_filters or [])
-            report_filter_state["serials"] = self._auto_plot_available_serial_values()
-            report_filter_state["control_periods"] = list(self._available_control_period_filters or [])
-            report_filter_state["suppression_voltages"] = []
-            _apply_report_filter_change()
-
         def _browse_output_dir() -> None:
             start_dir = (ed_output_dir.text() or "").strip() or str(edin_root_path)
             chosen = QtWidgets.QFileDialog.getExistingDirectory(dlg, "Select Output Folder", start_dir)
@@ -9259,11 +9297,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         btn_cert_popup.clicked.connect(_open_certification_popup)
         btn_params_popup.clicked.connect(_open_params_popup)
         btn_metrics_popup.clicked.connect(_open_metrics_popup)
-        btn_report_program_filters.clicked.connect(_open_report_program_filters_popup)
-        btn_report_serial_filters.clicked.connect(_open_report_serial_filters_popup)
-        btn_report_suppression_filters.clicked.connect(_open_report_suppression_filters_popup)
-        btn_report_control_filters.clicked.connect(_open_report_control_period_filters_popup)
-        btn_report_reset_filters.clicked.connect(_reset_report_filters)
+        btn_report_filters_popup.clicked.connect(_open_report_filters_popup)
         btn_output_default.clicked.connect(_use_default_output_dir)
         btn_output_browse.clicked.connect(_browse_output_dir)
 
@@ -10964,10 +10998,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             else str((self._smart_solver_config or {}).get("run_type_mode") or "pulsed_mode").strip().lower()
         )
         parts = [
-            str(getattr(getattr(self, "lbl_program_filter_summary", None), "text", lambda: "")() or "").strip(),
-            str(getattr(getattr(self, "lbl_serial_filter_summary", None), "text", lambda: "")() or "").strip(),
-            str(getattr(getattr(self, "lbl_suppression_voltage_filter_summary", None), "text", lambda: "")() or "").strip(),
-            str(getattr(getattr(self, "lbl_control_period_filter_summary", None), "text", lambda: "")() or "").strip(),
+            self._global_filter_summary_line("programs")[0],
+            self._global_filter_summary_line("serials")[0],
+            self._global_filter_summary_line("suppression_voltages")[0],
+            self._global_filter_summary_line("control_periods")[0],
         ]
         parts = [part for part in parts if part]
         if run_type_mode == "steady_state":
@@ -11218,33 +11252,17 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         form.addRow("Data Source:", QtWidgets.QLabel("td_metrics_calc_sequences"))
         form.addRow(
             "Program Filters:",
-            QtWidgets.QLabel(
-                str(getattr(self, "lbl_program_filter_summary", None).text() if hasattr(self, "lbl_program_filter_summary") else "-")
-            ),
+            QtWidgets.QLabel(self._global_filter_summary_line("programs")[0]),
         )
         form.addRow(
             "Serial Filters:",
-            QtWidgets.QLabel(
-                str(getattr(self, "lbl_serial_filter_summary", None).text() if hasattr(self, "lbl_serial_filter_summary") else "-")
-            ),
+            QtWidgets.QLabel(self._global_filter_summary_line("serials")[0]),
         )
         form.addRow(
             "Suppression Filters:",
-            QtWidgets.QLabel(
-                str(
-                    getattr(self, "lbl_suppression_voltage_filter_summary", None).text()
-                    if hasattr(self, "lbl_suppression_voltage_filter_summary")
-                    else "-"
-                )
-            ),
+            QtWidgets.QLabel(self._global_filter_summary_line("suppression_voltages")[0]),
         )
-        lbl_cp_filters_value = QtWidgets.QLabel(
-            str(
-                getattr(self, "lbl_control_period_filter_summary", None).text()
-                if hasattr(self, "lbl_control_period_filter_summary")
-                else "-"
-            )
-        )
+        lbl_cp_filters_value = QtWidgets.QLabel(self._global_filter_summary_line("control_periods")[0])
         form.addRow("CP Filters:", lbl_cp_filters_value)
         layout.addLayout(form)
 
@@ -11274,11 +11292,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             lbl_cp_filters_value.setText(
                 "Ignored in steady-state mode."
                 if is_steady
-                else str(
-                    getattr(self, "lbl_control_period_filter_summary", None).text()
-                    if hasattr(self, "lbl_control_period_filter_summary")
-                    else "-"
-                )
+                else self._global_filter_summary_line("control_periods")[0]
             )
 
         combo_condition_family.currentIndexChanged.connect(lambda *_: _update_mode_copy())
@@ -17090,89 +17104,15 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         filter_layout.addWidget(filter_title)
 
         lbl_filter_summary = QtWidgets.QLabel("")
+        lbl_filter_summary.setObjectName("saved_global_filters_summary_label")
         lbl_filter_summary.setWordWrap(True)
         lbl_filter_summary.setStyleSheet("color: #475569; font-size: 11px;")
         filter_layout.addWidget(lbl_filter_summary)
 
-        row_labels: dict[str, QtWidgets.QLabel] = {}
-
-        def _filter_values_for_key(key: str) -> list[str]:
-            if key == "programs":
-                return list(self._available_program_filters or [])
-            if key == "serials":
-                return self._auto_plot_available_serial_values()
-            if key == "control_periods":
-                return list(self._available_control_period_filters or [])
-            if key == "suppression_voltages":
-                return list(self._available_suppression_voltage_filters or [])
-            if key == "valve_voltages":
-                return list(self._available_valve_voltage_filters or [])
-            return []
-
         def _refresh_filter_labels() -> None:
-            label_map = {
-                "programs": "Programs",
-                "serials": "Serials",
-                "control_periods": "Control Period",
-                "suppression_voltages": "Suppression Voltage",
-                "valve_voltages": "Valve Voltage",
-            }
-            for key in TD_AUTO_PLOT_FILTER_KEYS:
-                selected_values = [str(value).strip() for value in (filter_state.get(key) or []) if str(value).strip()]
-                total = len(_filter_values_for_key(key))
-                summary = self._popup_selection_summary(selected_values, total_count=total, empty_text="-")
-                row_labels[key].setText(f"{label_map[key]}: {summary}")
-                row_labels[key].setToolTip(", ".join(selected_values))
-            lbl_filter_summary.setText(self._auto_plot_filter_summary_text(filter_state))
-
-        def _edit_filter_values(key: str, title_text: str) -> None:
-            values = _filter_values_for_key(key)
-            if not values:
-                QtWidgets.QMessageBox.information(
-                    dlg,
-                    "Auto-Graphs",
-                    f"No {title_text.lower()} are available in the current cache.",
-                )
-                return
-            entries = [
-                {"value": value, "label": value, "search": value.lower()}
-                for value in values
-                if str(value).strip()
-            ]
-            chosen = self._show_filter_checklist_popup(
-                title=title_text,
-                entries=entries,
-                selected_values=list(filter_state.get(key) or []),
-            )
-            if chosen is None:
-                return
-            chosen_set = {str(value).strip() for value in chosen if str(value).strip()}
-            filter_state[key] = [value for value in values if value in chosen_set]
-            _refresh_filter_labels()
-
-        for key, label_text in (
-            ("programs", "Programs"),
-            ("serials", "Serials"),
-            ("control_periods", "Control Period"),
-            ("suppression_voltages", "Suppression Voltage"),
-            ("valve_voltages", "Valve Voltage"),
-        ):
-            row = QtWidgets.QHBoxLayout()
-            row.setSpacing(8)
-            btn = QtWidgets.QPushButton(f"{label_text}...")
-            btn.clicked.connect(
-                lambda _checked=False, key=key, label_text=label_text: _edit_filter_values(
-                    key, f"Saved {label_text}"
-                )
-            )
-            lbl = QtWidgets.QLabel("")
-            lbl.setWordWrap(True)
-            row_labels[key] = lbl
-            row.addWidget(btn, 0)
-            row.addWidget(lbl, 1)
-            filter_layout.addLayout(row)
-
-        btn_use_current = QtWidgets.QPushButton("Use Current Global Filters")
+            summary_text = self._auto_plot_filter_summary_text(filter_state)
+            lbl_filter_summary.setText(f"Filters: {summary_text}")
+            lbl_filter_summary.setToolTip(summary_text)
 
         def _reset_to_current_filters() -> None:
             current = self._current_auto_plot_filter_state()
@@ -17180,8 +17120,43 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 filter_state[key] = [str(value).strip() for value in (current.get(key) or []) if str(value).strip()]
             _refresh_filter_labels()
 
-        btn_use_current.clicked.connect(_reset_to_current_filters)
-        filter_layout.addWidget(btn_use_current, 0, QtCore.Qt.AlignmentFlag.AlignLeft)
+        btn_saved_filters_popup = QtWidgets.QPushButton("Saved Global Filters...")
+        btn_saved_filters_popup.setObjectName("saved_global_filters_popup_button")
+        btn_saved_filters_popup.clicked.connect(
+            lambda *_: (
+                lambda chosen: (
+                    filter_state.clear(),
+                    filter_state.update(chosen),
+                    _refresh_filter_labels(),
+                )
+                if chosen is not None
+                else None
+            )(
+                self._show_grouped_filter_popup(
+                    title="Saved Global Filters",
+                    heading="Saved Global Filters",
+                    hint_text="Edit the stored global-filter snapshot that this preset should use when opened or exported.",
+                    filter_state=filter_state,
+                    dialog_object_name="saved_global_filters_popup",
+                    parent=dlg,
+                    summary_prefix="Saved scope",
+                    summary_object_name="saved_global_filters_popup_summary_label",
+                    key_object_name_prefix="saved_global_filters_popup",
+                    checklist_title_prefix="Saved",
+                    extra_actions=[
+                        {
+                            "text": "Use Current Global Filters",
+                            "object_name": "saved_global_filters_popup_use_current_button",
+                            "callback": lambda _state: [
+                                _state.__setitem__(key, list(self._current_auto_plot_filter_state().get(key) or []))
+                                for key in TD_AUTO_PLOT_FILTER_KEYS
+                            ],
+                        }
+                    ],
+                )
+            )
+        )
+        filter_layout.addWidget(btn_saved_filters_popup, 0, QtCore.Qt.AlignmentFlag.AlignLeft)
         layout.addWidget(filter_frame, 1)
         _refresh_filter_labels()
 
@@ -18331,23 +18306,14 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         lbl_runs_summary.setStyleSheet("color: #475569; font-size: 11px;")
         selection_layout.addWidget(lbl_runs_summary)
 
-        filter_row = QtWidgets.QHBoxLayout()
-        filter_row.setSpacing(8)
-        btn_programs = QtWidgets.QPushButton("Programs...")
-        btn_serials = QtWidgets.QPushButton("Serials...")
-        btn_control_periods = QtWidgets.QPushButton("Control Period...")
-        btn_suppression = QtWidgets.QPushButton("Suppression Voltage...")
-        btn_valve = QtWidgets.QPushButton("Valve Voltage...")
-        btn_reset_filters = QtWidgets.QPushButton("Reset Filters")
-        for button in (btn_programs, btn_serials, btn_control_periods, btn_suppression, btn_valve, btn_reset_filters):
-            filter_row.addWidget(button)
-        filter_row.addStretch(1)
-        selection_layout.addLayout(filter_row)
-
         lbl_filter_summary = QtWidgets.QLabel("")
+        lbl_filter_summary.setObjectName("auto_graphs_filters_summary_label")
         lbl_filter_summary.setWordWrap(True)
         lbl_filter_summary.setStyleSheet("color: #475569; font-size: 11px;")
         selection_layout.addWidget(lbl_filter_summary)
+        btn_selection_filters_popup = QtWidgets.QPushButton("Global Filters...")
+        btn_selection_filters_popup.setObjectName("auto_graphs_filters_popup_button")
+        selection_layout.addWidget(btn_selection_filters_popup, 0, QtCore.Qt.AlignmentFlag.AlignLeft)
         layout.addWidget(selection_frame, 0)
 
         list_widget = QtWidgets.QListWidget()
@@ -18409,6 +18375,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             lbl_filter_summary.setText(
                 f"Filters: {self._auto_plot_filter_summary_text(self._auto_plot_filters_from_global_selection(current))}"
             )
+            lbl_filter_summary.setToolTip(self._auto_plot_filter_summary_text(self._auto_plot_filters_from_global_selection(current)))
+            btn_selection_filters_popup.setEnabled(
+                any(bool(self._auto_plot_available_filter_values(key)) for key in TD_AUTO_PLOT_FILTER_KEYS)
+            )
             self._refresh_auto_plots_list(list_widget)
             self._update_auto_actions(
                 list_widget=list_widget,
@@ -18420,23 +18390,24 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 btn_save_all=btn_save_all,
             )
 
-        def _edit_filter(key: str, title_text: str) -> None:
+        def _open_selection_filters_popup() -> None:
             current = self._normalize_auto_plot_global_selection(state.get("global_selection"), default_to_current=True)
             filters = self._auto_plot_filters_from_global_selection(current)
-            values = self._auto_plot_available_filter_values(key)
-            if not values:
-                QtWidgets.QMessageBox.information(dlg, "Auto-Graphs", f"No {title_text.lower()} are available.")
-                return
-            chosen = self._show_filter_checklist_popup(
-                title=title_text,
-                entries=[{"value": value, "label": value, "search": value.lower()} for value in values],
-                selected_values=list(filters.get(key) or []),
+            chosen = self._show_grouped_filter_popup(
+                title="Auto-Graphs Global Filters",
+                heading="Shared Auto-Graphs Filters",
+                hint_text="Adjust the shared filter scope used by Auto-Graphs without changing the live Trend / Analyze GUI state.",
+                filter_state=filters,
+                dialog_object_name="auto_graphs_filters_popup",
+                parent=dlg,
+                summary_prefix="Shared scope",
+                summary_object_name="auto_graphs_filters_popup_summary_label",
+                key_object_name_prefix="auto_graphs_filters_popup",
+                checklist_title_prefix="Auto-Graphs",
             )
             if chosen is None:
                 return
-            chosen_set = {str(value).strip() for value in chosen if str(value).strip()}
-            filters[key] = [value for value in values if value in chosen_set]
-            current["filters"] = filters
+            current["filters"] = chosen
             state["global_selection"] = self._normalize_auto_plot_global_selection(current, default_to_current=True)
             _persist_selection()
             _refresh_builder()
@@ -18477,16 +18448,6 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             _persist_selection()
             _refresh_builder()
 
-        def _reset_filters() -> None:
-            current = self._normalize_auto_plot_global_selection(state.get("global_selection"), default_to_current=True)
-            current["filters"] = {
-                key: self._auto_plot_available_filter_values(key)
-                for key in TD_AUTO_PLOT_FILTER_KEYS
-            }
-            state["global_selection"] = self._normalize_auto_plot_global_selection(current, default_to_current=True)
-            _persist_selection()
-            _refresh_builder()
-
         def _new_entry() -> None:
             edited = self._open_auto_plot_editor(global_selection=state["global_selection"])
             if edited is None:
@@ -18515,12 +18476,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
         cb_run_scope.currentIndexChanged.connect(_on_scope_changed)
         btn_pick_runs.clicked.connect(_edit_runs)
-        btn_programs.clicked.connect(lambda: _edit_filter("programs", "Auto-Graphs Programs"))
-        btn_serials.clicked.connect(lambda: _edit_filter("serials", "Auto-Graphs Serials"))
-        btn_control_periods.clicked.connect(lambda: _edit_filter("control_periods", "Auto-Graphs Control Period"))
-        btn_suppression.clicked.connect(lambda: _edit_filter("suppression_voltages", "Auto-Graphs Suppression Voltage"))
-        btn_valve.clicked.connect(lambda: _edit_filter("valve_voltages", "Auto-Graphs Valve Voltage"))
-        btn_reset_filters.clicked.connect(_reset_filters)
+        btn_selection_filters_popup.clicked.connect(_open_selection_filters_popup)
         list_widget.itemDoubleClicked.connect(lambda *_: self._open_selected_auto_plot(list_widget=list_widget))
         list_widget.itemSelectionChanged.connect(
             lambda: self._update_auto_actions(
@@ -21072,20 +21028,14 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         lbl_runs_summary.setWordWrap(True)
         lbl_runs_summary.setStyleSheet("color: #475569; font-size: 11px;")
         selection_layout.addWidget(lbl_runs_summary)
-        filter_row = QtWidgets.QHBoxLayout()
-        btn_programs = QtWidgets.QPushButton("Programs...")
-        btn_serials = QtWidgets.QPushButton("Serials...")
-        btn_control_periods = QtWidgets.QPushButton("Control Period...")
-        btn_suppression = QtWidgets.QPushButton("Suppression Voltage...")
-        btn_valve = QtWidgets.QPushButton("Valve Voltage...")
-        for button in (btn_programs, btn_serials, btn_control_periods, btn_suppression, btn_valve):
-            filter_row.addWidget(button)
-        filter_row.addStretch(1)
-        selection_layout.addLayout(filter_row)
         lbl_filters_summary = QtWidgets.QLabel("")
+        lbl_filters_summary.setObjectName("graph_file_filters_summary_label")
         lbl_filters_summary.setWordWrap(True)
         lbl_filters_summary.setStyleSheet("color: #475569; font-size: 11px;")
         selection_layout.addWidget(lbl_filters_summary)
+        btn_filters_popup = QtWidgets.QPushButton("Global Filters...")
+        btn_filters_popup.setObjectName("graph_file_filters_popup_button")
+        selection_layout.addWidget(btn_filters_popup, 0, QtCore.Qt.AlignmentFlag.AlignLeft)
         layout.addWidget(selection_frame)
 
         splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
@@ -21308,7 +21258,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             if bool(cb_track_serials.isChecked()):
                 filters_text += " | Serials: Auto from programs"
             lbl_filters_summary.setText(f"Filters: {filters_text}")
-            btn_serials.setEnabled(not bool(cb_track_serials.isChecked()))
+            lbl_filters_summary.setToolTip(filters_text)
+            btn_filters_popup.setEnabled(
+                any(bool(self._auto_plot_available_filter_values(key)) for key in TD_AUTO_PLOT_FILTER_KEYS)
+            )
 
         def _refresh_builder_sources() -> None:
             columns = _available_columns()
@@ -21491,6 +21444,39 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 selected_values=selected_values,
             )
 
+        def _open_graph_file_filters_popup() -> None:
+            current_filters = self._normalize_auto_plot_filter_state(
+                (state.get("global_selection") or {}).get("filters"),
+                default_to_current=True,
+            )
+            chosen = self._show_grouped_filter_popup(
+                title="Graph File Global Filters",
+                heading="Graph File Global Filters",
+                hint_text="Adjust the saved filter scope for this graph file without using editor space for each individual selector.",
+                filter_state=current_filters,
+                dialog_object_name="graph_file_filters_popup",
+                parent=dlg,
+                summary_prefix="File scope",
+                summary_object_name="graph_file_filters_popup_summary_label",
+                key_object_name_prefix="graph_file_filters_popup",
+                checklist_title_prefix="Graph File",
+                disabled_reasons=(
+                    {"serials": "Serial tracking is enabled, so serials are derived automatically from the selected programs."}
+                    if bool(cb_track_serials.isChecked())
+                    else {}
+                ),
+                row_summary_overrides=(
+                    {"serials": lambda _state: ("Serials: Auto from programs", "")}
+                    if bool(cb_track_serials.isChecked())
+                    else {}
+                ),
+            )
+            if chosen is None:
+                return
+            state["global_selection"]["filters"] = chosen
+            _refresh_selection_summary()
+            _refresh_builder_sources()
+
         def _save_plot_from_builder() -> None:
             existing_entry = None
             edit_id = str(state.get("editing_plot_id") or "").strip()
@@ -21606,60 +21592,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             dlg.setProperty("_chosen_auto_graph_file", normalized)
             dlg.accept()
 
-        btn_programs.clicked.connect(lambda: (
-            lambda chosen: (
-                state["global_selection"].__setitem__(
-                    "filters",
-                    {**self._normalize_auto_plot_filter_state((state.get("global_selection") or {}).get("filters"), default_to_current=True), "programs": [value for value in self._auto_plot_available_filter_values("programs") if value in {str(item).strip() for item in chosen}]},
-                ),
-                _refresh_selection_summary(),
-                _refresh_builder_sources(),
-            ) if chosen is not None else None
-        )(_pick_values("Graph File Programs", self._auto_plot_available_filter_values("programs"), list(self._resolve_auto_graph_file_filter_state(_draft_graph_file()).get("programs") or []))))
-        btn_serials.clicked.connect(lambda: (
-            QtWidgets.QMessageBox.information(dlg, "Auto-Graphs", "Serial tracking is enabled, so serials are derived automatically from the selected programs.")
-            if cb_track_serials.isChecked()
-            else (
-                lambda chosen: (
-                    state["global_selection"].__setitem__(
-                        "filters",
-                        {**self._normalize_auto_plot_filter_state((state.get("global_selection") or {}).get("filters"), default_to_current=True), "serials": [value for value in self._auto_plot_available_filter_values("serials") if value in {str(item).strip() for item in chosen}]},
-                    ),
-                    _refresh_selection_summary(),
-                    _refresh_builder_sources(),
-                ) if chosen is not None else None
-            )(_pick_values("Graph File Serials", self._auto_plot_available_filter_values("serials"), list(self._resolve_auto_graph_file_filter_state(_draft_graph_file()).get("serials") or [])))
-        ))
-        btn_control_periods.clicked.connect(lambda: (
-            lambda chosen: (
-                state["global_selection"].__setitem__(
-                    "filters",
-                    {**self._normalize_auto_plot_filter_state((state.get("global_selection") or {}).get("filters"), default_to_current=True), "control_periods": [value for value in self._auto_plot_available_filter_values("control_periods") if value in {str(item).strip() for item in chosen}]},
-                ),
-                _refresh_selection_summary(),
-                _refresh_builder_sources(),
-            ) if chosen is not None else None
-        )(_pick_values("Graph File Control Period", self._auto_plot_available_filter_values("control_periods"), list(self._resolve_auto_graph_file_filter_state(_draft_graph_file()).get("control_periods") or []))))
-        btn_suppression.clicked.connect(lambda: (
-            lambda chosen: (
-                state["global_selection"].__setitem__(
-                    "filters",
-                    {**self._normalize_auto_plot_filter_state((state.get("global_selection") or {}).get("filters"), default_to_current=True), "suppression_voltages": [value for value in self._auto_plot_available_filter_values("suppression_voltages") if value in {str(item).strip() for item in chosen}]},
-                ),
-                _refresh_selection_summary(),
-                _refresh_builder_sources(),
-            ) if chosen is not None else None
-        )(_pick_values("Graph File Suppression Voltage", self._auto_plot_available_filter_values("suppression_voltages"), list(self._resolve_auto_graph_file_filter_state(_draft_graph_file()).get("suppression_voltages") or []))))
-        btn_valve.clicked.connect(lambda: (
-            lambda chosen: (
-                state["global_selection"].__setitem__(
-                    "filters",
-                    {**self._normalize_auto_plot_filter_state((state.get("global_selection") or {}).get("filters"), default_to_current=True), "valve_voltages": [value for value in self._auto_plot_available_filter_values("valve_voltages") if value in {str(item).strip() for item in chosen}]},
-                ),
-                _refresh_selection_summary(),
-                _refresh_builder_sources(),
-            ) if chosen is not None else None
-        )(_pick_values("Graph File Valve Voltage", self._auto_plot_available_filter_values("valve_voltages"), list(self._resolve_auto_graph_file_filter_state(_draft_graph_file()).get("valve_voltages") or []))))
+        btn_filters_popup.clicked.connect(_open_graph_file_filters_popup)
         btn_pick_runs.clicked.connect(lambda: (
             lambda current_file: (
                 lambda chosen: (

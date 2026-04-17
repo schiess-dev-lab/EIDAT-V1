@@ -7,7 +7,10 @@ import tempfile
 from types import SimpleNamespace
 from unittest import mock
 
-from ui_next import trend_auto_report as tar
+try:
+    from ui_next import trend_auto_report as tar
+except ModuleNotFoundError:
+    from EIDAT_App_Files.ui_next import trend_auto_report as tar
 
 
 class _FakeParagraph:
@@ -326,12 +329,16 @@ class TestTrendAutoReportFilters(unittest.TestCase):
                 "serials": ["SN-001", "SN-002"],
                 "control_periods": ["10"],
                 "suppression_voltages": ["5"],
+                "valve_voltages": ["28"],
             },
             "filtered_serials": ["SN-001"],
             "run_selections": [
                 {
                     "member_sequences": ["Seq A"],
                     "member_programs": ["Program A"],
+                    "program_title": "Program A",
+                    "member_valve_voltages": ["28"],
+                    "valve_voltage": "28",
                 }
             ],
         }
@@ -340,11 +347,10 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         self.assertEqual(
             initial_options["filter_state"],
             {
-                "programs": ["Program A"],
-                "serials": ["SN-001", "SN-002"],
                 "control_periods": ["10"],
             },
         )
+        self.assertEqual(initial_options["run_selections"], [{"member_sequences": ["Seq A"]}])
         self.assertNotIn("filtered_serials", initial_options)
 
         resolved = tar._resolve_filtered_serials(
@@ -1665,10 +1671,10 @@ class TestTrendAutoReportFilters(unittest.TestCase):
             for idx, item in enumerate(story)
             if isinstance(item, _FakeTable) and _table_text(item)[0][0] == "Disposition"
         )
-        initial_vs_final_idx = next(
+        program_pool_idx = next(
             idx
             for idx, item in enumerate(story)
-            if isinstance(item, _FakeTable) and _table_text(item)[0][0] == "Initial vs Final Run"
+            if isinstance(item, _FakeTable) and _table_text(item)[0][0] == "Program Pool Grading"
         )
         watch_idx = next(
             idx
@@ -1679,8 +1685,8 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         self.assertGreater(toc_idx, page_break_idx)
         self.assertLess(exec_table_idx, disposition_idx)
         self.assertLess(exception_table_idx, disposition_idx)
-        self.assertLess(disposition_idx, initial_vs_final_idx)
-        self.assertLess(initial_vs_final_idx, watch_idx)
+        self.assertLess(disposition_idx, program_pool_idx)
+        self.assertLess(program_pool_idx, watch_idx)
         self.assertLess(watch_idx, counts_idx)
         self.assertLess(counts_idx, toc_idx)
 

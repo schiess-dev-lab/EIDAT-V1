@@ -1555,6 +1555,7 @@ def _tar_prepass_gate_details_for_program_traces(
     *,
     program_by_serial: Mapping[str, str] | None,
     reference_program: str,
+    metric_values_by_serial: Mapping[str, object] | None = None,
     comparator: str,
     noise_score_max: float,
     noise_floor_pct: float,
@@ -1566,7 +1567,12 @@ def _tar_prepass_gate_details_for_program_traces(
         traces_by_serial,
         program_by_serial=program_by_serial,
     )
-    program_means = _tar_program_trace_scalar_mean_map(centers_by_program)
+    metric_program_means = _tar_program_mean_map(
+        metric_values_by_serial,
+        program_by_serial=program_by_serial,
+    )
+    program_means = metric_program_means or _tar_program_trace_scalar_mean_map(centers_by_program)
+    mean_source = "cached_metric_mean" if metric_program_means else "curve_trace_mean"
     reference = _td_display_program_title(reference_program)
     program_order = _tar_unique_text_values(list(centers_by_program.keys()) or list(program_means.keys()))
     details: list[dict[str, Any]] = []
@@ -1584,6 +1590,7 @@ def _tar_prepass_gate_details_for_program_traces(
                     "pooled_noise": None,
                     "noise_score": None,
                     "mean_delta_pct": _tar_percent_delta_between_scalars(program_means.get(program), program_means.get(reference)),
+                    "mean_source": mean_source,
                     "admitted": False,
                     "gate_mode": "missing_reference_program",
                 }
@@ -1659,6 +1666,7 @@ def _tar_prepass_gate_details_for_program_traces(
                 "pooled_noise": _safe_float(pooled_noise),
                 "noise_score": _safe_float(noise_score),
                 "mean_delta_pct": _safe_float(mean_delta_pct),
+                "mean_source": mean_source,
                 "admitted": bool(admitted),
                 "gate_mode": gate_mode,
             }
@@ -1795,6 +1803,8 @@ def _tar_normalize_grade_token(grade: object) -> str:
     normalized = raw.replace("-", "_").replace(" ", "_")
     if normalized in {"NO_DATA", "NODATA"}:
         return "NO_DATA"
+    if normalized in {"LIMITED", "NO_SCORE", "NOSCORE"}:
+        return "LIMITED"
     if normalized == "FAILED":
         return "FAIL"
     if normalized == "CERTIFIED":
@@ -1805,10 +1815,13 @@ def _tar_normalize_grade_token(grade: object) -> str:
 def _overall_cert_status(grades: list[str], *, ignore_no_data: bool = False, empty_status: str = "NO_DATA") -> str:
     gs = [_tar_normalize_grade_token(g) for g in (grades or [])]
     evaluable = [g for g in gs if g in {"PASS", "WATCH", "FAIL"}]
+    has_limited = any(g == "LIMITED" for g in gs)
     if any(g == "FAIL" for g in evaluable):
         return "FAILED"
     if any(g == "WATCH" for g in evaluable):
         return "WATCH"
+    if has_limited:
+        return "LIMITED"
     if not ignore_no_data and (any(g == "NO_DATA" for g in gs) or not gs):
         return "NO_DATA"
     if any(g == "PASS" for g in evaluable):
@@ -2919,7 +2932,16 @@ def _render_portrait_story_pdf(
 
 
 _TAR_COMPARISON_FONT_CHOICES = (9, 8)
-_TAR_COMPARISON_METRIC_ROWS = ("Initial Status", "Graded Mean", "Certified Serial Mean", "Z-Score", "Official Grade", "Grade Basis")
+_TAR_COMPARISON_METRIC_ROWS = (
+    "Initial Status",
+    "Graded Mean",
+    "Certified Serial Mean",
+    "Deviation Score",
+    "Official Grade",
+    "Comparison Pool",
+    "Comparison Series",
+    "Grade Basis",
+)
 _TAR_COMPARISON_PAGE_WIDTH = 17.0 * 72.0
 _TAR_COMPARISON_PAGE_HEIGHT = 11.0 * 72.0
 _TAR_COMPARISON_LEFT_MARGIN = 24.0
@@ -3076,6 +3098,28 @@ def _tar_grade_basis_text(row: Mapping[str, object] | None) -> str:
     if not isinstance(row, Mapping):
         return ""
     pass_type = str(row.get("official_pass_type") or "").strip().lower()
+    if pass_type == "selected_program_pool" or (
+        pass_type == "initial_prepass"
+        and (
+            row.get("comparison_pool_text")
+            or row.get("target_comparison_text")
+            or row.get("grading_basis_status")
+        )
+    ):
+        status = str(row.get("grading_basis_status") or "").strip().lower()
+        pool_text = str(row.get("comparison_pool_text") or "").strip()
+        target_text = str(row.get("target_comparison_text") or "").strip()
+        basis = "Selected program pool"
+        if status == "program_only_pool":
+            basis = "Selected certifying-program pool"
+        elif status == "limited_target_excluded_baseline":
+            basis = "Limited selected-pool baseline"
+        lines = [basis]
+        if pool_text:
+            lines.append(f"Comparison Pool: {pool_text}")
+        if target_text:
+            lines.append(target_text)
+        return "\n".join(lines)
     if pass_type == "final_exact_condition":
         suppression = str(row.get("official_suppression_voltage_label") or row.get("final_suppression_voltage_label") or "All").strip() or "All"
         valve = str(row.get("official_valve_voltage_label") or row.get("final_valve_voltage_label") or "All").strip() or "All"
@@ -3120,10 +3164,20 @@ def _tar_comparison_page_metric_value(row: Mapping[str, object] | None, metric_l
         return _fmt_num(_pick("official_baseline_mean", "final_family_mean", "final_atp_mean", "initial_family_mean", "initial_atp_mean"), sig=5)
     if metric_label == "Certified Serial Mean":
         return _fmt_num(_pick("official_serial_mean", "final_serial_mean", "final_actual_mean", "initial_serial_mean", "initial_actual_mean"), sig=5)
-    if metric_label == "Z-Score":
-        return _fmt_num(_pick("official_zscore", "final_zscore", "final_delta", "initial_zscore", "initial_delta"), sig=4)
+    if metric_label in {"Deviation Score", "Z-Score"}:
+        return _fmt_num(_pick("official_deviation_score", "official_zscore", "final_zscore", "final_delta", "initial_zscore", "initial_delta"), sig=4)
     if metric_label == "Official Grade":
         return str(_pick("official_grade", "final_grade", "grade", "initial_grade") or "NO_DATA").strip().upper() or "NO_DATA"
+    if metric_label == "Comparison Pool":
+        pool_text = str(row.get("comparison_pool_text") or "").strip()
+        if pool_text:
+            return pool_text
+        return _tar_pool_summary_text(row.get("selected_programs") or [], row.get("selected_pool_series_count"))
+    if metric_label == "Comparison Series":
+        target_text = str(row.get("target_comparison_text") or "").strip()
+        if target_text:
+            return target_text
+        return _fmt_num(row.get("target_excluded_comparison_series_count"), sig=4)
     if metric_label == "Grade Basis":
         return str(row.get("grade_basis_text") or _tar_grade_basis_text(row)).strip()
     return ""
@@ -4172,8 +4226,8 @@ def generate_test_data_auto_report(
                 "Grading metrics (family comparison):",
                 "  • Family curve: median across all serials in the project cache (per run/param).",
                 "  • Residual metrics: max_abs, max_pct, rms_pct, x@max.",
-                "  • Grade basis: z-score of max_abs vs family distribution.",
-                f"  • Thresholds: PASS if |z|≤{_fmt_num(z_pass)}; WATCH if |z|≤{_fmt_num(z_watch)}; else FAIL.",
+                "  • Grade basis: Deviation Score from the selected comparison pool.",
+                f"  • Thresholds: PASS if score≤{_fmt_num(z_pass)}; WATCH if score≤{_fmt_num(z_watch)}; else FAIL.",
                 "  • Main body shows WATCH/FAIL only; PASS details are in the appendix.",
             ]
             y = 0.30
@@ -4187,7 +4241,7 @@ def generate_test_data_auto_report(
             if not nonpass_findings:
                 pdf.savefig(_figure_text_page("Non‑PASS Findings (Overview)", ["All investigated serials are CERTIFIED (all PASS)."]))
             else:
-                cols = ["Serial", "Run", "Param", "Grade", "Max %", "RMS %", "x@max", "z"]
+                cols = ["Serial", "Run", "Param", "Grade", "Max %", "RMS %", "x@max", "Score"]
                 rows = [
                     [
                         r.get("serial"),
@@ -4204,7 +4258,7 @@ def generate_test_data_auto_report(
                 pdf.savefig(_figure_table_page2("Non‑PASS Findings (Overview)", cols, rows, landscape=True, font_size=7))
 
             # 4) Non-PASS findings by serial (two per page)
-            cols_by_sn = ["Run", "Param", "Grade", "Max %", "RMS %", "x@max", "z"]
+            cols_by_sn = ["Run", "Param", "Grade", "Max %", "RMS %", "x@max", "Score"]
             for i in range(0, len(serials_nonpass_sorted), 2):
                 left_sn = serials_nonpass_sorted[i]
                 right_sn = serials_nonpass_sorted[i + 1] if i + 1 < len(serials_nonpass_sorted) else ""
@@ -4680,7 +4734,7 @@ def generate_test_data_auto_report(
 
             # Optional appendix: full deviations table (kept tight)
             if include_deviations and grading_rows:
-                cols = ["Serial", "Run", "Param", "Grade", "z", "Max Abs", "RMS", "Max %", "RMS %", "x@max"]
+                cols = ["Serial", "Run", "Param", "Grade", "Score", "Max Abs", "RMS", "Max %", "RMS %", "x@max"]
                 max_rows = 60
                 rows = []
                 for r in grading_rows[:max_rows]:
@@ -4947,6 +5001,8 @@ def _tar_grade_color(grade: object, *, default: str = "#2563eb") -> str:
         return "#dc2626"
     if token == "WATCH":
         return "#f59e0b"
+    if token in {"LIMITED", "NO_SCORE"}:
+        return "#64748b"
     if token in {"PASS", "CERTIFIED"}:
         return "#2563eb"
     return default
@@ -5125,6 +5181,8 @@ def _tar_grade_rank(grade: object) -> int:
         return 2
     if token in {"PASS", "CERTIFIED"}:
         return 1
+    if token in {"LIMITED", "NO_SCORE"}:
+        return 0
     return 0
 
 
@@ -5161,6 +5219,8 @@ def _tar_initial_overall_status_from_rows(rows: list[Mapping[str, Any]] | None) 
     evaluable = [_tar_normalize_grade_token(status) for status in statuses if _tar_normalize_grade_token(status) in {"PASS", "WATCH", "FAIL"}]
     if evaluable:
         return _overall_cert_status(evaluable, ignore_no_data=True, empty_status="")
+    if any(_tar_normalize_grade_token(status) == "LIMITED" for status in statuses):
+        return "LIMITED"
     if any(status == "SKIPPED" for status in statuses):
         return "SKIPPED"
     return ""
@@ -5347,10 +5407,22 @@ def _tar_filter_state_without_suppression(
         return out
     for key, value in filter_state.items():
         name = str(key)
-        if name in {"suppression_voltages", "valve_voltages"}:
+        if name in {"programs", "serials", "suppression_voltages", "valve_voltages"}:
             continue
         if isinstance(value, list):
             out[name] = [str(item).strip() for item in value if str(item).strip()]
+    return out
+
+
+def _tar_selection_without_pool_limiters(selection: Mapping[str, object] | None) -> dict[str, object]:
+    out = dict(selection or {}) if isinstance(selection, Mapping) else {}
+    for key in (
+        "member_programs",
+        "program_title",
+        "member_valve_voltages",
+        "valve_voltage",
+    ):
+        out.pop(key, None)
     return out
 
 
@@ -5359,6 +5431,13 @@ def _tar_initial_analysis_options(options: Mapping[str, object] | None) -> dict[
     out["filter_state"] = _tar_filter_state_without_suppression(
         (options.get("filter_state") if isinstance(options, Mapping) else None)
     )
+    raw_selections = out.get("run_selections") or []
+    if isinstance(raw_selections, list):
+        out["run_selections"] = [
+            _tar_selection_without_pool_limiters(selection)
+            for selection in raw_selections
+            if isinstance(selection, Mapping)
+        ]
     out.pop("filtered_serials", None)
     return out
 
@@ -6176,8 +6255,18 @@ def _tar_build_per_serial_comparison_rows(
             ) or initial_grade
             row_final_suppression = regrade_suppression or final_suppression
             row_final_valve = regrade_valve or final_valve
-            official_baseline_mean = final_family_mean if official_pass_type == "final_exact_condition" and final_pass_applied else initial_family_mean
-            official_serial_mean = final_serial_mean if official_pass_type == "final_exact_condition" and final_pass_applied else initial_serial_mean
+            official_baseline_override = _safe_float(finding_row.get("official_baseline_mean"))
+            official_serial_override = _safe_float(finding_row.get("official_serial_mean"))
+            official_baseline_mean = (
+                official_baseline_override
+                if official_baseline_override is not None
+                else (final_family_mean if official_pass_type == "final_exact_condition" and final_pass_applied else initial_family_mean)
+            )
+            official_serial_mean = (
+                official_serial_override
+                if official_serial_override is not None
+                else (final_serial_mean if official_pass_type == "final_exact_condition" and final_pass_applied else initial_serial_mean)
+            )
             official_zscore = final_zscore if official_pass_type == "final_exact_condition" and final_pass_applied else initial_zscore
             official_suppression = row_final_suppression if official_pass_type == "final_exact_condition" and final_pass_applied else initial_suppression
             official_valve = row_final_valve if official_pass_type == "final_exact_condition" and final_pass_applied else initial_valve
@@ -6242,9 +6331,19 @@ def _tar_build_per_serial_comparison_rows(
                 "official_baseline_mean": official_baseline_mean,
                 "official_serial_mean": official_serial_mean,
                 "official_zscore": official_zscore,
+                "official_deviation_score": _safe_float(finding_row.get("official_deviation_score")) if _safe_float(finding_row.get("official_deviation_score")) is not None else official_zscore,
                 "official_grade": str(finding_row.get("official_grade") or final_grade or initial_grade).strip().upper() or "NO_DATA",
                 "official_suppression_voltage_label": str(finding_row.get("official_suppression_voltage_label") or official_suppression or "").strip(),
                 "official_valve_voltage_label": str(finding_row.get("official_valve_voltage_label") or official_valve or "").strip(),
+                "selected_program_count": int(finding_row.get("selected_program_count") or len(finding_row.get("selected_programs") or spec.get("prepass_included_programs") or [])),
+                "selected_programs": list(finding_row.get("selected_programs") or spec.get("prepass_included_programs") or []),
+                "selected_pool_series_count": int(finding_row.get("selected_pool_series_count") or 0),
+                "comparison_program_count": int(finding_row.get("comparison_program_count") or len(finding_row.get("comparison_programs") or [])),
+                "comparison_programs": list(finding_row.get("comparison_programs") or []),
+                "target_excluded_comparison_series_count": int(finding_row.get("target_excluded_comparison_series_count") or 0),
+                "comparison_pool_text": str(finding_row.get("comparison_pool_text") or "").strip(),
+                "target_comparison_text": str(finding_row.get("target_comparison_text") or "").strip(),
+                "grading_basis_status": str(finding_row.get("grading_basis_status") or "").strip(),
             }
             row_data["grade_basis_text"] = _tar_grade_basis_text(row_data)
             row_data["prepass_cohort_note"] = _tar_prepass_cohort_note(row_data)
@@ -7314,6 +7413,193 @@ def _tar_compute_curve_deviation(
     }
 
 
+def _tar_percentile(values: Iterable[object] | None, q: float) -> float | None:
+    finite = [
+        float(value)
+        for value in (values or [])
+        if isinstance(value, (int, float)) and math.isfinite(float(value))
+    ]
+    if not finite:
+        return None
+    finite.sort()
+    if len(finite) == 1:
+        return finite[0]
+    pos = max(0.0, min(1.0, float(q))) * (len(finite) - 1)
+    lo = int(math.floor(pos))
+    hi = int(math.ceil(pos))
+    if lo == hi:
+        return finite[lo]
+    frac = pos - lo
+    return float(finite[lo] + (finite[hi] - finite[lo]) * frac)
+
+
+def _tar_pool_programs_for_traces(
+    traces_by_serial: Mapping[str, list[float]] | None,
+    *,
+    program_by_serial: Mapping[str, str] | None,
+) -> list[str]:
+    programs: list[str] = []
+    seen: set[str] = set()
+    for serial in (traces_by_serial or {}).keys():
+        program = _tar_program_label(program_by_serial, serial)
+        if not program or program.casefold() in seen:
+            continue
+        seen.add(program.casefold())
+        programs.append(program)
+    return programs
+
+
+def _tar_pool_summary_text(programs: Collection[object] | None, series_count: object) -> str:
+    program_names = _tar_unique_text_values([_td_display_program_title(value) for value in (programs or [])])
+    program_count = len(program_names)
+    try:
+        series_num = int(series_count or 0)
+    except Exception:
+        series_num = 0
+    noun_program = "program" if program_count == 1 else "programs"
+    noun_series = "series" if series_num == 1 else "series"
+    names = _tar_join_limited(program_names, max_items=8, empty="none")
+    return f"{program_count} {noun_program} ({names}), {series_num} {noun_series} used"
+
+
+def _tar_build_target_excluded_pool_model(
+    traces_by_serial: Mapping[str, list[float]] | None,
+    *,
+    target_serial: str,
+    program_by_serial: Mapping[str, str] | None,
+    allowed_programs: Collection[str] | None,
+    x_grid: list[float],
+    x_name: str,
+    units: str,
+    degree: int,
+    normalize_x: bool,
+) -> dict[str, Any] | None:
+    allowed = {
+        _td_display_program_title(program)
+        for program in (allowed_programs or [])
+        if _td_display_program_title(program)
+    }
+    selected_traces: dict[str, list[float]] = {}
+    for raw_serial, trace in (traces_by_serial or {}).items():
+        serial = str(raw_serial or "").strip()
+        if not serial or not isinstance(trace, list):
+            continue
+        program = _tar_program_label(program_by_serial, serial)
+        if allowed and program not in allowed:
+            continue
+        selected_traces[serial] = list(trace)
+
+    target = str(target_serial or "").strip()
+    comparison_traces = {
+        serial: list(trace)
+        for serial, trace in selected_traces.items()
+        if serial != target
+    }
+    selected_programs = _tar_pool_programs_for_traces(selected_traces, program_by_serial=program_by_serial)
+    comparison_programs = _tar_pool_programs_for_traces(comparison_traces, program_by_serial=program_by_serial)
+    program_center_traces = _tar_program_trace_map(
+        comparison_traces,
+        program_by_serial=program_by_serial,
+    )
+    if x_grid and program_center_traces:
+        master_y = _nan_median([list(trace) for trace in program_center_traces.values()])
+    else:
+        master_y = []
+    band_y = _nan_std([list(trace) for trace in comparison_traces.values()]) if comparison_traces else []
+    fit_x: list[float] = []
+    fit_y: list[float] = []
+    for xv, yv in zip(x_grid, master_y):
+        if isinstance(yv, (int, float)) and not math.isnan(float(yv)):
+            fit_x.append(float(xv))
+            fit_y.append(float(yv))
+    poly = (
+        _poly_fit(fit_x, fit_y, degree, normalize_x=normalize_x)
+        if fit_x
+        else {"degree": degree, "coeffs": [], "rmse": None, "x0": None, "sx": None}
+    )
+    denom = max(
+        (
+            abs(value)
+            for value in master_y
+            if isinstance(value, (int, float)) and not math.isnan(float(value))
+        ),
+        default=0.0,
+    )
+    return {
+        "x_name": str(x_name or "").strip(),
+        "units": str(units or "").strip(),
+        "domain": [float(min(x_grid)), float(max(x_grid))] if x_grid else [],
+        "grid_points": int(len(x_grid)),
+        "x_grid": list(x_grid),
+        "master_y": list(master_y),
+        "std_y": list(band_y),
+        "poly": poly,
+        "equation": _fmt_equation(poly),
+        "denom": float(denom) if denom > 0 else 1.0,
+        "selected_programs": list(selected_programs),
+        "selected_program_count": int(len(selected_programs)),
+        "selected_pool_series_count": int(len(selected_traces)),
+        "comparison_programs": list(comparison_programs),
+        "comparison_program_count": int(len(comparison_programs)),
+        "target_excluded_comparison_series_count": int(len(comparison_traces)),
+    }
+
+
+def _tar_compute_band_deviation(
+    y_curve: list[float],
+    master_y: list[float],
+    band_y: list[float],
+    x_grid: list[float],
+    *,
+    denom: float,
+    band_floor_pct: float = 1.5,
+) -> dict[str, float] | None:
+    residual: list[float] = []
+    band_scores: list[float] = []
+    peak_idx = 0
+    peak_abs = -1.0
+    safe_denom = float(denom) if isinstance(denom, (int, float)) and math.isfinite(float(denom)) and float(denom) > 0 else 1.0
+    floor_abs = max(safe_denom * max(0.0, float(band_floor_pct)) / 100.0, 1e-12)
+    for idx, (actual, baseline) in enumerate(zip(y_curve, master_y)):
+        if not (isinstance(actual, (int, float)) and not math.isnan(float(actual))):
+            continue
+        if not (isinstance(baseline, (int, float)) and not math.isnan(float(baseline))):
+            continue
+        diff = float(actual) - float(baseline)
+        residual.append(diff)
+        value_abs = abs(diff)
+        local_band = band_y[idx] if idx < len(band_y) else None
+        local_band_float = (
+            float(local_band)
+            if isinstance(local_band, (int, float)) and math.isfinite(float(local_band)) and float(local_band) > 0
+            else 0.0
+        )
+        effective_band = max(local_band_float, floor_abs)
+        band_scores.append(value_abs / effective_band)
+        if value_abs > peak_abs:
+            peak_abs = value_abs
+            peak_idx = idx
+    if not residual:
+        return None
+    max_abs = max(abs(value) for value in residual)
+    rms = math.sqrt(sum(value * value for value in residual) / max(1, len(residual)))
+    rms_band = math.sqrt(sum(value * value for value in band_scores) / max(1, len(band_scores))) if band_scores else 0.0
+    p90_band = _tar_percentile(band_scores, 0.90) or 0.0
+    max_band = max(band_scores) if band_scores else 0.0
+    deviation_score = max(float(rms_band), float(p90_band))
+    return {
+        "max_abs": float(max_abs),
+        "rms": float(rms),
+        "max_pct": float((max_abs / safe_denom) * 100.0),
+        "rms_pct": float((rms / safe_denom) * 100.0),
+        "x_at_max_abs": float(x_grid[peak_idx]) if 0 <= peak_idx < len(x_grid) else None,
+        "deviation_score": float(deviation_score),
+        "rms_band_deviation": float(rms_band),
+        "p90_band_deviation": float(p90_band),
+        "max_band_deviation": float(max_band),
+    }
+
+
 def _tar_worst_candidate_sort_key(row: Mapping[str, object] | None) -> tuple[int, float, float]:
     if not isinstance(row, Mapping):
         return (0, 0.0, 0.0)
@@ -7571,6 +7857,15 @@ def _tar_prepare_row_specs(
             )
             if not series:
                 continue
+            metric_mean_by_serial = _load_metric_map_for_selection(
+                be,
+                db_path,
+                run_name,
+                param_name,
+                "mean",
+                selection=selection,
+                filter_state=filter_state,
+            )
             raw_condition_pairs: list[dict[str, str]] = []
             seen_condition_keys: set[str] = set()
             for row in filter_rows or []:
@@ -7662,6 +7957,7 @@ def _tar_prepare_row_specs(
                     "x_name": x_name,
                     "base_filter_state": _tar_clone_filter_state(filter_state),
                     "series": list(series),
+                    "metric_mean_by_serial": dict(metric_mean_by_serial),
                     "series_by_condition_key": dict(series_by_condition_key),
                     "initial_model": {},
                     "initial_plot_payload": {},
@@ -7854,6 +8150,7 @@ def _tar_analyze_curve_groups(
         x_grid = list(initial_scope_model.get("x_grid") or [])
         full_trace_map_by_spec: dict[str, dict[str, list[float]]] = {}
         full_trace_map_all: dict[str, list[float]] = {}
+        full_metric_mean_all: dict[str, float] = {}
         for spec in members:
             pair_id = str(spec.get("pair_id") or "").strip()
             resampled = _tar_resampled_trace_map(
@@ -7863,6 +8160,11 @@ def _tar_analyze_curve_groups(
             )
             full_trace_map_by_spec[pair_id] = dict(resampled)
             full_trace_map_all.update(resampled)
+            for raw_serial, raw_value in dict(spec.get("metric_mean_by_serial") or {}).items():
+                serial = str(raw_serial or "").strip()
+                value = _safe_float(raw_value)
+                if serial and value is not None and math.isfinite(float(value)):
+                    full_metric_mean_all[serial] = float(value)
         full_program_traces = _tar_program_trace_map(
             full_trace_map_all,
             program_by_serial=program_by_serial,
@@ -7875,6 +8177,7 @@ def _tar_analyze_curve_groups(
                 full_trace_map_all,
                 program_by_serial=program_by_serial,
                 reference_program=reference_program,
+                metric_values_by_serial=full_metric_mean_all,
                 comparator=comparator,
                 noise_score_max=float(noise_score_max),
                 noise_floor_pct=float(noise_floor_pct),
@@ -7905,8 +8208,6 @@ def _tar_analyze_curve_groups(
         initial_skip_reason = ""
         if reference_program and reference_program not in full_program_traces:
             initial_skip_reason = "missing_reference_program"
-        elif len(included_programs) <= 1:
-            initial_skip_reason = "no_compatible_programs"
 
         initial_model: dict[str, Any] | None = None
         admitted_program_traces = _tar_program_trace_map(
@@ -7937,6 +8238,18 @@ def _tar_analyze_curve_groups(
                         for serial, trace in (full_trace_map_by_spec.get(pair_id) or {}).items()
                         if _tar_program_label(program_by_serial, serial) in included_program_set
                     }
+        visual_initial_model: dict[str, Any] | None = None
+        if full_program_traces:
+            visual_initial_model = _tar_build_curve_model_for_program_traces(
+                x_name=str(members[0].get("x_name") or ""),
+                units=str(members[0].get("units") or ""),
+                x_grid=x_grid,
+                traces_by_program=full_program_traces,
+                degree=degree,
+                normalize_x=normalize_x,
+            )
+            if not isinstance(visual_initial_model, dict):
+                visual_initial_model = None
         for spec in members:
             spec["prepass_reference_program"] = reference_program
             spec["prepass_included_programs"] = list(included_programs)
@@ -7949,6 +8262,19 @@ def _tar_analyze_curve_groups(
         initial_denom = float(initial_model.get("denom") or 1.0) if isinstance(initial_model, dict) else 1.0
         initial_entries: list[tuple[dict, str, dict]] = []
         trace_curves: list[dict] = []
+        visual_trace_curves: list[dict] = []
+        if isinstance(visual_initial_model, dict):
+            for spec in members:
+                pair_id = str(spec.get("pair_id") or "").strip()
+                for serial, y_curve in dict(full_trace_map_by_spec.get(pair_id) or {}).items():
+                    visual_trace_curves.append(
+                        {
+                            "pair_id": pair_id,
+                            "selection_label": str(spec.get("selection_label") or ""),
+                            "serial": serial,
+                            "y_curve": list(y_curve),
+                        }
+                    )
         if isinstance(initial_model, dict):
             for spec in members:
                 pair_id = str(spec.get("pair_id") or "").strip()
@@ -8034,78 +8360,141 @@ def _tar_analyze_curve_groups(
                         gate_details=prepass_gate_details,
                     )
         else:
-            mean_score, std_score = _tar_program_score_stats(
-                [(serial, dev) for _spec, serial, dev in initial_entries],
-                program_by_serial=program_by_serial,
-            )
-            for spec, serial, dev in initial_entries:
-                z_score = (float(dev.get("max_abs") or 0.0) - mean_score) / std_score if std_score else 0.0
-                grade = _grade_from_z(z_score, z_pass, z_watch)
-                if serial not in hi_set:
-                    continue
-                row = {
-                    "pair_id": str(spec.get("pair_id") or ""),
-                    "selection_id": str(spec.get("selection_id") or ""),
-                    "selection_label": str(spec.get("selection_label") or ""),
-                    "serial": serial,
-                    "run": str(spec.get("run") or ""),
-                    "param": str(spec.get("param") or ""),
-                    "units": str(spec.get("units") or ""),
-                    "x_name": str(spec.get("x_name") or ""),
-                    "base_condition_label": str(spec.get("base_condition_label") or ""),
-                    "suppression_voltage_label": str(spec.get("suppression_voltage_label") or ""),
-                    "valve_voltage_label": str(spec.get("valve_voltage_label") or ""),
-                    "initial_max_abs": dev.get("max_abs"),
-                    "initial_rms": dev.get("rms"),
-                    "initial_max_pct": dev.get("max_pct"),
-                    "initial_rms_pct": dev.get("rms_pct"),
-                    "initial_x_at_max_abs": dev.get("x_at_max_abs"),
-                    "initial_z": float(z_score),
-                    "initial_grade": grade,
-                    "initial_poly_rmse": (initial_model.get("poly") or {}).get("rmse"),
-                    "initial_skipped": False,
-                    "initial_skip_reason": "",
-                    "prepass_reference_program": reference_program,
-                    "prepass_included_programs": list(included_programs),
-                    "prepass_excluded_programs": list(excluded_programs),
-                    "prepass_gate_mode": prepass_gate_mode,
-                    "prepass_gate_details": [dict(item) for item in prepass_gate_details],
-                }
-                initial_rows[(str(spec.get("pair_id") or ""), serial)] = row
-                watch = False
-                if max_abs_thr is not None and float(dev.get("max_abs") or 0.0) >= float(max_abs_thr):
-                    watch = True
-                if max_pct_thr is not None and float(dev.get("max_pct") or 0.0) >= float(max_pct_thr):
-                    watch = True
-                if rms_pct_thr is not None and float(dev.get("rms_pct") or 0.0) >= float(rms_pct_thr):
-                    watch = True
-                if watch:
-                    initial_watch_items.append({**row, "grade": grade, "z": float(z_score), "max_pct": dev.get("max_pct")})
-        if isinstance(initial_model, dict):
+            for spec in members:
+                pair_id = str(spec.get("pair_id") or "").strip()
+                target_trace_map = dict(full_trace_map_by_spec.get(pair_id) or {})
+                for serial, y_curve in target_trace_map.items():
+                    if serial not in hi_set:
+                        continue
+                    pool_model = _tar_build_target_excluded_pool_model(
+                        full_trace_map_all,
+                        target_serial=serial,
+                        program_by_serial=program_by_serial,
+                        allowed_programs=included_programs,
+                        x_grid=x_grid,
+                        x_name=str(spec.get("x_name") or ""),
+                        units=str(spec.get("units") or ""),
+                        degree=degree,
+                        normalize_x=normalize_x,
+                    )
+                    pool_model = dict(pool_model or {})
+                    selected_programs = list(pool_model.get("selected_programs") or [])
+                    comparison_programs = list(pool_model.get("comparison_programs") or [])
+                    selected_pool_series_count = int(pool_model.get("selected_pool_series_count") or 0)
+                    comparison_series_count = int(pool_model.get("target_excluded_comparison_series_count") or 0)
+                    official_baseline_mean = _tar_finite_mean(list(pool_model.get("master_y") or []))
+                    official_serial_mean = _tar_finite_mean(list(y_curve))
+                    comparison_pool_text = _tar_pool_summary_text(selected_programs, selected_pool_series_count)
+                    comparison_program_names = _tar_join_limited(comparison_programs, max_items=8, empty="none")
+                    comparison_program_count = len(comparison_programs)
+                    comparison_program_noun = "program" if comparison_program_count == 1 else "programs"
+                    comparison_series_noun = "series" if comparison_series_count == 1 else "series"
+                    target_comparison_text = (
+                        f"{serial} graded against: {comparison_program_count} {comparison_program_noun} "
+                        f"({comparison_program_names}), {comparison_series_count} comparison {comparison_series_noun}"
+                    )
+                    if comparison_series_count < 2 or not pool_model.get("master_y"):
+                        dev = None
+                        deviation_score = None
+                        grade = "LIMITED"
+                        grading_basis_status = "limited_target_excluded_baseline"
+                    else:
+                        dev = _tar_compute_band_deviation(
+                            list(y_curve),
+                            list(pool_model.get("master_y") or []),
+                            list(pool_model.get("std_y") or []),
+                            x_grid,
+                            denom=float(pool_model.get("denom") or 1.0),
+                        )
+                        deviation_score = _safe_float((dev or {}).get("deviation_score"))
+                        grade = _grade_from_z(float(deviation_score), z_pass, z_watch) if deviation_score is not None else "NO_DATA"
+                        grading_basis_status = (
+                            "program_only_pool"
+                            if len(selected_programs) <= 1
+                            else "selected_program_pool"
+                        )
+                    row = {
+                        "pair_id": pair_id,
+                        "selection_id": str(spec.get("selection_id") or ""),
+                        "selection_label": str(spec.get("selection_label") or ""),
+                        "serial": serial,
+                        "run": str(spec.get("run") or ""),
+                        "param": str(spec.get("param") or ""),
+                        "units": str(spec.get("units") or ""),
+                        "x_name": str(spec.get("x_name") or ""),
+                        "base_condition_label": str(spec.get("base_condition_label") or ""),
+                        "suppression_voltage_label": str(spec.get("suppression_voltage_label") or ""),
+                        "valve_voltage_label": str(spec.get("valve_voltage_label") or ""),
+                        "initial_max_abs": (dev or {}).get("max_abs"),
+                        "initial_rms": (dev or {}).get("rms"),
+                        "initial_max_pct": (dev or {}).get("max_pct"),
+                        "initial_rms_pct": (dev or {}).get("rms_pct"),
+                        "initial_x_at_max_abs": (dev or {}).get("x_at_max_abs"),
+                        "initial_z": deviation_score,
+                        "initial_deviation_score": deviation_score,
+                        "initial_rms_band_deviation": (dev or {}).get("rms_band_deviation"),
+                        "initial_p90_band_deviation": (dev or {}).get("p90_band_deviation"),
+                        "initial_max_band_deviation": (dev or {}).get("max_band_deviation"),
+                        "initial_grade": grade,
+                        "initial_poly_rmse": (pool_model.get("poly") or {}).get("rmse") if isinstance(pool_model.get("poly"), Mapping) else None,
+                        "initial_skipped": False,
+                        "initial_skip_reason": "",
+                        "official_baseline_mean": official_baseline_mean,
+                        "official_serial_mean": official_serial_mean,
+                        "prepass_reference_program": reference_program,
+                        "prepass_included_programs": list(included_programs),
+                        "prepass_excluded_programs": list(excluded_programs),
+                        "prepass_gate_mode": prepass_gate_mode,
+                        "prepass_gate_details": [dict(item) for item in prepass_gate_details],
+                        "selected_program_count": int(pool_model.get("selected_program_count") or len(selected_programs)),
+                        "selected_programs": list(selected_programs),
+                        "selected_pool_series_count": selected_pool_series_count,
+                        "comparison_program_count": comparison_program_count,
+                        "comparison_programs": list(comparison_programs),
+                        "target_excluded_comparison_series_count": comparison_series_count,
+                        "comparison_pool_text": comparison_pool_text,
+                        "target_comparison_text": target_comparison_text,
+                        "grading_basis_status": grading_basis_status,
+                    }
+                    initial_rows[(pair_id, serial)] = row
+                    watch = grade in {"WATCH", "FAIL"}
+                    if dev is not None:
+                        if max_abs_thr is not None and float(dev.get("max_abs") or 0.0) >= float(max_abs_thr):
+                            watch = True
+                        if max_pct_thr is not None and float(dev.get("max_pct") or 0.0) >= float(max_pct_thr):
+                            watch = True
+                        if rms_pct_thr is not None and float(dev.get("rms_pct") or 0.0) >= float(rms_pct_thr):
+                            watch = True
+                    if watch:
+                        initial_watch_items.append({**row, "grade": grade, "z": deviation_score, "max_pct": (dev or {}).get("max_pct")})
+        cohort_model = visual_initial_model if isinstance(visual_initial_model, dict) else initial_model
+        cohort_trace_curves = visual_trace_curves if visual_trace_curves else trace_curves
+        if isinstance(cohort_model, dict):
             initial_cohort_specs.append(
                 {
                     "cohort_id": f"initial:{group_index}:{_norm_key(members[0].get('base_condition_label') or '')}:{_norm_key(members[0].get('param') or '')}:{_norm_key(members[0].get('x_name') or '')}",
                     "cohort_type": "initial",
                     "param": str(members[0].get("param") or ""),
                     "units": str(members[0].get("units") or ""),
-                    "x_name": str(initial_model.get("x_name") or ""),
+                    "x_name": str(cohort_model.get("x_name") or ""),
                     "base_condition_label": str(members[0].get("base_condition_label") or ""),
                     "suppression_voltage_label": "",
                     "valve_voltage_label": "",
                     "selection_labels": [str(spec.get("selection_label") or "") for spec in members if str(spec.get("selection_label") or "").strip()],
                     "member_pair_ids": [str(spec.get("pair_id") or "") for spec in members if str(spec.get("pair_id") or "").strip()],
                     "model": {
-                        "x_name": str(initial_model.get("x_name") or ""),
-                        "units": str(initial_model.get("units") or ""),
-                        "domain": list(initial_model.get("domain") or []),
-                        "grid_points": int(initial_model.get("grid_points") or len(x_grid)),
-                        "poly": dict(initial_model.get("poly") or {}),
-                        "equation": str(initial_model.get("equation") or ""),
+                        "x_name": str(cohort_model.get("x_name") or ""),
+                        "units": str(cohort_model.get("units") or ""),
+                        "domain": list(cohort_model.get("domain") or []),
+                        "grid_points": int(cohort_model.get("grid_points") or len(x_grid)),
+                        "poly": dict(cohort_model.get("poly") or {}),
+                        "equation": str(cohort_model.get("equation") or ""),
                     },
                     "x_grid": list(x_grid),
-                    "master_y": list(initial_model.get("master_y") or []),
-                    "std_y": list(initial_model.get("std_y") or []),
-                    "trace_curves": trace_curves,
+                    "master_y": list(cohort_model.get("master_y") or []),
+                    "std_y": list(cohort_model.get("std_y") or []),
+                    "trace_curves": cohort_trace_curves,
+                    "visual_program_scope": "all_programs",
                     "prepass_reference_program": reference_program,
                     "prepass_included_programs": list(included_programs),
                     "prepass_excluded_programs": list(excluded_programs),
@@ -8323,6 +8712,9 @@ def _tar_analyze_curve_groups(
                 }
             )
 
+    final_candidates = {}
+    regrade_cohort_specs = []
+
     grading_rows: list[dict] = []
     initial_grade_map_by_pair_serial: dict[tuple[str, str], str] = {}
     final_grade_map_by_pair_serial: dict[tuple[str, str], str] = {}
@@ -8359,7 +8751,7 @@ def _tar_analyze_curve_groups(
                 if str(ctx_row.get("initial_status") or "").strip().upper() in {"WATCH", "FAIL", "SKIPPED"}
             ]
         )
-        block_final_required = bool(trigger_serials)
+        block_final_required = False
         shared_final_condition_key = ""
         representative_final_condition_key = ""
         selected_candidates: dict[str, dict[str, Any]] = {}
@@ -8490,7 +8882,7 @@ def _tar_analyze_curve_groups(
             )
             block_final_required = bool(pair_decision.get("block_final_required"))
             block_final_available = bool(pair_decision.get("block_final_available"))
-            official_pass_type = "final_exact_condition" if block_final_required and block_final_available and regrade_row else "initial_prepass"
+            official_pass_type = "final_exact_condition" if block_final_required and block_final_available and regrade_row else "selected_program_pool"
             final_source = regrade_row if official_pass_type == "final_exact_condition" else row
             final_grade = str(
                 final_source.get("regrade_grade", final_source.get("initial_grade", row.get("initial_grade", "NO_DATA"))) or "NO_DATA"
@@ -8567,8 +8959,18 @@ def _tar_analyze_curve_groups(
                     "official_pass_type": official_pass_type,
                     "official_grade": final_grade,
                     "official_zscore": final_source.get("regrade_z", final_source.get("initial_z")),
+                    "official_deviation_score": final_source.get("regrade_z", final_source.get("initial_z")),
                     "official_suppression_voltage_label": final_suppression_label,
                     "official_valve_voltage_label": final_valve_label,
+                    "selected_program_count": row.get("selected_program_count"),
+                    "selected_programs": list(row.get("selected_programs") or []),
+                    "selected_pool_series_count": row.get("selected_pool_series_count"),
+                    "comparison_program_count": row.get("comparison_program_count"),
+                    "comparison_programs": list(row.get("comparison_programs") or []),
+                    "target_excluded_comparison_series_count": row.get("target_excluded_comparison_series_count"),
+                    "comparison_pool_text": row.get("comparison_pool_text"),
+                    "target_comparison_text": row.get("target_comparison_text"),
+                    "grading_basis_status": row.get("grading_basis_status"),
                 }
             )
             grading_rows.append(row)
@@ -8990,6 +9392,16 @@ def _tar_prepare_base(
                     "final_selection_mode",
                     "grade_basis_text",
                     "prepass_cohort_note",
+                    "official_deviation_score",
+                    "selected_program_count",
+                    "selected_programs",
+                    "selected_pool_series_count",
+                    "comparison_program_count",
+                    "comparison_programs",
+                    "target_excluded_comparison_series_count",
+                    "comparison_pool_text",
+                    "target_comparison_text",
+                    "grading_basis_status",
                 )
                 if key in comparison_by_pair_serial.get((str(row.get("pair_id") or "").strip(), str(row.get("serial") or "").strip()), {})
             },
@@ -9020,6 +9432,16 @@ def _tar_prepare_base(
                     "final_selection_mode",
                     "grade_basis_text",
                     "prepass_cohort_note",
+                    "official_deviation_score",
+                    "selected_program_count",
+                    "selected_programs",
+                    "selected_pool_series_count",
+                    "comparison_program_count",
+                    "comparison_programs",
+                    "target_excluded_comparison_series_count",
+                    "comparison_pool_text",
+                    "target_comparison_text",
+                    "grading_basis_status",
                 )
                 if field in comparison_by_pair_serial.get(key, {})
             },
@@ -9252,6 +9674,7 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
         "CERTIFIED": sum(1 for status in (ctx.get("overall_by_sn") or {}).values() if status == "CERTIFIED"),
         "WATCH": sum(1 for status in (ctx.get("overall_by_sn") or {}).values() if status == "WATCH"),
         "FAILED": sum(1 for status in (ctx.get("overall_by_sn") or {}).values() if status == "FAILED"),
+        "LIMITED": sum(1 for status in (ctx.get("overall_by_sn") or {}).values() if status == "LIMITED"),
     }
     highlight_lines = []
     nonpass_findings = list(ctx.get("nonpass_findings") or [])
@@ -9270,7 +9693,7 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
             )
             highlight_lines.append(
                 f"{finding.get('serial')} | {display_text} | {param_name} | {finding.get('grade')} | "
-                f"Max % {_fmt_num(finding.get('max_pct'))} | z {_fmt_num(finding.get('z'), sig=4)}"
+                f"Max % {_fmt_num(finding.get('max_pct'))} | score {_fmt_num(finding.get('z'), sig=4)}"
             )
         if len(nonpass_findings) > len(highlight_lines):
             highlight_lines.append(f"+{len(nonpass_findings) - len(highlight_lines)} more WATCH / FAIL findings")
@@ -9288,14 +9711,13 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
             comparison_rows_by_serial.setdefault(serial, []).append(dict(row))
     initial_vs_final_lines = [
         (
-            "Initial Run: Noise-aware admitted-program pre-pass that grades against the admitted program cohort before any exact-condition escalation. "
+            "Pool Selection: Noise-aware pre-pass chooses compatible programs within each base run condition, parameter, and X axis. "
             f"Suppression Voltage: {str(quick_summary.get('initial_suppression_voltage') or 'All').strip() or 'All'} | "
             f"Valve Voltage: {str(quick_summary.get('initial_valve_voltage') or 'All').strip() or 'All'}"
         ),
         (
-            "Final Run: Program-synced exact-condition official pass that is applied only when the initial pre-pass is WATCH, FAIL, or SKIPPED. "
-            f"Suppression Voltage: {str(quick_summary.get('final_suppression_voltage') or quick_summary.get('p8_suppression_voltage') or 'All').strip() or 'All'} | "
-            f"Valve Voltage: {str(quick_summary.get('final_valve_voltage') or quick_summary.get('p8_valve_voltage') or 'All').strip() or 'All'}"
+            "Official Grade: Each certification serial is removed from its own selected-pool baseline, then graded against the remaining "
+            "program median and band using a sustained deviation score."
         ),
     ]
 
@@ -9306,9 +9728,9 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
     story.append(
         _portrait_paragraph(
             "This report validates ATP run criteria against family data and compares the selected certification serials "
-            "to the admitted-program graded baseline for the chosen run scope. Initial grading applies a noise-aware "
-            "pre-pass within each base run condition, parameter, and X axis, and an exact-condition final pass is "
-            "only promoted to the official result when the synchronized certification block requires it.",
+            "to a selected program-pool baseline for the chosen run scope. The pre-pass selects compatible programs "
+            "within each base run condition, parameter, and X axis. Official grading excludes the target serial from "
+            "its own baseline and uses a band-normalized deviation score.",
             styles["body"],
             rl,
         )
@@ -9378,6 +9800,7 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
                 f"CERTIFIED: {status_counts['CERTIFIED']}",
                 f"WATCH: {status_counts['WATCH']}",
                 f"FAILED: {status_counts['FAILED']}",
+                f"LIMITED: {status_counts['LIMITED']}",
                 f"Curves evaluated: {len(ctx.get('pair_specs') or [])}",
                 f"Performance plots configured: {len(ctx.get('performance_plot_specs') or [])}",
             ],
@@ -9386,7 +9809,7 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
         )
     )
     story.append(Spacer(1, 0.10 * inch))
-    story.append(_portrait_card("Initial vs Final Run", initial_vs_final_lines, styles=styles, rl=rl))
+    story.append(_portrait_card("Program Pool Grading", initial_vs_final_lines, styles=styles, rl=rl))
     story.append(Spacer(1, 0.10 * inch))
     story.append(_portrait_card("Watch / Review Highlights", highlight_lines, styles=styles, rl=rl))
     story.append(Spacer(1, 0.10 * inch))
@@ -9436,7 +9859,7 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
         story.append(
             _portrait_paragraph(
                 "Each table groups one selected run condition. Rows show the official graded mean for each certified serial's "
-                "selected cohort, alongside the certified serial mean, z-score, initial status, and official grade basis.",
+                "selected cohort, alongside the certified serial mean, deviation score, initial status, and official grade basis.",
                 styles["body"],
                 rl,
             )
@@ -9702,7 +10125,7 @@ def _tar_render_curve_cohort_page(
         note_lines.append(
             f"{serial} | {selection_label or param_name} | {grade} | "
             f"Max % {_fmt_num(finding.get(f'{metric_prefix}_max_pct'))} | "
-            f"z {_fmt_num(finding.get(f'{metric_prefix}_z'), sig=4)}"
+            f"score {_fmt_num(finding.get(f'{metric_prefix}_z'), sig=4)}"
         )
     ax.grid(True, alpha=0.25)
     try:
@@ -9806,7 +10229,7 @@ def _tar_render_watch_curve_page(
         note_lines.append(f"{serial} ({grade})")
         note_lines.append(f"Max %: {_fmt_num(finding.get('final_max_pct'))}")
         note_lines.append(f"RMS %: {_fmt_num(finding.get('final_rms_pct'))}")
-        note_lines.append(f"z: {_fmt_num(finding.get('final_z'), sig=4)}")
+        note_lines.append(f"score: {_fmt_num(finding.get('final_z'), sig=4)}")
         if bool(finding.get("regrade_applied")):
             note_lines.append(
                 "Final pass: "
@@ -10001,7 +10424,7 @@ def _tar_render_plot_sections(
                 ax.plot(x_grid, y_curve, linewidth=1.8, color=color, label=f"{serial} ({grade})")
                 finding = (ctx.get("finding_by_key") or {}).get((run_name, param_name, serial)) or {}
                 if finding:
-                    note_lines.append(f"{serial} ({grade}) | Max % {_fmt_num(finding.get('max_pct'))} | z {_fmt_num(finding.get('z'), sig=4)}")
+                    note_lines.append(f"{serial} ({grade}) | Max % {_fmt_num(finding.get('max_pct'))} | score {_fmt_num(finding.get('z'), sig=4)}")
             ax.grid(True, alpha=0.25)
             try:
                 handles, labels = ax.get_legend_handles_labels()
@@ -10183,7 +10606,7 @@ def _tar_render_plot_sections(
                 note_lines.append(f"{serial} ({grade})")
                 note_lines.append(f"Max %: {_fmt_num(finding.get('max_pct'))}")
                 note_lines.append(f"RMS %: {_fmt_num(finding.get('rms_pct'))}")
-                note_lines.append(f"z: {_fmt_num(finding.get('z'), sig=4)}")
+                note_lines.append(f"score: {_fmt_num(finding.get('z'), sig=4)}")
                 note_lines.append("")
             ax.grid(True, alpha=0.25)
             try:
@@ -10275,7 +10698,7 @@ def _tar_render_plot_sections(
                 section_title="Run Condition Metrics",
                 section_key="run_condition_plot_metrics",
                 grade_map_by_pair_serial=(ctx.get("initial_grade_map_by_pair_serial") or {}),
-                family_mean_label="Initial admitted-program graded mean",
+                family_mean_label="All-program visual mean",
             )
             if plot_spec:
                 plot_specs.append(plot_spec)
@@ -10300,9 +10723,9 @@ def _tar_render_plot_sections(
                 ),
                 grade_map_by_pair_serial=(ctx.get("initial_grade_map_by_pair_serial") or {}),
                 metric_prefix="initial",
-                family_label="Initial admitted-program graded mean",
-                band_label="Initial admitted-program +/-1 sigma",
-                equation_label="Initial admitted-program equation",
+                family_label="All-program visual mean",
+                band_label="All-program visual +/-1 sigma",
+                equation_label="All-program visual equation",
             )
             if plot_spec:
                 plot_specs.append(plot_spec)
@@ -10528,6 +10951,7 @@ def _tar_build_closing_story(ctx: Mapping[str, Any], *, counts: Mapping[str, int
         "CERTIFIED": sum(1 for status in overall_by_sn.values() if status == "CERTIFIED"),
         "WATCH": sum(1 for status in overall_by_sn.values() if status == "WATCH"),
         "FAILED": sum(1 for status in overall_by_sn.values() if status == "FAILED"),
+        "LIMITED": sum(1 for status in overall_by_sn.values() if status == "LIMITED"),
     }
 
     story: list[Any] = []
@@ -10557,6 +10981,7 @@ def _tar_build_closing_story(ctx: Mapping[str, Any], *, counts: Mapping[str, int
                 f"CERTIFIED serials: {status_counts['CERTIFIED']}",
                 f"WATCH serials: {status_counts['WATCH']}",
                 f"FAILED serials: {status_counts['FAILED']}",
+                f"LIMITED serials: {status_counts['LIMITED']}",
             ],
             styles=styles,
             rl=rl,
@@ -10614,7 +11039,7 @@ def _tar_build_closing_story(ctx: Mapping[str, Any], *, counts: Mapping[str, int
         ]
         story.append(
             _portrait_box_table(
-                [["Serial", "Run", "Parameter", "Grade", "Max %", "z"], *review_rows],
+                [["Serial", "Run", "Parameter", "Grade", "Max %", "Score"], *review_rows],
                 col_widths=[0.95 * inch, 1.35 * inch, 1.45 * inch, 0.80 * inch, 0.85 * inch, 0.80 * inch],
                 styles=styles,
                 rl=rl,

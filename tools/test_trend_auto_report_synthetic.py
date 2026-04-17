@@ -888,25 +888,22 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
 
         self.assertEqual(len(analysis["initial_cohort_specs"]), 1)
         self.assertEqual(analysis["initial_cohort_specs"][0]["prepass_included_programs"], ["Program A"])
-        self.assertEqual({spec["suppression_voltage_label"] for spec in analysis["regrade_cohort_specs"]}, {"100"})
+        self.assertEqual(analysis["regrade_cohort_specs"], [])
         row = analysis["grading_rows"][0]
         self.assertEqual(row["pair_id"], "pair-100")
-        self.assertEqual(row["initial_grade"], "NO_DATA")
-        self.assertTrue(row["initial_skipped"])
-        self.assertEqual(row["initial_skip_reason"], "no_compatible_programs")
-        self.assertEqual(row["final_grade"], "PASS")
-        self.assertTrue(row["regrade_applied"])
+        self.assertEqual(row["initial_grade"], "LIMITED")
+        self.assertFalse(row["initial_skipped"])
+        self.assertEqual(row["initial_skip_reason"], "")
+        self.assertEqual(row["final_grade"], "LIMITED")
+        self.assertFalse(row["regrade_applied"])
+        self.assertEqual(row["official_pass_type"], "selected_program_pool")
+        self.assertEqual(row["grading_basis_status"], "limited_target_excluded_baseline")
+        self.assertEqual(row["selected_program_count"], 1)
+        self.assertEqual(row["selected_programs"], ["Program A"])
+        self.assertEqual(row["selected_pool_series_count"], 1)
+        self.assertEqual(row["target_excluded_comparison_series_count"], 0)
         pair_specs = {str(spec.get("pair_id") or ""): spec for spec in analysis["pair_specs"]}
-        self.assertEqual(
-            pair_specs["pair-100"]["filter_state_override"],
-            {
-                "programs": ["Program A"],
-                "serials": ["HI", "ATP1", "ATP2", "ATP3"],
-                "control_periods": ["10"],
-                "suppression_voltages": ["100"],
-                "valve_voltages": [],
-            },
-        )
+        self.assertEqual(pair_specs["pair-100"]["filter_state_override"], {})
         self.assertEqual(pair_specs["pair-200"]["filter_state_override"], {})
         self.assertEqual(analysis["initial_nonpass_findings"], [])
         self.assertEqual(analysis["nonpass_findings"], [])
@@ -961,8 +958,13 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         self.assertEqual(row["initial_grade"], "PASS")
         self.assertEqual(row["final_grade"], "PASS")
         self.assertFalse(row["regrade_applied"])
+        self.assertEqual(row["official_pass_type"], "selected_program_pool")
+        self.assertEqual(row["selected_programs"], ["Program A", "Program B"])
+        self.assertEqual(row["selected_pool_series_count"], 3)
+        self.assertEqual(row["target_excluded_comparison_series_count"], 2)
+        self.assertEqual(row["target_comparison_text"], "HI graded against: 1 program (Program B), 2 comparison series")
         self.assertEqual(len(analysis["initial_cohort_specs"]), 1)
-        self.assertEqual(len(analysis["regrade_cohort_specs"]), 1)
+        self.assertEqual(analysis["regrade_cohort_specs"], [])
         self.assertEqual(pair_spec["filter_state_override"], {})
 
     @unittest.skipUnless(_have_numpy(), "numpy not installed")
@@ -1000,12 +1002,17 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
             rms_pct_thr=None,
         )
 
-        self.assertEqual(len(analysis["regrade_cohort_specs"]), 1)
+        self.assertEqual(analysis["regrade_cohort_specs"], [])
         row = analysis["grading_rows"][0]
-        self.assertTrue(row["initial_skipped"])
-        self.assertTrue(row["regrade_applied"])
-        self.assertEqual(row["initial_grade"], "NO_DATA")
-        self.assertEqual(row["final_grade"], "PASS")
+        self.assertFalse(row["initial_skipped"])
+        self.assertFalse(row["regrade_applied"])
+        self.assertEqual(row["initial_grade"], "LIMITED")
+        self.assertEqual(row["final_grade"], "LIMITED")
+        self.assertEqual(row["official_pass_type"], "selected_program_pool")
+        self.assertEqual(row["grading_basis_status"], "limited_target_excluded_baseline")
+        self.assertEqual(row["selected_programs"], ["Program A"])
+        self.assertEqual(row["selected_pool_series_count"], 1)
+        self.assertEqual(row["target_excluded_comparison_series_count"], 0)
 
     @unittest.skipUnless(_have_numpy(), "numpy not installed")
     def test_analyze_curve_groups_limits_regrade_cohort_to_targeted_suppression_members(self):
@@ -1075,11 +1082,15 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
             rms_pct_thr=None,
         )
 
-        self.assertEqual(len(analysis["regrade_cohort_specs"]), 1)
-        regrade_spec = analysis["regrade_cohort_specs"][0]
-        self.assertEqual(regrade_spec["suppression_voltage_label"], "100")
-        self.assertEqual(regrade_spec["member_pair_ids"], ["pair-target", "pair-peer"])
-        self.assertEqual({trace["pair_id"] for trace in regrade_spec["trace_curves"]}, {"pair-target", "pair-peer"})
+        self.assertEqual(analysis["regrade_cohort_specs"], [])
+        row = analysis["grading_rows"][0]
+        self.assertEqual(row["serial"], "HI")
+        self.assertEqual(row["final_grade"], "LIMITED")
+        self.assertEqual(row["official_pass_type"], "selected_program_pool")
+        self.assertEqual(row["selected_programs"], ["Program A"])
+        self.assertEqual(row["selected_pool_series_count"], 1)
+        self.assertEqual(row["target_excluded_comparison_series_count"], 0)
+        self.assertFalse(row["final_pass_applied"])
 
     @unittest.skipUnless(_have_numpy(), "numpy not installed")
     def test_analyze_curve_groups_noise_aware_prepass_admits_noisy_candidate_program(self):
@@ -1128,6 +1139,57 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         self.assertLess(detail["noise_score"], 1.25)
 
     @unittest.skipUnless(_have_numpy(), "numpy not installed")
+    def test_analyze_curve_groups_prepass_uses_cached_metric_means_for_mean_delta_guard(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        spec = self._row_spec(
+            tar,
+            pair_id="pair-metric-mean",
+            run="RunMetricMean",
+            selection_label="Condition A | Supp 100",
+            base_condition_label="Condition A",
+            suppression_value="100",
+            series=[
+                tar.CurveSeries(serial="HI", x=[0.0, 1.0, 2.0], y=[80.0, 80.0, 80.0]),
+                tar.CurveSeries(serial="A2", x=[0.0, 1.0, 2.0], y=[120.0, 120.0, 120.0]),
+                tar.CurveSeries(serial="ATP1", x=[0.0, 1.0, 2.0], y=[90.0, 90.0, 90.0]),
+                tar.CurveSeries(serial="ATP2", x=[0.0, 1.0, 2.0], y=[130.0, 130.0, 130.0]),
+            ],
+        )
+        spec["metric_mean_by_serial"] = {
+            "HI": 99.0,
+            "A2": 101.0,
+            "ATP1": 103.0,
+            "ATP2": 105.0,
+        }
+        program_by_serial = {"HI": "Program A", "A2": "Program A", "ATP1": "Program B", "ATP2": "Program B"}
+
+        analysis = tar._tar_analyze_curve_groups(
+            [spec],
+            hi=["HI"],
+            program_by_serial=program_by_serial,
+            certifying_program="Program A",
+            grid_points=3,
+            degree=1,
+            normalize_x=False,
+            z_pass=10.0,
+            z_watch=20.0,
+            max_abs_thr=None,
+            max_pct_thr=None,
+            rms_pct_thr=None,
+        )
+
+        row = analysis["grading_rows"][0]
+        detail = next(item for item in row["prepass_gate_details"] if item["program"] == "Program B")
+        self.assertEqual(detail["mean_source"], "cached_metric_mean")
+        self.assertTrue(detail["admitted"])
+        self.assertLess(detail["mean_delta_pct"], 8.0)
+        self.assertEqual(row["prepass_included_programs"], ["Program A", "Program B"])
+        self.assertEqual(row["selected_programs"], ["Program A", "Program B"])
+        self.assertEqual(row["selected_pool_series_count"], 4)
+        self.assertEqual(row["target_excluded_comparison_series_count"], 3)
+
+    @unittest.skipUnless(_have_numpy(), "numpy not installed")
     def test_analyze_curve_groups_noise_aware_prepass_rejects_tight_shifted_candidate_program(self):
         from EIDAT_App_Files.ui_next import trend_auto_report as tar
 
@@ -1166,8 +1228,14 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
 
         row = analysis["grading_rows"][0]
         detail = next(item for item in row["prepass_gate_details"] if item["program"] == "Program B")
-        self.assertTrue(row["initial_skipped"])
-        self.assertEqual(row["initial_skip_reason"], "no_compatible_programs")
+        self.assertFalse(row["initial_skipped"])
+        self.assertEqual(row["initial_skip_reason"], "")
+        self.assertEqual(row["initial_grade"], "LIMITED")
+        self.assertEqual(row["final_grade"], "LIMITED")
+        self.assertEqual(row["grading_basis_status"], "limited_target_excluded_baseline")
+        self.assertEqual(row["selected_programs"], ["Program A"])
+        self.assertEqual(row["selected_pool_series_count"], 2)
+        self.assertEqual(row["target_excluded_comparison_series_count"], 1)
         self.assertFalse(detail["admitted"])
         self.assertLess(detail["mean_delta_pct"], 8.0)
         self.assertGreater(detail["noise_score"], 1.25)
@@ -1211,7 +1279,12 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
 
         row = analysis["grading_rows"][0]
         detail = next(item for item in row["prepass_gate_details"] if item["program"] == "Program B")
-        self.assertTrue(row["initial_skipped"])
+        self.assertFalse(row["initial_skipped"])
+        self.assertEqual(row["initial_grade"], "LIMITED")
+        self.assertEqual(row["final_grade"], "LIMITED")
+        self.assertEqual(row["selected_programs"], ["Program A"])
+        self.assertEqual(row["selected_pool_series_count"], 2)
+        self.assertEqual(row["target_excluded_comparison_series_count"], 1)
         self.assertFalse(detail["admitted"])
         self.assertGreater(detail["mean_delta_pct"], 8.0)
         self.assertLess(detail["noise_score"], 1.25)
@@ -1254,16 +1327,29 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
 
         row = analysis["grading_rows"][0]
         detail = next(item for item in row["prepass_gate_details"] if item["program"] == "Program B")
-        self.assertTrue(row["initial_skipped"])
-        self.assertEqual(row["initial_skip_reason"], "no_compatible_programs")
+        self.assertFalse(row["initial_skipped"])
+        self.assertEqual(row["initial_skip_reason"], "")
+        self.assertEqual(row["initial_grade"], "LIMITED")
+        self.assertEqual(row["final_grade"], "LIMITED")
+        self.assertEqual(row["selected_programs"], ["Program A"])
+        self.assertEqual(row["selected_pool_series_count"], 1)
+        self.assertEqual(row["target_excluded_comparison_series_count"], 0)
         self.assertEqual(detail["gate_mode"], "sparse_percent_fallback")
         self.assertFalse(detail["admitted"])
         self.assertGreater(detail["mean_delta_pct"], 4.0)
         self.assertEqual(len(analysis["initial_cohort_specs"]), 1)
-        self.assertTrue(analysis["initial_cohort_specs"][0]["master_y"])
+        cohort_spec = analysis["initial_cohort_specs"][0]
+        self.assertTrue(cohort_spec["master_y"])
+        self.assertEqual(cohort_spec["visual_program_scope"], "all_programs")
+        self.assertEqual(
+            {str(trace.get("serial") or "") for trace in cohort_spec["trace_curves"]},
+            {"HI", "ATP1", "ATP2"},
+        )
+        self.assertAlmostEqual(float(cohort_spec["master_y"][0]), 102.5)
         pair_spec = analysis["pair_specs"][0]
         self.assertTrue(pair_spec["initial_plot_payload"]["master_y"])
         self.assertIn("HI", pair_spec["initial_plot_payload"]["y_resampled_by_sn"])
+        self.assertNotIn("ATP1", pair_spec["initial_plot_payload"]["y_resampled_by_sn"])
 
     @unittest.skipUnless(_have_numpy(), "numpy not installed")
     def test_analyze_curve_groups_syncs_final_pass_across_certified_serials_in_same_block(self):
@@ -1309,14 +1395,25 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
             rms_pct_thr=None,
         )
 
+        self.assertEqual(analysis["regrade_cohort_specs"], [])
         rows = {row["serial"]: row for row in analysis["grading_rows"]}
-        self.assertTrue(rows["HI1"]["final_pass_applied"])
-        self.assertTrue(rows["HI2"]["final_pass_applied"])
-        self.assertTrue(rows["HI2"]["program_sync_applied"])
-        self.assertEqual(rows["HI1"]["shared_final_condition_key"], rows["HI2"]["shared_final_condition_key"])
-        self.assertEqual(rows["HI2"]["official_pass_type"], "final_exact_condition")
-        self.assertTrue(rows["HI2"]["block_final_required"])
-        self.assertTrue(rows["HI2"]["block_final_available"])
+        self.assertFalse(rows["HI1"]["final_pass_applied"])
+        self.assertFalse(rows["HI2"]["final_pass_applied"])
+        self.assertFalse(rows["HI2"]["program_sync_applied"])
+        self.assertEqual(rows["HI1"]["shared_final_condition_key"], "")
+        self.assertEqual(rows["HI2"]["shared_final_condition_key"], "")
+        self.assertEqual(rows["HI1"]["official_pass_type"], "selected_program_pool")
+        self.assertEqual(rows["HI2"]["official_pass_type"], "selected_program_pool")
+        self.assertFalse(rows["HI1"]["block_final_required"])
+        self.assertFalse(rows["HI2"]["block_final_available"])
+        self.assertEqual(rows["HI1"]["final_grade"], "FAIL")
+        self.assertEqual(rows["HI2"]["final_grade"], "PASS")
+        self.assertAlmostEqual(float(rows["HI1"]["official_baseline_mean"]), 12.5)
+        self.assertAlmostEqual(float(rows["HI1"]["official_serial_mean"]), 0.0)
+        self.assertAlmostEqual(float(rows["HI2"]["official_baseline_mean"]), 10.0)
+        self.assertAlmostEqual(float(rows["HI2"]["official_serial_mean"]), 10.0)
+        self.assertEqual(rows["HI1"]["target_excluded_comparison_series_count"], 4)
+        self.assertEqual(rows["HI2"]["target_excluded_comparison_series_count"], 4)
 
     @unittest.skipUnless(_have_numpy(), "numpy not installed")
     def test_analyze_curve_groups_uses_per_serial_final_when_no_shared_exact_condition_exists(self):
@@ -1384,18 +1481,20 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
             rms_pct_thr=None,
         )
 
+        self.assertEqual(analysis["regrade_cohort_specs"], [])
         rows = {row["serial"]: row for row in analysis["grading_rows"]}
-        self.assertTrue(rows["HI1"]["final_pass_applied"])
-        self.assertTrue(rows["HI2"]["final_pass_applied"])
-        self.assertTrue(rows["HI1"]["block_final_available"])
-        self.assertTrue(rows["HI2"]["block_final_available"])
-        self.assertEqual(rows["HI1"]["official_pass_type"], "final_exact_condition")
-        self.assertEqual(rows["HI2"]["official_pass_type"], "final_exact_condition")
-        self.assertEqual(rows["HI1"]["final_selection_mode"], "per_serial_exact_condition")
-        self.assertEqual(rows["HI2"]["final_selection_mode"], "per_serial_exact_condition")
+        self.assertFalse(rows["HI1"]["final_pass_applied"])
+        self.assertFalse(rows["HI2"]["final_pass_applied"])
+        self.assertFalse(rows["HI1"]["block_final_available"])
+        self.assertFalse(rows["HI2"]["block_final_available"])
+        self.assertEqual(rows["HI1"]["official_pass_type"], "selected_program_pool")
+        self.assertEqual(rows["HI2"]["official_pass_type"], "selected_program_pool")
+        self.assertEqual(rows["HI1"]["final_selection_mode"], "")
+        self.assertEqual(rows["HI2"]["final_selection_mode"], "")
         self.assertEqual(rows["HI1"]["shared_final_condition_key"], "")
         self.assertEqual(rows["HI2"]["shared_final_condition_key"], "")
-        self.assertNotEqual(rows["HI1"]["final_condition_key"], rows["HI2"]["final_condition_key"])
+        self.assertEqual(rows["HI1"]["final_condition_key"], "")
+        self.assertEqual(rows["HI2"]["final_condition_key"], "")
 
     @unittest.skipUnless(_have_numpy(), "numpy not installed")
     def test_analyze_curve_groups_splits_incompatible_x_axes(self):
@@ -1781,12 +1880,14 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         self.assertEqual(matrix_rows[2][:5], ["Condition 00", "Seq 00", "Initial Status", "PASS", "PASS"])
         self.assertEqual(matrix_rows[3][:5], ["", "", "Graded Mean", "12", "20"])
         self.assertEqual(matrix_rows[4][:5], ["", "", "Certified Serial Mean", "11", "19"])
-        self.assertEqual(matrix_rows[5][:5], ["", "", "Z-Score", "-1", "-1"])
+        self.assertEqual(matrix_rows[5][:5], ["", "", "Deviation Score", "-1", "-1"])
         self.assertEqual(matrix_rows[6][:5], ["", "", "Official Grade", "WATCH", "PASS"])
-        self.assertEqual(matrix_rows[7][:5], ["", "", "Grade Basis", "Program-synced exact-condition final\nSupp: 5 | Valve: 28", "Initial admitted-program cohort"])
-        self.assertIn(("SPAN", (0, 2), (0, 7)), style_cmds)
-        self.assertIn(("SPAN", (1, 2), (1, 7)), style_cmds)
-        self.assertIn(("BACKGROUND", (3, 2), (3, 7), "#fef3c7"), style_cmds)
+        self.assertEqual(matrix_rows[7][:5], ["", "", "Comparison Pool", "0 programs (none), 0 series used", "0 programs (none), 0 series used"])
+        self.assertEqual(matrix_rows[8][:5], ["", "", "Comparison Series", "—", "—"])
+        self.assertEqual(matrix_rows[9][:5], ["", "", "Grade Basis", "Program-synced exact-condition final\nSupp: 5 | Valve: 28", "Initial admitted-program cohort"])
+        self.assertIn(("SPAN", (0, 2), (0, 9)), style_cmds)
+        self.assertIn(("SPAN", (1, 2), (1, 9)), style_cmds)
+        self.assertIn(("BACKGROUND", (3, 2), (3, 9), "#fef3c7"), style_cmds)
 
     def test_generate_auto_report_merges_tabloid_comparison_pages_before_plots(self):
         fitz = __import__("fitz")

@@ -1087,7 +1087,7 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
             if tmpdir:
                 shutil.rmtree(str(tmpdir), ignore_errors=True)
 
-    def test_auto_report_certification_helpers_ignore_suppression_but_keep_family_filter_scope(self) -> None:
+    def test_auto_report_certification_helpers_honor_suppression_and_family_scope(self) -> None:
         window = self._make_window()
         try:
             window._available_program_filters = ["Program Alpha", "Program Beta"]
@@ -1127,11 +1127,11 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
             self.assertEqual(window._active_serials(filter_state=filter_state), ["SN-101"])
             self.assertEqual(
                 window._auto_report_certifying_program_options(filter_state=filter_state),
-                ["Program Alpha", "Program Beta"],
+                ["Program Beta"],
             )
             self.assertEqual(
                 [row["serial"] for row in window._auto_report_serial_rows_for_certifying_program("Program Alpha", filter_state=filter_state)],
-                ["SN-002"],
+                [],
             )
         finally:
             window.close()
@@ -1139,7 +1139,7 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
             if tmpdir:
                 shutil.rmtree(str(tmpdir), ignore_errors=True)
 
-    def test_auto_report_run_selection_visibility_ignores_suppression_membership(self) -> None:
+    def test_auto_report_run_selection_visibility_honors_suppression_membership(self) -> None:
         window = self._make_window()
         try:
             window._available_program_filters = ["Program Alpha"]
@@ -1175,7 +1175,7 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
                 "programs": ["Program Alpha"],
                 "serials": ["SN-002"],
                 "control_periods": ["10"],
-                "suppression_voltages": ["5"],
+                "suppression_voltages": ["10"],
             }
 
             items = window._visible_auto_report_run_selection_items_for_filter_state(
@@ -1266,7 +1266,7 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
                 "programs": ["Program Alpha", "Program Beta"],
                 "serials": ["SN-001", "SN-002", "SN-101"],
                 "control_periods": ["10"],
-                "suppression_voltages": ["5"],
+                "suppression_voltages": ["10"],
             }
 
             items = window._visible_auto_report_certification_run_selection_items_for_filter_state(
@@ -1298,6 +1298,8 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
                 window._checked_control_period_filters = ["10"]
                 window._available_suppression_voltage_filters = ["5", "10"]
                 window._checked_suppression_voltage_filters = ["5", "10"]
+                window._available_valve_voltage_filters = ["28"]
+                window._checked_valve_voltage_filters = ["28"]
                 window._available_serial_filter_rows = [
                     {"serial": "SN-001", "program_title": "Program Alpha"},
                     {"serial": "SN-002", "program_title": "Program Alpha"},
@@ -1311,6 +1313,7 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
                         "source_run_name": "Seq 1",
                         "control_period": 10.0,
                         "suppression_voltage": 5.0,
+                        "valve_voltage": 28.0,
                     },
                     {
                         "serial": "SN-002",
@@ -1318,6 +1321,7 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
                         "source_run_name": "Seq 1",
                         "control_period": 10.0,
                         "suppression_voltage": 10.0,
+                        "valve_voltage": 28.0,
                     },
                     {
                         "serial": "SN-101",
@@ -1325,6 +1329,7 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
                         "source_run_name": "Seq 1",
                         "control_period": 10.0,
                         "suppression_voltage": 5.0,
+                        "valve_voltage": 28.0,
                     },
                 ]
                 window._run_selection_views = {
@@ -1339,6 +1344,7 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
                             "member_sequences": ["Seq 1"],
                             "member_control_periods": ["10"],
                             "member_suppression_voltages": ["5", "10"],
+                            "member_valve_voltages": ["28"],
                             "member_run_type_modes": ["pulsed_mode"],
                         }
                     ],
@@ -1348,6 +1354,37 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
                 captured: dict[str, object] = {}
 
                 def _run_dialog() -> int:
+                    report_filters_popup = next(
+                        (
+                            widget
+                            for widget in self._app.topLevelWidgets()
+                            if isinstance(widget, QtWidgets.QDialog) and widget.windowTitle() == "Report Filters"
+                        ),
+                        None,
+                    )
+                    if report_filters_popup is not None:
+                        self.assertIsNotNone(
+                            report_filters_popup.findChild(
+                                QtWidgets.QLabel, "auto_report_filters_popup_summary_label"
+                            )
+                        )
+                        for object_name in (
+                            "auto_report_filters_popup_programs_button",
+                            "auto_report_filters_popup_serials_button",
+                            "auto_report_filters_popup_suppression_voltages_button",
+                            "auto_report_filters_popup_valve_voltages_button",
+                            "auto_report_filters_popup_control_periods_button",
+                        ):
+                            self.assertIsNotNone(
+                                report_filters_popup.findChild(QtWidgets.QPushButton, object_name)
+                            )
+                        apply_btn = report_filters_popup.findChild(
+                            QtWidgets.QPushButton, "auto_report_filters_popup_apply_button"
+                        )
+                        self.assertIsNotNone(apply_btn)
+                        apply_btn.click()
+                        return int(QtWidgets.QDialog.DialogCode.Accepted)
+
                     cert_popup = next(
                         (
                             widget
@@ -1361,22 +1398,53 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
                         popup_serials = cert_popup.findChild(QtWidgets.QListWidget, "auto_report_cert_popup_serials")
                         popup_runs = cert_popup.findChild(QtWidgets.QListWidget, "auto_report_cert_popup_runs")
                         popup_params = cert_popup.findChild(QtWidgets.QListWidget, "auto_report_cert_popup_params")
+                        popup_program_summary = cert_popup.findChild(
+                            QtWidgets.QLabel, "auto_report_cert_popup_program_summary"
+                        )
+                        popup_serial_summary = cert_popup.findChild(
+                            QtWidgets.QLabel, "auto_report_cert_popup_serials_summary"
+                        )
+                        popup_run_summary = cert_popup.findChild(
+                            QtWidgets.QLabel, "auto_report_cert_popup_runs_summary"
+                        )
+                        popup_params_summary = cert_popup.findChild(
+                            QtWidgets.QLabel, "auto_report_certification_params_summary"
+                        )
+                        popup_grade_summary = cert_popup.findChild(
+                            QtWidgets.QLabel, "auto_report_grade_scoring_summary"
+                        )
                         self.assertIsNotNone(popup_program)
                         self.assertIsNotNone(popup_serials)
                         self.assertIsNotNone(popup_runs)
                         self.assertIsNotNone(popup_params)
+                        self.assertIsNotNone(popup_program_summary)
+                        self.assertIsNotNone(popup_serial_summary)
+                        self.assertIsNotNone(popup_run_summary)
+                        self.assertIsNotNone(popup_params_summary)
+                        self.assertIsNotNone(popup_grade_summary)
                         popup_program.setCurrentText("Program Alpha")
                         self._app.processEvents()
                         self.assertEqual(
                             [popup_serials.item(i).text() for i in range(popup_serials.count())],
                             ["SN-001", "SN-002"],
                         )
-                        popup_serials.item(1).setSelected(True)
+                        popup_serials.clearSelection()
+                        popup_serials.selectionModel().select(
+                            popup_serials.model().index(1, 0),
+                            QtCore.QItemSelectionModel.SelectionFlag.ClearAndSelect
+                            | QtCore.QItemSelectionModel.SelectionFlag.Rows,
+                        )
+                        popup_serials.setCurrentRow(1)
                         self._app.processEvents()
                         self.assertGreaterEqual(popup_runs.count(), 1)
                         self.assertEqual(popup_params.count(), 2)
                         for i in range(popup_params.count()):
                             popup_params.item(i).setCheckState(QtCore.Qt.CheckState.Checked)
+                        self._app.processEvents()
+                        self.assertIn("Certification Parameters:", popup_params_summary.text())
+                        self.assertIn("1 / 2", popup_serial_summary.text())
+                        self.assertIn("PASS if |z| <= 1.5", popup_grade_summary.text())
+                        self.assertIn("WATCH if |z| <= 2.5", popup_grade_summary.text())
                         apply_btn = next(
                             btn for btn in cert_popup.findChildren(QtWidgets.QPushButton) if btn.text() == "Apply"
                         )
@@ -1391,35 +1459,57 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
                     cert_button = dialog.findChild(
                         QtWidgets.QPushButton, "auto_report_certification_popup_button"
                     )
+                    report_filters_button = dialog.findChild(
+                        QtWidgets.QPushButton, "auto_report_filters_popup_button"
+                    )
                     report_name = dialog.findChild(QtWidgets.QLineEdit, "auto_report_report_name")
                     output_dir = dialog.findChild(QtWidgets.QLineEdit, "auto_report_output_dir")
-                    grade_summary = dialog.findChild(QtWidgets.QLabel, "auto_report_grade_scoring_summary")
-                    params_summary = dialog.findChild(
-                        QtWidgets.QLabel, "auto_report_certification_params_summary"
+                    report_filters_summary = dialog.findChild(
+                        QtWidgets.QLabel, "auto_report_filters_summary_label"
                     )
                     self.assertIsNotNone(cert_button)
+                    self.assertIsNotNone(report_filters_button)
                     self.assertIsNotNone(report_name)
                     self.assertIsNotNone(output_dir)
-                    self.assertIsNotNone(grade_summary)
-                    self.assertIsNotNone(params_summary)
-                    self.assertIn("Family Serials...", [btn.text() for btn in dialog.findChildren(QtWidgets.QPushButton)])
+                    self.assertIsNotNone(report_filters_summary)
+                    self.assertIsNone(dialog.findChild(QtWidgets.QLabel, "auto_report_grade_scoring_summary"))
+                    self.assertIsNone(dialog.findChild(QtWidgets.QLabel, "auto_report_certification_params_summary"))
+                    self.assertIn("Report Filters...", [btn.text() for btn in dialog.findChildren(QtWidgets.QPushButton)])
                     self.assertIn("Certification Specifics...", [btn.text() for btn in dialog.findChildren(QtWidgets.QPushButton)])
+                    self.assertNotIn("Programs...", [btn.text() for btn in dialog.findChildren(QtWidgets.QPushButton)])
+                    self.assertNotIn("Family Serials...", [btn.text() for btn in dialog.findChildren(QtWidgets.QPushButton)])
                     self.assertNotIn("Select Certification Parameters...", [btn.text() for btn in dialog.findChildren(QtWidgets.QPushButton)])
                     self.assertNotIn("Select Metrics Pages...", [btn.text() for btn in dialog.findChildren(QtWidgets.QPushButton)])
-                    self.assertIn("Certification Parameters:", params_summary.text())
-                    self.assertIn("z =", grade_summary.text())
-                    self.assertIn("PASS if |z| <= 1.5", grade_summary.text())
-                    self.assertIn("WATCH if |z| <= 2.5", grade_summary.text())
+                    self.assertIn("Suppression Voltage:", report_filters_summary.text())
+                    self.assertIn("Valve Voltage:", report_filters_summary.text())
+                    report_filters_button.click()
+                    self._app.processEvents()
                     cert_button.click()
                     self._app.processEvents()
-                    self.assertIn("SN-002", report_name.text())
+                    hidden_serials = dialog.findChild(
+                        QtWidgets.QListWidget, "auto_report_certification_serials"
+                    )
+                    hidden_params = dialog.findChild(
+                        QtWidgets.QListWidget, "auto_report_certification_params"
+                    )
+                    self.assertIsNotNone(hidden_serials)
+                    self.assertIsNotNone(hidden_params)
+                    if not hidden_serials.selectedItems():
+                        hidden_serials.clearSelection()
+                        hidden_serials.selectionModel().select(
+                            hidden_serials.model().index(1, 0),
+                            QtCore.QItemSelectionModel.SelectionFlag.ClearAndSelect
+                            | QtCore.QItemSelectionModel.SelectionFlag.Rows,
+                        )
+                    for i in range(hidden_params.count()):
+                        hidden_params.item(i).setCheckState(QtCore.Qt.CheckState.Checked)
+                    self._app.processEvents()
                     self.assertTrue(str(report_name.text()).endswith("_Test Data Report.pdf"))
                     self.assertTrue(
                         output_dir.text().endswith(
                             str(Path("EDIN Program Folders") / "Program Alpha" / "EDAT reports")
                         )
                     )
-                    self.assertIn("2 / 2", params_summary.text())
                     gen_btn = next(btn for btn in dialog.findChildren(QtWidgets.QPushButton) if btn.text() == "Generate Report")
                     gen_btn.click()
                     return int(QtWidgets.QDialog.DialogCode.Accepted)
@@ -1461,6 +1551,135 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
                 self.assertEqual(payload["params"], ["Flow", "Thrust"])
                 self.assertIn("Program Alpha", str(payload["output_pdf"]))
                 self.assertIn("EDAT reports", str(payload["output_pdf"]))
+        finally:
+            window.close()
+            tmpdir = getattr(window, "_test_tmpdir", "")
+            if tmpdir:
+                shutil.rmtree(str(tmpdir), ignore_errors=True)
+
+    def test_live_global_filters_use_compact_card_and_grouped_popup(self) -> None:
+        window = self._make_window()
+        try:
+            window._available_program_filters = ["Program A", "Program B"]
+            window._checked_program_filters = ["Program A", "Program B"]
+            window._available_serial_filter_rows = [
+                {"serial": "SN-001", "program_title": "Program A"},
+                {"serial": "SN-002", "program_title": "Program B"},
+            ]
+            window._checked_serial_filters = ["SN-001", "SN-002"]
+            window._available_control_period_filters = ["10"]
+            window._checked_control_period_filters = ["10"]
+            window._available_suppression_voltage_filters = ["5"]
+            window._checked_suppression_voltage_filters = ["5"]
+            window._available_valve_voltage_filters = ["28"]
+            window._checked_valve_voltage_filters = ["28"]
+            window._refresh_global_filter_summaries()
+
+            buttons = [btn.text() for btn in window.filter_frame.findChildren(QtWidgets.QPushButton)]
+            self.assertIn("Global Filters...", buttons)
+            self.assertNotIn("Programs...", buttons)
+            self.assertNotIn("Serials...", buttons)
+            self.assertNotIn("Suppression Voltage...", buttons)
+            self.assertNotIn("Valve Voltage...", buttons)
+            self.assertNotIn("Control Period...", buttons)
+            summary_label = window.filter_frame.findChild(QtWidgets.QLabel, "global_filters_summary_label")
+            self.assertIsNotNone(summary_label)
+            self.assertIn("Valve Voltage:", summary_label.text())
+
+            def _inspect_popup() -> int:
+                popup = next(
+                    widget
+                    for widget in self._app.topLevelWidgets()
+                    if isinstance(widget, QtWidgets.QDialog) and widget.windowTitle() == "Global Filters"
+                )
+                self.assertIsNotNone(popup.findChild(QtWidgets.QLabel, "global_filters_popup_summary_label"))
+                for object_name in (
+                    "global_filters_popup_programs_button",
+                    "global_filters_popup_serials_button",
+                    "global_filters_popup_suppression_voltages_button",
+                    "global_filters_popup_valve_voltages_button",
+                    "global_filters_popup_control_periods_button",
+                ):
+                    self.assertIsNotNone(popup.findChild(QtWidgets.QPushButton, object_name))
+                popup.findChild(QtWidgets.QPushButton, "global_filters_popup_apply_button").click()
+                return int(QtWidgets.QDialog.DialogCode.Accepted)
+
+            with patch(
+                "ui_next.qt_main.QtWidgets.QDialog.exec",
+                side_effect=_inspect_popup,
+            ), patch(
+                "ui_next.qt_main._fit_widget_to_screen",
+                lambda *_args, **_kwargs: None,
+            ):
+                window._open_global_filters_popup()
+        finally:
+            window.close()
+            tmpdir = getattr(window, "_test_tmpdir", "")
+            if tmpdir:
+                shutil.rmtree(str(tmpdir), ignore_errors=True)
+
+    def test_graph_file_editor_uses_grouped_filter_popup_and_disables_serial_edits_when_tracking(self) -> None:
+        window = self._make_window()
+        try:
+            window._available_program_filters = ["Program A"]
+            window._available_serial_filter_rows = [{"serial": "SN-001", "program_title": "Program A"}]
+            window._available_control_period_filters = ["10"]
+            window._available_suppression_voltage_filters = ["5"]
+            window._available_valve_voltage_filters = ["28"]
+
+            def _run_dialog() -> int:
+                popup = next(
+                    (
+                        widget
+                        for widget in self._app.topLevelWidgets()
+                        if isinstance(widget, QtWidgets.QDialog) and widget.windowTitle() == "Graph File Global Filters"
+                    ),
+                    None,
+                )
+                if popup is not None:
+                    self.assertIsNotNone(
+                        popup.findChild(QtWidgets.QLabel, "graph_file_filters_popup_summary_label")
+                    )
+                    serial_button = popup.findChild(
+                        QtWidgets.QPushButton, "graph_file_filters_popup_serials_button"
+                    )
+                    self.assertIsNotNone(serial_button)
+                    self.assertFalse(serial_button.isEnabled())
+                    popup.findChild(QtWidgets.QPushButton, "graph_file_filters_popup_apply_button").click()
+                    return int(QtWidgets.QDialog.DialogCode.Accepted)
+
+                dialog = next(
+                    widget
+                    for widget in self._app.topLevelWidgets()
+                    if isinstance(widget, QtWidgets.QDialog) and widget.windowTitle() == "Create Graph File"
+                )
+                summary_label = dialog.findChild(QtWidgets.QLabel, "graph_file_filters_summary_label")
+                filters_button = dialog.findChild(QtWidgets.QPushButton, "graph_file_filters_popup_button")
+                self.assertIsNotNone(summary_label)
+                self.assertIsNotNone(filters_button)
+                self.assertNotIn("Programs...", [btn.text() for btn in dialog.findChildren(QtWidgets.QPushButton)])
+                track_box = next(
+                    btn
+                    for btn in dialog.findChildren(QtWidgets.QCheckBox)
+                    if btn.text() == "Track serials from selected programs"
+                )
+                track_box.setChecked(True)
+                self._app.processEvents()
+                self.assertIn("Filters:", summary_label.text())
+                filters_button.click()
+                self._app.processEvents()
+                dialog.reject()
+                return int(QtWidgets.QDialog.DialogCode.Rejected)
+
+            with patch(
+                "ui_next.qt_main.QtWidgets.QDialog.exec",
+                side_effect=_run_dialog,
+            ), patch(
+                "ui_next.qt_main._fit_widget_to_screen",
+                lambda *_args, **_kwargs: None,
+            ):
+                result = window._open_auto_graph_file_editor()
+            self.assertIsNone(result)
         finally:
             window.close()
             tmpdir = getattr(window, "_test_tmpdir", "")
@@ -1513,7 +1732,7 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
             if tmpdir:
                 shutil.rmtree(str(tmpdir), ignore_errors=True)
 
-    def test_auto_report_visibility_ignores_suppression_but_keeps_valve_scope(self) -> None:
+    def test_auto_report_visibility_honors_suppression_and_valve_scope(self) -> None:
         window = self._make_window()
         try:
             window._available_program_filters = ["Program Alpha"]
@@ -1555,7 +1774,7 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
                     "programs": ["Program Alpha"],
                     "serials": ["SN-002"],
                     "control_periods": ["10"],
-                    "suppression_voltages": ["5"],
+                    "suppression_voltages": ["10"],
                     "valve_voltages": ["32"],
                 },
                 require_active_serial_match=True,
