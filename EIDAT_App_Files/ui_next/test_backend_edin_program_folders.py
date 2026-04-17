@@ -101,7 +101,7 @@ class TestBackendEdinProgramFolders(unittest.TestCase):
 
             self.assertEqual(titles, ["Program Alpha", "Program Beta"])
 
-    def test_td_auto_report_default_filename_uses_program_and_certification_serials(self) -> None:
+    def test_td_auto_report_default_filename_uses_certification_serials(self) -> None:
         name = backend.td_auto_report_default_filename(
             "Program Alpha",
             ["SN-001", "SN-002", "SN-003", "SN-004"],
@@ -109,7 +109,7 @@ class TestBackendEdinProgramFolders(unittest.TestCase):
         )
         self.assertEqual(
             name,
-            "Program Alpha__SN-001__SN-002__SN-003__plus_1_more__TD_Auto_Report__2026-04-09.pdf",
+            "SN-001__SN-002__SN-003__plus_1_more_Test Data Report.pdf",
         )
 
     def test_get_repo_root_prefers_active_node_root_over_configured_repo_root(self) -> None:

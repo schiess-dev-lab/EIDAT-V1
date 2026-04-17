@@ -7745,7 +7745,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         # Build a lightweight options dialog on-demand (keeps startup fast).
         dlg = QtWidgets.QDialog(self)
         dlg.setWindowTitle("Auto Report Options")
-        dlg.resize(860, 680)
+        dlg.resize(860, 560)
         # Force readable light theme regardless of OS/app palette (prevents white-on-white / low-contrast text).
         dlg.setStyleSheet(
             """
@@ -7861,10 +7861,11 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         default_name = (
             getattr(be, "td_auto_report_default_filename", None)("", [], when=datetime.datetime.now())
             if callable(getattr(be, "td_auto_report_default_filename", None))
-            else f"TD_Auto_Report__{time.strftime('%Y-%m-%d')}.pdf"
+            else "No_Serials_Test Data Report.pdf"
         )
         ed_out.setObjectName("auto_report_output_pdf")
         ed_out.setText(str(edin_root_path / default_name))
+        ed_out.hide()
         btn_browse = QtWidgets.QPushButton("Browse…")
         def _browse():
             path, _ = QtWidgets.QFileDialog.getSaveFileName(
@@ -7883,7 +7884,6 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         btn_browse.clicked.connect(_browse)
         row_out.addWidget(ed_out, 1)
         row_out.addWidget(btn_browse)
-        layout.addLayout(row_out)
 
         output_dir_auto = {"enabled": True}
         output_frame = QtWidgets.QFrame()
@@ -7895,29 +7895,28 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         lbl_output_title = QtWidgets.QLabel("Output")
         lbl_output_title.setStyleSheet("font-size: 12px; font-weight: 800; color: #000000;")
         lbl_output_hint = QtWidgets.QLabel(
-            "Reports default into the selected certifying program folder under EDIN Program Folders. You can override the folder or edit the generated report name."
+            "Reports default into the selected certifying program folder under EDIN Program Folders. Override the folder or edit the generated report name if needed."
         )
         lbl_output_hint.setWordWrap(True)
         lbl_output_hint.setStyleSheet("color: #4b5563; font-size: 11px;")
         output_layout.addWidget(lbl_output_title, 0, 0, 1, 3)
         output_layout.addWidget(lbl_output_hint, 1, 0, 1, 3)
-        output_layout.addWidget(QtWidgets.QLabel("EDIN Program Folders Root"), 2, 0)
         ed_edin_root = QtWidgets.QLineEdit(str(edin_root_path))
         ed_edin_root.setObjectName("auto_report_edin_root")
         ed_edin_root.setReadOnly(True)
-        output_layout.addWidget(ed_edin_root, 2, 1, 1, 2)
-        output_layout.addWidget(QtWidgets.QLabel("Output Folder"), 3, 0)
+        ed_edin_root.hide()
+        output_layout.addWidget(QtWidgets.QLabel("Output Folder"), 2, 0)
         ed_output_dir = QtWidgets.QLineEdit(str(edin_root_path))
         ed_output_dir.setObjectName("auto_report_output_dir")
-        output_layout.addWidget(ed_output_dir, 3, 1)
+        output_layout.addWidget(ed_output_dir, 2, 1)
         btn_output_default = QtWidgets.QPushButton("Use Program Folder")
-        output_layout.addWidget(btn_output_default, 3, 2)
-        output_layout.addWidget(QtWidgets.QLabel("Report Name"), 4, 0)
+        output_layout.addWidget(btn_output_default, 2, 2)
+        output_layout.addWidget(QtWidgets.QLabel("Report Name"), 3, 0)
         ed_report_name = QtWidgets.QLineEdit(default_name)
         ed_report_name.setObjectName("auto_report_report_name")
-        output_layout.addWidget(ed_report_name, 4, 1)
+        output_layout.addWidget(ed_report_name, 3, 1)
         btn_output_browse = QtWidgets.QPushButton("Browse...")
-        output_layout.addWidget(btn_output_browse, 4, 2)
+        output_layout.addWidget(btn_output_browse, 3, 2)
         layout.addWidget(output_frame)
 
         # Options checkboxes
@@ -8000,9 +7999,6 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             report_filter_layout.addWidget(btn)
         layout.addWidget(report_filter_frame)
 
-        splitter = QtWidgets.QSplitter()
-        splitter.setOrientation(QtCore.Qt.Orientation.Horizontal)
-        layout.addWidget(splitter, 1)
 
         list_runs = QtWidgets.QListWidget(dlg)
         list_runs.hide()
@@ -8034,16 +8030,18 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         list_sn.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
         list_sn.hide()
 
-        # Left: Certification specifics summary
-        left = QtWidgets.QFrame()
-        left_l = QtWidgets.QVBoxLayout(left)
-        left_l.setContentsMargins(10, 10, 10, 10)
+        certification_frame = QtWidgets.QFrame()
+        certification_frame.setStyleSheet(
+            "QFrame { background: #ffffff; border: 1px solid #d1d5db; border-radius: 10px; }"
+        )
+        left_l = QtWidgets.QVBoxLayout(certification_frame)
+        left_l.setContentsMargins(12, 10, 12, 10)
         left_l.setSpacing(8)
         lbl_certification_title = QtWidgets.QLabel("Certification Specifics")
         lbl_certification_title.setStyleSheet("font-size: 12px; font-weight: 800; color: #000000;")
         left_l.addWidget(lbl_certification_title)
         lbl_certification_hint = QtWidgets.QLabel(
-            "Use the popup to pick the certifying program, certification serials, and run scope. "
+            "Use the popup to pick the certifying program, certification serials, certification parameters, and run scope. "
             "Initial grading uses all suppression voltages in scope, and regrade automatically narrows to the certification-family suppression only when needed."
         )
         lbl_certification_hint.setWordWrap(True)
@@ -8061,6 +8059,11 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         lbl_runs_auto.setStyleSheet("color: #64748b; font-size: 11px;")
         lbl_runs_auto.setWordWrap(True)
         left_l.addWidget(lbl_runs_auto)
+        lbl_params_auto = QtWidgets.QLabel("Certification Parameters: -")
+        lbl_params_auto.setObjectName("auto_report_certification_params_summary")
+        lbl_params_auto.setStyleSheet("color: #64748b; font-size: 11px;")
+        lbl_params_auto.setWordWrap(True)
+        left_l.addWidget(lbl_params_auto)
         grade_summary_box = QtWidgets.QFrame()
         grade_summary_box.setStyleSheet(
             "QFrame { background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 8px; }"
@@ -8080,7 +8083,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         btn_cert_popup = QtWidgets.QPushButton("Certification Specifics...")
         btn_cert_popup.setObjectName("auto_report_certification_popup_button")
         left_l.addWidget(btn_cert_popup)
-        left_l.addStretch(1)
+        layout.addWidget(certification_frame)
 
         default_hi = []
         try:
@@ -8090,7 +8093,6 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         want_hi = {str(s).strip() for s in (default_hi or []) if str(s).strip()}
         applied_default_hi = False
 
-        splitter.addWidget(left)
 
         # Right: Certification parameter selection (checkbox lists)
         right = QtWidgets.QFrame()
@@ -8147,6 +8149,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             it.setCheckState(QtCore.Qt.CheckState.Checked if default_checked else QtCore.Qt.CheckState.Unchecked)
             list_metric_stats.addItem(it)
         right_l.addWidget(gb_metrics)
+        lbl_params_auto = certification_frame.findChild(
+            QtWidgets.QLabel, "auto_report_certification_params_summary"
+        ) or lbl_params_auto
 
         def _collect_checked(listw: QtWidgets.QListWidget) -> list[str]:
             out = []
@@ -8407,7 +8412,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
         def _update_params_label():
             sel = _collect_checked(list_params)
-            lbl_params_auto.setText(f"Selected certification params: {_selection_summary(sel, list_params.count())}")
+            lbl_params_auto.setText(f"Certification Parameters: {_selection_summary(sel, list_params.count())}")
 
         def _update_metric_params_label():
             params_sel = _collect_checked(list_params)
@@ -8468,6 +8473,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             lbl_cert_serials_auto.setText(f"Certification Serials: {_selection_summary(serials, list_sn.count())}")
             lbl_cert_serials_auto.setToolTip(", ".join(serials))
             _update_runs_label()
+            _update_params_label()
 
         def _apply_certification_scope_change(
             *,
@@ -8486,13 +8492,13 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         def _open_certification_popup() -> None:
             pop = QtWidgets.QDialog(dlg)
             pop.setWindowTitle("Certification Specifics")
-            pop.resize(920, 640)
+            pop.resize(1140, 640)
             pop_l = QtWidgets.QVBoxLayout(pop)
             pop_l.setContentsMargins(12, 12, 12, 12)
             pop_l.setSpacing(10)
 
             lbl_popup_hint = QtWidgets.QLabel(
-                "Choose the certifying program, certification serials, and runs included in certification. "
+                "Choose the certifying program, certification serials, certification parameters, and runs included in certification. "
                 "Initial grading always uses all suppression voltages in scope, and regrade automatically narrows to the certification-family suppression only when needed."
             )
             lbl_popup_hint.setWordWrap(True)
@@ -8582,14 +8588,46 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             run_btns.addStretch(1)
             runs_layout.addLayout(run_btns)
             local_splitter.addWidget(runs_frame)
+            params_frame = QtWidgets.QFrame()
+            params_layout = QtWidgets.QVBoxLayout(params_frame)
+            params_layout.setContentsMargins(0, 0, 0, 0)
+            params_layout.setSpacing(8)
+            params_title = QtWidgets.QLabel("Certification Parameters")
+            params_title.setStyleSheet("font-size: 12px; font-weight: 700; color: #000000;")
+            params_layout.addWidget(params_title)
+            local_param_filter = QtWidgets.QLineEdit()
+            local_param_filter.setPlaceholderText("Filter certification parameters...")
+            params_layout.addWidget(local_param_filter)
+            local_params = QtWidgets.QListWidget()
+            local_params.setObjectName("auto_report_cert_popup_params")
+            local_params.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
+            params_layout.addWidget(local_params, 1)
+            local_params_summary = QtWidgets.QLabel("Certification Parameters: -")
+            local_params_summary.setStyleSheet("color: #64748b; font-size: 11px;")
+            local_params_summary.setWordWrap(True)
+            params_layout.addWidget(local_params_summary)
+            param_btns = QtWidgets.QHBoxLayout()
+            btn_local_params_all = QtWidgets.QPushButton("Select All")
+            btn_local_params_clear = QtWidgets.QPushButton("Clear")
+            param_btns.addWidget(btn_local_params_all)
+            param_btns.addWidget(btn_local_params_clear)
+            param_btns.addStretch(1)
+            params_layout.addLayout(param_btns)
+            local_splitter.addWidget(params_frame)
             local_splitter.setStretchFactor(0, 1)
             local_splitter.setStretchFactor(1, 1)
+            local_splitter.setStretchFactor(2, 1)
 
             local_run_states: dict[str, dict[str, bool]] = {
                 "sequence": dict(run_selection_check_states.get("sequence") or {}),
                 "condition": dict(run_selection_check_states.get("condition") or {}),
             }
             local_current_run_mode = str(local_run_scope.currentData() or "sequence").strip().lower()
+            local_param_states: dict[str, bool] = {}
+            for i in range(list_params.count()):
+                it = list_params.item(i)
+                if it is not None:
+                    local_param_states[_norm_name(it.text())] = bool(it.checkState() == QtCore.Qt.CheckState.Checked)
 
             def _local_selected_serials() -> list[str]:
                 return [it.text().strip() for it in local_serials.selectedItems() if it and it.text().strip()]
@@ -8625,6 +8663,84 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     f"Runs Included ({scope_label}): {_selection_summary(labels, local_runs.count())}"
                 )
                 local_runs_summary.setToolTip(", ".join(labels))
+
+            def _local_capture_param_states() -> None:
+                local_param_states.clear()
+                for i in range(local_params.count()):
+                    it = local_params.item(i)
+                    if it is not None:
+                        local_param_states[_norm_name(it.text())] = bool(
+                            it.checkState() == QtCore.Qt.CheckState.Checked
+                        )
+
+            def _local_selected_member_runs() -> list[str]:
+                out: list[str] = []
+                seen: set[str] = set()
+                for i in range(local_runs.count()):
+                    it = local_runs.item(i)
+                    if not it or it.checkState() != QtCore.Qt.CheckState.Checked:
+                        continue
+                    data = it.data(QtCore.Qt.ItemDataRole.UserRole)
+                    if not isinstance(data, dict):
+                        continue
+                    members = data.get("member_runs") or []
+                    if isinstance(members, list):
+                        for run in members:
+                            rn = str(run or "").strip()
+                            if not rn or rn in seen:
+                                continue
+                            seen.add(rn)
+                            out.append(rn)
+                    rn = str(data.get("run_name") or "").strip()
+                    if rn and rn not in seen:
+                        seen.add(rn)
+                        out.append(rn)
+                return out
+
+            def _local_update_params_summary() -> None:
+                labels = [
+                    local_params.item(i).text().strip()
+                    for i in range(local_params.count())
+                    if local_params.item(i) is not None
+                    and local_params.item(i).checkState() == QtCore.Qt.CheckState.Checked
+                    and local_params.item(i).text().strip()
+                ]
+                local_params_summary.setText(
+                    f"Certification Parameters: {_selection_summary(labels, local_params.count())}"
+                )
+                local_params_summary.setToolTip(", ".join(labels))
+
+            def _local_populate_params(*, capture_current: bool = True) -> None:
+                if capture_current:
+                    _local_capture_param_states()
+                y_norms: set[str] = set()
+                y_names: list[str] = []
+                try:
+                    for rn in _local_selected_member_runs():
+                        for col in be.td_list_y_columns(self._db_path, rn):
+                            name = str((col or {}).get("name") or "").strip()
+                            if not name:
+                                continue
+                            nk = _norm_name(name)
+                            if nk in x_exclude_norms or nk in y_norms:
+                                continue
+                            y_norms.add(nk)
+                            y_names.append(name)
+                except Exception:
+                    y_names = []
+                y_names = sorted(y_names, key=lambda value: value.lower())
+                local_params.blockSignals(True)
+                try:
+                    local_params.clear()
+                    for name in y_names:
+                        it = QtWidgets.QListWidgetItem(name)
+                        it.setFlags(it.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+                        checked = bool(local_param_states.get(_norm_name(name), False))
+                        it.setCheckState(QtCore.Qt.CheckState.Checked if checked else QtCore.Qt.CheckState.Unchecked)
+                        local_params.addItem(it)
+                finally:
+                    local_params.blockSignals(False)
+                _local_update_params_summary()
 
             def _local_refresh_serials(*, selected_values: Sequence[object] | None = None) -> None:
                 if selected_values is not None:
@@ -8705,6 +8821,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     local_serials.blockSignals(False)
                 _local_sync_run_scope_availability()
                 _local_populate_runs()
+                _local_populate_params()
 
             def _local_clear_serials() -> None:
                 local_serials.blockSignals(True)
@@ -8714,6 +8831,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     local_serials.blockSignals(False)
                 _local_sync_run_scope_availability()
                 _local_populate_runs()
+                _local_populate_params()
 
             def _local_set_run_checks(checked: bool) -> None:
                 local_runs.blockSignals(True)
@@ -8725,25 +8843,47 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 finally:
                     local_runs.blockSignals(False)
                 _local_update_runs_summary()
+                _local_populate_params()
+
+            def _local_set_param_checks(checked: bool) -> None:
+                local_params.blockSignals(True)
+                try:
+                    for i in range(local_params.count()):
+                        it = local_params.item(i)
+                        if it is not None and not it.isHidden():
+                            it.setCheckState(QtCore.Qt.CheckState.Checked if checked else QtCore.Qt.CheckState.Unchecked)
+                finally:
+                    local_params.blockSignals(False)
+                _local_update_params_summary()
 
             btn_local_serials_all.clicked.connect(_local_select_all_serials)
             btn_local_serials_clear.clicked.connect(_local_clear_serials)
             btn_local_runs_all.clicked.connect(lambda *_: _local_set_run_checks(True))
             btn_local_runs_clear.clicked.connect(lambda *_: _local_set_run_checks(False))
+            btn_local_params_all.clicked.connect(lambda *_: _local_set_param_checks(True))
+            btn_local_params_clear.clicked.connect(lambda *_: _local_set_param_checks(False))
             local_serial_filter.textChanged.connect(lambda text: _set_filtered_hidden(local_serials, text))
             local_run_filter.textChanged.connect(lambda text: _set_filtered_hidden(local_runs, text))
+            local_param_filter.textChanged.connect(lambda text: _set_filtered_hidden(local_params, text))
             local_program.currentIndexChanged.connect(
-                lambda *_: (_local_refresh_serials(), _local_sync_run_scope_availability(), _local_populate_runs())
+                lambda *_: (
+                    _local_refresh_serials(),
+                    _local_sync_run_scope_availability(),
+                    _local_populate_runs(),
+                    _local_populate_params(),
+                )
             )
             local_serials.itemSelectionChanged.connect(
-                lambda: (_local_sync_run_scope_availability(), _local_populate_runs())
+                lambda: (_local_sync_run_scope_availability(), _local_populate_runs(), _local_populate_params())
             )
-            local_run_scope.currentIndexChanged.connect(lambda *_: _local_populate_runs())
-            local_runs.itemChanged.connect(lambda *_: _local_update_runs_summary())
+            local_run_scope.currentIndexChanged.connect(lambda *_: (_local_populate_runs(), _local_populate_params()))
+            local_runs.itemChanged.connect(lambda *_: (_local_update_runs_summary(), _local_populate_params()))
+            local_params.itemChanged.connect(lambda *_: _local_update_params_summary())
 
             _local_refresh_serials()
             _local_sync_run_scope_availability()
             _local_populate_runs(capture_current=False)
+            _local_populate_params(capture_current=False)
 
             btns = QtWidgets.QHBoxLayout()
             btns.addStretch(1)
@@ -8755,6 +8895,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
             def _apply_local_certification() -> None:
                 _local_capture_run_states()
+                _local_capture_param_states()
                 chosen_program = str(local_program.currentText() or "").strip()
                 chosen_serials = _local_selected_serials()
                 run_selection_check_states["sequence"] = dict(local_run_states.get("sequence") or {})
@@ -8780,6 +8921,23 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     selected_serials=chosen_serials,
                     capture_run_states=False,
                 )
+                list_params.blockSignals(True)
+                try:
+                    for i in range(list_params.count()):
+                        it = list_params.item(i)
+                        if it is None:
+                            continue
+                        checked = bool(local_param_states.get(_norm_name(it.text()), False))
+                        it.setCheckState(
+                            QtCore.Qt.CheckState.Checked if checked else QtCore.Qt.CheckState.Unchecked
+                        )
+                finally:
+                    list_params.blockSignals(False)
+                _update_params_label()
+                try:
+                    _refresh_perf_eq_options()
+                except Exception:
+                    pass
                 pop.accept()
 
             btn_apply.clicked.connect(_apply_local_certification)
@@ -9122,10 +9280,6 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         ed_report_name.textChanged.connect(lambda *_: ed_out.setText(str(Path((ed_output_dir.text() or "").strip() or str(edin_root_path)).expanduser() / _normalize_pdf_name(ed_report_name.text()))))
         _apply_report_filter_change()
         _refresh_output_path_preview(force_dir=True, force_name=True)
-
-        splitter.addWidget(right)
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 2)
 
         # Performance equations (optional, user-selectable in GUI)
         gb_perf = QtWidgets.QGroupBox("Performance Equations (optional)")

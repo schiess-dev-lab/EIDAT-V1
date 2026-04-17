@@ -868,10 +868,13 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
                 "serials": ["HI", "ATP1", "ATP2", "ATP3"],
                 "control_periods": ["10"],
             }
+        program_by_serial = {"HI": "Program A", "ATP1": "Program B", "ATP2": "Program B", "ATP3": "Program B"}
 
         analysis = tar._tar_analyze_curve_groups(
             row_specs,
             hi=["HI"],
+            program_by_serial=program_by_serial,
+            certifying_program="Program A",
             grid_points=3,
             degree=1,
             normalize_x=False,
@@ -882,11 +885,13 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
             rms_pct_thr=None,
         )
 
-        self.assertEqual(len(analysis["initial_cohort_specs"]), 1)
+        self.assertEqual(analysis["initial_cohort_specs"], [])
         self.assertEqual({spec["suppression_voltage_label"] for spec in analysis["regrade_cohort_specs"]}, {"100"})
         row = analysis["grading_rows"][0]
         self.assertEqual(row["pair_id"], "pair-100")
-        self.assertEqual(row["initial_grade"], "FAIL")
+        self.assertEqual(row["initial_grade"], "NO_DATA")
+        self.assertTrue(row["initial_skipped"])
+        self.assertEqual(row["initial_skip_reason"], "no_compatible_programs")
         self.assertEqual(row["final_grade"], "PASS")
         self.assertTrue(row["regrade_applied"])
         pair_specs = {str(spec.get("pair_id") or ""): spec for spec in analysis["pair_specs"]}
@@ -897,10 +902,11 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
                 "serials": ["HI", "ATP1", "ATP2", "ATP3"],
                 "control_periods": ["10"],
                 "suppression_voltages": ["100"],
+                "valve_voltages": [],
             },
         )
         self.assertEqual(pair_specs["pair-200"]["filter_state_override"], {})
-        self.assertEqual(len(analysis["initial_nonpass_findings"]), 1)
+        self.assertEqual(analysis["initial_nonpass_findings"], [])
         self.assertEqual(analysis["nonpass_findings"], [])
         self.assertEqual(analysis["watch_pair_ids"], [])
 
@@ -931,10 +937,13 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
                 ],
             ),
         ]
+        program_by_serial = {"HI": "Program A", "ATP1": "Program B", "ATP2": "Program B"}
 
         analysis = tar._tar_analyze_curve_groups(
             row_specs,
             hi=["HI"],
+            program_by_serial=program_by_serial,
+            certifying_program="Program A",
             grid_points=3,
             degree=1,
             normalize_x=False,
@@ -949,9 +958,10 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         pair_spec = next(spec for spec in analysis["pair_specs"] if str(spec.get("pair_id") or "") == "pair-100")
         self.assertEqual(row["initial_grade"], "PASS")
         self.assertEqual(row["final_grade"], "PASS")
-        self.assertFalse(row["regrade_applied"])
-        self.assertEqual(analysis["regrade_cohort_specs"], [])
-        self.assertEqual(pair_spec["filter_state_override"], {})
+        self.assertTrue(row["regrade_applied"])
+        self.assertEqual(len(analysis["initial_cohort_specs"]), 1)
+        self.assertEqual(len(analysis["regrade_cohort_specs"]), 1)
+        self.assertEqual(pair_spec["filter_state_override"], {"suppression_voltages": ["100"], "valve_voltages": []})
 
     @unittest.skipUnless(_have_numpy(), "numpy not installed")
     def test_analyze_curve_groups_skips_regrade_for_single_suppression(self):
@@ -971,10 +981,13 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
                 ],
             )
         ]
+        program_by_serial = {"HI": "Program A", "ATP1": "Program B"}
 
         analysis = tar._tar_analyze_curve_groups(
             row_specs,
             hi=["HI"],
+            program_by_serial=program_by_serial,
+            certifying_program="Program A",
             grid_points=3,
             degree=1,
             normalize_x=False,
@@ -985,10 +998,12 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
             rms_pct_thr=None,
         )
 
-        self.assertEqual(analysis["regrade_cohort_specs"], [])
+        self.assertEqual(len(analysis["regrade_cohort_specs"]), 1)
         row = analysis["grading_rows"][0]
-        self.assertFalse(row["regrade_applied"])
-        self.assertEqual(row["final_grade"], row["initial_grade"])
+        self.assertTrue(row["initial_skipped"])
+        self.assertTrue(row["regrade_applied"])
+        self.assertEqual(row["initial_grade"], "NO_DATA")
+        self.assertEqual(row["final_grade"], "PASS")
 
     @unittest.skipUnless(_have_numpy(), "numpy not installed")
     def test_analyze_curve_groups_limits_regrade_cohort_to_targeted_suppression_members(self):
@@ -1033,10 +1048,21 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
                 ],
             ),
         ]
+        program_by_serial = {
+            "HI": "Program A",
+            "ATP1": "Program B",
+            "ATP2": "Program B",
+            "ATP3": "Program C",
+            "ATP4": "Program C",
+            "ATP5": "Program D",
+            "ATP6": "Program D",
+        }
 
         analysis = tar._tar_analyze_curve_groups(
             row_specs,
             hi=["HI"],
+            program_by_serial=program_by_serial,
+            certifying_program="Program A",
             grid_points=3,
             degree=1,
             normalize_x=False,
@@ -1050,8 +1076,8 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         self.assertEqual(len(analysis["regrade_cohort_specs"]), 1)
         regrade_spec = analysis["regrade_cohort_specs"][0]
         self.assertEqual(regrade_spec["suppression_voltage_label"], "100")
-        self.assertEqual(regrade_spec["member_pair_ids"], ["pair-target"])
-        self.assertEqual({trace["pair_id"] for trace in regrade_spec["trace_curves"]}, {"pair-target"})
+        self.assertEqual(regrade_spec["member_pair_ids"], ["pair-target", "pair-peer"])
+        self.assertEqual({trace["pair_id"] for trace in regrade_spec["trace_curves"]}, {"pair-target", "pair-peer"})
 
     @unittest.skipUnless(_have_numpy(), "numpy not installed")
     def test_analyze_curve_groups_splits_incompatible_x_axes(self):
@@ -1068,7 +1094,7 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
                 x_name="Time",
                 series=[
                     tar.CurveSeries(serial="HI", x=[0.0, 1.0, 2.0], y=[1.0, 1.0, 1.0]),
-                    tar.CurveSeries(serial="ATP1", x=[0.0, 1.0, 2.0], y=[1.1, 1.1, 1.1]),
+                    tar.CurveSeries(serial="ATP1", x=[0.0, 1.0, 2.0], y=[1.02, 1.02, 1.02]),
                 ],
             ),
             self._row_spec(
@@ -1081,14 +1107,17 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
                 x_name="Pulse Number",
                 series=[
                     tar.CurveSeries(serial="HI", x=[1.0, 2.0, 3.0], y=[2.0, 2.0, 2.0]),
-                    tar.CurveSeries(serial="ATP2", x=[1.0, 2.0, 3.0], y=[2.1, 2.1, 2.1]),
+                    tar.CurveSeries(serial="ATP2", x=[1.0, 2.0, 3.0], y=[2.04, 2.04, 2.04]),
                 ],
             ),
         ]
+        program_by_serial = {"HI": "Program A", "ATP1": "Program B", "ATP2": "Program B"}
 
         analysis = tar._tar_analyze_curve_groups(
             row_specs,
             hi=["HI"],
+            program_by_serial=program_by_serial,
+            certifying_program="Program A",
             grid_points=3,
             degree=1,
             normalize_x=False,
@@ -1119,6 +1148,9 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
             },
             "base_condition_label": "Condition A",
             "suppression_voltage_label": "100",
+            "prepass_reference_program": "Program A",
+            "prepass_included_programs": ["Program A", "Program B"],
+            "prepass_excluded_programs": [],
             "initial_plot_payload": {
                 "master_y": [1.0, 1.0, 1.0],
                 "y_resampled_by_sn": {
@@ -1148,7 +1180,13 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
 
         with mock.patch.object(tar, "_tar_metric_map_for_pair", side_effect=_metric_map_side_effect):
             rows = tar._tar_build_per_serial_comparison_rows(
-                {"filter_state": {}, "be": object(), "db_path": Path("fake.sqlite3"), "options": {}},
+                {
+                    "filter_state": {},
+                    "be": object(),
+                    "db_path": Path("fake.sqlite3"),
+                    "options": {},
+                    "program_by_serial": {"SN1": "Program A", "SN2": "Program B"},
+                },
                 pair_specs=[pair_spec],
                 all_serials=["SN1"],
                 hi=["SN1"],
@@ -1157,11 +1195,15 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
                 finding_by_pair_serial={
                     ("pair-1", "SN1"): {
                         "regrade_applied": True,
+                        "final_pass_applied": True,
                         "regrade_suppression_voltage_label": "100",
                         "regrade_condition_key": tar._tar_condition_combo_key("100", ""),
                         "regrade_cohort_id": "regrade:1",
                         "initial_z": -0.5,
                         "final_z": 1.25,
+                        "prepass_reference_program": "Program A",
+                        "prepass_included_programs": ["Program A", "Program B"],
+                        "prepass_excluded_programs": [],
                     }
                 },
             )
@@ -1175,7 +1217,11 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         self.assertEqual(row["final_serial_mean"], 5.0)
         self.assertEqual(row["final_zscore"], 1.25)
         self.assertTrue(row["regrade_applied"])
+        self.assertTrue(row["final_pass_applied"])
         self.assertEqual(row["regrade_cohort_id"], "regrade:1")
+        self.assertEqual(row["prepass_reference_program"], "Program A")
+        self.assertEqual(row["prepass_included_programs"], ["Program A", "Program B"])
+        self.assertEqual(row["prepass_excluded_programs"], [])
 
     def test_build_intro_story_renders_outcome_mix_and_exception_rows(self):
         from EIDAT_App_Files.ui_next import trend_auto_report as tar

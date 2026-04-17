@@ -776,10 +776,8 @@ def td_auto_report_default_filename(
     *,
     when: datetime | None = None,
 ) -> str:
-    program_token = _safe_windows_path_name(program_title, fallback="Program")
     serial_token = td_auto_report_serial_token(certification_serials)
-    date_token = (when or datetime.now()).strftime("%Y-%m-%d")
-    return f"{program_token}__{serial_token}__TD_Auto_Report__{date_token}.pdf"
+    return f"{serial_token}_Test Data Report.pdf"
 
 
 def td_auto_report_default_output_pdf(

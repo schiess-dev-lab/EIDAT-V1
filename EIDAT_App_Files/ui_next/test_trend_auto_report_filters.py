@@ -54,7 +54,8 @@ class _FakeColors:
 def _fake_reportlab() -> dict[str, object]:
     return {
         "colors": _FakeColors,
-        "inch": 1.0,
+        "inch": 72.0,
+        "letter": (8.5 * 72.0, 11.0 * 72.0),
         "PageBreak": _FakePageBreak,
         "Paragraph": _FakeParagraph,
         "Spacer": _FakeSpacer,
@@ -79,6 +80,18 @@ def _table_text(table: _FakeTable) -> list[list[str]]:
     for row in table._cellvalues:
         out.append([str(getattr(cell, "text", cell)) for cell in row])
     return out
+
+
+def _iter_fake_tables(value: object):
+    if isinstance(value, _FakeTable):
+        yield value
+        for row in value._cellvalues:
+            for cell in row:
+                yield from _iter_fake_tables(cell)
+        return
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _iter_fake_tables(item)
 
 
 class _FakePlotHandle:
@@ -573,6 +586,51 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         self.assertEqual(rows[0]["final_suppression_voltage_label"], "All")
         self.assertFalse(rows[0]["regrade_applied"])
 
+    def test_build_per_serial_comparison_rows_omits_cert_serial_without_selected_parameter_data(self) -> None:
+        ctx = {"filter_state": {}, "be": object(), "db_path": Path("fake.sqlite3"), "options": {}}
+        pair_specs = [
+            {
+                "pair_id": "pair-3",
+                "selection_id": "sel-3",
+                "run": "Run C",
+                "run_title": "Sequence C",
+                "base_condition_label": "Condition C",
+                "selection_fields": {
+                    "mode": "condition",
+                    "sequence_text": "Sequence C",
+                    "condition_text": "Condition C",
+                },
+                "param": "Temperature",
+                "units": "F",
+                "initial_plot_payload": {
+                    "master_y": [100.0, 102.0],
+                    "y_resampled_by_sn": {
+                        "SN-001": [99.0, 101.0],
+                    },
+                },
+            }
+        ]
+        with mock.patch.object(tar, "_tar_metric_map_for_pair", return_value={"SN-001": 100.0}):
+            rows = tar._tar_build_per_serial_comparison_rows(
+                ctx,
+                pair_specs=pair_specs,
+                all_serials=["SN-001", "SN-002"],
+                hi=["SN-001", "SN-002"],
+                initial_grade_map_by_pair_serial={
+                    ("pair-3", "SN-001"): "PASS",
+                },
+                final_grade_map_by_pair_serial={
+                    ("pair-3", "SN-001"): "PASS",
+                },
+                finding_by_pair_serial={
+                    ("pair-3", "SN-001"): {"initial_z": -0.25, "final_z": -0.25},
+                },
+            )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["serial"], "SN-001")
+        self.assertEqual(rows[0]["parameter"], "Temperature")
+
     def test_metric_program_segments_group_contiguous_programs(self) -> None:
         segments = tar._tar_metric_program_segments(
             ["SN-001", "SN-002", "SN-003", "SN-004"],
@@ -920,17 +978,53 @@ class TestTrendAutoReportFilters(unittest.TestCase):
                     "stat": "mean",
                     "page_number": idx + 1,
                 }
-                for idx in range(30)
+                for idx in range(140)
             ]
         )
 
-        pages = tar._tar_paginate_plot_navigation(navigation)
+        with mock.patch.object(tar, "_reportlab_imports", return_value=_fake_reportlab()), mock.patch.object(
+            tar,
+            "_build_portrait_styles",
+            return_value=_fake_styles(),
+        ):
+            pages = tar._tar_paginate_plot_navigation(navigation)
 
         self.assertGreater(len(pages), 1)
-        self.assertTrue(pages[0]["show_navigator"])
-        self.assertFalse(pages[1]["show_navigator"])
+        self.assertEqual(pages[0]["column_count"], 3)
+        self.assertEqual(pages[0]["navigator_sections"], [])
         self.assertEqual(pages[0]["rows"][0]["text"], "Run Condition Metrics")
         self.assertEqual(pages[1]["rows"][0]["text"], "Run Condition Metrics")
+        first_page_columns = [column for column in pages[0]["columns"] if column.get("rows")]
+        self.assertEqual(len(first_page_columns), 3)
+        self.assertTrue(all(column["rows"][0]["text"] == "Run Condition Metrics" for column in first_page_columns))
+
+    def test_paginate_plot_navigation_uses_two_columns_before_continuing(self) -> None:
+        navigation = tar._tar_build_plot_navigation(
+            [
+                {
+                    "section": "run_condition_plot_metrics",
+                    "param": f"Pressure {idx}",
+                    "x_name": "Time",
+                    "stat": "mean",
+                    "page_number": idx + 1,
+                }
+                for idx in range(45)
+            ]
+        )
+
+        with mock.patch.object(tar, "_reportlab_imports", return_value=_fake_reportlab()), mock.patch.object(
+            tar,
+            "_build_portrait_styles",
+            return_value=_fake_styles(),
+        ):
+            pages = tar._tar_paginate_plot_navigation(navigation)
+
+        self.assertEqual(len(pages), 1)
+        self.assertEqual(pages[0]["column_count"], 2)
+        used_columns = [column for column in pages[0]["columns"] if column.get("rows")]
+        self.assertEqual(len(used_columns), 2)
+        self.assertEqual(used_columns[0]["rows"][0]["text"], "Run Condition Metrics")
+        self.assertEqual(used_columns[1]["rows"][0]["text"], "Run Condition Metrics")
 
     def test_apply_pdf_navigation_adds_links_and_bookmarks(self) -> None:
         fitz = __import__("fitz")
@@ -938,9 +1032,9 @@ class TestTrendAutoReportFilters(unittest.TestCase):
             pdf_path = Path(tmp_dir) / "toc_navigation.pdf"
             doc = fitz.open()
             toc_page = doc.new_page()
-            toc_page.insert_text((72, 72), "Run Metrics")
-            toc_page.insert_text((72, 104), "Run Condition Metrics")
-            toc_page.insert_text((72, 136), "Pressure | Time | mean")
+            toc_page.insert_text((72, 72), "Run Condition Metrics")
+            toc_page.insert_text((72, 104), "Pressure | Time | mean")
+            toc_page.insert_text((220, 104), "2")
             doc.new_page()
             doc.new_page()
             doc.save(str(pdf_path))
@@ -961,7 +1055,7 @@ class TestTrendAutoReportFilters(unittest.TestCase):
                 plot_toc_layout=[
                     {
                         "toc_page_number": 1,
-                        "navigator_sections": [{"label": "Run Metrics", "target_page_index": 1}],
+                        "navigator_sections": [],
                         "rows": [
                             {"kind": "section", "text": "Run Condition Metrics", "target_page_index": 1},
                             {"kind": "plot", "text": "Pressure | Time | mean", "target_page_index": 1, "page_text": "2"},
@@ -977,8 +1071,116 @@ class TestTrendAutoReportFilters(unittest.TestCase):
                 self.assertEqual(toc_rows[0][2], 2)
                 self.assertEqual(toc_rows[1][1], "Pressure | Time | mean")
                 links = result.load_page(0).get_links()
-                self.assertGreaterEqual(len(links), 3)
+                self.assertGreaterEqual(len(links), 2)
                 self.assertTrue(all(link.get("page") == 1 for link in links))
+            finally:
+                result.close()
+
+    def test_apply_pdf_navigation_links_rows_in_multiple_toc_columns(self) -> None:
+        fitz = __import__("fitz")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pdf_path = Path(tmp_dir) / "toc_navigation_multicolumn.pdf"
+            doc = fitz.open()
+            toc_page = doc.new_page()
+            toc_page.insert_text((72, 72), "Plot Table of Contents")
+            toc_page.insert_text((72, 104), "Run Condition Metrics")
+            toc_page.insert_text((72, 136), "Pressure | Time | mean")
+            toc_page.insert_text((220, 136), "2")
+            toc_page.insert_text((250, 104), "Performance Plots")
+            toc_page.insert_text((250, 136), "ATP Fit | Flow vs Bus Voltage | mean")
+            toc_page.insert_text((398, 136), "3")
+            toc_page.insert_text((428, 104), "Watch / Non-PASS Curves")
+            toc_page.insert_text((428, 136), "Run A | Pressure | 2 Serials")
+            toc_page.insert_text((576, 136), "4")
+            doc.new_page()
+            doc.new_page()
+            doc.new_page()
+            doc.save(str(pdf_path))
+            doc.close()
+
+            tar._tar_apply_pdf_navigation(
+                pdf_path,
+                plot_navigation=[
+                    {
+                        "section_key": "run_condition_plot_metrics",
+                        "section_label": "Run Condition Metrics",
+                        "navigator_label": "Run Metrics",
+                        "plot_label": "Pressure | Time | mean",
+                        "page_number": 2,
+                        "destination_page_index": 1,
+                    },
+                    {
+                        "section_key": "performance_plots",
+                        "section_label": "Performance Plots",
+                        "navigator_label": "Performance",
+                        "plot_label": "ATP Fit | Flow vs Bus Voltage | mean",
+                        "page_number": 3,
+                        "destination_page_index": 2,
+                    },
+                    {
+                        "section_key": "watch_nonpass_curves",
+                        "section_label": "Watch / Non-PASS Curves",
+                        "navigator_label": "Watch / Fail",
+                        "plot_label": "Run A | Pressure | 2 Serials",
+                        "page_number": 4,
+                        "destination_page_index": 3,
+                    },
+                ],
+                plot_toc_layout=[
+                    {
+                        "toc_page_number": 1,
+                        "navigator_sections": [],
+                        "column_count": 3,
+                        "columns": [
+                            {
+                                "column_index": 1,
+                                "rows": [
+                                    {"kind": "section", "text": "Run Condition Metrics", "target_page_index": 1},
+                                    {"kind": "plot", "text": "Pressure | Time | mean", "target_page_index": 1, "page_text": "2"},
+                                ],
+                            },
+                            {
+                                "column_index": 2,
+                                "rows": [
+                                    {"kind": "section", "text": "Performance Plots", "target_page_index": 2},
+                                    {
+                                        "kind": "plot",
+                                        "text": "ATP Fit | Flow vs Bus Voltage | mean",
+                                        "target_page_index": 2,
+                                        "page_text": "3",
+                                    },
+                                ],
+                            },
+                            {
+                                "column_index": 3,
+                                "rows": [
+                                    {"kind": "section", "text": "Watch / Non-PASS Curves", "target_page_index": 3},
+                                    {"kind": "plot", "text": "Run A | Pressure | 2 Serials", "target_page_index": 3, "page_text": "4"},
+                                ],
+                            },
+                        ],
+                        "rows": [
+                            {"kind": "section", "text": "Run Condition Metrics", "target_page_index": 1},
+                            {"kind": "plot", "text": "Pressure | Time | mean", "target_page_index": 1, "page_text": "2"},
+                            {"kind": "section", "text": "Performance Plots", "target_page_index": 2},
+                            {"kind": "plot", "text": "ATP Fit | Flow vs Bus Voltage | mean", "target_page_index": 2, "page_text": "3"},
+                            {"kind": "section", "text": "Watch / Non-PASS Curves", "target_page_index": 3},
+                            {"kind": "plot", "text": "Run A | Pressure | 2 Serials", "target_page_index": 3, "page_text": "4"},
+                        ],
+                    }
+                ],
+            )
+
+            result = fitz.open(str(pdf_path))
+            try:
+                links = result.load_page(0).get_links()
+                self.assertEqual(sorted(link.get("page") for link in links), [1, 1, 2, 2, 3, 3])
+                page_2_links = [link for link in links if link.get("page") == 1]
+                page_3_links = [link for link in links if link.get("page") == 2]
+                page_4_links = [link for link in links if link.get("page") == 3]
+                self.assertTrue(all(link["from"].x1 < 240 for link in page_2_links))
+                self.assertTrue(all(link["from"].x0 > 200 for link in page_3_links))
+                self.assertTrue(all(link["from"].x0 > 380 for link in page_4_links))
             finally:
                 result.close()
 
@@ -993,10 +1195,12 @@ class TestTrendAutoReportFilters(unittest.TestCase):
             toc_page_1.insert_text((72, 72), "Plot Table of Contents")
             toc_page_1.insert_text((72, 104), "Run Condition Metrics")
             toc_page_1.insert_text((72, 136), "Pressure | Time | mean")
+            toc_page_1.insert_text((220, 136), "4")
             toc_page_2 = doc.new_page()
             toc_page_2.insert_text((72, 72), "Plot Table of Contents (Continued)")
             toc_page_2.insert_text((72, 104), "Regrade Pass Metrics")
             toc_page_2.insert_text((72, 136), "Flow | Time | mean")
+            toc_page_2.insert_text((220, 136), "5")
             doc.new_page()
             doc.new_page()
             doc.save(str(pdf_path))
@@ -1025,7 +1229,7 @@ class TestTrendAutoReportFilters(unittest.TestCase):
                 plot_toc_layout=[
                     {
                         "toc_page_number": 1,
-                        "navigator_sections": [{"label": "Run Metrics", "target_page_index": 3}],
+                        "navigator_sections": [],
                         "rows": [
                             {"kind": "section", "text": "Run Condition Metrics", "target_page_index": 3},
                             {"kind": "plot", "text": "Pressure | Time | mean", "target_page_index": 3, "page_text": "4"},
@@ -1139,101 +1343,101 @@ class TestTrendAutoReportFilters(unittest.TestCase):
                 },
             ]
         )
-        ctx = {
-            "print_ctx": tar.PrintContext(
-                printed_at="2026-04-12 09:00 MDT",
-                printed_timezone="MDT",
-                report_title="EIDAT Test Trend Data Analyze Auto Report",
-                report_subtitle="Certification",
-            ),
-            "pair_specs": [
-                {
-                    "pair_id": "pair-1",
-                    "param": "Pressure",
-                    "selection_fields": {"mode": "condition", "display_text": "Condition A"},
-                }
-            ],
-            "options": {},
-            "overall_by_sn": {"SN-001": "CERTIFIED"},
-            "nonpass_findings": [],
-            "pair_by_id": {},
-            "hi": ["SN-001"],
-            "params": ["Pressure"],
-            "metric_stats": ["mean"],
-            "include_metrics": False,
-            "meta_note": "",
-            "change_summary": "",
-            "performance_plot_specs": [],
-            "initial_overall_by_sn": {"SN-001": "CERTIFIED"},
-            "final_overall_by_sn": {"SN-001": "CERTIFIED"},
-            "comparison_rows": [
-                {
-                    "run_condition": "Condition A",
-                    "serial": "SN-001",
-                    "sequence_text": "Sequence A",
-                    "parameter": "Pressure",
-                    "units": "psi",
-                    "initial_atp_mean": 10.0,
-                    "final_atp_mean": 12.0,
-                    "initial_actual_mean": 9.0,
-                    "final_actual_mean": 11.0,
-                    "initial_delta": -1.0,
-                    "final_delta": -1.0,
-                    "initial_grade": "PASS",
-                    "final_grade": "WATCH",
-                    "initial_suppression_voltage_label": "All",
-                    "final_suppression_voltage_label": "5",
-                    "initial_valve_voltage_label": "All",
-                    "final_valve_voltage_label": "28",
-                    "regrade_applied": False,
-                }
-            ],
-            "meta_by_sn": {
-                "SN-001": {
-                    "program_title": "Program A",
-                    "part_number": "PN-1",
-                    "revision": "A",
-                    "acceptance_test_plan_number": "ATP-1",
-                    "similarity_group": "SG-1",
-                    "asset_type": "Valve",
-                    "asset_specific_type": "Injector",
-                    "vendor": "Vendor A",
-                    "test_date": "2026-03-01",
-                    "report_date": "2026-03-04",
-                    "document_type": "Acceptance Test Plan",
-                    "document_type_acronym": "ATP",
-                },
-                "SN-010": {"program_title": "Program B"},
-            },
-            "watch_pair_ids": ["pair-1"],
-            "runs": ["Run A"],
-            "all_serials": ["SN-001", "SN-010"],
-            "plot_navigation": plot_navigation,
-            "plot_toc_layout": tar._tar_paginate_plot_navigation(plot_navigation),
-            "quick_summary": {
-                "lines": [
-                    "Certifying Program(s): Program A",
-                    "Certified Serial(s): SN-001",
-                    "Selected Run Condition(s): Condition A",
-                    "Watch Parameter(s): Pressure",
-                    "Programs Compared: Program B",
-                    "Suppression Voltage: 5",
-                    "Valve Voltage: 28",
-                ],
-                "initial_suppression_voltage": "All",
-                "final_suppression_voltage": "5",
-                "initial_valve_voltage": "All",
-                "final_valve_voltage": "28",
-                "p8_suppression_voltage": "5",
-                "p8_valve_voltage": "28",
-            },
-        }
-
         with mock.patch.object(tar, "_reportlab_imports", return_value=_fake_reportlab()), mock.patch.object(
             tar,
             "_build_portrait_styles",
             return_value=_fake_styles(),
         ):
+            plot_toc_layout = tar._tar_paginate_plot_navigation(plot_navigation)
+            ctx = {
+                "print_ctx": tar.PrintContext(
+                    printed_at="2026-04-12 09:00 MDT",
+                    printed_timezone="MDT",
+                    report_title="EIDAT Test Trend Data Analyze Auto Report",
+                    report_subtitle="Certification",
+                ),
+                "pair_specs": [
+                    {
+                        "pair_id": "pair-1",
+                        "param": "Pressure",
+                        "selection_fields": {"mode": "condition", "display_text": "Condition A"},
+                    }
+                ],
+                "options": {},
+                "overall_by_sn": {"SN-001": "CERTIFIED"},
+                "nonpass_findings": [],
+                "pair_by_id": {},
+                "hi": ["SN-001"],
+                "params": ["Pressure"],
+                "metric_stats": ["mean"],
+                "include_metrics": False,
+                "meta_note": "",
+                "change_summary": "",
+                "performance_plot_specs": [],
+                "initial_overall_by_sn": {"SN-001": "CERTIFIED"},
+                "final_overall_by_sn": {"SN-001": "CERTIFIED"},
+                "comparison_rows": [
+                    {
+                        "run_condition": "Condition A",
+                        "serial": "SN-001",
+                        "sequence_text": "Sequence A",
+                        "parameter": "Pressure",
+                        "units": "psi",
+                        "initial_atp_mean": 10.0,
+                        "final_atp_mean": 12.0,
+                        "initial_actual_mean": 9.0,
+                        "final_actual_mean": 11.0,
+                        "initial_delta": -1.0,
+                        "final_delta": -1.0,
+                        "initial_grade": "PASS",
+                        "final_grade": "WATCH",
+                        "initial_suppression_voltage_label": "All",
+                        "final_suppression_voltage_label": "5",
+                        "initial_valve_voltage_label": "All",
+                        "final_valve_voltage_label": "28",
+                        "regrade_applied": False,
+                    }
+                ],
+                "meta_by_sn": {
+                    "SN-001": {
+                        "program_title": "Program A",
+                        "part_number": "PN-1",
+                        "revision": "A",
+                        "acceptance_test_plan_number": "ATP-1",
+                        "similarity_group": "SG-1",
+                        "asset_type": "Valve",
+                        "asset_specific_type": "Injector",
+                        "vendor": "Vendor A",
+                        "test_date": "2026-03-01",
+                        "report_date": "2026-03-04",
+                        "document_type": "Acceptance Test Plan",
+                        "document_type_acronym": "ATP",
+                    },
+                    "SN-010": {"program_title": "Program B"},
+                },
+                "watch_pair_ids": ["pair-1"],
+                "runs": ["Run A"],
+                "all_serials": ["SN-001", "SN-010"],
+                "plot_navigation": plot_navigation,
+                "plot_toc_layout": plot_toc_layout,
+                "quick_summary": {
+                    "lines": [
+                        "Certifying Program(s): Program A",
+                        "Certified Serial(s): SN-001",
+                        "Selected Run Condition(s): Condition A",
+                        "Watch Parameter(s): Pressure",
+                        "Programs Compared: Program B",
+                        "Suppression Voltage: 5",
+                        "Valve Voltage: 28",
+                    ],
+                    "initial_suppression_voltage": "All",
+                    "final_suppression_voltage": "5",
+                    "initial_valve_voltage": "All",
+                    "final_valve_voltage": "28",
+                    "p8_suppression_voltage": "5",
+                    "p8_valve_voltage": "28",
+                },
+            }
             story = tar._tar_build_intro_story(ctx)
 
         self.assertFalse(
@@ -1309,15 +1513,66 @@ class TestTrendAutoReportFilters(unittest.TestCase):
             )
         )
 
-        toc_table = next(
+        all_tables = list(_iter_fake_tables(story))
+        self.assertFalse(
+            any(
+                "Run Metrics" in cell
+                for table in all_tables
+                for row in _table_text(table)
+                for cell in row
+            )
+        )
+        toc_tables = [table for table in all_tables if _table_text(table) and _table_text(table)[0][0] == "Plot / Section"]
+        toc_rows = [row for table in toc_tables for row in _table_text(table)[1:]]
+        self.assertEqual(toc_rows[0][0], "Run Condition Metrics")
+        self.assertEqual(toc_rows[1][0], "Pressure | Time | mean")
+        self.assertEqual(toc_rows[2][0], "Performance Plots")
+
+    def test_build_plot_toc_story_uses_side_by_side_columns_without_navigator(self) -> None:
+        plot_navigation = tar._tar_build_plot_navigation(
+            [
+                {
+                    "section": "run_condition_plot_metrics",
+                    "param": f"Pressure {idx}",
+                    "x_name": "Time",
+                    "stat": "mean",
+                    "page_number": idx + 1,
+                }
+                for idx in range(45)
+            ]
+        )
+
+        with mock.patch.object(tar, "_reportlab_imports", return_value=_fake_reportlab()), mock.patch.object(
+            tar,
+            "_build_portrait_styles",
+            return_value=_fake_styles(),
+        ):
+            layout = tar._tar_paginate_plot_navigation(plot_navigation)
+            story = tar._tar_build_plot_toc_story(
+                {"plot_navigation": plot_navigation, "plot_toc_layout": layout},
+                styles=_fake_styles(),
+                rl=_fake_reportlab(),
+            )
+
+        self.assertEqual(len(layout), 1)
+        self.assertEqual(layout[0]["column_count"], 2)
+        outer_toc_table = next(
             item
             for item in story
-            if isinstance(item, _FakeTable) and _table_text(item)[0][0] == "Plot / Section"
+            if isinstance(item, _FakeTable) and any(isinstance(cell, _FakeTable) for row in item._cellvalues for cell in row)
         )
-        toc_rows = _table_text(toc_table)
-        self.assertEqual(toc_rows[1][0], "Run Condition Metrics")
-        self.assertEqual(toc_rows[2][0], "Pressure | Time | mean")
-        self.assertEqual(toc_rows[3][0], "Performance Plots")
+        inner_toc_tables = [cell for cell in outer_toc_table._cellvalues[0] if isinstance(cell, _FakeTable)]
+        self.assertEqual(len(inner_toc_tables), 2)
+        self.assertEqual(_table_text(inner_toc_tables[0])[1][0], "Run Condition Metrics")
+        self.assertEqual(_table_text(inner_toc_tables[1])[1][0], "Run Condition Metrics")
+        self.assertFalse(
+            any(
+                "Run Metrics" in cell
+                for table in _iter_fake_tables(story)
+                for row in _table_text(table)
+                for cell in row
+            )
+        )
 
     def test_build_intro_story_excludes_regraded_run_comparison_tables(self) -> None:
         ctx = {

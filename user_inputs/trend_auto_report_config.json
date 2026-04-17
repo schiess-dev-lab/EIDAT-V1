@@ -16,7 +16,17 @@
   },
   "grading": {
     "zscore_pass_max": 2.0,
-    "zscore_watch_max": 3.0
+    "zscore_watch_max": 3.0,
+    "prepass": {
+      "enabled": true,
+      "scope": "base_condition_plot",
+      "comparator": "percent_delta_to_certifying_program",
+      "percent_delta_max": 5.0,
+      "voltage_rule": "mean_only",
+      "initial_role": "gate_and_grade",
+      "final_pass_policy": "always_exact_condition",
+      "family_weighting": "equal_program_weight"
+    }
   },
   "report": {
     "statistics": "from_excel_trend_config",

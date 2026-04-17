@@ -10,7 +10,7 @@ on optional plotting/scientific libraries (matplotlib, numpy).
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any, Callable, Collection, Iterable, Mapping
 
 import html
 import importlib
@@ -388,6 +388,16 @@ def default_trend_auto_report_config() -> dict:
         "grading": {
             "zscore_pass_max": 2.0,
             "zscore_watch_max": 3.0,
+            "prepass": {
+                "enabled": True,
+                "scope": "base_condition_plot",
+                "comparator": "percent_delta_to_certifying_program",
+                "percent_delta_max": 5.0,
+                "voltage_rule": "mean_only",
+                "initial_role": "gate_and_grade",
+                "final_pass_policy": "always_exact_condition",
+                "family_weighting": "equal_program_weight",
+            },
         },
         "report": {
             "statistics": "from_excel_trend_config",
@@ -1359,6 +1369,168 @@ def _nan_std(cols: list[list[float]]) -> list[float]:
         else:
             out.append(float(statistics.pstdev(vs)))
     return out
+
+
+def _tar_mean_trace(traces: list[list[float]]) -> list[float]:
+    return _nan_mean(traces)
+
+
+def _tar_program_label(program_by_serial: Mapping[str, str] | None, serial: object) -> str:
+    serial_text = str(serial or "").strip()
+    if not serial_text:
+        return ""
+    return _td_display_program_title((program_by_serial or {}).get(serial_text))
+
+
+def _tar_program_mean_map(
+    values_by_serial: Mapping[str, object] | None,
+    *,
+    program_by_serial: Mapping[str, str] | None,
+    allowed_programs: Collection[str] | None = None,
+) -> dict[str, float]:
+    by_program: dict[str, list[float]] = {}
+    allowed = {
+        _td_display_program_title(value)
+        for value in (allowed_programs or [])
+        if _td_display_program_title(value)
+    }
+    for raw_serial, raw_value in (values_by_serial or {}).items():
+        serial = str(raw_serial or "").strip()
+        if not serial:
+            continue
+        value = _safe_float(raw_value)
+        if value is None or not math.isfinite(value):
+            continue
+        program = _tar_program_label(program_by_serial, serial)
+        if not program or (allowed and program not in allowed):
+            continue
+        by_program.setdefault(program, []).append(float(value))
+    out: dict[str, float] = {}
+    for program, values in by_program.items():
+        mean_value = _tar_finite_mean(values)
+        if mean_value is not None:
+            out[program] = float(mean_value)
+    return out
+
+
+def _tar_program_trace_map(
+    traces_by_serial: Mapping[str, list[float]] | None,
+    *,
+    program_by_serial: Mapping[str, str] | None,
+    allowed_programs: Collection[str] | None = None,
+) -> dict[str, list[float]]:
+    by_program: dict[str, list[list[float]]] = {}
+    allowed = {
+        _td_display_program_title(value)
+        for value in (allowed_programs or [])
+        if _td_display_program_title(value)
+    }
+    for raw_serial, trace in (traces_by_serial or {}).items():
+        serial = str(raw_serial or "").strip()
+        if not serial or not isinstance(trace, list):
+            continue
+        program = _tar_program_label(program_by_serial, serial)
+        if not program or (allowed and program not in allowed):
+            continue
+        by_program.setdefault(program, []).append(list(trace))
+    return {
+        program: _tar_mean_trace(program_traces)
+        for program, program_traces in by_program.items()
+        if program_traces
+    }
+
+
+def _tar_program_trace_scalar_mean_map(
+    traces_by_program: Mapping[str, list[float]] | None,
+) -> dict[str, float]:
+    out: dict[str, float] = {}
+    for program, trace in (traces_by_program or {}).items():
+        if not isinstance(trace, list):
+            continue
+        mean_value = _tar_finite_mean(trace)
+        if mean_value is not None:
+            out[str(program or "").strip()] = float(mean_value)
+    return out
+
+
+def _tar_program_score_stats(
+    entries: Iterable[tuple[str, Mapping[str, object]]],
+    *,
+    program_by_serial: Mapping[str, str] | None,
+) -> tuple[float, float]:
+    program_scores: dict[str, list[float]] = {}
+    for serial, dev in entries:
+        program = _tar_program_label(program_by_serial, serial)
+        score = _safe_float((dev or {}).get("max_abs"))
+        if not program or score is None or not math.isfinite(score):
+            continue
+        program_scores.setdefault(program, []).append(float(score))
+    collapsed = [
+        float(mean_value)
+        for mean_value in (_tar_finite_mean(scores) for scores in program_scores.values())
+        if mean_value is not None and math.isfinite(float(mean_value))
+    ]
+    if not collapsed:
+        return 0.0, 1.0
+    mean_score = float(statistics.mean(collapsed))
+    std_score = float(statistics.pstdev(collapsed)) if len(collapsed) > 1 else 1.0
+    if std_score == 0.0:
+        std_score = 1.0
+    return mean_score, std_score
+
+
+def _tar_programs_within_percent_delta(
+    program_means: Mapping[str, float] | None,
+    *,
+    reference_program: str,
+    percent_delta_max: float,
+) -> tuple[list[str], list[str]]:
+    reference = str(reference_program or "").strip()
+    ref_value = _safe_float((program_means or {}).get(reference))
+    if not reference or ref_value is None or not math.isfinite(ref_value):
+        return [], sorted(_tar_unique_text_values(list((program_means or {}).keys())))
+    included: list[str] = []
+    excluded: list[str] = []
+    for program in _tar_unique_text_values(list((program_means or {}).keys())):
+        value = _safe_float((program_means or {}).get(program))
+        if value is None or not math.isfinite(value):
+            excluded.append(program)
+            continue
+        denom = max(abs(float(value)), abs(float(ref_value)), 1e-12)
+        pct_delta = (100.0 * abs(float(value) - float(ref_value))) / denom
+        if program == reference or pct_delta <= float(percent_delta_max):
+            included.append(program)
+        else:
+            excluded.append(program)
+    if reference not in included and reference:
+        included.insert(0, reference)
+        excluded = [program for program in excluded if program != reference]
+    return _tar_unique_text_values(included), _tar_unique_text_values(excluded)
+
+
+def _tar_resolve_program_by_serial(
+    meta_by_sn: Mapping[str, Mapping[str, object]] | None,
+    *,
+    filter_rows: Iterable[Mapping[str, object]] | None = None,
+) -> dict[str, str]:
+    program_by_serial: dict[str, str] = {}
+    for raw_serial, meta in (meta_by_sn or {}).items():
+        serial = str(raw_serial or "").strip()
+        if not serial:
+            continue
+        label = _td_display_program_title((meta or {}).get("program_title"))
+        if label:
+            program_by_serial[serial] = label
+    for row in (filter_rows or []):
+        if not isinstance(row, Mapping):
+            continue
+        serial = str(row.get("serial") or "").strip()
+        if not serial or serial in program_by_serial:
+            continue
+        label = _td_display_program_title(row.get("program_title"))
+        if label:
+            program_by_serial[serial] = label
+    return program_by_serial
 
 
 def _poly_fit(x: list[float], y: list[float], degree: int, *, normalize_x: bool) -> dict:
@@ -2671,7 +2843,7 @@ def _tar_comparison_page_metric_value(row: Mapping[str, object] | None, metric_l
                 return value
         return None
 
-    regrade_applied = bool(row.get("regrade_applied"))
+    regrade_applied = bool(row.get("regrade_applied")) or bool(row.get("final_pass_applied")) or bool(row.get("initial_skipped"))
     if metric_label == "Family Mean":
         return _tar_comparison_metric_text(
             _pick("initial_family_mean", "initial_atp_mean"),
@@ -4078,7 +4250,7 @@ def generate_test_data_auto_report(
                         finite_vals = [float(v) for v in yv if isinstance(v, (int, float)) and not math.isnan(float(v))]
                         if finite_vals:
                             fam_med = float(statistics.median(finite_vals))
-                            ax.axhline(fam_med, color="#0f172a", linestyle="--", linewidth=1.1, alpha=0.6, label="family median")
+                            ax.axhline(fam_med, color="#0f172a", linestyle="--", linewidth=1.1, alpha=0.6, label="family mean")
                     except Exception:
                         pass
 
@@ -4205,7 +4377,7 @@ def generate_test_data_auto_report(
                         finite_vals = [float(v) for v in yv if isinstance(v, (int, float)) and not math.isnan(float(v))]
                         if finite_vals:
                             fam_med = float(statistics.median(finite_vals))
-                            ax.axhline(fam_med, color="#0f172a", linestyle="--", linewidth=1.1, alpha=0.6, label="family median")
+                            ax.axhline(fam_med, color="#0f172a", linestyle="--", linewidth=1.1, alpha=0.6, label="family mean")
                     except Exception:
                         pass
 
@@ -4879,7 +5051,7 @@ def _tar_filter_state_without_suppression(
         return out
     for key, value in filter_state.items():
         name = str(key)
-        if name == "suppression_voltages":
+        if name in {"suppression_voltages", "valve_voltages"}:
             continue
         if isinstance(value, list):
             out[name] = [str(item).strip() for item in value if str(item).strip()]
@@ -5009,7 +5181,16 @@ def _tar_curve_plot_payload_for_pair(
     grid_points = max(2, int(ctx.get("grid_points") or 200))
     x_grid = [lo + (hi_dom - lo) * (idx / (grid_points - 1)) for idx in range(grid_points)]
     y_resampled_by_sn = {curve.serial: _interp_linear(curve.x, curve.y, x_grid) for curve in series}
-    y_matrix = list(y_resampled_by_sn.values())
+    program_traces = _tar_program_trace_map(
+        y_resampled_by_sn,
+        program_by_serial=(ctx.get("program_by_serial") if isinstance(ctx, Mapping) else None),
+        allowed_programs=(
+            list(spec.get("prepass_included_programs") or [])
+            if not (isinstance(override_filter_state, Mapping) and override_filter_state)
+            else None
+        ),
+    )
+    y_matrix = list(program_traces.values()) or list(y_resampled_by_sn.values())
     payload = {
         "run": run_name,
         "param": param_name,
@@ -5018,7 +5199,9 @@ def _tar_curve_plot_payload_for_pair(
         "x_name": x_name,
         "x_grid": list(x_grid),
         "y_resampled_by_sn": y_resampled_by_sn,
-        "master_y": _nan_median(y_matrix),
+        "program_traces_by_program": dict(program_traces),
+        "program_weighting": "equal_program_weight",
+        "master_y": _tar_mean_trace(y_matrix),
         "std_y": _nan_std(y_matrix),
     }
     cache[cache_key] = payload
@@ -5046,20 +5229,80 @@ def _tar_payload_metric_pair(
     payload: Mapping[str, Any] | None,
     *,
     serial: str,
+    program_by_serial: Mapping[str, str] | None = None,
+    allowed_programs: Collection[str] | None = None,
 ) -> tuple[float | None, float | None]:
     spec = dict(payload or {})
     curve_map = spec.get("y_resampled_by_sn") or {}
     serial_curve = curve_map.get(serial) if isinstance(curve_map, Mapping) else None
     if not isinstance(serial_curve, list):
         serial_curve = []
-    cohort_values: list[object] = []
-    if isinstance(curve_map, Mapping):
+    program_traces = _tar_program_trace_map(
+        curve_map if isinstance(curve_map, Mapping) else {},
+        program_by_serial=program_by_serial,
+        allowed_programs=allowed_programs,
+    )
+    family_mean = _tar_finite_mean(_tar_program_trace_scalar_mean_map(program_traces).values())
+    if family_mean is None and isinstance(curve_map, Mapping):
+        cohort_values: list[object] = []
         for curve in curve_map.values():
             if isinstance(curve, list):
                 cohort_values.extend(curve)
-    family_mean = _tar_finite_mean(cohort_values)
+        family_mean = _tar_finite_mean(cohort_values)
     serial_mean = _tar_finite_mean(serial_curve)
     return family_mean, serial_mean
+
+
+def _tar_payload_has_serial_data(
+    payload: Mapping[str, Any] | None,
+    *,
+    serial: str,
+) -> bool:
+    spec = dict(payload or {})
+    curve_map = spec.get("y_resampled_by_sn") or {}
+    if not isinstance(curve_map, Mapping):
+        return False
+    serial_curve = curve_map.get(str(serial or "").strip())
+    if not isinstance(serial_curve, list):
+        return False
+    return any(isinstance(value, (int, float)) and math.isfinite(float(value)) for value in serial_curve)
+
+
+def _tar_comparison_pair_has_serial_data(
+    ctx: Mapping[str, Any],
+    pair_spec: Mapping[str, Any],
+    *,
+    serial: str,
+    filter_state_override: Mapping[str, object] | None = None,
+    payload: Mapping[str, Any] | None = None,
+) -> bool:
+    serial_text = str(serial or "").strip()
+    if not serial_text:
+        return False
+    if (
+        isinstance(ctx, Mapping)
+        and ctx.get("be") is not None
+        and ctx.get("db_path") is not None
+        and isinstance(ctx.get("options"), Mapping)
+    ):
+        try:
+            loaded = _tar_metric_map_for_pair(
+                ctx,
+                pair_spec,
+                "mean",
+                filter_state_override=filter_state_override,
+            )
+        except Exception:
+            loaded = {}
+        if isinstance(loaded, dict):
+            metric_map = {
+                str(key or "").strip(): float(value)
+                for key, value in loaded.items()
+                if str(key or "").strip() and isinstance(value, (int, float)) and math.isfinite(float(value))
+            }
+            if serial_text in metric_map:
+                return True
+    return _tar_payload_has_serial_data(payload, serial=serial_text)
 
 
 def _tar_comparison_metric_pair(
@@ -5071,6 +5314,14 @@ def _tar_comparison_metric_pair(
     payload: Mapping[str, Any] | None = None,
 ) -> tuple[float | None, float | None]:
     metric_map: dict[str, float] = {}
+    allowed_programs = (
+        list((pair_spec or {}).get("prepass_included_programs") or [])
+        if not (
+            _filter_state_has_key(filter_state_override, "suppression_voltages")
+            or _filter_state_has_key(filter_state_override, "valve_voltages")
+        )
+        else None
+    )
     if (
         isinstance(ctx, Mapping)
         and ctx.get("be") is not None
@@ -5093,10 +5344,21 @@ def _tar_comparison_metric_pair(
                 if str(key or "").strip() and isinstance(value, (int, float)) and math.isfinite(float(value))
             }
     if metric_map:
-        family_mean = _tar_finite_mean(metric_map.values())
+        family_mean = _tar_finite_mean(
+            _tar_program_mean_map(
+                metric_map,
+                program_by_serial=(ctx.get("program_by_serial") if isinstance(ctx, Mapping) else None),
+                allowed_programs=allowed_programs,
+            ).values()
+        )
         serial_mean = _safe_float(metric_map.get(str(serial or "").strip()))
         return family_mean, serial_mean
-    return _tar_payload_metric_pair(payload, serial=serial)
+    return _tar_payload_metric_pair(
+        payload,
+        serial=serial,
+        program_by_serial=(ctx.get("program_by_serial") if isinstance(ctx, Mapping) else None),
+        allowed_programs=allowed_programs,
+    )
 
 
 def _tar_meta(ctx: Mapping[str, Any], serial: str, key: str) -> str:
@@ -5497,7 +5759,10 @@ def _tar_build_per_serial_comparison_rows(
 
         for serial in hi:
             finding_row = dict(finding_by_pair_serial.get((pair_id, serial)) or {})
+            initial_skipped = bool(finding_row.get("initial_skipped"))
+            initial_skip_reason = str(finding_row.get("initial_skip_reason") or "").strip()
             regrade_applied = bool(finding_row.get("regrade_applied"))
+            final_pass_applied = bool(finding_row.get("final_pass_applied")) or regrade_applied
             regrade_suppression = str(finding_row.get("regrade_suppression_voltage_label") or "").strip()
             regrade_valve = str(finding_row.get("regrade_valve_voltage_label") or "").strip()
             regrade_condition_key = str(finding_row.get("regrade_condition_key") or "").strip()
@@ -5509,6 +5774,22 @@ def _tar_build_per_serial_comparison_rows(
             if not isinstance(final_payload, Mapping):
                 final_payload = None
 
+            row_final_filter_state = (
+                _tar_clone_filter_state(
+                    base_filter_state if isinstance(base_filter_state, Mapping) else None,
+                    suppression_voltage=regrade_suppression,
+                    valve_voltage=regrade_valve,
+                )
+                if (regrade_suppression or regrade_valve)
+                else final_override
+            )
+            initial_has_data = _tar_comparison_pair_has_serial_data(
+                ctx,
+                spec,
+                serial=serial,
+                filter_state_override=base_filter_state if isinstance(base_filter_state, Mapping) else None,
+                payload=initial_payload,
+            )
             initial_family_mean, initial_serial_mean = _tar_comparison_metric_pair(
                 ctx,
                 spec,
@@ -5516,7 +5797,7 @@ def _tar_build_per_serial_comparison_rows(
                 filter_state_override=base_filter_state if isinstance(base_filter_state, Mapping) else None,
                 payload=initial_payload,
             )
-            if regrade_applied:
+            if final_pass_applied:
                 row_final_filter_state = (
                     _tar_clone_filter_state(
                         base_filter_state if isinstance(base_filter_state, Mapping) else None,
@@ -5535,6 +5816,19 @@ def _tar_build_per_serial_comparison_rows(
                 )
             else:
                 final_family_mean, final_serial_mean = initial_family_mean, initial_serial_mean
+            final_has_data = (
+                _tar_comparison_pair_has_serial_data(
+                    ctx,
+                    spec,
+                    serial=serial,
+                    filter_state_override=row_final_filter_state,
+                    payload=final_payload,
+                )
+                if final_pass_applied
+                else initial_has_data
+            )
+            if not initial_has_data and not final_has_data:
+                continue
 
             initial_zscore = _safe_float(finding_row.get("initial_z"))
             if initial_zscore is None:
@@ -5579,13 +5873,19 @@ def _tar_build_per_serial_comparison_rows(
                     "initial_grade": initial_grade,
                     "final_grade": final_grade,
                     "grade": final_grade,
-                    "grade_text": _tar_comparison_grade_text(initial_grade, final_grade, regrade_applied=regrade_applied),
+                    "grade_text": _tar_comparison_grade_text(initial_grade, final_grade, regrade_applied=(regrade_applied or final_pass_applied or initial_skipped)),
                     "selection_mode": selection_fields.get("mode") or "sequence",
                     "base_condition_label": str(spec.get("base_condition_label") or "").strip(),
                     "initial_suppression_voltage_label": initial_suppression,
                     "final_suppression_voltage_label": row_final_suppression,
                     "initial_valve_voltage_label": initial_valve,
                     "final_valve_voltage_label": row_final_valve,
+                    "initial_skipped": initial_skipped,
+                    "initial_skip_reason": initial_skip_reason,
+                    "final_pass_applied": final_pass_applied,
+                    "prepass_reference_program": str(finding_row.get("prepass_reference_program") or spec.get("prepass_reference_program") or ""),
+                    "prepass_included_programs": list(finding_row.get("prepass_included_programs") or spec.get("prepass_included_programs") or []),
+                    "prepass_excluded_programs": list(finding_row.get("prepass_excluded_programs") or spec.get("prepass_excluded_programs") or []),
                     "regrade_applied": regrade_applied,
                     "regrade_cohort_id": str(finding_row.get("regrade_cohort_id") or "").strip(),
                     "regrade_suppression_voltage_label": regrade_suppression,
@@ -5782,12 +6082,12 @@ _TAR_PLOT_TOC_SECTION_META = {
         "navigator_label": "Run Curves",
     },
     "regrade_pass_plot_metrics": {
-        "section_label": "Regrade Pass Metrics",
-        "navigator_label": "Regrade Metrics",
+        "section_label": "Final Exact-Condition Metrics",
+        "navigator_label": "Final Metrics",
     },
     "regrade_pass_curve_overlays": {
-        "section_label": "Regrade Pass Curve Overlays",
-        "navigator_label": "Regrade Curves",
+        "section_label": "Final Exact-Condition Curves",
+        "navigator_label": "Final Curves",
     },
     "performance_plots": {
         "section_label": "Performance Plots",
@@ -5799,8 +6099,11 @@ _TAR_PLOT_TOC_SECTION_META = {
     },
 }
 
-_TAR_PLOT_TOC_FIRST_PAGE_ROW_BUDGET = 12
-_TAR_PLOT_TOC_CONTINUATION_ROW_BUDGET = 24
+_TAR_PLOT_TOC_MAX_COLUMNS = 3
+_TAR_PLOT_TOC_TABLE_WIDTH = 6.9 * 72.0
+_TAR_PLOT_TOC_COLUMN_GAP = 12.0
+_TAR_PLOT_TOC_PAGE_NUMBER_WIDTH_MIN = 28.0
+_TAR_PLOT_TOC_PAGE_NUMBER_WIDTH_MAX = 42.0
 
 
 def _tar_plot_toc_section_rank(section_key: object) -> int:
@@ -5842,6 +6145,228 @@ def _tar_plot_toc_label(plot_spec: Mapping[str, object] | None) -> str:
         serial_text = f"{serial_count} Serial" if serial_count == 1 else f"{serial_count} Serials"
         return " | ".join([value for value in (run_name, param_name, serial_text) if value]) or "Watch / Non-PASS Curve"
     return str(spec.get("title") or spec.get("label") or spec.get("param") or spec.get("run") or "Plot").strip() or "Plot"
+
+
+def _tar_plot_toc_outer_column_width(column_count: int) -> float:
+    columns = max(1, int(column_count or 1))
+    gap_total = _TAR_PLOT_TOC_COLUMN_GAP * max(0, columns - 1)
+    return max(120.0, float(_TAR_PLOT_TOC_TABLE_WIDTH - gap_total) / float(columns))
+
+
+def _tar_plot_toc_inner_col_widths(column_count: int) -> list[float]:
+    outer_width = _tar_plot_toc_outer_column_width(column_count)
+    page_width = min(
+        _TAR_PLOT_TOC_PAGE_NUMBER_WIDTH_MAX,
+        max(_TAR_PLOT_TOC_PAGE_NUMBER_WIDTH_MIN, outer_width * 0.18),
+    )
+    label_width = max(72.0, outer_width - page_width)
+    page_width = max(24.0, outer_width - label_width)
+    return [float(label_width), float(page_width)]
+
+
+def _tar_plot_toc_body_row(
+    *,
+    kind: str,
+    section_key: str,
+    text: str,
+    page_text: str = "",
+    target_page_index: object = None,
+    page_number: object = None,
+    nav_index: object = None,
+) -> dict[str, Any]:
+    return {
+        "kind": str(kind or "").strip(),
+        "section_key": str(section_key or "").strip(),
+        "text": str(text or "").strip(),
+        "page_text": str(page_text or "").strip(),
+        "target_page_index": target_page_index,
+        "page_number": page_number,
+        "nav_index": nav_index,
+    }
+
+
+def _tar_plot_toc_column_table_spec(rows: list[Mapping[str, object]] | None) -> tuple[list[list[object]], list[tuple]]:
+    table_rows: list[list[object]] = [["Plot / Section", "Page"]]
+    extra_styles: list[tuple] = []
+    for row_index, raw_row in enumerate(rows or [], start=1):
+        row = dict(raw_row or {})
+        table_rows.append([str(row.get("text") or "").strip(), str(row.get("page_text") or "").strip()])
+        if str(row.get("kind") or "").strip() == "section":
+            extra_styles.extend(
+                [
+                    ("SPAN", (0, row_index), (-1, row_index)),
+                    ("BACKGROUND", (0, row_index), (-1, row_index), "#e0f2fe"),
+                    ("FONTNAME", (0, row_index), (-1, row_index), "Helvetica-Bold"),
+                ]
+            )
+    return table_rows, extra_styles
+
+
+def _tar_build_plot_toc_column_table(
+    rows: list[Mapping[str, object]] | None,
+    *,
+    column_count: int,
+    styles: Mapping[str, Any],
+    rl: Mapping[str, Any],
+) -> Any:
+    colors = rl["colors"]
+    table_rows, extra_styles = _tar_plot_toc_column_table_spec(rows)
+    resolved_styles: list[tuple] = []
+    for command in extra_styles:
+        cmd = list(command)
+        if cmd and isinstance(cmd[-1], str) and str(cmd[-1]).startswith("#"):
+            cmd[-1] = colors.HexColor(str(cmd[-1]))
+        resolved_styles.append(tuple(cmd))
+    return _portrait_box_table(
+        table_rows,
+        col_widths=_tar_plot_toc_inner_col_widths(column_count),
+        styles=styles,
+        rl=rl,
+        repeat_rows=1,
+        compact=True,
+        header_rows=1,
+        extra_style_commands=resolved_styles,
+    )
+
+
+def _tar_measure_plot_toc_column_height(
+    rows: list[Mapping[str, object]] | None,
+    *,
+    column_count: int,
+    styles: Mapping[str, Any],
+    rl: Mapping[str, Any],
+) -> float:
+    table = _tar_build_plot_toc_column_table(rows, column_count=column_count, styles=styles, rl=rl)
+    wrap = getattr(table, "wrap", None)
+    if callable(wrap):
+        try:
+            _, height = wrap(_tar_plot_toc_outer_column_width(column_count), 10000)
+            return float(height)
+        except Exception:
+            pass
+    return float(22.0 + 16.0 * len(list(rows or [])))
+
+
+def _tar_plot_toc_height_budget(
+    *,
+    continuation: bool,
+    styles: Mapping[str, Any],
+    rl: Mapping[str, Any],
+) -> float:
+    page_width, page_height = rl.get("letter", (612.0, 792.0))
+    usable_height = float(page_height) - 72.0 - 36.0
+    heading_text = "Plot Table of Contents (Continued)" if continuation else "Plot Table of Contents"
+    heading = _portrait_paragraph(heading_text, styles["section"], rl)
+    heading_height = 18.0
+    wrap = getattr(heading, "wrap", None)
+    if callable(wrap):
+        try:
+            _, heading_height = wrap(min(_TAR_PLOT_TOC_TABLE_WIDTH, float(page_width) - 72.0), 10000)
+        except Exception:
+            heading_height = 18.0
+    return max(140.0, usable_height - float(heading_height) - 8.0 - (0.10 * float(rl["inch"])))
+
+
+def _tar_pack_plot_toc_pages(
+    grouped_entries: Mapping[str, list[dict[str, Any]]],
+    section_meta: Mapping[str, Mapping[str, str]],
+    section_order: list[str],
+    *,
+    column_count: int,
+    allow_multiple_pages: bool,
+    styles: Mapping[str, Any],
+    rl: Mapping[str, Any],
+) -> list[dict[str, Any]] | None:
+    column_total = max(1, int(column_count or 1))
+    pages: list[dict[str, Any]] = []
+    current_budget = _tar_plot_toc_height_budget(continuation=False, styles=styles, rl=rl)
+
+    def _new_page(page_number: int) -> dict[str, Any]:
+        return {
+            "toc_page_number": int(page_number),
+            "show_navigator": False,
+            "navigator_sections": [],
+            "column_count": int(column_total),
+            "columns": [{"column_index": index + 1, "rows": []} for index in range(column_total)],
+            "rows": [],
+        }
+
+    current_page = _new_page(1)
+    current_column_index = 0
+
+    def _current_column_rows() -> list[dict[str, Any]]:
+        return list((current_page.get("columns") or [])[current_column_index].get("rows") or [])
+
+    def _replace_current_column(rows: list[dict[str, Any]]) -> None:
+        current_page["columns"][current_column_index]["rows"] = list(rows)
+
+    def _append_block(block_rows: list[dict[str, Any]]) -> None:
+        rows = _current_column_rows()
+        rows.extend(dict(row) for row in block_rows)
+        _replace_current_column(rows)
+        current_page["rows"].extend(dict(row) for row in block_rows)
+
+    def _advance_container() -> bool:
+        nonlocal current_page, current_column_index, current_budget
+        if current_column_index + 1 < column_total:
+            current_column_index += 1
+            return True
+        if not allow_multiple_pages:
+            return False
+        if current_page.get("rows"):
+            pages.append(current_page)
+        current_page = _new_page(len(pages) + 1)
+        current_column_index = 0
+        current_budget = _tar_plot_toc_height_budget(continuation=True, styles=styles, rl=rl)
+        return True
+
+    for section_key in section_order:
+        entries_for_section = [dict(entry) for entry in (grouped_entries.get(section_key) or []) if isinstance(entry, Mapping)]
+        if not entries_for_section:
+            continue
+        first_target = entries_for_section[0].get("destination_page_index")
+        section_header = _tar_plot_toc_body_row(
+            kind="section",
+            section_key=section_key,
+            text=str((section_meta.get(section_key) or {}).get("section_label") or section_key).strip() or section_key,
+            target_page_index=first_target,
+        )
+        entry_index = 0
+        while entry_index < len(entries_for_section):
+            current_rows = _current_column_rows()
+            need_header = entry_index == 0 or not current_rows
+            block_rows: list[dict[str, Any]] = []
+            if need_header:
+                block_rows.append(dict(section_header))
+            entry = dict(entries_for_section[entry_index] or {})
+            block_rows.append(
+                _tar_plot_toc_body_row(
+                    kind="plot",
+                    section_key=section_key,
+                    text=str(entry.get("plot_label") or "").strip(),
+                    page_text=str(entry.get("page_text") or "").strip(),
+                    target_page_index=entry.get("destination_page_index"),
+                    page_number=entry.get("page_number"),
+                    nav_index=entry.get("nav_index"),
+                )
+            )
+            candidate_rows = current_rows + block_rows
+            candidate_height = _tar_measure_plot_toc_column_height(
+                candidate_rows,
+                column_count=column_total,
+                styles=styles,
+                rl=rl,
+            )
+            if current_rows and candidate_height > current_budget:
+                if not _advance_container():
+                    return None
+                continue
+            _append_block(block_rows)
+            entry_index += 1
+
+    if current_page.get("rows"):
+        pages.append(current_page)
+    return pages
 
 
 def _tar_metric_cohort_has_plot_data(
@@ -6057,79 +6582,33 @@ def _tar_paginate_plot_navigation(plot_navigation: list[dict] | None) -> list[di
             }
         grouped_entries[section_key].append(entry)
 
-    pages: list[dict] = []
-    toc_page_number = 1
-    row_budget = _TAR_PLOT_TOC_FIRST_PAGE_ROW_BUDGET
-    navigator_sections_all: list[dict] = []
-    current_page = {
-        "toc_page_number": toc_page_number,
-        "show_navigator": True,
-        "navigator_sections": [],
-        "rows": [],
-    }
-    current_rows_used = 0
-
-    def _start_new_page() -> tuple[dict, int]:
-        next_page_number = len(pages) + 2
-        return (
-            {
-                "toc_page_number": next_page_number,
-                "show_navigator": False,
-                "navigator_sections": [],
-                "rows": [],
-            },
-            0,
+    rl = _reportlab_imports()
+    styles = _build_portrait_styles(rl)
+    pages: list[dict[str, Any]] | None = None
+    for candidate_columns in (1, 2):
+        pages = _tar_pack_plot_toc_pages(
+            grouped_entries,
+            section_meta,
+            section_order,
+            column_count=candidate_columns,
+            allow_multiple_pages=False,
+            styles=styles,
+            rl=rl,
         )
-
-    for section_key in section_order:
-        entries_for_section = list(grouped_entries.get(section_key) or [])
-        if not entries_for_section:
-            continue
-        first_target = entries_for_section[0].get("destination_page_index")
-        navigator_sections_all.append(
-            {
-                "section_key": section_key,
-                "label": section_meta[section_key]["navigator_label"],
-                "target_page_index": first_target,
-            }
+        if pages and len(pages) == 1:
+            break
+    else:
+        pages = _tar_pack_plot_toc_pages(
+            grouped_entries,
+            section_meta,
+            section_order,
+            column_count=_TAR_PLOT_TOC_MAX_COLUMNS,
+            allow_multiple_pages=True,
+            styles=styles,
+            rl=rl,
         )
-        if current_rows_used >= row_budget:
-            pages.append(current_page)
-            current_page, current_rows_used = _start_new_page()
-            row_budget = _TAR_PLOT_TOC_CONTINUATION_ROW_BUDGET
-        section_header = {
-            "kind": "section",
-            "section_key": section_key,
-            "text": section_meta[section_key]["section_label"],
-            "page_text": "",
-            "target_page_index": first_target,
-        }
-        current_page["rows"].append(dict(section_header))
-        current_rows_used += 1
-
-        for entry in entries_for_section:
-            if current_rows_used >= row_budget:
-                pages.append(current_page)
-                current_page, current_rows_used = _start_new_page()
-                row_budget = _TAR_PLOT_TOC_CONTINUATION_ROW_BUDGET
-                current_page["rows"].append(dict(section_header))
-                current_rows_used += 1
-            current_page["rows"].append(
-                {
-                    "kind": "plot",
-                    "section_key": section_key,
-                    "text": str(entry.get("plot_label") or "").strip(),
-                    "page_text": str(entry.get("page_text") or "").strip(),
-                    "target_page_index": entry.get("destination_page_index"),
-                    "page_number": entry.get("page_number"),
-                    "nav_index": entry.get("nav_index"),
-                }
-            )
-            current_rows_used += 1
-
-    pages.append(current_page)
-    if pages:
-        pages[0]["navigator_sections"] = list(navigator_sections_all)
+    if not pages:
+        return []
     for page in pages:
         text_counts: dict[str, int] = {}
         for navigator in page.get("navigator_sections") or []:
@@ -6154,6 +6633,8 @@ def _tar_build_plot_toc_story(ctx: Mapping[str, Any], *, styles: Mapping[str, An
     Spacer = rl["Spacer"]
     inch = rl["inch"]
     colors = rl["colors"]
+    if "Table" not in rl or "TableStyle" not in rl:
+        return []
 
     for page_index, toc_page in enumerate(pages):
         page_story: list[Any] = []
@@ -6162,53 +6643,53 @@ def _tar_build_plot_toc_story(ctx: Mapping[str, Any], *, styles: Mapping[str, An
             page_story.append(_portrait_paragraph("Plot Table of Contents (Continued)", styles["section"], rl))
         else:
             page_story.append(_portrait_paragraph("Plot Table of Contents", styles["section"], rl))
-
-        navigator_sections = list(toc_page.get("navigator_sections") or [])
-        if toc_page.get("show_navigator") and navigator_sections:
-            nav_labels = [str(section.get("label") or "").strip() for section in navigator_sections]
-            if nav_labels:
-                page_story.append(
-                    _portrait_box_table(
-                        [nav_labels],
-                        col_widths=[(6.9 * inch) / max(1, len(nav_labels))] * len(nav_labels),
+        column_count = max(
+            1,
+            int(
+                toc_page.get("column_count")
+                or len([column for column in (toc_page.get("columns") or []) if isinstance(column, Mapping)])
+                or 1
+            ),
+        )
+        columns = [dict(column) for column in (toc_page.get("columns") or []) if isinstance(column, Mapping)]
+        if not columns:
+            columns = [{"column_index": 1, "rows": list(toc_page.get("rows") or [])}]
+            column_count = 1
+        while len(columns) < column_count:
+            columns.append({"column_index": len(columns) + 1, "rows": []})
+        outer_column_width = _tar_plot_toc_outer_column_width(column_count) / float(inch)
+        outer_cells: list[Any] = []
+        outer_widths: list[float] = []
+        for column_index, column in enumerate(columns):
+            rows = [dict(row) for row in (column.get("rows") or []) if isinstance(row, Mapping)]
+            if rows:
+                outer_cells.append(
+                    _tar_build_plot_toc_column_table(
+                        rows,
+                        column_count=column_count,
                         styles=styles,
                         rl=rl,
-                        repeat_rows=0,
-                        compact=True,
-                        header_rows=0,
-                        extra_style_commands=[
-                            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#dbeafe")),
-                            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                            ("ALIGN", (0, 0), (-1, 0), "CENTER"),
-                        ],
                     )
                 )
-                page_story.append(Spacer(1, 0.08 * inch))
-
-        rows = [["Plot / Section", "Page"]]
-        extra_styles: list[tuple] = []
-        for row_index, row in enumerate(toc_page.get("rows") or [], start=1):
-            rows.append([str(row.get("text") or "").strip(), str(row.get("page_text") or "").strip()])
-            if str(row.get("kind") or "").strip() == "section":
-                extra_styles.extend(
-                    [
-                        ("SPAN", (0, row_index), (-1, row_index)),
-                        ("BACKGROUND", (0, row_index), (-1, row_index), colors.HexColor("#e0f2fe")),
-                        ("FONTNAME", (0, row_index), (-1, row_index), "Helvetica-Bold"),
-                    ]
-                )
-        page_story.append(
-            _portrait_box_table(
-                rows,
-                col_widths=[6.15 * inch, 0.75 * inch],
-                styles=styles,
-                rl=rl,
-                repeat_rows=1,
-                compact=True,
-                header_rows=1,
-                extra_style_commands=extra_styles,
+            else:
+                outer_cells.append("")
+            outer_widths.append(outer_column_width * inch)
+            if column_index != len(columns) - 1:
+                outer_cells.append("")
+                outer_widths.append((_TAR_PLOT_TOC_COLUMN_GAP / 72.0) * inch)
+        outer_table = rl["Table"]([outer_cells], colWidths=outer_widths, hAlign="LEFT")
+        outer_table.setStyle(
+            rl["TableStyle"](
+                [
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                    ("TOPPADDING", (0, 0), (-1, -1), 0),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+                ]
             )
         )
+        page_story.append(outer_table)
         page_story.append(Spacer(1, 0.10 * inch))
         if callable(KeepTogether):
             story.append(KeepTogether(page_story))
@@ -6235,6 +6716,53 @@ def _tar_insert_page_link(page: Any, rect: Any, destination_page_index: object) 
         )
     except Exception:
         pass
+
+
+def _tar_plot_toc_row_link_rect(
+    page: Any,
+    label_rect: Any,
+    row: Mapping[str, object] | None,
+    *,
+    fitz_module: Any,
+) -> Any:
+    page_rect = getattr(page, "rect", None)
+    page_width = float(getattr(page_rect, "width", 0.0) or 0.0)
+    page_height = float(getattr(page_rect, "height", 0.0) or 0.0)
+    max_x = max(float(getattr(label_rect, "x1", 0.0) or 0.0) + 2.0, page_width - 36.0) if page_width else float(getattr(label_rect, "x1", 0.0) or 0.0) + 2.0
+    max_y = page_height if page_height else float(getattr(label_rect, "y1", 0.0) or 0.0) + 1.0
+
+    x0 = max(36.0, float(getattr(label_rect, "x0", 0.0) or 0.0) - 2.0)
+    y0 = max(0.0, float(getattr(label_rect, "y0", 0.0) or 0.0) - 1.0)
+    x1 = min(max_x, float(getattr(label_rect, "x1", 0.0) or 0.0) + 2.0)
+    y1 = min(max_y, float(getattr(label_rect, "y1", 0.0) or 0.0) + 1.0)
+
+    page_text = str((row or {}).get("page_text") or "").strip()
+    if page_text:
+        label_mid_y = (float(getattr(label_rect, "y0", 0.0) or 0.0) + float(getattr(label_rect, "y1", 0.0) or 0.0)) / 2.0
+        label_height = max(1.0, float(getattr(label_rect, "y1", 0.0) or 0.0) - float(getattr(label_rect, "y0", 0.0) or 0.0))
+        max_horizontal_gap = max(120.0, page_width * 0.24) if page_width else 120.0
+        best_rect = None
+        best_score = None
+        for candidate in list(page.search_for(page_text)):
+            candidate_mid_y = (float(getattr(candidate, "y0", 0.0) or 0.0) + float(getattr(candidate, "y1", 0.0) or 0.0)) / 2.0
+            vertical_gap = abs(candidate_mid_y - label_mid_y)
+            if vertical_gap > max(8.0, label_height + 2.0):
+                continue
+            horizontal_gap = float(getattr(candidate, "x0", 0.0) or 0.0) - float(getattr(label_rect, "x1", 0.0) or 0.0)
+            if horizontal_gap < -4.0:
+                continue
+            if horizontal_gap > max_horizontal_gap:
+                continue
+            score = (vertical_gap, abs(horizontal_gap))
+            if best_score is None or score < best_score:
+                best_rect = candidate
+                best_score = score
+        if best_rect is not None:
+            x1 = min(max_x, max(x1, float(getattr(best_rect, "x1", 0.0) or 0.0) + 2.0))
+            y0 = max(0.0, min(y0, float(getattr(best_rect, "y0", 0.0) or 0.0) - 1.0))
+            y1 = min(max_y, max(y1, float(getattr(best_rect, "y1", 0.0) or 0.0) + 1.0))
+
+    return fitz_module.Rect(x0, y0, max(x0 + 1.0, x1), max(y0 + 1.0, y1))
 
 
 def _tar_resolve_plot_toc_page_numbers(doc: Any, toc_layout: list[dict] | None) -> list[dict]:
@@ -6344,7 +6872,12 @@ def _tar_apply_pdf_navigation(
                     continue
                 text_occurrences[label] = match_index + 1
                 label_rect = rects[match_index]
-                row_rect = fitz.Rect(36.0, max(0.0, label_rect.y0 - 1.0), max(36.0, float(page.rect.width) - 36.0), min(float(page.rect.height), label_rect.y1 + 1.0))
+                row_rect = _tar_plot_toc_row_link_rect(
+                    page,
+                    label_rect,
+                    row,
+                    fitz_module=fitz,
+                )
                 _tar_insert_page_link(page, row_rect, row.get("target_page_index"))
 
         if toc_target_page_index is not None:
@@ -6540,7 +7073,7 @@ def _tar_build_curve_model_for_series(
     point_count = max(2, int(grid_points or 200))
     x_grid = [lo + (hi_dom - lo) * (idx / (point_count - 1)) for idx in range(point_count)]
     y_resampled = [_interp_linear(curve.x, curve.y, x_grid) for curve in series]
-    master_y = _nan_median(y_resampled)
+    master_y = _tar_mean_trace(y_resampled)
     std_y = _nan_std(y_resampled)
     fit_x: list[float] = []
     fit_y: list[float] = []
@@ -6566,6 +7099,53 @@ def _tar_build_curve_model_for_series(
         "units": str(units or "").strip(),
         "domain": [float(lo), float(hi_dom)],
         "grid_points": int(point_count),
+        "x_grid": list(x_grid),
+        "master_y": list(master_y),
+        "std_y": list(std_y),
+        "poly": poly,
+        "equation": _fmt_equation(poly),
+        "denom": float(denom) if denom > 0 else 1.0,
+    }
+
+
+def _tar_build_curve_model_for_program_traces(
+    *,
+    x_name: str,
+    units: str,
+    x_grid: list[float],
+    traces_by_program: Mapping[str, list[float]] | None,
+    degree: int,
+    normalize_x: bool,
+) -> dict[str, Any] | None:
+    program_traces = [list(trace) for trace in (traces_by_program or {}).values() if isinstance(trace, list)]
+    if not x_grid or not program_traces:
+        return None
+    master_y = _tar_mean_trace(program_traces)
+    std_y = _nan_std(program_traces)
+    fit_x: list[float] = []
+    fit_y: list[float] = []
+    for xv, yv in zip(x_grid, master_y):
+        if isinstance(yv, (int, float)) and not math.isnan(float(yv)):
+            fit_x.append(float(xv))
+            fit_y.append(float(yv))
+    poly = (
+        _poly_fit(fit_x, fit_y, degree, normalize_x=normalize_x)
+        if fit_x
+        else {"degree": degree, "coeffs": [], "rmse": None, "x0": None, "sx": None}
+    )
+    denom = max(
+        (
+            abs(value)
+            for value in master_y
+            if isinstance(value, (int, float)) and not math.isnan(float(value))
+        ),
+        default=0.0,
+    )
+    return {
+        "x_name": str(x_name or "").strip(),
+        "units": str(units or "").strip(),
+        "domain": [float(min(x_grid)), float(max(x_grid))],
+        "grid_points": int(len(x_grid)),
         "x_grid": list(x_grid),
         "master_y": list(master_y),
         "std_y": list(std_y),
@@ -6737,10 +7317,111 @@ def _tar_prepare_row_specs(
     return row_specs
 
 
+def _tar_spec_condition_pairs(spec: Mapping[str, Any]) -> list[dict[str, str]]:
+    raw_pairs = [dict(pair) for pair in (spec.get("condition_pairs") or []) if isinstance(pair, Mapping)]
+    if raw_pairs:
+        return raw_pairs
+    suppression_value = str(spec.get("suppression_voltage_label") or "").strip()
+    valve_value = str(spec.get("valve_voltage_label") or "").strip()
+    if list(spec.get("series") or []) or suppression_value or valve_value:
+        return [
+            {
+                "key": _tar_condition_combo_key(suppression_value, valve_value),
+                "suppression_voltage_label": suppression_value,
+                "valve_voltage_label": valve_value,
+            }
+        ]
+    return []
+
+
+def _tar_spec_series_by_condition_key(spec: Mapping[str, Any]) -> dict[str, list[CurveSeries]]:
+    raw = spec.get("series_by_condition_key") or {}
+    out: dict[str, list[CurveSeries]] = {}
+    if isinstance(raw, Mapping):
+        for key, series in raw.items():
+            text = str(key or "").strip()
+            if text:
+                out[text] = [curve for curve in (series or []) if isinstance(curve, CurveSeries)]
+    if out:
+        return out
+    fallback_pairs = _tar_spec_condition_pairs(spec)
+    fallback_key = str((fallback_pairs[0] or {}).get("key") or "").strip() if fallback_pairs else ""
+    series = [curve for curve in (spec.get("series") or []) if isinstance(curve, CurveSeries)]
+    if fallback_key and series:
+        out[fallback_key] = list(series)
+    return out
+
+
+def _tar_resampled_trace_map(
+    series: Iterable[CurveSeries] | None,
+    *,
+    x_grid: list[float],
+    program_by_serial: Mapping[str, str] | None = None,
+    allowed_programs: Collection[str] | None = None,
+) -> dict[str, list[float]]:
+    allowed = {
+        _td_display_program_title(value)
+        for value in (allowed_programs or [])
+        if _td_display_program_title(value)
+    }
+    out: dict[str, list[float]] = {}
+    for curve in (series or []):
+        if not isinstance(curve, CurveSeries):
+            continue
+        serial = str(curve.serial or "").strip()
+        if not serial:
+            continue
+        program = _tar_program_label(program_by_serial, serial)
+        if allowed and program not in allowed:
+            continue
+        out[serial] = _interp_linear(curve.x, curve.y, x_grid)
+    return out
+
+
+def _tar_initial_skip_row(
+    spec: Mapping[str, Any],
+    *,
+    serial: str,
+    reference_program: str,
+    included_programs: list[str],
+    excluded_programs: list[str],
+    reason: str,
+) -> dict[str, Any]:
+    return {
+        "pair_id": str(spec.get("pair_id") or ""),
+        "selection_id": str(spec.get("selection_id") or ""),
+        "selection_label": str(spec.get("selection_label") or ""),
+        "serial": str(serial or "").strip(),
+        "run": str(spec.get("run") or ""),
+        "param": str(spec.get("param") or ""),
+        "units": str(spec.get("units") or ""),
+        "x_name": str(spec.get("x_name") or ""),
+        "base_condition_label": str(spec.get("base_condition_label") or ""),
+        "suppression_voltage_label": str(spec.get("suppression_voltage_label") or ""),
+        "valve_voltage_label": str(spec.get("valve_voltage_label") or ""),
+        "initial_max_abs": None,
+        "initial_rms": None,
+        "initial_max_pct": None,
+        "initial_rms_pct": None,
+        "initial_x_at_max_abs": None,
+        "initial_z": None,
+        "initial_grade": "NO_DATA",
+        "initial_poly_rmse": None,
+        "initial_skipped": True,
+        "initial_skip_reason": str(reason or "").strip() or "no_compatible_programs",
+        "prepass_reference_program": str(reference_program or "").strip(),
+        "prepass_included_programs": list(included_programs or []),
+        "prepass_excluded_programs": list(excluded_programs or []),
+    }
+
+
 def _tar_analyze_curve_groups(
     row_specs: list[dict],
     *,
     hi: list[str],
+    program_by_serial: Mapping[str, str] | None = None,
+    certifying_program: str = "",
+    prepass_cfg: Mapping[str, object] | None = None,
     grid_points: int,
     degree: int,
     normalize_x: bool,
@@ -6751,24 +7432,42 @@ def _tar_analyze_curve_groups(
     rms_pct_thr: float | None,
 ) -> dict[str, Any]:
     specs = [dict(spec) for spec in (row_specs or []) if isinstance(spec, dict) and list(spec.get("series") or [])]
+    for spec in specs:
+        spec["condition_pairs"] = _tar_spec_condition_pairs(spec)
+        spec["series_by_condition_key"] = _tar_spec_series_by_condition_key(spec)
+        spec.setdefault("regrade_models", {})
+        spec.setdefault("regrade_plot_payloads", {})
+        spec.setdefault("final_programs_by_condition", {})
     hi_set = {str(serial).strip() for serial in (hi or []) if str(serial).strip()}
+    reference_program = _td_display_program_title(certifying_program)
+    if not reference_program:
+        reference_program = _td_display_program_title((program_by_serial or {}).get(next(iter(hi_set), "")))
+    prepass_options = dict(prepass_cfg or {})
+    prepass_enabled = bool(prepass_options.get("enabled", True))
+    percent_delta_max = _safe_float(prepass_options.get("percent_delta_max"))
+    if percent_delta_max is None:
+        percent_delta_max = 5.0
     initial_rows: dict[tuple[str, str], dict] = {}
-    regrade_candidates: dict[tuple[str, str], list[dict]] = {}
+    final_candidates: dict[tuple[str, str], list[dict]] = {}
     initial_watch_items: list[dict] = []
     final_watch_items: list[dict] = []
     initial_cohort_specs: list[dict] = []
     regrade_cohort_specs: list[dict] = []
 
-    initial_groups: dict[tuple[str, str], list[dict]] = {}
+    initial_groups: dict[tuple[str, str, str], list[dict]] = {}
     for spec in specs:
-        key = (_norm_key(spec.get("param") or ""), _norm_key(spec.get("x_name") or ""))
+        key = (
+            _norm_key(spec.get("base_condition_label") or ""),
+            _norm_key(spec.get("param") or ""),
+            _norm_key(spec.get("x_name") or ""),
+        )
         initial_groups.setdefault(key, []).append(spec)
 
     for group_index, members in enumerate(initial_groups.values(), start=1):
         pooled_series: list[CurveSeries] = []
         for spec in members:
             pooled_series.extend(list(spec.get("series") or []))
-        model = _tar_build_curve_model_for_series(
+        initial_scope_model = _tar_build_curve_model_for_series(
             pooled_series,
             x_name=str(members[0].get("x_name") or ""),
             units=str(members[0].get("units") or ""),
@@ -6776,125 +7475,227 @@ def _tar_analyze_curve_groups(
             degree=degree,
             normalize_x=normalize_x,
         )
-        if not isinstance(model, dict):
+        if not isinstance(initial_scope_model, dict):
             continue
-        x_grid = list(model.get("x_grid") or [])
-        master_y = list(model.get("master_y") or [])
-        std_y = list(model.get("std_y") or [])
-        denom = float(model.get("denom") or 1.0)
-        all_entries: list[tuple[dict, str, dict]] = []
-        trace_curves: list[dict] = []
+        x_grid = list(initial_scope_model.get("x_grid") or [])
+        full_trace_map_by_spec: dict[str, dict[str, list[float]]] = {}
+        full_trace_map_all: dict[str, list[float]] = {}
         for spec in members:
-            y_resampled_by_sn = {
-                curve.serial: _interp_linear(curve.x, curve.y, x_grid)
-                for curve in (spec.get("series") or [])
-            }
-            spec["initial_model"] = {
-                "x_name": str(model.get("x_name") or ""),
-                "units": str(spec.get("units") or model.get("units") or ""),
-                "domain": list(model.get("domain") or []),
-                "grid_points": int(model.get("grid_points") or len(x_grid)),
-                "poly": dict(model.get("poly") or {}),
-                "equation": str(model.get("equation") or ""),
-            }
-            spec["initial_plot_payload"] = {
-                "run": spec.get("run"),
-                "param": spec.get("param"),
-                "units": str(spec.get("units") or ""),
-                "selection": dict(spec.get("selection") or {}),
-                "x_name": str(model.get("x_name") or ""),
-                "x_grid": list(x_grid),
-                "y_resampled_by_sn": dict(y_resampled_by_sn),
-                "master_y": list(master_y),
-                "std_y": list(std_y),
-            }
-            for serial, y_curve in y_resampled_by_sn.items():
-                trace_curves.append(
-                    {
-                        "pair_id": str(spec.get("pair_id") or ""),
-                        "selection_label": str(spec.get("selection_label") or ""),
-                        "serial": serial,
-                        "y_curve": list(y_curve),
-                    }
-                )
-                dev = _tar_compute_curve_deviation(y_curve, master_y, x_grid, denom=denom)
-                if dev is not None:
-                    all_entries.append((spec, serial, dev))
-        scores = [float(dev.get("max_abs") or 0.0) for _spec, _serial, dev in all_entries]
-        mean_score = float(statistics.mean(scores)) if scores else 0.0
-        std_score = float(statistics.pstdev(scores)) if len(scores) > 1 else 1.0
-        if std_score == 0.0:
-            std_score = 1.0
-
-        for spec, serial, dev in all_entries:
-            z_score = (float(dev.get("max_abs") or 0.0) - mean_score) / std_score if std_score else 0.0
-            grade = _grade_from_z(z_score, z_pass, z_watch)
-            if serial not in hi:
-                continue
-            row = {
-                "pair_id": str(spec.get("pair_id") or ""),
-                "selection_id": str(spec.get("selection_id") or ""),
-                "selection_label": str(spec.get("selection_label") or ""),
-                "serial": serial,
-                "run": str(spec.get("run") or ""),
-                "param": str(spec.get("param") or ""),
-                "units": str(spec.get("units") or ""),
-                "x_name": str(spec.get("x_name") or ""),
-                "base_condition_label": str(spec.get("base_condition_label") or ""),
-                "suppression_voltage_label": str(spec.get("suppression_voltage_label") or ""),
-                "valve_voltage_label": str(spec.get("valve_voltage_label") or ""),
-                "initial_max_abs": dev.get("max_abs"),
-                "initial_rms": dev.get("rms"),
-                "initial_max_pct": dev.get("max_pct"),
-                "initial_rms_pct": dev.get("rms_pct"),
-                "initial_x_at_max_abs": dev.get("x_at_max_abs"),
-                "initial_z": float(z_score),
-                "initial_grade": grade,
-                "initial_poly_rmse": (model.get("poly") or {}).get("rmse"),
-            }
-            initial_rows[(str(spec.get("pair_id") or ""), serial)] = row
-            watch = False
-            if max_abs_thr is not None and float(dev.get("max_abs") or 0.0) >= float(max_abs_thr):
-                watch = True
-            if max_pct_thr is not None and float(dev.get("max_pct") or 0.0) >= float(max_pct_thr):
-                watch = True
-            if rms_pct_thr is not None and float(dev.get("rms_pct") or 0.0) >= float(rms_pct_thr):
-                watch = True
-            if watch:
-                initial_watch_items.append({**row, "grade": grade, "z": float(z_score), "max_pct": dev.get("max_pct")})
-
-        initial_cohort_specs.append(
-            {
-                "cohort_id": f"initial:{group_index}:{_norm_key(members[0].get('param') or '')}:{_norm_key(members[0].get('x_name') or '')}",
-                "cohort_type": "initial",
-                "param": str(members[0].get("param") or ""),
-                "units": str(members[0].get("units") or ""),
-                "x_name": str(model.get("x_name") or ""),
-                "base_condition_label": "",
-                "suppression_voltage_label": "",
-                "valve_voltage_label": "",
-                "selection_labels": [str(spec.get("selection_label") or "") for spec in members if str(spec.get("selection_label") or "").strip()],
-                "member_pair_ids": [str(spec.get("pair_id") or "") for spec in members if str(spec.get("pair_id") or "").strip()],
-                "model": {
-                    "x_name": str(model.get("x_name") or ""),
-                    "units": str(model.get("units") or ""),
-                    "domain": list(model.get("domain") or []),
-                    "grid_points": int(model.get("grid_points") or len(x_grid)),
-                    "poly": dict(model.get("poly") or {}),
-                    "equation": str(model.get("equation") or ""),
-                },
-                "x_grid": list(x_grid),
-                "master_y": list(master_y),
-                "std_y": list(std_y),
-                "trace_curves": trace_curves,
-            }
+            pair_id = str(spec.get("pair_id") or "").strip()
+            resampled = _tar_resampled_trace_map(
+                spec.get("series") or [],
+                x_grid=x_grid,
+                program_by_serial=program_by_serial,
+            )
+            full_trace_map_by_spec[pair_id] = dict(resampled)
+            full_trace_map_all.update(resampled)
+        full_program_traces = _tar_program_trace_map(
+            full_trace_map_all,
+            program_by_serial=program_by_serial,
         )
+        full_program_means = _tar_program_trace_scalar_mean_map(full_program_traces)
+        if prepass_enabled:
+            included_programs, excluded_programs = _tar_programs_within_percent_delta(
+                full_program_means,
+                reference_program=reference_program,
+                percent_delta_max=float(percent_delta_max),
+            )
+        else:
+            included_programs = _tar_unique_text_values(list(full_program_means.keys()))
+            excluded_programs = []
+            if reference_program and reference_program not in included_programs:
+                included_programs.insert(0, reference_program)
+        initial_skip_reason = ""
+        if reference_program and reference_program not in full_program_means:
+            initial_skip_reason = "missing_reference_program"
+        elif len(included_programs) <= 1:
+            initial_skip_reason = "no_compatible_programs"
 
-    initial_nonpass_targets = {
-        (pair_id, serial)
-        for (pair_id, serial), row in initial_rows.items()
-        if str((row or {}).get("initial_grade") or "").strip().upper() in {"WATCH", "FAIL"}
-    }
+        initial_model: dict[str, Any] | None = None
+        admitted_program_traces = _tar_program_trace_map(
+            full_trace_map_all,
+            program_by_serial=program_by_serial,
+            allowed_programs=included_programs,
+        )
+        admitted_trace_map_by_spec: dict[str, dict[str, list[float]]] = {}
+        if not initial_skip_reason and admitted_program_traces:
+            initial_model = _tar_build_curve_model_for_program_traces(
+                x_name=str(members[0].get("x_name") or ""),
+                units=str(members[0].get("units") or ""),
+                x_grid=x_grid,
+                traces_by_program=admitted_program_traces,
+                degree=degree,
+                normalize_x=normalize_x,
+            )
+            if not isinstance(initial_model, dict):
+                initial_skip_reason = "insufficient_program_data"
+            else:
+                for spec in members:
+                    pair_id = str(spec.get("pair_id") or "").strip()
+                    admitted_trace_map_by_spec[pair_id] = {
+                        serial: list(trace)
+                        for serial, trace in (full_trace_map_by_spec.get(pair_id) or {}).items()
+                        if _tar_program_label(program_by_serial, serial) in set(included_programs)
+                    }
+        for spec in members:
+            spec["prepass_reference_program"] = reference_program
+            spec["prepass_included_programs"] = list(included_programs)
+            spec["prepass_excluded_programs"] = list(excluded_programs)
+
+        if initial_skip_reason:
+            for spec in members:
+                pair_id = str(spec.get("pair_id") or "").strip()
+                spec["initial_model"] = {}
+                spec["initial_plot_payload"] = {
+                    "run": spec.get("run"),
+                    "param": spec.get("param"),
+                    "units": str(spec.get("units") or ""),
+                    "selection": dict(spec.get("selection") or {}),
+                    "x_name": str(spec.get("x_name") or ""),
+                    "x_grid": list(x_grid),
+                    "y_resampled_by_sn": {},
+                    "master_y": [],
+                    "std_y": [],
+                    "program_traces_by_program": {},
+                    "program_weighting": "equal_program_weight",
+                    "prepass_reference_program": reference_program,
+                    "prepass_included_programs": list(included_programs),
+                    "prepass_excluded_programs": list(excluded_programs),
+                }
+                hi_serials = {
+                    str(curve.serial or "").strip()
+                    for curve in (spec.get("series") or [])
+                    if isinstance(curve, CurveSeries) and str(curve.serial or "").strip() in hi_set
+                }
+                for serial in hi_serials:
+                    initial_rows[(pair_id, serial)] = _tar_initial_skip_row(
+                        spec,
+                        serial=serial,
+                        reference_program=reference_program,
+                        included_programs=included_programs,
+                        excluded_programs=excluded_programs,
+                        reason=initial_skip_reason,
+                    )
+        else:
+            assert isinstance(initial_model, dict)
+            initial_master_y = list(initial_model.get("master_y") or [])
+            initial_std_y = list(initial_model.get("std_y") or [])
+            initial_denom = float(initial_model.get("denom") or 1.0)
+            initial_entries: list[tuple[dict, str, dict]] = []
+            trace_curves: list[dict] = []
+            for spec in members:
+                pair_id = str(spec.get("pair_id") or "").strip()
+                admitted_trace_map = dict(admitted_trace_map_by_spec.get(pair_id) or {})
+                spec["initial_model"] = {
+                    "x_name": str(initial_model.get("x_name") or ""),
+                    "units": str(spec.get("units") or initial_model.get("units") or ""),
+                    "domain": list(initial_model.get("domain") or []),
+                    "grid_points": int(initial_model.get("grid_points") or len(x_grid)),
+                    "poly": dict(initial_model.get("poly") or {}),
+                    "equation": str(initial_model.get("equation") or ""),
+                }
+                spec["initial_plot_payload"] = {
+                    "run": spec.get("run"),
+                    "param": spec.get("param"),
+                    "units": str(spec.get("units") or ""),
+                    "selection": dict(spec.get("selection") or {}),
+                    "x_name": str(initial_model.get("x_name") or ""),
+                    "x_grid": list(x_grid),
+                    "y_resampled_by_sn": dict(admitted_trace_map),
+                    "master_y": list(initial_master_y),
+                    "std_y": list(initial_std_y),
+                    "program_traces_by_program": dict(admitted_program_traces),
+                    "program_weighting": "equal_program_weight",
+                    "prepass_reference_program": reference_program,
+                    "prepass_included_programs": list(included_programs),
+                    "prepass_excluded_programs": list(excluded_programs),
+                }
+                for serial, y_curve in admitted_trace_map.items():
+                    trace_curves.append(
+                        {
+                            "pair_id": pair_id,
+                            "selection_label": str(spec.get("selection_label") or ""),
+                            "serial": serial,
+                            "y_curve": list(y_curve),
+                        }
+                    )
+                    dev = _tar_compute_curve_deviation(y_curve, initial_master_y, x_grid, denom=initial_denom)
+                    if dev is not None:
+                        initial_entries.append((spec, serial, dev))
+            mean_score, std_score = _tar_program_score_stats(
+                [(serial, dev) for _spec, serial, dev in initial_entries],
+                program_by_serial=program_by_serial,
+            )
+            for spec, serial, dev in initial_entries:
+                z_score = (float(dev.get("max_abs") or 0.0) - mean_score) / std_score if std_score else 0.0
+                grade = _grade_from_z(z_score, z_pass, z_watch)
+                if serial not in hi_set:
+                    continue
+                row = {
+                    "pair_id": str(spec.get("pair_id") or ""),
+                    "selection_id": str(spec.get("selection_id") or ""),
+                    "selection_label": str(spec.get("selection_label") or ""),
+                    "serial": serial,
+                    "run": str(spec.get("run") or ""),
+                    "param": str(spec.get("param") or ""),
+                    "units": str(spec.get("units") or ""),
+                    "x_name": str(spec.get("x_name") or ""),
+                    "base_condition_label": str(spec.get("base_condition_label") or ""),
+                    "suppression_voltage_label": str(spec.get("suppression_voltage_label") or ""),
+                    "valve_voltage_label": str(spec.get("valve_voltage_label") or ""),
+                    "initial_max_abs": dev.get("max_abs"),
+                    "initial_rms": dev.get("rms"),
+                    "initial_max_pct": dev.get("max_pct"),
+                    "initial_rms_pct": dev.get("rms_pct"),
+                    "initial_x_at_max_abs": dev.get("x_at_max_abs"),
+                    "initial_z": float(z_score),
+                    "initial_grade": grade,
+                    "initial_poly_rmse": (initial_model.get("poly") or {}).get("rmse"),
+                    "initial_skipped": False,
+                    "initial_skip_reason": "",
+                    "prepass_reference_program": reference_program,
+                    "prepass_included_programs": list(included_programs),
+                    "prepass_excluded_programs": list(excluded_programs),
+                }
+                initial_rows[(str(spec.get("pair_id") or ""), serial)] = row
+                watch = False
+                if max_abs_thr is not None and float(dev.get("max_abs") or 0.0) >= float(max_abs_thr):
+                    watch = True
+                if max_pct_thr is not None and float(dev.get("max_pct") or 0.0) >= float(max_pct_thr):
+                    watch = True
+                if rms_pct_thr is not None and float(dev.get("rms_pct") or 0.0) >= float(rms_pct_thr):
+                    watch = True
+                if watch:
+                    initial_watch_items.append({**row, "grade": grade, "z": float(z_score), "max_pct": dev.get("max_pct")})
+            initial_cohort_specs.append(
+                {
+                    "cohort_id": f"initial:{group_index}:{_norm_key(members[0].get('base_condition_label') or '')}:{_norm_key(members[0].get('param') or '')}:{_norm_key(members[0].get('x_name') or '')}",
+                    "cohort_type": "initial",
+                    "param": str(members[0].get("param") or ""),
+                    "units": str(members[0].get("units") or ""),
+                    "x_name": str(initial_model.get("x_name") or ""),
+                    "base_condition_label": str(members[0].get("base_condition_label") or ""),
+                    "suppression_voltage_label": "",
+                    "valve_voltage_label": "",
+                    "selection_labels": [str(spec.get("selection_label") or "") for spec in members if str(spec.get("selection_label") or "").strip()],
+                    "member_pair_ids": [str(spec.get("pair_id") or "") for spec in members if str(spec.get("pair_id") or "").strip()],
+                    "model": {
+                        "x_name": str(initial_model.get("x_name") or ""),
+                        "units": str(initial_model.get("units") or ""),
+                        "domain": list(initial_model.get("domain") or []),
+                        "grid_points": int(initial_model.get("grid_points") or len(x_grid)),
+                        "poly": dict(initial_model.get("poly") or {}),
+                        "equation": str(initial_model.get("equation") or ""),
+                    },
+                    "x_grid": list(x_grid),
+                    "master_y": list(initial_model.get("master_y") or []),
+                    "std_y": list(initial_model.get("std_y") or []),
+                    "trace_curves": trace_curves,
+                    "prepass_reference_program": reference_program,
+                    "prepass_included_programs": list(included_programs),
+                    "prepass_excluded_programs": list(excluded_programs),
+                }
+            )
 
     family_groups: dict[tuple[str, str, str], list[dict]] = {}
     for spec in specs:
@@ -6947,7 +7748,7 @@ def _tar_analyze_curve_groups(
                     }
                 )
         family_condition_pairs = list(family_condition_pairs_hi or family_condition_pairs_all)
-        if len(family_condition_pairs_all) <= 1 or not family_condition_pairs:
+        if not family_condition_pairs:
             continue
         for condition_pair in family_condition_pairs:
             condition_key = str(condition_pair.get("key") or "").strip()
@@ -6961,80 +7762,99 @@ def _tar_analyze_curve_groups(
                 member_specs.append(spec)
             if not member_specs:
                 continue
-            targeted_member_specs = [
-                spec
-                for spec in member_specs
-                if any((str(spec.get("pair_id") or ""), serial) in initial_nonpass_targets for serial in hi_set)
-            ]
-            if not targeted_member_specs:
-                continue
             pooled_series: list[CurveSeries] = []
-            for spec in targeted_member_specs:
+            for spec in member_specs:
                 pooled_series.extend(list(((spec.get("series_by_condition_key") or {}).get(condition_key) or [])))
-            model = _tar_build_curve_model_for_series(
+            final_scope_model = _tar_build_curve_model_for_series(
                 pooled_series,
-                x_name=str(targeted_member_specs[0].get("x_name") or members[0].get("x_name") or ""),
-                units=str(targeted_member_specs[0].get("units") or members[0].get("units") or ""),
+                x_name=str(member_specs[0].get("x_name") or members[0].get("x_name") or ""),
+                units=str(member_specs[0].get("units") or members[0].get("units") or ""),
                 grid_points=grid_points,
                 degree=degree,
                 normalize_x=normalize_x,
             )
-            if not isinstance(model, dict):
+            if not isinstance(final_scope_model, dict):
                 continue
-            x_grid = list(model.get("x_grid") or [])
-            master_y = list(model.get("master_y") or [])
-            std_y = list(model.get("std_y") or [])
-            denom = float(model.get("denom") or 1.0)
+            x_grid = list(final_scope_model.get("x_grid") or [])
+            full_trace_map_by_spec: dict[str, dict[str, list[float]]] = {}
+            full_trace_map_all: dict[str, list[float]] = {}
+            for spec in member_specs:
+                pair_id = str(spec.get("pair_id") or "").strip()
+                condition_series = list(((spec.get("series_by_condition_key") or {}).get(condition_key) or []))
+                resampled = _tar_resampled_trace_map(
+                    condition_series,
+                    x_grid=x_grid,
+                    program_by_serial=program_by_serial,
+                )
+                full_trace_map_by_spec[pair_id] = dict(resampled)
+                full_trace_map_all.update(resampled)
+            final_program_traces = _tar_program_trace_map(
+                full_trace_map_all,
+                program_by_serial=program_by_serial,
+            )
+            final_model = _tar_build_curve_model_for_program_traces(
+                x_name=str(member_specs[0].get("x_name") or members[0].get("x_name") or ""),
+                units=str(member_specs[0].get("units") or members[0].get("units") or ""),
+                x_grid=x_grid,
+                traces_by_program=final_program_traces,
+                degree=degree,
+                normalize_x=normalize_x,
+            )
+            if not isinstance(final_model, dict):
+                continue
+            final_master_y = list(final_model.get("master_y") or [])
+            final_std_y = list(final_model.get("std_y") or [])
+            final_denom = float(final_model.get("denom") or 1.0)
             all_entries: list[tuple[dict, str, dict]] = []
             trace_curves: list[dict] = []
-            for spec in targeted_member_specs:
-                y_resampled_by_sn = {
-                    curve.serial: _interp_linear(curve.x, curve.y, x_grid)
-                    for curve in (((spec.get("series_by_condition_key") or {}).get(condition_key) or []))
-                }
+            for spec in member_specs:
+                pair_id = str(spec.get("pair_id") or "").strip()
+                y_resampled_by_sn = dict(full_trace_map_by_spec.get(pair_id) or {})
                 spec.setdefault("regrade_models", {})[condition_key] = {
-                    "x_name": str(model.get("x_name") or ""),
-                    "units": str(spec.get("units") or model.get("units") or ""),
-                    "domain": list(model.get("domain") or []),
-                    "grid_points": int(model.get("grid_points") or len(x_grid)),
-                    "poly": dict(model.get("poly") or {}),
-                    "equation": str(model.get("equation") or ""),
+                    "x_name": str(final_model.get("x_name") or ""),
+                    "units": str(spec.get("units") or final_model.get("units") or ""),
+                    "domain": list(final_model.get("domain") or []),
+                    "grid_points": int(final_model.get("grid_points") or len(x_grid)),
+                    "poly": dict(final_model.get("poly") or {}),
+                    "equation": str(final_model.get("equation") or ""),
                 }
                 spec.setdefault("regrade_plot_payloads", {})[condition_key] = {
                     "run": spec.get("run"),
                     "param": spec.get("param"),
                     "units": str(spec.get("units") or ""),
                     "selection": dict(spec.get("selection") or {}),
-                    "x_name": str(model.get("x_name") or ""),
+                    "x_name": str(final_model.get("x_name") or ""),
                     "x_grid": list(x_grid),
                     "y_resampled_by_sn": dict(y_resampled_by_sn),
-                    "master_y": list(master_y),
-                    "std_y": list(std_y),
+                    "master_y": list(final_master_y),
+                    "std_y": list(final_std_y),
+                    "program_traces_by_program": dict(final_program_traces),
+                    "program_weighting": "equal_program_weight",
                 }
+                spec.setdefault("final_programs_by_condition", {})[condition_key] = _tar_unique_text_values(list(final_program_traces.keys()))
                 for serial, y_curve in y_resampled_by_sn.items():
                     trace_curves.append(
                         {
-                            "pair_id": str(spec.get("pair_id") or ""),
+                            "pair_id": pair_id,
                             "selection_label": str(spec.get("selection_label") or ""),
                             "serial": serial,
                             "y_curve": list(y_curve),
                         }
                     )
-                    dev = _tar_compute_curve_deviation(y_curve, master_y, x_grid, denom=denom)
+                    dev = _tar_compute_curve_deviation(y_curve, final_master_y, x_grid, denom=final_denom)
                     if dev is not None:
                         all_entries.append((spec, serial, dev))
-            scores = [float(dev.get("max_abs") or 0.0) for _spec, _serial, dev in all_entries]
-            mean_score = float(statistics.mean(scores)) if scores else 0.0
-            std_score = float(statistics.pstdev(scores)) if len(scores) > 1 else 1.0
-            if std_score == 0.0:
-                std_score = 1.0
+            mean_score, std_score = _tar_program_score_stats(
+                [(serial, dev) for _spec, serial, dev in all_entries],
+                program_by_serial=program_by_serial,
+            )
 
             for spec, serial, dev in all_entries:
                 z_score = (float(dev.get("max_abs") or 0.0) - mean_score) / std_score if std_score else 0.0
                 grade = _grade_from_z(z_score, z_pass, z_watch)
-                if serial not in hi or (str(spec.get("pair_id") or ""), serial) not in initial_nonpass_targets:
+                if serial not in hi_set:
                     continue
-                regrade_candidates.setdefault((str(spec.get("pair_id") or ""), serial), []).append(
+                final_candidates.setdefault((str(spec.get("pair_id") or ""), serial), []).append(
                     {
                         "pair_id": str(spec.get("pair_id") or ""),
                         "selection_id": str(spec.get("selection_id") or ""),
@@ -7055,33 +7875,33 @@ def _tar_analyze_curve_groups(
                         "regrade_x_at_max_abs": dev.get("x_at_max_abs"),
                         "regrade_z": float(z_score),
                         "regrade_grade": grade,
-                        "regrade_poly_rmse": (model.get("poly") or {}).get("rmse"),
+                        "regrade_poly_rmse": (final_model.get("poly") or {}).get("rmse"),
                         "regrade_cohort_id": f"regrade:{family_index}:{_norm_key(str(spec.get('base_condition_label') or ''))}:{_norm_key(suppression_value)}:{_norm_key(valve_value)}:{_norm_key(str(spec.get('param') or ''))}:{_norm_key(str(spec.get('x_name') or ''))}",
                     }
                 )
             regrade_cohort_specs.append(
                 {
-                    "cohort_id": f"regrade:{family_index}:{_norm_key(str(targeted_member_specs[0].get('base_condition_label') or members[0].get('base_condition_label') or ''))}:{_norm_key(suppression_value)}:{_norm_key(valve_value)}:{_norm_key(str(targeted_member_specs[0].get('param') or members[0].get('param') or ''))}:{_norm_key(str(targeted_member_specs[0].get('x_name') or members[0].get('x_name') or ''))}",
+                    "cohort_id": f"regrade:{family_index}:{_norm_key(str(member_specs[0].get('base_condition_label') or members[0].get('base_condition_label') or ''))}:{_norm_key(suppression_value)}:{_norm_key(valve_value)}:{_norm_key(str(member_specs[0].get('param') or members[0].get('param') or ''))}:{_norm_key(str(member_specs[0].get('x_name') or members[0].get('x_name') or ''))}",
                     "cohort_type": "regrade",
-                    "param": str(targeted_member_specs[0].get("param") or members[0].get("param") or ""),
-                    "units": str(targeted_member_specs[0].get("units") or members[0].get("units") or ""),
-                    "x_name": str(model.get("x_name") or ""),
-                    "base_condition_label": str(targeted_member_specs[0].get("base_condition_label") or members[0].get("base_condition_label") or ""),
+                    "param": str(member_specs[0].get("param") or members[0].get("param") or ""),
+                    "units": str(member_specs[0].get("units") or members[0].get("units") or ""),
+                    "x_name": str(final_model.get("x_name") or ""),
+                    "base_condition_label": str(member_specs[0].get("base_condition_label") or members[0].get("base_condition_label") or ""),
                     "suppression_voltage_label": suppression_value,
                     "valve_voltage_label": valve_value,
-                    "selection_labels": [str(spec.get("selection_label") or "") for spec in targeted_member_specs if str(spec.get("selection_label") or "").strip()],
-                    "member_pair_ids": [str(spec.get("pair_id") or "") for spec in targeted_member_specs if str(spec.get("pair_id") or "").strip()],
+                    "selection_labels": [str(spec.get("selection_label") or "") for spec in member_specs if str(spec.get("selection_label") or "").strip()],
+                    "member_pair_ids": [str(spec.get("pair_id") or "") for spec in member_specs if str(spec.get("pair_id") or "").strip()],
                     "model": {
-                        "x_name": str(model.get("x_name") or ""),
-                        "units": str(model.get("units") or ""),
-                        "domain": list(model.get("domain") or []),
-                        "grid_points": int(model.get("grid_points") or len(x_grid)),
-                        "poly": dict(model.get("poly") or {}),
-                        "equation": str(model.get("equation") or ""),
+                        "x_name": str(final_model.get("x_name") or ""),
+                        "units": str(final_model.get("units") or ""),
+                        "domain": list(final_model.get("domain") or []),
+                        "grid_points": int(final_model.get("grid_points") or len(x_grid)),
+                        "poly": dict(final_model.get("poly") or {}),
+                        "equation": str(final_model.get("equation") or ""),
                     },
                     "x_grid": list(x_grid),
-                    "master_y": list(master_y),
-                    "std_y": list(std_y),
+                    "master_y": list(final_master_y),
+                    "std_y": list(final_std_y),
                     "trace_curves": trace_curves,
                 }
             )
@@ -7096,7 +7916,7 @@ def _tar_analyze_curve_groups(
         pair_id = str(spec.get("pair_id") or "")
         pair_candidates = [
             candidate
-            for (candidate_pair_id, _serial), rows in regrade_candidates.items()
+            for (candidate_pair_id, _serial), rows in final_candidates.items()
             if candidate_pair_id == pair_id
             for candidate in rows
         ]
@@ -7130,9 +7950,7 @@ def _tar_analyze_curve_groups(
 
         for serial in hi:
             initial_row = dict(initial_rows.get((pair_id, serial)) or {})
-            if not initial_row:
-                continue
-            candidates = list(regrade_candidates.get((pair_id, serial)) or [])
+            candidates = list(final_candidates.get((pair_id, serial)) or [])
             if candidates:
                 regrade_row = max(candidates, key=_tar_worst_candidate_sort_key)
                 final_grade = str(regrade_row.get("regrade_grade") or initial_row.get("initial_grade") or "NO_DATA").strip().upper() or "NO_DATA"
@@ -7142,7 +7960,32 @@ def _tar_analyze_curve_groups(
                 final_grade = str(initial_row.get("initial_grade") or "NO_DATA").strip().upper() or "NO_DATA"
                 final_source = initial_row
 
-            row = dict(initial_row)
+            if not initial_row and not regrade_row:
+                continue
+            row = dict(
+                initial_row
+                or _tar_initial_skip_row(
+                    spec,
+                    serial=serial,
+                    reference_program=str(spec.get("prepass_reference_program") or reference_program or ""),
+                    included_programs=list(spec.get("prepass_included_programs") or []),
+                    excluded_programs=list(spec.get("prepass_excluded_programs") or []),
+                    reason="no_initial_data",
+                )
+            )
+            final_condition_key = str(regrade_row.get("condition_key") or "").strip()
+            final_suppression_label = str(regrade_row.get("suppression_voltage_label") or row.get("suppression_voltage_label") or "").strip()
+            final_valve_label = str(regrade_row.get("valve_voltage_label") or row.get("valve_voltage_label") or "").strip()
+            regrade_applied = bool(
+                regrade_row
+                and (
+                    bool(row.get("initial_skipped"))
+                    or final_condition_key
+                    or final_grade != str(row.get("initial_grade") or "").strip().upper()
+                    or final_suppression_label != str(row.get("suppression_voltage_label") or "").strip()
+                    or final_valve_label != str(row.get("valve_voltage_label") or "").strip()
+                )
+            )
             row.update(
                 {
                     "regrade_max_abs": regrade_row.get("regrade_max_abs"),
@@ -7155,7 +7998,9 @@ def _tar_analyze_curve_groups(
                     "regrade_poly_rmse": regrade_row.get("regrade_poly_rmse"),
                     "regrade_cohort_id": regrade_row.get("regrade_cohort_id"),
                     "regrade_condition_key": regrade_row.get("condition_key"),
-                    "regrade_applied": bool(regrade_row),
+                    "final_condition_key": final_condition_key,
+                    "final_pass_applied": bool(regrade_row),
+                    "regrade_applied": regrade_applied,
                     "final_max_abs": final_source.get("regrade_max_abs", final_source.get("initial_max_abs")),
                     "final_rms": final_source.get("regrade_rms", final_source.get("initial_rms")),
                     "final_max_pct": final_source.get("regrade_max_pct", final_source.get("initial_max_pct")),
@@ -7170,14 +8015,19 @@ def _tar_analyze_curve_groups(
                     "rms_pct": final_source.get("regrade_rms_pct", final_source.get("initial_rms_pct")),
                     "x_at_max_abs": final_source.get("regrade_x_at_max_abs", final_source.get("initial_x_at_max_abs")),
                     "z": final_source.get("regrade_z", final_source.get("initial_z")),
-                    "suppression_voltage_label": str(initial_row.get("suppression_voltage_label") or regrade_row.get("suppression_voltage_label") or ""),
-                    "valve_voltage_label": str(initial_row.get("valve_voltage_label") or regrade_row.get("valve_voltage_label") or ""),
+                    "suppression_voltage_label": str(row.get("suppression_voltage_label") or ""),
+                    "valve_voltage_label": str(row.get("valve_voltage_label") or ""),
                     "regrade_suppression_voltage_label": str(regrade_row.get("suppression_voltage_label") or ""),
                     "regrade_valve_voltage_label": str(regrade_row.get("valve_voltage_label") or ""),
+                    "final_suppression_voltage_label": final_suppression_label,
+                    "final_valve_voltage_label": final_valve_label,
+                    "prepass_reference_program": str(row.get("prepass_reference_program") or spec.get("prepass_reference_program") or ""),
+                    "prepass_included_programs": list(row.get("prepass_included_programs") or spec.get("prepass_included_programs") or []),
+                    "prepass_excluded_programs": list(row.get("prepass_excluded_programs") or spec.get("prepass_excluded_programs") or []),
                 }
             )
             grading_rows.append(row)
-            initial_grade_map_by_pair_serial[(pair_id, serial)] = str(initial_row.get("initial_grade") or "NO_DATA").strip().upper() or "NO_DATA"
+            initial_grade_map_by_pair_serial[(pair_id, serial)] = str(row.get("initial_grade") or "NO_DATA").strip().upper() or "NO_DATA"
             final_grade_map_by_pair_serial[(pair_id, serial)] = final_grade
             finding_by_pair_serial[(pair_id, serial)] = dict(row)
             watch = False
@@ -7394,6 +8244,34 @@ def _tar_prepare_base(
         filter_rows = []
     if not isinstance(filter_rows, list):
         filter_rows = []
+    cache_meta_by_sn, cache_meta_note = _read_cached_source_metadata(conn)
+    workbook_meta_by_sn, workbook_meta_note = _read_workbook_metadata(wb)
+    gui_meta_by_sn, gui_meta_note = _read_gui_source_metadata(be, wb)
+    meta_by_sn: dict[str, dict[str, str]] = {}
+    for serial in sorted(set(cache_meta_by_sn.keys()) | set(workbook_meta_by_sn.keys()) | set(gui_meta_by_sn.keys())):
+        merged = dict(workbook_meta_by_sn.get(serial) or {})
+        for key, value in (cache_meta_by_sn.get(serial) or {}).items():
+            if str(value or "").strip():
+                merged[key] = str(value).strip()
+        for key, value in (gui_meta_by_sn.get(serial) or {}).items():
+            if str(value or "").strip():
+                merged[key] = str(value).strip()
+        meta_by_sn[serial] = merged
+    meta_note = ""
+    if not meta_by_sn:
+        meta_note = gui_meta_note or cache_meta_note or workbook_meta_note
+    program_by_serial = _tar_resolve_program_by_serial(meta_by_sn, filter_rows=filter_rows)
+    certifying_programs = _tar_unique_text_values(
+        [_tar_program_label(program_by_serial, serial) for serial in hi if _tar_program_label(program_by_serial, serial)]
+    )
+    if len(certifying_programs) > 1:
+        raise RuntimeError(
+            "Auto Report requires highlighted certification serials to belong to a single program. "
+            f"Found: {', '.join(certifying_programs)}"
+        )
+    certifying_program = certifying_programs[0] if certifying_programs else ""
+    if not certifying_program:
+        raise RuntimeError("Auto Report could not resolve the program for the highlighted certification serials.")
 
     report_selections = _tar_resolve_report_selections(run_by_name, runs, initial_options)
     _tar_emit_progress(progress_cb, f"Preparing curve comparisons for {len(report_selections)} selection(s) and {len(params)} parameter(s)")
@@ -7414,6 +8292,9 @@ def _tar_prepare_base(
     analysis = _tar_analyze_curve_groups(
         pair_specs,
         hi=hi,
+        program_by_serial=program_by_serial,
+        certifying_program=certifying_program,
+        prepass_cfg=dict((grade_cfg.get("prepass") or {})),
         grid_points=grid_points,
         degree=degree,
         normalize_x=normalize_x,
@@ -7455,23 +8336,6 @@ def _tar_prepare_base(
         for spec in pair_specs
         if str(spec.get("pair_id") or "").strip()
     }
-
-    cache_meta_by_sn, cache_meta_note = _read_cached_source_metadata(conn)
-    workbook_meta_by_sn, workbook_meta_note = _read_workbook_metadata(wb)
-    gui_meta_by_sn, gui_meta_note = _read_gui_source_metadata(be, wb)
-    meta_by_sn: dict[str, dict[str, str]] = {}
-    for serial in sorted(set(cache_meta_by_sn.keys()) | set(workbook_meta_by_sn.keys()) | set(gui_meta_by_sn.keys())):
-        merged = dict(workbook_meta_by_sn.get(serial) or {})
-        for key, value in (cache_meta_by_sn.get(serial) or {}).items():
-            if str(value or "").strip():
-                merged[key] = str(value).strip()
-        for key, value in (gui_meta_by_sn.get(serial) or {}).items():
-            if str(value or "").strip():
-                merged[key] = str(value).strip()
-        meta_by_sn[serial] = merged
-    meta_note = ""
-    if not meta_by_sn:
-        meta_note = gui_meta_note or cache_meta_note or workbook_meta_note
     print_ctx = _capture_print_context(report_subtitle=_tar_default_report_subtitle(serials=hi, meta_by_sn=meta_by_sn))
 
     ctx: dict[str, Any] = {
@@ -7498,6 +8362,8 @@ def _tar_prepare_base(
         "grid_points": grid_points,
         "colors": colors,
         "meta_by_sn": meta_by_sn,
+        "program_by_serial": program_by_serial,
+        "certifying_program": certifying_program,
         "meta_note": meta_note,
         "change_summary": change_summary,
         "curves_summary": curves_summary,
@@ -7815,12 +8681,12 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
             comparison_rows_by_serial.setdefault(serial, []).append(dict(row))
     initial_vs_final_lines = [
         (
-            "Initial Run: Base certification comparison before suppression-and-valve-specific regrade. "
+            "Initial Run: Program-mean pre-pass with compatible-program gating before exact-condition certification. "
             f"Suppression Voltage: {str(quick_summary.get('initial_suppression_voltage') or 'All').strip() or 'All'} | "
             f"Valve Voltage: {str(quick_summary.get('initial_valve_voltage') or 'All').strip() or 'All'}"
         ),
         (
-            "Final Run: Suppression-and-valve-aware certification comparison after regrade. "
+            "Final Run: Exact run-condition, suppression-voltage, and valve-voltage certification comparison. "
             f"Suppression Voltage: {str(quick_summary.get('final_suppression_voltage') or quick_summary.get('p8_suppression_voltage') or 'All').strip() or 'All'} | "
             f"Valve Voltage: {str(quick_summary.get('final_valve_voltage') or quick_summary.get('p8_valve_voltage') or 'All').strip() or 'All'}"
         ),
@@ -7833,8 +8699,9 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
     story.append(
         _portrait_paragraph(
             "This report validates ATP run criteria against family data and compares the selected certification serials "
-            "to the compiled family baseline for the chosen run scope. Initial grading pools the selected TD conditions "
-            "by parameter and X axis before a suppression-and-valve regrade pass is applied where needed.",
+            "to the compiled family baseline for the chosen run scope. Initial grading applies a compatible-program "
+            "pre-pass within each base run condition, parameter, and X axis before the exact-condition final pass "
+            "establishes the official certification result.",
             styles["body"],
             rl,
         )
@@ -7963,8 +8830,8 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
         story.append(
             _portrait_paragraph(
                 "Each table groups one selected run condition. Rows compare the ATP family mean with each certified serial's "
-                "actual result for the same parameter. Initial values use the base certification scope, and final values use "
-                "the suppression-and-valve-aware regrade path.",
+                "actual result for the same parameter. Initial values use the compatible-program pre-pass, and final values use "
+                "the exact-condition certification pass.",
                 styles["body"],
                 rl,
             )
@@ -7990,7 +8857,7 @@ def _tar_build_equation_story(ctx: Mapping[str, Any]) -> list[Any]:
     story.append(_portrait_paragraph("Performance Equations", styles["section"], rl))
     story.append(
         _portrait_paragraph(
-            "Performance equations are shown after the run-condition and regrade-pass charts so the fits remain informational, not grading inputs.",
+            "Performance equations are shown after the run-condition and final exact-condition charts so the fits remain informational, not grading inputs.",
             styles["body"],
             rl,
         )
@@ -8314,7 +9181,7 @@ def _tar_render_watch_curve_page(
             continue
         if y_curve:
             ax.plot(x_grid, y_curve, linewidth=0.8, alpha=0.08, color="#94a3b8")
-    ax.plot(x_grid, master_y, linewidth=2.1, color="#0f172a", label="Family median")
+    ax.plot(x_grid, master_y, linewidth=2.1, color="#0f172a", label="Family mean")
     try:
         band_lo = [a - b if (isinstance(a, (int, float)) and not math.isnan(float(a)) and isinstance(b, (int, float)) and not math.isnan(float(b))) else float("nan") for a, b in zip(master_y, std_y)]
         band_hi = [a + b if (isinstance(a, (int, float)) and not math.isnan(float(a)) and isinstance(b, (int, float)) and not math.isnan(float(b))) else float("nan") for a, b in zip(master_y, std_y)]
@@ -8337,7 +9204,7 @@ def _tar_render_watch_curve_page(
         note_lines.append(f"z: {_fmt_num(finding.get('final_z'), sig=4)}")
         if bool(finding.get("regrade_applied")):
             note_lines.append(
-                "Regrade: "
+                "Final pass: "
                 f"Supp {str(finding.get('regrade_suppression_voltage_label') or '').strip() or '(unknown)'} | "
                 f"Valve {str(finding.get('regrade_valve_voltage_label') or '').strip() or '(unknown)'}"
             )
@@ -8506,7 +9373,7 @@ def _tar_render_plot_sections(
                     continue
                 if y_curve:
                     ax.plot(x_grid, y_curve, linewidth=0.8, alpha=0.09, color="#94a3b8")
-            ax.plot(x_grid, master_y, linewidth=2.1, color="#0f172a", label="Family median")
+            ax.plot(x_grid, master_y, linewidth=2.1, color="#0f172a", label="Family mean")
             try:
                 band_lo = [a - b if (isinstance(a, (int, float)) and not math.isnan(float(a)) and isinstance(b, (int, float)) and not math.isnan(float(b))) else float("nan") for a, b in zip(master_y, std_y)]
                 band_hi = [a + b if (isinstance(a, (int, float)) and not math.isnan(float(a)) and isinstance(b, (int, float)) and not math.isnan(float(b))) else float("nan") for a, b in zip(master_y, std_y)]
@@ -8692,7 +9559,7 @@ def _tar_render_plot_sections(
                     continue
                 if y_curve:
                     ax.plot(x_grid, y_curve, linewidth=0.8, alpha=0.08, color="#94a3b8")
-            ax.plot(x_grid, master_y, linewidth=2.1, color="#0f172a", label="Family median")
+            ax.plot(x_grid, master_y, linewidth=2.1, color="#0f172a", label="Family mean")
             try:
                 band_lo = [a - b if (isinstance(a, (int, float)) and not math.isnan(float(a)) and isinstance(b, (int, float)) and not math.isnan(float(b))) else float("nan") for a, b in zip(master_y, std_y)]
                 band_hi = [a + b if (isinstance(a, (int, float)) and not math.isnan(float(a)) and isinstance(b, (int, float)) and not math.isnan(float(b))) else float("nan") for a, b in zip(master_y, std_y)]
@@ -8828,7 +9695,7 @@ def _tar_render_plot_sections(
                 ),
                 grade_map_by_pair_serial=(ctx.get("initial_grade_map_by_pair_serial") or {}),
                 metric_prefix="initial",
-                family_label="Pooled family median",
+                family_label="Pooled family mean",
                 band_label="Pooled family +/-1 sigma",
                 equation_label="Pooled family equation",
             )
@@ -8838,13 +9705,13 @@ def _tar_render_plot_sections(
                 run_condition_curve_plot_count += 1
 
         if regrade_metric_specs:
-            _tar_emit_progress(progress_cb, f"Rendering regrade-pass metric pages ({len(regrade_metric_specs)} planned)")
+            _tar_emit_progress(progress_cb, f"Rendering final exact-condition metric pages ({len(regrade_metric_specs)} planned)")
         for index, (cohort_spec, metric_stat) in enumerate(regrade_metric_specs, start=1):
             suppression_value = str(cohort_spec.get("suppression_voltage_label") or "").strip()
             valve_value = str(cohort_spec.get("valve_voltage_label") or "").strip()
             _tar_emit_progress(
                 progress_cb,
-                f"Regrade metric page {index}/{len(regrade_metric_specs)}: {cohort_spec.get('param')} | "
+                f"Final exact-condition metric page {index}/{len(regrade_metric_specs)}: {cohort_spec.get('param')} | "
                 f"Supp {suppression_value or 'n/a'} | Valve {valve_value or 'n/a'} | {metric_stat}",
             )
             filter_override = _tar_clone_filter_state(
@@ -8858,11 +9725,11 @@ def _tar_render_plot_sections(
                 cohort_spec=cohort_spec,
                 metric_stat=metric_stat,
                 page_number=intro_pages + plot_page_count + 1,
-                section_title="Regrade Pass Metrics",
+                section_title="Final Exact-Condition Metrics",
                 section_key="regrade_pass_plot_metrics",
                 grade_map_by_pair_serial=(ctx.get("final_grade_map_by_pair_serial") or {}),
                 filter_state_override=filter_override,
-                family_mean_label="Regrade family mean",
+                family_mean_label="Final exact-condition family mean",
             )
             if plot_spec:
                 plot_specs.append(plot_spec)
@@ -8870,13 +9737,13 @@ def _tar_render_plot_sections(
                 regrade_metric_plot_count += 1
 
         if regrade_cohort_specs:
-            _tar_emit_progress(progress_cb, f"Rendering regrade-pass curve pages ({len(regrade_cohort_specs)} planned)")
+            _tar_emit_progress(progress_cb, f"Rendering final exact-condition curve pages ({len(regrade_cohort_specs)} planned)")
         for index, cohort_spec in enumerate(regrade_cohort_specs, start=1):
             suppression_value = str(cohort_spec.get("suppression_voltage_label") or "").strip()
             valve_value = str(cohort_spec.get("valve_voltage_label") or "").strip()
             _tar_emit_progress(
                 progress_cb,
-                f"Regrade curve page {index}/{len(regrade_cohort_specs)}: {cohort_spec.get('param')} | "
+                f"Final exact-condition curve page {index}/{len(regrade_cohort_specs)}: {cohort_spec.get('param')} | "
                 f"Supp {suppression_value or 'n/a'} | Valve {valve_value or 'n/a'}",
             )
             plot_spec = _tar_render_curve_cohort_page(
@@ -8884,7 +9751,7 @@ def _tar_render_plot_sections(
                 pdf,
                 cohort_spec=cohort_spec,
                 page_number=intro_pages + plot_page_count + 1,
-                section_title="Regrade Pass",
+                section_title="Final Exact-Condition Pass",
                 section_key="regrade_pass_curve_overlays",
                 subtitle=(
                     f"Run Condition: {str(cohort_spec.get('base_condition_label') or '').strip() or '(unknown)'} | "
@@ -8894,9 +9761,9 @@ def _tar_render_plot_sections(
                 ),
                 grade_map_by_pair_serial=(ctx.get("final_grade_map_by_pair_serial") or {}),
                 metric_prefix="final",
-                family_label="Regrade family median",
-                band_label="Regrade family +/-1 sigma",
-                equation_label="Regrade family equation",
+                family_label="Final exact-condition family mean",
+                band_label="Final exact-condition family +/-1 sigma",
+                equation_label="Final exact-condition family equation",
             )
             if plot_spec:
                 plot_specs.append(plot_spec)
@@ -9068,8 +9935,8 @@ def _tar_build_closing_story(ctx: Mapping[str, Any], *, counts: Mapping[str, int
                 f"Printed: {ctx['print_ctx'].printed_at}",
                 f"Run-condition metric pages: {int(counts.get('run_condition_metric_plot_count') or 0)}",
                 f"Run-condition curve pages: {int(counts.get('run_condition_curve_plot_count') or 0)}",
-                f"Regrade metric pages: {int(counts.get('regrade_metric_plot_count') or 0)}",
-                f"Regrade curve pages: {int(counts.get('regrade_curve_plot_count') or 0)}",
+                f"Final exact-condition metric pages: {int(counts.get('regrade_metric_plot_count') or 0)}",
+                f"Final exact-condition curve pages: {int(counts.get('regrade_curve_plot_count') or 0)}",
                 f"Performance equation pages: {int(counts.get('equation_page_count') or 0)}",
                 f"Performance plot pages: {int(counts.get('performance_plot_count') or 0)}",
                 f"Watch / Non-PASS curve pages: {int(counts.get('watch_plot_count') or 0)}",

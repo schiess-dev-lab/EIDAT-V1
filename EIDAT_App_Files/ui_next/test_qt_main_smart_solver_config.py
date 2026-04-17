@@ -1360,9 +1360,11 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
                         popup_program = cert_popup.findChild(QtWidgets.QComboBox, "auto_report_cert_popup_program")
                         popup_serials = cert_popup.findChild(QtWidgets.QListWidget, "auto_report_cert_popup_serials")
                         popup_runs = cert_popup.findChild(QtWidgets.QListWidget, "auto_report_cert_popup_runs")
+                        popup_params = cert_popup.findChild(QtWidgets.QListWidget, "auto_report_cert_popup_params")
                         self.assertIsNotNone(popup_program)
                         self.assertIsNotNone(popup_serials)
                         self.assertIsNotNone(popup_runs)
+                        self.assertIsNotNone(popup_params)
                         popup_program.setCurrentText("Program Alpha")
                         self._app.processEvents()
                         self.assertEqual(
@@ -1372,6 +1374,9 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
                         popup_serials.item(1).setSelected(True)
                         self._app.processEvents()
                         self.assertGreaterEqual(popup_runs.count(), 1)
+                        self.assertEqual(popup_params.count(), 2)
+                        for i in range(popup_params.count()):
+                            popup_params.item(i).setCheckState(QtCore.Qt.CheckState.Checked)
                         apply_btn = next(
                             btn for btn in cert_popup.findChildren(QtWidgets.QPushButton) if btn.text() == "Apply"
                         )
@@ -1389,38 +1394,32 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
                     report_name = dialog.findChild(QtWidgets.QLineEdit, "auto_report_report_name")
                     output_dir = dialog.findChild(QtWidgets.QLineEdit, "auto_report_output_dir")
                     grade_summary = dialog.findChild(QtWidgets.QLabel, "auto_report_grade_scoring_summary")
-                    params_title = dialog.findChild(QtWidgets.QLabel, "auto_report_certification_params_title")
-                    params_list = dialog.findChild(QtWidgets.QListWidget, "auto_report_certification_params")
+                    params_summary = dialog.findChild(
+                        QtWidgets.QLabel, "auto_report_certification_params_summary"
+                    )
                     self.assertIsNotNone(cert_button)
                     self.assertIsNotNone(report_name)
                     self.assertIsNotNone(output_dir)
                     self.assertIsNotNone(grade_summary)
-                    self.assertIsNotNone(params_title)
-                    self.assertIsNotNone(params_list)
+                    self.assertIsNotNone(params_summary)
                     self.assertIn("Family Serials...", [btn.text() for btn in dialog.findChildren(QtWidgets.QPushButton)])
                     self.assertIn("Certification Specifics...", [btn.text() for btn in dialog.findChildren(QtWidgets.QPushButton)])
-                    self.assertEqual(params_title.text(), "Certification Parameter Selection (required)")
-                    self.assertEqual(params_list.count(), 2)
-                    self.assertTrue(
-                        all(
-                            params_list.item(i).checkState() == QtCore.Qt.CheckState.Unchecked
-                            for i in range(params_list.count())
-                        )
-                    )
-                    for i in range(params_list.count()):
-                        params_list.item(i).setCheckState(QtCore.Qt.CheckState.Checked)
+                    self.assertNotIn("Select Certification Parameters...", [btn.text() for btn in dialog.findChildren(QtWidgets.QPushButton)])
+                    self.assertNotIn("Select Metrics Pages...", [btn.text() for btn in dialog.findChildren(QtWidgets.QPushButton)])
+                    self.assertIn("Certification Parameters:", params_summary.text())
                     self.assertIn("z =", grade_summary.text())
                     self.assertIn("PASS if |z| <= 1.5", grade_summary.text())
                     self.assertIn("WATCH if |z| <= 2.5", grade_summary.text())
                     cert_button.click()
                     self._app.processEvents()
-                    self.assertIn("Program Alpha", report_name.text())
                     self.assertIn("SN-002", report_name.text())
+                    self.assertTrue(str(report_name.text()).endswith("_Test Data Report.pdf"))
                     self.assertTrue(
                         output_dir.text().endswith(
                             str(Path("EDIN Program Folders") / "Program Alpha" / "EDAT reports")
                         )
                     )
+                    self.assertIn("2 / 2", params_summary.text())
                     gen_btn = next(btn for btn in dialog.findChildren(QtWidgets.QPushButton) if btn.text() == "Generate Report")
                     gen_btn.click()
                     return int(QtWidgets.QDialog.DialogCode.Accepted)
