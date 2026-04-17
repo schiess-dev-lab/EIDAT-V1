@@ -391,11 +391,15 @@ def default_trend_auto_report_config() -> dict:
             "prepass": {
                 "enabled": True,
                 "scope": "base_condition_plot",
-                "comparator": "percent_delta_to_certifying_program",
-                "percent_delta_max": 5.0,
+                "comparator": "noise_normalized_rms_to_certifying_program",
+                "noise_score_max": 1.25,
+                "noise_floor_pct": 1.5,
+                "percent_delta_guard_max": 8.0,
+                "sparse_min_serials_per_program": 2,
+                "sparse_percent_delta_max": 4.0,
                 "voltage_rule": "mean_only",
                 "initial_role": "gate_and_grade",
-                "final_pass_policy": "always_exact_condition",
+                "final_pass_policy": "sync_on_initial_nonpass_or_skip",
                 "family_weighting": "equal_program_weight",
             },
         },
@@ -1479,6 +1483,199 @@ def _tar_program_score_stats(
     return mean_score, std_score
 
 
+def _tar_percent_delta_between_scalars(left: object, right: object) -> float | None:
+    left_value = _safe_float(left)
+    right_value = _safe_float(right)
+    if left_value is None or right_value is None:
+        return None
+    denom = max(abs(float(left_value)), abs(float(right_value)), 1e-12)
+    return (100.0 * abs(float(left_value) - float(right_value))) / denom
+
+
+def _tar_trace_rms_delta(left: Iterable[object] | None, right: Iterable[object] | None) -> float | None:
+    residuals: list[float] = []
+    for left_value, right_value in zip(left or [], right or []):
+        lv = _safe_float(left_value)
+        rv = _safe_float(right_value)
+        if lv is None or rv is None:
+            continue
+        residuals.append((float(lv) - float(rv)) ** 2)
+    if not residuals:
+        return None
+    return math.sqrt(sum(residuals) / max(1, len(residuals)))
+
+
+def _tar_program_serial_trace_members(
+    traces_by_serial: Mapping[str, list[float]] | None,
+    *,
+    program_by_serial: Mapping[str, str] | None,
+) -> dict[str, list[tuple[str, list[float]]]]:
+    by_program: dict[str, list[tuple[str, list[float]]]] = {}
+    for raw_serial, trace in (traces_by_serial or {}).items():
+        serial = str(raw_serial or "").strip()
+        if not serial or not isinstance(trace, list):
+            continue
+        program = _tar_program_label(program_by_serial, serial)
+        if not program:
+            continue
+        by_program.setdefault(program, []).append((serial, list(trace)))
+    return by_program
+
+
+def _tar_program_trace_noise_stats(
+    traces_by_serial: Mapping[str, list[float]] | None,
+    *,
+    program_by_serial: Mapping[str, str] | None,
+) -> tuple[dict[str, list[float]], dict[str, float], dict[str, int]]:
+    members_by_program = _tar_program_serial_trace_members(
+        traces_by_serial,
+        program_by_serial=program_by_serial,
+    )
+    centers_by_program: dict[str, list[float]] = {}
+    noise_by_program: dict[str, float] = {}
+    serial_count_by_program: dict[str, int] = {}
+    for program, members in members_by_program.items():
+        traces = [list(trace) for _serial, trace in members if isinstance(trace, list)]
+        if not traces:
+            continue
+        center_trace = _tar_mean_trace(traces)
+        centers_by_program[program] = list(center_trace)
+        serial_count_by_program[program] = len(traces)
+        residual_rms_values = [
+            rms
+            for rms in (_tar_trace_rms_delta(trace, center_trace) for trace in traces)
+            if rms is not None and math.isfinite(float(rms))
+        ]
+        noise_by_program[program] = float(statistics.median(residual_rms_values)) if residual_rms_values else 0.0
+    return centers_by_program, noise_by_program, serial_count_by_program
+
+
+def _tar_prepass_gate_details_for_program_traces(
+    traces_by_serial: Mapping[str, list[float]] | None,
+    *,
+    program_by_serial: Mapping[str, str] | None,
+    reference_program: str,
+    comparator: str,
+    noise_score_max: float,
+    noise_floor_pct: float,
+    percent_delta_guard_max: float,
+    sparse_min_serials_per_program: int,
+    sparse_percent_delta_max: float,
+) -> tuple[list[str], list[str], list[dict[str, Any]], str]:
+    centers_by_program, noise_by_program, serial_count_by_program = _tar_program_trace_noise_stats(
+        traces_by_serial,
+        program_by_serial=program_by_serial,
+    )
+    program_means = _tar_program_trace_scalar_mean_map(centers_by_program)
+    reference = _td_display_program_title(reference_program)
+    program_order = _tar_unique_text_values(list(centers_by_program.keys()) or list(program_means.keys()))
+    details: list[dict[str, Any]] = []
+    if not reference:
+        return [], program_order, details, "missing_reference_program"
+    reference_trace = centers_by_program.get(reference)
+    if not isinstance(reference_trace, list):
+        for program in program_order:
+            details.append(
+                {
+                    "program": program,
+                    "serial_count": int(serial_count_by_program.get(program, 0)),
+                    "between_rms": None,
+                    "program_noise": _safe_float(noise_by_program.get(program)),
+                    "pooled_noise": None,
+                    "noise_score": None,
+                    "mean_delta_pct": _tar_percent_delta_between_scalars(program_means.get(program), program_means.get(reference)),
+                    "admitted": False,
+                    "gate_mode": "missing_reference_program",
+                }
+            )
+        return [], program_order, details, "missing_reference_program"
+    reference_noise = float(noise_by_program.get(reference, 0.0) or 0.0)
+    reference_count = int(serial_count_by_program.get(reference, 0) or 0)
+    baseline_scale = max(
+        (
+            abs(float(value))
+            for value in reference_trace
+            if isinstance(value, (int, float)) and math.isfinite(float(value))
+        ),
+        default=0.0,
+    )
+    noise_floor_abs = max(0.0, float(baseline_scale) * max(0.0, float(noise_floor_pct)) / 100.0)
+    included: list[str] = []
+    excluded: list[str] = []
+    overall_mode = comparator
+    for program in program_order:
+        serial_count = int(serial_count_by_program.get(program, 0) or 0)
+        program_noise = _safe_float(noise_by_program.get(program))
+        mean_delta_pct = _tar_percent_delta_between_scalars(program_means.get(program), program_means.get(reference))
+        between_rms: float | None = None
+        pooled_noise: float | None = None
+        noise_score: float | None = None
+        admitted = False
+        gate_mode = comparator
+        if program == reference:
+            admitted = True
+            between_rms = 0.0
+            pooled_noise = float(reference_noise)
+            noise_score = 0.0
+            gate_mode = "reference_program"
+        elif comparator == "percent_delta_to_certifying_program":
+            admitted = mean_delta_pct is not None and mean_delta_pct <= float(sparse_percent_delta_max)
+            gate_mode = "percent_delta_fallback"
+        else:
+            candidate_trace = centers_by_program.get(program)
+            between_rms = _tar_trace_rms_delta(reference_trace, candidate_trace)
+            if reference_count < int(sparse_min_serials_per_program) or serial_count < int(sparse_min_serials_per_program):
+                admitted = mean_delta_pct is not None and mean_delta_pct <= float(sparse_percent_delta_max)
+                gate_mode = "sparse_percent_fallback"
+                overall_mode = "sparse_percent_fallback"
+            else:
+                candidate_noise = float(program_noise or 0.0)
+                pooled_noise = math.sqrt(((reference_noise ** 2) + (candidate_noise ** 2)) / 2.0)
+                effective_noise = max(float(pooled_noise), float(noise_floor_abs))
+                if between_rms is not None:
+                    if effective_noise > 0.0:
+                        noise_score = float(between_rms) / float(effective_noise)
+                    else:
+                        noise_score = 0.0 if float(between_rms) <= 0.0 else float("inf")
+                admitted = (
+                    between_rms is not None
+                    and noise_score is not None
+                    and math.isfinite(float(noise_score))
+                    and float(noise_score) <= float(noise_score_max)
+                    and mean_delta_pct is not None
+                    and float(mean_delta_pct) <= float(percent_delta_guard_max)
+                )
+                gate_mode = "noise_normalized_rms"
+        if admitted:
+            included.append(program)
+        else:
+            excluded.append(program)
+        details.append(
+            {
+                "program": program,
+                "serial_count": serial_count,
+                "between_rms": _safe_float(between_rms),
+                "program_noise": program_noise,
+                "pooled_noise": _safe_float(pooled_noise),
+                "noise_score": _safe_float(noise_score),
+                "mean_delta_pct": _safe_float(mean_delta_pct),
+                "admitted": bool(admitted),
+                "gate_mode": gate_mode,
+            }
+        )
+    if reference not in included:
+        included.insert(0, reference)
+        excluded = [program for program in excluded if program != reference]
+        details = [
+            {
+                **detail,
+                "admitted": True if str(detail.get("program") or "") == reference else bool(detail.get("admitted")),
+            }
+            for detail in details
+        ]
+    return _tar_unique_text_values(included), _tar_unique_text_values(excluded), details, overall_mode
+
+
 def _tar_programs_within_percent_delta(
     program_means: Mapping[str, float] | None,
     *,
@@ -1496,8 +1693,7 @@ def _tar_programs_within_percent_delta(
         if value is None or not math.isfinite(value):
             excluded.append(program)
             continue
-        denom = max(abs(float(value)), abs(float(ref_value)), 1e-12)
-        pct_delta = (100.0 * abs(float(value) - float(ref_value))) / denom
+        pct_delta = _tar_percent_delta_between_scalars(value, ref_value)
         if program == reference or pct_delta <= float(percent_delta_max):
             included.append(program)
         else:
@@ -2723,7 +2919,7 @@ def _render_portrait_story_pdf(
 
 
 _TAR_COMPARISON_FONT_CHOICES = (9, 8)
-_TAR_COMPARISON_METRIC_ROWS = ("Family Mean", "Serial Mean", "Z-Score", "Grade")
+_TAR_COMPARISON_METRIC_ROWS = ("Initial Status", "Graded Mean", "Certified Serial Mean", "Z-Score", "Official Grade", "Grade Basis")
 _TAR_COMPARISON_PAGE_WIDTH = 17.0 * 72.0
 _TAR_COMPARISON_PAGE_HEIGHT = 11.0 * 72.0
 _TAR_COMPARISON_LEFT_MARGIN = 24.0
@@ -2832,6 +3028,71 @@ def _tar_group_comparison_rows_by_serial(
     return out
 
 
+def _tar_skip_reason_label(reason: object) -> str:
+    token = str(reason or "").strip().lower()
+    if token == "missing_reference_program":
+        return "missing reference program"
+    if token == "no_compatible_programs":
+        return "no compatible programs"
+    if token == "insufficient_program_data":
+        return "insufficient program data"
+    if token == "no_initial_data":
+        return "no initial data"
+    return token.replace("_", " ").strip()
+
+
+def _tar_prepass_gate_mode_label(mode: object) -> str:
+    token = str(mode or "").strip().lower()
+    if token in {"noise_normalized_rms_to_certifying_program", "noise_normalized_rms"}:
+        return "Noise-aware RMS gate"
+    if token == "sparse_percent_fallback":
+        return "Sparse-data percent fallback"
+    if token == "percent_delta_fallback":
+        return "Legacy percent delta gate"
+    if token == "disabled_include_all":
+        return "All in-scope programs"
+    if token == "reference_program":
+        return "Reference program"
+    return str(mode or "").strip()
+
+
+def _tar_initial_status_display(row: Mapping[str, object] | None) -> str:
+    if not isinstance(row, Mapping):
+        return ""
+    status = str(row.get("initial_status") or "").strip().upper()
+    if not status:
+        status = "SKIPPED" if bool(row.get("initial_skipped")) else (str(row.get("initial_grade") or "NO_DATA").strip().upper() or "NO_DATA")
+    if status == "SKIPPED":
+        reason_text = _tar_skip_reason_label(row.get("initial_skip_reason"))
+        return f"SKIPPED ({reason_text})" if reason_text else "SKIPPED"
+    return status or "NO_DATA"
+
+
+def _tar_grade_basis_text(row: Mapping[str, object] | None) -> str:
+    if not isinstance(row, Mapping):
+        return ""
+    pass_type = str(row.get("official_pass_type") or "").strip().lower()
+    if pass_type == "final_exact_condition":
+        suppression = str(row.get("official_suppression_voltage_label") or row.get("final_suppression_voltage_label") or "All").strip() or "All"
+        valve = str(row.get("official_valve_voltage_label") or row.get("final_valve_voltage_label") or "All").strip() or "All"
+        return f"Program-synced exact-condition final\nSupp: {suppression} | Valve: {valve}"
+    return "Initial admitted-program cohort"
+
+
+def _tar_prepass_cohort_note(row: Mapping[str, object] | None) -> str:
+    if not isinstance(row, Mapping):
+        return ""
+    parts: list[str] = []
+    gate_label = _tar_prepass_gate_mode_label(row.get("prepass_gate_mode"))
+    if gate_label:
+        parts.append(gate_label)
+    included = _tar_join_limited(row.get("prepass_included_programs") or [], max_items=6, empty="(none)")
+    excluded = _tar_join_limited(row.get("prepass_excluded_programs") or [], max_items=6, empty="None")
+    parts.append(f"Admitted: {included}")
+    parts.append(f"Excluded: {excluded}")
+    return "\n".join(parts)
+
+
 def _tar_comparison_page_metric_value(row: Mapping[str, object] | None, metric_label: str) -> str:
     if not isinstance(row, Mapping):
         return ""
@@ -2843,30 +3104,18 @@ def _tar_comparison_page_metric_value(row: Mapping[str, object] | None, metric_l
                 return value
         return None
 
-    regrade_applied = bool(row.get("regrade_applied")) or bool(row.get("final_pass_applied")) or bool(row.get("initial_skipped"))
-    if metric_label == "Family Mean":
-        return _tar_comparison_metric_text(
-            _pick("initial_family_mean", "initial_atp_mean"),
-            _pick("final_family_mean", "final_atp_mean"),
-            regrade_applied=regrade_applied,
-            sig=5,
-        )
-    if metric_label == "Serial Mean":
-        return _tar_comparison_metric_text(
-            _pick("initial_serial_mean", "initial_actual_mean"),
-            _pick("final_serial_mean", "final_actual_mean"),
-            regrade_applied=regrade_applied,
-            sig=5,
-        )
+    if metric_label == "Initial Status":
+        return _tar_initial_status_display(row)
+    if metric_label == "Graded Mean":
+        return _fmt_num(_pick("official_baseline_mean", "final_family_mean", "final_atp_mean", "initial_family_mean", "initial_atp_mean"), sig=5)
+    if metric_label == "Certified Serial Mean":
+        return _fmt_num(_pick("official_serial_mean", "final_serial_mean", "final_actual_mean", "initial_serial_mean", "initial_actual_mean"), sig=5)
     if metric_label == "Z-Score":
-        return _tar_comparison_metric_text(
-            _pick("initial_zscore", "initial_delta"),
-            _pick("final_zscore", "final_delta"),
-            regrade_applied=regrade_applied,
-            sig=4,
-        )
-    if metric_label == "Grade":
-        return _tar_comparison_grade_text(row.get("initial_grade"), row.get("final_grade"), regrade_applied=regrade_applied)
+        return _fmt_num(_pick("official_zscore", "final_zscore", "final_delta", "initial_zscore", "initial_delta"), sig=4)
+    if metric_label == "Official Grade":
+        return str(_pick("official_grade", "final_grade", "grade", "initial_grade") or "NO_DATA").strip().upper() or "NO_DATA"
+    if metric_label == "Grade Basis":
+        return str(row.get("grade_basis_text") or _tar_grade_basis_text(row)).strip()
     return ""
 
 
@@ -4250,7 +4499,7 @@ def generate_test_data_auto_report(
                         finite_vals = [float(v) for v in yv if isinstance(v, (int, float)) and not math.isnan(float(v))]
                         if finite_vals:
                             fam_med = float(statistics.median(finite_vals))
-                            ax.axhline(fam_med, color="#0f172a", linestyle="--", linewidth=1.1, alpha=0.6, label="family mean")
+                            ax.axhline(fam_med, color="#0f172a", linestyle="--", linewidth=1.1, alpha=0.6, label="admitted-program mean")
                     except Exception:
                         pass
 
@@ -4377,7 +4626,7 @@ def generate_test_data_auto_report(
                         finite_vals = [float(v) for v in yv if isinstance(v, (int, float)) and not math.isnan(float(v))]
                         if finite_vals:
                             fam_med = float(statistics.median(finite_vals))
-                            ax.axhline(fam_med, color="#0f172a", linestyle="--", linewidth=1.1, alpha=0.6, label="family mean")
+                            ax.axhline(fam_med, color="#0f172a", linestyle="--", linewidth=1.1, alpha=0.6, label="admitted-program mean")
                     except Exception:
                         pass
 
@@ -5623,6 +5872,30 @@ def _tar_build_quick_summary(ctx: Mapping[str, Any]) -> dict[str, object]:
     )
     if not comparison_programs:
         comparison_programs = list(certifying_programs)
+    comparison_rows = [dict(row) for row in (ctx.get("comparison_rows") or []) if isinstance(row, Mapping)]
+    prepass_gate_modes = _tar_unique_text_values(
+        [
+            _tar_prepass_gate_mode_label(row.get("prepass_gate_mode"))
+            for row in comparison_rows
+            if _tar_prepass_gate_mode_label(row.get("prepass_gate_mode"))
+        ]
+    )
+    admitted_programs = _tar_unique_text_values(
+        [
+            str(program).strip()
+            for row in comparison_rows
+            for program in (row.get("prepass_included_programs") or [])
+            if str(program).strip()
+        ]
+    )
+    excluded_programs = _tar_unique_text_values(
+        [
+            str(program).strip()
+            for row in comparison_rows
+            for program in (row.get("prepass_excluded_programs") or [])
+            if str(program).strip()
+        ]
+    )
 
     initial_suppression = _tar_filter_state_label(ctx.get("filter_state"), "suppression_voltages", all_text="All", none_text="None")
     initial_valve = _tar_filter_state_label(ctx.get("filter_state"), "valve_voltages", all_text="All", none_text="None")
@@ -5657,6 +5930,9 @@ def _tar_build_quick_summary(ctx: Mapping[str, Any]) -> dict[str, object]:
         "selected_run_conditions": list(selected_run_conditions),
         "watch_parameters": list(watch_parameters),
         "comparison_programs": list(comparison_programs),
+        "prepass_gate_modes": list(prepass_gate_modes),
+        "prepass_admitted_programs": list(admitted_programs),
+        "prepass_excluded_programs": list(excluded_programs),
         "initial_suppression_voltage": initial_suppression,
         "final_suppression_voltage": final_suppression,
         "p8_suppression_voltage": final_suppression,
@@ -5670,6 +5946,8 @@ def _tar_build_quick_summary(ctx: Mapping[str, Any]) -> dict[str, object]:
         f"Selected Run Condition(s): {_tar_join_limited(summary['selected_run_conditions'], max_items=6, empty='(none)')}",
         f"Watch Parameter(s): {_tar_join_limited(summary['watch_parameters'], max_items=6, empty='None')}",
         f"Programs Compared: {_tar_join_limited(summary['comparison_programs'], max_items=6, empty='(unknown)')}",
+        f"Pre-pass Gate: {_tar_join_limited(summary['prepass_gate_modes'], max_items=4, empty='(not available)')}",
+        f"Pre-pass Cohort: Admitted {_tar_join_limited(summary['prepass_admitted_programs'], max_items=6, empty='(none)')} | Excluded {_tar_join_limited(summary['prepass_excluded_programs'], max_items=6, empty='None')}",
         f"Suppression Voltage: {summary['p8_suppression_voltage']}",
         f"Valve Voltage: {summary['p8_valve_voltage']}",
     ]
@@ -5762,10 +6040,16 @@ def _tar_build_per_serial_comparison_rows(
             initial_skipped = bool(finding_row.get("initial_skipped"))
             initial_skip_reason = str(finding_row.get("initial_skip_reason") or "").strip()
             regrade_applied = bool(finding_row.get("regrade_applied"))
+            final_pass_requested = bool(finding_row.get("final_pass_requested")) or bool(finding_row.get("block_final_required"))
+            final_pass_available = bool(finding_row.get("final_pass_available")) or bool(finding_row.get("block_final_available"))
             final_pass_applied = bool(finding_row.get("final_pass_applied")) or regrade_applied
             regrade_suppression = str(finding_row.get("regrade_suppression_voltage_label") or "").strip()
             regrade_valve = str(finding_row.get("regrade_valve_voltage_label") or "").strip()
             regrade_condition_key = str(finding_row.get("regrade_condition_key") or "").strip()
+            official_pass_type = str(finding_row.get("official_pass_type") or ("final_exact_condition" if final_pass_applied else "initial_prepass")).strip().lower()
+            initial_status = str(finding_row.get("initial_status") or "").strip().upper()
+            if not initial_status:
+                initial_status = "SKIPPED" if initial_skipped else ""
             final_payload = (
                 (regrade_payloads.get(regrade_condition_key) if regrade_condition_key else None)
                 if isinstance(regrade_payloads, Mapping)
@@ -5845,53 +6129,77 @@ def _tar_build_per_serial_comparison_rows(
             ) or initial_grade
             row_final_suppression = regrade_suppression or final_suppression
             row_final_valve = regrade_valve or final_valve
-
-            comparison_rows.append(
-                {
-                    "pair_id": pair_id,
-                    "selection_id": str(spec.get("selection_id") or "").strip(),
-                    "run": run_name,
-                    "run_title": str(spec.get("run_title") or run_name).strip() or run_name,
-                    "run_condition": run_condition,
-                    "sequence_text": sequence_text,
-                    "serial": serial,
-                    "parameter": param_name,
-                    "units": units,
-                    "initial_family_mean": initial_family_mean,
-                    "final_family_mean": final_family_mean,
-                    "initial_serial_mean": initial_serial_mean,
-                    "final_serial_mean": final_serial_mean,
-                    "initial_zscore": initial_zscore,
-                    "final_zscore": final_zscore,
-                    # Legacy aliases retained for older summary-json consumers.
-                    "initial_atp_mean": initial_family_mean,
-                    "final_atp_mean": final_family_mean,
-                    "initial_actual_mean": initial_serial_mean,
-                    "final_actual_mean": final_serial_mean,
-                    "initial_delta": initial_zscore,
-                    "final_delta": final_zscore,
-                    "initial_grade": initial_grade,
-                    "final_grade": final_grade,
-                    "grade": final_grade,
-                    "grade_text": _tar_comparison_grade_text(initial_grade, final_grade, regrade_applied=(regrade_applied or final_pass_applied or initial_skipped)),
-                    "selection_mode": selection_fields.get("mode") or "sequence",
-                    "base_condition_label": str(spec.get("base_condition_label") or "").strip(),
-                    "initial_suppression_voltage_label": initial_suppression,
-                    "final_suppression_voltage_label": row_final_suppression,
-                    "initial_valve_voltage_label": initial_valve,
-                    "final_valve_voltage_label": row_final_valve,
-                    "initial_skipped": initial_skipped,
-                    "initial_skip_reason": initial_skip_reason,
-                    "final_pass_applied": final_pass_applied,
-                    "prepass_reference_program": str(finding_row.get("prepass_reference_program") or spec.get("prepass_reference_program") or ""),
-                    "prepass_included_programs": list(finding_row.get("prepass_included_programs") or spec.get("prepass_included_programs") or []),
-                    "prepass_excluded_programs": list(finding_row.get("prepass_excluded_programs") or spec.get("prepass_excluded_programs") or []),
-                    "regrade_applied": regrade_applied,
-                    "regrade_cohort_id": str(finding_row.get("regrade_cohort_id") or "").strip(),
-                    "regrade_suppression_voltage_label": regrade_suppression,
-                    "regrade_valve_voltage_label": regrade_valve,
-                }
-            )
+            official_baseline_mean = final_family_mean if official_pass_type == "final_exact_condition" and final_pass_applied else initial_family_mean
+            official_serial_mean = final_serial_mean if official_pass_type == "final_exact_condition" and final_pass_applied else initial_serial_mean
+            official_zscore = final_zscore if official_pass_type == "final_exact_condition" and final_pass_applied else initial_zscore
+            official_suppression = row_final_suppression if official_pass_type == "final_exact_condition" and final_pass_applied else initial_suppression
+            official_valve = row_final_valve if official_pass_type == "final_exact_condition" and final_pass_applied else initial_valve
+            row_data = {
+                "pair_id": pair_id,
+                "selection_id": str(spec.get("selection_id") or "").strip(),
+                "run": run_name,
+                "run_title": str(spec.get("run_title") or run_name).strip() or run_name,
+                "run_condition": run_condition,
+                "sequence_text": sequence_text,
+                "serial": serial,
+                "parameter": param_name,
+                "units": units,
+                "initial_family_mean": initial_family_mean,
+                "final_family_mean": final_family_mean,
+                "initial_serial_mean": initial_serial_mean,
+                "final_serial_mean": final_serial_mean,
+                "initial_zscore": initial_zscore,
+                "final_zscore": final_zscore,
+                # Legacy aliases retained for older summary-json consumers.
+                "initial_atp_mean": initial_family_mean,
+                "final_atp_mean": final_family_mean,
+                "initial_actual_mean": initial_serial_mean,
+                "final_actual_mean": final_serial_mean,
+                "initial_delta": initial_zscore,
+                "final_delta": final_zscore,
+                "initial_grade": initial_grade,
+                "final_grade": final_grade,
+                "grade": final_grade,
+                "grade_text": _tar_comparison_grade_text(initial_grade, final_grade, regrade_applied=(regrade_applied or final_pass_applied or initial_skipped)),
+                "selection_mode": selection_fields.get("mode") or "sequence",
+                "base_condition_label": str(spec.get("base_condition_label") or "").strip(),
+                "initial_suppression_voltage_label": initial_suppression,
+                "final_suppression_voltage_label": row_final_suppression,
+                "initial_valve_voltage_label": initial_valve,
+                "final_valve_voltage_label": row_final_valve,
+                "initial_skipped": initial_skipped,
+                "initial_skip_reason": initial_skip_reason,
+                "initial_status": initial_status or ("SKIPPED" if initial_skipped else initial_grade),
+                "final_pass_requested": final_pass_requested,
+                "final_pass_available": final_pass_available,
+                "final_pass_applied": final_pass_applied,
+                "prepass_reference_program": str(finding_row.get("prepass_reference_program") or spec.get("prepass_reference_program") or ""),
+                "prepass_included_programs": list(finding_row.get("prepass_included_programs") or spec.get("prepass_included_programs") or []),
+                "prepass_excluded_programs": list(finding_row.get("prepass_excluded_programs") or spec.get("prepass_excluded_programs") or []),
+                "prepass_gate_mode": str(finding_row.get("prepass_gate_mode") or spec.get("prepass_gate_mode") or ""),
+                "prepass_gate_details": [dict(item) for item in (finding_row.get("prepass_gate_details") or spec.get("prepass_gate_details") or []) if isinstance(item, Mapping)],
+                "regrade_applied": regrade_applied,
+                "regrade_cohort_id": str(finding_row.get("regrade_cohort_id") or "").strip(),
+                "regrade_suppression_voltage_label": regrade_suppression,
+                "regrade_valve_voltage_label": regrade_valve,
+                "sync_block_id": str(finding_row.get("sync_block_id") or pair_id),
+                "sync_trigger_serials": list(finding_row.get("sync_trigger_serials") or []),
+                "shared_final_condition_key": str(finding_row.get("shared_final_condition_key") or ""),
+                "program_sync_applied": bool(finding_row.get("program_sync_applied")),
+                "block_final_required": bool(finding_row.get("block_final_required")),
+                "block_final_available": bool(finding_row.get("block_final_available")),
+                "final_unavailable_reason": str(finding_row.get("final_unavailable_reason") or ""),
+                "official_pass_type": official_pass_type,
+                "official_baseline_mean": official_baseline_mean,
+                "official_serial_mean": official_serial_mean,
+                "official_zscore": official_zscore,
+                "official_grade": str(finding_row.get("official_grade") or final_grade or initial_grade).strip().upper() or "NO_DATA",
+                "official_suppression_voltage_label": str(finding_row.get("official_suppression_voltage_label") or official_suppression or "").strip(),
+                "official_valve_voltage_label": str(finding_row.get("official_valve_voltage_label") or official_valve or "").strip(),
+            }
+            row_data["grade_basis_text"] = _tar_grade_basis_text(row_data)
+            row_data["prepass_cohort_note"] = _tar_prepass_cohort_note(row_data)
+            comparison_rows.append(row_data)
     return comparison_rows
 
 
@@ -7386,6 +7694,8 @@ def _tar_initial_skip_row(
     included_programs: list[str],
     excluded_programs: list[str],
     reason: str,
+    gate_mode: str = "",
+    gate_details: list[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     return {
         "pair_id": str(spec.get("pair_id") or ""),
@@ -7412,6 +7722,8 @@ def _tar_initial_skip_row(
         "prepass_reference_program": str(reference_program or "").strip(),
         "prepass_included_programs": list(included_programs or []),
         "prepass_excluded_programs": list(excluded_programs or []),
+        "prepass_gate_mode": str(gate_mode or "").strip(),
+        "prepass_gate_details": [dict(item) for item in (gate_details or []) if isinstance(item, Mapping)],
     }
 
 
@@ -7444,9 +7756,24 @@ def _tar_analyze_curve_groups(
         reference_program = _td_display_program_title((program_by_serial or {}).get(next(iter(hi_set), "")))
     prepass_options = dict(prepass_cfg or {})
     prepass_enabled = bool(prepass_options.get("enabled", True))
-    percent_delta_max = _safe_float(prepass_options.get("percent_delta_max"))
-    if percent_delta_max is None:
-        percent_delta_max = 5.0
+    comparator = str(prepass_options.get("comparator") or "noise_normalized_rms_to_certifying_program").strip().lower()
+    legacy_percent_delta_max = _safe_float(prepass_options.get("percent_delta_max"))
+    noise_score_max = _safe_float(prepass_options.get("noise_score_max"))
+    if noise_score_max is None:
+        noise_score_max = 1.25
+    noise_floor_pct = _safe_float(prepass_options.get("noise_floor_pct"))
+    if noise_floor_pct is None:
+        noise_floor_pct = 1.5
+    percent_delta_guard_max = _safe_float(prepass_options.get("percent_delta_guard_max"))
+    if percent_delta_guard_max is None:
+        percent_delta_guard_max = 8.0
+    try:
+        sparse_min_serials_per_program = max(1, int(prepass_options.get("sparse_min_serials_per_program") or 2))
+    except Exception:
+        sparse_min_serials_per_program = 2
+    sparse_percent_delta_max = _safe_float(prepass_options.get("sparse_percent_delta_max"))
+    if sparse_percent_delta_max is None:
+        sparse_percent_delta_max = legacy_percent_delta_max if legacy_percent_delta_max is not None else 4.0
     initial_rows: dict[tuple[str, str], dict] = {}
     final_candidates: dict[tuple[str, str], list[dict]] = {}
     initial_watch_items: list[dict] = []
@@ -7494,19 +7821,42 @@ def _tar_analyze_curve_groups(
             program_by_serial=program_by_serial,
         )
         full_program_means = _tar_program_trace_scalar_mean_map(full_program_traces)
+        prepass_gate_mode = comparator
+        prepass_gate_details: list[dict[str, Any]] = []
         if prepass_enabled:
-            included_programs, excluded_programs = _tar_programs_within_percent_delta(
-                full_program_means,
+            included_programs, excluded_programs, prepass_gate_details, prepass_gate_mode = _tar_prepass_gate_details_for_program_traces(
+                full_trace_map_all,
+                program_by_serial=program_by_serial,
                 reference_program=reference_program,
-                percent_delta_max=float(percent_delta_max),
+                comparator=comparator,
+                noise_score_max=float(noise_score_max),
+                noise_floor_pct=float(noise_floor_pct),
+                percent_delta_guard_max=float(percent_delta_guard_max),
+                sparse_min_serials_per_program=int(sparse_min_serials_per_program),
+                sparse_percent_delta_max=float(sparse_percent_delta_max),
             )
         else:
             included_programs = _tar_unique_text_values(list(full_program_means.keys()))
             excluded_programs = []
             if reference_program and reference_program not in included_programs:
                 included_programs.insert(0, reference_program)
+            prepass_gate_mode = "disabled_include_all"
+            prepass_gate_details = [
+                {
+                    "program": program,
+                    "serial_count": 0,
+                    "between_rms": 0.0 if program == reference_program else None,
+                    "program_noise": None,
+                    "pooled_noise": None,
+                    "noise_score": None,
+                    "mean_delta_pct": _tar_percent_delta_between_scalars(full_program_means.get(program), full_program_means.get(reference_program)),
+                    "admitted": True,
+                    "gate_mode": "disabled_include_all",
+                }
+                for program in included_programs
+            ]
         initial_skip_reason = ""
-        if reference_program and reference_program not in full_program_means:
+        if reference_program and reference_program not in full_program_traces:
             initial_skip_reason = "missing_reference_program"
         elif len(included_programs) <= 1:
             initial_skip_reason = "no_compatible_programs"
@@ -7541,6 +7891,8 @@ def _tar_analyze_curve_groups(
             spec["prepass_reference_program"] = reference_program
             spec["prepass_included_programs"] = list(included_programs)
             spec["prepass_excluded_programs"] = list(excluded_programs)
+            spec["prepass_gate_mode"] = prepass_gate_mode
+            spec["prepass_gate_details"] = [dict(item) for item in prepass_gate_details]
 
         if initial_skip_reason:
             for spec in members:
@@ -7561,6 +7913,8 @@ def _tar_analyze_curve_groups(
                     "prepass_reference_program": reference_program,
                     "prepass_included_programs": list(included_programs),
                     "prepass_excluded_programs": list(excluded_programs),
+                    "prepass_gate_mode": prepass_gate_mode,
+                    "prepass_gate_details": [dict(item) for item in prepass_gate_details],
                 }
                 hi_serials = {
                     str(curve.serial or "").strip()
@@ -7575,6 +7929,8 @@ def _tar_analyze_curve_groups(
                         included_programs=included_programs,
                         excluded_programs=excluded_programs,
                         reason=initial_skip_reason,
+                        gate_mode=prepass_gate_mode,
+                        gate_details=prepass_gate_details,
                     )
         else:
             assert isinstance(initial_model, dict)
@@ -7609,6 +7965,8 @@ def _tar_analyze_curve_groups(
                     "prepass_reference_program": reference_program,
                     "prepass_included_programs": list(included_programs),
                     "prepass_excluded_programs": list(excluded_programs),
+                    "prepass_gate_mode": prepass_gate_mode,
+                    "prepass_gate_details": [dict(item) for item in prepass_gate_details],
                 }
                 for serial, y_curve in admitted_trace_map.items():
                     trace_curves.append(
@@ -7656,6 +8014,8 @@ def _tar_analyze_curve_groups(
                     "prepass_reference_program": reference_program,
                     "prepass_included_programs": list(included_programs),
                     "prepass_excluded_programs": list(excluded_programs),
+                    "prepass_gate_mode": prepass_gate_mode,
+                    "prepass_gate_details": [dict(item) for item in prepass_gate_details],
                 }
                 initial_rows[(str(spec.get("pair_id") or ""), serial)] = row
                 watch = False
@@ -7694,6 +8054,8 @@ def _tar_analyze_curve_groups(
                     "prepass_reference_program": reference_program,
                     "prepass_included_programs": list(included_programs),
                     "prepass_excluded_programs": list(excluded_programs),
+                    "prepass_gate_mode": prepass_gate_mode,
+                    "prepass_gate_details": [dict(item) for item in prepass_gate_details],
                 }
             )
 
@@ -7910,27 +8272,99 @@ def _tar_analyze_curve_groups(
     initial_grade_map_by_pair_serial: dict[tuple[str, str], str] = {}
     final_grade_map_by_pair_serial: dict[tuple[str, str], str] = {}
     finding_by_pair_serial: dict[tuple[str, str], dict] = {}
-    pair_regrade_candidates: dict[str, list[dict]] = {}
+    pair_final_decisions: dict[str, dict[str, Any]] = {}
 
     for spec in specs:
         pair_id = str(spec.get("pair_id") or "")
-        pair_candidates = [
-            candidate
-            for (candidate_pair_id, _serial), rows in final_candidates.items()
-            if candidate_pair_id == pair_id
-            for candidate in rows
-        ]
-        if pair_candidates:
-            pair_regrade_candidates[pair_id] = list(pair_candidates)
+        if not pair_id:
+            continue
+        serial_context: dict[str, dict[str, Any]] = {}
+        for serial in hi:
+            serial_text = str(serial or "").strip()
+            if not serial_text:
+                continue
+            initial_row = dict(initial_rows.get((pair_id, serial_text)) or {})
+            candidates = [dict(row) for row in (final_candidates.get((pair_id, serial_text)) or []) if isinstance(row, Mapping)]
+            if initial_row or candidates:
+                if initial_row:
+                    initial_status = "SKIPPED" if bool(initial_row.get("initial_skipped")) else (
+                        str(initial_row.get("initial_grade") or "NO_DATA").strip().upper() or "NO_DATA"
+                    )
+                else:
+                    initial_status = "SKIPPED"
+                serial_context[serial_text] = {
+                    "initial_row": initial_row,
+                    "candidates": candidates,
+                    "initial_status": initial_status,
+                }
+        trigger_serials = sorted(
+            [
+                serial
+                for serial, ctx_row in serial_context.items()
+                if str(ctx_row.get("initial_status") or "").strip().upper() in {"WATCH", "FAIL", "SKIPPED"}
+            ]
+        )
+        block_final_required = bool(trigger_serials)
+        shared_final_condition_key = ""
+        selected_candidates: dict[str, dict[str, Any]] = {}
+        final_unavailable_reason = ""
+        if block_final_required and serial_context:
+            per_serial_candidate_map: dict[str, dict[str, dict[str, Any]]] = {}
+            shared_keys: set[str] | None = None
+            for serial, ctx_row in serial_context.items():
+                candidate_map = {
+                    str(candidate.get("condition_key") or "").strip(): dict(candidate)
+                    for candidate in (ctx_row.get("candidates") or [])
+                    if str(candidate.get("condition_key") or "").strip()
+                }
+                per_serial_candidate_map[serial] = candidate_map
+                if shared_keys is None:
+                    shared_keys = set(candidate_map.keys())
+                else:
+                    shared_keys &= set(candidate_map.keys())
+            if shared_keys:
+                def _shared_condition_sort_key(condition_key: str) -> tuple[int, float, float]:
+                    candidate_rows = [
+                        per_serial_candidate_map[serial][condition_key]
+                        for serial in sorted(per_serial_candidate_map.keys())
+                        if condition_key in per_serial_candidate_map[serial]
+                    ]
+                    worst = max(candidate_rows, key=_tar_worst_candidate_sort_key)
+                    return _tar_worst_candidate_sort_key(worst)
+
+                shared_final_condition_key = max(sorted(shared_keys), key=_shared_condition_sort_key)
+                selected_candidates = {
+                    serial: dict(per_serial_candidate_map[serial][shared_final_condition_key])
+                    for serial in sorted(per_serial_candidate_map.keys())
+                    if shared_final_condition_key in per_serial_candidate_map[serial]
+                }
+            else:
+                final_unavailable_reason = "no_shared_exact_condition"
+        pair_final_decisions[pair_id] = {
+            "sync_block_id": pair_id,
+            "block_final_required": block_final_required,
+            "block_final_available": bool(shared_final_condition_key),
+            "shared_final_condition_key": shared_final_condition_key,
+            "selected_candidates": selected_candidates,
+            "sync_trigger_serials": list(trigger_serials),
+            "final_unavailable_reason": final_unavailable_reason,
+        }
 
     for spec in specs:
         pair_id = str(spec.get("pair_id") or "")
-        per_pair_candidates = list(pair_regrade_candidates.get(pair_id) or [])
-        if per_pair_candidates:
-            pair_worst = max(per_pair_candidates, key=_tar_worst_candidate_sort_key)
-            pair_condition_key = str(pair_worst.get("condition_key") or "").strip()
-            pair_suppression = str(pair_worst.get("suppression_voltage_label") or "").strip()
-            pair_valve = str(pair_worst.get("valve_voltage_label") or "").strip()
+        pair_decision = dict(pair_final_decisions.get(pair_id) or {})
+        pair_condition_key = str(pair_decision.get("shared_final_condition_key") or "").strip()
+        if bool(pair_decision.get("block_final_available")) and pair_condition_key:
+            selected_pair_candidate = next(
+                (
+                    dict(candidate)
+                    for candidate in (pair_decision.get("selected_candidates") or {}).values()
+                    if str(candidate.get("pair_id") or "").strip() == pair_id
+                ),
+                {},
+            )
+            pair_suppression = str(selected_pair_candidate.get("suppression_voltage_label") or "").strip()
+            pair_valve = str(selected_pair_candidate.get("valve_voltage_label") or "").strip()
             override_base_state = spec.get("base_filter_state") if isinstance(spec.get("base_filter_state"), Mapping) else {}
             spec["model"] = dict((spec.get("regrade_models") or {}).get(pair_condition_key) or spec.get("initial_model") or {})
             spec["plot_payload"] = dict((spec.get("regrade_plot_payloads") or {}).get(pair_condition_key) or spec.get("initial_plot_payload") or {})
@@ -7949,42 +8383,51 @@ def _tar_analyze_curve_groups(
             spec["filter_state_override"] = {}
 
         for serial in hi:
-            initial_row = dict(initial_rows.get((pair_id, serial)) or {})
-            candidates = list(final_candidates.get((pair_id, serial)) or [])
-            if candidates:
-                regrade_row = max(candidates, key=_tar_worst_candidate_sort_key)
-                final_grade = str(regrade_row.get("regrade_grade") or initial_row.get("initial_grade") or "NO_DATA").strip().upper() or "NO_DATA"
-                final_source = regrade_row
-            else:
-                regrade_row = {}
-                final_grade = str(initial_row.get("initial_grade") or "NO_DATA").strip().upper() or "NO_DATA"
-                final_source = initial_row
-
-            if not initial_row and not regrade_row:
+            serial_text = str(serial or "").strip()
+            initial_row = dict(initial_rows.get((pair_id, serial_text)) or {})
+            candidate_rows = [dict(row) for row in (final_candidates.get((pair_id, serial_text)) or []) if isinstance(row, Mapping)]
+            regrade_row = dict((pair_decision.get("selected_candidates") or {}).get(serial_text) or {})
+            if not initial_row and not candidate_rows and not regrade_row:
                 continue
             row = dict(
                 initial_row
                 or _tar_initial_skip_row(
                     spec,
-                    serial=serial,
+                    serial=serial_text,
                     reference_program=str(spec.get("prepass_reference_program") or reference_program or ""),
                     included_programs=list(spec.get("prepass_included_programs") or []),
                     excluded_programs=list(spec.get("prepass_excluded_programs") or []),
                     reason="no_initial_data",
+                    gate_mode=str(spec.get("prepass_gate_mode") or ""),
+                    gate_details=list(spec.get("prepass_gate_details") or []),
                 )
             )
-            final_condition_key = str(regrade_row.get("condition_key") or "").strip()
-            final_suppression_label = str(regrade_row.get("suppression_voltage_label") or row.get("suppression_voltage_label") or "").strip()
-            final_valve_label = str(regrade_row.get("valve_voltage_label") or row.get("valve_voltage_label") or "").strip()
-            regrade_applied = bool(
-                regrade_row
-                and (
-                    bool(row.get("initial_skipped"))
-                    or final_condition_key
-                    or final_grade != str(row.get("initial_grade") or "").strip().upper()
-                    or final_suppression_label != str(row.get("suppression_voltage_label") or "").strip()
-                    or final_valve_label != str(row.get("valve_voltage_label") or "").strip()
-                )
+            initial_status = "SKIPPED" if bool(row.get("initial_skipped")) else (
+                str(row.get("initial_grade") or "NO_DATA").strip().upper() or "NO_DATA"
+            )
+            block_final_required = bool(pair_decision.get("block_final_required"))
+            block_final_available = bool(pair_decision.get("block_final_available"))
+            official_pass_type = "final_exact_condition" if block_final_required and block_final_available and regrade_row else "initial_prepass"
+            final_source = regrade_row if official_pass_type == "final_exact_condition" else row
+            final_grade = str(
+                final_source.get("regrade_grade", final_source.get("initial_grade", row.get("initial_grade", "NO_DATA"))) or "NO_DATA"
+            ).strip().upper() or "NO_DATA"
+            final_condition_key = str(regrade_row.get("condition_key") or "").strip() if official_pass_type == "final_exact_condition" else ""
+            final_suppression_label = (
+                str(regrade_row.get("suppression_voltage_label") or "").strip()
+                if official_pass_type == "final_exact_condition"
+                else str(row.get("suppression_voltage_label") or "").strip()
+            )
+            final_valve_label = (
+                str(regrade_row.get("valve_voltage_label") or "").strip()
+                if official_pass_type == "final_exact_condition"
+                else str(row.get("valve_voltage_label") or "").strip()
+            )
+            regrade_applied = official_pass_type == "final_exact_condition"
+            program_sync_applied = bool(
+                regrade_applied
+                and initial_status == "PASS"
+                and serial_text not in set(pair_decision.get("sync_trigger_serials") or [])
             )
             row.update(
                 {
@@ -7999,7 +8442,9 @@ def _tar_analyze_curve_groups(
                     "regrade_cohort_id": regrade_row.get("regrade_cohort_id"),
                     "regrade_condition_key": regrade_row.get("condition_key"),
                     "final_condition_key": final_condition_key,
-                    "final_pass_applied": bool(regrade_row),
+                    "final_pass_requested": block_final_required,
+                    "final_pass_available": block_final_available,
+                    "final_pass_applied": regrade_applied,
                     "regrade_applied": regrade_applied,
                     "final_max_abs": final_source.get("regrade_max_abs", final_source.get("initial_max_abs")),
                     "final_rms": final_source.get("regrade_rms", final_source.get("initial_rms")),
@@ -8024,12 +8469,27 @@ def _tar_analyze_curve_groups(
                     "prepass_reference_program": str(row.get("prepass_reference_program") or spec.get("prepass_reference_program") or ""),
                     "prepass_included_programs": list(row.get("prepass_included_programs") or spec.get("prepass_included_programs") or []),
                     "prepass_excluded_programs": list(row.get("prepass_excluded_programs") or spec.get("prepass_excluded_programs") or []),
+                    "prepass_gate_mode": str(row.get("prepass_gate_mode") or spec.get("prepass_gate_mode") or ""),
+                    "prepass_gate_details": [dict(item) for item in (row.get("prepass_gate_details") or spec.get("prepass_gate_details") or []) if isinstance(item, Mapping)],
+                    "initial_status": initial_status,
+                    "sync_block_id": str(pair_decision.get("sync_block_id") or pair_id),
+                    "sync_trigger_serials": list(pair_decision.get("sync_trigger_serials") or []),
+                    "shared_final_condition_key": str(pair_decision.get("shared_final_condition_key") or ""),
+                    "program_sync_applied": program_sync_applied,
+                    "block_final_required": block_final_required,
+                    "block_final_available": block_final_available,
+                    "final_unavailable_reason": str(pair_decision.get("final_unavailable_reason") or ""),
+                    "official_pass_type": official_pass_type,
+                    "official_grade": final_grade,
+                    "official_zscore": final_source.get("regrade_z", final_source.get("initial_z")),
+                    "official_suppression_voltage_label": final_suppression_label,
+                    "official_valve_voltage_label": final_valve_label,
                 }
             )
             grading_rows.append(row)
-            initial_grade_map_by_pair_serial[(pair_id, serial)] = str(row.get("initial_grade") or "NO_DATA").strip().upper() or "NO_DATA"
-            final_grade_map_by_pair_serial[(pair_id, serial)] = final_grade
-            finding_by_pair_serial[(pair_id, serial)] = dict(row)
+            initial_grade_map_by_pair_serial[(pair_id, serial_text)] = str(row.get("initial_grade") or "NO_DATA").strip().upper() or "NO_DATA"
+            final_grade_map_by_pair_serial[(pair_id, serial_text)] = final_grade
+            finding_by_pair_serial[(pair_id, serial_text)] = dict(row)
             watch = False
             if max_abs_thr is not None and float(row.get("final_max_abs") or 0.0) >= float(max_abs_thr):
                 watch = True
@@ -8416,6 +8876,69 @@ def _tar_prepare_base(
         final_grade_map_by_pair_serial=final_grade_map_by_pair_serial,
         finding_by_pair_serial=finding_by_pair_serial,
     )
+    comparison_by_pair_serial = {
+        (str(row.get("pair_id") or "").strip(), str(row.get("serial") or "").strip()): dict(row)
+        for row in comparison_rows
+        if isinstance(row, Mapping)
+    }
+    grading_rows = [
+        {
+            **dict(row),
+            **{
+                key: comparison_by_pair_serial.get((str(row.get("pair_id") or "").strip(), str(row.get("serial") or "").strip()), {}).get(key)
+                for key in (
+                    "official_pass_type",
+                    "official_baseline_mean",
+                    "official_serial_mean",
+                    "official_zscore",
+                    "official_grade",
+                    "official_suppression_voltage_label",
+                    "official_valve_voltage_label",
+                    "initial_status",
+                    "program_sync_applied",
+                    "block_final_required",
+                    "block_final_available",
+                    "final_pass_requested",
+                    "final_pass_available",
+                    "grade_basis_text",
+                    "prepass_cohort_note",
+                )
+                if key in comparison_by_pair_serial.get((str(row.get("pair_id") or "").strip(), str(row.get("serial") or "").strip()), {})
+            },
+        }
+        for row in grading_rows
+    ]
+    finding_by_pair_serial = {
+        key: {
+            **dict(value),
+            **{
+                field: comparison_by_pair_serial.get(key, {}).get(field)
+                for field in (
+                    "official_pass_type",
+                    "official_baseline_mean",
+                    "official_serial_mean",
+                    "official_zscore",
+                    "official_grade",
+                    "official_suppression_voltage_label",
+                    "official_valve_voltage_label",
+                    "initial_status",
+                    "program_sync_applied",
+                    "block_final_required",
+                    "block_final_available",
+                    "final_pass_requested",
+                    "final_pass_available",
+                    "grade_basis_text",
+                    "prepass_cohort_note",
+                )
+                if field in comparison_by_pair_serial.get(key, {})
+            },
+        }
+        for key, value in (finding_by_pair_serial or {}).items()
+    }
+    nonpass_findings = sorted(
+        [row for row in grading_rows if str(row.get("final_grade") or "").strip().upper() in {"WATCH", "FAIL"}],
+        key=_finding_sort_key,
+    )
 
     pair_ids = [str(spec.get("pair_id") or "").strip() for spec in pair_specs if str(spec.get("pair_id") or "").strip()]
     initial_overall_by_sn = {
@@ -8445,6 +8968,7 @@ def _tar_prepare_base(
     ctx["initial_grade_map_by_pair_serial"] = initial_grade_map_by_pair_serial
     ctx["final_grade_map_by_pair_serial"] = final_grade_map_by_pair_serial
     ctx["finding_by_pair_serial"] = finding_by_pair_serial
+    ctx["grading_rows"] = grading_rows
     ctx["comparison_rows"] = comparison_rows
     ctx["pair_specs"] = pair_specs
     ctx["pair_by_id"] = pair_by_id
@@ -8681,12 +9205,12 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
             comparison_rows_by_serial.setdefault(serial, []).append(dict(row))
     initial_vs_final_lines = [
         (
-            "Initial Run: Program-mean pre-pass with compatible-program gating before exact-condition certification. "
+            "Initial Run: Noise-aware admitted-program pre-pass that grades against the admitted program cohort before any exact-condition escalation. "
             f"Suppression Voltage: {str(quick_summary.get('initial_suppression_voltage') or 'All').strip() or 'All'} | "
             f"Valve Voltage: {str(quick_summary.get('initial_valve_voltage') or 'All').strip() or 'All'}"
         ),
         (
-            "Final Run: Exact run-condition, suppression-voltage, and valve-voltage certification comparison. "
+            "Final Run: Program-synced exact-condition official pass that is applied only when the initial pre-pass is WATCH, FAIL, or SKIPPED. "
             f"Suppression Voltage: {str(quick_summary.get('final_suppression_voltage') or quick_summary.get('p8_suppression_voltage') or 'All').strip() or 'All'} | "
             f"Valve Voltage: {str(quick_summary.get('final_valve_voltage') or quick_summary.get('p8_valve_voltage') or 'All').strip() or 'All'}"
         ),
@@ -8699,9 +9223,9 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
     story.append(
         _portrait_paragraph(
             "This report validates ATP run criteria against family data and compares the selected certification serials "
-            "to the compiled family baseline for the chosen run scope. Initial grading applies a compatible-program "
-            "pre-pass within each base run condition, parameter, and X axis before the exact-condition final pass "
-            "establishes the official certification result.",
+            "to the admitted-program graded baseline for the chosen run scope. Initial grading applies a noise-aware "
+            "pre-pass within each base run condition, parameter, and X axis, and an exact-condition final pass is "
+            "only promoted to the official result when the synchronized certification block requires it.",
             styles["body"],
             rl,
         )
@@ -8829,9 +9353,8 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
         story.append(_portrait_paragraph("Run Comparison", styles["section"], rl))
         story.append(
             _portrait_paragraph(
-                "Each table groups one selected run condition. Rows compare the ATP family mean with each certified serial's "
-                "actual result for the same parameter. Initial values use the compatible-program pre-pass, and final values use "
-                "the exact-condition certification pass.",
+                "Each table groups one selected run condition. Rows show the official graded mean for each certified serial's "
+                "selected cohort, alongside the certified serial mean, z-score, initial status, and official grade basis.",
                 styles["body"],
                 rl,
             )
@@ -9670,7 +10193,7 @@ def _tar_render_plot_sections(
                 section_title="Run Condition Metrics",
                 section_key="run_condition_plot_metrics",
                 grade_map_by_pair_serial=(ctx.get("initial_grade_map_by_pair_serial") or {}),
-                family_mean_label="Pooled family mean",
+                family_mean_label="Initial admitted-program graded mean",
             )
             if plot_spec:
                 plot_specs.append(plot_spec)
@@ -9695,9 +10218,9 @@ def _tar_render_plot_sections(
                 ),
                 grade_map_by_pair_serial=(ctx.get("initial_grade_map_by_pair_serial") or {}),
                 metric_prefix="initial",
-                family_label="Pooled family mean",
-                band_label="Pooled family +/-1 sigma",
-                equation_label="Pooled family equation",
+                family_label="Initial admitted-program graded mean",
+                band_label="Initial admitted-program +/-1 sigma",
+                equation_label="Initial admitted-program equation",
             )
             if plot_spec:
                 plot_specs.append(plot_spec)
@@ -9729,7 +10252,7 @@ def _tar_render_plot_sections(
                 section_key="regrade_pass_plot_metrics",
                 grade_map_by_pair_serial=(ctx.get("final_grade_map_by_pair_serial") or {}),
                 filter_state_override=filter_override,
-                family_mean_label="Final exact-condition family mean",
+                family_mean_label="Official exact-condition graded mean",
             )
             if plot_spec:
                 plot_specs.append(plot_spec)
@@ -9761,9 +10284,9 @@ def _tar_render_plot_sections(
                 ),
                 grade_map_by_pair_serial=(ctx.get("final_grade_map_by_pair_serial") or {}),
                 metric_prefix="final",
-                family_label="Final exact-condition family mean",
-                band_label="Final exact-condition family +/-1 sigma",
-                equation_label="Final exact-condition family equation",
+                family_label="Official exact-condition graded mean",
+                band_label="Official exact-condition +/-1 sigma",
+                equation_label="Official exact-condition equation",
             )
             if plot_spec:
                 plot_specs.append(plot_spec)

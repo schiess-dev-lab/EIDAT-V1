@@ -369,7 +369,15 @@ class TestTrendAutoReportFilters(unittest.TestCase):
                 "SN-003": {"program_title": "Program C"},
             },
             "nonpass_findings": [{"param": "Flow"}, {"param": "Pressure"}],
-            "comparison_rows": [{"final_suppression_voltage_label": "5", "final_valve_voltage_label": "28"}],
+            "comparison_rows": [
+                {
+                    "final_suppression_voltage_label": "5",
+                    "final_valve_voltage_label": "28",
+                    "prepass_gate_mode": "noise_normalized_rms_to_certifying_program",
+                    "prepass_included_programs": ["Program A", "Program B"],
+                    "prepass_excluded_programs": ["Program C"],
+                }
+            ],
             "filter_state": {},
         }
 
@@ -380,10 +388,14 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         self.assertEqual(summary["selected_run_conditions"], ["Condition A", "Condition B"])
         self.assertEqual(summary["watch_parameters"], ["Flow", "Pressure"])
         self.assertEqual(summary["comparison_programs"], ["Program B", "Program C"])
+        self.assertEqual(summary["prepass_gate_modes"], ["Noise-aware RMS gate"])
+        self.assertEqual(summary["prepass_admitted_programs"], ["Program A", "Program B"])
+        self.assertEqual(summary["prepass_excluded_programs"], ["Program C"])
         self.assertEqual(summary["initial_suppression_voltage"], "All")
         self.assertEqual(summary["p8_suppression_voltage"], "5")
         self.assertEqual(summary["p8_valve_voltage"], "28")
         self.assertTrue(any("Programs Compared: Program B, Program C" in line for line in summary["lines"]))
+        self.assertTrue(any("Pre-pass Gate: Noise-aware RMS gate" in line for line in summary["lines"]))
         self.assertIn("Suppression Voltage: 5", summary["lines"])
         self.assertIn("Valve Voltage: 28", summary["lines"])
         self.assertFalse(any(line.startswith("P8 ") for line in summary["lines"]))
@@ -513,6 +525,17 @@ class TestTrendAutoReportFilters(unittest.TestCase):
                 finding_by_pair_serial={
                     ("pair-1", "SN-001"): {
                         "regrade_applied": True,
+                        "final_pass_requested": True,
+                        "final_pass_available": True,
+                        "final_pass_applied": True,
+                        "official_pass_type": "final_exact_condition",
+                        "official_grade": "WATCH",
+                        "official_suppression_voltage_label": "5",
+                        "official_valve_voltage_label": "28",
+                        "initial_status": "PASS",
+                        "prepass_gate_mode": "noise_normalized_rms_to_certifying_program",
+                        "prepass_included_programs": ["Program A", "Program B"],
+                        "prepass_excluded_programs": [],
                         "regrade_suppression_voltage_label": "5",
                         "regrade_valve_voltage_label": "28",
                         "regrade_condition_key": tar._tar_condition_combo_key("5", "28"),
@@ -533,6 +556,13 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         self.assertEqual(rows[0]["initial_grade"], "PASS")
         self.assertEqual(rows[0]["final_grade"], "WATCH")
         self.assertEqual(rows[0]["grade_text"], "Initial: PASS\nFinal: WATCH")
+        self.assertEqual(rows[0]["official_pass_type"], "final_exact_condition")
+        self.assertEqual(rows[0]["official_baseline_mean"], 20.0)
+        self.assertEqual(rows[0]["official_serial_mean"], 14.0)
+        self.assertEqual(rows[0]["official_zscore"], 1.25)
+        self.assertEqual(rows[0]["official_grade"], "WATCH")
+        self.assertEqual(rows[0]["initial_status"], "PASS")
+        self.assertEqual(rows[0]["grade_basis_text"], "Program-synced exact-condition final\nSupp: 5 | Valve: 28")
         self.assertEqual(rows[0]["initial_suppression_voltage_label"], "All")
         self.assertEqual(rows[0]["final_suppression_voltage_label"], "5")
         self.assertEqual(rows[0]["initial_valve_voltage_label"], "All")
@@ -572,7 +602,18 @@ class TestTrendAutoReportFilters(unittest.TestCase):
                 hi=["SN-001"],
                 initial_grade_map_by_pair_serial={("pair-2", "SN-001"): "PASS"},
                 final_grade_map_by_pair_serial={("pair-2", "SN-001"): "PASS"},
-                finding_by_pair_serial={("pair-2", "SN-001"): {"initial_z": -0.5, "final_z": -0.5}},
+                finding_by_pair_serial={
+                    ("pair-2", "SN-001"): {
+                        "initial_z": -0.5,
+                        "final_z": -0.5,
+                        "official_pass_type": "initial_prepass",
+                        "initial_status": "PASS",
+                        "official_grade": "PASS",
+                        "prepass_gate_mode": "noise_normalized_rms_to_certifying_program",
+                        "prepass_included_programs": ["Program A", "Program B"],
+                        "prepass_excluded_programs": [],
+                    }
+                },
             )
 
         self.assertEqual(len(rows), 1)
@@ -583,6 +624,12 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         self.assertEqual(rows[0]["initial_zscore"], -0.5)
         self.assertEqual(rows[0]["final_zscore"], -0.5)
         self.assertEqual(rows[0]["grade_text"], "PASS")
+        self.assertEqual(rows[0]["official_pass_type"], "initial_prepass")
+        self.assertEqual(rows[0]["official_baseline_mean"], 12.0)
+        self.assertEqual(rows[0]["official_serial_mean"], 8.0)
+        self.assertEqual(rows[0]["official_grade"], "PASS")
+        self.assertEqual(rows[0]["initial_status"], "PASS")
+        self.assertEqual(rows[0]["grade_basis_text"], "Initial admitted-program cohort")
         self.assertEqual(rows[0]["final_suppression_voltage_label"], "All")
         self.assertFalse(rows[0]["regrade_applied"])
 

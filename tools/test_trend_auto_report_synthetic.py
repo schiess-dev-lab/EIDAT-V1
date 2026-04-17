@@ -958,10 +958,10 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         pair_spec = next(spec for spec in analysis["pair_specs"] if str(spec.get("pair_id") or "") == "pair-100")
         self.assertEqual(row["initial_grade"], "PASS")
         self.assertEqual(row["final_grade"], "PASS")
-        self.assertTrue(row["regrade_applied"])
+        self.assertFalse(row["regrade_applied"])
         self.assertEqual(len(analysis["initial_cohort_specs"]), 1)
         self.assertEqual(len(analysis["regrade_cohort_specs"]), 1)
-        self.assertEqual(pair_spec["filter_state_override"], {"suppression_voltages": ["100"], "valve_voltages": []})
+        self.assertEqual(pair_spec["filter_state_override"], {})
 
     @unittest.skipUnless(_have_numpy(), "numpy not installed")
     def test_analyze_curve_groups_skips_regrade_for_single_suppression(self):
@@ -1078,6 +1078,238 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         self.assertEqual(regrade_spec["suppression_voltage_label"], "100")
         self.assertEqual(regrade_spec["member_pair_ids"], ["pair-target", "pair-peer"])
         self.assertEqual({trace["pair_id"] for trace in regrade_spec["trace_curves"]}, {"pair-target", "pair-peer"})
+
+    @unittest.skipUnless(_have_numpy(), "numpy not installed")
+    def test_analyze_curve_groups_noise_aware_prepass_admits_noisy_candidate_program(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        row_specs = [
+            self._row_spec(
+                tar,
+                pair_id="pair-noisy",
+                run="RunNoise",
+                selection_label="Condition A | Supp 100",
+                base_condition_label="Condition A",
+                suppression_value="100",
+                series=[
+                    tar.CurveSeries(serial="HI", x=[0.0, 1.0, 2.0], y=[90.0, 90.0, 90.0]),
+                    tar.CurveSeries(serial="A2", x=[0.0, 1.0, 2.0], y=[110.0, 110.0, 110.0]),
+                    tar.CurveSeries(serial="ATP1", x=[0.0, 1.0, 2.0], y=[96.0, 96.0, 96.0]),
+                    tar.CurveSeries(serial="ATP2", x=[0.0, 1.0, 2.0], y=[116.0, 116.0, 116.0]),
+                ],
+            )
+        ]
+        program_by_serial = {"HI": "Program A", "A2": "Program A", "ATP1": "Program B", "ATP2": "Program B"}
+
+        analysis = tar._tar_analyze_curve_groups(
+            row_specs,
+            hi=["HI"],
+            program_by_serial=program_by_serial,
+            certifying_program="Program A",
+            grid_points=3,
+            degree=1,
+            normalize_x=False,
+            z_pass=10.0,
+            z_watch=20.0,
+            max_abs_thr=None,
+            max_pct_thr=None,
+            rms_pct_thr=None,
+        )
+
+        row = analysis["grading_rows"][0]
+        detail = next(item for item in row["prepass_gate_details"] if item["program"] == "Program B")
+        self.assertFalse(row["initial_skipped"])
+        self.assertEqual(row["prepass_gate_mode"], "noise_normalized_rms_to_certifying_program")
+        self.assertEqual(row["prepass_included_programs"], ["Program A", "Program B"])
+        self.assertTrue(detail["admitted"])
+        self.assertGreater(detail["mean_delta_pct"], 5.0)
+        self.assertLess(detail["noise_score"], 1.25)
+
+    @unittest.skipUnless(_have_numpy(), "numpy not installed")
+    def test_analyze_curve_groups_noise_aware_prepass_rejects_tight_shifted_candidate_program(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        row_specs = [
+            self._row_spec(
+                tar,
+                pair_id="pair-tight",
+                run="RunTight",
+                selection_label="Condition A | Supp 100",
+                base_condition_label="Condition A",
+                suppression_value="100",
+                series=[
+                    tar.CurveSeries(serial="HI", x=[0.0, 1.0, 2.0], y=[100.0, 100.0, 100.0]),
+                    tar.CurveSeries(serial="A2", x=[0.0, 1.0, 2.0], y=[100.2, 100.2, 100.2]),
+                    tar.CurveSeries(serial="ATP1", x=[0.0, 1.0, 2.0], y=[102.1, 102.1, 102.1]),
+                    tar.CurveSeries(serial="ATP2", x=[0.0, 1.0, 2.0], y=[102.3, 102.3, 102.3]),
+                ],
+            )
+        ]
+        program_by_serial = {"HI": "Program A", "A2": "Program A", "ATP1": "Program B", "ATP2": "Program B"}
+
+        analysis = tar._tar_analyze_curve_groups(
+            row_specs,
+            hi=["HI"],
+            program_by_serial=program_by_serial,
+            certifying_program="Program A",
+            grid_points=3,
+            degree=1,
+            normalize_x=False,
+            z_pass=10.0,
+            z_watch=20.0,
+            max_abs_thr=None,
+            max_pct_thr=None,
+            rms_pct_thr=None,
+        )
+
+        row = analysis["grading_rows"][0]
+        detail = next(item for item in row["prepass_gate_details"] if item["program"] == "Program B")
+        self.assertTrue(row["initial_skipped"])
+        self.assertEqual(row["initial_skip_reason"], "no_compatible_programs")
+        self.assertFalse(detail["admitted"])
+        self.assertLess(detail["mean_delta_pct"], 8.0)
+        self.assertGreater(detail["noise_score"], 1.25)
+
+    @unittest.skipUnless(_have_numpy(), "numpy not installed")
+    def test_analyze_curve_groups_percent_guard_rejects_noisy_large_shift_candidate_program(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        row_specs = [
+            self._row_spec(
+                tar,
+                pair_id="pair-guard",
+                run="RunGuard",
+                selection_label="Condition A | Supp 100",
+                base_condition_label="Condition A",
+                suppression_value="100",
+                series=[
+                    tar.CurveSeries(serial="HI", x=[0.0, 1.0, 2.0], y=[80.0, 80.0, 80.0]),
+                    tar.CurveSeries(serial="A2", x=[0.0, 1.0, 2.0], y=[120.0, 120.0, 120.0]),
+                    tar.CurveSeries(serial="ATP1", x=[0.0, 1.0, 2.0], y=[70.0, 70.0, 70.0]),
+                    tar.CurveSeries(serial="ATP2", x=[0.0, 1.0, 2.0], y=[170.0, 170.0, 170.0]),
+                ],
+            )
+        ]
+        program_by_serial = {"HI": "Program A", "A2": "Program A", "ATP1": "Program B", "ATP2": "Program B"}
+
+        analysis = tar._tar_analyze_curve_groups(
+            row_specs,
+            hi=["HI"],
+            program_by_serial=program_by_serial,
+            certifying_program="Program A",
+            grid_points=3,
+            degree=1,
+            normalize_x=False,
+            z_pass=10.0,
+            z_watch=20.0,
+            max_abs_thr=None,
+            max_pct_thr=None,
+            rms_pct_thr=None,
+        )
+
+        row = analysis["grading_rows"][0]
+        detail = next(item for item in row["prepass_gate_details"] if item["program"] == "Program B")
+        self.assertTrue(row["initial_skipped"])
+        self.assertFalse(detail["admitted"])
+        self.assertGreater(detail["mean_delta_pct"], 8.0)
+        self.assertLess(detail["noise_score"], 1.25)
+
+    @unittest.skipUnless(_have_numpy(), "numpy not installed")
+    def test_analyze_curve_groups_sparse_prepass_uses_stricter_percent_fallback(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        row_specs = [
+            self._row_spec(
+                tar,
+                pair_id="pair-sparse",
+                run="RunSparse",
+                selection_label="Condition A | Supp 100",
+                base_condition_label="Condition A",
+                suppression_value="100",
+                series=[
+                    tar.CurveSeries(serial="HI", x=[0.0, 1.0, 2.0], y=[100.0, 100.0, 100.0]),
+                    tar.CurveSeries(serial="ATP1", x=[0.0, 1.0, 2.0], y=[102.0, 102.0, 102.0]),
+                    tar.CurveSeries(serial="ATP2", x=[0.0, 1.0, 2.0], y=[108.0, 108.0, 108.0]),
+                ],
+            )
+        ]
+        program_by_serial = {"HI": "Program A", "ATP1": "Program B", "ATP2": "Program B"}
+
+        analysis = tar._tar_analyze_curve_groups(
+            row_specs,
+            hi=["HI"],
+            program_by_serial=program_by_serial,
+            certifying_program="Program A",
+            grid_points=3,
+            degree=1,
+            normalize_x=False,
+            z_pass=10.0,
+            z_watch=20.0,
+            max_abs_thr=None,
+            max_pct_thr=None,
+            rms_pct_thr=None,
+        )
+
+        row = analysis["grading_rows"][0]
+        detail = next(item for item in row["prepass_gate_details"] if item["program"] == "Program B")
+        self.assertTrue(row["initial_skipped"])
+        self.assertEqual(row["initial_skip_reason"], "no_compatible_programs")
+        self.assertEqual(detail["gate_mode"], "sparse_percent_fallback")
+        self.assertFalse(detail["admitted"])
+        self.assertGreater(detail["mean_delta_pct"], 4.0)
+
+    @unittest.skipUnless(_have_numpy(), "numpy not installed")
+    def test_analyze_curve_groups_syncs_final_pass_across_certified_serials_in_same_block(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        row_specs = [
+            self._row_spec(
+                tar,
+                pair_id="pair-sync",
+                run="RunSync",
+                selection_label="Condition A | Supp 100",
+                base_condition_label="Condition A",
+                suppression_value="100",
+                series=[
+                    tar.CurveSeries(serial="HI1", x=[0.0, 1.0, 2.0], y=[0.0, 0.0, 0.0]),
+                    tar.CurveSeries(serial="HI2", x=[0.0, 1.0, 2.0], y=[10.0, 10.0, 10.0]),
+                    tar.CurveSeries(serial="A3", x=[0.0, 1.0, 2.0], y=[20.0, 20.0, 20.0]),
+                    tar.CurveSeries(serial="ATP1", x=[0.0, 1.0, 2.0], y=[10.0, 10.0, 10.0]),
+                    tar.CurveSeries(serial="ATP2", x=[0.0, 1.0, 2.0], y=[10.0, 10.0, 10.0]),
+                ],
+            )
+        ]
+        program_by_serial = {
+            "HI1": "Program A",
+            "HI2": "Program A",
+            "A3": "Program A",
+            "ATP1": "Program B",
+            "ATP2": "Program B",
+        }
+
+        analysis = tar._tar_analyze_curve_groups(
+            row_specs,
+            hi=["HI1", "HI2"],
+            program_by_serial=program_by_serial,
+            certifying_program="Program A",
+            grid_points=3,
+            degree=1,
+            normalize_x=False,
+            z_pass=1.0,
+            z_watch=1.5,
+            max_abs_thr=None,
+            max_pct_thr=None,
+            rms_pct_thr=None,
+        )
+
+        rows = {row["serial"]: row for row in analysis["grading_rows"]}
+        self.assertTrue(rows["HI1"]["final_pass_applied"])
+        self.assertTrue(rows["HI2"]["final_pass_applied"])
+        self.assertTrue(rows["HI2"]["program_sync_applied"])
+        self.assertEqual(rows["HI1"]["shared_final_condition_key"], rows["HI2"]["shared_final_condition_key"])
+        self.assertEqual(rows["HI2"]["official_pass_type"], "final_exact_condition")
+        self.assertTrue(rows["HI2"]["block_final_required"])
+        self.assertTrue(rows["HI2"]["block_final_available"])
 
     @unittest.skipUnless(_have_numpy(), "numpy not installed")
     def test_analyze_curve_groups_splits_incompatible_x_axes(self):
@@ -1358,6 +1590,10 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
                 ("Pressure", "psi", 10.0 + block_index, 12.0 + block_index, 9.0 + block_index, 11.0 + block_index, -1.0, -1.0, "PASS", "WATCH", block_index == 0),
                 ("Flow", "kg/s", 20.0 + block_index, 20.0 + block_index, 19.0 + block_index, 19.0 + block_index, -1.0, -1.0, "PASS", "PASS", False),
             ):
+                official_pass_type = "final_exact_condition" if regrade_applied else "initial_prepass"
+                official_baseline = final_atp if regrade_applied else initial_atp
+                official_actual = final_actual if regrade_applied else initial_actual
+                official_grade = final_grade if regrade_applied else initial_grade
                 comparison_rows.append(
                     {
                         "selection_id": selection_id,
@@ -1374,7 +1610,18 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
                         "final_delta": final_delta,
                         "initial_grade": initial_grade,
                         "final_grade": final_grade,
+                        "initial_status": initial_grade,
                         "regrade_applied": regrade_applied,
+                        "official_pass_type": official_pass_type,
+                        "official_baseline_mean": official_baseline,
+                        "official_serial_mean": official_actual,
+                        "official_zscore": final_delta if regrade_applied else initial_delta,
+                        "official_grade": official_grade,
+                        "grade_basis_text": (
+                            "Program-synced exact-condition final\nSupp: 5 | Valve: 28"
+                            if regrade_applied
+                            else "Initial admitted-program cohort"
+                        ),
                     }
                 )
         comparison_rows.extend(
@@ -1394,7 +1641,14 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
                     "final_delta": -2.0,
                     "initial_grade": "WATCH",
                     "final_grade": "WATCH",
+                    "initial_status": "WATCH",
                     "regrade_applied": False,
+                    "official_pass_type": "initial_prepass",
+                    "official_baseline_mean": 33.0,
+                    "official_serial_mean": 31.0,
+                    "official_zscore": -2.0,
+                    "official_grade": "WATCH",
+                    "grade_basis_text": "Initial admitted-program cohort",
                 },
                 {
                     "selection_id": "sel-sn2",
@@ -1411,7 +1665,14 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
                     "final_delta": -2.0,
                     "initial_grade": "PASS",
                     "final_grade": "PASS",
+                    "initial_status": "PASS",
                     "regrade_applied": False,
+                    "official_pass_type": "initial_prepass",
+                    "official_baseline_mean": 44.0,
+                    "official_serial_mean": 42.0,
+                    "official_zscore": -2.0,
+                    "official_grade": "PASS",
+                    "grade_basis_text": "Initial admitted-program cohort",
                 },
             ]
         )
@@ -1432,13 +1693,15 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         matrix_rows, style_cmds = tar._tar_build_comparison_page_matrix(first_page)
         self.assertEqual(matrix_rows[0][:5], ["Run Condition", "Sequence(s)", "Metric", "Pressure", "Flow"])
         self.assertEqual(matrix_rows[1][:5], ["", "", "", "psi", "kg/s"])
-        self.assertEqual(matrix_rows[2][:5], ["Condition 00", "Seq 00", "Family Mean", "Initial: 10\nFinal: 12", "20"])
-        self.assertEqual(matrix_rows[3][:5], ["", "", "Serial Mean", "Initial: 9\nFinal: 11", "19"])
-        self.assertEqual(matrix_rows[4][:5], ["", "", "Z-Score", "Initial: -1\nFinal: -1", "-1"])
-        self.assertEqual(matrix_rows[5][:5], ["", "", "Grade", "Initial: PASS\nFinal: WATCH", "PASS"])
-        self.assertIn(("SPAN", (0, 2), (0, 5)), style_cmds)
-        self.assertIn(("SPAN", (1, 2), (1, 5)), style_cmds)
-        self.assertIn(("BACKGROUND", (3, 2), (3, 5), "#fef3c7"), style_cmds)
+        self.assertEqual(matrix_rows[2][:5], ["Condition 00", "Seq 00", "Initial Status", "PASS", "PASS"])
+        self.assertEqual(matrix_rows[3][:5], ["", "", "Graded Mean", "12", "20"])
+        self.assertEqual(matrix_rows[4][:5], ["", "", "Certified Serial Mean", "11", "19"])
+        self.assertEqual(matrix_rows[5][:5], ["", "", "Z-Score", "-1", "-1"])
+        self.assertEqual(matrix_rows[6][:5], ["", "", "Official Grade", "WATCH", "PASS"])
+        self.assertEqual(matrix_rows[7][:5], ["", "", "Grade Basis", "Program-synced exact-condition final\nSupp: 5 | Valve: 28", "Initial admitted-program cohort"])
+        self.assertIn(("SPAN", (0, 2), (0, 7)), style_cmds)
+        self.assertIn(("SPAN", (1, 2), (1, 7)), style_cmds)
+        self.assertIn(("BACKGROUND", (3, 2), (3, 7), "#fef3c7"), style_cmds)
 
     def test_generate_auto_report_merges_tabloid_comparison_pages_before_plots(self):
         fitz = __import__("fitz")

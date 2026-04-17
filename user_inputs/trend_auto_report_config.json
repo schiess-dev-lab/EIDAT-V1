@@ -20,11 +20,15 @@
     "prepass": {
       "enabled": true,
       "scope": "base_condition_plot",
-      "comparator": "percent_delta_to_certifying_program",
-      "percent_delta_max": 5.0,
+      "comparator": "noise_normalized_rms_to_certifying_program",
+      "noise_score_max": 1.25,
+      "noise_floor_pct": 1.5,
+      "percent_delta_guard_max": 8.0,
+      "sparse_min_serials_per_program": 2,
+      "sparse_percent_delta_max": 4.0,
       "voltage_rule": "mean_only",
       "initial_role": "gate_and_grade",
-      "final_pass_policy": "always_exact_condition",
+      "final_pass_policy": "sync_on_initial_nonpass_or_skip",
       "family_weighting": "equal_program_weight"
     }
   },
