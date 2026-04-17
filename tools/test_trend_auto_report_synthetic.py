@@ -363,6 +363,7 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         self.assertEqual(tar._overall_cert_status(["NO_DATA", "PASS"], ignore_no_data=True), "CERTIFIED")
         self.assertEqual(tar._overall_cert_status(["NO_DATA", "WATCH"], ignore_no_data=True), "WATCH")
         self.assertEqual(tar._overall_cert_status(["NO_DATA"], ignore_no_data=True), "NO_DATA")
+        self.assertEqual(tar._overall_cert_status(["NO_DATA"], ignore_no_data=True, empty_status=""), "")
         self.assertEqual(tar._overall_cert_status([]), "NO_DATA")
 
     def test_capture_print_context_contains_single_formatted_timestamp(self):
@@ -885,7 +886,8 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
             rms_pct_thr=None,
         )
 
-        self.assertEqual(analysis["initial_cohort_specs"], [])
+        self.assertEqual(len(analysis["initial_cohort_specs"]), 1)
+        self.assertEqual(analysis["initial_cohort_specs"][0]["prepass_included_programs"], ["Program A"])
         self.assertEqual({spec["suppression_voltage_label"] for spec in analysis["regrade_cohort_specs"]}, {"100"})
         row = analysis["grading_rows"][0]
         self.assertEqual(row["pair_id"], "pair-100")
@@ -1257,6 +1259,11 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         self.assertEqual(detail["gate_mode"], "sparse_percent_fallback")
         self.assertFalse(detail["admitted"])
         self.assertGreater(detail["mean_delta_pct"], 4.0)
+        self.assertEqual(len(analysis["initial_cohort_specs"]), 1)
+        self.assertTrue(analysis["initial_cohort_specs"][0]["master_y"])
+        pair_spec = analysis["pair_specs"][0]
+        self.assertTrue(pair_spec["initial_plot_payload"]["master_y"])
+        self.assertIn("HI", pair_spec["initial_plot_payload"]["y_resampled_by_sn"])
 
     @unittest.skipUnless(_have_numpy(), "numpy not installed")
     def test_analyze_curve_groups_syncs_final_pass_across_certified_serials_in_same_block(self):
@@ -1310,6 +1317,85 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         self.assertEqual(rows["HI2"]["official_pass_type"], "final_exact_condition")
         self.assertTrue(rows["HI2"]["block_final_required"])
         self.assertTrue(rows["HI2"]["block_final_available"])
+
+    @unittest.skipUnless(_have_numpy(), "numpy not installed")
+    def test_analyze_curve_groups_uses_per_serial_final_when_no_shared_exact_condition_exists(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        key_100 = tar._tar_condition_combo_key("100", "")
+        key_200 = tar._tar_condition_combo_key("200", "")
+        row_specs = [
+            {
+                **self._row_spec(
+                    tar,
+                    pair_id="pair-sync-fallback",
+                    run="RunSyncFallback",
+                    selection_label="Condition A",
+                    base_condition_label="Condition A",
+                    suppression_value="",
+                    series=[
+                        tar.CurveSeries(serial="HI1", x=[0.0, 1.0, 2.0], y=[0.0, 0.0, 0.0]),
+                        tar.CurveSeries(serial="HI2", x=[0.0, 1.0, 2.0], y=[10.0, 10.0, 10.0]),
+                        tar.CurveSeries(serial="A3", x=[0.0, 1.0, 2.0], y=[20.0, 20.0, 20.0]),
+                        tar.CurveSeries(serial="ATP1", x=[0.0, 1.0, 2.0], y=[10.0, 10.0, 10.0]),
+                        tar.CurveSeries(serial="ATP2", x=[0.0, 1.0, 2.0], y=[10.0, 10.0, 10.0]),
+                    ],
+                ),
+                "condition_pairs": [
+                    {"key": key_100, "suppression_voltage_label": "100", "valve_voltage_label": ""},
+                    {"key": key_200, "suppression_voltage_label": "200", "valve_voltage_label": ""},
+                ],
+                "series_by_condition_key": {
+                    key_100: [
+                        tar.CurveSeries(serial="HI1", x=[0.0, 1.0, 2.0], y=[0.0, 0.0, 0.0]),
+                        tar.CurveSeries(serial="A3", x=[0.0, 1.0, 2.0], y=[20.0, 20.0, 20.0]),
+                        tar.CurveSeries(serial="ATP1", x=[0.0, 1.0, 2.0], y=[10.0, 10.0, 10.0]),
+                        tar.CurveSeries(serial="ATP2", x=[0.0, 1.0, 2.0], y=[10.0, 10.0, 10.0]),
+                    ],
+                    key_200: [
+                        tar.CurveSeries(serial="HI2", x=[0.0, 1.0, 2.0], y=[10.0, 10.0, 10.0]),
+                        tar.CurveSeries(serial="A3", x=[0.0, 1.0, 2.0], y=[20.0, 20.0, 20.0]),
+                        tar.CurveSeries(serial="ATP1", x=[0.0, 1.0, 2.0], y=[10.0, 10.0, 10.0]),
+                        tar.CurveSeries(serial="ATP2", x=[0.0, 1.0, 2.0], y=[10.0, 10.0, 10.0]),
+                    ],
+                },
+            }
+        ]
+        program_by_serial = {
+            "HI1": "Program A",
+            "HI2": "Program A",
+            "A3": "Program A",
+            "ATP1": "Program B",
+            "ATP2": "Program B",
+        }
+
+        analysis = tar._tar_analyze_curve_groups(
+            row_specs,
+            hi=["HI1", "HI2"],
+            program_by_serial=program_by_serial,
+            certifying_program="Program A",
+            grid_points=3,
+            degree=1,
+            normalize_x=False,
+            z_pass=1.0,
+            z_watch=1.5,
+            max_abs_thr=None,
+            max_pct_thr=None,
+            rms_pct_thr=None,
+        )
+
+        rows = {row["serial"]: row for row in analysis["grading_rows"]}
+        self.assertTrue(rows["HI1"]["final_pass_applied"])
+        self.assertTrue(rows["HI2"]["final_pass_applied"])
+        self.assertTrue(rows["HI1"]["block_final_available"])
+        self.assertTrue(rows["HI2"]["block_final_available"])
+        self.assertEqual(rows["HI1"]["official_pass_type"], "final_exact_condition")
+        self.assertEqual(rows["HI2"]["official_pass_type"], "final_exact_condition")
+        self.assertEqual(rows["HI1"]["final_selection_mode"], "per_serial_exact_condition")
+        self.assertEqual(rows["HI2"]["final_selection_mode"], "per_serial_exact_condition")
+        self.assertEqual(rows["HI1"]["shared_final_condition_key"], "")
+        self.assertEqual(rows["HI2"]["shared_final_condition_key"], "")
+        self.assertNotEqual(rows["HI1"]["final_condition_key"], rows["HI2"]["final_condition_key"])
 
     @unittest.skipUnless(_have_numpy(), "numpy not installed")
     def test_analyze_curve_groups_splits_incompatible_x_axes(self):
@@ -1575,9 +1661,8 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         self.assertEqual(exec_table[1][1], "Initial: FAILED\nFinal: WATCH")
         self.assertEqual(exec_table[0], ["Serial", "Overall", "Program", "Part #", "Rev", "Outcome Mix"])
         self.assertEqual(exec_table[1][5], "PASS 50% | WATCH 50% | FAIL 0%")
-        self.assertEqual([row[4] for row in exception_table[1:]], ["WATCH", "NO_DATA"])
+        self.assertEqual([row[4] for row in exception_table[1:]], ["WATCH"])
         self.assertTrue(str(exception_table[1][5]).startswith("Chart "))
-        self.assertEqual(exception_table[2][5], "")
         self.assertFalse(any(rows and str(rows[0][0]).startswith("Run Condition:") for rows in tables))
 
     def test_plan_comparison_pages_pivots_by_serial_and_splits_by_run_blocks(self):

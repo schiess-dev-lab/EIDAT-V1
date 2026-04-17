@@ -633,6 +633,137 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         self.assertEqual(rows[0]["final_suppression_voltage_label"], "All")
         self.assertFalse(rows[0]["regrade_applied"])
 
+    def test_build_per_serial_comparison_rows_labels_per_serial_exact_condition_final(self) -> None:
+        ctx = {"filter_state": {}, "be": object(), "db_path": Path("fake.sqlite3"), "options": {}}
+        pair_specs = [
+            {
+                "pair_id": "pair-2b",
+                "selection_id": "sel-2b",
+                "run": "Run B",
+                "run_title": "Sequence B",
+                "base_condition_label": "Condition B",
+                "selection_fields": {
+                    "mode": "condition",
+                    "sequence_text": "Sequence B",
+                    "condition_text": "Condition B",
+                },
+                "param": "Flow",
+                "units": "lpm",
+                "initial_plot_payload": {
+                    "master_y": [8.0, 12.0],
+                    "y_resampled_by_sn": {
+                        "SN-001": [7.0, 9.0],
+                        "SN-002": [11.0, 21.0],
+                    },
+                },
+                "regrade_plot_payloads": {
+                    tar._tar_condition_combo_key("7", "30"): {
+                        "master_y": [9.0, 13.0],
+                        "y_resampled_by_sn": {
+                            "SN-001": [8.0, 10.0],
+                            "SN-002": [10.0, 14.0],
+                        },
+                    }
+                },
+            }
+        ]
+        def _metric_map_side_effect(_ctx, pair_spec, stat, *, filter_state_override=None):
+            self.assertEqual(stat, "mean")
+            self.assertEqual(str(pair_spec.get("pair_id") or ""), "pair-2b")
+            suppression = tuple((filter_state_override or {}).get("suppression_voltages") or [])
+            valve = tuple((filter_state_override or {}).get("valve_voltages") or [])
+            if suppression == ("7",) and valve == ("30",):
+                return {"SN-001": 9.0, "SN-002": 12.0}
+            return {"SN-001": 8.0, "SN-002": 16.0}
+
+        with mock.patch.object(tar, "_tar_metric_map_for_pair", side_effect=_metric_map_side_effect):
+            rows = tar._tar_build_per_serial_comparison_rows(
+                ctx,
+                pair_specs=pair_specs,
+                all_serials=["SN-001", "SN-002"],
+                hi=["SN-001"],
+                initial_grade_map_by_pair_serial={("pair-2b", "SN-001"): "PASS"},
+                final_grade_map_by_pair_serial={("pair-2b", "SN-001"): "WATCH"},
+                finding_by_pair_serial={
+                    ("pair-2b", "SN-001"): {
+                        "regrade_applied": True,
+                        "final_pass_requested": True,
+                        "final_pass_available": True,
+                        "final_pass_applied": True,
+                        "official_pass_type": "final_exact_condition",
+                        "official_grade": "WATCH",
+                        "official_suppression_voltage_label": "7",
+                        "official_valve_voltage_label": "30",
+                        "initial_status": "PASS",
+                        "final_selection_mode": "per_serial_exact_condition",
+                        "regrade_suppression_voltage_label": "7",
+                        "regrade_valve_voltage_label": "30",
+                        "regrade_condition_key": tar._tar_condition_combo_key("7", "30"),
+                        "initial_z": -0.5,
+                        "final_z": 1.0,
+                    }
+                },
+            )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(
+            rows[0]["grade_basis_text"],
+            "Program-synced exact-condition final\nPer-serial exact condition\nSupp: 7 | Valve: 30",
+        )
+
+    def test_build_per_serial_comparison_rows_labels_final_unavailable_fallback(self) -> None:
+        ctx = {"filter_state": {}, "be": object(), "db_path": Path("fake.sqlite3"), "options": {}}
+        pair_specs = [
+            {
+                "pair_id": "pair-2c",
+                "selection_id": "sel-2c",
+                "run": "Run C",
+                "run_title": "Sequence C",
+                "base_condition_label": "Condition C",
+                "selection_fields": {
+                    "mode": "condition",
+                    "sequence_text": "Sequence C",
+                    "condition_text": "Condition C",
+                },
+                "param": "Flow",
+                "units": "lpm",
+                "initial_plot_payload": {
+                    "master_y": [8.0, 12.0],
+                    "y_resampled_by_sn": {
+                        "SN-001": [7.0, 9.0],
+                        "SN-002": [11.0, 21.0],
+                    },
+                },
+            }
+        ]
+        with mock.patch.object(tar, "_tar_metric_map_for_pair", return_value={"SN-001": 8.0, "SN-002": 16.0}):
+            rows = tar._tar_build_per_serial_comparison_rows(
+                ctx,
+                pair_specs=pair_specs,
+                all_serials=["SN-001", "SN-002"],
+                hi=["SN-001"],
+                initial_grade_map_by_pair_serial={("pair-2c", "SN-001"): "NO_DATA"},
+                final_grade_map_by_pair_serial={("pair-2c", "SN-001"): "NO_DATA"},
+                finding_by_pair_serial={
+                    ("pair-2c", "SN-001"): {
+                        "initial_skipped": True,
+                        "initial_skip_reason": "no_compatible_programs",
+                        "initial_status": "SKIPPED",
+                        "final_pass_requested": True,
+                        "final_pass_available": False,
+                        "final_unavailable_reason": "missing_final_candidates_for_some_serials",
+                        "official_pass_type": "initial_prepass",
+                        "official_grade": "NO_DATA",
+                    }
+                },
+            )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(
+            rows[0]["grade_basis_text"],
+            "Initial admitted-program cohort\nFinal unavailable: missing final candidates for some serials",
+        )
+
     def test_build_per_serial_comparison_rows_omits_cert_serial_without_selected_parameter_data(self) -> None:
         ctx = {"filter_state": {}, "be": object(), "db_path": Path("fake.sqlite3"), "options": {}}
         pair_specs = [

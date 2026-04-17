@@ -1802,7 +1802,7 @@ def _tar_normalize_grade_token(grade: object) -> str:
     return normalized
 
 
-def _overall_cert_status(grades: list[str], *, ignore_no_data: bool = False) -> str:
+def _overall_cert_status(grades: list[str], *, ignore_no_data: bool = False, empty_status: str = "NO_DATA") -> str:
     gs = [_tar_normalize_grade_token(g) for g in (grades or [])]
     evaluable = [g for g in gs if g in {"PASS", "WATCH", "FAIL"}]
     if any(g == "FAIL" for g in evaluable):
@@ -1813,7 +1813,7 @@ def _overall_cert_status(grades: list[str], *, ignore_no_data: bool = False) -> 
         return "NO_DATA"
     if any(g == "PASS" for g in evaluable):
         return "CERTIFIED"
-    return "NO_DATA"
+    return str(empty_status or "").strip().upper()
 
 
 def _resolve_selected_runs(run_rows: list[dict], options: dict) -> list[str]:
@@ -3038,6 +3038,10 @@ def _tar_skip_reason_label(reason: object) -> str:
         return "insufficient program data"
     if token == "no_initial_data":
         return "no initial data"
+    if token == "no_shared_exact_condition":
+        return "no shared exact condition"
+    if token == "missing_final_candidates_for_some_serials":
+        return "missing final candidates for some serials"
     return token.replace("_", " ").strip()
 
 
@@ -3075,7 +3079,13 @@ def _tar_grade_basis_text(row: Mapping[str, object] | None) -> str:
     if pass_type == "final_exact_condition":
         suppression = str(row.get("official_suppression_voltage_label") or row.get("final_suppression_voltage_label") or "All").strip() or "All"
         valve = str(row.get("official_valve_voltage_label") or row.get("final_valve_voltage_label") or "All").strip() or "All"
+        if str(row.get("final_selection_mode") or "").strip().lower() == "per_serial_exact_condition":
+            return f"Program-synced exact-condition final\nPer-serial exact condition\nSupp: {suppression} | Valve: {valve}"
         return f"Program-synced exact-condition final\nSupp: {suppression} | Valve: {valve}"
+    if bool(row.get("final_pass_requested")) and not bool(row.get("final_pass_available")):
+        reason = _tar_skip_reason_label(row.get("final_unavailable_reason"))
+        if reason:
+            return f"Initial admitted-program cohort\nFinal unavailable: {reason}"
     return "Initial admitted-program cohort"
 
 
@@ -3901,7 +3911,14 @@ def generate_test_data_auto_report(
                 if actual:
                     run_param_pairs.append((run, actual))
 
-        overall_by_sn = {sn: _overall_cert_status([grade_map.get((run, param, sn), "NO_DATA") for run, param in run_param_pairs]) for sn in hi}
+        overall_by_sn = {
+            sn: _overall_cert_status(
+                [grade_map.get((run, param, sn), "NO_DATA") for run, param in run_param_pairs],
+                ignore_no_data=True,
+                empty_status="",
+            )
+            for sn in hi
+        }
 
         nonpass_findings = [r for r in grading_rows if str(r.get("grade") or "").strip().upper() in ("WATCH", "FAIL")]
         nonpass_findings = sorted(nonpass_findings, key=_finding_sort_key)
@@ -5128,6 +5145,36 @@ def _tar_stacked_grade_text(initial_grade: object, final_grade: object) -> str:
     return f"Initial: {initial}\nFinal: {final}"
 
 
+def _tar_exec_overall_text(initial_status: object, final_status: object) -> str:
+    initial = str(initial_status or "").strip().upper()
+    final = str(final_status or "").strip().upper()
+    lines: list[str] = []
+    if initial and initial != "NO_DATA":
+        lines.append(f"Initial: {initial}")
+    if final and final != "NO_DATA":
+        lines.append(f"Final: {final}")
+    return "\n".join(lines)
+
+
+def _tar_initial_overall_status_from_rows(rows: list[Mapping[str, Any]] | None) -> str:
+    statuses = [str((row or {}).get("initial_status") or "").strip().upper() for row in (rows or []) if isinstance(row, Mapping)]
+    evaluable = [_tar_normalize_grade_token(status) for status in statuses if _tar_normalize_grade_token(status) in {"PASS", "WATCH", "FAIL"}]
+    if evaluable:
+        return _overall_cert_status(evaluable, ignore_no_data=True, empty_status="")
+    if any(status == "SKIPPED" for status in statuses):
+        return "SKIPPED"
+    return ""
+
+
+def _tar_final_overall_status_from_rows(rows: list[Mapping[str, Any]] | None) -> str:
+    grades = [
+        _tar_normalize_grade_token((row or {}).get("official_grade") or (row or {}).get("final_grade") or (row or {}).get("grade"))
+        for row in (rows or [])
+        if isinstance(row, Mapping)
+    ]
+    return _overall_cert_status([grade for grade in grades if grade], ignore_no_data=True, empty_status="")
+
+
 def _tar_comparison_grade_text(initial_grade: object, final_grade: object, *, regrade_applied: bool) -> str:
     if regrade_applied:
         return _tar_stacked_grade_text(initial_grade, final_grade)
@@ -6185,6 +6232,8 @@ def _tar_build_per_serial_comparison_rows(
                 "sync_block_id": str(finding_row.get("sync_block_id") or pair_id),
                 "sync_trigger_serials": list(finding_row.get("sync_trigger_serials") or []),
                 "shared_final_condition_key": str(finding_row.get("shared_final_condition_key") or ""),
+                "representative_final_condition_key": str(finding_row.get("representative_final_condition_key") or ""),
+                "final_selection_mode": str(finding_row.get("final_selection_mode") or ""),
                 "program_sync_applied": bool(finding_row.get("program_sync_applied")),
                 "block_final_required": bool(finding_row.get("block_final_required")),
                 "block_final_available": bool(finding_row.get("block_final_available")),
@@ -6257,9 +6306,7 @@ def _tar_exec_exception_severity_rank(status: object) -> int:
         return 0
     if token == "WATCH":
         return 1
-    if token == "NO_DATA":
-        return 2
-    return 3
+    return 2
 
 
 def _tar_percent_text(numerator: int, denominator: int) -> str:
@@ -6316,8 +6363,8 @@ def _tar_build_exec_exception_rows(ctx: Mapping[str, Any]) -> list[dict[str, Any
     for raw_row in (ctx.get("comparison_rows") or []):
         if not isinstance(raw_row, Mapping):
             continue
-        final_status = _tar_normalize_grade_token(raw_row.get("final_grade") or raw_row.get("grade")) or "NO_DATA"
-        if final_status not in {"FAIL", "WATCH", "NO_DATA"}:
+        final_status = _tar_normalize_grade_token(raw_row.get("official_grade") or raw_row.get("final_grade") or raw_row.get("grade")) or ""
+        if final_status not in {"FAIL", "WATCH"}:
             continue
         cohort_id = str(raw_row.get("regrade_cohort_id") or "").strip()
         rows.append(
@@ -7868,7 +7915,7 @@ def _tar_analyze_curve_groups(
             allowed_programs=included_programs,
         )
         admitted_trace_map_by_spec: dict[str, dict[str, list[float]]] = {}
-        if not initial_skip_reason and admitted_program_traces:
+        if admitted_program_traces:
             initial_model = _tar_build_curve_model_for_program_traces(
                 x_name=str(members[0].get("x_name") or ""),
                 units=str(members[0].get("units") or ""),
@@ -7878,14 +7925,17 @@ def _tar_analyze_curve_groups(
                 normalize_x=normalize_x,
             )
             if not isinstance(initial_model, dict):
-                initial_skip_reason = "insufficient_program_data"
+                initial_model = None
+                if not initial_skip_reason:
+                    initial_skip_reason = "insufficient_program_data"
             else:
+                included_program_set = set(included_programs)
                 for spec in members:
                     pair_id = str(spec.get("pair_id") or "").strip()
                     admitted_trace_map_by_spec[pair_id] = {
                         serial: list(trace)
                         for serial, trace in (full_trace_map_by_spec.get(pair_id) or {}).items()
-                        if _tar_program_label(program_by_serial, serial) in set(included_programs)
+                        if _tar_program_label(program_by_serial, serial) in included_program_set
                     }
         for spec in members:
             spec["prepass_reference_program"] = reference_program
@@ -7894,51 +7944,12 @@ def _tar_analyze_curve_groups(
             spec["prepass_gate_mode"] = prepass_gate_mode
             spec["prepass_gate_details"] = [dict(item) for item in prepass_gate_details]
 
-        if initial_skip_reason:
-            for spec in members:
-                pair_id = str(spec.get("pair_id") or "").strip()
-                spec["initial_model"] = {}
-                spec["initial_plot_payload"] = {
-                    "run": spec.get("run"),
-                    "param": spec.get("param"),
-                    "units": str(spec.get("units") or ""),
-                    "selection": dict(spec.get("selection") or {}),
-                    "x_name": str(spec.get("x_name") or ""),
-                    "x_grid": list(x_grid),
-                    "y_resampled_by_sn": {},
-                    "master_y": [],
-                    "std_y": [],
-                    "program_traces_by_program": {},
-                    "program_weighting": "equal_program_weight",
-                    "prepass_reference_program": reference_program,
-                    "prepass_included_programs": list(included_programs),
-                    "prepass_excluded_programs": list(excluded_programs),
-                    "prepass_gate_mode": prepass_gate_mode,
-                    "prepass_gate_details": [dict(item) for item in prepass_gate_details],
-                }
-                hi_serials = {
-                    str(curve.serial or "").strip()
-                    for curve in (spec.get("series") or [])
-                    if isinstance(curve, CurveSeries) and str(curve.serial or "").strip() in hi_set
-                }
-                for serial in hi_serials:
-                    initial_rows[(pair_id, serial)] = _tar_initial_skip_row(
-                        spec,
-                        serial=serial,
-                        reference_program=reference_program,
-                        included_programs=included_programs,
-                        excluded_programs=excluded_programs,
-                        reason=initial_skip_reason,
-                        gate_mode=prepass_gate_mode,
-                        gate_details=prepass_gate_details,
-                    )
-        else:
-            assert isinstance(initial_model, dict)
-            initial_master_y = list(initial_model.get("master_y") or [])
-            initial_std_y = list(initial_model.get("std_y") or [])
-            initial_denom = float(initial_model.get("denom") or 1.0)
-            initial_entries: list[tuple[dict, str, dict]] = []
-            trace_curves: list[dict] = []
+        initial_master_y = list(initial_model.get("master_y") or []) if isinstance(initial_model, dict) else []
+        initial_std_y = list(initial_model.get("std_y") or []) if isinstance(initial_model, dict) else []
+        initial_denom = float(initial_model.get("denom") or 1.0) if isinstance(initial_model, dict) else 1.0
+        initial_entries: list[tuple[dict, str, dict]] = []
+        trace_curves: list[dict] = []
+        if isinstance(initial_model, dict):
             for spec in members:
                 pair_id = str(spec.get("pair_id") or "").strip()
                 admitted_trace_map = dict(admitted_trace_map_by_spec.get(pair_id) or {})
@@ -7977,9 +7988,52 @@ def _tar_analyze_curve_groups(
                             "y_curve": list(y_curve),
                         }
                     )
-                    dev = _tar_compute_curve_deviation(y_curve, initial_master_y, x_grid, denom=initial_denom)
-                    if dev is not None:
-                        initial_entries.append((spec, serial, dev))
+                    if not initial_skip_reason:
+                        dev = _tar_compute_curve_deviation(y_curve, initial_master_y, x_grid, denom=initial_denom)
+                        if dev is not None:
+                            initial_entries.append((spec, serial, dev))
+        else:
+            for spec in members:
+                spec["initial_model"] = {}
+                spec["initial_plot_payload"] = {
+                    "run": spec.get("run"),
+                    "param": spec.get("param"),
+                    "units": str(spec.get("units") or ""),
+                    "selection": dict(spec.get("selection") or {}),
+                    "x_name": str(spec.get("x_name") or ""),
+                    "x_grid": list(x_grid),
+                    "y_resampled_by_sn": {},
+                    "master_y": [],
+                    "std_y": [],
+                    "program_traces_by_program": {},
+                    "program_weighting": "equal_program_weight",
+                    "prepass_reference_program": reference_program,
+                    "prepass_included_programs": list(included_programs),
+                    "prepass_excluded_programs": list(excluded_programs),
+                    "prepass_gate_mode": prepass_gate_mode,
+                    "prepass_gate_details": [dict(item) for item in prepass_gate_details],
+                }
+
+        if initial_skip_reason:
+            for spec in members:
+                pair_id = str(spec.get("pair_id") or "").strip()
+                hi_serials = {
+                    str(curve.serial or "").strip()
+                    for curve in (spec.get("series") or [])
+                    if isinstance(curve, CurveSeries) and str(curve.serial or "").strip() in hi_set
+                }
+                for serial in hi_serials:
+                    initial_rows[(pair_id, serial)] = _tar_initial_skip_row(
+                        spec,
+                        serial=serial,
+                        reference_program=reference_program,
+                        included_programs=included_programs,
+                        excluded_programs=excluded_programs,
+                        reason=initial_skip_reason,
+                        gate_mode=prepass_gate_mode,
+                        gate_details=prepass_gate_details,
+                    )
+        else:
             mean_score, std_score = _tar_program_score_stats(
                 [(serial, dev) for _spec, serial, dev in initial_entries],
                 program_by_serial=program_by_serial,
@@ -8027,6 +8081,7 @@ def _tar_analyze_curve_groups(
                     watch = True
                 if watch:
                     initial_watch_items.append({**row, "grade": grade, "z": float(z_score), "max_pct": dev.get("max_pct")})
+        if isinstance(initial_model, dict):
             initial_cohort_specs.append(
                 {
                     "cohort_id": f"initial:{group_index}:{_norm_key(members[0].get('base_condition_label') or '')}:{_norm_key(members[0].get('param') or '')}:{_norm_key(members[0].get('x_name') or '')}",
@@ -8306,11 +8361,14 @@ def _tar_analyze_curve_groups(
         )
         block_final_required = bool(trigger_serials)
         shared_final_condition_key = ""
+        representative_final_condition_key = ""
         selected_candidates: dict[str, dict[str, Any]] = {}
         final_unavailable_reason = ""
+        final_selection_mode = ""
         if block_final_required and serial_context:
             per_serial_candidate_map: dict[str, dict[str, dict[str, Any]]] = {}
             shared_keys: set[str] | None = None
+            all_serials_have_candidates = True
             for serial, ctx_row in serial_context.items():
                 candidate_map = {
                     str(candidate.get("condition_key") or "").strip(): dict(candidate)
@@ -8318,6 +8376,8 @@ def _tar_analyze_curve_groups(
                     if str(candidate.get("condition_key") or "").strip()
                 }
                 per_serial_candidate_map[serial] = candidate_map
+                if not candidate_map:
+                    all_serials_have_candidates = False
                 if shared_keys is None:
                     shared_keys = set(candidate_map.keys())
                 else:
@@ -8333,35 +8393,58 @@ def _tar_analyze_curve_groups(
                     return _tar_worst_candidate_sort_key(worst)
 
                 shared_final_condition_key = max(sorted(shared_keys), key=_shared_condition_sort_key)
+                representative_final_condition_key = shared_final_condition_key
                 selected_candidates = {
                     serial: dict(per_serial_candidate_map[serial][shared_final_condition_key])
                     for serial in sorted(per_serial_candidate_map.keys())
                     if shared_final_condition_key in per_serial_candidate_map[serial]
                 }
+                final_selection_mode = "shared_exact_condition"
+            elif all_serials_have_candidates:
+                selected_candidates = {
+                    serial: dict(max(candidate_map.values(), key=_tar_worst_candidate_sort_key))
+                    for serial, candidate_map in per_serial_candidate_map.items()
+                    if candidate_map
+                }
+                representative_candidate = max(
+                    selected_candidates.values(),
+                    key=_tar_worst_candidate_sort_key,
+                ) if selected_candidates else {}
+                representative_final_condition_key = str(representative_candidate.get("condition_key") or "").strip()
+                final_selection_mode = "per_serial_exact_condition"
             else:
-                final_unavailable_reason = "no_shared_exact_condition"
+                final_unavailable_reason = "missing_final_candidates_for_some_serials"
+        block_final_available = bool(serial_context) and len(selected_candidates) == len(serial_context)
         pair_final_decisions[pair_id] = {
             "sync_block_id": pair_id,
             "block_final_required": block_final_required,
-            "block_final_available": bool(shared_final_condition_key),
+            "block_final_available": block_final_available,
             "shared_final_condition_key": shared_final_condition_key,
+            "representative_final_condition_key": representative_final_condition_key,
             "selected_candidates": selected_candidates,
             "sync_trigger_serials": list(trigger_serials),
             "final_unavailable_reason": final_unavailable_reason,
+            "final_selection_mode": final_selection_mode,
         }
 
     for spec in specs:
         pair_id = str(spec.get("pair_id") or "")
         pair_decision = dict(pair_final_decisions.get(pair_id) or {})
-        pair_condition_key = str(pair_decision.get("shared_final_condition_key") or "").strip()
+        pair_condition_key = str(
+            pair_decision.get("representative_final_condition_key")
+            or pair_decision.get("shared_final_condition_key")
+            or ""
+        ).strip()
         if bool(pair_decision.get("block_final_available")) and pair_condition_key:
-            selected_pair_candidate = next(
-                (
-                    dict(candidate)
-                    for candidate in (pair_decision.get("selected_candidates") or {}).values()
-                    if str(candidate.get("pair_id") or "").strip() == pair_id
-                ),
-                {},
+            selected_pair_candidates = [
+                dict(candidate)
+                for candidate in (pair_decision.get("selected_candidates") or {}).values()
+                if str(candidate.get("pair_id") or "").strip() == pair_id
+            ]
+            selected_pair_candidate = (
+                max(selected_pair_candidates, key=_tar_worst_candidate_sort_key)
+                if selected_pair_candidates
+                else {}
             )
             pair_suppression = str(selected_pair_candidate.get("suppression_voltage_label") or "").strip()
             pair_valve = str(selected_pair_candidate.get("valve_voltage_label") or "").strip()
@@ -8475,6 +8558,8 @@ def _tar_analyze_curve_groups(
                     "sync_block_id": str(pair_decision.get("sync_block_id") or pair_id),
                     "sync_trigger_serials": list(pair_decision.get("sync_trigger_serials") or []),
                     "shared_final_condition_key": str(pair_decision.get("shared_final_condition_key") or ""),
+                    "representative_final_condition_key": str(pair_decision.get("representative_final_condition_key") or ""),
+                    "final_selection_mode": str(pair_decision.get("final_selection_mode") or ""),
                     "program_sync_applied": program_sync_applied,
                     "block_final_required": block_final_required,
                     "block_final_available": block_final_available,
@@ -8900,6 +8985,9 @@ def _tar_prepare_base(
                     "block_final_available",
                     "final_pass_requested",
                     "final_pass_available",
+                    "shared_final_condition_key",
+                    "representative_final_condition_key",
+                    "final_selection_mode",
                     "grade_basis_text",
                     "prepass_cohort_note",
                 )
@@ -8927,6 +9015,9 @@ def _tar_prepare_base(
                     "block_final_available",
                     "final_pass_requested",
                     "final_pass_available",
+                    "shared_final_condition_key",
+                    "representative_final_condition_key",
+                    "final_selection_mode",
                     "grade_basis_text",
                     "prepass_cohort_note",
                 )
@@ -8940,24 +9031,17 @@ def _tar_prepare_base(
         key=_finding_sort_key,
     )
 
-    pair_ids = [str(spec.get("pair_id") or "").strip() for spec in pair_specs if str(spec.get("pair_id") or "").strip()]
+    comparison_rows_by_serial: dict[str, list[dict[str, Any]]] = {}
+    for row in comparison_rows:
+        serial = str(row.get("serial") or "").strip()
+        if serial:
+            comparison_rows_by_serial.setdefault(serial, []).append(dict(row))
     initial_overall_by_sn = {
-        serial: _overall_cert_status(
-            [
-                str(initial_grade_map_by_pair_serial.get((pair_id, serial), "NO_DATA") or "NO_DATA").strip().upper() or "NO_DATA"
-                for pair_id in pair_ids
-            ]
-        )
+        serial: _tar_initial_overall_status_from_rows(comparison_rows_by_serial.get(serial) or [])
         for serial in hi
     }
     final_overall_by_sn = {
-        serial: _overall_cert_status(
-            [
-                str(final_grade_map_by_pair_serial.get((pair_id, serial), "NO_DATA") or "NO_DATA").strip().upper() or "NO_DATA"
-                for pair_id in pair_ids
-            ],
-            ignore_no_data=True,
-        )
+        serial: _tar_final_overall_status_from_rows(comparison_rows_by_serial.get(serial) or [])
         for serial in hi
     }
 
@@ -9168,7 +9252,6 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
         "CERTIFIED": sum(1 for status in (ctx.get("overall_by_sn") or {}).values() if status == "CERTIFIED"),
         "WATCH": sum(1 for status in (ctx.get("overall_by_sn") or {}).values() if status == "WATCH"),
         "FAILED": sum(1 for status in (ctx.get("overall_by_sn") or {}).values() if status == "FAILED"),
-        "NO_DATA": sum(1 for status in (ctx.get("overall_by_sn") or {}).values() if status == "NO_DATA"),
     }
     highlight_lines = []
     nonpass_findings = list(ctx.get("nonpass_findings") or [])
@@ -9236,9 +9319,9 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
     exec_rows = [
         [
             serial,
-            _tar_stacked_grade_text(
-                (ctx.get("initial_overall_by_sn") or {}).get(serial, "NO_DATA"),
-                (ctx.get("final_overall_by_sn") or {}).get(serial, "NO_DATA"),
+            _tar_exec_overall_text(
+                (ctx.get("initial_overall_by_sn") or {}).get(serial, ""),
+                (ctx.get("final_overall_by_sn") or {}).get(serial, ""),
             ),
             _tar_meta(ctx, serial, "program_title"),
             _tar_meta(ctx, serial, "part_number"),
@@ -9295,7 +9378,6 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
                 f"CERTIFIED: {status_counts['CERTIFIED']}",
                 f"WATCH: {status_counts['WATCH']}",
                 f"FAILED: {status_counts['FAILED']}",
-                f"NO_DATA: {status_counts['NO_DATA']}",
                 f"Curves evaluated: {len(ctx.get('pair_specs') or [])}",
                 f"Performance plots configured: {len(ctx.get('performance_plot_specs') or [])}",
             ],
@@ -10446,7 +10528,6 @@ def _tar_build_closing_story(ctx: Mapping[str, Any], *, counts: Mapping[str, int
         "CERTIFIED": sum(1 for status in overall_by_sn.values() if status == "CERTIFIED"),
         "WATCH": sum(1 for status in overall_by_sn.values() if status == "WATCH"),
         "FAILED": sum(1 for status in overall_by_sn.values() if status == "FAILED"),
-        "NO_DATA": sum(1 for status in overall_by_sn.values() if status == "NO_DATA"),
     }
 
     story: list[Any] = []
@@ -10476,7 +10557,6 @@ def _tar_build_closing_story(ctx: Mapping[str, Any], *, counts: Mapping[str, int
                 f"CERTIFIED serials: {status_counts['CERTIFIED']}",
                 f"WATCH serials: {status_counts['WATCH']}",
                 f"FAILED serials: {status_counts['FAILED']}",
-                f"NO_DATA serials: {status_counts['NO_DATA']}",
             ],
             styles=styles,
             rl=rl,
@@ -10501,7 +10581,7 @@ def _tar_build_closing_story(ctx: Mapping[str, Any], *, counts: Mapping[str, int
     outcome_rows = [
         [
             serial,
-            overall_by_sn.get(serial, "NO_DATA"),
+            str(overall_by_sn.get(serial) or "").strip(),
             str(len(nonpass_by_sn.get(serial) or [])),
             _tar_meta(ctx, serial, "program_title"),
             _tar_meta(ctx, serial, "acceptance_test_plan_number"),
