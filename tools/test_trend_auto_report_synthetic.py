@@ -962,7 +962,7 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         self.assertEqual(row["selected_programs"], ["Program A", "Program B"])
         self.assertEqual(row["selected_pool_series_count"], 3)
         self.assertEqual(row["target_excluded_comparison_series_count"], 2)
-        self.assertEqual(row["target_comparison_text"], "HI graded against: 1 program (Program B), 2 comparison series")
+        self.assertEqual(row["target_comparison_text"], "HI graded against: 1 program, 2 comparison series")
         self.assertEqual(len(analysis["initial_cohort_specs"]), 1)
         self.assertEqual(analysis["regrade_cohort_specs"], [])
         self.assertEqual(pair_spec["filter_state_override"], {})
@@ -1882,12 +1882,10 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         self.assertEqual(matrix_rows[4][:5], ["", "", "Certified Serial Mean", "11", "19"])
         self.assertEqual(matrix_rows[5][:5], ["", "", "Deviation Score", "-1", "-1"])
         self.assertEqual(matrix_rows[6][:5], ["", "", "Official Grade", "WATCH", "PASS"])
-        self.assertEqual(matrix_rows[7][:5], ["", "", "Comparison Pool", "0 programs (none), 0 series used", "0 programs (none), 0 series used"])
-        self.assertEqual(matrix_rows[8][:5], ["", "", "Comparison Series", "—", "—"])
-        self.assertEqual(matrix_rows[9][:5], ["", "", "Grade Basis", "Program-synced exact-condition final\nSupp: 5 | Valve: 28", "Initial admitted-program cohort"])
-        self.assertIn(("SPAN", (0, 2), (0, 9)), style_cmds)
-        self.assertIn(("SPAN", (1, 2), (1, 9)), style_cmds)
-        self.assertIn(("BACKGROUND", (3, 2), (3, 9), "#fef3c7"), style_cmds)
+        self.assertEqual(matrix_rows[7][:5], ["", "", "Grade Basis", "Program-synced exact-condition final\nSupp: 5 | Valve: 28", "Initial admitted-program cohort"])
+        self.assertIn(("SPAN", (0, 2), (0, 7)), style_cmds)
+        self.assertIn(("SPAN", (1, 2), (1, 7)), style_cmds)
+        self.assertIn(("BACKGROUND", (3, 2), (3, 7), "#fef3c7"), style_cmds)
 
     def test_generate_auto_report_merges_tabloid_comparison_pages_before_plots(self):
         fitz = __import__("fitz")
@@ -1973,7 +1971,14 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
             }
             captured: dict[str, object] = {}
 
-            def _render_intro(intro_pdf: Path, *, ctx: dict[str, object], progress_cb: object = None) -> tuple[int, list[object]]:
+            def _render_intro(
+                intro_pdf: Path,
+                *,
+                ctx: dict[str, object],
+                plot_specs_override: object = None,
+                comparison_page_count: object = None,
+                progress_cb: object = None,
+            ) -> tuple[int, list[object]]:
                 _write_pdf(intro_pdf, [(612.0, 792.0), (612.0, 792.0)])
                 return 2, ["intro"]
 

@@ -468,6 +468,26 @@ class TestTrendAutoReportFilters(unittest.TestCase):
             )
         )
 
+    def test_grade_basis_selected_pool_uses_counts_without_program_names(self) -> None:
+        text = tar._tar_grade_basis_text(
+            {
+                "official_pass_type": "selected_program_pool",
+                "grading_basis_status": "selected_program_pool",
+                "selected_programs": ["Program A", "Program B"],
+                "selected_program_count": 2,
+                "selected_pool_series_count": 3,
+                "comparison_programs": ["Program B"],
+                "comparison_program_count": 1,
+                "target_excluded_comparison_series_count": 2,
+                "comparison_pool_text": "2 programs (Program A, Program B), 3 series used",
+                "target_comparison_text": "HI graded against: 1 program (Program B), 2 comparison series",
+            }
+        )
+
+        self.assertEqual(text, "Selected program pool\nPrograms used: 1 | Comparison series: 2")
+        self.assertNotIn("Program A", text)
+        self.assertNotIn("Program B", text)
+
     def test_build_per_serial_comparison_rows_tracks_initial_and_final_values(self) -> None:
         ctx = {"filter_state": {}, "be": object(), "db_path": Path("fake.sqlite3"), "options": {}}
         pair_specs = [
@@ -1209,6 +1229,37 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         self.assertEqual(len(used_columns), 2)
         self.assertEqual(used_columns[0]["rows"][0]["text"], "Run Condition Metrics")
         self.assertEqual(used_columns[1]["rows"][0]["text"], "Run Condition Metrics")
+
+    def test_prepare_intro_story_with_actual_plot_specs_rebases_toc_pages(self) -> None:
+        ctx = {
+            "comparison_page_specs": [{"serial": "SN1"}, {"serial": "SN2"}],
+        }
+        actual_plot_specs = [
+            {
+                "section": "performance_plots",
+                "name": "Actual Fit",
+                "x": "Bus Voltage",
+                "y": "Flow",
+                "stat": "mean",
+                "page_number": 999,
+            }
+        ]
+
+        with mock.patch.object(tar, "_tar_plan_plot_specs") as plan_mock, mock.patch.object(
+            tar, "_tar_paginate_plot_navigation", return_value=[{"rows": []}]
+        ), mock.patch.object(tar, "_tar_build_intro_story", return_value=["intro"]):
+            story = tar._tar_prepare_intro_story_with_navigation(
+                ctx,
+                intro_pages=4,
+                plot_specs_override=actual_plot_specs,
+                comparison_page_count=2,
+            )
+
+        plan_mock.assert_not_called()
+        self.assertEqual(story, ["intro"])
+        self.assertEqual(ctx["planned_plot_specs"][0]["page_number"], 7)
+        self.assertEqual(ctx["plot_navigation"][0]["page_text"], "7")
+        self.assertEqual(ctx["plot_navigation"][0]["plot_label"], "Actual Fit | Flow vs Bus Voltage | mean")
 
     def test_apply_pdf_navigation_adds_links_and_bookmarks(self) -> None:
         fitz = __import__("fitz")

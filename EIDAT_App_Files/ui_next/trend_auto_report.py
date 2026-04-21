@@ -2938,8 +2938,6 @@ _TAR_COMPARISON_METRIC_ROWS = (
     "Certified Serial Mean",
     "Deviation Score",
     "Official Grade",
-    "Comparison Pool",
-    "Comparison Series",
     "Grade Basis",
 )
 _TAR_COMPARISON_PAGE_WIDTH = 17.0 * 72.0
@@ -3094,6 +3092,35 @@ def _tar_initial_status_display(row: Mapping[str, object] | None) -> str:
     return status or "NO_DATA"
 
 
+def _tar_count_value(value: object) -> int | None:
+    try:
+        count = int(value)
+    except Exception:
+        return None
+    return max(0, count)
+
+
+def _tar_comparison_basis_count_text(row: Mapping[str, object] | None) -> str:
+    if not isinstance(row, Mapping):
+        return ""
+    program_count = _tar_count_value(row.get("comparison_program_count"))
+    if program_count is None:
+        comparison_programs = row.get("comparison_programs")
+        if isinstance(comparison_programs, (list, tuple, set)):
+            program_count = len(_tar_unique_text_values(list(comparison_programs)))
+    if program_count is None:
+        program_count = _tar_count_value(row.get("selected_program_count"))
+    if program_count is None:
+        selected_programs = row.get("selected_programs")
+        if isinstance(selected_programs, (list, tuple, set)):
+            program_count = len(_tar_unique_text_values(list(selected_programs)))
+    series_count = _tar_count_value(row.get("target_excluded_comparison_series_count"))
+    if series_count is None:
+        selected_series_count = _tar_count_value(row.get("selected_pool_series_count"))
+        series_count = max(0, selected_series_count - 1) if selected_series_count is not None else 0
+    return f"Programs used: {int(program_count or 0)} | Comparison series: {int(series_count or 0)}"
+
+
 def _tar_grade_basis_text(row: Mapping[str, object] | None) -> str:
     if not isinstance(row, Mapping):
         return ""
@@ -3107,18 +3134,15 @@ def _tar_grade_basis_text(row: Mapping[str, object] | None) -> str:
         )
     ):
         status = str(row.get("grading_basis_status") or "").strip().lower()
-        pool_text = str(row.get("comparison_pool_text") or "").strip()
-        target_text = str(row.get("target_comparison_text") or "").strip()
         basis = "Selected program pool"
         if status == "program_only_pool":
             basis = "Selected certifying-program pool"
         elif status == "limited_target_excluded_baseline":
             basis = "Limited selected-pool baseline"
         lines = [basis]
-        if pool_text:
-            lines.append(f"Comparison Pool: {pool_text}")
-        if target_text:
-            lines.append(target_text)
+        count_text = _tar_comparison_basis_count_text(row)
+        if count_text:
+            lines.append(count_text)
         return "\n".join(lines)
     if pass_type == "final_exact_condition":
         suppression = str(row.get("official_suppression_voltage_label") or row.get("final_suppression_voltage_label") or "All").strip() or "All"
@@ -6556,8 +6580,8 @@ _TAR_PLOT_TOC_SECTION_META = {
 _TAR_PLOT_TOC_MAX_COLUMNS = 3
 _TAR_PLOT_TOC_TABLE_WIDTH = 6.9 * 72.0
 _TAR_PLOT_TOC_COLUMN_GAP = 12.0
-_TAR_PLOT_TOC_PAGE_NUMBER_WIDTH_MIN = 28.0
-_TAR_PLOT_TOC_PAGE_NUMBER_WIDTH_MAX = 42.0
+_TAR_PLOT_TOC_PAGE_NUMBER_WIDTH_MIN = 42.0
+_TAR_PLOT_TOC_PAGE_NUMBER_WIDTH_MAX = 54.0
 
 
 def _tar_plot_toc_section_rank(section_key: object) -> int:
@@ -7458,8 +7482,7 @@ def _tar_pool_summary_text(programs: Collection[object] | None, series_count: ob
         series_num = 0
     noun_program = "program" if program_count == 1 else "programs"
     noun_series = "series" if series_num == 1 else "series"
-    names = _tar_join_limited(program_names, max_items=8, empty="none")
-    return f"{program_count} {noun_program} ({names}), {series_num} {noun_series} used"
+    return f"{program_count} {noun_program}, {series_num} {noun_series} used"
 
 
 def _tar_build_target_excluded_pool_model(
@@ -8385,13 +8408,12 @@ def _tar_analyze_curve_groups(
                     official_baseline_mean = _tar_finite_mean(list(pool_model.get("master_y") or []))
                     official_serial_mean = _tar_finite_mean(list(y_curve))
                     comparison_pool_text = _tar_pool_summary_text(selected_programs, selected_pool_series_count)
-                    comparison_program_names = _tar_join_limited(comparison_programs, max_items=8, empty="none")
                     comparison_program_count = len(comparison_programs)
                     comparison_program_noun = "program" if comparison_program_count == 1 else "programs"
                     comparison_series_noun = "series" if comparison_series_count == 1 else "series"
                     target_comparison_text = (
-                        f"{serial} graded against: {comparison_program_count} {comparison_program_noun} "
-                        f"({comparison_program_names}), {comparison_series_count} comparison {comparison_series_noun}"
+                        f"{serial} graded against: {comparison_program_count} {comparison_program_noun}, "
+                        f"{comparison_series_count} comparison {comparison_series_noun}"
                     )
                     if comparison_series_count < 2 or not pool_model.get("master_y"):
                         dev = None
@@ -11059,10 +11081,43 @@ def _tar_build_closing_story(ctx: Mapping[str, Any], *, counts: Mapping[str, int
     return story
 
 
-def _tar_prepare_intro_story_with_navigation(ctx: dict[str, Any], *, intro_pages: int) -> list[Any]:
+def _tar_rebase_plot_specs(
+    plot_specs: list[dict] | None,
+    *,
+    intro_pages: int,
+    comparison_page_count: int,
+) -> list[dict]:
+    page_number = max(0, int(intro_pages or 0) + int(comparison_page_count or 0))
+    rebased: list[dict] = []
+    for raw_spec in plot_specs or []:
+        if not isinstance(raw_spec, Mapping):
+            continue
+        page_number += 1
+        spec = dict(raw_spec)
+        spec["page_number"] = int(page_number)
+        rebased.append(spec)
+    return rebased
+
+
+def _tar_prepare_intro_story_with_navigation(
+    ctx: dict[str, Any],
+    *,
+    intro_pages: int,
+    plot_specs_override: list[dict] | None = None,
+    comparison_page_count: int | None = None,
+) -> list[Any]:
     comparison_page_specs = [dict(page) for page in (ctx.get("comparison_page_specs") or _tar_plan_comparison_pages(ctx)) if isinstance(page, Mapping)]
     ctx["comparison_page_specs"] = comparison_page_specs
-    planned_plot_specs = _tar_plan_plot_specs(ctx, intro_pages=intro_pages + len(comparison_page_specs))
+    comparison_pages = int(comparison_page_count if comparison_page_count is not None else len(comparison_page_specs))
+    planned_plot_specs = (
+        _tar_rebase_plot_specs(
+            plot_specs_override,
+            intro_pages=intro_pages,
+            comparison_page_count=comparison_pages,
+        )
+        if plot_specs_override is not None
+        else _tar_plan_plot_specs(ctx, intro_pages=intro_pages + comparison_pages)
+    )
     plot_navigation = _tar_build_plot_navigation(planned_plot_specs)
     ctx["planned_plot_specs"] = planned_plot_specs
     ctx["plot_navigation"] = plot_navigation
@@ -11074,12 +11129,19 @@ def _tar_render_stabilized_intro_pdf(
     intro_pdf: Path,
     *,
     ctx: dict[str, Any],
+    plot_specs_override: list[dict] | None = None,
+    comparison_page_count: int | None = None,
     progress_cb: Callable[[str], None] | None = None,
 ) -> tuple[int, list[Any]]:
     guess = 0
     story: list[Any] = []
     for attempt in range(6):
-        story = _tar_prepare_intro_story_with_navigation(ctx, intro_pages=guess)
+        story = _tar_prepare_intro_story_with_navigation(
+            ctx,
+            intro_pages=guess,
+            plot_specs_override=plot_specs_override,
+            comparison_page_count=comparison_page_count,
+        )
         if attempt:
             _tar_emit_progress(progress_cb, f"Re-rendering summary pages to stabilize plot TOC page references ({attempt + 1}/6)")
         actual_pages = _render_portrait_story_pdf(intro_pdf, story=story, print_ctx=ctx["print_ctx"], page_number_offset=0)
@@ -11087,7 +11149,12 @@ def _tar_render_stabilized_intro_pdf(
             return int(actual_pages), story
         guess = int(actual_pages)
 
-    story = _tar_prepare_intro_story_with_navigation(ctx, intro_pages=guess)
+    story = _tar_prepare_intro_story_with_navigation(
+        ctx,
+        intro_pages=guess,
+        plot_specs_override=plot_specs_override,
+        comparison_page_count=comparison_page_count,
+    )
     final_pages = _render_portrait_story_pdf(intro_pdf, story=story, print_ctx=ctx["print_ctx"], page_number_offset=0)
     return int(final_pages), story
 
@@ -11176,6 +11243,40 @@ def generate_test_data_auto_report(
                 progress_cb=progress_cb,
             )
             timings["render_plot_pages_seconds"] = round(time.perf_counter() - plot_render_start, 3)
+            actual_plot_specs = [dict(spec) for spec in (plot_counts.get("plot_specs") or []) if isinstance(spec, Mapping)]
+
+            actual_intro_render_start = time.perf_counter()
+            _tar_emit_progress(progress_cb, "Re-rendering cover, TOC, and summary pages from actual plot inventory")
+            intro_pages, intro_story = _tar_render_stabilized_intro_pdf(
+                intro_pdf,
+                ctx=ctx,
+                plot_specs_override=actual_plot_specs,
+                comparison_page_count=comparison_pages,
+                progress_cb=progress_cb,
+            )
+            timings["render_actual_intro_pages_seconds"] = round(time.perf_counter() - actual_intro_render_start, 3)
+
+            comparison_rerender_start = time.perf_counter()
+            comparison_pages = 0
+            if comparison_story:
+                _tar_emit_progress(progress_cb, "Re-rendering run comparison pages with final page offsets")
+                comparison_pages = _render_tabloid_landscape_story_pdf(
+                    comparison_pdf,
+                    story=comparison_story,
+                    print_ctx=ctx["print_ctx"],
+                    page_number_offset=intro_pages,
+                )
+            timings["rerender_comparison_pages_seconds"] = round(time.perf_counter() - comparison_rerender_start, 3)
+
+            final_plot_render_start = time.perf_counter()
+            _tar_emit_progress(progress_cb, "Re-rendering plot pages with final TOC page references")
+            plot_counts = _tar_render_plot_sections(
+                ctx,
+                intro_pages=intro_pages + comparison_pages,
+                plots_pdf=plots_pdf,
+                progress_cb=progress_cb,
+            )
+            timings["rerender_plot_pages_seconds"] = round(time.perf_counter() - final_plot_render_start, 3)
             actual_plot_navigation = _tar_build_plot_navigation(list(plot_counts.get("plot_specs") or []))
             plot_counts = dict(plot_counts)
             plot_counts["plot_specs"] = actual_plot_navigation
