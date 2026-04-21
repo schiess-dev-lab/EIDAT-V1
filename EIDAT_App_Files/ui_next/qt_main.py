@@ -4236,10 +4236,6 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         metrics_condition_actions.addStretch(1)
         metrics_condition_layout.addLayout(metrics_condition_actions)
 
-        self.lbl_run_details = QtWidgets.QLabel("Sequence: -")
-        self.lbl_run_details.setStyleSheet("color: #64748b; font-size: 11px;")
-        self.lbl_run_details.setWordWrap(True)
-        form.addRow("", self.lbl_run_details)
         run_selector_layout.addLayout(form)
         run_selector_layout.addWidget(self.metrics_condition_frame)
         left_layout.addWidget(self.run_selector_frame)
@@ -4293,12 +4289,14 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         """
         self.btn_zone_zoom = QtWidgets.QPushButton("Magnify")
         self.btn_zone_zoom.setCheckable(True)
+        self.btn_save_plot_pdf = QtWidgets.QPushButton("Save Plot PDF")
         self.btn_zoom_out = QtWidgets.QPushButton("Zoom -")
         self.btn_zoom_in = QtWidgets.QPushButton("Zoom +")
         self.btn_zoom_reset = QtWidgets.QPushButton("Reset")
         self.btn_expand_plot = QtWidgets.QPushButton("Expand")
         for b in (
             self.btn_zone_zoom,
+            self.btn_save_plot_pdf,
             self.btn_zoom_out,
             self.btn_zoom_in,
             self.btn_zoom_reset,
@@ -4307,10 +4305,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             b.setEnabled(False)
             b.setStyleSheet(zoom_btn_css)
         self.btn_zone_zoom.setToolTip("Magnify zones: click-drag a rectangle on the plot to zoom to that area")
+        self.btn_save_plot_pdf.setToolTip("Save the current plot as a PDF")
         self.btn_zoom_out.setToolTip("Zoom out (mouse wheel also works)")
         self.btn_zoom_in.setToolTip("Zoom in (mouse wheel also works)")
         self.btn_zoom_reset.setToolTip("Reset zoom to the default view")
         self.btn_expand_plot.setToolTip("Open a larger popup for zooming/panning")
+        self.btn_save_plot_pdf.clicked.connect(self._save_plot_pdf)
         self.btn_zoom_out.clicked.connect(lambda: self._zoom_main_plot(1.25))
         self.btn_zoom_in.clicked.connect(lambda: self._zoom_main_plot(0.8))
         self.btn_zoom_reset.clicked.connect(self._reset_main_plot_zoom)
@@ -4325,6 +4325,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self.btn_plot_legend.setEnabled(False)
         self.btn_plot_legend.clicked.connect(self._open_main_plot_legend_popup)
         plot_header.addWidget(self.btn_zone_zoom)
+        plot_header.addWidget(self.btn_save_plot_pdf)
         plot_header.addWidget(self.btn_zoom_out)
         plot_header.addWidget(self.btn_zoom_in)
         plot_header.addWidget(self.btn_zoom_reset)
@@ -4579,33 +4580,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self.btn_add_auto_plot.setEnabled(False)
         self.btn_add_auto_plot.clicked.connect(self._add_current_plot_to_autoplots)
         self.btn_add_auto_plot.hide()
-        self.btn_save_plot_pdf = QtWidgets.QPushButton("Save Plot PDF")
-        self.btn_save_plot_pdf.setEnabled(False)
-        self.btn_save_plot_pdf.clicked.connect(self._save_plot_pdf)
         self.btn_view_auto_plots = QtWidgets.QPushButton("View Auto-Graphs...")
         self.btn_view_auto_plots.setEnabled(False)
         self.btn_view_auto_plots.clicked.connect(self._open_auto_plots_popup)
         self.btn_view_auto_plots.hide()
         self.lbl_source = QtWidgets.QLabel("")
-        self.lbl_source.setStyleSheet("color: #64748b; font-size: 11px;")
-        self.lbl_source.setWordWrap(True)
-
-        footer_frame = QtWidgets.QFrame()
-        self.footer_frame = footer_frame
-        footer_frame.setStyleSheet(
-            "QFrame { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 10px; }"
-        )
-        footer_layout = QtWidgets.QVBoxLayout(footer_frame)
-        footer_layout.setContentsMargins(10, 8, 10, 8)
-        footer_layout.setSpacing(8)
-
-        footer_row = QtWidgets.QHBoxLayout()
-        footer_row.setSpacing(8)
-        footer_row.addWidget(self.btn_save_plot_pdf)
-        footer_row.addStretch(1)
-        footer_layout.addLayout(footer_row)
-        footer_layout.addWidget(self.lbl_source)
-        right_layout.addWidget(footer_frame, 0)
+        self.lbl_source.setVisible(False)
 
         splitter.addWidget(right)
         splitter.setHandleWidth(0)
@@ -5902,6 +5882,16 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         except Exception:
             return
 
+    @staticmethod
+    def _axis_bounds_valid(bounds: tuple[float, float] | None) -> bool:
+        if not isinstance(bounds, tuple) or len(bounds) != 2:
+            return False
+        try:
+            lo, hi = float(bounds[0]), float(bounds[1])
+        except Exception:
+            return False
+        return math.isfinite(lo) and math.isfinite(hi) and abs(hi - lo) > 1e-12
+
     def _capture_main_plot_base_view(self) -> None:
         if not self._axes:
             return
@@ -5964,18 +5954,33 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             return
         if str(getattr(self._axes, "name", "") or "").strip().lower() == "3d":
             return
-        if self._plot_base_xlim and self._plot_base_ylim:
+        reset_done = False
+        if self._axis_bounds_valid(self._plot_base_xlim) and self._axis_bounds_valid(self._plot_base_ylim):
             try:
                 self._axes.set_xlim(*self._plot_base_xlim)
                 self._axes.set_ylim(*self._plot_base_ylim)
+                reset_done = True
             except Exception:
-                pass
-        else:
+                reset_done = False
+        if not reset_done:
             try:
+                self._axes.set_autoscale_on(True)
                 self._axes.relim()
                 self._axes.autoscale_view()
             except Exception:
                 pass
+        if hasattr(self, "btn_zone_zoom"):
+            try:
+                self.btn_zone_zoom.setChecked(False)
+            except Exception:
+                pass
+        if self._zone_zoom_rect is not None:
+            try:
+                self._zone_zoom_rect.remove()
+            except Exception:
+                pass
+        self._zone_zoom_press_xy = None
+        self._zone_zoom_rect = None
         try:
             self._canvas.draw_idle()
         except Exception:
@@ -6202,11 +6207,31 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         base_ylim = ax.get_ylim()
 
         def _reset():
+            nonlocal press_xy, rect_patch
             try:
-                ax.set_xlim(*base_xlim)
-                ax.set_ylim(*base_ylim)
+                btn_mag.setChecked(False)
             except Exception:
                 pass
+            if rect_patch is not None:
+                try:
+                    rect_patch.remove()
+                except Exception:
+                    pass
+            press_xy = None
+            rect_patch = None
+            if self._axis_bounds_valid(tuple(float(v) for v in base_xlim)) and self._axis_bounds_valid(tuple(float(v) for v in base_ylim)):
+                try:
+                    ax.set_xlim(*base_xlim)
+                    ax.set_ylim(*base_ylim)
+                except Exception:
+                    pass
+            else:
+                try:
+                    ax.set_autoscale_on(True)
+                    ax.relim()
+                    ax.autoscale_view()
+                except Exception:
+                    pass
             try:
                 canvas.draw_idle()
             except Exception:
@@ -6829,11 +6854,62 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             ],
         )
 
+    @staticmethod
+    def _restrictive_filter_values(
+        selected_values: Sequence[object] | None,
+        available_values: Sequence[object] | None,
+    ) -> list[str]:
+        available = [str(value).strip() for value in (available_values or []) if str(value).strip()]
+        selected = [str(value).strip() for value in (selected_values or []) if str(value).strip()]
+        if not available or not selected:
+            return []
+        available_set = set(available)
+        selected = [value for value in selected if value in available_set]
+        if not selected:
+            return []
+        if set(selected) >= available_set:
+            return []
+        seen: set[str] = set()
+        out: list[str] = []
+        for value in selected:
+            if value in seen:
+                continue
+            seen.add(value)
+            out.append(value)
+        return out
+
+    def _restrictive_control_period_filter_values(
+        self,
+        filter_state: Mapping[str, object] | None = None,
+    ) -> list[str]:
+        return self._restrictive_filter_values(
+            self._active_control_period_filter_values(filter_state=filter_state),
+            list(self._available_control_period_filters or []),
+        )
+
+    def _restrictive_suppression_voltage_filter_values(
+        self,
+        filter_state: Mapping[str, object] | None = None,
+    ) -> list[str]:
+        return self._restrictive_filter_values(
+            self._active_suppression_voltage_filter_values(filter_state=filter_state),
+            list(self._available_suppression_voltage_filters or []),
+        )
+
+    def _restrictive_valve_voltage_filter_values(
+        self,
+        filter_state: Mapping[str, object] | None = None,
+    ) -> list[str]:
+        return self._restrictive_filter_values(
+            self._active_valve_voltage_filter_values(filter_state=filter_state),
+            list(self._available_valve_voltage_filters or []),
+        )
+
     def _single_active_control_period_filter_value(
         self,
         filter_state: Mapping[str, object] | None = None,
     ) -> object | None:
-        active = self._active_control_period_filter_values(filter_state=filter_state)
+        active = self._restrictive_control_period_filter_values(filter_state=filter_state)
         return active[0] if len(active) == 1 else None
 
     def _active_serial_rows(self, filter_state: Mapping[str, object] | None = None) -> list[dict]:
@@ -6847,9 +6923,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 live_values=[str(serial).strip() for serial in (self._checked_serial_filters or []) if str(serial).strip()],
             )
         )
-        selected_control_periods = set(self._active_control_period_filter_values(filter_state=effective_filter_state))
-        selected_suppression = set(self._active_suppression_voltage_filter_values(filter_state=effective_filter_state))
-        selected_valves = set(self._active_valve_voltage_filter_values(filter_state=effective_filter_state))
+        selected_control_periods = set(self._restrictive_control_period_filter_values(filter_state=effective_filter_state))
+        selected_suppression = set(self._restrictive_suppression_voltage_filter_values(filter_state=effective_filter_state))
+        selected_valves = set(self._restrictive_valve_voltage_filter_values(filter_state=effective_filter_state))
         if not self._global_filter_rows:
             out: list[dict] = []
             for row in (self._available_serial_filter_rows or []):
@@ -6916,17 +6992,17 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         program_label = self._row_program_label(row)
         if program_label not in set(self._active_program_filter_values(filter_state=effective_filter_state)):
             return False
-        selected_control_periods = set(self._active_control_period_filter_values(filter_state=effective_filter_state))
+        selected_control_periods = set(self._restrictive_control_period_filter_values(filter_state=effective_filter_state))
         if selected_control_periods:
             control_period = _td_control_period_filter_value(row)
             if not control_period or control_period not in selected_control_periods:
                 return False
-        selected_suppression = set(self._active_suppression_voltage_filter_values(filter_state=effective_filter_state))
+        selected_suppression = set(self._restrictive_suppression_voltage_filter_values(filter_state=effective_filter_state))
         if selected_suppression:
             suppression_voltage = _td_suppression_voltage_filter_value(row)
             if not suppression_voltage or suppression_voltage not in selected_suppression:
                 return False
-        selected_valves = set(self._active_valve_voltage_filter_values(filter_state=effective_filter_state))
+        selected_valves = set(self._restrictive_valve_voltage_filter_values(filter_state=effective_filter_state))
         if selected_valves:
             valve_voltage = _td_valve_voltage_filter_value(row)
             if not valve_voltage or valve_voltage not in selected_valves:
@@ -7084,9 +7160,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
     ) -> list[dict]:
         effective_filter_state = self._selection_filter_state(filter_state)
         selected_programs = set(self._active_program_filter_values(filter_state=effective_filter_state))
-        selected_control_periods = set(self._active_control_period_filter_values(filter_state=effective_filter_state))
-        selected_suppression = set(self._active_suppression_voltage_filter_values(filter_state=effective_filter_state))
-        selected_valves = set(self._active_valve_voltage_filter_values(filter_state=effective_filter_state))
+        selected_control_periods = set(self._restrictive_control_period_filter_values(filter_state=effective_filter_state))
+        selected_suppression = set(self._restrictive_suppression_voltage_filter_values(filter_state=effective_filter_state))
+        selected_valves = set(self._restrictive_valve_voltage_filter_values(filter_state=effective_filter_state))
         out: list[dict] = []
         for item in (self._run_selection_views.get(mode) or []):
             if not isinstance(item, dict):
@@ -7338,9 +7414,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
     ) -> list[dict]:
         effective_filter_state = self._auto_report_filter_state_without_suppression(filter_state)
         selected_programs = set(self._active_program_filter_values(filter_state=effective_filter_state))
-        selected_control_periods = set(self._active_control_period_filter_values(filter_state=effective_filter_state))
-        selected_suppression = set(self._active_suppression_voltage_filter_values(filter_state=effective_filter_state))
-        selected_valves = set(self._active_valve_voltage_filter_values(filter_state=effective_filter_state))
+        selected_control_periods = set(self._restrictive_control_period_filter_values(filter_state=effective_filter_state))
+        selected_suppression = set(self._restrictive_suppression_voltage_filter_values(filter_state=effective_filter_state))
+        selected_valves = set(self._restrictive_valve_voltage_filter_values(filter_state=effective_filter_state))
         items: list[dict] = []
         for raw_item in (self._run_selection_views.get(mode) or []):
             if not isinstance(raw_item, dict):
@@ -10061,24 +10137,105 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             seq_text = str(selection.get("sequence_name") or (seqs[0] if seqs else selection.get("run_name")) or "").strip()
         return seq_text, run_condition
 
-    def _compose_run_title(self, selection: dict | None, suffix: str = "") -> str:
-        seq_text, run_condition = self._selection_title_parts(selection)
-        mode = str((selection or {}).get("mode") or "").strip().lower()
-        multi_condition = len([str(v).strip() for v in ((selection or {}).get("selection_labels") or (selection or {}).get("run_conditions") or []) if str(v).strip()]) > 1
+    @staticmethod
+    def _format_plot_title(run_condition: object = "", graph_type: object = "") -> str:
+        condition_text = str(run_condition or "").strip()
+        graph_text = str(graph_type or "").strip()
         parts: list[str] = []
-        if mode == "condition":
-            if run_condition:
-                parts.append(f"{'Run Conditions' if multi_condition else 'Run Condition'}: {run_condition}")
-            if seq_text:
-                parts.append(f"Sequences: {seq_text}")
+        if condition_text:
+            parts.append(f"Run Condition: {condition_text}")
+        if graph_text:
+            parts.append(f"Graph Type: {graph_text}")
+        return " | ".join(parts)
+
+    @staticmethod
+    def _plot_value_summary(values: Sequence[object] | None, *, max_items: int = 3) -> str:
+        items = [str(value).strip() for value in (values or []) if str(value).strip()]
+        if not items:
+            return ""
+        max_items = max(1, int(max_items or 1))
+        if len(items) <= max_items:
+            return ", ".join(items)
+        return f"{', '.join(items[:max_items])} +{len(items) - max_items} more"
+
+    def _metric_graph_type_text(
+        self,
+        y_columns: Sequence[object] | None,
+        stats: Sequence[object] | None,
+    ) -> str:
+        y_text = self._plot_value_summary(y_columns) or "Metric value"
+        stats_label = self._metric_title_suffix(
+            [str(stat).strip().lower() for stat in (stats or []) if str(stat).strip()]
+        )
+        if stats_label:
+            y_text = f"{y_text} ({stats_label})"
+        return f"Serial Number vs {y_text}"
+
+    def _performance_graph_type_text(
+        self,
+        input1: object,
+        output: object,
+        input2: object = "",
+    ) -> str:
+        x1 = str(input1 or "").strip() or "Input 1"
+        y = str(output or "").strip() or "Output"
+        x2 = str(input2 or "").strip()
+        if x2:
+            return f"{x1}, {x2} vs {y}"
+        return f"{x1} vs {y}"
+
+    def _performance_run_condition_text(
+        self,
+        run_type_mode: object = "",
+        filter_mode: object = "",
+        control_period: object = None,
+    ) -> str:
+        mode = str(run_type_mode or "").strip().lower() or "steady_state"
+        labeler = getattr(be, "td_perf_run_type_mode_label", None)
+        if callable(labeler):
+            try:
+                mode_label = str(labeler(mode) or "").strip()
+            except Exception:
+                mode_label = ""
         else:
-            if seq_text:
-                parts.append(f"Sequence: {seq_text}")
-            if run_condition:
-                parts.append(f"Run Condition: {run_condition}")
-        if suffix:
-            parts.append(str(suffix).strip())
-        return " | ".join([p for p in parts if str(p).strip()])
+            mode_label = ""
+        if not mode_label:
+            mode_label = "Pulsed mode" if mode == "pulsed_mode" else "Steady-state"
+        parts = [mode_label]
+        if (
+            mode == "pulsed_mode"
+            and str(filter_mode or "").strip().lower() == "match_control_period"
+            and control_period not in (None, "")
+        ):
+            cp_text = _td_compact_filter_value(control_period)
+            if cp_text:
+                parts.append(f"Control Period: {cp_text}")
+        return "; ".join([part for part in parts if str(part).strip()])
+
+    def _current_performance_run_condition_text(self) -> str:
+        return self._performance_run_condition_text(
+            self._selected_perf_run_type_mode(),
+            self._selected_perf_filter_mode(),
+            self._selected_perf_control_period(),
+        )
+
+    def _performance_plot_title_text(
+        self,
+        *,
+        output: object,
+        input1: object,
+        input2: object = "",
+        run_type_mode: object = "",
+        filter_mode: object = "",
+        control_period: object = None,
+    ) -> str:
+        return self._format_plot_title(
+            self._performance_run_condition_text(run_type_mode, filter_mode, control_period),
+            self._performance_graph_type_text(input1, output, input2),
+        )
+
+    def _compose_run_title(self, selection: dict | None, suffix: str = "") -> str:
+        return self._format_plot_title(self._selection_condition_label(selection), suffix)
 
     @staticmethod
     def _selection_observation_filters(selection: dict | None) -> tuple[str, str]:
@@ -10168,8 +10325,40 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 run_type_filter=run_type_filter,
                 metric_source=metric_source_norm,
             )
-            return self._filter_rows_for_global_selection(rows, filter_state=filter_state)
+            filtered_rows = self._filter_rows_for_global_selection(rows, filter_state=filter_state)
+            try:
+                diagnostics = getattr(self, "_last_metric_series_diagnostics", None)
+                if isinstance(diagnostics, list):
+                    diagnostics.append(
+                        {
+                            "run_name": str(run_name or "").strip(),
+                            "column_name": str(column_name or "").strip(),
+                            "stat": str(stat or "").strip(),
+                            "metric_source": metric_source_norm,
+                            "loaded_count": len(rows or []),
+                            "filtered_count": len(filtered_rows or []),
+                        }
+                    )
+            except Exception:
+                pass
+            return filtered_rows
         except Exception:
+            try:
+                diagnostics = getattr(self, "_last_metric_series_diagnostics", None)
+                if isinstance(diagnostics, list):
+                    diagnostics.append(
+                        {
+                            "run_name": str(run_name or "").strip(),
+                            "column_name": str(column_name or "").strip(),
+                            "stat": str(stat or "").strip(),
+                            "metric_source": metric_source_norm,
+                            "loaded_count": 0,
+                            "filtered_count": 0,
+                            "error": True,
+                        }
+                    )
+            except Exception:
+                pass
             return []
 
     def _load_curves_for_selection(
@@ -11182,11 +11371,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             self.btn_stats_toggle.setVisible(not is_solver)
         if hasattr(self, "_stats_frame"):
             self._stats_frame.setVisible((not is_solver) and bool(getattr(self, "btn_stats_toggle", None) and self.btn_stats_toggle.isChecked()))
-        if hasattr(self, "footer_frame"):
-            self.footer_frame.setVisible(not is_solver)
 
         for widget_name in (
             "btn_zone_zoom",
+            "btn_save_plot_pdf",
             "btn_zoom_out",
             "btn_zoom_in",
             "btn_zoom_reset",
@@ -11857,7 +12045,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             y_units = str(next((row.get("y_units") for row in rows if str(row.get("y_units") or "").strip()), "") or "").strip()
             x_label = f"{x_param} ({x_units})" if x_units else x_param
             y_label = f"{y_param} ({y_units})" if y_units else y_param
-            self._axes.set_title(self._compose_run_title(selection, f"{y_param} vs {x_param} over life"))
+            self._axes.set_title(self._compose_run_title(selection, f"{x_param} vs {y_param}"))
             self._axes.set_xlabel(x_label)
             self._axes.set_ylabel(y_label)
             grouped: dict[str, list[dict]] = {}
@@ -11903,7 +12091,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 return
             y_units = str(next((row.get("units") for row in rows if str(row.get("units") or "").strip()), "") or "").strip()
             y_label = f"{y_param} ({y_units})" if y_units else y_param
-            self._axes.set_title(self._compose_run_title(selection, f"{y_param} vs {life_axis_label}"))
+            self._axes.set_title(self._compose_run_title(selection, f"{life_axis_label} vs {y_param}"))
             self._axes.set_xlabel(life_axis_label)
             self._axes.set_ylabel(y_label)
             grouped: dict[str, list[dict]] = {}
@@ -11996,6 +12184,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             "plot_type": plot_type,
             **last_plot_extra,
         }
+        self._update_plot_zoom_actions()
         self.btn_add_auto_plot.setEnabled(True)
 
     def _plot_metrics(self) -> None:
@@ -12031,11 +12220,11 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             return
 
         metric_source = self._selected_metric_plot_source()
-        stats_label = self._metric_title_suffix(stats)
+        self._last_metric_series_diagnostics = []
         y_label = stats[0] if len(stats) == 1 else "Metric value"
         plot_bounds = bool(getattr(self, "cb_plot_metric_bounds", None) and self.cb_plot_metric_bounds.isChecked())
         self._axes.clear()
-        self._axes.set_title(self._compose_run_title(selection, stats_label))
+        self._axes.set_title(self._compose_run_title(selection, self._metric_graph_type_text(y_cols, stats)))
         self._axes.set_xlabel("Serial Number")
         self._axes.set_ylabel(y_label)
         x = list(range(len(labels)))
@@ -12135,6 +12324,18 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     except Exception:
                         continue
         if not any_plotted:
+            diagnostics = getattr(self, "_last_metric_series_diagnostics", [])
+            if isinstance(diagnostics, list) and diagnostics:
+                loaded_count = sum(int((row or {}).get("loaded_count") or 0) for row in diagnostics if isinstance(row, dict))
+                filtered_count = sum(int((row or {}).get("filtered_count") or 0) for row in diagnostics if isinstance(row, dict))
+                if loaded_count > 0 and filtered_count <= 0:
+                    self._set_plot_note(
+                        "Metric rows were found before global filters, but no rows remained after filters."
+                    )
+                elif filtered_count > 0:
+                    self._set_plot_note(
+                        "Metric rows loaded, but none matched the selected serial labels or plot settings."
+                    )
             QtWidgets.QMessageBox.information(self, "Plot Metrics", "No metric values found for this selection.")
             return
         self._apply_metric_program_segments(self._axes, labels)
@@ -12182,6 +12383,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             "plot_bounds": bool(plot_bounds),
             "metric_plot_source": metric_source,
         }
+        self._update_plot_zoom_actions()
         self.btn_add_auto_plot.setEnabled(True)
         self._refresh_stats_preview()
 
@@ -12206,7 +12408,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             return
 
         self._axes.clear()
-        self._axes.set_title(self._compose_run_title(selection, f"{y_col} vs {x_label}"))
+        self._axes.set_title(self._compose_run_title(selection, f"{x_label} vs {y_col}"))
         self._axes.set_xlabel(x_label)
         self._axes.set_ylabel(y_col)
         any_plotted = False
@@ -12274,6 +12476,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             "x": (x_label or x_col_title),
             "y": [y_col],
         }
+        self._update_plot_zoom_actions()
         self.btn_add_auto_plot.setEnabled(True)
         self._populate_stats_table(runs[0], y_col, self._highlight_sn)
 
@@ -13784,7 +13987,6 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         use_cached_condition_means = plot_method == "cached_condition_means"
         stat_label = str(result.get("stat_label") or "").strip().lower()
         master_model = result.get("master_model") or {}
-        master_family = self._perf_fit_family_label((master_model or {}).get("fit_family") or "")
         if plot_dimension == "3d":
             points_3d = result.get("points_3d") or {}
             if not isinstance(points_3d, dict) or not points_3d:
@@ -13795,9 +13997,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             input1_units = str(result.get("input1_units") or "").strip()
             input2_units = str(result.get("input2_units") or "").strip()
             output_units = str(result.get("output_units") or "").strip()
-            pair_label = str(result.get("pair_label") or f"{output_target} vs {input1_target},{input2_target}").strip() or "Performance"
-            title = str(title_override or "").strip() or (
-                f"Performance - {pair_label} - {stat_label}" + (f" ({master_family})" if master_family else "")
+            graph_type = self._performance_graph_type_text(input1_target, output_target, input2_target)
+            title = str(title_override or "").strip() or self._format_plot_title(
+                self._current_performance_run_condition_text(),
+                graph_type,
             )
             ax.clear()
             ax.set_title(title)
@@ -13890,9 +14093,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             y_target = str(result.get("y_target") or "").strip()
             x_units = str(result.get("x_units") or "").strip()
             y_units = str(result.get("y_units") or "").strip()
-            pair_label = str(result.get("pair_label") or f"{y_target} vs {x_target}").strip() or "Performance"
-            title = str(title_override or "").strip() or (
-                f"Performance - {pair_label} - {stat_label}" + (f" ({master_family})" if master_family else "")
+            graph_type = self._performance_graph_type_text(x_target, y_target)
+            title = str(title_override or "").strip() or self._format_plot_title(
+                self._current_performance_run_condition_text(),
+                graph_type,
             )
 
             ax.clear()
@@ -16194,6 +16398,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             "selected_control_period": control_period_filter,
             "highlight_serial": str(getattr(self, "_highlight_sn", "") or "").strip(),
         }
+        self._update_plot_zoom_actions()
         self.btn_add_auto_plot.setEnabled(True)
 
     def _plot_performance_cached_condition_means(self, *, user_initiated: bool = False) -> None:
@@ -16341,6 +16546,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             "selected_control_period": control_period_filter,
             "highlight_serial": str(getattr(self, "_highlight_sn", "") or "").strip(),
         }
+        self._update_plot_zoom_actions()
         self.btn_add_auto_plot.setEnabled(True)
 
     def _save_plot_pdf(self) -> None:
@@ -19199,7 +19405,6 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             fig = self._render_plot_def_to_figure(
                 plot_definition,
                 filter_state=self._auto_plot_entry_filter_state(entry),
-                title_override=title,
             )
             return fig, ""
         except Exception as exc:
@@ -19325,7 +19530,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 raise RuntimeError("The saved curve graph is missing its X or Y axis definition.")
             if not runs:
                 raise RuntimeError("No runs remain for this saved curve graph.")
-            ax.set_title(title_override or str(d.get("name") or "") or self._compose_run_title(selection, f"{y} vs {x_label}"))
+            ax.set_title(title_override or self._compose_run_title(selection, f"{x_label} vs {y}"))
             ax.set_xlabel(x_label)
             ax.set_ylabel(y)
             active_serials = self._active_serials(filter_state=render_filter_state)
@@ -19389,9 +19594,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     metric_source = str(d.get("metric_plot_source") or metric_source).strip().lower() or str(metric_source)
             else:
                 metric_source = str(d.get("metric_plot_source") or metric_source).strip().lower() or str(metric_source)
-            stats_label = self._metric_title_suffix(stats)
             plot_bounds = bool(d.get("plot_bounds"))
-            ax.set_title(title_override or str(d.get("name") or "") or self._compose_run_title(selection, stats_label))
+            ax.set_title(title_override or self._compose_run_title(selection, self._metric_graph_type_text(y_cols, stats)))
             ax.set_xlabel("Serial Number")
             ax.set_ylabel(stats[0] if len(stats) == 1 else "Metric value")
             serial_rows = self._active_serial_rows(filter_state=render_filter_state)
@@ -19523,7 +19727,15 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 ax,
                 result,
                 highlight_serial=str(d.get("highlight_serial") or "").strip(),
-                title_override=title_override or str(d.get("name") or "").strip(),
+                title_override=title_override
+                or self._performance_plot_title_text(
+                    output=output,
+                    input1=input1,
+                    input2=input2,
+                    run_type_mode=run_type_mode,
+                    filter_mode=perf_filter_mode,
+                    control_period=control_period_filter,
+                ),
             )
 
         try:
@@ -20131,6 +20343,51 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         if len(y_cols) > 3:
             y_label += f" +{len(y_cols) - 3} more"
         return f"Metrics: {stats_label} ({y_label})"
+
+    def _auto_plot_graph_type_text(self, entry: Mapping[str, object] | None) -> str:
+        plot_definition = self._auto_plot_entry_plot_definition(entry)
+        mode = str(plot_definition.get("mode") or "").strip().lower()
+        if mode == "curves":
+            y_values = plot_definition.get("y")
+            y_name = ""
+            if isinstance(y_values, list) and y_values:
+                y_name = str(y_values[0] or "").strip()
+            x_name = str(plot_definition.get("x") or "Time").strip() or "Time"
+            return f"{x_name} vs {y_name or 'Y'}"
+        if mode == "performance":
+            return self._performance_graph_type_text(
+                plot_definition.get("input1") or "Input 1",
+                plot_definition.get("output") or "Output",
+                plot_definition.get("input2") or "",
+            )
+        stats = (
+            [str(value).strip().lower() for value in (plot_definition.get("stats") or []) if str(value).strip()]
+            if isinstance(plot_definition.get("stats"), list)
+            else []
+        )
+        stat_value = str(plot_definition.get("stat") or "").strip().lower()
+        if stat_value and stat_value not in stats:
+            stats.append(stat_value)
+        if not stats:
+            stats = ["mean"]
+        y_cols = (
+            [str(value).strip() for value in (plot_definition.get("y") or []) if str(value).strip()]
+            if isinstance(plot_definition.get("y"), list)
+            else []
+        )
+        return self._metric_graph_type_text(y_cols, stats)
+
+    def _auto_graph_plot_header_text(
+        self,
+        graph_file: Mapping[str, object] | None,
+        plot_entry: Mapping[str, object] | None,
+    ) -> str:
+        global_selection = self._resolve_auto_graph_file_global_selection(graph_file)
+        selection = self._combined_auto_plot_selection(global_selection)
+        run_condition = self._selection_condition_label(selection)
+        if not run_condition:
+            run_condition = self._auto_plot_run_selection_summary_text(global_selection)
+        return self._format_plot_title(run_condition, self._auto_plot_graph_type_text(plot_entry))
 
     def _auto_plot_list_item_text(self, entry: Mapping[str, object] | None) -> str:
         return f"{self._auto_plot_mode_label(entry)} | {self._auto_plot_display_name(entry) or 'Auto-Graph'}"
@@ -20949,7 +21206,6 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             fig = self._render_plot_def_to_figure(
                 render_definition,
                 filter_state=filter_state,
-                title_override=title,
             )
             return fig, ""
         except Exception as exc:
@@ -21121,27 +21377,13 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         title.setStyleSheet("font-size: 15px; font-weight: 800;")
         layout.addWidget(title)
 
-        subtitle = QtWidgets.QLabel(
-            "\n".join(
-                [
-                    self._auto_graph_file_program_summary_text(current_file["value"]),
-                    (
-                        "Track serials from selected programs: On"
-                        if bool(current_file["value"].get("track_program_serials"))
-                        else "Track serials from selected programs: Off"
-                    ),
-                    self._auto_plot_global_selection_details_text(
-                        self._resolve_auto_graph_file_global_selection(current_file["value"])
-                    ),
-                ]
-            )
-        )
+        subtitle = QtWidgets.QLabel("")
         subtitle.setWordWrap(True)
         subtitle.setStyleSheet(
             "QLabel { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 10px; "
             "padding: 10px 12px; color: #334155; font-size: 11px; }"
         )
-        layout.addWidget(subtitle)
+        subtitle.setVisible(False)
 
         splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
         layout.addWidget(splitter, 1)
@@ -21161,7 +21403,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(8)
         plot_title = QtWidgets.QLabel("")
-        plot_title.setStyleSheet("font-size: 13px; font-weight: 700;")
+        plot_title.setStyleSheet(
+            "QLabel { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px; "
+            "padding: 8px 10px; color: #0f172a; font-size: 12px; font-weight: 800; }"
+        )
         plot_title.setWordWrap(True)
         right_layout.addWidget(plot_title)
         warning_label = QtWidgets.QLabel("")
@@ -21211,7 +21456,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             plot_entry = self._normalize_auto_plot_entry(payload if isinstance(payload, Mapping) else None)
             if plot_entry is None:
                 return
-            plot_title.setText(self._auto_plot_display_name(plot_entry))
+            plot_title.setText(self._auto_graph_plot_header_text(current_file["value"], plot_entry))
             fig, warning_text = self._render_auto_graph_plot_figure(current_file["value"], plot_entry)
             while canvas_layout.count():
                 child = canvas_layout.takeAt(0)
@@ -21251,21 +21496,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 return
             current_file["value"] = dict(saved)
             title.setText(str(saved.get("name") or "Auto-Graph File"))
-            subtitle.setText(
-                "\n".join(
-                    [
-                        self._auto_graph_file_program_summary_text(saved),
-                        (
-                            "Track serials from selected programs: On"
-                            if bool(saved.get("track_program_serials"))
-                            else "Track serials from selected programs: Off"
-                        ),
-                        self._auto_plot_global_selection_details_text(
-                            self._resolve_auto_graph_file_global_selection(saved)
-                        ),
-                    ]
-                )
-            )
+            subtitle.setText("")
             _refresh_plot_list(select_plot_id=selected_plot_id)
             _render_selected()
 
@@ -21316,7 +21547,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
         dlg = QtWidgets.QDialog(self)
         dlg.setWindowTitle("Edit Graph File" if str(seed_file.get("id") or "").strip() else "Create Graph File")
-        dlg.resize(1120, 860)
+        dlg.resize(560, 430)
         dlg.setStyleSheet(
             """
             QDialog { background: #f8fafc; color: #0f172a; }
@@ -21394,6 +21625,14 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         left_layout.addWidget(QtWidgets.QLabel("Plots In File"))
         plot_list = QtWidgets.QListWidget()
         plot_list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        plot_list.setMinimumHeight(80)
+        plot_list.setSizeAdjustPolicy(QtWidgets.QAbstractScrollArea.SizeAdjustPolicy.AdjustIgnored)
+        plot_list.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        plot_list.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        plot_list.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Ignored,
+        )
         left_layout.addWidget(plot_list, 1)
         left_btn_row = QtWidgets.QHBoxLayout()
         btn_edit_plot = QtWidgets.QPushButton("Edit Plot")
@@ -21417,7 +21656,26 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         cb_type.addItem("Plot Performance", "performance")
         right_layout.addWidget(cb_type, 0)
         stack = QtWidgets.QStackedWidget()
+        stack.setMinimumHeight(120)
+        stack.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Ignored,
+        )
         right_layout.addWidget(stack, 1)
+
+        def _scrollable_builder_page(page: QtWidgets.QWidget) -> QtWidgets.QScrollArea:
+            scroll = QtWidgets.QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+            scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+            scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+            scroll.setSizePolicy(
+                QtWidgets.QSizePolicy.Policy.Expanding,
+                QtWidgets.QSizePolicy.Policy.Ignored,
+            )
+            scroll.setStyleSheet("QScrollArea { background: transparent; border: 0; }")
+            scroll.setWidget(page)
+            return scroll
 
         selected_metric_y: list[str] = []
         metric_stats: list[str] = ["mean"]
@@ -21451,7 +21709,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         cb_metric_bounds = QtWidgets.QCheckBox("Include bounds when available")
         metrics_form.addRow("Metric Source:", cb_metric_source)
         metrics_form.addRow("Bounds:", cb_metric_bounds)
-        stack.addWidget(metrics_page)
+        stack.addWidget(_scrollable_builder_page(metrics_page))
 
         curves_page = QtWidgets.QWidget()
         curves_form = QtWidgets.QFormLayout(curves_page)
@@ -21461,7 +21719,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         cb_curve_y = QtWidgets.QComboBox()
         curves_form.addRow("X Axis:", cb_curve_x)
         curves_form.addRow("Y Axis:", cb_curve_y)
-        stack.addWidget(curves_page)
+        stack.addWidget(_scrollable_builder_page(curves_page))
 
         perf_page = QtWidgets.QWidget()
         perf_form = QtWidgets.QFormLayout(perf_page)
@@ -21518,7 +21776,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         perf_form.addRow("Condition Filter:", cb_perf_filter_mode)
         perf_form.addRow("Control Period:", cb_perf_control_period)
         perf_form.addRow("Highlight Serial:", cb_perf_highlight_serial)
-        stack.addWidget(perf_page)
+        stack.addWidget(_scrollable_builder_page(perf_page))
 
         right_btn_row = QtWidgets.QHBoxLayout()
         btn_add_plot = QtWidgets.QPushButton("Add Plot")

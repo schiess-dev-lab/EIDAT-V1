@@ -10669,6 +10669,78 @@ def _resolve_td_support_sequence_for_run(run_name: str, support_cfg: dict) -> di
     return _td_resolve_support_condition_for_source("", run, support_cfg)
 
 
+TD_SEQUENCE_OBS_SERIAL_IDX = 1
+TD_SEQUENCE_OBS_RUN_IDX = 2
+TD_SEQUENCE_OBS_RUN_TYPE_IDX = 5
+TD_SEQUENCE_OBS_PULSE_WIDTH_IDX = 6
+TD_SEQUENCE_OBS_CONTROL_PERIOD_IDX = 7
+TD_SEQUENCE_OBS_SUPPRESSION_VOLTAGE_IDX = 8
+TD_SEQUENCE_OBS_VALVE_VOLTAGE_IDX = 9
+
+
+def _td_group_sequence_observation_rows(
+    sequence_obs_rows: Sequence[Sequence[object]] | None,
+) -> tuple[dict[tuple[str, str], list[tuple[object, ...]]], dict[str, list[tuple[object, ...]]]]:
+    by_condition_serial: dict[tuple[str, str], list[tuple[object, ...]]] = {}
+    by_condition: dict[str, list[tuple[object, ...]]] = {}
+    for raw_row in sequence_obs_rows or []:
+        row = tuple(raw_row or ())
+        if len(row) <= TD_SEQUENCE_OBS_RUN_IDX:
+            continue
+        serial = str(row[TD_SEQUENCE_OBS_SERIAL_IDX] or "").strip()
+        condition_key = str(row[TD_SEQUENCE_OBS_RUN_IDX] or "").strip()
+        if not condition_key:
+            continue
+        by_condition.setdefault(condition_key, []).append(row)
+        if serial:
+            by_condition_serial.setdefault((condition_key, serial), []).append(row)
+    return by_condition_serial, by_condition
+
+
+def _td_unique_sequence_float(rows: Sequence[Sequence[object]], index: int) -> float | None:
+    values_by_key: dict[float, float] = {}
+    for row in rows or []:
+        if len(row) <= index:
+            continue
+        value = _td_finite_float(row[index])
+        if value is None:
+            continue
+        values_by_key.setdefault(round(float(value), 12), float(value))
+    if len(values_by_key) == 1:
+        return next(iter(values_by_key.values()))
+    return None
+
+
+def _td_unique_sequence_text(rows: Sequence[Sequence[object]], index: int) -> str:
+    values_by_key: dict[str, str] = {}
+    for row in rows or []:
+        if len(row) <= index:
+            continue
+        value = str(row[index] or "").strip()
+        if not value:
+            continue
+        values_by_key.setdefault(value.casefold(), value)
+    if len(values_by_key) == 1:
+        return next(iter(values_by_key.values()))
+    return ""
+
+
+def _td_first_finite_from_values(*values: object) -> float | None:
+    for value in values:
+        out = _td_finite_float(value)
+        if out is not None:
+            return out
+    return None
+
+
+def _td_first_text_from_values(*values: object) -> str:
+    for value in values:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
 def _write_test_data_project_calc_cache_from_aggregates(
     db_path: Path,
     workbook_path: Path,
@@ -10715,6 +10787,8 @@ def _write_test_data_project_calc_cache_from_aggregates(
     column_rows_to_write: list[tuple[object, ...]] = []
     obs_rows_to_write: list[tuple[object, ...]] = []
     metric_rows_to_write: list[tuple[object, ...]] = []
+    sequence_obs_rows_list = [tuple(row or ()) for row in (sequence_obs_rows or [])]
+    sequence_rows_by_condition_serial, sequence_rows_by_condition = _td_group_sequence_observation_rows(sequence_obs_rows_list)
 
     def _compute_stats(values: list[float]) -> dict[str, float | int | None]:
         n = len(values)
@@ -10752,17 +10826,32 @@ def _write_test_data_project_calc_cache_from_aggregates(
             or condition_key_clean
         )
         default_x = str(run_defaults.get("default_x") or "Time").strip() or "Time"
-        pulse_width_value = _td_finite_float(
-            condition_meta.get("pulse_width_on", condition_meta.get("pulse_width", run_defaults.get("pulse_width")))
+        condition_sequence_rows = sequence_rows_by_condition.get(condition_key_clean) or []
+        run_pulse_width_value = _td_first_finite_from_values(
+            condition_meta.get("pulse_width_on"),
+            condition_meta.get("pulse_width"),
+            run_defaults.get("pulse_width"),
         )
-        control_period_value = _td_finite_float(condition_meta.get("control_period", run_defaults.get("control_period")))
-        suppression_voltage_value = _td_finite_float(
+        if run_pulse_width_value is None:
+            run_pulse_width_value = _td_unique_sequence_float(condition_sequence_rows, TD_SEQUENCE_OBS_PULSE_WIDTH_IDX)
+        run_control_period_value = _td_first_finite_from_values(condition_meta.get("control_period", run_defaults.get("control_period")))
+        if run_control_period_value is None:
+            run_control_period_value = _td_unique_sequence_float(condition_sequence_rows, TD_SEQUENCE_OBS_CONTROL_PERIOD_IDX)
+        run_suppression_voltage_value = _td_first_finite_from_values(
             condition_meta.get("suppression_voltage", run_defaults.get("suppression_voltage"))
         )
-        valve_voltage_value = _td_finite_float(
+        if run_suppression_voltage_value is None:
+            run_suppression_voltage_value = _td_unique_sequence_float(condition_sequence_rows, TD_SEQUENCE_OBS_SUPPRESSION_VOLTAGE_IDX)
+        run_valve_voltage_value = _td_first_finite_from_values(
             condition_meta.get("valve_voltage", run_defaults.get("valve_voltage"))
         )
-        run_type_text = str(condition_meta.get("run_type") or run_defaults.get("run_type") or "").strip()
+        if run_valve_voltage_value is None:
+            run_valve_voltage_value = _td_unique_sequence_float(condition_sequence_rows, TD_SEQUENCE_OBS_VALVE_VOLTAGE_IDX)
+        run_type_text = _td_first_text_from_values(
+            condition_meta.get("run_type"),
+            run_defaults.get("run_type"),
+            _td_unique_sequence_text(condition_sequence_rows, TD_SEQUENCE_OBS_RUN_TYPE_IDX),
+        )
         member_source_runs = sorted({str(v).strip() for v in (meta.get("source_run_names") or set()) if str(v).strip()})
 
         if condition_key_clean not in inserted_runs:
@@ -10773,8 +10862,8 @@ def _write_test_data_project_calc_cache_from_aggregates(
                     default_x,
                     run_display_name,
                     run_type_text,
-                    control_period_value,
-                    pulse_width_value,
+                    run_control_period_value,
+                    run_pulse_width_value,
                 )
             )
             calc_param_defs = _ordered_support_param_defs(
@@ -10796,7 +10885,7 @@ def _write_test_data_project_calc_cache_from_aggregates(
                     (condition_key_clean, col_name, str(param_def.get("units") or cfg_units.get(col_name) or "").strip(), "y")
                 )
                 calc_columns_written += 1
-            if pulse_width_value is not None and (condition_key_clean, "pulse_width") not in inserted_columns:
+            if run_pulse_width_value is not None and (condition_key_clean, "pulse_width") not in inserted_columns:
                 inserted_columns.add((condition_key_clean, "pulse_width"))
                 column_rows_to_write.append(
                     (condition_key_clean, "pulse_width", str(cfg_units.get("pulse_width") or "").strip(), "y")
@@ -10807,6 +10896,20 @@ def _write_test_data_project_calc_cache_from_aggregates(
         program_titles_txt = ", ".join(sorted({str(v).strip() for v in (meta.get("program_titles") or set()) if str(v).strip()}))
         member_source_runs_txt = ", ".join(member_source_runs)
         source_mtime_max = max([int(v) for v in (meta.get("source_mtime_ns") or [])], default=0)
+        serial_sequence_rows = sequence_rows_by_condition_serial.get((condition_key_clean, serial_clean)) or condition_sequence_rows
+        pulse_width_value = run_pulse_width_value
+        if pulse_width_value is None:
+            pulse_width_value = _td_unique_sequence_float(serial_sequence_rows, TD_SEQUENCE_OBS_PULSE_WIDTH_IDX)
+        control_period_value = run_control_period_value
+        if control_period_value is None:
+            control_period_value = _td_unique_sequence_float(serial_sequence_rows, TD_SEQUENCE_OBS_CONTROL_PERIOD_IDX)
+        suppression_voltage_value = run_suppression_voltage_value
+        if suppression_voltage_value is None:
+            suppression_voltage_value = _td_unique_sequence_float(serial_sequence_rows, TD_SEQUENCE_OBS_SUPPRESSION_VOLTAGE_IDX)
+        valve_voltage_value = run_valve_voltage_value
+        if valve_voltage_value is None:
+            valve_voltage_value = _td_unique_sequence_float(serial_sequence_rows, TD_SEQUENCE_OBS_VALVE_VOLTAGE_IDX)
+        obs_run_type_text = run_type_text or _td_unique_sequence_text(serial_sequence_rows, TD_SEQUENCE_OBS_RUN_TYPE_IDX)
         obs_rows_to_write.append(
             (
                 observation_id_calc,
@@ -10814,7 +10917,7 @@ def _write_test_data_project_calc_cache_from_aggregates(
                 condition_key_clean,
                 program_titles_txt,
                 member_source_runs_txt,
-                run_type_text,
+                obs_run_type_text,
                 pulse_width_value,
                 control_period_value,
                 suppression_voltage_value,
@@ -11126,7 +11229,6 @@ def _write_test_data_project_calc_cache_from_aggregates(
                 """,
                 plotter_curve_rows_to_write,
             )
-        sequence_obs_rows_list = list(sequence_obs_rows or [])
         sequence_metric_rows_list = list(sequence_metric_rows or [])
         if sequence_obs_rows_list:
             conn.executemany(
@@ -11782,6 +11884,9 @@ def _rebuild_test_data_project_calc_cache_from_raw(
         column_rows_to_write: list[tuple[object, ...]] = []
         obs_rows_to_write: list[tuple[object, ...]] = []
         metric_rows_to_write: list[tuple[object, ...]] = []
+        sequence_rows_by_condition_serial, sequence_rows_by_condition = _td_group_sequence_observation_rows(
+            list(sequence_obs_rows_by_id.values())
+        )
         for (condition_key, serial_txt), meta in aggregated_obs_meta.items():
             condition_meta = dict(condition_meta_by_key.get(condition_key) or {})
             run_display_name = str(condition_meta.get("display_name") or condition_key).strip() or condition_key
@@ -11792,6 +11897,29 @@ def _rebuild_test_data_project_calc_cache_from_raw(
                 if raw_default:
                     default_x = raw_default
                     break
+            condition_sequence_rows = sequence_rows_by_condition.get(condition_key) or []
+            run_pulse_width_value = _td_first_finite_from_values(
+                condition_meta.get("pulse_width_on"),
+                condition_meta.get("pulse_width"),
+            )
+            if run_pulse_width_value is None:
+                run_pulse_width_value = _td_unique_sequence_float(condition_sequence_rows, TD_SEQUENCE_OBS_PULSE_WIDTH_IDX)
+            run_control_period_value = _td_first_finite_from_values(condition_meta.get("control_period"))
+            if run_control_period_value is None:
+                run_control_period_value = _td_unique_sequence_float(condition_sequence_rows, TD_SEQUENCE_OBS_CONTROL_PERIOD_IDX)
+            run_suppression_voltage_value = _td_first_finite_from_values(condition_meta.get("suppression_voltage"))
+            if run_suppression_voltage_value is None:
+                run_suppression_voltage_value = _td_unique_sequence_float(
+                    condition_sequence_rows,
+                    TD_SEQUENCE_OBS_SUPPRESSION_VOLTAGE_IDX,
+                )
+            run_valve_voltage_value = _td_first_finite_from_values(condition_meta.get("valve_voltage"))
+            if run_valve_voltage_value is None:
+                run_valve_voltage_value = _td_unique_sequence_float(condition_sequence_rows, TD_SEQUENCE_OBS_VALVE_VOLTAGE_IDX)
+            run_type_text = _td_first_text_from_values(
+                condition_meta.get("run_type"),
+                _td_unique_sequence_text(condition_sequence_rows, TD_SEQUENCE_OBS_RUN_TYPE_IDX),
+            )
             if condition_key not in inserted_runs:
                 inserted_runs.add(condition_key)
                 run_rows_to_write.append(
@@ -11799,9 +11927,9 @@ def _rebuild_test_data_project_calc_cache_from_raw(
                         condition_key,
                         default_x,
                         run_display_name,
-                        str(condition_meta.get("run_type") or "").strip(),
-                        _finite_float(condition_meta.get("control_period")),
-                        _finite_float(condition_meta.get("pulse_width_on", condition_meta.get("pulse_width"))),
+                        run_type_text,
+                        run_control_period_value,
+                        run_pulse_width_value,
                     )
                 )
                 calc_param_defs = _ordered_support_param_defs(
@@ -11822,7 +11950,7 @@ def _rebuild_test_data_project_calc_cache_from_raw(
                         (condition_key, col_name, str(param_def.get("units") or cfg_units.get(col_name) or "").strip(), "y")
                     )
                     calc_columns_written += 1
-                if _finite_float(condition_meta.get("pulse_width_on", condition_meta.get("pulse_width"))) is not None and (condition_key, "pulse_width") not in inserted_columns:
+                if run_pulse_width_value is not None and (condition_key, "pulse_width") not in inserted_columns:
                     inserted_columns.add((condition_key, "pulse_width"))
                     column_rows_to_write.append(
                         (condition_key, "pulse_width", str(cfg_units.get("pulse_width") or "").strip(), "y")
@@ -11833,9 +11961,20 @@ def _rebuild_test_data_project_calc_cache_from_raw(
             program_titles_txt = ", ".join(sorted({str(v).strip() for v in (meta.get("program_titles") or set()) if str(v).strip()}))
             member_source_runs_txt = ", ".join(member_source_runs)
             source_mtime_max = max([int(v) for v in (meta.get("source_mtime_ns") or [])], default=0)
-            pulse_width_value = _finite_float(condition_meta.get("pulse_width_on", condition_meta.get("pulse_width")))
-            suppression_voltage_value = _finite_float(condition_meta.get("suppression_voltage"))
-            valve_voltage_value = _finite_float(condition_meta.get("valve_voltage"))
+            serial_sequence_rows = sequence_rows_by_condition_serial.get((condition_key, serial_txt)) or condition_sequence_rows
+            pulse_width_value = run_pulse_width_value
+            if pulse_width_value is None:
+                pulse_width_value = _td_unique_sequence_float(serial_sequence_rows, TD_SEQUENCE_OBS_PULSE_WIDTH_IDX)
+            control_period_value = run_control_period_value
+            if control_period_value is None:
+                control_period_value = _td_unique_sequence_float(serial_sequence_rows, TD_SEQUENCE_OBS_CONTROL_PERIOD_IDX)
+            suppression_voltage_value = run_suppression_voltage_value
+            if suppression_voltage_value is None:
+                suppression_voltage_value = _td_unique_sequence_float(serial_sequence_rows, TD_SEQUENCE_OBS_SUPPRESSION_VOLTAGE_IDX)
+            valve_voltage_value = run_valve_voltage_value
+            if valve_voltage_value is None:
+                valve_voltage_value = _td_unique_sequence_float(serial_sequence_rows, TD_SEQUENCE_OBS_VALVE_VOLTAGE_IDX)
+            obs_run_type_text = run_type_text or _td_unique_sequence_text(serial_sequence_rows, TD_SEQUENCE_OBS_RUN_TYPE_IDX)
             obs_rows_to_write.append(
                 (
                     observation_id_calc,
@@ -11843,9 +11982,9 @@ def _rebuild_test_data_project_calc_cache_from_raw(
                     condition_key,
                     program_titles_txt,
                     member_source_runs_txt,
-                    str(condition_meta.get("run_type") or "").strip(),
+                    obs_run_type_text,
                     pulse_width_value,
-                    _finite_float(condition_meta.get("control_period")),
+                    control_period_value,
                     suppression_voltage_value,
                     valve_voltage_value,
                     source_mtime_max,

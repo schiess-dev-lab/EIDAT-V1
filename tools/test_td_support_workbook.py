@@ -905,17 +905,19 @@ class _GlobalFilterHarness:
         ]
         self._serial_source_by_serial = {"SN1": dict(self._serial_source_rows[0]), "SN2": dict(self._serial_source_rows[1])}
         self._global_filter_rows = [
-            {"observation_id": "obs_a", "serial": "SN1", "serial_number": "SN1", "program_title": "Program A", "control_period": 60.0, "suppression_voltage": 24.0},
-            {"observation_id": "obs_b", "serial": "SN2", "serial_number": "SN2", "program_title": "Program B", "control_period": 120.0, "suppression_voltage": 28.0},
+            {"observation_id": "obs_a", "serial": "SN1", "serial_number": "SN1", "program_title": "Program A", "control_period": 60.0, "suppression_voltage": 24.0, "valve_voltage": 12.0},
+            {"observation_id": "obs_b", "serial": "SN2", "serial_number": "SN2", "program_title": "Program B", "control_period": 120.0, "suppression_voltage": 28.0, "valve_voltage": 24.0},
         ]
         self._available_program_filters = ["Program A", "Program B"]
         self._available_serial_filter_rows = list(self._serial_source_rows)
         self._available_control_period_filters = ["60", "120"]
         self._available_suppression_voltage_filters = ["24", "28"]
+        self._available_valve_voltage_filters = ["12", "24"]
         self._checked_program_filters = ["Program A"]
         self._checked_serial_filters = ["SN1", "SN2"]
         self._checked_control_period_filters = ["60", "120"]
         self._checked_suppression_voltage_filters = ["24", "28"]
+        self._checked_valve_voltage_filters = ["12", "24"]
         self.lbl_highlight_serials = QtWidgets.QLabel()
         self._refresh_stats_preview_calls = 0
         self._refresh_stats_preview = lambda: setattr(
@@ -927,14 +929,22 @@ class _GlobalFilterHarness:
         self._fill_perf_equations_table = lambda: None
         self._redraw_performance_view = lambda: None
         self._selection_observation_filters = lambda selection=None: ("", "")
+        self._restrictive_filter_values = TestDataTrendDialog._restrictive_filter_values
 
         for name in (
+            "_auto_plot_available_serial_values",
+            "_auto_plot_selected_filter_values",
+            "_selection_filter_state",
             "_active_control_period_filter_values",
             "_single_active_control_period_filter_value",
             "_active_program_filter_values",
             "_active_suppression_voltage_filter_values",
+            "_active_valve_voltage_filter_values",
             "_active_serial_rows",
             "_active_serials",
+            "_restrictive_control_period_filter_values",
+            "_restrictive_suppression_voltage_filter_values",
+            "_restrictive_valve_voltage_filter_values",
             "_row_program_label",
             "_row_matches_global_filters",
             "_filter_rows_for_global_selection",
@@ -1457,6 +1467,112 @@ class TestTDTrendDialogLayout(unittest.TestCase):
                 str(((dlg._perf_results_by_stat.get("mean") or {}).get("master_model") or {}).get("equation") or ""),
                 "y=x",
             )
+        finally:
+            dlg.close()
+
+    def test_plot_metrics_after_life_metrics_mode_uses_condition_selection(self) -> None:
+        from PySide6 import QtCore, QtWidgets
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        dlg = _build_test_data_dialog()
+        try:
+            dlg._db_path = Path("C:/tmp/fake.sqlite3")
+            dlg._plot_ready = True
+            dlg._run_selection_views = {
+                "sequence": [],
+                "condition": [
+                    {
+                        "mode": "condition",
+                        "id": "condition:RunA",
+                        "run_name": "RunA",
+                        "display_text": "Run A",
+                        "run_condition": "Run A",
+                        "member_runs": ["RunA"],
+                        "member_sequences": ["Seq1"],
+                        "member_programs": ["Program A"],
+                        "details_text": "Source Sequences: Seq1",
+                    }
+                ],
+            }
+            dlg._available_program_filters = ["Program A"]
+            dlg._checked_program_filters = ["Program A"]
+            dlg._serial_source_rows = [{"serial": "SN1", "serial_number": "SN1", "program_title": "Program A"}]
+            dlg._serial_source_by_serial = {"SN1": dict(dlg._serial_source_rows[0])}
+            dlg._available_serial_filter_rows = list(dlg._serial_source_rows)
+            dlg._checked_serial_filters = ["SN1"]
+            dlg._global_filter_rows = []
+            dlg._available_control_period_filters = ["60"]
+            dlg._checked_control_period_filters = ["60"]
+            dlg._available_suppression_voltage_filters = ["24"]
+            dlg._checked_suppression_voltage_filters = ["24"]
+            dlg._available_valve_voltage_filters = []
+            dlg._checked_valve_voltage_filters = []
+            dlg._set_mode("life_metrics")
+            dlg._set_mode("metrics")
+            for i in range(dlg.list_metric_run_conditions.count()):
+                item = dlg.list_metric_run_conditions.item(i)
+                if item:
+                    item.setCheckState(QtCore.Qt.CheckState.Checked)
+            dlg.list_y_metrics.clear()
+            dlg.list_y_metrics.addItem(QtWidgets.QListWidgetItem("thrust"))
+            dlg.list_y_metrics.selectAll()
+            for i in range(dlg.list_stats.count()):
+                item = dlg.list_stats.item(i)
+                item.setSelected(item.text().strip().lower() == "mean")
+
+            class _Line:
+                def get_color(self):
+                    return "#000000"
+
+            class _Axes:
+                def clear(self):
+                    pass
+
+                def set_title(self, *_args, **_kwargs):
+                    pass
+
+                def set_xlabel(self, *_args, **_kwargs):
+                    pass
+
+                def set_ylabel(self, *_args, **_kwargs):
+                    pass
+
+                def plot(self, *_args, **_kwargs):
+                    return [_Line()]
+
+                def set_xlim(self, *_args, **_kwargs):
+                    pass
+
+                def set_xticks(self, *_args, **_kwargs):
+                    pass
+
+                def set_xticklabels(self, *_args, **_kwargs):
+                    pass
+
+                def grid(self, *_args, **_kwargs):
+                    pass
+
+            class _Figure:
+                def tight_layout(self):
+                    pass
+
+            dlg._figure = _Figure()
+            dlg._axes = _Axes()
+            dlg._canvas = mock.Mock()
+            dlg._ensure_main_axes = lambda plot_dimension="2d": None
+            dlg._apply_interactive_legend_policy = lambda *_args, **_kwargs: []
+            dlg._apply_plot_view_bands_to_axes = lambda *_args, **_kwargs: None
+            dlg._capture_main_plot_base_view = lambda: None
+
+            rows = [{"observation_id": "obs_agg", "serial": "SN1", "value_num": 15.0, "program_title": "Program A"}]
+            with mock.patch.object(be, "td_load_metric_series", return_value=rows) as load_mock:
+                with mock.patch.object(QtWidgets.QMessageBox, "information") as info_mock:
+                    dlg._plot_metrics()
+
+            load_mock.assert_called()
+            self.assertEqual(load_mock.call_args.kwargs.get("metric_source"), be.TD_METRIC_PLOT_SOURCE_AGGREGATE)
+            self.assertIsNone(load_mock.call_args.kwargs.get("control_period_filter"))
+            info_mock.assert_not_called()
         finally:
             dlg.close()
 
@@ -2290,6 +2406,64 @@ class TestTDSupportWorkbook(unittest.TestCase):
             "sheet_name": None,
             "header_row": 0,
         }
+
+    def test_calc_cache_backfills_aggregate_observation_metadata_from_unique_sequence_rows(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            db_path = root / "implementation_trending.sqlite3"
+            wb_path = root / "project.xlsx"
+            be._write_test_data_project_calc_cache_from_aggregates(
+                db_path,
+                wb_path,
+                cfg_cols=[{"name": "thrust", "units": "lbf"}],
+                cfg_units={"thrust": "lbf"},
+                selected_stats=["mean"],
+                support_cfg={"path": str(root / "support.xlsx")},
+                support_settings={},
+                bounds_by_sequence={},
+                condition_defaults_by_run={},
+                condition_meta_by_key={"RunA": {"display_name": "Run A"}},
+                aggregated_curve_values={("RunA", "SN1", "thrust"): [10.0, 20.0]},
+                aggregated_obs_meta={
+                    ("RunA", "SN1"): {
+                        "program_titles": {"Program A"},
+                        "source_run_names": {"Seq1"},
+                        "source_mtime_ns": [123],
+                    }
+                },
+                condition_y_names={"RunA": {"thrust"}},
+                sequence_obs_rows=[
+                    ("obs_seq1", "SN1", "RunA", "Program A", "Seq1", "pulsed mode", 0.25, 60.0, 24.0, 12.0, 123, 456)
+                ],
+                sequence_metric_rows=[
+                    ("obs_seq1", "SN1", "RunA", "thrust", "mean", 15.0, 456, 123, "Program A", "Seq1")
+                ],
+                project_cfg={},
+                computed_epoch_ns=456,
+            )
+
+            with sqlite3.connect(str(db_path)) as conn:
+                obs = conn.execute(
+                    """
+                    SELECT run_type, pulse_width, control_period, suppression_voltage, valve_voltage
+                    FROM td_condition_observations
+                    WHERE serial=? AND run_name=?
+                    """,
+                    ("SN1", "RunA"),
+                ).fetchone()
+                run = conn.execute(
+                    """
+                    SELECT run_type, control_period, pulse_width
+                    FROM td_runs
+                    WHERE run_name=?
+                    """,
+                    ("RunA",),
+                ).fetchone()
+
+            self.assertEqual(obs, ("pulsed mode", 0.25, 60.0, 24.0, 12.0))
+            self.assertEqual(run, ("pulsed mode", 60.0, 0.25))
 
     def _default_program_sheet_name(self, be) -> str:
         return str(be._td_support_program_sheet_name(be.TD_SUPPORT_DEFAULT_PROGRAM_TITLE, 0))
@@ -10187,6 +10361,51 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 "suppression_voltages": ["24"],
             },
         )
+
+    def test_default_all_global_filters_do_not_filter_metric_rows_with_missing_metadata(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        harness = _GlobalFilterHarness()
+        harness._available_control_period_filters = ["60"]
+        harness._checked_control_period_filters = ["60"]
+        harness._available_suppression_voltage_filters = ["24"]
+        harness._checked_suppression_voltage_filters = ["24"]
+        harness._available_valve_voltage_filters = ["12"]
+        harness._checked_valve_voltage_filters = ["12"]
+        rows = [
+            {
+                "observation_id": "obs_metric",
+                "serial": "SN1",
+                "value_num": 1.0,
+                "program_title": "Program A",
+                "control_period": None,
+                "suppression_voltage": None,
+                "valve_voltage": None,
+            }
+        ]
+
+        with mock.patch.object(be, "td_load_metric_series", return_value=rows) as load_mock:
+            result = harness._load_metric_series_for_selection("RunA", "thrust", "mean")
+
+        load_mock.assert_called_once()
+        self.assertIsNone(load_mock.call_args.kwargs.get("control_period_filter"))
+        self.assertEqual([row.get("observation_id") for row in result], ["obs_metric"])
+
+    def test_strict_subset_control_period_filter_remains_restrictive(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        harness = _GlobalFilterHarness()
+        harness._checked_control_period_filters = ["60"]
+        rows = [
+            {"observation_id": "obs_missing", "serial": "SN1", "value_num": 1.0, "program_title": "Program A", "control_period": None},
+            {"observation_id": "obs_match", "serial": "SN1", "value_num": 2.0, "program_title": "Program A", "control_period": 60.0},
+        ]
+
+        with mock.patch.object(be, "td_load_metric_series", return_value=rows) as load_mock:
+            result = harness._load_metric_series_for_selection("RunA", "thrust", "mean")
+
+        self.assertEqual(load_mock.call_args.kwargs.get("control_period_filter"), "60")
+        self.assertEqual([row.get("observation_id") for row in result], ["obs_match"])
 
     def test_metric_series_loader_filters_programs_serials_suppression_and_control_period(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
