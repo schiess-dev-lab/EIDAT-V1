@@ -846,6 +846,7 @@ def eidat_manager_process(
     dpi: int = 0,
     force: bool = False,
     only_candidates: bool = False,
+    file_paths: Sequence[str | Path] | None = None,
 ) -> Dict[str, object]:
     args: list[str] = []
     if limit and int(limit) > 0:
@@ -856,6 +857,10 @@ def eidat_manager_process(
         args.append("--force")
     if only_candidates:
         args.append("--only-candidates")
+    for file_path in file_paths or []:
+        text = str(file_path or "").strip()
+        if text:
+            args.extend(["--file", text])
     result = _run_eidat_manager(global_repo, "process", args)
     # Auto-rebuild index after processing
     if result.get("processed_ok", 0) > 0:
@@ -864,6 +869,44 @@ def eidat_manager_process(
             result["index"] = index_result
         except Exception:
             pass  # Index failure shouldn't fail the whole process
+    return result
+
+
+def eidat_manager_force_single_file(global_repo: Path, file_path: str | Path, *, dpi: int = 0) -> Dict[str, object]:
+    repo = Path(global_repo).expanduser()
+    source = resolve_path_within_global_repo(repo, Path(file_path), "Source file")
+    if not source.exists():
+        raise FileNotFoundError(f"Source file not found: {source}")
+    if not source.is_file():
+        raise RuntimeError(f"Source path is not a file: {source}")
+    if source.suffix.lower() not in ({".pdf"} | set(EXCEL_EXTENSIONS)):
+        raise RuntimeError("Select a PDF, Excel, or MAT source file.")
+
+    try:
+        rel_path = source.resolve().relative_to(repo.resolve()).as_posix()
+    except Exception:
+        rel_path = source.as_posix()
+
+    scan_payload = eidat_manager_scan(repo)
+    result = eidat_manager_process(repo, dpi=dpi, force=True, file_paths=[source])
+    result["scan"] = scan_payload
+    result["source_file"] = str(source)
+    result["source_rel_path"] = rel_path
+
+    processed_ok = int(result.get("processed_ok") or 0)
+    processed_failed = int(result.get("processed_failed") or 0)
+    if processed_failed > 0 or processed_ok <= 0:
+        errors: list[str] = []
+        try:
+            for item in list(result.get("results") or []):
+                if not bool((item or {}).get("ok")):
+                    err = str((item or {}).get("error") or "").strip()
+                    if err:
+                        errors.append(err)
+        except Exception:
+            pass
+        detail = f": {'; '.join(errors[:3])}" if errors else ""
+        raise RuntimeError(f"Single-file force update did not complete for {rel_path}{detail}")
     return result
 
 
@@ -2821,7 +2864,8 @@ GLOBAL_RUN_MIRROR_DIRNAME = "global_run_mirror"
 LOCAL_PROJECTS_MIRROR_DIRNAME = "projects"
 PROJECT_UPDATE_DEBUG_JSON = "update_debug.json"
 TD_CACHE_DEBUG_JSON = "td_cache_debug.json"
-TD_PROJECT_CACHE_SCHEMA_VERSION = "5"
+TD_PROJECT_CACHE_SCHEMA_VERSION = "6"
+TD_LIFE_METRICS_TABLE = "td_life_metrics"
 TD_PLOTTER_SEQUENCES_TABLE = "td_plotter_sequences"
 TD_PLOTTER_CURVE_CATALOG_TABLE = "td_plotter_curve_catalog"
 TD_PLOTTER_OBSERVATIONS_TABLE = "td_plotter_condition_observations"
@@ -3811,6 +3855,74 @@ def _ensure_test_data_impl_tables(conn: sqlite3.Connection) -> None:
         """
     )
     conn.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {TD_LIFE_METRICS_TABLE} (
+            observation_id TEXT NOT NULL,
+            serial TEXT NOT NULL,
+            sequence_index INTEGER NOT NULL,
+            sequence_label TEXT,
+            condition_key TEXT NOT NULL,
+            condition_display TEXT,
+            program_title TEXT,
+            source_run_name TEXT,
+            parameter_name TEXT NOT NULL,
+            stat TEXT NOT NULL,
+            value_num REAL,
+            units TEXT,
+            sequence_pulses REAL,
+            cumulative_pulses REAL,
+            sequence_on_time REAL,
+            cumulative_on_time REAL,
+            sequence_elapsed_time REAL,
+            cumulative_elapsed_time REAL,
+            sequence_throughput REAL,
+            cumulative_throughput REAL,
+            sequence_impulse REAL,
+            cumulative_impulse REAL,
+            diagnostics TEXT,
+            source_mtime_ns INTEGER,
+            computed_epoch_ns INTEGER NOT NULL,
+            PRIMARY KEY (serial, observation_id, parameter_name, stat)
+        )
+        """
+    )
+    for column_name, column_sql in (
+        ("sequence_label", "TEXT"),
+        ("condition_key", "TEXT"),
+        ("condition_display", "TEXT"),
+        ("program_title", "TEXT"),
+        ("source_run_name", "TEXT"),
+        ("units", "TEXT"),
+        ("sequence_pulses", "REAL"),
+        ("cumulative_pulses", "REAL"),
+        ("sequence_on_time", "REAL"),
+        ("cumulative_on_time", "REAL"),
+        ("sequence_elapsed_time", "REAL"),
+        ("cumulative_elapsed_time", "REAL"),
+        ("sequence_throughput", "REAL"),
+        ("cumulative_throughput", "REAL"),
+        ("sequence_impulse", "REAL"),
+        ("cumulative_impulse", "REAL"),
+        ("diagnostics", "TEXT"),
+        ("source_mtime_ns", "INTEGER"),
+    ):
+        try:
+            conn.execute(f"ALTER TABLE {TD_LIFE_METRICS_TABLE} ADD COLUMN {column_name} {column_sql}")
+        except Exception:
+            pass
+    conn.execute(
+        f"""
+        CREATE INDEX IF NOT EXISTS td_life_metrics_condition_param_idx
+        ON {TD_LIFE_METRICS_TABLE} (condition_key, parameter_name, serial, sequence_index)
+        """
+    )
+    conn.execute(
+        f"""
+        CREATE INDEX IF NOT EXISTS td_life_metrics_serial_sequence_idx
+        ON {TD_LIFE_METRICS_TABLE} (serial, sequence_index, observation_id)
+        """
+    )
+    conn.execute(
         """
         CREATE INDEX IF NOT EXISTS td_condition_observations_run_type_cp_idx
         ON td_condition_observations (
@@ -3882,6 +3994,611 @@ def _td_metric_source_observation_table_name(metric_source: object) -> str:
         if td_metric_normalize_plot_source(metric_source) == TD_METRIC_PLOT_SOURCE_ALL_SEQUENCES
         else "td_condition_observations"
     )
+
+
+TD_LIFE_AXIS_OPTIONS: tuple[tuple[str, str], ...] = (
+    ("sequence_index", "Sequence"),
+    ("cumulative_pulses", "Cumulative Pulses"),
+    ("cumulative_throughput", "Cumulative Throughput"),
+    ("cumulative_on_time", "Cumulative On Time"),
+    ("cumulative_impulse", "Cumulative Impulse"),
+)
+
+TD_LIFE_BASE_ALIASES: dict[str, tuple[str, ...]] = {
+    "pulse_count": ("pulse count", "number of pulses", "pulses", "num_pulses", "n_pulses"),
+    "prop_per_pulse": ("prop per pulse", "prop_per_pulse", "propellant per pulse", "mass per pulse"),
+    "flow_rate": ("flowrate", "flow rate", "mass flow rate", "mdot", "m_dot"),
+    "impulse_per_pulse": ("impulse bit", "impulse per pulse", "impulse_bit"),
+    "elapsed_time": ("elapsed time", "time elapsed", "duration", "run time"),
+    "thrust": ("thrust",),
+}
+
+
+def _td_life_norm_key(value: object) -> str:
+    return "".join(ch.lower() for ch in str(value or "").strip() if ch.isalnum())
+
+
+def _td_life_unique_aliases(values: Iterable[object]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = str(value or "").strip()
+        key = _td_life_norm_key(text)
+        if not text or not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(text)
+    return out
+
+
+def _td_life_config_object(project_cfg: Mapping[str, object] | None) -> Mapping[str, object]:
+    cfg = project_cfg if isinstance(project_cfg, Mapping) else {}
+    candidates: list[object] = [cfg.get("life_metrics")]
+    runtime_cfg = cfg.get("runtime_config")
+    if isinstance(runtime_cfg, Mapping):
+        candidates.append(runtime_cfg.get("life_metrics"))
+        runtime_config_cfg = runtime_cfg.get("config")
+        if isinstance(runtime_config_cfg, Mapping):
+            candidates.append(runtime_config_cfg.get("life_metrics"))
+    nested_cfg = cfg.get("config")
+    if isinstance(nested_cfg, Mapping):
+        candidates.append(nested_cfg.get("life_metrics"))
+    for candidate in candidates:
+        if isinstance(candidate, Mapping):
+            return candidate
+    return {}
+
+
+def _td_life_aliases_from_config(raw: object) -> list[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        return [raw]
+    if isinstance(raw, Mapping):
+        values: list[object] = []
+        for key in ("aliases", "alias", "columns", "column", "names", "name"):
+            value = raw.get(key)
+            if isinstance(value, (list, tuple, set)):
+                values.extend(list(value))
+            elif value not in (None, ""):
+                values.append(value)
+        return _td_life_unique_aliases(values)
+    if isinstance(raw, (list, tuple, set)):
+        return _td_life_unique_aliases(list(raw))
+    return []
+
+
+def _td_life_alias_sets(project_cfg: Mapping[str, object] | None) -> dict[str, list[str]]:
+    aliases: dict[str, list[str]] = {
+        role: _td_life_unique_aliases(values)
+        for role, values in TD_LIFE_BASE_ALIASES.items()
+    }
+    life_cfg = _td_life_config_object(project_cfg)
+    role_config_keys = {
+        "pulse_count": ("pulse_count", "pulse_count_aliases", "pulses", "pulses_aliases"),
+        "prop_per_pulse": ("prop_per_pulse", "prop_per_pulse_aliases", "propellant_per_pulse"),
+        "flow_rate": ("flow_rate", "flow_rate_aliases", "flowrate", "flowrate_aliases"),
+        "impulse_per_pulse": ("impulse_per_pulse", "impulse_per_pulse_aliases", "impulse_bit"),
+        "elapsed_time": ("elapsed_time", "elapsed_time_aliases", "time_elapsed"),
+        "thrust": ("thrust", "thrust_aliases"),
+    }
+    for role, keys in role_config_keys.items():
+        extra: list[object] = []
+        for key in keys:
+            if key in life_cfg:
+                extra.extend(_td_life_aliases_from_config(life_cfg.get(key)))
+        aliases[role] = _td_life_unique_aliases(list(aliases.get(role) or []) + extra)
+
+    cfg = project_cfg if isinstance(project_cfg, Mapping) else {}
+    column_defs: list[Mapping[str, object]] = []
+    for source in (
+        cfg.get("columns"),
+        (cfg.get("runtime_config") if isinstance(cfg.get("runtime_config"), Mapping) else {}).get("columns")
+        if isinstance(cfg.get("runtime_config"), Mapping)
+        else None,
+    ):
+        if isinstance(source, list):
+            column_defs.extend([cast(Mapping[str, object], item) for item in source if isinstance(item, Mapping)])
+    for col in column_defs:
+        name = str(col.get("name") or "").strip()
+        col_aliases = [
+            str(value or "").strip()
+            for value in (col.get("aliases") or [])
+            if str(value or "").strip()
+        ] if isinstance(col.get("aliases"), list) else []
+        candidates = _td_life_unique_aliases([name] + col_aliases)
+        candidate_norms = {_td_life_norm_key(value) for value in candidates}
+        for role, role_aliases in list(aliases.items()):
+            role_norms = {_td_life_norm_key(value) for value in role_aliases}
+            if candidate_norms & role_norms:
+                aliases[role] = _td_life_unique_aliases(list(role_aliases) + candidates)
+    return aliases
+
+
+def _td_life_axis_aliases(project_cfg: Mapping[str, object] | None) -> tuple[set[str], set[str]]:
+    alias_sets = _td_life_alias_sets(project_cfg)
+    pulse_aliases = set(_td_life_norm_key(value) for value in alias_sets.get("pulse_count") or [])
+    time_aliases = set(_td_life_norm_key(value) for value in alias_sets.get("elapsed_time") or [])
+    runtime_cfg = (project_cfg or {}).get("runtime_config") if isinstance(project_cfg, Mapping) else {}
+    runtime_config = runtime_cfg.get("config") if isinstance(runtime_cfg, Mapping) else {}
+    x_axis_cfg = runtime_config.get("x_axis") if isinstance(runtime_config, Mapping) else {}
+    if not isinstance(x_axis_cfg, Mapping):
+        x_axis_cfg = {}
+    for value in (x_axis_cfg.get("pulse_aliases") or []):
+        pulse_aliases.add(_td_life_norm_key(value))
+    for value in (x_axis_cfg.get("time_aliases") or []):
+        time_aliases.add(_td_life_norm_key(value))
+    pulse_aliases.add(_td_life_norm_key("Pulse Number"))
+    time_aliases.add(_td_life_norm_key("Time"))
+    return pulse_aliases, time_aliases
+
+
+def _td_life_first_metric_value(
+    metrics_by_name: Mapping[str, Mapping[str, object]],
+    aliases: Sequence[object],
+) -> float | None:
+    for alias in aliases:
+        key = _td_life_norm_key(alias)
+        if not key:
+            continue
+        row = metrics_by_name.get(key)
+        if not isinstance(row, Mapping):
+            continue
+        value = _td_finite_float(row.get("value_num"))
+        if value is not None:
+            return float(value)
+    return None
+
+
+def _td_life_pulse_count_from_values(values: Sequence[object]) -> float | None:
+    finite_values: list[float] = []
+    for value in values:
+        fval = _td_finite_float(value)
+        if fval is not None:
+            finite_values.append(float(fval))
+    if not finite_values:
+        return None
+    unique_values = sorted(set(round(value, 9) for value in finite_values))
+    if not unique_values:
+        return None
+    int_values: list[int] = []
+    int_like = True
+    for value in unique_values:
+        rounded = int(round(float(value)))
+        if abs(float(value) - float(rounded)) > 1e-6:
+            int_like = False
+            break
+        int_values.append(rounded)
+    if int_like and int_values:
+        min_value = min(int_values)
+        max_value = max(int_values)
+        if min_value >= 1:
+            return float(max_value)
+        if min_value == 0:
+            return float(max_value + 1)
+    return float(len(unique_values))
+
+
+def _td_life_elapsed_from_values(values: Sequence[object]) -> float | None:
+    finite_values = [float(v) for v in (_td_finite_float(value) for value in values) if v is not None]
+    if not finite_values:
+        return None
+    min_value = min(finite_values)
+    max_value = max(finite_values)
+    if max_value < min_value:
+        return None
+    duration = float(max_value - min_value)
+    if duration > 0:
+        return duration
+    if max_value > 0:
+        return float(max_value)
+    return None
+
+
+def _td_life_raw_axis_metrics(
+    raw_db_path: Path,
+    *,
+    pulse_aliases: set[str],
+    time_aliases: set[str],
+) -> tuple[dict[str, float], dict[str, float]]:
+    pulse_counts: dict[str, float] = {}
+    elapsed_times: dict[str, float] = {}
+    path = Path(raw_db_path).expanduser()
+    if not path.exists() or not path.is_file():
+        return pulse_counts, elapsed_times
+    try:
+        with sqlite3.connect(str(path)) as raw_conn:
+            _ensure_test_data_raw_cache_tables(raw_conn)
+            rows = raw_conn.execute(
+                """
+                SELECT observation_id, x_name, x_json
+                FROM td_curves_raw
+                WHERE observation_id IS NOT NULL
+                  AND TRIM(observation_id) <> ''
+                  AND x_name IS NOT NULL
+                  AND TRIM(x_name) <> ''
+                """
+            ).fetchall()
+    except Exception:
+        return pulse_counts, elapsed_times
+    for observation_id, x_name, x_json in rows:
+        obs_id = str(observation_id or "").strip()
+        x_key = _td_life_norm_key(x_name)
+        if not obs_id or not x_key:
+            continue
+        try:
+            values = json.loads(x_json or "[]")
+        except Exception:
+            values = []
+        if not isinstance(values, list):
+            continue
+        if x_key in pulse_aliases:
+            pulse_count = _td_life_pulse_count_from_values(values)
+            if pulse_count is not None:
+                pulse_counts[obs_id] = max(float(pulse_counts.get(obs_id, 0.0)), float(pulse_count))
+        if x_key in time_aliases:
+            elapsed = _td_life_elapsed_from_values(values)
+            if elapsed is not None:
+                elapsed_times[obs_id] = max(float(elapsed_times.get(obs_id, 0.0)), float(elapsed))
+    return pulse_counts, elapsed_times
+
+
+def _td_life_sequence_number(value: object) -> int | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    match = re.search(r"(?:seq(?:uence)?|run|block|test)[^\d]*(\d+)", text, flags=re.IGNORECASE)
+    if match:
+        try:
+            return int(match.group(1))
+        except Exception:
+            return None
+    match = re.search(r"(\d+)", text)
+    if match:
+        try:
+            return int(match.group(1))
+        except Exception:
+            return None
+    return None
+
+
+def _td_life_sequence_sort_key(row: Mapping[str, object], source_order_by_serial: Mapping[str, int]) -> tuple[object, ...]:
+    serial = str(row.get("serial") or "").strip()
+    source_order = int(source_order_by_serial.get(serial, 10**9))
+    number_candidates = [
+        _td_life_sequence_number(row.get("source_run_name")),
+        _td_life_sequence_number(row.get("condition_key")),
+        _td_life_sequence_number(row.get("observation_id")),
+    ]
+    sequence_number = next((value for value in number_candidates if value is not None), None)
+    return (
+        source_order,
+        0 if sequence_number is not None else 1,
+        int(sequence_number) if sequence_number is not None else 10**9,
+        str(row.get("source_run_name") or "").casefold(),
+        str(row.get("condition_key") or "").casefold(),
+        int(row.get("source_mtime_ns") or 0),
+        str(row.get("observation_id") or "").casefold(),
+    )
+
+
+def _td_life_add_cumulative(current: float | None, increment: float | None) -> float | None:
+    if increment is None:
+        return None
+    base = float(current) if current is not None else 0.0
+    return float(base + float(increment))
+
+
+def _td_life_join_diagnostics(values: Sequence[object]) -> str:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = str(value or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
+    return "; ".join(out)
+
+
+def _td_rebuild_life_metrics(
+    conn: sqlite3.Connection,
+    *,
+    workbook_path: Path,
+    project_cfg: Mapping[str, object] | None,
+    raw_db_path: Path,
+    computed_epoch_ns: int,
+) -> int:
+    _ensure_test_data_impl_tables(conn)
+    conn.execute(f"DELETE FROM {TD_LIFE_METRICS_TABLE}")
+
+    alias_sets = _td_life_alias_sets(project_cfg)
+    pulse_axis_aliases, time_axis_aliases = _td_life_axis_aliases(project_cfg)
+    raw_pulse_counts, raw_elapsed_times = _td_life_raw_axis_metrics(
+        raw_db_path,
+        pulse_aliases=pulse_axis_aliases,
+        time_aliases=time_axis_aliases,
+    )
+    try:
+        source_rows = _read_test_data_sources(Path(workbook_path).expanduser())
+    except Exception:
+        source_rows = []
+    source_order_by_serial = {
+        str(row.get("serial") or "").strip(): idx
+        for idx, row in enumerate(source_rows)
+        if isinstance(row, Mapping) and str(row.get("serial") or "").strip()
+    }
+
+    observation_rows = conn.execute(
+        """
+        SELECT
+            o.observation_id,
+            o.serial,
+            o.run_name,
+            COALESCE(r.display_name, ''),
+            COALESCE(o.program_title, ''),
+            COALESCE(o.source_run_name, ''),
+            COALESCE(o.run_type, ''),
+            o.pulse_width,
+            o.control_period,
+            o.source_mtime_ns
+        FROM td_condition_observations_sequences o
+        LEFT JOIN td_runs r
+          ON r.run_name = o.run_name
+        ORDER BY o.serial, o.run_name, o.observation_id
+        """
+    ).fetchall()
+    observations_by_id: dict[str, dict[str, object]] = {}
+    for (
+        observation_id,
+        serial,
+        run_name,
+        condition_display,
+        program_title,
+        source_run_name,
+        run_type,
+        pulse_width,
+        control_period,
+        source_mtime_ns,
+    ) in observation_rows:
+        obs_id = str(observation_id or "").strip()
+        serial_txt = str(serial or "").strip()
+        condition_key = str(run_name or "").strip()
+        if not obs_id or not serial_txt or not condition_key:
+            continue
+        display = str(condition_display or "").strip() or condition_key
+        source_run = str(source_run_name or "").strip()
+        sequence_label = display or condition_key or source_run
+        observations_by_id[obs_id] = {
+            "observation_id": obs_id,
+            "serial": serial_txt,
+            "condition_key": condition_key,
+            "condition_display": display,
+            "program_title": str(program_title or "").strip(),
+            "source_run_name": source_run,
+            "run_type": str(run_type or "").strip(),
+            "pulse_width": _td_finite_float(pulse_width),
+            "control_period": _td_finite_float(control_period),
+            "source_mtime_ns": int(source_mtime_ns or 0),
+            "sequence_label": sequence_label,
+        }
+
+    metric_rows = conn.execute(
+        """
+        SELECT
+            m.observation_id,
+            m.serial,
+            m.run_name,
+            m.column_name,
+            m.value_num,
+            COALESCE(c.units, ''),
+            m.source_mtime_ns
+        FROM td_metrics_calc_sequences m
+        LEFT JOIN td_columns_calc c
+          ON c.run_name = m.run_name AND c.name = m.column_name AND c.kind = 'y'
+        WHERE lower(m.stat) = 'mean'
+        ORDER BY m.serial, m.observation_id, m.column_name
+        """
+    ).fetchall()
+    metrics_by_obs: dict[str, list[dict[str, object]]] = {}
+    for observation_id, serial, run_name, column_name, value_num, units, source_mtime_ns in metric_rows:
+        obs_id = str(observation_id or "").strip()
+        param = str(column_name or "").strip()
+        if not obs_id or not param:
+            continue
+        metrics_by_obs.setdefault(obs_id, []).append(
+            {
+                "observation_id": obs_id,
+                "serial": str(serial or "").strip(),
+                "condition_key": str(run_name or "").strip(),
+                "parameter_name": param,
+                "value_num": value_num,
+                "units": str(units or "").strip(),
+                "source_mtime_ns": int(source_mtime_ns or 0),
+            }
+        )
+
+    observations_by_serial: dict[str, list[dict[str, object]]] = {}
+    for obs_id, obs in observations_by_id.items():
+        if obs_id not in metrics_by_obs:
+            continue
+        serial = str(obs.get("serial") or "").strip()
+        if serial:
+            observations_by_serial.setdefault(serial, []).append(dict(obs))
+
+    rows_to_insert: list[tuple[object, ...]] = []
+    for serial, serial_obs_rows in observations_by_serial.items():
+        ordered_obs = sorted(
+            serial_obs_rows,
+            key=lambda row: _td_life_sequence_sort_key(row, source_order_by_serial),
+        )
+        cumulative_pulses: float | None = None
+        cumulative_on_time: float | None = None
+        cumulative_elapsed_time: float | None = None
+        cumulative_throughput: float | None = None
+        cumulative_impulse: float | None = None
+        for seq_idx, obs in enumerate(ordered_obs, start=1):
+            obs_id = str(obs.get("observation_id") or "").strip()
+            metrics = [dict(row) for row in metrics_by_obs.get(obs_id, [])]
+            metrics_by_name = {
+                _td_life_norm_key(row.get("parameter_name")): row
+                for row in metrics
+                if _td_life_norm_key(row.get("parameter_name"))
+            }
+
+            explicit_pulses = _td_life_first_metric_value(metrics_by_name, alias_sets.get("pulse_count") or [])
+            raw_pulses = raw_pulse_counts.get(obs_id)
+            sequence_pulses = explicit_pulses if explicit_pulses is not None else raw_pulses
+            if sequence_pulses is not None and sequence_pulses < 0:
+                sequence_pulses = None
+
+            prop_per_pulse = _td_life_first_metric_value(metrics_by_name, alias_sets.get("prop_per_pulse") or [])
+            flow_rate = _td_life_first_metric_value(metrics_by_name, alias_sets.get("flow_rate") or [])
+            impulse_per_pulse = _td_life_first_metric_value(metrics_by_name, alias_sets.get("impulse_per_pulse") or [])
+            thrust = _td_life_first_metric_value(metrics_by_name, alias_sets.get("thrust") or [])
+            explicit_elapsed = _td_life_first_metric_value(metrics_by_name, alias_sets.get("elapsed_time") or [])
+            raw_elapsed = raw_elapsed_times.get(obs_id)
+            elapsed_input = explicit_elapsed if explicit_elapsed is not None else raw_elapsed
+            pulse_width = _td_finite_float(obs.get("pulse_width"))
+            control_period = _td_finite_float(obs.get("control_period"))
+            run_type_text = str(obs.get("run_type") or "").strip()
+            is_pm = (
+                td_normalize_run_type(run_type_text) == "PM"
+                or td_perf_normalize_run_type_mode(run_type_text) == "pulsed_mode"
+                or (sequence_pulses is not None and pulse_width is not None)
+            )
+
+            diagnostics: list[str] = []
+            sequence_on_time: float | None = None
+            sequence_elapsed_time: float | None = None
+            sequence_throughput: float | None = None
+            sequence_impulse: float | None = None
+
+            if is_pm:
+                if sequence_pulses is None:
+                    diagnostics.append("missing pulse count")
+                if pulse_width is None:
+                    diagnostics.append("missing pulse_width_on")
+                if sequence_pulses is not None and pulse_width is not None:
+                    sequence_on_time = float(sequence_pulses) * float(pulse_width)
+                if elapsed_input is not None:
+                    sequence_elapsed_time = float(elapsed_input)
+                elif sequence_pulses is not None and control_period is not None:
+                    sequence_elapsed_time = float(sequence_pulses) * float(control_period)
+                else:
+                    diagnostics.append("missing elapsed time")
+                if prop_per_pulse is not None and sequence_pulses is not None:
+                    sequence_throughput = float(prop_per_pulse) * float(sequence_pulses)
+                elif flow_rate is not None and sequence_on_time is not None:
+                    sequence_throughput = float(flow_rate) * float(sequence_on_time)
+                else:
+                    diagnostics.append("missing throughput inputs")
+                if impulse_per_pulse is not None and sequence_pulses is not None:
+                    sequence_impulse = float(impulse_per_pulse) * float(sequence_pulses)
+                elif thrust is not None and sequence_on_time is not None:
+                    sequence_impulse = float(thrust) * float(sequence_on_time)
+                else:
+                    diagnostics.append("missing impulse inputs")
+            else:
+                if elapsed_input is None:
+                    diagnostics.append("missing elapsed time")
+                else:
+                    sequence_elapsed_time = float(elapsed_input)
+                    sequence_on_time = float(elapsed_input)
+                if flow_rate is not None and sequence_on_time is not None:
+                    sequence_throughput = float(flow_rate) * float(sequence_on_time)
+                else:
+                    diagnostics.append("missing throughput inputs")
+                if thrust is not None and sequence_on_time is not None:
+                    sequence_impulse = float(thrust) * float(sequence_on_time)
+                else:
+                    diagnostics.append("missing impulse inputs")
+
+            next_cumulative_pulses = _td_life_add_cumulative(cumulative_pulses, sequence_pulses)
+            next_cumulative_on_time = _td_life_add_cumulative(cumulative_on_time, sequence_on_time)
+            next_cumulative_elapsed_time = _td_life_add_cumulative(cumulative_elapsed_time, sequence_elapsed_time)
+            next_cumulative_throughput = _td_life_add_cumulative(cumulative_throughput, sequence_throughput)
+            next_cumulative_impulse = _td_life_add_cumulative(cumulative_impulse, sequence_impulse)
+            if next_cumulative_pulses is not None:
+                cumulative_pulses = next_cumulative_pulses
+            if next_cumulative_on_time is not None:
+                cumulative_on_time = next_cumulative_on_time
+            if next_cumulative_elapsed_time is not None:
+                cumulative_elapsed_time = next_cumulative_elapsed_time
+            if next_cumulative_throughput is not None:
+                cumulative_throughput = next_cumulative_throughput
+            if next_cumulative_impulse is not None:
+                cumulative_impulse = next_cumulative_impulse
+
+            diagnostic_text = _td_life_join_diagnostics(diagnostics)
+            for metric in metrics:
+                param = str(metric.get("parameter_name") or "").strip()
+                if not param:
+                    continue
+                rows_to_insert.append(
+                    (
+                        obs_id,
+                        serial,
+                        int(seq_idx),
+                        str(obs.get("sequence_label") or "").strip(),
+                        str(obs.get("condition_key") or "").strip(),
+                        str(obs.get("condition_display") or "").strip(),
+                        str(obs.get("program_title") or "").strip(),
+                        str(obs.get("source_run_name") or "").strip(),
+                        param,
+                        "mean",
+                        metric.get("value_num"),
+                        str(metric.get("units") or "").strip(),
+                        sequence_pulses,
+                        next_cumulative_pulses,
+                        sequence_on_time,
+                        next_cumulative_on_time,
+                        sequence_elapsed_time,
+                        next_cumulative_elapsed_time,
+                        sequence_throughput,
+                        next_cumulative_throughput,
+                        sequence_impulse,
+                        next_cumulative_impulse,
+                        diagnostic_text,
+                        int(metric.get("source_mtime_ns") or obs.get("source_mtime_ns") or 0),
+                        int(computed_epoch_ns),
+                    )
+                )
+
+    if rows_to_insert:
+        conn.executemany(
+            f"""
+            INSERT OR REPLACE INTO {TD_LIFE_METRICS_TABLE} (
+                observation_id,
+                serial,
+                sequence_index,
+                sequence_label,
+                condition_key,
+                condition_display,
+                program_title,
+                source_run_name,
+                parameter_name,
+                stat,
+                value_num,
+                units,
+                sequence_pulses,
+                cumulative_pulses,
+                sequence_on_time,
+                cumulative_on_time,
+                sequence_elapsed_time,
+                cumulative_elapsed_time,
+                sequence_throughput,
+                cumulative_throughput,
+                sequence_impulse,
+                cumulative_impulse,
+                diagnostics,
+                source_mtime_ns,
+                computed_epoch_ns
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows_to_insert,
+        )
+    return len(rows_to_insert)
 
 
 def td_smart_solver_has_sequence_rows(db_path: Path) -> bool:
@@ -8600,18 +9317,24 @@ def _td_impl_cache_counts(conn: sqlite3.Connection) -> dict[str, int | bool]:
         )
     except Exception:
         sequence_metrics_count = 0
+    try:
+        life_metrics_count = int(conn.execute(f"SELECT COUNT(*) FROM {TD_LIFE_METRICS_TABLE}").fetchone()[0] or 0)
+    except Exception:
+        life_metrics_count = 0
     return {
         "runs": runs_count,
         "calc_y": calc_y_count,
         "metrics": metrics_count,
         "sequence_observations": sequence_obs_count,
         "sequence_metrics": sequence_metrics_count,
+        "life_metrics": life_metrics_count,
         "complete": bool(
             runs_count > 0
             and calc_y_count > 0
             and metrics_count > 0
             and sequence_obs_count > 0
             and sequence_metrics_count > 0
+            and life_metrics_count > 0
         ),
     }
 
@@ -8865,6 +9588,7 @@ def _td_cache_state_summary(state: Mapping[str, object] | None) -> dict[str, obj
             "td_metrics_calc": int(impl_counts_raw.get("metrics") or 0),
             "td_condition_observations_sequences": int(impl_counts_raw.get("sequence_observations") or 0),
             "td_metrics_calc_sequences": int(impl_counts_raw.get("sequence_metrics") or 0),
+            "td_life_metrics": int(impl_counts_raw.get("life_metrics") or 0),
         },
         "raw_counts": {
             "td_raw_sequences": int(raw_counts_raw.get("raw_runs") or 0),
@@ -8899,6 +9623,7 @@ def _td_cache_validation_summary_line(summary: Mapping[str, object] | None) -> s
         f"td_metrics_calc={int(impl_counts.get('td_metrics_calc') or 0)}",
         f"td_condition_observations_sequences={int(impl_counts.get('td_condition_observations_sequences') or 0)}",
         f"td_metrics_calc_sequences={int(impl_counts.get('td_metrics_calc_sequences') or 0)}",
+        f"td_life_metrics={int(impl_counts.get('td_life_metrics') or 0)}",
         f"td_raw_sequences={int(raw_counts.get('td_raw_sequences') or 0)}",
         f"td_columns_raw_y={int(raw_counts.get('td_columns_raw_y') or 0)}",
         f"td_curves_raw={int(raw_counts.get('td_curves_raw') or 0)}",
@@ -9175,6 +9900,7 @@ def _td_validate_generated_workbook_outputs(
     expected_metric_labels: Sequence[str],
     expected_metrics_long_rows: int,
     expected_metrics_long_sequence_rows: int,
+    expected_life_metrics_rows: int,
     expected_raw_long_rows: int,
 ) -> dict[str, object]:
     try:
@@ -9212,6 +9938,33 @@ def _td_validate_generated_workbook_outputs(
         "control_period",
         "source_mtime_ns",
     ]
+    life_header = [
+        "observation_id",
+        "serial",
+        "sequence_index",
+        "sequence_label",
+        "condition_key",
+        "condition_display",
+        "program_title",
+        "source_run_name",
+        "parameter_name",
+        "stat",
+        "value_num",
+        "units",
+        "sequence_pulses",
+        "cumulative_pulses",
+        "sequence_on_time",
+        "cumulative_on_time",
+        "sequence_elapsed_time",
+        "cumulative_elapsed_time",
+        "sequence_throughput",
+        "cumulative_throughput",
+        "sequence_impulse",
+        "cumulative_impulse",
+        "diagnostics",
+        "source_mtime_ns",
+        "computed_epoch_ns",
+    ]
     summary: dict[str, object] = {
         "ok": False,
         "data_calc": {
@@ -9233,6 +9986,12 @@ def _td_validate_generated_workbook_outputs(
             "ok": False,
             "rows": 0,
             "expected_rows": int(expected_metrics_long_sequence_rows),
+        },
+        "life_metrics": {
+            "exists": False,
+            "ok": False,
+            "rows": 0,
+            "expected_rows": int(expected_life_metrics_rows),
         },
         "raw_cache_long": {
             "exists": False,
@@ -9352,6 +10111,26 @@ def _td_validate_generated_workbook_outputs(
                 "Metrics_long_sequences" in problem for problem in problems
             )
 
+        if "Life_metrics" not in wb.sheetnames:
+            problems.append("Project workbook outputs are incomplete: missing sheet Life_metrics.")
+        else:
+            ws = wb["Life_metrics"]
+            life_metrics = summary["life_metrics"] if isinstance(summary.get("life_metrics"), dict) else {}
+            life_metrics["exists"] = True
+            header_values = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), tuple())
+            header = [str(value or "").strip() for value in header_values]
+            row_count = _count_data_rows(ws)
+            life_metrics["rows"] = row_count
+            if header[: len(life_header)] != life_header:
+                problems.append("Project workbook outputs are incomplete: Life_metrics header row is invalid.")
+            if row_count <= 0:
+                problems.append("Project workbook outputs are incomplete: Life_metrics has no data rows.")
+            if row_count != int(expected_life_metrics_rows):
+                problems.append(
+                    "Project workbook outputs are incomplete: Life_metrics row count does not match td_life_metrics."
+                )
+            life_metrics["ok"] = not any("Life_metrics" in problem for problem in problems)
+
         if "RawCache_long" not in wb.sheetnames:
             problems.append("Project workbook outputs are incomplete: missing sheet RawCache_long.")
         else:
@@ -9435,6 +10214,7 @@ def _td_collect_project_readiness(
                 "td_metrics_calc",
                 "td_condition_observations_sequences",
                 "td_metrics_calc_sequences",
+                TD_LIFE_METRICS_TABLE,
             )
             impl_tables = {
                 str(row[0] or "").strip()
@@ -9442,7 +10222,7 @@ def _td_collect_project_readiness(
                     """
                     SELECT name
                     FROM sqlite_master
-                    WHERE type='table' AND name IN (?, ?, ?, ?, ?)
+                    WHERE type='table' AND name IN (?, ?, ?, ?, ?, ?)
                     """,
                     required_impl_tables,
                 ).fetchall()
@@ -9481,6 +10261,9 @@ def _td_collect_project_readiness(
             expected_metrics_long_rows = int(conn.execute("SELECT COUNT(*) FROM td_metrics_calc").fetchone()[0] or 0)
             expected_metrics_long_sequence_rows = int(
                 conn.execute("SELECT COUNT(*) FROM td_metrics_calc_sequences").fetchone()[0] or 0
+            )
+            expected_life_metrics_rows = int(
+                conn.execute(f"SELECT COUNT(*) FROM {TD_LIFE_METRICS_TABLE}").fetchone()[0] or 0
             )
 
         with closing(sqlite3.connect(str(raw_db_path))) as conn:
@@ -9526,6 +10309,7 @@ def _td_collect_project_readiness(
                 expected_metric_labels=expected_metric_labels,
                 expected_metrics_long_rows=expected_metrics_long_rows,
                 expected_metrics_long_sequence_rows=expected_metrics_long_sequence_rows,
+                expected_life_metrics_rows=expected_life_metrics_rows,
                 expected_raw_long_rows=expected_raw_long_rows,
             )
             summary["workbook_outputs"] = workbook_outputs
@@ -9902,6 +10686,7 @@ def _write_test_data_project_calc_cache_from_aggregates(
     condition_y_names: Mapping[str, set[str]],
     sequence_obs_rows: Sequence[tuple[object, ...]] | None = None,
     sequence_metric_rows: Sequence[tuple[object, ...]] | None = None,
+    project_cfg: Mapping[str, object] | None = None,
     computed_epoch_ns: int,
     progress_cb: Callable[[str], None] | None = None,
 ) -> dict[str, object]:
@@ -9922,6 +10707,7 @@ def _write_test_data_project_calc_cache_from_aggregates(
     metrics_written = 0
     sequence_observations_written = 0
     sequence_metrics_written = 0
+    life_metrics_written = 0
     calc_columns_written = 0
     inserted_columns: set[tuple[str, str]] = set()
     inserted_runs: set[str] = set()
@@ -10362,6 +11148,14 @@ def _write_test_data_project_calc_cache_from_aggregates(
                 sequence_metric_rows_list,
             )
             sequence_metrics_written = len(sequence_metric_rows_list)
+        _td_emit_progress(progress_cb, "Calculating TD life metrics")
+        life_metrics_written = _td_rebuild_life_metrics(
+            conn,
+            workbook_path=wb_path,
+            project_cfg=project_cfg,
+            raw_db_path=raw_db_path,
+            computed_epoch_ns=int(computed_epoch_ns),
+        )
         conn.execute(
             "INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)",
             ("workbook_path", str(wb_path)),
@@ -10406,6 +11200,7 @@ def _write_test_data_project_calc_cache_from_aggregates(
         "calc_columns_written": calc_columns_written,
         "sequence_observations_written": sequence_observations_written,
         "sequence_metrics_written": sequence_metrics_written,
+        "life_metrics_written": life_metrics_written,
         "mode": "calc_from_current_pass",
         "timings": dict(timings),
     }
@@ -11192,6 +11987,14 @@ def _rebuild_test_data_project_calc_cache_from_raw(
                 """,
                 sequence_metric_rows_to_write,
             )
+        _td_emit_progress(progress_cb, "Calculating TD life metrics")
+        life_metrics_written = _td_rebuild_life_metrics(
+            conn,
+            workbook_path=wb_path,
+            project_cfg=project_cfg,
+            raw_db_path=raw_db_path,
+            computed_epoch_ns=int(computed_epoch_ns),
+        )
         conn.execute(
             "INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)",
             ("workbook_path", str(wb_path)),
@@ -11237,6 +12040,7 @@ def _rebuild_test_data_project_calc_cache_from_raw(
         "calc_columns_written": calc_columns_written,
         "sequence_observations_written": len(sequence_obs_rows_by_id),
         "sequence_metrics_written": len(sequence_metric_rows_by_key),
+        "life_metrics_written": life_metrics_written,
         "mode": "calc_from_raw",
         "timings": dict(timings),
     }
@@ -11298,6 +12102,7 @@ def validate_test_data_project_cache_for_open(project_dir: Path, workbook_path: 
                     "td_metrics_calc",
                     "td_condition_observations_sequences",
                     "td_metrics_calc_sequences",
+                    TD_LIFE_METRICS_TABLE,
                 ),
             )
             if missing_impl_tables:
@@ -11310,6 +12115,7 @@ def validate_test_data_project_cache_for_open(project_dir: Path, workbook_path: 
             metrics_count = int(conn.execute("SELECT COUNT(*) FROM td_metrics_calc").fetchone()[0] or 0)
             sequence_obs_count = int(conn.execute("SELECT COUNT(*) FROM td_condition_observations_sequences").fetchone()[0] or 0)
             sequence_metrics_count = int(conn.execute("SELECT COUNT(*) FROM td_metrics_calc_sequences").fetchone()[0] or 0)
+            life_metrics_count = int(conn.execute(f"SELECT COUNT(*) FROM {TD_LIFE_METRICS_TABLE}").fetchone()[0] or 0)
     except RuntimeError:
         raise
     except Exception as exc:
@@ -11322,6 +12128,7 @@ def validate_test_data_project_cache_for_open(project_dir: Path, workbook_path: 
         or metrics_count <= 0
         or sequence_obs_count <= 0
         or sequence_metrics_count <= 0
+        or life_metrics_count <= 0
     ):
         raise RuntimeError(f"Project cache DB is incomplete: {db_path}. {guidance}")
 
@@ -13418,6 +14225,7 @@ def rebuild_test_data_project_cache(
             condition_y_names={str(k): set(v) for k, v in calc_condition_y_names.items()},
             sequence_obs_rows=list(calc_sequence_obs_rows_by_id.values()),
             sequence_metric_rows=list(calc_sequence_metric_rows_by_key.values()),
+            project_cfg=project_cfg,
             computed_epoch_ns=computed_epoch_ns,
             progress_cb=progress_cb,
         )
@@ -14481,6 +15289,265 @@ def td_load_metric_series(
         for r in rows
         if str(r[0] or "").strip() and str(r[1] or "").strip()
     ]
+
+
+def td_list_life_axes(db_path: Path) -> list[dict]:
+    path = Path(db_path).expanduser()
+    if not path.exists():
+        return []
+    try:
+        with sqlite3.connect(str(path)) as conn:
+            _ensure_test_data_impl_tables(conn)
+    except Exception:
+        return []
+    return [{"key": key, "label": label} for key, label in TD_LIFE_AXIS_OPTIONS]
+
+
+def td_list_life_parameters(db_path: Path, run_names: Sequence[object]) -> list[str]:
+    path = Path(db_path).expanduser()
+    if not path.exists():
+        return []
+    runs = [str(value or "").strip() for value in (run_names or []) if str(value or "").strip()]
+    sql = [
+        f"""
+        SELECT DISTINCT parameter_name
+        FROM {TD_LIFE_METRICS_TABLE}
+        WHERE lower(stat) = 'mean'
+        """
+    ]
+    params: list[object] = []
+    if runs:
+        sql.append(f" AND condition_key IN ({','.join('?' for _ in runs)})")
+        params.extend(runs)
+    sql.append(" ORDER BY parameter_name")
+    with sqlite3.connect(str(path)) as conn:
+        _ensure_test_data_impl_tables(conn)
+        rows = conn.execute("".join(sql), tuple(params)).fetchall()
+    return [str(row[0] or "").strip() for row in rows if str(row[0] or "").strip()]
+
+
+def _td_normalize_life_axis(value: object) -> str:
+    raw = str(value or "").strip().lower()
+    aliases = {
+        "sequence": "sequence_index",
+        "seq": "sequence_index",
+        "sequence_index": "sequence_index",
+        "cumulative_pulses": "cumulative_pulses",
+        "pulses": "cumulative_pulses",
+        "cumulative_throughput": "cumulative_throughput",
+        "throughput": "cumulative_throughput",
+        "cumulative_on_time": "cumulative_on_time",
+        "on_time": "cumulative_on_time",
+        "cumulative_impulse": "cumulative_impulse",
+        "impulse": "cumulative_impulse",
+    }
+    return aliases.get(raw, "sequence_index")
+
+
+def td_load_life_metric_series(
+    db_path: Path,
+    run_names: Sequence[object],
+    parameter: str,
+    life_axis: str,
+    serials: Sequence[object] | None = None,
+) -> list[dict]:
+    path = Path(db_path).expanduser()
+    if not path.exists():
+        return []
+    runs = [str(value or "").strip() for value in (run_names or []) if str(value or "").strip()]
+    param = str(parameter or "").strip()
+    axis = _td_normalize_life_axis(life_axis)
+    allowed_axes = {key for key, _label in TD_LIFE_AXIS_OPTIONS}
+    if axis not in allowed_axes:
+        axis = "sequence_index"
+    serial_list = [str(value or "").strip() for value in (serials or []) if str(value or "").strip()]
+    if not runs or not param:
+        return []
+    sql = [
+        f"""
+        SELECT
+            l.observation_id,
+            l.serial,
+            l.condition_key,
+            COALESCE(l.condition_display, ''),
+            COALESCE(l.program_title, ''),
+            COALESCE(l.source_run_name, ''),
+            l.sequence_index,
+            COALESCE(l.sequence_label, ''),
+            l.parameter_name,
+            l.value_num,
+            COALESCE(l.units, ''),
+            l.{axis},
+            l.sequence_pulses,
+            l.cumulative_pulses,
+            l.sequence_on_time,
+            l.cumulative_on_time,
+            l.sequence_elapsed_time,
+            l.cumulative_elapsed_time,
+            l.sequence_throughput,
+            l.cumulative_throughput,
+            l.sequence_impulse,
+            l.cumulative_impulse,
+            COALESCE(l.diagnostics, ''),
+            COALESCE(o.run_type, ''),
+            o.control_period,
+            o.suppression_voltage,
+            o.valve_voltage
+        FROM {TD_LIFE_METRICS_TABLE} l
+        LEFT JOIN td_condition_observations_sequences o
+          ON o.observation_id = l.observation_id
+        WHERE l.parameter_name = ?
+          AND lower(l.stat) = 'mean'
+        """
+    ]
+    params: list[object] = [param]
+    sql.append(f" AND l.condition_key IN ({','.join('?' for _ in runs)})")
+    params.extend(runs)
+    if serial_list:
+        sql.append(f" AND l.serial IN ({','.join('?' for _ in serial_list)})")
+        params.extend(serial_list)
+    sql.append(" ORDER BY l.serial, l.sequence_index, l.condition_key, l.observation_id")
+    with sqlite3.connect(str(path)) as conn:
+        _ensure_test_data_impl_tables(conn)
+        rows = conn.execute("".join(sql), tuple(params)).fetchall()
+    out: list[dict] = []
+    for row in rows:
+        x_value = _td_finite_float(row[11])
+        y_value = _td_finite_float(row[9])
+        if x_value is None or y_value is None:
+            continue
+        out.append(
+            {
+                "observation_id": str(row[0] or "").strip(),
+                "serial": str(row[1] or "").strip(),
+                "condition_key": str(row[2] or "").strip(),
+                "condition_display": str(row[3] or "").strip(),
+                "program_title": str(row[4] or "").strip(),
+                "source_run_name": str(row[5] or "").strip(),
+                "sequence_index": int(row[6] or 0),
+                "sequence_label": str(row[7] or "").strip(),
+                "parameter_name": str(row[8] or "").strip(),
+                "value_num": y_value,
+                "units": str(row[10] or "").strip(),
+                "life_axis": axis,
+                "x_value": x_value,
+                "y_value": y_value,
+                "sequence_pulses": row[12],
+                "cumulative_pulses": row[13],
+                "sequence_on_time": row[14],
+                "cumulative_on_time": row[15],
+                "sequence_elapsed_time": row[16],
+                "cumulative_elapsed_time": row[17],
+                "sequence_throughput": row[18],
+                "cumulative_throughput": row[19],
+                "sequence_impulse": row[20],
+                "cumulative_impulse": row[21],
+                "diagnostics": str(row[22] or "").strip(),
+                "run_type": str(row[23] or "").strip(),
+                "control_period": row[24],
+                "suppression_voltage": row[25],
+                "valve_voltage": row[26],
+            }
+        )
+    return out
+
+
+def td_load_life_metric_xy(
+    db_path: Path,
+    run_names: Sequence[object],
+    x_parameter: str,
+    y_parameter: str,
+    serials: Sequence[object] | None = None,
+) -> list[dict]:
+    path = Path(db_path).expanduser()
+    if not path.exists():
+        return []
+    runs = [str(value or "").strip() for value in (run_names or []) if str(value or "").strip()]
+    x_param = str(x_parameter or "").strip()
+    y_param = str(y_parameter or "").strip()
+    serial_list = [str(value or "").strip() for value in (serials or []) if str(value or "").strip()]
+    if not runs or not x_param or not y_param:
+        return []
+    sql = [
+        f"""
+        SELECT
+            x.observation_id,
+            x.serial,
+            x.condition_key,
+            COALESCE(x.condition_display, ''),
+            COALESCE(x.program_title, ''),
+            COALESCE(x.source_run_name, ''),
+            x.sequence_index,
+            COALESCE(x.sequence_label, ''),
+            x.value_num,
+            y.value_num,
+            COALESCE(x.units, ''),
+            COALESCE(y.units, ''),
+            x.cumulative_pulses,
+            x.cumulative_on_time,
+            x.cumulative_throughput,
+            x.cumulative_impulse,
+            COALESCE(x.diagnostics, ''),
+            COALESCE(o.run_type, ''),
+            o.control_period,
+            o.suppression_voltage,
+            o.valve_voltage
+        FROM {TD_LIFE_METRICS_TABLE} x
+        INNER JOIN {TD_LIFE_METRICS_TABLE} y
+          ON y.serial = x.serial
+         AND y.observation_id = x.observation_id
+         AND lower(y.stat) = 'mean'
+         AND y.parameter_name = ?
+        LEFT JOIN td_condition_observations_sequences o
+          ON o.observation_id = x.observation_id
+        WHERE x.parameter_name = ?
+          AND lower(x.stat) = 'mean'
+        """
+    ]
+    params: list[object] = [y_param, x_param]
+    sql.append(f" AND x.condition_key IN ({','.join('?' for _ in runs)})")
+    params.extend(runs)
+    if serial_list:
+        sql.append(f" AND x.serial IN ({','.join('?' for _ in serial_list)})")
+        params.extend(serial_list)
+    sql.append(" ORDER BY x.serial, x.sequence_index, x.condition_key, x.observation_id")
+    with sqlite3.connect(str(path)) as conn:
+        _ensure_test_data_impl_tables(conn)
+        rows = conn.execute("".join(sql), tuple(params)).fetchall()
+    out: list[dict] = []
+    for row in rows:
+        x_value = _td_finite_float(row[8])
+        y_value = _td_finite_float(row[9])
+        if x_value is None or y_value is None:
+            continue
+        out.append(
+            {
+                "observation_id": str(row[0] or "").strip(),
+                "serial": str(row[1] or "").strip(),
+                "condition_key": str(row[2] or "").strip(),
+                "condition_display": str(row[3] or "").strip(),
+                "program_title": str(row[4] or "").strip(),
+                "source_run_name": str(row[5] or "").strip(),
+                "sequence_index": int(row[6] or 0),
+                "sequence_label": str(row[7] or "").strip(),
+                "x_parameter": x_param,
+                "y_parameter": y_param,
+                "x_value": x_value,
+                "y_value": y_value,
+                "x_units": str(row[10] or "").strip(),
+                "y_units": str(row[11] or "").strip(),
+                "cumulative_pulses": row[12],
+                "cumulative_on_time": row[13],
+                "cumulative_throughput": row[14],
+                "cumulative_impulse": row[15],
+                "diagnostics": str(row[16] or "").strip(),
+                "run_type": str(row[17] or "").strip(),
+                "control_period": row[18],
+                "suppression_voltage": row[19],
+                "valve_voltage": row[20],
+            }
+        )
+    return out
 
 
 def td_metric_plot_values(series_rows: list[dict], serials: list[str], stat: str) -> list[float]:
@@ -27850,6 +28917,7 @@ def update_test_data_trending_project_workbook(
         "data_calc_build_s": 0.0,
         "metrics_long_sheet_s": 0.0,
         "metrics_long_sequences_sheet_s": 0.0,
+        "life_metrics_sheet_s": 0.0,
         "raw_cache_long_sheet_s": 0.0,
         "perf_candidates_main_s": 0.0,
         "perf_candidates_cp_total_s": 0.0,
@@ -28146,6 +29214,38 @@ def update_test_data_trending_project_workbook(
             ORDER BY m.run_name, m.serial, m.observation_id, m.column_name, m.stat
             """
         ).fetchall()
+        life_metric_rows = conn.execute(
+            f"""
+            SELECT
+                observation_id,
+                serial,
+                sequence_index,
+                COALESCE(sequence_label, ''),
+                condition_key,
+                COALESCE(condition_display, ''),
+                COALESCE(program_title, ''),
+                COALESCE(source_run_name, ''),
+                parameter_name,
+                stat,
+                value_num,
+                COALESCE(units, ''),
+                sequence_pulses,
+                cumulative_pulses,
+                sequence_on_time,
+                cumulative_on_time,
+                sequence_elapsed_time,
+                cumulative_elapsed_time,
+                sequence_throughput,
+                cumulative_throughput,
+                sequence_impulse,
+                cumulative_impulse,
+                COALESCE(diagnostics, ''),
+                source_mtime_ns,
+                computed_epoch_ns
+            FROM {TD_LIFE_METRICS_TABLE}
+            ORDER BY serial, sequence_index, condition_key, observation_id, parameter_name
+            """
+        ).fetchall()
         y_units_rows = conn.execute(
             "SELECT run_name, name, units FROM td_columns_calc WHERE kind='y'"
         ).fetchall()
@@ -28318,6 +29418,43 @@ def update_test_data_trending_project_workbook(
     for row in metric_rows_long_sequences:
         ws_metrics_long_sequences.append(list(row))
     timings["metrics_long_sequences_sheet_s"] = round(time.perf_counter() - t0, 3)
+
+    _td_emit_progress(progress_cb, "Writing Life_metrics")
+    t0 = time.perf_counter()
+    ws_life_metrics = _td_reset_workbook_sheet(
+        wb,
+        "Life_metrics",
+        [
+            "observation_id",
+            "serial",
+            "sequence_index",
+            "sequence_label",
+            "condition_key",
+            "condition_display",
+            "program_title",
+            "source_run_name",
+            "parameter_name",
+            "stat",
+            "value_num",
+            "units",
+            "sequence_pulses",
+            "cumulative_pulses",
+            "sequence_on_time",
+            "cumulative_on_time",
+            "sequence_elapsed_time",
+            "cumulative_elapsed_time",
+            "sequence_throughput",
+            "cumulative_throughput",
+            "sequence_impulse",
+            "cumulative_impulse",
+            "diagnostics",
+            "source_mtime_ns",
+            "computed_epoch_ns",
+        ],
+    )
+    for row in life_metric_rows:
+        ws_life_metrics.append(list(row))
+    timings["life_metrics_sheet_s"] = round(time.perf_counter() - t0, 3)
 
     _td_emit_progress(progress_cb, "Writing RawCache_long")
     t0 = time.perf_counter()

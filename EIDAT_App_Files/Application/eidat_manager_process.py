@@ -1270,6 +1270,39 @@ def _sha1_file(path: Path) -> str:
     return h.hexdigest()
 
 
+def _normalize_process_file_filters(paths: SupportPaths, file_paths: list[str | Path] | None) -> list[str]:
+    requested: list[str] = []
+    seen: set[str] = set()
+    repo = Path(paths.global_repo).expanduser()
+    try:
+        repo_res = repo.resolve()
+    except Exception:
+        repo_res = repo.absolute()
+
+    for raw in file_paths or []:
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        path = Path(text).expanduser()
+        rel = ""
+        if path.is_absolute():
+            try:
+                rel = path.resolve().relative_to(repo_res).as_posix()
+            except Exception:
+                rel = path.as_posix()
+        else:
+            rel = path.as_posix()
+        rel = rel.replace("\\", "/").strip()
+        while rel.startswith("./"):
+            rel = rel[2:]
+        rel = rel.lstrip("/")
+        key = rel.casefold()
+        if rel and key not in seen:
+            seen.add(key)
+            requested.append(rel)
+    return requested
+
+
 def process_candidates(
     paths: SupportPaths,
     *,
@@ -1277,6 +1310,7 @@ def process_candidates(
     dpi: int | None = None,
     force: bool = False,
     only_candidates: bool = False,
+    file_paths: list[str | Path] | None = None,
 ) -> list[ProcessResult]:
     now_ns = time.time_ns()
     core = None
@@ -1329,34 +1363,43 @@ def process_candidates(
 
     with connect_db(paths.db_path) as conn:
         ensure_schema(conn)
-        if bool(only_candidates):
-            rows = conn.execute(
-                """
-                SELECT rel_path, mtime_ns
-                FROM files
-                WHERE needs_processing = 1
-                ORDER BY last_seen_epoch_ns DESC
-                """
+        requested_rel_paths = _normalize_process_file_filters(paths, file_paths)
+        missing_requested: list[str] = []
+        params: list[object] = []
+        where: list[str] = []
+        if requested_rel_paths:
+            placeholders = ", ".join("?" for _ in requested_rel_paths)
+            tracked = conn.execute(
+                f"SELECT rel_path FROM files WHERE rel_path IN ({placeholders})",
+                list(requested_rel_paths),
             ).fetchall()
-        elif force:
-            rows = conn.execute(
-                """
-                SELECT rel_path, mtime_ns
-                FROM files
-                ORDER BY last_seen_epoch_ns DESC
-                """
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                """
-                SELECT rel_path, mtime_ns
-                FROM files
-                WHERE needs_processing = 1
-                ORDER BY last_seen_epoch_ns DESC
-                """
-            ).fetchall()
+            tracked_rel_paths = {str(r["rel_path"] or "") for r in tracked}
+            missing_requested = [rel for rel in requested_rel_paths if rel not in tracked_rel_paths]
+            where.append(f"rel_path IN ({placeholders})")
+            params.extend(requested_rel_paths)
+        if bool(only_candidates) or not bool(force):
+            where.append("needs_processing = 1")
 
-        results: list[ProcessResult] = []
+        where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+        rows = conn.execute(
+            f"""
+            SELECT rel_path, mtime_ns
+            FROM files
+            {where_sql}
+            ORDER BY last_seen_epoch_ns DESC
+            """,
+            params,
+        ).fetchall()
+
+        results: list[ProcessResult] = [
+            ProcessResult(
+                rel_path=rel,
+                abs_path=str((paths.global_repo / Path(rel)).expanduser()),
+                ok=False,
+                error="File is not tracked; run scan before processing this file.",
+            )
+            for rel in missing_requested
+        ]
         bundle_outcomes: dict[str, ProcessResult] = {}
         prev_env = _set_env_for_support(paths)
         try:

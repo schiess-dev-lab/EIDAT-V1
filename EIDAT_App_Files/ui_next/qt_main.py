@@ -3400,7 +3400,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._workbook_path = Path(workbook_path).expanduser()
         self._db_path: Path | None = None
         self._plot_ready = False
-        self._mode = "curves"  # curves | metrics | performance | smart_solver
+        self._mode = "curves"  # curves | metrics | life_metrics | performance | smart_solver
         self._highlight_sn = ""
         self._highlight_sns: list[str] = []
         self._serial_source_rows: list[dict] = []
@@ -3619,9 +3619,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         switch_lbl.setStyleSheet("font-size: 12px; font-weight: 700; color: #334155;")
         self.btn_mode_curves = QtWidgets.QPushButton("Plot Curves")
         self.btn_mode_metrics = QtWidgets.QPushButton("Plot Metrics")
+        self.btn_mode_life = QtWidgets.QPushButton("Life Metrics")
         self.btn_mode_perf = QtWidgets.QPushButton("Performance")
         self.btn_mode_solver = QtWidgets.QPushButton("Smart Equation Solver")
-        for b in (self.btn_mode_curves, self.btn_mode_metrics, self.btn_mode_perf, self.btn_mode_solver):
+        for b in (self.btn_mode_curves, self.btn_mode_metrics, self.btn_mode_life, self.btn_mode_perf, self.btn_mode_solver):
             b.setCheckable(True)
             b.setStyleSheet(
                 """
@@ -3645,10 +3646,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._mode_group.setExclusive(True)
         self._mode_group.addButton(self.btn_mode_curves)
         self._mode_group.addButton(self.btn_mode_metrics)
+        self._mode_group.addButton(self.btn_mode_life)
         self._mode_group.addButton(self.btn_mode_perf)
         self._mode_group.addButton(self.btn_mode_solver)
         self.btn_mode_curves.clicked.connect(lambda: self._set_mode("curves"))
         self.btn_mode_metrics.clicked.connect(lambda: self._set_mode("metrics"))
+        self.btn_mode_life.clicked.connect(lambda: self._set_mode("life_metrics"))
         self.btn_mode_perf.clicked.connect(lambda: self._set_mode("performance"))
         self.btn_mode_solver.clicked.connect(lambda: self._set_mode("smart_solver"))
 
@@ -3660,8 +3663,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         switch_grid.setVerticalSpacing(8)
         switch_grid.addWidget(self.btn_mode_curves, 0, 0)
         switch_grid.addWidget(self.btn_mode_metrics, 0, 1)
-        switch_grid.addWidget(self.btn_mode_perf, 1, 0)
-        switch_grid.addWidget(self.btn_mode_solver, 1, 1)
+        switch_grid.addWidget(self.btn_mode_life, 1, 0)
+        switch_grid.addWidget(self.btn_mode_perf, 1, 1)
+        switch_grid.addWidget(self.btn_mode_solver, 2, 0, 1, 2)
         switch_layout.addLayout(switch_grid)
         left_layout.addLayout(switch_layout)
 
@@ -3820,6 +3824,57 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self.cb_plot_metric_bounds.setChecked(False)
         self.cb_plot_metric_bounds.setToolTip("Draw min/max bounds entered in the support spreadsheet for the selected run/parameter.")
         metrics_layout.addWidget(self.cb_plot_metric_bounds)
+
+        # Life Metrics tab
+        tab_life = QtWidgets.QWidget()
+        life_layout = QtWidgets.QVBoxLayout(tab_life)
+        life_layout.setContentsMargins(10, 10, 10, 10)
+        life_layout.setSpacing(8)
+        life_layout.setSizeConstraint(QtWidgets.QLayout.SizeConstraint.SetMinimumSize)
+
+        life_plot_type_row = QtWidgets.QHBoxLayout()
+        life_plot_type_row.addWidget(QtWidgets.QLabel("Plot Type:"))
+        self.cb_life_plot_type = QtWidgets.QComboBox(tab_life)
+        self.cb_life_plot_type.addItem("Parameter vs Life", "life_axis")
+        self.cb_life_plot_type.addItem("Parameter vs Parameter", "metric_xy")
+        self.cb_life_plot_type.currentIndexChanged.connect(lambda *_: self._refresh_life_controls())
+        life_plot_type_row.addWidget(self.cb_life_plot_type, 1)
+        life_layout.addLayout(life_plot_type_row)
+
+        self.life_axis_row = QtWidgets.QWidget(tab_life)
+        life_axis_row_layout = QtWidgets.QHBoxLayout(self.life_axis_row)
+        life_axis_row_layout.setContentsMargins(0, 0, 0, 0)
+        life_axis_row_layout.addWidget(QtWidgets.QLabel("Life Axis:"))
+        self.cb_life_axis = QtWidgets.QComboBox(tab_life)
+        self.cb_life_axis.addItem("Sequence", "sequence_index")
+        self.cb_life_axis.addItem("Cumulative Pulses", "cumulative_pulses")
+        self.cb_life_axis.addItem("Cumulative Throughput", "cumulative_throughput")
+        self.cb_life_axis.addItem("Cumulative On Time", "cumulative_on_time")
+        self.cb_life_axis.addItem("Cumulative Impulse", "cumulative_impulse")
+        self.cb_life_axis.currentIndexChanged.connect(lambda *_: self._refresh_life_controls())
+        life_axis_row_layout.addWidget(self.cb_life_axis, 1)
+        life_layout.addWidget(self.life_axis_row)
+
+        life_y_row = QtWidgets.QHBoxLayout()
+        life_y_row.addWidget(QtWidgets.QLabel("Y Parameter:"))
+        self.cb_life_y_param = QtWidgets.QComboBox(tab_life)
+        self.cb_life_y_param.currentIndexChanged.connect(lambda *_: self._refresh_life_controls())
+        life_y_row.addWidget(self.cb_life_y_param, 1)
+        life_layout.addLayout(life_y_row)
+
+        self.life_x_param_row = QtWidgets.QWidget(tab_life)
+        life_x_param_row_layout = QtWidgets.QHBoxLayout(self.life_x_param_row)
+        life_x_param_row_layout.setContentsMargins(0, 0, 0, 0)
+        life_x_param_row_layout.addWidget(QtWidgets.QLabel("X Parameter:"))
+        self.cb_life_x_param = QtWidgets.QComboBox(tab_life)
+        self.cb_life_x_param.currentIndexChanged.connect(lambda *_: self._refresh_life_controls())
+        life_x_param_row_layout.addWidget(self.cb_life_x_param, 1)
+        life_layout.addWidget(self.life_x_param_row)
+
+        self.lbl_life_summary = QtWidgets.QLabel("Life metrics: -")
+        self.lbl_life_summary.setStyleSheet("color: #64748b; font-size: 11px;")
+        self.lbl_life_summary.setWordWrap(True)
+        life_layout.addWidget(self.lbl_life_summary)
 
         # Curves tab
         tab_curves = QtWidgets.QWidget()
@@ -4131,6 +4186,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         tabs.addWidget(tab_curves)
         tabs.addWidget(tab_perf)
         tabs.addWidget(tab_solver)
+        tabs.addWidget(tab_life)
         left_layout.addWidget(tabs, 0)
 
         self.run_selector_frame = QtWidgets.QFrame()
@@ -4885,6 +4941,37 @@ class TestDataTrendDialog(QtWidgets.QDialog):
     def _refresh_curve_selector_summaries(self) -> None:
         self._refresh_curve_y_column_summary()
         self._refresh_curve_x_column_summary()
+
+    def _selected_life_plot_type(self) -> str:
+        value = self._combo_box_current_value(getattr(self, "cb_life_plot_type", None))
+        return value if value in {"life_axis", "metric_xy"} else "life_axis"
+
+    def _current_life_axis(self) -> str:
+        value = self._combo_box_current_value(getattr(self, "cb_life_axis", None))
+        return value or "sequence_index"
+
+    def _current_life_y_parameter(self) -> str:
+        return self._combo_box_current_value(getattr(self, "cb_life_y_param", None))
+
+    def _current_life_x_parameter(self) -> str:
+        return self._combo_box_current_value(getattr(self, "cb_life_x_param", None))
+
+    def _refresh_life_controls(self) -> None:
+        plot_type = self._selected_life_plot_type()
+        metric_xy = plot_type == "metric_xy"
+        if hasattr(self, "life_axis_row"):
+            self.life_axis_row.setVisible(not metric_xy)
+        if hasattr(self, "life_x_param_row"):
+            self.life_x_param_row.setVisible(metric_xy)
+        if hasattr(self, "lbl_life_summary"):
+            y_param = self._current_life_y_parameter()
+            if metric_xy:
+                x_param = self._current_life_x_parameter()
+                self.lbl_life_summary.setText(f"Life metrics: {x_param or '-'} vs {y_param or '-'}")
+            else:
+                axis = str(self.cb_life_axis.currentText() if hasattr(self, "cb_life_axis") else "").strip()
+                self.lbl_life_summary.setText(f"Life metrics: {y_param or '-'} over {axis or '-'}")
+        self._schedule_mode_panel_height_sync()
 
     def _on_curve_y_column_changed(self) -> None:
         self._refresh_curve_y_column_summary()
@@ -9749,7 +9836,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
     def _metrics_condition_multiselect_active(self) -> bool:
         return (
-            str(getattr(self, "_mode", "") or "").strip().lower() == "metrics"
+            str(getattr(self, "_mode", "") or "").strip().lower() in {"metrics", "life_metrics"}
             and self._current_run_selector_mode() == "condition"
             and hasattr(self, "list_metric_run_conditions")
         )
@@ -10507,8 +10594,13 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             self.cb_y_curve.clear()
             self.cb_x.clear()
             self.list_y_metrics.clear()
+            if hasattr(self, "cb_life_y_param"):
+                self.cb_life_y_param.clear()
+            if hasattr(self, "cb_life_x_param"):
+                self.cb_life_x_param.clear()
             self._refresh_metric_selector_summaries()
             self._refresh_curve_selector_summaries()
+            self._refresh_life_controls()
             self._schedule_mode_panel_height_sync()
             return
 
@@ -10583,6 +10675,54 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             self.list_y_metrics.selectAll()
         self.list_y_metrics.blockSignals(False)
         self._refresh_metric_y_columns_summary()
+
+        if hasattr(self, "cb_life_y_param") and hasattr(self, "cb_life_x_param"):
+            prev_life_y = self._current_life_y_parameter()
+            prev_life_x = self._current_life_x_parameter()
+            prev_life_axis = self._current_life_axis()
+            life_params: list[str] = []
+            try:
+                life_params = be.td_list_life_parameters(self._db_path, runs)
+            except Exception:
+                life_params = []
+            life_axes: list[dict] = []
+            try:
+                life_axes = be.td_list_life_axes(self._db_path)
+            except Exception:
+                life_axes = []
+            if hasattr(self, "cb_life_axis") and life_axes:
+                self.cb_life_axis.blockSignals(True)
+                try:
+                    self.cb_life_axis.clear()
+                    for axis in life_axes:
+                        key = str((axis or {}).get("key") or "").strip()
+                        label = str((axis or {}).get("label") or key).strip()
+                        if key:
+                            self.cb_life_axis.addItem(label, key)
+                    self._set_combo_to_value(self.cb_life_axis, prev_life_axis)
+                finally:
+                    self.cb_life_axis.blockSignals(False)
+            self.cb_life_y_param.blockSignals(True)
+            self.cb_life_x_param.blockSignals(True)
+            try:
+                self.cb_life_y_param.clear()
+                self.cb_life_x_param.clear()
+                for name in life_params:
+                    text = str(name or "").strip()
+                    if not text:
+                        continue
+                    self.cb_life_y_param.addItem(text, text)
+                    self.cb_life_x_param.addItem(text, text)
+                if prev_life_y:
+                    self._set_combo_to_value(self.cb_life_y_param, prev_life_y)
+                if prev_life_x:
+                    self._set_combo_to_value(self.cb_life_x_param, prev_life_x)
+                if self.cb_life_x_param.count() > 1 and self.cb_life_x_param.currentIndex() == self.cb_life_y_param.currentIndex():
+                    self.cb_life_x_param.setCurrentIndex(1)
+            finally:
+                self.cb_life_y_param.blockSignals(False)
+                self.cb_life_x_param.blockSignals(False)
+            self._refresh_life_controls()
 
         prev_x = self._current_curve_x_key() or self._current_curve_x_label()
         self.cb_x.blockSignals(True)
@@ -11602,7 +11742,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
     def _set_mode(self, mode: str) -> None:
         m = str(mode or "").strip().lower()
-        if m not in {"curves", "metrics", "performance", "smart_solver"}:
+        if m not in {"curves", "metrics", "life_metrics", "performance", "smart_solver"}:
             return
         self._mode = m
         if hasattr(self, "_tabs"):
@@ -11612,22 +11752,34 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 self._tabs.setCurrentIndex(1)
             elif m == "performance":
                 self._tabs.setCurrentIndex(2)
-            else:
+            elif m == "smart_solver":
                 self._tabs.setCurrentIndex(3)
+            else:
+                self._tabs.setCurrentIndex(4)
         self.btn_mode_curves.setChecked(m == "curves")
         self.btn_mode_metrics.setChecked(m == "metrics")
+        if hasattr(self, "btn_mode_life"):
+            self.btn_mode_life.setChecked(m == "life_metrics")
         if hasattr(self, "btn_mode_perf"):
             self.btn_mode_perf.setChecked(m == "performance")
         if hasattr(self, "btn_mode_solver"):
             self.btn_mode_solver.setChecked(m == "smart_solver")
+        if m == "life_metrics" and hasattr(self, "cb_run_mode"):
+            changed_to_condition = self._set_combo_to_value(self.cb_run_mode, "condition")
+            if changed_to_condition:
+                self._refresh_run_dropdown()
         if hasattr(self, "run_selector_frame"):
             self.run_selector_frame.setVisible(m not in {"performance", "smart_solver"})
         self._refresh_run_selection_visibility()
+        if m == "life_metrics":
+            self._refresh_life_controls()
         self._refresh_plot_view_band_controls()
         if m == "curves":
             self.btn_plot.setText("Plot Curves")
         elif m == "metrics":
             self.btn_plot.setText("Plot Metrics")
+        elif m == "life_metrics":
+            self.btn_plot.setText("Plot Life Metrics")
         elif m == "performance":
             self.btn_plot.setText("Plot Performance (Legacy)")
         else:
@@ -11649,8 +11801,202 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             self._run_smart_solver(user_initiated=True)
         elif self._mode == "metrics":
             self._plot_metrics()
+        elif self._mode == "life_metrics":
+            self._plot_life_metrics()
         else:
             self._plot_curves()
+
+    def _plot_life_metrics(self) -> None:
+        if not self._plot_ready or not self._db_path:
+            return
+        self._set_plot_note("")
+        self._ensure_main_axes("2d")
+        if self._current_run_selector_mode() != "condition":
+            QtWidgets.QMessageBox.information(self, "Life Metrics", "Select one or more run conditions.")
+            return
+        selections = self._current_run_selections()
+        selections = [dict(item) for item in selections if isinstance(item, dict)]
+        if not selections:
+            QtWidgets.QMessageBox.information(self, "Life Metrics", "Select at least one run condition.")
+            return
+        selection = self._current_run_selection()
+        runs = self._current_member_runs()
+        if not runs:
+            QtWidgets.QMessageBox.information(self, "Life Metrics", "Select at least one run condition.")
+            return
+        serials = self._active_serials()
+        if not serials:
+            QtWidgets.QMessageBox.information(self, "Life Metrics", "No serial numbers available.")
+            return
+
+        plot_type = self._selected_life_plot_type()
+        y_param = self._current_life_y_parameter()
+        if not y_param:
+            QtWidgets.QMessageBox.information(self, "Life Metrics", "Select a Y parameter.")
+            return
+
+        self._axes.clear()
+        any_plotted = False
+        hi_set = {str(v).strip() for v in (self._highlight_sns or []) if str(v).strip()}
+
+        if plot_type == "metric_xy":
+            x_param = self._current_life_x_parameter()
+            if not x_param:
+                QtWidgets.QMessageBox.information(self, "Life Metrics", "Select an X parameter.")
+                return
+            try:
+                rows = be.td_load_life_metric_xy(self._db_path, runs, x_param, y_param, serials=serials)
+                rows = self._filter_rows_for_global_selection(rows)
+            except Exception as exc:
+                QtWidgets.QMessageBox.warning(self, "Life Metrics", str(exc))
+                return
+            if not rows:
+                QtWidgets.QMessageBox.information(self, "Life Metrics", "No life metric values found for this selection.")
+                return
+            x_units = str(next((row.get("x_units") for row in rows if str(row.get("x_units") or "").strip()), "") or "").strip()
+            y_units = str(next((row.get("y_units") for row in rows if str(row.get("y_units") or "").strip()), "") or "").strip()
+            x_label = f"{x_param} ({x_units})" if x_units else x_param
+            y_label = f"{y_param} ({y_units})" if y_units else y_param
+            self._axes.set_title(self._compose_run_title(selection, f"{y_param} vs {x_param} over life"))
+            self._axes.set_xlabel(x_label)
+            self._axes.set_ylabel(y_label)
+            grouped: dict[str, list[dict]] = {}
+            for row in rows:
+                sn = str(row.get("serial") or "").strip()
+                if sn:
+                    grouped.setdefault(sn, []).append(dict(row))
+            for sn in serials:
+                points = grouped.get(sn) or []
+                if not points:
+                    continue
+                points = sorted(
+                    points,
+                    key=lambda row: (
+                        int(row.get("sequence_index") or 0),
+                        str(row.get("condition_key") or "").lower(),
+                        str(row.get("observation_id") or "").lower(),
+                    ),
+                )
+                xs = [float(row.get("x_value") or 0.0) for row in points]
+                ys = [float(row.get("y_value") or 0.0) for row in points]
+                self._axes.plot(
+                    xs,
+                    ys,
+                    marker="o",
+                    linewidth=(2.4 if sn in hi_set else 1.3),
+                    alpha=(1.0 if sn in hi_set else 0.82),
+                    label=sn,
+                )
+                any_plotted = True
+            last_plot_extra = {"x_parameter": x_param, "y_parameter": y_param}
+        else:
+            life_axis = self._current_life_axis()
+            life_axis_label = str(self.cb_life_axis.currentText() if hasattr(self, "cb_life_axis") else "").strip() or life_axis
+            try:
+                rows = be.td_load_life_metric_series(self._db_path, runs, y_param, life_axis, serials=serials)
+                rows = self._filter_rows_for_global_selection(rows)
+            except Exception as exc:
+                QtWidgets.QMessageBox.warning(self, "Life Metrics", str(exc))
+                return
+            if not rows:
+                QtWidgets.QMessageBox.information(self, "Life Metrics", "No life metric values found for this selection.")
+                return
+            y_units = str(next((row.get("units") for row in rows if str(row.get("units") or "").strip()), "") or "").strip()
+            y_label = f"{y_param} ({y_units})" if y_units else y_param
+            self._axes.set_title(self._compose_run_title(selection, f"{y_param} vs {life_axis_label}"))
+            self._axes.set_xlabel(life_axis_label)
+            self._axes.set_ylabel(y_label)
+            grouped: dict[str, list[dict]] = {}
+            for row in rows:
+                sn = str(row.get("serial") or "").strip()
+                if sn:
+                    grouped.setdefault(sn, []).append(dict(row))
+            for sn in serials:
+                points = grouped.get(sn) or []
+                if not points:
+                    continue
+                points = sorted(
+                    points,
+                    key=lambda row: (
+                        float(row.get("x_value") or 0.0),
+                        int(row.get("sequence_index") or 0),
+                        str(row.get("condition_key") or "").lower(),
+                    ),
+                )
+                xs = [float(row.get("x_value") or 0.0) for row in points]
+                ys = [float(row.get("y_value") or 0.0) for row in points]
+                self._axes.plot(
+                    xs,
+                    ys,
+                    marker="o",
+                    linewidth=(2.4 if sn in hi_set else 1.3),
+                    alpha=(1.0 if sn in hi_set else 0.82),
+                    label=sn,
+                )
+                any_plotted = True
+            last_plot_extra = {"life_axis": life_axis, "y_parameter": y_param}
+
+        if not any_plotted:
+            QtWidgets.QMessageBox.information(self, "Life Metrics", "No life metric values found for this selection.")
+            return
+        self._axes.grid(True, alpha=0.25)
+        self._main_plot_legend_entries = self._apply_interactive_legend_policy(
+            self._axes,
+            overflow_button=getattr(self, "btn_plot_legend", None),
+        )
+        diagnostics_count = len(
+            [
+                row
+                for row in (rows or [])
+                if str(row.get("diagnostics") or "").strip()
+            ]
+        )
+        if diagnostics_count:
+            self._set_plot_note(f"{diagnostics_count} plotted life point(s) include life input diagnostics.")
+        self._apply_plot_view_bands_to_axes(self._axes, mode="life_metrics")
+        self._refresh_plot_note()
+        try:
+            self._figure.tight_layout()
+        except Exception:
+            pass
+        try:
+            self._canvas.draw()
+        except Exception:
+            pass
+        self._capture_main_plot_base_view()
+        self._update_perf_primary_equation_banner()
+        self.btn_save_plot_pdf.setEnabled(True)
+        selection_ids = [
+            str(item.get("id") or "").strip()
+            for item in selections
+            if isinstance(item, dict) and str(item.get("id") or "").strip()
+        ]
+        selection_labels = [
+            self._selection_display_text(item)
+            for item in selections
+            if isinstance(item, dict) and self._selection_display_text(item)
+        ]
+        run_conditions = [
+            self._selection_condition_label(item)
+            for item in selections
+            if isinstance(item, dict) and self._selection_condition_label(item)
+        ]
+        self._last_plot_def = {
+            "mode": "life_metrics",
+            "run": runs[0],
+            "selector_mode": "condition",
+            "selection_id": str(selection.get("id") or ""),
+            "selection_ids": list(selection_ids),
+            "selection_labels": list(selection_labels),
+            "display_text": self._selection_display_text(selection),
+            "run_condition": self._selection_condition_label(selection),
+            "run_conditions": list(run_conditions),
+            "member_sequences": list(selection.get("member_sequences") or []),
+            "member_runs": list(runs),
+            "plot_type": plot_type,
+            **last_plot_extra,
+        }
+        self.btn_add_auto_plot.setEnabled(True)
 
     def _plot_metrics(self) -> None:
         if not self._plot_ready or not self._db_path:
@@ -22925,6 +23271,29 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.btn_manager_force_all.clicked.connect(self._act_manager_force_all)
         scan_row.addWidget(self.btn_manager_force_all)
+
+        self.btn_manager_force_file = QtWidgets.QPushButton("Force Process File")
+        self.btn_manager_force_file.setMinimumHeight(button_min_h)
+        self.btn_manager_force_file.setStyleSheet(
+            """
+            QPushButton {
+                padding: 8px 16px;
+                border-radius: 6px;
+                background: #ffffff;
+                color: #7f1d1d;
+                border: 1px solid #fecaca;
+                font-size: 12px;
+                font-weight: 600;
+            }
+            QPushButton:hover {
+                background: #fef2f2;
+                border-color: #f87171;
+            }
+            """
+        )
+        self.btn_manager_force_file.setToolTip("Select one source file and rebuild only that file's generated artifacts and index data.")
+        self.btn_manager_force_file.clicked.connect(self._act_manager_force_single_file)
+        scan_row.addWidget(self.btn_manager_force_file)
         scan_row.addStretch(1)
         repo_layout.addLayout(scan_row)
 
@@ -28407,6 +28776,52 @@ class MainWindow(QtWidgets.QMainWindow):
             heading="Force Process All",
             status_text="Processing all files",
             task=lambda: be.eidat_manager_process(repo, force=True),
+            on_success=_on_success,
+        )
+
+    def _act_manager_force_single_file(self) -> None:
+        try:
+            repo_raw = (self.ed_global_repo.text() or "").strip()
+            if not repo_raw:
+                raise RuntimeError("Select a Global Repo first.")
+            repo = Path(repo_raw).expanduser()
+            if not repo.exists():
+                raise RuntimeError(f"Global repo does not exist: {repo}")
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Force Process File", str(exc))
+            return
+
+        filter_str = "EIDAT source files (*.pdf *.xlsx *.xls *.xlsm *.mat);;All files (*)"
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Select Source File to Force Process",
+            str(repo),
+            filter_str,
+        )
+        if not path:
+            return
+        source = Path(path).expanduser()
+
+        def _on_success(payload: dict):
+            ok = int(payload.get("processed_ok") or 0)
+            failed = int(payload.get("processed_failed") or 0)
+            rel = str(payload.get("source_rel_path") or source.name).strip()
+            self._append_log(f"[EDAT MANAGER] Force processed file: {rel}; ok={ok}, failed={failed}")
+            results = payload.get("results") or []
+            for r in results:
+                if not r.get("ok") and r.get("error"):
+                    self._append_log(f"[EDAT MANAGER] FAILED: {r.get('rel_path')}: {r.get('error')}")
+            try:
+                self._refresh_files_tab()
+            except Exception:
+                pass
+            self._show_toast(f"Force processed {rel}.")
+            return f"Force file complete - ok={ok}, failed={failed}"
+
+        self._start_manager_action(
+            heading="Force Process File",
+            status_text=f"Processing {source.name}",
+            task=lambda: be.eidat_manager_force_single_file(repo, source),
             on_success=_on_success,
         )
 

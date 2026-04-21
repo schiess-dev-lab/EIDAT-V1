@@ -57,8 +57,23 @@ def _cmd_scan(paths: SupportPaths) -> dict:
     }
 
 
-def _cmd_process(paths: SupportPaths, *, limit: int | None, dpi: int | None, force: bool, only_candidates: bool) -> dict:
-    results = process_candidates(paths, limit=limit, dpi=dpi, force=force, only_candidates=only_candidates)
+def _cmd_process(
+    paths: SupportPaths,
+    *,
+    limit: int | None,
+    dpi: int | None,
+    force: bool,
+    only_candidates: bool,
+    file_paths: list[str] | None,
+) -> dict:
+    results = process_candidates(
+        paths,
+        limit=limit,
+        dpi=dpi,
+        force=force,
+        only_candidates=only_candidates,
+        file_paths=file_paths,
+    )
     ok = [r for r in results if r.ok]
     failed = [r for r in results if not r.ok]
     # Log failed results to stderr for debugging
@@ -145,6 +160,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Process only scan candidates (needs_processing=1). Useful with --force to overwrite only new/changed files.",
     )
+    sp.add_argument(
+        "--file",
+        dest="file_paths",
+        action="append",
+        default=[],
+        help="Limit processing to one repo-relative or absolute source file path. Repeat to process more than one file.",
+    )
     si = sub.add_parser("index", help="Build serial index + similarity grouping from EIDAT Support metadata.")
     si.add_argument("--similarity", type=float, default=0.86, help="Similarity threshold for grouping titles.")
     se = sub.add_parser("excel_to_sqlite", help="Convert Excel data files into per-workbook SQLite databases.")
@@ -185,6 +207,7 @@ def main(argv: list[str] | None = None) -> int:
             dpi=(None if dpi <= 0 else dpi),
             force=bool(getattr(args, "force", False)),
             only_candidates=only_candidates,
+            file_paths=list(getattr(args, "file_paths", []) or []) or None,
         )
     elif args.cmd == "index":
         sim = float(getattr(args, "similarity", 0.86) or 0.86)

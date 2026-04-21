@@ -18,6 +18,13 @@
       "require_min_points": 2
     }
   ],
+  "life_metrics": {
+    "pulse_count": ["pulse count", "number of pulses", "pulses", "num_pulses", "n_pulses"],
+    "prop_per_pulse": ["prop per pulse", "prop_per_pulse", "propellant per pulse", "mass per pulse"],
+    "flow_rate": ["flowrate", "flow rate", "mass flow rate", "mdot", "m_dot"],
+    "impulse_per_pulse": ["impulse bit", "impulse per pulse", "impulse_bit"],
+    "elapsed_time": ["elapsed time", "time elapsed", "duration", "run time"]
+  },
   "sheet_name": null,
   "header_row": 0,
   "td_run_labeling": {

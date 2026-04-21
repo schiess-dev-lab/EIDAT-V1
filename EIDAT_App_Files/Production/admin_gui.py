@@ -44,15 +44,24 @@ class _Worker(QtCore.QThread):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._tasks: list[tuple[str, str, str, bool, str]] = []  # (node_id, node_root, runtime_root, node_env_enabled, action)
+        self._tasks: list[tuple[str, str, str, bool, str, dict[str, object]]] = []
 
-    def set_tasks(self, tasks: list[tuple[str, str, str, bool, str]]) -> None:
-        self._tasks = list(tasks)
+    def set_tasks(self, tasks: list[tuple]) -> None:
+        normalized: list[tuple[str, str, str, bool, str, dict[str, object]]] = []
+        for task in tasks:
+            if len(task) == 5:
+                node_id, node_root, runtime_root, node_env_enabled, action = task
+                options: dict[str, object] = {}
+            else:
+                node_id, node_root, runtime_root, node_env_enabled, action, raw_options = task
+                options = dict(raw_options or {}) if isinstance(raw_options, dict) else {}
+            normalized.append((str(node_id), str(node_root), str(runtime_root), bool(node_env_enabled), str(action), options))
+        self._tasks = normalized
 
     def run(self) -> None:  # type: ignore[override]
         from .admin_runner import run_scan_force_candidates
 
-        for node_id, node_root, runtime_root, node_env_enabled, action in self._tasks:
+        for node_id, node_root, runtime_root, node_env_enabled, action, options in self._tasks:
             def _emit(line: str) -> None:
                 s = str(line or "").strip()
                 if not s:
@@ -72,6 +81,18 @@ class _Worker(QtCore.QThread):
                 res = run_scan_force_candidates(
                     node_root=node_root,
                     runtime_root=runtime_root,
+                    node_env_enabled=node_env_enabled,
+                    on_log=_emit,
+                )
+            elif action == "force_single_file":
+                from .admin_runner import run_force_single_file
+
+                file_path = str(options.get("file_path") or "").strip()
+                _emit("[ACTION] force update single source file")
+                res = run_force_single_file(
+                    node_root=node_root,
+                    runtime_root=runtime_root,
+                    file_path=file_path,
                     node_env_enabled=node_env_enabled,
                     on_log=_emit,
                 )
@@ -99,6 +120,20 @@ class _Worker(QtCore.QThread):
             if res.ok:
                 if action == "update_processor":
                     _emit("[OK] update_processor")
+                elif action == "force_single_file":
+                    proc = res.outputs.get("process") or {}
+                    source = res.outputs.get("source_file") or {}
+                    try:
+                        ok = int((proc or {}).get("processed_ok", 0))
+                        bad = int((proc or {}).get("processed_failed", 0))
+                    except Exception:
+                        ok = bad = 0
+                    try:
+                        rel = str((source or {}).get("rel_path") or "").strip()
+                    except Exception:
+                        rel = ""
+                    suffix = f" file={rel}" if rel else ""
+                    _emit(f"[OK] force_single_file processed_ok={ok} processed_failed={bad}{suffix}")
                 else:
                     scan = res.outputs.get("scan") or {}
                     proc = res.outputs.get("process") or {}
@@ -231,7 +266,7 @@ class AdminWindow(QtWidgets.QMainWindow):
         self.tbl.setColumnWidth(2, 240)
         self.tbl.setColumnWidth(3, 160)
         self.tbl.setColumnWidth(4, 220)
-        self.tbl.setColumnWidth(5, 320)
+        self.tbl.setColumnWidth(5, 420)
         self.tbl.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
         self.tbl.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.DoubleClicked | QtWidgets.QAbstractItemView.EditTrigger.SelectedClicked)
         layout.addWidget(self.tbl, 2)
@@ -432,22 +467,29 @@ class AdminWindow(QtWidgets.QMainWindow):
                 b_reset = QtWidgets.QPushButton("Reset")
                 b_proc = QtWidgets.QPushButton("Process")
                 b_update = QtWidgets.QPushButton("Update Proc")
+                b_force_file = QtWidgets.QPushButton("Force File")
                 b_update.setToolTip(
                     "Refresh node runtime and node UI venv packages against the current runtime code "
                     "without deleting node caches/artifacts."
                 )
-                for b in (b_open, b_deploy, b_reset, b_proc, b_update):
+                b_force_file.setToolTip(
+                    "Select one PDF, Excel, or MAT source file in this node and rebuild only that file's "
+                    "EIDAT Support artifacts, metadata, source pointer when applicable, and index entries."
+                )
+                for b in (b_open, b_deploy, b_reset, b_proc, b_update, b_force_file):
                     b.setMaximumWidth(120)
                 b_open.clicked.connect(lambda _=False, root=n.node_root: self._open_folder(root))
                 b_deploy.clicked.connect(lambda _=False, root=n.node_root: self._deploy_node(root))
                 b_reset.clicked.connect(lambda _=False, root=n.node_root: self._reset_node(root))
                 b_proc.clicked.connect(lambda _=False, nid=n.node_id: self._process_one(nid))
                 b_update.clicked.connect(lambda _=False, nid=n.node_id: self._update_processor(nid))
+                b_force_file.clicked.connect(lambda _=False, nid=n.node_id: self._act_force_single_file(nid))
                 row1.addWidget(b_open)
                 row1.addWidget(b_deploy)
                 row1.addWidget(b_reset)
                 row2.addWidget(b_proc)
                 row2.addWidget(b_update)
+                row2.addWidget(b_force_file)
                 row1.addStretch(1)
                 row2.addStretch(1)
                 outer.addLayout(row1)
@@ -614,10 +656,46 @@ class AdminWindow(QtWidgets.QMainWindow):
         self._run_status.begin(f"Scan+Force Candidates: {Path(n.node_root).name}")
         self.worker.start()
 
+    def _act_force_single_file(self, node_id: str) -> None:
+        nodes = {n.node_id: n for n in admin_db.list_nodes(self._conn)}
+        n = nodes.get(node_id)
+        if not n:
+            return
+        if self.worker.isRunning():
+            QtWidgets.QMessageBox.information(self, "Busy", "Processing is already running.")
+            return
+
+        node_root = _as_abs(n.node_root)
+        filter_str = "EIDAT source files (*.pdf *.xlsx *.xls *.xlsm *.mat);;All files (*)"
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Select Source File to Force Update",
+            str(node_root),
+            filter_str,
+        )
+        if not path:
+            return
+        source = _as_abs(path)
+        if source.suffix.lower() not in {".pdf", ".xlsx", ".xls", ".xlsm", ".mat"}:
+            QtWidgets.QMessageBox.warning(self, "Force File", "Select a PDF, Excel, or MAT source file.")
+            return
+        try:
+            source.resolve().relative_to(node_root.resolve())
+        except Exception:
+            QtWidgets.QMessageBox.warning(self, "Force File", "Select a source file inside the node root.")
+            return
+
+        self._ensure_node_env_file(n.node_root)
+        self.worker.set_tasks(
+            [(n.node_id, n.node_root, n.runtime_root, True, "force_single_file", {"file_path": str(source)})]
+        )
+        self._run_status.begin(f"Force File Update: {source.name}")
+        self.worker.start()
+
     def _on_finished_one(self, node_id: str, action: str, started_ns: int, finished_ns: int, ok: bool, error: str) -> None:
         try:
             # Only record actual processing runs in the run registry.
-            if action in {"pipeline", "scan_force_candidates"}:
+            if action in {"pipeline", "scan_force_candidates", "force_single_file"}:
                 status = "ok" if ok else "failed"
                 summary = {"ok": ok, "action": action, "error": error} if error else {"ok": ok, "action": action}
                 admin_db.insert_run(

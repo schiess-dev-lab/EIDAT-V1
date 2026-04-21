@@ -13,6 +13,10 @@ from typing import Callable
 
 from . import sync_product_center_assets
 
+_SUPPORTED_SOURCE_EXTENSIONS = {".pdf", ".xlsx", ".xls", ".xlsm", ".mat"}
+_IGNORED_SOURCE_DIR_PARTS = {"eidat", "eidat support", "edat", "edat support"}
+
+
 @dataclass(frozen=True)
 class PipelineResult:
     ok: bool
@@ -56,6 +60,26 @@ def _base_env(runtime_root: Path) -> dict[str, str]:
 
 def _node_env_path(node_root: Path) -> Path:
     return node_root / "EIDAT" / "UserData" / ".env"
+
+
+def _source_rel_path(node_root: Path, file_path: str | Path) -> str:
+    node = _as_abs(node_root)
+    source = _as_abs(file_path)
+    if not source.exists():
+        raise FileNotFoundError(f"Source file not found: {source}")
+    if not source.is_file():
+        raise RuntimeError(f"Source path is not a file: {source}")
+    if source.suffix.lower() not in _SUPPORTED_SOURCE_EXTENSIONS:
+        allowed = ", ".join(sorted(_SUPPORTED_SOURCE_EXTENSIONS))
+        raise RuntimeError(f"Unsupported source file type: {source.suffix or source.name} (allowed: {allowed})")
+    try:
+        rel = source.resolve().relative_to(node.resolve())
+    except Exception as exc:
+        raise RuntimeError(f"Source file must be inside the node root: {node}") from exc
+    parts = {str(part).strip().casefold() for part in rel.parts}
+    if parts.intersection(_IGNORED_SOURCE_DIR_PARTS):
+        raise RuntimeError("Select a source file outside EIDAT runtime/support folders.")
+    return rel.as_posix()
 
 
 def _env_truthy(val: object) -> bool:
@@ -532,6 +556,101 @@ def run_scan_force_candidates(
             node_env_enabled=node_env_enabled,
             on_log=on_log,
         )
+        outputs["index"] = _run_manager(
+            python_exe,
+            runtime,
+            node,
+            "index",
+            extra=["--similarity", str(float(similarity))],
+            node_env_enabled=node_env_enabled,
+            on_log=on_log,
+        )
+        return PipelineResult(ok=True, node_root=node, outputs=outputs)
+    except Exception as exc:
+        return PipelineResult(ok=False, node_root=node, outputs=outputs, error=str(exc))
+
+
+def run_force_single_file(
+    *,
+    node_root: str | Path,
+    runtime_root: str | Path,
+    file_path: str | Path,
+    py: str | None = None,
+    similarity: float = 0.86,
+    node_env_enabled: bool = False,
+    on_log: Callable[[str], None] | None = None,
+) -> PipelineResult:
+    """
+    Force-process one source file, then refresh the index.
+
+    The scan step runs first so newly added files are tracked, but the process step
+    is filtered to the selected file only.
+    """
+    node = _as_abs(node_root)
+    runtime = _as_abs(runtime_root)
+    python_exe = py or sys.executable
+
+    outputs: dict[str, object] = {}
+    try:
+        if not node.exists():
+            raise RuntimeError(f"Node root does not exist: {node}")
+        if not node.is_dir():
+            raise RuntimeError(f"Node root is not a directory: {node}")
+        if not (runtime / "EIDAT_App_Files").exists():
+            raise RuntimeError(f"Runtime root does not contain EIDAT_App_Files: {runtime}")
+
+        rel_path = _source_rel_path(node, file_path)
+        outputs["source_file"] = {
+            "rel_path": rel_path,
+            "abs_path": str((node / Path(rel_path)).expanduser()),
+        }
+
+        if on_log is not None:
+            on_log(f"[NODE] {node}")
+            on_log(f"[FILE] force update: {rel_path}")
+
+        outputs["init"] = _run_manager(python_exe, runtime, node, "init", node_env_enabled=node_env_enabled, on_log=on_log)
+        scan = _run_manager(python_exe, runtime, node, "scan", node_env_enabled=node_env_enabled, on_log=on_log)
+        outputs["scan"] = scan
+
+        if on_log is not None:
+            try:
+                on_log(f"[SCAN] candidates={int((scan or {}).get('candidates_count') or 0)}")
+            except Exception:
+                pass
+
+        cfg = _load_node_config(runtime, node, node_env_enabled=node_env_enabled)
+        eff_dpi = _env_int(cfg.get("EIDAT_PROCESS_DPI"), 0)
+
+        extra: list[str] = ["--force", "--file", rel_path]
+        if eff_dpi and eff_dpi > 0:
+            extra += ["--dpi", str(int(eff_dpi))]
+
+        process_payload = _run_manager(
+            python_exe,
+            runtime,
+            node,
+            "process",
+            extra=extra,
+            node_env_enabled=node_env_enabled,
+            on_log=on_log,
+        )
+        outputs["process"] = process_payload
+        processed_ok = int((process_payload or {}).get("processed_ok") or 0)
+        processed_failed = int((process_payload or {}).get("processed_failed") or 0)
+        if processed_failed > 0 or processed_ok <= 0:
+            errors: list[str] = []
+            try:
+                for item in list((process_payload or {}).get("results") or []):
+                    if not bool((item or {}).get("ok")):
+                        err = str((item or {}).get("error") or "").strip()
+                        if err:
+                            errors.append(err)
+            except Exception:
+                pass
+            detail = f": {'; '.join(errors[:3])}" if errors else ""
+            raise RuntimeError(f"Single-file force update did not complete for {rel_path}{detail}")
+
         outputs["index"] = _run_manager(
             python_exe,
             runtime,

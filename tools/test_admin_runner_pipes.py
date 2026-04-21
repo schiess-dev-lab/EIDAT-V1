@@ -1,9 +1,11 @@
 import os
 import sys
+import tempfile
 import traceback
 import unittest
 from multiprocessing import get_context
 from pathlib import Path
+from unittest import mock
 
 
 def _repo_root() -> Path:
@@ -92,6 +94,77 @@ class TestScanIgnoresHeavyDirs(unittest.TestCase):
             self.assertEqual(int(summary.pdf_count or 0), 1)
             self.assertEqual(len(summary.candidates), 1)
             self.assertEqual(summary.candidates[0].rel_path.replace("\\", "/"), "normal/a.pdf")
+
+
+class TestSingleFileForceUpdate(unittest.TestCase):
+    def test_backend_process_passes_file_filters_to_manager(self) -> None:
+        root = _repo_root()
+        sys.path.insert(0, str(root / "EIDAT_App_Files"))
+        from ui_next import backend as be  # type: ignore
+
+        with mock.patch.object(
+            be,
+            "_run_eidat_manager",
+            return_value={"processed_ok": 0, "processed_failed": 0, "results": []},
+        ) as run_mock:
+            be.eidat_manager_process(
+                Path("repo"),
+                force=True,
+                file_paths=[Path("data") / "a.pdf", "nested/b.xlsx"],
+            )
+
+        run_mock.assert_called_once()
+        _, cmd, args = run_mock.call_args.args
+        self.assertEqual(cmd, "process")
+        self.assertIn("--force", args)
+        self.assertEqual(args.count("--file"), 2)
+        self.assertIn(str(Path("data") / "a.pdf"), args)
+        self.assertIn("nested/b.xlsx", args)
+
+    def test_admin_runner_force_single_file_processes_only_selected_rel_path(self) -> None:
+        root = _repo_root()
+        sys.path.insert(0, str(root / "EIDAT_App_Files"))
+        from Production import admin_runner  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            base = Path(td)
+            node = base / "node"
+            runtime = base / "runtime"
+            source = node / "data" / "a.pdf"
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_bytes(b"%PDF-1.4\n")
+            (runtime / "EIDAT_App_Files").mkdir(parents=True, exist_ok=True)
+
+            calls: list[tuple[str, list[str]]] = []
+
+            def fake_run_manager(_py, _runtime, _node, cmd, extra=None, **_kwargs):
+                calls.append((str(cmd), list(extra or [])))
+                if cmd == "scan":
+                    return {"candidates_count": 3}
+                if cmd == "process":
+                    return {
+                        "processed_ok": 1,
+                        "processed_failed": 0,
+                        "results": [{"rel_path": "data/a.pdf", "ok": True}],
+                    }
+                if cmd == "index":
+                    return {"indexed_count": 1}
+                return {}
+
+            with (
+                mock.patch.object(admin_runner, "_run_manager", side_effect=fake_run_manager),
+                mock.patch.object(admin_runner, "_load_node_config", return_value={}),
+            ):
+                result = admin_runner.run_force_single_file(
+                    node_root=node,
+                    runtime_root=runtime,
+                    file_path=source,
+                )
+
+            self.assertTrue(result.ok, result.error)
+            process_calls = [extra for cmd, extra in calls if cmd == "process"]
+            self.assertEqual(process_calls, [["--force", "--file", "data/a.pdf"]])
+            self.assertIn("index", [cmd for cmd, _extra in calls])
 
 
 if __name__ == "__main__":
