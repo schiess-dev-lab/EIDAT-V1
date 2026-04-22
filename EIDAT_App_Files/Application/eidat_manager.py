@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import warnings
 from pathlib import Path
 
 
@@ -14,6 +15,15 @@ def _bootstrap_imports() -> None:
 
 
 _bootstrap_imports()
+
+_OPENPYXL_SPARKLINE_EXTENSION_WARNING_RE = (
+    r".*[Ss]parkline\s+[Gg]roup\s+extension\s+is\s+not\s+supported\s+and\s+will\s+be\s+removed.*"
+)
+warnings.filterwarnings(
+    "ignore",
+    message=_OPENPYXL_SPARKLINE_EXTENSION_WARNING_RE,
+    category=UserWarning,
+)
 
 from eidat_manager_db import SupportPaths, support_paths  # noqa: E402
 from eidat_manager_scan import scan_global_repo  # noqa: E402

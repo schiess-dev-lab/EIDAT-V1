@@ -22437,6 +22437,279 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         return fig
 
 
+class ProjectDocumentManagerDialog(QtWidgets.QDialog):
+    COLS = ["Name", "Kind", "Scope", "Location", "Modified", "Size"]
+
+    def __init__(
+        self,
+        *,
+        mode: str,
+        global_repo: Path,
+        record: Mapping[str, object],
+        request_update,
+        open_graph_library,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self._mode = "graphs" if str(mode or "").strip().lower() == "graphs" else "reports"
+        self._global_repo = Path(global_repo).expanduser()
+        self._record = dict(record or {})
+        self._request_update = request_update
+        self._open_graph_library = open_graph_library
+        self._items: list[dict[str, object]] = []
+
+        project_name = str(self._record.get("name") or "").strip() or "Selected Project"
+        title_text = "Project Graphs" if self._mode == "graphs" else "Project Reports"
+        self.setWindowTitle(f"{title_text} - {project_name}")
+        self.resize(980, 560)
+        self.setStyleSheet(
+            """
+            QDialog { background: #ffffff; color: #0f172a; }
+            QLabel { color: #0f172a; }
+            QTableWidget {
+                background: #ffffff;
+                alternate-background-color: #f8fafc;
+                color: #1f2937;
+                gridline-color: #e5e7eb;
+                selection-background-color: #dbeafe;
+                selection-color: #1f2937;
+            }
+            QHeaderView::section {
+                background: #f3f4f6;
+                color: #1f2937;
+                padding: 6px 8px;
+                border: 1px solid #e5e7eb;
+                font-weight: 600;
+            }
+            QPushButton {
+                padding: 8px 12px;
+                border-radius: 8px;
+                background: #ffffff;
+                color: #374151;
+                border: 1px solid #d1d5db;
+                font-size: 12px;
+                font-weight: 600;
+            }
+            QPushButton:hover { background: #f9fafb; }
+            QPushButton:disabled { color: #94a3b8; background: #f8fafc; }
+            """
+        )
+
+        root = QtWidgets.QVBoxLayout(self)
+        root.setContentsMargins(14, 14, 14, 14)
+        root.setSpacing(10)
+
+        title = QtWidgets.QLabel(title_text)
+        title.setStyleSheet("font-size: 15px; font-weight: 800; color: #0f172a;")
+        root.addWidget(title)
+
+        self.lbl_status = QtWidgets.QLabel("")
+        self.lbl_status.setWordWrap(True)
+        self.lbl_status.setStyleSheet("font-size: 11px; color: #475569;")
+        root.addWidget(self.lbl_status)
+
+        self.tbl = QtWidgets.QTableWidget(0, len(self.COLS))
+        self.tbl.setHorizontalHeaderLabels(self.COLS)
+        self.tbl.verticalHeader().setVisible(False)
+        self.tbl.setAlternatingRowColors(True)
+        self.tbl.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.tbl.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        self.tbl.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.tbl.horizontalHeader().setStretchLastSection(True)
+        self.tbl.itemSelectionChanged.connect(self._update_actions)
+        self.tbl.doubleClicked.connect(self._act_open)
+        root.addWidget(self.tbl, 1)
+
+        btn_row = QtWidgets.QHBoxLayout()
+        self.btn_open = QtWidgets.QPushButton("Open")
+        self.btn_rename = QtWidgets.QPushButton("Rename")
+        self.btn_delete = QtWidgets.QPushButton("Delete")
+        self.btn_update = QtWidgets.QPushButton("Update Project")
+        self.btn_refresh = QtWidgets.QPushButton("Refresh")
+        self.btn_close = QtWidgets.QPushButton("Close")
+        for button in (self.btn_open, self.btn_rename, self.btn_delete, self.btn_update, self.btn_refresh):
+            btn_row.addWidget(button)
+        btn_row.addStretch(1)
+        btn_row.addWidget(self.btn_close)
+        root.addLayout(btn_row)
+
+        self.btn_open.clicked.connect(self._act_open)
+        self.btn_rename.clicked.connect(self._act_rename)
+        self.btn_delete.clicked.connect(self._act_delete)
+        self.btn_update.clicked.connect(self._act_update)
+        self.btn_refresh.clicked.connect(self.refresh_items)
+        self.btn_close.clicked.connect(self.accept)
+
+        self.refresh_items()
+
+    def _project_dir(self) -> Path:
+        return Path(str(self._record.get("folder") or "")).expanduser()
+
+    def _workbook_path(self) -> Path:
+        return Path(str(self._record.get("workbook") or "")).expanduser()
+
+    def _project_type(self) -> str:
+        return str(self._record.get("type") or "").strip()
+
+    def _format_modified(self, value: object) -> str:
+        try:
+            epoch = float(value or 0)
+        except Exception:
+            epoch = 0
+        if epoch <= 0:
+            return ""
+        try:
+            return datetime.datetime.fromtimestamp(epoch).strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            return ""
+
+    def _format_size(self, value: object) -> str:
+        try:
+            size = int(value or 0)
+        except Exception:
+            size = 0
+        if size <= 0:
+            return ""
+        units = ("B", "KB", "MB", "GB")
+        amount = float(size)
+        unit = units[0]
+        for unit in units:
+            if amount < 1024 or unit == units[-1]:
+                break
+            amount /= 1024.0
+        return f"{amount:.1f} {unit}" if unit != "B" else f"{int(amount)} B"
+
+    def _load_items(self) -> list[dict[str, object]]:
+        if self._mode == "reports":
+            return be.list_project_report_items(self._global_repo, self._project_dir(), self._workbook_path())
+        return be.list_project_graph_items(self._project_dir(), self._project_type())
+
+    def refresh_items(self) -> None:
+        try:
+            self._items = [dict(item) for item in self._load_items() if isinstance(item, Mapping)]
+            self.lbl_status.setText(f"{len(self._items)} item(s) for {self._project_dir()}")
+        except Exception as exc:
+            self._items = []
+            self.lbl_status.setText(f"Error: {exc}")
+            QtWidgets.QMessageBox.warning(self, self.windowTitle(), str(exc))
+
+        self.tbl.setRowCount(0)
+        for row, item in enumerate(self._items):
+            self.tbl.insertRow(row)
+            values = [
+                str(item.get("name") or ""),
+                str(item.get("kind") or ""),
+                str(item.get("scope") or ""),
+                str(item.get("location") or item.get("path") or ""),
+                self._format_modified(item.get("modified_epoch")),
+                self._format_size(item.get("size_bytes")),
+            ]
+            for col, value in enumerate(values):
+                cell = QtWidgets.QTableWidgetItem(value)
+                if col == 0:
+                    cell.setData(QtCore.Qt.ItemDataRole.UserRole, dict(item))
+                self.tbl.setItem(row, col, cell)
+        self.tbl.resizeColumnsToContents()
+        self._update_actions()
+
+    def _selected_item(self) -> dict[str, object] | None:
+        rows = self.tbl.selectionModel().selectedRows() if self.tbl.selectionModel() is not None else []
+        if not rows:
+            return None
+        item = self.tbl.item(rows[0].row(), 0)
+        payload = item.data(QtCore.Qt.ItemDataRole.UserRole) if item is not None else None
+        return dict(payload) if isinstance(payload, Mapping) else None
+
+    def _update_actions(self) -> None:
+        has = self._selected_item() is not None
+        self.btn_open.setEnabled(has)
+        self.btn_rename.setEnabled(has)
+        self.btn_delete.setEnabled(has)
+
+    def _act_open(self) -> None:
+        item = self._selected_item()
+        if not item:
+            return
+        try:
+            if str(item.get("type") or "") == "graph_definition":
+                self._open_graph_library()
+                return
+            path = Path(str(item.get("path") or "")).expanduser()
+            if not path.exists():
+                raise RuntimeError(f"File not found: {path}")
+            be.open_path(path)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Open", str(exc))
+
+    def _act_rename(self) -> None:
+        item = self._selected_item()
+        if not item:
+            return
+        old_name = str(item.get("name") or "").strip()
+        new_name, ok = QtWidgets.QInputDialog.getText(self, "Rename", "New name:", text=old_name)
+        if not ok:
+            return
+        new_name = str(new_name or "").strip()
+        if not new_name:
+            return
+        try:
+            item_type = str(item.get("type") or "")
+            if item_type == "graph_definition":
+                be.rename_project_graph_definition(
+                    self._project_dir(),
+                    self._project_type(),
+                    str(item.get("graph_key") or ""),
+                    new_name,
+                )
+            else:
+                be.rename_project_managed_file(
+                    Path(str(item.get("path") or "")).expanduser(),
+                    new_name,
+                    allowed_dir=Path(str(item.get("allowed_dir") or "")).expanduser(),
+                    rename_summary_sidecar=(item_type == "report_pdf"),
+                )
+            self.refresh_items()
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Rename", str(exc))
+
+    def _act_delete(self) -> None:
+        item = self._selected_item()
+        if not item:
+            return
+        name = str(item.get("name") or "selected item").strip()
+        resp = QtWidgets.QMessageBox.question(
+            self,
+            "Delete",
+            f"Delete '{name}'?",
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+        )
+        if resp != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        try:
+            item_type = str(item.get("type") or "")
+            if item_type == "graph_definition":
+                be.delete_project_graph_definition(
+                    self._project_dir(),
+                    self._project_type(),
+                    str(item.get("graph_key") or ""),
+                )
+            else:
+                be.delete_project_managed_file(
+                    Path(str(item.get("path") or "")).expanduser(),
+                    allowed_dir=Path(str(item.get("allowed_dir") or "")).expanduser(),
+                    delete_summary_sidecar=(item_type == "report_pdf"),
+                )
+            self.refresh_items()
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Delete", str(exc))
+
+    def _act_update(self) -> None:
+        try:
+            self._request_update(self.refresh_items)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Update Project", str(exc))
+
+
 class ProjectEnvDialog(QtWidgets.QDialog):
     def __init__(self, project_dir: Path, parent=None):
         super().__init__(parent)
@@ -25157,6 +25430,30 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.btn_project_implementation.clicked.connect(self._act_open_project_implementation)
         l.addWidget(self.btn_project_implementation)
+
+        self.btn_project_view_reports = QtWidgets.QPushButton("View Reports")
+        self.btn_project_view_graphs = QtWidgets.QPushButton("View Graphs")
+        for b in (self.btn_project_view_reports, self.btn_project_view_graphs):
+            b.setEnabled(False)
+            b.setStyleSheet(
+                """
+                QPushButton {
+                    padding: 9px 14px;
+                    border-radius: 8px;
+                    background: #ffffff;
+                    color: #374151;
+                    border: 1px solid #d1d5db;
+                    font-size: 13px;
+                    font-weight: 700;
+                }
+                QPushButton:hover { background: #f9fafb; }
+                QPushButton:disabled { background: #f8fafc; color: #94a3b8; border-color: #e2e8f0; }
+                """
+            )
+        self.btn_project_view_reports.clicked.connect(self._act_open_project_reports)
+        self.btn_project_view_graphs.clicked.connect(self._act_open_project_graphs)
+        l.addWidget(self.btn_project_view_reports)
+        l.addWidget(self.btn_project_view_graphs)
         l.addStretch(1)
 
         self.lbl_projects_hint = QtWidgets.QLabel("Tip: run 'Index' first to populate metadata.")
@@ -25988,6 +26285,10 @@ class MainWindow(QtWidgets.QMainWindow):
             is_td = ptype == getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending")
         if hasattr(self, "btn_project_implementation"):
             self.btn_project_implementation.setEnabled(bool(record) and is_impl_supported)
+        if hasattr(self, "btn_project_view_reports"):
+            self.btn_project_view_reports.setEnabled(bool(record) and is_impl_supported and not project_busy)
+        if hasattr(self, "btn_project_view_graphs"):
+            self.btn_project_view_graphs.setEnabled(bool(record) and is_impl_supported and not project_busy)
         if hasattr(self, "cb_project_overwrite"):
             self.cb_project_overwrite.setEnabled(bool(record) and is_update_supported and not project_busy)
         if hasattr(self, "cb_project_force_rebuild"):
@@ -26398,27 +26699,88 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "Project Env", str(exc))
 
-    def _act_open_project_implementation(self) -> None:
+    def _selected_supported_project_record(self) -> dict:
+        record = self._selected_project_record()
+        if not record:
+            raise RuntimeError("Select a project in the list first.")
+        ptype = str(record.get("type") or "").strip()
+        if ptype not in (
+            getattr(be, "EIDAT_PROJECT_TYPE_TRENDING", "EIDP Trending"),
+            getattr(be, "EIDAT_PROJECT_TYPE_RAW_TRENDING", "EIDP Raw File Trending"),
+            getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending"),
+        ):
+            raise RuntimeError(
+                "This action is available only for EIDP Trending, Raw File Trending, or Test Data Trending projects."
+            )
+        project_dir = Path(str(record.get("folder") or "")).expanduser()
+        workbook = Path(str(record.get("workbook") or "")).expanduser()
+        if not project_dir.exists():
+            raise RuntimeError(f"Project folder not found: {project_dir}")
+        if not workbook.exists():
+            raise RuntimeError(f"Project workbook not found: {workbook}")
+        return dict(record)
+
+    def _act_open_project_reports(self) -> None:
+        self._act_open_project_document_manager("reports")
+
+    def _act_open_project_graphs(self) -> None:
+        self._act_open_project_document_manager("graphs")
+
+    def _act_open_project_document_manager(self, mode: str) -> None:
         try:
-            record = self._selected_project_record()
-            if not record:
-                raise RuntimeError("Select a project in the list first.")
-            ptype = str(record.get("type") or "").strip()
-            if ptype not in (
-                getattr(be, "EIDAT_PROJECT_TYPE_TRENDING", "EIDP Trending"),
-                getattr(be, "EIDAT_PROJECT_TYPE_RAW_TRENDING", "EIDP Raw File Trending"),
-                getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending"),
-            ):
-                raise RuntimeError(
-                    "Implementation is available only for EIDP Trending, Raw File Trending, or Test Data Trending projects."
+            repo_raw = (self.ed_global_repo.text() or "").strip()
+            if not repo_raw:
+                raise RuntimeError("Select a Global Repo first (Setup tab).")
+            record = self._selected_supported_project_record()
+            repo = Path(repo_raw).expanduser()
+
+            def _request_update(refresh_callback) -> None:
+                ptype = str(record.get("type") or "").strip()
+                force_full = bool(
+                    ptype == getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending")
+                    and getattr(self, "cb_project_force_rebuild", None)
+                    and self.cb_project_force_rebuild.isChecked()
+                )
+                self._run_project_update(
+                    record,
+                    force_project_rebuild=force_full,
+                    on_success_extra=lambda _payload: refresh_callback() if callable(refresh_callback) else None,
                 )
 
+            dlg = ProjectDocumentManagerDialog(
+                mode=mode,
+                global_repo=repo,
+                record=record,
+                request_update=_request_update,
+                open_graph_library=lambda: self._open_project_graph_library(record),
+                parent=self,
+            )
+            self._prepare_dialog(dlg)
+            dlg.exec()
+        except Exception as exc:
+            title = "View Graphs" if str(mode or "").strip().lower() == "graphs" else "View Reports"
+            QtWidgets.QMessageBox.warning(self, title, str(exc))
+
+    def _open_project_graph_library(self, record: Mapping[str, object]) -> None:
+        ptype = str((record or {}).get("type") or "").strip()
+        project_dir = Path(str((record or {}).get("folder") or "")).expanduser()
+        workbook = Path(str((record or {}).get("workbook") or "")).expanduser()
+        if ptype == getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending"):
+            dlg = TestDataTrendDialog(project_dir, workbook, self)
+            QtCore.QTimer.singleShot(0, dlg._open_auto_plots_popup)
+        else:
+            dlg = ImplementationTrendDialog(project_dir, workbook, self)
+            if hasattr(dlg, "_open_auto_plot_panel"):
+                QtCore.QTimer.singleShot(0, dlg._open_auto_plot_panel)
+        self._prepare_dialog(dlg)
+        dlg.exec()
+
+    def _act_open_project_implementation(self) -> None:
+        try:
+            record = self._selected_supported_project_record()
+            ptype = str(record.get("type") or "").strip()
             project_dir = Path(str(record.get("folder") or "")).expanduser()
             workbook = Path(str(record.get("workbook") or "")).expanduser()
-            if not project_dir.exists():
-                raise RuntimeError(f"Project folder not found: {project_dir}")
-            if not workbook.exists():
-                raise RuntimeError(f"Project workbook not found: {workbook}")
 
             if ptype == getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending"):
                 dlg = TestDataTrendDialog(project_dir, workbook, self)
@@ -26429,7 +26791,7 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "Implementation", str(exc))
 
-    def _run_project_update(self, record: dict, *, force_project_rebuild: bool = False) -> None:
+    def _run_project_update(self, record: dict, *, force_project_rebuild: bool = False, on_success_extra=None) -> None:
         repo_raw = (self.ed_global_repo.text() or "").strip()
         if not repo_raw:
             raise RuntimeError("Select a Global Repo first (Setup tab).")
@@ -26467,13 +26829,23 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
             raise RuntimeError(f"Unsupported project type: {ptype}")
 
+        def _on_success(payload):
+            msg = self._handle_project_update_success(payload, wb_path=wb_path, ptype=ptype, started=started)
+            if callable(on_success_extra):
+                try:
+                    on_success_extra(payload)
+                except Exception as exc:
+                    self._append_log(f"[PROJECT UPDATE] Post-update refresh failed: {exc}")
+                    QtWidgets.QMessageBox.warning(self, "Update Project", f"Project updated, but refresh failed:\n{exc}")
+            return msg
+
         self._start_project_task(
             heading="Update Project",
             status_text=f"Updating {project_name}",
             project_dir=wb_path.parent,
             log_prefix="project_update",
             task_factory=_task,
-            on_success=lambda payload: self._handle_project_update_success(payload, wb_path=wb_path, ptype=ptype, started=started),
+            on_success=_on_success,
         )
 
     def _act_edit_project(self) -> None:

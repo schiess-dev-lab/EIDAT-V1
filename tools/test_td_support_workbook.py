@@ -2407,6 +2407,82 @@ class TestTDSupportWorkbook(unittest.TestCase):
             "header_row": 0,
         }
 
+    def test_duplicate_serials_are_keyed_by_program_asset_source_identity(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            src_a = root / "src_a.sqlite3"
+            src_b = root / "src_b.sqlite3"
+            self._make_source_sqlite(src_a)
+            self._make_source_sqlite_with_rows(
+                src_b,
+                [
+                    (1, 0.0, 100.0, 5.0, 110.0),
+                    (2, 1.0, 100.0, 5.0, 120.0),
+                    (3, 2.0, 100.0, 5.0, 130.0),
+                    (4, 3.0, 100.0, 5.0, 140.0),
+                    (5, 4.0, 100.0, 5.0, 150.0),
+                    (6, 5.0, 100.0, 5.0, 160.0),
+                ],
+            )
+
+            wb_path = root / "project.xlsx"
+            docs = [
+                {
+                    "serial_number": "SN42",
+                    "program_title": "Program A",
+                    "asset_type": "Thruster",
+                    "asset_specific_type": "Valve",
+                    "document_type": "TD",
+                    "excel_sqlite_rel": str(src_a),
+                },
+                {
+                    "serial_number": "SN42",
+                    "program_title": "Program B",
+                    "asset_type": "Thruster",
+                    "asset_specific_type": "Valve",
+                    "document_type": "TD",
+                    "excel_sqlite_rel": str(src_b),
+                },
+            ]
+            be._write_test_data_trending_workbook(
+                wb_path,
+                global_repo=None,
+                serials=["SN42"],
+                docs=docs,
+                config=self._make_config(),
+            )
+            support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+            be._write_td_support_workbook(
+                support_path,
+                sequence_names=["RunA"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+                program_titles=["Program A", "Program B"],
+            )
+
+            payload = be.sync_test_data_project_cache(root, wb_path, rebuild=True)
+            expected = [
+                "Program A / Thruster / Valve / SN42",
+                "Program B / Thruster / Valve / SN42",
+            ]
+            self.assertEqual(payload.get("compiled_serials"), expected)
+
+            with sqlite3.connect(str(root / be.EIDAT_PROJECT_IMPLEMENTATION_DB)) as conn:
+                source_rows = conn.execute(
+                    "SELECT serial, source_serial_number FROM td_source_metadata ORDER BY serial"
+                ).fetchall()
+                metric_rows = conn.execute(
+                    """
+                    SELECT serial, value_num
+                    FROM td_metrics_calc
+                    WHERE run_name='RunA' AND column_name='thrust' AND stat='mean'
+                    ORDER BY serial
+                    """
+                ).fetchall()
+            self.assertEqual(source_rows, [(expected[0], "SN42"), (expected[1], "SN42")])
+            self.assertEqual(metric_rows, [(expected[0], 30.0), (expected[1], 130.0)])
+
     def test_calc_cache_backfills_aggregate_observation_metadata_from_unique_sequence_rows(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
 

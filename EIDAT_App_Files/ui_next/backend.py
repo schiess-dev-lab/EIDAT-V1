@@ -10,6 +10,7 @@ import sys
 import shutil
 import subprocess
 import re
+import warnings
 from contextlib import closing
 from datetime import datetime
 from functools import lru_cache
@@ -21,6 +22,14 @@ from typing import Callable, Dict, Iterable, Mapping, Optional, Sequence, TypeVa
 APP_ROOT = Path(__file__).resolve().parents[1]
 ROOT = APP_ROOT.parent  # repository root that holds user data folders
 T = TypeVar("T")
+_OPENPYXL_SPARKLINE_EXTENSION_WARNING_RE = (
+    r".*[Ss]parkline\s+[Gg]roup\s+extension\s+is\s+not\s+supported\s+and\s+will\s+be\s+removed.*"
+)
+warnings.filterwarnings(
+    "ignore",
+    message=_OPENPYXL_SPARKLINE_EXTENSION_WARNING_RE,
+    category=UserWarning,
+)
 
 _APP_APPLICATION_ROOT = APP_ROOT / "Application"
 if str(_APP_APPLICATION_ROOT) not in sys.path:
@@ -3641,6 +3650,7 @@ def _ensure_test_data_impl_tables(conn: sqlite3.Connection) -> None:
         """
         CREATE TABLE IF NOT EXISTS td_source_metadata (
             serial TEXT PRIMARY KEY,
+            source_serial_number TEXT,
             program_title TEXT,
             asset_type TEXT,
             asset_specific_type TEXT,
@@ -3664,6 +3674,10 @@ def _ensure_test_data_impl_tables(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    try:
+        conn.execute("ALTER TABLE td_source_metadata ADD COLUMN source_serial_number TEXT")
+    except Exception:
+        pass
     try:
         conn.execute("ALTER TABLE td_source_metadata ADD COLUMN metadata_source TEXT")
     except Exception:
@@ -5053,6 +5067,68 @@ TD_SOURCE_METADATA_FIELDS = (
 )
 
 
+def _td_source_unknownish(value: object) -> bool:
+    txt = str(value or "").strip()
+    return not txt or txt.casefold() in {"unknown", "none", "null", "n/a", "na", "-"}
+
+
+def _td_source_identity_part(value: object, *, fallback: str) -> str:
+    txt = str(value or "").strip()
+    if _td_source_unknownish(txt):
+        return fallback
+    return re.sub(r"\s+", " ", txt)
+
+
+def _td_source_serial_number(source_row: Mapping[str, object], source_meta: Mapping[str, object] | None = None) -> str:
+    meta = dict(source_meta or {})
+    for key in ("serial_number", "source_serial_number"):
+        txt = str(source_row.get(key) or meta.get(key) or "").strip()
+        if txt:
+            return txt
+    return str(source_row.get("serial") or meta.get("serial") or "").strip()
+
+
+def _td_build_source_composite_key(
+    source_row: Mapping[str, object],
+    source_meta: Mapping[str, object] | None = None,
+) -> str:
+    meta = dict(source_meta or {})
+    serial_number = _td_source_serial_number(source_row, meta)
+    if not serial_number:
+        return ""
+
+    program_title = source_row.get("program_title") or meta.get("program_title")
+    asset_type = source_row.get("asset_type") or meta.get("asset_type")
+    asset_specific_type = source_row.get("asset_specific_type") or meta.get("asset_specific_type")
+
+    # Existing ad-hoc test workbooks often have no metadata context at all. In
+    # that case, preserve the historical serial-only identity because there is
+    # no program/asset namespace available to protect it.
+    if all(_td_source_unknownish(value) for value in (program_title, asset_type, asset_specific_type)):
+        return serial_number
+
+    return " / ".join(
+        [
+            _td_source_identity_part(program_title, fallback="Unknown Program"),
+            _td_source_identity_part(asset_type, fallback="Unknown Asset"),
+            _td_source_identity_part(asset_specific_type, fallback="Unknown Type"),
+            _td_source_identity_part(serial_number, fallback="Unknown Serial"),
+        ]
+    )
+
+
+def _td_source_composite_key(
+    source_row: Mapping[str, object],
+    source_meta: Mapping[str, object] | None = None,
+) -> str:
+    existing_key = str(source_row.get("source_key") or "").strip()
+    if existing_key:
+        return existing_key
+    if "source_key" in source_row:
+        return _td_build_source_composite_key(source_row, source_meta)
+    return _td_source_serial_number(source_row, source_meta)
+
+
 def _td_canonical_source_link_for_node(node_root: Path, path: Path) -> str:
     p = Path(path).expanduser()
     support_dir = eidat_support_dir(node_root)
@@ -5112,6 +5188,7 @@ def _write_test_data_source_link_updates(workbook_path: Path, updates_by_serial:
             if key:
                 headers[key] = col
         serial_col = headers.get("serial_number") or headers.get("serial")
+        source_key_col = headers.get("source_key")
         sqlite_col = headers.get("excel_sqlite_rel")
         if not serial_col or not sqlite_col:
             return {}
@@ -5119,14 +5196,16 @@ def _write_test_data_source_link_updates(workbook_path: Path, updates_by_serial:
         dirty = False
         for row in range(2, (ws.max_row or 0) + 1):
             serial = str(ws.cell(row, serial_col).value or "").strip()
-            if not serial or serial not in updates:
+            source_key = str(ws.cell(row, source_key_col).value or "").strip() if source_key_col else ""
+            update_key = source_key if source_key in updates else serial
+            if not update_key or update_key not in updates:
                 continue
-            new_value = str(updates[serial]).strip()
+            new_value = str(updates[update_key]).strip()
             cur_value = str(ws.cell(row, sqlite_col).value or "").strip()
             if cur_value == new_value:
                 continue
             ws.cell(row, sqlite_col).value = new_value
-            changed[serial] = new_value
+            changed[update_key] = new_value
             dirty = True
 
         if dirty:
@@ -5158,14 +5237,17 @@ def _resolve_td_source_metadata_path(workbook_path: Path, source_row: Mapping[st
 
 
 def _load_td_source_metadata(workbook_path: Path, source_row: Mapping[str, object]) -> dict[str, object]:
-    serial = str(source_row.get("serial") or source_row.get("serial_number") or "").strip()
+    serial_number = str(source_row.get("serial_number") or source_row.get("source_serial_number") or source_row.get("serial") or "").strip()
     excel_sqlite_rel = str(source_row.get("excel_sqlite_rel") or "").strip()
     metadata_rel = str(source_row.get("metadata_rel") or "").strip()
     artifacts_rel = str(source_row.get("artifacts_rel") or "").strip()
 
     fallback = {
-        "serial_number": serial,
+        "serial_number": serial_number,
+        "source_serial_number": serial_number,
         "program_title": str(source_row.get("program_title") or "").strip(),
+        "asset_type": str(source_row.get("asset_type") or "").strip(),
+        "asset_specific_type": str(source_row.get("asset_specific_type") or "").strip(),
         "document_type": str(source_row.get("document_type") or "").strip(),
         "metadata_rel": metadata_rel,
         "artifacts_rel": artifacts_rel,
@@ -5186,8 +5268,10 @@ def _load_td_source_metadata(workbook_path: Path, source_row: Mapping[str, objec
         metadata_mtime_ns = 0
 
     merged = _merge_metadata(meta_from_file, fallback)
+    merged_serial_number = str(merged.get("serial_number") or serial_number).strip()
     out: dict[str, object] = {
-        "serial_number": serial,
+        "serial_number": merged_serial_number,
+        "source_serial_number": merged_serial_number,
         "metadata_rel": metadata_rel,
         "artifacts_rel": artifacts_rel,
         "excel_sqlite_rel": excel_sqlite_rel,
@@ -5219,6 +5303,8 @@ def _td_source_runtime_state(
     sqlite_path = Path(sqlite_path_raw).expanduser() if sqlite_path_raw else Path()
     status = str(source_resolution.get("status") or "missing").strip().lower() or "missing"
     source_meta = _load_td_source_metadata(workbook_path, source_row)
+    source_key = _td_source_composite_key(source_row, source_meta)
+    serial_number = _td_source_serial_number(source_row, source_meta)
     mtime_ns = 0
     size_bytes = 0
     if status == "ok":
@@ -5238,7 +5324,8 @@ def _td_source_runtime_state(
     ).strip()
     effective_excel_sqlite_rel = healed_excel_sqlite_rel or workbook_excel_sqlite_rel
     fingerprint_payload = {
-        "serial": str(source_row.get("serial") or source_row.get("serial_number") or "").strip(),
+        "serial": source_key,
+        "serial_number": serial_number,
         "status": status,
         "sqlite_path": str(sqlite_path) if sqlite_path else "",
         "mtime_ns": int(mtime_ns),
@@ -5250,7 +5337,9 @@ def _td_source_runtime_state(
         "project_raw_signature": str(project_raw_signature),
     }
     return {
-        "serial": str(source_row.get("serial") or source_row.get("serial_number") or "").strip(),
+        "serial": source_key,
+        "source_key": source_key,
+        "serial_number": serial_number,
         "source_row": dict(source_row),
         "source_resolution": dict(source_resolution),
         "source_meta": dict(source_meta),
@@ -9720,11 +9809,18 @@ def _td_compiled_serials_from_cache(conn: sqlite3.Connection, workbook_path: Pat
     }
     if not compiled_serial_set:
         return []
-    source_serials = [
-        str(item.get("serial") or "").strip()
-        for item in _read_test_data_sources(Path(workbook_path).expanduser())
-        if str(item.get("serial") or "").strip()
-    ]
+    wb_path = Path(workbook_path).expanduser()
+    source_serials: list[str] = []
+    for item in _read_test_data_sources(wb_path):
+        if not isinstance(item, Mapping):
+            continue
+        try:
+            source_meta = _load_td_source_metadata(wb_path, item)
+        except Exception:
+            source_meta = {}
+        source_key = _td_source_composite_key(item, source_meta)
+        if source_key:
+            source_serials.append(source_key)
     ordered = [serial for serial in source_serials if serial in compiled_serial_set]
     extras = sorted(compiled_serial_set - set(ordered), key=lambda value: str(value).lower())
     return ordered + extras
@@ -13383,14 +13479,27 @@ def rebuild_test_data_project_cache(
     _ensure_test_data_impl_tables(impl_conn)
     _ensure_test_data_raw_cache_tables(raw_conn)
     if not full_reset and (removed_serials or entries):
-        serials_to_delete = sorted({*removed_serials, *[str(entry.get("serial") or "").strip() for entry in entries if str(entry.get("serial") or "").strip()]})
+        entry_source_keys: list[str] = []
+        for entry in entries:
+            if not isinstance(entry, Mapping):
+                continue
+            try:
+                entry_meta = _load_td_source_metadata(wb_path, entry)
+            except Exception:
+                entry_meta = {}
+            source_key = _td_source_composite_key(entry, entry_meta)
+            if source_key:
+                entry_source_keys.append(source_key)
+        serials_to_delete = sorted({*removed_serials, *entry_source_keys})
         _td_delete_serial_rows_from_cache(impl_conn, raw_conn, serials_to_delete)
         impl_conn.commit()
         raw_conn.commit()
 
     for idx, entry in enumerate(entries, start=1):
-        sn = str(entry.get("serial") or "").strip()
-        _td_emit_progress(progress_cb, f"Ingesting source {idx}/{max(1, len(entries))}: {sn or 'unknown serial'}")
+        source_meta = _load_td_source_metadata(wb_path, entry)
+        source_serial_number = _td_source_serial_number(entry, source_meta)
+        sn = _td_source_composite_key(entry, source_meta)
+        _td_emit_progress(progress_cb, f"Ingesting source {idx}/{max(1, len(entries))}: {sn or source_serial_number or 'unknown serial'}")
         t_source_resolution = time.perf_counter()
         source_resolution = _resolve_td_source_sqlite_for_workbook(wb_path, entry)
         sqlite_path_raw = source_resolution.get("path")
@@ -13402,6 +13511,8 @@ def rebuild_test_data_project_cache(
         healed_excel_sqlite_rel = str(source_resolution.get("healed_excel_sqlite_rel") or "").strip()
         source_info = {
             "serial": sn,
+            "source_key": sn,
+            "serial_number": source_serial_number,
             "status": status,
             "resolved_from": resolved_from,
             "resolved_sqlite_path": str(sqlite_path) if sqlite_path else "",
@@ -13450,12 +13561,12 @@ def rebuild_test_data_project_cache(
                 str(source_fingerprints.get(sn) or ""),
             ),
         )
-        source_meta = _load_td_source_metadata(wb_path, entry)
         raw_fingerprint = str(source_fingerprints.get(sn) or "").strip()
         if not raw_fingerprint:
             raw_fingerprint = _td_hash_payload(
                 {
                     "serial": sn,
+                    "serial_number": source_serial_number,
                     "status": status,
                     "sqlite_path": str(sqlite_path) if sqlite_path else "",
                     "mtime_ns": int(mtime_ns or 0),
@@ -13481,6 +13592,7 @@ def rebuild_test_data_project_cache(
             """
             INSERT OR REPLACE INTO td_source_metadata(
                 serial,
+                source_serial_number,
                 program_title,
                 asset_type,
                 asset_specific_type,
@@ -13501,10 +13613,11 @@ def rebuild_test_data_project_cache(
                 manual_override_fields_json,
                 manual_override_updated_at,
                 applied_asset_specific_type_rule
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 sn,
+                source_serial_number,
                 str(source_meta.get("program_title") or "").strip(),
                 str(source_meta.get("asset_type") or "").strip(),
                 str(source_meta.get("asset_specific_type") or "").strip(),
@@ -15260,6 +15373,7 @@ def td_read_sources_metadata_from_cache(db_path: Path) -> list[dict]:
             """
             SELECT
                 s.serial,
+                COALESCE(m.source_serial_number, s.serial),
                 COALESCE(m.program_title, ''),
                 COALESCE(m.document_type, ''),
                 COALESCE(m.metadata_rel, ''),
@@ -15272,14 +15386,15 @@ def td_read_sources_metadata_from_cache(db_path: Path) -> list[dict]:
             """
         ).fetchall()
     out: list[dict] = []
-    for serial, program_title, document_type, metadata_rel, artifacts_rel, excel_sqlite_rel in rows:
+    for serial, source_serial_number, program_title, document_type, metadata_rel, artifacts_rel, excel_sqlite_rel in rows:
         sn = str(serial or "").strip()
         if not sn:
             continue
         out.append(
             {
                 "serial": sn,
-                "serial_number": sn,
+                "source_key": sn,
+                "serial_number": str(source_serial_number or sn).strip(),
                 "program_title": str(program_title or "").strip(),
                 "document_type": str(document_type or "").strip(),
                 "metadata_rel": str(metadata_rel or "").strip(),
@@ -15302,6 +15417,7 @@ def td_read_observation_filter_rows_from_cache(db_path: Path) -> list[dict]:
             SELECT
                 o.observation_id,
                 o.serial,
+                COALESCE(m.source_serial_number, o.serial),
                 COALESCE(o.program_title, ''),
                 COALESCE(o.source_run_name, ''),
                 o.control_period,
@@ -15318,7 +15434,7 @@ def td_read_observation_filter_rows_from_cache(db_path: Path) -> list[dict]:
             """
         ).fetchall()
     out: list[dict] = []
-    for observation_id, serial, program_title, source_run_name, control_period, suppression_voltage, valve_voltage, document_type, metadata_rel, artifacts_rel, excel_sqlite_rel in rows:
+    for observation_id, serial, source_serial_number, program_title, source_run_name, control_period, suppression_voltage, valve_voltage, document_type, metadata_rel, artifacts_rel, excel_sqlite_rel in rows:
         sn = str(serial or "").strip()
         obs_id = str(observation_id or "").strip()
         if not sn or not obs_id:
@@ -15327,7 +15443,8 @@ def td_read_observation_filter_rows_from_cache(db_path: Path) -> list[dict]:
             {
                 "observation_id": obs_id,
                 "serial": sn,
-                "serial_number": sn,
+                "source_key": sn,
+                "serial_number": str(source_serial_number or sn).strip(),
                 "program_title": str(program_title or "").strip(),
                 "source_run_name": str(source_run_name or "").strip(),
                 "control_period": control_period,
@@ -29112,6 +29229,9 @@ def update_test_data_trending_project_workbook(
         "metadata_rel",
         "artifacts_rel",
         "excel_sqlite_rel",
+        "asset_type",
+        "asset_specific_type",
+        "source_key",
     ]
     for key in required_src_cols:
         if key in src_headers:
@@ -29138,6 +29258,34 @@ def update_test_data_trending_project_workbook(
         excluded_serials = set()
     if "serial_number" not in src_headers:
         raise RuntimeError("Sources sheet missing required column: serial_number")
+
+    for r in range(2, (ws_src.max_row or 0) + 1):
+        row_item: dict[str, str] = {}
+        for key, col in src_headers.items():
+            row_item[key] = str(ws_src.cell(r, col).value or "").strip()
+        if not str(row_item.get("serial_number") or "").strip():
+            continue
+        try:
+            row_meta = _load_td_source_metadata(wb_path, row_item)
+        except Exception:
+            row_meta = {}
+        for key in ("asset_type", "asset_specific_type"):
+            col = src_headers.get(key)
+            if not col:
+                continue
+            current = str(ws_src.cell(r, col).value or "").strip()
+            value = str(row_meta.get(key) or "").strip()
+            if not current and value:
+                ws_src.cell(r, col).value = value
+                row_item[key] = value
+        source_key_col = src_headers.get("source_key")
+        if source_key_col:
+            current_key = str(ws_src.cell(r, source_key_col).value or "").strip()
+            if not current_key:
+                source_key = _td_build_source_composite_key(row_item, row_meta)
+                if source_key:
+                    ws_src.cell(r, source_key_col).value = source_key
+                    row_item["source_key"] = source_key
 
     serials: list[str] = []
     serials_set: set[str] = set()
@@ -29184,6 +29332,18 @@ def update_test_data_trending_project_workbook(
                 ws_src.cell(row, int(src_headers["metadata_rel"])).value = str(doc.get("metadata_rel") or "")
                 ws_src.cell(row, int(src_headers["artifacts_rel"])).value = str(doc.get("artifacts_rel") or "")
                 ws_src.cell(row, int(src_headers["excel_sqlite_rel"])).value = str(doc.get("excel_sqlite_rel") or "")
+                ws_src.cell(row, int(src_headers["asset_type"])).value = str(doc.get("asset_type") or "")
+                ws_src.cell(row, int(src_headers["asset_specific_type"])).value = str(doc.get("asset_specific_type") or "")
+                source_key = _td_build_source_composite_key(
+                    {
+                        "serial_number": str(sn),
+                        "program_title": str(doc.get("program_title") or ""),
+                        "asset_type": str(doc.get("asset_type") or ""),
+                        "asset_specific_type": str(doc.get("asset_specific_type") or ""),
+                    },
+                    doc,
+                )
+                ws_src.cell(row, int(src_headers["source_key"])).value = source_key
                 serials.append(sn)
                 serials_set.add(sn)
                 added_serials.append(sn)
@@ -34648,6 +34808,498 @@ def list_eidat_projects(global_repo: Path) -> list[dict]:
     return out
 
 
+def _project_report_sidecar_path(pdf_path: Path) -> Path:
+    return Path(pdf_path).expanduser().with_suffix(".summary.json")
+
+
+def _project_path_key(value: object) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        return os.path.normcase(str(Path(raw).expanduser().resolve()))
+    except Exception:
+        try:
+            return os.path.normcase(str(Path(raw).expanduser().absolute()))
+        except Exception:
+            return os.path.normcase(raw)
+
+
+def _project_paths_match(left: object, right: object) -> bool:
+    left_key = _project_path_key(left)
+    right_key = _project_path_key(right)
+    return bool(left_key and right_key and left_key == right_key)
+
+
+def _project_item_stat(path: Path) -> dict[str, object]:
+    p = Path(path).expanduser()
+    try:
+        st = p.stat()
+        modified_epoch = float(st.st_mtime)
+        size_bytes = int(st.st_size)
+    except Exception:
+        modified_epoch = 0.0
+        size_bytes = 0
+    return {
+        "modified_epoch": modified_epoch,
+        "size_bytes": size_bytes,
+    }
+
+
+def _project_file_item(
+    *,
+    item_type: str,
+    kind: str,
+    path: Path,
+    scope: str,
+    allowed_dir: Path,
+    sidecar_path: Path | None = None,
+) -> dict[str, object]:
+    p = Path(path).expanduser()
+    payload = {
+        "id": f"{item_type}:{_project_path_key(p) or str(p)}",
+        "type": item_type,
+        "kind": kind,
+        "name": p.stem,
+        "path": str(p),
+        "location": str(p.parent),
+        "scope": str(scope or ""),
+        "allowed_dir": str(Path(allowed_dir).expanduser()),
+        **_project_item_stat(p),
+    }
+    if sidecar_path is not None:
+        payload["sidecar_path"] = str(Path(sidecar_path).expanduser())
+    return payload
+
+
+def _project_selected_serials(project_meta: Mapping[str, object], docs: Sequence[Mapping[str, object]] | None = None) -> list[str]:
+    serials: list[str] = []
+    seen: set[str] = set()
+    for value in (project_meta.get("serials") or []):
+        serial = str(value or "").strip()
+        if serial and serial.casefold() not in seen:
+            seen.add(serial.casefold())
+            serials.append(serial)
+    if serials:
+        return serials
+    for doc in docs or []:
+        serial = str((doc or {}).get("serial_number") or "").strip()
+        if serial and serial.casefold() not in seen:
+            seen.add(serial.casefold())
+            serials.append(serial)
+    return serials
+
+
+def _coerce_list_text_values(value: object) -> list[str]:
+    if isinstance(value, str):
+        raw_values = [value]
+    elif isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray, str)):
+        raw_values = list(value)
+    else:
+        raw_values = []
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_values:
+        text = str(raw or "").strip()
+        key = text.casefold()
+        if text and key not in seen:
+            seen.add(key)
+            out.append(text)
+    return out
+
+
+def resolve_project_program_titles(global_repo: Path, project_dir: Path) -> list[str]:
+    repo = Path(global_repo).expanduser()
+    proj = Path(project_dir).expanduser()
+    meta = _read_project_meta(proj)
+    selected = {
+        str(value or "").strip()
+        for value in (meta.get("selected_metadata_rel") or [])
+        if str(value or "").strip()
+    }
+    docs: list[dict] = []
+    try:
+        docs = read_eidat_index_documents(repo)
+    except Exception:
+        docs = []
+
+    programs: list[str] = []
+    seen: set[str] = set()
+
+    def _add(value: object) -> None:
+        text = str(value or "").strip()
+        key = text.casefold()
+        if text and key not in seen:
+            seen.add(key)
+            programs.append(text)
+
+    for doc in docs:
+        if str(doc.get("metadata_rel") or "").strip() in selected:
+            _add(doc.get("program_title"))
+
+    if not programs:
+        continued = meta.get("continued_population") if isinstance(meta.get("continued_population"), Mapping) else {}
+        for value in _coerce_list_text_values((continued or {}).get("program_title")):
+            _add(value)
+
+    if not programs:
+        serials = {serial.casefold() for serial in _project_selected_serials(meta)}
+        for doc in docs:
+            if str(doc.get("serial_number") or "").strip().casefold() in serials:
+                _add(doc.get("program_title"))
+
+    return sorted(programs, key=lambda value: value.casefold())
+
+
+def _project_report_sidecar_matches(sidecar_path: Path, project_dir: Path, workbook_path: Path) -> bool:
+    try:
+        payload = json.loads(Path(sidecar_path).expanduser().read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    if not isinstance(payload, Mapping):
+        return False
+    return _project_paths_match(payload.get("project_dir"), project_dir) or _project_paths_match(
+        payload.get("workbook_path"),
+        workbook_path,
+    )
+
+
+def list_project_report_items(global_repo: Path, project_dir: Path, workbook_path: Path) -> list[dict[str, object]]:
+    repo = Path(global_repo).expanduser()
+    proj = Path(project_dir).expanduser()
+    wb_path = Path(workbook_path).expanduser()
+    meta = _read_project_meta(proj)
+    try:
+        docs = read_eidat_index_documents(repo)
+    except Exception:
+        docs = []
+    selected_rels = {
+        str(value or "").strip()
+        for value in (meta.get("selected_metadata_rel") or [])
+        if str(value or "").strip()
+    }
+    selected_docs = [
+        doc
+        for doc in docs
+        if not selected_rels or str(doc.get("metadata_rel") or "").strip() in selected_rels
+    ]
+    serials = _project_selected_serials(meta, selected_docs)
+    serial_tokens = [serial.casefold() for serial in serials if serial]
+    programs = resolve_project_program_titles(repo, proj)
+    out: list[dict[str, object]] = []
+    seen_paths: set[str] = set()
+
+    for program in programs:
+        report_dir = edin_program_report_dir(repo, program, create=True)
+        try:
+            pdfs = sorted(report_dir.glob("*.pdf"), key=lambda path: path.name.casefold())
+        except Exception:
+            pdfs = []
+        for pdf in pdfs:
+            sidecar = _project_report_sidecar_path(pdf)
+            include = False
+            if sidecar.exists():
+                include = _project_report_sidecar_matches(sidecar, proj, wb_path)
+            else:
+                name_key = pdf.name.casefold()
+                include = bool(serial_tokens and any(token in name_key for token in serial_tokens))
+            if not include:
+                continue
+            path_key = _project_path_key(pdf)
+            if path_key in seen_paths:
+                continue
+            seen_paths.add(path_key)
+            out.append(
+                _project_file_item(
+                    item_type="report_pdf",
+                    kind="Report PDF",
+                    path=pdf,
+                    scope=program,
+                    allowed_dir=report_dir,
+                    sidecar_path=sidecar if sidecar.exists() else None,
+                )
+            )
+
+    out.sort(
+        key=lambda item: (
+            -float(item.get("modified_epoch") or 0),
+            str(item.get("scope") or "").casefold(),
+            str(item.get("name") or "").casefold(),
+        )
+    )
+    return out
+
+
+def project_graph_store_path(project_dir: Path, project_type: str) -> Path:
+    proj = Path(project_dir).expanduser()
+    if str(project_type or "").strip() == EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING:
+        return proj / "auto_plots_test_data.json"
+    return proj / "auto_plots.json"
+
+
+def _load_project_graph_store(project_dir: Path, project_type: str) -> dict[str, object]:
+    path = project_graph_store_path(project_dir, project_type)
+    if not path.exists():
+        return {"path": path, "kind": "missing", "payload": None, "entries": []}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {"path": path, "kind": "invalid", "payload": None, "entries": []}
+    if isinstance(payload, list):
+        return {"path": path, "kind": "list", "payload": payload, "entries": [item for item in payload if isinstance(item, Mapping)]}
+    if isinstance(payload, Mapping):
+        graph_files = payload.get("graph_files")
+        if isinstance(graph_files, list):
+            return {
+                "path": path,
+                "kind": "graph_files",
+                "payload": dict(payload),
+                "entries": [item for item in graph_files if isinstance(item, Mapping)],
+            }
+        entries = payload.get("entries")
+        if isinstance(entries, list):
+            return {
+                "path": path,
+                "kind": "entries",
+                "payload": dict(payload),
+                "entries": [item for item in entries if isinstance(item, Mapping)],
+            }
+    return {"path": path, "kind": "unknown", "payload": payload, "entries": []}
+
+
+def _write_project_graph_store(store: Mapping[str, object], entries: Sequence[Mapping[str, object]]) -> None:
+    path = Path(store.get("path") or "").expanduser()
+    if not path:
+        raise RuntimeError("Graph store path is unavailable.")
+    kind = str(store.get("kind") or "").strip()
+    original_payload = store.get("payload")
+    clean_entries = [dict(entry) for entry in entries if isinstance(entry, Mapping)]
+    if kind == "list":
+        payload: object = clean_entries
+    elif kind == "graph_files":
+        payload = dict(original_payload or {}) if isinstance(original_payload, Mapping) else {}
+        payload["graph_files"] = clean_entries
+    elif kind == "entries":
+        payload = dict(original_payload or {}) if isinstance(original_payload, Mapping) else {}
+        payload["entries"] = clean_entries
+    else:
+        raise RuntimeError("Graph store has no supported schema to update.")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=(kind != "list")), encoding="utf-8")
+
+
+def _project_graph_entry_key(entry: Mapping[str, object], index: int) -> str:
+    raw_id = str((entry or {}).get("id") or "").strip()
+    if raw_id:
+        return f"id:{raw_id}"
+    return f"index:{int(index)}"
+
+
+def _project_graph_entry_matches(entry: Mapping[str, object], index: int, graph_key: object) -> bool:
+    return _project_graph_entry_key(entry, index) == str(graph_key or "").strip()
+
+
+def _project_graph_entry_name(entry: Mapping[str, object], index: int) -> str:
+    name = str((entry or {}).get("name") or "").strip()
+    if name:
+        return name
+    mode = str((entry or {}).get("mode") or (entry or {}).get("type") or "").strip()
+    if mode:
+        return f"Auto-Graph {mode}"
+    return f"Auto-Graph {index + 1}"
+
+
+def _project_graph_definition_items(project_dir: Path, project_type: str) -> list[dict[str, object]]:
+    store = _load_project_graph_store(project_dir, project_type)
+    store_path = Path(store.get("path") or project_graph_store_path(project_dir, project_type)).expanduser()
+    out: list[dict[str, object]] = []
+    for idx, raw_entry in enumerate(store.get("entries") or []):
+        if not isinstance(raw_entry, Mapping):
+            continue
+        graph_key = _project_graph_entry_key(raw_entry, idx)
+        updated_at = str(raw_entry.get("updated_at") or raw_entry.get("saved_at") or "").strip()
+        modified_epoch = 0.0
+        if updated_at:
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+                try:
+                    modified_epoch = datetime.strptime(updated_at, fmt).timestamp()
+                    break
+                except Exception:
+                    continue
+        if not modified_epoch:
+            try:
+                modified_epoch = float(store_path.stat().st_mtime)
+            except Exception:
+                modified_epoch = 0.0
+        plots = raw_entry.get("plots")
+        plot_count = len(plots) if isinstance(plots, list) else 1
+        out.append(
+            {
+                "id": f"graph_definition:{graph_key}",
+                "type": "graph_definition",
+                "kind": "Graph Definition",
+                "name": _project_graph_entry_name(raw_entry, idx),
+                "scope": f"{plot_count} plot{'s' if plot_count != 1 else ''}",
+                "location": str(store_path),
+                "path": str(store_path),
+                "allowed_dir": str(store_path.parent),
+                "graph_key": graph_key,
+                "store_path": str(store_path),
+                "modified_epoch": modified_epoch,
+                "size_bytes": 0,
+            }
+        )
+    return out
+
+
+def _project_graph_pdf_items(project_dir: Path) -> list[dict[str, object]]:
+    proj = Path(project_dir).expanduser()
+    out: list[dict[str, object]] = []
+    try:
+        pdfs = sorted(proj.glob("*.pdf"), key=lambda path: path.name.casefold())
+    except Exception:
+        pdfs = []
+    for pdf in pdfs:
+        if _project_report_sidecar_path(pdf).exists():
+            continue
+        out.append(
+            _project_file_item(
+                item_type="graph_pdf",
+                kind="Graph PDF",
+                path=pdf,
+                scope="Project Folder",
+                allowed_dir=proj,
+            )
+        )
+    return out
+
+
+def list_project_graph_items(project_dir: Path, project_type: str) -> list[dict[str, object]]:
+    out = _project_graph_definition_items(project_dir, project_type)
+    out.extend(_project_graph_pdf_items(project_dir))
+    out.sort(
+        key=lambda item: (
+            0 if str(item.get("type") or "") == "graph_definition" else 1,
+            -float(item.get("modified_epoch") or 0),
+            str(item.get("name") or "").casefold(),
+        )
+    )
+    return out
+
+
+def _safe_output_file_stem(new_name: object, suffix: str) -> str:
+    raw = Path(str(new_name or "").strip()).name
+    suffix_text = str(suffix or "").strip()
+    if suffix_text and raw.casefold().endswith(suffix_text.casefold()):
+        raw = raw[: -len(suffix_text)]
+    return _safe_windows_path_name(raw, fallback="Untitled")
+
+
+def rename_project_managed_file(
+    file_path: Path,
+    new_name: str,
+    *,
+    allowed_dir: Path,
+    rename_summary_sidecar: bool = False,
+) -> dict[str, object]:
+    src = Path(file_path).expanduser()
+    allowed = Path(allowed_dir).expanduser()
+    if not src.exists():
+        raise FileNotFoundError(f"File not found: {src}")
+    if not _project_paths_match(src.parent, allowed):
+        raise RuntimeError(f"File is not in the expected project output folder: {allowed}")
+    stem = _safe_output_file_stem(new_name, src.suffix)
+    dest = src.with_name(f"{stem}{src.suffix}")
+    if _project_paths_match(src, dest):
+        return {"path": str(src), "renamed": False}
+    if dest.exists():
+        raise FileExistsError(f"A file already exists with that name: {dest}")
+    sidecar_src = _project_report_sidecar_path(src)
+    sidecar_dest = _project_report_sidecar_path(dest)
+    if rename_summary_sidecar and sidecar_src.exists() and sidecar_dest.exists():
+        raise FileExistsError(f"A report summary already exists with that name: {sidecar_dest}")
+    src.rename(dest)
+    sidecar_renamed = False
+    if rename_summary_sidecar and sidecar_src.exists():
+        sidecar_src.rename(sidecar_dest)
+        sidecar_renamed = True
+    return {
+        "path": str(dest),
+        "old_path": str(src),
+        "renamed": True,
+        "sidecar_path": str(sidecar_dest) if sidecar_renamed else "",
+        "sidecar_renamed": sidecar_renamed,
+    }
+
+
+def delete_project_managed_file(
+    file_path: Path,
+    *,
+    allowed_dir: Path,
+    delete_summary_sidecar: bool = False,
+) -> dict[str, object]:
+    path = Path(file_path).expanduser()
+    allowed = Path(allowed_dir).expanduser()
+    if not _project_paths_match(path.parent, allowed):
+        raise RuntimeError(f"File is not in the expected project output folder: {allowed}")
+    deleted = False
+    if path.exists():
+        path.unlink()
+        deleted = True
+    sidecar_deleted = False
+    sidecar = _project_report_sidecar_path(path)
+    if delete_summary_sidecar and sidecar.exists():
+        sidecar.unlink()
+        sidecar_deleted = True
+    return {
+        "path": str(path),
+        "deleted": deleted,
+        "sidecar_path": str(sidecar) if sidecar_deleted else "",
+        "sidecar_deleted": sidecar_deleted,
+    }
+
+
+def rename_project_graph_definition(project_dir: Path, project_type: str, graph_key: str, new_name: str) -> dict[str, object]:
+    store = _load_project_graph_store(project_dir, project_type)
+    entries = [dict(entry) for entry in (store.get("entries") or []) if isinstance(entry, Mapping)]
+    target_idx = -1
+    for idx, entry in enumerate(entries):
+        if _project_graph_entry_matches(entry, idx, graph_key):
+            target_idx = idx
+            break
+    if target_idx < 0:
+        raise RuntimeError("Selected graph definition was not found.")
+    cleaned_name = _safe_windows_path_name(new_name, fallback="Auto-Graph")
+    entries[target_idx]["name"] = cleaned_name
+    entries[target_idx]["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    _write_project_graph_store(store, entries)
+    return {
+        "graph_key": _project_graph_entry_key(entries[target_idx], target_idx),
+        "name": cleaned_name,
+        "store_path": str(store.get("path") or ""),
+    }
+
+
+def delete_project_graph_definition(project_dir: Path, project_type: str, graph_key: str) -> dict[str, object]:
+    store = _load_project_graph_store(project_dir, project_type)
+    entries = [dict(entry) for entry in (store.get("entries") or []) if isinstance(entry, Mapping)]
+    kept: list[dict[str, object]] = []
+    deleted = False
+    for idx, entry in enumerate(entries):
+        if _project_graph_entry_matches(entry, idx, graph_key):
+            deleted = True
+            continue
+        kept.append(entry)
+    if not deleted:
+        raise RuntimeError("Selected graph definition was not found.")
+    _write_project_graph_store(store, kept)
+    return {
+        "deleted": True,
+        "graph_key": str(graph_key or ""),
+        "store_path": str(store.get("path") or ""),
+    }
+
+
 PRODUCT_CENTER_IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp")
 
 
@@ -35413,7 +36065,44 @@ def _write_test_data_trending_workbook(
 
     wb = Workbook()
 
-    sn_cols = [str(s).strip() for s in serials if str(s).strip()]
+    source_rows: list[dict[str, str]] = []
+    seen_source_keys: set[str] = set()
+    for doc in docs or []:
+        sn = str((doc or {}).get("serial_number") or "").strip()
+        if not sn:
+            continue
+        row = {
+            "serial_number": sn,
+            "program_title": str((doc or {}).get("program_title") or "").strip(),
+            "asset_type": str((doc or {}).get("asset_type") or "").strip(),
+            "asset_specific_type": str((doc or {}).get("asset_specific_type") or "").strip(),
+            "document_type": str((doc or {}).get("document_type") or "").strip(),
+            "metadata_rel": str((doc or {}).get("metadata_rel") or "").strip(),
+            "artifacts_rel": str((doc or {}).get("artifacts_rel") or "").strip(),
+            "excel_sqlite_rel": str((doc or {}).get("excel_sqlite_rel") or "").strip(),
+        }
+        source_key = _td_build_source_composite_key(row, doc)
+        if not source_key or source_key in seen_source_keys:
+            continue
+        row["source_key"] = source_key
+        seen_source_keys.add(source_key)
+        source_rows.append(row)
+    if not source_rows:
+        for sn in [str(s).strip() for s in serials if str(s).strip()]:
+            row = {
+                "serial_number": sn,
+                "program_title": "",
+                "asset_type": "",
+                "asset_specific_type": "",
+                "document_type": "",
+                "metadata_rel": "",
+                "artifacts_rel": "",
+                "excel_sqlite_rel": "",
+            }
+            row["source_key"] = _td_build_source_composite_key(row)
+            source_rows.append(row)
+
+    sn_cols = [str(row.get("source_key") or row.get("serial_number") or "").strip() for row in source_rows if str(row.get("source_key") or row.get("serial_number") or "").strip()]
 
     # Data_calc is the computed TD workbook view.
     ws_data_calc = wb.active
@@ -35467,25 +36156,24 @@ def _write_test_data_trending_workbook(
         )
 
     ws_src = wb.create_sheet("Sources")
-    ws_src.append(["serial_number", "program_title", "document_type", "metadata_rel", "artifacts_rel", "excel_sqlite_rel"])
-    docs_by_serial: dict[str, list[dict]] = {}
-    for d in (docs or []):
-        sn = str(d.get("serial_number") or "").strip()
-        if sn:
-            docs_by_serial.setdefault(sn, []).append(d)
-    support_dir = eidat_support_dir(repo) if repo is not None else None
-    for sn in sn_cols:
-        doc = (
-            _best_doc_for_serial(support_dir, docs_by_serial.get(sn, []))
-            if support_dir is not None
-            else (docs_by_serial.get(sn, [{}])[0] if docs_by_serial.get(sn) else {})
-        )
-        resolved_sqlite_rel = str(doc.get("excel_sqlite_rel") or "").strip()
+    ws_src.append([
+        "serial_number",
+        "program_title",
+        "document_type",
+        "metadata_rel",
+        "artifacts_rel",
+        "excel_sqlite_rel",
+        "asset_type",
+        "asset_specific_type",
+        "source_key",
+    ])
+    for row in source_rows:
+        resolved_sqlite_rel = str(row.get("excel_sqlite_rel") or "").strip()
         if repo is not None:
             resolved = _resolve_td_source_sqlite_for_node(
                 repo,
                 excel_sqlite_rel=resolved_sqlite_rel,
-                artifacts_rel=str(doc.get("artifacts_rel") or "").strip(),
+                artifacts_rel=str(row.get("artifacts_rel") or "").strip(),
             )
             if str(resolved.get("status") or "") == "ok":
                 resolved_sqlite_rel = str(
@@ -35495,12 +36183,15 @@ def _write_test_data_trending_workbook(
                 ).strip()
         ws_src.append(
             [
-                str(sn or "").strip(),
-                str(doc.get("program_title") or "").strip(),
-                str(doc.get("document_type") or "").strip(),
-                str(doc.get("metadata_rel") or "").strip(),
-                str(doc.get("artifacts_rel") or "").strip(),
+                str(row.get("serial_number") or "").strip(),
+                str(row.get("program_title") or "").strip(),
+                str(row.get("document_type") or "").strip(),
+                str(row.get("metadata_rel") or "").strip(),
+                str(row.get("artifacts_rel") or "").strip(),
                 resolved_sqlite_rel,
+                str(row.get("asset_type") or "").strip(),
+                str(row.get("asset_specific_type") or "").strip(),
+                str(row.get("source_key") or "").strip(),
             ]
         )
 

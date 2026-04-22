@@ -146,6 +146,62 @@ class TestTDExcelSparklineWarningSuppression(unittest.TestCase):
         self.assertIs(result, fake_workbook)
         self.assertEqual(["unrelated workbook warning"], [str(w.message) for w in caught])
 
+    def test_metadata_excel_loader_ignores_openpyxl_sparkline_warning(self) -> None:
+        import eidat_manager_metadata as emd  # type: ignore
+
+        class FakeWorkbook:
+            sheetnames: list[str] = []
+
+            def close(self) -> None:
+                pass
+
+        fake_openpyxl = types.ModuleType("openpyxl")
+
+        def load_workbook(*_args, **_kwargs):
+            warnings.warn("Sparkline Group extension is not supported and will be removed", UserWarning)
+            return FakeWorkbook()
+
+        fake_openpyxl.load_workbook = load_workbook  # type: ignore[attr-defined]
+        self._swap_module("openpyxl", fake_openpyxl)
+
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "source.xlsx"
+            path.write_bytes(b"fake workbook bytes")
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("error")
+                result = emd.extract_metadata_from_excel(path)
+
+        self.assertIsInstance(result, dict)
+        self.assertEqual([], [str(w.message) for w in caught])
+
+    def test_metadata_excel_loader_preserves_unrelated_warnings(self) -> None:
+        import eidat_manager_metadata as emd  # type: ignore
+
+        class FakeWorkbook:
+            sheetnames: list[str] = []
+
+            def close(self) -> None:
+                pass
+
+        fake_openpyxl = types.ModuleType("openpyxl")
+
+        def load_workbook(*_args, **_kwargs):
+            warnings.warn("unrelated workbook warning", UserWarning)
+            return FakeWorkbook()
+
+        fake_openpyxl.load_workbook = load_workbook  # type: ignore[attr-defined]
+        self._swap_module("openpyxl", fake_openpyxl)
+
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "source.xlsx"
+            path.write_bytes(b"fake workbook bytes")
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                result = emd.extract_metadata_from_excel(path)
+
+        self.assertIsInstance(result, dict)
+        self.assertEqual(["unrelated workbook warning"], [str(w.message) for w in caught])
+
 
 @unittest.skipUnless(_have_openpyxl(), "openpyxl not installed")
 class TestTDExcelHeaderMapping(unittest.TestCase):

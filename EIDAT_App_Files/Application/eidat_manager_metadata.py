@@ -3,9 +3,27 @@ from __future__ import annotations
 import json
 import os
 import re
+import warnings
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+
+
+_OPENPYXL_SPARKLINE_EXTENSION_WARNING_RE = (
+    r".*[Ss]parkline\s+[Gg]roup\s+extension\s+is\s+not\s+supported\s+and\s+will\s+be\s+removed.*"
+)
+
+
+@contextmanager
+def _ignore_openpyxl_sparkline_extension_warning():
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=_OPENPYXL_SPARKLINE_EXTENSION_WARNING_RE,
+            category=UserWarning,
+        )
+        yield
 
 
 REMOVED_KEYS = {"valve", "test_setup", "files", "operator", "facility", "program_code"}
@@ -1927,7 +1945,8 @@ def extract_metadata_from_excel(
         else:
             from openpyxl import load_workbook  # type: ignore
 
-            wb = load_workbook(str(p), read_only=True, data_only=True)
+            with _ignore_openpyxl_sparkline_extension_warning():
+                wb = load_workbook(str(p), read_only=True, data_only=True)
             try:
                 sheetnames = list(getattr(wb, "sheetnames", []) or [])
             except Exception:
