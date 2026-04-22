@@ -5,12 +5,14 @@ import importlib.util
 import json
 import multiprocessing
 import os
+import re
 import shutil
+import sqlite3
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 import hashlib
 import uuid
 
@@ -99,6 +101,15 @@ EXCEL_EXTENSIONS = {".xlsx", ".xls", ".xlsm"}
 MAT_EXTENSIONS = {".mat"}
 DATA_MATRIX_EXTENSIONS = set(EXCEL_EXTENSIONS) | set(MAT_EXTENSIONS)
 EXCEL_ARTIFACT_SUFFIX = "__excel"
+TD_SERIAL_AGGREGATES_DIRNAME = "td_serial_sources"
+TD_SERIAL_AGGREGATE_METADATA_SOURCE = "td_serial_aggregate"
+
+_TD_AGG_SEQ_SHEET_RE = re.compile(
+    r"^\s*seq(?:uence)?[\s_-]*(?=[A-Za-z0-9\s_-]*\d)[A-Za-z0-9]+(?:[\s_-]*[A-Za-z0-9]+)*\s*$",
+    flags=re.IGNORECASE,
+)
+_TD_AGG_SERIAL_RE = re.compile(r"\bSN[-_ ]?[A-Z0-9]+(?:[-_ ][A-Z0-9]+)*\b", flags=re.IGNORECASE)
+_TD_AGG_SERIAL_LABEL_RE = re.compile(r"\b(?:serial(?:\s*(?:number|no\.?|#))?|s\s*/?\s*n)\b", flags=re.IGNORECASE)
 
 _IGNORED_REPO_DIRNAMES_CASEFOLD = {
     "eidat",
@@ -1121,6 +1132,763 @@ def _write_mat_bundle_manifest(
     out = artifacts_dir / "mat_seq_bundle.json"
     out.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
     return out
+
+
+def _td_agg_unknownish(value: object) -> bool:
+    txt = str(value or "").strip()
+    return not txt or txt.casefold() in {"unknown", "none", "null", "n/a"}
+
+
+def _td_agg_clean_scope_value(value: object, *, fallback: str = "Unknown") -> str:
+    txt = str(value or "").strip()
+    if not txt:
+        return fallback
+    return txt
+
+
+def _td_agg_safe_path_name(value: object, *, fallback: str = "unknown") -> str:
+    raw = str(value or "").strip() or str(fallback or "unknown")
+    cleaned = re.sub(r"[^A-Za-z0-9._ -]+", "_", raw).strip(" .")
+    cleaned = re.sub(r"\s+", "_", cleaned)
+    return cleaned[:80] or str(fallback or "unknown")
+
+
+def _td_agg_safe_ident(value: object, *, prefix: str = "sheet") -> str:
+    raw = str(value or "").strip()
+    cleaned = re.sub(r"[^0-9A-Za-z_]+", "_", raw).strip("_")
+    if not cleaned:
+        cleaned = prefix
+    if cleaned[0].isdigit():
+        cleaned = f"{prefix}_{cleaned}"
+    return cleaned[:80]
+
+
+def _td_agg_table_name(run_name: object) -> str:
+    return f"sheet__{_td_agg_safe_ident(run_name, prefix='sheet')}"
+
+
+def _td_agg_quote_ident(value: object) -> str:
+    return '"' + str(value or "").replace('"', '""') + '"'
+
+
+def _td_agg_is_sequence_sheet_name(value: object) -> bool:
+    return bool(_TD_AGG_SEQ_SHEET_RE.match(str(value or "").strip()))
+
+
+def _td_agg_sequence_token(value: object) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    m = re.match(r"^\s*seq(?:uence)?[\s_-]*(.+?)\s*$", raw, flags=re.IGNORECASE)
+    if m:
+        raw = str(m.group(1) or "").strip()
+    raw = re.sub(r"[\s_-]+", "", raw)
+    return raw
+
+
+def _td_agg_natural_sequence_key(value: object) -> list[tuple[int, object]]:
+    token = _td_agg_sequence_token(value) or str(value or "").strip()
+    parts = re.findall(r"\d+|[A-Za-z]+|[^A-Za-z0-9]+", token)
+    key: list[tuple[int, object]] = []
+    for part in parts:
+        if part.isdigit():
+            key.append((0, int(part)))
+        elif part.isalpha():
+            key.append((1, part.casefold()))
+        else:
+            key.append((2, part.casefold()))
+    if not key:
+        key.append((3, str(value or "").casefold()))
+    return key
+
+
+def _td_agg_normalize_serial(value: object) -> str:
+    txt = str(value or "").strip()
+    if not txt or txt.casefold() in {"unknown", "none", "null", "n/a"}:
+        return ""
+    txt = txt.replace("S/N", "SN").replace("s/n", "SN")
+    match = _TD_AGG_SERIAL_RE.search(txt)
+    if match:
+        txt = match.group(0)
+    cleaned = re.sub(r"\s+", "", str(txt or "").strip().upper())
+    if re.fullmatch(r"\d{1,8}", cleaned):
+        if len(cleaned) <= 4:
+            cleaned = cleaned.zfill(4)
+        return f"SN{cleaned}"
+    return cleaned
+
+
+def _td_agg_serial_from_text(value: object, *, allow_raw: bool = False) -> str:
+    txt = str(value or "").strip()
+    if not txt:
+        return ""
+    match = _TD_AGG_SERIAL_RE.search(txt)
+    if match:
+        return _td_agg_normalize_serial(match.group(0))
+    if allow_raw:
+        return _td_agg_normalize_serial(txt)
+    return ""
+
+
+def _td_agg_extract_tab_serial(
+    conn: sqlite3.Connection,
+    *,
+    sheet_name: str,
+    fallback_serial: object,
+) -> tuple[str, str]:
+    try:
+        rows = conn.execute(
+            """
+            SELECT excel_row, excel_col, value
+            FROM __meta_cells
+            WHERE sheet_name=?
+            ORDER BY excel_row, excel_col
+            """,
+            (str(sheet_name),),
+        ).fetchall()
+    except Exception:
+        rows = []
+    cells = {(int(r[0]), int(r[1])): str(r[2] or "").strip() for r in rows if str(r[2] or "").strip()}
+    for (row, col), text in sorted(cells.items()):
+        if not _TD_AGG_SERIAL_LABEL_RE.search(text):
+            continue
+        same_cell = _td_agg_serial_from_text(text)
+        if same_cell:
+            return same_cell, "tab_label_same_cell"
+        for delta_col in range(1, 5):
+            cand = _td_agg_serial_from_text(cells.get((row, col + delta_col)), allow_raw=True)
+            if cand:
+                return cand, "tab_label_right_cell"
+        for delta_row in range(1, 3):
+            cand = _td_agg_serial_from_text(cells.get((row + delta_row, col)), allow_raw=True)
+            if cand:
+                return cand, "tab_label_below_cell"
+            cand = _td_agg_serial_from_text(cells.get((row + delta_row, col + 1)), allow_raw=True)
+            if cand:
+                return cand, "tab_label_below_right_cell"
+    for _pos, text in sorted(cells.items()):
+        cand = _td_agg_serial_from_text(text)
+        if cand:
+            return cand, "tab_regex"
+    fallback = _td_agg_normalize_serial(fallback_serial)
+    if fallback:
+        return fallback, "metadata_fallback"
+    return "", ""
+
+
+def _td_agg_resolve_support_path(paths: SupportPaths, raw_path: object) -> Path:
+    raw = str(raw_path or "").strip().strip('"')
+    if not raw:
+        return Path()
+    p = Path(raw).expanduser()
+    if p.is_absolute():
+        return p
+    norm = raw.replace("/", "\\").lstrip("\\")
+    parts = list(Path(norm).parts)
+    support_names = {"eidat support", "edat support"}
+    container_names = {"eidat", "edat"}
+    if parts and str(parts[0]).strip().casefold() in support_names:
+        rest = Path(*parts[1:]) if len(parts) > 1 else Path()
+        return paths.support_dir / rest
+    for idx, part in enumerate(parts):
+        if str(part).strip().casefold() not in support_names:
+            continue
+        prefix = [str(v).strip().casefold() for v in parts[:idx]]
+        if prefix and all(v in container_names for v in prefix):
+            return paths.global_repo / Path(*parts)
+        rest = Path(*parts[idx + 1 :]) if idx + 1 < len(parts) else Path()
+        return paths.support_dir / rest
+    candidate = paths.global_repo / Path(norm)
+    if candidate.exists():
+        return candidate
+    return paths.support_dir / Path(norm)
+
+
+def _td_agg_metadata_files(support_dir: Path) -> list[Path]:
+    root = Path(support_dir) / "debug" / "ocr"
+    if not root.exists():
+        return []
+    out: list[Path] = []
+    aggregate_root_name = TD_SERIAL_AGGREGATES_DIRNAME.casefold()
+    for path in root.rglob("*"):
+        try:
+            if not path.is_file():
+                continue
+        except Exception:
+            continue
+        low = path.name.lower()
+        if not (low.endswith("_metadata.json") or low.endswith(".metadata.json")):
+            continue
+        try:
+            parts = [p.casefold() for p in path.relative_to(root).parts]
+        except Exception:
+            parts = [p.casefold() for p in path.parts]
+        if aggregate_root_name in parts:
+            continue
+        out.append(path)
+    return sorted(out, key=lambda p: str(p).casefold())
+
+
+def _td_agg_ordered_sheet_info(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    try:
+        conn.row_factory = sqlite3.Row
+        cols = {str(row[1] or "") for row in conn.execute("PRAGMA table_info(__sheet_info)").fetchall()}
+    except Exception:
+        cols = set()
+    order_sql = "ORDER BY COALESCE(import_order, rowid), rowid" if "import_order" in cols else "ORDER BY rowid"
+    try:
+        return list(conn.execute(f"SELECT * FROM __sheet_info {order_sql}").fetchall())
+    except Exception:
+        return []
+
+
+def _td_agg_collect_members(paths: SupportPaths) -> list[dict[str, Any]]:
+    support_dir = Path(paths.support_dir)
+    members: list[dict[str, Any]] = []
+    for meta_path in _td_agg_metadata_files(support_dir):
+        try:
+            meta_raw = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(meta_raw, dict):
+            continue
+        if str(meta_raw.get("metadata_source") or "").strip() == TD_SERIAL_AGGREGATE_METADATA_SOURCE:
+            continue
+        ext = str(meta_raw.get("file_extension") or "").strip().lower()
+        if ext == ".mat":
+            continue
+        if not _is_confirmed_test_data_meta(meta_raw):
+            continue
+        sqlite_rel = str(meta_raw.get("excel_sqlite_rel") or "").strip()
+        sqlite_path = _td_agg_resolve_support_path(paths, sqlite_rel)
+        if not sqlite_path.exists() or not sqlite_path.is_file():
+            continue
+        try:
+            metadata_rel = str(meta_path.resolve().relative_to(support_dir.resolve())).replace("\\", "/")
+        except Exception:
+            metadata_rel = str(meta_path)
+        try:
+            artifacts_rel = str(meta_path.parent.resolve().relative_to(support_dir.resolve())).replace("\\", "/")
+        except Exception:
+            artifacts_rel = str(meta_path.parent)
+        try:
+            with sqlite3.connect(str(sqlite_path)) as src:
+                src.row_factory = sqlite3.Row
+                sheet_rows = _td_agg_ordered_sheet_info(src)
+                for sheet_row in sheet_rows:
+                    sheet_name = str(sheet_row["sheet_name"] if "sheet_name" in sheet_row.keys() else "").strip()
+                    source_sheet_name = str(
+                        sheet_row["source_sheet_name"] if "source_sheet_name" in sheet_row.keys() else sheet_name
+                    ).strip()
+                    real_tab_name = source_sheet_name or sheet_name
+                    if not _td_agg_is_sequence_sheet_name(real_tab_name):
+                        continue
+                    tab_serial, serial_source = _td_agg_extract_tab_serial(
+                        src,
+                        sheet_name=sheet_name,
+                        fallback_serial=meta_raw.get("serial_number"),
+                    )
+                    if not tab_serial:
+                        continue
+                    program_title = _td_agg_clean_scope_value(meta_raw.get("program_title"))
+                    asset_type = _td_agg_clean_scope_value(meta_raw.get("asset_type"))
+                    asset_specific_type = _td_agg_clean_scope_value(meta_raw.get("asset_specific_type"))
+                    table_name = str(sheet_row["table_name"] if "table_name" in sheet_row.keys() else "").strip()
+                    if not table_name:
+                        table_name = _td_agg_table_name(sheet_name)
+                    try:
+                        import_order = int(sheet_row["import_order"] if "import_order" in sheet_row.keys() else 0)
+                    except Exception:
+                        import_order = 0
+                    sequence_order_key = _td_agg_natural_sequence_key(real_tab_name)
+                    members.append(
+                        {
+                            "group_key": (
+                                program_title.casefold(),
+                                asset_type.casefold(),
+                                asset_specific_type.casefold(),
+                                tab_serial.casefold(),
+                            ),
+                            "program_title": program_title,
+                            "asset_type": asset_type,
+                            "asset_specific_type": asset_specific_type,
+                            "serial_number": tab_serial,
+                            "serial_source": serial_source,
+                            "sqlite_path": sqlite_path,
+                            "sqlite_rel": sqlite_rel,
+                            "metadata_path": meta_path,
+                            "metadata_rel": metadata_rel,
+                            "artifacts_rel": artifacts_rel,
+                            "source_file": str(meta_raw.get("source_file") or ""),
+                            "sheet_name": sheet_name,
+                            "source_sheet_name": real_tab_name,
+                            "table_name": table_name,
+                            "import_order": int(import_order),
+                            "sequence_token": _td_agg_sequence_token(real_tab_name),
+                            "sequence_order_key": sequence_order_key,
+                            "metadata": dict(meta_raw),
+                            "sheet_info": {k: sheet_row[k] for k in sheet_row.keys()},
+                        }
+                    )
+        except Exception:
+            continue
+    return members
+
+
+def _td_agg_create_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        PRAGMA journal_mode=DELETE;
+        PRAGMA synchronous=NORMAL;
+        PRAGMA temp_store=MEMORY;
+
+        CREATE TABLE IF NOT EXISTS __workbook (
+          source_file TEXT NOT NULL,
+          imported_epoch_ns INTEGER NOT NULL,
+          excel_size_bytes INTEGER NOT NULL,
+          excel_mtime_ns INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS __sheet_info (
+          sheet_name TEXT PRIMARY KEY,
+          source_sheet_name TEXT,
+          table_name TEXT NOT NULL,
+          header_row INTEGER NOT NULL,
+          import_order INTEGER,
+          excel_col_indices_json TEXT NOT NULL,
+          headers_json TEXT NOT NULL,
+          columns_json TEXT NOT NULL,
+          mapped_headers_json TEXT,
+          rows_inserted INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS __column_map (
+          sheet_name TEXT NOT NULL,
+          header TEXT NOT NULL,
+          mapped_header TEXT NOT NULL,
+          sqlite_column TEXT NOT NULL,
+          PRIMARY KEY(sheet_name, header)
+        );
+
+        CREATE TABLE IF NOT EXISTS __meta_cells (
+          sheet_name TEXT NOT NULL,
+          excel_row INTEGER NOT NULL,
+          excel_col INTEGER NOT NULL,
+          value TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS __sequence_context (
+          sheet_name TEXT PRIMARY KEY,
+          source_sheet_name TEXT,
+          data_mode_raw TEXT,
+          run_type TEXT,
+          on_time_value REAL,
+          on_time_units TEXT,
+          off_time_value REAL,
+          off_time_units TEXT,
+          control_period REAL,
+          nominal_pf_value REAL,
+          nominal_pf_units TEXT,
+          nominal_tf_value REAL,
+          nominal_tf_units TEXT,
+          suppression_voltage_value REAL,
+          suppression_voltage_units TEXT,
+          valve_voltage_value REAL,
+          valve_voltage_units TEXT,
+          extraction_status TEXT,
+          extraction_reason TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS __td_serial_aggregate_members (
+          sheet_name TEXT PRIMARY KEY,
+          source_sheet_name TEXT,
+          source_sqlite_rel TEXT,
+          source_metadata_rel TEXT,
+          source_artifacts_rel TEXT,
+          source_table_name TEXT,
+          tab_serial TEXT,
+          serial_source TEXT,
+          sequence_token TEXT,
+          sequence_order_json TEXT,
+          output_table_name TEXT,
+          duplicate_of TEXT
+        );
+        """
+    )
+
+
+def _td_agg_copy_data_table(
+    src: sqlite3.Connection,
+    dest: sqlite3.Connection,
+    *,
+    source_table: str,
+    output_table: str,
+) -> int:
+    info = src.execute(f"PRAGMA table_info({_td_agg_quote_ident(source_table)})").fetchall()
+    if not info:
+        raise RuntimeError(f"Source sequence table not found: {source_table}")
+    col_defs: list[str] = []
+    col_names: list[str] = []
+    for row in info:
+        name = str(row[1] or "").strip()
+        if not name:
+            continue
+        typ = str(row[2] or "").strip() or "REAL"
+        not_null = bool(int(row[3] or 0))
+        col_defs.append(f"{_td_agg_quote_ident(name)} {typ}{' NOT NULL' if not_null else ''}")
+        col_names.append(name)
+    dest.execute(f"DROP TABLE IF EXISTS {_td_agg_quote_ident(output_table)}")
+    dest.execute(f"CREATE TABLE {_td_agg_quote_ident(output_table)} ({', '.join(col_defs)})")
+    if not col_names:
+        return 0
+    q_cols = ", ".join(_td_agg_quote_ident(name) for name in col_names)
+    placeholders = ", ".join("?" for _ in col_names)
+    rows = src.execute(f"SELECT {q_cols} FROM {_td_agg_quote_ident(source_table)} ORDER BY rowid").fetchall()
+    if rows:
+        dest.executemany(
+            f"INSERT INTO {_td_agg_quote_ident(output_table)} ({q_cols}) VALUES ({placeholders})",
+            [tuple(row) for row in rows],
+        )
+    return len(rows)
+
+
+def _td_agg_copy_sequence_context(
+    src: sqlite3.Connection,
+    dest: sqlite3.Connection,
+    *,
+    source_sheet_name: str,
+    output_sheet_name: str,
+    output_source_sheet_name: str,
+) -> None:
+    try:
+        src.row_factory = sqlite3.Row
+        row = src.execute("SELECT * FROM __sequence_context WHERE sheet_name=? LIMIT 1", (source_sheet_name,)).fetchone()
+    except Exception:
+        row = None
+    if row is None:
+        dest.execute(
+            """
+            INSERT OR REPLACE INTO __sequence_context(
+              sheet_name, source_sheet_name, extraction_status, extraction_reason
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (output_sheet_name, output_source_sheet_name, "incomplete", "sequence context unavailable in source aggregate input"),
+        )
+        return
+    payload = {k: row[k] for k in row.keys()}
+    payload["sheet_name"] = output_sheet_name
+    payload["source_sheet_name"] = output_source_sheet_name
+    columns = [
+        "sheet_name",
+        "source_sheet_name",
+        "data_mode_raw",
+        "run_type",
+        "on_time_value",
+        "on_time_units",
+        "off_time_value",
+        "off_time_units",
+        "control_period",
+        "nominal_pf_value",
+        "nominal_pf_units",
+        "nominal_tf_value",
+        "nominal_tf_units",
+        "suppression_voltage_value",
+        "suppression_voltage_units",
+        "valve_voltage_value",
+        "valve_voltage_units",
+        "extraction_status",
+        "extraction_reason",
+    ]
+    dest.execute(
+        "INSERT OR REPLACE INTO __sequence_context("
+        + ", ".join(columns)
+        + ") VALUES ("
+        + ", ".join("?" for _ in columns)
+        + ")",
+        tuple(payload.get(col) for col in columns),
+    )
+
+
+def _td_agg_write_group(
+    paths: SupportPaths,
+    *,
+    group_members: Sequence[Mapping[str, Any]],
+    export_text_mirror: Any | None,
+    export_excel_mirror: Any | None,
+    mirror_xlsx: bool,
+) -> dict[str, Any]:
+    first = dict(group_members[0])
+    serial = str(first.get("serial_number") or "").strip()
+    program_title = str(first.get("program_title") or "Unknown").strip() or "Unknown"
+    asset_type = str(first.get("asset_type") or "Unknown").strip() or "Unknown"
+    asset_specific_type = str(first.get("asset_specific_type") or "Unknown").strip() or "Unknown"
+    out_dir = (
+        Path(paths.support_dir)
+        / "debug"
+        / "ocr"
+        / TD_SERIAL_AGGREGATES_DIRNAME
+        / _td_agg_safe_path_name(program_title, fallback="program")
+        / _td_agg_safe_path_name(asset_type, fallback="asset")
+        / _td_agg_safe_path_name(asset_specific_type, fallback="asset_specific")
+        / _td_agg_safe_path_name(serial, fallback="serial")
+    )
+    out_dir.mkdir(parents=True, exist_ok=True)
+    sqlite_path = out_dir / f"{_td_agg_safe_path_name(serial, fallback='serial')}.sqlite3"
+    if sqlite_path.exists():
+        try:
+            sqlite_path.unlink()
+        except Exception:
+            pass
+
+    warnings: list[str] = []
+    manifest_members: list[dict[str, Any]] = []
+    used_run_names: dict[str, int] = {}
+    now_ns = time.time_ns()
+    with sqlite3.connect(str(sqlite_path)) as dest:
+        _td_agg_create_schema(dest)
+        for idx, raw_member in enumerate(group_members, start=1):
+            member = dict(raw_member)
+            source_sqlite = Path(member.get("sqlite_path") or "")
+            source_sheet = str(member.get("sheet_name") or "").strip()
+            source_tab = str(member.get("source_sheet_name") or source_sheet).strip()
+            source_table = str(member.get("table_name") or "").strip()
+            base_run = source_tab or source_sheet or f"seq_{idx}"
+            run_key = base_run.casefold()
+            dup_idx = used_run_names.get(run_key, 0) + 1
+            used_run_names[run_key] = dup_idx
+            output_run = base_run if dup_idx == 1 else f"{base_run}__{dup_idx}"
+            duplicate_of = "" if dup_idx == 1 else base_run
+            if duplicate_of:
+                warnings.append(f"Duplicate sequence name {base_run!r} was written as {output_run!r}.")
+            output_table = _td_agg_table_name(output_run)
+            try:
+                st = source_sqlite.stat()
+                size_bytes = int(st.st_size)
+                mtime_ns = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)))
+            except Exception:
+                size_bytes = 0
+                mtime_ns = 0
+            with sqlite3.connect(str(source_sqlite)) as src:
+                src.row_factory = sqlite3.Row
+                dest.execute(
+                    "INSERT INTO __workbook(source_file, imported_epoch_ns, excel_size_bytes, excel_mtime_ns) VALUES (?, ?, ?, ?)",
+                    (str(source_sqlite), int(now_ns), int(size_bytes), int(mtime_ns)),
+                )
+                rows_inserted = _td_agg_copy_data_table(
+                    src,
+                    dest,
+                    source_table=source_table,
+                    output_table=output_table,
+                )
+                sheet_info = dict(member.get("sheet_info") or {})
+                dest.execute(
+                    """
+                    INSERT INTO __sheet_info(
+                      sheet_name, source_sheet_name, table_name, header_row, import_order,
+                      excel_col_indices_json, headers_json, columns_json, mapped_headers_json, rows_inserted
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        output_run,
+                        source_tab,
+                        output_table,
+                        int(sheet_info.get("header_row") or 0),
+                        int(idx),
+                        str(sheet_info.get("excel_col_indices_json") or "[]"),
+                        str(sheet_info.get("headers_json") or "[]"),
+                        str(sheet_info.get("columns_json") or "{}"),
+                        str(sheet_info.get("mapped_headers_json") or "[]"),
+                        int(rows_inserted),
+                    ),
+                )
+                try:
+                    col_rows = src.execute(
+                        "SELECT header, mapped_header, sqlite_column FROM __column_map WHERE sheet_name=? ORDER BY rowid",
+                        (source_sheet,),
+                    ).fetchall()
+                    dest.executemany(
+                        "INSERT OR REPLACE INTO __column_map(sheet_name, header, mapped_header, sqlite_column) VALUES (?, ?, ?, ?)",
+                        [(output_run, row[0], row[1], row[2]) for row in col_rows],
+                    )
+                except Exception:
+                    pass
+                try:
+                    meta_rows = src.execute(
+                        "SELECT excel_row, excel_col, value FROM __meta_cells WHERE sheet_name=? ORDER BY excel_row, excel_col",
+                        (source_sheet,),
+                    ).fetchall()
+                    dest.executemany(
+                        "INSERT INTO __meta_cells(sheet_name, excel_row, excel_col, value) VALUES (?, ?, ?, ?)",
+                        [(output_run, int(row[0]), int(row[1]), str(row[2] or "")) for row in meta_rows],
+                    )
+                except Exception:
+                    pass
+                _td_agg_copy_sequence_context(
+                    src,
+                    dest,
+                    source_sheet_name=source_sheet,
+                    output_sheet_name=output_run,
+                    output_source_sheet_name=source_tab,
+                )
+            sequence_order_json = json.dumps(member.get("sequence_order_key") or [], ensure_ascii=True)
+            dest.execute(
+                """
+                INSERT OR REPLACE INTO __td_serial_aggregate_members(
+                  sheet_name, source_sheet_name, source_sqlite_rel, source_metadata_rel,
+                  source_artifacts_rel, source_table_name, tab_serial, serial_source,
+                  sequence_token, sequence_order_json, output_table_name, duplicate_of
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    output_run,
+                    source_tab,
+                    str(member.get("sqlite_rel") or ""),
+                    str(member.get("metadata_rel") or ""),
+                    str(member.get("artifacts_rel") or ""),
+                    source_table,
+                    serial,
+                    str(member.get("serial_source") or ""),
+                    str(member.get("sequence_token") or ""),
+                    sequence_order_json,
+                    output_table,
+                    duplicate_of,
+                ),
+            )
+            manifest_members.append(
+                {
+                    "sheet_name": output_run,
+                    "source_sheet_name": source_tab,
+                    "source_sqlite_rel": str(member.get("sqlite_rel") or ""),
+                    "source_metadata_rel": str(member.get("metadata_rel") or ""),
+                    "source_artifacts_rel": str(member.get("artifacts_rel") or ""),
+                    "source_table_name": source_table,
+                    "tab_serial": serial,
+                    "serial_source": str(member.get("serial_source") or ""),
+                    "sequence_token": str(member.get("sequence_token") or ""),
+                    "sequence_order_key": list(member.get("sequence_order_key") or []),
+                    "duplicate_of": duplicate_of,
+                    "rows_inserted": int(rows_inserted),
+                }
+            )
+        dest.commit()
+
+    sqlite_rel = _safe_repo_rel(paths.global_repo, sqlite_path)
+    metadata_path = out_dir / f"{_td_agg_safe_path_name(serial, fallback='serial')}_metadata.json"
+    manifest_path = out_dir / "td_serial_aggregate.json"
+    source_metadata_rels = [
+        str(item.get("source_metadata_rel") or "")
+        for item in manifest_members
+        if str(item.get("source_metadata_rel") or "").strip()
+    ]
+    aggregate_meta = {
+        "program_title": program_title,
+        "asset_type": asset_type,
+        "asset_specific_type": asset_specific_type,
+        "serial_number": serial,
+        "part_number": str(first.get("metadata", {}).get("part_number") or "Unknown"),
+        "revision": str(first.get("metadata", {}).get("revision") or "Unknown"),
+        "test_date": str(first.get("metadata", {}).get("test_date") or "Unknown"),
+        "report_date": str(first.get("metadata", {}).get("report_date") or "Unknown"),
+        "vendor": str(first.get("metadata", {}).get("vendor") or "Unknown"),
+        "acceptance_test_plan_number": str(first.get("metadata", {}).get("acceptance_test_plan_number") or "Unknown"),
+        "document_type": "TD",
+        "document_type_acronym": "TD",
+        "document_type_status": "confirmed",
+        "document_type_source": "td_serial_aggregate",
+        "document_type_reason": "td_serial_aggregate",
+        "document_type_evidence": [
+            {
+                "kind": "td_serial_aggregate",
+                "serial_number": serial,
+                "sequence_count": len(manifest_members),
+            }
+        ],
+        "document_type_review_required": False,
+        "excel_sqlite_rel": sqlite_rel,
+        "file_extension": ".sqlite3",
+        "metadata_source": TD_SERIAL_AGGREGATE_METADATA_SOURCE,
+    }
+    metadata_path.write_text(json.dumps(aggregate_meta, indent=2, ensure_ascii=True), encoding="utf-8")
+    manifest = {
+        "kind": TD_SERIAL_AGGREGATE_METADATA_SOURCE,
+        "serial_number": serial,
+        "program_title": program_title,
+        "asset_type": asset_type,
+        "asset_specific_type": asset_specific_type,
+        "sqlite_rel": sqlite_rel,
+        "metadata_rel": _safe_repo_rel(paths.global_repo, metadata_path),
+        "source_metadata_rels": source_metadata_rels,
+        "sequence_count": len(manifest_members),
+        "members": manifest_members,
+        "warnings": warnings,
+        "built_epoch_ns": int(now_ns),
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=True), encoding="utf-8")
+    if export_text_mirror is not None:
+        try:
+            export_text_mirror(sqlite_path)
+        except Exception:
+            pass
+    if mirror_xlsx and export_excel_mirror is not None:
+        try:
+            export_excel_mirror(sqlite_path)
+        except Exception:
+            pass
+    return {
+        "serial_number": serial,
+        "sqlite_path": str(sqlite_path),
+        "metadata_path": str(metadata_path),
+        "manifest_path": str(manifest_path),
+        "sequence_count": len(manifest_members),
+        "warnings": warnings,
+    }
+
+
+def rebuild_td_serial_aggregates(
+    paths: SupportPaths,
+    *,
+    export_text_mirror: Any | None = None,
+    export_excel_mirror: Any | None = None,
+    mirror_xlsx: bool = False,
+) -> dict[str, Any]:
+    members = _td_agg_collect_members(paths)
+    aggregate_root = Path(paths.support_dir) / "debug" / "ocr" / TD_SERIAL_AGGREGATES_DIRNAME
+    if aggregate_root.exists():
+        shutil.rmtree(aggregate_root, ignore_errors=True)
+    groups: dict[tuple[str, str, str, str], list[dict[str, Any]]] = {}
+    for member in members:
+        key = tuple(member.get("group_key") or ())
+        if len(key) != 4:
+            continue
+        groups.setdefault(key, []).append(member)
+    outputs: list[dict[str, Any]] = []
+    for _key, group_members in sorted(groups.items(), key=lambda item: item[0]):
+        ordered = sorted(
+            group_members,
+            key=lambda item: (
+                item.get("sequence_order_key") or [],
+                str(item.get("metadata_rel") or "").casefold(),
+                int(item.get("import_order") or 0),
+                str(item.get("source_sheet_name") or "").casefold(),
+            ),
+        )
+        if not ordered:
+            continue
+        outputs.append(
+            _td_agg_write_group(
+                paths,
+                group_members=ordered,
+                export_text_mirror=export_text_mirror,
+                export_excel_mirror=export_excel_mirror,
+                mirror_xlsx=bool(mirror_xlsx),
+            )
+        )
+    return {
+        "aggregate_root": str(aggregate_root),
+        "source_sequence_count": len(members),
+        "aggregate_count": len(outputs),
+        "aggregates": outputs,
+    }
 
 
 def _mark_files_processed(

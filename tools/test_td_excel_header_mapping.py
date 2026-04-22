@@ -3,7 +3,9 @@ import json
 import sqlite3
 import sys
 import tempfile
+import types
 import unittest
+import warnings
 from pathlib import Path
 
 
@@ -31,6 +33,118 @@ def _have_openpyxl() -> bool:
     except Exception:
         return False
     return True
+
+
+class TestTDExcelSparklineWarningSuppression(unittest.TestCase):
+    def _swap_module(self, name: str, replacement):
+        sentinel = object()
+        original = sys.modules.get(name, sentinel)
+        sys.modules[name] = replacement
+        self.addCleanup(self._restore_module, name, original, sentinel)
+
+    @staticmethod
+    def _restore_module(name: str, original, sentinel) -> None:
+        if original is sentinel:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = original
+
+    def test_legacy_excel_loader_ignores_openpyxl_sparkline_warning(self) -> None:
+        excel_extraction = _load_excel_extraction_module()
+        fake_workbook = object()
+        fake_openpyxl = types.ModuleType("openpyxl")
+
+        def load_workbook(*_args, **_kwargs):
+            warnings.warn("Sparkline Group extension is not supported and will be removed", UserWarning)
+            return fake_workbook
+
+        fake_openpyxl.load_workbook = load_workbook  # type: ignore[attr-defined]
+        self._swap_module("openpyxl", fake_openpyxl)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            result = excel_extraction._load_workbook_any(Path("source.xlsx"))
+
+        self.assertIs(result, fake_workbook)
+        self.assertEqual([], [str(w.message) for w in caught])
+
+    def test_legacy_excel_loader_preserves_unrelated_warnings(self) -> None:
+        excel_extraction = _load_excel_extraction_module()
+        fake_workbook = object()
+        fake_openpyxl = types.ModuleType("openpyxl")
+
+        def load_workbook(*_args, **_kwargs):
+            warnings.warn("unrelated workbook warning", UserWarning)
+            return fake_workbook
+
+        fake_openpyxl.load_workbook = load_workbook  # type: ignore[attr-defined]
+        self._swap_module("openpyxl", fake_openpyxl)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            result = excel_extraction._load_workbook_any(Path("source.xlsx"))
+
+        self.assertIs(result, fake_workbook)
+        self.assertEqual(["unrelated workbook warning"], [str(w.message) for w in caught])
+
+    def test_legacy_pandas_read_ignores_openpyxl_sparkline_warning(self) -> None:
+        excel_extraction = _load_excel_extraction_module()
+        fake_pandas = types.ModuleType("pandas")
+        fake_frame = object()
+
+        def read_excel(*_args, **_kwargs):
+            warnings.warn("Sparkline Group extension is not supported and will be removed", UserWarning)
+            return fake_frame
+
+        fake_pandas.read_excel = read_excel  # type: ignore[attr-defined]
+        self._swap_module("pandas", fake_pandas)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            result = excel_extraction._read_dataframe(Path("source.xlsx"), sheet_name=None, header_row=0)
+
+        self.assertIs(result, fake_frame)
+        self.assertEqual([], [str(w.message) for w in caught])
+
+    def test_sqlite_excel_loader_ignores_openpyxl_sparkline_warning(self) -> None:
+        import eidat_manager_excel_to_sqlite as etm  # type: ignore
+
+        fake_workbook = object()
+        fake_openpyxl = types.ModuleType("openpyxl")
+
+        def load_workbook(*_args, **_kwargs):
+            warnings.warn("Sparkline Group extension is not supported and will be removed", UserWarning)
+            return fake_workbook
+
+        fake_openpyxl.load_workbook = load_workbook  # type: ignore[attr-defined]
+        self._swap_module("openpyxl", fake_openpyxl)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            result = etm._load_openpyxl_workbook_for_td_source(Path("source.xlsx"))  # type: ignore[attr-defined]
+
+        self.assertIs(result, fake_workbook)
+        self.assertEqual([], [str(w.message) for w in caught])
+
+    def test_sqlite_excel_loader_preserves_unrelated_warnings(self) -> None:
+        import eidat_manager_excel_to_sqlite as etm  # type: ignore
+
+        fake_workbook = object()
+        fake_openpyxl = types.ModuleType("openpyxl")
+
+        def load_workbook(*_args, **_kwargs):
+            warnings.warn("unrelated workbook warning", UserWarning)
+            return fake_workbook
+
+        fake_openpyxl.load_workbook = load_workbook  # type: ignore[attr-defined]
+        self._swap_module("openpyxl", fake_openpyxl)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            result = etm._load_openpyxl_workbook_for_td_source(Path("source.xlsx"))  # type: ignore[attr-defined]
+
+        self.assertIs(result, fake_workbook)
+        self.assertEqual(["unrelated workbook warning"], [str(w.message) for w in caught])
 
 
 @unittest.skipUnless(_have_openpyxl(), "openpyxl not installed")

@@ -8,6 +8,8 @@ import re
 import sqlite3
 import sys
 import time
+import warnings
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
@@ -30,6 +32,9 @@ _NUM_RE = re.compile(r"^[\s\+\-]?\d[\d,\s]*(\.\d+)?([eE][\+\-]?\d+)?\s*$")
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _TEST_DATA_ENV_PATH = _REPO_ROOT / "user_inputs" / "test_data.env"
 _EXCEL_TREND_CONFIG_PATH = _REPO_ROOT / "user_inputs" / "excel_trend_config.json"
+_OPENPYXL_SPARKLINE_EXTENSION_WARNING_RE = (
+    r".*[Ss]parkline\s+[Gg]roup\s+extension\s+is\s+not\s+supported\s+and\s+will\s+be\s+removed.*"
+)
 
 
 def _now_ns() -> int:
@@ -44,6 +49,27 @@ def _stderr(line: str) -> None:
     if not s:
         return
     print(s, file=sys.stderr, flush=True)
+
+
+@contextmanager
+def _ignore_openpyxl_sparkline_extension_warning():
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=_OPENPYXL_SPARKLINE_EXTENSION_WARNING_RE,
+            category=UserWarning,
+        )
+        yield
+
+
+def _load_openpyxl_workbook_for_td_source(excel_path: Path):
+    try:
+        from openpyxl import load_workbook  # type: ignore
+    except Exception as exc:
+        raise RuntimeError("openpyxl is required to read Excel files in this runtime.") from exc
+
+    with _ignore_openpyxl_sparkline_extension_warning():
+        return load_workbook(str(excel_path), data_only=True, read_only=False)
 
 
 def export_sqlite_text_mirror(
@@ -3359,11 +3385,7 @@ def _write_workbook_sqlite(
             ) from exc
         wb = _XlsWorkbookAdapter(xlrd.open_workbook(str(excel_path), on_demand=True))
     else:
-        try:
-            from openpyxl import load_workbook  # type: ignore
-        except Exception as exc:
-            raise RuntimeError("openpyxl is required to read Excel files in this runtime.") from exc
-        wb = load_workbook(str(excel_path), data_only=True, read_only=False)
+        wb = _load_openpyxl_workbook_for_td_source(excel_path)
 
     _stderr(f"[EXCEL] {excel_path}")
 

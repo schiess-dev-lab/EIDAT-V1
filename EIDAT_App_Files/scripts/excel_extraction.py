@@ -6,6 +6,8 @@ import difflib
 import json
 import os
 import re
+import warnings
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -13,6 +15,22 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 def _repo_root() -> Path:
     # EIDAT_App_Files/scripts/excel_extraction.py -> repo root is parents[2]
     return Path(__file__).resolve().parents[2]
+
+
+_OPENPYXL_SPARKLINE_EXTENSION_WARNING_RE = (
+    r".*[Ss]parkline\s+[Gg]roup\s+extension\s+is\s+not\s+supported\s+and\s+will\s+be\s+removed.*"
+)
+
+
+@contextmanager
+def _ignore_openpyxl_sparkline_extension_warning():
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=_OPENPYXL_SPARKLINE_EXTENSION_WARNING_RE,
+            category=UserWarning,
+        )
+        yield
 
 
 def _parse_env_file(path: Path) -> Dict[str, str]:
@@ -173,7 +191,8 @@ def _load_workbook_any(excel_path: Path):
         from openpyxl import load_workbook  # type: ignore
     except Exception as exc:
         raise RuntimeError("openpyxl is required to read .xlsx files in this runtime.") from exc
-    return load_workbook(str(p), data_only=True, read_only=False)
+    with _ignore_openpyxl_sparkline_extension_warning():
+        return load_workbook(str(p), data_only=True, read_only=False)
 
 
 def _read_dataframe(excel_path: Path, *, sheet_name: Optional[str], header_row: int):
@@ -183,15 +202,16 @@ def _read_dataframe(excel_path: Path, *, sheet_name: Optional[str], header_row: 
         raise RuntimeError("pandas is required for Excel extraction in this repo.") from exc
 
     sheet = sheet_name if sheet_name not in ("", None) else 0
-    try:
-        if excel_path.suffix.lower() == ".xls":
-            return pd.read_excel(excel_path, sheet_name=sheet, header=int(header_row), engine="xlrd")
-        return pd.read_excel(excel_path, sheet_name=sheet, header=int(header_row))
-    except ValueError:
-        # sheet name missing, fall back to first sheet
-        if excel_path.suffix.lower() == ".xls":
-            return pd.read_excel(excel_path, sheet_name=0, header=int(header_row), engine="xlrd")
-        return pd.read_excel(excel_path, sheet_name=0, header=int(header_row))
+    with _ignore_openpyxl_sparkline_extension_warning():
+        try:
+            if excel_path.suffix.lower() == ".xls":
+                return pd.read_excel(excel_path, sheet_name=sheet, header=int(header_row), engine="xlrd")
+            return pd.read_excel(excel_path, sheet_name=sheet, header=int(header_row))
+        except ValueError:
+            # sheet name missing, fall back to first sheet
+            if excel_path.suffix.lower() == ".xls":
+                return pd.read_excel(excel_path, sheet_name=0, header=int(header_row), engine="xlrd")
+            return pd.read_excel(excel_path, sheet_name=0, header=int(header_row))
 
 
 _TD_UNIT_SUFFIX_TOKENS = {

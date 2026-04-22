@@ -1758,8 +1758,8 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         exec_table = next(rows for rows in tables if rows and rows[0][0] == "Serial" and rows[0][1] == "Overall")
         exception_table = next(rows for rows in tables if rows and rows[0][0] == "Serial" and rows[0][1] == "Run Condition")
         self.assertEqual(exec_table[1][1], "Initial: FAILED\nFinal: WATCH")
-        self.assertEqual(exec_table[0], ["Serial", "Overall", "Program", "Part #", "Rev", "Outcome Mix"])
-        self.assertEqual(exec_table[1][5], "PASS 50% | WATCH 50% | FAIL 0%")
+        self.assertEqual(exec_table[0], ["Serial", "Overall", "Program", "Part #", "Rev", "Pass / Watch / Fail"])
+        self.assertEqual(exec_table[1][5], "PASS 1/2 (50%)\nWATCH 1/2 (50%)\nFAIL 0/2 (0%)")
         self.assertEqual([row[4] for row in exception_table[1:]], ["WATCH"])
         self.assertTrue(str(exception_table[1][5]).startswith("Chart "))
         self.assertFalse(any(rows and str(rows[0][0]).startswith("Run Condition:") for rows in tables))
@@ -2095,6 +2095,44 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         self.assertEqual(len(chart_links), 1)
         self.assertEqual(chart_links[0]["destination_page_index"], 8)
         self.assertEqual(chart_links[0]["regrade_cohort_id"], "regrade:cohort-1")
+
+    def test_build_exception_chart_links_prefers_watch_curve_pages(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        ctx = {
+            "plot_navigation": [
+                {
+                    "section_key": "regrade_pass_curve_overlays",
+                    "cohort_id": "regrade:cohort-1",
+                    "destination_page_index": 8,
+                },
+                {
+                    "section_key": "watch_nonpass_curves",
+                    "pair_id": "pair-1",
+                    "destination_page_index": 12,
+                },
+            ],
+            "comparison_rows": [
+                {
+                    "pair_id": "pair-1",
+                    "serial": "SN1",
+                    "run_condition": "Condition A",
+                    "sequence_text": "Seq 1",
+                    "parameter": "thrust",
+                    "final_grade": "FAIL",
+                    "regrade_cohort_id": "regrade:cohort-1",
+                }
+            ],
+        }
+
+        exception_rows = tar._tar_build_exec_exception_rows(ctx)
+        self.assertEqual(exception_rows[0]["chart_target_page_index"], 12)
+        self.assertEqual(exception_rows[0]["chart_target_section"], "watch_nonpass_curves")
+
+        chart_links = tar._tar_build_exception_chart_links(ctx)
+        self.assertEqual(chart_links[0]["destination_page_index"], 12)
+        self.assertEqual(chart_links[0]["target_section"], "watch_nonpass_curves")
+        self.assertEqual(chart_links[0]["pair_id"], "pair-1")
 
     def test_generate_auto_report_sidecar_uses_regrade_section_order_and_split_overall_results(self):
         from EIDAT_App_Files.ui_next import trend_auto_report as tar

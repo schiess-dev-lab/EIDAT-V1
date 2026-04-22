@@ -1167,10 +1167,10 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         self.assertEqual(len(navigation), 3)
         self.assertEqual(navigation[0]["section_label"], "Run Condition Metrics")
         self.assertEqual(navigation[0]["navigator_label"], "Run Metrics")
-        self.assertEqual(navigation[0]["plot_label"], "Pressure | Time | mean")
+        self.assertEqual(navigation[0]["plot_label"], "Parameter: Pressure | X: Time | Stat: mean")
         self.assertEqual(navigation[0]["destination_page_index"], 3)
-        self.assertEqual(navigation[1]["plot_label"], "ATP Fit | Flow vs Bus Voltage | mean")
-        self.assertEqual(navigation[2]["plot_label"], "Run A | Pressure | 2 Serials")
+        self.assertEqual(navigation[1]["plot_label"], "ATP Fit | Flow vs Bus Voltage | Stat: mean")
+        self.assertEqual(navigation[2]["plot_label"], "Parameter: Pressure | Serials: SN-001, SN-002")
 
     def test_paginate_plot_navigation_allows_continuation_and_repeats_section_header(self) -> None:
         navigation = tar._tar_build_plot_navigation(
@@ -1230,6 +1230,58 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         self.assertEqual(used_columns[0]["rows"][0]["text"], "Run Condition Metrics")
         self.assertEqual(used_columns[1]["rows"][0]["text"], "Run Condition Metrics")
 
+    def test_paginate_plot_navigation_embeds_run_condition_headers(self) -> None:
+        navigation = tar._tar_build_plot_navigation(
+            [
+                {
+                    "section": "run_condition_plot_metrics",
+                    "base_condition_label": "Condition A",
+                    "suppression_voltage_label": "5",
+                    "valve_voltage_label": "28",
+                    "param": "Pressure",
+                    "x_name": "Time",
+                    "stat": "mean",
+                    "page_number": 4,
+                },
+                {
+                    "section": "run_condition_plot_metrics",
+                    "base_condition_label": "Condition A",
+                    "suppression_voltage_label": "5",
+                    "valve_voltage_label": "28",
+                    "param": "Flow",
+                    "x_name": "Time",
+                    "stat": "mean",
+                    "page_number": 5,
+                },
+                {
+                    "section": "run_condition_plot_metrics",
+                    "base_condition_label": "Condition B",
+                    "param": "Pressure",
+                    "x_name": "Time",
+                    "stat": "mean",
+                    "page_number": 6,
+                },
+            ]
+        )
+
+        with mock.patch.object(tar, "_reportlab_imports", return_value=_fake_reportlab()), mock.patch.object(
+            tar,
+            "_build_portrait_styles",
+            return_value=_fake_styles(),
+        ):
+            pages = tar._tar_paginate_plot_navigation(navigation)
+
+        rows = pages[0]["rows"]
+        self.assertEqual(rows[0]["text"], "Run Condition Metrics")
+        self.assertEqual(rows[1]["kind"], "condition")
+        self.assertEqual(rows[1]["text"], "Run Condition: Condition A | Supp 5 | Valve 28")
+        self.assertEqual(rows[1]["page_text"], "4")
+        self.assertEqual(rows[2]["text"], "Parameter: Pressure | X: Time | Stat: mean")
+        self.assertEqual(rows[3]["text"], "Parameter: Flow | X: Time | Stat: mean")
+        self.assertEqual(rows[4]["kind"], "condition")
+        self.assertEqual(rows[4]["text"], "Run Condition: Condition B")
+        self.assertEqual(rows[5]["text"], "Parameter: Pressure | X: Time | Stat: mean")
+
     def test_prepare_intro_story_with_actual_plot_specs_rebases_toc_pages(self) -> None:
         ctx = {
             "comparison_page_specs": [{"serial": "SN1"}, {"serial": "SN2"}],
@@ -1259,7 +1311,7 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         self.assertEqual(story, ["intro"])
         self.assertEqual(ctx["planned_plot_specs"][0]["page_number"], 7)
         self.assertEqual(ctx["plot_navigation"][0]["page_text"], "7")
-        self.assertEqual(ctx["plot_navigation"][0]["plot_label"], "Actual Fit | Flow vs Bus Voltage | mean")
+        self.assertEqual(ctx["plot_navigation"][0]["plot_label"], "Actual Fit | Flow vs Bus Voltage | Stat: mean")
 
     def test_apply_pdf_navigation_adds_links_and_bookmarks(self) -> None:
         fitz = __import__("fitz")
@@ -1760,7 +1812,7 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         toc_tables = [table for table in all_tables if _table_text(table) and _table_text(table)[0][0] == "Plot / Section"]
         toc_rows = [row for table in toc_tables for row in _table_text(table)[1:]]
         self.assertEqual(toc_rows[0][0], "Run Condition Metrics")
-        self.assertEqual(toc_rows[1][0], "Pressure | Time | mean")
+        self.assertEqual(toc_rows[1][0], "Parameter: Pressure | X: Time | Stat: mean")
         self.assertEqual(toc_rows[2][0], "Performance Plots")
 
     def test_build_plot_toc_story_uses_side_by_side_columns_without_navigator(self) -> None:
@@ -1808,6 +1860,42 @@ class TestTrendAutoReportFilters(unittest.TestCase):
                 for cell in row
             )
         )
+
+    def test_build_equation_story_adds_overall_and_serial_equation_table(self) -> None:
+        ctx = {
+            "hi": ["SN-002", "SN-001"],
+            "performance_models": [
+                {
+                    "name": "Run Fit",
+                    "x": {"column": "Pressure"},
+                    "y": {"column": "Flow"},
+                    "stat": "mean",
+                    "master": {"equation": "y = 2*x + 1", "rmse": 0.125},
+                    "highlighted": {
+                        "SN-001": {"equation": "y = 2.1*x + 0.9", "rmse": 0.2},
+                        "SN-002": {"equation": "y = 1.9*x + 1.1", "rmse": 0.3},
+                    },
+                }
+            ],
+            "equation_cards": [],
+        }
+
+        with mock.patch.object(tar, "_reportlab_imports", return_value=_fake_reportlab()), mock.patch.object(
+            tar,
+            "_build_portrait_styles",
+            return_value=_fake_styles(),
+        ):
+            story = tar._tar_build_equation_story(ctx)
+
+        table = next(
+            item
+            for item in story
+            if isinstance(item, _FakeTable) and _table_text(item)[0] == ["Run Equation", "Serial", "Equation", "RMSE"]
+        )
+        rows = _table_text(table)
+        self.assertEqual(rows[1], ["Run Fit | Flow vs Pressure | Stat: mean", "Overall", "y = 2*x + 1", "0.125"])
+        self.assertEqual(rows[2], ["Run Fit | Flow vs Pressure | Stat: mean", "SN-002", "y = 1.9*x + 1.1", "0.3"])
+        self.assertEqual(rows[3], ["Run Fit | Flow vs Pressure | Stat: mean", "SN-001", "y = 2.1*x + 0.9", "0.2"])
 
     def test_build_intro_story_excludes_regraded_run_comparison_tables(self) -> None:
         ctx = {
