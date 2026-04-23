@@ -66,6 +66,9 @@ DEFAULT_TREND_AUTO_REPORT_CONFIG = DATA_ROOT / "user_inputs" / "trend_auto_repor
 DEFAULT_ACCEPTANCE_HEURISTICS = DATA_ROOT / "user_inputs" / "acceptance_heuristics.json"
 EXCEL_EXTENSIONS = {".xlsx", ".xls", ".xlsm", ".mat"}
 EXCEL_ARTIFACT_SUFFIX = "__excel"
+TD_SERIAL_SOURCES_DIRNAME = "Test Data File Extractions"
+TD_LEGACY_SERIAL_SOURCES_DIRNAME = "td_serial_sources"
+TD_SERIAL_SOURCE_ARTIFACTS_DIRNAME = "sources"
 TD_DEFAULT_STATS_ORDER = ["mean", "min", "max", "std"]
 TD_ALLOWED_STATS_ORDER = ["mean", "min", "max", "std", "median", "count"]
 TD_ALLOWED_STATS = set(TD_ALLOWED_STATS_ORDER)
@@ -596,6 +599,7 @@ def _eidat_support_dir_score(path: Path) -> tuple[int, int]:
         ("eidat_index.sqlite3", 12),
         ("eidat_support.sqlite3", 12),
         ("projects/projects_registry.sqlite3", 10),
+        (TD_SERIAL_SOURCES_DIRNAME, 4),
         ("projects", 3),
         ("debug/ocr", 3),
         ("excel_sqlite", 2),
@@ -3614,7 +3618,14 @@ def _resolve_excel_sqlite_path_from_workbook(workbook_path: Path, excel_sqlite_r
         prefix = [str(part or "").strip().casefold() for part in parts[:support_idx]]
         if prefix and all(part in {name.casefold() for name in _EIDAT_CONTAINER_DIR_NAMES} for part in prefix):
             return (node_root / Path(*parts)).expanduser()
-    if low.startswith("debug\\") or low.startswith("projects\\") or low.startswith("cache\\"):
+    td_root_prefix = TD_SERIAL_SOURCES_DIRNAME.replace("/", "\\").casefold() + "\\"
+    if (
+        low.startswith("debug\\")
+        or low.startswith("projects\\")
+        or low.startswith("cache\\")
+        or low == TD_SERIAL_SOURCES_DIRNAME.casefold()
+        or low.startswith(td_root_prefix)
+    ):
         return (support_dir / Path(norm)).expanduser()
 
     return (Path(workbook_path).expanduser().parent / p).expanduser()
@@ -5127,6 +5138,177 @@ def _td_source_composite_key(
     if "source_key" in source_row:
         return _td_build_source_composite_key(source_row, source_meta)
     return _td_source_serial_number(source_row, source_meta)
+
+
+def _td_rel_parts(value: object) -> list[str]:
+    raw = str(value or "").strip().strip('"').strip("'")
+    if not raw:
+        return []
+    return [part for part in re.split(r"[\\/]+", raw) if part and part != "."]
+
+
+def _td_rel_uses_official_source_location(value: object) -> bool:
+    parts = [part.casefold() for part in _td_rel_parts(value)]
+    try:
+        root_idx = parts.index(TD_SERIAL_SOURCES_DIRNAME.casefold())
+    except ValueError:
+        return False
+    return TD_SERIAL_SOURCE_ARTIFACTS_DIRNAME.casefold() in parts[root_idx + 1 :]
+
+
+def _td_doc_uses_official_source_location(doc: Mapping[str, object]) -> bool:
+    return any(
+        _td_rel_uses_official_source_location(doc.get(key))
+        for key in ("metadata_rel", "artifacts_rel", "excel_sqlite_rel")
+    )
+
+
+def _td_project_source_identity_key(source_row: Mapping[str, object]) -> str:
+    return _td_build_source_composite_key(source_row, source_row).casefold()
+
+
+def _td_project_doc_rank(global_repo: Path, support_dir: Path, doc: Mapping[str, object]) -> tuple[int, int, int, str]:
+    official_score = sum(
+        1
+        for key in ("metadata_rel", "artifacts_rel", "excel_sqlite_rel")
+        if _td_rel_uses_official_source_location(doc.get(key))
+    )
+    sqlite_ok = 0
+    try:
+        resolved = _resolve_td_source_sqlite_for_node(
+            Path(global_repo).expanduser(),
+            excel_sqlite_rel=str(doc.get("excel_sqlite_rel") or "").strip(),
+            artifacts_rel=str(doc.get("artifacts_rel") or "").strip(),
+        )
+        sqlite_ok = 1 if str(resolved.get("status") or "").strip().lower() == "ok" else 0
+    except Exception:
+        sqlite_ok = 0
+    mtime_ns = 0
+    try:
+        meta_path = _resolve_support_path(support_dir, str(doc.get("metadata_rel") or "").strip())
+        if meta_path and meta_path.exists():
+            mtime_ns = int(getattr(meta_path.stat(), "st_mtime_ns", int(meta_path.stat().st_mtime * 1e9)))
+    except Exception:
+        mtime_ns = 0
+    return (
+        int(official_score),
+        int(sqlite_ok),
+        int(mtime_ns),
+        str(doc.get("metadata_rel") or "").casefold(),
+    )
+
+
+def _td_canonical_project_doc(
+    global_repo: Path,
+    doc: Mapping[str, object],
+    *,
+    docs_pool: Sequence[Mapping[str, object]] | None = None,
+) -> dict[str, object]:
+    row = dict(doc or {})
+    row_key = _td_project_source_identity_key(row)
+    if not row_key and not _td_doc_uses_official_source_location(row):
+        return row
+
+    repo = Path(global_repo).expanduser()
+    support_dir = eidat_support_dir(repo)
+    candidates: list[dict[str, object]] = []
+    if _td_doc_uses_official_source_location(row):
+        candidates.append(dict(row))
+
+    pool = [dict(item) for item in (docs_pool or []) if isinstance(item, Mapping)]
+    for candidate in pool:
+        try:
+            if not is_test_data_doc(candidate):
+                continue
+        except Exception:
+            continue
+        if not _td_doc_uses_official_source_location(candidate):
+            continue
+        cand_key = _td_project_source_identity_key(candidate)
+        if row_key and cand_key == row_key:
+            candidates.append(dict(candidate))
+
+    if not candidates:
+        serial = _td_source_serial_number(row, row).casefold()
+        if serial:
+            serial_matches: list[dict[str, object]] = []
+            serial_identity_keys: set[str] = set()
+            for candidate in pool:
+                try:
+                    if not is_test_data_doc(candidate):
+                        continue
+                except Exception:
+                    continue
+                if not _td_doc_uses_official_source_location(candidate):
+                    continue
+                cand_serial = _td_source_serial_number(candidate, candidate).casefold()
+                if cand_serial != serial:
+                    continue
+                serial_matches.append(dict(candidate))
+                cand_key = _td_project_source_identity_key(candidate)
+                if cand_key:
+                    serial_identity_keys.add(cand_key)
+            if len(serial_identity_keys) == 1 and serial_matches:
+                candidates = serial_matches
+
+    if not candidates:
+        return row
+    return max(candidates, key=lambda item: _td_project_doc_rank(repo, support_dir, item))
+
+
+def _td_canonicalize_project_docs(
+    global_repo: Path,
+    docs: Sequence[Mapping[str, object]] | None,
+    *,
+    docs_pool: Sequence[Mapping[str, object]] | None = None,
+) -> list[dict[str, object]]:
+    pool = list(docs_pool or docs or [])
+    out: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for doc in docs or []:
+        if not isinstance(doc, Mapping):
+            continue
+        canonical = _td_canonical_project_doc(global_repo, doc, docs_pool=pool)
+        key = (
+            str(canonical.get("metadata_rel") or "").strip().casefold()
+            or _td_project_source_identity_key(canonical)
+            or str(canonical.get("excel_sqlite_rel") or "").strip().casefold()
+        )
+        if key and key in seen:
+            continue
+        if key:
+            seen.add(key)
+        out.append(canonical)
+    return out
+
+
+def _td_canonical_selected_metadata_rels(
+    global_repo: Path,
+    selected_rels: Sequence[object],
+    docs_pool: Sequence[Mapping[str, object]] | None,
+) -> list[str]:
+    docs_by_rel: dict[str, Mapping[str, object]] = {}
+    for doc in docs_pool or []:
+        if not isinstance(doc, Mapping):
+            continue
+        rel = str(doc.get("metadata_rel") or "").strip()
+        if rel:
+            docs_by_rel.setdefault(rel, doc)
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw_rel in selected_rels or []:
+        rel = str(raw_rel or "").strip()
+        if not rel:
+            continue
+        doc = docs_by_rel.get(rel)
+        if doc is not None:
+            canonical = _td_canonical_project_doc(global_repo, doc, docs_pool=docs_pool)
+            rel = str(canonical.get("metadata_rel") or rel).strip()
+        key = rel.casefold()
+        if key and key not in seen:
+            seen.add(key)
+            out.append(rel)
+    return out
 
 
 def _td_canonical_source_link_for_node(node_root: Path, path: Path) -> str:
@@ -29259,12 +29441,75 @@ def update_test_data_trending_project_workbook(
     if "serial_number" not in src_headers:
         raise RuntimeError("Sources sheet missing required column: serial_number")
 
+    try:
+        index_docs_for_td = [dict(doc) for doc in read_eidat_index_documents(repo) if isinstance(doc, Mapping)]
+    except Exception:
+        index_docs_for_td = []
+
+    if project_meta and project_meta.get("selected_metadata_rel"):
+        try:
+            canonical_selected = _td_canonical_selected_metadata_rels(
+                repo,
+                project_meta.get("selected_metadata_rel") or [],
+                index_docs_for_td,
+            )
+            current_selected = [
+                str(v).strip()
+                for v in (project_meta.get("selected_metadata_rel") or [])
+                if str(v).strip()
+            ]
+            if canonical_selected and canonical_selected != current_selected:
+                project_meta["selected_metadata_rel"] = canonical_selected
+                project_meta["selected_count"] = len(canonical_selected)
+                project_meta_changed = True
+        except Exception:
+            pass
+
     for r in range(2, (ws_src.max_row or 0) + 1):
         row_item: dict[str, str] = {}
         for key, col in src_headers.items():
             row_item[key] = str(ws_src.cell(r, col).value or "").strip()
         if not str(row_item.get("serial_number") or "").strip():
             continue
+        try:
+            canonical_doc = _td_canonical_project_doc(repo, row_item, docs_pool=index_docs_for_td)
+        except Exception:
+            canonical_doc = {}
+        if canonical_doc and _td_doc_uses_official_source_location(canonical_doc):
+            for key in (
+                "serial_number",
+                "program_title",
+                "document_type",
+                "metadata_rel",
+                "artifacts_rel",
+                "excel_sqlite_rel",
+                "asset_type",
+                "asset_specific_type",
+            ):
+                col = src_headers.get(key)
+                if not col:
+                    continue
+                value = str(canonical_doc.get(key) or "").strip()
+                if key == "excel_sqlite_rel":
+                    try:
+                        resolved = _resolve_td_source_sqlite_for_node(
+                            repo,
+                            excel_sqlite_rel=value,
+                            artifacts_rel=str(canonical_doc.get("artifacts_rel") or row_item.get("artifacts_rel") or "").strip(),
+                        )
+                        if str(resolved.get("status") or "").strip().lower() == "ok":
+                            value = str(
+                                resolved.get("healed_excel_sqlite_rel")
+                                or resolved.get("workbook_excel_sqlite_rel")
+                                or value
+                            ).strip()
+                    except Exception:
+                        pass
+                current = str(ws_src.cell(r, col).value or "").strip()
+                if value and current != value:
+                    ws_src.cell(r, col).value = value
+                    row_item[key] = value
+                    project_meta_changed = True
         try:
             row_meta = _load_td_source_metadata(wb_path, row_item)
         except Exception:
@@ -29289,8 +29534,12 @@ def update_test_data_trending_project_workbook(
 
     serials: list[str] = []
     serials_set: set[str] = set()
+    source_keys_set: set[str] = set()
     for r in range(2, (ws_src.max_row or 0) + 1):
         sn = str(ws_src.cell(r, src_headers["serial_number"]).value or "").strip()
+        source_key = str(ws_src.cell(r, src_headers.get("source_key", 0)).value or "").strip() if src_headers.get("source_key") else ""
+        if source_key:
+            source_keys_set.add(source_key)
         if sn and sn not in serials_set:
             serials.append(sn)
             serials_set.add(sn)
@@ -29300,8 +29549,12 @@ def update_test_data_trending_project_workbook(
     added_serials: list[str] = []
     if continued_rules and not dry_run:
         try:
-            docs = read_eidat_index_documents(repo)
-            matched_docs = _docs_matching_population_rules(docs, continued_rules)
+            docs = index_docs_for_td or read_eidat_index_documents(repo)
+            matched_docs = _td_canonicalize_project_docs(
+                repo,
+                _docs_matching_population_rules(docs, continued_rules),
+                docs_pool=docs,
+            )
 
             eligible_docs: list[dict] = []
             for d in matched_docs:
@@ -29320,20 +29573,9 @@ def update_test_data_trending_project_workbook(
 
             support_dir = eidat_support_dir(repo)
             for sn in sorted(docs_by_serial.keys()):
-                if sn in serials_set:
-                    continue
                 if sn in excluded_serials:
                     continue
                 doc = _best_doc_for_serial(support_dir, docs_by_serial.get(sn, [])) or {}
-                row = int((ws_src.max_row or 0) + 1)
-                ws_src.cell(row, int(src_headers["serial_number"])).value = str(sn)
-                ws_src.cell(row, int(src_headers["program_title"])).value = str(doc.get("program_title") or "")
-                ws_src.cell(row, int(src_headers["document_type"])).value = str(doc.get("document_type") or "")
-                ws_src.cell(row, int(src_headers["metadata_rel"])).value = str(doc.get("metadata_rel") or "")
-                ws_src.cell(row, int(src_headers["artifacts_rel"])).value = str(doc.get("artifacts_rel") or "")
-                ws_src.cell(row, int(src_headers["excel_sqlite_rel"])).value = str(doc.get("excel_sqlite_rel") or "")
-                ws_src.cell(row, int(src_headers["asset_type"])).value = str(doc.get("asset_type") or "")
-                ws_src.cell(row, int(src_headers["asset_specific_type"])).value = str(doc.get("asset_specific_type") or "")
                 source_key = _td_build_source_composite_key(
                     {
                         "serial_number": str(sn),
@@ -29343,9 +29585,40 @@ def update_test_data_trending_project_workbook(
                     },
                     doc,
                 )
+                if source_key and source_key in source_keys_set:
+                    continue
+                if not source_key and sn in serials_set:
+                    continue
+                resolved_sqlite_rel = str(doc.get("excel_sqlite_rel") or "").strip()
+                try:
+                    resolved = _resolve_td_source_sqlite_for_node(
+                        repo,
+                        excel_sqlite_rel=resolved_sqlite_rel,
+                        artifacts_rel=str(doc.get("artifacts_rel") or "").strip(),
+                    )
+                    if str(resolved.get("status") or "").strip().lower() == "ok":
+                        resolved_sqlite_rel = str(
+                            resolved.get("healed_excel_sqlite_rel")
+                            or resolved.get("workbook_excel_sqlite_rel")
+                            or resolved_sqlite_rel
+                        ).strip()
+                except Exception:
+                    pass
+                row = int((ws_src.max_row or 0) + 1)
+                ws_src.cell(row, int(src_headers["serial_number"])).value = str(sn)
+                ws_src.cell(row, int(src_headers["program_title"])).value = str(doc.get("program_title") or "")
+                ws_src.cell(row, int(src_headers["document_type"])).value = str(doc.get("document_type") or "")
+                ws_src.cell(row, int(src_headers["metadata_rel"])).value = str(doc.get("metadata_rel") or "")
+                ws_src.cell(row, int(src_headers["artifacts_rel"])).value = str(doc.get("artifacts_rel") or "")
+                ws_src.cell(row, int(src_headers["excel_sqlite_rel"])).value = resolved_sqlite_rel
+                ws_src.cell(row, int(src_headers["asset_type"])).value = str(doc.get("asset_type") or "")
+                ws_src.cell(row, int(src_headers["asset_specific_type"])).value = str(doc.get("asset_specific_type") or "")
                 ws_src.cell(row, int(src_headers["source_key"])).value = source_key
-                serials.append(sn)
-                serials_set.add(sn)
+                if sn not in serials_set:
+                    serials.append(sn)
+                    serials_set.add(sn)
+                if source_key:
+                    source_keys_set.add(source_key)
                 added_serials.append(sn)
 
                 if project_meta:
@@ -29792,7 +30065,11 @@ def update_test_data_trending_project_workbook(
     try:
         support_dir = eidat_support_dir(repo)
         docs = read_eidat_index_documents(repo)
-        selected = _project_selected_metadata_rels(project_dir)
+        selected = {
+            str(v).strip()
+            for v in (project_meta.get("selected_metadata_rel") or [])
+            if str(v).strip()
+        } or _project_selected_metadata_rels(project_dir)
         docs_preferred = [d for d in docs if str(d.get("metadata_rel") or "").strip() in selected] if selected else None
         _sync_project_workbook_metadata_inplace(
             wb,
@@ -29835,7 +30112,17 @@ def update_test_data_trending_project_workbook(
                 else:
                     project_meta.pop("excluded_serials", None)
                 if "selected_metadata_rel" in project_meta:
-                    rels_now = sorted(
+                    source_rels_now: list[str] = []
+                    seen_source_rels: set[str] = set()
+                    meta_rel_col = src_headers.get("metadata_rel")
+                    if meta_rel_col:
+                        for row_idx in range(2, (ws_src.max_row or 0) + 1):
+                            rel = str(ws_src.cell(row_idx, int(meta_rel_col)).value or "").strip()
+                            key = rel.casefold()
+                            if rel and key not in seen_source_rels:
+                                seen_source_rels.add(key)
+                                source_rels_now.append(rel)
+                    rels_now = source_rels_now or sorted(
                         {
                             str(v).strip()
                             for v in (project_meta.get("selected_metadata_rel") or [])
@@ -30369,13 +30656,41 @@ def get_file_artifacts_path(global_repo: Path, rel_path: str) -> Path | None:
     ext = path_obj.suffix.lower()
     root = eidat_debug_ocr_root(repo)
     candidates: list[Path] = []
+    support_dir = eidat_support_dir(repo)
+    td_root = support_dir / TD_SERIAL_SOURCES_DIRNAME
+    if ext in EXCEL_EXTENSIONS and td_root.exists():
+        td_source_stems = [stem]
+        if ext == ".mat" and detect_mat_bundle_member is not None:
+            try:
+                bundle = detect_mat_bundle_member(repo / path_obj, repo_root=repo)
+            except Exception:
+                bundle = None
+            if bundle is not None:
+                td_source_stems.insert(0, bundle.bundle_stem)
+        for source_stem in td_source_stems:
+            safe_stem = re.sub(r"[^A-Za-z0-9._ -]+", "_", str(source_stem or "").strip()).strip(" .")
+            safe_stem = re.sub(r"\s+", "_", safe_stem)[:80]
+            if not safe_stem:
+                continue
+            try:
+                candidates.extend(
+                    [
+                        p
+                        for p in td_root.glob(
+                            f"*/*/*/*/{TD_SERIAL_SOURCE_ARTIFACTS_DIRNAME}/{safe_stem}__*{EXCEL_ARTIFACT_SUFFIX}"
+                        )
+                        if p.exists()
+                    ]
+                )
+            except Exception:
+                pass
     if ext == ".mat" and detect_mat_bundle_member is not None and mat_bundle_artifacts_dir is not None:
         try:
             bundle = detect_mat_bundle_member(repo / path_obj, repo_root=repo)
         except Exception:
             bundle = None
         if bundle is not None:
-            candidates.append(mat_bundle_artifacts_dir(eidat_support_dir(repo), bundle))
+            candidates.append(mat_bundle_artifacts_dir(support_dir, bundle))
     if ext in EXCEL_EXTENSIONS:
         candidates.append(root / f"{stem}{EXCEL_ARTIFACT_SUFFIX}")
     candidates.append(root / stem)
@@ -31382,6 +31697,12 @@ def save_test_data_trending_project_editor_changes(
         )
 
     chosen_docs = [dict(docs_by_rel[rel]) for rel in selected_rels]
+    chosen_docs = _td_canonicalize_project_docs(repo, chosen_docs, docs_pool=docs)
+    selected_rels = _td_canonical_selected_metadata_rels(
+        repo,
+        [str(doc.get("metadata_rel") or "").strip() for doc in chosen_docs],
+        docs,
+    )
     serials = sorted(
         {
             str(doc.get("serial_number") or "").strip()
@@ -31426,6 +31747,9 @@ def save_test_data_trending_project_editor_changes(
             "metadata_rel",
             "artifacts_rel",
             "excel_sqlite_rel",
+            "asset_type",
+            "asset_specific_type",
+            "source_key",
         ]
         for key in required_src_cols:
             if key in src_headers:
@@ -31462,6 +31786,17 @@ def save_test_data_trending_project_editor_changes(
             ws_src.cell(row_idx, int(src_headers["metadata_rel"])).value = str(doc.get("metadata_rel") or "").strip()
             ws_src.cell(row_idx, int(src_headers["artifacts_rel"])).value = str(doc.get("artifacts_rel") or "").strip()
             ws_src.cell(row_idx, int(src_headers["excel_sqlite_rel"])).value = resolved_sqlite_rel
+            ws_src.cell(row_idx, int(src_headers["asset_type"])).value = str(doc.get("asset_type") or "").strip()
+            ws_src.cell(row_idx, int(src_headers["asset_specific_type"])).value = str(doc.get("asset_specific_type") or "").strip()
+            ws_src.cell(row_idx, int(src_headers["source_key"])).value = _td_build_source_composite_key(
+                {
+                    "serial_number": str(serial),
+                    "program_title": str(doc.get("program_title") or "").strip(),
+                    "asset_type": str(doc.get("asset_type") or "").strip(),
+                    "asset_specific_type": str(doc.get("asset_specific_type") or "").strip(),
+                },
+                doc,
+            )
         wb.save(str(wb_path))
     finally:
         try:
@@ -36059,7 +36394,18 @@ def _write_test_data_trending_workbook(
         stats = list(TD_DEFAULT_STATS_ORDER)
 
     repo = Path(global_repo).expanduser() if global_repo is not None else None
-    runs = _discover_td_runs_for_docs(global_repo, docs)
+    docs_for_workbook: list[dict[str, object]] = [dict(doc) for doc in (docs or []) if isinstance(doc, Mapping)]
+    if repo is not None and docs_for_workbook:
+        try:
+            index_docs = [dict(doc) for doc in read_eidat_index_documents(repo) if isinstance(doc, Mapping)]
+        except Exception:
+            index_docs = []
+        docs_for_workbook = _td_canonicalize_project_docs(
+            repo,
+            docs_for_workbook,
+            docs_pool=[*index_docs, *docs_for_workbook],
+        )
+    runs = _discover_td_runs_for_docs(global_repo, docs_for_workbook)
     if not runs:
         runs = ["Run1"]
 
@@ -36067,7 +36413,7 @@ def _write_test_data_trending_workbook(
 
     source_rows: list[dict[str, str]] = []
     seen_source_keys: set[str] = set()
-    for doc in docs or []:
+    for doc in docs_for_workbook:
         sn = str((doc or {}).get("serial_number") or "").strip()
         if not sn:
             continue
@@ -36824,6 +37170,14 @@ def create_eidat_project(
     selected = {str(s).strip() for s in (selected_metadata_rel or []) if str(s).strip()}
     chosen_docs = [d for d in docs if str(d.get("metadata_rel") or "").strip() in selected]
     continued_population_clean = _sanitize_continued_population(continued_population)
+
+    if project_type == EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING:
+        chosen_docs = _td_canonicalize_project_docs(repo, chosen_docs, docs_pool=docs)
+        selected = {
+            str(doc.get("metadata_rel") or "").strip()
+            for doc in chosen_docs
+            if str(doc.get("metadata_rel") or "").strip()
+        }
 
     if project_type in (EIDAT_PROJECT_TYPE_TRENDING, EIDAT_PROJECT_TYPE_RAW_TRENDING):
         bad = [d for d in chosen_docs if isinstance(d, dict) and not _is_confirmed_doc_type(d, "EIDP")]

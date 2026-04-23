@@ -101,7 +101,9 @@ EXCEL_EXTENSIONS = {".xlsx", ".xls", ".xlsm"}
 MAT_EXTENSIONS = {".mat"}
 DATA_MATRIX_EXTENSIONS = set(EXCEL_EXTENSIONS) | set(MAT_EXTENSIONS)
 EXCEL_ARTIFACT_SUFFIX = "__excel"
-TD_SERIAL_AGGREGATES_DIRNAME = "td_serial_sources"
+TD_SERIAL_AGGREGATES_DIRNAME = "Test Data File Extractions"
+TD_LEGACY_SERIAL_AGGREGATES_DIRNAME = "td_serial_sources"
+TD_SERIAL_SOURCE_ARTIFACTS_DIRNAME = "sources"
 TD_SERIAL_AGGREGATE_METADATA_SOURCE = "td_serial_aggregate"
 
 _TD_AGG_SEQ_SHEET_RE = re.compile(
@@ -1098,6 +1100,32 @@ def _cleanup_stale_mat_member_artifacts(paths: SupportPaths, members: list[MatBu
             shutil.rmtree(old_dir, ignore_errors=True)
 
 
+def _cleanup_stale_td_source_artifacts(support_dir: Path, old_dir: Path, keep_dir: Path) -> None:
+    old = Path(old_dir).expanduser()
+    keep = Path(keep_dir).expanduser()
+    try:
+        if old.resolve() == keep.resolve():
+            return
+    except Exception:
+        if str(old) == str(keep):
+            return
+    try:
+        debug_ocr = Path(support_dir).expanduser() / "debug" / "ocr"
+        old.resolve().relative_to(debug_ocr.resolve())
+    except Exception:
+        return
+    try:
+        rel_parts = [part.casefold() for part in old.relative_to(debug_ocr).parts]
+    except Exception:
+        rel_parts = [part.casefold() for part in old.parts]
+    if TD_LEGACY_SERIAL_AGGREGATES_DIRNAME.casefold() in rel_parts:
+        return
+    if not old.name.endswith(EXCEL_ARTIFACT_SUFFIX):
+        return
+    if old.exists() and old.is_dir():
+        shutil.rmtree(old, ignore_errors=True)
+
+
 def _write_mat_bundle_manifest(
     *,
     global_repo: Path,
@@ -1151,6 +1179,55 @@ def _td_agg_safe_path_name(value: object, *, fallback: str = "unknown") -> str:
     cleaned = re.sub(r"[^A-Za-z0-9._ -]+", "_", raw).strip(" .")
     cleaned = re.sub(r"\s+", "_", cleaned)
     return cleaned[:80] or str(fallback or "unknown")
+
+
+def _td_extractions_root(support_dir: Path) -> Path:
+    return Path(support_dir) / TD_SERIAL_AGGREGATES_DIRNAME
+
+
+def _td_legacy_extractions_root(support_dir: Path) -> Path:
+    return Path(support_dir) / "debug" / "ocr" / TD_LEGACY_SERIAL_AGGREGATES_DIRNAME
+
+
+def _td_metadata_search_roots(support_dir: Path) -> list[Path]:
+    roots = [
+        _td_extractions_root(support_dir),
+        Path(support_dir) / "debug" / "ocr",
+    ]
+    out: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        key = str(root).casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(root)
+    return out
+
+
+def _td_source_scoped_artifacts_dir(
+    support_dir: Path,
+    metadata: Mapping[str, Any],
+    data_path: Path,
+    *,
+    bundle_stem: str = "",
+) -> Path:
+    source_stem = _td_agg_safe_path_name(bundle_stem or Path(data_path).stem, fallback="source")
+    try:
+        source_hash_basis = str(Path(data_path).expanduser().resolve()).casefold()
+    except Exception:
+        source_hash_basis = str(Path(data_path).expanduser()).casefold()
+    source_hash = hashlib.sha1(source_hash_basis.encode("utf-8", errors="ignore")).hexdigest()[:10]
+    source_leaf = f"{source_stem}__{source_hash}{EXCEL_ARTIFACT_SUFFIX}"
+    return (
+        _td_extractions_root(support_dir)
+        / _td_agg_safe_path_name(metadata.get("program_title"), fallback="Unknown_Program")
+        / _td_agg_safe_path_name(metadata.get("asset_type"), fallback="Unknown_Asset")
+        / _td_agg_safe_path_name(metadata.get("asset_specific_type"), fallback="Unknown_Type")
+        / _td_agg_safe_path_name(metadata.get("serial_number"), fallback="Unknown_Serial")
+        / TD_SERIAL_SOURCE_ARTIFACTS_DIRNAME
+        / source_leaf
+    )
 
 
 def _td_agg_safe_ident(value: object, *, prefix: str = "sheet") -> str:
@@ -1305,27 +1382,37 @@ def _td_agg_resolve_support_path(paths: SupportPaths, raw_path: object) -> Path:
 
 
 def _td_agg_metadata_files(support_dir: Path) -> list[Path]:
-    root = Path(support_dir) / "debug" / "ocr"
-    if not root.exists():
-        return []
     out: list[Path] = []
-    aggregate_root_name = TD_SERIAL_AGGREGATES_DIRNAME.casefold()
-    for path in root.rglob("*"):
-        try:
-            if not path.is_file():
+    seen: set[str] = set()
+    debug_ocr_root = Path(support_dir) / "debug" / "ocr"
+    legacy_root = _td_legacy_extractions_root(support_dir)
+    for root in _td_metadata_search_roots(support_dir):
+        if not root.exists():
+            continue
+        for path in root.rglob("*"):
+            try:
+                if not path.is_file():
+                    continue
+            except Exception:
                 continue
-        except Exception:
-            continue
-        low = path.name.lower()
-        if not (low.endswith("_metadata.json") or low.endswith(".metadata.json")):
-            continue
-        try:
-            parts = [p.casefold() for p in path.relative_to(root).parts]
-        except Exception:
-            parts = [p.casefold() for p in path.parts]
-        if aggregate_root_name in parts:
-            continue
-        out.append(path)
+            low = path.name.lower()
+            if not (low.endswith("_metadata.json") or low.endswith(".metadata.json")):
+                continue
+            if root == debug_ocr_root:
+                try:
+                    path.resolve().relative_to(legacy_root.resolve())
+                except Exception:
+                    pass
+                else:
+                    # The former composite TD repository can still be read by
+                    # direct project links, but it is no longer a source for new
+                    # aggregate discovery now that the top-level TD root is official.
+                    continue
+            key = str(path).casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(path)
     return sorted(out, key=lambda p: str(p).casefold())
 
 
@@ -1623,10 +1710,7 @@ def _td_agg_write_group(
     asset_type = str(first.get("asset_type") or "Unknown").strip() or "Unknown"
     asset_specific_type = str(first.get("asset_specific_type") or "Unknown").strip() or "Unknown"
     out_dir = (
-        Path(paths.support_dir)
-        / "debug"
-        / "ocr"
-        / TD_SERIAL_AGGREGATES_DIRNAME
+        _td_extractions_root(paths.support_dir)
         / _td_agg_safe_path_name(program_title, fallback="program")
         / _td_agg_safe_path_name(asset_type, fallback="asset")
         / _td_agg_safe_path_name(asset_specific_type, fallback="asset_specific")
@@ -1844,6 +1928,39 @@ def _td_agg_write_group(
     }
 
 
+def _td_agg_clear_previous_outputs(aggregate_root: Path) -> None:
+    root = Path(aggregate_root)
+    if not root.exists():
+        return
+    for path in sorted(root.rglob("*"), key=lambda p: len(p.parts), reverse=True):
+        try:
+            rel_parts = [part.casefold() for part in path.relative_to(root).parts]
+        except Exception:
+            rel_parts = [part.casefold() for part in path.parts]
+        if "sources" in rel_parts:
+            continue
+        try:
+            if path.is_file():
+                low = path.name.lower()
+                if low == "td_serial_aggregate.json" or low.endswith(".sqlite3") or low.endswith("_metadata.json"):
+                    path.unlink(missing_ok=True)  # type: ignore[call-arg]
+            elif path.is_dir():
+                try:
+                    next(path.iterdir())
+                except StopIteration:
+                    path.rmdir()
+                except Exception:
+                    pass
+        except TypeError:
+            try:
+                if path.exists() and path.is_file():
+                    path.unlink()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+
 def rebuild_td_serial_aggregates(
     paths: SupportPaths,
     *,
@@ -1852,9 +1969,8 @@ def rebuild_td_serial_aggregates(
     mirror_xlsx: bool = False,
 ) -> dict[str, Any]:
     members = _td_agg_collect_members(paths)
-    aggregate_root = Path(paths.support_dir) / "debug" / "ocr" / TD_SERIAL_AGGREGATES_DIRNAME
-    if aggregate_root.exists():
-        shutil.rmtree(aggregate_root, ignore_errors=True)
+    aggregate_root = _td_extractions_root(paths.support_dir)
+    _td_agg_clear_previous_outputs(aggregate_root)
     groups: dict[tuple[str, str, str, str], list[dict[str, Any]]] = {}
     for member in members:
         key = tuple(member.get("group_key") or ())
@@ -2221,8 +2337,10 @@ def process_candidates(
                             if is_mat_bundle and bundle_seed is not None
                             else _excel_artifacts_dir(paths, abs_path)
                         )
+                        legacy_artifacts_root = artifacts_root
                         artifacts_dir = str(artifacts_root)
                         metadata_identity_path = _bundle_identity_path(bundle_seed) if is_mat_bundle and bundle_seed is not None else abs_path
+                        data_matrix_sqlite_abs: Path | None = None
 
                         # Load any existing artifacts metadata first (treated as curated when present).
                         try:
@@ -2279,6 +2397,33 @@ def process_candidates(
                         is_confirmed_test_data = bool(is_mat) or _is_confirmed_test_data_meta(
                             raw_meta if isinstance(raw_meta, dict) else {}
                         )
+                        if is_test_data and isinstance(raw_meta, dict):
+                            scoped_artifacts_root = _td_source_scoped_artifacts_dir(
+                                paths.support_dir,
+                                raw_meta,
+                                metadata_identity_path,
+                                bundle_stem=bundle_seed.bundle_stem if is_mat_bundle and bundle_seed is not None else "",
+                            )
+                            try:
+                                scoped_existing_meta = load_metadata_from_artifacts(
+                                    scoped_artifacts_root,
+                                    metadata_identity_path,
+                                )
+                            except Exception:
+                                scoped_existing_meta = None
+                            if scoped_existing_meta is not None:
+                                try:
+                                    raw_meta = canonicalize_metadata_for_file(
+                                        bundle_seed.file_path if is_mat_bundle and bundle_seed is not None else abs_path,
+                                        existing_meta=scoped_existing_meta,
+                                        extracted_meta=raw_meta,
+                                        default_document_type="TD" if is_mat else "Unknown",
+                                    )
+                                    existing_meta = scoped_existing_meta
+                                except Exception:
+                                    pass
+                            artifacts_root = scoped_artifacts_root
+                            artifacts_dir = str(artifacts_root)
 
                         # Always run config-driven extraction as part of processing.
                         # If pandas is missing, allow Test Data flows to continue (SQLite is the key output).
@@ -2313,7 +2458,7 @@ def process_candidates(
                                 if is_mat_bundle and bundle_seed is not None:
                                     artifacts_root.mkdir(parents=True, exist_ok=True)
                                     _cleanup_stale_mat_member_artifacts(paths, bundle_members, artifacts_root)
-                                    sqlite_abs = mat_bundle_sqlite_path(paths.support_dir, bundle_seed)
+                                    sqlite_abs = artifacts_root / f"{bundle_seed.bundle_stem}.sqlite3"
                                     write_mat_bundle_sqlite(
                                         mat_paths=[member.file_path for member in bundle_members],
                                         sqlite_path=sqlite_abs,
@@ -2355,6 +2500,7 @@ def process_candidates(
                                             except Exception:
                                                 sqlite_rel = sp
                                             break
+                                data_matrix_sqlite_abs = sqlite_abs
                                 if not sqlite_rel:
                                     detail = next((msg for msg in sqlite_errors if msg), "")
                                     if detail:
@@ -2436,10 +2582,12 @@ def process_candidates(
                                 artifacts_dir=artifacts_root,
                                 bundle=bundle_seed,
                                 members=bundle_members,
-                                sqlite_path=mat_bundle_sqlite_path(paths.support_dir, bundle_seed),
+                                sqlite_path=data_matrix_sqlite_abs or (artifacts_root / f"{bundle_seed.bundle_stem}.sqlite3"),
                                 metadata_path=metadata_path,
                                 metadata=clean_meta,
                             )
+                        if is_test_data and metadata_path is not None:
+                            _cleanup_stale_td_source_artifacts(paths.support_dir, legacy_artifacts_root, artifacts_root)
                     else:
                         core = _get_core()
                         # Use default debug-method pipeline (fused tables)

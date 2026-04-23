@@ -53,13 +53,44 @@ def _stderr(line: str) -> None:
 
 @contextmanager
 def _ignore_openpyxl_sparkline_extension_warning():
+    patched: list[tuple[Any, Any]] = []
+    try:
+        # EIDAT only reads workbook cell values here.  Some TD workbooks contain
+        # sparkline extension XML that openpyxl can warn about, or occasionally
+        # fail while parsing.  Skip unsupported worksheet extensions completely
+        # so visual-only sparklines cannot block SQLite generation.
+        from openpyxl.worksheet import _reader as worksheet_reader  # type: ignore
+
+        parser_cls = getattr(worksheet_reader, "WorkSheetParser", None)
+        original = getattr(parser_cls, "parse_extensions", None) if parser_cls is not None else None
+        if parser_cls is not None and original is not None:
+            def _skip_unsupported_extensions(self, element):  # type: ignore[no-untyped-def]
+                return None
+
+            setattr(parser_cls, "parse_extensions", _skip_unsupported_extensions)
+            patched.append((parser_cls, original))
+    except Exception:
+        pass
+
     with warnings.catch_warnings():
         warnings.filterwarnings(
             "ignore",
             message=_OPENPYXL_SPARKLINE_EXTENSION_WARNING_RE,
             category=UserWarning,
         )
-        yield
+        warnings.filterwarnings(
+            "ignore",
+            message=r".*[Ee]xtension\s+is\s+not\s+supported\s+and\s+will\s+be\s+removed.*",
+            category=UserWarning,
+        )
+        try:
+            yield
+        finally:
+            for parser_cls, original in reversed(patched):
+                try:
+                    setattr(parser_cls, "parse_extensions", original)
+                except Exception:
+                    pass
 
 
 def _load_openpyxl_workbook_for_td_source(excel_path: Path):

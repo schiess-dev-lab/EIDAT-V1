@@ -2483,6 +2483,282 @@ class TestTDSupportWorkbook(unittest.TestCase):
             self.assertEqual(source_rows, [(expected[0], "SN42"), (expected[1], "SN42")])
             self.assertEqual(metric_rows, [(expected[0], 30.0), (expected[1], 130.0)])
 
+    def test_td_project_workbook_prefers_official_source_location_from_index(self) -> None:
+        from openpyxl import load_workbook  # type: ignore
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            support_dir = root / "EIDAT Support"
+            official_artifacts_rel = (
+                "Test Data File Extractions/Program_A/Thruster/Valve/SN1/"
+                "sources/source__abc123__excel"
+            )
+            official_dir = support_dir / Path(official_artifacts_rel)
+            official_dir.mkdir(parents=True, exist_ok=True)
+            official_sqlite = official_dir / "source.sqlite3"
+            self._make_source_sqlite(official_sqlite)
+            official_metadata_rel = f"{official_artifacts_rel}/source_metadata.json"
+            (support_dir / Path(official_metadata_rel)).write_text(
+                json.dumps(
+                    {
+                        "program_title": "Program A",
+                        "asset_type": "Thruster",
+                        "asset_specific_type": "Valve",
+                        "serial_number": "SN1",
+                        "document_type": "TD",
+                        "document_type_acronym": "TD",
+                        "document_type_status": "confirmed",
+                        "document_type_review_required": False,
+                        "excel_sqlite_rel": f"EIDAT Support/{official_artifacts_rel}/source.sqlite3",
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            old_doc = {
+                "serial_number": "SN1",
+                "program_title": "Program A",
+                "asset_type": "Thruster",
+                "asset_specific_type": "Valve",
+                "document_type": "TD",
+                "document_type_acronym": "TD",
+                "document_type_status": "confirmed",
+                "document_type_review_required": False,
+                "metadata_rel": "debug/ocr/old_source/source_metadata.json",
+                "artifacts_rel": "debug/ocr/old_source",
+                "excel_sqlite_rel": "debug/ocr/old_source/source.sqlite3",
+            }
+            official_doc = dict(old_doc)
+            official_doc.update(
+                {
+                    "metadata_rel": official_metadata_rel,
+                    "artifacts_rel": official_artifacts_rel,
+                    "excel_sqlite_rel": f"EIDAT Support/{official_artifacts_rel}/source.sqlite3",
+                }
+            )
+
+            wb_path = root / "project.xlsx"
+            with mock.patch.object(be, "read_eidat_index_documents", return_value=[old_doc, official_doc]):
+                be._write_test_data_trending_workbook(
+                    wb_path,
+                    global_repo=root,
+                    serials=["SN1"],
+                    docs=[old_doc],
+                    config=self._make_config(),
+                )
+
+            wb = load_workbook(str(wb_path), read_only=True, data_only=True)
+            try:
+                ws = wb["Sources"]
+                headers = {
+                    str(ws.cell(1, col).value or "").strip().lower(): col
+                    for col in range(1, (ws.max_column or 0) + 1)
+                }
+                self.assertEqual(str(ws.cell(2, headers["metadata_rel"]).value or ""), official_metadata_rel)
+                self.assertEqual(str(ws.cell(2, headers["artifacts_rel"]).value or ""), official_artifacts_rel)
+                self.assertIn("Test Data File Extractions", str(ws.cell(2, headers["excel_sqlite_rel"]).value or ""))
+                self.assertEqual(
+                    str(ws.cell(2, headers["source_key"]).value or ""),
+                    "Program A / Thruster / Valve / SN1",
+                )
+            finally:
+                wb.close()
+
+    def test_update_td_project_workbook_migrates_sources_to_official_location(self) -> None:
+        from openpyxl import load_workbook  # type: ignore
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            support_dir = root / "EIDAT Support"
+            official_artifacts_rel = (
+                "Test Data File Extractions/Program_A/Thruster/Valve/SN1/"
+                "sources/source__abc123__excel"
+            )
+            official_dir = support_dir / Path(official_artifacts_rel)
+            official_dir.mkdir(parents=True, exist_ok=True)
+            official_sqlite = official_dir / "source.sqlite3"
+            self._make_source_sqlite(official_sqlite)
+            official_metadata_rel = f"{official_artifacts_rel}/source_metadata.json"
+            (support_dir / Path(official_metadata_rel)).write_text(
+                json.dumps(
+                    {
+                        "program_title": "Program A",
+                        "asset_type": "Thruster",
+                        "asset_specific_type": "Valve",
+                        "serial_number": "SN1",
+                        "document_type": "TD",
+                        "document_type_acronym": "TD",
+                        "document_type_status": "confirmed",
+                        "document_type_review_required": False,
+                        "excel_sqlite_rel": f"EIDAT Support/{official_artifacts_rel}/source.sqlite3",
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            old_metadata_rel = "debug/ocr/old_source/source_metadata.json"
+            old_doc = {
+                "serial_number": "SN1",
+                "program_title": "Program A",
+                "asset_type": "Thruster",
+                "asset_specific_type": "Valve",
+                "document_type": "TD",
+                "document_type_acronym": "TD",
+                "document_type_status": "confirmed",
+                "document_type_review_required": False,
+                "metadata_rel": old_metadata_rel,
+                "artifacts_rel": "debug/ocr/old_source",
+                "excel_sqlite_rel": "debug/ocr/old_source/source.sqlite3",
+            }
+            official_doc = dict(old_doc)
+            official_doc.update(
+                {
+                    "metadata_rel": official_metadata_rel,
+                    "artifacts_rel": official_artifacts_rel,
+                    "excel_sqlite_rel": f"EIDAT Support/{official_artifacts_rel}/source.sqlite3",
+                }
+            )
+
+            wb_path = root / "project.xlsx"
+            be._write_test_data_trending_workbook(
+                wb_path,
+                global_repo=None,
+                serials=["SN1"],
+                docs=[old_doc],
+                config=self._make_config(),
+            )
+            support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+            be._write_td_support_workbook(
+                support_path,
+                sequence_names=["RunA"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+                program_titles=["Program A"],
+            )
+            (root / be.EIDAT_PROJECT_META).write_text(
+                json.dumps(
+                    {
+                        "name": "project",
+                        "type": be.EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING,
+                        "global_repo": str(root),
+                        "project_dir": str(root),
+                        "workbook": str(wb_path),
+                        "selected_metadata_rel": [old_metadata_rel],
+                        "selected_count": 1,
+                        "serials": ["SN1"],
+                        "serials_count": 1,
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(be, "read_eidat_index_documents", return_value=[official_doc]):
+                be.update_test_data_trending_project_workbook(
+                    root,
+                    wb_path,
+                    overwrite=True,
+                    require_existing_cache=False,
+                )
+
+            saved_meta = json.loads((root / be.EIDAT_PROJECT_META).read_text(encoding="utf-8"))
+            self.assertEqual(saved_meta.get("selected_metadata_rel"), [official_metadata_rel])
+
+            wb = load_workbook(str(wb_path), read_only=True, data_only=True)
+            try:
+                ws = wb["Sources"]
+                headers = {
+                    str(ws.cell(1, col).value or "").strip().lower(): col
+                    for col in range(1, (ws.max_column or 0) + 1)
+                }
+                self.assertEqual(str(ws.cell(2, headers["metadata_rel"]).value or ""), official_metadata_rel)
+                self.assertEqual(str(ws.cell(2, headers["artifacts_rel"]).value or ""), official_artifacts_rel)
+                self.assertIn("Test Data File Extractions", str(ws.cell(2, headers["excel_sqlite_rel"]).value or ""))
+            finally:
+                wb.close()
+
+    def test_index_discovers_top_level_test_data_file_extractions(self) -> None:
+        app_dir = ROOT / "EIDAT_App_Files" / "Application"
+        if str(app_dir) not in sys.path:
+            sys.path.insert(0, str(app_dir))
+        from eidat_manager_db import SupportPaths  # type: ignore
+        from eidat_manager_index import build_index  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            support_dir = root / "EIDAT Support"
+            artifacts_rel = (
+                "Test Data File Extractions/Program_A/Thruster/Valve/SN1/"
+                "sources/source__abc123__excel"
+            )
+            artifacts_dir = support_dir / Path(artifacts_rel)
+            artifacts_dir.mkdir(parents=True, exist_ok=True)
+            metadata_rel = f"{artifacts_rel}/source_metadata.json"
+            (support_dir / Path(metadata_rel)).write_text(
+                json.dumps(
+                    {
+                        "program_title": "Program A",
+                        "asset_type": "Thruster",
+                        "asset_specific_type": "Valve",
+                        "serial_number": "SN1",
+                        "document_type": "TD",
+                        "document_type_acronym": "TD",
+                        "document_type_status": "confirmed",
+                        "document_type_review_required": False,
+                        "excel_sqlite_rel": f"EIDAT Support/{artifacts_rel}/source.sqlite3",
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            paths = SupportPaths(
+                global_repo=root,
+                support_dir=support_dir,
+                db_path=support_dir / "eidat_support.sqlite3",
+                logs_dir=support_dir / "logs",
+                staging_dir=support_dir / "staging",
+            )
+
+            summary = build_index(paths)
+            self.assertEqual(summary.metadata_count, 1)
+            with sqlite3.connect(str(support_dir / "eidat_index.sqlite3")) as conn:
+                row = conn.execute(
+                    "SELECT metadata_rel, artifacts_rel, excel_sqlite_rel FROM documents"
+                ).fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(str(row[0]).replace("\\", "/"), metadata_rel)
+            self.assertEqual(str(row[1]).replace("\\", "/"), artifacts_rel)
+            self.assertIn("Test Data File Extractions", row[2])
+
+    def test_scan_recognizes_top_level_test_data_file_extraction_artifacts(self) -> None:
+        app_dir = ROOT / "EIDAT_App_Files" / "Application"
+        if str(app_dir) not in sys.path:
+            sys.path.insert(0, str(app_dir))
+        import eidat_manager_scan as scan  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            support_dir = root / "EIDAT Support"
+            source_file = root / "source.xlsx"
+            source_file.write_text("placeholder", encoding="utf-8")
+            leaf = scan._td_source_leaf_for_path(source_file)  # type: ignore[attr-defined]
+            artifacts_dir = (
+                support_dir
+                / "Test Data File Extractions"
+                / "Program_A"
+                / "Thruster"
+                / "Valve"
+                / "SN1"
+                / "sources"
+                / leaf
+            )
+            artifacts_dir.mkdir(parents=True, exist_ok=True)
+            (artifacts_dir / "source_metadata.json").write_text("{}", encoding="utf-8")
+
+            self.assertTrue(scan._expected_artifacts_exist(support_dir, source_file))  # type: ignore[attr-defined]
+
     def test_calc_cache_backfills_aggregate_observation_metadata_from_unique_sequence_rows(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
 

@@ -74,6 +74,7 @@ def _support_dir_score(path: Path) -> tuple[int, int]:
         ("eidat_index.sqlite3", 12),
         ("eidat_support.sqlite3", 12),
         ("projects/projects_registry.sqlite3", 10),
+        ("Test Data File Extractions", 4),
         ("projects", 3),
         ("debug/ocr", 3),
         ("excel_sqlite", 2),

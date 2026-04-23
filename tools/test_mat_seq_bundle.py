@@ -90,7 +90,13 @@ class TestMatSeqBundle(unittest.TestCase):
             self.assertEqual([m.sequence_name for m in members], ["seq1", "seq2", "seq3"])
             bundle = detect_mat_bundle_member(seq1, repo_root=repo)
             assert bundle is not None
-            artifacts_dir = paths.support_dir / "debug" / "ocr" / f"{bundle.bundle_stem}__excel"
+            artifact_matches = list(
+                (paths.support_dir / "Test Data File Extractions").glob(
+                    f"*/*/*/SN123/sources/{bundle.bundle_stem}__*__excel"
+                )
+            )
+            self.assertEqual(len(artifact_matches), 1)
+            artifacts_dir = artifact_matches[0]
             sqlite_path = artifacts_dir / f"{bundle.bundle_stem}.sqlite3"
             metadata_path = artifacts_dir / f"{bundle.bundle_stem}_metadata.json"
             manifest_path = artifacts_dir / "mat_seq_bundle.json"
@@ -158,8 +164,12 @@ class TestMatSeqBundle(unittest.TestCase):
             scan_global_repo(paths)
             results = process_candidates(paths)
             self.assertTrue(any(item.ok for item in results))
-            standalone_dir = paths.support_dir / "debug" / "ocr" / "capture__excel"
-            self.assertTrue(standalone_dir.exists())
+            matches = list(
+                (paths.support_dir / "Test Data File Extractions").glob(
+                    "*/*/*/*/sources/capture__*__excel"
+                )
+            )
+            self.assertEqual(len(matches), 1)
 
 
 if __name__ == "__main__":

@@ -13,6 +13,9 @@ from typing import Any
 from eidat_manager_db import SupportPaths
 from eidat_manager_metadata import normalize_title, sanitize_metadata
 
+TD_FILE_EXTRACTIONS_DIRNAME = "Test Data File Extractions"
+TD_LEGACY_SERIAL_SOURCES_DIRNAME = "td_serial_sources"
+
 
 @dataclass(frozen=True)
 class IndexSummary:
@@ -253,18 +256,39 @@ def _connect(db_path: Path) -> sqlite3.Connection:
 
 
 def _load_metadata_files(support_dir: Path) -> list[Path]:
-    root = support_dir / "debug" / "ocr"
-    if not root.exists():
-        return []
     files: list[Path] = []
-    for p in root.rglob("*"):
-        try:
-            if not p.is_file():
-                continue
-        except Exception:
+    roots = [
+        support_dir / TD_FILE_EXTRACTIONS_DIRNAME,
+        support_dir / "debug" / "ocr",
+    ]
+    seen: set[str] = set()
+    debug_ocr_root = support_dir / "debug" / "ocr"
+    legacy_td_root = debug_ocr_root / TD_LEGACY_SERIAL_SOURCES_DIRNAME
+    for root in roots:
+        if not root.exists():
             continue
-        name = p.name.lower()
-        if name.endswith("_metadata.json") or name.endswith(".metadata.json"):
+        for p in root.rglob("*"):
+            try:
+                if not p.is_file():
+                    continue
+            except Exception:
+                continue
+            name = p.name.lower()
+            if not (name.endswith("_metadata.json") or name.endswith(".metadata.json")):
+                continue
+            if root == debug_ocr_root:
+                try:
+                    p.resolve().relative_to(legacy_td_root.resolve())
+                except Exception:
+                    pass
+                else:
+                    # The old composite TD repository has been superseded by the
+                    # top-level Test Data File Extractions root. Avoid indexing both.
+                    continue
+            key = str(p).casefold()
+            if key in seen:
+                continue
+            seen.add(key)
             files.append(p)
     return files
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 import time
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -37,6 +38,7 @@ except Exception:  # pragma: no cover
 # Supported file extensions for scanning
 SUPPORTED_EXTENSIONS = {".pdf", ".xlsx", ".xls", ".xlsm", ".mat"}
 EXCEL_ARTIFACT_SUFFIX = "__excel"
+TD_FILE_EXTRACTIONS_DIRNAME = "Test Data File Extractions"
 
 
 def _node_root_from_support_dir(support_dir: Path) -> Path:
@@ -298,11 +300,16 @@ def _pointer_artifacts_exist(global_repo: Path, file_path: Path) -> bool:
         return True
 
     # If token indicates an artifacts folder, require that it exists and has at least one expected artifact.
+    if artifacts_path is not None and _artifacts_exist(artifacts_path):
+        return True
+    return False
+
+
+def _artifacts_exist(artifacts_path: Path) -> bool:
     if artifacts_path is None or not artifacts_path.exists():
         return False
     if artifacts_path.is_file():
         return True
-
     try:
         if (artifacts_path / "combined.txt").exists():
             return True
@@ -324,8 +331,9 @@ def _expected_artifacts_dir(support_dir: Path, file_path: Path) -> Path:
     """
     Where this codebase writes artifacts for a given input file.
 
-    PDFs:  EIDAT Support/debug/ocr/<stem>/
-    Excel: EIDAT Support/debug/ocr/<stem>__excel/
+    PDFs:      EIDAT Support/debug/ocr/<stem>/
+    non-TD Excel: EIDAT Support/debug/ocr/<stem>__excel/
+    TD Excel:  EIDAT Support/Test Data File Extractions/.../sources/<stem>__<hash>__excel/
     """
     ext = str(file_path.suffix or "").lower()
     if ext == ".mat" and detect_mat_bundle_member is not None and mat_bundle_artifacts_dir is not None:
@@ -341,7 +349,54 @@ def _expected_artifacts_dir(support_dir: Path, file_path: Path) -> Path:
     return Path(support_dir) / "debug" / "ocr" / name
 
 
+def _safe_td_source_stem(value: object, *, fallback: str = "source") -> str:
+    import re
+
+    raw = str(value or "").strip() or str(fallback or "source")
+    cleaned = re.sub(r"[^A-Za-z0-9._ -]+", "_", raw).strip(" .")
+    cleaned = re.sub(r"\s+", "_", cleaned)
+    return cleaned[:80] or str(fallback or "source")
+
+
+def _td_source_leaf_for_path(file_path: Path, *, bundle_stem: str = "") -> str:
+    source_stem = _safe_td_source_stem(bundle_stem or Path(file_path).stem, fallback="source")
+    try:
+        source_hash_basis = str(Path(file_path).expanduser().resolve()).casefold()
+    except Exception:
+        source_hash_basis = str(Path(file_path).expanduser()).casefold()
+    source_hash = hashlib.sha1(source_hash_basis.encode("utf-8", errors="ignore")).hexdigest()[:10]
+    return f"{source_stem}__{source_hash}{EXCEL_ARTIFACT_SUFFIX}"
+
+
+def _official_td_artifact_candidates(support_dir: Path, file_path: Path) -> list[Path]:
+    ext = str(file_path.suffix or "").lower()
+    if ext not in {".xlsx", ".xls", ".xlsm", ".mat"}:
+        return []
+    root = Path(support_dir) / TD_FILE_EXTRACTIONS_DIRNAME
+    if not root.exists():
+        return []
+    leaves = {_td_source_leaf_for_path(file_path)}
+    if ext == ".mat" and detect_mat_bundle_member is not None:
+        repo_root = _node_root_from_support_dir(support_dir)
+        try:
+            bundle = detect_mat_bundle_member(file_path, repo_root=repo_root)
+        except Exception:
+            bundle = None
+        if bundle is not None:
+            leaves.add(_td_source_leaf_for_path(file_path.with_name(f"{bundle.bundle_stem}.mat"), bundle_stem=bundle.bundle_stem))
+    out: list[Path] = []
+    for leaf in sorted(leaves):
+        try:
+            out.extend([p for p in root.glob(f"*/*/*/*/sources/{leaf}") if p.exists()])
+        except Exception:
+            continue
+    return out
+
+
 def _expected_artifacts_exist(support_dir: Path, file_path: Path) -> bool:
+    for td_dir in _official_td_artifact_candidates(support_dir, file_path):
+        if _artifacts_exist(td_dir):
+            return True
     artifacts_dir = _expected_artifacts_dir(support_dir, file_path)
     if not artifacts_dir.exists():
         return False
