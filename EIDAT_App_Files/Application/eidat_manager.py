@@ -76,6 +76,7 @@ def _cmd_process(
     only_candidates: bool,
     file_paths: list[str] | None,
 ) -> dict:
+    td_serial_aggregates: dict[str, object] = {}
     results = process_candidates(
         paths,
         limit=limit,
@@ -83,18 +84,20 @@ def _cmd_process(
         force=force,
         only_candidates=only_candidates,
         file_paths=file_paths,
+        td_serial_aggregates_summary=td_serial_aggregates,
     )
     ok = [r for r in results if r.ok]
     failed = [r for r in results if not r.ok]
     # Log failed results to stderr for debugging
     for r in failed:
         print(f"[PROCESS FAILED] {r.rel_path}: {r.error}", file=sys.stderr)
-    return {
+    payload = {
         "global_repo": str(paths.global_repo),
         "support_dir": str(paths.support_dir),
         "db_path": str(paths.db_path),
         "processed_ok": len(ok),
         "processed_failed": len(failed),
+        "td_serial_aggregates": dict(td_serial_aggregates),
         "results": [
             {
                 "rel_path": r.rel_path,
@@ -106,6 +109,12 @@ def _cmd_process(
             for r in results
         ],
     }
+    if len(ok) > 0:
+        try:
+            payload["index"] = _cmd_index(paths, similarity=0.86)
+        except Exception as exc:
+            payload["index"] = {"error": str(exc)}
+    return payload
 
 
 def _cmd_index(paths: SupportPaths, *, similarity: float) -> dict:

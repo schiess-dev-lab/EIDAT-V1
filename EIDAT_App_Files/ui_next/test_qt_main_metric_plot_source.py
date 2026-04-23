@@ -480,9 +480,11 @@ class TestQtMainMetricPlotSource(unittest.TestCase):
                 with patch.object(window, "_current_run_selection", return_value=selection), patch.object(
                     window, "_current_member_runs", return_value=["CondA"]
                 ), patch.object(
+                    window, "_current_run_selections", return_value=[selection]
+                ), patch.object(
                     window, "_ensure_main_axes", return_value=None
                 ), patch.object(
-                    window, "_current_curve_y_name", return_value="Pressure"
+                    window, "_selected_curve_y_names", return_value=["Pressure"]
                 ), patch.object(
                     window, "_current_curve_x_key", return_value="time"
                 ), patch.object(
@@ -507,6 +509,133 @@ class TestQtMainMetricPlotSource(unittest.TestCase):
                 info_mock.assert_not_called()
                 self.assertEqual(window._last_plot_def["mode"], "curves")
                 self.assertTrue(axes.plot_calls)
+        finally:
+            window.close()
+            tmpdir = getattr(window, "_test_tmpdir", "")
+            if tmpdir:
+                shutil.rmtree(str(tmpdir), ignore_errors=True)
+
+    def test_plot_curves_supports_multiple_runs_and_y_columns(self) -> None:
+        window = self._make_window()
+        try:
+            with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+                db_path = Path(tmpdir) / "cache.sqlite3"
+                db_path.write_text("", encoding="utf-8")
+                axes = self._prepare_plot_window(window, db_path, mode="curves")
+                selections = [
+                    {
+                        "mode": "condition",
+                        "id": "condition:CondA",
+                        "run_name": "CondA",
+                        "display_text": "Condition A",
+                        "member_runs": ["CondA"],
+                    },
+                    {
+                        "mode": "condition",
+                        "id": "condition:CondB",
+                        "run_name": "CondB",
+                        "display_text": "Condition B",
+                        "member_runs": ["CondB"],
+                    },
+                ]
+                combined_selection = {
+                    "mode": "condition",
+                    "id": "condition:multi:condition:CondA|condition:CondB",
+                    "display_text": "Condition A, Condition B",
+                    "run_condition": "Condition A, Condition B",
+                    "member_runs": ["CondA", "CondB"],
+                }
+
+                def _fake_load_curves(run_name: str, y_name: str, *_args, **_kwargs) -> list[dict]:
+                    return [
+                        {
+                            "serial": f"{run_name}-{y_name}-SN-001",
+                            "x": [0.0, 1.0],
+                            "y": [1.0, 2.0],
+                            "program_title": "Program Alpha",
+                            "source_run_name": f"{run_name}-Seq",
+                        }
+                    ]
+
+                with patch.object(window, "_current_run_selection", return_value=combined_selection), patch.object(
+                    window, "_current_run_selections", return_value=selections
+                ), patch.object(
+                    window, "_current_member_runs", return_value=["CondA", "CondB"]
+                ), patch.object(
+                    window, "_ensure_main_axes", return_value=None
+                ), patch.object(
+                    window, "_selected_curve_y_names", return_value=["Pressure", "Voltage"]
+                ), patch.object(
+                    window, "_current_curve_x_key", return_value="time"
+                ), patch.object(
+                    window, "_current_curve_x_label", return_value="Time"
+                ), patch.object(
+                    window, "_resolve_curve_x_key", return_value="time"
+                ), patch.object(
+                    window, "_compose_run_title", return_value="Curve Plot"
+                ), patch.object(
+                    window, "_load_curves_for_selection", side_effect=_fake_load_curves
+                ), patch.object(
+                    window, "_apply_interactive_legend_policy", return_value=[]
+                ), patch.object(
+                    window, "_apply_plot_view_bands_to_axes", return_value=None
+                ), patch.object(
+                    window, "_capture_main_plot_base_view", return_value=None
+                ), patch.object(
+                    window, "_populate_stats_table", return_value=None
+                ), patch(
+                    "ui_next.qt_main.QtWidgets.QMessageBox.information"
+                ) as info_mock:
+                    window._plot_curves()
+
+                info_mock.assert_not_called()
+                self.assertEqual(len(axes.plot_calls), 4)
+                labels = [str(kwargs.get("label") or "") for _, kwargs in axes.plot_calls]
+                self.assertTrue(any(label.startswith("Pressure | ") for label in labels))
+                self.assertTrue(any(label.startswith("Voltage | ") for label in labels))
+                self.assertEqual(window._last_plot_def["member_runs"], ["CondA", "CondB"])
+                self.assertEqual(window._last_plot_def["y"], ["Pressure", "Voltage"])
+                self.assertEqual(window._last_plot_def["selection_ids"], ["condition:CondA", "condition:CondB"])
+        finally:
+            window.close()
+            tmpdir = getattr(window, "_test_tmpdir", "")
+            if tmpdir:
+                shutil.rmtree(str(tmpdir), ignore_errors=True)
+
+    def test_auto_plot_display_name_lists_multiple_curve_y_columns(self) -> None:
+        window = self._make_window()
+        try:
+            name = window._auto_plot_display_name(
+                {
+                    "plot_definition": {
+                        "mode": "curves",
+                        "x": "Time",
+                        "y": ["Pressure", "Voltage"],
+                    }
+                }
+            )
+            self.assertIn("Pressure", name)
+            self.assertIn("Voltage", name)
+            self.assertIn("Time", name)
+        finally:
+            window.close()
+            tmpdir = getattr(window, "_test_tmpdir", "")
+            if tmpdir:
+                shutil.rmtree(str(tmpdir), ignore_errors=True)
+
+    def test_curve_trace_label_uses_serial_number_from_composite_source_key(self) -> None:
+        window = self._make_window()
+        try:
+            label = window._curve_trace_label(
+                "CondA",
+                {
+                    "serial": "Program Alpha / Valve / Primary / SN-001 / source_a",
+                    "program_title": "Program Alpha",
+                    "source_run_name": "Seq-1",
+                },
+                multi_run=False,
+            )
+            self.assertEqual(label, "SN-001 | Program Alpha | Seq-1")
         finally:
             window.close()
             tmpdir = getattr(window, "_test_tmpdir", "")

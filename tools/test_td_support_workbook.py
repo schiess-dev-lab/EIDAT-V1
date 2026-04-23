@@ -2566,6 +2566,85 @@ class TestTDSupportWorkbook(unittest.TestCase):
             finally:
                 wb.close()
 
+    def test_td_project_workbook_prefers_serial_aggregate_from_index(self) -> None:
+        from openpyxl import load_workbook  # type: ignore
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            support_dir = root / "EIDAT Support"
+            source_artifacts_rel = (
+                "Test Data File Extractions/Program_A/Thruster/Valve/SN1/"
+                "sources/source__abc123def0__excel"
+            )
+            source_dir = support_dir / Path(source_artifacts_rel)
+            source_dir.mkdir(parents=True, exist_ok=True)
+            source_sqlite = source_dir / "source.sqlite3"
+            self._make_source_sqlite(source_sqlite)
+            source_metadata_rel = f"{source_artifacts_rel}/source_metadata.json"
+
+            aggregate_artifacts_rel = "Test Data File Extractions/Program_A/Thruster/Valve/SN1"
+            aggregate_dir = support_dir / Path(aggregate_artifacts_rel)
+            aggregate_dir.mkdir(parents=True, exist_ok=True)
+            aggregate_sqlite = aggregate_dir / "SN1.sqlite3"
+            self._make_source_sqlite(aggregate_sqlite)
+            aggregate_metadata_rel = f"{aggregate_artifacts_rel}/SN1_metadata.json"
+
+            source_doc = {
+                "serial_number": "SN1",
+                "program_title": "Program A",
+                "asset_type": "Thruster",
+                "asset_specific_type": "Valve",
+                "document_type": "TD",
+                "document_type_acronym": "TD",
+                "document_type_status": "confirmed",
+                "document_type_review_required": False,
+                "metadata_rel": source_metadata_rel,
+                "artifacts_rel": source_artifacts_rel,
+                "excel_sqlite_rel": f"EIDAT Support/{source_artifacts_rel}/source.sqlite3",
+            }
+            aggregate_doc = {
+                **source_doc,
+                "metadata_rel": aggregate_metadata_rel,
+                "artifacts_rel": aggregate_artifacts_rel,
+                "excel_sqlite_rel": f"EIDAT Support/{aggregate_artifacts_rel}/SN1.sqlite3",
+                "metadata_source": "td_serial_aggregate",
+                "file_extension": ".sqlite3",
+            }
+
+            wb_path = root / "project.xlsx"
+            with mock.patch.object(be, "read_eidat_index_documents", return_value=[source_doc, aggregate_doc]):
+                be._write_test_data_trending_workbook(
+                    wb_path,
+                    global_repo=root,
+                    serials=["SN1"],
+                    docs=[source_doc],
+                    config=self._make_config(),
+                )
+
+            wb = load_workbook(str(wb_path), read_only=True, data_only=True)
+            try:
+                ws = wb["Sources"]
+                headers = {
+                    str(ws.cell(1, col).value or "").strip().lower(): col
+                    for col in range(1, (ws.max_column or 0) + 1)
+                }
+                aggregate_artifacts_rel_win = aggregate_artifacts_rel.replace("/", "\\")
+                aggregate_excel_rel = f"EIDAT Support\\{aggregate_artifacts_rel_win}\\SN1.sqlite3"
+                self.assertEqual(int(ws.max_row or 0), 2)
+                self.assertEqual(str(ws.cell(2, headers["metadata_rel"]).value or ""), aggregate_metadata_rel)
+                self.assertEqual(str(ws.cell(2, headers["artifacts_rel"]).value or ""), aggregate_artifacts_rel)
+                self.assertEqual(
+                    str(ws.cell(2, headers["excel_sqlite_rel"]).value or ""),
+                    aggregate_excel_rel,
+                )
+                self.assertEqual(
+                    str(ws.cell(2, headers["source_key"]).value or ""),
+                    "Program A / Thruster / Valve / SN1",
+                )
+            finally:
+                wb.close()
+
     def test_update_td_project_workbook_migrates_sources_to_official_location(self) -> None:
         from openpyxl import load_workbook  # type: ignore
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
@@ -2678,6 +2757,213 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 self.assertIn("Test Data File Extractions", str(ws.cell(2, headers["excel_sqlite_rel"]).value or ""))
             finally:
                 wb.close()
+
+    def test_update_td_project_workbook_promotes_sources_to_serial_aggregate(self) -> None:
+        from openpyxl import load_workbook  # type: ignore
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            support_dir = root / "EIDAT Support"
+            source_a_rel = (
+                "Test Data File Extractions/Program_A/Thruster/Valve/SN1/"
+                "sources/source_a__aaaaaaaaaa__excel"
+            )
+            source_b_rel = (
+                "Test Data File Extractions/Program_A/Thruster/Valve/SN1/"
+                "sources/source_b__bbbbbbbbbb__excel"
+            )
+            for rel, stem in ((source_a_rel, "source_a"), (source_b_rel, "source_b")):
+                src_dir = support_dir / Path(rel)
+                src_dir.mkdir(parents=True, exist_ok=True)
+                self._make_source_sqlite(src_dir / f"{stem}.sqlite3")
+
+            source_doc_a = {
+                "serial_number": "SN1",
+                "program_title": "Program A",
+                "asset_type": "Thruster",
+                "asset_specific_type": "Valve",
+                "document_type": "TD",
+                "document_type_acronym": "TD",
+                "document_type_status": "confirmed",
+                "document_type_review_required": False,
+                "metadata_rel": f"{source_a_rel}/source_a_metadata.json",
+                "artifacts_rel": source_a_rel,
+                "excel_sqlite_rel": f"EIDAT Support/{source_a_rel}/source_a.sqlite3",
+            }
+            source_doc_b = {
+                **source_doc_a,
+                "metadata_rel": f"{source_b_rel}/source_b_metadata.json",
+                "artifacts_rel": source_b_rel,
+                "excel_sqlite_rel": f"EIDAT Support/{source_b_rel}/source_b.sqlite3",
+            }
+
+            aggregate_artifacts_rel = "Test Data File Extractions/Program_A/Thruster/Valve/SN1"
+            aggregate_dir = support_dir / Path(aggregate_artifacts_rel)
+            aggregate_dir.mkdir(parents=True, exist_ok=True)
+            aggregate_sqlite = aggregate_dir / "SN1.sqlite3"
+            self._make_source_sqlite(aggregate_sqlite)
+            aggregate_metadata_rel = f"{aggregate_artifacts_rel}/SN1_metadata.json"
+            aggregate_doc = {
+                **source_doc_a,
+                "metadata_rel": aggregate_metadata_rel,
+                "artifacts_rel": aggregate_artifacts_rel,
+                "excel_sqlite_rel": f"EIDAT Support/{aggregate_artifacts_rel}/SN1.sqlite3",
+                "metadata_source": "td_serial_aggregate",
+                "file_extension": ".sqlite3",
+            }
+
+            wb_path = root / "project.xlsx"
+            be._write_test_data_trending_workbook(
+                wb_path,
+                global_repo=None,
+                serials=["SN1"],
+                docs=[source_doc_a, source_doc_b],
+                config=self._make_config(),
+            )
+            support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+            be._write_td_support_workbook(
+                support_path,
+                sequence_names=["RunA"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+                program_titles=["Program A"],
+            )
+            (root / be.EIDAT_PROJECT_META).write_text(
+                json.dumps(
+                    {
+                        "name": "project",
+                        "type": be.EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING,
+                        "global_repo": str(root),
+                        "project_dir": str(root),
+                        "workbook": str(wb_path),
+                        "selected_metadata_rel": [source_doc_a["metadata_rel"], source_doc_b["metadata_rel"]],
+                        "selected_count": 2,
+                        "serials": ["SN1"],
+                        "serials_count": 1,
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(
+                be,
+                "read_eidat_index_documents",
+                return_value=[source_doc_a, source_doc_b, aggregate_doc],
+            ):
+                be.update_test_data_trending_project_workbook(
+                    root,
+                    wb_path,
+                    overwrite=True,
+                    require_existing_cache=False,
+                )
+
+            saved_meta = json.loads((root / be.EIDAT_PROJECT_META).read_text(encoding="utf-8"))
+            self.assertEqual(saved_meta.get("selected_metadata_rel"), [aggregate_metadata_rel])
+
+            wb = load_workbook(str(wb_path), read_only=True, data_only=True)
+            try:
+                ws = wb["Sources"]
+                headers = {
+                    str(ws.cell(1, col).value or "").strip().lower(): col
+                    for col in range(1, (ws.max_column or 0) + 1)
+                }
+                self.assertEqual(int(ws.max_row or 0), 2)
+                self.assertEqual(str(ws.cell(2, headers["metadata_rel"]).value or ""), aggregate_metadata_rel)
+                self.assertEqual(str(ws.cell(2, headers["source_key"]).value or ""), "Program A / Thruster / Valve / SN1")
+            finally:
+                wb.close()
+
+    def test_save_td_project_editor_changes_preserves_multiple_sources_without_aggregate(self) -> None:
+        from openpyxl import load_workbook  # type: ignore
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            support_dir = root / "EIDAT Support"
+            source_a_rel = (
+                "Test Data File Extractions/Program_A/Thruster/Valve/SN1/"
+                "sources/source_a__aaaaaaaaaa__excel"
+            )
+            source_b_rel = (
+                "Test Data File Extractions/Program_A/Thruster/Valve/SN1/"
+                "sources/source_b__bbbbbbbbbb__excel"
+            )
+            for rel, stem in ((source_a_rel, "source_a"), (source_b_rel, "source_b")):
+                src_dir = support_dir / Path(rel)
+                src_dir.mkdir(parents=True, exist_ok=True)
+                self._make_source_sqlite(src_dir / f"{stem}.sqlite3")
+
+            doc_a = {
+                "serial_number": "SN1",
+                "program_title": "Program A",
+                "asset_type": "Thruster",
+                "asset_specific_type": "Valve",
+                "document_type": "TD",
+                "document_type_acronym": "TD",
+                "document_type_status": "confirmed",
+                "document_type_review_required": False,
+                "metadata_rel": f"{source_a_rel}/source_a_metadata.json",
+                "artifacts_rel": source_a_rel,
+                "excel_sqlite_rel": f"EIDAT Support/{source_a_rel}/source_a.sqlite3",
+            }
+            doc_b = {
+                **doc_a,
+                "metadata_rel": f"{source_b_rel}/source_b_metadata.json",
+                "artifacts_rel": source_b_rel,
+                "excel_sqlite_rel": f"EIDAT Support/{source_b_rel}/source_b.sqlite3",
+            }
+
+            wb_path = root / "project.xlsx"
+            be._write_test_data_trending_workbook(
+                wb_path,
+                global_repo=None,
+                serials=["SN1"],
+                docs=[],
+                config=self._make_config(),
+            )
+
+            with mock.patch.object(be, "read_eidat_index_documents", return_value=[doc_a, doc_b]):
+                payload = be.save_test_data_trending_project_editor_changes(
+                    root,
+                    root,
+                    wb_path,
+                    selected_metadata_rel=[doc_a["metadata_rel"], doc_b["metadata_rel"]],
+                )
+
+            self.assertEqual(payload.get("selected_metadata_rel"), [doc_a["metadata_rel"], doc_b["metadata_rel"]])
+            saved_meta = json.loads((root / be.EIDAT_PROJECT_META).read_text(encoding="utf-8"))
+            self.assertEqual(saved_meta.get("selected_metadata_rel"), [doc_a["metadata_rel"], doc_b["metadata_rel"]])
+
+            wb = load_workbook(str(wb_path), read_only=True, data_only=True)
+            try:
+                ws = wb["Sources"]
+                headers = {
+                    str(ws.cell(1, col).value or "").strip().lower(): col
+                    for col in range(1, (ws.max_column or 0) + 1)
+                }
+                rows = [
+                    {
+                        "metadata_rel": str(ws.cell(row, headers["metadata_rel"]).value or ""),
+                        "source_key": str(ws.cell(row, headers["source_key"]).value or ""),
+                    }
+                    for row in range(2, (ws.max_row or 0) + 1)
+                ]
+            finally:
+                wb.close()
+
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(
+                [row["metadata_rel"] for row in rows],
+                [doc_a["metadata_rel"], doc_b["metadata_rel"]],
+            )
+            self.assertEqual(
+                [row["source_key"] for row in rows],
+                [
+                    "Program A / Thruster / Valve / SN1 / source_a",
+                    "Program A / Thruster / Valve / SN1 / source_b",
+                ],
+            )
 
     def test_index_discovers_top_level_test_data_file_extractions(self) -> None:
         app_dir = ROOT / "EIDAT_App_Files" / "Application"

@@ -1441,9 +1441,6 @@ def _td_agg_collect_members(paths: SupportPaths) -> list[dict[str, Any]]:
             continue
         if str(meta_raw.get("metadata_source") or "").strip() == TD_SERIAL_AGGREGATE_METADATA_SOURCE:
             continue
-        ext = str(meta_raw.get("file_extension") or "").strip().lower()
-        if ext == ".mat":
-            continue
         if not _is_confirmed_test_data_meta(meta_raw):
             continue
         sqlite_rel = str(meta_raw.get("excel_sqlite_rel") or "").strip()
@@ -1458,6 +1455,10 @@ def _td_agg_collect_members(paths: SupportPaths) -> list[dict[str, Any]]:
             artifacts_rel = str(meta_path.parent.resolve().relative_to(support_dir.resolve())).replace("\\", "/")
         except Exception:
             artifacts_rel = str(meta_path.parent)
+        try:
+            metadata_mtime_ns = int(getattr(meta_path.stat(), "st_mtime_ns", int(meta_path.stat().st_mtime * 1e9)))
+        except Exception:
+            metadata_mtime_ns = 0
         try:
             with sqlite3.connect(str(sqlite_path)) as src:
                 src.row_factory = sqlite3.Row
@@ -1505,6 +1506,7 @@ def _td_agg_collect_members(paths: SupportPaths) -> list[dict[str, Any]]:
                             "sqlite_rel": sqlite_rel,
                             "metadata_path": meta_path,
                             "metadata_rel": metadata_rel,
+                            "metadata_mtime_ns": int(metadata_mtime_ns),
                             "artifacts_rel": artifacts_rel,
                             "source_file": str(meta_raw.get("source_file") or ""),
                             "sheet_name": sheet_name,
@@ -1705,10 +1707,20 @@ def _td_agg_write_group(
     mirror_xlsx: bool,
 ) -> dict[str, Any]:
     first = dict(group_members[0])
-    serial = str(first.get("serial_number") or "").strip()
-    program_title = str(first.get("program_title") or "Unknown").strip() or "Unknown"
-    asset_type = str(first.get("asset_type") or "Unknown").strip() or "Unknown"
-    asset_specific_type = str(first.get("asset_specific_type") or "Unknown").strip() or "Unknown"
+    header_member = max(
+        [dict(member) for member in group_members],
+        key=lambda item: (
+            int(item.get("metadata_mtime_ns") or 0),
+            str(item.get("metadata_rel") or "").casefold(),
+            str(item.get("source_sheet_name") or "").casefold(),
+        ),
+    )
+    header_meta = dict(first.get("metadata") or {})
+    header_meta.update(dict(header_member.get("metadata") or {}))
+    serial = str(header_member.get("serial_number") or first.get("serial_number") or "").strip()
+    program_title = str(header_member.get("program_title") or first.get("program_title") or "Unknown").strip() or "Unknown"
+    asset_type = str(header_member.get("asset_type") or first.get("asset_type") or "Unknown").strip() or "Unknown"
+    asset_specific_type = str(header_member.get("asset_specific_type") or first.get("asset_specific_type") or "Unknown").strip() or "Unknown"
     out_dir = (
         _td_extractions_root(paths.support_dir)
         / _td_agg_safe_path_name(program_title, fallback="program")
@@ -1864,17 +1876,20 @@ def _td_agg_write_group(
         for item in manifest_members
         if str(item.get("source_metadata_rel") or "").strip()
     ]
+    header_metadata_rel = str(header_member.get("metadata_rel") or "").strip()
+    header_sqlite_rel = str(header_member.get("sqlite_rel") or "").strip()
+    header_sheet_name = str(header_member.get("source_sheet_name") or header_member.get("sheet_name") or "").strip()
     aggregate_meta = {
         "program_title": program_title,
         "asset_type": asset_type,
         "asset_specific_type": asset_specific_type,
         "serial_number": serial,
-        "part_number": str(first.get("metadata", {}).get("part_number") or "Unknown"),
-        "revision": str(first.get("metadata", {}).get("revision") or "Unknown"),
-        "test_date": str(first.get("metadata", {}).get("test_date") or "Unknown"),
-        "report_date": str(first.get("metadata", {}).get("report_date") or "Unknown"),
-        "vendor": str(first.get("metadata", {}).get("vendor") or "Unknown"),
-        "acceptance_test_plan_number": str(first.get("metadata", {}).get("acceptance_test_plan_number") or "Unknown"),
+        "part_number": str(header_meta.get("part_number") or "Unknown"),
+        "revision": str(header_meta.get("revision") or "Unknown"),
+        "test_date": str(header_meta.get("test_date") or "Unknown"),
+        "report_date": str(header_meta.get("report_date") or "Unknown"),
+        "vendor": str(header_meta.get("vendor") or "Unknown"),
+        "acceptance_test_plan_number": str(header_meta.get("acceptance_test_plan_number") or "Unknown"),
         "document_type": "TD",
         "document_type_acronym": "TD",
         "document_type_status": "confirmed",
@@ -1891,6 +1906,9 @@ def _td_agg_write_group(
         "excel_sqlite_rel": sqlite_rel,
         "file_extension": ".sqlite3",
         "metadata_source": TD_SERIAL_AGGREGATE_METADATA_SOURCE,
+        "aggregate_header_source_metadata_rel": header_metadata_rel,
+        "aggregate_header_source_sqlite_rel": header_sqlite_rel,
+        "aggregate_header_source_sheet_name": header_sheet_name,
     }
     metadata_path.write_text(json.dumps(aggregate_meta, indent=2, ensure_ascii=True), encoding="utf-8")
     manifest = {
@@ -1902,6 +1920,10 @@ def _td_agg_write_group(
         "sqlite_rel": sqlite_rel,
         "metadata_rel": _safe_repo_rel(paths.global_repo, metadata_path),
         "source_metadata_rels": source_metadata_rels,
+        "header_metadata_source_metadata_rel": header_metadata_rel,
+        "header_metadata_source_sqlite_rel": header_sqlite_rel,
+        "header_metadata_source_sheet_name": header_sheet_name,
+        "header_metadata_source_mtime_ns": int(header_member.get("metadata_mtime_ns") or 0),
         "sequence_count": len(manifest_members),
         "members": manifest_members,
         "warnings": warnings,
@@ -2195,12 +2217,24 @@ def process_candidates(
     force: bool = False,
     only_candidates: bool = False,
     file_paths: list[str | Path] | None = None,
+    td_serial_aggregates_summary: dict[str, Any] | None = None,
 ) -> list[ProcessResult]:
     now_ns = time.time_ns()
     core = None
     excel_mod = None
     excel_config_path = _default_excel_config_path()
     excel_sqlite_helpers = None
+    td_source_results_detected = 0
+    if isinstance(td_serial_aggregates_summary, dict):
+        td_serial_aggregates_summary.clear()
+        td_serial_aggregates_summary.update(
+            {
+                "triggered": False,
+                "source_results_detected": 0,
+                "aggregate_count": 0,
+                "aggregates": [],
+            }
+        )
 
     def _get_core() -> Any:
         nonlocal core
@@ -2587,6 +2621,7 @@ def process_candidates(
                                 metadata=clean_meta,
                             )
                         if is_test_data and metadata_path is not None:
+                            td_source_results_detected += 1
                             _cleanup_stale_td_source_artifacts(paths.support_dir, legacy_artifacts_root, artifacts_root)
                     else:
                         core = _get_core()
@@ -2868,5 +2903,43 @@ def process_candidates(
             conn.commit()
         finally:
             _restore_env(prev_env)
+
+    if td_source_results_detected > 0:
+        aggregate_payload: dict[str, Any]
+        try:
+            (
+                _excel_to_sqlite,
+                export_sqlite_text_mirror,
+                export_sqlite_excel_mirror,
+                _load_test_data_env,
+                _truthy,
+                _write_mat_bundle_sqlite,
+            ) = _get_excel_sqlite_helpers()
+            try:
+                env = _load_test_data_env()
+                mirror_xlsx = bool(_truthy(env.get("EIDAT_TEST_DATA_SQLITE_MIRROR_XLSX", "1")))
+            except Exception:
+                mirror_xlsx = False
+            aggregate_payload = rebuild_td_serial_aggregates(
+                paths,
+                export_text_mirror=export_sqlite_text_mirror,
+                export_excel_mirror=export_sqlite_excel_mirror,
+                mirror_xlsx=mirror_xlsx,
+            )
+            aggregate_payload["triggered"] = True
+            aggregate_payload["source_results_detected"] = int(td_source_results_detected)
+        except Exception as exc:
+            aggregate_payload = {
+                "triggered": True,
+                "source_results_detected": int(td_source_results_detected),
+                "aggregate_count": 0,
+                "aggregates": [],
+                "error": str(exc),
+            }
+        if isinstance(td_serial_aggregates_summary, dict):
+            td_serial_aggregates_summary.clear()
+            td_serial_aggregates_summary.update(aggregate_payload)
+    elif isinstance(td_serial_aggregates_summary, dict):
+        td_serial_aggregates_summary["source_results_detected"] = 0
 
     return results

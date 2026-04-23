@@ -876,7 +876,7 @@ def eidat_manager_process(
             args.extend(["--file", text])
     result = _run_eidat_manager(global_repo, "process", args)
     # Auto-rebuild index after processing
-    if result.get("processed_ok", 0) > 0:
+    if result.get("processed_ok", 0) > 0 and "index" not in result:
         try:
             index_result = eidat_manager_index(global_repo)
             result["index"] = index_result
@@ -4033,8 +4033,9 @@ TD_LIFE_BASE_ALIASES: dict[str, tuple[str, ...]] = {
     "pulse_count": ("pulse count", "number of pulses", "pulses", "num_pulses", "n_pulses"),
     "prop_per_pulse": ("prop per pulse", "prop_per_pulse", "propellant per pulse", "mass per pulse"),
     "flow_rate": ("flowrate", "flow rate", "mass flow rate", "mdot", "m_dot"),
-    "impulse_per_pulse": ("impulse bit", "impulse per pulse", "impulse_bit"),
+    "impulse_per_pulse": ("impulse bit", "impulse per pulse", "impulse_bit", "i bit", "i-bit", "ibit"),
     "elapsed_time": ("elapsed time", "time elapsed", "duration", "run time"),
+    "on_time": ("on time", "ontime", "pulse on", "pulse_on", "pulse width on", "pulse_width_on"),
     "thrust": ("thrust",),
 }
 
@@ -4105,6 +4106,7 @@ def _td_life_alias_sets(project_cfg: Mapping[str, object] | None) -> dict[str, l
         "flow_rate": ("flow_rate", "flow_rate_aliases", "flowrate", "flowrate_aliases"),
         "impulse_per_pulse": ("impulse_per_pulse", "impulse_per_pulse_aliases", "impulse_bit"),
         "elapsed_time": ("elapsed_time", "elapsed_time_aliases", "time_elapsed"),
+        "on_time": ("on_time", "on_time_aliases", "pulse_on_time", "pulse_width_on"),
         "thrust": ("thrust", "thrust_aliases"),
     }
     for role, keys in role_config_keys.items():
@@ -4220,23 +4222,62 @@ def _td_life_elapsed_from_values(values: Sequence[object]) -> float | None:
     return None
 
 
-def _td_life_raw_axis_metrics(
+def _td_life_series_sum(values: Sequence[object]) -> float | None:
+    finite_values = [float(v) for v in (_td_finite_float(value) for value in values) if v is not None]
+    if not finite_values:
+        return None
+    total = float(sum(finite_values))
+    return total if math.isfinite(total) else None
+
+
+def _td_life_series_trapezoid(xs: Sequence[object], ys: Sequence[object]) -> float | None:
+    points: list[tuple[float, float]] = []
+    for x_raw, y_raw in zip(xs, ys):
+        x_num = _td_finite_float(x_raw)
+        y_num = _td_finite_float(y_raw)
+        if x_num is None or y_num is None:
+            continue
+        points.append((float(x_num), float(y_num)))
+    if len(points) < 2:
+        return None
+    points.sort(key=lambda item: item[0])
+    area = 0.0
+    prev_x, prev_y = points[0]
+    used_segment = False
+    for x_val, y_val in points[1:]:
+        dx = float(x_val) - float(prev_x)
+        if dx <= 0:
+            prev_x, prev_y = x_val, y_val
+            continue
+        area += dx * (float(prev_y) + float(y_val)) * 0.5
+        used_segment = True
+        prev_x, prev_y = x_val, y_val
+    if not used_segment or not math.isfinite(area):
+        return None
+    return float(area)
+
+
+def _td_life_raw_curve_metrics(
     raw_db_path: Path,
     *,
     pulse_aliases: set[str],
     time_aliases: set[str],
-) -> tuple[dict[str, float], dict[str, float]]:
+    impulse_aliases: set[str],
+    thrust_aliases: set[str],
+) -> tuple[dict[str, float], dict[str, float], dict[str, float], dict[str, float]]:
     pulse_counts: dict[str, float] = {}
     elapsed_times: dict[str, float] = {}
+    pulse_impulses: dict[str, float] = {}
+    steady_impulses: dict[str, float] = {}
     path = Path(raw_db_path).expanduser()
     if not path.exists() or not path.is_file():
-        return pulse_counts, elapsed_times
+        return pulse_counts, elapsed_times, pulse_impulses, steady_impulses
     try:
         with sqlite3.connect(str(path)) as raw_conn:
             _ensure_test_data_raw_cache_tables(raw_conn)
             rows = raw_conn.execute(
                 """
-                SELECT observation_id, x_name, x_json
+                SELECT observation_id, x_name, y_name, x_json, y_json
                 FROM td_curves_raw
                 WHERE observation_id IS NOT NULL
                   AND TRIM(observation_id) <> ''
@@ -4245,27 +4286,40 @@ def _td_life_raw_axis_metrics(
                 """
             ).fetchall()
     except Exception:
-        return pulse_counts, elapsed_times
-    for observation_id, x_name, x_json in rows:
+        return pulse_counts, elapsed_times, pulse_impulses, steady_impulses
+    for observation_id, x_name, y_name, x_json, y_json in rows:
         obs_id = str(observation_id or "").strip()
         x_key = _td_life_norm_key(x_name)
+        y_key = _td_life_norm_key(y_name)
         if not obs_id or not x_key:
             continue
         try:
-            values = json.loads(x_json or "[]")
+            xs = json.loads(x_json or "[]")
         except Exception:
-            values = []
-        if not isinstance(values, list):
+            xs = []
+        try:
+            ys = json.loads(y_json or "[]")
+        except Exception:
+            ys = []
+        if not isinstance(xs, list):
             continue
         if x_key in pulse_aliases:
-            pulse_count = _td_life_pulse_count_from_values(values)
+            pulse_count = _td_life_pulse_count_from_values(xs)
             if pulse_count is not None:
                 pulse_counts[obs_id] = max(float(pulse_counts.get(obs_id, 0.0)), float(pulse_count))
+            if y_key in impulse_aliases and isinstance(ys, list):
+                impulse_sum = _td_life_series_sum(ys)
+                if impulse_sum is not None:
+                    pulse_impulses[obs_id] = max(float(pulse_impulses.get(obs_id, 0.0)), float(impulse_sum))
         if x_key in time_aliases:
-            elapsed = _td_life_elapsed_from_values(values)
+            elapsed = _td_life_elapsed_from_values(xs)
             if elapsed is not None:
                 elapsed_times[obs_id] = max(float(elapsed_times.get(obs_id, 0.0)), float(elapsed))
-    return pulse_counts, elapsed_times
+            if y_key in thrust_aliases and isinstance(ys, list):
+                thrust_integral = _td_life_series_trapezoid(xs, ys)
+                if thrust_integral is not None:
+                    steady_impulses[obs_id] = max(float(steady_impulses.get(obs_id, 0.0)), float(thrust_integral))
+    return pulse_counts, elapsed_times, pulse_impulses, steady_impulses
 
 
 def _td_life_sequence_number(value: object) -> int | None:
@@ -4339,10 +4393,14 @@ def _td_rebuild_life_metrics(
 
     alias_sets = _td_life_alias_sets(project_cfg)
     pulse_axis_aliases, time_axis_aliases = _td_life_axis_aliases(project_cfg)
-    raw_pulse_counts, raw_elapsed_times = _td_life_raw_axis_metrics(
+    impulse_aliases = {_td_life_norm_key(value) for value in (alias_sets.get("impulse_per_pulse") or []) if _td_life_norm_key(value)}
+    thrust_aliases = {_td_life_norm_key(value) for value in (alias_sets.get("thrust") or []) if _td_life_norm_key(value)}
+    raw_pulse_counts, raw_elapsed_times, raw_pulse_impulses, raw_steady_impulses = _td_life_raw_curve_metrics(
         raw_db_path,
         pulse_aliases=pulse_axis_aliases,
         time_aliases=time_axis_aliases,
+        impulse_aliases=impulse_aliases,
+        thrust_aliases=thrust_aliases,
     )
     try:
         source_rows = _read_test_data_sources(Path(workbook_path).expanduser())
@@ -4482,9 +4540,12 @@ def _td_rebuild_life_metrics(
             impulse_per_pulse = _td_life_first_metric_value(metrics_by_name, alias_sets.get("impulse_per_pulse") or [])
             thrust = _td_life_first_metric_value(metrics_by_name, alias_sets.get("thrust") or [])
             explicit_elapsed = _td_life_first_metric_value(metrics_by_name, alias_sets.get("elapsed_time") or [])
+            explicit_on_time = _td_life_first_metric_value(metrics_by_name, alias_sets.get("on_time") or [])
             raw_elapsed = raw_elapsed_times.get(obs_id)
             elapsed_input = explicit_elapsed if explicit_elapsed is not None else raw_elapsed
             pulse_width = _td_finite_float(obs.get("pulse_width"))
+            if pulse_width is None:
+                pulse_width = explicit_on_time
             control_period = _td_finite_float(obs.get("control_period"))
             run_type_text = str(obs.get("run_type") or "").strip()
             is_pm = (
@@ -4518,23 +4579,34 @@ def _td_rebuild_life_metrics(
                     sequence_throughput = float(flow_rate) * float(sequence_on_time)
                 else:
                     diagnostics.append("missing throughput inputs")
-                if impulse_per_pulse is not None and sequence_pulses is not None:
+                raw_pulse_impulse = raw_pulse_impulses.get(obs_id)
+                if raw_pulse_impulse is not None:
+                    sequence_impulse = float(raw_pulse_impulse)
+                elif impulse_per_pulse is not None and sequence_pulses is not None:
                     sequence_impulse = float(impulse_per_pulse) * float(sequence_pulses)
                 elif thrust is not None and sequence_on_time is not None:
                     sequence_impulse = float(thrust) * float(sequence_on_time)
                 else:
                     diagnostics.append("missing impulse inputs")
             else:
-                if elapsed_input is None:
+                steady_duration = explicit_elapsed
+                if steady_duration is None:
+                    steady_duration = explicit_on_time
+                if steady_duration is None:
+                    steady_duration = raw_elapsed
+                if steady_duration is None:
                     diagnostics.append("missing elapsed time")
                 else:
-                    sequence_elapsed_time = float(elapsed_input)
-                    sequence_on_time = float(elapsed_input)
+                    sequence_elapsed_time = float(steady_duration)
+                    sequence_on_time = float(steady_duration)
                 if flow_rate is not None and sequence_on_time is not None:
                     sequence_throughput = float(flow_rate) * float(sequence_on_time)
                 else:
                     diagnostics.append("missing throughput inputs")
-                if thrust is not None and sequence_on_time is not None:
+                raw_steady_impulse = raw_steady_impulses.get(obs_id)
+                if raw_steady_impulse is not None:
+                    sequence_impulse = float(raw_steady_impulse)
+                elif thrust is not None and sequence_on_time is not None:
                     sequence_impulse = float(thrust) * float(sequence_on_time)
                 else:
                     diagnostics.append("missing impulse inputs")
@@ -5156,6 +5228,11 @@ def _td_rel_uses_official_source_location(value: object) -> bool:
     return TD_SERIAL_SOURCE_ARTIFACTS_DIRNAME.casefold() in parts[root_idx + 1 :]
 
 
+def _td_rel_uses_official_td_location(value: object) -> bool:
+    parts = [part.casefold() for part in _td_rel_parts(value)]
+    return TD_SERIAL_SOURCES_DIRNAME.casefold() in parts
+
+
 def _td_doc_uses_official_source_location(doc: Mapping[str, object]) -> bool:
     return any(
         _td_rel_uses_official_source_location(doc.get(key))
@@ -5163,15 +5240,35 @@ def _td_doc_uses_official_source_location(doc: Mapping[str, object]) -> bool:
     )
 
 
+def _td_doc_uses_official_td_location(doc: Mapping[str, object]) -> bool:
+    return any(
+        _td_rel_uses_official_td_location(doc.get(key))
+        for key in ("metadata_rel", "artifacts_rel", "excel_sqlite_rel")
+    )
+
+
+def _td_is_serial_aggregate_doc(doc: Mapping[str, object]) -> bool:
+    meta_source = str(doc.get("metadata_source") or "").strip().casefold()
+    if meta_source == "td_serial_aggregate":
+        return True
+    if not _td_doc_uses_official_td_location(doc):
+        return False
+    if _td_doc_uses_official_source_location(doc):
+        return False
+    excel_sqlite_rel = str(doc.get("excel_sqlite_rel") or "").strip().casefold()
+    return excel_sqlite_rel.endswith(".sqlite3")
+
+
 def _td_project_source_identity_key(source_row: Mapping[str, object]) -> str:
     return _td_build_source_composite_key(source_row, source_row).casefold()
 
 
-def _td_project_doc_rank(global_repo: Path, support_dir: Path, doc: Mapping[str, object]) -> tuple[int, int, int, str]:
+def _td_project_doc_rank(global_repo: Path, support_dir: Path, doc: Mapping[str, object]) -> tuple[int, int, int, int, str]:
+    aggregate_score = 1 if _td_is_serial_aggregate_doc(doc) else 0
     official_score = sum(
         1
         for key in ("metadata_rel", "artifacts_rel", "excel_sqlite_rel")
-        if _td_rel_uses_official_source_location(doc.get(key))
+        if _td_rel_uses_official_td_location(doc.get(key))
     )
     sqlite_ok = 0
     try:
@@ -5191,6 +5288,7 @@ def _td_project_doc_rank(global_repo: Path, support_dir: Path, doc: Mapping[str,
     except Exception:
         mtime_ns = 0
     return (
+        int(aggregate_score),
         int(official_score),
         int(sqlite_ok),
         int(mtime_ns),
@@ -5206,13 +5304,13 @@ def _td_canonical_project_doc(
 ) -> dict[str, object]:
     row = dict(doc or {})
     row_key = _td_project_source_identity_key(row)
-    if not row_key and not _td_doc_uses_official_source_location(row):
+    if not row_key and not _td_doc_uses_official_td_location(row):
         return row
 
     repo = Path(global_repo).expanduser()
     support_dir = eidat_support_dir(repo)
     candidates: list[dict[str, object]] = []
-    if _td_doc_uses_official_source_location(row):
+    if _td_doc_uses_official_td_location(row):
         candidates.append(dict(row))
 
     pool = [dict(item) for item in (docs_pool or []) if isinstance(item, Mapping)]
@@ -5222,7 +5320,7 @@ def _td_canonical_project_doc(
                 continue
         except Exception:
             continue
-        if not _td_doc_uses_official_source_location(candidate):
+        if not _td_doc_uses_official_td_location(candidate):
             continue
         cand_key = _td_project_source_identity_key(candidate)
         if row_key and cand_key == row_key:
@@ -5239,7 +5337,7 @@ def _td_canonical_project_doc(
                         continue
                 except Exception:
                     continue
-                if not _td_doc_uses_official_source_location(candidate):
+                if not _td_doc_uses_official_td_location(candidate):
                     continue
                 cand_serial = _td_source_serial_number(candidate, candidate).casefold()
                 if cand_serial != serial:
@@ -5252,6 +5350,11 @@ def _td_canonical_project_doc(
                 candidates = serial_matches
 
     if not candidates:
+        return row
+    aggregate_candidates = [dict(candidate) for candidate in candidates if _td_is_serial_aggregate_doc(candidate)]
+    if aggregate_candidates:
+        return max(aggregate_candidates, key=lambda item: _td_project_doc_rank(repo, support_dir, item))
+    if _td_doc_uses_official_td_location(row):
         return row
     return max(candidates, key=lambda item: _td_project_doc_rank(repo, support_dir, item))
 
@@ -5280,6 +5383,117 @@ def _td_canonicalize_project_docs(
             seen.add(key)
         out.append(canonical)
     return out
+
+
+def _td_source_row_payload(doc: Mapping[str, object]) -> dict[str, str]:
+    return {
+        "serial_number": str(doc.get("serial_number") or doc.get("source_serial_number") or doc.get("serial") or "").strip(),
+        "program_title": str(doc.get("program_title") or "").strip(),
+        "document_type": str(doc.get("document_type") or "").strip(),
+        "metadata_rel": str(doc.get("metadata_rel") or "").strip(),
+        "artifacts_rel": str(doc.get("artifacts_rel") or "").strip(),
+        "excel_sqlite_rel": str(doc.get("excel_sqlite_rel") or "").strip(),
+        "asset_type": str(doc.get("asset_type") or "").strip(),
+        "asset_specific_type": str(doc.get("asset_specific_type") or "").strip(),
+        "metadata_source": str(doc.get("metadata_source") or "").strip(),
+    }
+
+
+def _td_source_materialization_label(doc: Mapping[str, object]) -> str:
+    candidate_values = [
+        str(doc.get("artifacts_rel") or "").strip(),
+        str(doc.get("metadata_rel") or "").strip(),
+        str(doc.get("excel_sqlite_rel") or "").strip(),
+    ]
+    for raw in candidate_values:
+        parts = _td_rel_parts(raw)
+        if not parts:
+            continue
+        leaf = ""
+        if raw == str(doc.get("metadata_rel") or "").strip():
+            if len(parts) >= 2 and str(parts[-1]).lower().endswith(".json"):
+                leaf = str(parts[-2]).strip()
+            else:
+                leaf = str(parts[-1]).strip()
+        elif raw == str(doc.get("excel_sqlite_rel") or "").strip():
+            leaf = Path(parts[-1]).stem
+        else:
+            leaf = str(parts[-1]).strip()
+        if not leaf:
+            continue
+        m = re.match(r"(.+?)__[0-9a-f]{10}__excel$", leaf, flags=re.IGNORECASE)
+        if m:
+            leaf = str(m.group(1) or "").strip()
+        elif leaf.lower().endswith("__excel"):
+            leaf = leaf[: -len("__excel")].strip()
+        if leaf.lower().endswith("_metadata"):
+            leaf = leaf[: -len("_metadata")].strip()
+        if leaf:
+            return leaf
+    return "source"
+
+
+def _td_materialize_source_rows(
+    global_repo: Path | None,
+    docs: Sequence[Mapping[str, object]] | None,
+    *,
+    docs_pool: Sequence[Mapping[str, object]] | None = None,
+) -> list[dict[str, str]]:
+    rows = [dict(doc) for doc in (docs or []) if isinstance(doc, Mapping)]
+    repo = Path(global_repo).expanduser() if global_repo is not None else None
+    pool = [dict(item) for item in (docs_pool or []) if isinstance(item, Mapping)]
+    pool.extend([dict(item) for item in rows])
+
+    materialized: list[dict[str, str]] = []
+    seen_rows: set[str] = set()
+    for raw in rows:
+        serial_number = _td_source_serial_number(raw, raw)
+        if not serial_number:
+            continue
+        current = dict(raw)
+        if repo is not None:
+            try:
+                current = _td_canonical_project_doc(repo, raw, docs_pool=pool)
+            except Exception:
+                current = dict(raw)
+        row = _td_source_row_payload(current)
+        exact_key = (
+            str(row.get("metadata_rel") or "").strip().casefold()
+            or str(row.get("excel_sqlite_rel") or "").strip().casefold()
+            or str(row.get("artifacts_rel") or "").strip().casefold()
+            or (
+                _td_project_source_identity_key(row)
+                + "|"
+                + _td_source_materialization_label(row).casefold()
+            )
+        )
+        if exact_key and exact_key in seen_rows:
+            continue
+        if exact_key:
+            seen_rows.add(exact_key)
+        materialized.append(row)
+
+    grouped_counts: dict[str, int] = {}
+    for row in materialized:
+        base = _td_build_source_composite_key(row, row) or _td_source_serial_number(row, row)
+        grouped_counts[base.casefold()] = int(grouped_counts.get(base.casefold(), 0)) + 1
+
+    label_counts: dict[tuple[str, str], int] = {}
+    for row in materialized:
+        base = _td_build_source_composite_key(row, row) or _td_source_serial_number(row, row)
+        base_key = base.casefold()
+        if int(grouped_counts.get(base_key, 0)) <= 1 or _td_is_serial_aggregate_doc(row):
+            row["source_key"] = base
+            continue
+        label = _td_source_materialization_label(row)
+        source_key = f"{base} / {label}" if label else base
+        pair_key = (base_key, source_key.casefold())
+        count = int(label_counts.get(pair_key, 0)) + 1
+        label_counts[pair_key] = count
+        if count > 1:
+            source_key = f"{source_key} ({count})"
+        row["source_key"] = source_key
+    return materialized
 
 
 def _td_canonical_selected_metadata_rels(
@@ -29475,7 +29689,7 @@ def update_test_data_trending_project_workbook(
             canonical_doc = _td_canonical_project_doc(repo, row_item, docs_pool=index_docs_for_td)
         except Exception:
             canonical_doc = {}
-        if canonical_doc and _td_doc_uses_official_source_location(canonical_doc):
+        if canonical_doc and _td_doc_uses_official_td_location(canonical_doc):
             for key in (
                 "serial_number",
                 "program_title",
@@ -29532,20 +29746,7 @@ def update_test_data_trending_project_workbook(
                     ws_src.cell(r, source_key_col).value = source_key
                     row_item["source_key"] = source_key
 
-    serials: list[str] = []
-    serials_set: set[str] = set()
-    source_keys_set: set[str] = set()
-    for r in range(2, (ws_src.max_row or 0) + 1):
-        sn = str(ws_src.cell(r, src_headers["serial_number"]).value or "").strip()
-        source_key = str(ws_src.cell(r, src_headers.get("source_key", 0)).value or "").strip() if src_headers.get("source_key") else ""
-        if source_key:
-            source_keys_set.add(source_key)
-        if sn and sn not in serials_set:
-            serials.append(sn)
-            serials_set.add(sn)
-    if not serials:
-        raise RuntimeError("No serial numbers found in Sources sheet.")
-
+    source_rows = _td_collect_sources_sheet_rows(ws_src, src_headers)
     added_serials: list[str] = []
     if continued_rules and not dry_run:
         try:
@@ -29564,61 +29765,27 @@ def update_test_data_trending_project_workbook(
                 if not sqlite_rel:
                     continue
                 eligible_docs.append(d)
-
-            docs_by_serial: dict[str, list[dict]] = {}
-            for d in eligible_docs:
-                sn = str(d.get("serial_number") or "").strip()
-                if sn:
-                    docs_by_serial.setdefault(sn, []).append(d)
-
-            support_dir = eidat_support_dir(repo)
-            for sn in sorted(docs_by_serial.keys()):
-                if sn in excluded_serials:
+            existing_source_keys = {
+                str(row.get("metadata_rel") or "").strip().casefold()
+                or str(row.get("excel_sqlite_rel") or "").strip().casefold()
+                or str(row.get("artifacts_rel") or "").strip().casefold()
+                for row in source_rows
+                if isinstance(row, Mapping)
+            }
+            for doc in eligible_docs:
+                sn = str(doc.get("serial_number") or "").strip()
+                if not sn or sn in excluded_serials:
                     continue
-                doc = _best_doc_for_serial(support_dir, docs_by_serial.get(sn, [])) or {}
-                source_key = _td_build_source_composite_key(
-                    {
-                        "serial_number": str(sn),
-                        "program_title": str(doc.get("program_title") or ""),
-                        "asset_type": str(doc.get("asset_type") or ""),
-                        "asset_specific_type": str(doc.get("asset_specific_type") or ""),
-                    },
-                    doc,
+                source_key = (
+                    str(doc.get("metadata_rel") or "").strip().casefold()
+                    or str(doc.get("excel_sqlite_rel") or "").strip().casefold()
+                    or str(doc.get("artifacts_rel") or "").strip().casefold()
                 )
-                if source_key and source_key in source_keys_set:
+                if source_key and source_key in existing_source_keys:
                     continue
-                if not source_key and sn in serials_set:
-                    continue
-                resolved_sqlite_rel = str(doc.get("excel_sqlite_rel") or "").strip()
-                try:
-                    resolved = _resolve_td_source_sqlite_for_node(
-                        repo,
-                        excel_sqlite_rel=resolved_sqlite_rel,
-                        artifacts_rel=str(doc.get("artifacts_rel") or "").strip(),
-                    )
-                    if str(resolved.get("status") or "").strip().lower() == "ok":
-                        resolved_sqlite_rel = str(
-                            resolved.get("healed_excel_sqlite_rel")
-                            or resolved.get("workbook_excel_sqlite_rel")
-                            or resolved_sqlite_rel
-                        ).strip()
-                except Exception:
-                    pass
-                row = int((ws_src.max_row or 0) + 1)
-                ws_src.cell(row, int(src_headers["serial_number"])).value = str(sn)
-                ws_src.cell(row, int(src_headers["program_title"])).value = str(doc.get("program_title") or "")
-                ws_src.cell(row, int(src_headers["document_type"])).value = str(doc.get("document_type") or "")
-                ws_src.cell(row, int(src_headers["metadata_rel"])).value = str(doc.get("metadata_rel") or "")
-                ws_src.cell(row, int(src_headers["artifacts_rel"])).value = str(doc.get("artifacts_rel") or "")
-                ws_src.cell(row, int(src_headers["excel_sqlite_rel"])).value = resolved_sqlite_rel
-                ws_src.cell(row, int(src_headers["asset_type"])).value = str(doc.get("asset_type") or "")
-                ws_src.cell(row, int(src_headers["asset_specific_type"])).value = str(doc.get("asset_specific_type") or "")
-                ws_src.cell(row, int(src_headers["source_key"])).value = source_key
-                if sn not in serials_set:
-                    serials.append(sn)
-                    serials_set.add(sn)
+                source_rows.append(_td_source_row_payload(doc))
                 if source_key:
-                    source_keys_set.add(source_key)
+                    existing_source_keys.add(source_key)
                 added_serials.append(sn)
 
                 if project_meta:
@@ -29637,6 +29804,28 @@ def update_test_data_trending_project_workbook(
                         project_meta_changed = True
         except Exception:
             pass
+
+    materialized_source_rows = _td_materialize_source_rows(
+        repo,
+        source_rows,
+        docs_pool=index_docs_for_td,
+    )
+    _td_write_sources_sheet_rows(ws_src, src_headers, materialized_source_rows)
+
+    serials: list[str] = []
+    serials_set: set[str] = set()
+    source_keys_set: set[str] = set()
+    for row in materialized_source_rows:
+        sn = str(row.get("serial_number") or "").strip()
+        source_key = str(row.get("source_key") or "").strip()
+        if source_key:
+            source_keys_set.add(source_key)
+        if sn and sn not in serials_set:
+            serials.append(sn)
+            serials_set.add(sn)
+    if not serials:
+        raise RuntimeError("No serial numbers found in Sources sheet.")
+
     if project_meta and excluded_serials:
         remaining_excluded = sorted({value for value in excluded_serials if value not in serials_set}, key=lambda value: value.casefold())
         if remaining_excluded != _sanitize_excluded_serials(project_meta.get("excluded_serials")):
@@ -31610,9 +31799,11 @@ def _resolve_support_path(support_dir: Path, maybe_rel: str | None) -> Path | No
 def _best_doc_for_serial(support_dir: Path, docs: list[dict]) -> dict | None:
     if not docs:
         return None
+    aggregate_docs = [dict(doc) for doc in docs if isinstance(doc, Mapping) and _td_is_serial_aggregate_doc(doc)]
+    candidates = aggregate_docs or [dict(doc) for doc in docs]
     best = None
     best_mtime = -1
-    for d in docs:
+    for d in candidates:
         meta_rel = str(d.get("metadata_rel") or "").strip()
         meta_path = _resolve_support_path(support_dir, meta_rel)
         try:
@@ -31622,7 +31813,44 @@ def _best_doc_for_serial(support_dir: Path, docs: list[dict]) -> dict | None:
         if mtime >= best_mtime:
             best_mtime = mtime
             best = d
-    return best or docs[0]
+    return best or candidates[0]
+
+
+def _td_collect_sources_sheet_rows(ws_src, src_headers: Mapping[str, int]) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    for row_idx in range(2, (ws_src.max_row or 0) + 1):
+        item = {
+            str(key): str(ws_src.cell(row_idx, int(col)).value or "").strip()
+            for key, col in src_headers.items()
+        }
+        serial_number = str(item.get("serial_number") or item.get("serial") or "").strip()
+        if not serial_number:
+            continue
+        item["serial_number"] = serial_number
+        rows.append(item)
+    return rows
+
+
+def _td_write_sources_sheet_rows(ws_src, src_headers: Mapping[str, int], rows: Sequence[Mapping[str, object]]) -> None:
+    if int(ws_src.max_row or 0) > 1:
+        ws_src.delete_rows(2, int(ws_src.max_row or 0) - 1)
+    ordered_keys = [
+        "serial_number",
+        "program_title",
+        "document_type",
+        "metadata_rel",
+        "artifacts_rel",
+        "excel_sqlite_rel",
+        "asset_type",
+        "asset_specific_type",
+        "source_key",
+    ]
+    for row_idx, row in enumerate(rows, start=2):
+        for key in ordered_keys:
+            col = src_headers.get(key)
+            if not col:
+                continue
+            ws_src.cell(row_idx, int(col)).value = str((row or {}).get(key) or "").strip()
 
 
 def _project_selected_metadata_rels(project_dir: Path) -> set[str]:
@@ -31757,46 +31985,12 @@ def save_test_data_trending_project_editor_changes(
             col = int((ws_src.max_column or 0) + 1)
             ws_src.cell(1, col).value = key
             src_headers[key] = col
-        if int(ws_src.max_row or 0) > 1:
-            ws_src.delete_rows(2, int(ws_src.max_row or 0) - 1)
-
-        support_dir = eidat_support_dir(repo)
-        docs_by_serial: dict[str, list[dict[str, object]]] = {}
-        for doc in chosen_docs:
-            serial = str(doc.get("serial_number") or "").strip()
-            if serial:
-                docs_by_serial.setdefault(serial, []).append(doc)
-        for row_idx, serial in enumerate(serials, start=2):
-            doc = _best_doc_for_serial(support_dir, cast(list[dict], docs_by_serial.get(serial, []))) or {}
-            resolved_sqlite_rel = str(doc.get("excel_sqlite_rel") or "").strip()
-            resolved = _resolve_td_source_sqlite_for_node(
-                repo,
-                excel_sqlite_rel=resolved_sqlite_rel,
-                artifacts_rel=str(doc.get("artifacts_rel") or "").strip(),
-            )
-            if str(resolved.get("status") or "").strip().lower() == "ok":
-                resolved_sqlite_rel = str(
-                    resolved.get("healed_excel_sqlite_rel")
-                    or resolved.get("workbook_excel_sqlite_rel")
-                    or resolved_sqlite_rel
-                ).strip()
-            ws_src.cell(row_idx, int(src_headers["serial_number"])).value = serial
-            ws_src.cell(row_idx, int(src_headers["program_title"])).value = str(doc.get("program_title") or "").strip()
-            ws_src.cell(row_idx, int(src_headers["document_type"])).value = str(doc.get("document_type") or "").strip()
-            ws_src.cell(row_idx, int(src_headers["metadata_rel"])).value = str(doc.get("metadata_rel") or "").strip()
-            ws_src.cell(row_idx, int(src_headers["artifacts_rel"])).value = str(doc.get("artifacts_rel") or "").strip()
-            ws_src.cell(row_idx, int(src_headers["excel_sqlite_rel"])).value = resolved_sqlite_rel
-            ws_src.cell(row_idx, int(src_headers["asset_type"])).value = str(doc.get("asset_type") or "").strip()
-            ws_src.cell(row_idx, int(src_headers["asset_specific_type"])).value = str(doc.get("asset_specific_type") or "").strip()
-            ws_src.cell(row_idx, int(src_headers["source_key"])).value = _td_build_source_composite_key(
-                {
-                    "serial_number": str(serial),
-                    "program_title": str(doc.get("program_title") or "").strip(),
-                    "asset_type": str(doc.get("asset_type") or "").strip(),
-                    "asset_specific_type": str(doc.get("asset_specific_type") or "").strip(),
-                },
-                doc,
-            )
+        materialized_rows = _td_materialize_source_rows(
+            repo,
+            chosen_docs,
+            docs_pool=docs,
+        )
+        _td_write_sources_sheet_rows(ws_src, src_headers, materialized_rows)
         wb.save(str(wb_path))
     finally:
         try:
@@ -36411,28 +36605,11 @@ def _write_test_data_trending_workbook(
 
     wb = Workbook()
 
-    source_rows: list[dict[str, str]] = []
-    seen_source_keys: set[str] = set()
-    for doc in docs_for_workbook:
-        sn = str((doc or {}).get("serial_number") or "").strip()
-        if not sn:
-            continue
-        row = {
-            "serial_number": sn,
-            "program_title": str((doc or {}).get("program_title") or "").strip(),
-            "asset_type": str((doc or {}).get("asset_type") or "").strip(),
-            "asset_specific_type": str((doc or {}).get("asset_specific_type") or "").strip(),
-            "document_type": str((doc or {}).get("document_type") or "").strip(),
-            "metadata_rel": str((doc or {}).get("metadata_rel") or "").strip(),
-            "artifacts_rel": str((doc or {}).get("artifacts_rel") or "").strip(),
-            "excel_sqlite_rel": str((doc or {}).get("excel_sqlite_rel") or "").strip(),
-        }
-        source_key = _td_build_source_composite_key(row, doc)
-        if not source_key or source_key in seen_source_keys:
-            continue
-        row["source_key"] = source_key
-        seen_source_keys.add(source_key)
-        source_rows.append(row)
+    source_rows = _td_materialize_source_rows(
+        repo,
+        docs_for_workbook,
+        docs_pool=docs_for_workbook,
+    )
     if not source_rows:
         for sn in [str(s).strip() for s in serials if str(s).strip()]:
             row = {

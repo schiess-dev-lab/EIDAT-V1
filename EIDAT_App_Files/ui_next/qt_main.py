@@ -121,7 +121,7 @@ def _td_serial_metadata_by_serial(rows: list[dict]) -> dict[str, dict]:
 
 
 TD_UNKNOWN_PROGRAM_LABEL = "Unknown Program"
-TD_AUTO_PLOT_STORE_VERSION = 3
+TD_AUTO_PLOT_STORE_VERSION = 4
 TD_AUTO_PLOT_FILTER_KEYS = (
     "programs",
     "serials",
@@ -129,6 +129,8 @@ TD_AUTO_PLOT_FILTER_KEYS = (
     "suppression_voltages",
     "valve_voltages",
 )
+TD_AUTO_GRAPH_PLOT_SELECTION_STRATEGIES = ("explicit", "all_filtered", "condition_family")
+TD_AUTO_GRAPH_PLOT_SELECTION_FAMILIES = ("steady_state", "pulsed_mode")
 
 
 def _td_auto_plot_timestamp_text() -> str:
@@ -186,6 +188,25 @@ def _td_serial_value(row: dict | None) -> str:
     if not isinstance(row, dict):
         return ""
     return str(row.get("serial") or row.get("serial_number") or "").strip()
+
+
+def _td_plot_serial_label(row_or_value: Mapping[str, object] | object) -> str:
+    if isinstance(row_or_value, Mapping):
+        for key in ("serial_number", "source_serial_number"):
+            txt = str(row_or_value.get(key) or "").strip()
+            if txt:
+                return txt
+        raw = str(row_or_value.get("serial") or row_or_value.get("source_key") or "").strip()
+    else:
+        raw = str(row_or_value or "").strip()
+    if not raw:
+        return ""
+    parts = [part.strip() for part in re.split(r"\s+[|/]\s+", raw) if part.strip()]
+    if len(parts) >= 4:
+        return parts[3]
+    if parts:
+        return parts[-1]
+    return raw
 
 
 def _td_compact_filter_value(value: object) -> str:
@@ -3897,12 +3918,16 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self.cb_y_curve = QtWidgets.QComboBox(tab_curves)
         self.cb_y_curve.hide()
         self.cb_y_curve.currentIndexChanged.connect(self._on_curve_y_column_changed)
+        self.list_y_curve = QtWidgets.QListWidget(tab_curves)
+        self.list_y_curve.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.list_y_curve.hide()
+        self.list_y_curve.itemSelectionChanged.connect(self._on_curve_y_column_changed)
 
         row_y_curve = QtWidgets.QHBoxLayout()
         row_y_curve.setSpacing(8)
-        self.btn_curve_y_column_popup = QtWidgets.QPushButton("Y Column...")
+        self.btn_curve_y_column_popup = QtWidgets.QPushButton("Y Columns...")
         self.btn_curve_y_column_popup.clicked.connect(self._open_curve_y_column_popup)
-        self.lbl_curve_y_column_summary = QtWidgets.QLabel("Y Column: -")
+        self.lbl_curve_y_column_summary = QtWidgets.QLabel("Y Columns: -")
         self.lbl_curve_y_column_summary.setStyleSheet("color: #64748b; font-size: 11px;")
         self.lbl_curve_y_column_summary.setWordWrap(False)
         self.lbl_curve_y_column_summary.setSizePolicy(
@@ -4888,8 +4913,35 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._refresh_metric_y_columns_summary()
         self._refresh_metric_stats_summary()
 
+    def _selected_curve_y_names(self) -> list[str]:
+        list_widget = getattr(self, "list_y_curve", None)
+        if isinstance(list_widget, QtWidgets.QListWidget):
+            return self._selected_list_widget_texts(list_widget)
+        current = self._combo_box_current_value(getattr(self, "cb_y_curve", None))
+        return [current] if current else []
+
     def _current_curve_y_name(self) -> str:
-        return self._combo_box_current_value(getattr(self, "cb_y_curve", None))
+        selected = self._selected_curve_y_names()
+        return str(selected[0] or "").strip() if selected else ""
+
+    def _set_curve_y_selection(self, values: Sequence[object] | None) -> None:
+        selected: list[str] = []
+        seen: set[str] = set()
+        for value in values or []:
+            text = str(value or "").strip()
+            if text and text.lower() not in seen:
+                seen.add(text.lower())
+                selected.append(text)
+        list_widget = getattr(self, "list_y_curve", None)
+        if isinstance(list_widget, QtWidgets.QListWidget):
+            self._set_list_widget_selection(list_widget, selected)
+        if hasattr(self, "cb_y_curve"):
+            self.cb_y_curve.blockSignals(True)
+            try:
+                if selected:
+                    self._set_combo_to_value(self.cb_y_curve, selected[0])
+            finally:
+                self.cb_y_curve.blockSignals(False)
 
     def _current_curve_x_key(self) -> str:
         return self._combo_box_current_value(getattr(self, "cb_x", None))
@@ -4903,10 +4955,11 @@ class TestDataTrendDialog(QtWidgets.QDialog):
     def _refresh_curve_y_column_summary(self) -> None:
         if not hasattr(self, "lbl_curve_y_column_summary"):
             return
-        selected = self._current_curve_y_name()
-        text = f"Y Column: {selected or '-'}"
+        selected = self._selected_curve_y_names()
+        all_items = self._list_widget_item_texts(getattr(self, "list_y_curve", None))
+        text = "Y Columns: " + self._popup_selection_summary(selected, total_count=len(all_items))
         self.lbl_curve_y_column_summary.setText(text)
-        self.lbl_curve_y_column_summary.setToolTip(selected)
+        self.lbl_curve_y_column_summary.setToolTip(", ".join(selected))
         self._schedule_mode_panel_height_sync()
 
     def _refresh_curve_x_column_summary(self) -> None:
@@ -4954,6 +5007,13 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._schedule_mode_panel_height_sync()
 
     def _on_curve_y_column_changed(self) -> None:
+        selected = self._selected_curve_y_names()
+        if hasattr(self, "cb_y_curve") and selected:
+            self.cb_y_curve.blockSignals(True)
+            try:
+                self._set_combo_to_value(self.cb_y_curve, selected[0])
+            finally:
+                self.cb_y_curve.blockSignals(False)
         self._refresh_curve_y_column_summary()
         self._refresh_stats_preview()
 
@@ -5085,23 +5145,20 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         return str(chosen.get("value") or "").strip() or None
 
     def _open_curve_y_column_popup(self) -> None:
-        if not hasattr(self, "cb_y_curve"):
+        if not hasattr(self, "list_y_curve"):
             return
         entries = [
-            {"value": self._combo_box_current_value(self.cb_y_curve) if i == self.cb_y_curve.currentIndex() else str(self.cb_y_curve.itemData(i) or self.cb_y_curve.itemText(i) or "").strip(),
-             "label": str(self.cb_y_curve.itemText(i) or "").strip(),
-             "search": str(self.cb_y_curve.itemText(i) or "").strip().lower()}
-            for i in range(self.cb_y_curve.count())
-            if str(self.cb_y_curve.itemText(i) or "").strip()
+            {"value": text, "label": text, "search": text.lower()}
+            for text in self._list_widget_item_texts(self.list_y_curve)
         ]
-        chosen = self._show_filter_single_select_popup(
-            title="Curve Y Column",
+        chosen = self._show_filter_checklist_popup(
+            title="Curve Y Columns",
             entries=entries,
-            selected_value=self._current_curve_y_name(),
+            selected_values=self._selected_curve_y_names(),
         )
         if chosen is None:
             return
-        self._set_combo_to_value(self.cb_y_curve, chosen)
+        self._set_curve_y_selection(chosen)
         self._on_curve_y_column_changed()
 
     def _open_curve_x_column_popup(self) -> None:
@@ -5412,6 +5469,143 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             )
         return out
 
+    def _live_filter_values_for_key(self, key: str) -> list[str]:
+        norm_key = str(key or "").strip()
+        if norm_key == "programs":
+            return [str(value).strip() for value in (self._checked_program_filters or []) if str(value).strip()]
+        if norm_key == "serials":
+            return [str(value).strip() for value in (self._checked_serial_filters or []) if str(value).strip()]
+        if norm_key == "control_periods":
+            return [str(value).strip() for value in (self._checked_control_period_filters or []) if str(value).strip()]
+        if norm_key == "suppression_voltages":
+            return [str(value).strip() for value in (self._checked_suppression_voltage_filters or []) if str(value).strip()]
+        if norm_key == "valve_voltages":
+            return [str(value).strip() for value in (self._checked_valve_voltage_filters or []) if str(value).strip()]
+        return []
+
+    def _faceted_filter_source_rows(self) -> list[dict]:
+        filter_rows = [
+            dict(row)
+            for row in (self._global_filter_rows or [])
+            if isinstance(row, dict) and _td_serial_value(row)
+        ]
+        if filter_rows:
+            return filter_rows
+        return [
+            dict(row)
+            for row in (self._available_serial_filter_rows or self._serial_source_rows or [])
+            if isinstance(row, dict) and _td_serial_value(row)
+        ]
+
+    def _faceted_filter_row_value(self, row: Mapping[str, object] | None, key: str) -> str:
+        if not isinstance(row, Mapping):
+            return ""
+        norm_key = str(key or "").strip()
+        row_dict = dict(row)
+        if norm_key == "programs":
+            return self._row_program_label(row_dict)
+        if norm_key == "serials":
+            return _td_serial_value(row_dict)
+        if norm_key == "control_periods":
+            return _td_control_period_filter_value(row_dict)
+        if norm_key == "suppression_voltages":
+            return _td_suppression_voltage_filter_value(row_dict)
+        if norm_key == "valve_voltages":
+            return _td_valve_voltage_filter_value(row_dict)
+        return ""
+
+    def _sort_filter_values_for_key(self, key: str, values: list[str]) -> list[str]:
+        clean_values = [str(value).strip() for value in (values or []) if str(value).strip()]
+        if key == "programs":
+            return sorted(
+                clean_values,
+                key=lambda value: (1 if value == TD_UNKNOWN_PROGRAM_LABEL else 0, value.casefold()),
+            )
+        if key == "serials":
+            return sorted(clean_values, key=lambda value: value.casefold())
+        return sorted(clean_values, key=_td_compact_filter_sort_key)
+
+    def _faceted_filter_universe_values(self, key: str) -> list[str]:
+        norm_key = str(key or "").strip()
+        rows = self._faceted_filter_source_rows()
+        if not rows:
+            return self._auto_plot_available_filter_values(norm_key)
+        values = [
+            self._faceted_filter_row_value(row, norm_key)
+            for row in rows
+            if self._faceted_filter_row_value(row, norm_key)
+        ]
+        if values:
+            return self._sort_filter_values_for_key(norm_key, list({value for value in values if value}))
+        return []
+
+    def _selected_filter_values_from_available(
+        self,
+        key: str,
+        available_values: list[str],
+        *,
+        filter_state: Mapping[str, object] | None = None,
+    ) -> list[str]:
+        return self._auto_plot_selected_filter_values(
+            filter_state=filter_state,
+            key=str(key or "").strip(),
+            available_values=list(available_values or []),
+            live_values=self._live_filter_values_for_key(key),
+        )
+
+    def _faceted_rows_for_filter_key(
+        self,
+        key: str,
+        *,
+        filter_state: Mapping[str, object] | None = None,
+    ) -> list[dict]:
+        norm_key = str(key or "").strip()
+        rows = self._faceted_filter_source_rows()
+        if not rows:
+            return []
+        for other_key in TD_AUTO_PLOT_FILTER_KEYS:
+            if other_key == norm_key:
+                continue
+            universe = self._faceted_filter_universe_values(other_key)
+            if not universe:
+                continue
+            selected = self._selected_filter_values_from_available(
+                other_key,
+                universe,
+                filter_state=filter_state,
+            )
+            if not selected:
+                return []
+            if set(selected) >= set(universe):
+                continue
+            allowed = set(selected)
+            rows = [
+                dict(row)
+                for row in rows
+                if self._faceted_filter_row_value(row, other_key) in allowed
+            ]
+            if not rows:
+                return []
+        return [dict(row) for row in rows]
+
+    def _faceted_available_filter_values(
+        self,
+        key: str,
+        *,
+        filter_state: Mapping[str, object] | None = None,
+    ) -> list[str]:
+        norm_key = str(key or "").strip()
+        source_rows = self._faceted_filter_source_rows()
+        if not source_rows:
+            return self._auto_plot_available_filter_values(norm_key)
+        rows = self._faceted_rows_for_filter_key(norm_key, filter_state=filter_state)
+        values = [
+            self._faceted_filter_row_value(row, norm_key)
+            for row in rows
+            if self._faceted_filter_row_value(row, norm_key)
+        ]
+        return self._sort_filter_values_for_key(norm_key, list({value for value in values if value}))
+
     def _auto_plot_entry_plot_definition(self, entry: Mapping[str, object] | None) -> dict[str, object]:
         if not isinstance(entry, Mapping):
             return {}
@@ -5477,13 +5671,6 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._auto_plot_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     def _auto_plot_filter_summary_text(self, filter_state: Mapping[str, object] | None) -> str:
-        available = {
-            "programs": list(self._available_program_filters or []),
-            "serials": self._auto_plot_available_serial_values(),
-            "control_periods": list(self._available_control_period_filters or []),
-            "suppression_voltages": list(self._available_suppression_voltage_filters or []),
-            "valve_voltages": list(self._available_valve_voltage_filters or []),
-        }
         labels = {
             "programs": "Programs",
             "serials": "Serials",
@@ -5491,16 +5678,15 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             "suppression_voltages": "Suppression Voltage",
             "valve_voltages": "Valve Voltage",
         }
-        current_state = self._current_auto_plot_filter_state()
         parts: list[str] = []
         for key in TD_AUTO_PLOT_FILTER_KEYS:
-            selected = self._auto_plot_selected_filter_values(
+            available_values = self._faceted_available_filter_values(key, filter_state=filter_state)
+            selected = self._selected_filter_values_from_available(
+                key,
+                available_values,
                 filter_state=filter_state,
-                key=key,
-                available_values=list(available.get(key) or []),
-                live_values=list(current_state.get(key) or []),
             )
-            total = len(available.get(key) or [])
+            total = len(available_values)
             if total <= 0:
                 parts.append(f"{labels[key]}: -")
             elif len(selected) >= total:
@@ -6704,6 +6890,19 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._update_plot_zoom_actions()
 
     def _refresh_global_filter_options(self) -> None:
+        def _resolve_checked_values(
+            available_values: list[str],
+            prev_available_values: set[str],
+            prev_checked_values: set[str],
+        ) -> list[str]:
+            if not prev_available_values:
+                return list(available_values)
+            represented_all = prev_checked_values >= prev_available_values
+            if represented_all:
+                return list(available_values)
+            kept = [value for value in available_values if value in prev_checked_values]
+            return kept or list(available_values)
+
         serial_rows = [dict(row) for row in (self._serial_source_rows or []) if isinstance(row, dict)]
         serial_rows = [row for row in serial_rows if _td_serial_value(row)]
         serial_rows.sort(key=lambda row: _td_serial_value(row).casefold())
@@ -6725,63 +6924,48 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         prev_valve = set(self._available_valve_voltage_filters or [])
         prev_checked_valve = set(self._checked_valve_voltage_filters or [])
 
-        if not prev_programs:
-            self._checked_program_filters = list(program_values)
-        else:
-            self._checked_program_filters = [
-                value
-                for value in program_values
-                if value in prev_checked_programs or value not in prev_programs
-            ]
+        self._checked_program_filters = _resolve_checked_values(
+            list(program_values),
+            prev_programs,
+            prev_checked_programs,
+        )
 
         serial_values = [_td_serial_value(row) for row in serial_rows]
-        if not prev_serials:
-            self._checked_serial_filters = list(serial_values)
-        else:
-            self._checked_serial_filters = [
-                serial
-                for serial in serial_values
-                if serial in prev_checked_serials or serial not in prev_serials
-            ]
+        self._checked_serial_filters = _resolve_checked_values(
+            list(serial_values),
+            prev_serials,
+            prev_checked_serials,
+        )
 
         control_period_values = sorted(
             {_td_control_period_filter_value(row) for row in filter_rows if _td_control_period_filter_value(row)},
             key=_td_compact_filter_sort_key,
         )
-        if not prev_control_periods:
-            self._checked_control_period_filters = list(control_period_values)
-        else:
-            self._checked_control_period_filters = [
-                value
-                for value in control_period_values
-                if value in prev_checked_control_periods or value not in prev_control_periods
-            ]
+        self._checked_control_period_filters = _resolve_checked_values(
+            list(control_period_values),
+            prev_control_periods,
+            prev_checked_control_periods,
+        )
 
         suppression_values = sorted(
             {_td_suppression_voltage_filter_value(row) for row in filter_rows if _td_suppression_voltage_filter_value(row)},
             key=_td_compact_filter_sort_key,
         )
-        if not prev_suppression:
-            self._checked_suppression_voltage_filters = list(suppression_values)
-        else:
-            self._checked_suppression_voltage_filters = [
-                value
-                for value in suppression_values
-                if value in prev_checked_suppression or value not in prev_suppression
-            ]
+        self._checked_suppression_voltage_filters = _resolve_checked_values(
+            list(suppression_values),
+            prev_suppression,
+            prev_checked_suppression,
+        )
 
         valve_values = sorted(
             {_td_valve_voltage_filter_value(row) for row in filter_rows if _td_valve_voltage_filter_value(row)},
             key=_td_compact_filter_sort_key,
         )
-        if not prev_valve:
-            self._checked_valve_voltage_filters = list(valve_values)
-        else:
-            self._checked_valve_voltage_filters = [
-                value
-                for value in valve_values
-                if value in prev_checked_valve or value not in prev_valve
-            ]
+        self._checked_valve_voltage_filters = _resolve_checked_values(
+            list(valve_values),
+            prev_valve,
+            prev_checked_valve,
+        )
 
         self._available_program_filters = list(program_values)
         self._available_serial_filter_rows = list(serial_rows)
@@ -7626,15 +7810,27 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             "valve_voltages": "Valve Voltage",
         }.get(str(key or "").strip(), str(key or "").strip().replace("_", " ").title())
 
-    def _filter_checklist_entries(self, key: str) -> list[dict]:
+    def _filter_checklist_entries(
+        self,
+        key: str,
+        *,
+        filter_state: Mapping[str, object] | None = None,
+    ) -> list[dict]:
         norm_key = str(key or "").strip()
+        available_values = self._faceted_available_filter_values(norm_key, filter_state=filter_state)
         if norm_key == "serials":
             entries: list[dict] = []
-            for row in (self._available_serial_filter_rows or []):
+            row_by_serial: dict[str, dict] = {}
+            for row in list(self._available_serial_filter_rows or []) + list(self._global_filter_rows or []):
+                if not isinstance(row, dict):
+                    continue
                 serial = _td_serial_value(row)
                 if not serial:
                     continue
-                program = _td_display_program_title((row or {}).get("program_title"))
+                row_by_serial.setdefault(serial, dict(row))
+            for serial in available_values:
+                row = row_by_serial.get(serial) or {"serial": serial, "serial_number": serial}
+                program = self._row_program_label(row)
                 doc_type = str((row or {}).get("document_type") or "").strip()
                 parts = [serial, program]
                 if doc_type:
@@ -7649,7 +7845,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             return entries
         return [
             {"value": value, "label": value, "search": value.lower()}
-            for value in self._auto_plot_available_filter_values(norm_key)
+            for value in available_values
             if str(value).strip()
         ]
 
@@ -7659,13 +7855,11 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         *,
         filter_state: Mapping[str, object] | None = None,
     ) -> list[str]:
-        available_values = self._auto_plot_available_filter_values(key)
-        current_state = self._current_auto_plot_filter_state()
-        return self._auto_plot_selected_filter_values(
+        available_values = self._faceted_available_filter_values(key, filter_state=filter_state)
+        return self._selected_filter_values_from_available(
+            key,
+            available_values,
             filter_state=filter_state,
-            key=key,
-            available_values=available_values,
-            live_values=list(current_state.get(key) or []),
         )
 
     def _global_filter_summary_line(
@@ -7675,7 +7869,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         filter_state: Mapping[str, object] | None = None,
     ) -> tuple[str, str]:
         label = self._filter_key_label(key)
-        available_values = self._auto_plot_available_filter_values(key)
+        available_values = self._faceted_available_filter_values(key, filter_state=filter_state)
         selected_values = self._selected_filter_values_for_key(key, filter_state=filter_state)
         total = len(available_values)
         if total <= 0:
@@ -7783,22 +7977,23 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                         row_tooltip = ""
                 else:
                     selected_values = self._selected_filter_values_for_key(key, filter_state=state)
+                    available_values = self._faceted_available_filter_values(key, filter_state=state)
                     row_text = (
                         f"{self._filter_key_label(key)}: "
-                        f"{self._popup_selection_summary(selected_values, total_count=len(self._auto_plot_available_filter_values(key)), empty_text='-')}"
+                        f"{self._popup_selection_summary(selected_values, total_count=len(available_values), empty_text='-')}"
                     )
                     row_tooltip = ", ".join(selected_values)
                 row_labels[key].setText(row_text)
                 row_labels[key].setToolTip(row_tooltip)
                 row_buttons[key].setEnabled(
-                    bool(self._auto_plot_available_filter_values(key)) and key not in disabled_map
+                    bool(self._faceted_available_filter_values(key, filter_state=state)) and key not in disabled_map
                 )
                 row_buttons[key].setToolTip(disabled_map.get(key, ""))
 
         def _edit_key(key: str) -> None:
             if key in disabled_map:
                 return
-            entries = self._filter_checklist_entries(key)
+            entries = self._filter_checklist_entries(key, filter_state=state)
             if not entries:
                 QtWidgets.QMessageBox.information(pop, title, f"No {self._filter_key_label(key).lower()} are available.")
                 return
@@ -7811,7 +8006,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             if chosen is None:
                 return
             chosen_set = {str(value).strip() for value in chosen if str(value).strip()}
-            available_values = self._auto_plot_available_filter_values(key)
+            available_values = self._faceted_available_filter_values(key, filter_state=state)
             state[key] = [value for value in available_values if value in chosen_set]
             _refresh_popup_summaries()
 
@@ -7892,11 +8087,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._set_live_global_filter_state(chosen)
 
     def _open_program_filter_popup(self) -> None:
-        entries = [
-            {"value": value, "label": value, "search": value.lower()}
-            for value in (self._available_program_filters or [])
-            if str(value).strip()
-        ]
+        state = self._current_auto_plot_filter_state()
+        entries = self._filter_checklist_entries("programs", filter_state=state)
         chosen = self._show_filter_checklist_popup(
             title="Visible Programs",
             entries=entries,
@@ -7904,27 +8096,13 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         )
         if chosen is None:
             return
-        self._checked_program_filters = [value for value in (self._available_program_filters or []) if value in set(chosen)]
+        available_values = self._faceted_available_filter_values("programs", filter_state=state)
+        self._checked_program_filters = [value for value in available_values if value in set(chosen)]
         self._on_global_filters_changed()
 
     def _open_serial_filter_popup(self) -> None:
-        entries: list[dict] = []
-        for row in (self._available_serial_filter_rows or []):
-            serial = _td_serial_value(row)
-            if not serial:
-                continue
-            program = _td_display_program_title((row or {}).get("program_title"))
-            doc_type = str((row or {}).get("document_type") or "").strip()
-            parts = [serial, program]
-            if doc_type:
-                parts.append(doc_type)
-            entries.append(
-                {
-                    "value": serial,
-                    "label": " | ".join(parts),
-                    "search": self._serial_row_filter_text(row),
-                }
-            )
+        state = self._current_auto_plot_filter_state()
+        entries = self._filter_checklist_entries("serials", filter_state=state)
         chosen = self._show_filter_checklist_popup(
             title="Visible Serials",
             entries=entries,
@@ -7932,19 +8110,13 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         )
         if chosen is None:
             return
-        self._checked_serial_filters = [
-            _td_serial_value(row)
-            for row in (self._available_serial_filter_rows or [])
-            if _td_serial_value(row) in set(chosen)
-        ]
+        available_values = self._faceted_available_filter_values("serials", filter_state=state)
+        self._checked_serial_filters = [value for value in available_values if value in set(chosen)]
         self._on_global_filters_changed()
 
     def _open_suppression_voltage_filter_popup(self) -> None:
-        entries = [
-            {"value": value, "label": value, "search": value.lower()}
-            for value in (self._available_suppression_voltage_filters or [])
-            if str(value).strip()
-        ]
+        state = self._current_auto_plot_filter_state()
+        entries = self._filter_checklist_entries("suppression_voltages", filter_state=state)
         chosen = self._show_filter_checklist_popup(
             title="Visible Suppression Voltages",
             entries=entries,
@@ -7952,17 +8124,13 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         )
         if chosen is None:
             return
-        self._checked_suppression_voltage_filters = [
-            value for value in (self._available_suppression_voltage_filters or []) if value in set(chosen)
-        ]
+        available_values = self._faceted_available_filter_values("suppression_voltages", filter_state=state)
+        self._checked_suppression_voltage_filters = [value for value in available_values if value in set(chosen)]
         self._on_global_filters_changed()
 
     def _open_valve_voltage_filter_popup(self) -> None:
-        entries = [
-            {"value": value, "label": value, "search": value.lower()}
-            for value in (self._available_valve_voltage_filters or [])
-            if str(value).strip()
-        ]
+        state = self._current_auto_plot_filter_state()
+        entries = self._filter_checklist_entries("valve_voltages", filter_state=state)
         chosen = self._show_filter_checklist_popup(
             title="Visible Valve Voltages",
             entries=entries,
@@ -7970,17 +8138,13 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         )
         if chosen is None:
             return
-        self._checked_valve_voltage_filters = [
-            value for value in (self._available_valve_voltage_filters or []) if value in set(chosen)
-        ]
+        available_values = self._faceted_available_filter_values("valve_voltages", filter_state=state)
+        self._checked_valve_voltage_filters = [value for value in available_values if value in set(chosen)]
         self._on_global_filters_changed()
 
     def _open_control_period_filter_popup(self) -> None:
-        entries = [
-            {"value": value, "label": value, "search": value.lower()}
-            for value in (self._available_control_period_filters or [])
-            if str(value).strip()
-        ]
+        state = self._current_auto_plot_filter_state()
+        entries = self._filter_checklist_entries("control_periods", filter_state=state)
         chosen = self._show_filter_checklist_popup(
             title="Visible Control Periods",
             entries=entries,
@@ -7988,9 +8152,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         )
         if chosen is None:
             return
-        self._checked_control_period_filters = [
-            value for value in (self._available_control_period_filters or []) if value in set(chosen)
-        ]
+        available_values = self._faceted_available_filter_values("control_periods", filter_state=state)
+        self._checked_control_period_filters = [value for value in available_values if value in set(chosen)]
         self._on_global_filters_changed()
 
     def _reset_global_filters(self) -> None:
@@ -9912,7 +10075,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
     def _metrics_condition_multiselect_active(self) -> bool:
         return (
-            str(getattr(self, "_mode", "") or "").strip().lower() in {"metrics", "life_metrics"}
+            str(getattr(self, "_mode", "") or "").strip().lower() in {"curves", "metrics", "life_metrics"}
             and self._current_run_selector_mode() == "condition"
             and hasattr(self, "list_metric_run_conditions")
         )
@@ -10718,7 +10881,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         return out
 
     def _curve_trace_label(self, run_name: str, curve_row: dict, *, multi_run: bool) -> str:
-        serial = str(curve_row.get("serial") or "").strip() or "SN"
+        serial = _td_plot_serial_label(curve_row) or "SN"
         program_title = str(curve_row.get("program_title") or "").strip()
         source_run_name = str(curve_row.get("source_run_name") or "").strip()
         parts: list[str] = []
@@ -10730,6 +10893,32 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         if source_run_name:
             parts.append(source_run_name)
         return " | ".join([part for part in parts if str(part).strip()])
+
+    @staticmethod
+    def _curve_plot_y_values(plot_definition: Mapping[str, object] | None) -> list[str]:
+        if not isinstance(plot_definition, Mapping):
+            return []
+        values = (
+            [str(value).strip() for value in (plot_definition.get("y") or []) if str(value).strip()]
+            if isinstance(plot_definition.get("y"), list)
+            else []
+        )
+        if values:
+            return values
+        fallback = str(plot_definition.get("y_name") or plot_definition.get("column") or "").strip()
+        return [fallback] if fallback else []
+
+    def _curve_series_label(
+        self,
+        run_name: str,
+        y_name: str,
+        curve_row: dict,
+        *,
+        multi_run: bool,
+        multi_y: bool,
+    ) -> str:
+        base = self._curve_trace_label(run_name, curve_row, multi_run=multi_run)
+        return f"{y_name} | {base}" if multi_y else base
 
     def _select_run_by_name(self, run_name: str) -> None:
         rn = str(run_name or "").strip()
@@ -10781,6 +10970,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         runs = self._current_member_runs()
         if not runs:
             self.cb_y_curve.clear()
+            if hasattr(self, "list_y_curve"):
+                self.list_y_curve.clear()
             self.cb_x.clear()
             self.list_y_metrics.clear()
             if hasattr(self, "cb_life_y_param"):
@@ -10958,11 +11149,16 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         if not self._db_path or not hasattr(self, "cb_y_curve") or not hasattr(self, "cb_x"):
             return
         runs = self._current_member_runs()
-        prev_y = self._current_curve_y_name()
+        prev_y = self._selected_curve_y_names()
         self.cb_y_curve.blockSignals(True)
         self.cb_y_curve.clear()
+        if hasattr(self, "list_y_curve"):
+            self.list_y_curve.blockSignals(True)
+            self.list_y_curve.clear()
         if not runs:
             self.cb_y_curve.blockSignals(False)
+            if hasattr(self, "list_y_curve"):
+                self.list_y_curve.blockSignals(False)
             self._refresh_curve_y_column_summary()
             return
         x_key = self._current_curve_x_key()
@@ -10982,11 +11178,15 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     y_names.append(name)
         for name in y_names:
             self.cb_y_curve.addItem(name, name)
+            if hasattr(self, "list_y_curve"):
+                self.list_y_curve.addItem(name)
         if prev_y:
-            self._set_combo_to_value(self.cb_y_curve, prev_y)
+            self._set_curve_y_selection(prev_y)
         elif y_names:
-            self.cb_y_curve.setCurrentIndex(0)
+            self._set_curve_y_selection([y_names[0]])
         self.cb_y_curve.blockSignals(False)
+        if hasattr(self, "list_y_curve"):
+            self.list_y_curve.blockSignals(False)
         self._refresh_curve_y_column_summary()
         if self._mode == "curves":
             self._refresh_stats_preview()
@@ -12073,7 +12273,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     marker="o",
                     linewidth=(2.4 if sn in hi_set else 1.3),
                     alpha=(1.0 if sn in hi_set else 0.82),
-                    label=sn,
+                    label=_td_plot_serial_label(sn) or sn,
                 )
                 any_plotted = True
             last_plot_extra = {"x_parameter": x_param, "y_parameter": y_param}
@@ -12119,7 +12319,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     marker="o",
                     linewidth=(2.4 if sn in hi_set else 1.3),
                     alpha=(1.0 if sn in hi_set else 0.82),
-                    label=sn,
+                    label=_td_plot_serial_label(sn) or sn,
                 )
                 any_plotted = True
             last_plot_extra = {"life_axis": life_axis, "y_parameter": y_param}
@@ -12393,11 +12593,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._set_plot_note("")
         self._ensure_main_axes("2d")
         selection = self._current_run_selection()
+        selections = self._current_run_selections()
         runs = self._current_member_runs()
-        y_col = self._current_curve_y_name()
+        y_cols = self._selected_curve_y_names()
         x_key = self._current_curve_x_key()
         x_label = self._current_curve_x_label()
-        if not runs or not y_col:
+        if not runs or not y_cols:
             return
         if not x_label:
             QtWidgets.QMessageBox.information(
@@ -12408,43 +12609,46 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             return
 
         self._axes.clear()
-        self._axes.set_title(self._compose_run_title(selection, f"{x_label} vs {y_col}"))
+        y_axis_label = self._plot_value_summary(y_cols) or "Y"
+        self._axes.set_title(self._compose_run_title(selection, f"{x_label} vs {y_axis_label}"))
         self._axes.set_xlabel(x_label)
-        self._axes.set_ylabel(y_col)
+        self._axes.set_ylabel(y_axis_label)
         any_plotted = False
         multi_run = len(runs) > 1
+        multi_y = len(y_cols) > 1
         x_col_title = ""
-        for run in runs:
-            x_col = self._resolve_curve_x_key(run, x_key or x_label)
-            if not x_col:
-                continue
-            if not x_col_title:
-                x_col_title = x_col
-            try:
-                curves = self._load_curves_for_selection(run, y_col, x_col, selection=selection, serials=self._active_serials())
-            except Exception as exc:
-                QtWidgets.QMessageBox.warning(self, "Plot Curves", str(exc))
-                return
-            for s in curves:
-                sn = str(s.get("serial") or "").strip()
-                xs = s.get("x") or []
-                ys = s.get("y") or []
-                if not isinstance(xs, list) or not isinstance(ys, list) or not xs or not ys:
+        for y_col in y_cols:
+            for run in runs:
+                x_col = self._resolve_curve_x_key(run, x_key or x_label)
+                if not x_col:
                     continue
+                if not x_col_title:
+                    x_col_title = x_col
                 try:
-                    hi_set = {str(v).strip() for v in (self._highlight_sns or []) if str(v).strip()}
-                    is_hi = bool(hi_set) and sn in hi_set
-                    label = self._curve_trace_label(run, s, multi_run=multi_run)
-                    self._axes.plot(
-                        xs,
-                        ys,
-                        linewidth=(2.6 if is_hi else 1.1),
-                        alpha=(1.0 if is_hi else 0.75),
-                        label=label,
-                    )
-                    any_plotted = True
-                except Exception:
-                    continue
+                    curves = self._load_curves_for_selection(run, y_col, x_col, selection=selection, serials=self._active_serials())
+                except Exception as exc:
+                    QtWidgets.QMessageBox.warning(self, "Plot Curves", str(exc))
+                    return
+                for s in curves:
+                    sn = str(s.get("serial") or "").strip()
+                    xs = s.get("x") or []
+                    ys = s.get("y") or []
+                    if not isinstance(xs, list) or not isinstance(ys, list) or not xs or not ys:
+                        continue
+                    try:
+                        hi_set = {str(v).strip() for v in (self._highlight_sns or []) if str(v).strip()}
+                        is_hi = bool(hi_set) and sn in hi_set
+                        label = self._curve_series_label(run, y_col, s, multi_run=multi_run, multi_y=multi_y)
+                        self._axes.plot(
+                            xs,
+                            ys,
+                            linewidth=(2.6 if is_hi else 1.1),
+                            alpha=(1.0 if is_hi else 0.75),
+                            label=label,
+                        )
+                        any_plotted = True
+                    except Exception:
+                        continue
         if not any_plotted:
             QtWidgets.QMessageBox.information(self, "Plot Curves", "No curve data found for this selection.")
             return
@@ -12464,21 +12668,27 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             pass
         self._capture_main_plot_base_view()
         self.btn_save_plot_pdf.setEnabled(True)
+        selection_ids = [str(item.get("id") or "").strip() for item in selections if isinstance(item, dict) and str(item.get("id") or "").strip()]
+        selection_labels = [self._selection_display_text(item) for item in selections if isinstance(item, dict) and self._selection_display_text(item)]
+        run_conditions = [self._selection_condition_label(item) for item in selections if isinstance(item, dict) and self._selection_condition_label(item)]
         self._last_plot_def = {
             "mode": "curves",
             "run": runs[0],
             "selector_mode": str(selection.get("mode") or "sequence"),
             "selection_id": str(selection.get("id") or ""),
+            "selection_ids": list(selection_ids),
+            "selection_labels": list(selection_labels),
             "display_text": self._selection_display_text(selection),
             "run_condition": self._selection_condition_label(selection),
+            "run_conditions": list(run_conditions),
             "member_sequences": list(selection.get("member_sequences") or []),
             "member_runs": list(runs),
             "x": (x_label or x_col_title),
-            "y": [y_col],
+            "y": list(y_cols),
         }
         self._update_plot_zoom_actions()
         self.btn_add_auto_plot.setEnabled(True)
-        self._populate_stats_table(runs[0], y_col, self._highlight_sn)
+        self._populate_stats_table(runs[0], y_cols[0], self._highlight_sn)
 
     def _selected_perf_runs(self) -> list[str]:
         if not getattr(self, "_db_path", None):
@@ -14033,7 +14243,15 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     x1s = [p[0] for p in pts]
                     x2s = [p[1] for p in pts]
                     ys = [p[2] for p in pts]
-                    ax.scatter(x1s, x2s, ys, s=28, alpha=0.95, color=hi_color, label=highlight_serial)
+                    ax.scatter(
+                        x1s,
+                        x2s,
+                        ys,
+                        s=28,
+                        alpha=0.95,
+                        color=hi_color,
+                        label=_td_plot_serial_label(highlight_serial) or highlight_serial,
+                    )
                     if not use_cached_condition_means and len(pts) >= 2:
                         ax.plot(x1s, x2s, ys, linewidth=2.0, alpha=0.9, color=hi_color)
                     for x1, x2, yv, lbl in pts:
@@ -14067,7 +14285,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             ):
                 try:
                     fam = self._perf_fit_family_label(hi_model.get("fit_family") or "")
-                    label = f"{highlight_serial} fit ({fam})" if fam else f"{highlight_serial} fit"
+                    serial_label = _td_plot_serial_label(highlight_serial) or highlight_serial
+                    label = f"{serial_label} fit ({fam})" if fam else f"{serial_label} fit"
                     ax.plot_wireframe(
                         hi_model["x1_grid"],
                         hi_model["x2_grid"],
@@ -14127,11 +14346,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 if isinstance(pts, list) and pts:
                     xs = [p[0] for p in pts]
                     ys = [p[1] for p in pts]
+                    serial_label = _td_plot_serial_label(highlight_serial) or highlight_serial
                     if use_cached_condition_means:
-                        ax.scatter(xs, ys, s=32, alpha=0.95, color=hi_color, label=highlight_serial)
+                        ax.scatter(xs, ys, s=32, alpha=0.95, color=hi_color, label=serial_label)
                     else:
                         if len(pts) >= 2:
-                            ax.plot(xs, ys, marker="o", linewidth=2.4, alpha=0.98, color=hi_color, label=highlight_serial)
+                            ax.plot(xs, ys, marker="o", linewidth=2.4, alpha=0.98, color=hi_color, label=serial_label)
                     for x, y, lbl in pts:
                         try:
                             ax.annotate(str(lbl), (x, y), textcoords="offset points", xytext=(4, 4), fontsize=7, alpha=0.8, color=hi_color)
@@ -14149,7 +14369,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             if isinstance(hi_model, dict) and hi_model.get("xfit") and hi_model.get("yfit"):
                 try:
                     fam = self._perf_fit_family_label(hi_model.get("fit_family") or "")
-                    label = f"{highlight_serial} fit ({fam})" if fam else f"{highlight_serial} fit"
+                    serial_label = _td_plot_serial_label(highlight_serial) or highlight_serial
+                    label = f"{serial_label} fit ({fam})" if fam else f"{serial_label} fit"
                     ax.plot(hi_model["xfit"], hi_model["yfit"], linestyle="--", linewidth=1.5, alpha=0.8, color=hi_color, label=label)
                 except Exception:
                     pass
@@ -16690,19 +16911,19 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         selection = self._selection_from_plot_def(d)
         selection_ids = [str(v).strip() for v in (d.get("selection_ids") or []) if str(v).strip()] if isinstance(d.get("selection_ids"), list) else []
         sel_id = str(selection.get("id") or d.get("selection_id") or "").strip()
-        if mode == "metrics" and want_mode == "condition":
-            self._set_mode("metrics")
+        if mode in {"curves", "metrics"} and want_mode == "condition":
+            self._set_mode(mode)
             restore_ids = list(selection_ids)
             if not restore_ids and sel_id:
                 restore_ids = [sel_id]
             self._set_metric_condition_selection_ids(restore_ids if restore_ids else None)
-        if sel_id and not (mode == "metrics" and want_mode == "condition"):
+        if sel_id and not (mode in {"curves", "metrics"} and want_mode == "condition"):
             self._select_run_by_id(sel_id)
         self._set_mode(mode)
         if mode == "curves":
-            ys = d.get("y") or []
-            if isinstance(ys, list) and ys:
-                self._set_combo_to_value(self.cb_y_curve, str(ys[0]))
+            ys = self._curve_plot_y_values(d)
+            if ys:
+                self._set_curve_y_selection(ys)
             x = str(d.get("x") or "").strip()
             if x:
                 def _norm_name(s: str) -> str:
@@ -17223,28 +17444,30 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         else:
             ax = fig.add_subplot(111)
         if mode == "curves":
-            ys = d.get("y") or []
-            y = str(ys[0] if isinstance(ys, list) and ys else "").strip()
+            y_values = self._curve_plot_y_values(d)
+            y = self._plot_value_summary(y_values) or "Y"
             x_label = str(d.get("x") or "").strip()
             ax.set_title(str(d.get("name") or "") or self._compose_run_title(selection, f"{y} vs {x_label}"))
             ax.set_xlabel(x_label)
             ax.set_ylabel(y)
             multi_run = len(runs) > 1
-            for run in runs:
-                x = self._resolve_curve_x_key(run, x_label)
-                curves = self._load_curves_for_selection(run, y, x, selection=selection, serials=self._active_serials())  # type: ignore[arg-type]
-                for s in curves:
-                    xs = s.get("x") or []
-                    ys2 = s.get("y") or []
-                    if not isinstance(xs, list) or not isinstance(ys2, list) or not xs or not ys2:
-                        continue
-                    ax.plot(
-                        xs,
-                        ys2,
-                        linewidth=1.1,
-                        alpha=0.85,
-                        label=self._curve_trace_label(run, s, multi_run=multi_run),
-                    )
+            multi_y = len(y_values) > 1
+            for y_name in y_values:
+                for run in runs:
+                    x = self._resolve_curve_x_key(run, x_label)
+                    curves = self._load_curves_for_selection(run, y_name, x, selection=selection, serials=self._active_serials())  # type: ignore[arg-type]
+                    for s in curves:
+                        xs = s.get("x") or []
+                        ys2 = s.get("y") or []
+                        if not isinstance(xs, list) or not isinstance(ys2, list) or not xs or not ys2:
+                            continue
+                        ax.plot(
+                            xs,
+                            ys2,
+                            linewidth=1.1,
+                            alpha=0.85,
+                            label=self._curve_series_label(run, y_name, s, multi_run=multi_run, multi_y=multi_y),
+                        )
             ax.grid(True, alpha=0.25)
             ax.legend(fontsize=8, loc="best")
         elif mode == "metrics":
@@ -18094,44 +18317,46 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         ax = fig.add_subplot(111, projection="3d") if plot_dimension == "3d" else fig.add_subplot(111)
 
         if mode == "curves":
-            ys = d.get("y") or []
-            y_name = str(ys[0] if isinstance(ys, list) and ys else "").strip()
+            y_values = self._curve_plot_y_values(d)
             x_label = str(d.get("x") or "").strip()
-            if not y_name or not x_label:
+            if not y_values or not x_label:
                 raise RuntimeError("The saved curve graph is missing its X or Y axis definition.")
             if not runs:
                 raise RuntimeError("No runs remain for this saved curve graph.")
-            ax.set_title(title_override or str(d.get("name") or "") or self._compose_run_title(selection, f"{y_name} vs {x_label}"))
+            y_label = self._plot_value_summary(y_values) or "Y"
+            ax.set_title(title_override or str(d.get("name") or "") or self._compose_run_title(selection, f"{y_label} vs {x_label}"))
             ax.set_xlabel(x_label)
-            ax.set_ylabel(y_name)
+            ax.set_ylabel(y_label)
             active_serials = self._active_serials(filter_state=render_filter_state)
             if not active_serials:
                 raise RuntimeError("No serials remain after applying the Auto-Graphs filters.")
             plotted_any = False
             multi_run = len(runs) > 1
-            for run_name in runs:
-                x_key = self._resolve_curve_x_key(run_name, x_label)
-                curves = self._load_curves_for_selection(
-                    run_name,
-                    y_name,
-                    x_key,
-                    selection=selection,
-                    serials=active_serials,
-                    filter_state=render_filter_state,
-                )
-                for series in curves:
-                    xs = series.get("x") or []
-                    ys2 = series.get("y") or []
-                    if not isinstance(xs, list) or not isinstance(ys2, list) or not xs or not ys2:
-                        continue
-                    plotted_any = True
-                    ax.plot(
-                        xs,
-                        ys2,
-                        linewidth=1.1,
-                        alpha=0.85,
-                        label=self._curve_trace_label(run_name, series, multi_run=multi_run),
+            multi_y = len(y_values) > 1
+            for y_name in y_values:
+                for run_name in runs:
+                    x_key = self._resolve_curve_x_key(run_name, x_label)
+                    curves = self._load_curves_for_selection(
+                        run_name,
+                        y_name,
+                        x_key,
+                        selection=selection,
+                        serials=active_serials,
+                        filter_state=render_filter_state,
                     )
+                    for series in curves:
+                        xs = series.get("x") or []
+                        ys2 = series.get("y") or []
+                        if not isinstance(xs, list) or not isinstance(ys2, list) or not xs or not ys2:
+                            continue
+                        plotted_any = True
+                        ax.plot(
+                            xs,
+                            ys2,
+                            linewidth=1.1,
+                            alpha=0.85,
+                            label=self._curve_series_label(run_name, y_name, series, multi_run=multi_run, multi_y=multi_y),
+                        )
             if not plotted_any:
                 raise RuntimeError("No curve data matched this Auto-Graph after applying the shared selection.")
             ax.grid(True, alpha=0.25)
@@ -18403,6 +18628,11 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             if isinstance(plot_definition.get("y"), list) and mode == "metrics"
             else ([column_names[0]] if column_names else [])
         )
+        selected_curve_y = (
+            self._curve_plot_y_values(plot_definition)
+            if mode == "curves"
+            else ([column_names[0]] if column_names else [])
+        )
 
         metrics_page = QtWidgets.QWidget()
         metrics_layout = QtWidgets.QFormLayout(metrics_page)
@@ -18449,19 +18679,16 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         idx_curve_x = cb_curve_x.findData(curve_x_value)
         if idx_curve_x >= 0:
             cb_curve_x.setCurrentIndex(idx_curve_x)
-        cb_curve_y = QtWidgets.QComboBox()
-        for name in column_names:
-            cb_curve_y.addItem(name, name)
-        curve_y_value = ""
-        if isinstance(plot_definition.get("y"), list) and plot_definition.get("y"):
-            curve_y_value = str((plot_definition.get("y") or [None])[0] or "").strip()
-        if not curve_y_value and column_names:
-            curve_y_value = column_names[0]
-        idx_curve_y = cb_curve_y.findData(curve_y_value)
-        if idx_curve_y >= 0:
-            cb_curve_y.setCurrentIndex(idx_curve_y)
+        btn_curve_y = QtWidgets.QPushButton("Select Y Columns...")
+        lbl_curve_y = QtWidgets.QLabel("")
+        lbl_curve_y.setWordWrap(True)
+        curve_y_row = QtWidgets.QHBoxLayout()
+        curve_y_row.addWidget(btn_curve_y)
+        curve_y_row.addWidget(lbl_curve_y, 1)
+        curve_y_widget = QtWidgets.QWidget()
+        curve_y_widget.setLayout(curve_y_row)
         curves_layout.addRow("X Axis:", cb_curve_x)
-        curves_layout.addRow("Y Axis:", cb_curve_y)
+        curves_layout.addRow("Y Axes:", curve_y_widget)
         stack.addWidget(curves_page)
 
         perf_page = QtWidgets.QWidget()
@@ -18581,6 +18808,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             lbl_metric_y.setText(_summary_label(selected_metric_y, len(column_names)))
             lbl_metric_stats.setText(_summary_label(metric_stats, len(metric_stat_choices)))
 
+        def _refresh_curve_labels() -> None:
+            lbl_curve_y.setText(_summary_label(selected_curve_y, len(column_names)))
+
         def _refresh_perf_labels() -> None:
             nonlocal perf_stats
             if not perf_stats:
@@ -18613,6 +18843,14 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             selected_metric_y = [str(value).strip() for value in chosen if str(value).strip()]
             _refresh_metric_labels()
 
+        def _pick_curve_y() -> None:
+            nonlocal selected_curve_y
+            chosen = _open_value_picker("Curve Y Columns", column_names, selected_curve_y)
+            if chosen is None:
+                return
+            selected_curve_y = [str(value).strip() for value in chosen if str(value).strip()]
+            _refresh_curve_labels()
+
         def _pick_metric_stats() -> None:
             nonlocal metric_stats
             chosen = _open_value_picker("Metric Stats", metric_stat_choices, metric_stats)
@@ -18633,6 +18871,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             stack.setCurrentIndex({"metrics": 0, "curves": 1, "performance": 2}.get(str(cb_type.currentData() or "metrics"), 0))
 
         btn_metric_y.clicked.connect(_pick_metric_y)
+        btn_curve_y.clicked.connect(_pick_curve_y)
         btn_metric_stats.clicked.connect(_pick_metric_stats)
         btn_perf_stats.clicked.connect(_pick_perf_stats)
         cb_perf_input2.currentIndexChanged.connect(lambda *_: _refresh_perf_fit_controls())
@@ -18640,6 +18879,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         cb_type.currentIndexChanged.connect(lambda *_: _sync_type_page())
 
         _refresh_metric_labels()
+        _refresh_curve_labels()
         _refresh_perf_labels()
         _refresh_perf_fit_controls()
         _sync_type_page()
@@ -18656,12 +18896,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 return
             selected_mode = str(cb_type.currentData() or "metrics").strip().lower()
             if selected_mode == "curves":
-                y_name = str(cb_curve_y.currentData() or cb_curve_y.currentText() or "").strip()
+                y_values = [str(value).strip() for value in selected_curve_y if str(value).strip()]
                 x_name = str(cb_curve_x.currentData() or cb_curve_x.currentText() or "").strip()
-                if not y_name or not x_name:
+                if not y_values or not x_name:
                     QtWidgets.QMessageBox.warning(dlg, "Auto-Graphs", "Choose both the curve X and Y axes.")
                     return
-                plot_payload = {"mode": "curves", "x": x_name, "y": [y_name]}
+                plot_payload = {"mode": "curves", "x": x_name, "y": list(y_values)}
             elif selected_mode == "performance":
                 output = str(cb_perf_output.currentData() or cb_perf_output.currentText() or "").strip()
                 input1 = str(cb_perf_input1.currentData() or cb_perf_input1.currentText() or "").strip()
@@ -19184,44 +19424,46 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         ax = fig.add_subplot(111, projection="3d") if plot_dimension == "3d" else fig.add_subplot(111)
 
         if mode == "curves":
-            ys = d.get("y") or []
-            y_name = str(ys[0] if isinstance(ys, list) and ys else "").strip()
+            y_values = self._curve_plot_y_values(d)
             x_label = str(d.get("x") or "").strip()
-            if not y_name or not x_label:
+            if not y_values or not x_label:
                 raise RuntimeError("The saved curve graph is missing its X or Y axis definition.")
             if not runs:
                 raise RuntimeError("No runs remain for this saved curve graph.")
-            ax.set_title(title_override or str(d.get("name") or "") or self._compose_run_title(selection, f"{y_name} vs {x_label}"))
+            y_label = self._plot_value_summary(y_values) or "Y"
+            ax.set_title(title_override or str(d.get("name") or "") or self._compose_run_title(selection, f"{y_label} vs {x_label}"))
             ax.set_xlabel(x_label)
-            ax.set_ylabel(y_name)
+            ax.set_ylabel(y_label)
             active_serials = self._active_serials(filter_state=render_filter_state)
             if not active_serials:
                 raise RuntimeError("No serials remain after applying the Auto-Graphs filters.")
             plotted_any = False
             multi_run = len(runs) > 1
-            for run_name in runs:
-                x_key = self._resolve_curve_x_key(run_name, x_label)
-                curves = self._load_curves_for_selection(
-                    run_name,
-                    y_name,
-                    x_key,
-                    selection=selection,
-                    serials=active_serials,
-                    filter_state=render_filter_state,
-                )
-                for series in curves:
-                    xs = series.get("x") or []
-                    ys2 = series.get("y") or []
-                    if not isinstance(xs, list) or not isinstance(ys2, list) or not xs or not ys2:
-                        continue
-                    plotted_any = True
-                    ax.plot(
-                        xs,
-                        ys2,
-                        linewidth=1.1,
-                        alpha=0.85,
-                        label=self._curve_trace_label(run_name, series, multi_run=multi_run),
+            multi_y = len(y_values) > 1
+            for y_name in y_values:
+                for run_name in runs:
+                    x_key = self._resolve_curve_x_key(run_name, x_label)
+                    curves = self._load_curves_for_selection(
+                        run_name,
+                        y_name,
+                        x_key,
+                        selection=selection,
+                        serials=active_serials,
+                        filter_state=render_filter_state,
                     )
+                    for series in curves:
+                        xs = series.get("x") or []
+                        ys2 = series.get("y") or []
+                        if not isinstance(xs, list) or not isinstance(ys2, list) or not xs or not ys2:
+                            continue
+                        plotted_any = True
+                        ax.plot(
+                            xs,
+                            ys2,
+                            linewidth=1.1,
+                            alpha=0.85,
+                            label=self._curve_series_label(run_name, y_name, series, multi_run=multi_run, multi_y=multi_y),
+                        )
             if not plotted_any:
                 raise RuntimeError("No curve data matched this Auto-Graph after applying the shared selection.")
             ax.grid(True, alpha=0.25)
@@ -19523,44 +19765,46 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         ax = fig.add_subplot(111, projection="3d") if plot_dimension == "3d" else fig.add_subplot(111)
 
         if mode == "curves":
-            ys = d.get("y") or []
-            y = str(ys[0] if isinstance(ys, list) and ys else "").strip()
+            y_values = self._curve_plot_y_values(d)
             x_label = str(d.get("x") or "").strip()
-            if not y or not x_label:
+            if not y_values or not x_label:
                 raise RuntimeError("The saved curve graph is missing its X or Y axis definition.")
             if not runs:
                 raise RuntimeError("No runs remain for this saved curve graph.")
-            ax.set_title(title_override or self._compose_run_title(selection, f"{x_label} vs {y}"))
+            y_label = self._plot_value_summary(y_values) or "Y"
+            ax.set_title(title_override or self._compose_run_title(selection, f"{x_label} vs {y_label}"))
             ax.set_xlabel(x_label)
-            ax.set_ylabel(y)
+            ax.set_ylabel(y_label)
             active_serials = self._active_serials(filter_state=render_filter_state)
             if not active_serials:
                 raise RuntimeError("No serials remain after applying the saved global filters.")
             plotted_any = False
             multi_run = len(runs) > 1
-            for run in runs:
-                x_key = self._resolve_curve_x_key(run, x_label)
-                curves = self._load_curves_for_selection(
-                    run,
-                    y,
-                    x_key,
-                    selection=selection,
-                    serials=active_serials,
-                    filter_state=render_filter_state,
-                )  # type: ignore[arg-type]
-                for series in curves:
-                    xs = series.get("x") or []
-                    ys2 = series.get("y") or []
-                    if not isinstance(xs, list) or not isinstance(ys2, list) or not xs or not ys2:
-                        continue
-                    plotted_any = True
-                    ax.plot(
-                        xs,
-                        ys2,
-                        linewidth=1.1,
-                        alpha=0.85,
-                        label=self._curve_trace_label(run, series, multi_run=multi_run),
-                    )
+            multi_y = len(y_values) > 1
+            for y_name in y_values:
+                for run in runs:
+                    x_key = self._resolve_curve_x_key(run, x_label)
+                    curves = self._load_curves_for_selection(
+                        run,
+                        y_name,
+                        x_key,
+                        selection=selection,
+                        serials=active_serials,
+                        filter_state=render_filter_state,
+                    )  # type: ignore[arg-type]
+                    for series in curves:
+                        xs = series.get("x") or []
+                        ys2 = series.get("y") or []
+                        if not isinstance(xs, list) or not isinstance(ys2, list) or not xs or not ys2:
+                            continue
+                        plotted_any = True
+                        ax.plot(
+                            xs,
+                            ys2,
+                            linewidth=1.1,
+                            alpha=0.85,
+                            label=self._curve_series_label(run, y_name, series, multi_run=multi_run, multi_y=multi_y),
+                        )
             if not plotted_any:
                 raise RuntimeError("No curve data matched this saved graph after applying the saved global filters.")
             ax.grid(True, alpha=0.25)
@@ -19654,6 +19898,117 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             ax.set_xlim(-0.5, max(len(serial_labels) - 0.5, 0.5))
             ax.set_xticks(x_idx)
             ax.set_xticklabels(serial_labels, rotation=45, ha="right", fontsize=8)
+            ax.grid(True, alpha=0.25)
+            handles, labels = ax.get_legend_handles_labels()
+            if handles and labels:
+                ax.legend(fontsize=8, loc="best")
+        elif mode == "life_metrics":
+            if not runs:
+                raise RuntimeError("No run conditions remain for this saved life metrics graph.")
+            active_serials = self._active_serials(filter_state=render_filter_state)
+            if not active_serials:
+                raise RuntimeError("No serials remain after applying the saved global filters.")
+            plot_type = str(d.get("plot_type") or "life_axis").strip().lower()
+            if plot_type not in {"life_axis", "metric_xy"}:
+                plot_type = "life_axis"
+            y_param = str(d.get("y_parameter") or "").strip()
+            if not y_param:
+                raise RuntimeError("The saved life metrics graph is missing its Y parameter.")
+            plotted_any = False
+            if plot_type == "metric_xy":
+                x_param = str(d.get("x_parameter") or "").strip()
+                if not x_param:
+                    raise RuntimeError("The saved life metrics graph is missing its X parameter.")
+                rows = be.td_load_life_metric_xy(self._db_path, runs, x_param, y_param, serials=active_serials)
+                rows = self._filter_rows_for_global_selection(rows, filter_state=render_filter_state)
+                if not rows:
+                    raise RuntimeError("No life metric data matched this saved graph after applying the saved global filters.")
+                x_units = str(
+                    next((row.get("x_units") for row in rows if str(row.get("x_units") or "").strip()), "") or ""
+                ).strip()
+                y_units = str(
+                    next((row.get("y_units") for row in rows if str(row.get("y_units") or "").strip()), "") or ""
+                ).strip()
+                ax.set_title(title_override or self._compose_run_title(selection, f"{x_param} vs {y_param}"))
+                ax.set_xlabel(f"{x_param} ({x_units})" if x_units else x_param)
+                ax.set_ylabel(f"{y_param} ({y_units})" if y_units else y_param)
+                grouped: dict[str, list[dict]] = {}
+                for row in rows:
+                    serial = str(row.get("serial") or "").strip()
+                    if serial:
+                        grouped.setdefault(serial, []).append(dict(row))
+                for serial in active_serials:
+                    points = grouped.get(serial) or []
+                    if not points:
+                        continue
+                    points = sorted(
+                        points,
+                        key=lambda row: (
+                            int(row.get("sequence_index") or 0),
+                            str(row.get("condition_key") or "").lower(),
+                            str(row.get("observation_id") or "").lower(),
+                        ),
+                    )
+                    ax.plot(
+                        [float(row.get("x_value") or 0.0) for row in points],
+                        [float(row.get("y_value") or 0.0) for row in points],
+                        marker="o",
+                        linewidth=1.3,
+                        alpha=0.88,
+                        label=_td_plot_serial_label(serial) or serial,
+                    )
+                    plotted_any = True
+            else:
+                life_axis = str(d.get("life_axis") or "sequence_index").strip() or "sequence_index"
+                life_axis_label = str(d.get("life_axis_label") or "").strip()
+                if not life_axis_label:
+                    life_axis_items = []
+                    try:
+                        life_axis_items = be.td_list_life_axes(self._db_path)
+                    except Exception:
+                        life_axis_items = []
+                    for item in (life_axis_items or []):
+                        key = str((item or {}).get("key") or "").strip()
+                        if key == life_axis:
+                            life_axis_label = str((item or {}).get("label") or "").strip()
+                            break
+                life_axis_label = life_axis_label or life_axis
+                rows = be.td_load_life_metric_series(self._db_path, runs, y_param, life_axis, serials=active_serials)
+                rows = self._filter_rows_for_global_selection(rows, filter_state=render_filter_state)
+                if not rows:
+                    raise RuntimeError("No life metric data matched this saved graph after applying the saved global filters.")
+                y_units = str(next((row.get("units") for row in rows if str(row.get("units") or "").strip()), "") or "").strip()
+                ax.set_title(title_override or self._compose_run_title(selection, f"{life_axis_label} vs {y_param}"))
+                ax.set_xlabel(life_axis_label)
+                ax.set_ylabel(f"{y_param} ({y_units})" if y_units else y_param)
+                grouped: dict[str, list[dict]] = {}
+                for row in rows:
+                    serial = str(row.get("serial") or "").strip()
+                    if serial:
+                        grouped.setdefault(serial, []).append(dict(row))
+                for serial in active_serials:
+                    points = grouped.get(serial) or []
+                    if not points:
+                        continue
+                    points = sorted(
+                        points,
+                        key=lambda row: (
+                            float(row.get("x_value") or 0.0),
+                            int(row.get("sequence_index") or 0),
+                            str(row.get("condition_key") or "").lower(),
+                        ),
+                    )
+                    ax.plot(
+                        [float(row.get("x_value") or 0.0) for row in points],
+                        [float(row.get("y_value") or 0.0) for row in points],
+                        marker="o",
+                        linewidth=1.3,
+                        alpha=0.88,
+                        label=_td_plot_serial_label(serial) or serial,
+                    )
+                    plotted_any = True
+            if not plotted_any:
+                raise RuntimeError("No life metric data matched this saved graph after applying the saved global filters.")
             ax.grid(True, alpha=0.25)
             handles, labels = ax.get_legend_handles_labels()
             if handles and labels:
@@ -20303,10 +20658,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         mode = str(plot_definition.get("mode") or "").strip().lower()
         if mode == "curves":
             return "Plot Curves"
+        if mode == "life_metrics":
+            return "Life Metrics"
         if mode == "performance":
             method = self._perf_normalize_plot_method(plot_definition.get("performance_plot_method"))
             return "Performance Curves (Run Conditions)" if method == "cached_condition_means" else "Performance Curves"
-        return "Plot Metric"
+        return "Plot Metrics"
 
     def _auto_plot_display_name(self, entry: Mapping[str, object] | None) -> str:
         if isinstance(entry, Mapping):
@@ -20316,11 +20673,26 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         plot_definition = self._auto_plot_entry_plot_definition(entry)
         mode = str(plot_definition.get("mode") or "").strip().lower()
         if mode == "curves":
-            y_name = ""
-            if isinstance(plot_definition.get("y"), list) and plot_definition.get("y"):
-                y_name = str((plot_definition.get("y") or [None])[0] or "").strip()
+            y_name = self._plot_value_summary(self._curve_plot_y_values(plot_definition), max_items=2)
             x_name = str(plot_definition.get("x") or "Time").strip() or "Time"
             return f"Curves: {y_name or 'Y'} vs {x_name}"
+        if mode == "life_metrics":
+            plot_type = str(plot_definition.get("plot_type") or "life_axis").strip().lower()
+            y_param = str(plot_definition.get("y_parameter") or "").strip() or "Y Parameter"
+            if plot_type == "metric_xy":
+                x_param = str(plot_definition.get("x_parameter") or "").strip() or "X Parameter"
+                return f"Life Metrics: {x_param} vs {y_param}"
+            axis_label = str(plot_definition.get("life_axis_label") or "").strip()
+            if not axis_label:
+                axis_key = str(plot_definition.get("life_axis") or "sequence_index").strip()
+                axis_label = {
+                    "sequence_index": "Sequence",
+                    "cumulative_pulses": "Cumulative Pulses",
+                    "cumulative_throughput": "Cumulative Throughput",
+                    "cumulative_on_time": "Cumulative On Time",
+                    "cumulative_impulse": "Cumulative Impulse",
+                }.get(axis_key, axis_key or "Life")
+            return f"Life Metrics: {y_param} over {axis_label}"
         if mode == "performance":
             output = str(plot_definition.get("output") or "").strip() or "Output"
             input1 = str(plot_definition.get("input1") or "").strip() or "Input"
@@ -20348,12 +20720,26 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         plot_definition = self._auto_plot_entry_plot_definition(entry)
         mode = str(plot_definition.get("mode") or "").strip().lower()
         if mode == "curves":
-            y_values = plot_definition.get("y")
-            y_name = ""
-            if isinstance(y_values, list) and y_values:
-                y_name = str(y_values[0] or "").strip()
+            y_name = self._plot_value_summary(self._curve_plot_y_values(plot_definition), max_items=2)
             x_name = str(plot_definition.get("x") or "Time").strip() or "Time"
             return f"{x_name} vs {y_name or 'Y'}"
+        if mode == "life_metrics":
+            plot_type = str(plot_definition.get("plot_type") or "life_axis").strip().lower()
+            y_param = str(plot_definition.get("y_parameter") or "").strip() or "Y Parameter"
+            if plot_type == "metric_xy":
+                x_param = str(plot_definition.get("x_parameter") or "").strip() or "X Parameter"
+                return f"{x_param} vs {y_param}"
+            axis_label = str(plot_definition.get("life_axis_label") or "").strip()
+            if not axis_label:
+                axis_key = str(plot_definition.get("life_axis") or "sequence_index").strip()
+                axis_label = {
+                    "sequence_index": "Sequence",
+                    "cumulative_pulses": "Cumulative Pulses",
+                    "cumulative_throughput": "Cumulative Throughput",
+                    "cumulative_on_time": "Cumulative On Time",
+                    "cumulative_impulse": "Cumulative Impulse",
+                }.get(axis_key, axis_key or "Life")
+            return f"{axis_label} vs {y_param}"
         if mode == "performance":
             return self._performance_graph_type_text(
                 plot_definition.get("input1") or "Input 1",
@@ -20382,11 +20768,11 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         graph_file: Mapping[str, object] | None,
         plot_entry: Mapping[str, object] | None,
     ) -> str:
-        global_selection = self._resolve_auto_graph_file_global_selection(graph_file)
-        selection = self._combined_auto_plot_selection(global_selection)
+        plot_definition = self._auto_plot_entry_plot_definition(plot_entry)
+        selection = self._auto_graph_plot_combined_selection(plot_definition, graph_file=graph_file)
         run_condition = self._selection_condition_label(selection)
         if not run_condition:
-            run_condition = self._auto_plot_run_selection_summary_text(global_selection)
+            run_condition = self._auto_graph_plot_selection_summary_text(plot_definition, graph_file=graph_file)
         return self._format_plot_title(run_condition, self._auto_plot_graph_type_text(plot_entry))
 
     def _auto_plot_list_item_text(self, entry: Mapping[str, object] | None) -> str:
@@ -20602,16 +20988,23 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             return None
 
         mode = str(plot_definition.get("mode") or entry.get("mode") or "").strip().lower()
-        if mode not in {"curves", "metrics", "performance"}:
+        if mode not in {"curves", "metrics", "life_metrics", "performance"}:
             if str(plot_definition.get("output") or "").strip() and str(plot_definition.get("input1") or "").strip():
                 mode = "performance"
+            elif (
+                str(plot_definition.get("plot_type") or "").strip().lower() in {"life_axis", "metric_xy"}
+                or str(plot_definition.get("y_parameter") or "").strip()
+                or str(plot_definition.get("life_axis") or "").strip()
+                or str(plot_definition.get("x_parameter") or "").strip()
+            ):
+                mode = "life_metrics"
             elif any(
                 str(plot_definition.get(key) or "").strip() for key in ("metric_plot_source", "plot_bounds")
             ) or isinstance(plot_definition.get("stats"), list):
                 mode = "metrics"
             elif str(plot_definition.get("x") or "").strip() or isinstance(plot_definition.get("y"), list):
                 mode = "curves"
-        if mode not in {"curves", "metrics", "performance"}:
+        if mode not in {"curves", "metrics", "life_metrics", "performance"}:
             return None
 
         normalized_plot_definition = dict(plot_definition)
@@ -20657,6 +21050,25 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 metric_source = str(metric_source_value or metric_source).strip().lower() or str(metric_source)
             normalized_plot_definition["metric_plot_source"] = metric_source
             normalized_plot_definition["plot_bounds"] = bool(plot_definition.get("plot_bounds"))
+        elif mode == "life_metrics":
+            plot_type = str(plot_definition.get("plot_type") or "life_axis").strip().lower()
+            if plot_type not in {"life_axis", "metric_xy"}:
+                plot_type = "life_axis"
+            normalized_plot_definition["plot_type"] = plot_type
+            normalized_plot_definition["life_axis"] = (
+                str(plot_definition.get("life_axis") or "sequence_index").strip() or "sequence_index"
+            )
+            y_parameter = str(
+                plot_definition.get("y_parameter")
+                or (((plot_definition.get("y") or [None])[0]) if isinstance(plot_definition.get("y"), list) else "")
+                or ""
+            ).strip()
+            normalized_plot_definition["y_parameter"] = y_parameter
+            x_parameter = str(plot_definition.get("x_parameter") or "").strip()
+            if plot_type == "metric_xy" and x_parameter:
+                normalized_plot_definition["x_parameter"] = x_parameter
+            elif "x_parameter" in normalized_plot_definition:
+                normalized_plot_definition.pop("x_parameter", None)
         else:
             stats = (
                 [str(value).strip().lower() for value in (plot_definition.get("stats") or []) if str(value).strip()]
@@ -20705,6 +21117,70 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             if highlight_serial:
                 normalized_plot_definition["highlight_serial"] = highlight_serial
 
+        raw_selection_ids: list[str] = []
+        if isinstance(plot_definition.get("selection_ids"), list):
+            raw_selection_ids.extend(
+                [str(value).strip() for value in (plot_definition.get("selection_ids") or []) if str(value).strip()]
+            )
+        selection_id = str(plot_definition.get("selection_id") or "").strip()
+        if selection_id:
+            raw_selection_ids.append(selection_id)
+        selection_ids: list[str] = []
+        seen_selection_ids: set[str] = set()
+        for value in raw_selection_ids:
+            if value and value not in seen_selection_ids:
+                seen_selection_ids.add(value)
+                selection_ids.append(value)
+        family_normalizer = getattr(be, "td_perf_normalize_run_type_mode", None)
+        selection_family = str(plot_definition.get("selection_family") or "").strip().lower()
+        if callable(family_normalizer):
+            try:
+                selection_family = str(family_normalizer(selection_family)).strip().lower()
+            except Exception:
+                selection_family = str(selection_family).strip().lower()
+        if selection_family not in TD_AUTO_GRAPH_PLOT_SELECTION_FAMILIES:
+            selection_family = ""
+        selector_mode = str(plot_definition.get("selector_mode") or "").strip().lower()
+        if selector_mode not in {"sequence", "condition"}:
+            selector_mode = "condition" if (mode == "life_metrics" or selection_family) else "sequence"
+        selection_strategy = str(plot_definition.get("selection_strategy") or "").strip().lower()
+        if selection_strategy not in TD_AUTO_GRAPH_PLOT_SELECTION_STRATEGIES:
+            if selection_family:
+                selection_strategy = "condition_family"
+            elif selection_ids:
+                selection_strategy = "explicit"
+            else:
+                selection_strategy = "all_filtered"
+        if mode == "life_metrics":
+            selector_mode = "condition"
+            if selection_strategy not in {"explicit", "all_filtered", "condition_family"}:
+                selection_strategy = "all_filtered"
+        if selection_strategy == "condition_family":
+            selector_mode = "condition"
+            if not selection_family:
+                selection_strategy = "all_filtered"
+        normalized_plot_definition["selector_mode"] = selector_mode
+        normalized_plot_definition["selection_strategy"] = selection_strategy
+        if selection_ids:
+            normalized_plot_definition["selection_ids"] = list(selection_ids)
+            normalized_plot_definition["selection_id"] = selection_ids[0]
+        else:
+            normalized_plot_definition.pop("selection_ids", None)
+            normalized_plot_definition.pop("selection_id", None)
+        if selection_strategy == "condition_family" and selection_family:
+            normalized_plot_definition["selection_family"] = selection_family
+        else:
+            normalized_plot_definition.pop("selection_family", None)
+
+        if mode == "performance" and selection_strategy == "condition_family" and selection_family:
+            normalized_plot_definition["performance_run_type_mode"] = selection_family
+            if (
+                selection_family != "pulsed_mode"
+                and str(normalized_plot_definition.get("performance_filter_mode") or "").strip().lower()
+                == "match_control_period"
+            ):
+                normalized_plot_definition["performance_filter_mode"] = "all_conditions"
+
         for list_key in ("selection_ids", "selection_labels", "member_runs", "member_sequences", "run_conditions"):
             if list_key in normalized_plot_definition and isinstance(normalized_plot_definition.get(list_key), list):
                 normalized_plot_definition[list_key] = [
@@ -20720,6 +21196,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             "run",
             "fit_family",
             "name",
+            "selection_family",
+            "life_axis_label",
         ):
             if text_key in normalized_plot_definition:
                 text_value = str(normalized_plot_definition.get(text_key) or "").strip()
@@ -20753,6 +21231,244 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 out.append(normalized)
         return out
 
+    def _auto_graph_file_global_selection_filters_only(
+        self,
+        raw_selection: Mapping[str, object] | None,
+        *,
+        default_to_current: bool = True,
+    ) -> dict[str, object]:
+        normalized_selection = self._normalize_auto_plot_global_selection(
+            raw_selection,
+            default_to_current=default_to_current,
+        )
+        return {
+            "filters": self._normalize_auto_plot_filter_state(
+                normalized_selection.get("filters"),
+                default_to_current=default_to_current,
+            )
+        }
+
+    def _auto_graph_plot_has_selection_spec(self, plot_definition: Mapping[str, object] | None) -> bool:
+        if not isinstance(plot_definition, Mapping):
+            return False
+        strategy = str(plot_definition.get("selection_strategy") or "").strip().lower()
+        if strategy in TD_AUTO_GRAPH_PLOT_SELECTION_STRATEGIES:
+            return True
+        if str(plot_definition.get("selection_family") or "").strip():
+            return True
+        if str(plot_definition.get("selection_id") or "").strip():
+            return True
+        selection_ids = plot_definition.get("selection_ids")
+        if isinstance(selection_ids, list):
+            return any(str(value).strip() for value in selection_ids)
+        return False
+
+    def _migrate_auto_graph_plot_selection(
+        self,
+        plot_entry: Mapping[str, object] | None,
+        legacy_selection: Mapping[str, object] | None,
+    ) -> dict[str, object] | None:
+        normalized = self._normalize_auto_plot_entry(plot_entry if isinstance(plot_entry, Mapping) else None)
+        if normalized is None:
+            return None
+        plot_definition = dict(normalized.get("plot_definition") or {})
+        if self._auto_graph_plot_has_selection_spec(plot_definition):
+            return normalized
+        legacy = self._normalize_auto_plot_global_selection(legacy_selection, default_to_current=True)
+        selector_mode = str(legacy.get("run_scope") or "").strip().lower()
+        if selector_mode not in {"sequence", "condition"}:
+            selector_mode = "condition" if str(plot_definition.get("mode") or "").strip().lower() == "life_metrics" else "sequence"
+        if str(plot_definition.get("mode") or "").strip().lower() == "life_metrics":
+            selector_mode = "condition"
+        selection_ids = [
+            str(value).strip()
+            for value in (legacy.get("selected_selection_ids") or [])
+            if str(value).strip()
+        ]
+        plot_definition["selector_mode"] = selector_mode
+        plot_definition["selection_strategy"] = "explicit" if selection_ids else "all_filtered"
+        if selection_ids:
+            plot_definition["selection_ids"] = list(selection_ids)
+            plot_definition["selection_id"] = selection_ids[0]
+        migrated = self._normalize_auto_plot_entry(
+            {
+                "id": str(normalized.get("id") or "").strip(),
+                "name": str(normalized.get("name") or "").strip(),
+                "saved_at": str(normalized.get("saved_at") or "").strip(),
+                "updated_at": str(normalized.get("updated_at") or "").strip(),
+                "plot_definition": plot_definition,
+            }
+        )
+        return migrated or normalized
+
+    def _auto_graph_plot_selection_mode(self, plot_definition: Mapping[str, object] | None) -> str:
+        mode = str((plot_definition or {}).get("mode") or "").strip().lower()
+        selector_mode = str((plot_definition or {}).get("selector_mode") or "").strip().lower()
+        if mode == "life_metrics":
+            return "condition"
+        if str((plot_definition or {}).get("selection_family") or "").strip():
+            return "condition"
+        return selector_mode if selector_mode in {"sequence", "condition"} else "sequence"
+
+    def _auto_graph_plot_selection_strategy(self, plot_definition: Mapping[str, object] | None) -> str:
+        strategy = str((plot_definition or {}).get("selection_strategy") or "").strip().lower()
+        if strategy in TD_AUTO_GRAPH_PLOT_SELECTION_STRATEGIES:
+            return strategy
+        if str((plot_definition or {}).get("selection_family") or "").strip():
+            return "condition_family"
+        selection_ids = (plot_definition or {}).get("selection_ids")
+        if isinstance(selection_ids, list) and any(str(value).strip() for value in selection_ids):
+            return "explicit"
+        if str((plot_definition or {}).get("selection_id") or "").strip():
+            return "explicit"
+        return "all_filtered"
+
+    def _auto_graph_plot_selection_ids(self, plot_definition: Mapping[str, object] | None) -> list[str]:
+        raw_ids: list[str] = []
+        if isinstance((plot_definition or {}).get("selection_ids"), list):
+            raw_ids.extend(
+                [str(value).strip() for value in ((plot_definition or {}).get("selection_ids") or []) if str(value).strip()]
+            )
+        single_id = str((plot_definition or {}).get("selection_id") or "").strip()
+        if single_id:
+            raw_ids.append(single_id)
+        out: list[str] = []
+        seen: set[str] = set()
+        for value in raw_ids:
+            if value and value not in seen:
+                seen.add(value)
+                out.append(value)
+        return out
+
+    def _auto_graph_plot_selection_family(self, plot_definition: Mapping[str, object] | None) -> str:
+        normalizer = getattr(be, "td_perf_normalize_run_type_mode", None)
+        value = str((plot_definition or {}).get("selection_family") or "").strip().lower()
+        if callable(normalizer):
+            try:
+                value = str(normalizer(value)).strip().lower()
+            except Exception:
+                value = str(value).strip().lower()
+        return value if value in TD_AUTO_GRAPH_PLOT_SELECTION_FAMILIES else ""
+
+    def _auto_graph_plot_selection_items(
+        self,
+        plot_definition: Mapping[str, object] | None,
+        *,
+        graph_file: Mapping[str, object] | None = None,
+        filter_state: Mapping[str, object] | None = None,
+    ) -> list[dict]:
+        if not isinstance(plot_definition, Mapping):
+            return []
+        resolved_filter_state = (
+            self._resolve_auto_graph_file_filter_state(graph_file)
+            if isinstance(graph_file, Mapping)
+            else self._normalize_auto_plot_filter_state(filter_state, default_to_current=True)
+        )
+        selector_mode = self._auto_graph_plot_selection_mode(plot_definition)
+        items = self._available_auto_plot_selection_items(selector_mode, filter_state=resolved_filter_state)
+        strategy = self._auto_graph_plot_selection_strategy(plot_definition)
+        if strategy == "condition_family":
+            family = self._auto_graph_plot_selection_family(plot_definition)
+            if not family:
+                return []
+            return [
+                dict(item)
+                for item in items
+                if family in set(self._selection_run_type_modes(item if isinstance(item, Mapping) else None))
+            ]
+        if strategy == "explicit":
+            wanted_ids = set(self._auto_graph_plot_selection_ids(plot_definition))
+            return [
+                dict(item)
+                for item in items
+                if isinstance(item, dict) and str(item.get("id") or "").strip() in wanted_ids
+            ]
+        return [dict(item) for item in items if isinstance(item, dict)]
+
+    def _auto_graph_plot_member_runs(
+        self,
+        plot_definition: Mapping[str, object] | None,
+        *,
+        graph_file: Mapping[str, object] | None = None,
+        filter_state: Mapping[str, object] | None = None,
+    ) -> list[str]:
+        runs: list[str] = []
+        seen: set[str] = set()
+        for selection in self._auto_graph_plot_selection_items(
+            plot_definition,
+            graph_file=graph_file,
+            filter_state=filter_state,
+        ):
+            for run_name in (selection.get("member_runs") or []):
+                text = str(run_name or "").strip()
+                if text and text.casefold() not in seen:
+                    seen.add(text.casefold())
+                    runs.append(text)
+            run_name = str(selection.get("run_name") or "").strip()
+            if run_name and run_name.casefold() not in seen:
+                seen.add(run_name.casefold())
+                runs.append(run_name)
+        return runs
+
+    def _auto_graph_plot_combined_selection(
+        self,
+        plot_definition: Mapping[str, object] | None,
+        *,
+        graph_file: Mapping[str, object] | None = None,
+        filter_state: Mapping[str, object] | None = None,
+    ) -> dict:
+        items = self._auto_graph_plot_selection_items(
+            plot_definition,
+            graph_file=graph_file,
+            filter_state=filter_state,
+        )
+        if not items:
+            return {}
+        if len(items) == 1:
+            return dict(items[0])
+        return self._combine_run_selections(items)
+
+    def _auto_graph_plot_selection_summary_text(
+        self,
+        plot_definition: Mapping[str, object] | None,
+        *,
+        graph_file: Mapping[str, object] | None = None,
+        filter_state: Mapping[str, object] | None = None,
+    ) -> str:
+        if not isinstance(plot_definition, Mapping):
+            return "-"
+        selector_mode = self._auto_graph_plot_selection_mode(plot_definition)
+        strategy = self._auto_graph_plot_selection_strategy(plot_definition)
+        if strategy == "condition_family":
+            family = self._auto_graph_plot_selection_family(plot_definition)
+            return "All Pulsed mode" if family == "pulsed_mode" else "All Steady-state"
+        if strategy == "all_filtered":
+            return "All filtered run conditions" if selector_mode == "condition" else "All filtered sequences"
+        labels = [
+            self._selection_display_text(selection)
+            for selection in self._auto_graph_plot_selection_items(
+                plot_definition,
+                graph_file=graph_file,
+                filter_state=filter_state,
+            )
+            if isinstance(selection, dict) and self._selection_display_text(selection)
+        ]
+        labels = [str(label).strip() for label in labels if str(label).strip()]
+        if not labels:
+            return "Selected run conditions" if selector_mode == "condition" else "Selected sequences"
+        return self._popup_selection_summary(labels, total_count=len(labels), empty_text="-")
+
+    def _auto_graph_plot_list_text(
+        self,
+        plot_entry: Mapping[str, object] | None,
+        *,
+        graph_file: Mapping[str, object] | None = None,
+    ) -> str:
+        plot_definition = self._auto_plot_entry_plot_definition(plot_entry)
+        title = f"{self._auto_plot_mode_label(plot_entry)} | {self._auto_plot_display_name(plot_entry)}"
+        selection_text = self._auto_graph_plot_selection_summary_text(plot_definition, graph_file=graph_file)
+        return f"{title}\n{selection_text}" if selection_text else title
+
     def _legacy_auto_graph_file_from_entry(
         self,
         raw_entry: Mapping[str, object] | None,
@@ -20773,7 +21489,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             "name": str(raw_entry.get("name") or plot_entry.get("name") or "").strip() or "Auto-Graph File",
             "saved_at": str(raw_entry.get("saved_at") or plot_entry.get("saved_at") or "").strip(),
             "updated_at": str(raw_entry.get("updated_at") or plot_entry.get("updated_at") or "").strip(),
-            "global_selection": raw_selection,
+            "global_selection": self._auto_graph_file_global_selection_filters_only(raw_selection),
             "track_program_serials": False,
             "plots": [plot_entry],
         }
@@ -20807,7 +21523,19 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             raw_selection = fallback_global_selection
         if not isinstance(raw_selection, Mapping):
             raw_selection = self._default_auto_plot_global_selection()
-        global_selection = self._normalize_auto_plot_global_selection(raw_selection, default_to_current=True)
+        legacy_selection = self._normalize_auto_plot_global_selection(raw_selection, default_to_current=True)
+        normalized_plots = [
+            migrated
+            for migrated in (
+                self._migrate_auto_graph_plot_selection(plot_entry, legacy_selection)
+                for plot_entry in normalized_plots
+            )
+            if migrated is not None
+        ]
+        global_selection = self._auto_graph_file_global_selection_filters_only(
+            raw_selection,
+            default_to_current=True,
+        )
         name = str(raw.get("name") or "").strip()
         if not name:
             name = (
@@ -20835,8 +21563,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
     ) -> dict[str, list[str]]:
         if not isinstance(graph_file, Mapping):
             return self._current_auto_plot_filter_state()
-        selection = self._normalize_auto_plot_global_selection(
-            graph_file.get("global_selection"),
+        selection = self._auto_graph_file_global_selection_filters_only(
+            graph_file.get("global_selection") if isinstance(graph_file.get("global_selection"), Mapping) else None,
             default_to_current=True,
         )
         filters = self._normalize_auto_plot_filter_state(selection.get("filters"), default_to_current=True)
@@ -20869,13 +21597,13 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         graph_file: Mapping[str, object] | None,
     ) -> dict[str, object]:
         if not isinstance(graph_file, Mapping):
-            return self._default_auto_plot_global_selection()
-        selection = self._normalize_auto_plot_global_selection(
-            graph_file.get("global_selection"),
+            return {"filters": self._current_auto_plot_filter_state()}
+        selection = self._auto_graph_file_global_selection_filters_only(
+            graph_file.get("global_selection") if isinstance(graph_file.get("global_selection"), Mapping) else None,
             default_to_current=True,
         )
         selection["filters"] = self._resolve_auto_graph_file_filter_state(graph_file)
-        return self._normalize_auto_plot_global_selection(selection, default_to_current=True)
+        return selection
 
     def _normalized_auto_plot_entries(self) -> list[dict[str, object]]:
         normalized: list[dict[str, object]] = []
@@ -20988,12 +21716,13 @@ class TestDataTrendDialog(QtWidgets.QDialog):
     def _auto_graph_file_tooltip(self, graph_file: Mapping[str, object] | None) -> str:
         if not isinstance(graph_file, Mapping):
             return ""
+        filters = self._resolve_auto_graph_file_filter_state(graph_file)
         lines = [
             str(graph_file.get("name") or "").strip() or "Auto-Graph File",
             self._auto_graph_file_program_summary_text(graph_file),
             f"Plots: {len(self._auto_graph_file_plot_entries(graph_file))}",
             "Track serials from programs: On" if bool(graph_file.get("track_program_serials")) else "Track serials from programs: Off",
-            self._auto_plot_global_selection_details_text(self._resolve_auto_graph_file_global_selection(graph_file)),
+            f"Filters: {self._auto_plot_filter_summary_text(filters)}",
         ]
         saved_at = str(graph_file.get("saved_at") or "").strip()
         updated_at = str(graph_file.get("updated_at") or "").strip()
@@ -21158,32 +21887,41 @@ class TestDataTrendDialog(QtWidgets.QDialog):
     ) -> tuple[object, str]:
         plot_definition = self._auto_plot_entry_plot_definition(plot_entry)
         title = self._auto_plot_display_name(plot_entry)
-        global_selection = self._resolve_auto_graph_file_global_selection(graph_file)
-        selection = self._combined_auto_plot_selection(global_selection)
         filter_state = self._resolve_auto_graph_file_filter_state(graph_file)
-        if not selection or not self._selected_auto_plot_member_runs(global_selection):
+        selection_items = self._auto_graph_plot_selection_items(
+            plot_definition,
+            graph_file=graph_file,
+            filter_state=filter_state,
+        )
+        selection = self._auto_graph_plot_combined_selection(
+            plot_definition,
+            graph_file=graph_file,
+            filter_state=filter_state,
+        )
+        member_runs = self._auto_graph_plot_member_runs(
+            plot_definition,
+            graph_file=graph_file,
+            filter_state=filter_state,
+        )
+        if not selection or not member_runs:
             message = "No runs remain for this graph file after applying its saved selection."
             return self._auto_plot_warning_figure(title=title or "Auto-Graph", message=message), message
         render_definition = dict(plot_definition)
-        render_definition["selector_mode"] = str(selection.get("mode") or global_selection.get("run_scope") or "sequence")
+        render_definition["selector_mode"] = self._auto_graph_plot_selection_mode(plot_definition)
+        render_definition["selection_strategy"] = self._auto_graph_plot_selection_strategy(plot_definition)
+        selection_family = self._auto_graph_plot_selection_family(plot_definition)
+        if selection_family:
+            render_definition["selection_family"] = selection_family
         render_definition["selection_id"] = str(selection.get("id") or "").strip()
         render_definition["selection_ids"] = [
-            str(value).strip()
-            for value in (
-                selection.get("selection_ids")
-                or global_selection.get("selected_selection_ids")
-                or ([selection.get("id")] if str(selection.get("id") or "").strip() else [])
-            )
-            if str(value).strip()
+            str(item.get("id") or "").strip()
+            for item in selection_items
+            if isinstance(item, Mapping) and str(item.get("id") or "").strip()
         ]
         render_definition["selection_labels"] = [
-            str(value).strip()
-            for value in (
-                selection.get("selection_labels")
-                or selection.get("run_conditions")
-                or [self._selection_display_text(selection)]
-            )
-            if str(value).strip()
+            self._selection_display_text(item if isinstance(item, Mapping) else None)
+            for item in selection_items
+            if isinstance(item, Mapping) and self._selection_display_text(item)
         ]
         render_definition["display_text"] = self._selection_display_text(selection)
         render_definition["run_condition"] = self._selection_condition_label(selection)
@@ -21194,7 +21932,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         ]
         render_definition["member_runs"] = [
             str(value).strip()
-            for value in (selection.get("member_runs") or [])
+            for value in member_runs
             if str(value).strip()
         ]
         render_definition["member_sequences"] = [
@@ -21383,7 +22121,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             "QLabel { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 10px; "
             "padding: 10px 12px; color: #334155; font-size: 11px; }"
         )
-        subtitle.setVisible(False)
+        subtitle.setText(f"Filters: {self._auto_plot_filter_summary_text(self._resolve_auto_graph_file_filter_state(normalized))}")
+        subtitle.setVisible(True)
+        layout.addWidget(subtitle)
 
         splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
         layout.addWidget(splitter, 1)
@@ -21435,7 +22175,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             first_item = None
             for plot_entry in _plots():
                 item = QtWidgets.QListWidgetItem(
-                    f"{self._auto_plot_mode_label(plot_entry)} | {self._auto_plot_display_name(plot_entry)}"
+                    self._auto_graph_plot_list_text(plot_entry, graph_file=current_file["value"])
                 )
                 item.setData(QtCore.Qt.ItemDataRole.UserRole, plot_entry)
                 plot_list.addItem(item)
@@ -21678,6 +22418,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             return scroll
 
         selected_metric_y: list[str] = []
+        selected_curve_y: list[str] = []
         metric_stats: list[str] = ["mean"]
         perf_stats: list[str] = ["mean"]
 
@@ -21716,9 +22457,16 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         cb_curve_x = QtWidgets.QComboBox()
         cb_curve_x.addItem("Time", "Time")
         cb_curve_x.addItem("Pulse Number", "Pulse Number")
-        cb_curve_y = QtWidgets.QComboBox()
+        btn_curve_y = QtWidgets.QPushButton("Select Y Columns...")
+        lbl_curve_y = QtWidgets.QLabel("-")
+        lbl_curve_y.setWordWrap(True)
+        row_curve_y = QtWidgets.QHBoxLayout()
+        row_curve_y.addWidget(btn_curve_y)
+        row_curve_y.addWidget(lbl_curve_y, 1)
+        w_curve_y = QtWidgets.QWidget()
+        w_curve_y.setLayout(row_curve_y)
         curves_form.addRow("X Axis:", cb_curve_x)
-        curves_form.addRow("Y Axis:", cb_curve_y)
+        curves_form.addRow("Y Axes:", w_curve_y)
         stack.addWidget(_scrollable_builder_page(curves_page))
 
         perf_page = QtWidgets.QWidget()
@@ -21869,11 +22617,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
         def _refresh_builder_sources() -> None:
             columns = _available_columns()
-            _set_combo_values(
-                cb_curve_y,
-                columns,
-                current_value=str(cb_curve_y.currentData() or cb_curve_y.currentText() or "").strip(),
-            )
+            selected_curve_y[:] = [value for value in selected_curve_y if value in columns]
+            if not selected_curve_y and columns:
+                selected_curve_y[:] = [columns[0]]
             _set_combo_values(
                 cb_perf_output,
                 columns,
@@ -21905,6 +22651,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 include_blank=True,
                 blank_text="(None)",
             )
+            lbl_curve_y.setText(self._popup_selection_summary(selected_curve_y, total_count=len(columns), empty_text="-"))
             lbl_metric_y.setText(self._popup_selection_summary(selected_metric_y, total_count=len(columns), empty_text="-"))
             lbl_metric_stats.setText(self._popup_selection_summary(metric_stats, total_count=len(self._auto_plot_metric_stat_choices()), empty_text="-"))
             if not perf_stats:
@@ -21935,9 +22682,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             for plot_entry in state.get("plots") or []:
                 if not isinstance(plot_entry, Mapping):
                     continue
-                item = QtWidgets.QListWidgetItem(
-                    f"{self._auto_plot_mode_label(plot_entry)} | {self._auto_plot_display_name(plot_entry)}"
-                )
+                item = QtWidgets.QListWidgetItem(self._auto_graph_plot_list_text(plot_entry))
                 item.setData(QtCore.Qt.ItemDataRole.UserRole, plot_entry)
                 plot_list.addItem(item)
                 if first_item is None:
@@ -21959,6 +22704,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             if idx_type >= 0:
                 cb_type.setCurrentIndex(idx_type)
             selected_metric_y.clear()
+            selected_curve_y.clear()
             metric_stats[:] = ["mean"]
             perf_stats[:] = ["mean"]
             idx_source = cb_metric_source.findData(aggregate_source)
@@ -22035,10 +22781,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 idx_curve_x = cb_curve_x.findData(str(plot_definition.get("x") or "Time").strip() or "Time")
                 if idx_curve_x >= 0:
                     cb_curve_x.setCurrentIndex(idx_curve_x)
-                curve_y = str(((plot_definition.get("y") or [None])[0]) or "").strip() if isinstance(plot_definition.get("y"), list) else ""
-                idx_curve_y = cb_curve_y.findData(curve_y)
-                if idx_curve_y >= 0:
-                    cb_curve_y.setCurrentIndex(idx_curve_y)
+                selected_curve_y[:] = self._curve_plot_y_values(plot_definition)
+                _refresh_builder_sources()
             btn_add_plot.setText("Update Plot")
 
         def _pick_values(title_text: str, values: list[str], selected_values: list[str]) -> list[str] | None:
@@ -22139,13 +22883,13 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     }
                 )
             else:
-                y_name = str(cb_curve_y.currentData() or "").strip()
+                y_values = [str(value).strip() for value in selected_curve_y if str(value).strip()]
                 x_name = str(cb_curve_x.currentData() or "Time").strip() or "Time"
-                if not y_name:
-                    QtWidgets.QMessageBox.warning(dlg, "Auto-Graphs", "Choose the curve Y axis.")
+                if not y_values:
+                    QtWidgets.QMessageBox.warning(dlg, "Auto-Graphs", "Choose at least one curve Y axis.")
                     return
                 plot_payload = dict(base_definition)
-                plot_payload.update({"mode": "curves", "x": x_name, "y": [y_name]})
+                plot_payload.update({"mode": "curves", "x": x_name, "y": list(y_values)})
 
             now_text = _td_auto_plot_timestamp_text()
             plot_entry = self._normalize_auto_plot_entry(
@@ -22238,6 +22982,13 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 _refresh_builder_sources(),
             ) if chosen is not None else None
         )(_pick_values("Metric Y Columns", _available_columns(), list(selected_metric_y))))
+        btn_curve_y.clicked.connect(lambda: (
+            lambda chosen: (
+                selected_curve_y.clear(),
+                selected_curve_y.extend([str(value).strip() for value in chosen if str(value).strip()]),
+                _refresh_builder_sources(),
+            ) if chosen is not None else None
+        )(_pick_values("Curve Y Columns", _available_columns(), list(selected_curve_y))))
         btn_metric_stats.clicked.connect(lambda: (
             lambda chosen: (
                 metric_stats.clear(),
@@ -22326,7 +23077,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         title.setStyleSheet("font-size: 15px; font-weight: 800;")
         layout.addWidget(title)
         hint = QtWidgets.QLabel(
-            "Open saved graph files from the tile library. Each file keeps its own filters, run selection, and plot list."
+            "Open saved graph files from the tile library. Each file keeps shared filters and serial tracking, while each plot keeps its own selector and graph settings."
         )
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #64748b; font-size: 11px;")

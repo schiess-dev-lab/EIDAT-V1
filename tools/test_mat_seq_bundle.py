@@ -1,6 +1,7 @@
 import sqlite3
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -14,9 +15,10 @@ sys.path.insert(0, str(ROOT / "EIDAT_App_Files" / "Application"))
 sys.path.insert(0, str(ROOT / "EIDAT_App_Files"))
 
 from eidat_manager_db import support_paths  # type: ignore
+from eidat_manager import _cmd_process  # type: ignore
 from eidat_manager_index import build_index  # type: ignore
 from eidat_manager_mat_bundle import detect_mat_bundle_member, list_mat_bundle_members  # type: ignore
-from eidat_manager_process import process_candidates  # type: ignore
+from eidat_manager_process import process_candidates, rebuild_td_serial_aggregates  # type: ignore
 from eidat_manager_scan import scan_global_repo  # type: ignore
 from ui_next.backend import get_file_artifacts_path, read_eidat_index_documents  # type: ignore
 
@@ -49,6 +51,81 @@ class TestMatSeqBundle(unittest.TestCase):
                 "bad_matrix": np.array([[1.0, 2.0], [3.0, 4.0]], dtype=float),
             },
         )
+
+    def _write_td_source_sqlite(self, path: Path, *, source_sheet_name: str, serial_number: str, thrust_offset: float = 0.0) -> None:
+        table_name = f"sheet__{source_sheet_name}"
+        with sqlite3.connect(str(path)) as conn:
+            conn.execute(
+                f'''
+                CREATE TABLE "{table_name}" (
+                    excel_row INTEGER NOT NULL,
+                    "Time" REAL,
+                    thrust REAL
+                )
+                '''
+            )
+            conn.executemany(
+                f'INSERT INTO "{table_name}"(excel_row,"Time",thrust) VALUES(?,?,?)',
+                [
+                    (1, 0.0, 10.0 + thrust_offset),
+                    (2, 1.0, 20.0 + thrust_offset),
+                    (3, 2.0, 30.0 + thrust_offset),
+                ],
+            )
+            conn.execute(
+                """
+                CREATE TABLE __sheet_info (
+                    sheet_name TEXT PRIMARY KEY,
+                    source_sheet_name TEXT,
+                    table_name TEXT NOT NULL,
+                    header_row INTEGER NOT NULL,
+                    import_order INTEGER,
+                    excel_col_indices_json TEXT NOT NULL,
+                    headers_json TEXT NOT NULL,
+                    columns_json TEXT NOT NULL,
+                    mapped_headers_json TEXT,
+                    rows_inserted INTEGER NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO __sheet_info(
+                    sheet_name, source_sheet_name, table_name, header_row, import_order,
+                    excel_col_indices_json, headers_json, columns_json, mapped_headers_json, rows_inserted
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    source_sheet_name,
+                    source_sheet_name,
+                    table_name,
+                    1,
+                    1,
+                    "[1,2,3]",
+                    '["excel_row","Time","thrust"]',
+                    '{"excel_row":"INTEGER","Time":"REAL","thrust":"REAL"}',
+                    "[]",
+                    3,
+                ),
+            )
+            conn.execute(
+                """
+                CREATE TABLE __meta_cells (
+                    sheet_name TEXT NOT NULL,
+                    excel_row INTEGER NOT NULL,
+                    excel_col INTEGER NOT NULL,
+                    value TEXT NOT NULL
+                )
+                """
+            )
+            conn.executemany(
+                "INSERT INTO __meta_cells(sheet_name, excel_row, excel_col, value) VALUES(?, ?, ?, ?)",
+                [
+                    (source_sheet_name, 1, 1, "Serial Number"),
+                    (source_sheet_name, 1, 2, serial_number),
+                ],
+            )
+            conn.commit()
 
     def test_bundle_detector_matches_seq_files_only(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
@@ -100,11 +177,18 @@ class TestMatSeqBundle(unittest.TestCase):
             sqlite_path = artifacts_dir / f"{bundle.bundle_stem}.sqlite3"
             metadata_path = artifacts_dir / f"{bundle.bundle_stem}_metadata.json"
             manifest_path = artifacts_dir / "mat_seq_bundle.json"
+            aggregate_dir = artifacts_dir.parent.parent
+            aggregate_sqlite = aggregate_dir / "SN123.sqlite3"
+            aggregate_metadata = aggregate_dir / "SN123_metadata.json"
+            aggregate_manifest = aggregate_dir / "td_serial_aggregate.json"
 
             self.assertTrue(artifacts_dir.exists())
             self.assertTrue(sqlite_path.exists())
             self.assertTrue(metadata_path.exists())
             self.assertTrue(manifest_path.exists())
+            self.assertTrue(aggregate_sqlite.exists())
+            self.assertTrue(aggregate_metadata.exists())
+            self.assertTrue(aggregate_manifest.exists())
             self.assertFalse((paths.support_dir / "debug" / "ocr" / "SN123_seq1__excel").exists())
             meta = __import__("json").loads(metadata_path.read_text(encoding="utf-8"))
             manifest = __import__("json").loads(manifest_path.read_text(encoding="utf-8"))
@@ -127,8 +211,21 @@ class TestMatSeqBundle(unittest.TestCase):
             build_index(paths)
             docs = read_eidat_index_documents(repo)
             td_docs = [doc for doc in docs if str(doc.get("serial_number") or "").strip() == "SN123"]
-            self.assertEqual(len(td_docs), 1)
-            self.assertIn(bundle.bundle_stem, str(td_docs[0].get("excel_sqlite_rel") or ""))
+            self.assertEqual(len(td_docs), 2)
+            source_docs = [
+                doc
+                for doc in td_docs
+                if "/sources/" in str(doc.get("artifacts_rel") or "").replace("\\", "/")
+            ]
+            aggregate_docs = [
+                doc
+                for doc in td_docs
+                if "/sources/" not in str(doc.get("artifacts_rel") or "").replace("\\", "/")
+            ]
+            self.assertEqual(len(source_docs), 1)
+            self.assertEqual(len(aggregate_docs), 1)
+            self.assertIn(bundle.bundle_stem, str(source_docs[0].get("excel_sqlite_rel") or ""))
+            self.assertTrue(str(aggregate_docs[0].get("excel_sqlite_rel") or "").replace("\\", "/").endswith("/SN123/SN123.sqlite3"))
 
             resolved_artifacts = get_file_artifacts_path(repo, "Valve/ModelX/SN123_seq2.mat")
             self.assertIsNotNone(resolved_artifacts)
@@ -170,6 +267,109 @@ class TestMatSeqBundle(unittest.TestCase):
                 )
             )
             self.assertEqual(len(matches), 1)
+
+    def test_rebuild_td_serial_aggregates_prefers_newest_metadata_for_header(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            repo = Path(td)
+            paths = support_paths(repo)
+            support_dir = paths.support_dir
+            src_a_rel = Path("Test Data File Extractions/Program_A/Thruster/Valve/SN123/sources/source_a__1111111111__excel")
+            src_b_rel = Path("Test Data File Extractions/Program_A/Thruster/Valve/SN123/sources/source_b__2222222222__excel")
+            src_a_dir = support_dir / src_a_rel
+            src_b_dir = support_dir / src_b_rel
+            src_a_dir.mkdir(parents=True, exist_ok=True)
+            src_b_dir.mkdir(parents=True, exist_ok=True)
+            src_a_sqlite = src_a_dir / "source_a.sqlite3"
+            src_b_sqlite = src_b_dir / "source_b.sqlite3"
+            self._write_td_source_sqlite(src_a_sqlite, source_sheet_name="seq1", serial_number="SN123", thrust_offset=0.0)
+            self._write_td_source_sqlite(src_b_sqlite, source_sheet_name="seq2", serial_number="SN123", thrust_offset=100.0)
+
+            meta_a = src_a_dir / "source_a_metadata.json"
+            meta_b = src_b_dir / "source_b_metadata.json"
+            src_a_rel_text = str(src_a_rel).replace("/", "\\")
+            src_b_rel_text = str(src_b_rel).replace("/", "\\")
+            meta_a.write_text(
+                __import__("json").dumps(
+                    {
+                        "program_title": "Program A",
+                        "asset_type": "Thruster",
+                        "asset_specific_type": "Valve",
+                        "serial_number": "SN123",
+                        "document_type": "TD",
+                        "document_type_acronym": "TD",
+                        "document_type_status": "confirmed",
+                        "document_type_review_required": False,
+                        "vendor": "Vendor Old",
+                        "excel_sqlite_rel": f"EIDAT Support\\{src_a_rel_text}\\source_a.sqlite3",
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            time.sleep(0.05)
+            meta_b.write_text(
+                __import__("json").dumps(
+                    {
+                        "program_title": "Program A",
+                        "asset_type": "Thruster",
+                        "asset_specific_type": "Valve",
+                        "serial_number": "SN123",
+                        "document_type": "TD",
+                        "document_type_acronym": "TD",
+                        "document_type_status": "confirmed",
+                        "document_type_review_required": False,
+                        "vendor": "Vendor New",
+                        "excel_sqlite_rel": f"EIDAT Support\\{src_b_rel_text}\\source_b.sqlite3",
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            payload = rebuild_td_serial_aggregates(paths)
+            self.assertEqual(int(payload.get("aggregate_count") or 0), 1)
+
+            aggregate_dir = support_dir / "Test Data File Extractions" / "Program_A" / "Thruster" / "Valve" / "SN123"
+            aggregate_meta = __import__("json").loads((aggregate_dir / "SN123_metadata.json").read_text(encoding="utf-8"))
+            aggregate_manifest = __import__("json").loads((aggregate_dir / "td_serial_aggregate.json").read_text(encoding="utf-8"))
+            self.assertEqual(str(aggregate_meta.get("vendor") or "").strip(), "Vendor New")
+            self.assertEqual(
+                str(aggregate_meta.get("aggregate_header_source_metadata_rel") or "").replace("\\", "/"),
+                str((src_b_rel / "source_b_metadata.json")).replace("\\", "/"),
+            )
+            self.assertEqual(
+                str(aggregate_manifest.get("header_metadata_source_metadata_rel") or "").replace("\\", "/"),
+                str((src_b_rel / "source_b_metadata.json")).replace("\\", "/"),
+            )
+
+    def test_cmd_process_returns_td_aggregate_and_index_payload(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            repo = Path(td)
+            src_dir = repo / "Valve" / "ModelX"
+            src_dir.mkdir(parents=True, exist_ok=True)
+            seq1 = src_dir / "SN123_seq1.mat"
+            seq2 = src_dir / "SN123_seq2.mat"
+            self._write_valid_mat(seq1, 0.0)
+            self._write_valid_mat(seq2, 10.0)
+
+            paths = support_paths(repo)
+            scan_global_repo(paths)
+            payload = _cmd_process(
+                paths,
+                limit=None,
+                dpi=None,
+                force=False,
+                only_candidates=False,
+                file_paths=None,
+            )
+
+            self.assertEqual(int(payload.get("processed_ok") or 0), 2)
+            self.assertIn("td_serial_aggregates", payload)
+            self.assertIn("index", payload)
+            td_payload = dict(payload.get("td_serial_aggregates") or {})
+            self.assertTrue(bool(td_payload.get("triggered")))
+            self.assertEqual(int(td_payload.get("aggregate_count") or 0), 1)
+            self.assertEqual(int((payload.get("index") or {}).get("metadata_count") or 0), 2)
 
 
 if __name__ == "__main__":
