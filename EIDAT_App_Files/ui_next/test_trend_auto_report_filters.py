@@ -406,6 +406,27 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         self.assertIn("Valve Voltage: 28", summary["lines"])
         self.assertFalse(any(line.startswith("P8 ") for line in summary["lines"]))
 
+    def test_build_quick_summary_lines_show_display_serial_for_composite_source_keys(self) -> None:
+        composite_serial = "Program A / Valve / Injector / SN-001 / source_a"
+        other_serial = "Program B / Valve / Pilot / SN-002 / source_b"
+        ctx = {
+            "hi": [composite_serial],
+            "all_serials": [composite_serial, other_serial],
+            "pair_specs": [],
+            "meta_by_sn": {
+                composite_serial: {"program_title": "Program A", "serial_number": "SN-001"},
+                other_serial: {"program_title": "Program B", "serial_number": "SN-002"},
+            },
+            "comparison_rows": [],
+            "filter_state": {},
+        }
+
+        summary = tar._tar_build_quick_summary(ctx)
+
+        self.assertEqual(summary["certified_serials"], [composite_serial])
+        self.assertIn("Certified Serial(s): SN-001", summary["lines"])
+        self.assertFalse(any(composite_serial in line for line in summary["lines"]))
+
     def test_metadata_snapshot_lines_include_each_certified_serial(self) -> None:
         ctx = {
             "hi": ["SN-001", "SN-002"],
@@ -449,6 +470,34 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         self.assertTrue(any("Document: Acceptance Test Plan (ATP)" in line for line in lines))
         self.assertTrue(any("Document: Certification Report (CR)" in line for line in lines))
         self.assertEqual(lines[-1], "Metadata note: Workbook metadata unavailable.")
+
+    def test_metadata_snapshot_lines_use_display_serial_for_composite_source_keys(self) -> None:
+        composite_serial = "Program A / Valve / Injector / SN-001 / source_a"
+        ctx = {
+            "hi": [composite_serial],
+            "meta_by_sn": {
+                composite_serial: {
+                    "serial_number": "SN-001",
+                    "program_title": "Program A",
+                    "similarity_group": "SG-1",
+                    "acceptance_test_plan_number": "ATP-10",
+                    "asset_type": "Valve",
+                    "asset_specific_type": "Injector",
+                    "vendor": "Vendor A",
+                    "part_number": "PN-1",
+                    "revision": "A",
+                    "test_date": "2026-03-01",
+                    "report_date": "2026-03-05",
+                    "document_type": "Acceptance Test Plan",
+                    "document_type_acronym": "ATP",
+                }
+            },
+        }
+
+        lines = tar._tar_metadata_snapshot_lines(ctx)
+
+        self.assertTrue(any(line.startswith("SN-001 | Program: Program A") for line in lines))
+        self.assertFalse(any(composite_serial in line for line in lines))
 
     def test_show_pooled_family_overlay_only_for_single_set(self) -> None:
         self.assertFalse(
@@ -895,6 +944,37 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         self.assertTrue(all(call[1]["color"] == tar._TAR_METRIC_GUIDE_COLOR for call in axes.axvline_calls))
         self.assertEqual(len(axes.patches), 2)
         self.assertEqual([call[0][2] for call in axes.text_calls], ["Program A", "Program B"])
+
+    def test_apply_metric_axis_format_uses_display_serial_ticks_for_composite_source_keys(self) -> None:
+        axes = _FakePlotAxes()
+        fig = _FakePlotFigure()
+        fake_plt = _FakePyplot()
+        fake_matplotlib = SimpleNamespace(pyplot=fake_plt)
+        fake_patches = SimpleNamespace(Rectangle=_FakeRectangle)
+        fake_transforms = SimpleNamespace(blended_transform_factory=lambda *args: ("blend", args))
+        composite_a = "Program A / Valve / Injector / SN-001 / source_a"
+        composite_b = "Program B / Valve / Pilot / SN-002 / source_b"
+
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "matplotlib": fake_matplotlib,
+                "matplotlib.pyplot": fake_plt,
+                "matplotlib.patches": fake_patches,
+                "matplotlib.transforms": fake_transforms,
+            },
+        ):
+            tar._tar_apply_metric_axis_format(
+                fig,
+                axes,
+                serials=[composite_a, composite_b],
+                meta_by_sn={
+                    composite_a: {"program_title": "Program A", "serial_number": "SN-001"},
+                    composite_b: {"program_title": "Program B", "serial_number": "SN-002"},
+                },
+            )
+
+        self.assertEqual(axes.xticklabels, ["SN-001", "SN-002"])
 
     def test_render_metric_cohort_page_uses_scatter_only_and_supports_both_metric_sections(self) -> None:
         fake_plt = _FakePyplot()

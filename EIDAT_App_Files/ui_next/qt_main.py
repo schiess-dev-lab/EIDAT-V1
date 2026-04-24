@@ -191,6 +191,14 @@ def _td_serial_value(row: dict | None) -> str:
 
 
 def _td_plot_serial_label(row_or_value: Mapping[str, object] | object) -> str:
+    backend_helper = getattr(be, "td_display_serial_label", None)
+    if callable(backend_helper):
+        try:
+            text = str(backend_helper(row_or_value) or "").strip()
+            if text:
+                return text
+        except Exception:
+            pass
     if isinstance(row_or_value, Mapping):
         for key in ("serial_number", "source_serial_number"):
             txt = str(row_or_value.get(key) or "").strip()
@@ -201,12 +209,27 @@ def _td_plot_serial_label(row_or_value: Mapping[str, object] | object) -> str:
         raw = str(row_or_value or "").strip()
     if not raw:
         return ""
-    parts = [part.strip() for part in re.split(r"\s+[|/]\s+", raw) if part.strip()]
+    parts = [part.strip() for part in re.split(r"\s*[|/]\s*", raw) if part.strip()]
     if len(parts) >= 4:
         return parts[3]
     if parts:
         return parts[-1]
     return raw
+
+
+def _td_display_serial_values(values: list[object] | tuple[object, ...] | None) -> list[str]:
+    return [_td_plot_serial_label(value) or str(value or "").strip() for value in (values or []) if str(value or "").strip()]
+
+
+def _td_metric_display_serial_labels(labels: list[str], serial_rows: list[dict]) -> list[str]:
+    meta_by_sn = _td_serial_metadata_by_serial(serial_rows)
+    out: list[str] = []
+    for raw_sn in labels or []:
+        sn = str(raw_sn or "").strip()
+        if not sn:
+            continue
+        out.append(_td_plot_serial_label(meta_by_sn.get(sn) or sn) or sn)
+    return out
 
 
 def _td_compact_filter_value(value: object) -> str:
@@ -2569,6 +2592,568 @@ class TDProjectEditorDialog(NewProjectWizardDialog):
             self.cb_force_rebuild.setVisible(visible)
 
 
+class TDParameterNormalizationDialog(QtWidgets.QDialog):
+    COLS = ["Raw Name", "Canonical Display", "Units", "Programs", "Surfaces", "Status"]
+
+    def __init__(self, project_dir: Path, workbook_path: Path, parent=None):
+        super().__init__(parent)
+        self._project_dir = Path(project_dir).expanduser()
+        self._workbook_path = Path(workbook_path).expanduser()
+        self._db_path = be.validate_test_data_project_cache_for_open(self._project_dir, self._workbook_path)
+        self._working_normalization = dict(be.load_td_project_parameter_normalization(self._project_dir) or {})
+        self._context: dict[str, object] = {}
+        self._display_rows: list[dict[str, object]] = []
+        self.saved = False
+
+        self.setWindowTitle("Parameter Normalization")
+        self.resize(1180, 720)
+        self.setStyleSheet(
+            """
+            QDialog { background: #f8fafc; color: #0f172a; }
+            QLabel { color: #0f172a; }
+            QTableWidget {
+                background: #ffffff;
+                border: 1px solid #e2e8f0;
+                border-radius: 8px;
+                gridline-color: #e2e8f0;
+            }
+            QHeaderView::section {
+                background: #f1f5f9;
+                color: #0f172a;
+                padding: 6px 8px;
+                border: 1px solid #e2e8f0;
+                font-weight: 600;
+            }
+            QPlainTextEdit {
+                background: #ffffff;
+                border: 1px solid #e2e8f0;
+                border-radius: 8px;
+                color: #0f172a;
+            }
+            """
+        )
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+
+        title = QtWidgets.QLabel("Project Parameter Normalization")
+        title.setStyleSheet("font-size: 15px; font-weight: 800;")
+        layout.addWidget(title)
+
+        hint = QtWidgets.QLabel(
+            "Review all detected TD parameters across the project cache, assign canonical display names, and add program-specific overrides for oddball historical names."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #475569; font-size: 11px;")
+        layout.addWidget(hint)
+
+        self.ed_filter = QtWidgets.QLineEdit()
+        self.ed_filter.setPlaceholderText("Filter parameters, canonical names, or programs...")
+        self.ed_filter.textChanged.connect(self._refresh_table)
+        layout.addWidget(self.ed_filter)
+
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        layout.addWidget(splitter, 1)
+
+        left = QtWidgets.QWidget()
+        left_layout = QtWidgets.QVBoxLayout(left)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(8)
+        splitter.addWidget(left)
+
+        self.tbl = QtWidgets.QTableWidget(0, len(self.COLS))
+        self.tbl.setHorizontalHeaderLabels(self.COLS)
+        self.tbl.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.tbl.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.tbl.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.tbl.itemSelectionChanged.connect(self._sync_selection)
+        left_layout.addWidget(self.tbl, 1)
+
+        right = QtWidgets.QWidget()
+        right_layout = QtWidgets.QVBoxLayout(right)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(8)
+        splitter.addWidget(right)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+
+        self.lbl_summary = QtWidgets.QLabel("")
+        self.lbl_summary.setWordWrap(True)
+        self.lbl_summary.setStyleSheet(
+            "QLabel { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px; padding: 10px 12px; color: #334155; }"
+        )
+        right_layout.addWidget(self.lbl_summary)
+
+        self.detail = QtWidgets.QPlainTextEdit()
+        self.detail.setReadOnly(True)
+        right_layout.addWidget(self.detail, 1)
+
+        action_row = QtWidgets.QHBoxLayout()
+        self.btn_set_name = QtWidgets.QPushButton("Set Canonical Name...")
+        self.btn_merge = QtWidgets.QPushButton("Merge Selected...")
+        self.btn_override = QtWidgets.QPushButton("Program Override...")
+        self.btn_reset = QtWidgets.QPushButton("Reset Mapping")
+        for button in (self.btn_set_name, self.btn_merge, self.btn_override, self.btn_reset):
+            action_row.addWidget(button)
+        action_row.addStretch(1)
+        right_layout.addLayout(action_row)
+
+        button_row = QtWidgets.QHBoxLayout()
+        button_row.addStretch(1)
+        self.btn_save = QtWidgets.QPushButton("Save")
+        self.btn_close = QtWidgets.QPushButton("Close")
+        button_row.addWidget(self.btn_save)
+        button_row.addWidget(self.btn_close)
+        layout.addLayout(button_row)
+
+        self.btn_set_name.clicked.connect(self._act_set_canonical_name)
+        self.btn_merge.clicked.connect(self._act_merge_selected)
+        self.btn_override.clicked.connect(self._act_program_override)
+        self.btn_reset.clicked.connect(self._act_reset_mapping)
+        self.btn_save.clicked.connect(self._act_save)
+        self.btn_close.clicked.connect(self.reject)
+
+        self._reload_context(select_raw_names=[])
+
+    @staticmethod
+    def _norm_name(value: object) -> str:
+        return "".join(ch.lower() for ch in str(value or "").strip() if ch.isalnum())
+
+    def _normalize_working(self) -> None:
+        normalizer = getattr(be, "_td_normalize_parameter_normalization", None)
+        if callable(normalizer):
+            self._working_normalization = dict(normalizer(self._working_normalization) or {})
+
+    def _new_group_id(self, seed: object = "") -> str:
+        generator = getattr(be, "_td_parameter_normalization_group_id", None)
+        if callable(generator):
+            try:
+                return str(generator(seed)).strip()
+            except Exception:
+                pass
+        digest = hashlib.sha1(f"{seed}|{time.time_ns()}".encode("utf-8")).hexdigest()[:16]
+        return f"group:{digest}"
+
+    def _working_groups(self) -> list[dict[str, object]]:
+        return [dict(item) for item in (self._working_normalization.get("groups") or []) if isinstance(item, Mapping)]
+
+    def _working_mappings(self) -> list[dict[str, object]]:
+        return [dict(item) for item in (self._working_normalization.get("mappings") or []) if isinstance(item, Mapping)]
+
+    def _ensure_group(
+        self,
+        *,
+        display_name: str,
+        preferred_units: str = "",
+        canonical_id: str = "",
+    ) -> str:
+        self._normalize_working()
+        groups = self._working_groups()
+        group_id = str(canonical_id or "").strip()
+        if not group_id or group_id.startswith("raw:"):
+            group_id = self._new_group_id(display_name)
+        updated = False
+        for idx, group in enumerate(groups):
+            if str(group.get("id") or "").strip() != group_id:
+                continue
+            group["display_name"] = str(display_name or group.get("display_name") or "").strip()
+            if preferred_units:
+                group["preferred_units"] = str(preferred_units).strip()
+            groups[idx] = group
+            updated = True
+            break
+        if not updated:
+            groups.append(
+                {
+                    "id": group_id,
+                    "display_name": str(display_name or "").strip(),
+                    "preferred_units": str(preferred_units or "").strip(),
+                }
+            )
+        self._working_normalization["groups"] = groups
+        self._normalize_working()
+        return group_id
+
+    def _cleanup_unused_groups(self) -> None:
+        self._normalize_working()
+        used_ids = {
+            str(rule.get("canonical_id") or "").strip()
+            for rule in self._working_mappings()
+            if str(rule.get("canonical_id") or "").strip()
+        }
+        self._working_normalization["groups"] = [
+            dict(group)
+            for group in self._working_groups()
+            if str(group.get("id") or "").strip() in used_ids
+        ]
+        self._normalize_working()
+
+    def _replace_global_mapping(self, raw_name: str, canonical_id: str) -> None:
+        mappings: list[dict[str, object]] = []
+        target_norm = self._norm_name(raw_name)
+        for rule in self._working_mappings():
+            if self._norm_name(rule.get("raw_name")) == target_norm and not list(rule.get("program_titles") or []):
+                continue
+            mappings.append(rule)
+        mappings.append({"canonical_id": canonical_id, "raw_name": raw_name, "program_titles": []})
+        self._working_normalization["mappings"] = mappings
+        self._normalize_working()
+
+    def _replace_program_override(self, raw_name: str, program_titles: list[str], canonical_id: str) -> None:
+        target_norm = self._norm_name(raw_name)
+        chosen_norms = {str(program or "").strip().casefold() for program in program_titles if str(program or "").strip()}
+        mappings: list[dict[str, object]] = []
+        for rule in self._working_mappings():
+            if self._norm_name(rule.get("raw_name")) != target_norm:
+                mappings.append(rule)
+                continue
+            existing_programs = [str(value).strip() for value in (rule.get("program_titles") or []) if str(value).strip()]
+            if not existing_programs:
+                mappings.append(rule)
+                continue
+            kept_programs = [value for value in existing_programs if value.casefold() not in chosen_norms]
+            if kept_programs:
+                rule["program_titles"] = kept_programs
+                mappings.append(rule)
+        mappings.append(
+            {
+                "canonical_id": canonical_id,
+                "raw_name": raw_name,
+                "program_titles": [value for value in program_titles if str(value).strip()],
+            }
+        )
+        self._working_normalization["mappings"] = mappings
+        self._normalize_working()
+
+    def _selected_rows(self) -> list[dict[str, object]]:
+        rows: list[dict[str, object]] = []
+        seen: set[int] = set()
+        for item in self.tbl.selectedItems():
+            row_idx = item.row()
+            if row_idx in seen or not (0 <= row_idx < len(self._display_rows)):
+                continue
+            seen.add(row_idx)
+            rows.append(dict(self._display_rows[row_idx]))
+        return rows
+
+    def _status_text(self, row: Mapping[str, object]) -> str:
+        status = str(row.get("status") or "").strip().lower()
+        mapping = {
+            "implicit": "Implicit Raw Name",
+            "explicit": "Explicit Mapping",
+            "suggested": "Suggested",
+            "split_by_program": "Split by Program",
+        }
+        label = mapping.get(status, status.title() or "Implicit Raw Name")
+        suggestion = row.get("suggestion") if isinstance(row.get("suggestion"), Mapping) else {}
+        suggestion_name = str(suggestion.get("display_name") or "").strip()
+        if status == "suggested" and suggestion_name:
+            label = f"{label}: {suggestion_name}"
+        return label
+
+    def _refresh_table(self) -> None:
+        search = str(self.ed_filter.text() or "").strip().lower()
+        inventory = [
+            dict(item)
+            for item in (self._context.get("inventory") or [])
+            if isinstance(item, Mapping)
+        ]
+        rows: list[dict[str, object]] = []
+        for row in inventory:
+            search_blob = "\n".join(
+                [
+                    str(row.get("raw_name") or ""),
+                    str(row.get("canonical_display") or ""),
+                    " ".join([str(value) for value in (row.get("program_titles") or [])]),
+                    " ".join([str(value) for value in (row.get("surfaces") or [])]),
+                    str(((row.get("suggestion") or {}) if isinstance(row.get("suggestion"), Mapping) else {}).get("display_name") or ""),
+                ]
+            ).lower()
+            if search and search not in search_blob:
+                continue
+            rows.append(row)
+        self._display_rows = rows
+        self.tbl.setRowCount(len(rows))
+        for row_idx, row in enumerate(rows):
+            values = [
+                str(row.get("raw_name") or "").strip(),
+                str(row.get("canonical_display") or "").strip(),
+                ", ".join([str(value).strip() for value in (row.get("units") or []) if str(value).strip()]) or "-",
+                ", ".join([str(value).strip() for value in (row.get("program_titles") or []) if str(value).strip()][:3]),
+                ", ".join([str(value).strip() for value in (row.get("surfaces") or []) if str(value).strip()]),
+                self._status_text(row),
+            ]
+            for col_idx, value in enumerate(values):
+                item = QtWidgets.QTableWidgetItem(value)
+                item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+                item.setData(QtCore.Qt.ItemDataRole.UserRole, str(row.get("raw_name") or "").strip())
+                if col_idx == 0:
+                    suggestion = row.get("suggestion") if isinstance(row.get("suggestion"), Mapping) else {}
+                    suggestion_name = str(suggestion.get("display_name") or "").strip()
+                    if suggestion_name:
+                        item.setToolTip(f"Suggested canonical name: {suggestion_name}")
+                self.tbl.setItem(row_idx, col_idx, item)
+        try:
+            self.tbl.resizeColumnsToContents()
+            self.tbl.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+            self.tbl.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        except Exception:
+            pass
+        self._sync_selection()
+
+    def _sync_selection(self) -> None:
+        rows = self._selected_rows()
+        count = len(rows)
+        inventory = [item for item in (self._context.get("inventory") or []) if isinstance(item, Mapping)]
+        explicit_count = len(
+            [
+                row
+                for row in inventory
+                if str(row.get("status") or "").strip().lower() in {"explicit", "split_by_program"}
+            ]
+        )
+        self.lbl_summary.setText(
+            f"Detected parameters: {len(inventory)} | Explicit mappings: {explicit_count} | Selected: {count}"
+        )
+        if not rows:
+            self.detail.setPlainText("Select one or more raw parameters to inspect their programs, sources, and active normalization rules.")
+        elif count == 1:
+            row = rows[0]
+            suggestion = row.get("suggestion") if isinstance(row.get("suggestion"), Mapping) else {}
+            lines = [
+                f"Raw Name: {str(row.get('raw_name') or '').strip()}",
+                f"Canonical Display: {str(row.get('canonical_display') or '').strip() or '-'}",
+                f"Units: {', '.join([str(value).strip() for value in (row.get('units') or []) if str(value).strip()]) or '-'}",
+                f"Programs: {', '.join([str(value).strip() for value in (row.get('program_titles') or []) if str(value).strip()]) or '-'}",
+                f"Surfaces: {', '.join([str(value).strip() for value in (row.get('surfaces') or []) if str(value).strip()]) or '-'}",
+                f"Source Runs: {', '.join([str(value).strip() for value in (row.get('source_run_names') or []) if str(value).strip()][:12]) or '-'}",
+                f"Status: {self._status_text(row)}",
+            ]
+            suggestion_name = str(suggestion.get("display_name") or "").strip()
+            if suggestion_name:
+                lines.append(f"Suggestion: {suggestion_name}")
+            self.detail.setPlainText("\n".join(lines))
+        else:
+            raw_names = [str(row.get("raw_name") or "").strip() for row in rows if str(row.get("raw_name") or "").strip()]
+            programs = sorted(
+                {
+                    str(value).strip()
+                    for row in rows
+                    for value in (row.get("program_titles") or [])
+                    if str(value).strip()
+                },
+                key=str.casefold,
+            )
+            self.detail.setPlainText(
+                "\n".join(
+                    [
+                        f"Selected Raw Parameters: {len(raw_names)}",
+                        f"Raw Names: {', '.join(raw_names)}",
+                        f"Programs: {', '.join(programs) or '-'}",
+                        "Use Merge Selected to map them to one canonical display name.",
+                    ]
+                )
+            )
+        self.btn_set_name.setEnabled(count == 1)
+        self.btn_merge.setEnabled(count >= 2)
+        self.btn_override.setEnabled(
+            count == 1 and bool([value for value in ((rows[0].get("program_titles") or []) if rows else []) if str(value).strip()])
+        )
+        self.btn_reset.setEnabled(count >= 1)
+
+    def _reload_context(self, *, select_raw_names: Sequence[object] | None = None) -> None:
+        builder = getattr(be, "td_build_parameter_normalization_context", None)
+        if callable(builder):
+            self._context = dict(
+                builder(
+                    self._project_dir,
+                    self._workbook_path,
+                    self._db_path,
+                    normalization_override=self._working_normalization,
+                )
+                or {}
+            )
+        else:
+            self._context = {}
+        self._refresh_table()
+        wanted = {self._norm_name(value) for value in (select_raw_names or []) if self._norm_name(value)}
+        if wanted:
+            self.tbl.clearSelection()
+            for row_idx, row in enumerate(self._display_rows):
+                if self._norm_name(row.get("raw_name")) in wanted:
+                    self.tbl.selectRow(row_idx)
+        self._sync_selection()
+
+    def _prompt_display_name(self, *, title: str, prompt: str, default: str) -> str | None:
+        text, ok = QtWidgets.QInputDialog.getText(self, title, prompt, text=str(default or "").strip())
+        if not ok:
+            return None
+        clean = str(text or "").strip()
+        return clean or None
+
+    def _prompt_programs(self, programs: list[str]) -> list[str] | None:
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Program Override")
+        dlg.resize(420, 420)
+        layout = QtWidgets.QVBoxLayout(dlg)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+        layout.addWidget(QtWidgets.QLabel("Choose the programs that should use the override:"))
+        listw = QtWidgets.QListWidget()
+        listw.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
+        layout.addWidget(listw, 1)
+        for program in programs:
+            item = QtWidgets.QListWidgetItem(program)
+            item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(QtCore.Qt.CheckState.Unchecked)
+            listw.addItem(item)
+        button_row = QtWidgets.QHBoxLayout()
+        button_row.addStretch(1)
+        btn_apply = QtWidgets.QPushButton("Apply")
+        btn_cancel = QtWidgets.QPushButton("Cancel")
+        button_row.addWidget(btn_apply)
+        button_row.addWidget(btn_cancel)
+        layout.addLayout(button_row)
+        chosen: list[str] = []
+
+        def _accept() -> None:
+            chosen.clear()
+            for idx in range(listw.count()):
+                item = listw.item(idx)
+                if item is not None and item.checkState() == QtCore.Qt.CheckState.Checked and str(item.text() or "").strip():
+                    chosen.append(str(item.text() or "").strip())
+            if not chosen:
+                QtWidgets.QMessageBox.information(dlg, "Program Override", "Select at least one program.")
+                return
+            dlg.accept()
+
+        btn_apply.clicked.connect(_accept)
+        btn_cancel.clicked.connect(dlg.reject)
+        _fit_widget_to_screen(dlg)
+        if dlg.exec() != int(QtWidgets.QDialog.DialogCode.Accepted):
+            return None
+        return chosen
+
+    def _act_set_canonical_name(self) -> None:
+        rows = self._selected_rows()
+        if len(rows) != 1:
+            return
+        row = rows[0]
+        suggestion = row.get("suggestion") if isinstance(row.get("suggestion"), Mapping) else {}
+        default_name = (
+            str(suggestion.get("display_name") or "").strip()
+            or str(row.get("canonical_display") or "").strip()
+            or str(row.get("raw_name") or "").strip()
+        )
+        display_name = self._prompt_display_name(
+            title="Set Canonical Name",
+            prompt="Canonical display name:",
+            default=default_name,
+        )
+        if not display_name:
+            return
+        preferred_units = str(suggestion.get("preferred_units") or "").strip()
+        if not preferred_units:
+            units = [str(value).strip() for value in (row.get("units") or []) if str(value).strip()]
+            preferred_units = units[0] if len(units) == 1 else ""
+        existing_id = str(row.get("primary_canonical_id") or "").strip()
+        canonical_id = self._ensure_group(
+            display_name=display_name,
+            preferred_units=preferred_units,
+            canonical_id=("" if existing_id.startswith("raw:") else existing_id),
+        )
+        self._replace_global_mapping(str(row.get("raw_name") or "").strip(), canonical_id)
+        self._cleanup_unused_groups()
+        self._reload_context(select_raw_names=[row.get("raw_name")])
+
+    def _act_merge_selected(self) -> None:
+        rows = self._selected_rows()
+        if len(rows) < 2:
+            return
+        default_name = str(rows[0].get("canonical_display") or rows[0].get("raw_name") or "").strip()
+        display_name = self._prompt_display_name(
+            title="Merge Selected Parameters",
+            prompt="Canonical display name for the merged group:",
+            default=default_name,
+        )
+        if not display_name:
+            return
+        units = sorted(
+            {
+                str(value).strip()
+                for row in rows
+                for value in (row.get("units") or [])
+                if str(value).strip()
+            },
+            key=str.casefold,
+        )
+        preferred_units = units[0] if len(units) == 1 else ""
+        canonical_id = self._ensure_group(display_name=display_name, preferred_units=preferred_units)
+        for row in rows:
+            self._replace_global_mapping(str(row.get("raw_name") or "").strip(), canonical_id)
+        self._cleanup_unused_groups()
+        self._reload_context(select_raw_names=[row.get("raw_name") for row in rows])
+
+    def _act_program_override(self) -> None:
+        rows = self._selected_rows()
+        if len(rows) != 1:
+            return
+        row = rows[0]
+        programs = [str(value).strip() for value in (row.get("program_titles") or []) if str(value).strip()]
+        if not programs:
+            QtWidgets.QMessageBox.information(self, "Program Override", "This parameter has no program-level provenance to override.")
+            return
+        display_name = self._prompt_display_name(
+            title="Program Override",
+            prompt="Canonical display name for the selected programs:",
+            default=str(row.get("canonical_display") or row.get("raw_name") or "").strip(),
+        )
+        if not display_name:
+            return
+        chosen_programs = self._prompt_programs(programs)
+        if not chosen_programs:
+            return
+        units = [str(value).strip() for value in (row.get("units") or []) if str(value).strip()]
+        canonical_id = self._ensure_group(
+            display_name=display_name,
+            preferred_units=(units[0] if len(units) == 1 else ""),
+        )
+        self._replace_program_override(str(row.get("raw_name") or "").strip(), chosen_programs, canonical_id)
+        self._cleanup_unused_groups()
+        self._reload_context(select_raw_names=[row.get("raw_name")])
+
+    def _act_reset_mapping(self) -> None:
+        rows = self._selected_rows()
+        if not rows:
+            return
+        raw_names = [str(row.get("raw_name") or "").strip() for row in rows if str(row.get("raw_name") or "").strip()]
+        answer = QtWidgets.QMessageBox.question(
+            self,
+            "Reset Mapping",
+            "Reset the selected raw parameter mappings back to their default raw-name behavior?",
+        )
+        if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        remove_norms = {self._norm_name(value) for value in raw_names if self._norm_name(value)}
+        self._working_normalization["mappings"] = [
+            dict(rule)
+            for rule in self._working_mappings()
+            if self._norm_name(rule.get("raw_name")) not in remove_norms
+        ]
+        self._cleanup_unused_groups()
+        self._reload_context(select_raw_names=raw_names)
+
+    def _act_save(self) -> None:
+        try:
+            self._normalize_working()
+            be.save_td_project_parameter_normalization(self._project_dir, self._working_normalization)
+            self.saved = True
+            self.accept()
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Parameter Normalization", str(exc))
+
+
 class ImplementationTrendDialog(QtWidgets.QDialog):
     def __init__(self, project_dir: Path, workbook_path: Path, parent=None):
         super().__init__(parent)
@@ -2955,6 +3540,7 @@ class ImplementationTrendDialog(QtWidgets.QDialog):
         self._axes.set_ylabel(self._units_label(term_payloads))
 
         x = list(range(len(self._serials)))
+        serial_labels = _td_display_serial_values(self._serials)
 
         stats_rows: list[dict] = []
         for payload in term_payloads:
@@ -3014,12 +3600,12 @@ class ImplementationTrendDialog(QtWidgets.QDialog):
                     "max_limit": max_limit,
                     "exceed_low": len(exceed_low),
                     "exceed_high": len(exceed_high),
-                    "exceed_sns": ", ".join(sorted(set(exceed_low + exceed_high))),
+                    "exceed_sns": ", ".join(sorted({_td_plot_serial_label(sn) or str(sn).strip() for sn in (exceed_low + exceed_high)})),
                 }
             )
 
         self._axes.set_xticks(x)
-        self._axes.set_xticklabels(self._serials, rotation=45, ha="right", fontsize=8)
+        self._axes.set_xticklabels(serial_labels, rotation=45, ha="right", fontsize=8)
         self._axes.grid(True, alpha=0.25)
         self._axes.legend(fontsize=8, loc="best")
         self._figure.tight_layout()
@@ -3340,6 +3926,7 @@ class ImplementationTrendDialog(QtWidgets.QDialog):
         ax.set_ylabel(self._units_label(term_payloads))
 
         x = list(range(len(self._serials)))
+        serial_labels = _td_display_serial_values(self._serials)
         for payload in term_payloads:
             term_key = str(payload.get("term_key") or "").strip()
             term_name = str(payload.get("term_label") or payload.get("term") or "").strip() or "Term"
@@ -3360,7 +3947,7 @@ class ImplementationTrendDialog(QtWidgets.QDialog):
                 ax.axhline(float(max_limit), color=color, linestyle="--", alpha=0.4)
 
         ax.set_xticks(x)
-        ax.set_xticklabels(self._serials, rotation=45, ha="right", fontsize=8)
+        ax.set_xticklabels(serial_labels, rotation=45, ha="right", fontsize=8)
         ax.grid(True, alpha=0.25)
         ax.legend(fontsize=8, loc="best")
         fig.tight_layout()
@@ -3473,6 +4060,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._smart_solver_worker: ProjectTaskWorker | None = None
         self._smart_solver_progress_visible = False
         self._smart_solver_signals_connected = False
+        self._parameter_normalization_context: dict[str, object] = {}
+        self._metric_parameter_options: list[dict[str, object]] = []
+        self._curve_parameter_options: list[dict[str, object]] = []
+        self._life_parameter_options: list[dict[str, object]] = []
 
         self.setWindowTitle("Test Data - Trend / Analyze")
         self.resize(1280, 760)
@@ -4873,6 +5464,296 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             return txt
         return str(combo_box.currentText() or "").strip()
 
+    @staticmethod
+    def _list_widget_item_value(item: QtWidgets.QListWidgetItem | None) -> str:
+        if item is None:
+            return ""
+        try:
+            value = item.data(QtCore.Qt.ItemDataRole.UserRole)
+        except Exception:
+            value = None
+        text = str(value if value not in (None, "") else item.text() or "").strip()
+        return text
+
+    @classmethod
+    def _list_widget_values(cls, list_widget: QtWidgets.QListWidget | None) -> list[str]:
+        if list_widget is None:
+            return []
+        out: list[str] = []
+        for i in range(list_widget.count()):
+            value = cls._list_widget_item_value(list_widget.item(i))
+            if value:
+                out.append(value)
+        return out
+
+    @classmethod
+    def _selected_list_widget_values(cls, list_widget: QtWidgets.QListWidget | None) -> list[str]:
+        if list_widget is None:
+            return []
+        out: list[str] = []
+        for item in list_widget.selectedItems():
+            value = cls._list_widget_item_value(item)
+            if value:
+                out.append(value)
+        return out
+
+    @staticmethod
+    def _selected_list_widget_labels(list_widget: QtWidgets.QListWidget | None) -> list[str]:
+        if list_widget is None:
+            return []
+        return [str(item.text() or "").strip() for item in list_widget.selectedItems() if str(item.text() or "").strip()]
+
+    def _set_list_widget_selection_by_value(
+        self,
+        list_widget: QtWidgets.QListWidget,
+        values: Sequence[object] | None,
+    ) -> None:
+        wanted = {self._perf_norm_name(value) for value in (values or []) if self._perf_norm_name(value)}
+        list_widget.blockSignals(True)
+        try:
+            list_widget.clearSelection()
+            for i in range(list_widget.count()):
+                item = list_widget.item(i)
+                item_value = self._list_widget_item_value(item)
+                if item is not None and self._perf_norm_name(item_value) in wanted:
+                    item.setSelected(True)
+        finally:
+            list_widget.blockSignals(False)
+
+    def _load_parameter_normalization_context(self) -> None:
+        if not getattr(self, "_db_path", None):
+            self._parameter_normalization_context = {}
+            return
+        builder = getattr(be, "td_build_parameter_normalization_context", None)
+        if not callable(builder):
+            self._parameter_normalization_context = {}
+            return
+        try:
+            context = builder(self._project_dir, self._workbook_path, self._db_path)
+        except Exception:
+            context = {}
+        self._parameter_normalization_context = dict(context or {})
+
+    def _parameter_selector_options(
+        self,
+        *,
+        surface: str,
+        run_names: Sequence[object] | None = None,
+        raw_names: Sequence[object] | None = None,
+        raw_columns: Sequence[Mapping[str, object] | object] | None = None,
+    ) -> list[dict[str, object]]:
+        run_list = [str(value).strip() for value in (run_names or []) if str(value).strip()]
+        raw_name_list = [str(value).strip() for value in (raw_names or []) if str(value).strip()]
+        builder = getattr(be, "td_build_parameter_selector_options", None)
+        if callable(builder):
+            try:
+                options = builder(
+                    getattr(self, "_parameter_normalization_context", None),
+                    run_names=run_list,
+                    surface=surface,
+                    raw_names=raw_name_list or None,
+                )
+            except Exception:
+                options = []
+            if isinstance(options, list):
+                cleaned = [dict(option) for option in options if isinstance(option, Mapping) and str(option.get("value") or "").strip()]
+                if cleaned:
+                    return cleaned
+        fallback_union: dict[str, dict[str, object]] = {}
+        if raw_columns:
+            for raw_column in raw_columns:
+                if isinstance(raw_column, Mapping):
+                    name = str(raw_column.get("name") or "").strip()
+                    units = str(raw_column.get("units") or "").strip()
+                else:
+                    name = str(raw_column or "").strip()
+                    units = ""
+                if not name:
+                    continue
+                key = self._perf_norm_name(name)
+                if key not in fallback_union:
+                    fallback_union[key] = {
+                        "value": name,
+                        "display_name": name,
+                        "label": f"{name} ({units})" if units else name,
+                        "preferred_units": units,
+                        "units": [units] if units else [],
+                        "unit_conflict": False,
+                        "raw_names": [name],
+                        "program_titles": [],
+                        "run_names": list(run_list),
+                        "surfaces": [surface],
+                        "search": " ".join([name, units]).strip().lower(),
+                    }
+        return sorted(fallback_union.values(), key=lambda option: str(option.get("display_name") or "").casefold())
+
+    def _selector_option_by_value(
+        self,
+        options: Sequence[Mapping[str, object]] | None,
+        value: object,
+    ) -> dict[str, object]:
+        want = self._perf_norm_name(value)
+        if not want:
+            return {}
+        for option in (options or []):
+            if not isinstance(option, Mapping):
+                continue
+            if self._perf_norm_name(option.get("value")) == want:
+                return dict(option)
+        return {}
+
+    def _parameter_display_name(
+        self,
+        value: object,
+        *,
+        options: Sequence[Mapping[str, object]] | None = None,
+        fallback: object = "",
+    ) -> str:
+        option = self._selector_option_by_value(options, value)
+        if option:
+            display_name = str(option.get("display_name") or option.get("label") or "").strip()
+            if display_name:
+                return display_name
+        resolver = getattr(be, "td_parameter_value_display_name", None)
+        if callable(resolver):
+            try:
+                resolved = str(
+                    resolver(getattr(self, "_parameter_normalization_context", None), value, fallback=fallback)
+                    or ""
+                ).strip()
+                if resolved:
+                    return resolved
+            except Exception:
+                pass
+        return str(fallback or value or "").strip()
+
+    def _parameter_selection_raw_names(
+        self,
+        value: object,
+        *,
+        run_names: Sequence[object] | None = None,
+        surface: str,
+        raw_names: Sequence[object] | None = None,
+    ) -> list[str]:
+        resolver = getattr(be, "td_parameter_selection_raw_names", None)
+        if callable(resolver):
+            try:
+                return [
+                    str(item).strip()
+                    for item in resolver(
+                        getattr(self, "_parameter_normalization_context", None),
+                        value,
+                        run_names=run_names,
+                        surface=surface,
+                        raw_names=raw_names,
+                    )
+                    if str(item).strip()
+                ]
+            except Exception:
+                pass
+        text = str(value or "").strip()
+        return [text] if text else []
+
+    def _parameter_selection_matches_row(
+        self,
+        value: object,
+        *,
+        raw_name: object,
+        program_title: object = "",
+    ) -> bool:
+        matcher = getattr(be, "td_parameter_selection_matches", None)
+        if callable(matcher):
+            try:
+                return bool(
+                    matcher(
+                        getattr(self, "_parameter_normalization_context", None),
+                        value,
+                        raw_name,
+                        program_title,
+                    )
+                )
+            except Exception:
+                pass
+        return self._perf_norm_name(value) == self._perf_norm_name(raw_name)
+
+    def _populate_parameter_list_widget(
+        self,
+        list_widget: QtWidgets.QListWidget,
+        options: Sequence[Mapping[str, object]] | None,
+        *,
+        previous_values: Sequence[object] | None = None,
+        select_all_default: bool = False,
+    ) -> None:
+        previous = {self._perf_norm_name(value) for value in (previous_values or []) if self._perf_norm_name(value)}
+        list_widget.blockSignals(True)
+        try:
+            list_widget.clear()
+            for option in (options or []):
+                if not isinstance(option, Mapping):
+                    continue
+                value = str(option.get("value") or "").strip()
+                label = str(option.get("label") or option.get("display_name") or value).strip()
+                if not value or not label:
+                    continue
+                item = QtWidgets.QListWidgetItem(label)
+                item.setData(QtCore.Qt.ItemDataRole.UserRole, value)
+                tooltip_parts = [
+                    label,
+                    ", ".join([str(name).strip() for name in (option.get("raw_names") or []) if str(name).strip()]),
+                    ", ".join([str(name).strip() for name in (option.get("program_titles") or []) if str(name).strip()]),
+                ]
+                item.setToolTip("\n".join([part for part in tooltip_parts if part]))
+                list_widget.addItem(item)
+            restored = False
+            if previous:
+                for i in range(list_widget.count()):
+                    item = list_widget.item(i)
+                    if self._perf_norm_name(self._list_widget_item_value(item)) in previous:
+                        item.setSelected(True)
+                        restored = True
+            if not restored and select_all_default and list_widget.count() > 0:
+                list_widget.selectAll()
+        finally:
+            list_widget.blockSignals(False)
+
+    def _populate_parameter_combo(
+        self,
+        combo_box: QtWidgets.QComboBox,
+        options: Sequence[Mapping[str, object]] | None,
+        *,
+        previous_value: object = "",
+        allow_blank: bool = False,
+        blank_label: str = "None",
+    ) -> None:
+        wanted = self._perf_norm_name(previous_value)
+        combo_box.blockSignals(True)
+        try:
+            combo_box.clear()
+            if allow_blank:
+                combo_box.addItem(blank_label, "")
+            for option in (options or []):
+                if not isinstance(option, Mapping):
+                    continue
+                value = str(option.get("value") or "").strip()
+                label = str(option.get("label") or option.get("display_name") or value).strip()
+                if not value and not allow_blank:
+                    continue
+                combo_box.addItem(label, value)
+            if wanted:
+                for i in range(combo_box.count()):
+                    if self._perf_norm_name(combo_box.itemData(i)) == wanted:
+                        combo_box.setCurrentIndex(i)
+                        break
+            elif combo_box.count() > 0:
+                combo_box.setCurrentIndex(0)
+        finally:
+            combo_box.blockSignals(False)
+
+    def _current_combo_label(self, combo_box: QtWidgets.QComboBox | None) -> str:
+        if combo_box is None:
+            return ""
+        return str(combo_box.currentText() or "").strip()
+
     def _set_list_widget_selection(self, list_widget: QtWidgets.QListWidget, values: list[str] | tuple[str, ...]) -> None:
         wanted = {str(value).strip() for value in (values or []) if str(value).strip()}
         list_widget.blockSignals(True)
@@ -4892,7 +5773,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
     def _refresh_metric_y_columns_summary(self) -> None:
         if not hasattr(self, "lbl_metric_y_columns_summary"):
             return
-        selected = self._selected_list_widget_texts(getattr(self, "list_y_metrics", None))
+        selected = self._selected_list_widget_labels(getattr(self, "list_y_metrics", None))
         all_items = self._list_widget_item_texts(getattr(self, "list_y_metrics", None))
         text = "Y Columns: " + self._popup_selection_summary(selected, total_count=len(all_items))
         self.lbl_metric_y_columns_summary.setText(text)
@@ -4916,7 +5797,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
     def _selected_curve_y_names(self) -> list[str]:
         list_widget = getattr(self, "list_y_curve", None)
         if isinstance(list_widget, QtWidgets.QListWidget):
-            return self._selected_list_widget_texts(list_widget)
+            return self._selected_list_widget_values(list_widget)
         current = self._combo_box_current_value(getattr(self, "cb_y_curve", None))
         return [current] if current else []
 
@@ -4934,7 +5815,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 selected.append(text)
         list_widget = getattr(self, "list_y_curve", None)
         if isinstance(list_widget, QtWidgets.QListWidget):
-            self._set_list_widget_selection(list_widget, selected)
+            self._set_list_widget_selection_by_value(list_widget, selected)
         if hasattr(self, "cb_y_curve"):
             self.cb_y_curve.blockSignals(True)
             try:
@@ -4955,7 +5836,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
     def _refresh_curve_y_column_summary(self) -> None:
         if not hasattr(self, "lbl_curve_y_column_summary"):
             return
-        selected = self._selected_curve_y_names()
+        selected = self._selected_list_widget_labels(getattr(self, "list_y_curve", None))
+        if not selected and hasattr(self, "cb_y_curve"):
+            current_label = str(self.cb_y_curve.currentText() or "").strip()
+            selected = [current_label] if current_label else []
         all_items = self._list_widget_item_texts(getattr(self, "list_y_curve", None))
         text = "Y Columns: " + self._popup_selection_summary(selected, total_count=len(all_items))
         self.lbl_curve_y_column_summary.setText(text)
@@ -4997,9 +5881,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         if hasattr(self, "life_x_param_row"):
             self.life_x_param_row.setVisible(metric_xy)
         if hasattr(self, "lbl_life_summary"):
-            y_param = self._current_life_y_parameter()
+            y_param = self._current_combo_label(getattr(self, "cb_life_y_param", None))
             if metric_xy:
-                x_param = self._current_life_x_parameter()
+                x_param = self._current_combo_label(getattr(self, "cb_life_x_param", None))
                 self.lbl_life_summary.setText(f"Life metrics: {x_param or '-'} vs {y_param or '-'}")
             else:
                 axis = str(self.cb_life_axis.currentText() if hasattr(self, "cb_life_axis") else "").strip()
@@ -5025,17 +5909,27 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         if not hasattr(self, "list_y_metrics"):
             return
         entries = [
-            {"value": text, "label": text, "search": text.lower()}
-            for text in self._list_widget_item_texts(self.list_y_metrics)
+            {
+                "value": self._list_widget_item_value(self.list_y_metrics.item(i)),
+                "label": str(self.list_y_metrics.item(i).text() or "").strip(),
+                "search": " ".join(
+                    [
+                        str(self.list_y_metrics.item(i).text() or "").strip().lower(),
+                        str(self.list_y_metrics.item(i).toolTip() or "").strip().lower(),
+                    ]
+                ).strip(),
+            }
+            for i in range(self.list_y_metrics.count())
+            if self.list_y_metrics.item(i) is not None and self._list_widget_item_value(self.list_y_metrics.item(i))
         ]
         chosen = self._show_filter_checklist_popup(
             title="Metric Y Columns",
             entries=entries,
-            selected_values=self._selected_list_widget_texts(self.list_y_metrics),
+            selected_values=self._selected_list_widget_values(self.list_y_metrics),
         )
         if chosen is None:
             return
-        self._set_list_widget_selection(self.list_y_metrics, chosen)
+        self._set_list_widget_selection_by_value(self.list_y_metrics, chosen)
         self._on_metric_y_selection_changed()
 
     def _open_metric_stats_popup(self) -> None:
@@ -5148,8 +6042,18 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         if not hasattr(self, "list_y_curve"):
             return
         entries = [
-            {"value": text, "label": text, "search": text.lower()}
-            for text in self._list_widget_item_texts(self.list_y_curve)
+            {
+                "value": self._list_widget_item_value(self.list_y_curve.item(i)),
+                "label": str(self.list_y_curve.item(i).text() or "").strip(),
+                "search": " ".join(
+                    [
+                        str(self.list_y_curve.item(i).text() or "").strip().lower(),
+                        str(self.list_y_curve.item(i).toolTip() or "").strip().lower(),
+                    ]
+                ).strip(),
+            }
+            for i in range(self.list_y_curve.count())
+            if self.list_y_curve.item(i) is not None and self._list_widget_item_value(self.list_y_curve.item(i))
         ]
         chosen = self._show_filter_checklist_popup(
             title="Curve Y Columns",
@@ -5694,7 +6598,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             elif not selected:
                 parts.append(f"{labels[key]}: None")
             elif len(selected) <= 2:
-                parts.append(f"{labels[key]}: {', '.join(selected)}")
+                display_selected = _td_display_serial_values(selected) if key == "serials" else list(selected)
+                parts.append(f"{labels[key]}: {', '.join(display_selected)}")
             else:
                 parts.append(f"{labels[key]}: {len(selected)} of {total}")
         return " | ".join(parts)
@@ -6870,6 +7775,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._serial_source_rows = [by_sn.get(sn, {"serial": sn, "serial_number": sn}) for sn in serials if str(sn).strip()]
         self._serial_source_by_serial = _td_serial_metadata_by_serial(self._serial_source_rows)
         self._global_filter_rows = [dict(row) for row in (filter_rows or []) if isinstance(row, dict)]
+        self._load_parameter_normalization_context()
         self._refresh_global_filter_options()
 
         self._sync_run_mode_availability()
@@ -7832,7 +8738,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 row = row_by_serial.get(serial) or {"serial": serial, "serial_number": serial}
                 program = self._row_program_label(row)
                 doc_type = str((row or {}).get("document_type") or "").strip()
-                parts = [serial, program]
+                parts = [_td_plot_serial_label(row) or serial, program]
                 if doc_type:
                     parts.append(doc_type)
                 entries.append(
@@ -7886,7 +8792,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 text = f"{label}: {', '.join(selected_values)}"
             else:
                 text = f"{label}: {len(selected_values)} of {total} active"
-        tooltip_items = selected_values[:20] if key == "serials" else selected_values
+        tooltip_items = (_td_display_serial_values(selected_values[:20]) if key == "serials" else selected_values)
         tooltip = ", ".join(tooltip_items)
         if key == "serials" and len(selected_values) > 20:
             tooltip += f" (+{len(selected_values) - 20} more)"
@@ -8609,7 +9515,14 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         report_name_auto = {"enabled": True}
 
         def _selected_certification_serials() -> list[str]:
-            return [it.text().strip() for it in list_sn.selectedItems() if it and it.text().strip()]
+            out: list[str] = []
+            for it in list_sn.selectedItems():
+                if it is None:
+                    continue
+                value = str(it.data(QtCore.Qt.ItemDataRole.UserRole) or it.text() or "").strip()
+                if value:
+                    out.append(value)
+            return out
 
         def _normalize_pdf_name(name: object) -> str:
             raw = str(name or "").strip()
@@ -8823,7 +9736,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             for i in range(list_sn.count()):
                 it = list_sn.item(i)
                 if it is not None:
-                    it.setSelected(it.text().strip() in wanted)
+                    value = str(it.data(QtCore.Qt.ItemDataRole.UserRole) or it.text() or "").strip()
+                    it.setSelected(value in wanted)
 
         def _update_runs_label() -> None:
             sel = [_selection_label(d) for d in _collect_checked_run_selections() if _selection_label(d)]
@@ -8864,9 +9778,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 {str(value).strip() for value in (selected_values or []) if str(value).strip()}
                 if selected_values is not None
                 else {
-                    it.text().strip()
+                    str(it.data(QtCore.Qt.ItemDataRole.UserRole) or it.text() or "").strip()
                     for it in list_sn.selectedItems()
-                    if it is not None and it.text().strip()
+                    if it is not None and str(it.data(QtCore.Qt.ItemDataRole.UserRole) or it.text() or "").strip()
                 }
             )
             certifying_program = str(cb_cert_program.currentText() or "").strip()
@@ -8878,7 +9792,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             list_sn.blockSignals(True)
             list_sn.clear()
             for serial in serial_values:
-                list_sn.addItem(QtWidgets.QListWidgetItem(serial))
+                item = QtWidgets.QListWidgetItem(_td_plot_serial_label(serial) or serial)
+                item.setData(QtCore.Qt.ItemDataRole.UserRole, serial)
+                list_sn.addItem(item)
             desired = selected_before
             if not desired and not applied_default_hi:
                 desired = set(want_hi)
@@ -8889,10 +9805,11 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         def _refresh_certification_summary() -> None:
             program = str(cb_cert_program.currentText() or "").strip()
             serials = _selected_certification_serials()
+            serial_labels = _td_display_serial_values(serials)
             lbl_cert_program_auto.setText(f"Certifying Program: {program or '-'}")
             lbl_cert_program_auto.setToolTip(program)
-            lbl_cert_serials_auto.setText(f"Certification Serials: {_selection_summary(serials, list_sn.count())}")
-            lbl_cert_serials_auto.setToolTip(", ".join(serials))
+            lbl_cert_serials_auto.setText(f"Certification Serials: {_selection_summary(serial_labels, list_sn.count())}")
+            lbl_cert_serials_auto.setToolTip(", ".join(serial_labels))
             _update_runs_label()
             _update_params_label()
 
@@ -9098,18 +10015,26 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     local_param_states[_norm_name(it.text())] = bool(it.checkState() == QtCore.Qt.CheckState.Checked)
 
             def _local_selected_serials() -> list[str]:
-                return [it.text().strip() for it in local_serials.selectedItems() if it and it.text().strip()]
+                out: list[str] = []
+                for it in local_serials.selectedItems():
+                    if it is None:
+                        continue
+                    value = str(it.data(QtCore.Qt.ItemDataRole.UserRole) or it.text() or "").strip()
+                    if value:
+                        out.append(value)
+                return out
 
             def _local_refresh_popup_summary() -> None:
                 selected_serials = _local_selected_serials()
+                display_serials = _td_display_serial_values(selected_serials)
                 lbl_popup_program_summary.setText(
                     f"Certifying Program: {str(local_program.currentText() or '').strip() or '-'}"
                 )
                 lbl_popup_program_summary.setToolTip(str(local_program.currentText() or "").strip())
                 lbl_popup_serials_summary.setText(
-                    f"Certification Serials: {_selection_summary(selected_serials, local_serials.count())}"
+                    f"Certification Serials: {_selection_summary(display_serials, local_serials.count())}"
                 )
-                lbl_popup_serials_summary.setToolTip(", ".join(selected_serials))
+                lbl_popup_serials_summary.setToolTip(", ".join(display_serials))
                 lbl_popup_runs_summary.setText(local_runs_summary.text())
                 lbl_popup_runs_summary.setToolTip(local_runs_summary.toolTip())
                 lbl_popup_params_summary.setText(local_params_summary.text())
@@ -9241,10 +10166,13 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 try:
                     local_serials.clear()
                     for serial in serial_values:
-                        local_serials.addItem(QtWidgets.QListWidgetItem(serial))
+                        item = QtWidgets.QListWidgetItem(_td_plot_serial_label(serial) or serial)
+                        item.setData(QtCore.Qt.ItemDataRole.UserRole, serial)
+                        local_serials.addItem(item)
                     for i in range(local_serials.count()):
                         it = local_serials.item(i)
-                        if it is not None and it.text().strip() in desired:
+                        value = str(it.data(QtCore.Qt.ItemDataRole.UserRole) or it.text() or "").strip() if it is not None else ""
+                        if it is not None and value in desired:
                             it.setSelected(True)
                 finally:
                     local_serials.blockSignals(False)
@@ -10340,9 +11268,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         output: object,
         input2: object = "",
     ) -> str:
-        x1 = str(input1 or "").strip() or "Input 1"
-        y = str(output or "").strip() or "Output"
-        x2 = str(input2 or "").strip()
+        x1 = self._perf_display_name(input1) or str(input1 or "").strip() or "Input 1"
+        y = self._perf_display_name(output) or str(output or "").strip() or "Output"
+        x2 = self._perf_display_name(input2) or str(input2 or "").strip()
         if x2:
             return f"{x1}, {x2} vs {y}"
         return f"{x1} vs {y}"
@@ -10460,6 +11388,14 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             if metric_source is not None
             else getattr(be, "TD_METRIC_PLOT_SOURCE_AGGREGATE", "aggregate")
         )
+        selection_value = str(column_name or "").strip()
+        candidate_raw_names = self._parameter_selection_raw_names(
+            selection_value,
+            run_names=([run_name] if run_name else []),
+            surface="metrics",
+        )
+        if not candidate_raw_names and selection_value:
+            candidate_raw_names = [selection_value]
         normalizer = getattr(be, "td_metric_normalize_plot_source", None)
         if callable(normalizer):
             try:
@@ -10476,35 +11412,61 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             if control_period_filter not in (None, "")
             else self._single_active_control_period_filter_value(filter_state=filter_state)
         )
+        combined_rows: list[dict] = []
+        seen_keys: set[tuple[str, str, str, str]] = set()
+        loaded_total = 0
+        filtered_total = 0
         try:
-            rows = be.td_load_metric_series(
-                self._db_path,
-                run_name,
-                column_name,
-                stat,
-                program_title=(program_title or None),
-                source_run_name=(source_run_name or None),
-                control_period_filter=loader_control_period_filter,
-                run_type_filter=run_type_filter,
-                metric_source=metric_source_norm,
-            )
-            filtered_rows = self._filter_rows_for_global_selection(rows, filter_state=filter_state)
+            for raw_name in candidate_raw_names:
+                rows = be.td_load_metric_series(
+                    self._db_path,
+                    run_name,
+                    raw_name,
+                    stat,
+                    program_title=(program_title or None),
+                    source_run_name=(source_run_name or None),
+                    control_period_filter=loader_control_period_filter,
+                    run_type_filter=run_type_filter,
+                    metric_source=metric_source_norm,
+                )
+                loaded_total += len(rows or [])
+                filtered_rows = self._filter_rows_for_global_selection(rows, filter_state=filter_state)
+                for row in filtered_rows:
+                    if not self._parameter_selection_matches_row(
+                        selection_value,
+                        raw_name=raw_name,
+                        program_title=row.get("program_title"),
+                    ):
+                        continue
+                    tagged = dict(row)
+                    tagged["parameter_name"] = str(raw_name or "").strip()
+                    row_key = (
+                        str(tagged.get("observation_id") or "").strip(),
+                        str(tagged.get("parameter_name") or "").strip(),
+                        str(tagged.get("program_title") or "").strip().casefold(),
+                        str(tagged.get("source_run_name") or "").strip().casefold(),
+                    )
+                    if row_key in seen_keys:
+                        continue
+                    seen_keys.add(row_key)
+                    combined_rows.append(tagged)
+                filtered_total = len(combined_rows)
             try:
                 diagnostics = getattr(self, "_last_metric_series_diagnostics", None)
                 if isinstance(diagnostics, list):
                     diagnostics.append(
                         {
                             "run_name": str(run_name or "").strip(),
-                            "column_name": str(column_name or "").strip(),
+                            "column_name": selection_value,
                             "stat": str(stat or "").strip(),
                             "metric_source": metric_source_norm,
-                            "loaded_count": len(rows or []),
-                            "filtered_count": len(filtered_rows or []),
+                            "loaded_count": loaded_total,
+                            "filtered_count": filtered_total,
                         }
                     )
             except Exception:
                 pass
-            return filtered_rows
+            return combined_rows
         except Exception:
             try:
                 diagnostics = getattr(self, "_last_metric_series_diagnostics", None)
@@ -10512,7 +11474,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     diagnostics.append(
                         {
                             "run_name": str(run_name or "").strip(),
-                            "column_name": str(column_name or "").strip(),
+                            "column_name": selection_value,
                             "stat": str(stat or "").strip(),
                             "metric_source": metric_source_norm,
                             "loaded_count": 0,
@@ -10536,23 +11498,165 @@ class TestDataTrendDialog(QtWidgets.QDialog):
     ) -> list[dict]:
         if not getattr(self, "_db_path", None):
             return []
+        selection_value = str(y_name or "").strip()
+        candidate_raw_names = self._parameter_selection_raw_names(
+            selection_value,
+            run_names=([run_name] if run_name else []),
+            surface="curves",
+        )
+        if not candidate_raw_names and selection_value:
+            candidate_raw_names = [selection_value]
         program_title, source_run_name = self._selection_observation_filters(selection)
         active_serials = [
             str(value).strip()
             for value in (serials or self._active_serials(filter_state=filter_state))
             if str(value).strip()
         ]
-        rows = be.td_load_curves(
-            self._db_path,
-            run_name,
-            y_name,
-            x_name,
-            serials=active_serials,
-            program_title=(program_title or None),
-            source_run_name=(source_run_name or None),
-            control_period_filter=self._single_active_control_period_filter_value(filter_state=filter_state),
+        combined_rows: list[dict] = []
+        seen_keys: set[tuple[str, str, str, str]] = set()
+        for raw_name in candidate_raw_names:
+            rows = be.td_load_curves(
+                self._db_path,
+                run_name,
+                raw_name,
+                x_name,
+                serials=active_serials,
+                program_title=(program_title or None),
+                source_run_name=(source_run_name or None),
+                control_period_filter=self._single_active_control_period_filter_value(filter_state=filter_state),
+            )
+            filtered_rows = self._filter_rows_for_global_selection(rows, filter_state=filter_state)
+            for row in filtered_rows:
+                if not self._parameter_selection_matches_row(
+                    selection_value,
+                    raw_name=raw_name,
+                    program_title=row.get("program_title"),
+                ):
+                    continue
+                tagged = dict(row)
+                tagged["parameter_name"] = str(raw_name or "").strip()
+                row_key = (
+                    str(tagged.get("observation_id") or "").strip(),
+                    str(tagged.get("parameter_name") or "").strip(),
+                    str(tagged.get("program_title") or "").strip().casefold(),
+                    str(tagged.get("source_run_name") or "").strip().casefold(),
+                )
+                if row_key in seen_keys:
+                    continue
+                seen_keys.add(row_key)
+                combined_rows.append(tagged)
+        return combined_rows
+
+    def _load_life_metric_series_for_selection(
+        self,
+        run_names: Sequence[object],
+        parameter_value: object,
+        life_axis: str,
+        *,
+        serials: Sequence[object] | None = None,
+        filter_state: Mapping[str, object] | None = None,
+    ) -> list[dict]:
+        if not getattr(self, "_db_path", None):
+            return []
+        runs = [str(value).strip() for value in (run_names or []) if str(value).strip()]
+        selection_value = str(parameter_value or "").strip()
+        candidate_raw_names = self._parameter_selection_raw_names(
+            selection_value,
+            run_names=runs,
+            surface="life_metrics",
         )
-        return self._filter_rows_for_global_selection(rows, filter_state=filter_state)
+        if not candidate_raw_names and selection_value:
+            candidate_raw_names = [selection_value]
+        active_serials = [str(value).strip() for value in (serials or []) if str(value).strip()]
+        combined_rows: list[dict] = []
+        seen_keys: set[tuple[str, str, str]] = set()
+        for raw_name in candidate_raw_names:
+            rows = be.td_load_life_metric_series(
+                self._db_path,
+                runs,
+                raw_name,
+                life_axis,
+                serials=active_serials or None,
+            )
+            filtered_rows = self._filter_rows_for_global_selection(rows, filter_state=filter_state)
+            for row in filtered_rows:
+                if not self._parameter_selection_matches_row(
+                    selection_value,
+                    raw_name=raw_name,
+                    program_title=row.get("program_title"),
+                ):
+                    continue
+                tagged = dict(row)
+                tagged["parameter_name"] = str(raw_name or "").strip()
+                row_key = (
+                    str(tagged.get("observation_id") or "").strip(),
+                    str(tagged.get("parameter_name") or "").strip(),
+                    str(tagged.get("program_title") or "").strip().casefold(),
+                )
+                if row_key in seen_keys:
+                    continue
+                seen_keys.add(row_key)
+                combined_rows.append(tagged)
+        return combined_rows
+
+    def _load_life_metric_xy_for_selection(
+        self,
+        run_names: Sequence[object],
+        x_parameter_value: object,
+        y_parameter_value: object,
+        *,
+        serials: Sequence[object] | None = None,
+        filter_state: Mapping[str, object] | None = None,
+    ) -> list[dict]:
+        if not getattr(self, "_db_path", None):
+            return []
+        runs = [str(value).strip() for value in (run_names or []) if str(value).strip()]
+        x_value = str(x_parameter_value or "").strip()
+        y_value = str(y_parameter_value or "").strip()
+        x_raw_names = self._parameter_selection_raw_names(x_value, run_names=runs, surface="life_metrics")
+        y_raw_names = self._parameter_selection_raw_names(y_value, run_names=runs, surface="life_metrics")
+        if not x_raw_names and x_value:
+            x_raw_names = [x_value]
+        if not y_raw_names and y_value:
+            y_raw_names = [y_value]
+        active_serials = [str(value).strip() for value in (serials or []) if str(value).strip()]
+        combined_rows: list[dict] = []
+        seen_keys: set[tuple[str, str, str, str]] = set()
+        for x_raw_name in x_raw_names:
+            for y_raw_name in y_raw_names:
+                rows = be.td_load_life_metric_xy(
+                    self._db_path,
+                    runs,
+                    x_raw_name,
+                    y_raw_name,
+                    serials=active_serials or None,
+                )
+                filtered_rows = self._filter_rows_for_global_selection(rows, filter_state=filter_state)
+                for row in filtered_rows:
+                    if not self._parameter_selection_matches_row(
+                        x_value,
+                        raw_name=row.get("x_parameter") or x_raw_name,
+                        program_title=row.get("program_title"),
+                    ):
+                        continue
+                    if not self._parameter_selection_matches_row(
+                        y_value,
+                        raw_name=row.get("y_parameter") or y_raw_name,
+                        program_title=row.get("program_title"),
+                    ):
+                        continue
+                    tagged = dict(row)
+                    row_key = (
+                        str(tagged.get("observation_id") or "").strip(),
+                        str(tagged.get("x_parameter") or "").strip(),
+                        str(tagged.get("y_parameter") or "").strip(),
+                        str(tagged.get("program_title") or "").strip().casefold(),
+                    )
+                    if row_key in seen_keys:
+                        continue
+                    seen_keys.add(row_key)
+                    combined_rows.append(tagged)
+        return combined_rows
 
     def _select_run_by_id(self, selection_id: str) -> None:
         key = str(selection_id or "").strip()
@@ -10918,7 +12022,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         multi_y: bool,
     ) -> str:
         base = self._curve_trace_label(run_name, curve_row, multi_run=multi_run)
-        return f"{y_name} | {base}" if multi_y else base
+        display_y = self._parameter_display_name(y_name, options=self._curve_parameter_options, fallback=y_name)
+        return f"{display_y} | {base}" if multi_y else base
 
     def _select_run_by_name(self, run_name: str) -> None:
         rn = str(run_name or "").strip()
@@ -10974,6 +12079,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 self.list_y_curve.clear()
             self.cb_x.clear()
             self.list_y_metrics.clear()
+            self._metric_parameter_options = []
+            self._curve_parameter_options = []
+            self._life_parameter_options = []
             if hasattr(self, "cb_life_y_param"):
                 self.cb_life_y_param.clear()
             if hasattr(self, "cb_life_x_param"):
@@ -11038,33 +12146,42 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             metric_y_names = list(y_names)
 
         # Multi-select Y list for metrics mode
-        prev_selected = {it.text() for it in self.list_y_metrics.selectedItems()} if hasattr(self, "list_y_metrics") else set()
-        self.list_y_metrics.blockSignals(True)
-        self.list_y_metrics.clear()
-        for name in metric_y_names:
-            self.list_y_metrics.addItem(QtWidgets.QListWidgetItem(name))
-        # Restore selection if possible; otherwise select all by default.
-        restored = False
-        if prev_selected:
-            for i in range(self.list_y_metrics.count()):
-                it = self.list_y_metrics.item(i)
-                if it.text() in prev_selected:
-                    it.setSelected(True)
-                    restored = True
-        if not restored and self.list_y_metrics.count() > 0:
-            self.list_y_metrics.selectAll()
-        self.list_y_metrics.blockSignals(False)
+        metric_raw_columns = [
+            dict(col)
+            for col in metric_y_cols
+            if str(col.get("name") or "").strip() in set(metric_y_names)
+        ]
+        self._metric_parameter_options = self._parameter_selector_options(
+            surface="metrics",
+            run_names=runs,
+            raw_names=metric_y_names,
+            raw_columns=metric_raw_columns,
+        )
+        prev_selected = self._selected_list_widget_values(self.list_y_metrics) if hasattr(self, "list_y_metrics") else []
+        self._populate_parameter_list_widget(
+            self.list_y_metrics,
+            self._metric_parameter_options,
+            previous_values=prev_selected,
+            select_all_default=True,
+        )
         self._refresh_metric_y_columns_summary()
 
         if hasattr(self, "cb_life_y_param") and hasattr(self, "cb_life_x_param"):
             prev_life_y = self._current_life_y_parameter()
             prev_life_x = self._current_life_x_parameter()
             prev_life_axis = self._current_life_axis()
-            life_params: list[str] = []
+            life_params: list[dict] = []
             try:
-                life_params = be.td_list_life_parameters(self._db_path, runs)
+                life_params = be.td_list_life_parameter_options(self._db_path, runs)
             except Exception:
                 life_params = []
+            life_raw_names = [str((item or {}).get("name") or "").strip() for item in life_params if str((item or {}).get("name") or "").strip()]
+            self._life_parameter_options = self._parameter_selector_options(
+                surface="life_metrics",
+                run_names=runs,
+                raw_names=life_raw_names,
+                raw_columns=life_params,
+            )
             life_axes: list[dict] = []
             try:
                 life_axes = be.td_list_life_axes(self._db_path)
@@ -11087,16 +12204,16 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             try:
                 self.cb_life_y_param.clear()
                 self.cb_life_x_param.clear()
-                for name in life_params:
-                    text = str(name or "").strip()
-                    if not text:
-                        continue
-                    self.cb_life_y_param.addItem(text, text)
-                    self.cb_life_x_param.addItem(text, text)
-                if prev_life_y:
-                    self._set_combo_to_value(self.cb_life_y_param, prev_life_y)
-                if prev_life_x:
-                    self._set_combo_to_value(self.cb_life_x_param, prev_life_x)
+                self._populate_parameter_combo(
+                    self.cb_life_y_param,
+                    self._life_parameter_options,
+                    previous_value=prev_life_y,
+                )
+                self._populate_parameter_combo(
+                    self.cb_life_x_param,
+                    self._life_parameter_options,
+                    previous_value=prev_life_x,
+                )
                 if self.cb_life_x_param.count() > 1 and self.cb_life_x_param.currentIndex() == self.cb_life_y_param.currentIndex():
                     self.cb_life_x_param.setCurrentIndex(1)
             finally:
@@ -11164,7 +12281,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         x_key = self._current_curve_x_key()
         x_label = self._current_curve_x_label()
         seen_y: set[str] = set()
-        y_names: list[str] = []
+        y_columns: list[dict[str, str]] = []
         for run in runs:
             x_col = self._resolve_curve_x_key(run, x_key or x_label)
             try:
@@ -11175,15 +12292,34 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 name = str((col or {}).get("name") or "").strip()
                 if name and name not in seen_y:
                     seen_y.add(name)
-                    y_names.append(name)
-        for name in y_names:
-            self.cb_y_curve.addItem(name, name)
-            if hasattr(self, "list_y_curve"):
-                self.list_y_curve.addItem(name)
+                    y_columns.append(
+                        {
+                            "name": name,
+                            "units": str((col or {}).get("units") or "").strip(),
+                        }
+                    )
+        self._curve_parameter_options = self._parameter_selector_options(
+            surface="curves",
+            run_names=runs,
+            raw_names=[str(col.get("name") or "").strip() for col in y_columns if str(col.get("name") or "").strip()],
+            raw_columns=y_columns,
+        )
+        self._populate_parameter_combo(
+            self.cb_y_curve,
+            self._curve_parameter_options,
+            previous_value=(prev_y[0] if prev_y else ""),
+        )
+        if hasattr(self, "list_y_curve"):
+            self._populate_parameter_list_widget(
+                self.list_y_curve,
+                self._curve_parameter_options,
+                previous_values=prev_y,
+                select_all_default=False,
+            )
         if prev_y:
             self._set_curve_y_selection(prev_y)
-        elif y_names:
-            self._set_curve_y_selection([y_names[0]])
+        elif self._curve_parameter_options:
+            self._set_curve_y_selection([str((self._curve_parameter_options[0] or {}).get("value") or "").strip()])
         self.cb_y_curve.blockSignals(False)
         if hasattr(self, "list_y_curve"):
             self.list_y_curve.blockSignals(False)
@@ -11257,7 +12393,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         sels = [str(sn).strip() for sn in (self._highlight_sns or []) if str(sn).strip()]
         if not sels:
             return "Highlighted serials: -"
-        shown = ", ".join(sels[:3])
+        shown = ", ".join(_td_display_serial_values(sels[:3]))
         extra = "" if len(sels) <= 3 else f" +{len(sels) - 3} more"
         return f"Highlighted serials: {len(sels)} ({shown}{extra})"
 
@@ -11309,7 +12445,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 continue
             program = _td_display_program_title((row or {}).get("program_title"))
             doc_type = str(row.get("document_type") or "").strip()
-            label_parts = [sn]
+            label_parts = [_td_plot_serial_label(row) or sn]
             if program:
                 label_parts.append(program)
             if doc_type:
@@ -11376,7 +12512,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 _set_val(k, None)
             return
 
-        _set_val("serial", sn)
+        _set_val("serial", _td_plot_serial_label(sn) or sn)
         selection = self._current_run_selection()
         metric_source = self._selected_metric_plot_source()
         for st in ("count", "mean", "std", "min", "max"):
@@ -11410,11 +12546,23 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         run = self._current_run_name()
         y_col = ""
         if self._mode == "curves":
-            y_col = self._current_curve_y_name()
+            selected_value = self._current_curve_y_name()
+            raw_names = self._parameter_selection_raw_names(
+                selected_value,
+                run_names=([run] if run else []),
+                surface="curves",
+            )
+            y_col = (raw_names[0] if raw_names else str(selected_value or "").strip()).strip()
         else:
             # Preview first selected Y column (keeps table compact).
-            selected = self._selected_list_widget_texts(getattr(self, "list_y_metrics", None))
-            y_col = (selected[0] if selected else "").strip()
+            selected = self._selected_list_widget_values(getattr(self, "list_y_metrics", None))
+            selection_value = (selected[0] if selected else "").strip()
+            raw_names = self._parameter_selection_raw_names(
+                selection_value,
+                run_names=([run] if run else []),
+                surface="metrics",
+            )
+            y_col = (raw_names[0] if raw_names else selection_value).strip()
         self._populate_stats_table(run, y_col, self._highlight_sn)
 
     def _smart_solver_available_column_names(self) -> list[str]:
@@ -12222,6 +13370,15 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         if not y_param:
             QtWidgets.QMessageBox.information(self, "Life Metrics", "Select a Y parameter.")
             return
+        y_option = self._selector_option_by_value(self._life_parameter_options, y_param)
+        if bool(y_option.get("unit_conflict")):
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Life Metrics",
+                "The selected Y parameter has conflicting units across its normalized sources. Resolve the conflict in Parameter Normalization first.",
+            )
+            return
+        y_display = self._parameter_display_name(y_param, options=self._life_parameter_options, fallback=y_param)
 
         self._axes.clear()
         any_plotted = False
@@ -12232,9 +13389,22 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             if not x_param:
                 QtWidgets.QMessageBox.information(self, "Life Metrics", "Select an X parameter.")
                 return
+            x_option = self._selector_option_by_value(self._life_parameter_options, x_param)
+            if bool(x_option.get("unit_conflict")):
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Life Metrics",
+                    "The selected X parameter has conflicting units across its normalized sources. Resolve the conflict in Parameter Normalization first.",
+                )
+                return
+            x_display = self._parameter_display_name(x_param, options=self._life_parameter_options, fallback=x_param)
             try:
-                rows = be.td_load_life_metric_xy(self._db_path, runs, x_param, y_param, serials=serials)
-                rows = self._filter_rows_for_global_selection(rows)
+                rows = self._load_life_metric_xy_for_selection(
+                    runs,
+                    x_param,
+                    y_param,
+                    serials=serials,
+                )
             except Exception as exc:
                 QtWidgets.QMessageBox.warning(self, "Life Metrics", str(exc))
                 return
@@ -12243,9 +13413,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 return
             x_units = str(next((row.get("x_units") for row in rows if str(row.get("x_units") or "").strip()), "") or "").strip()
             y_units = str(next((row.get("y_units") for row in rows if str(row.get("y_units") or "").strip()), "") or "").strip()
-            x_label = f"{x_param} ({x_units})" if x_units else x_param
-            y_label = f"{y_param} ({y_units})" if y_units else y_param
-            self._axes.set_title(self._compose_run_title(selection, f"{x_param} vs {y_param}"))
+            x_label = f"{x_display} ({x_units})" if x_units else x_display
+            y_label = f"{y_display} ({y_units})" if y_units else y_display
+            self._axes.set_title(self._compose_run_title(selection, f"{x_display} vs {y_display}"))
             self._axes.set_xlabel(x_label)
             self._axes.set_ylabel(y_label)
             grouped: dict[str, list[dict]] = {}
@@ -12276,13 +13446,22 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     label=_td_plot_serial_label(sn) or sn,
                 )
                 any_plotted = True
-            last_plot_extra = {"x_parameter": x_param, "y_parameter": y_param}
+            last_plot_extra = {
+                "x_parameter": x_param,
+                "y_parameter": y_param,
+                "x_parameter_label": x_display,
+                "y_parameter_label": y_display,
+            }
         else:
             life_axis = self._current_life_axis()
             life_axis_label = str(self.cb_life_axis.currentText() if hasattr(self, "cb_life_axis") else "").strip() or life_axis
             try:
-                rows = be.td_load_life_metric_series(self._db_path, runs, y_param, life_axis, serials=serials)
-                rows = self._filter_rows_for_global_selection(rows)
+                rows = self._load_life_metric_series_for_selection(
+                    runs,
+                    y_param,
+                    life_axis,
+                    serials=serials,
+                )
             except Exception as exc:
                 QtWidgets.QMessageBox.warning(self, "Life Metrics", str(exc))
                 return
@@ -12290,8 +13469,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 QtWidgets.QMessageBox.information(self, "Life Metrics", "No life metric values found for this selection.")
                 return
             y_units = str(next((row.get("units") for row in rows if str(row.get("units") or "").strip()), "") or "").strip()
-            y_label = f"{y_param} ({y_units})" if y_units else y_param
-            self._axes.set_title(self._compose_run_title(selection, f"{life_axis_label} vs {y_param}"))
+            y_label = f"{y_display} ({y_units})" if y_units else y_display
+            self._axes.set_title(self._compose_run_title(selection, f"{life_axis_label} vs {y_display}"))
             self._axes.set_xlabel(life_axis_label)
             self._axes.set_ylabel(y_label)
             grouped: dict[str, list[dict]] = {}
@@ -12322,7 +13501,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     label=_td_plot_serial_label(sn) or sn,
                 )
                 any_plotted = True
-            last_plot_extra = {"life_axis": life_axis, "y_parameter": y_param}
+            last_plot_extra = {
+                "life_axis": life_axis,
+                "life_axis_label": life_axis_label,
+                "y_parameter": y_param,
+                "y_parameter_label": y_display,
+            }
 
         if not any_plotted:
             QtWidgets.QMessageBox.information(self, "Life Metrics", "No life metric values found for this selection.")
@@ -12401,10 +13585,26 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             stats.append("average")
         if not runs or not stats:
             return
-        y_cols = self._selected_list_widget_texts(getattr(self, "list_y_metrics", None))
+        y_cols = self._selected_list_widget_values(getattr(self, "list_y_metrics", None))
         y_cols = [c for c in y_cols if c]
         if not y_cols:
             QtWidgets.QMessageBox.information(self, "Plot Metrics", "Select at least one Y column.")
+            return
+        y_display_names = {
+            value: self._parameter_display_name(value, options=self._metric_parameter_options, fallback=value)
+            for value in y_cols
+        }
+        conflicting = [
+            y_display_names.get(value, value)
+            for value in y_cols
+            if bool(self._selector_option_by_value(self._metric_parameter_options, value).get("unit_conflict"))
+        ]
+        if conflicting:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Plot Metrics",
+                "Resolve unit conflicts in Parameter Normalization before plotting:\n\n" + "\n".join(conflicting),
+            )
             return
 
         try:
@@ -12413,8 +13613,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 [_td_serial_value(row) for row in serial_rows if _td_serial_value(row)],
                 serial_rows,
             )
+            display_labels = _td_metric_display_serial_labels(labels, serial_rows)
         except Exception:
             labels = []
+            display_labels = []
         if not labels:
             QtWidgets.QMessageBox.information(self, "Plot Metrics", "No serial numbers available.")
             return
@@ -12424,7 +13626,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         y_label = stats[0] if len(stats) == 1 else "Metric value"
         plot_bounds = bool(getattr(self, "cb_plot_metric_bounds", None) and self.cb_plot_metric_bounds.isChecked())
         self._axes.clear()
-        self._axes.set_title(self._compose_run_title(selection, self._metric_graph_type_text(y_cols, stats)))
+        self._axes.set_title(
+            self._compose_run_title(selection, self._metric_graph_type_text(list(y_display_names.values()), stats))
+        )
         self._axes.set_xlabel("Serial Number")
         self._axes.set_ylabel(y_label)
         x = list(range(len(labels)))
@@ -12451,6 +13655,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         for run, run_selection in run_selection_pairs:
             metric_bounds = self._metric_bounds_for_run(run) if plot_bounds else {}
             for y_col in y_cols:
+                display_y_col = y_display_names.get(y_col, y_col)
+                bound_raw_names = self._parameter_selection_raw_names(y_col, run_names=[run], surface="metrics")
                 for stat in stats:
                     source_stat = "mean" if str(stat).strip().lower() == "average" else stat
                     series = self._load_metric_series_for_selection(
@@ -12476,7 +13682,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                             for sn in labels
                         ]
                     stat_label = str(stat)
-                    label = f"{run}.{y_col}.{stat_label}" if multi_run else f"{y_col}.{stat_label}"
+                    label = f"{run}.{display_y_col}.{stat_label}" if multi_run else f"{display_y_col}.{stat_label}"
                     try:
                         is_average = str(stat).strip().lower() == "average"
                         if is_average:
@@ -12502,7 +13708,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                                 alpha=0.88,
                                 label=label,
                             )[0]
-                        bound = dict(metric_bounds.get(str(y_col)) or {})
+                        bound = {}
+                        for raw_name in bound_raw_names:
+                            candidate = dict(metric_bounds.get(str(raw_name)) or {})
+                            if candidate:
+                                bound = candidate
+                                break
                         self._plot_metric_bound_lines(self._axes, bound)
                         if is_average:
                             avg_val = next((float(v) for v in y if isinstance(v, (int, float)) and math.isfinite(float(v))), None)
@@ -12541,7 +13752,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._apply_metric_program_segments(self._axes, labels)
         self._axes.set_xlim(-0.5, max(len(labels) - 0.5, 0.5))
         self._axes.set_xticks(x)
-        self._axes.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
+        self._axes.set_xticklabels(display_labels or labels, rotation=45, ha="right", fontsize=8)
         self._axes.grid(True, alpha=0.25)
         self._main_plot_legend_entries = self._apply_interactive_legend_policy(
             self._axes,
@@ -12580,6 +13791,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             "member_runs": list(runs),
             "stats": list(stats),
             "y": list(y_cols),
+            "y_labels": [y_display_names.get(value, value) for value in y_cols],
             "plot_bounds": bool(plot_bounds),
             "metric_plot_source": metric_source,
         }
@@ -12600,6 +13812,22 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         x_label = self._current_curve_x_label()
         if not runs or not y_cols:
             return
+        y_display_names = {
+            value: self._parameter_display_name(value, options=self._curve_parameter_options, fallback=value)
+            for value in y_cols
+        }
+        conflicting = [
+            y_display_names.get(value, value)
+            for value in y_cols
+            if bool(self._selector_option_by_value(self._curve_parameter_options, value).get("unit_conflict"))
+        ]
+        if conflicting:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Plot Curves",
+                "Resolve unit conflicts in Parameter Normalization before plotting:\n\n" + "\n".join(conflicting),
+            )
+            return
         if not x_label:
             QtWidgets.QMessageBox.information(
                 self,
@@ -12609,7 +13837,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             return
 
         self._axes.clear()
-        y_axis_label = self._plot_value_summary(y_cols) or "Y"
+        y_axis_label = self._plot_value_summary(list(y_display_names.values())) or "Y"
         self._axes.set_title(self._compose_run_title(selection, f"{x_label} vs {y_axis_label}"))
         self._axes.set_xlabel(x_label)
         self._axes.set_ylabel(y_axis_label)
@@ -12685,10 +13913,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             "member_runs": list(runs),
             "x": (x_label or x_col_title),
             "y": list(y_cols),
+            "y_labels": [y_display_names.get(value, value) for value in y_cols],
         }
         self._update_plot_zoom_actions()
         self.btn_add_auto_plot.setEnabled(True)
-        self._populate_stats_table(runs[0], y_cols[0], self._highlight_sn)
+        preview_raw_names = self._parameter_selection_raw_names(y_cols[0], run_names=[runs[0]], surface="curves")
+        self._populate_stats_table(runs[0], (preview_raw_names[0] if preview_raw_names else y_cols[0]), self._highlight_sn)
 
     def _selected_perf_runs(self) -> list[str]:
         if not getattr(self, "_db_path", None):
@@ -12858,6 +14088,17 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         input1_name = self._perf_current_col_name(self.cb_perf_x_col) if hasattr(self, "cb_perf_x_col") else ""
         input2_name = self._perf_current_col_name(self.cb_perf_z_col) if hasattr(self, "cb_perf_z_col") else ""
         return output_name, input1_name, input2_name
+
+    def _perf_display_name(self, value: object) -> str:
+        return self._parameter_display_name(value, options=getattr(self, "_perf_available_columns", None), fallback=value)
+
+    def _perf_var_display_names(self) -> tuple[str, str, str]:
+        output_name, input1_name, input2_name = self._perf_var_names()
+        return (
+            self._perf_display_name(output_name),
+            self._perf_display_name(input1_name),
+            self._perf_display_name(input2_name),
+        )
 
     def _perf_axis_names(self) -> tuple[str, str]:
         x_name = self._perf_current_col_name(self.cb_perf_x_col) if hasattr(self, "cb_perf_x_col") else ""
@@ -13086,15 +14327,14 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         if allow_blank:
             cb.addItem("None", "")
         for col in (getattr(self, "_perf_available_columns", []) or []):
-            nm = str((col or {}).get("name") or "").strip()
-            if not nm:
+            value = str((col or {}).get("value") or (col or {}).get("name") or "").strip()
+            if not value:
                 continue
-            nk = self._perf_norm_name(nm)
+            nk = self._perf_norm_name(value)
             if allowed_norms is not None and nk not in allowed_norms:
                 continue
-            units = str((col or {}).get("units") or "").strip()
-            label = f"{nm} ({units})" if units else nm
-            cb.addItem(label, nm)
+            label = str((col or {}).get("label") or (col or {}).get("display_name") or value).strip() or value
+            cb.addItem(label, value)
         if prev_norm:
             for i in range(cb.count()):
                 if self._perf_norm_name(cb.itemData(i)) == prev_norm:
@@ -13149,7 +14389,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
     def _update_perf_axes_label(self) -> None:
         if not hasattr(self, "lbl_perf_axes"):
             return
-        output_name, input1_name, input2_name = self._perf_var_names()
+        output_name, input1_name, input2_name = self._perf_var_display_names()
         self.lbl_perf_axes.setText(
             f"Output: {output_name or '-'} | Input 1: {input1_name or '-'} | Input 2: {input2_name or '-'}"
         )
@@ -13165,6 +14405,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         if not hasattr(self, "lbl_perf_common_runs"):
             return
         output_name, input1_name, input2_name = self._perf_var_names()
+        output_label, input1_label, input2_label = self._perf_var_display_names()
         self._update_perf_axes_label()
         if not output_name or not input1_name:
             self.lbl_perf_common_runs.setText("Common runs for selected variables: -")
@@ -13180,7 +14421,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         shown = ", ".join(common[:4])
         extra = f" (+{len(common) - 4})" if len(common) > 4 else ""
         mode_label = "surface" if str(plot_dimension or "").strip().lower() == "3d" or str(input2_name or "").strip() else "curve"
-        text = f"Common runs: {len(common)} - {shown}{extra} | Mode: {mode_label}"
+        text = (
+            f"Common runs: {len(common)} - {shown}{extra} | Mode: {mode_label}"
+            f" | Output: {output_label or '-'} | Input 1: {input1_label or '-'}"
+        )
+        if str(input2_name or "").strip():
+            text += f" | Input 2: {input2_label or '-'}"
         if stats:
             text += f" | Plot stats: {', '.join(stats)}"
         if qualifying_serial_count is not None:
@@ -14204,6 +15450,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             output_target = str(result.get("output_target") or "").strip()
             input1_target = str(result.get("input1_target") or "").strip()
             input2_target = str(result.get("input2_target") or "").strip()
+            output_label = self._perf_display_name(output_target) or output_target
+            input1_label = self._perf_display_name(input1_target) or input1_target
+            input2_label = self._perf_display_name(input2_target) or input2_target
             input1_units = str(result.get("input1_units") or "").strip()
             input2_units = str(result.get("input2_units") or "").strip()
             output_units = str(result.get("output_units") or "").strip()
@@ -14214,10 +15463,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             )
             ax.clear()
             ax.set_title(title)
-            ax.set_xlabel(f"{input1_target}.{stat_label}" + (f" ({input1_units})" if input1_units else ""))
-            ax.set_ylabel(f"{input2_target}.{stat_label}" + (f" ({input2_units})" if input2_units else ""))
+            ax.set_xlabel(f"{input1_label}.{stat_label}" + (f" ({input1_units})" if input1_units else ""))
+            ax.set_ylabel(f"{input2_label}.{stat_label}" + (f" ({input2_units})" if input2_units else ""))
             try:
-                ax.set_zlabel(f"{output_target}.{stat_label}" + (f" ({output_units})" if output_units else ""))
+                ax.set_zlabel(f"{output_label}.{stat_label}" + (f" ({output_units})" if output_units else ""))
             except Exception:
                 pass
 
@@ -14310,6 +15559,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 return
             x_target = str(result.get("x_target") or "").strip()
             y_target = str(result.get("y_target") or "").strip()
+            x_label = self._perf_display_name(x_target) or x_target
+            y_label = self._perf_display_name(y_target) or y_target
             x_units = str(result.get("x_units") or "").strip()
             y_units = str(result.get("y_units") or "").strip()
             graph_type = self._performance_graph_type_text(x_target, y_target)
@@ -14320,8 +15571,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
             ax.clear()
             ax.set_title(title)
-            ax.set_xlabel(f"{x_target}.{stat_label}" + (f" ({x_units})" if x_units else ""))
-            ax.set_ylabel(f"{y_target}.{stat_label}" + (f" ({y_units})" if y_units else ""))
+            ax.set_xlabel(f"{x_label}.{stat_label}" + (f" ({x_units})" if x_units else ""))
+            ax.set_ylabel(f"{y_label}.{stat_label}" + (f" ({y_units})" if y_units else ""))
 
             for sn, pts in curves.items():
                 if not isinstance(pts, list) or not pts:
@@ -14670,6 +15921,11 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         tgt = str(target or "").strip()
         if not tgt or not self._db_path:
             return "", ""
+        option = self._selector_option_by_value(getattr(self, "_perf_available_columns", None), tgt)
+        if option:
+            preferred_units = str(option.get("preferred_units") or "").strip()
+            units_list = [str(value).strip() for value in (option.get("units") or []) if str(value).strip()]
+            return tgt, preferred_units or (units_list[0] if len(units_list) == 1 else "")
 
         def _norm(s: str) -> str:
             return "".join(ch.lower() for ch in str(s or "").strip() if ch.isalnum())
@@ -16338,8 +17594,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             available_run_type_modes = be.td_list_performance_run_type_modes(self._db_path)
         except Exception:
             available_run_type_modes = ["steady_state", "pulsed_mode"]
-        union: dict[str, dict] = {}
-        col_runs: dict[str, set[str]] = {}
+        union: dict[str, dict[str, str]] = {}
         for rn in runs:
             try:
                 cols = be.td_list_y_columns(self._db_path, rn)
@@ -16351,13 +17606,24 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     continue
                 units = str((col or {}).get("units") or "").strip()
                 key = self._perf_norm_name(name)
-                col_runs.setdefault(key, set()).add(str(rn))
                 if key not in union:
                     union[key] = {"name": name, "units": units}
                 elif not str(union[key].get("units") or "").strip() and units:
                     union[key]["units"] = units
-        self._perf_available_columns = sorted(union.values(), key=lambda d: str(d.get("name") or "").lower())
-        self._perf_col_runs = col_runs
+        raw_perf_columns = sorted(union.values(), key=lambda d: str(d.get("name") or "").lower())
+        self._perf_available_columns = self._parameter_selector_options(
+            surface="performance",
+            run_names=runs,
+            raw_names=[str(col.get("name") or "").strip() for col in raw_perf_columns if str(col.get("name") or "").strip()],
+            raw_columns=raw_perf_columns,
+        )
+        self._perf_col_runs = {
+            self._perf_norm_name(option.get("value")): set(
+                str(run_name).strip() for run_name in (option.get("run_names") or []) if str(run_name).strip()
+            )
+            for option in (self._perf_available_columns or [])
+            if isinstance(option, Mapping) and self._perf_norm_name(option.get("value"))
+        }
         self._perf_all_runs = [str(r).strip() for r in runs if str(r).strip()]
 
         self._fill_perf_axis_combo(self.cb_perf_x_col)
@@ -16495,6 +17761,18 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         chosen = [nm for nm in (output_target, input1_target, input2_target) if str(nm).strip()]
         if len({self._perf_norm_name(v) for v in chosen}) != len(chosen):
             QtWidgets.QMessageBox.information(self, "Performance", "Output and selected inputs must be different columns.")
+            return
+        conflicting = [
+            self._perf_display_name(value)
+            for value in chosen
+            if bool(self._selector_option_by_value(getattr(self, "_perf_available_columns", None), value).get("unit_conflict"))
+        ]
+        if conflicting:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Performance",
+                "Resolve unit conflicts in Parameter Normalization before plotting:\n\n" + "\n".join(conflicting),
+            )
             return
         plot_stats = self._perf_plot_stat_candidates()
 
@@ -16636,6 +17914,18 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 self,
                 "Performance",
                 "Output and selected inputs must be different columns.",
+            )
+            return
+        conflicting = [
+            self._perf_display_name(value)
+            for value in chosen
+            if bool(self._selector_option_by_value(getattr(self, "_perf_available_columns", None), value).get("unit_conflict"))
+        ]
+        if conflicting:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Performance",
+                "Resolve unit conflicts in Parameter Normalization before plotting:\n\n" + "\n".join(conflicting),
             )
             return
         plot_stats = self._perf_plot_stat_candidates()
@@ -17504,6 +18794,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 [_td_serial_value(row) for row in serial_rows if _td_serial_value(row)],
                 serial_rows,
             )
+            display_labels = _td_metric_display_serial_labels(labels, serial_rows)
             x_idx = list(range(len(labels)))
             multi_run = len(runs) > 1
             for run in runs:
@@ -17546,7 +18837,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             self._apply_metric_program_segments(ax, labels)
             ax.set_xlim(-0.5, max(len(labels) - 0.5, 0.5))
             ax.set_xticks(x_idx)
-            ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
+            ax.set_xticklabels(display_labels or labels, rotation=45, ha="right", fontsize=8)
             ax.grid(True, alpha=0.25)
             ax.legend(fontsize=8, loc="best")
         else:
@@ -18395,6 +19686,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             )
             if not serial_labels:
                 raise RuntimeError("No serials remain after applying the Auto-Graphs filters.")
+            display_serial_labels = _td_metric_display_serial_labels(serial_labels, serial_rows)
             x_idx = list(range(len(serial_labels)))
             plotted_any = False
             multi_run = len(runs) > 1
@@ -18442,7 +19734,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             self._apply_metric_program_segments(ax, serial_labels, filter_state=render_filter_state)
             ax.set_xlim(-0.5, max(len(serial_labels) - 0.5, 0.5))
             ax.set_xticks(x_idx)
-            ax.set_xticklabels(serial_labels, rotation=45, ha="right", fontsize=8)
+            ax.set_xticklabels(display_serial_labels or serial_labels, rotation=45, ha="right", fontsize=8)
             ax.grid(True, alpha=0.25)
             handles, labels = ax.get_legend_handles_labels()
             if handles and labels:
@@ -19502,6 +20794,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             )
             if not serial_labels:
                 raise RuntimeError("No serials remain after applying the Auto-Graphs filters.")
+            display_serial_labels = _td_metric_display_serial_labels(serial_labels, serial_rows)
             x_idx = list(range(len(serial_labels)))
             plotted_any = False
             multi_run = len(runs) > 1
@@ -19549,7 +20842,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             self._apply_metric_program_segments(ax, serial_labels, filter_state=render_filter_state)
             ax.set_xlim(-0.5, max(len(serial_labels) - 0.5, 0.5))
             ax.set_xticks(x_idx)
-            ax.set_xticklabels(serial_labels, rotation=45, ha="right", fontsize=8)
+            ax.set_xticklabels(display_serial_labels or serial_labels, rotation=45, ha="right", fontsize=8)
             ax.grid(True, alpha=0.25)
             handles, labels = ax.get_legend_handles_labels()
             if handles and labels:
@@ -19771,7 +21064,18 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 raise RuntimeError("The saved curve graph is missing its X or Y axis definition.")
             if not runs:
                 raise RuntimeError("No runs remain for this saved curve graph.")
-            y_label = self._plot_value_summary(y_values) or "Y"
+            y_display_values = [self._parameter_display_name(value, options=self._curve_parameter_options, fallback=value) for value in y_values]
+            conflicting = [
+                self._parameter_display_name(value, options=self._curve_parameter_options, fallback=value)
+                for value in y_values
+                if bool(self._selector_option_by_value(self._curve_parameter_options, value).get("unit_conflict"))
+            ]
+            if conflicting:
+                raise RuntimeError(
+                    "Resolve unit conflicts in Parameter Normalization before rendering this saved curve graph:\n"
+                    + "\n".join(conflicting)
+                )
+            y_label = self._plot_value_summary(y_display_values) or "Y"
             ax.set_title(title_override or self._compose_run_title(selection, f"{x_label} vs {y_label}"))
             ax.set_xlabel(x_label)
             ax.set_ylabel(y_label)
@@ -19827,6 +21131,20 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             y_cols = [str(value).strip() for value in (d.get("y") or []) if str(value).strip()]
             if not y_cols:
                 raise RuntimeError("The saved metric graph has no selected Y columns.")
+            y_display_names = {
+                value: self._parameter_display_name(value, options=self._metric_parameter_options, fallback=value)
+                for value in y_cols
+            }
+            conflicting = [
+                y_display_names.get(value, value)
+                for value in y_cols
+                if bool(self._selector_option_by_value(self._metric_parameter_options, value).get("unit_conflict"))
+            ]
+            if conflicting:
+                raise RuntimeError(
+                    "Resolve unit conflicts in Parameter Normalization before rendering this saved metric graph:\n"
+                    + "\n".join(conflicting)
+                )
             if not runs:
                 raise RuntimeError("No runs remain for this saved metric graph.")
             metric_source = getattr(be, "TD_METRIC_PLOT_SOURCE_AGGREGATE", "aggregate")
@@ -19839,7 +21157,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             else:
                 metric_source = str(d.get("metric_plot_source") or metric_source).strip().lower() or str(metric_source)
             plot_bounds = bool(d.get("plot_bounds"))
-            ax.set_title(title_override or self._compose_run_title(selection, self._metric_graph_type_text(y_cols, stats)))
+            ax.set_title(
+                title_override or self._compose_run_title(selection, self._metric_graph_type_text(list(y_display_names.values()), stats))
+            )
             ax.set_xlabel("Serial Number")
             ax.set_ylabel(stats[0] if len(stats) == 1 else "Metric value")
             serial_rows = self._active_serial_rows(filter_state=render_filter_state)
@@ -19849,12 +21169,15 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             )
             if not serial_labels:
                 raise RuntimeError("No serials remain after applying the saved global filters.")
+            display_serial_labels = _td_metric_display_serial_labels(serial_labels, serial_rows)
             x_idx = list(range(len(serial_labels)))
             plotted_any = False
             multi_run = len(runs) > 1
             for run in runs:
                 metric_bounds = self._metric_bounds_for_run(run) if plot_bounds else {}
                 for y_col in y_cols:
+                    display_y_col = y_display_names.get(y_col, y_col)
+                    bound_raw_names = self._parameter_selection_raw_names(y_col, run_names=[run], surface="metrics")
                     for stat in stats:
                         source_stat = "mean" if str(stat).strip().lower() == "average" else stat
                         series = self._load_metric_series_for_selection(
@@ -19874,7 +21197,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                                 avg_values,
                                 marker=None,
                                 linewidth=1.2,
-                                label=(f"{run}.{y_col}.{stat}" if multi_run else f"{y_col}.{stat}"),
+                                label=(f"{run}.{display_y_col}.{stat}" if multi_run else f"{display_y_col}.{stat}"),
                             )
                         else:
                             points = self._metric_points_for_serial_labels(series, serial_labels)
@@ -19888,16 +21211,21 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                                 marker="o",
                                 markersize=5.0,
                                 alpha=0.88,
-                                label=(f"{run}.{y_col}.{stat}" if multi_run else f"{y_col}.{stat}"),
+                                label=(f"{run}.{display_y_col}.{stat}" if multi_run else f"{display_y_col}.{stat}"),
                             )
-                        bound = dict(metric_bounds.get(str(y_col)) or {})
+                        bound = {}
+                        for raw_name in bound_raw_names:
+                            candidate = dict(metric_bounds.get(str(raw_name)) or {})
+                            if candidate:
+                                bound = candidate
+                                break
                         self._plot_metric_bound_lines(ax, bound)
             if not plotted_any:
                 raise RuntimeError("No metric data matched this saved graph after applying the saved global filters.")
             self._apply_metric_program_segments(ax, serial_labels, filter_state=render_filter_state)
             ax.set_xlim(-0.5, max(len(serial_labels) - 0.5, 0.5))
             ax.set_xticks(x_idx)
-            ax.set_xticklabels(serial_labels, rotation=45, ha="right", fontsize=8)
+            ax.set_xticklabels(display_serial_labels or serial_labels, rotation=45, ha="right", fontsize=8)
             ax.grid(True, alpha=0.25)
             handles, labels = ax.get_legend_handles_labels()
             if handles and labels:
@@ -19914,13 +21242,34 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             y_param = str(d.get("y_parameter") or "").strip()
             if not y_param:
                 raise RuntimeError("The saved life metrics graph is missing its Y parameter.")
+            y_option = self._selector_option_by_value(self._life_parameter_options, y_param)
+            if bool(y_option.get("unit_conflict")):
+                raise RuntimeError("Resolve the saved life-metric Y parameter unit conflict in Parameter Normalization first.")
+            y_display = str(d.get("y_parameter_label") or "").strip() or self._parameter_display_name(
+                y_param,
+                options=self._life_parameter_options,
+                fallback=y_param,
+            )
             plotted_any = False
             if plot_type == "metric_xy":
                 x_param = str(d.get("x_parameter") or "").strip()
                 if not x_param:
                     raise RuntimeError("The saved life metrics graph is missing its X parameter.")
-                rows = be.td_load_life_metric_xy(self._db_path, runs, x_param, y_param, serials=active_serials)
-                rows = self._filter_rows_for_global_selection(rows, filter_state=render_filter_state)
+                x_option = self._selector_option_by_value(self._life_parameter_options, x_param)
+                if bool(x_option.get("unit_conflict")):
+                    raise RuntimeError("Resolve the saved life-metric X parameter unit conflict in Parameter Normalization first.")
+                x_display = str(d.get("x_parameter_label") or "").strip() or self._parameter_display_name(
+                    x_param,
+                    options=self._life_parameter_options,
+                    fallback=x_param,
+                )
+                rows = self._load_life_metric_xy_for_selection(
+                    runs,
+                    x_param,
+                    y_param,
+                    serials=active_serials,
+                    filter_state=render_filter_state,
+                )
                 if not rows:
                     raise RuntimeError("No life metric data matched this saved graph after applying the saved global filters.")
                 x_units = str(
@@ -19929,9 +21278,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 y_units = str(
                     next((row.get("y_units") for row in rows if str(row.get("y_units") or "").strip()), "") or ""
                 ).strip()
-                ax.set_title(title_override or self._compose_run_title(selection, f"{x_param} vs {y_param}"))
-                ax.set_xlabel(f"{x_param} ({x_units})" if x_units else x_param)
-                ax.set_ylabel(f"{y_param} ({y_units})" if y_units else y_param)
+                ax.set_title(title_override or self._compose_run_title(selection, f"{x_display} vs {y_display}"))
+                ax.set_xlabel(f"{x_display} ({x_units})" if x_units else x_display)
+                ax.set_ylabel(f"{y_display} ({y_units})" if y_units else y_display)
                 grouped: dict[str, list[dict]] = {}
                 for row in rows:
                     serial = str(row.get("serial") or "").strip()
@@ -19973,14 +21322,19 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                             life_axis_label = str((item or {}).get("label") or "").strip()
                             break
                 life_axis_label = life_axis_label or life_axis
-                rows = be.td_load_life_metric_series(self._db_path, runs, y_param, life_axis, serials=active_serials)
-                rows = self._filter_rows_for_global_selection(rows, filter_state=render_filter_state)
+                rows = self._load_life_metric_series_for_selection(
+                    runs,
+                    y_param,
+                    life_axis,
+                    serials=active_serials,
+                    filter_state=render_filter_state,
+                )
                 if not rows:
                     raise RuntimeError("No life metric data matched this saved graph after applying the saved global filters.")
                 y_units = str(next((row.get("units") for row in rows if str(row.get("units") or "").strip()), "") or "").strip()
-                ax.set_title(title_override or self._compose_run_title(selection, f"{life_axis_label} vs {y_param}"))
+                ax.set_title(title_override or self._compose_run_title(selection, f"{life_axis_label} vs {y_display}"))
                 ax.set_xlabel(life_axis_label)
-                ax.set_ylabel(f"{y_param} ({y_units})" if y_units else y_param)
+                ax.set_ylabel(f"{y_display} ({y_units})" if y_units else y_display)
                 grouped: dict[str, list[dict]] = {}
                 for row in rows:
                     serial = str(row.get("serial") or "").strip()
@@ -20019,6 +21373,17 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             input2 = str(d.get("input2") or "").strip()
             if not output or not input1:
                 raise RuntimeError("The saved performance graph is missing Output or Input selections.")
+            conflicting = [
+                self._perf_display_name(value)
+                for value in (output, input1, input2)
+                if str(value).strip()
+                and bool(self._selector_option_by_value(getattr(self, "_perf_available_columns", None), value).get("unit_conflict"))
+            ]
+            if conflicting:
+                raise RuntimeError(
+                    "Resolve unit conflicts in Parameter Normalization before rendering this saved performance graph:\n"
+                    + "\n".join(conflicting)
+                )
             stats_val = d.get("stats")
             plot_stats = (
                 [str(value).strip().lower() for value in stats_val if str(value).strip()]
@@ -20673,14 +22038,26 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         plot_definition = self._auto_plot_entry_plot_definition(entry)
         mode = str(plot_definition.get("mode") or "").strip().lower()
         if mode == "curves":
-            y_name = self._plot_value_summary(self._curve_plot_y_values(plot_definition), max_items=2)
+            y_values = self._curve_plot_y_values(plot_definition)
+            y_labels = [self._parameter_display_name(value, options=self._curve_parameter_options, fallback=value) for value in y_values]
+            y_name = self._plot_value_summary(y_labels, max_items=2)
             x_name = str(plot_definition.get("x") or "Time").strip() or "Time"
             return f"Curves: {y_name or 'Y'} vs {x_name}"
         if mode == "life_metrics":
             plot_type = str(plot_definition.get("plot_type") or "life_axis").strip().lower()
-            y_param = str(plot_definition.get("y_parameter") or "").strip() or "Y Parameter"
+            y_param = str(
+                plot_definition.get("y_parameter_label")
+                or self._parameter_display_name(plot_definition.get("y_parameter") or "", options=self._life_parameter_options, fallback="")
+                or plot_definition.get("y_parameter")
+                or ""
+            ).strip() or "Y Parameter"
             if plot_type == "metric_xy":
-                x_param = str(plot_definition.get("x_parameter") or "").strip() or "X Parameter"
+                x_param = str(
+                    plot_definition.get("x_parameter_label")
+                    or self._parameter_display_name(plot_definition.get("x_parameter") or "", options=self._life_parameter_options, fallback="")
+                    or plot_definition.get("x_parameter")
+                    or ""
+                ).strip() or "X Parameter"
                 return f"Life Metrics: {x_param} vs {y_param}"
             axis_label = str(plot_definition.get("life_axis_label") or "").strip()
             if not axis_label:
@@ -20694,9 +22071,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 }.get(axis_key, axis_key or "Life")
             return f"Life Metrics: {y_param} over {axis_label}"
         if mode == "performance":
-            output = str(plot_definition.get("output") or "").strip() or "Output"
-            input1 = str(plot_definition.get("input1") or "").strip() or "Input"
-            input2 = str(plot_definition.get("input2") or "").strip()
+            output = self._perf_display_name(plot_definition.get("output") or "") or str(plot_definition.get("output") or "").strip() or "Output"
+            input1 = self._perf_display_name(plot_definition.get("input1") or "") or str(plot_definition.get("input1") or "").strip() or "Input"
+            input2 = self._perf_display_name(plot_definition.get("input2") or "") or str(plot_definition.get("input2") or "").strip()
             if input2:
                 return f"Performance: {output} vs {input1}, {input2}"
             return f"Performance: {output} vs {input1}"
@@ -20711,7 +22088,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             else []
         )
         stats_label = self._metric_title_suffix(stats)
-        y_label = ", ".join(y_cols[:3]) if y_cols else "Metrics"
+        y_display = [self._parameter_display_name(value, options=self._metric_parameter_options, fallback=value) for value in y_cols]
+        y_label = ", ".join(y_display[:3]) if y_display else "Metrics"
         if len(y_cols) > 3:
             y_label += f" +{len(y_cols) - 3} more"
         return f"Metrics: {stats_label} ({y_label})"
@@ -20720,14 +22098,28 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         plot_definition = self._auto_plot_entry_plot_definition(entry)
         mode = str(plot_definition.get("mode") or "").strip().lower()
         if mode == "curves":
-            y_name = self._plot_value_summary(self._curve_plot_y_values(plot_definition), max_items=2)
+            y_values = self._curve_plot_y_values(plot_definition)
+            y_name = self._plot_value_summary(
+                [self._parameter_display_name(value, options=self._curve_parameter_options, fallback=value) for value in y_values],
+                max_items=2,
+            )
             x_name = str(plot_definition.get("x") or "Time").strip() or "Time"
             return f"{x_name} vs {y_name or 'Y'}"
         if mode == "life_metrics":
             plot_type = str(plot_definition.get("plot_type") or "life_axis").strip().lower()
-            y_param = str(plot_definition.get("y_parameter") or "").strip() or "Y Parameter"
+            y_param = str(
+                plot_definition.get("y_parameter_label")
+                or self._parameter_display_name(plot_definition.get("y_parameter") or "", options=self._life_parameter_options, fallback="")
+                or plot_definition.get("y_parameter")
+                or ""
+            ).strip() or "Y Parameter"
             if plot_type == "metric_xy":
-                x_param = str(plot_definition.get("x_parameter") or "").strip() or "X Parameter"
+                x_param = str(
+                    plot_definition.get("x_parameter_label")
+                    or self._parameter_display_name(plot_definition.get("x_parameter") or "", options=self._life_parameter_options, fallback="")
+                    or plot_definition.get("x_parameter")
+                    or ""
+                ).strip() or "X Parameter"
                 return f"{x_param} vs {y_param}"
             axis_label = str(plot_definition.get("life_axis_label") or "").strip()
             if not axis_label:
@@ -20761,7 +22153,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             if isinstance(plot_definition.get("y"), list)
             else []
         )
-        return self._metric_graph_type_text(y_cols, stats)
+        return self._metric_graph_type_text(
+            [self._parameter_display_name(value, options=self._metric_parameter_options, fallback=value) for value in y_cols],
+            stats,
+        )
 
     def _auto_graph_plot_header_text(
         self,
@@ -20908,11 +22303,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
     def _auto_plot_column_choices(
         self,
         global_selection: Mapping[str, object] | None = None,
-    ) -> list[dict[str, str]]:
+    ) -> list[dict[str, object]]:
         if not getattr(self, "_db_path", None):
             return []
+        run_names = self._selected_auto_plot_member_runs(global_selection)
         union: dict[str, dict[str, str]] = {}
-        for run_name in self._selected_auto_plot_member_runs(global_selection):
+        for run_name in run_names:
             try:
                 columns = be.td_list_y_columns(self._db_path, run_name)
             except Exception:
@@ -20931,7 +22327,19 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     union[key] = {"name": name, "units": units}
                 elif units and not str(union[key].get("units") or "").strip():
                     union[key]["units"] = units
-        return sorted(union.values(), key=lambda item: str(item.get("name") or "").lower())
+        options = self._parameter_selector_options(
+            surface="performance",
+            run_names=run_names,
+            raw_names=[str(item.get("name") or "").strip() for item in union.values() if str(item.get("name") or "").strip()],
+            raw_columns=list(union.values()),
+        )
+        out: list[dict[str, object]] = []
+        for option in options:
+            payload = dict(option)
+            payload.setdefault("name", str(option.get("display_name") or option.get("label") or option.get("value") or "").strip())
+            payload.setdefault("units", str(option.get("preferred_units") or "").strip())
+            out.append(payload)
+        return out
 
     def _auto_plot_metric_stat_choices(self) -> list[str]:
         stats: list[str] = []
@@ -22566,32 +23974,64 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 "plots": list(state.get("plots") or []),
             }
 
-        def _available_columns() -> list[str]:
+        def _available_columns() -> list[dict[str, object]]:
             current_file = _draft_graph_file()
             selection = self._resolve_auto_graph_file_global_selection(current_file)
             return [
-                str(item.get("name") or "").strip()
+                dict(item)
                 for item in self._auto_plot_column_choices(global_selection=selection)
-                if str(item.get("name") or "").strip()
+                if isinstance(item, Mapping) and str(item.get("value") or "").strip()
             ]
+
+        def _available_column_values() -> list[str]:
+            return [
+                str(item.get("value") or "").strip()
+                for item in _available_columns()
+                if str(item.get("value") or "").strip()
+            ]
+
+        def _available_column_label_map() -> dict[str, str]:
+            return {
+                str(item.get("value") or "").strip(): str(
+                    item.get("label") or item.get("display_name") or item.get("value") or ""
+                ).strip()
+                for item in _available_columns()
+                if str(item.get("value") or "").strip()
+            }
 
         def _set_combo_values(
             combo: QtWidgets.QComboBox,
-            values: list[str],
+            values: list[object],
             *,
             current_value: str = "",
             include_blank: bool = False,
             blank_text: str = "(None)",
+            display_formatter: Callable[[str], str] | None = None,
         ) -> None:
             combo.blockSignals(True)
             combo.clear()
             if include_blank:
                 combo.addItem(blank_text, "")
-            items = [str(value).strip() for value in values if str(value).strip()]
-            if current_value and current_value not in items:
-                items.append(current_value)
-            for value in items:
-                combo.addItem(value, value)
+            seen_values: set[str] = set()
+            items: list[tuple[str, str]] = []
+            for raw in values:
+                if isinstance(raw, Mapping):
+                    value = str(raw.get("value") or "").strip()
+                    label = str(raw.get("label") or raw.get("display_name") or raw.get("name") or value).strip()
+                else:
+                    value = str(raw or "").strip()
+                    label = value
+                if not value or value in seen_values:
+                    continue
+                seen_values.add(value)
+                if callable(display_formatter):
+                    label = display_formatter(value) or label
+                items.append((value, label or value))
+            if current_value and current_value not in seen_values:
+                label = display_formatter(current_value) if callable(display_formatter) else current_value
+                items.append((current_value, label or current_value))
+            for value, label in items:
+                combo.addItem(label, value)
             idx = combo.findData(current_value)
             if idx < 0 and include_blank:
                 idx = 0
@@ -22617,9 +24057,16 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
         def _refresh_builder_sources() -> None:
             columns = _available_columns()
-            selected_curve_y[:] = [value for value in selected_curve_y if value in columns]
-            if not selected_curve_y and columns:
-                selected_curve_y[:] = [columns[0]]
+            column_values = [str(item.get("value") or "").strip() for item in columns if str(item.get("value") or "").strip()]
+            column_labels = {
+                str(item.get("value") or "").strip(): str(item.get("label") or item.get("display_name") or item.get("value") or "").strip()
+                for item in columns
+                if str(item.get("value") or "").strip()
+            }
+            selected_metric_y[:] = [value for value in selected_metric_y if value in column_values]
+            selected_curve_y[:] = [value for value in selected_curve_y if value in column_values]
+            if not selected_curve_y and column_values:
+                selected_curve_y[:] = [column_values[0]]
             _set_combo_values(
                 cb_perf_output,
                 columns,
@@ -22650,9 +24097,22 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 current_value=str(cb_perf_highlight_serial.currentData() or "").strip(),
                 include_blank=True,
                 blank_text="(None)",
+                display_formatter=lambda value: _td_plot_serial_label(value) or value,
             )
-            lbl_curve_y.setText(self._popup_selection_summary(selected_curve_y, total_count=len(columns), empty_text="-"))
-            lbl_metric_y.setText(self._popup_selection_summary(selected_metric_y, total_count=len(columns), empty_text="-"))
+            lbl_curve_y.setText(
+                self._popup_selection_summary(
+                    [column_labels.get(value, value) for value in selected_curve_y],
+                    total_count=len(column_values),
+                    empty_text="-",
+                )
+            )
+            lbl_metric_y.setText(
+                self._popup_selection_summary(
+                    [column_labels.get(value, value) for value in selected_metric_y],
+                    total_count=len(column_values),
+                    empty_text="-",
+                )
+            )
             lbl_metric_stats.setText(self._popup_selection_summary(metric_stats, total_count=len(self._auto_plot_metric_stat_choices()), empty_text="-"))
             if not perf_stats:
                 perf_stats.append("mean")
@@ -22785,10 +24245,18 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 _refresh_builder_sources()
             btn_add_plot.setText("Update Plot")
 
-        def _pick_values(title_text: str, values: list[str], selected_values: list[str]) -> list[str] | None:
+        def _pick_values(title_text: str, values: list[dict[str, object]], selected_values: list[str]) -> list[str] | None:
             return self._show_filter_checklist_popup(
                 title=title_text,
-                entries=[{"value": value, "label": value, "search": value.lower()} for value in values if str(value).strip()],
+                entries=[
+                    {
+                        "value": str(item.get("value") or "").strip(),
+                        "label": str(item.get("label") or item.get("display_name") or item.get("value") or "").strip(),
+                        "search": str(item.get("search") or item.get("label") or item.get("display_name") or item.get("value") or "").strip().lower(),
+                    }
+                    for item in values
+                    if isinstance(item, Mapping) and str(item.get("value") or "").strip()
+                ],
                 selected_values=selected_values,
             )
 
@@ -26326,6 +27794,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cb_project_force_rebuild.setChecked(False)
         self.cb_project_force_rebuild.setStyleSheet("color:#0f172a; font-size: 12px;")
         self.btn_project_edit = QtWidgets.QPushButton("Edit Project")
+        self.btn_project_parameter_normalization = QtWidgets.QPushButton("Parameter Normalization...")
         self.btn_project_update = QtWidgets.QPushButton("Update Project")
         self.btn_project_perf_sheets = QtWidgets.QPushButton("Generate Performance Sheets")
         self.btn_project_debug_excels = QtWidgets.QPushButton("Generate Debug Excel Files")
@@ -26336,6 +27805,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_project_open_support = QtWidgets.QPushButton("Open Support Workbook")
         for b in (
             self.btn_project_edit,
+            self.btn_project_parameter_normalization,
             self.btn_project_update,
             self.btn_project_perf_sheets,
             self.btn_project_debug_excels,
@@ -26360,6 +27830,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 """
         )
         self.btn_project_edit.clicked.connect(self._act_edit_project)
+        self.btn_project_parameter_normalization.clicked.connect(self._act_project_parameter_normalization)
         self.btn_project_update.clicked.connect(self._act_update_project)
         self.btn_project_perf_sheets.clicked.connect(self._act_generate_project_performance_sheets)
         self.btn_project_debug_excels.clicked.connect(self._act_generate_project_debug_excels)
@@ -27048,6 +28519,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.cb_project_force_rebuild.setChecked(False)
         if hasattr(self, "btn_project_edit"):
             self.btn_project_edit.setEnabled(bool(record) and is_td and not project_busy)
+        if hasattr(self, "btn_project_parameter_normalization"):
+            self.btn_project_parameter_normalization.setEnabled(bool(record) and is_td and not project_busy)
         if hasattr(self, "btn_project_update"):
             self.btn_project_update.setEnabled(bool(record) and is_update_supported and not project_busy)
         if hasattr(self, "btn_project_perf_sheets"):
@@ -27624,6 +29097,26 @@ class MainWindow(QtWidgets.QMainWindow):
                     self._show_toast("Project changes saved")
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "Edit Project", str(exc))
+
+    def _act_project_parameter_normalization(self) -> None:
+        try:
+            record = self._selected_project_record()
+            if not record:
+                raise RuntimeError("Select a project in the list first.")
+            ptype = str(record.get("type") or "").strip()
+            if ptype != getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending"):
+                raise RuntimeError("Parameter Normalization is available only for Test Data Trending projects.")
+            project_dir = Path(str(record.get("folder") or "")).expanduser()
+            workbook = Path(str(record.get("workbook") or "")).expanduser()
+            dlg = TDParameterNormalizationDialog(project_dir, workbook, self)
+            self._prepare_dialog(dlg)
+            if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted and getattr(dlg, "saved", False):
+                self._show_toast("Parameter normalization saved")
+        except Exception as exc:
+            message = str(exc)
+            if "Trend / Analyze" in message or "cache" in message.casefold():
+                message = f"{message}\n\nRun Update Project first if this Test Data project has not been built yet."
+            QtWidgets.QMessageBox.warning(self, "Parameter Normalization", message)
 
     def _act_update_project(self) -> None:
         try:

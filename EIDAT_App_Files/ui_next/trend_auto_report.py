@@ -138,6 +138,52 @@ def _td_serial_value(row: Mapping[str, object] | None) -> str:
     return str(row.get("serial") or row.get("serial_number") or "").strip()
 
 
+def _tar_display_serial_label(value: object | Mapping[str, object]) -> str:
+    if isinstance(value, Mapping):
+        for key in ("serial_number", "source_serial_number"):
+            txt = str(value.get(key) or "").strip()
+            if txt:
+                return txt
+        raw = str(value.get("serial") or value.get("source_key") or "").strip()
+    else:
+        raw = str(value or "").strip()
+    if not raw:
+        return ""
+    parts = [part.strip() for part in re.split(r"\s*[|/]\s*", raw) if part.strip()]
+    if len(parts) >= 4:
+        return parts[3]
+    if parts:
+        return parts[-1]
+    return raw
+
+
+def _tar_display_serial(ctx: Mapping[str, Any] | None, serial: object) -> str:
+    raw = str(serial or "").strip()
+    if not raw:
+        return ""
+    meta_lookup = (ctx.get("meta_by_sn") or {}) if isinstance(ctx, Mapping) else {}
+    if isinstance(meta_lookup, Mapping):
+        label = _tar_display_serial_label(meta_lookup.get(raw) or raw)
+        if label:
+            return label
+    return _tar_display_serial_label(raw) or raw
+
+
+def _tar_display_serial_values(
+    values: Collection[object] | None,
+    *,
+    ctx: Mapping[str, Any] | None = None,
+) -> list[str]:
+    out: list[str] = []
+    for value in values or []:
+        raw = str(value or "").strip()
+        if not raw:
+            continue
+        label = _tar_display_serial(ctx, raw) if ctx is not None else _tar_display_serial_label(raw)
+        out.append(label or raw)
+    return out
+
+
 def _td_compact_filter_value(value: object) -> str:
     if value is None or isinstance(value, bool):
         return ""
@@ -2494,7 +2540,8 @@ def _figure_performance_equation_page(
         ys = [p[1] for p in pts]
         pooled_x.extend(xs)
         color = colors[idx % len(colors)] if colors else "#2563eb"
-        ax.plot(xs, ys, marker="o", linewidth=2.1, alpha=0.95, color=color, label=sn)
+        serial_label = _tar_display_serial_label(sn) or str(sn).strip()
+        ax.plot(xs, ys, marker="o", linewidth=2.1, alpha=0.95, color=color, label=serial_label)
         for x, y, run_label in pts:
             ax.annotate(str(run_label), (x, y), textcoords="offset points", xytext=(4, 4), fontsize=7, alpha=0.75, color=color)
 
@@ -2556,7 +2603,7 @@ def _figure_performance_equation_page(
         eqn = str(hm.get("equation") or "").strip()
         if not eqn:
             continue
-        text_lines.append(f"{sn}")
+        text_lines.append(_tar_display_serial_label(sn) or str(sn).strip())
         text_lines.append(_wrap_cell(eqn, max_chars=34, max_lines=6))
         text_lines.append(f"RMSE: {_fmt_num(hm.get('rmse'))}  Points: {int(hm.get('points') or 0)}")
         text_lines.append("")
@@ -3486,7 +3533,7 @@ def _tar_build_comparison_story(ctx: Mapping[str, Any]) -> list[Any]:
     story: list[Any] = []
     for page_index, page_spec in enumerate(page_specs):
         serial = str(page_spec.get("serial") or "").strip() or "(unknown)"
-        title = f"Run Comparison - {serial}"
+        title = f"Run Comparison - {_tar_display_serial(ctx, serial) or serial}"
         if bool(page_spec.get("continued")):
             title += " (Continued)"
         subtitle_parts: list[str] = []
@@ -3952,11 +3999,18 @@ def generate_test_data_auto_report(
             except Exception:
                 return ""
 
+        def _display_sn(sn: object) -> str:
+            raw = str(sn or "").strip()
+            if not raw:
+                return ""
+            return _tar_display_serial_label(meta_by_sn.get(raw) or raw) or raw
+
         def _metric_tick_label(sn: str) -> str:
             program = _meta(sn, "program_title")
+            serial_label = _display_sn(sn) or sn
             if program:
-                return f"{program}\n{sn}"
-            return sn
+                return f"{program}\n{serial_label}"
+            return serial_label
 
         def _metric_map_for_run(run_name: str, column_name: str, stat: str, *, control_period_filter: object = None) -> dict[str, float]:
             selection = _selection_for_run(run_name, options)
@@ -4096,6 +4150,14 @@ def generate_test_data_auto_report(
             f"  • Params included: {', '.join(params)}",
             f"  • Generated: {_now_datestr()}",
         ]
+        cover_lines = [
+            (
+                f"  â€¢ Serials under certification ({len(hi)}): {', '.join(_display_sn(sn) or sn for sn in hi)}"
+                if isinstance(line, str) and "Serials under certification" in line
+                else line
+            )
+            for line in cover_lines
+        ]
         if meta_note:
             cover_lines += ["", f"Note: {meta_note}"]
 
@@ -4213,7 +4275,7 @@ def generate_test_data_auto_report(
             for sn in hi:
                 exec_rows.append(
                     [
-                        sn,
+                        _display_sn(sn) or sn,
                         overall_by_sn.get(sn, "NO_DATA"),
                         _meta(sn, "part_number"),
                         _meta(sn, "revision"),
@@ -4268,7 +4330,7 @@ def generate_test_data_auto_report(
                 cols = ["Serial", "Run", "Param", "Grade", "Max %", "RMS %", "x@max", "Score"]
                 rows = [
                     [
-                        r.get("serial"),
+                        _display_sn(r.get("serial")) or str(r.get("serial") or "").strip(),
                         r.get("run"),
                         r.get("param"),
                         r.get("grade"),
@@ -4310,6 +4372,8 @@ def generate_test_data_auto_report(
                     ]
                     for rr in (by_sn_nonpass.get(right_sn) or [])
                 ]
+                left_sn = _display_sn(left_sn) or left_sn
+                right_sn = _display_sn(right_sn) or right_sn
                 fig = _figure_two_tables_page(
                     "Non‑PASS Findings (By Serial)",
                     left_title=left_sn or "—",
@@ -4494,10 +4558,10 @@ def generate_test_data_auto_report(
                     for sn in hi:
                         hm = highlighted_models.get(sn)
                         if not isinstance(hm, dict):
-                            trows.append([sn, "", "", ""])
+                            trows.append([_display_sn(sn) or sn, "", "", ""])
                             continue
                         eqn = _wrap_cell(str(hm.get("equation") or ""), max_chars=52, max_lines=2)
-                        trows.append([sn, str(hm.get("points") or ""), eqn, _fmt_num(hm.get("rmse"))])
+                        trows.append([_display_sn(sn) or sn, str(hm.get("points") or ""), eqn, _fmt_num(hm.get("rmse"))])
                     tab = ax.table(cellText=trows, colLabels=tcols, cellLoc="left", loc="upper left")
                     tab.auto_set_font_size(False)
                     tab.set_fontsize(7)
@@ -4661,7 +4725,8 @@ def generate_test_data_auto_report(
                     if not yv:
                         continue
                     g = grade_map.get((run, param_name, sn), "NO_DATA")
-                    ax.plot(x_grid, yv, linewidth=1.7, color=colors[idx % len(colors)], label=f"{sn} ({g})")
+                    serial_label = _display_sn(sn) or sn
+                    ax.plot(x_grid, yv, linewidth=1.7, color=colors[idx % len(colors)], label=f"{serial_label} ({g})")
 
                 eqn = str(model.get("equation") or "").strip()
                 rmse = (model.get("poly") or {}).get("rmse")
@@ -4726,7 +4791,7 @@ def generate_test_data_auto_report(
                         pass
 
                     ax.set_xticks(x_idx)
-                    ax.set_xticklabels(serials, rotation=45, ha="right", fontsize=7)
+                    ax.set_xticklabels([_display_sn(sn) or sn for sn in serials], rotation=45, ha="right", fontsize=7)
                     ax.grid(True, alpha=0.25)
                     try:
                         ax.legend(fontsize=8, loc="best")
@@ -4741,7 +4806,7 @@ def generate_test_data_auto_report(
 
             # 9) Appendix — Grade matrix
             if appendix_include_grade_matrix and run_param_pairs and hi:
-                cols = ["Run", "Param"] + hi
+                cols = ["Run", "Param"] + [(_display_sn(sn) or sn) for sn in hi]
                 matrix_rows_all: list[list[object]] = []
                 for run, param in run_param_pairs:
                     matrix_rows_all.append([run, param] + [grade_map.get((run, param, sn), "NO_DATA") for sn in hi])
@@ -4764,7 +4829,7 @@ def generate_test_data_auto_report(
                 for r in grading_rows[:max_rows]:
                     rows.append(
                         [
-                            r.get("serial"),
+                            _display_sn(r.get("serial")) or str(r.get("serial") or "").strip(),
                             r.get("run"),
                             r.get("param"),
                             r.get("grade"),
@@ -5769,15 +5834,19 @@ def _tar_meta(ctx: Mapping[str, Any], serial: str, key: str) -> str:
 
 def _tar_metric_tick_label(ctx: Mapping[str, Any], serial: str) -> str:
     program = _tar_meta(ctx, serial, "program_title")
-    return f"{program}\n{serial}" if program else serial
+    serial_label = _tar_display_serial(ctx, serial) or serial
+    return f"{program}\n{serial_label}" if program else serial_label
 
 
 _TAR_METRIC_PROGRAM_SEGMENT_PALETTE = ["#1d4ed8", "#0f766e", "#b45309", "#7c3aed", "#be123c", "#334155"]
 _TAR_METRIC_GUIDE_COLOR = "#cbd5e1"
 
 
-def _tar_metric_serial_tick_label(serial: object) -> str:
-    return str(serial or "").strip()
+def _tar_metric_serial_tick_label(serial: object, *, ctx: Mapping[str, Any] | None = None) -> str:
+    raw = str(serial or "").strip()
+    if not raw:
+        return ""
+    return _tar_display_serial(ctx, raw) if ctx is not None else (_tar_display_serial_label(raw) or raw)
 
 
 def _tar_metric_program_segments(
@@ -5888,7 +5957,7 @@ def _tar_apply_metric_axis_format(
 ) -> None:
     if axes is None:
         return
-    serial_labels = [_tar_metric_serial_tick_label(serial) for serial in (serials or [])]
+    serial_labels = [_tar_metric_serial_tick_label(serial, ctx={"meta_by_sn": meta_by_sn or {}}) for serial in (serials or [])]
     x_idx = list(range(len(serial_labels)))
     tick_fontsize = 5 if len(serial_labels) > 48 else 6
     try:
@@ -5930,6 +5999,8 @@ def _tar_filter_summary_line(ctx: Mapping[str, Any], key: str, label: str) -> st
     values = _filter_state_values(filter_state, key)
     if not values:
         return f"{label}: None"
+    if key == "serials":
+        values = _tar_display_serial_values(values, ctx=ctx)
     return f"{label}: {_tar_join_limited(values, max_items=4, empty='None')}"
 
 
@@ -6074,6 +6145,8 @@ def _tar_build_quick_summary(ctx: Mapping[str, Any]) -> dict[str, object]:
         )
     final_valve = _tar_join_limited(final_valve_values, max_items=6, empty=initial_valve)
 
+    certified_serial_labels = _tar_display_serial_values(highlighted, ctx=ctx)
+
     summary = {
         "certifying_programs": list(certifying_programs),
         "certified_serials": list(highlighted),
@@ -6092,7 +6165,7 @@ def _tar_build_quick_summary(ctx: Mapping[str, Any]) -> dict[str, object]:
     }
     summary["lines"] = [
         f"Certifying Program(s): {_tar_join_limited(summary['certifying_programs'], max_items=4, empty='(unknown)')}",
-        f"Certified Serial(s): {_tar_join_limited(summary['certified_serials'], max_items=8, empty='(none)')}",
+        f"Certified Serial(s): {_tar_join_limited(certified_serial_labels, max_items=8, empty='(none)')}",
         f"Selected Run Condition(s): {_tar_join_limited(summary['selected_run_conditions'], max_items=6, empty='(none)')}",
         f"Watch Parameter(s): {_tar_join_limited(summary['watch_parameters'], max_items=6, empty='None')}",
         f"Programs Compared: {_tar_join_limited(summary['comparison_programs'], max_items=6, empty='(unknown)')}",
@@ -6111,8 +6184,9 @@ def _tar_metadata_snapshot_lines(ctx: Mapping[str, Any]) -> list[str]:
 
     lines: list[str] = []
     for index, serial in enumerate(highlighted):
+        serial_label = _tar_display_serial(ctx, serial) or serial
         lines.append(
-            f"{serial} | Program: {_tar_meta_display_value(ctx, serial, 'program_title')} | "
+            f"{serial_label} | Program: {_tar_meta_display_value(ctx, serial, 'program_title')} | "
             f"Similarity Group: {_tar_meta_display_value(ctx, serial, 'similarity_group')} | "
             f"Acceptance Test Plan: {_tar_meta_display_value(ctx, serial, 'acceptance_test_plan_number')}"
         )
@@ -6827,7 +6901,7 @@ def _tar_plot_toc_label(plot_spec: Mapping[str, object] | None) -> str:
         ) or "Performance Plot"
     if section_key == "watch_nonpass_curves":
         param_name = str(spec.get("param") or "").strip()
-        serials = [str(serial).strip() for serial in (spec.get("serials") or []) if str(serial).strip()] if isinstance(spec.get("serials"), list) else []
+        serials = _tar_display_serial_values(spec.get("serials") or []) if isinstance(spec.get("serials"), list) else []
         serial_text = _tar_join_limited(serials, max_items=4, empty="")
         if not serial_text:
             serial_count = 0
@@ -9981,7 +10055,7 @@ def _tar_prepare_performance_models(ctx: dict[str, Any]) -> None:
                     equation_cards.append(
                         {
                             "kind": "serial",
-                            "title": f"{name} | {serial}",
+                            "title": f"{name} | {_tar_display_serial(ctx, serial) or serial}",
                             "lines": [
                                 f"Parameters: {y_target} vs {x_target}",
                                 f"Statistic: {perf_stat}",
@@ -10026,7 +10100,8 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
                 or run_name
             )
             highlight_lines.append(
-                f"{finding.get('serial')} | {display_text} | {param_name} | {finding.get('grade')} | "
+                f"{_tar_display_serial(ctx, finding.get('serial')) or str(finding.get('serial') or '').strip()} | "
+                f"{display_text} | {param_name} | {finding.get('grade')} | "
                 f"Max % {_fmt_num(finding.get('max_pct'))} | score {_fmt_num(finding.get('z'), sig=4)}"
             )
         if len(nonpass_findings) > len(highlight_lines):
@@ -10075,7 +10150,7 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
 
     exec_rows = [
         [
-            serial,
+            _tar_display_serial(ctx, serial) or serial,
             _tar_exec_overall_text(
                 (ctx.get("initial_overall_by_sn") or {}).get(serial, ""),
                 (ctx.get("final_overall_by_sn") or {}).get(serial, ""),
@@ -10111,7 +10186,7 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
                     ["Serial", "Run Condition", "Sequence(s)", "Parameter", "Final Status", "Chart"],
                     *[
                         [
-                            str(row.get("serial") or ""),
+                            _tar_display_serial(ctx, row.get("serial")) or str(row.get("serial") or "").strip(),
                             str(row.get("run_condition") or ""),
                             str(row.get("sequence_text") or ""),
                             str(row.get("parameter") or ""),
@@ -10246,7 +10321,7 @@ def _tar_equation_summary_rows(ctx: Mapping[str, Any]) -> list[list[str]]:
             equation = str(serial_model.get("equation") or "").strip()
             if not equation:
                 continue
-            rows.append([model_label, serial, equation, _fmt_num(serial_model.get("rmse"), sig=5)])
+            rows.append([model_label, _tar_display_serial(ctx, serial) or serial, equation, _fmt_num(serial_model.get("rmse"), sig=5)])
     return rows
 
 
@@ -10513,11 +10588,12 @@ def _tar_render_curve_cohort_page(
         default_color = colors[highlighted_trace_index % len(colors)]
         highlighted_trace_index += 1
         color = default_color if grade not in {"WATCH", "FAIL"} else _tar_grade_color(grade, default=default_color)
-        label = f"{serial} | {selection_label} ({grade})" if selection_label else f"{serial} ({grade})"
+        serial_label = _tar_display_serial(ctx, serial) or serial
+        label = f"{serial_label} | {selection_label} ({grade})" if selection_label else f"{serial_label} ({grade})"
         ax.plot(x_grid, y_curve, linewidth=1.8, color=color, label=label)
         finding = finding_by_pair_serial.get((pair_id, serial)) or {}
         note_lines.append(
-            f"{serial} | {selection_label or param_name} | {grade} | "
+            f"{serial_label} | {selection_label or param_name} | {grade} | "
             f"Max % {_fmt_num(finding.get(f'{metric_prefix}_max_pct'))} | "
             f"score {_fmt_num(finding.get(f'{metric_prefix}_z'), sig=4)}"
         )
@@ -10621,9 +10697,10 @@ def _tar_render_watch_curve_page(
             continue
         grade = str(final_grade_map.get((pair_id, serial), "NO_DATA") or "NO_DATA").strip().upper() or "NO_DATA"
         color = _tar_grade_color(grade, default=colors[idx % len(colors)])
-        ax.plot(x_grid, y_curve, linewidth=1.9, color=color, label=f"{serial} ({grade})")
+        serial_label = _tar_display_serial(ctx, serial) or serial
+        ax.plot(x_grid, y_curve, linewidth=1.9, color=color, label=f"{serial_label} ({grade})")
         finding = finding_by_pair_serial.get((pair_id, serial)) or {}
-        note_lines.append(f"{serial} ({grade})")
+        note_lines.append(f"{serial_label} ({grade})")
         note_lines.append(f"Max %: {_fmt_num(finding.get('final_max_pct'))}")
         note_lines.append(f"RMS %: {_fmt_num(finding.get('final_rms_pct'))}")
         note_lines.append(f"score: {_fmt_num(finding.get('final_z'), sig=4)}")
@@ -10739,7 +10816,8 @@ def _tar_render_plot_sections(
                         continue
                     grade = (ctx.get("grade_map") or {}).get((run_name, param_name, serial), "NO_DATA")
                     color = _tar_grade_color(grade)
-                    ax.scatter([xi], [y_val], s=44, color=color, zorder=5, label=f"{serial} ({grade})")
+                    serial_label = _tar_display_serial(ctx, serial) or serial
+                    ax.scatter([xi], [y_val], s=44, color=color, zorder=5, label=f"{serial_label} ({grade})")
                     ax.axvline(xi, color=color, linewidth=0.9, alpha=0.10)
                 tick_labels = [_tar_metric_tick_label(ctx, serial) for serial in serials]
                 tick_step = max(1, int(math.ceil(len(serials) / 18.0)))
@@ -10821,10 +10899,11 @@ def _tar_render_plot_sections(
                     continue
                 grade = (ctx.get("grade_map") or {}).get((run_name, param_name, serial), "NO_DATA")
                 color = ctx["colors"][idx % len(ctx["colors"])] if grade not in {"WATCH", "FAIL"} else _tar_grade_color(grade)
-                ax.plot(x_grid, y_curve, linewidth=1.8, color=color, label=f"{serial} ({grade})")
+                serial_label = _tar_display_serial(ctx, serial) or serial
+                ax.plot(x_grid, y_curve, linewidth=1.8, color=color, label=f"{serial_label} ({grade})")
                 finding = (ctx.get("finding_by_key") or {}).get((run_name, param_name, serial)) or {}
                 if finding:
-                    note_lines.append(f"{serial} ({grade}) | Max % {_fmt_num(finding.get('max_pct'))} | score {_fmt_num(finding.get('z'), sig=4)}")
+                    note_lines.append(f"{serial_label} ({grade}) | Max % {_fmt_num(finding.get('max_pct'))} | score {_fmt_num(finding.get('z'), sig=4)}")
             ax.grid(True, alpha=0.25)
             try:
                 handles, labels = ax.get_legend_handles_labels()
@@ -10906,7 +10985,8 @@ def _tar_render_plot_sections(
                 xs = [point[0] for point in pts]
                 ys = [point[1] for point in pts]
                 color = ctx["colors"][idx % len(ctx["colors"])]
-                ax.plot(xs, ys, marker="o", linewidth=2.1, alpha=0.95, color=color, label=serial)
+                serial_label = _tar_display_serial(ctx, serial) or serial
+                ax.plot(xs, ys, marker="o", linewidth=2.1, alpha=0.95, color=color, label=serial_label)
                 for x_val, y_val, run_label in pts:
                     ax.annotate(str(run_label), (x_val, y_val), textcoords="offset points", xytext=(4, 4), fontsize=7, alpha=0.75, color=color)
                 highlighted_model = highlighted_models.get(serial) if isinstance(highlighted_models, dict) else None
@@ -10925,7 +11005,7 @@ def _tar_render_plot_sections(
                 if isinstance(highlighted_model, dict):
                     eqn = str(highlighted_model.get("equation") or "").strip()
                     if eqn:
-                        note_lines.append(f"{serial}")
+                        note_lines.append(serial_label)
                         note_lines.extend(textwrap.wrap(eqn, width=30) or [eqn])
                         note_lines.append(f"RMSE: {_fmt_num(highlighted_model.get('rmse'), sig=5)}")
                         note_lines.append("")
@@ -11011,9 +11091,10 @@ def _tar_render_plot_sections(
                     continue
                 grade = (ctx.get("grade_map") or {}).get((run_name, param_name, serial), "NO_DATA")
                 color = _tar_grade_color(grade, default=ctx["colors"][idx % len(ctx["colors"])])
-                ax.plot(x_grid, y_curve, linewidth=1.9, color=color, label=f"{serial} ({grade})")
+                serial_label = _tar_display_serial(ctx, serial) or serial
+                ax.plot(x_grid, y_curve, linewidth=1.9, color=color, label=f"{serial_label} ({grade})")
                 finding = (ctx.get("finding_by_key") or {}).get((run_name, param_name, serial)) or {}
-                note_lines.append(f"{serial} ({grade})")
+                note_lines.append(f"{serial_label} ({grade})")
                 note_lines.append(f"Max %: {_fmt_num(finding.get('max_pct'))}")
                 note_lines.append(f"RMS %: {_fmt_num(finding.get('rms_pct'))}")
                 note_lines.append(f"score: {_fmt_num(finding.get('z'), sig=4)}")
@@ -11270,7 +11351,8 @@ def _tar_render_plot_sections(
                 xs = [point[0] for point in pts]
                 ys = [point[1] for point in pts]
                 color = ctx["colors"][idx % len(ctx["colors"])]
-                ax.plot(xs, ys, marker="o", linewidth=2.1, alpha=0.95, color=color, label=serial)
+                serial_label = _tar_display_serial(ctx, serial) or serial
+                ax.plot(xs, ys, marker="o", linewidth=2.1, alpha=0.95, color=color, label=serial_label)
                 for x_val, y_val, run_label in pts:
                     ax.annotate(str(run_label), (x_val, y_val), textcoords="offset points", xytext=(4, 4), fontsize=7, alpha=0.75, color=color)
                 highlighted_model = highlighted_models.get(serial) if isinstance(highlighted_models, dict) else None
@@ -11289,7 +11371,7 @@ def _tar_render_plot_sections(
                 if isinstance(highlighted_model, dict):
                     eqn = str(highlighted_model.get("equation") or "").strip()
                     if eqn:
-                        note_lines.append(f"{serial}")
+                        note_lines.append(serial_label)
                         note_lines.extend(textwrap.wrap(eqn, width=30) or [eqn])
                         note_lines.append(f"RMSE: {_fmt_num(highlighted_model.get('rmse'), sig=5)}")
                         note_lines.append("")
@@ -11415,7 +11497,7 @@ def _tar_build_closing_story(ctx: Mapping[str, Any], *, counts: Mapping[str, int
                 _tar_meta_summary_line(ctx, "program_title", "Program"),
                 _tar_meta_summary_line(ctx, "similarity_group", "Similarity Group"),
                 _tar_meta_summary_line(ctx, "acceptance_test_plan_number", "Acceptance Test Plan"),
-                f"Certification serials: {_tar_join_limited(ctx.get('hi') or [], max_items=8, empty='(none)')}",
+                f"Certification serials: {_tar_join_limited(_tar_display_serial_values(ctx.get('hi') or [], ctx=ctx), max_items=8, empty='(none)')}",
                 f"Selected scope items: {_tar_join_limited(ctx.get('options', {}).get('run_selection_labels') or [], max_items=6, empty='(none)')}",
             ],
             styles=styles,
@@ -11425,7 +11507,7 @@ def _tar_build_closing_story(ctx: Mapping[str, Any], *, counts: Mapping[str, int
     story.append(Spacer(1, 0.10 * inch))
     outcome_rows = [
         [
-            serial,
+            _tar_display_serial(ctx, serial) or serial,
             str(overall_by_sn.get(serial) or "").strip(),
             str(len(nonpass_by_sn.get(serial) or [])),
             _tar_meta(ctx, serial, "program_title"),
@@ -11454,7 +11536,7 @@ def _tar_build_closing_story(ctx: Mapping[str, Any], *, counts: Mapping[str, int
         story.append(Spacer(1, 0.12 * inch))
         review_rows = [
             [
-                str(row.get("serial") or ""),
+                _tar_display_serial(ctx, row.get("serial")) or str(row.get("serial") or "").strip(),
                 str(row.get("run") or ""),
                 str(row.get("param") or ""),
                 str(row.get("grade") or ""),

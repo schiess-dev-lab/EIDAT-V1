@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import re
 import warnings
+import uuid
 from contextlib import closing
 from datetime import datetime
 from functools import lru_cache
@@ -765,13 +766,32 @@ def edin_program_report_dir(
     return report_dir
 
 
+def td_display_serial_label(value: object | Mapping[str, object]) -> str:
+    if isinstance(value, Mapping):
+        for key in ("serial_number", "source_serial_number"):
+            txt = str(value.get(key) or "").strip()
+            if txt:
+                return txt
+        raw = str(value.get("serial") or value.get("source_key") or "").strip()
+    else:
+        raw = str(value or "").strip()
+    if not raw:
+        return ""
+    parts = [part.strip() for part in re.split(r"\s*[|/]\s*", raw) if part.strip()]
+    if len(parts) >= 4:
+        return parts[3]
+    if parts:
+        return parts[-1]
+    return raw
+
+
 def td_auto_report_serial_token(serials: Sequence[object] | None) -> str:
     cleaned: list[str] = []
     seen: set[str] = set()
     for value in (serials or []):
         if not str(value or "").strip():
             continue
-        serial = _safe_windows_path_name(value, fallback="")
+        serial = _safe_windows_path_name(td_display_serial_label(value), fallback="")
         if not serial or serial.casefold() in seen:
             continue
         seen.add(serial.casefold())
@@ -2872,6 +2892,9 @@ EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING = "Test Data Trending"
 EIDAT_PROJECT_IMPLEMENTATION_DB = "implementation_trending.sqlite3"
 EIDAT_PROJECT_TD_RAW_CACHE_DB = "test_data_raw_cache.sqlite3"
 EIDAT_PROJECT_TD_RAW_POINTS_XLSX = "test_data_raw_points.xlsx"
+TD_PARAMETER_NORMALIZATION_KEY = "parameter_normalization"
+TD_PARAMETER_NORMALIZATION_VERSION = 1
+TD_PARAMETER_SELECTOR_CANONICAL_PREFIX = "canonical:"
 TD_SUPPORT_WORKBOOK_SUFFIX = ".support.xlsx"
 GLOBAL_RUN_MIRROR_DIRNAME = "global_run_mirror"
 LOCAL_PROJECTS_MIRROR_DIRNAME = "projects"
@@ -3565,6 +3588,817 @@ def _read_project_meta(project_dir: Path) -> dict:
     except Exception:
         return {}
     return dict(raw) if isinstance(raw, dict) else {}
+
+
+def _write_project_meta(project_dir: Path, meta: Mapping[str, object]) -> dict[str, object]:
+    proj_dir = Path(project_dir).expanduser()
+    proj_dir.mkdir(parents=True, exist_ok=True)
+    payload = dict(meta or {})
+    (proj_dir / EIDAT_PROJECT_META).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return payload
+
+
+def _td_param_norm_name(value: object) -> str:
+    return "".join(ch.lower() for ch in str(value or "").strip() if ch.isalnum())
+
+
+def _td_param_norm_program(value: object) -> str:
+    text = re.sub(r"\s+", " ", str(value or "").strip())
+    return text.casefold()
+
+
+def _td_parameter_tokens(value: object) -> list[str]:
+    return [token for token in re.findall(r"[a-z0-9]+", str(value or "").strip().lower()) if token]
+
+
+def td_parameter_selector_is_canonical(value: object) -> bool:
+    return str(value or "").strip().lower().startswith(TD_PARAMETER_SELECTOR_CANONICAL_PREFIX)
+
+
+def td_parameter_selector_canonical_id(value: object) -> str:
+    raw = str(value or "").strip()
+    if td_parameter_selector_is_canonical(raw):
+        return raw[len(TD_PARAMETER_SELECTOR_CANONICAL_PREFIX):].strip()
+    return ""
+
+
+def td_parameter_selector_value(canonical_id: object) -> str:
+    cid = str(canonical_id or "").strip()
+    return f"{TD_PARAMETER_SELECTOR_CANONICAL_PREFIX}{cid}" if cid else ""
+
+
+def _td_parameter_implicit_canonical_id(raw_name: object) -> str:
+    text = str(raw_name or "").strip()
+    norm = _td_param_norm_name(text)
+    if norm:
+        return f"raw:{norm}"
+    if not text:
+        return "raw:blank"
+    return "raw:" + hashlib.sha1(text.encode("utf-8")).hexdigest()[:12]
+
+
+def _td_parameter_normalization_group_id(seed: object = "") -> str:
+    text = str(seed or "").strip()
+    norm = _td_param_norm_name(text)
+    if norm:
+        return f"group:{norm}:{uuid.uuid4().hex[:8]}"
+    return f"group:{uuid.uuid4().hex}"
+
+
+def _td_parameter_units_compatible(units_a: Sequence[object] | None, units_b: object) -> bool:
+    a_norms = {_td_param_norm_name(value) for value in (units_a or []) if _td_param_norm_name(value)}
+    b_norm = _td_param_norm_name(units_b)
+    if not a_norms or not b_norm:
+        return True
+    return b_norm in a_norms
+
+
+def _td_parameter_display_name_for_group(
+    normalization: Mapping[str, object] | None,
+    canonical_id: object,
+    *,
+    raw_names: Sequence[object] | None = None,
+    fallback: object = "",
+) -> str:
+    groups_by_id = (
+        normalization.get("groups_by_id")
+        if isinstance(normalization, Mapping) and isinstance(normalization.get("groups_by_id"), Mapping)
+        else {}
+    )
+    group = dict(groups_by_id.get(str(canonical_id or "").strip()) or {})
+    display_name = str(group.get("display_name") or "").strip()
+    if display_name:
+        return display_name
+    for raw_name in (raw_names or []):
+        text = str(raw_name or "").strip()
+        if text:
+            return text
+    return str(fallback or "").strip()
+
+
+def _td_normalize_parameter_normalization(raw: object) -> dict[str, object]:
+    payload = raw if isinstance(raw, Mapping) else {}
+    groups_raw = payload.get("groups") if isinstance(payload.get("groups"), list) else []
+    rules_raw = payload.get("mappings")
+    if not isinstance(rules_raw, list):
+        rules_raw = payload.get("rules") if isinstance(payload.get("rules"), list) else []
+    groups: list[dict[str, object]] = []
+    groups_by_id: dict[str, dict[str, object]] = {}
+    for item in groups_raw:
+        if not isinstance(item, Mapping):
+            continue
+        group_id = str(item.get("id") or "").strip() or _td_parameter_normalization_group_id(item.get("display_name"))
+        display_name = str(item.get("display_name") or item.get("name") or "").strip()
+        preferred_units = str(item.get("preferred_units") or item.get("units") or "").strip()
+        group = {
+            "id": group_id,
+            "display_name": display_name,
+            "preferred_units": preferred_units,
+        }
+        groups.append(group)
+        groups_by_id[group_id] = dict(group)
+    mappings: list[dict[str, object]] = []
+    seen_rules: set[tuple[str, str, tuple[str, ...]]] = set()
+    for item in rules_raw or []:
+        if not isinstance(item, Mapping):
+            continue
+        canonical_id = str(item.get("canonical_id") or "").strip()
+        raw_name = str(item.get("raw_name") or item.get("name") or "").strip()
+        if not canonical_id or not raw_name:
+            continue
+        if canonical_id not in groups_by_id:
+            groups_by_id[canonical_id] = {
+                "id": canonical_id,
+                "display_name": "",
+                "preferred_units": "",
+            }
+            groups.append(dict(groups_by_id[canonical_id]))
+        program_titles = item.get("program_titles")
+        if not isinstance(program_titles, list):
+            program_titles = item.get("programs") if isinstance(item.get("programs"), list) else []
+        programs_clean: list[str] = []
+        seen_programs: set[str] = set()
+        for value in (program_titles or []):
+            text = str(value or "").strip()
+            norm = _td_param_norm_program(text)
+            if text and norm not in seen_programs:
+                seen_programs.add(norm)
+                programs_clean.append(text)
+        rule_key = (canonical_id, _td_param_norm_name(raw_name), tuple(sorted(_td_param_norm_program(v) for v in programs_clean)))
+        if rule_key in seen_rules:
+            continue
+        seen_rules.add(rule_key)
+        mappings.append(
+            {
+                "canonical_id": canonical_id,
+                "raw_name": raw_name,
+                "program_titles": programs_clean,
+            }
+        )
+    return {
+        "version": int(payload.get("version") or TD_PARAMETER_NORMALIZATION_VERSION),
+        "groups": groups,
+        "groups_by_id": groups_by_id,
+        "mappings": mappings,
+    }
+
+
+def _td_parameter_normalization_persistable(normalization: Mapping[str, object] | None) -> dict[str, object]:
+    normalized = _td_normalize_parameter_normalization(normalization)
+    return {
+        "version": int(normalized.get("version") or TD_PARAMETER_NORMALIZATION_VERSION),
+        "groups": [
+            {
+                "id": str(group.get("id") or "").strip(),
+                "display_name": str(group.get("display_name") or "").strip(),
+                "preferred_units": str(group.get("preferred_units") or "").strip(),
+            }
+            for group in (normalized.get("groups") or [])
+            if isinstance(group, Mapping) and str(group.get("id") or "").strip()
+        ],
+        "mappings": [
+            {
+                "canonical_id": str(rule.get("canonical_id") or "").strip(),
+                "raw_name": str(rule.get("raw_name") or "").strip(),
+                "program_titles": [
+                    str(value).strip()
+                    for value in (rule.get("program_titles") or [])
+                    if str(value).strip()
+                ],
+            }
+            for rule in (normalized.get("mappings") or [])
+            if isinstance(rule, Mapping)
+            and str(rule.get("canonical_id") or "").strip()
+            and str(rule.get("raw_name") or "").strip()
+        ],
+    }
+
+
+def load_td_project_parameter_normalization(project_dir: Path) -> dict[str, object]:
+    meta = _read_project_meta(Path(project_dir).expanduser())
+    return _td_normalize_parameter_normalization(meta.get(TD_PARAMETER_NORMALIZATION_KEY))
+
+
+def save_td_project_parameter_normalization(project_dir: Path, normalization: Mapping[str, object] | None) -> dict[str, object]:
+    proj_dir = Path(project_dir).expanduser()
+    meta = _read_project_meta(proj_dir)
+    payload = _td_parameter_normalization_persistable(normalization)
+    meta[TD_PARAMETER_NORMALIZATION_KEY] = payload
+    _write_project_meta(proj_dir, meta)
+    return _td_normalize_parameter_normalization(payload)
+
+
+def _td_effective_parameter_canonical(
+    normalization: Mapping[str, object] | None,
+    raw_name: object,
+    program_title: object = "",
+) -> str:
+    normalized = _td_normalize_parameter_normalization(normalization)
+    want_raw = _td_param_norm_name(raw_name)
+    if not want_raw:
+        return _td_parameter_implicit_canonical_id(raw_name)
+    want_program = _td_param_norm_program(program_title)
+    global_match = ""
+    for rule in (normalized.get("mappings") or []):
+        if not isinstance(rule, Mapping):
+            continue
+        if _td_param_norm_name(rule.get("raw_name")) != want_raw:
+            continue
+        canonical_id = str(rule.get("canonical_id") or "").strip()
+        programs = [
+            _td_param_norm_program(value)
+            for value in (rule.get("program_titles") or [])
+            if _td_param_norm_program(value)
+        ]
+        if programs:
+            if want_program and want_program in programs:
+                return canonical_id
+            continue
+        if canonical_id:
+            global_match = canonical_id
+    if global_match:
+        return global_match
+    return _td_parameter_implicit_canonical_id(raw_name)
+
+
+def _td_parameter_config_candidates(workbook_path: Path | None) -> list[dict[str, object]]:
+    wb_path = Path(workbook_path).expanduser() if workbook_path else Path()
+    if not wb_path or not wb_path.exists():
+        return []
+    try:
+        project_cfg = _load_project_td_trend_config(wb_path)
+    except Exception:
+        return []
+    out: list[dict[str, object]] = []
+    for column in (project_cfg.get("columns") or []):
+        if not isinstance(column, Mapping):
+            continue
+        display_name = str(column.get("name") or "").strip()
+        if not display_name:
+            continue
+        aliases = [display_name]
+        aliases.extend(
+            [str(value).strip() for value in (column.get("aliases") or []) if str(value).strip()]
+        )
+        out.append(
+            {
+                "display_name": display_name,
+                "units": str(column.get("units") or "").strip(),
+                "aliases": aliases,
+            }
+        )
+    return out
+
+
+def _td_parameter_inventory_suggestion(
+    raw_name: str,
+    *,
+    units: Sequence[object] | None = None,
+    config_candidates: Sequence[Mapping[str, object]] | None = None,
+) -> dict[str, str]:
+    raw_norm = _td_param_norm_name(raw_name)
+    if not raw_norm:
+        return {}
+    candidates = [dict(item) for item in (config_candidates or []) if isinstance(item, Mapping)]
+    exact_matches: list[dict[str, object]] = []
+    fuzzy_matches: list[dict[str, object]] = []
+    raw_tokens = set(_td_parameter_tokens(raw_name))
+    for candidate in candidates:
+        display_name = str(candidate.get("display_name") or "").strip()
+        if not display_name:
+            continue
+        if not _td_parameter_units_compatible(units, candidate.get("units")):
+            continue
+        aliases = [str(value).strip() for value in (candidate.get("aliases") or []) if str(value).strip()]
+        alias_norms = {_td_param_norm_name(value) for value in aliases if _td_param_norm_name(value)}
+        if raw_norm in alias_norms:
+            exact_matches.append(candidate)
+            continue
+        if not raw_tokens:
+            continue
+        best_ratio = 0.0
+        best_token_match = False
+        for alias in aliases:
+            alias_norm = _td_param_norm_name(alias)
+            alias_tokens = set(_td_parameter_tokens(alias))
+            best_ratio = max(best_ratio, SequenceMatcher(None, raw_norm, alias_norm).ratio())
+            if raw_tokens == alias_tokens and alias_tokens:
+                best_token_match = True
+        if best_token_match or best_ratio >= 0.92:
+            fuzzy_matches.append(candidate)
+    unique_exact = {str(item.get("display_name") or "").strip(): item for item in exact_matches}
+    if len(unique_exact) == 1:
+        match = next(iter(unique_exact.values()))
+        return {
+            "display_name": str(match.get("display_name") or "").strip(),
+            "preferred_units": str(match.get("units") or "").strip(),
+            "reason": "config_alias",
+        }
+    unique_fuzzy = {str(item.get("display_name") or "").strip(): item for item in fuzzy_matches}
+    if len(unique_fuzzy) == 1:
+        match = next(iter(unique_fuzzy.values()))
+        return {
+            "display_name": str(match.get("display_name") or "").strip(),
+            "preferred_units": str(match.get("units") or "").strip(),
+            "reason": "fuzzy_alias",
+        }
+    return {}
+
+
+def td_build_parameter_normalization_context(
+    project_dir: Path,
+    workbook_path: Path | None = None,
+    db_path: Path | None = None,
+    normalization_override: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    proj_dir = Path(project_dir).expanduser()
+    impl_db = Path(db_path).expanduser() if db_path else (proj_dir / EIDAT_PROJECT_IMPLEMENTATION_DB)
+    raw_db = td_raw_cache_db_path_for(proj_dir)
+    workbook = Path(workbook_path).expanduser() if workbook_path else Path()
+    normalization = (
+        _td_normalize_parameter_normalization(normalization_override)
+        if isinstance(normalization_override, Mapping)
+        else load_td_project_parameter_normalization(proj_dir)
+    )
+    config_candidates = _td_parameter_config_candidates(workbook if workbook else None)
+    inventory_acc: dict[str, dict[str, object]] = {}
+    entry_keys: set[tuple[str, str, str, str, str, str]] = set()
+    entries: list[dict[str, str]] = []
+
+    def _inventory_row(raw_name: str) -> dict[str, object]:
+        raw_norm = _td_param_norm_name(raw_name)
+        row = inventory_acc.get(raw_norm)
+        if row is not None:
+            return row
+        row = {
+            "raw_name": raw_name,
+            "raw_norm": raw_norm,
+            "_units": set(),
+            "_program_titles": set(),
+            "_source_run_names": set(),
+            "_surfaces": set(),
+            "_run_names": set(),
+        }
+        inventory_acc[raw_norm] = row
+        return row
+
+    def _add_entry(
+        *,
+        raw_name: object,
+        units: object = "",
+        program_title: object = "",
+        source_run_name: object = "",
+        run_name: object = "",
+        surfaces: Sequence[str] | None = None,
+    ) -> None:
+        text = str(raw_name or "").strip()
+        if not text:
+            return
+        row = _inventory_row(text)
+        units_text = str(units or "").strip()
+        if units_text:
+            cast(set[str], row["_units"]).add(units_text)
+        program_text = str(program_title or "").strip()
+        source_run_text = str(source_run_name or "").strip()
+        run_text = str(run_name or "").strip()
+        if program_text:
+            cast(set[str], row["_program_titles"]).add(program_text)
+        if source_run_text:
+            cast(set[str], row["_source_run_names"]).add(source_run_text)
+        if run_text:
+            cast(set[str], row["_run_names"]).add(run_text)
+        for surface in (surfaces or []):
+            surface_key = str(surface or "").strip().lower()
+            if not surface_key:
+                continue
+            cast(set[str], row["_surfaces"]).add(surface_key)
+            entry_key = (
+                surface_key,
+                run_text.casefold(),
+                _td_param_norm_name(text),
+                _td_param_norm_program(program_text),
+                source_run_text.casefold(),
+                _td_param_norm_name(units_text),
+            )
+            if entry_key in entry_keys:
+                continue
+            entry_keys.add(entry_key)
+            entries.append(
+                {
+                    "surface": surface_key,
+                    "run_name": run_text,
+                    "raw_name": text,
+                    "raw_norm": _td_param_norm_name(text),
+                    "units": units_text,
+                    "program_title": program_text,
+                    "program_norm": _td_param_norm_program(program_text),
+                    "source_run_name": source_run_text,
+                }
+            )
+
+    if impl_db.exists():
+        with sqlite3.connect(str(impl_db)) as conn:
+            _ensure_test_data_impl_tables(conn)
+            try:
+                metric_rows = conn.execute(
+                    """
+                    SELECT DISTINCT
+                        m.run_name,
+                        m.column_name,
+                        COALESCE(c.units, ''),
+                        COALESCE(m.program_title, ''),
+                        COALESCE(m.source_run_name, '')
+                    FROM td_metrics_calc m
+                    LEFT JOIN td_columns_calc c
+                      ON c.run_name = m.run_name AND c.name = m.column_name AND c.kind = 'y'
+                    WHERE m.value_num IS NOT NULL
+                    ORDER BY m.run_name, m.column_name
+                    """
+                ).fetchall()
+            except Exception:
+                metric_rows = []
+            for run_name, raw_name, units, program_title, source_run_name in metric_rows:
+                _add_entry(
+                    raw_name=raw_name,
+                    units=units,
+                    program_title=program_title,
+                    source_run_name=source_run_name,
+                    run_name=run_name,
+                    surfaces=("metrics", "performance"),
+                )
+            try:
+                life_rows = conn.execute(
+                    f"""
+                    SELECT DISTINCT
+                        condition_key,
+                        parameter_name,
+                        COALESCE(units, ''),
+                        COALESCE(program_title, ''),
+                        COALESCE(source_run_name, '')
+                    FROM {TD_LIFE_METRICS_TABLE}
+                    WHERE lower(stat) = 'mean'
+                    ORDER BY condition_key, parameter_name
+                    """
+                ).fetchall()
+            except Exception:
+                life_rows = []
+            for run_name, raw_name, units, program_title, source_run_name in life_rows:
+                _add_entry(
+                    raw_name=raw_name,
+                    units=units,
+                    program_title=program_title,
+                    source_run_name=source_run_name,
+                    run_name=run_name,
+                    surfaces=("life_metrics",),
+                )
+    if raw_db.exists():
+        with sqlite3.connect(str(raw_db)) as conn:
+            _ensure_test_data_raw_cache_tables(conn)
+            try:
+                curve_rows = conn.execute(
+                    """
+                    SELECT DISTINCT
+                        c.run_name,
+                        c.y_name,
+                        COALESCE(cat.units, ''),
+                        COALESCE(c.program_title, ''),
+                        COALESCE(c.source_run_name, '')
+                    FROM td_curves_raw c
+                    LEFT JOIN td_raw_curve_catalog cat
+                      ON cat.run_name = c.run_name AND cat.parameter_name = c.y_name
+                    ORDER BY c.run_name, c.y_name
+                    """
+                ).fetchall()
+            except Exception:
+                curve_rows = []
+            for run_name, raw_name, units, program_title, source_run_name in curve_rows:
+                _add_entry(
+                    raw_name=raw_name,
+                    units=units,
+                    program_title=program_title,
+                    source_run_name=source_run_name,
+                    run_name=run_name,
+                    surfaces=("curves",),
+                )
+
+    canonical_groups: dict[str, dict[str, object]] = {}
+    for entry in entries:
+        raw_name = str(entry.get("raw_name") or "").strip()
+        canonical_id = _td_effective_parameter_canonical(normalization, raw_name, entry.get("program_title"))
+        group = canonical_groups.setdefault(
+            canonical_id,
+            {
+                "id": canonical_id,
+                "display_name": "",
+                "preferred_units": "",
+                "_raw_names": set(),
+                "_units": set(),
+                "_program_titles": set(),
+                "_source_run_names": set(),
+                "_surfaces": set(),
+                "_run_names": set(),
+                "explicit": canonical_id in cast(dict[str, dict[str, object]], normalization.get("groups_by_id") or {}),
+            },
+        )
+        cast(set[str], group["_raw_names"]).add(raw_name)
+        if str(entry.get("units") or "").strip():
+            cast(set[str], group["_units"]).add(str(entry.get("units") or "").strip())
+        if str(entry.get("program_title") or "").strip():
+            cast(set[str], group["_program_titles"]).add(str(entry.get("program_title") or "").strip())
+        if str(entry.get("source_run_name") or "").strip():
+            cast(set[str], group["_source_run_names"]).add(str(entry.get("source_run_name") or "").strip())
+        if str(entry.get("surface") or "").strip():
+            cast(set[str], group["_surfaces"]).add(str(entry.get("surface") or "").strip())
+        if str(entry.get("run_name") or "").strip():
+            cast(set[str], group["_run_names"]).add(str(entry.get("run_name") or "").strip())
+    for group_id, group in list(canonical_groups.items()):
+        raw_names = sorted(cast(set[str], group.get("_raw_names") or set()), key=str.casefold)
+        units = sorted(cast(set[str], group.get("_units") or set()), key=str.casefold)
+        group["display_name"] = _td_parameter_display_name_for_group(
+            normalization,
+            group_id,
+            raw_names=raw_names,
+            fallback=(raw_names[0] if raw_names else group_id),
+        )
+        preferred_units = str(
+            ((normalization.get("groups_by_id") or {}).get(group_id) or {}).get("preferred_units")
+            if isinstance(normalization.get("groups_by_id"), Mapping)
+            else ""
+        ).strip()
+        if not preferred_units and len(units) == 1:
+            preferred_units = units[0]
+        group["preferred_units"] = preferred_units
+        group["raw_names"] = raw_names
+        group["units"] = units
+        group["program_titles"] = sorted(cast(set[str], group.get("_program_titles") or set()), key=str.casefold)
+        group["source_run_names"] = sorted(cast(set[str], group.get("_source_run_names") or set()), key=str.casefold)
+        group["surfaces"] = sorted(cast(set[str], group.get("_surfaces") or set()), key=str.casefold)
+        group["run_names"] = sorted(cast(set[str], group.get("_run_names") or set()), key=str.casefold)
+        group["unit_conflict"] = len([value for value in units if str(value).strip()]) > 1
+        for key in ("_raw_names", "_units", "_program_titles", "_source_run_names", "_surfaces", "_run_names"):
+            group.pop(key, None)
+
+    inventory: list[dict[str, object]] = []
+    for row in sorted(inventory_acc.values(), key=lambda item: str(item.get("raw_name") or "").casefold()):
+        raw_name = str(row.get("raw_name") or "").strip()
+        programs = sorted(cast(set[str], row.get("_program_titles") or set()), key=str.casefold)
+        canonical_ids = {
+            _td_effective_parameter_canonical(normalization, raw_name, program_title)
+            for program_title in (programs or [""])
+        }
+        suggestion = _td_parameter_inventory_suggestion(
+            raw_name,
+            units=sorted(cast(set[str], row.get("_units") or set()), key=str.casefold),
+            config_candidates=config_candidates,
+        )
+        primary_canonical_id = next(iter(sorted(canonical_ids))) if canonical_ids else _td_parameter_implicit_canonical_id(raw_name)
+        status = "implicit"
+        if len(canonical_ids) > 1:
+            status = "split_by_program"
+        elif any(_td_param_norm_name(rule.get("raw_name")) == _td_param_norm_name(raw_name) for rule in (normalization.get("mappings") or [])):
+            status = "explicit"
+        elif suggestion:
+            status = "suggested"
+        inventory.append(
+            {
+                "raw_name": raw_name,
+                "raw_norm": str(row.get("raw_norm") or "").strip(),
+                "units": sorted(cast(set[str], row.get("_units") or set()), key=str.casefold),
+                "program_titles": programs,
+                "source_run_names": sorted(cast(set[str], row.get("_source_run_names") or set()), key=str.casefold),
+                "surfaces": sorted(cast(set[str], row.get("_surfaces") or set()), key=str.casefold),
+                "run_names": sorted(cast(set[str], row.get("_run_names") or set()), key=str.casefold),
+                "canonical_ids": sorted(canonical_ids),
+                "canonical_display": _td_parameter_display_name_for_group(
+                    normalization,
+                    primary_canonical_id,
+                    raw_names=[raw_name],
+                    fallback=raw_name,
+                ),
+                "primary_canonical_id": primary_canonical_id,
+                "status": status,
+                "suggestion": suggestion,
+                "source_count": len(cast(set[str], row.get("_source_run_names") or set())),
+                "program_count": len(programs),
+            }
+        )
+
+    return {
+        "project_dir": str(proj_dir),
+        "workbook_path": str(workbook or ""),
+        "db_path": str(impl_db),
+        "raw_db_path": str(raw_db),
+        "normalization": normalization,
+        "inventory": inventory,
+        "inventory_by_raw_norm": {
+            str(row.get("raw_norm") or "").strip(): dict(row)
+            for row in inventory
+            if isinstance(row, Mapping) and str(row.get("raw_norm") or "").strip()
+        },
+        "entries": entries,
+        "canonical_groups": {
+            str(group_id): dict(group)
+            for group_id, group in canonical_groups.items()
+            if str(group_id).strip()
+        },
+        "config_candidates": config_candidates,
+    }
+
+
+def td_build_parameter_selector_options(
+    context: Mapping[str, object] | None,
+    *,
+    run_names: Sequence[object] | None = None,
+    surface: object = "",
+    raw_names: Sequence[object] | None = None,
+) -> list[dict[str, object]]:
+    ctx = dict(context or {})
+    normalization = _td_normalize_parameter_normalization(ctx.get("normalization"))
+    run_set = {str(value).strip() for value in (run_names or []) if str(value).strip()}
+    surface_key = str(surface or "").strip().lower()
+    raw_norms = {_td_param_norm_name(value) for value in (raw_names or []) if _td_param_norm_name(value)}
+    groups: dict[str, dict[str, object]] = {}
+    for entry in (ctx.get("entries") or []):
+        if not isinstance(entry, Mapping):
+            continue
+        entry_surface = str(entry.get("surface") or "").strip().lower()
+        if surface_key and entry_surface != surface_key:
+            continue
+        entry_run = str(entry.get("run_name") or "").strip()
+        if run_set and entry_run not in run_set:
+            continue
+        entry_raw_name = str(entry.get("raw_name") or "").strip()
+        entry_raw_norm = _td_param_norm_name(entry_raw_name)
+        if raw_norms and entry_raw_norm not in raw_norms:
+            continue
+        canonical_id = _td_effective_parameter_canonical(normalization, entry_raw_name, entry.get("program_title"))
+        group = groups.setdefault(
+            canonical_id,
+            {
+                "canonical_id": canonical_id,
+                "_raw_names": set(),
+                "_units": set(),
+                "_program_titles": set(),
+                "_run_names": set(),
+                "_surfaces": set(),
+            },
+        )
+        cast(set[str], group["_raw_names"]).add(entry_raw_name)
+        if str(entry.get("units") or "").strip():
+            cast(set[str], group["_units"]).add(str(entry.get("units") or "").strip())
+        if str(entry.get("program_title") or "").strip():
+            cast(set[str], group["_program_titles"]).add(str(entry.get("program_title") or "").strip())
+        if entry_run:
+            cast(set[str], group["_run_names"]).add(entry_run)
+        if entry_surface:
+            cast(set[str], group["_surfaces"]).add(entry_surface)
+    if raw_norms:
+        inventory_by_raw_norm = ctx.get("inventory_by_raw_norm") if isinstance(ctx.get("inventory_by_raw_norm"), Mapping) else {}
+        for raw_name in (raw_names or []):
+            raw_text = str(raw_name or "").strip()
+            raw_norm = _td_param_norm_name(raw_text)
+            if not raw_text or not raw_norm:
+                continue
+            if any(raw_text in cast(set[str], group.get("_raw_names") or set()) for group in groups.values()):
+                continue
+            inventory_row = dict(inventory_by_raw_norm.get(raw_norm) or {})
+            canonical_id = _td_parameter_implicit_canonical_id(raw_text)
+            group = groups.setdefault(
+                canonical_id,
+                {
+                    "canonical_id": canonical_id,
+                    "_raw_names": {raw_text},
+                    "_units": set(str(value).strip() for value in (inventory_row.get("units") or []) if str(value).strip()),
+                    "_program_titles": set(
+                        str(value).strip() for value in (inventory_row.get("program_titles") or []) if str(value).strip()
+                    ),
+                    "_run_names": set(str(value).strip() for value in (inventory_row.get("run_names") or []) if str(value).strip()),
+                    "_surfaces": set(str(value).strip() for value in (inventory_row.get("surfaces") or []) if str(value).strip()),
+                },
+            )
+            cast(set[str], group["_raw_names"]).add(raw_text)
+    options: list[dict[str, object]] = []
+    for canonical_id, group in groups.items():
+        raw_name_list = sorted(cast(set[str], group.get("_raw_names") or set()), key=str.casefold)
+        if not raw_name_list:
+            continue
+        units = sorted(cast(set[str], group.get("_units") or set()), key=str.casefold)
+        unit_conflict = len([value for value in units if str(value).strip()]) > 1
+        display_name = _td_parameter_display_name_for_group(
+            normalization,
+            canonical_id,
+            raw_names=raw_name_list,
+            fallback=raw_name_list[0],
+        )
+        preferred_units = str(
+            ((normalization.get("groups_by_id") or {}).get(canonical_id) or {}).get("preferred_units")
+            if isinstance(normalization.get("groups_by_id"), Mapping)
+            else ""
+        ).strip()
+        if not preferred_units and len(units) == 1:
+            preferred_units = units[0]
+        label = f"{display_name} ({preferred_units})" if preferred_units else display_name
+        if unit_conflict:
+            label = f"{label} [unit conflict]"
+        search = " ".join(
+            [
+                display_name,
+                label,
+                " ".join(raw_name_list),
+                " ".join(sorted(cast(set[str], group.get("_program_titles") or set()), key=str.casefold)),
+            ]
+        ).strip().lower()
+        options.append(
+            {
+                "value": td_parameter_selector_value(canonical_id),
+                "canonical_id": canonical_id,
+                "display_name": display_name,
+                "label": label,
+                "preferred_units": preferred_units,
+                "units": units,
+                "unit_conflict": unit_conflict,
+                "raw_names": raw_name_list,
+                "program_titles": sorted(cast(set[str], group.get("_program_titles") or set()), key=str.casefold),
+                "run_names": sorted(cast(set[str], group.get("_run_names") or set()), key=str.casefold),
+                "surfaces": sorted(cast(set[str], group.get("_surfaces") or set()), key=str.casefold),
+                "search": search,
+            }
+        )
+    options.sort(
+        key=lambda item: (
+            str(item.get("display_name") or "").casefold(),
+            str(item.get("label") or "").casefold(),
+        )
+    )
+    return options
+
+
+def td_parameter_selection_matches(
+    context: Mapping[str, object] | None,
+    selection_value: object,
+    raw_name: object,
+    program_title: object = "",
+) -> bool:
+    selected = str(selection_value or "").strip()
+    raw_text = str(raw_name or "").strip()
+    if not selected or not raw_text:
+        return False
+    if td_parameter_selector_is_canonical(selected):
+        normalization = _td_normalize_parameter_normalization(dict(context or {}).get("normalization"))
+        wanted_id = td_parameter_selector_canonical_id(selected)
+        if not wanted_id:
+            return False
+        return wanted_id == _td_effective_parameter_canonical(normalization, raw_text, program_title)
+    return _td_param_norm_name(selected) == _td_param_norm_name(raw_text)
+
+
+def td_parameter_selection_raw_names(
+    context: Mapping[str, object] | None,
+    selection_value: object,
+    *,
+    run_names: Sequence[object] | None = None,
+    surface: object = "",
+    raw_names: Sequence[object] | None = None,
+) -> list[str]:
+    selected = str(selection_value or "").strip()
+    if not selected:
+        return []
+    if not td_parameter_selector_is_canonical(selected):
+        return [selected]
+    for option in td_build_parameter_selector_options(
+        context,
+        run_names=run_names,
+        surface=surface,
+        raw_names=raw_names,
+    ):
+        if str(option.get("value") or "").strip() == selected:
+            return [str(value).strip() for value in (option.get("raw_names") or []) if str(value).strip()]
+    canonical_groups = dict(dict(context or {}).get("canonical_groups") or {})
+    group = dict(canonical_groups.get(td_parameter_selector_canonical_id(selected)) or {})
+    return [str(value).strip() for value in (group.get("raw_names") or []) if str(value).strip()]
+
+
+def td_parameter_value_display_name(
+    context: Mapping[str, object] | None,
+    selection_value: object,
+    *,
+    fallback: object = "",
+) -> str:
+    selected = str(selection_value or "").strip()
+    if not selected:
+        return str(fallback or "").strip()
+    if not td_parameter_selector_is_canonical(selected):
+        return selected
+    canonical_id = td_parameter_selector_canonical_id(selected)
+    canonical_groups = dict(dict(context or {}).get("canonical_groups") or {})
+    group = dict(canonical_groups.get(canonical_id) or {})
+    display_name = str(group.get("display_name") or "").strip()
+    if display_name:
+        return display_name
+    raw_names = [str(value).strip() for value in (group.get("raw_names") or []) if str(value).strip()]
+    if raw_names:
+        return raw_names[0]
+    return str(fallback or "").strip()
 
 
 def resolve_test_data_project_global_repo(project_dir: Path, workbook_path: Path) -> Path:
@@ -15955,14 +16789,14 @@ def td_list_life_axes(db_path: Path) -> list[dict]:
     return [{"key": key, "label": label} for key, label in TD_LIFE_AXIS_OPTIONS]
 
 
-def td_list_life_parameters(db_path: Path, run_names: Sequence[object]) -> list[str]:
+def td_list_life_parameter_options(db_path: Path, run_names: Sequence[object]) -> list[dict[str, str]]:
     path = Path(db_path).expanduser()
     if not path.exists():
         return []
     runs = [str(value or "").strip() for value in (run_names or []) if str(value or "").strip()]
     sql = [
         f"""
-        SELECT DISTINCT parameter_name
+        SELECT parameter_name, COALESCE(units, '')
         FROM {TD_LIFE_METRICS_TABLE}
         WHERE lower(stat) = 'mean'
         """
@@ -15971,11 +16805,30 @@ def td_list_life_parameters(db_path: Path, run_names: Sequence[object]) -> list[
     if runs:
         sql.append(f" AND condition_key IN ({','.join('?' for _ in runs)})")
         params.extend(runs)
-    sql.append(" ORDER BY parameter_name")
+    sql.append(" ORDER BY parameter_name, units")
     with sqlite3.connect(str(path)) as conn:
         _ensure_test_data_impl_tables(conn)
         rows = conn.execute("".join(sql), tuple(params)).fetchall()
-    return [str(row[0] or "").strip() for row in rows if str(row[0] or "").strip()]
+    union: dict[str, dict[str, str]] = {}
+    for raw_name, raw_units in rows:
+        name = str(raw_name or "").strip()
+        if not name:
+            continue
+        units = str(raw_units or "").strip()
+        key = _td_param_norm_name(name)
+        if key not in union:
+            union[key] = {"name": name, "units": units}
+        elif units and not str(union[key].get("units") or "").strip():
+            union[key]["units"] = units
+    return sorted(union.values(), key=lambda item: str(item.get("name") or "").casefold())
+
+
+def td_list_life_parameters(db_path: Path, run_names: Sequence[object]) -> list[str]:
+    return [
+        str(item.get("name") or "").strip()
+        for item in td_list_life_parameter_options(db_path, run_names)
+        if isinstance(item, Mapping) and str(item.get("name") or "").strip()
+    ]
 
 
 def _td_normalize_life_axis(value: object) -> str:

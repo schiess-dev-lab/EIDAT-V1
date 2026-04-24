@@ -642,6 +642,30 @@ class TestQtMainMetricPlotSource(unittest.TestCase):
             if tmpdir:
                 shutil.rmtree(str(tmpdir), ignore_errors=True)
 
+    def test_stats_panel_displays_serial_number_from_composite_source_key(self) -> None:
+        window = self._make_window()
+        try:
+            composite_serial = "Program Alpha / Valve / Primary / SN-001 / source_a"
+            db_path = Path(getattr(window, "_test_tmpdir", "")) / "cache.sqlite3"
+            db_path.write_text("", encoding="utf-8")
+            window._db_path = db_path
+
+            with patch.object(window, "_current_run_selection", return_value={}), patch.object(
+                window, "_selected_metric_plot_source", return_value="sequence"
+            ), patch.object(
+                window,
+                "_load_metric_series_for_selection",
+                return_value=[{"serial": composite_serial, "value_num": 1.0}],
+            ):
+                window._populate_stats_table("CondA", "Pressure", composite_serial)
+
+            self.assertEqual(window._stats_values["serial"].text(), "SN-001")
+        finally:
+            window.close()
+            tmpdir = getattr(window, "_test_tmpdir", "")
+            if tmpdir:
+                shutil.rmtree(str(tmpdir), ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()
