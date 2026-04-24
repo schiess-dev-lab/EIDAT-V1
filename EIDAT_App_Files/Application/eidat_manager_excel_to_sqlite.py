@@ -1006,7 +1006,7 @@ def _mat_extract_run_table(
         raise RuntimeError(f"{mat_path.name} did not contain any TD-relevant aligned series.")
     headers = [header for header, _mapped in keep_pairs]
     mapped_headers = [mapped for _header, mapped in keep_pairs]
-    col_idents = _dedupe_idents(mapped_headers)
+    col_idents = _dedupe_idents(headers)
     rows: list[tuple[Any, ...]] = []
     for idx in range(int(dominant_len)):
         rows.append(tuple(selected[name][idx] for name in headers))
@@ -3173,7 +3173,7 @@ def _logical_sheet_from_block(
 ) -> DetectedSheet:
     mapped_headers = list(block.mapped_headers)
     headers = list(block.headers)
-    col_idents = _dedupe_idents(mapped_headers)
+    col_idents = _dedupe_idents(headers)
     return DetectedSheet(
         sheet_name=str(sheet_name),
         source_sheet_name=str(source_sheet_name or block.source_sheet_name),
@@ -3230,46 +3230,65 @@ def _merge_sequence_blocks_into_logical_sheets(blocks: Sequence[DetectedSequence
             continue
 
         header_labels: dict[str, str] = {}
+        ordered_raw_headers: list[str] = []
         ordered_mapped_headers: list[str] = []
         for block in ordered_blocks:
             for raw_header, mapped_header in zip(block.headers, block.mapped_headers):
-                key = str(mapped_header or "").strip()
-                if not key:
+                raw_key = str(raw_header or "").strip()
+                mapped_key = str(mapped_header or raw_key).strip()
+                if not raw_key:
                     continue
-                if key not in header_labels:
-                    header_labels[key] = str(raw_header or "").strip() or key
-                    ordered_mapped_headers.append(key)
+                if raw_key not in header_labels:
+                    header_labels[raw_key] = raw_key
+                    ordered_raw_headers.append(raw_key)
+                    ordered_mapped_headers.append(mapped_key)
 
         x_header = str(first_x_name)
-        if x_header in ordered_mapped_headers:
-            ordered_mapped_headers = [x_header] + [name for name in ordered_mapped_headers if name != x_header]
+        x_raw_header = ""
+        for raw_header, mapped_header in zip(ordered_raw_headers, ordered_mapped_headers):
+            if str(mapped_header or "").strip() == x_header:
+                x_raw_header = str(raw_header or "").strip()
+                break
+        if x_raw_header and x_raw_header in ordered_raw_headers:
+            ordered_pairs = list(zip(ordered_raw_headers, ordered_mapped_headers))
+            ordered_pairs = [(raw, mapped) for raw, mapped in ordered_pairs if raw != x_raw_header]
+            ordered_pairs.insert(0, (x_raw_header, x_header))
+            ordered_raw_headers = [raw for raw, _mapped in ordered_pairs]
+            ordered_mapped_headers = [mapped for _raw, mapped in ordered_pairs]
 
         row_map: dict[float, dict[str, float | None]] = {}
-        row_first_excel: dict[float, int] = {}
         for block in ordered_blocks:
-            idx_by_header = {str(name): idx for idx, name in enumerate(block.mapped_headers)}
-            x_idx = idx_by_header.get(x_header)
-            if x_idx is None:
+            x_col_idx = next(
+                (
+                    idx
+                    for idx, mapped_header in enumerate(block.mapped_headers)
+                    if str(mapped_header or "").strip() == x_header
+                ),
+                None,
+            )
+            if x_col_idx is None:
                 continue
             for excel_row, values in block.data_rows:
-                if x_idx >= len(values):
+                if x_col_idx >= len(values):
                     continue
-                x_value = values[x_idx]
+                x_value = values[x_col_idx]
                 if x_value is None:
                     continue
                 bucket = row_map.setdefault(float(x_value), {})
-                row_first_excel.setdefault(float(x_value), int(excel_row))
-                for mapped_header, idx in idx_by_header.items():
+                for raw_header, idx in zip(block.headers, range(len(block.headers))):
                     if idx >= len(values):
                         continue
                     value = values[idx]
-                    if mapped_header not in bucket or bucket.get(mapped_header) is None:
-                        bucket[mapped_header] = value
+                    raw_key = str(raw_header or "").strip()
+                    if not raw_key:
+                        continue
+                    if raw_key not in bucket or bucket.get(raw_key) is None:
+                        bucket[raw_key] = value
 
         merged_rows: list[tuple[int, list[float | None]]] = []
         for out_idx, x_value in enumerate(sorted(row_map.keys()), start=1):
             bucket = row_map.get(float(x_value)) or {}
-            values = [bucket.get(name) for name in ordered_mapped_headers]
+            values = [bucket.get(name) for name in ordered_raw_headers]
             merged_rows.append((out_idx, values))
 
         merged_meta_cells: list[tuple[int, int, str]] = []
@@ -3302,10 +3321,10 @@ def _merge_sequence_blocks_into_logical_sheets(blocks: Sequence[DetectedSequence
                 source_sheet_name=str(ordered_blocks[0].source_sheet_name),
                 table_name=_safe_table_name(str(run_name)),
                 header_row=int(ordered_blocks[0].header_row),
-                excel_col_indices=list(range(1, len(ordered_mapped_headers) + 1)),
-                headers=[header_labels.get(name) or name for name in ordered_mapped_headers],
+                excel_col_indices=list(range(1, len(ordered_raw_headers) + 1)),
+                headers=[header_labels.get(name) or name for name in ordered_raw_headers],
                 mapped_headers=list(ordered_mapped_headers),
-                col_idents=_dedupe_idents(ordered_mapped_headers),
+                col_idents=_dedupe_idents(ordered_raw_headers),
                 data_rows=list(merged_rows),
                 meta_cells=list(merged_meta_cells),
                 import_order=min(int(block.import_order) for block in ordered_blocks),

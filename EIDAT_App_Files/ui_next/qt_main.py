@@ -19,6 +19,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 # Allow running as a module or as a script
 try:
     from . import backend as be  # type: ignore
+    from . import auto_graph_quickcheck as agq  # type: ignore
 except Exception:  # pragma: no cover
     import sys as _sys
     from pathlib import Path as _Path
@@ -26,6 +27,7 @@ except Exception:  # pragma: no cover
     if str(_root) not in _sys.path:
         _sys.path.insert(0, str(_root))
     import ui_next.backend as be  # type: ignore
+    import ui_next.auto_graph_quickcheck as agq  # type: ignore
 
 
 def _fit_widget_to_screen(widget: QtWidgets.QWidget, margin: int = 40) -> None:
@@ -2593,20 +2595,40 @@ class TDProjectEditorDialog(NewProjectWizardDialog):
 
 
 class TDParameterNormalizationDialog(QtWidgets.QDialog):
-    COLS = ["Raw Name", "Canonical Display", "Units", "Programs", "Surfaces", "Status"]
+    COLS = [
+        "Program",
+        "Asset",
+        "Specific",
+        "Ingested",
+        "Default Display",
+        "Displayed",
+        "Units",
+        "Status",
+    ]
+
+    COL_PROGRAM = 0
+    COL_ASSET = 1
+    COL_SPECIFIC = 2
+    COL_INGESTED = 3
+    COL_DEFAULT = 4
+    COL_DISPLAYED = 5
+    COL_UNITS = 6
+    COL_STATUS = 7
 
     def __init__(self, project_dir: Path, workbook_path: Path, parent=None):
         super().__init__(parent)
         self._project_dir = Path(project_dir).expanduser()
         self._workbook_path = Path(workbook_path).expanduser()
         self._db_path = be.validate_test_data_project_cache_for_open(self._project_dir, self._workbook_path)
-        self._working_normalization = dict(be.load_td_project_parameter_normalization(self._project_dir) or {})
+        self._working_rows: list[dict[str, object]] = []
         self._context: dict[str, object] = {}
         self._display_rows: list[dict[str, object]] = []
+        self._table_refreshing = False
+        self._dirty = False
         self.saved = False
 
-        self.setWindowTitle("Parameter Normalization")
-        self.resize(1180, 720)
+        self.setWindowTitle("Project Parameters")
+        self.resize(1360, 760)
         self.setStyleSheet(
             """
             QDialog { background: #f8fafc; color: #0f172a; }
@@ -2637,19 +2659,21 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
         layout.setContentsMargins(14, 14, 14, 14)
         layout.setSpacing(10)
 
-        title = QtWidgets.QLabel("Project Parameter Normalization")
+        title = QtWidgets.QLabel("Project Parameters")
         title.setStyleSheet("font-size: 15px; font-weight: 800;")
         layout.addWidget(title)
 
         hint = QtWidgets.QLabel(
-            "Review all detected TD parameters across the project cache, assign canonical display names, and add program-specific overrides for oddball historical names."
+            "Review every ingested source parameter grouped by program and asset. "
+            "The displayed parameter is what the GUI uses for trending, analysis, and mapping. "
+            "Saving writes these defaults back into the ProgramRequirements workbook files for reuse by other projects."
         )
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #475569; font-size: 11px;")
         layout.addWidget(hint)
 
         self.ed_filter = QtWidgets.QLineEdit()
-        self.ed_filter.setPlaceholderText("Filter parameters, canonical names, or programs...")
+        self.ed_filter.setPlaceholderText("Filter programs, assets, ingested names, or displayed names...")
         self.ed_filter.textChanged.connect(self._refresh_table)
         layout.addWidget(self.ed_filter)
 
@@ -2666,8 +2690,13 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
         self.tbl.setHorizontalHeaderLabels(self.COLS)
         self.tbl.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
         self.tbl.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.tbl.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.tbl.setEditTriggers(
+            QtWidgets.QAbstractItemView.EditTrigger.DoubleClicked
+            | QtWidgets.QAbstractItemView.EditTrigger.SelectedClicked
+            | QtWidgets.QAbstractItemView.EditTrigger.EditKeyPressed
+        )
         self.tbl.itemSelectionChanged.connect(self._sync_selection)
+        self.tbl.itemChanged.connect(self._on_item_changed)
         left_layout.addWidget(self.tbl, 1)
 
         right = QtWidgets.QWidget()
@@ -2690,298 +2719,413 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
         right_layout.addWidget(self.detail, 1)
 
         action_row = QtWidgets.QHBoxLayout()
-        self.btn_set_name = QtWidgets.QPushButton("Set Canonical Name...")
-        self.btn_merge = QtWidgets.QPushButton("Merge Selected...")
-        self.btn_override = QtWidgets.QPushButton("Program Override...")
-        self.btn_reset = QtWidgets.QPushButton("Reset Mapping")
-        for button in (self.btn_set_name, self.btn_merge, self.btn_override, self.btn_reset):
+        self.btn_set_display = QtWidgets.QPushButton("Set Display...")
+        self.btn_reset = QtWidgets.QPushButton("Reset Selected")
+        for button in (self.btn_set_display, self.btn_reset):
             action_row.addWidget(button)
         action_row.addStretch(1)
         right_layout.addLayout(action_row)
 
         button_row = QtWidgets.QHBoxLayout()
         button_row.addStretch(1)
-        self.btn_save = QtWidgets.QPushButton("Save")
+        self.btn_save = QtWidgets.QPushButton("Save Defaults")
         self.btn_close = QtWidgets.QPushButton("Close")
         button_row.addWidget(self.btn_save)
         button_row.addWidget(self.btn_close)
         layout.addLayout(button_row)
 
-        self.btn_set_name.clicked.connect(self._act_set_canonical_name)
-        self.btn_merge.clicked.connect(self._act_merge_selected)
-        self.btn_override.clicked.connect(self._act_program_override)
-        self.btn_reset.clicked.connect(self._act_reset_mapping)
+        self.btn_set_display.clicked.connect(self._act_set_display_name)
+        self.btn_reset.clicked.connect(self._act_reset_rows)
         self.btn_save.clicked.connect(self._act_save)
         self.btn_close.clicked.connect(self.reject)
 
-        self._reload_context(select_raw_names=[])
+        self._reload_context()
 
     @staticmethod
     def _norm_name(value: object) -> str:
         return "".join(ch.lower() for ch in str(value or "").strip() if ch.isalnum())
 
-    def _normalize_working(self) -> None:
-        normalizer = getattr(be, "_td_normalize_parameter_normalization", None)
-        if callable(normalizer):
-            self._working_normalization = dict(normalizer(self._working_normalization) or {})
+    def _set_dirty(self, dirty: bool) -> None:
+        self._dirty = bool(dirty)
+        if hasattr(self, "btn_save"):
+            self.btn_save.setText("Save Defaults*" if self._dirty else "Save Defaults")
 
-    def _new_group_id(self, seed: object = "") -> str:
-        generator = getattr(be, "_td_parameter_normalization_group_id", None)
-        if callable(generator):
+    def _timestamp_text(self) -> str:
+        try:
+            return time.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return ""
+
+    def _normalize_row(self, row: Mapping[str, object] | None) -> dict[str, object]:
+        normalizer = getattr(be, "_td_program_parameter_mapping_normalize", None)
+        if callable(normalizer):
             try:
-                return str(generator(seed)).strip()
+                normalized = dict(normalizer(row) or {})
+            except Exception:
+                normalized = {}
+            if normalized:
+                return normalized
+        raw = dict(row or {})
+        ingested = str(raw.get("ingested_parameter") or raw.get("raw_name") or "").strip()
+        if not ingested:
+            return {}
+        default_display = str(
+            raw.get("default_display_parameter")
+            or raw.get("mapped_header")
+            or raw.get("displayed_parameter")
+            or ingested
+        ).strip() or ingested
+        displayed = str(raw.get("displayed_parameter") or default_display).strip() or default_display
+        return {
+            "program_title": str(raw.get("program_title") or "").strip(),
+            "asset_type": str(raw.get("asset_type") or "").strip(),
+            "asset_specific_type": str(raw.get("asset_specific_type") or "").strip(),
+            "ingested_parameter": ingested,
+            "default_display_parameter": default_display,
+            "displayed_parameter": displayed,
+            "preferred_units": str(raw.get("preferred_units") or raw.get("units") or "").strip(),
+            "edited": self._norm_name(displayed) != self._norm_name(default_display),
+            "updated_at": str(raw.get("updated_at") or "").strip(),
+        }
+
+    def _row_key(self, row: Mapping[str, object] | None) -> tuple[str, str, str, str]:
+        normalized = self._normalize_row(row)
+        helper = getattr(be, "_td_program_parameter_scope_key", None)
+        if callable(helper):
+            try:
+                raw_key = helper(
+                    normalized.get("program_title"),
+                    normalized.get("asset_type"),
+                    normalized.get("asset_specific_type"),
+                    normalized.get("ingested_parameter"),
+                )
+                return tuple(str(value or "").strip() for value in raw_key)
             except Exception:
                 pass
-        digest = hashlib.sha1(f"{seed}|{time.time_ns()}".encode("utf-8")).hexdigest()[:16]
-        return f"group:{digest}"
+        return (
+            self._norm_name(normalized.get("program_title")),
+            self._norm_name(normalized.get("asset_type")),
+            self._norm_name(normalized.get("asset_specific_type")),
+            self._norm_name(normalized.get("ingested_parameter")),
+        )
 
-    def _working_groups(self) -> list[dict[str, object]]:
-        return [dict(item) for item in (self._working_normalization.get("groups") or []) if isinstance(item, Mapping)]
+    def _sorted_rows(self, rows: Sequence[Mapping[str, object]] | None) -> list[dict[str, object]]:
+        normalized_rows = [self._normalize_row(item) for item in (rows or [])]
+        normalized_rows = [row for row in normalized_rows if row and str(row.get("ingested_parameter") or "").strip()]
+        sorter = getattr(be, "_td_program_parameter_mapping_sort_key", None)
+        if callable(sorter):
+            try:
+                return sorted(
+                    normalized_rows,
+                    key=lambda item: (
+                        self._norm_name(item.get("program_title")),
+                        sorter(item),
+                    ),
+                )
+            except Exception:
+                pass
+        return sorted(
+            normalized_rows,
+            key=lambda item: (
+                self._norm_name(item.get("program_title")),
+                self._norm_name(item.get("asset_type")),
+                self._norm_name(item.get("asset_specific_type")),
+                self._norm_name(item.get("ingested_parameter")),
+            ),
+        )
 
-    def _working_mappings(self) -> list[dict[str, object]]:
-        return [dict(item) for item in (self._working_normalization.get("mappings") or []) if isinstance(item, Mapping)]
-
-    def _ensure_group(
+    def _merge_rows(
         self,
-        *,
-        display_name: str,
-        preferred_units: str = "",
-        canonical_id: str = "",
-    ) -> str:
-        self._normalize_working()
-        groups = self._working_groups()
-        group_id = str(canonical_id or "").strip()
-        if not group_id or group_id.startswith("raw:"):
-            group_id = self._new_group_id(display_name)
-        updated = False
-        for idx, group in enumerate(groups):
-            if str(group.get("id") or "").strip() != group_id:
+        existing_rows: Sequence[Mapping[str, object]] | None,
+        discovered_rows: Sequence[Mapping[str, object]] | None,
+    ) -> list[dict[str, object]]:
+        merger = getattr(be, "_td_program_parameter_merge_rows", None)
+        if callable(merger):
+            try:
+                merged = merger(existing_rows, discovered_rows)
+                return self._sorted_rows(merged)
+            except Exception:
+                pass
+        out_by_key: dict[tuple[str, str, str, str], dict[str, object]] = {}
+        for item in discovered_rows or []:
+            row = self._normalize_row(item)
+            key = self._row_key(row)
+            if key[-1]:
+                out_by_key[key] = row
+        for item in existing_rows or []:
+            row = self._normalize_row(item)
+            key = self._row_key(row)
+            if key[-1]:
+                out_by_key[key] = row
+        return self._sorted_rows(out_by_key.values())
+
+    def _rows_from_inventory(self, context: Mapping[str, object] | None) -> list[dict[str, object]]:
+        rows: list[dict[str, object]] = []
+        for raw_item in (dict(context or {}).get("inventory") or []):
+            if not isinstance(raw_item, Mapping):
                 continue
-            group["display_name"] = str(display_name or group.get("display_name") or "").strip()
-            if preferred_units:
-                group["preferred_units"] = str(preferred_units).strip()
-            groups[idx] = group
-            updated = True
-            break
-        if not updated:
-            groups.append(
+            raw_name = str(raw_item.get("raw_name") or "").strip()
+            if not raw_name:
+                continue
+            units = [str(value).strip() for value in (raw_item.get("units") or []) if str(value).strip()]
+            row = self._normalize_row(
                 {
-                    "id": group_id,
-                    "display_name": str(display_name or "").strip(),
-                    "preferred_units": str(preferred_units or "").strip(),
+                    "program_title": raw_item.get("program_title"),
+                    "asset_type": raw_item.get("asset_type"),
+                    "asset_specific_type": raw_item.get("asset_specific_type"),
+                    "ingested_parameter": raw_name,
+                    "default_display_parameter": raw_item.get("default_display_parameter") or raw_name,
+                    "displayed_parameter": raw_item.get("displayed_parameter") or raw_item.get("canonical_display") or raw_name,
+                    "preferred_units": (units[0] if len(units) == 1 else ""),
+                    "edited": bool(raw_item.get("edited")),
                 }
             )
-        self._working_normalization["groups"] = groups
-        self._normalize_working()
-        return group_id
+            if row:
+                rows.append(row)
+        return rows
 
-    def _cleanup_unused_groups(self) -> None:
-        self._normalize_working()
-        used_ids = {
-            str(rule.get("canonical_id") or "").strip()
-            for rule in self._working_mappings()
-            if str(rule.get("canonical_id") or "").strip()
-        }
-        self._working_normalization["groups"] = [
-            dict(group)
-            for group in self._working_groups()
-            if str(group.get("id") or "").strip() in used_ids
-        ]
-        self._normalize_working()
+    def _working_override_normalization(self) -> dict[str, object] | None:
+        if not self._working_rows:
+            return None
+        builder = getattr(be, "_td_build_repo_parameter_normalization", None)
+        if callable(builder):
+            try:
+                return dict(builder(self._working_rows) or {})
+            except Exception:
+                return None
+        return None
 
-    def _replace_global_mapping(self, raw_name: str, canonical_id: str) -> None:
-        mappings: list[dict[str, object]] = []
-        target_norm = self._norm_name(raw_name)
-        for rule in self._working_mappings():
-            if self._norm_name(rule.get("raw_name")) == target_norm and not list(rule.get("program_titles") or []):
+    def _inventory_index(self) -> dict[tuple[str, str, str, str], dict[str, object]]:
+        out: dict[tuple[str, str, str, str], dict[str, object]] = {}
+        for item in (self._context.get("inventory") or []):
+            if not isinstance(item, Mapping):
                 continue
-            mappings.append(rule)
-        mappings.append({"canonical_id": canonical_id, "raw_name": raw_name, "program_titles": []})
-        self._working_normalization["mappings"] = mappings
-        self._normalize_working()
+            key = self._row_key(
+                {
+                    "program_title": item.get("program_title"),
+                    "asset_type": item.get("asset_type"),
+                    "asset_specific_type": item.get("asset_specific_type"),
+                    "ingested_parameter": item.get("raw_name"),
+                }
+            )
+            if key[-1]:
+                out[key] = dict(item)
+        return out
 
-    def _replace_program_override(self, raw_name: str, program_titles: list[str], canonical_id: str) -> None:
-        target_norm = self._norm_name(raw_name)
-        chosen_norms = {str(program or "").strip().casefold() for program in program_titles if str(program or "").strip()}
-        mappings: list[dict[str, object]] = []
-        for rule in self._working_mappings():
-            if self._norm_name(rule.get("raw_name")) != target_norm:
-                mappings.append(rule)
-                continue
-            existing_programs = [str(value).strip() for value in (rule.get("program_titles") or []) if str(value).strip()]
-            if not existing_programs:
-                mappings.append(rule)
-                continue
-            kept_programs = [value for value in existing_programs if value.casefold() not in chosen_norms]
-            if kept_programs:
-                rule["program_titles"] = kept_programs
-                mappings.append(rule)
-        mappings.append(
-            {
-                "canonical_id": canonical_id,
-                "raw_name": raw_name,
-                "program_titles": [value for value in program_titles if str(value).strip()],
-            }
-        )
-        self._working_normalization["mappings"] = mappings
-        self._normalize_working()
+    def _current_selected_keys(self) -> list[tuple[str, str, str, str]]:
+        keys: list[tuple[str, str, str, str]] = []
+        seen: set[tuple[str, str, str, str]] = set()
+        for item in self.tbl.selectedItems():
+            key = item.data(QtCore.Qt.ItemDataRole.UserRole)
+            if isinstance(key, tuple) and len(key) == 4 and key not in seen:
+                seen.add(key)
+                keys.append(key)
+        return keys
 
     def _selected_rows(self) -> list[dict[str, object]]:
         rows: list[dict[str, object]] = []
-        seen: set[int] = set()
-        for item in self.tbl.selectedItems():
-            row_idx = item.row()
-            if row_idx in seen or not (0 <= row_idx < len(self._display_rows)):
-                continue
-            seen.add(row_idx)
-            rows.append(dict(self._display_rows[row_idx]))
+        seen: set[tuple[str, str, str, str]] = set()
+        for row in self._display_rows:
+            key = row.get("_key")
+            if isinstance(key, tuple) and key not in seen and any(
+                isinstance(item.data(QtCore.Qt.ItemDataRole.UserRole), tuple)
+                and item.data(QtCore.Qt.ItemDataRole.UserRole) == key
+                for item in self.tbl.selectedItems()
+            ):
+                seen.add(key)
+                rows.append(dict(row))
         return rows
 
-    def _status_text(self, row: Mapping[str, object]) -> str:
-        status = str(row.get("status") or "").strip().lower()
-        mapping = {
-            "implicit": "Implicit Raw Name",
-            "explicit": "Explicit Mapping",
-            "suggested": "Suggested",
-            "split_by_program": "Split by Program",
-        }
-        label = mapping.get(status, status.title() or "Implicit Raw Name")
-        suggestion = row.get("suggestion") if isinstance(row.get("suggestion"), Mapping) else {}
-        suggestion_name = str(suggestion.get("display_name") or "").strip()
-        if status == "suggested" and suggestion_name:
-            label = f"{label}: {suggestion_name}"
-        return label
+    def _row_units(self, row: Mapping[str, object], inventory_row: Mapping[str, object] | None) -> list[str]:
+        units: list[str] = []
+        preferred = str(row.get("preferred_units") or "").strip()
+        if preferred:
+            units.append(preferred)
+        for value in (dict(inventory_row or {}).get("units") or []):
+            text = str(value or "").strip()
+            if text and text not in units:
+                units.append(text)
+        return units
+
+    def _status_text(self, row: Mapping[str, object], inventory_row: Mapping[str, object] | None = None) -> str:
+        displayed = str(row.get("displayed_parameter") or "").strip()
+        default_display = str(row.get("default_display_parameter") or "").strip()
+        if bool(row.get("edited")) or self._norm_name(displayed) != self._norm_name(default_display):
+            return "Edited"
+        inv_status = str((inventory_row or {}).get("status") or "").strip().lower()
+        if inv_status == "suggested":
+            return "Suggested"
+        if inv_status:
+            return inv_status.replace("_", " ").title()
+        return "Default"
 
     def _refresh_table(self) -> None:
         search = str(self.ed_filter.text() or "").strip().lower()
-        inventory = [
-            dict(item)
-            for item in (self._context.get("inventory") or [])
-            if isinstance(item, Mapping)
-        ]
+        wanted_keys = self._current_selected_keys()
+        inventory_index = self._inventory_index()
         rows: list[dict[str, object]] = []
-        for row in inventory:
+        for row in self._working_rows:
+            inventory_row = inventory_index.get(self._row_key(row)) or {}
+            units = self._row_units(row, inventory_row)
+            status_text = self._status_text(row, inventory_row)
+            display_row = {
+                "_key": self._row_key(row),
+                "program_title": str(row.get("program_title") or "").strip(),
+                "asset_type": str(row.get("asset_type") or "").strip(),
+                "asset_specific_type": str(row.get("asset_specific_type") or "").strip(),
+                "ingested_parameter": str(row.get("ingested_parameter") or "").strip(),
+                "default_display_parameter": str(row.get("default_display_parameter") or "").strip(),
+                "displayed_parameter": str(row.get("displayed_parameter") or "").strip(),
+                "preferred_units": str(row.get("preferred_units") or "").strip(),
+                "units": units,
+                "status_text": status_text,
+                "edited": bool(row.get("edited")) or self._norm_name(row.get("displayed_parameter")) != self._norm_name(row.get("default_display_parameter")),
+                "source_run_names": list(inventory_row.get("source_run_names") or []),
+                "surfaces": list(inventory_row.get("surfaces") or []),
+                "run_names": list(inventory_row.get("run_names") or []),
+                "source_count": int(inventory_row.get("source_count") or 0),
+                "program_count": int(inventory_row.get("program_count") or 0),
+            }
             search_blob = "\n".join(
                 [
-                    str(row.get("raw_name") or ""),
-                    str(row.get("canonical_display") or ""),
-                    " ".join([str(value) for value in (row.get("program_titles") or [])]),
-                    " ".join([str(value) for value in (row.get("surfaces") or [])]),
-                    str(((row.get("suggestion") or {}) if isinstance(row.get("suggestion"), Mapping) else {}).get("display_name") or ""),
+                    str(display_row.get("program_title") or ""),
+                    str(display_row.get("asset_type") or ""),
+                    str(display_row.get("asset_specific_type") or ""),
+                    str(display_row.get("ingested_parameter") or ""),
+                    str(display_row.get("default_display_parameter") or ""),
+                    str(display_row.get("displayed_parameter") or ""),
+                    " ".join(units),
                 ]
             ).lower()
             if search and search not in search_blob:
                 continue
-            rows.append(row)
+            rows.append(display_row)
         self._display_rows = rows
-        self.tbl.setRowCount(len(rows))
-        for row_idx, row in enumerate(rows):
-            values = [
-                str(row.get("raw_name") or "").strip(),
-                str(row.get("canonical_display") or "").strip(),
-                ", ".join([str(value).strip() for value in (row.get("units") or []) if str(value).strip()]) or "-",
-                ", ".join([str(value).strip() for value in (row.get("program_titles") or []) if str(value).strip()][:3]),
-                ", ".join([str(value).strip() for value in (row.get("surfaces") or []) if str(value).strip()]),
-                self._status_text(row),
-            ]
-            for col_idx, value in enumerate(values):
-                item = QtWidgets.QTableWidgetItem(value)
-                item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
-                item.setData(QtCore.Qt.ItemDataRole.UserRole, str(row.get("raw_name") or "").strip())
-                if col_idx == 0:
-                    suggestion = row.get("suggestion") if isinstance(row.get("suggestion"), Mapping) else {}
-                    suggestion_name = str(suggestion.get("display_name") or "").strip()
-                    if suggestion_name:
-                        item.setToolTip(f"Suggested canonical name: {suggestion_name}")
-                self.tbl.setItem(row_idx, col_idx, item)
+        self._table_refreshing = True
         try:
-            self.tbl.resizeColumnsToContents()
-            self.tbl.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
-            self.tbl.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Stretch)
-        except Exception:
-            pass
+            self.tbl.setRowCount(len(rows))
+            for row_idx, row in enumerate(rows):
+                values = [
+                    str(row.get("program_title") or "").strip() or "-",
+                    str(row.get("asset_type") or "").strip() or "-",
+                    str(row.get("asset_specific_type") or "").strip() or "-",
+                    str(row.get("ingested_parameter") or "").strip(),
+                    str(row.get("default_display_parameter") or "").strip(),
+                    str(row.get("displayed_parameter") or "").strip(),
+                    ", ".join([str(value).strip() for value in (row.get("units") or []) if str(value).strip()]) or "-",
+                    str(row.get("status_text") or "").strip(),
+                ]
+                for col_idx, value in enumerate(values):
+                    item = QtWidgets.QTableWidgetItem(value)
+                    item.setData(QtCore.Qt.ItemDataRole.UserRole, row.get("_key"))
+                    tooltip_lines = [
+                        f"Program: {str(row.get('program_title') or '').strip() or '-'}",
+                        f"Asset: {str(row.get('asset_type') or '').strip() or '-'}",
+                        f"Specific: {str(row.get('asset_specific_type') or '').strip() or '-'}",
+                        f"Ingested: {str(row.get('ingested_parameter') or '').strip()}",
+                        f"Default Display: {str(row.get('default_display_parameter') or '').strip()}",
+                        f"Displayed: {str(row.get('displayed_parameter') or '').strip()}",
+                    ]
+                    item.setToolTip("\n".join(tooltip_lines))
+                    if col_idx == self.COL_DISPLAYED:
+                        item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsEditable)
+                    else:
+                        item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+                    self.tbl.setItem(row_idx, col_idx, item)
+            try:
+                self.tbl.resizeColumnsToContents()
+                self.tbl.horizontalHeader().setSectionResizeMode(self.COL_DISPLAYED, QtWidgets.QHeaderView.ResizeMode.Stretch)
+                self.tbl.horizontalHeader().setSectionResizeMode(self.COL_STATUS, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+            except Exception:
+                pass
+        finally:
+            self._table_refreshing = False
+        if wanted_keys:
+            self.tbl.clearSelection()
+            wanted = {key for key in wanted_keys}
+            for row_idx, row in enumerate(self._display_rows):
+                if row.get("_key") in wanted:
+                    self.tbl.selectRow(row_idx)
         self._sync_selection()
 
     def _sync_selection(self) -> None:
         rows = self._selected_rows()
         count = len(rows)
-        inventory = [item for item in (self._context.get("inventory") or []) if isinstance(item, Mapping)]
-        explicit_count = len(
-            [
-                row
-                for row in inventory
-                if str(row.get("status") or "").strip().lower() in {"explicit", "split_by_program"}
-            ]
-        )
+        edited_count = len([row for row in self._working_rows if self._status_text(row).lower() == "edited"])
         self.lbl_summary.setText(
-            f"Detected parameters: {len(inventory)} | Explicit mappings: {explicit_count} | Selected: {count}"
+            f"Rows: {len(self._working_rows)} | Edited: {edited_count} | Selected: {count}"
         )
         if not rows:
-            self.detail.setPlainText("Select one or more raw parameters to inspect their programs, sources, and active normalization rules.")
+            self.detail.setPlainText(
+                "Select one or more parameter rows to inspect their program/asset scope, ingested name, and displayed parameter."
+            )
         elif count == 1:
             row = rows[0]
-            suggestion = row.get("suggestion") if isinstance(row.get("suggestion"), Mapping) else {}
             lines = [
-                f"Raw Name: {str(row.get('raw_name') or '').strip()}",
-                f"Canonical Display: {str(row.get('canonical_display') or '').strip() or '-'}",
+                f"Program: {str(row.get('program_title') or '').strip() or '-'}",
+                f"Asset: {str(row.get('asset_type') or '').strip() or '-'}",
+                f"Specific: {str(row.get('asset_specific_type') or '').strip() or '-'}",
+                f"Ingested Parameter: {str(row.get('ingested_parameter') or '').strip()}",
+                f"Default Display: {str(row.get('default_display_parameter') or '').strip() or '-'}",
+                f"Displayed Parameter: {str(row.get('displayed_parameter') or '').strip() or '-'}",
                 f"Units: {', '.join([str(value).strip() for value in (row.get('units') or []) if str(value).strip()]) or '-'}",
-                f"Programs: {', '.join([str(value).strip() for value in (row.get('program_titles') or []) if str(value).strip()]) or '-'}",
                 f"Surfaces: {', '.join([str(value).strip() for value in (row.get('surfaces') or []) if str(value).strip()]) or '-'}",
                 f"Source Runs: {', '.join([str(value).strip() for value in (row.get('source_run_names') or []) if str(value).strip()][:12]) or '-'}",
-                f"Status: {self._status_text(row)}",
+                f"Observed Sources: {int(row.get('source_count') or 0)}",
+                f"Status: {str(row.get('status_text') or '').strip() or '-'}",
             ]
-            suggestion_name = str(suggestion.get("display_name") or "").strip()
-            if suggestion_name:
-                lines.append(f"Suggestion: {suggestion_name}")
             self.detail.setPlainText("\n".join(lines))
         else:
-            raw_names = [str(row.get("raw_name") or "").strip() for row in rows if str(row.get("raw_name") or "").strip()]
-            programs = sorted(
+            ingested = [str(row.get("ingested_parameter") or "").strip() for row in rows if str(row.get("ingested_parameter") or "").strip()]
+            displayed = sorted(
                 {
-                    str(value).strip()
+                    str(row.get("displayed_parameter") or "").strip()
                     for row in rows
-                    for value in (row.get("program_titles") or [])
-                    if str(value).strip()
+                    if str(row.get("displayed_parameter") or "").strip()
                 },
                 key=str.casefold,
             )
             self.detail.setPlainText(
                 "\n".join(
                     [
-                        f"Selected Raw Parameters: {len(raw_names)}",
-                        f"Raw Names: {', '.join(raw_names)}",
-                        f"Programs: {', '.join(programs) or '-'}",
-                        "Use Merge Selected to map them to one canonical display name.",
+                        f"Selected Rows: {len(rows)}",
+                        f"Ingested Parameters: {', '.join(ingested)}",
+                        f"Displayed Parameters: {', '.join(displayed) or '-'}",
+                        "Use Set Display to assign the same displayed parameter to every selected row.",
                     ]
                 )
             )
-        self.btn_set_name.setEnabled(count == 1)
-        self.btn_merge.setEnabled(count >= 2)
-        self.btn_override.setEnabled(
-            count == 1 and bool([value for value in ((rows[0].get("program_titles") or []) if rows else []) if str(value).strip()])
-        )
+        self.btn_set_display.setEnabled(count >= 1)
         self.btn_reset.setEnabled(count >= 1)
 
-    def _reload_context(self, *, select_raw_names: Sequence[object] | None = None) -> None:
+    def _reload_context(self, *, select_keys: Sequence[tuple[str, str, str, str]] | None = None) -> None:
         builder = getattr(be, "td_build_parameter_normalization_context", None)
         if callable(builder):
+            override = self._working_override_normalization()
             self._context = dict(
                 builder(
                     self._project_dir,
                     self._workbook_path,
                     self._db_path,
-                    normalization_override=self._working_normalization,
+                    normalization_override=override,
                 )
                 or {}
             )
         else:
             self._context = {}
+        repo_rows = [
+            self._normalize_row(item)
+            for item in (self._context.get("repo_parameter_rows") or [])
+            if isinstance(item, Mapping)
+        ]
+        repo_rows = [row for row in repo_rows if row]
+        discovered_rows = self._rows_from_inventory(self._context)
+        self._working_rows = self._merge_rows(self._working_rows or repo_rows, discovered_rows)
         self._refresh_table()
-        wanted = {self._norm_name(value) for value in (select_raw_names or []) if self._norm_name(value)}
-        if wanted:
+        if select_keys:
             self.tbl.clearSelection()
             for row_idx, row in enumerate(self._display_rows):
-                if self._norm_name(row.get("raw_name")) in wanted:
+                if row.get("_key") in set(select_keys):
                     self.tbl.selectRow(row_idx)
         self._sync_selection()
 
@@ -2992,166 +3136,98 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
         clean = str(text or "").strip()
         return clean or None
 
-    def _prompt_programs(self, programs: list[str]) -> list[str] | None:
-        dlg = QtWidgets.QDialog(self)
-        dlg.setWindowTitle("Program Override")
-        dlg.resize(420, 420)
-        layout = QtWidgets.QVBoxLayout(dlg)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(8)
-        layout.addWidget(QtWidgets.QLabel("Choose the programs that should use the override:"))
-        listw = QtWidgets.QListWidget()
-        listw.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
-        layout.addWidget(listw, 1)
-        for program in programs:
-            item = QtWidgets.QListWidgetItem(program)
-            item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
-            item.setCheckState(QtCore.Qt.CheckState.Unchecked)
-            listw.addItem(item)
-        button_row = QtWidgets.QHBoxLayout()
-        button_row.addStretch(1)
-        btn_apply = QtWidgets.QPushButton("Apply")
-        btn_cancel = QtWidgets.QPushButton("Cancel")
-        button_row.addWidget(btn_apply)
-        button_row.addWidget(btn_cancel)
-        layout.addLayout(button_row)
-        chosen: list[str] = []
+    def _apply_display_value(
+        self,
+        *,
+        row_keys: Sequence[tuple[str, str, str, str]],
+        display_name: str | None = None,
+        reset: bool = False,
+    ) -> None:
+        wanted = {tuple(key) for key in row_keys if isinstance(key, tuple) and len(key) == 4}
+        if not wanted:
+            return
+        updated_rows: list[dict[str, object]] = []
+        changed = False
+        timestamp = self._timestamp_text()
+        for raw_row in self._working_rows:
+            row = self._normalize_row(raw_row)
+            key = self._row_key(row)
+            if key in wanted:
+                default_display = str(row.get("default_display_parameter") or row.get("ingested_parameter") or "").strip()
+                next_display = default_display if reset else str(display_name or "").strip()
+                if not next_display:
+                    next_display = default_display
+                edited = self._norm_name(next_display) != self._norm_name(default_display)
+                if (
+                    str(row.get("displayed_parameter") or "").strip() != next_display
+                    or bool(row.get("edited")) != edited
+                ):
+                    changed = True
+                row["displayed_parameter"] = next_display
+                row["edited"] = edited
+                row["updated_at"] = timestamp if edited else ""
+            updated_rows.append(row)
+        if not changed:
+            return
+        self._working_rows = self._sorted_rows(updated_rows)
+        self._set_dirty(True)
+        self._reload_context(select_keys=list(wanted))
 
-        def _accept() -> None:
-            chosen.clear()
-            for idx in range(listw.count()):
-                item = listw.item(idx)
-                if item is not None and item.checkState() == QtCore.Qt.CheckState.Checked and str(item.text() or "").strip():
-                    chosen.append(str(item.text() or "").strip())
-            if not chosen:
-                QtWidgets.QMessageBox.information(dlg, "Program Override", "Select at least one program.")
-                return
-            dlg.accept()
-
-        btn_apply.clicked.connect(_accept)
-        btn_cancel.clicked.connect(dlg.reject)
-        _fit_widget_to_screen(dlg)
-        if dlg.exec() != int(QtWidgets.QDialog.DialogCode.Accepted):
-            return None
-        return chosen
-
-    def _act_set_canonical_name(self) -> None:
-        rows = self._selected_rows()
-        if len(rows) != 1:
-            return
-        row = rows[0]
-        suggestion = row.get("suggestion") if isinstance(row.get("suggestion"), Mapping) else {}
-        default_name = (
-            str(suggestion.get("display_name") or "").strip()
-            or str(row.get("canonical_display") or "").strip()
-            or str(row.get("raw_name") or "").strip()
-        )
-        display_name = self._prompt_display_name(
-            title="Set Canonical Name",
-            prompt="Canonical display name:",
-            default=default_name,
-        )
-        if not display_name:
-            return
-        preferred_units = str(suggestion.get("preferred_units") or "").strip()
-        if not preferred_units:
-            units = [str(value).strip() for value in (row.get("units") or []) if str(value).strip()]
-            preferred_units = units[0] if len(units) == 1 else ""
-        existing_id = str(row.get("primary_canonical_id") or "").strip()
-        canonical_id = self._ensure_group(
-            display_name=display_name,
-            preferred_units=preferred_units,
-            canonical_id=("" if existing_id.startswith("raw:") else existing_id),
-        )
-        self._replace_global_mapping(str(row.get("raw_name") or "").strip(), canonical_id)
-        self._cleanup_unused_groups()
-        self._reload_context(select_raw_names=[row.get("raw_name")])
-
-    def _act_merge_selected(self) -> None:
-        rows = self._selected_rows()
-        if len(rows) < 2:
-            return
-        default_name = str(rows[0].get("canonical_display") or rows[0].get("raw_name") or "").strip()
-        display_name = self._prompt_display_name(
-            title="Merge Selected Parameters",
-            prompt="Canonical display name for the merged group:",
-            default=default_name,
-        )
-        if not display_name:
-            return
-        units = sorted(
-            {
-                str(value).strip()
-                for row in rows
-                for value in (row.get("units") or [])
-                if str(value).strip()
-            },
-            key=str.casefold,
-        )
-        preferred_units = units[0] if len(units) == 1 else ""
-        canonical_id = self._ensure_group(display_name=display_name, preferred_units=preferred_units)
-        for row in rows:
-            self._replace_global_mapping(str(row.get("raw_name") or "").strip(), canonical_id)
-        self._cleanup_unused_groups()
-        self._reload_context(select_raw_names=[row.get("raw_name") for row in rows])
-
-    def _act_program_override(self) -> None:
-        rows = self._selected_rows()
-        if len(rows) != 1:
-            return
-        row = rows[0]
-        programs = [str(value).strip() for value in (row.get("program_titles") or []) if str(value).strip()]
-        if not programs:
-            QtWidgets.QMessageBox.information(self, "Program Override", "This parameter has no program-level provenance to override.")
-            return
-        display_name = self._prompt_display_name(
-            title="Program Override",
-            prompt="Canonical display name for the selected programs:",
-            default=str(row.get("canonical_display") or row.get("raw_name") or "").strip(),
-        )
-        if not display_name:
-            return
-        chosen_programs = self._prompt_programs(programs)
-        if not chosen_programs:
-            return
-        units = [str(value).strip() for value in (row.get("units") or []) if str(value).strip()]
-        canonical_id = self._ensure_group(
-            display_name=display_name,
-            preferred_units=(units[0] if len(units) == 1 else ""),
-        )
-        self._replace_program_override(str(row.get("raw_name") or "").strip(), chosen_programs, canonical_id)
-        self._cleanup_unused_groups()
-        self._reload_context(select_raw_names=[row.get("raw_name")])
-
-    def _act_reset_mapping(self) -> None:
+    def _act_set_display_name(self) -> None:
         rows = self._selected_rows()
         if not rows:
             return
-        raw_names = [str(row.get("raw_name") or "").strip() for row in rows if str(row.get("raw_name") or "").strip()]
+        default_name = (
+            str(rows[0].get("displayed_parameter") or "").strip()
+            or str(rows[0].get("default_display_parameter") or "").strip()
+            or str(rows[0].get("ingested_parameter") or "").strip()
+        )
+        display_name = self._prompt_display_name(
+            title="Set Display Name",
+            prompt="Displayed parameter:",
+            default=default_name,
+        )
+        if not display_name:
+            return
+        self._apply_display_value(
+            row_keys=[row.get("_key") for row in rows if isinstance(row.get("_key"), tuple)],
+            display_name=display_name,
+        )
+
+    def _act_reset_rows(self) -> None:
+        rows = self._selected_rows()
+        if not rows:
+            return
         answer = QtWidgets.QMessageBox.question(
             self,
-            "Reset Mapping",
-            "Reset the selected raw parameter mappings back to their default raw-name behavior?",
+            "Reset Parameters",
+            "Reset the selected rows back to their default displayed parameter?",
         )
         if answer != QtWidgets.QMessageBox.StandardButton.Yes:
             return
-        remove_norms = {self._norm_name(value) for value in raw_names if self._norm_name(value)}
-        self._working_normalization["mappings"] = [
-            dict(rule)
-            for rule in self._working_mappings()
-            if self._norm_name(rule.get("raw_name")) not in remove_norms
-        ]
-        self._cleanup_unused_groups()
-        self._reload_context(select_raw_names=raw_names)
+        self._apply_display_value(
+            row_keys=[row.get("_key") for row in rows if isinstance(row.get("_key"), tuple)],
+            reset=True,
+        )
+
+    def _on_item_changed(self, item: QtWidgets.QTableWidgetItem) -> None:
+        if self._table_refreshing or item is None or item.column() != self.COL_DISPLAYED:
+            return
+        key = item.data(QtCore.Qt.ItemDataRole.UserRole)
+        if not isinstance(key, tuple) or len(key) != 4:
+            return
+        display_name = str(item.text() or "").strip()
+        self._apply_display_value(row_keys=[key], display_name=display_name)
 
     def _act_save(self) -> None:
         try:
-            self._normalize_working()
-            be.save_td_project_parameter_normalization(self._project_dir, self._working_normalization)
+            saved_rows = be.save_td_repo_parameter_mappings(self._project_dir, self._working_rows)
+            self._working_rows = self._sorted_rows(saved_rows)
+            self._set_dirty(False)
             self.saved = True
             self.accept()
         except Exception as exc:
-            QtWidgets.QMessageBox.warning(self, "Parameter Normalization", str(exc))
+            QtWidgets.QMessageBox.warning(self, "Project Parameters", str(exc))
 
 
 class ImplementationTrendDialog(QtWidgets.QDialog):
@@ -3288,23 +3364,25 @@ class ImplementationTrendDialog(QtWidgets.QDialog):
         self.btn_plot.clicked.connect(self._plot_selected_terms)
         left_layout.addWidget(self.btn_plot)
 
-        auto_label = QtWidgets.QLabel("Auto-Plots")
+        auto_label = QtWidgets.QLabel("Quick-Check Packs")
         auto_label.setStyleSheet("font-size: 13px; font-weight: 700; margin-top: 6px;")
         left_layout.addWidget(auto_label)
 
-        auto_hint = QtWidgets.QLabel("Select an auto-plot to open it in the plot pane.")
+        auto_hint = QtWidgets.QLabel(
+            "Select a frozen-baseline quick-check pack to run it against newly arrived data."
+        )
         auto_hint.setStyleSheet("color: #64748b; font-size: 11px;")
         auto_hint.setWordWrap(True)
         left_layout.addWidget(auto_hint)
 
         self.list_auto_plots = QtWidgets.QListWidget()
-        self.list_auto_plots.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.list_auto_plots.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
         self.list_auto_plots.itemSelectionChanged.connect(self._update_auto_plot_actions)
         self.list_auto_plots.itemDoubleClicked.connect(lambda *_: self._open_selected_auto_plot())
         left_layout.addWidget(self.list_auto_plots, 1)
 
         auto_btn_row = QtWidgets.QHBoxLayout()
-        self.btn_open_auto_panel = QtWidgets.QPushButton("Open Selected Auto-Plots")
+        self.btn_open_auto_panel = QtWidgets.QPushButton("Run Selected Pack")
         self.btn_open_auto_panel.setEnabled(False)
         self.btn_open_auto_panel.setStyleSheet(
             """
@@ -3322,7 +3400,7 @@ class ImplementationTrendDialog(QtWidgets.QDialog):
             """
         )
         self.btn_open_auto_panel.clicked.connect(self._open_auto_plot_panel)
-        self.btn_save_all_auto = QtWidgets.QPushButton("Save All Auto-Plots")
+        self.btn_save_all_auto = QtWidgets.QPushButton("Open Pack Library")
         self.btn_save_all_auto.setEnabled(False)
         self.btn_save_all_auto.setStyleSheet(
             """
@@ -3358,7 +3436,7 @@ class ImplementationTrendDialog(QtWidgets.QDialog):
         header_row = QtWidgets.QHBoxLayout()
         title = QtWidgets.QLabel("Trend Plot")
         title.setStyleSheet("font-size: 14px; font-weight: 700;")
-        self.btn_add_auto_plot = QtWidgets.QPushButton("Add to Auto-Plots")
+        self.btn_add_auto_plot = QtWidgets.QPushButton("Add Current Plot to Pack")
         self.btn_add_auto_plot.setEnabled(False)
         self.btn_add_auto_plot.setStyleSheet(
             """
@@ -5660,6 +5738,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         *,
         raw_name: object,
         program_title: object = "",
+        asset_type: object = "",
+        asset_specific_type: object = "",
     ) -> bool:
         matcher = getattr(be, "td_parameter_selection_matches", None)
         if callable(matcher):
@@ -5670,6 +5750,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                         value,
                         raw_name,
                         program_title,
+                        asset_type,
+                        asset_specific_type,
                     )
                 )
             except Exception:
@@ -11436,6 +11518,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                         selection_value,
                         raw_name=raw_name,
                         program_title=row.get("program_title"),
+                        asset_type=row.get("asset_type"),
+                        asset_specific_type=row.get("asset_specific_type"),
                     ):
                         continue
                     tagged = dict(row)
@@ -11531,6 +11615,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     selection_value,
                     raw_name=raw_name,
                     program_title=row.get("program_title"),
+                    asset_type=row.get("asset_type"),
+                    asset_specific_type=row.get("asset_specific_type"),
                 ):
                     continue
                 tagged = dict(row)
@@ -11584,6 +11670,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     selection_value,
                     raw_name=raw_name,
                     program_title=row.get("program_title"),
+                    asset_type=row.get("asset_type"),
+                    asset_specific_type=row.get("asset_specific_type"),
                 ):
                     continue
                 tagged = dict(row)
@@ -11637,12 +11725,16 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                         x_value,
                         raw_name=row.get("x_parameter") or x_raw_name,
                         program_title=row.get("program_title"),
+                        asset_type=row.get("asset_type"),
+                        asset_specific_type=row.get("asset_specific_type"),
                     ):
                         continue
                     if not self._parameter_selection_matches_row(
                         y_value,
                         raw_name=row.get("y_parameter") or y_raw_name,
                         program_title=row.get("program_title"),
+                        asset_type=row.get("asset_type"),
+                        asset_specific_type=row.get("asset_specific_type"),
                     ):
                         continue
                     tagged = dict(row)
@@ -13375,7 +13467,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.warning(
                 self,
                 "Life Metrics",
-                "The selected Y parameter has conflicting units across its normalized sources. Resolve the conflict in Parameter Normalization first.",
+                "The selected Y parameter has conflicting units across its merged sources. Resolve the conflict in Project Parameters first.",
             )
             return
         y_display = self._parameter_display_name(y_param, options=self._life_parameter_options, fallback=y_param)
@@ -13394,7 +13486,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 QtWidgets.QMessageBox.warning(
                     self,
                     "Life Metrics",
-                    "The selected X parameter has conflicting units across its normalized sources. Resolve the conflict in Parameter Normalization first.",
+                    "The selected X parameter has conflicting units across its merged sources. Resolve the conflict in Project Parameters first.",
                 )
                 return
             x_display = self._parameter_display_name(x_param, options=self._life_parameter_options, fallback=x_param)
@@ -13603,7 +13695,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.warning(
                 self,
                 "Plot Metrics",
-                "Resolve unit conflicts in Parameter Normalization before plotting:\n\n" + "\n".join(conflicting),
+                "Resolve unit conflicts in Project Parameters before plotting:\n\n" + "\n".join(conflicting),
             )
             return
 
@@ -13825,7 +13917,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.warning(
                 self,
                 "Plot Curves",
-                "Resolve unit conflicts in Parameter Normalization before plotting:\n\n" + "\n".join(conflicting),
+                "Resolve unit conflicts in Project Parameters before plotting:\n\n" + "\n".join(conflicting),
             )
             return
         if not x_label:
@@ -17771,7 +17863,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.warning(
                 self,
                 "Performance",
-                "Resolve unit conflicts in Parameter Normalization before plotting:\n\n" + "\n".join(conflicting),
+                "Resolve unit conflicts in Project Parameters before plotting:\n\n" + "\n".join(conflicting),
             )
             return
         plot_stats = self._perf_plot_stat_candidates()
@@ -17925,7 +18017,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.warning(
                 self,
                 "Performance",
-                "Resolve unit conflicts in Parameter Normalization before plotting:\n\n" + "\n".join(conflicting),
+                "Resolve unit conflicts in Project Parameters before plotting:\n\n" + "\n".join(conflicting),
             )
             return
         plot_stats = self._perf_plot_stat_candidates()
@@ -21072,7 +21164,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             ]
             if conflicting:
                 raise RuntimeError(
-                    "Resolve unit conflicts in Parameter Normalization before rendering this saved curve graph:\n"
+                    "Resolve unit conflicts in Project Parameters before rendering this saved curve graph:\n"
                     + "\n".join(conflicting)
                 )
             y_label = self._plot_value_summary(y_display_values) or "Y"
@@ -21142,7 +21234,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             ]
             if conflicting:
                 raise RuntimeError(
-                    "Resolve unit conflicts in Parameter Normalization before rendering this saved metric graph:\n"
+                    "Resolve unit conflicts in Project Parameters before rendering this saved metric graph:\n"
                     + "\n".join(conflicting)
                 )
             if not runs:
@@ -21244,7 +21336,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 raise RuntimeError("The saved life metrics graph is missing its Y parameter.")
             y_option = self._selector_option_by_value(self._life_parameter_options, y_param)
             if bool(y_option.get("unit_conflict")):
-                raise RuntimeError("Resolve the saved life-metric Y parameter unit conflict in Parameter Normalization first.")
+                raise RuntimeError("Resolve the saved life-metric Y parameter unit conflict in Project Parameters first.")
             y_display = str(d.get("y_parameter_label") or "").strip() or self._parameter_display_name(
                 y_param,
                 options=self._life_parameter_options,
@@ -21257,7 +21349,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     raise RuntimeError("The saved life metrics graph is missing its X parameter.")
                 x_option = self._selector_option_by_value(self._life_parameter_options, x_param)
                 if bool(x_option.get("unit_conflict")):
-                    raise RuntimeError("Resolve the saved life-metric X parameter unit conflict in Parameter Normalization first.")
+                    raise RuntimeError("Resolve the saved life-metric X parameter unit conflict in Project Parameters first.")
                 x_display = str(d.get("x_parameter_label") or "").strip() or self._parameter_display_name(
                     x_param,
                     options=self._life_parameter_options,
@@ -21381,7 +21473,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             ]
             if conflicting:
                 raise RuntimeError(
-                    "Resolve unit conflicts in Parameter Normalization before rendering this saved performance graph:\n"
+                    "Resolve unit conflicts in Project Parameters before rendering this saved performance graph:\n"
                     + "\n".join(conflicting)
                 )
             stats_val = d.get("stats")
@@ -24508,13 +24600,826 @@ class TestDataTrendDialog(QtWidgets.QDialog):
     ) -> dict[str, object] | None:
         return self._open_auto_graph_file_editor(entry)
 
+    def _quickcheck_pack_baseline_summary_text(self, pack: Mapping[str, object] | None) -> str:
+        if not isinstance(pack, Mapping):
+            return "Baseline: Not frozen"
+        snapshot = dict(pack.get("baseline_snapshot") or {}) if isinstance(pack.get("baseline_snapshot"), Mapping) else {}
+        db_path = str(snapshot.get("db_path") or "").strip()
+        serials = [str(value).strip() for value in (snapshot.get("baseline_serials") or []) if str(value).strip()]
+        filters = agq.normalize_filter_state(snapshot.get("baseline_filters"))
+        filter_parts = []
+        for key, label in (
+            ("programs", "Programs"),
+            ("control_periods", "Control Periods"),
+            ("suppression_voltages", "Suppression"),
+            ("valve_voltages", "Valve"),
+        ):
+            values = [str(value).strip() for value in (filters.get(key) or []) if str(value).strip()]
+            if values:
+                filter_parts.append(f"{label}: {len(values)}")
+        if not db_path or not Path(db_path).expanduser().exists():
+            return "Baseline: Not frozen"
+        captured_at = int(snapshot.get("captured_at_epoch_ns") or 0)
+        captured_text = ""
+        if captured_at > 0:
+            try:
+                captured_text = datetime.datetime.fromtimestamp(captured_at / 1_000_000_000).strftime("%Y-%m-%d %H:%M")
+            except Exception:
+                captured_text = ""
+        parts = [f"Baseline: {len(serials)} serial{'s' if len(serials) != 1 else ''}"]
+        if captured_text:
+            parts.append(f"Frozen: {captured_text}")
+        if filter_parts:
+            parts.append(", ".join(filter_parts))
+        return " | ".join(parts)
+
+    def _quickcheck_pack_list_text(self, pack: Mapping[str, object] | None) -> str:
+        if not isinstance(pack, Mapping):
+            return "Quick-Check Pack"
+        name = str(pack.get("name") or "").strip() or "Quick-Check Pack"
+        plot_count = len([item for item in (pack.get("plots") or []) if isinstance(item, Mapping)])
+        return f"{name}\nPlots: {plot_count} | {self._quickcheck_pack_baseline_summary_text(pack)}"
+
+    def _quickcheck_pack_tooltip(self, pack: Mapping[str, object] | None) -> str:
+        if not isinstance(pack, Mapping):
+            return ""
+        lines = [
+            str(pack.get("name") or "").strip() or "Quick-Check Pack",
+            self._quickcheck_pack_baseline_summary_text(pack),
+        ]
+        target_policy = dict(pack.get("target_policy") or {}) if isinstance(pack.get("target_policy"), Mapping) else {}
+        lines.append(f"Target Policy: {str(target_policy.get('mode') or 'auto_new_arrivals').strip() or 'auto_new_arrivals'}")
+        for plot in [dict(item) for item in (pack.get("plots") or []) if isinstance(item, Mapping)]:
+            lines.append(f"- {str(plot.get('name') or '').strip() or 'Plot'}")
+        return "\n".join([line for line in lines if str(line).strip()])
+
+    def _current_quickcheck_plot_entry(self) -> dict[str, object] | None:
+        if not self._last_plot_def:
+            return None
+        plot_definition = dict(self._last_plot_def or {})
+        mode = str(plot_definition.get("mode") or "").strip().lower()
+        if mode not in {"curves", "metrics", "life_metrics", "performance"}:
+            return None
+        try:
+            report_cfg = be.load_trend_auto_report_config(self._project_dir)
+        except Exception:
+            report_cfg = {}
+        name = self._auto_plot_display_name({"plot_definition": plot_definition}) or str(mode or "Plot").title()
+        return {
+            "id": _td_auto_plot_entry_id(name, plot_definition),
+            "name": name,
+            "plot_definition": plot_definition,
+            "finding_rule": agq.default_finding_rule(mode, report_config=report_cfg),
+        }
+
+    def _apply_auto_graph_quickcheck_plot_to_live_gui(self, plot_entry: Mapping[str, object] | None) -> None:
+        if not self._db_path or not self._plot_ready:
+            return
+        if not isinstance(plot_entry, Mapping):
+            return
+        plot_definition = (
+            dict(plot_entry.get("plot_definition") or {})
+            if isinstance(plot_entry.get("plot_definition"), Mapping)
+            else dict(plot_entry)
+        )
+        mode = str(plot_definition.get("mode") or "").strip().lower()
+        if mode not in {"curves", "metrics", "life_metrics", "performance"}:
+            return
+        want_mode = str(plot_definition.get("selector_mode") or ("condition" if mode == "life_metrics" else "sequence")).strip().lower()
+        if hasattr(self, "cb_run_mode"):
+            idx = self.cb_run_mode.findData(want_mode)
+            if idx >= 0:
+                self.cb_run_mode.setCurrentIndex(idx)
+        selection = self._selection_from_plot_def(plot_definition)
+        selection_ids = (
+            [str(value).strip() for value in (plot_definition.get("selection_ids") or []) if str(value).strip()]
+            if isinstance(plot_definition.get("selection_ids"), list)
+            else []
+        )
+        selection_id = str(selection.get("id") or plot_definition.get("selection_id") or "").strip()
+        if mode in {"curves", "metrics", "life_metrics"} and want_mode == "condition":
+            self._set_mode(mode)
+            restore_ids = list(selection_ids)
+            if not restore_ids and selection_id:
+                restore_ids = [selection_id]
+            self._set_metric_condition_selection_ids(restore_ids if restore_ids else None)
+        elif selection_id:
+            self._select_run_by_id(selection_id)
+
+        self._set_mode(mode)
+        if mode == "curves":
+            y_values = self._curve_plot_y_values(plot_definition)
+            if y_values:
+                self._set_curve_y_selection(y_values)
+            x_value = str(plot_definition.get("x") or "").strip()
+            if x_value:
+                def _norm_name(s: str) -> str:
+                    return "".join(ch.lower() for ch in str(s or "") if ch.isalnum())
+
+                time_norms = {_norm_name(value) for value in ("time", "time_s", "time(sec)", "time(s)", "time (s)", "time_sec", "times")}
+                pulse_norms = {_norm_name(value) for value in ("pulse number", "pulse#", "pulse #", "pulse_number", "pulsenumber", "cycle")}
+                wanted_x = x_value
+                if _norm_name(wanted_x) in time_norms:
+                    wanted_x = "Time"
+                elif _norm_name(wanted_x) in pulse_norms:
+                    wanted_x = "Pulse Number"
+                self._set_combo_to_value(self.cb_x, wanted_x)
+            self._plot_curves()
+            return
+
+        if mode == "metrics":
+            stats_value = plot_definition.get("stats")
+            stats = [str(value).strip().lower() for value in stats_value if str(value).strip()] if isinstance(stats_value, list) else []
+            if not stats:
+                stat = str(plot_definition.get("stat") or "").strip().lower()
+                if stat:
+                    stats = [stat]
+            if not stats:
+                stats = ["mean"]
+            want_stats = {value for value in stats if value}
+            want_average = "average" in want_stats
+            want_stats.discard("average")
+            if hasattr(self, "cb_metric_average"):
+                self.cb_metric_average.setChecked(want_average)
+            self._set_metric_plot_source(plot_definition.get("metric_plot_source"))
+            if hasattr(self, "list_stats"):
+                self.list_stats.clearSelection()
+                for index in range(self.list_stats.count()):
+                    item = self.list_stats.item(index)
+                    if item.text().strip().lower() in want_stats:
+                        item.setSelected(True)
+            y_values = (
+                {str(value).strip() for value in (plot_definition.get("y") or []) if str(value).strip()}
+                if isinstance(plot_definition.get("y"), list)
+                else set()
+            )
+            if y_values and hasattr(self, "list_y_metrics"):
+                self.list_y_metrics.clearSelection()
+                for index in range(self.list_y_metrics.count()):
+                    item = self.list_y_metrics.item(index)
+                    if item.text() in y_values:
+                        item.setSelected(True)
+            if hasattr(self, "cb_plot_metric_bounds"):
+                self.cb_plot_metric_bounds.setChecked(bool(plot_definition.get("plot_bounds")))
+            self._plot_metrics()
+            return
+
+        if mode == "life_metrics":
+            plot_type = str(plot_definition.get("plot_type") or "life_axis").strip().lower()
+            self._set_mode("life_metrics")
+            self._set_combo_to_value(getattr(self, "cb_life_plot_type", None), plot_type)
+            self._set_combo_to_value(getattr(self, "cb_life_y_param", None), str(plot_definition.get("y_parameter") or "").strip())
+            if plot_type == "metric_xy":
+                self._set_combo_to_value(getattr(self, "cb_life_x_param", None), str(plot_definition.get("x_parameter") or "").strip())
+            else:
+                self._set_combo_to_value(getattr(self, "cb_life_axis", None), str(plot_definition.get("life_axis") or "sequence_index").strip())
+            self._refresh_life_controls()
+            self._plot_life_metrics()
+            return
+
+        self._set_mode("performance")
+        self._refresh_performance_ui()
+        performance_plot_method = self._perf_normalize_plot_method(plot_definition.get("performance_plot_method"))
+        run_type_mode = str(plot_definition.get("performance_run_type_mode") or "").strip().lower()
+        if run_type_mode:
+            self._set_perf_run_type_mode(run_type_mode)
+        filter_mode = str(plot_definition.get("performance_filter_mode") or "all_conditions").strip().lower()
+        if hasattr(self, "cb_perf_filter_mode"):
+            idx = self.cb_perf_filter_mode.findData(filter_mode)
+            if idx >= 0:
+                self.cb_perf_filter_mode.setCurrentIndex(idx)
+        selected_cp = plot_definition.get("selected_control_period")
+        if selected_cp not in (None, "") and hasattr(self, "cb_perf_control_period"):
+            idx = self.cb_perf_control_period.findData(selected_cp)
+            if idx >= 0:
+                self.cb_perf_control_period.setCurrentIndex(idx)
+        self._update_perf_control_period_state()
+        self._set_combo_to_value(self.cb_perf_y_col, str(plot_definition.get("output") or ""))
+        self._set_combo_to_value(self.cb_perf_x_col, str(plot_definition.get("input1") or ""))
+        self._set_combo_to_value(self.cb_perf_z_col, str(plot_definition.get("input2") or ""))
+        self._on_perf_axis_changed("z" if str(plot_definition.get("input2") or "").strip() else "x")
+        if hasattr(self, "cb_perf_fit"):
+            self.cb_perf_fit.setChecked(bool(plot_definition.get("fit_enabled", True)))
+        fit_mode = str(plot_definition.get("fit_mode") or "").strip().lower()
+        if fit_mode and hasattr(self, "cb_perf_fit_model"):
+            idx = self.cb_perf_fit_model.findData(fit_mode)
+            if idx >= 0:
+                self.cb_perf_fit_model.setCurrentIndex(idx)
+        surface_fit_family = str(
+            plot_definition.get("surface_fit_family")
+            or ("auto_surface" if bool(plot_definition.get("auto_surface_families")) else "quadratic_surface")
+        ).strip().lower()
+        if hasattr(self, "cb_perf_surface_model"):
+            idx = self.cb_perf_surface_model.findData(surface_fit_family)
+            if idx >= 0:
+                self.cb_perf_surface_model.setCurrentIndex(idx)
+        if performance_plot_method == "cached_condition_means":
+            self._plot_performance_cached_condition_means()
+        else:
+            self._plot_performance()
+        view_stat = str(plot_definition.get("view_stat") or "").strip().lower()
+        if view_stat and hasattr(self, "cb_perf_view_stat"):
+            idx = self.cb_perf_view_stat.findData(view_stat)
+            if idx >= 0:
+                self.cb_perf_view_stat.setCurrentIndex(idx)
+            elif self.cb_perf_view_stat.count() > 0:
+                for index in range(self.cb_perf_view_stat.count()):
+                    if str(self.cb_perf_view_stat.itemText(index) or "").strip().lower() == view_stat:
+                        self.cb_perf_view_stat.setCurrentIndex(index)
+                        break
+        self._redraw_performance_view()
+
+    def _open_auto_graph_quickcheck_rule_editor(
+        self,
+        plot_entry: Mapping[str, object] | None,
+    ) -> dict[str, object] | None:
+        if not isinstance(plot_entry, Mapping):
+            return None
+        plot_definition = dict(plot_entry.get("plot_definition") or {})
+        mode = str(plot_definition.get("mode") or "").strip().lower()
+        rule = dict(plot_entry.get("finding_rule") or {})
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Edit Finding Rule")
+        dlg.resize(420, 320)
+        layout = QtWidgets.QVBoxLayout(dlg)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+        title = QtWidgets.QLabel(str(plot_entry.get("name") or "").strip() or "Plot")
+        title.setStyleSheet("font-size: 13px; font-weight: 700;")
+        layout.addWidget(title)
+        form = QtWidgets.QFormLayout()
+        edits: dict[str, QtWidgets.QLineEdit] = {}
+
+        def _add_numeric_field(label: str, key: str) -> None:
+            current_value = rule.get(key)
+            ed = QtWidgets.QLineEdit("" if current_value in (None, "") else str(current_value))
+            form.addRow(label, ed)
+            edits[key] = ed
+
+        if mode == "curves":
+            _add_numeric_field("Max Abs Watch", "max_abs_watch")
+            _add_numeric_field("Max Abs Fail", "max_abs_fail")
+            _add_numeric_field("Max % Watch", "max_pct_watch")
+            _add_numeric_field("Max % Fail", "max_pct_fail")
+            _add_numeric_field("RMS % Watch", "rms_pct_watch")
+            _add_numeric_field("RMS % Fail", "rms_pct_fail")
+        else:
+            _add_numeric_field("z PASS Max", "zscore_pass_max")
+            _add_numeric_field("z WATCH Max", "zscore_watch_max")
+            _add_numeric_field("Abs WATCH Max", "abs_watch_max")
+            _add_numeric_field("Abs FAIL Max", "abs_fail_max")
+            _add_numeric_field("Pct WATCH Max", "pct_watch_max")
+            _add_numeric_field("Pct FAIL Max", "pct_fail_max")
+        layout.addLayout(form)
+        hint = QtWidgets.QLabel(
+            "Leave any field blank to disable that threshold. Curve plots use curve-deviation thresholds; other plots use z-score and optional delta limits."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #64748b; font-size: 11px;")
+        layout.addWidget(hint)
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_row.addStretch(1)
+        btn_save = QtWidgets.QPushButton("Save")
+        btn_cancel = QtWidgets.QPushButton("Cancel")
+        btn_row.addWidget(btn_save)
+        btn_row.addWidget(btn_cancel)
+        layout.addLayout(btn_row)
+        btn_save.clicked.connect(dlg.accept)
+        btn_cancel.clicked.connect(dlg.reject)
+        _fit_widget_to_screen(dlg)
+        if dlg.exec() != int(QtWidgets.QDialog.DialogCode.Accepted):
+            return None
+        updated = dict(rule)
+        for key, edit in edits.items():
+            text = str(edit.text() or "").strip()
+            if not text:
+                updated[key] = None
+                continue
+            try:
+                updated[key] = float(text)
+            except Exception:
+                QtWidgets.QMessageBox.warning(self, "Finding Rule", f"'{text}' is not a valid number for {key}.")
+                return None
+        return updated
+
+    def _open_auto_graph_quickcheck_pack_editor(
+        self,
+        pack: Mapping[str, object] | None = None,
+        *,
+        seed_plot: Mapping[str, object] | None = None,
+    ) -> dict[str, object] | None:
+        saved_pack = (
+            dict(pack)
+            if isinstance(pack, Mapping)
+            else {
+                "id": "",
+                "name": "",
+                "created_at": "",
+                "updated_at": "",
+                "baseline_snapshot": {},
+                "eligibility_filters": {},
+                "target_policy": {"mode": "auto_new_arrivals"},
+                "plots": [],
+                "finding_rules": {},
+            }
+        )
+        plots_state = [dict(item) for item in (saved_pack.get("plots") or []) if isinstance(item, Mapping)]
+        if isinstance(seed_plot, Mapping):
+            plots_state.append(dict(seed_plot))
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Edit Quick-Check Pack" if str(saved_pack.get("id") or "").strip() else "Create Quick-Check Pack")
+        dlg.resize(860, 620)
+        dlg.setStyleSheet(
+            """
+            QDialog { background: #f8fafc; color: #0f172a; }
+            QLabel { color: #0f172a; }
+            QListWidget {
+                background: #ffffff;
+                border: 1px solid #e2e8f0;
+                border-radius: 8px;
+                padding: 6px;
+            }
+            QLineEdit {
+                background: #ffffff;
+                border: 1px solid #cbd5e1;
+                border-radius: 8px;
+                padding: 8px 10px;
+            }
+            QPushButton { padding: 8px 12px; border-radius: 8px; }
+            """
+        )
+        root = QtWidgets.QVBoxLayout(dlg)
+        root.setContentsMargins(14, 14, 14, 14)
+        root.setSpacing(10)
+
+        state: dict[str, object] = {
+            "id": str(saved_pack.get("id") or "").strip(),
+            "name": str(saved_pack.get("name") or "").strip(),
+            "created_at": str(saved_pack.get("created_at") or "").strip(),
+            "updated_at": str(saved_pack.get("updated_at") or "").strip(),
+            "baseline_snapshot": dict(saved_pack.get("baseline_snapshot") or {}),
+            "eligibility_filters": agq.normalize_filter_state(saved_pack.get("eligibility_filters")),
+            "target_policy": dict(saved_pack.get("target_policy") or {"mode": "auto_new_arrivals"}),
+            "plots": plots_state,
+        }
+
+        form = QtWidgets.QFormLayout()
+        form.setLabelAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
+        ed_name = QtWidgets.QLineEdit(str(state.get("name") or ""))
+        form.addRow("Pack Name:", ed_name)
+        root.addLayout(form)
+
+        baseline_frame = QtWidgets.QFrame()
+        baseline_frame.setStyleSheet("QFrame { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 10px; }")
+        baseline_layout = QtWidgets.QVBoxLayout(baseline_frame)
+        baseline_layout.setContentsMargins(12, 12, 12, 12)
+        baseline_layout.setSpacing(6)
+        baseline_title = QtWidgets.QLabel("Frozen Baseline")
+        baseline_title.setStyleSheet("font-size: 12px; font-weight: 800;")
+        baseline_layout.addWidget(baseline_title)
+        lbl_baseline = QtWidgets.QLabel("")
+        lbl_baseline.setWordWrap(True)
+        lbl_baseline.setStyleSheet("color: #475569; font-size: 11px;")
+        baseline_layout.addWidget(lbl_baseline)
+        btn_freeze = QtWidgets.QPushButton("Freeze / Rebuild From Current Selection")
+        baseline_layout.addWidget(btn_freeze, 0, QtCore.Qt.AlignmentFlag.AlignLeft)
+        root.addWidget(baseline_frame)
+
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        root.addWidget(splitter, 1)
+
+        left = QtWidgets.QWidget()
+        left_layout = QtWidgets.QVBoxLayout(left)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(8)
+        left_layout.addWidget(QtWidgets.QLabel("Saved Plots"))
+        list_plots = QtWidgets.QListWidget()
+        list_plots.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        left_layout.addWidget(list_plots, 1)
+        left_btn_row = QtWidgets.QHBoxLayout()
+        btn_add_current = QtWidgets.QPushButton("Add Current Plot")
+        btn_replace_current = QtWidgets.QPushButton("Replace From Current")
+        btn_load_live = QtWidgets.QPushButton("Load Into Live GUI")
+        btn_edit_rule = QtWidgets.QPushButton("Edit Rule")
+        btn_remove = QtWidgets.QPushButton("Remove")
+        btn_up = QtWidgets.QPushButton("Up")
+        btn_down = QtWidgets.QPushButton("Down")
+        for button in (btn_add_current, btn_replace_current, btn_load_live, btn_edit_rule, btn_remove, btn_up, btn_down):
+            left_btn_row.addWidget(button)
+        left_btn_row.addStretch(1)
+        left_layout.addLayout(left_btn_row)
+        splitter.addWidget(left)
+
+        right = QtWidgets.QWidget()
+        right_layout = QtWidgets.QVBoxLayout(right)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(8)
+        right_layout.addWidget(QtWidgets.QLabel("Selection Summary"))
+        summary_box = QtWidgets.QTextEdit()
+        summary_box.setReadOnly(True)
+        summary_box.setMinimumHeight(220)
+        right_layout.addWidget(summary_box, 1)
+        help_text = QtWidgets.QLabel(
+            "Saved plots are captured directly from the live Trend / Analyze GUI state. Use the real plot controls first, then add or replace the current plot here."
+        )
+        help_text.setWordWrap(True)
+        help_text.setStyleSheet("color: #64748b; font-size: 11px;")
+        right_layout.addWidget(help_text)
+        splitter.addWidget(right)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
+
+        footer = QtWidgets.QHBoxLayout()
+        footer.addStretch(1)
+        btn_save = QtWidgets.QPushButton("Save Pack")
+        btn_cancel = QtWidgets.QPushButton("Cancel")
+        footer.addWidget(btn_save)
+        footer.addWidget(btn_cancel)
+        root.addLayout(footer)
+
+        def _pack_payload() -> dict[str, object]:
+            plots = [dict(item) for item in (state.get("plots") or []) if isinstance(item, Mapping)]
+            finding_rules = {
+                str(item.get("id") or "").strip(): dict(item.get("finding_rule") or {})
+                for item in plots
+                if str(item.get("id") or "").strip()
+            }
+            return {
+                "id": str(state.get("id") or "").strip(),
+                "name": str(ed_name.text() or "").strip(),
+                "created_at": str(state.get("created_at") or "").strip(),
+                "updated_at": str(state.get("updated_at") or "").strip(),
+                "baseline_snapshot": dict(state.get("baseline_snapshot") or {}),
+                "eligibility_filters": dict(state.get("eligibility_filters") or {}),
+                "target_policy": dict(state.get("target_policy") or {"mode": "auto_new_arrivals"}),
+                "plots": [
+                    {
+                        "id": str(item.get("id") or "").strip(),
+                        "name": str(item.get("name") or "").strip(),
+                        "plot_definition": dict(item.get("plot_definition") or {}),
+                    }
+                    for item in plots
+                ],
+                "finding_rules": finding_rules,
+            }
+
+        def _selected_plot_index() -> int:
+            return list_plots.currentRow()
+
+        def _refresh_summary() -> None:
+            lbl_baseline.setText(self._quickcheck_pack_baseline_summary_text(_pack_payload()))
+            plot = None
+            row = _selected_plot_index()
+            if 0 <= row < len(state.get("plots") or []):
+                plot = (state.get("plots") or [])[row]
+            if not isinstance(plot, Mapping):
+                summary_box.setPlainText("No plot selected.")
+                return
+            plot_definition = dict(plot.get("plot_definition") or {})
+            rule = dict(plot.get("finding_rule") or {})
+            summary_box.setPlainText(
+                json.dumps(
+                    {
+                        "name": str(plot.get("name") or "").strip(),
+                        "mode": str(plot_definition.get("mode") or "").strip(),
+                        "selection_mode": str(plot_definition.get("selector_mode") or "").strip(),
+                        "member_runs": list(plot_definition.get("member_runs") or []),
+                        "finding_rule": rule,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+
+        def _refresh_plot_list(select_plot_id: str = "") -> None:
+            list_plots.clear()
+            selected_id = str(select_plot_id or "").strip()
+            first_item = None
+            for plot in [dict(item) for item in (state.get("plots") or []) if isinstance(item, Mapping)]:
+                item = QtWidgets.QListWidgetItem(str(plot.get("name") or "").strip() or "Plot")
+                item.setData(QtCore.Qt.ItemDataRole.UserRole, plot)
+                item.setToolTip(json.dumps(dict(plot.get("finding_rule") or {}), indent=2, sort_keys=True))
+                list_plots.addItem(item)
+                if first_item is None:
+                    first_item = item
+                if selected_id and str(plot.get("id") or "").strip() == selected_id:
+                    item.setSelected(True)
+            if not list_plots.selectedItems() and first_item is not None:
+                first_item.setSelected(True)
+            row = _selected_plot_index()
+            has_selection = row >= 0
+            btn_replace_current.setEnabled(has_selection)
+            btn_load_live.setEnabled(has_selection)
+            btn_edit_rule.setEnabled(has_selection)
+            btn_remove.setEnabled(has_selection)
+            btn_up.setEnabled(has_selection and row > 0)
+            btn_down.setEnabled(has_selection and row < list_plots.count() - 1)
+            _refresh_summary()
+
+        def _persist_pack() -> dict[str, object] | None:
+            try:
+                saved = be.save_auto_graph_quickcheck_pack(self._project_dir, _pack_payload())
+            except Exception as exc:
+                QtWidgets.QMessageBox.warning(dlg, "Quick-Check Pack", str(exc))
+                return None
+            state["id"] = str(saved.get("id") or "").strip()
+            state["created_at"] = str(saved.get("created_at") or "").strip()
+            state["updated_at"] = str(saved.get("updated_at") or "").strip()
+            state["baseline_snapshot"] = dict(saved.get("baseline_snapshot") or {})
+            state["eligibility_filters"] = agq.normalize_filter_state(saved.get("eligibility_filters"))
+            state["plots"] = [dict(item) for item in (saved.get("plots") or []) if isinstance(item, Mapping)]
+            ed_name.setText(str(saved.get("name") or "").strip())
+            return dict(saved)
+
+        def _add_or_replace_current(*, replace: bool) -> None:
+            current_plot = self._current_quickcheck_plot_entry()
+            if current_plot is None:
+                QtWidgets.QMessageBox.information(dlg, "Quick-Check Pack", "Create a live plot in the main GUI first.")
+                return
+            plots = [dict(item) for item in (state.get("plots") or []) if isinstance(item, Mapping)]
+            row = _selected_plot_index()
+            if replace and not (0 <= row < len(plots)):
+                return
+            if replace:
+                existing = plots[row]
+                current_plot["id"] = str(existing.get("id") or current_plot.get("id") or "").strip()
+                current_plot["finding_rule"] = dict(existing.get("finding_rule") or current_plot.get("finding_rule") or {})
+                plots[row] = current_plot
+                state["plots"] = plots
+                _refresh_plot_list(select_plot_id=str(current_plot.get("id") or "").strip())
+                return
+            plots.append(current_plot)
+            state["plots"] = plots
+            _refresh_plot_list(select_plot_id=str(current_plot.get("id") or "").strip())
+
+        def _freeze_baseline() -> None:
+            filters = self._current_auto_plot_filter_state()
+            serials = self._active_serials(filter_state=filters)
+            if not serials:
+                QtWidgets.QMessageBox.information(dlg, "Quick-Check Pack", "No active serials are available for the baseline snapshot.")
+                return
+            saved = _persist_pack()
+            if saved is None:
+                return
+            try:
+                frozen = be.build_auto_graph_quickcheck_snapshot(
+                    self._project_dir,
+                    self._workbook_path,
+                    str(saved.get("id") or "").strip(),
+                    filters,
+                    serials,
+                )
+            except Exception as exc:
+                QtWidgets.QMessageBox.warning(dlg, "Quick-Check Pack", str(exc))
+                return
+            state["baseline_snapshot"] = dict(frozen.get("baseline_snapshot") or {})
+            state["eligibility_filters"] = agq.normalize_filter_state(frozen.get("eligibility_filters"))
+            lbl_baseline.setText(self._quickcheck_pack_baseline_summary_text(frozen))
+
+        def _load_selected_plot_into_live() -> None:
+            row = _selected_plot_index()
+            plots = [dict(item) for item in (state.get("plots") or []) if isinstance(item, Mapping)]
+            if 0 <= row < len(plots):
+                self._apply_auto_graph_quickcheck_plot_to_live_gui(plots[row])
+
+        def _edit_rule() -> None:
+            row = _selected_plot_index()
+            plots = [dict(item) for item in (state.get("plots") or []) if isinstance(item, Mapping)]
+            if not (0 <= row < len(plots)):
+                return
+            updated_rule = self._open_auto_graph_quickcheck_rule_editor(plots[row])
+            if updated_rule is None:
+                return
+            plots[row]["finding_rule"] = updated_rule
+            state["plots"] = plots
+            _refresh_plot_list(select_plot_id=str(plots[row].get("id") or "").strip())
+
+        def _remove_plot() -> None:
+            row = _selected_plot_index()
+            plots = [dict(item) for item in (state.get("plots") or []) if isinstance(item, Mapping)]
+            if not (0 <= row < len(plots)):
+                return
+            plots.pop(row)
+            state["plots"] = plots
+            _refresh_plot_list()
+
+        def _move_plot(delta: int) -> None:
+            row = _selected_plot_index()
+            plots = [dict(item) for item in (state.get("plots") or []) if isinstance(item, Mapping)]
+            new_row = row + delta
+            if not (0 <= row < len(plots) and 0 <= new_row < len(plots)):
+                return
+            plot = plots.pop(row)
+            plots.insert(new_row, plot)
+            state["plots"] = plots
+            _refresh_plot_list(select_plot_id=str(plot.get("id") or "").strip())
+
+        def _save_pack_and_close() -> None:
+            saved = _persist_pack()
+            if saved is None:
+                return
+            dlg.setProperty("_chosen_quickcheck_pack", saved)
+            dlg.accept()
+
+        btn_add_current.clicked.connect(lambda: _add_or_replace_current(replace=False))
+        btn_replace_current.clicked.connect(lambda: _add_or_replace_current(replace=True))
+        btn_load_live.clicked.connect(_load_selected_plot_into_live)
+        btn_edit_rule.clicked.connect(_edit_rule)
+        btn_remove.clicked.connect(_remove_plot)
+        btn_up.clicked.connect(lambda: _move_plot(-1))
+        btn_down.clicked.connect(lambda: _move_plot(1))
+        btn_freeze.clicked.connect(_freeze_baseline)
+        btn_save.clicked.connect(_save_pack_and_close)
+        btn_cancel.clicked.connect(dlg.reject)
+        list_plots.itemSelectionChanged.connect(_refresh_summary)
+
+        _refresh_plot_list()
+        _fit_widget_to_screen(dlg)
+        if dlg.exec() != int(QtWidgets.QDialog.DialogCode.Accepted):
+            return None
+        chosen = dlg.property("_chosen_quickcheck_pack")
+        return dict(chosen) if isinstance(chosen, Mapping) else None
+
+    def _open_auto_graph_quickcheck_viewer(self, pack: Mapping[str, object] | None) -> None:
+        if not isinstance(pack, Mapping):
+            return
+        pack_id = str(pack.get("id") or "").strip()
+        if not pack_id:
+            return
+        try:
+            from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Quick-Check Viewer", f"Plotting unavailable: {exc}")
+            return
+
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle(str(pack.get("name") or "Quick-Check Pack"))
+        dlg.resize(1180, 800)
+        layout = QtWidgets.QVBoxLayout(dlg)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+
+        lbl_baseline = QtWidgets.QLabel("")
+        lbl_baseline.setWordWrap(True)
+        lbl_targets = QtWidgets.QLabel("")
+        lbl_targets.setWordWrap(True)
+        lbl_status = QtWidgets.QLabel("")
+        lbl_status.setWordWrap(True)
+        lbl_warnings = QtWidgets.QLabel("")
+        lbl_warnings.setWordWrap(True)
+        lbl_warnings.setStyleSheet("color: #991b1b;")
+        for label in (lbl_baseline, lbl_targets, lbl_status, lbl_warnings):
+            layout.addWidget(label)
+
+        tabs = QtWidgets.QTabWidget()
+        layout.addWidget(tabs, 1)
+
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_select_targets = QtWidgets.QPushButton("Select Targets...")
+        btn_rerun = QtWidgets.QPushButton("Rerun")
+        btn_load_live = QtWidgets.QPushButton("Load Selected Plot Into Live GUI")
+        btn_close = QtWidgets.QPushButton("Close")
+        for button in (btn_select_targets, btn_rerun, btn_load_live):
+            btn_row.addWidget(button)
+        btn_row.addStretch(1)
+        btn_row.addWidget(btn_close)
+        layout.addLayout(btn_row)
+
+        manual_targets: list[str] | None = None
+        latest_result: dict[str, object] = {}
+        current_pack = dict(pack)
+
+        def _selected_plot_result() -> dict[str, object] | None:
+            idx = tabs.currentIndex()
+            plot_results = [dict(item) for item in (latest_result.get("plot_results") or []) if isinstance(item, Mapping)]
+            if 0 <= idx < len(plot_results):
+                return plot_results[idx]
+            return None
+
+        def _render_result() -> None:
+            nonlocal latest_result, current_pack
+            try:
+                current_pack = be.save_auto_graph_quickcheck_pack(self._project_dir, current_pack)
+                latest_result = be.run_auto_graph_quickcheck_pack(
+                    self._project_dir,
+                    self._workbook_path,
+                    pack_id,
+                    target_serials=manual_targets,
+                )
+            except Exception as exc:
+                QtWidgets.QMessageBox.warning(dlg, "Quick-Check Run", str(exc))
+                return
+            tabs.clear()
+            current_pack = dict(
+                next(
+                    (
+                        item
+                        for item in (be.load_auto_graph_quickcheck_library(self._project_dir).get("packs") or [])
+                        if isinstance(item, Mapping) and str(item.get("id") or "").strip() == pack_id
+                    ),
+                    current_pack,
+                )
+            )
+            baseline_text = self._quickcheck_pack_baseline_summary_text(current_pack)
+            target_serials = [str(value).strip() for value in (latest_result.get("target_serials") or []) if str(value).strip()]
+            target_summary = ", ".join(_td_display_serial_values(target_serials)[:8])
+            if len(target_serials) > 8:
+                target_summary += f" ... ({len(target_serials)} total)"
+            lbl_baseline.setText(baseline_text)
+            lbl_targets.setText(f"Targets: {target_summary or '-'}")
+            counts = dict(latest_result.get("summary_counts") or {})
+            lbl_status.setText(
+                f"Overall: {str(latest_result.get('overall_status') or 'NO_DATA').strip()} | "
+                f"PASS {int(counts.get('PASS') or 0)} | WATCH {int(counts.get('WATCH') or 0)} | "
+                f"FAIL {int(counts.get('FAIL') or 0)} | NO_DATA {int(counts.get('NO_DATA') or 0)}"
+            )
+            warnings = [str(value).strip() for value in (latest_result.get("warnings") or []) if str(value).strip()]
+            lbl_warnings.setText("\n".join(warnings))
+            plot_results = [dict(item) for item in (latest_result.get("plot_results") or []) if isinstance(item, Mapping)]
+            render_filter_state = agq.normalize_filter_state(current_pack.get("eligibility_filters"))
+            render_filter_state["serials"] = list(target_serials)
+            for plot_result in plot_results:
+                plot_definition = (
+                    dict(((plot_result.get("render_context") or {}) if isinstance(plot_result.get("render_context"), Mapping) else {}).get("plot_definition") or {})
+                )
+                title_text = f"{str(plot_result.get('status') or 'NO_DATA').strip()} | {str(plot_result.get('plot_name') or '').strip() or 'Plot'}"
+                try:
+                    fig = self._render_plot_def_to_figure(
+                        plot_definition,
+                        filter_state=render_filter_state,
+                        title_override=title_text,
+                    )
+                except Exception as exc:
+                    message = str(plot_result.get("warning_text") or "").strip() or str(exc)
+                    fig = self._auto_plot_warning_figure(title=title_text, message=message)
+                tab = QtWidgets.QWidget()
+                tab_layout = QtWidgets.QVBoxLayout(tab)
+                tab_layout.setContentsMargins(8, 8, 8, 8)
+                tab_layout.setSpacing(8)
+                summary_label = QtWidgets.QLabel(
+                    f"{str(plot_result.get('summary_text') or '').strip()}\n{str(plot_result.get('warning_text') or '').strip()}".strip()
+                )
+                summary_label.setWordWrap(True)
+                summary_label.setStyleSheet("color: #475569; font-size: 11px;")
+                tab_layout.addWidget(summary_label)
+                canvas = FigureCanvas(fig)
+                tab_layout.addWidget(canvas, 1)
+                tabs.addTab(tab, str(plot_result.get("plot_name") or "Plot"))
+
+        def _select_targets() -> None:
+            nonlocal manual_targets
+            try:
+                candidates = be.list_auto_graph_quickcheck_target_candidates(
+                    self._project_dir,
+                    self._workbook_path,
+                    pack_id,
+                )
+            except Exception as exc:
+                QtWidgets.QMessageBox.warning(dlg, "Quick-Check Viewer", str(exc))
+                return
+            chosen = self._show_filter_checklist_popup(
+                title="Select Quick-Check Targets",
+                entries=[
+                    {
+                        "value": serial,
+                        "label": _td_plot_serial_label(serial) or serial,
+                        "search": f"{_td_plot_serial_label(serial) or serial} {serial}".lower(),
+                    }
+                    for serial in candidates
+                ],
+                selected_values=list(manual_targets or []),
+            )
+            if chosen is None:
+                return
+            manual_targets = list(chosen)
+            _render_result()
+
+        def _load_selected_plot() -> None:
+            plot_result = _selected_plot_result()
+            if not plot_result:
+                return
+            plot_definition = dict(
+                (((plot_result.get("render_context") or {}) if isinstance(plot_result.get("render_context"), Mapping) else {}).get("plot_definition") or {})
+            )
+            if not plot_definition:
+                return
+            self._apply_auto_graph_quickcheck_plot_to_live_gui({"plot_definition": plot_definition})
+
+        btn_select_targets.clicked.connect(_select_targets)
+        btn_rerun.clicked.connect(_render_result)
+        btn_load_live.clicked.connect(_load_selected_plot)
+        btn_close.clicked.connect(dlg.accept)
+        _render_result()
+        _fit_widget_to_screen(dlg)
+        dlg.exec()
+
     def _open_auto_plots_popup(self) -> None:
         if not self._plot_ready or not self._db_path:
             QtWidgets.QMessageBox.information(self, "Auto-Graphs", "Plotting is unavailable.")
             return
 
         dlg = QtWidgets.QDialog(self)
-        dlg.setWindowTitle("Auto-Graphs")
+        dlg.setWindowTitle("Quick-Check Packs")
         dlg.resize(960, 680)
         dlg.setStyleSheet(
             """
@@ -24541,11 +25446,11 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         layout = QtWidgets.QVBoxLayout(dlg)
         layout.setContentsMargins(14, 14, 14, 14)
         layout.setSpacing(10)
-        title = QtWidgets.QLabel("Graph Files")
+        title = QtWidgets.QLabel("Quick-Check Packs")
         title.setStyleSheet("font-size: 15px; font-weight: 800;")
         layout.addWidget(title)
         hint = QtWidgets.QLabel(
-            "Open saved graph files from the tile library. Each file keeps shared filters and serial tracking, while each plot keeps its own selector and graph settings."
+            "Frozen-baseline quick-check packs compare newly arrived Test Data against a saved baseline subset. Capture real plots from the live GUI, freeze a baseline, then rerun after Update Project refreshes the live cache."
         )
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #64748b; font-size: 11px;")
@@ -24555,8 +25460,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         layout.addWidget(list_widget, 1)
 
         btn_row = QtWidgets.QHBoxLayout()
-        btn_create = QtWidgets.QPushButton("Create New Graph File")
-        btn_open = QtWidgets.QPushButton("Open")
+        btn_create = QtWidgets.QPushButton("Create New Pack")
+        btn_open = QtWidgets.QPushButton("Run")
         btn_edit = QtWidgets.QPushButton("Edit")
         btn_delete = QtWidgets.QPushButton("Delete")
         btn_close = QtWidgets.QPushButton("Close")
@@ -24566,15 +25471,28 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         btn_row.addWidget(btn_close)
         layout.addLayout(btn_row)
 
-        def _refresh_and_select(file_id: str = "") -> None:
-            self._refresh_auto_plots_list(list_widget)
-            self._update_auto_actions(
-                list_widget=list_widget,
-                btn_open=btn_open,
-                btn_edit=btn_edit,
-                btn_delete=btn_delete,
-            )
-            wanted = str(file_id or "").strip()
+        def _refresh_and_select(pack_id: str = "") -> None:
+            list_widget.clear()
+            library = be.load_auto_graph_quickcheck_library(self._project_dir)
+            wanted = str(pack_id or "").strip()
+            first_item = None
+            for pack in [dict(item) for item in (library.get("packs") or []) if isinstance(item, Mapping)]:
+                item = QtWidgets.QListWidgetItem(self._quickcheck_pack_list_text(pack))
+                item.setData(QtCore.Qt.ItemDataRole.UserRole, pack)
+                item.setToolTip(self._quickcheck_pack_tooltip(pack))
+                item.setTextAlignment(int(QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignTop))
+                item.setSizeHint(QtCore.QSize(300, 90))
+                list_widget.addItem(item)
+                if first_item is None:
+                    first_item = item
+                if wanted and str(pack.get("id") or "").strip() == wanted:
+                    item.setSelected(True)
+            if not list_widget.selectedItems() and first_item is not None:
+                first_item.setSelected(True)
+            has_selection = bool(list_widget.selectedItems())
+            btn_open.setEnabled(has_selection)
+            btn_edit.setEnabled(has_selection)
+            btn_delete.setEnabled(has_selection)
             if not wanted:
                 return
             for idx in range(list_widget.count()):
@@ -24585,40 +25503,387 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     list_widget.scrollToItem(item)
                     break
 
-        def _create_file() -> None:
-            edited = self._open_auto_graph_file_editor()
+        def _selected_pack() -> dict[str, object] | None:
+            item = list_widget.currentItem()
+            payload = item.data(QtCore.Qt.ItemDataRole.UserRole) if item is not None else None
+            return dict(payload) if isinstance(payload, Mapping) else None
+
+        def _create_pack() -> None:
+            edited = self._open_auto_graph_quickcheck_pack_editor()
             if edited is None:
                 return
-            saved = self._upsert_auto_plot_entry(edited, list_widget=list_widget)
-            if saved is not None:
-                _refresh_and_select(str(saved.get("id") or "").strip())
+            _refresh_and_select(str(edited.get("id") or "").strip())
 
-        btn_create.clicked.connect(_create_file)
-        list_widget.itemDoubleClicked.connect(lambda *_: self._open_selected_auto_plot(list_widget=list_widget))
+        def _edit_selected() -> None:
+            selected = _selected_pack()
+            if selected is None:
+                return
+            edited = self._open_auto_graph_quickcheck_pack_editor(selected)
+            if edited is None:
+                return
+            _refresh_and_select(str(edited.get("id") or "").strip())
+
+        def _run_selected() -> None:
+            selected = _selected_pack()
+            if selected is None:
+                return
+            self._open_auto_graph_quickcheck_viewer(selected)
+            _refresh_and_select(str(selected.get("id") or "").strip())
+
+        def _delete_selected() -> None:
+            selected = _selected_pack()
+            if selected is None:
+                return
+            name = str(selected.get("name") or "selected pack").strip()
+            resp = QtWidgets.QMessageBox.question(
+                dlg,
+                "Delete Pack",
+                f"Delete '{name}'?",
+                QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+            )
+            if resp != QtWidgets.QMessageBox.StandardButton.Yes:
+                return
+            try:
+                be.delete_auto_graph_quickcheck_pack(self._project_dir, str(selected.get("id") or "").strip())
+            except Exception as exc:
+                QtWidgets.QMessageBox.warning(dlg, "Quick-Check Packs", str(exc))
+                return
+            _refresh_and_select()
+
+        btn_create.clicked.connect(_create_pack)
+        list_widget.itemDoubleClicked.connect(lambda *_: _run_selected())
         list_widget.itemSelectionChanged.connect(
-            lambda: self._update_auto_actions(
-                list_widget=list_widget,
-                btn_open=btn_open,
-                btn_edit=btn_edit,
-                btn_delete=btn_delete,
+            lambda: (
+                btn_open.setEnabled(bool(list_widget.selectedItems())),
+                btn_edit.setEnabled(bool(list_widget.selectedItems())),
+                btn_delete.setEnabled(bool(list_widget.selectedItems())),
             )
         )
-        btn_open.clicked.connect(lambda: self._open_selected_auto_plot(list_widget=list_widget))
-        btn_edit.clicked.connect(lambda: self._edit_selected_auto_plot(list_widget=list_widget))
-        btn_delete.clicked.connect(lambda: (self._delete_selected_auto_plots(list_widget=list_widget), _refresh_and_select()))
+        btn_open.clicked.connect(_run_selected)
+        btn_edit.clicked.connect(_edit_selected)
+        btn_delete.clicked.connect(_delete_selected)
         btn_close.clicked.connect(dlg.accept)
 
         _refresh_and_select()
         _fit_widget_to_screen(dlg)
         dlg.exec()
+        self._load_auto_plots()
 
     def _add_current_plot_to_autoplots(self) -> None:
-        if not self._last_plot_def:
+        current_plot = self._current_quickcheck_plot_entry()
+        if current_plot is None:
             return
-        edited = self._open_auto_graph_file_editor(seed_plot=dict(self._last_plot_def))
+        edited = self._open_auto_graph_quickcheck_pack_editor(seed_plot=current_plot)
         if edited is None:
             return
-        self._upsert_auto_plot_entry(edited)
+        _ = be.save_auto_graph_quickcheck_pack(self._project_dir, edited)
+        self._load_auto_plots()
+
+    def _auto_plot_store_payload(self) -> dict[str, object]:
+        return {
+            "version": agq.LIBRARY_VERSION,
+            "packs": [dict(entry) for entry in self._normalized_auto_plot_entries()],
+        }
+
+    def _normalized_auto_plot_entries(self) -> list[dict[str, object]]:
+        normalized: list[dict[str, object]] = []
+        seen_ids: set[str] = set()
+        for raw_pack in (self._auto_plots or []):
+            if not isinstance(raw_pack, Mapping):
+                continue
+            pack = dict(raw_pack)
+            pack_id = str(pack.get("id") or "").strip()
+            if pack_id and pack_id in seen_ids:
+                continue
+            if pack_id:
+                seen_ids.add(pack_id)
+            normalized.append(pack)
+        normalized.sort(
+            key=lambda item: (
+                _td_auto_plot_sort_datetime(item.get("updated_at") or item.get("created_at")),
+                str(item.get("name") or "").strip().lower(),
+            ),
+            reverse=True,
+        )
+        self._auto_plots = normalized
+        return [dict(item) for item in normalized]
+
+    def _save_auto_plots_store(self) -> None:
+        agq._write_library(self._project_dir, self._normalized_auto_plot_entries())
+
+    def _load_auto_plots(self) -> None:
+        try:
+            library = be.load_auto_graph_quickcheck_library(self._project_dir)
+            self._auto_plots = [
+                dict(item)
+                for item in (library.get("packs") or [])
+                if isinstance(item, Mapping)
+            ]
+        except Exception:
+            self._auto_plots = []
+        if hasattr(self, "list_auto_plots"):
+            self.list_auto_plots.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        self._sync_main_auto_plot_actions()
+        self._refresh_auto_plots_list()
+
+    def _auto_plot_list_item_text(self, entry: Mapping[str, object] | None) -> str:
+        if isinstance(entry, Mapping) and (
+            entry.get("baseline_snapshot") is not None or entry.get("target_policy") is not None
+        ):
+            return self._quickcheck_pack_list_text(entry)
+        if isinstance(entry, Mapping) and isinstance(entry.get("plots"), list):
+            return self._auto_graph_file_tile_text(entry)
+        return f"{self._auto_plot_mode_label(entry)} | {self._auto_plot_display_name(entry) or 'Auto-Graph'}"
+
+    def _auto_plot_entry_tooltip(self, entry: Mapping[str, object] | None) -> str:
+        if isinstance(entry, Mapping) and (
+            entry.get("baseline_snapshot") is not None or entry.get("target_policy") is not None
+        ):
+            return self._quickcheck_pack_tooltip(entry)
+        if isinstance(entry, Mapping) and isinstance(entry.get("plots"), list):
+            return self._auto_graph_file_tooltip(entry)
+        if not isinstance(entry, Mapping):
+            return ""
+        lines = [
+            self._auto_plot_display_name(entry),
+            f"Type: {self._auto_plot_mode_label(entry)}",
+        ]
+        saved_at = str(entry.get("saved_at") or "").strip()
+        updated_at = str(entry.get("updated_at") or "").strip()
+        if saved_at:
+            lines.append(f"Saved: {saved_at}")
+        if updated_at and updated_at != saved_at:
+            lines.append(f"Updated: {updated_at}")
+        return "\n".join([line for line in lines if str(line).strip()])
+
+    def _refresh_auto_plots_list(self, list_widget: QtWidgets.QListWidget | None = None) -> None:
+        widget = list_widget if list_widget is not None else getattr(self, "list_auto_plots", None)
+        if widget is None:
+            return
+        widget.clear()
+        try:
+            widget.setViewMode(QtWidgets.QListView.ViewMode.IconMode)
+            widget.setMovement(QtWidgets.QListView.Movement.Static)
+            widget.setResizeMode(QtWidgets.QListView.ResizeMode.Adjust)
+            widget.setWrapping(True)
+            widget.setWordWrap(True)
+            widget.setSpacing(10)
+            widget.setGridSize(QtCore.QSize(250, 110))
+        except Exception:
+            pass
+        entries = self._normalized_auto_plot_entries()
+        widget.setEnabled(bool(entries))
+        for pack in entries:
+            item = QtWidgets.QListWidgetItem(self._quickcheck_pack_list_text(pack))
+            item.setData(QtCore.Qt.ItemDataRole.UserRole, pack)
+            item.setToolTip(self._quickcheck_pack_tooltip(pack))
+            item.setTextAlignment(int(QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignTop))
+            item.setSizeHint(QtCore.QSize(230, 90))
+            widget.addItem(item)
+        self._update_auto_actions(list_widget=widget)
+
+    def _selected_auto_plot_definitions(
+        self,
+        *,
+        list_widget: QtWidgets.QListWidget | None = None,
+    ) -> list[dict[str, object]]:
+        widget = list_widget if list_widget is not None else getattr(self, "list_auto_plots", None)
+        if widget is None:
+            return []
+        out: list[dict[str, object]] = []
+        for item in widget.selectedItems():
+            payload = item.data(QtCore.Qt.ItemDataRole.UserRole) if item is not None else None
+            if isinstance(payload, Mapping) and (
+                payload.get("baseline_snapshot") is not None or payload.get("target_policy") is not None
+            ):
+                out.append(dict(payload))
+                continue
+            normalized = self._normalize_auto_graph_file(payload if isinstance(payload, Mapping) else None)
+            if normalized is not None:
+                out.append(normalized)
+        return out
+
+    def _update_auto_plot_actions(self) -> None:
+        self._update_auto_actions(
+            btn_open=self.btn_open_auto_panel if hasattr(self, "btn_open_auto_panel") else None,
+            btn_save_all=self.btn_save_all_auto if hasattr(self, "btn_save_all_auto") else None,
+        )
+
+    def _update_auto_actions(
+        self,
+        *,
+        list_widget: QtWidgets.QListWidget | None = None,
+        btn_open: QtWidgets.QPushButton | None = None,
+        btn_open_all: QtWidgets.QPushButton | None = None,
+        btn_edit: QtWidgets.QPushButton | None = None,
+        btn_delete: QtWidgets.QPushButton | None = None,
+        btn_save_selected: QtWidgets.QPushButton | None = None,
+        btn_save_all: QtWidgets.QPushButton | None = None,
+        btn_auto_report: QtWidgets.QPushButton | None = None,
+    ) -> None:
+        widget = list_widget if list_widget is not None else getattr(self, "list_auto_plots", None)
+        selected = widget.selectedItems() if widget is not None and widget.isEnabled() else []
+        selected_count = len(selected)
+        has_selection = selected_count > 0
+        plotting_ready = bool(self._plot_ready and self._db_path)
+
+        open_btn = btn_open if btn_open is not None else getattr(self, "btn_open_auto", None)
+        open_all_btn = btn_open_all if btn_open_all is not None else getattr(self, "btn_open_all_auto", None)
+        edit_btn = btn_edit if btn_edit is not None else getattr(self, "btn_edit_auto", None)
+        delete_btn = btn_delete if btn_delete is not None else getattr(self, "btn_delete_auto", None)
+        save_selected_btn = (
+            btn_save_selected if btn_save_selected is not None else getattr(self, "btn_save_selected_auto", None)
+        )
+        save_all_btn = btn_save_all if btn_save_all is not None else getattr(self, "btn_save_all_auto", None)
+        auto_report_btn = btn_auto_report if btn_auto_report is not None else getattr(self, "btn_auto_report", None)
+
+        if open_btn is not None:
+            open_btn.setEnabled(plotting_ready and selected_count == 1)
+        if open_all_btn is not None:
+            open_all_btn.setEnabled(False)
+        if edit_btn is not None:
+            edit_btn.setEnabled(selected_count == 1)
+        if delete_btn is not None:
+            delete_btn.setEnabled(has_selection)
+        if save_selected_btn is not None:
+            save_selected_btn.setEnabled(False)
+        if save_all_btn is not None:
+            save_all_btn.setEnabled(plotting_ready)
+        if auto_report_btn is not None:
+            auto_report_btn.setEnabled(plotting_ready)
+        self._sync_main_auto_plot_actions()
+
+    def _sync_main_auto_plot_actions(self) -> None:
+        plotting_ready = bool(self._plot_ready and self._db_path)
+        if hasattr(self, "btn_view_auto_plots"):
+            self.btn_view_auto_plots.setEnabled(plotting_ready)
+        if hasattr(self, "btn_add_auto_plot"):
+            self.btn_add_auto_plot.setEnabled(plotting_ready and self._current_quickcheck_plot_entry() is not None)
+        if hasattr(self, "btn_auto_graphs"):
+            self.btn_auto_graphs.setEnabled(plotting_ready)
+        if hasattr(self, "btn_auto_report"):
+            self.btn_auto_report.setEnabled(plotting_ready)
+        if hasattr(self, "btn_open_auto_panel"):
+            self.btn_open_auto_panel.setText("Run Selected Pack")
+        if hasattr(self, "btn_save_all_auto"):
+            self.btn_save_all_auto.setText("Open Pack Library")
+
+    def _upsert_auto_plot_entry(
+        self,
+        entry: Mapping[str, object] | None,
+        *,
+        list_widget: QtWidgets.QListWidget | None = None,
+    ) -> dict[str, object] | None:
+        if not isinstance(entry, Mapping):
+            return None
+        try:
+            saved = be.save_auto_graph_quickcheck_pack(self._project_dir, entry)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Quick-Check Packs", str(exc))
+            return None
+        self._load_auto_plots()
+        if list_widget is not None:
+            self._refresh_auto_plots_list(list_widget=list_widget)
+        self._sync_main_auto_plot_actions()
+        return dict(saved)
+
+    def _delete_selected_auto_plots(
+        self,
+        *,
+        list_widget: QtWidgets.QListWidget | None = None,
+    ) -> None:
+        selected = self._selected_auto_plot_definitions(list_widget=list_widget)
+        delete_ids = [str(entry.get("id") or "").strip() for entry in selected if str(entry.get("id") or "").strip()]
+        if not delete_ids:
+            return
+        try:
+            for pack_id in delete_ids:
+                be.delete_auto_graph_quickcheck_pack(self._project_dir, pack_id)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Quick-Check Packs", str(exc))
+            return
+        self._load_auto_plots()
+        if list_widget is not None:
+            self._refresh_auto_plots_list(list_widget=list_widget)
+        self._sync_main_auto_plot_actions()
+
+    def _open_selected_auto_plot(
+        self,
+        plot_def: dict | None = None,
+        *,
+        list_widget: QtWidgets.QListWidget | None = None,
+    ) -> None:
+        if not self._plot_ready or not self._db_path:
+            return
+        normalized = dict(plot_def) if isinstance(plot_def, Mapping) else None
+        if normalized is None:
+            selected = self._selected_auto_plot_definitions(list_widget=list_widget)
+            normalized = selected[0] if len(selected) == 1 else None
+        if normalized is None:
+            return
+        if normalized.get("baseline_snapshot") is not None or normalized.get("target_policy") is not None:
+            self._open_auto_graph_quickcheck_viewer(normalized)
+            self._load_auto_plots()
+            if list_widget is not None:
+                self._refresh_auto_plots_list(list_widget=list_widget)
+            return
+        legacy = self._normalize_auto_graph_file(normalized)
+        if legacy is None:
+            return
+        self._open_auto_graph_file_viewer(legacy)
+        if list_widget is not None:
+            self._refresh_auto_plots_list(list_widget=list_widget)
+
+    def _save_selected_auto_plots_pdf(
+        self,
+        *,
+        list_widget: QtWidgets.QListWidget | None = None,
+    ) -> None:
+        QtWidgets.QMessageBox.information(
+            self,
+            "Quick-Check Packs",
+            "PDF export is not part of the quick-check pack flow.",
+        )
+
+    def _save_all_auto_plots_pdf(self) -> None:
+        self._open_auto_plots_popup()
+
+    def _edit_selected_auto_plot(
+        self,
+        *,
+        list_widget: QtWidgets.QListWidget | None = None,
+    ) -> None:
+        selected = self._selected_auto_plot_definitions(list_widget=list_widget)
+        if len(selected) != 1:
+            return
+        selected_entry = selected[0]
+        if selected_entry.get("baseline_snapshot") is not None or selected_entry.get("target_policy") is not None:
+            edited = self._open_auto_graph_quickcheck_pack_editor(selected_entry)
+        else:
+            edited = self._open_auto_graph_file_editor(selected_entry)
+        if edited is None:
+            return
+        saved = self._upsert_auto_plot_entry(edited, list_widget=list_widget)
+        if saved is None or list_widget is None:
+            return
+        saved_id = str(saved.get("id") or "").strip()
+        for idx in range(list_widget.count()):
+            item = list_widget.item(idx)
+            payload = item.data(QtCore.Qt.ItemDataRole.UserRole) if item is not None else None
+            if isinstance(payload, Mapping) and str(payload.get("id") or "").strip() == saved_id:
+                item.setSelected(True)
+                list_widget.scrollToItem(item)
+                break
+
+    def _open_auto_plot_panel(self) -> None:
+        selected = self._selected_auto_plot_definitions()
+        if len(selected) == 1:
+            self._open_selected_auto_plot(selected[0])
+            return
+        self._open_auto_plots_popup()
+
+    def _open_all_auto_plots_panel(self) -> None:
+        self._open_auto_plots_popup()
 
     def _auto_plot_warning_figure(self, *, title: str, message: str):
         from matplotlib.figure import Figure
@@ -27794,7 +29059,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cb_project_force_rebuild.setChecked(False)
         self.cb_project_force_rebuild.setStyleSheet("color:#0f172a; font-size: 12px;")
         self.btn_project_edit = QtWidgets.QPushButton("Edit Project")
-        self.btn_project_parameter_normalization = QtWidgets.QPushButton("Parameter Normalization...")
+        self.btn_project_parameter_normalization = QtWidgets.QPushButton("Parameters...")
         self.btn_project_update = QtWidgets.QPushButton("Update Project")
         self.btn_project_perf_sheets = QtWidgets.QPushButton("Generate Performance Sheets")
         self.btn_project_debug_excels = QtWidgets.QPushButton("Generate Debug Excel Files")
@@ -27842,6 +29107,7 @@ class MainWindow(QtWidgets.QMainWindow):
         actions.addWidget(self.cb_project_overwrite)
         actions.addWidget(self.cb_project_force_rebuild)
         actions.addWidget(self.btn_project_edit)
+        actions.addWidget(self.btn_project_parameter_normalization)
         actions.addWidget(self.btn_project_update)
         actions.addWidget(self.btn_project_perf_sheets)
         actions.addWidget(self.btn_project_debug_excels)
@@ -29105,18 +30371,18 @@ class MainWindow(QtWidgets.QMainWindow):
                 raise RuntimeError("Select a project in the list first.")
             ptype = str(record.get("type") or "").strip()
             if ptype != getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending"):
-                raise RuntimeError("Parameter Normalization is available only for Test Data Trending projects.")
+                raise RuntimeError("Project Parameters is available only for Test Data Trending projects.")
             project_dir = Path(str(record.get("folder") or "")).expanduser()
             workbook = Path(str(record.get("workbook") or "")).expanduser()
             dlg = TDParameterNormalizationDialog(project_dir, workbook, self)
             self._prepare_dialog(dlg)
             if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted and getattr(dlg, "saved", False):
-                self._show_toast("Parameter normalization saved")
+                self._show_toast("Project parameters saved")
         except Exception as exc:
             message = str(exc)
             if "Trend / Analyze" in message or "cache" in message.casefold():
                 message = f"{message}\n\nRun Update Project first if this Test Data project has not been built yet."
-            QtWidgets.QMessageBox.warning(self, "Parameter Normalization", message)
+            QtWidgets.QMessageBox.warning(self, "Project Parameters", message)
 
     def _act_update_project(self) -> None:
         try:

@@ -105,6 +105,7 @@ TD_SERIAL_AGGREGATES_DIRNAME = "Test Data File Extractions"
 TD_LEGACY_SERIAL_AGGREGATES_DIRNAME = "td_serial_sources"
 TD_SERIAL_SOURCE_ARTIFACTS_DIRNAME = "sources"
 TD_SERIAL_AGGREGATE_METADATA_SOURCE = "td_serial_aggregate"
+TD_SERIAL_OFFICIAL_SOURCE_METADATA_SOURCE = "td_serial_official_source"
 
 _TD_AGG_SEQ_SHEET_RE = re.compile(
     r"^\s*seq(?:uence)?[\s_-]*(?=[A-Za-z0-9\s_-]*\d)[A-Za-z0-9]+(?:[\s_-]*[A-Za-z0-9]+)*\s*$",
@@ -1295,6 +1296,32 @@ def _td_agg_normalize_serial(value: object) -> str:
     return cleaned
 
 
+def _td_agg_is_valid_official_serial(value: object) -> bool:
+    serial = _td_agg_normalize_serial(value)
+    if not serial:
+        return False
+    return bool(re.fullmatch(r"SN[0-9A-Z]+(?:[-_][0-9A-Z]+)*", serial))
+
+
+def _td_agg_pick_authoritative_serial(
+    metadata_serial: object,
+    tab_serials: Sequence[object],
+) -> tuple[str, str, list[str]]:
+    meta_serial = _td_agg_normalize_serial(metadata_serial)
+    valid_tabs = sorted(
+        {
+            _td_agg_normalize_serial(value)
+            for value in (tab_serials or [])
+            if _td_agg_is_valid_official_serial(value)
+        }
+    )
+    if _td_agg_is_valid_official_serial(meta_serial):
+        return meta_serial, "source_metadata", valid_tabs
+    if len(valid_tabs) == 1:
+        return valid_tabs[0], "unique_tab_serial", valid_tabs
+    return "", "", valid_tabs
+
+
 def _td_agg_serial_from_text(value: object, *, allow_raw: bool = False) -> str:
     txt = str(value or "").strip()
     if not txt:
@@ -1429,9 +1456,10 @@ def _td_agg_ordered_sheet_info(conn: sqlite3.Connection) -> list[sqlite3.Row]:
         return []
 
 
-def _td_agg_collect_members(paths: SupportPaths) -> list[dict[str, Any]]:
+def _td_agg_collect_members(paths: SupportPaths) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     support_dir = Path(paths.support_dir)
     members: list[dict[str, Any]] = []
+    skipped_sources: list[dict[str, Any]] = []
     for meta_path in _td_agg_metadata_files(support_dir):
         try:
             meta_raw = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -1439,7 +1467,10 @@ def _td_agg_collect_members(paths: SupportPaths) -> list[dict[str, Any]]:
             continue
         if not isinstance(meta_raw, dict):
             continue
-        if str(meta_raw.get("metadata_source") or "").strip() == TD_SERIAL_AGGREGATE_METADATA_SOURCE:
+        if str(meta_raw.get("metadata_source") or "").strip() in {
+            TD_SERIAL_AGGREGATE_METADATA_SOURCE,
+            TD_SERIAL_OFFICIAL_SOURCE_METADATA_SOURCE,
+        }:
             continue
         if not _is_confirmed_test_data_meta(meta_raw):
             continue
@@ -1463,6 +1494,8 @@ def _td_agg_collect_members(paths: SupportPaths) -> list[dict[str, Any]]:
             with sqlite3.connect(str(sqlite_path)) as src:
                 src.row_factory = sqlite3.Row
                 sheet_rows = _td_agg_ordered_sheet_info(src)
+                source_members: list[dict[str, Any]] = []
+                tab_serial_candidates: list[str] = []
                 for sheet_row in sheet_rows:
                     sheet_name = str(sheet_row["sheet_name"] if "sheet_name" in sheet_row.keys() else "").strip()
                     source_sheet_name = str(
@@ -1471,16 +1504,13 @@ def _td_agg_collect_members(paths: SupportPaths) -> list[dict[str, Any]]:
                     real_tab_name = source_sheet_name or sheet_name
                     if not _td_agg_is_sequence_sheet_name(real_tab_name):
                         continue
-                    tab_serial, serial_source = _td_agg_extract_tab_serial(
+                    tab_serial, tab_serial_source = _td_agg_extract_tab_serial(
                         src,
                         sheet_name=sheet_name,
                         fallback_serial=meta_raw.get("serial_number"),
                     )
-                    if not tab_serial:
-                        continue
-                    program_title = _td_agg_clean_scope_value(meta_raw.get("program_title"))
-                    asset_type = _td_agg_clean_scope_value(meta_raw.get("asset_type"))
-                    asset_specific_type = _td_agg_clean_scope_value(meta_raw.get("asset_specific_type"))
+                    if tab_serial:
+                        tab_serial_candidates.append(tab_serial)
                     table_name = str(sheet_row["table_name"] if "table_name" in sheet_row.keys() else "").strip()
                     if not table_name:
                         table_name = _td_agg_table_name(sheet_name)
@@ -1488,40 +1518,78 @@ def _td_agg_collect_members(paths: SupportPaths) -> list[dict[str, Any]]:
                         import_order = int(sheet_row["import_order"] if "import_order" in sheet_row.keys() else 0)
                     except Exception:
                         import_order = 0
-                    sequence_order_key = _td_agg_natural_sequence_key(real_tab_name)
-                    members.append(
+                    source_members.append(
                         {
-                            "group_key": (
-                                program_title.casefold(),
-                                asset_type.casefold(),
-                                asset_specific_type.casefold(),
-                                tab_serial.casefold(),
-                            ),
-                            "program_title": program_title,
-                            "asset_type": asset_type,
-                            "asset_specific_type": asset_specific_type,
-                            "serial_number": tab_serial,
-                            "serial_source": serial_source,
-                            "sqlite_path": sqlite_path,
-                            "sqlite_rel": sqlite_rel,
-                            "metadata_path": meta_path,
-                            "metadata_rel": metadata_rel,
-                            "metadata_mtime_ns": int(metadata_mtime_ns),
-                            "artifacts_rel": artifacts_rel,
-                            "source_file": str(meta_raw.get("source_file") or ""),
                             "sheet_name": sheet_name,
                             "source_sheet_name": real_tab_name,
                             "table_name": table_name,
                             "import_order": int(import_order),
                             "sequence_token": _td_agg_sequence_token(real_tab_name),
-                            "sequence_order_key": sequence_order_key,
-                            "metadata": dict(meta_raw),
+                            "sequence_order_key": _td_agg_natural_sequence_key(real_tab_name),
                             "sheet_info": {k: sheet_row[k] for k in sheet_row.keys()},
+                            "tab_serial": _td_agg_normalize_serial(tab_serial),
+                            "tab_serial_source": str(tab_serial_source or "").strip(),
                         }
                     )
         except Exception:
             continue
-    return members
+        if not source_members:
+            continue
+        authoritative_serial, authoritative_source, valid_tab_serials = _td_agg_pick_authoritative_serial(
+            meta_raw.get("serial_number"),
+            tab_serial_candidates,
+        )
+        if not authoritative_serial:
+            skipped_sources.append(
+                {
+                    "metadata_rel": metadata_rel,
+                    "artifacts_rel": artifacts_rel,
+                    "sqlite_rel": sqlite_rel,
+                    "serial_number": str(meta_raw.get("serial_number") or "").strip(),
+                    "tab_serial_candidates": sorted({_td_agg_normalize_serial(v) for v in tab_serial_candidates if str(v).strip()}),
+                    "reason": "No trustworthy authoritative serial could be resolved from metadata or unique valid tab serials.",
+                }
+            )
+            continue
+        program_title = _td_agg_clean_scope_value(meta_raw.get("program_title"))
+        asset_type = _td_agg_clean_scope_value(meta_raw.get("asset_type"))
+        asset_specific_type = _td_agg_clean_scope_value(meta_raw.get("asset_specific_type"))
+        tab_serial_conflicts = [value for value in valid_tab_serials if value and value != authoritative_serial]
+        for item in source_members:
+            members.append(
+                {
+                    "group_key": (
+                        program_title.casefold(),
+                        asset_type.casefold(),
+                        asset_specific_type.casefold(),
+                        authoritative_serial.casefold(),
+                    ),
+                    "program_title": program_title,
+                    "asset_type": asset_type,
+                    "asset_specific_type": asset_specific_type,
+                    "serial_number": authoritative_serial,
+                    "serial_source": authoritative_source,
+                    "sqlite_path": sqlite_path,
+                    "sqlite_rel": sqlite_rel,
+                    "metadata_path": meta_path,
+                    "metadata_rel": metadata_rel,
+                    "metadata_mtime_ns": int(metadata_mtime_ns),
+                    "artifacts_rel": artifacts_rel,
+                    "source_file": str(meta_raw.get("source_file") or ""),
+                    "sheet_name": str(item.get("sheet_name") or ""),
+                    "source_sheet_name": str(item.get("source_sheet_name") or ""),
+                    "table_name": str(item.get("table_name") or ""),
+                    "import_order": int(item.get("import_order") or 0),
+                    "sequence_token": str(item.get("sequence_token") or ""),
+                    "sequence_order_key": list(item.get("sequence_order_key") or []),
+                    "metadata": dict(meta_raw),
+                    "sheet_info": dict(item.get("sheet_info") or {}),
+                    "tab_serial": str(item.get("tab_serial") or ""),
+                    "tab_serial_source": str(item.get("tab_serial_source") or ""),
+                    "tab_serial_conflicts": list(tab_serial_conflicts),
+                }
+            )
+    return members, skipped_sources
 
 
 def _td_agg_create_schema(conn: sqlite3.Connection) -> None:
@@ -1707,6 +1775,15 @@ def _td_agg_write_group(
     mirror_xlsx: bool,
 ) -> dict[str, Any]:
     first = dict(group_members[0])
+    unique_source_keys = {
+        (
+            str(member.get("metadata_rel") or "").casefold(),
+            str(member.get("sqlite_rel") or "").casefold(),
+            str(member.get("artifacts_rel") or "").casefold(),
+        )
+        for member in group_members
+    }
+    is_single_source = len(unique_source_keys) <= 1
     header_member = max(
         [dict(member) for member in group_members],
         key=lambda item: (
@@ -1756,6 +1833,11 @@ def _td_agg_write_group(
             duplicate_of = "" if dup_idx == 1 else base_run
             if duplicate_of:
                 warnings.append(f"Duplicate sequence name {base_run!r} was written as {output_run!r}.")
+            tab_serial = str(member.get("tab_serial") or "").strip()
+            if tab_serial and tab_serial != serial:
+                warnings.append(
+                    f"Ignored tab serial {tab_serial!r} for {source_tab or source_sheet or output_run!r}; using authoritative serial {serial!r}."
+                )
             output_table = _td_agg_table_name(output_run)
             try:
                 st = source_sqlite.stat()
@@ -1842,8 +1924,8 @@ def _td_agg_write_group(
                     str(member.get("metadata_rel") or ""),
                     str(member.get("artifacts_rel") or ""),
                     source_table,
-                    serial,
-                    str(member.get("serial_source") or ""),
+                    tab_serial,
+                    str(member.get("tab_serial_source") or member.get("serial_source") or ""),
                     str(member.get("sequence_token") or ""),
                     sequence_order_json,
                     output_table,
@@ -1858,8 +1940,8 @@ def _td_agg_write_group(
                     "source_metadata_rel": str(member.get("metadata_rel") or ""),
                     "source_artifacts_rel": str(member.get("artifacts_rel") or ""),
                     "source_table_name": source_table,
-                    "tab_serial": serial,
-                    "serial_source": str(member.get("serial_source") or ""),
+                    "tab_serial": tab_serial,
+                    "serial_source": str(member.get("tab_serial_source") or member.get("serial_source") or ""),
                     "sequence_token": str(member.get("sequence_token") or ""),
                     "sequence_order_key": list(member.get("sequence_order_key") or []),
                     "duplicate_of": duplicate_of,
@@ -1879,57 +1961,105 @@ def _td_agg_write_group(
     header_metadata_rel = str(header_member.get("metadata_rel") or "").strip()
     header_sqlite_rel = str(header_member.get("sqlite_rel") or "").strip()
     header_sheet_name = str(header_member.get("source_sheet_name") or header_member.get("sheet_name") or "").strip()
-    aggregate_meta = {
-        "program_title": program_title,
-        "asset_type": asset_type,
-        "asset_specific_type": asset_specific_type,
-        "serial_number": serial,
-        "part_number": str(header_meta.get("part_number") or "Unknown"),
-        "revision": str(header_meta.get("revision") or "Unknown"),
-        "test_date": str(header_meta.get("test_date") or "Unknown"),
-        "report_date": str(header_meta.get("report_date") or "Unknown"),
-        "vendor": str(header_meta.get("vendor") or "Unknown"),
-        "acceptance_test_plan_number": str(header_meta.get("acceptance_test_plan_number") or "Unknown"),
-        "document_type": "TD",
-        "document_type_acronym": "TD",
-        "document_type_status": "confirmed",
-        "document_type_source": "td_serial_aggregate",
-        "document_type_reason": "td_serial_aggregate",
-        "document_type_evidence": [
-            {
-                "kind": "td_serial_aggregate",
-                "serial_number": serial,
-                "sequence_count": len(manifest_members),
-            }
-        ],
-        "document_type_review_required": False,
-        "excel_sqlite_rel": sqlite_rel,
-        "file_extension": ".sqlite3",
-        "metadata_source": TD_SERIAL_AGGREGATE_METADATA_SOURCE,
-        "aggregate_header_source_metadata_rel": header_metadata_rel,
-        "aggregate_header_source_sqlite_rel": header_sqlite_rel,
-        "aggregate_header_source_sheet_name": header_sheet_name,
-    }
-    metadata_path.write_text(json.dumps(aggregate_meta, indent=2, ensure_ascii=True), encoding="utf-8")
-    manifest = {
-        "kind": TD_SERIAL_AGGREGATE_METADATA_SOURCE,
-        "serial_number": serial,
-        "program_title": program_title,
-        "asset_type": asset_type,
-        "asset_specific_type": asset_specific_type,
-        "sqlite_rel": sqlite_rel,
-        "metadata_rel": _safe_repo_rel(paths.global_repo, metadata_path),
-        "source_metadata_rels": source_metadata_rels,
-        "header_metadata_source_metadata_rel": header_metadata_rel,
-        "header_metadata_source_sqlite_rel": header_sqlite_rel,
-        "header_metadata_source_sheet_name": header_sheet_name,
-        "header_metadata_source_mtime_ns": int(header_member.get("metadata_mtime_ns") or 0),
-        "sequence_count": len(manifest_members),
-        "members": manifest_members,
-        "warnings": warnings,
-        "built_epoch_ns": int(now_ns),
-    }
-    manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=True), encoding="utf-8")
+    if is_single_source:
+        try:
+            manifest_path.unlink(missing_ok=True)  # type: ignore[call-arg]
+        except TypeError:
+            if manifest_path.exists():
+                try:
+                    manifest_path.unlink()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        official_meta = {
+            "program_title": program_title,
+            "asset_type": asset_type,
+            "asset_specific_type": asset_specific_type,
+            "serial_number": serial,
+            "part_number": str(header_meta.get("part_number") or "Unknown"),
+            "revision": str(header_meta.get("revision") or "Unknown"),
+            "test_date": str(header_meta.get("test_date") or "Unknown"),
+            "report_date": str(header_meta.get("report_date") or "Unknown"),
+            "vendor": str(header_meta.get("vendor") or "Unknown"),
+            "acceptance_test_plan_number": str(header_meta.get("acceptance_test_plan_number") or "Unknown"),
+            "document_type": "TD",
+            "document_type_acronym": "TD",
+            "document_type_status": "confirmed",
+            "document_type_source": TD_SERIAL_OFFICIAL_SOURCE_METADATA_SOURCE,
+            "document_type_reason": TD_SERIAL_OFFICIAL_SOURCE_METADATA_SOURCE,
+            "document_type_evidence": [
+                {
+                    "kind": TD_SERIAL_OFFICIAL_SOURCE_METADATA_SOURCE,
+                    "serial_number": serial,
+                    "sequence_count": len(manifest_members),
+                    "source_count": 1,
+                }
+            ],
+            "document_type_review_required": False,
+            "excel_sqlite_rel": sqlite_rel,
+            "file_extension": ".sqlite3",
+            "metadata_source": TD_SERIAL_OFFICIAL_SOURCE_METADATA_SOURCE,
+            "source_metadata_rel": header_metadata_rel,
+            "source_sqlite_rel": header_sqlite_rel,
+            "source_artifacts_rel": str(header_member.get("artifacts_rel") or "").strip(),
+            "source_file": str(header_member.get("source_file") or "").strip(),
+            "source_sheet_name": header_sheet_name,
+            "sequence_count": len(manifest_members),
+        }
+        metadata_path.write_text(json.dumps(official_meta, indent=2, ensure_ascii=True), encoding="utf-8")
+    else:
+        aggregate_meta = {
+            "program_title": program_title,
+            "asset_type": asset_type,
+            "asset_specific_type": asset_specific_type,
+            "serial_number": serial,
+            "part_number": str(header_meta.get("part_number") or "Unknown"),
+            "revision": str(header_meta.get("revision") or "Unknown"),
+            "test_date": str(header_meta.get("test_date") or "Unknown"),
+            "report_date": str(header_meta.get("report_date") or "Unknown"),
+            "vendor": str(header_meta.get("vendor") or "Unknown"),
+            "acceptance_test_plan_number": str(header_meta.get("acceptance_test_plan_number") or "Unknown"),
+            "document_type": "TD",
+            "document_type_acronym": "TD",
+            "document_type_status": "confirmed",
+            "document_type_source": "td_serial_aggregate",
+            "document_type_reason": "td_serial_aggregate",
+            "document_type_evidence": [
+                {
+                    "kind": "td_serial_aggregate",
+                    "serial_number": serial,
+                    "sequence_count": len(manifest_members),
+                }
+            ],
+            "document_type_review_required": False,
+            "excel_sqlite_rel": sqlite_rel,
+            "file_extension": ".sqlite3",
+            "metadata_source": TD_SERIAL_AGGREGATE_METADATA_SOURCE,
+            "aggregate_header_source_metadata_rel": header_metadata_rel,
+            "aggregate_header_source_sqlite_rel": header_sqlite_rel,
+            "aggregate_header_source_sheet_name": header_sheet_name,
+        }
+        metadata_path.write_text(json.dumps(aggregate_meta, indent=2, ensure_ascii=True), encoding="utf-8")
+        manifest = {
+            "kind": TD_SERIAL_AGGREGATE_METADATA_SOURCE,
+            "serial_number": serial,
+            "program_title": program_title,
+            "asset_type": asset_type,
+            "asset_specific_type": asset_specific_type,
+            "sqlite_rel": sqlite_rel,
+            "metadata_rel": _safe_repo_rel(paths.global_repo, metadata_path),
+            "source_metadata_rels": source_metadata_rels,
+            "header_metadata_source_metadata_rel": header_metadata_rel,
+            "header_metadata_source_sqlite_rel": header_sqlite_rel,
+            "header_metadata_source_sheet_name": header_sheet_name,
+            "header_metadata_source_mtime_ns": int(header_member.get("metadata_mtime_ns") or 0),
+            "sequence_count": len(manifest_members),
+            "members": manifest_members,
+            "warnings": warnings,
+            "built_epoch_ns": int(now_ns),
+        }
+        manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=True), encoding="utf-8")
     if export_text_mirror is not None:
         try:
             export_text_mirror(sqlite_path)
@@ -1941,10 +2071,11 @@ def _td_agg_write_group(
         except Exception:
             pass
     return {
+        "kind": "official_source" if is_single_source else "aggregate",
         "serial_number": serial,
         "sqlite_path": str(sqlite_path),
         "metadata_path": str(metadata_path),
-        "manifest_path": str(manifest_path),
+        "manifest_path": "" if is_single_source else str(manifest_path),
         "sequence_count": len(manifest_members),
         "warnings": warnings,
     }
@@ -1959,12 +2090,20 @@ def _td_agg_clear_previous_outputs(aggregate_root: Path) -> None:
             rel_parts = [part.casefold() for part in path.relative_to(root).parts]
         except Exception:
             rel_parts = [part.casefold() for part in path.parts]
-        if "sources" in rel_parts:
-            continue
         try:
+            if path.is_dir() and path.name.casefold() == TD_SERIAL_SOURCE_ARTIFACTS_DIRNAME.casefold():
+                shutil.rmtree(path, ignore_errors=True)
+                continue
             if path.is_file():
                 low = path.name.lower()
-                if low == "td_serial_aggregate.json" or low.endswith(".sqlite3") or low.endswith("_metadata.json"):
+                if (
+                    low == "td_serial_aggregate.json"
+                    or low.endswith(".sqlite3")
+                    or low.endswith(".sqlite3.txt")
+                    or low.endswith(".sqlite3.xlsx")
+                    or low.endswith("_metadata.json")
+                    or low.endswith(".metadata.json")
+                ):
                     path.unlink(missing_ok=True)  # type: ignore[call-arg]
             elif path.is_dir():
                 try:
@@ -1990,7 +2129,7 @@ def rebuild_td_serial_aggregates(
     export_excel_mirror: Any | None = None,
     mirror_xlsx: bool = False,
 ) -> dict[str, Any]:
-    members = _td_agg_collect_members(paths)
+    members, skipped_sources = _td_agg_collect_members(paths)
     aggregate_root = _td_extractions_root(paths.support_dir)
     _td_agg_clear_previous_outputs(aggregate_root)
     groups: dict[tuple[str, str, str, str], list[dict[str, Any]]] = {}
@@ -2000,6 +2139,8 @@ def rebuild_td_serial_aggregates(
             continue
         groups.setdefault(key, []).append(member)
     outputs: list[dict[str, Any]] = []
+    aggregate_count = 0
+    official_source_count = 0
     for _key, group_members in sorted(groups.items(), key=lambda item: item[0]):
         ordered = sorted(
             group_members,
@@ -2012,19 +2153,26 @@ def rebuild_td_serial_aggregates(
         )
         if not ordered:
             continue
-        outputs.append(
-            _td_agg_write_group(
-                paths,
-                group_members=ordered,
-                export_text_mirror=export_text_mirror,
-                export_excel_mirror=export_excel_mirror,
-                mirror_xlsx=bool(mirror_xlsx),
-            )
+        output = _td_agg_write_group(
+            paths,
+            group_members=ordered,
+            export_text_mirror=export_text_mirror,
+            export_excel_mirror=export_excel_mirror,
+            mirror_xlsx=bool(mirror_xlsx),
         )
+        outputs.append(output)
+        if str(output.get("kind") or "") == "aggregate":
+            aggregate_count += 1
+        else:
+            official_source_count += 1
     return {
         "aggregate_root": str(aggregate_root),
         "source_sequence_count": len(members),
-        "aggregate_count": len(outputs),
+        "materialized_count": len(outputs),
+        "aggregate_count": int(aggregate_count),
+        "official_source_count": int(official_source_count),
+        "skipped_source_count": len(skipped_sources),
+        "skipped_sources": skipped_sources,
         "aggregates": outputs,
     }
 
@@ -2231,7 +2379,10 @@ def process_candidates(
             {
                 "triggered": False,
                 "source_results_detected": 0,
+                "materialized_count": 0,
                 "aggregate_count": 0,
+                "official_source_count": 0,
+                "skipped_source_count": 0,
                 "aggregates": [],
             }
         )
@@ -2431,33 +2582,6 @@ def process_candidates(
                         is_confirmed_test_data = bool(is_mat) or _is_confirmed_test_data_meta(
                             raw_meta if isinstance(raw_meta, dict) else {}
                         )
-                        if is_test_data and isinstance(raw_meta, dict):
-                            scoped_artifacts_root = _td_source_scoped_artifacts_dir(
-                                paths.support_dir,
-                                raw_meta,
-                                metadata_identity_path,
-                                bundle_stem=bundle_seed.bundle_stem if is_mat_bundle and bundle_seed is not None else "",
-                            )
-                            try:
-                                scoped_existing_meta = load_metadata_from_artifacts(
-                                    scoped_artifacts_root,
-                                    metadata_identity_path,
-                                )
-                            except Exception:
-                                scoped_existing_meta = None
-                            if scoped_existing_meta is not None:
-                                try:
-                                    raw_meta = canonicalize_metadata_for_file(
-                                        bundle_seed.file_path if is_mat_bundle and bundle_seed is not None else abs_path,
-                                        existing_meta=scoped_existing_meta,
-                                        extracted_meta=raw_meta,
-                                        default_document_type="TD" if is_mat else "Unknown",
-                                    )
-                                    existing_meta = scoped_existing_meta
-                                except Exception:
-                                    pass
-                            artifacts_root = scoped_artifacts_root
-                            artifacts_dir = str(artifacts_root)
 
                         # Always run config-driven extraction as part of processing.
                         # If pandas is missing, allow Test Data flows to continue (SQLite is the key output).
@@ -2932,7 +3056,10 @@ def process_candidates(
             aggregate_payload = {
                 "triggered": True,
                 "source_results_detected": int(td_source_results_detected),
+                "materialized_count": 0,
                 "aggregate_count": 0,
+                "official_source_count": 0,
+                "skipped_source_count": 0,
                 "aggregates": [],
                 "error": str(exc),
             }

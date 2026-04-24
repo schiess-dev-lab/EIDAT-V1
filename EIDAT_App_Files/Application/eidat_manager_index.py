@@ -15,6 +15,8 @@ from eidat_manager_metadata import normalize_title, sanitize_metadata
 
 TD_FILE_EXTRACTIONS_DIRNAME = "Test Data File Extractions"
 TD_LEGACY_SERIAL_SOURCES_DIRNAME = "td_serial_sources"
+TD_SERIAL_SOURCE_ARTIFACTS_DIRNAME = "sources"
+TD_OFFICIAL_METADATA_SOURCES = {"td_serial_aggregate", "td_serial_official_source"}
 
 
 @dataclass(frozen=True)
@@ -255,6 +257,42 @@ def _connect(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
+def _rel_parts(value: object) -> list[str]:
+    raw = str(value or "").strip().strip('"').strip("'")
+    if not raw:
+        return []
+    return [part for part in re.split(r"[\\/]+", raw) if part and part != "."]
+
+
+def _is_confirmed_td_meta(meta: dict[str, Any]) -> bool:
+    doc_type = str(meta.get("document_type_acronym") or meta.get("document_type") or "").strip().upper()
+    status = str(meta.get("document_type_status") or "").strip().lower()
+    review_required = bool(meta.get("document_type_review_required"))
+    return doc_type == "TD" and status == "confirmed" and not review_required
+
+
+def _should_index_td_metadata(meta_path: Path, support_dir: Path, meta: dict[str, Any]) -> bool:
+    if not _is_confirmed_td_meta(meta):
+        return True
+    try:
+        rel = str(meta_path.resolve().relative_to(Path(support_dir).resolve())).replace("\\", "/")
+    except Exception:
+        rel = str(meta_path).replace("\\", "/")
+    parts = [part.casefold() for part in _rel_parts(rel)]
+    td_root = TD_FILE_EXTRACTIONS_DIRNAME.casefold()
+    debug_root = ["debug", "ocr"]
+    if td_root in parts:
+        root_idx = parts.index(td_root)
+        if TD_SERIAL_SOURCE_ARTIFACTS_DIRNAME.casefold() in parts[root_idx + 1 :]:
+            return False
+        meta_source = str(meta.get("metadata_source") or "").strip().casefold()
+        if meta_source in TD_OFFICIAL_METADATA_SOURCES:
+            return True
+        parent_name = str(meta_path.parent.name or "").strip()
+        return str(meta_path.stem or "").strip().casefold() == f"{parent_name}_metadata".casefold()
+    return parts[:2] != debug_root
+
+
 def _load_metadata_files(support_dir: Path) -> list[Path]:
     files: list[Path] = []
     roots = [
@@ -358,6 +396,11 @@ def build_index(paths: SupportPaths, *, similarity: float = 0.86) -> IndexSummar
         is_excel_artifacts = str(meta_path.parent.name).endswith("__excel")
         default_doc_type = "Unknown"
         meta = sanitize_metadata(raw, default_document_type=default_doc_type)
+        raw_metadata_source = str(raw.get("metadata_source") or "").strip()
+        if raw_metadata_source and str(meta.get("metadata_source") or "").strip() in {"", "scanned"}:
+            meta["metadata_source"] = raw_metadata_source
+        if not _should_index_td_metadata(meta_path, support_dir, meta):
+            continue
         title = str(meta.get("program_title") or "")
 
         title_norm = normalize_title(title)

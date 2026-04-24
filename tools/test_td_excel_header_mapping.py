@@ -694,6 +694,67 @@ class TestTDExcelHeaderMapping(unittest.TestCase):
             self.assertEqual(diagnostics.get("merge_status"), "merged_on_x_axis")
             self.assertEqual(diagnostics.get("merge_x_axis"), "Time")
 
+    def test_importer_keeps_distinct_sqlite_columns_for_same_canonical_headers(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            workbook_path = root / "td_canonical_collision.xlsx"
+            sqlite_path = root / "td_canonical_collision.sqlite3"
+            cells: list[tuple[int, int, object]] = [
+                (1, 1, "Sequence No:"),
+                (1, 3, 1),
+                (2, 1, "Time"),
+                (2, 2, "Cf"),
+            ]
+            cells.extend((row + 3, 1, float(row)) for row in range(10))
+            cells.extend((row + 3, 2, 10.0 + float(row)) for row in range(10))
+            cells.extend(
+                [
+                    (20, 1, "Sequence No:"),
+                    (20, 3, 1),
+                    (21, 1, "Time"),
+                    (21, 2, "Cf calc"),
+                ]
+            )
+            cells.extend((row + 22, 1, float(row)) for row in range(10))
+            cells.extend((row + 22, 2, 200.0 + float(row)) for row in range(10))
+            self._build_workbook_from_cells(workbook_path, title="DataPages", cells=cells)
+
+            self._import_workbook(workbook_path, sqlite_path, synthesize_td_seq_aliases=True)
+
+            raw_headers, mapped_headers, sqlite_cols, _source_sheet_name = self._sheet_info_row(
+                sqlite_path,
+                sheet_name="seq_1",
+            )
+            self.assertEqual(raw_headers, ["Time", "Cf", "Cf calc"])
+            self.assertEqual(mapped_headers, ["Time", "Cf_calc", "Cf_calc"])
+            self.assertEqual(sqlite_cols, ["excel_row", "Time", "Cf", "Cf_calc"])
+
+            cols, rows = self._table_rows(sqlite_path, sheet_name="seq_1")
+            self.assertEqual(cols, ["excel_row", "Time", "Cf", "Cf_calc"])
+            self.assertEqual(rows[0][1:], (0.0, 10.0, 200.0))
+            self.assertEqual(rows[-1][1:], (9.0, 19.0, 209.0))
+
+            conn = sqlite3.connect(str(sqlite_path))
+            try:
+                column_map_rows = conn.execute(
+                    """
+                    SELECT header, mapped_header, sqlite_column
+                    FROM __column_map
+                    WHERE sheet_name=? AND mapped_header=?
+                    ORDER BY rowid
+                    """,
+                    ("seq_1", "Cf_calc"),
+                ).fetchall()
+            finally:
+                conn.close()
+            self.assertEqual(
+                column_map_rows,
+                [
+                    ("Cf", "Cf_calc", "Cf"),
+                    ("Cf calc", "Cf_calc", "Cf_calc"),
+                ],
+            )
+
     def test_importer_merges_multirow_continuation_blocks_into_single_sequence(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
             root = Path(td)

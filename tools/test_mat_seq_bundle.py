@@ -167,28 +167,22 @@ class TestMatSeqBundle(unittest.TestCase):
             self.assertEqual([m.sequence_name for m in members], ["seq1", "seq2", "seq3"])
             bundle = detect_mat_bundle_member(seq1, repo_root=repo)
             assert bundle is not None
-            artifact_matches = list(
-                (paths.support_dir / "Test Data File Extractions").glob(
-                    f"*/*/*/SN123/sources/{bundle.bundle_stem}__*__excel"
-                )
-            )
-            self.assertEqual(len(artifact_matches), 1)
-            artifacts_dir = artifact_matches[0]
+            artifacts_dir = paths.support_dir / "debug" / "ocr" / f"{bundle.bundle_stem}__excel"
             sqlite_path = artifacts_dir / f"{bundle.bundle_stem}.sqlite3"
             metadata_path = artifacts_dir / f"{bundle.bundle_stem}_metadata.json"
             manifest_path = artifacts_dir / "mat_seq_bundle.json"
-            aggregate_dir = artifacts_dir.parent.parent
-            aggregate_sqlite = aggregate_dir / "SN123.sqlite3"
-            aggregate_metadata = aggregate_dir / "SN123_metadata.json"
-            aggregate_manifest = aggregate_dir / "td_serial_aggregate.json"
+            official_dir = paths.support_dir / "Test Data File Extractions" / "Unknown" / "Valve" / "ModelX" / "SN123"
+            official_sqlite = official_dir / "SN123.sqlite3"
+            official_metadata = official_dir / "SN123_metadata.json"
+            official_manifest = official_dir / "td_serial_aggregate.json"
 
             self.assertTrue(artifacts_dir.exists())
             self.assertTrue(sqlite_path.exists())
             self.assertTrue(metadata_path.exists())
             self.assertTrue(manifest_path.exists())
-            self.assertTrue(aggregate_sqlite.exists())
-            self.assertTrue(aggregate_metadata.exists())
-            self.assertTrue(aggregate_manifest.exists())
+            self.assertTrue(official_sqlite.exists())
+            self.assertTrue(official_metadata.exists())
+            self.assertFalse(official_manifest.exists())
             self.assertFalse((paths.support_dir / "debug" / "ocr" / "SN123_seq1__excel").exists())
             meta = __import__("json").loads(metadata_path.read_text(encoding="utf-8"))
             manifest = __import__("json").loads(manifest_path.read_text(encoding="utf-8"))
@@ -196,6 +190,9 @@ class TestMatSeqBundle(unittest.TestCase):
             self.assertEqual(str(meta.get("asset_specific_type") or "").strip(), "ModelX")
             self.assertEqual(str(manifest.get("asset_type") or "").strip(), "Valve")
             self.assertEqual(str(manifest.get("asset_specific_type") or "").strip(), "ModelX")
+            official_meta = __import__("json").loads(official_metadata.read_text(encoding="utf-8"))
+            self.assertEqual(str(official_meta.get("metadata_source") or "").strip(), "td_serial_official_source")
+            self.assertEqual(str(official_meta.get("source_artifacts_rel") or "").replace("\\", "/"), str(artifacts_dir.relative_to(paths.support_dir)).replace("\\", "/"))
 
             with sqlite3.connect(str(sqlite_path)) as conn:
                 runs = [str(row[0] or "") for row in conn.execute("SELECT sheet_name FROM __sheet_info ORDER BY sheet_name").fetchall()]
@@ -211,25 +208,13 @@ class TestMatSeqBundle(unittest.TestCase):
             build_index(paths)
             docs = read_eidat_index_documents(repo)
             td_docs = [doc for doc in docs if str(doc.get("serial_number") or "").strip() == "SN123"]
-            self.assertEqual(len(td_docs), 2)
-            source_docs = [
-                doc
-                for doc in td_docs
-                if "/sources/" in str(doc.get("artifacts_rel") or "").replace("\\", "/")
-            ]
-            aggregate_docs = [
-                doc
-                for doc in td_docs
-                if "/sources/" not in str(doc.get("artifacts_rel") or "").replace("\\", "/")
-            ]
-            self.assertEqual(len(source_docs), 1)
-            self.assertEqual(len(aggregate_docs), 1)
-            self.assertIn(bundle.bundle_stem, str(source_docs[0].get("excel_sqlite_rel") or ""))
-            self.assertTrue(str(aggregate_docs[0].get("excel_sqlite_rel") or "").replace("\\", "/").endswith("/SN123/SN123.sqlite3"))
+            self.assertEqual(len(td_docs), 1)
+            self.assertEqual(str(td_docs[0].get("metadata_source") or "").strip(), "td_serial_official_source")
+            self.assertTrue(str(td_docs[0].get("excel_sqlite_rel") or "").replace("\\", "/").endswith("/SN123/SN123.sqlite3"))
 
             resolved_artifacts = get_file_artifacts_path(repo, "Valve/ModelX/SN123_seq2.mat")
             self.assertIsNotNone(resolved_artifacts)
-            self.assertEqual(resolved_artifacts, artifacts_dir)
+            self.assertEqual(resolved_artifacts, official_dir)
 
             scan_after = scan_global_repo(paths)
             self.assertEqual(len(scan_after.candidates), 0)
@@ -261,20 +246,17 @@ class TestMatSeqBundle(unittest.TestCase):
             scan_global_repo(paths)
             results = process_candidates(paths)
             self.assertTrue(any(item.ok for item in results))
-            matches = list(
-                (paths.support_dir / "Test Data File Extractions").glob(
-                    "*/*/*/*/sources/capture__*__excel"
-                )
-            )
-            self.assertEqual(len(matches), 1)
+            raw_dir = paths.support_dir / "debug" / "ocr" / "capture__excel"
+            self.assertTrue(raw_dir.exists())
+            self.assertTrue((raw_dir / "capture.sqlite3").exists())
 
     def test_rebuild_td_serial_aggregates_prefers_newest_metadata_for_header(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
             repo = Path(td)
             paths = support_paths(repo)
             support_dir = paths.support_dir
-            src_a_rel = Path("Test Data File Extractions/Program_A/Thruster/Valve/SN123/sources/source_a__1111111111__excel")
-            src_b_rel = Path("Test Data File Extractions/Program_A/Thruster/Valve/SN123/sources/source_b__2222222222__excel")
+            src_a_rel = Path("debug/ocr/source_a__excel")
+            src_b_rel = Path("debug/ocr/source_b__excel")
             src_a_dir = support_dir / src_a_rel
             src_b_dir = support_dir / src_b_rel
             src_a_dir.mkdir(parents=True, exist_ok=True)
@@ -342,6 +324,48 @@ class TestMatSeqBundle(unittest.TestCase):
                 str((src_b_rel / "source_b_metadata.json")).replace("\\", "/"),
             )
 
+    def test_rebuild_td_serial_aggregates_keeps_source_serial_when_tab_serial_is_placeholder(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            repo = Path(td)
+            paths = support_paths(repo)
+            support_dir = paths.support_dir
+            src_rel = Path("debug/ocr/source_bad__excel")
+            src_dir = support_dir / src_rel
+            src_dir.mkdir(parents=True, exist_ok=True)
+            src_sqlite = src_dir / "source_bad.sqlite3"
+            self._write_td_source_sqlite(src_sqlite, source_sheet_name="seq1", serial_number="REMSERIALNUMBER", thrust_offset=0.0)
+            meta_path = src_dir / "source_bad_metadata.json"
+            src_rel_text = str(src_rel).replace("/", "\\")
+            meta_path.write_text(
+                __import__("json").dumps(
+                    {
+                        "program_title": "Program A",
+                        "asset_type": "Thruster",
+                        "asset_specific_type": "Valve",
+                        "serial_number": "SN123",
+                        "document_type": "TD",
+                        "document_type_acronym": "TD",
+                        "document_type_status": "confirmed",
+                        "document_type_review_required": False,
+                        "excel_sqlite_rel": f"EIDAT Support\\{src_rel_text}\\source_bad.sqlite3",
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            payload = rebuild_td_serial_aggregates(paths)
+            self.assertEqual(int(payload.get("aggregate_count") or 0), 0)
+            self.assertEqual(int(payload.get("official_source_count") or 0), 1)
+
+            official_dir = support_dir / "Test Data File Extractions" / "Program_A" / "Thruster" / "Valve" / "SN123"
+            self.assertTrue((official_dir / "SN123.sqlite3").exists())
+            self.assertTrue((official_dir / "SN123_metadata.json").exists())
+            self.assertFalse((official_dir / "td_serial_aggregate.json").exists())
+            self.assertFalse((support_dir / "Test Data File Extractions" / "Program_A" / "Thruster" / "Valve" / "REMSERIALNUMBER").exists())
+            warnings = list((payload.get("aggregates") or [{}])[0].get("warnings") or [])
+            self.assertTrue(any("Ignored tab serial" in str(msg) for msg in warnings))
+
     def test_cmd_process_returns_td_aggregate_and_index_payload(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
             repo = Path(td)
@@ -368,7 +392,8 @@ class TestMatSeqBundle(unittest.TestCase):
             self.assertIn("index", payload)
             td_payload = dict(payload.get("td_serial_aggregates") or {})
             self.assertTrue(bool(td_payload.get("triggered")))
-            self.assertEqual(int(td_payload.get("aggregate_count") or 0), 1)
+            self.assertEqual(int(td_payload.get("aggregate_count") or 0), 0)
+            self.assertEqual(int(td_payload.get("official_source_count") or 0), 1)
             self.assertEqual(int((payload.get("index") or {}).get("metadata_count") or 0), 2)
 
 

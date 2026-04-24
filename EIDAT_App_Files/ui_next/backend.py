@@ -70,6 +70,7 @@ EXCEL_ARTIFACT_SUFFIX = "__excel"
 TD_SERIAL_SOURCES_DIRNAME = "Test Data File Extractions"
 TD_LEGACY_SERIAL_SOURCES_DIRNAME = "td_serial_sources"
 TD_SERIAL_SOURCE_ARTIFACTS_DIRNAME = "sources"
+TD_OFFICIAL_METADATA_SOURCES = {"td_serial_aggregate", "td_serial_official_source"}
 TD_DEFAULT_STATS_ORDER = ["mean", "min", "max", "std"]
 TD_ALLOWED_STATS_ORDER = ["mean", "min", "max", "std", "median", "count"]
 TD_ALLOWED_STATS = set(TD_ALLOWED_STATS_ORDER)
@@ -3698,24 +3699,35 @@ def _td_normalize_parameter_normalization(raw: object) -> dict[str, object]:
         groups.append(group)
         groups_by_id[group_id] = dict(group)
     mappings: list[dict[str, object]] = []
-    seen_rules: set[tuple[str, str, tuple[str, ...]]] = set()
+    seen_rules: set[tuple[str, str, tuple[str, ...], tuple[str, ...], tuple[str, ...]]] = set()
     for item in rules_raw or []:
         if not isinstance(item, Mapping):
             continue
-        canonical_id = str(item.get("canonical_id") or "").strip()
+        displayed_parameter = str(
+            item.get("displayed_parameter")
+            or item.get("display_name")
+            or ""
+        ).strip()
+        canonical_id = str(item.get("canonical_id") or "").strip() or _td_program_parameter_canonical_id(displayed_parameter)
         raw_name = str(item.get("raw_name") or item.get("name") or "").strip()
         if not canonical_id or not raw_name:
             continue
         if canonical_id not in groups_by_id:
             groups_by_id[canonical_id] = {
                 "id": canonical_id,
-                "display_name": "",
-                "preferred_units": "",
+                "display_name": displayed_parameter,
+                "preferred_units": str(item.get("preferred_units") or item.get("units") or "").strip(),
             }
             groups.append(dict(groups_by_id[canonical_id]))
         program_titles = item.get("program_titles")
         if not isinstance(program_titles, list):
             program_titles = item.get("programs") if isinstance(item.get("programs"), list) else []
+        asset_types = item.get("asset_types")
+        if not isinstance(asset_types, list):
+            asset_types = [item.get("asset_type")] if str(item.get("asset_type") or "").strip() else []
+        asset_specific_types = item.get("asset_specific_types")
+        if not isinstance(asset_specific_types, list):
+            asset_specific_types = [item.get("asset_specific_type")] if str(item.get("asset_specific_type") or "").strip() else []
         programs_clean: list[str] = []
         seen_programs: set[str] = set()
         for value in (program_titles or []):
@@ -3724,17 +3736,55 @@ def _td_normalize_parameter_normalization(raw: object) -> dict[str, object]:
             if text and norm not in seen_programs:
                 seen_programs.add(norm)
                 programs_clean.append(text)
-        rule_key = (canonical_id, _td_param_norm_name(raw_name), tuple(sorted(_td_param_norm_program(v) for v in programs_clean)))
+        assets_clean: list[str] = []
+        seen_assets: set[str] = set()
+        for value in (asset_types or []):
+            text = _td_program_parameter_scope_text(value)
+            norm = _td_param_norm_program(text)
+            if text and norm not in seen_assets:
+                seen_assets.add(norm)
+                assets_clean.append(text)
+        asset_specific_clean: list[str] = []
+        seen_asset_specific: set[str] = set()
+        for value in (asset_specific_types or []):
+            text = _td_program_parameter_scope_text(value)
+            norm = _td_param_norm_program(text)
+            if text and norm not in seen_asset_specific:
+                seen_asset_specific.add(norm)
+                asset_specific_clean.append(text)
+        rule_key = (
+            canonical_id,
+            _td_param_norm_name(raw_name),
+            tuple(sorted(_td_param_norm_program(v) for v in programs_clean)),
+            tuple(sorted(_td_param_norm_program(v) for v in assets_clean)),
+            tuple(sorted(_td_param_norm_program(v) for v in asset_specific_clean)),
+        )
         if rule_key in seen_rules:
             continue
         seen_rules.add(rule_key)
+        if displayed_parameter:
+            groups_by_id[canonical_id]["display_name"] = displayed_parameter
+        preferred_units = str(item.get("preferred_units") or item.get("units") or groups_by_id[canonical_id].get("preferred_units") or "").strip()
+        if preferred_units:
+            groups_by_id[canonical_id]["preferred_units"] = preferred_units
         mappings.append(
             {
                 "canonical_id": canonical_id,
                 "raw_name": raw_name,
                 "program_titles": programs_clean,
+                "asset_types": assets_clean,
+                "asset_specific_types": asset_specific_clean,
+                "default_display_parameter": str(item.get("default_display_parameter") or "").strip(),
+                "displayed_parameter": displayed_parameter,
+                "preferred_units": preferred_units,
+                "edited": bool(item.get("edited")),
             }
         )
+    groups = [
+        dict(groups_by_id.get(str(group.get("id") or "").strip()) or group)
+        for group in groups
+        if str(group.get("id") or "").strip()
+    ]
     return {
         "version": int(payload.get("version") or TD_PARAMETER_NORMALIZATION_VERSION),
         "groups": groups,
@@ -3765,6 +3815,20 @@ def _td_parameter_normalization_persistable(normalization: Mapping[str, object] 
                     for value in (rule.get("program_titles") or [])
                     if str(value).strip()
                 ],
+                "asset_types": [
+                    str(value).strip()
+                    for value in (rule.get("asset_types") or [])
+                    if str(value).strip()
+                ],
+                "asset_specific_types": [
+                    str(value).strip()
+                    for value in (rule.get("asset_specific_types") or [])
+                    if str(value).strip()
+                ],
+                "default_display_parameter": str(rule.get("default_display_parameter") or "").strip(),
+                "displayed_parameter": str(rule.get("displayed_parameter") or "").strip(),
+                "preferred_units": str(rule.get("preferred_units") or "").strip(),
+                "edited": bool(rule.get("edited")),
             }
             for rule in (normalized.get("mappings") or [])
             if isinstance(rule, Mapping)
@@ -3772,6 +3836,153 @@ def _td_parameter_normalization_persistable(normalization: Mapping[str, object] 
             and str(rule.get("raw_name") or "").strip()
         ],
     }
+
+
+def _td_project_global_repo(project_dir: Path) -> Path | None:
+    meta = _read_project_meta(Path(project_dir).expanduser())
+    raw = str(meta.get("global_repo") or "").strip()
+    return Path(raw).expanduser() if raw else None
+
+
+def _td_project_program_titles(
+    project_dir: Path,
+    *,
+    workbook_path: Path | None = None,
+    db_path: Path | None = None,
+) -> list[str]:
+    proj_dir = Path(project_dir).expanduser()
+    programs: set[str] = set()
+    impl_db = Path(db_path).expanduser() if db_path else (proj_dir / EIDAT_PROJECT_IMPLEMENTATION_DB)
+    if impl_db.exists():
+        try:
+            with sqlite3.connect(str(impl_db)) as conn:
+                _ensure_test_data_impl_tables(conn)
+                rows = conn.execute(
+                    """
+                    SELECT DISTINCT program_title
+                    FROM td_source_metadata
+                    WHERE TRIM(COALESCE(program_title, '')) <> ''
+                    ORDER BY program_title
+                    """
+                ).fetchall()
+            programs.update(str(row[0] or "").strip() for row in rows if str(row[0] or "").strip())
+        except Exception:
+            pass
+    if programs:
+        return sorted(programs, key=str.casefold)
+    repo = _td_project_global_repo(proj_dir)
+    if repo is None:
+        return []
+    meta = _read_project_meta(proj_dir)
+    selected_rels = [
+        str(value).strip()
+        for value in (meta.get("selected_metadata_rel") or [])
+        if str(value).strip()
+    ]
+    if not selected_rels:
+        return []
+    try:
+        docs = read_eidat_index_documents(repo)
+    except Exception:
+        return []
+    wanted = {value.casefold() for value in selected_rels}
+    for doc in docs:
+        if not isinstance(doc, Mapping):
+            continue
+        metadata_rel = str(doc.get("metadata_rel") or "").strip()
+        program_title = str(doc.get("program_title") or "").strip()
+        if metadata_rel and metadata_rel.casefold() in wanted and program_title:
+            programs.add(program_title)
+    return sorted(programs, key=str.casefold)
+
+
+def load_td_repo_parameter_mappings(
+    project_dir: Path,
+    *,
+    workbook_path: Path | None = None,
+    db_path: Path | None = None,
+) -> list[dict[str, object]]:
+    proj_dir = Path(project_dir).expanduser()
+    repo = _td_project_global_repo(proj_dir)
+    if repo is None:
+        return []
+    rows: list[dict[str, object]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for program_title in _td_project_program_titles(
+        proj_dir,
+        workbook_path=workbook_path,
+        db_path=db_path,
+    ):
+        workbook_file = td_program_requirements_workbook_path_for(repo, program_title)
+        if not workbook_file.exists():
+            continue
+        try:
+            workbook_rows = _td_program_requirements_read_parameter_mappings(workbook_file)
+        except Exception:
+            continue
+        for row in workbook_rows:
+            normalized = _td_program_parameter_mapping_normalize(row, program_title=program_title)
+            key = _td_program_parameter_scope_key(
+                normalized.get("program_title"),
+                normalized.get("asset_type"),
+                normalized.get("asset_specific_type"),
+                normalized.get("ingested_parameter"),
+            )
+            if not key[-1] or key in seen:
+                continue
+            seen.add(key)
+            rows.append(normalized)
+    return sorted(rows, key=_td_program_parameter_mapping_sort_key)
+
+
+def save_td_repo_parameter_mappings(
+    project_dir: Path,
+    rows: Sequence[Mapping[str, object]] | None,
+) -> list[dict[str, object]]:
+    proj_dir = Path(project_dir).expanduser()
+    repo = _td_project_global_repo(proj_dir)
+    if repo is None:
+        raise RuntimeError("Project is missing its Global Repo path.")
+    normalized_rows = [
+        _td_program_parameter_mapping_normalize(row)
+        for row in (rows or [])
+        if _td_program_parameter_mapping_normalize(row)
+    ]
+    rows_by_program: dict[str, list[dict[str, object]]] = {}
+    for row in normalized_rows:
+        program_title = str(row.get("program_title") or "").strip() or TD_SUPPORT_DEFAULT_PROGRAM_TITLE
+        rows_by_program.setdefault(program_title, []).append(row)
+    for program_title, program_rows in rows_by_program.items():
+        workbook_file = td_program_requirements_workbook_path_for(repo, program_title)
+        existing_conditions: list[dict[str, object]] = []
+        if workbook_file.exists():
+            try:
+                from openpyxl import load_workbook  # type: ignore
+            except Exception as exc:
+                raise RuntimeError(
+                    "openpyxl is required to update ProgramRequirements workbooks. "
+                    "Install it with `py -m pip install openpyxl` within the project environment."
+                ) from exc
+            wb = load_workbook(str(workbook_file))
+            try:
+                state = _td_program_requirements_parse_workbook(wb)
+            finally:
+                try:
+                    wb.close()
+                except Exception:
+                    pass
+            existing_conditions = [
+                dict(item)
+                for item in (state.get("conditions") or [])
+                if isinstance(item, Mapping)
+            ]
+        _td_program_requirements_write_workbook(
+            workbook_file,
+            program_title=program_title,
+            discovered_conditions=existing_conditions,
+            parameter_mappings=program_rows,
+        )
+    return sorted(normalized_rows, key=_td_program_parameter_mapping_sort_key)
 
 
 def load_td_project_parameter_normalization(project_dir: Path) -> dict[str, object]:
@@ -3788,36 +3999,88 @@ def save_td_project_parameter_normalization(project_dir: Path, normalization: Ma
     return _td_normalize_parameter_normalization(payload)
 
 
+def _td_parameter_mapping_match_score(
+    rule: Mapping[str, object] | None,
+    *,
+    program_title: object = "",
+    asset_type: object = "",
+    asset_specific_type: object = "",
+) -> tuple[int, int, int] | None:
+    mapping = dict(rule or {})
+    want_program = _td_param_norm_program(program_title)
+    want_asset = _td_param_norm_program(_td_program_parameter_scope_text(asset_type))
+    want_specific = _td_param_norm_program(_td_program_parameter_scope_text(asset_specific_type))
+    rule_programs = {
+        _td_param_norm_program(value)
+        for value in (mapping.get("program_titles") or [])
+        if _td_param_norm_program(value)
+    }
+    rule_assets = {
+        _td_param_norm_program(value)
+        for value in (mapping.get("asset_types") or [])
+        if _td_param_norm_program(value)
+    }
+    rule_asset_specific = {
+        _td_param_norm_program(value)
+        for value in (mapping.get("asset_specific_types") or [])
+        if _td_param_norm_program(value)
+    }
+    if rule_programs and want_program not in rule_programs:
+        return None
+    if rule_assets and want_asset not in rule_assets:
+        return None
+    if rule_asset_specific and want_specific not in rule_asset_specific:
+        return None
+    return (
+        1 if rule_asset_specific else 0,
+        1 if rule_assets else 0,
+        1 if rule_programs else 0,
+    )
+
+
 def _td_effective_parameter_canonical(
     normalization: Mapping[str, object] | None,
     raw_name: object,
     program_title: object = "",
+    asset_type: object = "",
+    asset_specific_type: object = "",
+    fallback_display: object = "",
 ) -> str:
     normalized = _td_normalize_parameter_normalization(normalization)
     want_raw = _td_param_norm_name(raw_name)
     if not want_raw:
-        return _td_parameter_implicit_canonical_id(raw_name)
-    want_program = _td_param_norm_program(program_title)
-    global_match = ""
+        fallback_text = str(fallback_display or "").strip()
+        return _td_program_parameter_canonical_id(fallback_text) if fallback_text else _td_parameter_implicit_canonical_id(raw_name)
+    best_match: tuple[tuple[int, int, int], str] | None = None
     for rule in (normalized.get("mappings") or []):
         if not isinstance(rule, Mapping):
             continue
         if _td_param_norm_name(rule.get("raw_name")) != want_raw:
             continue
-        canonical_id = str(rule.get("canonical_id") or "").strip()
-        programs = [
-            _td_param_norm_program(value)
-            for value in (rule.get("program_titles") or [])
-            if _td_param_norm_program(value)
-        ]
-        if programs:
-            if want_program and want_program in programs:
-                return canonical_id
+        score = _td_parameter_mapping_match_score(
+            rule,
+            program_title=program_title,
+            asset_type=asset_type,
+            asset_specific_type=asset_specific_type,
+        )
+        if score is None:
             continue
-        if canonical_id:
-            global_match = canonical_id
-    if global_match:
-        return global_match
+        display_name = str(
+            rule.get("displayed_parameter")
+            or ((normalized.get("groups_by_id") or {}).get(str(rule.get("canonical_id") or "").strip()) or {}).get("display_name")
+            or fallback_display
+            or raw_name
+        ).strip()
+        canonical_id = str(rule.get("canonical_id") or "").strip() or _td_program_parameter_canonical_id(display_name)
+        if not canonical_id:
+            continue
+        if best_match is None or score > best_match[0]:
+            best_match = (score, canonical_id)
+    if best_match is not None:
+        return best_match[1]
+    fallback_text = str(fallback_display or "").strip()
+    if fallback_text:
+        return _td_program_parameter_canonical_id(fallback_text)
     return _td_parameter_implicit_canonical_id(raw_name)
 
 
@@ -3905,6 +4168,109 @@ def _td_parameter_inventory_suggestion(
     return {}
 
 
+def _td_build_repo_parameter_normalization(
+    rows: Sequence[Mapping[str, object]] | None,
+) -> dict[str, object]:
+    groups: list[dict[str, object]] = []
+    groups_by_id: dict[str, dict[str, object]] = {}
+    mappings: list[dict[str, object]] = []
+    for row in rows or []:
+        normalized_row = _td_program_parameter_mapping_normalize(row)
+        if not normalized_row:
+            continue
+        display_name = _td_program_parameter_effective_display(normalized_row)
+        canonical_id = _td_program_parameter_canonical_id(display_name)
+        if canonical_id not in groups_by_id:
+            group = {
+                "id": canonical_id,
+                "display_name": display_name,
+                "preferred_units": str(normalized_row.get("preferred_units") or "").strip(),
+            }
+            groups_by_id[canonical_id] = group
+            groups.append(dict(group))
+        elif str(normalized_row.get("preferred_units") or "").strip() and not str(groups_by_id[canonical_id].get("preferred_units") or "").strip():
+            groups_by_id[canonical_id]["preferred_units"] = str(normalized_row.get("preferred_units") or "").strip()
+        mappings.append(
+            {
+                "canonical_id": canonical_id,
+                "raw_name": str(normalized_row.get("ingested_parameter") or "").strip(),
+                "program_titles": [str(normalized_row.get("program_title") or "").strip()] if str(normalized_row.get("program_title") or "").strip() else [],
+                "asset_types": [str(normalized_row.get("asset_type") or "").strip()] if str(normalized_row.get("asset_type") or "").strip() else [],
+                "asset_specific_types": [str(normalized_row.get("asset_specific_type") or "").strip()] if str(normalized_row.get("asset_specific_type") or "").strip() else [],
+                "default_display_parameter": str(normalized_row.get("default_display_parameter") or "").strip(),
+                "displayed_parameter": str(normalized_row.get("displayed_parameter") or "").strip(),
+                "preferred_units": str(normalized_row.get("preferred_units") or "").strip(),
+                "edited": bool(normalized_row.get("edited")),
+            }
+        )
+    return _td_normalize_parameter_normalization(
+        {
+            "version": TD_PARAMETER_NORMALIZATION_VERSION,
+            "groups": groups,
+            "mappings": mappings,
+        }
+    )
+
+
+def _td_find_parameter_mapping_rule(
+    normalization: Mapping[str, object] | None,
+    raw_name: object,
+    *,
+    program_title: object = "",
+    asset_type: object = "",
+    asset_specific_type: object = "",
+) -> dict[str, object]:
+    normalized = _td_normalize_parameter_normalization(normalization)
+    want_raw = _td_param_norm_name(raw_name)
+    if not want_raw:
+        return {}
+    best_rule: dict[str, object] = {}
+    best_score: tuple[int, int, int] | None = None
+    for raw_rule in (normalized.get("mappings") or []):
+        if not isinstance(raw_rule, Mapping):
+            continue
+        if _td_param_norm_name(raw_rule.get("raw_name")) != want_raw:
+            continue
+        score = _td_parameter_mapping_match_score(
+            raw_rule,
+            program_title=program_title,
+            asset_type=asset_type,
+            asset_specific_type=asset_specific_type,
+        )
+        if score is None:
+            continue
+        if best_score is None or score > best_score:
+            best_score = score
+            best_rule = dict(raw_rule)
+    return best_rule
+
+
+def _td_effective_parameter_display(
+    normalization: Mapping[str, object] | None,
+    raw_name: object,
+    *,
+    program_title: object = "",
+    asset_type: object = "",
+    asset_specific_type: object = "",
+    fallback_display: object = "",
+) -> str:
+    rule = _td_find_parameter_mapping_rule(
+        normalization,
+        raw_name,
+        program_title=program_title,
+        asset_type=asset_type,
+        asset_specific_type=asset_specific_type,
+    )
+    display_name = str(
+        rule.get("displayed_parameter")
+        or rule.get("default_display_parameter")
+        or fallback_display
+        or raw_name
+        or ""
+    ).strip()
+    return display_name
+
+
 def td_build_parameter_normalization_context(
     project_dir: Path,
     workbook_path: Path | None = None,
@@ -3915,31 +4281,51 @@ def td_build_parameter_normalization_context(
     impl_db = Path(db_path).expanduser() if db_path else (proj_dir / EIDAT_PROJECT_IMPLEMENTATION_DB)
     raw_db = td_raw_cache_db_path_for(proj_dir)
     workbook = Path(workbook_path).expanduser() if workbook_path else Path()
+    repo_parameter_rows = load_td_repo_parameter_mappings(
+        proj_dir,
+        workbook_path=workbook if workbook else None,
+        db_path=impl_db,
+    )
     normalization = (
         _td_normalize_parameter_normalization(normalization_override)
         if isinstance(normalization_override, Mapping)
-        else load_td_project_parameter_normalization(proj_dir)
+        else _td_build_repo_parameter_normalization(repo_parameter_rows)
     )
     config_candidates = _td_parameter_config_candidates(workbook if workbook else None)
-    inventory_acc: dict[str, dict[str, object]] = {}
-    entry_keys: set[tuple[str, str, str, str, str, str]] = set()
+    inventory_acc: dict[tuple[str, str, str, str], dict[str, object]] = {}
+    entry_keys: set[tuple[str, str, str, str, str, str, str, str]] = set()
     entries: list[dict[str, str]] = []
 
-    def _inventory_row(raw_name: str) -> dict[str, object]:
+    def _inventory_row(
+        raw_name: str,
+        *,
+        program_title: str,
+        asset_type: str,
+        asset_specific_type: str,
+    ) -> dict[str, object]:
         raw_norm = _td_param_norm_name(raw_name)
-        row = inventory_acc.get(raw_norm)
+        row_key = (
+            raw_norm,
+            _td_param_norm_program(program_title),
+            _td_param_norm_program(asset_type),
+            _td_param_norm_program(asset_specific_type),
+        )
+        row = inventory_acc.get(row_key)
         if row is not None:
             return row
         row = {
             "raw_name": raw_name,
             "raw_norm": raw_norm,
+            "program_title": program_title,
+            "asset_type": asset_type,
+            "asset_specific_type": asset_specific_type,
             "_units": set(),
-            "_program_titles": set(),
             "_source_run_names": set(),
             "_surfaces": set(),
             "_run_names": set(),
+            "_source_keys": set(),
         }
-        inventory_acc[raw_norm] = row
+        inventory_acc[row_key] = row
         return row
 
     def _add_entry(
@@ -3947,26 +4333,53 @@ def td_build_parameter_normalization_context(
         raw_name: object,
         units: object = "",
         program_title: object = "",
+        asset_type: object = "",
+        asset_specific_type: object = "",
         source_run_name: object = "",
         run_name: object = "",
         surfaces: Sequence[str] | None = None,
+        source_key: object = "",
+        fallback_display: object = "",
     ) -> None:
         text = str(raw_name or "").strip()
         if not text:
             return
-        row = _inventory_row(text)
+        program_text = str(program_title or "").strip()
+        asset_text = _td_program_parameter_scope_text(asset_type)
+        asset_specific_text = _td_program_parameter_scope_text(asset_specific_type)
+        row = _inventory_row(
+            text,
+            program_title=program_text,
+            asset_type=asset_text,
+            asset_specific_type=asset_specific_text,
+        )
         units_text = str(units or "").strip()
         if units_text:
             cast(set[str], row["_units"]).add(units_text)
-        program_text = str(program_title or "").strip()
         source_run_text = str(source_run_name or "").strip()
         run_text = str(run_name or "").strip()
-        if program_text:
-            cast(set[str], row["_program_titles"]).add(program_text)
         if source_run_text:
             cast(set[str], row["_source_run_names"]).add(source_run_text)
         if run_text:
             cast(set[str], row["_run_names"]).add(run_text)
+        source_key_text = str(source_key or "").strip()
+        if source_key_text:
+            cast(set[str], row["_source_keys"]).add(source_key_text)
+        row["default_display_parameter"] = _td_effective_parameter_display(
+            normalization,
+            text,
+            program_title=program_text,
+            asset_type=asset_text,
+            asset_specific_type=asset_specific_text,
+            fallback_display=fallback_display or text,
+        ) or str(fallback_display or text).strip()
+        row["mapping_rule"] = _td_find_parameter_mapping_rule(
+            normalization,
+            text,
+            program_title=program_text,
+            asset_type=asset_text,
+            asset_specific_type=asset_specific_text,
+        )
         for surface in (surfaces or []):
             surface_key = str(surface or "").strip().lower()
             if not surface_key:
@@ -3977,7 +4390,10 @@ def td_build_parameter_normalization_context(
                 run_text.casefold(),
                 _td_param_norm_name(text),
                 _td_param_norm_program(program_text),
+                _td_param_norm_program(asset_text),
+                _td_param_norm_program(asset_specific_text),
                 source_run_text.casefold(),
+                source_key_text.casefold(),
                 _td_param_norm_name(units_text),
             )
             if entry_key in entry_keys:
@@ -3992,7 +4408,11 @@ def td_build_parameter_normalization_context(
                     "units": units_text,
                     "program_title": program_text,
                     "program_norm": _td_param_norm_program(program_text),
+                    "asset_type": asset_text,
+                    "asset_specific_type": asset_specific_text,
                     "source_run_name": source_run_text,
+                    "source_key": source_key_text,
+                    "default_display_parameter": str(row.get("default_display_parameter") or "").strip(),
                 }
             )
 
@@ -4007,24 +4427,32 @@ def td_build_parameter_normalization_context(
                         m.column_name,
                         COALESCE(c.units, ''),
                         COALESCE(m.program_title, ''),
-                        COALESCE(m.source_run_name, '')
+                        COALESCE(m.source_run_name, ''),
+                        COALESCE(sm.asset_type, ''),
+                        COALESCE(sm.asset_specific_type, ''),
+                        COALESCE(sm.source_serial_number, m.serial)
                     FROM td_metrics_calc m
                     LEFT JOIN td_columns_calc c
                       ON c.run_name = m.run_name AND c.name = m.column_name AND c.kind = 'y'
+                    LEFT JOIN td_source_metadata sm
+                      ON sm.serial = m.serial
                     WHERE m.value_num IS NOT NULL
                     ORDER BY m.run_name, m.column_name
                     """
                 ).fetchall()
             except Exception:
                 metric_rows = []
-            for run_name, raw_name, units, program_title, source_run_name in metric_rows:
+            for run_name, raw_name, units, program_title, source_run_name, asset_type, asset_specific_type, source_key in metric_rows:
                 _add_entry(
                     raw_name=raw_name,
                     units=units,
                     program_title=program_title,
+                    asset_type=asset_type,
+                    asset_specific_type=asset_specific_type,
                     source_run_name=source_run_name,
                     run_name=run_name,
                     surfaces=("metrics", "performance"),
+                    source_key=source_key,
                 )
             try:
                 life_rows = conn.execute(
@@ -4034,24 +4462,67 @@ def td_build_parameter_normalization_context(
                         parameter_name,
                         COALESCE(units, ''),
                         COALESCE(program_title, ''),
-                        COALESCE(source_run_name, '')
+                        COALESCE(source_run_name, ''),
+                        COALESCE(sm.asset_type, ''),
+                        COALESCE(sm.asset_specific_type, ''),
+                        COALESCE(sm.source_serial_number, l.serial)
                     FROM {TD_LIFE_METRICS_TABLE}
+                    LEFT JOIN td_source_metadata sm
+                      ON sm.serial = l.serial
                     WHERE lower(stat) = 'mean'
                     ORDER BY condition_key, parameter_name
                     """
                 ).fetchall()
             except Exception:
                 life_rows = []
-            for run_name, raw_name, units, program_title, source_run_name in life_rows:
+            for run_name, raw_name, units, program_title, source_run_name, asset_type, asset_specific_type, source_key in life_rows:
                 _add_entry(
                     raw_name=raw_name,
                     units=units,
                     program_title=program_title,
+                    asset_type=asset_type,
+                    asset_specific_type=asset_specific_type,
                     source_run_name=source_run_name,
                     run_name=run_name,
                     surfaces=("life_metrics",),
+                    source_key=source_key,
                 )
-    if raw_db.exists():
+            try:
+                curve_rows = conn.execute(
+                    f"""
+                    SELECT DISTINCT
+                        c.run_name,
+                        c.y_name,
+                        COALESCE(cat.units, ''),
+                        COALESCE(c.program_title, ''),
+                        COALESCE(c.source_run_name, ''),
+                        COALESCE(sm.asset_type, ''),
+                        COALESCE(sm.asset_specific_type, ''),
+                        COALESCE(sm.source_serial_number, c.serial)
+                    FROM {TD_PLOTTER_CURVES_TABLE} c
+                    LEFT JOIN {TD_PLOTTER_CURVE_CATALOG_TABLE} cat
+                      ON cat.run_name = c.run_name AND cat.parameter_name = c.y_name
+                    LEFT JOIN td_source_metadata sm
+                      ON sm.serial = c.serial
+                    ORDER BY c.run_name, c.y_name
+                    """
+                ).fetchall()
+            except Exception:
+                curve_rows = []
+            for run_name, raw_name, units, program_title, source_run_name, asset_type, asset_specific_type, source_key in curve_rows:
+                _add_entry(
+                    raw_name=raw_name,
+                    units=units,
+                    program_title=program_title,
+                    asset_type=asset_type,
+                    asset_specific_type=asset_specific_type,
+                    source_run_name=source_run_name,
+                    run_name=run_name,
+                    surfaces=("curves",),
+                    source_key=source_key,
+                )
+
+    if not entries and raw_db.exists():
         with sqlite3.connect(str(raw_db)) as conn:
             _ensure_test_data_raw_cache_tables(conn)
             try:
@@ -4084,7 +4555,14 @@ def td_build_parameter_normalization_context(
     canonical_groups: dict[str, dict[str, object]] = {}
     for entry in entries:
         raw_name = str(entry.get("raw_name") or "").strip()
-        canonical_id = _td_effective_parameter_canonical(normalization, raw_name, entry.get("program_title"))
+        canonical_id = _td_effective_parameter_canonical(
+            normalization,
+            raw_name,
+            entry.get("program_title"),
+            entry.get("asset_type"),
+            entry.get("asset_specific_type"),
+            fallback_display=entry.get("default_display_parameter"),
+        )
         group = canonical_groups.setdefault(
             canonical_id,
             {
@@ -4094,6 +4572,8 @@ def td_build_parameter_normalization_context(
                 "_raw_names": set(),
                 "_units": set(),
                 "_program_titles": set(),
+                "_asset_types": set(),
+                "_asset_specific_types": set(),
                 "_source_run_names": set(),
                 "_surfaces": set(),
                 "_run_names": set(),
@@ -4105,6 +4585,10 @@ def td_build_parameter_normalization_context(
             cast(set[str], group["_units"]).add(str(entry.get("units") or "").strip())
         if str(entry.get("program_title") or "").strip():
             cast(set[str], group["_program_titles"]).add(str(entry.get("program_title") or "").strip())
+        if str(entry.get("asset_type") or "").strip():
+            cast(set[str], group["_asset_types"]).add(str(entry.get("asset_type") or "").strip())
+        if str(entry.get("asset_specific_type") or "").strip():
+            cast(set[str], group["_asset_specific_types"]).add(str(entry.get("asset_specific_type") or "").strip())
         if str(entry.get("source_run_name") or "").strip():
             cast(set[str], group["_source_run_names"]).add(str(entry.get("source_run_name") or "").strip())
         if str(entry.get("surface") or "").strip():
@@ -4131,55 +4615,80 @@ def td_build_parameter_normalization_context(
         group["raw_names"] = raw_names
         group["units"] = units
         group["program_titles"] = sorted(cast(set[str], group.get("_program_titles") or set()), key=str.casefold)
+        group["asset_types"] = sorted(cast(set[str], group.get("_asset_types") or set()), key=str.casefold)
+        group["asset_specific_types"] = sorted(cast(set[str], group.get("_asset_specific_types") or set()), key=str.casefold)
         group["source_run_names"] = sorted(cast(set[str], group.get("_source_run_names") or set()), key=str.casefold)
         group["surfaces"] = sorted(cast(set[str], group.get("_surfaces") or set()), key=str.casefold)
         group["run_names"] = sorted(cast(set[str], group.get("_run_names") or set()), key=str.casefold)
         group["unit_conflict"] = len([value for value in units if str(value).strip()]) > 1
-        for key in ("_raw_names", "_units", "_program_titles", "_source_run_names", "_surfaces", "_run_names"):
+        for key in ("_raw_names", "_units", "_program_titles", "_asset_types", "_asset_specific_types", "_source_run_names", "_surfaces", "_run_names"):
             group.pop(key, None)
 
     inventory: list[dict[str, object]] = []
-    for row in sorted(inventory_acc.values(), key=lambda item: str(item.get("raw_name") or "").casefold()):
+    for row in sorted(
+        inventory_acc.values(),
+        key=lambda item: (
+            str(item.get("program_title") or "").casefold(),
+            str(item.get("asset_type") or "").casefold(),
+            str(item.get("asset_specific_type") or "").casefold(),
+            str(item.get("raw_name") or "").casefold(),
+        ),
+    ):
         raw_name = str(row.get("raw_name") or "").strip()
-        programs = sorted(cast(set[str], row.get("_program_titles") or set()), key=str.casefold)
-        canonical_ids = {
-            _td_effective_parameter_canonical(normalization, raw_name, program_title)
-            for program_title in (programs or [""])
-        }
+        program_title = str(row.get("program_title") or "").strip()
+        asset_type = str(row.get("asset_type") or "").strip()
+        asset_specific_type = str(row.get("asset_specific_type") or "").strip()
+        mapping_rule = dict(row.get("mapping_rule") or {})
+        canonical_id = _td_effective_parameter_canonical(
+            normalization,
+            raw_name,
+            program_title,
+            asset_type,
+            asset_specific_type,
+            fallback_display=row.get("default_display_parameter"),
+        )
+        canonical_ids = [canonical_id] if canonical_id else []
         suggestion = _td_parameter_inventory_suggestion(
             raw_name,
             units=sorted(cast(set[str], row.get("_units") or set()), key=str.casefold),
             config_candidates=config_candidates,
         )
-        primary_canonical_id = next(iter(sorted(canonical_ids))) if canonical_ids else _td_parameter_implicit_canonical_id(raw_name)
+        primary_canonical_id = canonical_id or _td_parameter_implicit_canonical_id(raw_name)
         status = "implicit"
-        if len(canonical_ids) > 1:
-            status = "split_by_program"
-        elif any(_td_param_norm_name(rule.get("raw_name")) == _td_param_norm_name(raw_name) for rule in (normalization.get("mappings") or [])):
-            status = "explicit"
+        if mapping_rule:
+            status = "edited" if bool(mapping_rule.get("edited")) else "default"
         elif suggestion:
             status = "suggested"
+        display_name = _td_effective_parameter_display(
+            normalization,
+            raw_name,
+            program_title=program_title,
+            asset_type=asset_type,
+            asset_specific_type=asset_specific_type,
+            fallback_display=row.get("default_display_parameter") or raw_name,
+        )
         inventory.append(
             {
                 "raw_name": raw_name,
                 "raw_norm": str(row.get("raw_norm") or "").strip(),
                 "units": sorted(cast(set[str], row.get("_units") or set()), key=str.casefold),
-                "program_titles": programs,
+                "program_title": program_title,
+                "program_titles": [program_title] if program_title else [],
+                "asset_type": asset_type,
+                "asset_specific_type": asset_specific_type,
                 "source_run_names": sorted(cast(set[str], row.get("_source_run_names") or set()), key=str.casefold),
                 "surfaces": sorted(cast(set[str], row.get("_surfaces") or set()), key=str.casefold),
                 "run_names": sorted(cast(set[str], row.get("_run_names") or set()), key=str.casefold),
-                "canonical_ids": sorted(canonical_ids),
-                "canonical_display": _td_parameter_display_name_for_group(
-                    normalization,
-                    primary_canonical_id,
-                    raw_names=[raw_name],
-                    fallback=raw_name,
-                ),
+                "canonical_ids": list(canonical_ids),
+                "canonical_display": display_name,
+                "default_display_parameter": str(row.get("default_display_parameter") or raw_name).strip(),
+                "displayed_parameter": display_name,
                 "primary_canonical_id": primary_canonical_id,
                 "status": status,
+                "edited": bool(mapping_rule.get("edited")),
                 "suggestion": suggestion,
-                "source_count": len(cast(set[str], row.get("_source_run_names") or set())),
-                "program_count": len(programs),
+                "source_count": len(cast(set[str], row.get("_source_keys") or set())) or len(cast(set[str], row.get("_source_run_names") or set())),
+                "program_count": 1 if program_title else 0,
             }
         )
 
@@ -4189,6 +4698,7 @@ def td_build_parameter_normalization_context(
         "db_path": str(impl_db),
         "raw_db_path": str(raw_db),
         "normalization": normalization,
+        "repo_parameter_rows": repo_parameter_rows,
         "inventory": inventory,
         "inventory_by_raw_norm": {
             str(row.get("raw_norm") or "").strip(): dict(row)
@@ -4231,7 +4741,14 @@ def td_build_parameter_selector_options(
         entry_raw_norm = _td_param_norm_name(entry_raw_name)
         if raw_norms and entry_raw_norm not in raw_norms:
             continue
-        canonical_id = _td_effective_parameter_canonical(normalization, entry_raw_name, entry.get("program_title"))
+        canonical_id = _td_effective_parameter_canonical(
+            normalization,
+            entry_raw_name,
+            entry.get("program_title"),
+            entry.get("asset_type"),
+            entry.get("asset_specific_type"),
+            fallback_display=entry.get("default_display_parameter"),
+        )
         group = groups.setdefault(
             canonical_id,
             {
@@ -4239,6 +4756,8 @@ def td_build_parameter_selector_options(
                 "_raw_names": set(),
                 "_units": set(),
                 "_program_titles": set(),
+                "_asset_types": set(),
+                "_asset_specific_types": set(),
                 "_run_names": set(),
                 "_surfaces": set(),
             },
@@ -4248,6 +4767,10 @@ def td_build_parameter_selector_options(
             cast(set[str], group["_units"]).add(str(entry.get("units") or "").strip())
         if str(entry.get("program_title") or "").strip():
             cast(set[str], group["_program_titles"]).add(str(entry.get("program_title") or "").strip())
+        if str(entry.get("asset_type") or "").strip():
+            cast(set[str], group["_asset_types"]).add(str(entry.get("asset_type") or "").strip())
+        if str(entry.get("asset_specific_type") or "").strip():
+            cast(set[str], group["_asset_specific_types"]).add(str(entry.get("asset_specific_type") or "").strip())
         if entry_run:
             cast(set[str], group["_run_names"]).add(entry_run)
         if entry_surface:
@@ -4262,7 +4785,7 @@ def td_build_parameter_selector_options(
             if any(raw_text in cast(set[str], group.get("_raw_names") or set()) for group in groups.values()):
                 continue
             inventory_row = dict(inventory_by_raw_norm.get(raw_norm) or {})
-            canonical_id = _td_parameter_implicit_canonical_id(raw_text)
+            canonical_id = str(inventory_row.get("primary_canonical_id") or "").strip() or _td_parameter_implicit_canonical_id(raw_text)
             group = groups.setdefault(
                 canonical_id,
                 {
@@ -4272,6 +4795,8 @@ def td_build_parameter_selector_options(
                     "_program_titles": set(
                         str(value).strip() for value in (inventory_row.get("program_titles") or []) if str(value).strip()
                     ),
+                    "_asset_types": {str(inventory_row.get("asset_type") or "").strip()} if str(inventory_row.get("asset_type") or "").strip() else set(),
+                    "_asset_specific_types": {str(inventory_row.get("asset_specific_type") or "").strip()} if str(inventory_row.get("asset_specific_type") or "").strip() else set(),
                     "_run_names": set(str(value).strip() for value in (inventory_row.get("run_names") or []) if str(value).strip()),
                     "_surfaces": set(str(value).strip() for value in (inventory_row.get("surfaces") or []) if str(value).strip()),
                 },
@@ -4319,6 +4844,8 @@ def td_build_parameter_selector_options(
                 "unit_conflict": unit_conflict,
                 "raw_names": raw_name_list,
                 "program_titles": sorted(cast(set[str], group.get("_program_titles") or set()), key=str.casefold),
+                "asset_types": sorted(cast(set[str], group.get("_asset_types") or set()), key=str.casefold),
+                "asset_specific_types": sorted(cast(set[str], group.get("_asset_specific_types") or set()), key=str.casefold),
                 "run_names": sorted(cast(set[str], group.get("_run_names") or set()), key=str.casefold),
                 "surfaces": sorted(cast(set[str], group.get("_surfaces") or set()), key=str.casefold),
                 "search": search,
@@ -4338,6 +4865,8 @@ def td_parameter_selection_matches(
     selection_value: object,
     raw_name: object,
     program_title: object = "",
+    asset_type: object = "",
+    asset_specific_type: object = "",
 ) -> bool:
     selected = str(selection_value or "").strip()
     raw_text = str(raw_name or "").strip()
@@ -4348,7 +4877,13 @@ def td_parameter_selection_matches(
         wanted_id = td_parameter_selector_canonical_id(selected)
         if not wanted_id:
             return False
-        return wanted_id == _td_effective_parameter_canonical(normalization, raw_text, program_title)
+        return wanted_id == _td_effective_parameter_canonical(
+            normalization,
+            raw_text,
+            program_title,
+            asset_type,
+            asset_specific_type,
+        )
     return _td_param_norm_name(selected) == _td_param_norm_name(raw_text)
 
 
@@ -6053,6 +6588,74 @@ def _td_rel_parts(value: object) -> list[str]:
     return [part for part in re.split(r"[\\/]+", raw) if part and part != "."]
 
 
+def _td_safe_path_name(value: object, *, fallback: str = "unknown") -> str:
+    raw = str(value or "").strip() or str(fallback or "unknown")
+    cleaned = re.sub(r"[^A-Za-z0-9._ -]+", "_", raw).strip(" .")
+    cleaned = re.sub(r"\s+", "_", cleaned)
+    return cleaned[:80] or str(fallback or "unknown")
+
+
+def _td_official_artifacts_dir_for_source_like(node_root: Path, source_like: Mapping[str, object]) -> Path | None:
+    serial = str(
+        source_like.get("serial_number") or source_like.get("source_serial_number") or source_like.get("serial") or ""
+    ).strip()
+    if not serial:
+        return None
+    support_dir = eidat_support_dir(Path(node_root).expanduser())
+    return (
+        support_dir
+        / TD_SERIAL_SOURCES_DIRNAME
+        / _td_safe_path_name(source_like.get("program_title"), fallback="Unknown_Program")
+        / _td_safe_path_name(source_like.get("asset_type"), fallback="Unknown_Asset")
+        / _td_safe_path_name(source_like.get("asset_specific_type"), fallback="Unknown_Type")
+        / _td_safe_path_name(serial, fallback="Unknown_Serial")
+    )
+
+
+def _td_official_sqlite_path_for_source_like(node_root: Path, source_like: Mapping[str, object]) -> Path | None:
+    art_dir = _td_official_artifacts_dir_for_source_like(node_root, source_like)
+    serial = str(
+        source_like.get("serial_number") or source_like.get("source_serial_number") or source_like.get("serial") or ""
+    ).strip()
+    if art_dir is None or not serial:
+        return None
+    return art_dir / f"{_td_safe_path_name(serial, fallback='Unknown_Serial')}.sqlite3"
+
+
+def _td_support_rel_path(support_dir: Path, path: Path | None) -> str:
+    if path is None:
+        return ""
+    p = Path(path).expanduser()
+    try:
+        return str(p.resolve().relative_to(Path(support_dir).resolve())).replace("\\", "/")
+    except Exception:
+        try:
+            return str(p.relative_to(Path(support_dir).expanduser())).replace("\\", "/")
+        except Exception:
+            return str(p).replace("\\", "/")
+
+
+def _td_resolve_existing_official_materialization(
+    node_root: Path,
+    source_like: Mapping[str, object],
+) -> dict[str, object]:
+    node_root = Path(node_root).expanduser()
+    support_dir = eidat_support_dir(node_root)
+    sqlite_path = _td_official_sqlite_path_for_source_like(node_root, source_like)
+    if sqlite_path is None or not sqlite_path.exists() or not sqlite_path.is_file():
+        return {}
+    art_dir = sqlite_path.parent
+    metadata_path = art_dir / f"{sqlite_path.stem}_metadata.json"
+    return {
+        "path": sqlite_path,
+        "artifacts_path": art_dir,
+        "artifacts_rel": _td_support_rel_path(support_dir, art_dir),
+        "metadata_path": metadata_path if metadata_path.exists() and metadata_path.is_file() else None,
+        "metadata_rel": _td_support_rel_path(support_dir, metadata_path) if metadata_path.exists() and metadata_path.is_file() else "",
+        "excel_sqlite_rel": _td_canonical_source_link_for_node(node_root, sqlite_path),
+    }
+
+
 def _td_rel_uses_official_source_location(value: object) -> bool:
     parts = [part.casefold() for part in _td_rel_parts(value)]
     try:
@@ -6083,7 +6686,7 @@ def _td_doc_uses_official_td_location(doc: Mapping[str, object]) -> bool:
 
 def _td_is_serial_aggregate_doc(doc: Mapping[str, object]) -> bool:
     meta_source = str(doc.get("metadata_source") or "").strip().casefold()
-    if meta_source == "td_serial_aggregate":
+    if meta_source in TD_OFFICIAL_METADATA_SOURCES:
         return True
     if not _td_doc_uses_official_td_location(doc):
         return False
@@ -6389,12 +6992,27 @@ def _td_canonical_source_link_for_node(node_root: Path, path: Path) -> str:
     return str(p)
 
 
-def _write_test_data_source_link_updates(workbook_path: Path, updates_by_serial: Mapping[str, str]) -> dict[str, str]:
-    updates = {
-        str(sn).strip(): str(val).strip()
-        for sn, val in (updates_by_serial or {}).items()
-        if str(sn).strip() and str(val).strip()
-    }
+def _write_test_data_source_link_updates(
+    workbook_path: Path,
+    updates_by_serial: Mapping[str, object],
+) -> dict[str, dict[str, str]]:
+    updates: dict[str, dict[str, str]] = {}
+    for raw_key, raw_value in (updates_by_serial or {}).items():
+        key = str(raw_key).strip()
+        if not key:
+            continue
+        normalized: dict[str, str] = {}
+        if isinstance(raw_value, Mapping):
+            for field in ("metadata_rel", "artifacts_rel", "excel_sqlite_rel"):
+                value = str(raw_value.get(field) or "").strip()
+                if value:
+                    normalized[field] = value
+        else:
+            value = str(raw_value or "").strip()
+            if value:
+                normalized["excel_sqlite_rel"] = value
+        if normalized:
+            updates[key] = normalized
     if not updates:
         return {}
     try:
@@ -6407,7 +7025,7 @@ def _write_test_data_source_link_updates(workbook_path: Path, updates_by_serial:
 
     wb_path = Path(workbook_path).expanduser()
     wb = load_workbook(str(wb_path))
-    changed: dict[str, str] = {}
+    changed: dict[str, dict[str, str]] = {}
     try:
         if "Sources" not in wb.sheetnames:
             return {}
@@ -6419,8 +7037,12 @@ def _write_test_data_source_link_updates(workbook_path: Path, updates_by_serial:
                 headers[key] = col
         serial_col = headers.get("serial_number") or headers.get("serial")
         source_key_col = headers.get("source_key")
-        sqlite_col = headers.get("excel_sqlite_rel")
-        if not serial_col or not sqlite_col:
+        target_cols = {
+            field: headers.get(field)
+            for field in ("metadata_rel", "artifacts_rel", "excel_sqlite_rel")
+            if headers.get(field)
+        }
+        if not serial_col or not target_cols:
             return {}
 
         dirty = False
@@ -6430,13 +7052,22 @@ def _write_test_data_source_link_updates(workbook_path: Path, updates_by_serial:
             update_key = source_key if source_key in updates else serial
             if not update_key or update_key not in updates:
                 continue
-            new_value = str(updates[update_key]).strip()
-            cur_value = str(ws.cell(row, sqlite_col).value or "").strip()
-            if cur_value == new_value:
-                continue
-            ws.cell(row, sqlite_col).value = new_value
-            changed[update_key] = new_value
-            dirty = True
+            requested = updates[update_key]
+            row_changed = False
+            applied = dict(requested)
+            for field, col in target_cols.items():
+                if field not in requested or not col:
+                    continue
+                new_value = str(requested.get(field) or "").strip()
+                cur_value = str(ws.cell(row, col).value or "").strip()
+                if cur_value == new_value:
+                    continue
+                ws.cell(row, col).value = new_value
+                applied[field] = new_value
+                row_changed = True
+                dirty = True
+            if row_changed:
+                changed[update_key] = applied
 
         if dirty:
             wb.save(str(wb_path))
@@ -6596,7 +7227,6 @@ def _td_build_project_raw_signature(
         "schema_version": TD_PROJECT_CACHE_SCHEMA_VERSION,
         "node_root": str(_infer_node_root_from_workbook_path(workbook_path)),
         "workbook_path": str(Path(workbook_path).expanduser()),
-        "raw_columns": str(raw_columns_csv),
         "x_axis": x_axis_cfg,
     }
     return _td_hash_payload(payload)
@@ -6719,6 +7349,24 @@ def _resolve_td_source_sqlite_for_workbook(
     meta = _load_td_source_metadata(wb_path, source_row)
     excel_sqlite_rel = str(source_row.get("excel_sqlite_rel") or meta.get("excel_sqlite_rel") or "").strip()
     artifacts_rel = str(source_row.get("artifacts_rel") or meta.get("artifacts_rel") or "").strip()
+    official = _td_resolve_existing_official_materialization(node_root, meta or source_row)
+    if official:
+        official_path = Path(official.get("path") or "").expanduser()
+        return {
+            "status": "ok",
+            "path": official_path,
+            "resolved_from": "official_td_materialization",
+            "reason": "",
+            "healed_excel_sqlite_rel": str(official.get("excel_sqlite_rel") or "").strip(),
+            "workbook_excel_sqlite_rel": excel_sqlite_rel,
+            "excel_sqlite_rel": excel_sqlite_rel,
+            "artifacts_rel": str(official.get("artifacts_rel") or artifacts_rel).strip(),
+            "healed_artifacts_rel": str(official.get("artifacts_rel") or "").strip(),
+            "metadata_rel": str(official.get("metadata_rel") or "").strip(),
+            "healed_metadata_rel": str(official.get("metadata_rel") or "").strip(),
+            "node_root": str(node_root),
+            "support_dir": str(support_dir),
+        }
     result = _resolve_td_source_sqlite_for_node(
         node_root,
         excel_sqlite_rel=excel_sqlite_rel,
@@ -6729,8 +7377,11 @@ def _resolve_td_source_sqlite_for_workbook(
         "path": Path(result["path"]).expanduser() if result.get("path") else None,
         "excel_sqlite_rel": excel_sqlite_rel,
         "artifacts_rel": artifacts_rel,
+        "metadata_rel": str(source_row.get("metadata_rel") or meta.get("metadata_rel") or "").strip(),
         "node_root": str(node_root),
         "support_dir": str(support_dir),
+        "healed_artifacts_rel": "",
+        "healed_metadata_rel": "",
         "healed_excel_sqlite_rel": str(result.get("healed_excel_sqlite_rel") or "").strip(),
         "workbook_excel_sqlite_rel": str(result.get("workbook_excel_sqlite_rel") or excel_sqlite_rel).strip(),
     }
@@ -7216,6 +7867,7 @@ TD_SUPPORT_CONDITION_SHEET_PREFIX = "Condition_"
 TD_PROGRAM_REQUIREMENTS_WORKBOOK_NAME = "ProgramRequirements.xlsx"
 TD_PROGRAM_REQUIREMENTS_INDEX_SHEET = "Index"
 TD_PROGRAM_REQUIREMENTS_VALIDATION_SHEET = "_validation"
+TD_PROGRAM_PARAMETER_MAP_SHEET = "ParameterMap"
 TD_PROGRAM_REQUIREMENTS_SUPPORT_INDEX_SHEET = "ProgramRequirements"
 TD_PROGRAM_REQUIREMENTS_SUPPORT_SHEET_PREFIX = "ProgramReq_"
 TD_PROGRAM_REQUIREMENTS_INDEX_HEADERS = [
@@ -7285,10 +7937,157 @@ TD_PROGRAM_REQUIREMENTS_METADATA_KEYS = [
 TD_PROGRAM_REQUIREMENTS_TABLE_HEADER_ROW = 10
 TD_PROGRAM_REQUIREMENTS_TABLE_FIRST_DATA_ROW = TD_PROGRAM_REQUIREMENTS_TABLE_HEADER_ROW + 1
 TD_PROGRAM_REQUIREMENTS_VALIDATION_LAST_ROW = 200
+TD_PROGRAM_PARAMETER_MAP_HEADERS = [
+    "program_title",
+    "asset_type",
+    "asset_specific_type",
+    "ingested_parameter",
+    "default_display_parameter",
+    "displayed_parameter",
+    "preferred_units",
+    "edited",
+    "updated_at",
+]
 
 
 def _td_support_norm_name(value: object) -> str:
     return "".join(ch.lower() for ch in str(value or "").strip() if ch.isalnum())
+
+
+def _td_program_parameter_canonical_id(display_name: object) -> str:
+    norm = _td_param_norm_name(display_name)
+    return f"display:{norm}" if norm else _td_parameter_implicit_canonical_id(display_name)
+
+
+def _td_program_parameter_scope_text(value: object) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip())
+
+
+def _td_program_parameter_scope_key(
+    program_title: object,
+    asset_type: object,
+    asset_specific_type: object,
+    ingested_parameter: object,
+) -> tuple[str, str, str, str]:
+    return (
+        _td_param_norm_program(program_title),
+        _td_param_norm_program(_td_program_parameter_scope_text(asset_type)),
+        _td_param_norm_program(_td_program_parameter_scope_text(asset_specific_type)),
+        _td_param_norm_name(ingested_parameter),
+    )
+
+
+def _td_program_parameter_mapping_normalize(
+    row: Mapping[str, object] | None,
+    *,
+    program_title: object = "",
+) -> dict[str, object]:
+    raw = dict(row or {})
+    normalized_program = _td_program_parameter_scope_text(raw.get("program_title") or program_title)
+    asset_type = _td_program_parameter_scope_text(raw.get("asset_type"))
+    asset_specific_type = _td_program_parameter_scope_text(raw.get("asset_specific_type"))
+    ingested_parameter = str(raw.get("ingested_parameter") or raw.get("raw_name") or "").strip()
+    if not ingested_parameter:
+        return {}
+    default_display = str(
+        raw.get("default_display_parameter")
+        or raw.get("mapped_parameter")
+        or raw.get("mapped_header")
+        or raw.get("displayed_parameter")
+        or raw.get("display_name")
+        or ingested_parameter
+    ).strip() or ingested_parameter
+    displayed_parameter = str(
+        raw.get("displayed_parameter")
+        or raw.get("display_name")
+        or default_display
+        or ingested_parameter
+    ).strip() or default_display
+    edited = bool(raw.get("edited"))
+    if _td_param_norm_name(displayed_parameter) != _td_param_norm_name(default_display):
+        edited = True
+    return {
+        "program_title": normalized_program,
+        "asset_type": asset_type,
+        "asset_specific_type": asset_specific_type,
+        "ingested_parameter": ingested_parameter,
+        "default_display_parameter": default_display,
+        "displayed_parameter": displayed_parameter,
+        "preferred_units": str(raw.get("preferred_units") or raw.get("units") or "").strip(),
+        "edited": bool(edited),
+        "updated_at": str(raw.get("updated_at") or "").strip(),
+    }
+
+
+def _td_program_parameter_effective_display(row: Mapping[str, object] | None) -> str:
+    payload = _td_program_parameter_mapping_normalize(row)
+    if not payload:
+        return ""
+    return str(
+        payload.get("displayed_parameter")
+        or payload.get("default_display_parameter")
+        or payload.get("ingested_parameter")
+        or ""
+    ).strip()
+
+
+def _td_program_parameter_mapping_sort_key(row: Mapping[str, object] | None) -> tuple[str, str, str, str]:
+    payload = _td_program_parameter_mapping_normalize(row)
+    return (
+        _td_param_norm_program(payload.get("asset_type")),
+        _td_param_norm_program(payload.get("asset_specific_type")),
+        _td_param_norm_name(payload.get("ingested_parameter")),
+        _td_param_norm_name(payload.get("displayed_parameter")),
+    )
+
+
+def _td_program_parameter_merge_rows(
+    existing_rows: Sequence[Mapping[str, object]] | None,
+    discovered_rows: Sequence[Mapping[str, object]] | None,
+    *,
+    program_title: object = "",
+) -> list[dict[str, object]]:
+    out_by_key: dict[tuple[str, str, str, str], dict[str, object]] = {}
+    for item in existing_rows or []:
+        normalized = _td_program_parameter_mapping_normalize(item, program_title=program_title)
+        key = _td_program_parameter_scope_key(
+            normalized.get("program_title"),
+            normalized.get("asset_type"),
+            normalized.get("asset_specific_type"),
+            normalized.get("ingested_parameter"),
+        )
+        if key[-1]:
+            out_by_key[key] = normalized
+    for item in discovered_rows or []:
+        discovered = _td_program_parameter_mapping_normalize(item, program_title=program_title)
+        key = _td_program_parameter_scope_key(
+            discovered.get("program_title"),
+            discovered.get("asset_type"),
+            discovered.get("asset_specific_type"),
+            discovered.get("ingested_parameter"),
+        )
+        if not key[-1]:
+            continue
+        existing = dict(out_by_key.get(key) or {})
+        merged = dict(discovered)
+        if existing:
+            merged["preferred_units"] = str(existing.get("preferred_units") or merged.get("preferred_units") or "").strip()
+            existing_edited = bool(existing.get("edited"))
+            existing_display = str(existing.get("displayed_parameter") or "").strip()
+            existing_default = str(existing.get("default_display_parameter") or "").strip()
+            if existing_edited or (
+                existing_display
+                and _td_param_norm_name(existing_display) != _td_param_norm_name(existing_default)
+            ):
+                merged["displayed_parameter"] = existing_display or merged["displayed_parameter"]
+                merged["edited"] = True
+                merged["updated_at"] = str(existing.get("updated_at") or merged.get("updated_at") or "").strip()
+            else:
+                merged["displayed_parameter"] = str(merged.get("default_display_parameter") or merged.get("ingested_parameter") or "").strip()
+                merged["edited"] = False
+                merged["updated_at"] = str(merged.get("updated_at") or "").strip()
+        out_by_key[key] = merged
+    return sorted(out_by_key.values(), key=_td_program_parameter_mapping_sort_key)
 
 
 def _td_support_program_sheet_name(program_title: str, index: int) -> str:
@@ -7481,23 +8280,7 @@ def _td_program_requirements_is_parameter_column(column_name: object, *, x_alias
         "row",
         "rowid",
         "index",
-        "feedpressure",
-        "feedtemperature",
-        "feedtemp",
         "runtype",
-        "pulsewidth",
-        "pulsewidthon",
-        "pulsewidthoff",
-        "pulseon",
-        "pulseoff",
-        "offtime",
-        "controlperiod",
-        "suppressionvoltage",
-        "suppressionv",
-        "nominalpfvalue",
-        "nominalpfunits",
-        "nominaltfvalue",
-        "nominaltfunits",
         "sheetname",
         "sourcesheetname",
         "datamoderaw",
@@ -7509,29 +8292,22 @@ def _td_program_requirements_is_parameter_column(column_name: object, *, x_alias
 
 def _td_program_requirements_discover_run_parameters(
     conn: sqlite3.Connection,
+    sheet_name: str,
     table_name: str,
     *,
     param_defs: Sequence[Mapping[str, object]] | None,
 ) -> list[dict[str, str]]:
-    name = str(table_name or "").strip()
-    if not name or not _td_table_exists(conn, name):
-        return []
-    try:
-        rows = conn.execute(f"PRAGMA table_info({_quote_ident(name)})").fetchall()
-    except Exception:
-        rows = []
-    if not rows:
-        return []
-    x_aliases = _td_program_requirements_runtime_x_aliases()
-    param_map = _td_program_requirements_param_def_map(param_defs)
     out: list[dict[str, str]] = []
     seen: set[str] = set()
-    for row in rows:
-        column_name = str(row[1] or "").strip()
-        if not _td_program_requirements_is_parameter_column(column_name, x_aliases=x_aliases):
+    for spec in _td_source_sqlite_column_specs(
+        conn,
+        sheet_name=str(sheet_name or "").strip(),
+        table_name=str(table_name or "").strip(),
+        param_defs=param_defs,
+    ):
+        if not bool(spec.get("is_parameter")):
             continue
-        matched = param_map.get(_td_support_norm_name(column_name)) or {}
-        canonical_name = str(matched.get("name") or column_name).strip()
+        canonical_name = str(spec.get("header") or "").strip()
         key = _td_support_norm_name(canonical_name)
         if not key or key in seen:
             continue
@@ -7539,7 +8315,79 @@ def _td_program_requirements_discover_run_parameters(
         out.append(
             {
                 "name": canonical_name,
-                "units": str(matched.get("units") or "").strip(),
+                "units": str(spec.get("preferred_units") or "").strip(),
+            }
+        )
+    return out
+
+
+def _td_source_sqlite_column_specs(
+    conn: sqlite3.Connection,
+    *,
+    sheet_name: str,
+    table_name: str,
+    param_defs: Sequence[Mapping[str, object]] | None,
+) -> list[dict[str, object]]:
+    name = str(table_name or "").strip()
+    if not name or not _td_table_exists(conn, name):
+        return []
+    try:
+        pragma_rows = conn.execute(f"PRAGMA table_info({_quote_ident(name)})").fetchall()
+    except Exception:
+        pragma_rows = []
+    if not pragma_rows:
+        return []
+    column_map_rows: list[tuple[object, object, object]] = []
+    if _td_table_exists(conn, "__column_map"):
+        try:
+            column_map_rows = conn.execute(
+                """
+                SELECT header, mapped_header, sqlite_column
+                FROM __column_map
+                WHERE sheet_name=?
+                ORDER BY rowid
+                """,
+                (str(sheet_name or "").strip(),),
+            ).fetchall()
+        except Exception:
+            column_map_rows = []
+    map_by_sqlite: dict[str, dict[str, str]] = {}
+    for header, mapped_header, sqlite_column in column_map_rows:
+        sqlite_key = str(sqlite_column or "").strip()
+        if not sqlite_key or sqlite_key in map_by_sqlite:
+            continue
+        map_by_sqlite[sqlite_key] = {
+            "header": str(header or "").strip(),
+            "mapped_header": str(mapped_header or "").strip(),
+        }
+    x_aliases = _td_program_requirements_runtime_x_aliases()
+    param_map = _td_program_requirements_param_def_map(param_defs)
+    out: list[dict[str, object]] = []
+    for row in pragma_rows:
+        sqlite_column = str(row[1] or "").strip()
+        if not sqlite_column or sqlite_column.startswith("__") or _td_support_norm_name(sqlite_column) == "excelrow":
+            continue
+        mapped = dict(map_by_sqlite.get(sqlite_column) or {})
+        header = str(mapped.get("header") or sqlite_column).strip() or sqlite_column
+        mapped_header = str(mapped.get("mapped_header") or header).strip() or header
+        param_match = (
+            param_map.get(_td_support_norm_name(mapped_header))
+            or param_map.get(_td_support_norm_name(header))
+            or {}
+        )
+        preferred_units = str(param_match.get("units") or "").strip()
+        candidate_name = mapped_header or header
+        is_parameter = _td_program_requirements_is_parameter_column(candidate_name, x_aliases=x_aliases)
+        if is_parameter and not _td_program_requirements_is_parameter_column(header, x_aliases=x_aliases):
+            is_parameter = _td_program_requirements_is_parameter_column(mapped_header, x_aliases=x_aliases)
+        out.append(
+            {
+                "sqlite_column": sqlite_column,
+                "header": header,
+                "mapped_header": mapped_header,
+                "default_display_parameter": mapped_header or header,
+                "preferred_units": preferred_units,
+                "is_parameter": bool(is_parameter),
             }
         )
     return out
@@ -7608,6 +8456,7 @@ def _td_program_requirements_discover_conditions_by_program(
                     table_name = table_name_by_run.get(_td_support_norm_name(clean_run)) or f"sheet__{clean_run}"
                     catalog = _td_program_requirements_discover_run_parameters(
                         conn,
+                        clean_run,
                         table_name,
                         param_defs=param_defs,
                     )
@@ -7656,6 +8505,121 @@ def _td_program_requirements_discover_conditions_by_program(
             )
         out[program_title] = normalized_conditions
     return out
+
+
+def _td_program_requirements_discover_parameter_mappings_by_program(
+    global_repo: Path | None,
+    docs: Sequence[Mapping[str, object]] | None,
+    *,
+    param_defs: Sequence[Mapping[str, object]] | None,
+) -> dict[str, list[dict[str, object]]]:
+    repo = Path(global_repo).expanduser() if global_repo is not None else None
+    rows_by_program: dict[str, dict[tuple[str, str, str, str], dict[str, object]]] = {}
+    for doc in docs or []:
+        if repo is None or not isinstance(doc, Mapping):
+            continue
+        program_title = str(doc.get("program_title") or "").strip() or TD_SUPPORT_DEFAULT_PROGRAM_TITLE
+        asset_type = _td_program_parameter_scope_text(doc.get("asset_type"))
+        asset_specific_type = _td_program_parameter_scope_text(doc.get("asset_specific_type"))
+        resolved = _resolve_td_source_sqlite_for_node(
+            repo,
+            excel_sqlite_rel=str(doc.get("excel_sqlite_rel") or "").strip(),
+            artifacts_rel=str(doc.get("artifacts_rel") or "").strip(),
+        )
+        sqlite_path = resolved.get("path")
+        if not sqlite_path:
+            continue
+        path = Path(sqlite_path).expanduser()
+        if not path.exists() or not path.is_file():
+            continue
+        try:
+            with sqlite3.connect(str(path)) as conn:
+                try:
+                    runs = [str(row[0] or "").strip() for row in _ordered_td_sheet_info_rows(conn) if str(row[0] or "").strip()]
+                except Exception:
+                    rows = conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'sheet__%' ORDER BY name"
+                    ).fetchall()
+                    runs = [str(row[0] or "")[7:] for row in rows if str(row[0] or "").startswith("sheet__")]
+                table_name_by_run: dict[str, str] = {}
+                if _td_table_exists(conn, "__sheet_info"):
+                    try:
+                        info_rows = conn.execute(
+                            "SELECT sheet_name, COALESCE(table_name, '') FROM __sheet_info ORDER BY rowid"
+                        ).fetchall()
+                    except Exception:
+                        info_rows = []
+                    for sheet_name, table_name in info_rows:
+                        run_name = str(sheet_name or "").strip()
+                        run_key = _td_support_norm_name(run_name)
+                        table = str(table_name or "").strip()
+                        if run_key and table:
+                            table_name_by_run[run_key] = table
+                for run_name in runs:
+                    clean_run = str(run_name or "").strip()
+                    if not clean_run:
+                        continue
+                    table_name = table_name_by_run.get(_td_support_norm_name(clean_run)) or f"sheet__{clean_run}"
+                    specs = _td_source_sqlite_column_specs(
+                        conn,
+                        sheet_name=clean_run,
+                        table_name=table_name,
+                        param_defs=param_defs,
+                    )
+                    for spec in specs:
+                        if not bool(spec.get("is_parameter")):
+                            continue
+                        normalized = _td_program_parameter_mapping_normalize(
+                            {
+                                "program_title": program_title,
+                                "asset_type": asset_type,
+                                "asset_specific_type": asset_specific_type,
+                                "ingested_parameter": str(spec.get("header") or "").strip(),
+                                "default_display_parameter": str(
+                                    spec.get("default_display_parameter")
+                                    or spec.get("mapped_header")
+                                    or spec.get("header")
+                                    or ""
+                                ).strip(),
+                                "displayed_parameter": str(
+                                    spec.get("default_display_parameter")
+                                    or spec.get("mapped_header")
+                                    or spec.get("header")
+                                    or ""
+                                ).strip(),
+                                "preferred_units": str(spec.get("preferred_units") or "").strip(),
+                                "edited": False,
+                                "updated_at": "",
+                            },
+                            program_title=program_title,
+                        )
+                        if not normalized:
+                            continue
+                        scope_key = _td_program_parameter_scope_key(
+                            normalized.get("program_title"),
+                            normalized.get("asset_type"),
+                            normalized.get("asset_specific_type"),
+                            normalized.get("ingested_parameter"),
+                        )
+                        bucket = rows_by_program.setdefault(program_title, {})
+                        existing = dict(bucket.get(scope_key) or {})
+                        if existing:
+                            if not str(existing.get("preferred_units") or "").strip():
+                                existing["preferred_units"] = str(normalized.get("preferred_units") or "").strip()
+                            existing_default = str(existing.get("default_display_parameter") or "").strip()
+                            normalized_default = str(normalized.get("default_display_parameter") or "").strip()
+                            if (not existing_default or existing_default == str(existing.get("ingested_parameter") or "").strip()) and normalized_default:
+                                existing["default_display_parameter"] = normalized_default
+                                existing["displayed_parameter"] = normalized_default
+                            bucket[scope_key] = existing
+                            continue
+                        bucket[scope_key] = normalized
+        except Exception:
+            continue
+    return {
+        program_title: sorted(program_rows.values(), key=_td_program_parameter_mapping_sort_key)
+        for program_title, program_rows in rows_by_program.items()
+    }
 
 
 def _td_program_requirements_header_map(ws, *, row_idx: int) -> dict[str, int]:
@@ -7720,12 +8684,70 @@ def _td_program_requirements_parse_condition_sheet(ws, *, fallback: Mapping[str,
     }
 
 
+def _td_program_requirements_parse_parameter_map_sheet(ws, *, program_title: object = "") -> list[dict[str, object]]:
+    headers = _td_program_requirements_header_map(ws, row_idx=1)
+    rows: list[dict[str, object]] = []
+    for row_idx in range(2, (ws.max_row or 0) + 1):
+        raw = {
+            header: ws.cell(row_idx, col).value
+            for header, col in headers.items()
+        }
+        if not any(value not in (None, "") for value in raw.values()):
+            continue
+        normalized = _td_program_parameter_mapping_normalize(raw, program_title=program_title)
+        if normalized:
+            rows.append(normalized)
+    return rows
+
+
+def _td_program_requirements_write_parameter_map_sheet(
+    ws,
+    *,
+    program_title: object,
+    rows: Sequence[Mapping[str, object]] | None,
+) -> None:
+    try:
+        ws.delete_rows(1, ws.max_row or 1)
+    except Exception:
+        parent = ws.parent
+        title = ws.title
+        try:
+            parent.remove(ws)
+        except Exception:
+            pass
+        ws = parent.create_sheet(title)
+    ws.append(list(TD_PROGRAM_PARAMETER_MAP_HEADERS))
+    for row in sorted(rows or [], key=_td_program_parameter_mapping_sort_key):
+        normalized = _td_program_parameter_mapping_normalize(row, program_title=program_title)
+        if not normalized:
+            continue
+        ws.append(
+            [
+                str(normalized.get("program_title") or program_title or "").strip(),
+                str(normalized.get("asset_type") or "").strip(),
+                str(normalized.get("asset_specific_type") or "").strip(),
+                str(normalized.get("ingested_parameter") or "").strip(),
+                str(normalized.get("default_display_parameter") or "").strip(),
+                str(normalized.get("displayed_parameter") or "").strip(),
+                str(normalized.get("preferred_units") or "").strip(),
+                bool(normalized.get("edited")),
+                str(normalized.get("updated_at") or "").strip(),
+            ]
+        )
+    try:
+        ws.freeze_panes = "A2"
+    except Exception:
+        pass
+
+
 def _td_program_requirements_parse_workbook(wb) -> dict[str, object]:
     reserved = {
         TD_PROGRAM_REQUIREMENTS_INDEX_SHEET.lower(),
         TD_PROGRAM_REQUIREMENTS_VALIDATION_SHEET.lower(),
+        TD_PROGRAM_PARAMETER_MAP_SHEET.lower(),
     }
     index_rows: list[dict[str, object]] = []
+    parameter_mappings: list[dict[str, object]] = []
     if TD_PROGRAM_REQUIREMENTS_INDEX_SHEET in wb.sheetnames:
         ws_index = wb[TD_PROGRAM_REQUIREMENTS_INDEX_SHEET]
         headers = _td_program_requirements_header_map(ws_index, row_idx=1)
@@ -7737,6 +8759,10 @@ def _td_program_requirements_parse_workbook(wb) -> dict[str, object]:
             if not any(value not in (None, "") for value in row.values()):
                 continue
             index_rows.append({str(key): value for key, value in row.items()})
+    if TD_PROGRAM_PARAMETER_MAP_SHEET in wb.sheetnames:
+        parameter_mappings = _td_program_requirements_parse_parameter_map_sheet(
+            wb[TD_PROGRAM_PARAMETER_MAP_SHEET],
+        )
     ordered_conditions: list[dict[str, object]] = []
     parsed_sheets: set[str] = set()
     for row in index_rows:
@@ -7761,7 +8787,10 @@ def _td_program_requirements_parse_workbook(wb) -> dict[str, object]:
             fallback={"sheet_name": sheet_name},
         )
         ordered_conditions.append(condition)
-    return {"conditions": ordered_conditions}
+    return {
+        "conditions": ordered_conditions,
+        "parameter_mappings": parameter_mappings,
+    }
 
 
 def _td_program_requirements_apply_units(
@@ -7854,6 +8883,8 @@ def _td_program_requirements_write_workbook(
     *,
     program_title: str,
     discovered_conditions: Sequence[Mapping[str, object]] | None,
+    discovered_parameter_mappings: Sequence[Mapping[str, object]] | None = None,
+    parameter_mappings: Sequence[Mapping[str, object]] | None = None,
 ) -> dict[str, object]:
     try:
         from openpyxl import Workbook  # type: ignore
@@ -7876,6 +8907,11 @@ def _td_program_requirements_write_workbook(
         existing_conditions = [
             dict(item)
             for item in (existing_state.get("conditions") or [])
+            if isinstance(item, Mapping)
+        ]
+        existing_parameter_mappings = [
+            dict(item)
+            for item in (existing_state.get("parameter_mappings") or [])
             if isinstance(item, Mapping)
         ]
         existing_by_key = {
@@ -8014,6 +9050,30 @@ def _td_program_requirements_write_workbook(
                 validation_formula=validation_formula,
             )
 
+        final_parameter_mappings = (
+            [
+                _td_program_parameter_mapping_normalize(item, program_title=program_title)
+                for item in (parameter_mappings or [])
+                if _td_program_parameter_mapping_normalize(item, program_title=program_title)
+            ]
+            if parameter_mappings is not None
+            else _td_program_parameter_merge_rows(
+                existing_parameter_mappings,
+                discovered_parameter_mappings,
+                program_title=program_title,
+            )
+        )
+        ws_parameter_map = (
+            wb[TD_PROGRAM_PARAMETER_MAP_SHEET]
+            if TD_PROGRAM_PARAMETER_MAP_SHEET in wb.sheetnames
+            else wb.create_sheet(TD_PROGRAM_PARAMETER_MAP_SHEET)
+        )
+        _td_program_requirements_write_parameter_map_sheet(
+            ws_parameter_map,
+            program_title=program_title,
+            rows=final_parameter_mappings,
+        )
+
         if (
             "Sheet" in wb.sheetnames
             and "Sheet" not in {TD_PROGRAM_REQUIREMENTS_INDEX_SHEET, TD_PROGRAM_REQUIREMENTS_VALIDATION_SHEET}
@@ -8039,6 +9099,7 @@ def _td_program_requirements_write_workbook(
         "created": bool(created),
         "updated": True,
         "condition_count": int(len(discovered_conditions or [])),
+        "parameter_mapping_count": int(len(parameter_mappings or discovered_parameter_mappings or [])),
     }
 
 
@@ -8055,9 +9116,15 @@ def _sync_td_program_requirements_workbooks_for_docs(
         docs,
         param_defs=param_defs,
     )
+    discovered_parameter_mappings = _td_program_requirements_discover_parameter_mappings_by_program(
+        repo,
+        docs,
+        param_defs=param_defs,
+    )
     summaries: list[dict[str, object]] = []
     warnings: list[str] = []
-    for program_title in sorted(discovered.keys(), key=lambda value: value.casefold()):
+    program_titles = sorted({*discovered.keys(), *discovered_parameter_mappings.keys()}, key=lambda value: value.casefold())
+    for program_title in program_titles:
         workbook_path = td_program_requirements_workbook_path_for(repo, program_title)
         if not create_missing and not workbook_path.exists():
             summaries.append(
@@ -8068,6 +9135,7 @@ def _sync_td_program_requirements_workbooks_for_docs(
                     "updated": False,
                     "skipped_missing": True,
                     "condition_count": int(len(discovered.get(program_title) or [])),
+                    "parameter_mapping_count": int(len(discovered_parameter_mappings.get(program_title) or [])),
                 }
             )
             continue
@@ -8076,6 +9144,7 @@ def _sync_td_program_requirements_workbooks_for_docs(
                 workbook_path,
                 program_title=program_title,
                 discovered_conditions=discovered.get(program_title) or [],
+                discovered_parameter_mappings=discovered_parameter_mappings.get(program_title) or [],
             )
             payload["skipped_missing"] = False
             summaries.append(payload)
@@ -8090,6 +9159,7 @@ def _sync_td_program_requirements_workbooks_for_docs(
                     "updated": False,
                     "skipped_missing": False,
                     "condition_count": int(len(discovered.get(program_title) or [])),
+                    "parameter_mapping_count": int(len(discovered_parameter_mappings.get(program_title) or [])),
                     "warning": message,
                 }
             )
@@ -8104,6 +9174,7 @@ def _sync_td_program_requirements_workbooks_for_docs(
                     "updated": False,
                     "skipped_missing": False,
                     "condition_count": int(len(discovered.get(program_title) or [])),
+                    "parameter_mapping_count": int(len(discovered_parameter_mappings.get(program_title) or [])),
                     "warning": message,
                 }
             )
@@ -8169,6 +9240,30 @@ def _td_program_requirements_read_source_workbook(path: Path) -> list[dict[str, 
             }
         )
     return imported
+
+
+def _td_program_requirements_read_parameter_mappings(path: Path) -> list[dict[str, object]]:
+    try:
+        from openpyxl import load_workbook  # type: ignore
+    except Exception as exc:
+        raise RuntimeError(
+            "openpyxl is required to read ProgramRequirements workbooks. "
+            "Install it with `py -m pip install openpyxl` within the project environment."
+        ) from exc
+    workbook_path = Path(path).expanduser()
+    wb = load_workbook(str(workbook_path), read_only=True, data_only=True)
+    try:
+        state = _td_program_requirements_parse_workbook(wb)
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
+    return [
+        _td_program_parameter_mapping_normalize(row)
+        for row in (state.get("parameter_mappings") or [])
+        if _td_program_parameter_mapping_normalize(row)
+    ]
 
 
 def _td_program_requirements_read_support_state(wb) -> dict[str, list[dict[str, object]]]:
@@ -9844,6 +10939,45 @@ def _ordered_support_param_defs(
     ordered_names = [name for name in fallback_order if name in defs_by_name]
     ordered_names.extend(sorted([name for name in defs_by_name.keys() if name not in ordered_names], key=lambda s: str(s).lower()))
     return [defs_by_name[name] for name in ordered_names]
+
+
+def _td_complete_calc_param_defs(
+    *,
+    ordered_defs: Sequence[Mapping[str, object]] | None,
+    discovered_names: Sequence[object] | None,
+    units_by_name: Mapping[str, object] | None = None,
+    fallback_units: Mapping[str, object] | None = None,
+) -> list[dict[str, object]]:
+    out: list[dict[str, object]] = []
+    seen_norms: set[str] = set()
+    discovered_texts = [
+        str(value or "").strip()
+        for value in (discovered_names or [])
+        if str(value or "").strip()
+    ]
+    units_map = {str(k).strip(): str(v or "").strip() for k, v in (units_by_name or {}).items() if str(k).strip()}
+    fallback_map = {str(k).strip(): str(v or "").strip() for k, v in (fallback_units or {}).items() if str(k).strip()}
+
+    def _append(name: str, payload: Mapping[str, object] | None = None) -> None:
+        text = str(name or "").strip()
+        if not text:
+            return
+        norm = _td_param_norm_name(text)
+        if not norm or norm in seen_norms:
+            return
+        seen_norms.add(norm)
+        row = dict(payload or {})
+        row["name"] = text
+        row["units"] = str(row.get("units") or units_map.get(text) or fallback_map.get(text) or "").strip()
+        out.append(row)
+
+    for item in (ordered_defs or []):
+        if not isinstance(item, Mapping):
+            continue
+        _append(str(item.get("name") or "").strip(), item)
+    for name in sorted(discovered_texts, key=str.casefold):
+        _append(name, {"name": name})
+    return out
 
 
 def _raw_curve_points(*, rows: list[dict], actual_x: str, y_name: str) -> tuple[list[float], list[float]]:
@@ -12082,6 +13216,7 @@ def _write_test_data_project_calc_cache_from_aggregates(
     aggregated_curve_values: Mapping[tuple[str, str, str], Sequence[float]],
     aggregated_obs_meta: Mapping[tuple[str, str], Mapping[str, object]],
     condition_y_names: Mapping[str, set[str]],
+    condition_units_by_name: Mapping[str, Mapping[str, object]] | None = None,
     sequence_obs_rows: Sequence[tuple[object, ...]] | None = None,
     sequence_metric_rows: Sequence[tuple[object, ...]] | None = None,
     project_cfg: Mapping[str, object] | None = None,
@@ -12192,16 +13327,20 @@ def _write_test_data_project_calc_cache_from_aggregates(
                     run_pulse_width_value,
                 )
             )
-            calc_param_defs = _ordered_support_param_defs(
-                sequence_names=[condition_key_clean],
-                support_cfg={
-                    "bounds_by_sequence": {condition_key_clean: dict(bounds_by_sequence.get(condition_key_clean) or {})},
-                    "settings": dict(support_settings or {}),
-                },
-                fallback_defs=[dict(d) for d in cfg_cols if isinstance(d, Mapping)],
+            calc_param_defs = _td_complete_calc_param_defs(
+                ordered_defs=_ordered_support_param_defs(
+                    sequence_names=[condition_key_clean],
+                    support_cfg={
+                        "bounds_by_sequence": {condition_key_clean: dict(bounds_by_sequence.get(condition_key_clean) or {})},
+                        "settings": dict(support_settings or {}),
+                    },
+                    fallback_defs=[dict(d) for d in cfg_cols if isinstance(d, Mapping)],
+                )
+                or [dict(d) for d in cfg_cols if isinstance(d, Mapping)],
+                discovered_names=sorted(condition_y_names.get(condition_key_clean) or set(), key=str.casefold),
+                units_by_name=dict((condition_units_by_name or {}).get(condition_key_clean) or {}),
+                fallback_units=cfg_units,
             )
-            if not calc_param_defs:
-                calc_param_defs = [dict(d) for d in cfg_cols if isinstance(d, Mapping)]
             for param_def in calc_param_defs:
                 col_name = str(param_def.get("name") or "").strip()
                 if not col_name or (condition_key_clean, col_name) in inserted_columns:
@@ -13079,8 +14218,16 @@ def _rebuild_test_data_project_calc_cache_from_raw(
         aggregated_curve_values: dict[tuple[str, str, str], list[float]] = {}
         aggregated_obs_meta: dict[tuple[str, str], dict[str, object]] = {}
         condition_y_names: dict[str, set[str]] = {}
+        condition_units_by_name: dict[str, dict[str, str]] = {}
         sequence_obs_rows_by_id: dict[str, tuple[object, ...]] = {}
         sequence_metric_rows_by_key: dict[tuple[str, str, str], tuple[object, ...]] = {}
+        raw_curve_units_by_run_param: dict[tuple[str, str], str] = {}
+        for run_name, parameter_name, units, _x_axis_kind, _display_name, _source_kind, _catalog_epoch_ns in raw_curve_catalog_rows:
+            run_txt = str(run_name or "").strip()
+            parameter_txt = str(parameter_name or "").strip()
+            units_txt = str(units or "").strip()
+            if run_txt and parameter_txt and units_txt and (run_txt, parameter_txt) not in raw_curve_units_by_run_param:
+                raw_curve_units_by_run_param[(run_txt, parameter_txt)] = units_txt
         t0 = time.perf_counter()
         for run_name_raw, y_name_raw, x_name_raw, observation_id, serial, program_title, source_run_name_raw, x_json, y_json, _n_points, source_mtime_ns, _curve_computed_epoch_ns in raw_curve_rows:
             raw_run = str(run_name_raw or "").strip()
@@ -13125,6 +14272,9 @@ def _rebuild_test_data_project_calc_cache_from_raw(
                 last_n_rows=_to_support_int(last_n_rows),
             )
             condition_y_names.setdefault(condition_key, set()).add(y_name)
+            units_txt = str(raw_curve_units_by_run_param.get((raw_run, y_name)) or "").strip()
+            if units_txt:
+                condition_units_by_name.setdefault(condition_key, {}).setdefault(y_name, units_txt)
             aggregated_curve_values.setdefault((condition_key, serial_txt, y_name), []).extend(filtered_y)
             obs_meta = aggregated_obs_meta.setdefault(
                 (condition_key, serial_txt),
@@ -13258,13 +14408,17 @@ def _rebuild_test_data_project_calc_cache_from_raw(
                         run_pulse_width_value,
                     )
                 )
-                calc_param_defs = _ordered_support_param_defs(
-                    sequence_names=[condition_key],
-                    support_cfg={"bounds_by_sequence": {condition_key: bounds_by_sequence.get(condition_key) or {}}, "settings": support_settings},
-                    fallback_defs=cfg_cols,
+                calc_param_defs = _td_complete_calc_param_defs(
+                    ordered_defs=_ordered_support_param_defs(
+                        sequence_names=[condition_key],
+                        support_cfg={"bounds_by_sequence": {condition_key: bounds_by_sequence.get(condition_key) or {}}, "settings": support_settings},
+                        fallback_defs=cfg_cols,
+                    )
+                    or [dict(d) for d in cfg_cols if isinstance(d, dict)],
+                    discovered_names=sorted(condition_y_names.get(condition_key) or set(), key=str.casefold),
+                    units_by_name=dict(condition_units_by_name.get(condition_key) or {}),
+                    fallback_units=cfg_units,
                 )
-                if not calc_param_defs:
-                    calc_param_defs = [dict(d) for d in cfg_cols if isinstance(d, dict)]
                 for param_def in calc_param_defs:
                     col_name = str(param_def.get("name") or "").strip()
                     if not col_name:
@@ -13910,6 +15064,7 @@ def rebuild_test_data_project_cache(
             y_cols.append((name, units))
             if units:
                 cfg_units[name] = units
+    cfg_param_meta_map = _td_program_requirements_param_def_map(cfg_cols)
 
     sources = _read_test_data_sources(wb_path)
     entries = (
@@ -14285,6 +15440,67 @@ def rebuild_test_data_project_cache(
         if best[0] and best[1] >= float(label_fuzzy_min_ratio):
             return best[0]
         return ""
+
+    def _source_column_label_candidates(spec: Mapping[str, object]) -> list[str]:
+        out: list[str] = []
+        for value in (
+            spec.get("mapped_header"),
+            spec.get("header"),
+            spec.get("sqlite_column"),
+        ):
+            text = str(value or "").strip()
+            if text and text not in out:
+                out.append(text)
+        return out
+
+    def _match_source_column_specs(
+        specs: Sequence[Mapping[str, object]],
+        aliases: Sequence[str],
+        *,
+        preferred_label: str = "",
+        fuzzy_enabled: bool,
+        min_ratio: float,
+    ) -> list[tuple[dict[str, object], float, int]]:
+        if not specs or not aliases:
+            return []
+        preferred_norm = _norm_name(preferred_label)
+        alias_norms = {_norm_name(alias) for alias in aliases if _norm_name(alias)}
+        out: list[tuple[dict[str, object], float, int]] = []
+        for idx, raw_spec in enumerate(specs):
+            spec = dict(raw_spec or {})
+            labels = _source_column_label_candidates(spec)
+            if not labels:
+                continue
+            best_score = 0.0
+            exact_match = False
+            for label in labels:
+                label_norm = _norm_name(label)
+                if not label_norm or label_norm == _norm_name("excel_row"):
+                    continue
+                if label_norm in alias_norms:
+                    exact_match = True
+                    best_score = 1.0
+                    break
+                if not fuzzy_enabled:
+                    continue
+                for alias in aliases:
+                    score = _fuzzy_col_score(str(alias or ""), label)
+                    if score > best_score:
+                        best_score = float(score)
+            if exact_match or best_score >= float(min_ratio):
+                out.append((spec, float(best_score), int(idx)))
+        out.sort(
+            key=lambda item: (
+                0
+                if preferred_norm
+                and any(_norm_name(label) == preferred_norm for label in _source_column_label_candidates(item[0]))
+                else 1,
+                int(item[2]),
+                -float(item[1]),
+                str(item[0].get("header") or item[0].get("sqlite_column") or "").lower(),
+            )
+        )
+        return out
 
     def _most_common_nonempty_value(src: sqlite3.Connection, table: str, col: str) -> object | None:
         q_table = _quote_ident(table)
@@ -14702,7 +15918,7 @@ def rebuild_test_data_project_cache(
     debug_diagnostics: list[dict] = []
     debug_sources: list[dict] = []
     valid_sources = 0
-    source_link_updates: dict[str, str] = {}
+    source_link_updates: dict[str, dict[str, str]] = {}
     source_link_update_errors: list[str] = []
     impl_conn = sqlite3.connect(str(db_path))
     raw_conn = sqlite3.connect(str(raw_db_path))
@@ -14739,6 +15955,8 @@ def rebuild_test_data_project_cache(
         resolved_from = str(source_resolution.get("resolved_from") or "").strip()
         workbook_excel_sqlite_rel = str(source_resolution.get("workbook_excel_sqlite_rel") or entry.get("excel_sqlite_rel") or "").strip()
         healed_excel_sqlite_rel = str(source_resolution.get("healed_excel_sqlite_rel") or "").strip()
+        healed_artifacts_rel = str(source_resolution.get("healed_artifacts_rel") or "").strip()
+        healed_metadata_rel = str(source_resolution.get("healed_metadata_rel") or "").strip()
         source_info = {
             "serial": sn,
             "source_key": sn,
@@ -14749,8 +15967,8 @@ def rebuild_test_data_project_cache(
             "workbook_excel_sqlite_rel": workbook_excel_sqlite_rel,
             "excel_sqlite_rel": healed_excel_sqlite_rel or workbook_excel_sqlite_rel,
             "healed_excel_sqlite_rel": healed_excel_sqlite_rel,
-            "artifacts_rel": str(source_resolution.get("artifacts_rel") or entry.get("artifacts_rel") or "").strip(),
-            "metadata_rel": str(entry.get("metadata_rel") or "").strip(),
+            "artifacts_rel": healed_artifacts_rel or str(source_resolution.get("artifacts_rel") or entry.get("artifacts_rel") or "").strip(),
+            "metadata_rel": healed_metadata_rel or str(source_resolution.get("metadata_rel") or entry.get("metadata_rel") or "").strip(),
             "node_root": str(source_resolution.get("node_root") or "").strip(),
             "support_dir": str(source_resolution.get("support_dir") or "").strip(),
             "reason": source_reason,
@@ -14768,13 +15986,33 @@ def rebuild_test_data_project_cache(
             missing_sources += 1
         elif status != "ok":
             invalid_sources += 1
-        elif healed_excel_sqlite_rel and healed_excel_sqlite_rel != workbook_excel_sqlite_rel:
-            entry["excel_sqlite_rel"] = healed_excel_sqlite_rel
-            source_link_updates[sn] = healed_excel_sqlite_rel
-            source_info["excel_sqlite_rel"] = healed_excel_sqlite_rel
-            source_info["link_healed"] = True
-            debug_sources[source_debug_source_idx]["excel_sqlite_rel"] = healed_excel_sqlite_rel
-            debug_sources[source_debug_source_idx]["link_healed"] = True
+        else:
+            row_link_updates = source_link_updates.setdefault(sn, {})
+            if healed_metadata_rel and healed_metadata_rel != str(entry.get("metadata_rel") or "").strip():
+                entry["metadata_rel"] = healed_metadata_rel
+                source_meta["metadata_rel"] = healed_metadata_rel
+                source_info["metadata_rel"] = healed_metadata_rel
+                debug_sources[source_debug_source_idx]["metadata_rel"] = healed_metadata_rel
+                row_link_updates["metadata_rel"] = healed_metadata_rel
+            if healed_artifacts_rel and healed_artifacts_rel != str(entry.get("artifacts_rel") or "").strip():
+                entry["artifacts_rel"] = healed_artifacts_rel
+                source_meta["artifacts_rel"] = healed_artifacts_rel
+                source_info["artifacts_rel"] = healed_artifacts_rel
+                debug_sources[source_debug_source_idx]["artifacts_rel"] = healed_artifacts_rel
+                row_link_updates["artifacts_rel"] = healed_artifacts_rel
+            if healed_excel_sqlite_rel and healed_excel_sqlite_rel != workbook_excel_sqlite_rel:
+                entry["excel_sqlite_rel"] = healed_excel_sqlite_rel
+                source_meta["excel_sqlite_rel"] = healed_excel_sqlite_rel
+                row_link_updates["excel_sqlite_rel"] = healed_excel_sqlite_rel
+                source_info["excel_sqlite_rel"] = healed_excel_sqlite_rel
+                source_info["link_healed"] = True
+                debug_sources[source_debug_source_idx]["excel_sqlite_rel"] = healed_excel_sqlite_rel
+                debug_sources[source_debug_source_idx]["link_healed"] = True
+            if row_link_updates:
+                source_info["link_healed"] = True
+                debug_sources[source_debug_source_idx]["link_healed"] = True
+            else:
+                source_link_updates.pop(sn, None)
 
         impl_conn.execute(
             """
@@ -14951,6 +16189,27 @@ def rebuild_test_data_project_cache(
                         source_issue_notes.append(f"Run '{run}' table '{table}' has no readable columns.")
                         continue
                     schema_runs += 1
+                    source_column_specs = _td_source_sqlite_column_specs(
+                        src,
+                        sheet_name=str(run),
+                        table_name=str(table),
+                        param_defs=cfg_cols,
+                    )
+                    source_column_labels = [
+                        str(
+                            spec.get("default_display_parameter")
+                            or spec.get("header")
+                            or spec.get("sqlite_column")
+                            or ""
+                        ).strip()
+                        for spec in source_column_specs
+                        if str(
+                            spec.get("default_display_parameter")
+                            or spec.get("header")
+                            or spec.get("sqlite_column")
+                            or ""
+                        ).strip()
+                    ]
 
                     order_by = "excel_row ASC" if "excel_row" in cols else "rowid ASC"
                     source_rows = _read_run_rows(src, table, cols=cols, order_by=order_by)
@@ -15001,46 +16260,52 @@ def rebuild_test_data_project_cache(
                     actual_pulse = ""
 
                     # Pick the first (left-most) matching column that also looks sequential.
-                    for c, _score, _idx in _match_by_aliases(
-                        col_list,
+                    for spec, _score, _idx in _match_source_column_specs(
+                        source_column_specs,
                         time_aliases,
                         preferred_label=X_TIME,
                         fuzzy_enabled=bool(fm_enabled),
                         min_ratio=float(fm_min_ratio),
                     ):
+                        actual_candidate = str(spec.get("sqlite_column") or "").strip()
+                        if not actual_candidate:
+                            continue
                         if not sv_enabled:
-                            actual_time = c
+                            actual_time = actual_candidate
                             break
                         vals = _probe_finite_values(
                             src,
                             table,
-                            c,
+                            actual_candidate,
                             order_by=order_by,
                             max_rows=int(sv_max_probe_rows),
                         )
                         if _is_time_sequential(vals, min_samples=int(sv_min_samples)):
-                            actual_time = c
+                            actual_time = actual_candidate
                             break
 
-                    for c, _score, _idx in _match_by_aliases(
-                        col_list,
+                    for spec, _score, _idx in _match_source_column_specs(
+                        source_column_specs,
                         pulse_aliases,
                         preferred_label=X_PULSE,
                         fuzzy_enabled=bool(fm_enabled),
                         min_ratio=float(fm_min_ratio),
                     ):
+                        actual_candidate = str(spec.get("sqlite_column") or "").strip()
+                        if not actual_candidate:
+                            continue
                         if not sv_enabled:
-                            actual_pulse = c
+                            actual_pulse = actual_candidate
                             break
                         vals = _probe_finite_values(
                             src,
                             table,
-                            c,
+                            actual_candidate,
                             order_by=order_by,
                             max_rows=int(sv_max_probe_rows),
                         )
                         if _is_pulse_sequential(vals, min_samples=int(sv_min_samples), min_run=int(sv_pulse_min_run)):
-                            actual_pulse = c
+                            actual_pulse = actual_candidate
                             break
                     if actual_time:
                         x_map[X_TIME] = actual_time
@@ -15061,49 +16326,30 @@ def rebuild_test_data_project_cache(
                     # Each sequence has one intrinsic X axis in the raw-cache model.
                     default_x = avail_x[0] if avail_x else ""
 
-                    raw_param_defs = [dict(c) for c in cfg_cols if isinstance(c, dict) and str(c.get("name") or "").strip()]
-                    calc_param_defs = _ordered_support_param_defs(
-                        sequence_names=[str(effective_run), str(run)],
-                        support_cfg=support_cfg,
-                        fallback_defs=cfg_cols,
-                    )
-                    calc_desired_y = [str(d.get("name") or "").strip() for d in calc_param_defs if str(d.get("name") or "").strip()]
-                    calc_units_by_name = {str(d.get("name") or "").strip(): str(d.get("units") or "").strip() for d in calc_param_defs}
-                    y_actual_by_name, y_match_issues = _match_configured_y_columns(
-                        col_list,
-                        raw_param_defs,
-                        used_x_actual=set(x_map.values()),
-                    )
-                    calc_y_actual_by_name, calc_match_issues = _match_configured_y_columns(
-                        col_list,
-                        calc_param_defs,
-                        used_x_actual=set(x_map.values()),
-                    )
-                    match_issues = list(dict.fromkeys(y_match_issues + calc_match_issues))
-                    matched_y_names = sorted(y_actual_by_name.keys(), key=lambda value: value.lower())
+                    discovered_y_specs: dict[str, dict[str, object]] = {}
+                    for spec in source_column_specs:
+                        actual_y = str(spec.get("sqlite_column") or "").strip()
+                        raw_name = str(spec.get("header") or "").strip()
+                        if not bool(spec.get("is_parameter")) or not actual_y or not raw_name:
+                            continue
+                        if actual_y in set(x_map.values()):
+                            continue
+                        discovered_y_specs.setdefault(raw_name, dict(spec))
+                    match_issues: list[str] = []
                     if not default_x:
                         match_issues.append(
-                            f"No canonical X axis detected. Available columns: {', '.join(col_list[:12])}"
+                            f"No canonical X axis detected. Available columns: {', '.join(source_column_labels[:12] or col_list[:12])}"
                         )
-                    if not matched_y_names:
-                        desired_names = [str(d.get("name") or "").strip() for d in raw_param_defs if str(d.get("name") or "").strip()]
+                    if not discovered_y_specs:
                         match_issues.append(
-                            "No configured Y columns matched. "
-                            f"Configured: {', '.join(desired_names[:12])}; Source: {', '.join(col_list[:12])}"
+                            "No source parameter columns were discovered. "
+                            f"Source: {', '.join(source_column_labels[:12] or col_list[:12])}"
                         )
-
-                    raw_units = run_y_raw_union.setdefault(str(effective_run), {})
-                    for y_name in matched_y_names:
-                        if y_name not in raw_units or not raw_units.get(y_name):
-                            raw_units[y_name] = str(cfg_units.get(y_name) or "").strip()
-
-                    calc_units = run_y_calc_union.setdefault(str(effective_run), {})
-                    for y_name in calc_desired_y:
-                        if y_name not in calc_units or not calc_units.get(y_name):
-                            calc_units[y_name] = str(calc_units_by_name.get(y_name) or cfg_units.get(y_name) or "").strip()
                     timings["run_discovery_and_matching_s"] += time.perf_counter() - t_match
 
                     run_curves_written = 0
+                    matched_y_names: list[str] = []
+                    serialized_curves: dict[str, tuple[list[float], list[float], str, str]] = {}
                     if default_x:
                         actual_x = x_map.get(default_x, "")
                         source_run_name_text = str(run_info.get("source_run_name") or run).strip()
@@ -15113,9 +16359,9 @@ def rebuild_test_data_project_cache(
                         suppression_voltage_float = _finite_float(run_info.get("suppression_voltage"))
                         valve_voltage_float = _finite_float(run_info.get("valve_voltage"))
                         matched_y_actuals = {
-                            str(y_name): str(y_actual_by_name.get(y_name) or "").strip()
-                            for y_name in matched_y_names
-                            if str(y_name).strip() and str(y_actual_by_name.get(y_name) or "").strip()
+                            str(raw_name): str(spec.get("sqlite_column") or "").strip()
+                            for raw_name, spec in discovered_y_specs.items()
+                            if str(raw_name).strip() and str(spec.get("sqlite_column") or "").strip()
                         }
                         t_extract = time.perf_counter()
                         curve_points_by_name = _raw_curve_points_multi(
@@ -15131,7 +16377,34 @@ def rebuild_test_data_project_cache(
                                 json.dumps(ys, separators=(",", ":"), ensure_ascii=False),
                             )
                             for y_name, (xs, ys) in curve_points_by_name.items()
+                            if xs and ys
                         }
+                        matched_y_names = sorted(serialized_curves.keys(), key=lambda value: value.lower())
+                        if discovered_y_specs and not matched_y_names:
+                            match_issues.append(
+                                "No numeric source parameter curves survived extraction for the detected X axis. "
+                                f"Source: {', '.join(source_column_labels[:12] or col_list[:12])}"
+                            )
+                        raw_units = run_y_raw_union.setdefault(str(effective_run), {})
+                        calc_units = run_y_calc_union.setdefault(str(effective_run), {})
+                        for y_name in matched_y_names:
+                            spec = dict(discovered_y_specs.get(y_name) or {})
+                            units = str(spec.get("preferred_units") or "").strip()
+                            if not units:
+                                units = str(
+                                    (
+                                        cfg_param_meta_map.get(
+                                            _td_support_norm_name(spec.get("mapped_header") or y_name)
+                                        )
+                                        or cfg_param_meta_map.get(_td_support_norm_name(y_name))
+                                        or {}
+                                    ).get("units")
+                                    or ""
+                                ).strip()
+                            if y_name not in raw_units or not raw_units.get(y_name):
+                                raw_units[y_name] = units
+                            if y_name not in calc_units or not calc_units.get(y_name):
+                                calc_units[y_name] = units
                         timings["raw_curve_extraction_s"] += time.perf_counter() - t_extract
                         if full_reset and actual_x and serialized_curves:
                             exclude_first_n = run_info.get("exclude_first_n")
@@ -15316,7 +16589,7 @@ def rebuild_test_data_project_cache(
                                 (
                                     effective_run,
                                     y_name,
-                                    str(cfg_units.get(y_name) or "").strip(),
+                                    str((run_y_raw_union.get(str(effective_run)) or {}).get(y_name) or "").strip(),
                                     default_x,
                                     table_name,
                                     run_display_name,
@@ -15337,7 +16610,12 @@ def rebuild_test_data_project_cache(
                             default_x,
                             json.dumps(
                                 [
-                                    {"name": name, "source_column": y_actual_by_name.get(name, "")}
+                                    {
+                                        "name": name,
+                                        "source_column": str(
+                                            (discovered_y_specs.get(name) or {}).get("sqlite_column") or ""
+                                        ).strip(),
+                                    }
                                     for name in matched_y_names
                                 ],
                                 ensure_ascii=False,
@@ -15354,7 +16632,12 @@ def rebuild_test_data_project_cache(
                             "run_name": effective_run,
                             "x_axis_kind": default_x,
                             "matched_y": [
-                                {"name": name, "source_column": y_actual_by_name.get(name, "")}
+                                {
+                                    "name": name,
+                                    "source_column": str(
+                                        (discovered_y_specs.get(name) or {}).get("sqlite_column") or ""
+                                    ).strip(),
+                                }
                                 for name in matched_y_names
                             ],
                             "curves_written": int(run_curves_written),
@@ -15452,13 +16735,25 @@ def rebuild_test_data_project_cache(
             for item in debug_sources:
                 sn = str(item.get("serial") or "").strip()
                 if sn in changed_links:
-                    item["excel_sqlite_rel"] = changed_links[sn]
-                    item["healed_excel_sqlite_rel"] = changed_links[sn]
+                    changed = changed_links[sn]
+                    for field in ("metadata_rel", "artifacts_rel", "excel_sqlite_rel"):
+                        value = str(changed.get(field) or "").strip()
+                        if value:
+                            item[field] = value
+                    healed_sqlite = str(changed.get("excel_sqlite_rel") or "").strip()
+                    if healed_sqlite:
+                        item["healed_excel_sqlite_rel"] = healed_sqlite
             for item in debug_diagnostics:
                 sn = str(item.get("serial") or "").strip()
                 if sn in changed_links:
-                    item["excel_sqlite_rel"] = changed_links[sn]
-                    item["healed_excel_sqlite_rel"] = changed_links[sn]
+                    changed = changed_links[sn]
+                    for field in ("metadata_rel", "artifacts_rel", "excel_sqlite_rel"):
+                        value = str(changed.get(field) or "").strip()
+                        if value:
+                            item[field] = value
+                    healed_sqlite = str(changed.get("excel_sqlite_rel") or "").strip()
+                    if healed_sqlite:
+                        item["healed_excel_sqlite_rel"] = healed_sqlite
         except Exception as exc:
             source_link_update_errors.append(str(exc))
 
@@ -15705,6 +17000,7 @@ def rebuild_test_data_project_cache(
                 for k, v in calc_aggregated_obs_meta.items()
             },
             condition_y_names={str(k): set(v) for k, v in calc_condition_y_names.items()},
+            condition_units_by_name={str(k): dict(v) for k, v in run_y_calc_union.items()},
             sequence_obs_rows=list(calc_sequence_obs_rows_by_id.values()),
             sequence_metric_rows=list(calc_sequence_metric_rows_by_key.values()),
             project_cfg=project_cfg,
@@ -16028,6 +17324,8 @@ def _td_try_load_plotter_curves(
                 c.serial,
                 COALESCE(c.program_title, ''),
                 COALESCE(c.source_run_name, ''),
+                COALESCE(sm.asset_type, ''),
+                COALESCE(sm.asset_specific_type, ''),
                 o.control_period,
                 o.suppression_voltage,
                 o.valve_voltage,
@@ -16036,6 +17334,8 @@ def _td_try_load_plotter_curves(
             FROM {TD_PLOTTER_CURVES_TABLE} c
             LEFT JOIN {TD_PLOTTER_OBSERVATIONS_TABLE} o
               ON o.observation_id = c.observation_id
+            LEFT JOIN td_source_metadata sm
+              ON sm.serial = c.serial
             WHERE c.run_name=? AND c.y_name=? AND c.x_name=?
             """
         ]
@@ -16063,7 +17363,7 @@ def _td_try_load_plotter_curves(
         curve_sql.append(" ORDER BY c.serial, c.observation_id")
         rows = conn.execute("".join(curve_sql), tuple(curve_params)).fetchall()
     out: list[dict] = []
-    for observation_id, sn, program_txt, source_run_txt, control_period, suppression_voltage, valve_voltage, xj, yj in rows:
+    for observation_id, sn, program_txt, source_run_txt, asset_type, asset_specific_type, control_period, suppression_voltage, valve_voltage, xj, yj in rows:
         try:
             xs = json.loads(xj or "[]")
             ys = json.loads(yj or "[]")
@@ -16078,6 +17378,8 @@ def _td_try_load_plotter_curves(
                 "serial": str(sn or "").strip(),
                 "program_title": str(program_txt or "").strip(),
                 "source_run_name": str(source_run_txt or "").strip(),
+                "asset_type": str(asset_type or "").strip(),
+                "asset_specific_type": str(asset_specific_type or "").strip(),
                 "control_period": control_period,
                 "suppression_voltage": suppression_voltage,
                 "valve_voltage": valve_voltage,
@@ -16280,6 +17582,8 @@ def _td_load_legacy_curves(
             "c.serial",
             "COALESCE(c.program_title, '')" if has_prog else "'' AS program_title",
             "COALESCE(c.source_run_name, '')" if has_src else "'' AS source_run_name",
+            "COALESCE(sm.asset_type, '') AS asset_type",
+            "COALESCE(sm.asset_specific_type, '') AS asset_specific_type",
             "o.control_period" if obs_table else "NULL AS control_period",
             "o.suppression_voltage" if obs_table and "suppression_voltage" in obs_cols else "NULL AS suppression_voltage",
             "o.valve_voltage" if obs_table and "valve_voltage" in obs_cols else "NULL AS valve_voltage",
@@ -16291,6 +17595,7 @@ def _td_load_legacy_curves(
         ]
         if obs_table:
             sql.append(f" LEFT JOIN {obs_table} o ON o.observation_id = c.observation_id")
+        sql.append(" LEFT JOIN td_source_metadata sm ON sm.serial = c.serial")
         sql.append(" WHERE c.run_name=? AND c.y_name=? AND c.x_name=?")
         params: list[object] = [run_name, y_name, x_name]
         if want:
@@ -16314,7 +17619,7 @@ def _td_load_legacy_curves(
         sql.append(" ORDER BY c.serial")
         rows = conn.execute("".join(sql), tuple(params)).fetchall()
     out: list[dict] = []
-    for observation_id, sn, program_txt, source_run_txt, control_period, suppression_voltage, valve_voltage, xj, yj in rows:
+    for observation_id, sn, program_txt, source_run_txt, asset_type, asset_specific_type, control_period, suppression_voltage, valve_voltage, xj, yj in rows:
         try:
             xs = json.loads(xj or "[]")
             ys = json.loads(yj or "[]")
@@ -16328,6 +17633,8 @@ def _td_load_legacy_curves(
                 "serial": serial,
                 "program_title": str(program_txt or "").strip(),
                 "source_run_name": str(source_run_txt or "").strip(),
+                "asset_type": str(asset_type or "").strip(),
+                "asset_specific_type": str(asset_specific_type or "").strip(),
                 "control_period": control_period,
                 "suppression_voltage": suppression_voltage,
                 "valve_voltage": valve_voltage,
@@ -16378,6 +17685,8 @@ def _td_try_load_raw_curves(
                 c.serial,
                 COALESCE(c.program_title, ''),
                 COALESCE(c.source_run_name, ''),
+                '' AS asset_type,
+                '' AS asset_specific_type,
                 o.control_period,
                 o.suppression_voltage,
                 o.valve_voltage,
@@ -16417,7 +17726,7 @@ def _td_try_load_raw_curves(
             if not _td_curve_schema_fallback_allowed(exc):
                 raise
             legacy_sql = [
-                f"SELECT '' AS observation_id, serial, '' AS program_title, '' AS source_run_name, NULL AS control_period, NULL AS suppression_voltage, NULL AS valve_voltage, x_json, y_json FROM {_quote_ident(table_name)} WHERE 1=1"
+                f"SELECT '' AS observation_id, serial, '' AS program_title, '' AS source_run_name, '' AS asset_type, '' AS asset_specific_type, NULL AS control_period, NULL AS suppression_voltage, NULL AS valve_voltage, x_json, y_json FROM {_quote_ident(table_name)} WHERE 1=1"
             ]
             legacy_params: list[object] = []
             if want:
@@ -16427,7 +17736,7 @@ def _td_try_load_raw_curves(
             legacy_sql.append(" ORDER BY serial")
             rows = conn.execute("".join(legacy_sql), tuple(legacy_params)).fetchall()
     out: list[dict] = []
-    for observation_id, sn, program_txt, source_run_txt, control_period, suppression_voltage, valve_voltage, xj, yj in rows:
+    for observation_id, sn, program_txt, source_run_txt, asset_type, asset_specific_type, control_period, suppression_voltage, valve_voltage, xj, yj in rows:
         try:
             xs = json.loads(xj or "[]")
             ys = json.loads(yj or "[]")
@@ -16442,6 +17751,8 @@ def _td_try_load_raw_curves(
                 "serial": str(sn or "").strip(),
                 "program_title": str(program_txt or "").strip(),
                 "source_run_name": str(source_run_txt or "").strip(),
+                "asset_type": str(asset_type or "").strip(),
+                "asset_specific_type": str(asset_specific_type or "").strip(),
                 "control_period": control_period,
                 "suppression_voltage": suppression_voltage,
                 "valve_voltage": valve_voltage,
@@ -16720,6 +18031,8 @@ def td_load_metric_series(
             m.value_num,
             COALESCE(m.program_title, ''),
             COALESCE(m.source_run_name, ''),
+            COALESCE(sm.asset_type, ''),
+            COALESCE(sm.asset_specific_type, ''),
             COALESCE(o.run_type, ''),
             o.control_period,
             o.suppression_voltage,
@@ -16727,6 +18040,8 @@ def td_load_metric_series(
         FROM {metrics_table} m
         LEFT JOIN {observations_table} o
           ON o.observation_id = m.observation_id
+        LEFT JOIN td_source_metadata sm
+          ON sm.serial = m.serial
         WHERE m.run_name=? AND m.column_name=? AND m.stat=?
         """
     ]
@@ -16767,10 +18082,12 @@ def td_load_metric_series(
             "value_num": r[2],
             "program_title": str(r[3] or "").strip(),
             "source_run_name": str(r[4] or "").strip(),
-            "run_type": str(r[5] or "").strip(),
-            "control_period": r[6],
-            "suppression_voltage": r[7],
-            "valve_voltage": r[8],
+            "asset_type": str(r[5] or "").strip(),
+            "asset_specific_type": str(r[6] or "").strip(),
+            "run_type": str(r[7] or "").strip(),
+            "control_period": r[8],
+            "suppression_voltage": r[9],
+            "valve_voltage": r[10],
         }
         for r in rows
         if str(r[0] or "").strip() and str(r[1] or "").strip()
@@ -16877,6 +18194,8 @@ def td_load_life_metric_series(
             COALESCE(l.condition_display, ''),
             COALESCE(l.program_title, ''),
             COALESCE(l.source_run_name, ''),
+            COALESCE(sm.asset_type, ''),
+            COALESCE(sm.asset_specific_type, ''),
             l.sequence_index,
             COALESCE(l.sequence_label, ''),
             l.parameter_name,
@@ -16901,6 +18220,8 @@ def td_load_life_metric_series(
         FROM {TD_LIFE_METRICS_TABLE} l
         LEFT JOIN td_condition_observations_sequences o
           ON o.observation_id = l.observation_id
+        LEFT JOIN td_source_metadata sm
+          ON sm.serial = l.serial
         WHERE l.parameter_name = ?
           AND lower(l.stat) = 'mean'
         """
@@ -16917,8 +18238,8 @@ def td_load_life_metric_series(
         rows = conn.execute("".join(sql), tuple(params)).fetchall()
     out: list[dict] = []
     for row in rows:
-        x_value = _td_finite_float(row[11])
-        y_value = _td_finite_float(row[9])
+        x_value = _td_finite_float(row[13])
+        y_value = _td_finite_float(row[11])
         if x_value is None or y_value is None:
             continue
         out.append(
@@ -16929,29 +18250,31 @@ def td_load_life_metric_series(
                 "condition_display": str(row[3] or "").strip(),
                 "program_title": str(row[4] or "").strip(),
                 "source_run_name": str(row[5] or "").strip(),
-                "sequence_index": int(row[6] or 0),
-                "sequence_label": str(row[7] or "").strip(),
-                "parameter_name": str(row[8] or "").strip(),
+                "asset_type": str(row[6] or "").strip(),
+                "asset_specific_type": str(row[7] or "").strip(),
+                "sequence_index": int(row[8] or 0),
+                "sequence_label": str(row[9] or "").strip(),
+                "parameter_name": str(row[10] or "").strip(),
                 "value_num": y_value,
-                "units": str(row[10] or "").strip(),
+                "units": str(row[12] or "").strip(),
                 "life_axis": axis,
                 "x_value": x_value,
                 "y_value": y_value,
-                "sequence_pulses": row[12],
-                "cumulative_pulses": row[13],
-                "sequence_on_time": row[14],
-                "cumulative_on_time": row[15],
-                "sequence_elapsed_time": row[16],
-                "cumulative_elapsed_time": row[17],
-                "sequence_throughput": row[18],
-                "cumulative_throughput": row[19],
-                "sequence_impulse": row[20],
-                "cumulative_impulse": row[21],
-                "diagnostics": str(row[22] or "").strip(),
-                "run_type": str(row[23] or "").strip(),
-                "control_period": row[24],
-                "suppression_voltage": row[25],
-                "valve_voltage": row[26],
+                "sequence_pulses": row[14],
+                "cumulative_pulses": row[15],
+                "sequence_on_time": row[16],
+                "cumulative_on_time": row[17],
+                "sequence_elapsed_time": row[18],
+                "cumulative_elapsed_time": row[19],
+                "sequence_throughput": row[20],
+                "cumulative_throughput": row[21],
+                "sequence_impulse": row[22],
+                "cumulative_impulse": row[23],
+                "diagnostics": str(row[24] or "").strip(),
+                "run_type": str(row[25] or "").strip(),
+                "control_period": row[26],
+                "suppression_voltage": row[27],
+                "valve_voltage": row[28],
             }
         )
     return out
@@ -16982,6 +18305,8 @@ def td_load_life_metric_xy(
             COALESCE(x.condition_display, ''),
             COALESCE(x.program_title, ''),
             COALESCE(x.source_run_name, ''),
+            COALESCE(sm.asset_type, ''),
+            COALESCE(sm.asset_specific_type, ''),
             x.sequence_index,
             COALESCE(x.sequence_label, ''),
             x.value_num,
@@ -17005,6 +18330,8 @@ def td_load_life_metric_xy(
          AND y.parameter_name = ?
         LEFT JOIN td_condition_observations_sequences o
           ON o.observation_id = x.observation_id
+        LEFT JOIN td_source_metadata sm
+          ON sm.serial = x.serial
         WHERE x.parameter_name = ?
           AND lower(x.stat) = 'mean'
         """
@@ -17021,8 +18348,8 @@ def td_load_life_metric_xy(
         rows = conn.execute("".join(sql), tuple(params)).fetchall()
     out: list[dict] = []
     for row in rows:
-        x_value = _td_finite_float(row[8])
-        y_value = _td_finite_float(row[9])
+        x_value = _td_finite_float(row[10])
+        y_value = _td_finite_float(row[11])
         if x_value is None or y_value is None:
             continue
         out.append(
@@ -17033,23 +18360,25 @@ def td_load_life_metric_xy(
                 "condition_display": str(row[3] or "").strip(),
                 "program_title": str(row[4] or "").strip(),
                 "source_run_name": str(row[5] or "").strip(),
-                "sequence_index": int(row[6] or 0),
-                "sequence_label": str(row[7] or "").strip(),
+                "asset_type": str(row[6] or "").strip(),
+                "asset_specific_type": str(row[7] or "").strip(),
+                "sequence_index": int(row[8] or 0),
+                "sequence_label": str(row[9] or "").strip(),
                 "x_parameter": x_param,
                 "y_parameter": y_param,
                 "x_value": x_value,
                 "y_value": y_value,
-                "x_units": str(row[10] or "").strip(),
-                "y_units": str(row[11] or "").strip(),
-                "cumulative_pulses": row[12],
-                "cumulative_on_time": row[13],
-                "cumulative_throughput": row[14],
-                "cumulative_impulse": row[15],
-                "diagnostics": str(row[16] or "").strip(),
-                "run_type": str(row[17] or "").strip(),
-                "control_period": row[18],
-                "suppression_voltage": row[19],
-                "valve_voltage": row[20],
+                "x_units": str(row[12] or "").strip(),
+                "y_units": str(row[13] or "").strip(),
+                "cumulative_pulses": row[14],
+                "cumulative_on_time": row[15],
+                "cumulative_throughput": row[16],
+                "cumulative_impulse": row[17],
+                "diagnostics": str(row[18] or "").strip(),
+                "run_type": str(row[19] or "").strip(),
+                "control_period": row[20],
+                "suppression_voltage": row[21],
+                "valve_voltage": row[22],
             }
         )
     return out
@@ -31698,8 +33027,35 @@ def get_file_artifacts_path(global_repo: Path, rel_path: str) -> Path | None:
     ext = path_obj.suffix.lower()
     root = eidat_debug_ocr_root(repo)
     candidates: list[Path] = []
+    raw_candidates: list[Path] = []
     support_dir = eidat_support_dir(repo)
     td_root = support_dir / TD_SERIAL_SOURCES_DIRNAME
+    if ext == ".mat" and detect_mat_bundle_member is not None and mat_bundle_artifacts_dir is not None:
+        try:
+            bundle = detect_mat_bundle_member(repo / path_obj, repo_root=repo)
+        except Exception:
+            bundle = None
+        if bundle is not None:
+            raw_candidates.append(mat_bundle_artifacts_dir(support_dir, bundle))
+    if ext in EXCEL_EXTENSIONS:
+        raw_candidates.append(root / f"{stem}{EXCEL_ARTIFACT_SUFFIX}")
+    for raw_cand in raw_candidates:
+        if not raw_cand.exists():
+            continue
+        try:
+            raw_meta = _load_metadata_from_artifacts_dir(raw_cand)
+        except Exception:
+            raw_meta = {}
+        if raw_meta:
+            try:
+                if is_test_data_doc(raw_meta):
+                    official = _td_resolve_existing_official_materialization(repo, raw_meta)
+                    official_art_dir = official.get("artifacts_path")
+                    if official_art_dir and Path(official_art_dir).exists():
+                        return Path(official_art_dir)
+            except Exception:
+                pass
+        candidates.append(raw_cand)
     if ext in EXCEL_EXTENSIONS and td_root.exists():
         td_source_stems = [stem]
         if ext == ".mat" and detect_mat_bundle_member is not None:
@@ -31726,15 +33082,6 @@ def get_file_artifacts_path(global_repo: Path, rel_path: str) -> Path | None:
                 )
             except Exception:
                 pass
-    if ext == ".mat" and detect_mat_bundle_member is not None and mat_bundle_artifacts_dir is not None:
-        try:
-            bundle = detect_mat_bundle_member(repo / path_obj, repo_root=repo)
-        except Exception:
-            bundle = None
-        if bundle is not None:
-            candidates.append(mat_bundle_artifacts_dir(support_dir, bundle))
-    if ext in EXCEL_EXTENSIONS:
-        candidates.append(root / f"{stem}{EXCEL_ARTIFACT_SUFFIX}")
     candidates.append(root / stem)
     for cand in candidates:
         if cand.exists():
@@ -36415,7 +37762,9 @@ def list_project_report_items(global_repo: Path, project_dir: Path, workbook_pat
 def project_graph_store_path(project_dir: Path, project_type: str) -> Path:
     proj = Path(project_dir).expanduser()
     if str(project_type or "").strip() == EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING:
-        return proj / "auto_plots_test_data.json"
+        from . import auto_graph_quickcheck as agq  # local import
+
+        return agq.quickcheck_library_path(proj)
     return proj / "auto_plots.json"
 
 
@@ -36557,6 +37906,58 @@ def _project_graph_pdf_items(project_dir: Path) -> list[dict[str, object]]:
 
 
 def list_project_graph_items(project_dir: Path, project_type: str) -> list[dict[str, object]]:
+    if str(project_type or "").strip() == EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING:
+        from . import auto_graph_quickcheck as agq  # local import
+
+        library = agq.load_auto_graph_quickcheck_library(project_dir)
+        store_path = Path(str(library.get("path") or agq.quickcheck_library_path(project_dir))).expanduser()
+        out: list[dict[str, object]] = []
+        for pack in [dict(item) for item in (library.get("packs") or []) if isinstance(item, Mapping)]:
+            plot_count = len([item for item in (pack.get("plots") or []) if isinstance(item, Mapping)])
+            snapshot = dict(pack.get("baseline_snapshot") or {})
+            baseline_ready = bool(str(snapshot.get("db_path") or "").strip() and Path(str(snapshot.get("db_path") or "")).expanduser().exists())
+            updated_at = str(pack.get("updated_at") or pack.get("created_at") or "").strip()
+            modified_epoch = 0.0
+            if updated_at:
+                for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+                    try:
+                        modified_epoch = datetime.strptime(updated_at, fmt).timestamp()
+                        break
+                    except Exception:
+                        continue
+            if not modified_epoch:
+                try:
+                    modified_epoch = float(store_path.stat().st_mtime)
+                except Exception:
+                    modified_epoch = 0.0
+            out.append(
+                {
+                    "id": f"graph_definition:{str(pack.get('id') or '').strip()}",
+                    "type": "graph_definition",
+                    "kind": "Quick-Check Pack",
+                    "name": str(pack.get("name") or "").strip() or "Quick-Check Pack",
+                    "scope": (
+                        f"{plot_count} plot{'s' if plot_count != 1 else ''} | "
+                        + ("Baseline ready" if baseline_ready else "No baseline")
+                    ),
+                    "location": str(store_path),
+                    "path": str(store_path),
+                    "allowed_dir": str(store_path.parent),
+                    "graph_key": str(pack.get("id") or "").strip(),
+                    "store_path": str(store_path),
+                    "modified_epoch": modified_epoch,
+                    "size_bytes": 0,
+                }
+            )
+        out.extend(_project_graph_pdf_items(project_dir))
+        out.sort(
+            key=lambda item: (
+                0 if str(item.get("type") or "") == "graph_definition" else 1,
+                -float(item.get("modified_epoch") or 0),
+                str(item.get("name") or "").casefold(),
+            )
+        )
+        return out
     out = _project_graph_definition_items(project_dir, project_type)
     out.extend(_project_graph_pdf_items(project_dir))
     out.sort(
@@ -36642,6 +38043,10 @@ def delete_project_managed_file(
 
 
 def rename_project_graph_definition(project_dir: Path, project_type: str, graph_key: str, new_name: str) -> dict[str, object]:
+    if str(project_type or "").strip() == EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING:
+        from . import auto_graph_quickcheck as agq  # local import
+
+        return agq.rename_auto_graph_quickcheck_pack(project_dir, graph_key, _safe_windows_path_name(new_name, fallback="Quick-Check Pack"))
     store = _load_project_graph_store(project_dir, project_type)
     entries = [dict(entry) for entry in (store.get("entries") or []) if isinstance(entry, Mapping)]
     target_idx = -1
@@ -36663,6 +38068,10 @@ def rename_project_graph_definition(project_dir: Path, project_type: str, graph_
 
 
 def delete_project_graph_definition(project_dir: Path, project_type: str, graph_key: str) -> dict[str, object]:
+    if str(project_type or "").strip() == EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING:
+        from . import auto_graph_quickcheck as agq  # local import
+
+        return agq.delete_auto_graph_quickcheck_pack(project_dir, graph_key)
     store = _load_project_graph_store(project_dir, project_type)
     entries = [dict(entry) for entry in (store.get("entries") or []) if isinstance(entry, Mapping)]
     kept: list[dict[str, object]] = []
@@ -36680,6 +38089,83 @@ def delete_project_graph_definition(project_dir: Path, project_type: str, graph_
         "graph_key": str(graph_key or ""),
         "store_path": str(store.get("path") or ""),
     }
+
+
+def load_auto_graph_quickcheck_library(project_dir: Path) -> dict[str, object]:
+    from . import auto_graph_quickcheck as agq  # local import
+
+    return agq.load_auto_graph_quickcheck_library(project_dir)
+
+
+def save_auto_graph_quickcheck_pack(project_dir: Path, pack_payload: Mapping[str, object]) -> dict[str, object]:
+    from . import auto_graph_quickcheck as agq  # local import
+
+    return agq.save_auto_graph_quickcheck_pack(project_dir, pack_payload)
+
+
+def delete_auto_graph_quickcheck_pack(project_dir: Path, pack_id: str) -> dict[str, object]:
+    from . import auto_graph_quickcheck as agq  # local import
+
+    return agq.delete_auto_graph_quickcheck_pack(project_dir, pack_id)
+
+
+def rename_auto_graph_quickcheck_pack(project_dir: Path, pack_id: str, new_name: str) -> dict[str, object]:
+    from . import auto_graph_quickcheck as agq  # local import
+
+    return agq.rename_auto_graph_quickcheck_pack(project_dir, pack_id, new_name)
+
+
+def build_auto_graph_quickcheck_snapshot(
+    project_dir: Path,
+    workbook_path: Path,
+    pack_id: str,
+    baseline_filters: Mapping[str, object] | None,
+    baseline_serials: Sequence[object] | None,
+) -> dict[str, object]:
+    from . import auto_graph_quickcheck as agq  # local import
+
+    proj = Path(project_dir).expanduser()
+    wb = Path(workbook_path).expanduser()
+    db_path = Path(validate_test_data_project_cache_for_open(proj, wb)).expanduser()
+    return agq.build_auto_graph_quickcheck_snapshot(proj, db_path, pack_id, baseline_filters, baseline_serials)
+
+
+def list_auto_graph_quickcheck_target_candidates(
+    project_dir: Path,
+    workbook_path: Path,
+    pack_id: str,
+) -> list[str]:
+    from . import auto_graph_quickcheck as agq  # local import
+
+    proj = Path(project_dir).expanduser()
+    wb = Path(workbook_path).expanduser()
+    db_path = Path(validate_test_data_project_cache_for_open(proj, wb)).expanduser()
+    library = agq.load_auto_graph_quickcheck_library(proj)
+    pack = next(
+        (
+            dict(item)
+            for item in (library.get("packs") or [])
+            if isinstance(item, Mapping) and str(item.get("id") or "").strip() == str(pack_id or "").strip()
+        ),
+        None,
+    )
+    if pack is None:
+        raise RuntimeError("Quick-check pack was not found.")
+    return agq.list_auto_graph_quickcheck_target_candidates(db_path, pack)
+
+
+def run_auto_graph_quickcheck_pack(
+    project_dir: Path,
+    workbook_path: Path,
+    pack_id: str,
+    target_serials: Sequence[object] | None = None,
+) -> dict[str, object]:
+    from . import auto_graph_quickcheck as agq  # local import
+
+    proj = Path(project_dir).expanduser()
+    wb = Path(workbook_path).expanduser()
+    db_path = Path(validate_test_data_project_cache_for_open(proj, wb)).expanduser()
+    return agq.run_auto_graph_quickcheck_pack(proj, db_path, pack_id, target_serials=target_serials)
 
 
 PRODUCT_CENTER_IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp")

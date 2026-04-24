@@ -175,32 +175,39 @@ class TestProjectDocumentsBackend(unittest.TestCase):
             self.assertFalse(new_pdf.exists())
             self.assertFalse(new_sidecar.exists())
 
-    def test_td_graph_definition_mutations_preserve_graph_files_schema(self) -> None:
+    def test_td_graph_definition_mutations_use_quickcheck_library_and_ignore_legacy_store(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
-            store = project_dir / "auto_plots_test_data.json"
-            store.write_text(
-                json.dumps({"version": 3, "graph_files": [{"id": "g1", "name": "Old", "plots": []}]}),
+            legacy_store = project_dir / "auto_plots_test_data.json"
+            legacy_store.write_text(
+                json.dumps({"version": 3, "graph_files": [{"id": "legacy", "name": "Old Legacy", "plots": []}]}),
                 encoding="utf-8",
             )
+            saved = be.save_auto_graph_quickcheck_pack(project_dir, {"name": "Quick Pack", "plots": []})
 
             items = be.list_project_graph_items(project_dir, be.EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING)
-            self.assertEqual(items[0].get("graph_key"), "id:g1")
+            self.assertEqual(items[0].get("graph_key"), str(saved.get("id") or "").strip())
+            self.assertEqual(items[0].get("name"), "Quick Pack")
             be.rename_project_graph_definition(
                 project_dir,
                 be.EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING,
-                "id:g1",
+                str(saved.get("id") or "").strip(),
                 "New",
             )
-            payload = json.loads(store.read_text(encoding="utf-8"))
-            self.assertEqual(payload.get("version"), 3)
-            self.assertEqual(payload.get("graph_files")[0].get("name"), "New")
-            self.assertTrue(payload.get("graph_files")[0].get("updated_at"))
+            payload = be.load_auto_graph_quickcheck_library(project_dir)
+            self.assertEqual(payload.get("version"), 1)
+            self.assertEqual(payload.get("packs")[0].get("name"), "New")
+            self.assertTrue(payload.get("packs")[0].get("updated_at"))
 
-            be.delete_project_graph_definition(project_dir, be.EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING, "id:g1")
-            payload = json.loads(store.read_text(encoding="utf-8"))
-            self.assertEqual(payload.get("version"), 3)
-            self.assertEqual(payload.get("graph_files"), [])
+            be.delete_project_graph_definition(
+                project_dir,
+                be.EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING,
+                str(saved.get("id") or "").strip(),
+            )
+            payload = be.load_auto_graph_quickcheck_library(project_dir)
+            self.assertEqual(payload.get("packs"), [])
+            legacy_payload = json.loads(legacy_store.read_text(encoding="utf-8"))
+            self.assertEqual(legacy_payload.get("graph_files")[0].get("name"), "Old Legacy")
 
     def test_eidp_graph_definition_mutations_preserve_list_schema(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
