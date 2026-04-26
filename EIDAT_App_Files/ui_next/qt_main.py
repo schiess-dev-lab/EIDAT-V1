@@ -211,12 +211,23 @@ def _td_plot_serial_label(row_or_value: Mapping[str, object] | object) -> str:
         raw = str(row_or_value or "").strip()
     if not raw:
         return ""
-    parts = [part.strip() for part in re.split(r"\s*[|/]\s*", raw) if part.strip()]
-    if len(parts) >= 4:
+    parts = [part.strip() for part in re.split(r"\s*\|\s*|\s+/\s+", raw) if part.strip()]
+    if not parts:
+        return raw
+    for part in reversed(parts):
+        token = str(part).strip()
+        if re.match(r"(?i)^sn[-_ ]*[A-Za-z0-9]", token) or (
+            any(ch.isalpha() for ch in token)
+            and any(ch.isdigit() for ch in token)
+            and "\\" not in token
+            and "/" not in token
+        ):
+            return token
+    if len(parts) >= 2 and str(parts[-1]).strip().casefold().startswith("source"):
+        return str(parts[-2]).strip() or str(parts[-1]).strip()
+    if len(parts) == 4:
         return parts[3]
-    if parts:
-        return parts[-1]
-    return raw
+    return parts[-1]
 
 
 def _td_display_serial_values(values: list[object] | tuple[object, ...] | None) -> list[str]:
@@ -441,13 +452,16 @@ class ProjectTaskWorker(QtCore.QThread):
             if self._log_path is not None:
                 self._log_path.parent.mkdir(parents=True, exist_ok=True)
                 handle = self._log_path.open("a", encoding="utf-8")
+            started = time.perf_counter()
 
             def _report(message: str) -> None:
                 txt = str(message or "").strip()
                 if not txt:
                     return
-                self._write_log_line(handle, txt)
-                self.progress.emit(txt)
+                elapsed_s = max(0.0, time.perf_counter() - started)
+                stamped = f"[+{elapsed_s:.1f}s] {txt}"
+                self._write_log_line(handle, stamped)
+                self.progress.emit(stamped)
 
             if self._log_path is not None:
                 _report(f"Log file: {self._log_path}")
@@ -705,7 +719,7 @@ class RepoScanDialog(QtWidgets.QDialog):
         self.setWindowTitle("Global Repo Scan")
         self.setModal(False)
         self.setWindowFlag(QtCore.Qt.WindowType.WindowContextHelpButtonHint, False)
-        self.resize(460, 230)
+        self.resize(700, 420)
         self.setStyleSheet(
             """
             QDialog {
@@ -714,6 +728,15 @@ class RepoScanDialog(QtWidgets.QDialog):
             }
             QDialog QLabel {
                 color: #f6fbff;
+            }
+            QPlainTextEdit {
+                background-color: #09111f;
+                color: #dbeafe;
+                border: 1px solid #284364;
+                border-radius: 6px;
+                padding: 8px;
+                font-family: Consolas, 'Courier New', monospace;
+                font-size: 11px;
             }
             QProgressBar {
                 background-color: #14253d;
@@ -759,6 +782,11 @@ class RepoScanDialog(QtWidgets.QDialog):
         self.lbl_detail.setWordWrap(True)
         self.lbl_detail.setStyleSheet("color: #dbeafe; font-size: 11px;")
 
+        self.txt_transcript = QtWidgets.QPlainTextEdit()
+        self.txt_transcript.setReadOnly(True)
+        self.txt_transcript.setLineWrapMode(QtWidgets.QPlainTextEdit.LineWrapMode.NoWrap)
+        self.txt_transcript.setMinimumHeight(180)
+
         self.progress_bar = QtWidgets.QProgressBar()
         self.progress_bar.setRange(0, 0)
         self.progress_bar.setTextVisible(True)
@@ -775,11 +803,14 @@ class RepoScanDialog(QtWidgets.QDialog):
         layout.addWidget(self.lbl_heading)
         layout.addWidget(self.lbl_status)
         layout.addWidget(self.lbl_detail)
+        layout.addWidget(self.txt_transcript, 1)
         layout.addWidget(self.progress_bar)
         layout.addWidget(self.lbl_hint)
         layout.addWidget(self.btn_close)
 
         self._base_status = ""
+        self._detail_lines: list[str] = []
+        self._detail_line_limit = 180
         self._dot_frames = ["", ".", "..", "..."]
         self._dot_index = 0
         self._dot_timer = QtCore.QTimer(self)
@@ -796,6 +827,8 @@ class RepoScanDialog(QtWidgets.QDialog):
         self._base_status = status_text
         self.lbl_status.setText(status_text)
         self.lbl_detail.setText("")
+        self._detail_lines = []
+        self.txt_transcript.clear()
         self.progress_bar.setRange(0, 0)
         self.progress_bar.setFormat("Scanning...")
         self.btn_close.setEnabled(False)
@@ -817,10 +850,25 @@ class RepoScanDialog(QtWidgets.QDialog):
     def set_detail_text(self, detail_text: str) -> None:
         self.lbl_detail.setText(str(detail_text or "").strip())
 
+    def append_detail_line(self, detail_text: str) -> None:
+        text = str(detail_text or "").strip()
+        if not text:
+            return
+        self.lbl_detail.setText(text)
+        self._detail_lines.append(text)
+        if len(self._detail_lines) > self._detail_line_limit:
+            self._detail_lines = self._detail_lines[-self._detail_line_limit :]
+        self.txt_transcript.setPlainText("\n".join(self._detail_lines))
+        bar = self.txt_transcript.verticalScrollBar()
+        if bar is not None:
+            bar.setValue(bar.maximum())
+
     def finish(self, message: str, success: bool = True):
         self._dot_timer.stop()
         self.lbl_status.setText(message)
-        self.lbl_detail.setText("")
+        self.lbl_detail.setText(str(message or "").strip())
+        if str(message or "").strip():
+            self.append_detail_line(str(message or "").strip())
         if self.progress_bar.maximum() == 0:
             self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(100 if success else self.progress_bar.value())
@@ -3222,9 +3270,28 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
     def _act_save(self) -> None:
         try:
             saved_rows = be.save_td_repo_parameter_mappings(self._project_dir, self._working_rows)
+            refresh_warning = ""
+            refresher = getattr(be, "refresh_td_parameter_runtime_cache", None)
+            if callable(refresher):
+                try:
+                    refresher(self._project_dir, self._workbook_path, self._db_path)
+                except Exception as refresh_exc:
+                    invalidator = getattr(be, "invalidate_td_parameter_runtime_cache", None)
+                    if callable(invalidator):
+                        try:
+                            invalidator(self._db_path)
+                        except Exception:
+                            pass
+                    refresh_warning = (
+                        "ProgramRequirements mappings were saved, but the runtime parameter cache could not be refreshed.\n\n"
+                        "Run Update Project before opening Trend / Analyze again.\n\n"
+                        f"Details: {refresh_exc}"
+                    )
             self._working_rows = self._sorted_rows(saved_rows)
             self._set_dirty(False)
             self.saved = True
+            if refresh_warning:
+                QtWidgets.QMessageBox.warning(self, "Project Parameters", refresh_warning)
             self.accept()
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "Project Parameters", str(exc))
@@ -4142,6 +4209,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._metric_parameter_options: list[dict[str, object]] = []
         self._curve_parameter_options: list[dict[str, object]] = []
         self._life_parameter_options: list[dict[str, object]] = []
+        self._raw_y_columns_by_run: dict[str, list[dict[str, object]]] = {}
+        self._metric_y_columns_by_run: dict[str, list[dict[str, object]]] = {}
+        self._x_columns_by_run: dict[str, list[str]] = {}
+        self._curve_y_columns_by_run_x: dict[tuple[str, str], list[dict[str, object]]] = {}
+        self._life_parameter_options_by_runs: dict[tuple[str, ...], list[dict[str, object]]] = {}
+        self._life_axes_cache: list[dict[str, object]] | None = None
 
         self.setWindowTitle("Test Data - Trend / Analyze")
         self.resize(1280, 760)
@@ -5602,12 +5675,16 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         if not getattr(self, "_db_path", None):
             self._parameter_normalization_context = {}
             return
-        builder = getattr(be, "td_build_parameter_normalization_context", None)
-        if not callable(builder):
-            self._parameter_normalization_context = {}
-            return
         try:
-            context = builder(self._project_dir, self._workbook_path, self._db_path)
+            context_loader = getattr(be, "td_load_parameter_runtime_context", None)
+            context = (
+                context_loader(self._project_dir, self._db_path)
+                if callable(context_loader)
+                else {}
+            )
+            if not isinstance(context, Mapping) or not dict(context):
+                builder = getattr(be, "td_build_parameter_normalization_context", None)
+                context = builder(self._project_dir, self._workbook_path, self._db_path) if callable(builder) else {}
         except Exception:
             context = {}
         self._parameter_normalization_context = dict(context or {})
@@ -7809,6 +7886,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
     def _refresh_from_cache(self) -> None:
         if not self._db_path:
             return
+        self._raw_y_columns_by_run = {}
+        self._metric_y_columns_by_run = {}
+        self._x_columns_by_run = {}
+        self._curve_y_columns_by_run_x = {}
+        self._life_parameter_options_by_runs = {}
+        self._life_axes_cache = None
         try:
             runs_ex = be.td_list_runs_ex(self._db_path)
             serials = be.td_list_serials(self._db_path)
@@ -11570,6 +11653,96 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 pass
             return []
 
+    def _load_metric_summary_for_selection(
+        self,
+        run_name: str,
+        column_name: str,
+        serial: str,
+        stats: Sequence[object],
+        *,
+        selection: dict | None = None,
+        control_period_filter: object = None,
+        run_type_filter: object = None,
+        metric_source: object = None,
+        filter_state: Mapping[str, object] | None = None,
+    ) -> list[dict]:
+        if not getattr(self, "_db_path", None):
+            return []
+        loader = getattr(be, "td_load_metric_summary_for_selection", None)
+        if not callable(loader):
+            return []
+        metric_source_value = (
+            metric_source
+            if metric_source is not None
+            else getattr(be, "TD_METRIC_PLOT_SOURCE_AGGREGATE", "aggregate")
+        )
+        selection_value = str(column_name or "").strip()
+        serial_txt = str(serial or "").strip()
+        candidate_raw_names = self._parameter_selection_raw_names(
+            selection_value,
+            run_names=([run_name] if run_name else []),
+            surface="metrics",
+        )
+        if not candidate_raw_names and selection_value:
+            candidate_raw_names = [selection_value]
+        normalizer = getattr(be, "td_metric_normalize_plot_source", None)
+        if callable(normalizer):
+            try:
+                metric_source_norm = str(normalizer(metric_source_value)).strip().lower()
+            except Exception:
+                metric_source_norm = str(metric_source_value or "").strip().lower()
+        else:
+            metric_source_norm = str(metric_source_value or "").strip().lower()
+        program_title, source_run_name = self._selection_observation_filters(selection)
+        if metric_source_norm != getattr(be, "TD_METRIC_PLOT_SOURCE_ALL_SEQUENCES", "all_sequences"):
+            program_title, source_run_name = "", ""
+        loader_control_period_filter = (
+            control_period_filter
+            if control_period_filter not in (None, "")
+            else self._single_active_control_period_filter_value(filter_state=filter_state)
+        )
+        try:
+            rows = loader(
+                self._db_path,
+                run_name,
+                candidate_raw_names,
+                serial_txt,
+                stats,
+                program_title=(program_title or None),
+                source_run_name=(source_run_name or None),
+                control_period_filter=loader_control_period_filter,
+                run_type_filter=run_type_filter,
+                metric_source=metric_source_norm,
+            )
+        except Exception:
+            return []
+        filtered_rows = self._filter_rows_for_global_selection(rows, filter_state=filter_state)
+        combined_rows: list[dict] = []
+        seen_keys: set[tuple[str, str, str, str]] = set()
+        for row in filtered_rows:
+            raw_name = str(row.get("column_name") or "").strip()
+            if not self._parameter_selection_matches_row(
+                selection_value,
+                raw_name=raw_name,
+                program_title=row.get("program_title"),
+                asset_type=row.get("asset_type"),
+                asset_specific_type=row.get("asset_specific_type"),
+            ):
+                continue
+            tagged = dict(row)
+            tagged["parameter_name"] = raw_name
+            row_key = (
+                str(tagged.get("observation_id") or "").strip(),
+                str(tagged.get("parameter_name") or "").strip(),
+                str(tagged.get("stat") or "").strip().lower(),
+                str(tagged.get("source_run_name") or "").strip().casefold(),
+            )
+            if row_key in seen_keys:
+                continue
+            seen_keys.add(row_key)
+            combined_rows.append(tagged)
+        return combined_rows
+
     def _load_curves_for_selection(
         self,
         run_name: str,
@@ -12191,18 +12364,27 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         seen_metric_y: set[str] = set()
         seen_x: set[str] = set()
         for run in runs:
-            try:
-                raw_cols = be.td_list_raw_y_columns(self._db_path, run)
-            except Exception:
-                raw_cols = []
-            try:
-                metric_cols = be.td_list_metric_y_columns(self._db_path, run)
-            except Exception:
-                metric_cols = []
-            try:
-                x_vals = be.td_list_x_columns(self._db_path, run)
-            except Exception:
-                x_vals = []
+            raw_cols = self._raw_y_columns_by_run.get(run)
+            if raw_cols is None:
+                try:
+                    raw_cols = [dict(col) for col in (be.td_list_raw_y_columns(self._db_path, run) or []) if isinstance(col, Mapping)]
+                except Exception:
+                    raw_cols = []
+                self._raw_y_columns_by_run[run] = list(raw_cols)
+            metric_cols = self._metric_y_columns_by_run.get(run)
+            if metric_cols is None:
+                try:
+                    metric_cols = [dict(col) for col in (be.td_list_metric_y_columns(self._db_path, run) or []) if isinstance(col, Mapping)]
+                except Exception:
+                    metric_cols = []
+                self._metric_y_columns_by_run[run] = list(metric_cols)
+            x_vals = self._x_columns_by_run.get(run)
+            if x_vals is None:
+                try:
+                    x_vals = [str(value).strip() for value in (be.td_list_x_columns(self._db_path, run) or []) if str(value).strip()]
+                except Exception:
+                    x_vals = []
+                self._x_columns_by_run[run] = list(x_vals)
             for col in raw_cols:
                 name = str((col or {}).get("name") or "").strip()
                 if name and name not in seen_y:
@@ -12262,11 +12444,14 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             prev_life_y = self._current_life_y_parameter()
             prev_life_x = self._current_life_x_parameter()
             prev_life_axis = self._current_life_axis()
-            life_params: list[dict] = []
-            try:
-                life_params = be.td_list_life_parameter_options(self._db_path, runs)
-            except Exception:
-                life_params = []
+            life_key = tuple(sorted({str(value).strip() for value in runs if str(value).strip()}, key=str.casefold))
+            life_params = self._life_parameter_options_by_runs.get(life_key)
+            if life_params is None:
+                try:
+                    life_params = [dict(item) for item in (be.td_list_life_parameter_options(self._db_path, runs) or []) if isinstance(item, Mapping)]
+                except Exception:
+                    life_params = []
+                self._life_parameter_options_by_runs[life_key] = list(life_params)
             life_raw_names = [str((item or {}).get("name") or "").strip() for item in life_params if str((item or {}).get("name") or "").strip()]
             self._life_parameter_options = self._parameter_selector_options(
                 surface="life_metrics",
@@ -12274,11 +12459,13 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 raw_names=life_raw_names,
                 raw_columns=life_params,
             )
-            life_axes: list[dict] = []
-            try:
-                life_axes = be.td_list_life_axes(self._db_path)
-            except Exception:
-                life_axes = []
+            life_axes = list(self._life_axes_cache or [])
+            if self._life_axes_cache is None:
+                try:
+                    life_axes = [dict(item) for item in (be.td_list_life_axes(self._db_path) or []) if isinstance(item, Mapping)]
+                except Exception:
+                    life_axes = []
+                self._life_axes_cache = list(life_axes)
             if hasattr(self, "cb_life_axis") and life_axes:
                 self.cb_life_axis.blockSignals(True)
                 try:
@@ -12376,10 +12563,14 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         y_columns: list[dict[str, str]] = []
         for run in runs:
             x_col = self._resolve_curve_x_key(run, x_key or x_label)
-            try:
-                y_cols = be.td_list_curve_y_columns(self._db_path, run, x_col)
-            except Exception:
-                y_cols = []
+            cache_key = (str(run).strip(), str(x_col or "").strip())
+            y_cols = self._curve_y_columns_by_run_x.get(cache_key)
+            if y_cols is None:
+                try:
+                    y_cols = [dict(col) for col in (be.td_list_curve_y_columns(self._db_path, run, x_col) or []) if isinstance(col, Mapping)]
+                except Exception:
+                    y_cols = []
+                self._curve_y_columns_by_run_x[cache_key] = list(y_cols)
             for col in y_cols:
                 name = str((col or {}).get("name") or "").strip()
                 if name and name not in seen_y:
@@ -12607,16 +12798,32 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         _set_val("serial", _td_plot_serial_label(sn) or sn)
         selection = self._current_run_selection()
         metric_source = self._selected_metric_plot_source()
-        for st in ("count", "mean", "std", "min", "max"):
+        stats_order = ("count", "mean", "std", "min", "max")
+        summary_rows = self._load_metric_summary_for_selection(
+            run,
+            y_col,
+            sn,
+            stats_order,
+            selection=selection,
+            metric_source=metric_source,
+        )
+        rows_by_stat: dict[str, list[dict]] = {}
+        for row in summary_rows:
+            stat_key = str(row.get("stat") or "").strip().lower()
+            if stat_key:
+                rows_by_stat.setdefault(stat_key, []).append(dict(row))
+        for st in stats_order:
             val = None
-            series = self._load_metric_series_for_selection(
-                run,
-                y_col,
-                st,
-                selection=selection,
-                metric_source=metric_source,
-            )
-            matches = [r for r in series if str(r.get("serial") or "").strip() == sn]
+            matches = list(rows_by_stat.get(st) or [])
+            if not summary_rows:
+                series = self._load_metric_series_for_selection(
+                    run,
+                    y_col,
+                    st,
+                    selection=selection,
+                    metric_source=metric_source,
+                )
+                matches = [r for r in series if str(r.get("serial") or "").strip() == sn]
             if (
                 metric_source == getattr(be, "TD_METRIC_PLOT_SOURCE_ALL_SEQUENCES", "all_sequences")
                 and len(matches) > 1
@@ -29823,7 +30030,7 @@ class MainWindow(QtWidgets.QMainWindow):
         log_path = self._project_task_log_path(project_dir, log_prefix)
         self._project_popup_active = True
         self._repo_scan_dialog.begin(status_text, heading=heading)
-        self._repo_scan_dialog.set_detail_text(f"Logging to {log_path.name}")
+        self._repo_scan_dialog.append_detail_line(f"Logging to {log_path.name}")
         self._append_log(f"[GUI] {heading} started")
         self._append_log(f"[PROJECT TASK] Log: {log_path}")
 
@@ -29840,7 +30047,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._append_log(f"[PROJECT TASK] {msg}")
         if self._project_popup_active:
-            self._repo_scan_dialog.set_detail_text(msg)
+            self._repo_scan_dialog.append_detail_line(msg)
 
     def _on_project_task_done(self, payload: object, on_success, heading: str) -> None:
         self._project_worker = None
@@ -29967,9 +30174,12 @@ class MainWindow(QtWidgets.QMainWindow):
                     "support_refresh_s",
                     "pre_cache_workbook_save_s",
                     "cache_ensure_s",
+                    "parameter_runtime_s",
                     "cache_read_s",
                     "data_calc_build_s",
                     "metrics_long_sheet_s",
+                    "metrics_long_sequences_sheet_s",
+                    "life_metrics_sheet_s",
                     "raw_cache_long_sheet_s",
                     "perf_candidates_main_s",
                     "perf_candidates_cp_total_s",

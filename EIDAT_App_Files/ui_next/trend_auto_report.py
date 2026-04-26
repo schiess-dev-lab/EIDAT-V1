@@ -139,6 +139,21 @@ def _td_serial_value(row: Mapping[str, object] | None) -> str:
 
 
 def _tar_display_serial_label(value: object | Mapping[str, object]) -> str:
+    try:
+        from . import backend as be  # type: ignore
+    except Exception:  # pragma: no cover
+        try:
+            import ui_next.backend as be  # type: ignore
+        except Exception:  # pragma: no cover
+            be = None  # type: ignore
+    backend_helper = getattr(be, "td_display_serial_label", None) if be is not None else None
+    if callable(backend_helper):
+        try:
+            text = str(backend_helper(value) or "").strip()
+            if text:
+                return text
+        except Exception:
+            pass
     if isinstance(value, Mapping):
         for key in ("serial_number", "source_serial_number"):
             txt = str(value.get(key) or "").strip()
@@ -149,12 +164,23 @@ def _tar_display_serial_label(value: object | Mapping[str, object]) -> str:
         raw = str(value or "").strip()
     if not raw:
         return ""
-    parts = [part.strip() for part in re.split(r"\s*[|/]\s*", raw) if part.strip()]
-    if len(parts) >= 4:
+    parts = [part.strip() for part in re.split(r"\s*\|\s*|\s+/\s+", raw) if part.strip()]
+    if not parts:
+        return raw
+    for part in reversed(parts):
+        token = str(part).strip()
+        if re.match(r"(?i)^sn[-_ ]*[A-Za-z0-9]", token) or (
+            any(ch.isalpha() for ch in token)
+            and any(ch.isdigit() for ch in token)
+            and "\\" not in token
+            and "/" not in token
+        ):
+            return token
+    if len(parts) >= 2 and str(parts[-1]).strip().casefold().startswith("source"):
+        return str(parts[-2]).strip() or str(parts[-1]).strip()
+    if len(parts) == 4:
         return parts[3]
-    if parts:
-        return parts[-1]
-    return raw
+    return parts[-1]
 
 
 def _tar_display_serial(ctx: Mapping[str, Any] | None, serial: object) -> str:
@@ -3002,8 +3028,8 @@ def _tar_comparison_table_width_budget() -> float:
 
 def _tar_comparison_left_col_widths(font_size: int) -> list[float]:
     if int(font_size) <= 8:
-        return [1.95 * 72.0, 1.60 * 72.0, 0.82 * 72.0]
-    return [2.05 * 72.0, 1.75 * 72.0, 0.90 * 72.0]
+        return [0.98 * 72.0, 0.80 * 72.0, 0.82 * 72.0]
+    return [1.03 * 72.0, 0.88 * 72.0, 0.90 * 72.0]
 
 
 def _tar_comparison_param_min_width(font_size: int) -> float:
@@ -3271,10 +3297,11 @@ def _tar_build_comparison_page_matrix(page_spec: Mapping[str, object]) -> tuple[
         block = dict(raw_block or {})
         start_row = len(rows)
         by_parameter = dict(block.get("rows_by_parameter") or {})
+        sample_row = next((dict(value) for value in by_parameter.values() if isinstance(value, Mapping)), {})
         for metric_index, metric_label in enumerate(_TAR_COMPARISON_METRIC_ROWS):
             row_values = [
-                str(block.get("run_condition") or "") if metric_index == 0 else "",
-                str(block.get("sequence_text") or "") if metric_index == 0 else "",
+                _tar_run_condition_bullet_text(sample_row or block) if metric_index == 0 else "",
+                _tar_sequence_bullet_text(sample_row or block) if metric_index == 0 else "",
                 metric_label,
             ]
             for param_name in param_names:
@@ -5106,6 +5133,15 @@ def _tar_join_limited(values: list[object], *, max_items: int = 5, empty: str = 
     return ", ".join(items[:max_items]) + f", +{len(items) - max_items} more"
 
 
+def _tar_join_pipe_limited(values: list[object], *, max_items: int = 5, empty: str = "All") -> str:
+    items = [str(value).strip() for value in values if str(value).strip()]
+    if not items:
+        return empty
+    if len(items) <= max_items:
+        return " | ".join(items)
+    return " | ".join(items[:max_items]) + f" | +{len(items) - max_items} more"
+
+
 def _tar_subtitle_text(text: object) -> str:
     raw = str(text or "").replace("\n", " | ").strip()
     if not raw:
@@ -5301,6 +5337,147 @@ def _tar_exec_overall_text(initial_status: object, final_status: object) -> str:
     if final and final != "NO_DATA":
         lines.append(f"Final: {final}")
     return "\n".join(lines)
+
+
+def _tar_exec_baseline_mean(row: Mapping[str, object] | None) -> float | None:
+    if not isinstance(row, Mapping):
+        return None
+    for key in ("official_baseline_mean", "final_family_mean", "final_atp_mean", "initial_family_mean", "initial_atp_mean"):
+        value = _safe_float(row.get(key))
+        if value is not None:
+            return float(value)
+    return None
+
+
+def _tar_exec_serial_mean(row: Mapping[str, object] | None) -> float | None:
+    if not isinstance(row, Mapping):
+        return None
+    for key in ("official_serial_mean", "final_serial_mean", "final_actual_mean", "initial_serial_mean", "initial_actual_mean"):
+        value = _safe_float(row.get(key))
+        if value is not None:
+            return float(value)
+    return None
+
+
+def _tar_exec_deviation_score(row: Mapping[str, object] | None) -> float | None:
+    if not isinstance(row, Mapping):
+        return None
+    for key in ("official_deviation_score", "official_zscore", "final_zscore", "final_delta", "initial_zscore", "initial_delta"):
+        value = _safe_float(row.get(key))
+        if value is not None:
+            return float(value)
+    return None
+
+
+def _tar_exec_difference_pct(row: Mapping[str, object] | None) -> float | None:
+    return _tar_percent_delta_between_scalars(_tar_exec_baseline_mean(row), _tar_exec_serial_mean(row))
+
+
+def _tar_exec_grade_thresholds(ctx: Mapping[str, Any] | None) -> tuple[float, float]:
+    report_cfg = (ctx or {}).get("report_cfg") if isinstance(ctx, Mapping) else {}
+    grading_cfg = report_cfg.get("grading") if isinstance(report_cfg, Mapping) else {}
+    pass_max = _safe_float((grading_cfg or {}).get("zscore_pass_max"))
+    watch_max = _safe_float((grading_cfg or {}).get("zscore_watch_max"))
+    return (
+        float(pass_max if pass_max is not None else 2.0),
+        float(watch_max if watch_max is not None else 3.0),
+    )
+
+
+def _tar_split_display_values(text: object, *, separators: str) -> list[str]:
+    raw = str(text or "").replace("\r", "\n").strip()
+    if not raw:
+        return []
+    parts = [raw]
+    for separator in separators:
+        next_parts: list[str] = []
+        for part in parts:
+            next_parts.extend(re.split(rf"\s*{re.escape(separator)}\s*", str(part or "").strip()))
+        parts = next_parts
+    return _tar_unique_text_values(parts)
+
+
+def _tar_bullet_text(items: Iterable[object] | None) -> str:
+    cleaned = [str(item).strip() for item in (items or []) if str(item).strip()]
+    return "\n".join(f"- {item}" for item in cleaned)
+
+
+def _tar_condition_token_text(token: object) -> str:
+    text = re.sub(r"\s+", " ", str(token or "").strip())
+    if not text:
+        return ""
+    patterns = (
+        (r"^pressure\b\s*:?\s*(.*)$", "Pressure"),
+        (r"^on(?:\s+|[-_])?time\b\s*:?\s*(.*)$", "On Time"),
+        (r"^off(?:\s+|[-_])?time\b\s*:?\s*(.*)$", "Off Time"),
+        (r"^supp(?:ression)?(?:\s+voltage)?\b\s*:?\s*(.*)$", "Suppression Voltage"),
+        (r"^valve(?:\s+voltage)?\b\s*:?\s*(.*)$", "Valve Voltage"),
+    )
+    for pattern, label in patterns:
+        match = re.match(pattern, text, flags=re.IGNORECASE)
+        if not match:
+            continue
+        value = str(match.group(1) or "").strip(" :|-")
+        return f"{label}: {value}" if value else label
+    return text
+
+
+def _tar_run_condition_bullet_items(row: Mapping[str, object] | None) -> list[str]:
+    if not isinstance(row, Mapping):
+        return []
+    items = [_tar_condition_token_text(token) for token in _tar_split_display_values(row.get("run_condition"), separators="|\n")]
+    items = _tar_unique_text_values([item for item in items if item])
+    seen_keys = [_norm_key(item) for item in items]
+    for label, key in (
+        (f"Suppression Voltage: {str(row.get('official_suppression_voltage_label') or row.get('final_suppression_voltage_label') or '').strip()}", "suppression voltage"),
+        (f"Valve Voltage: {str(row.get('official_valve_voltage_label') or row.get('final_valve_voltage_label') or '').strip()}", "valve voltage"),
+    ):
+        value = str(label.split(":", 1)[1] if ":" in label else "").strip()
+        if not value or value.upper() == "ALL" or any(_norm_key(key) in seen for seen in seen_keys):
+            continue
+        items.append(label)
+        seen_keys.append(_norm_key(label))
+    return items
+
+
+def _tar_run_condition_bullet_text(row: Mapping[str, object] | None) -> str:
+    return _tar_bullet_text(_tar_run_condition_bullet_items(row))
+
+
+def _tar_sequence_bullet_items(row: Mapping[str, object] | None) -> list[str]:
+    if not isinstance(row, Mapping):
+        return []
+    programs = _tar_unique_text_values(row.get("selection_member_programs") or [])
+    sequences = _tar_unique_text_values(row.get("selection_member_sequences") or [])
+    if not sequences:
+        sequences = _tar_split_display_values(row.get("sequence_text"), separators=",\n")
+    if not sequences:
+        sequences = _tar_unique_text_values(row.get("selection_member_runs") or [])
+    if programs and sequences:
+        if len(programs) == 1:
+            return [f"{programs[0]} | {sequence}" for sequence in sequences]
+        if len(programs) == len(sequences):
+            return [f"{program} | {sequence}" for program, sequence in zip(programs, sequences)]
+        program_text = " / ".join(programs)
+        return [f"{program_text} | {sequence}" for sequence in sequences]
+    if sequences:
+        return list(sequences)
+    return list(programs)
+
+
+def _tar_sequence_bullet_text(row: Mapping[str, object] | None) -> str:
+    return _tar_bullet_text(_tar_sequence_bullet_items(row))
+
+
+def _tar_exec_mean_pair_text(row: Mapping[str, object] | None) -> str:
+    if not isinstance(row, Mapping):
+        return ""
+    return "\n".join(
+        [
+            f"Graded: {_fmt_num(_tar_exec_baseline_mean(row), sig=5)}",
+            f"SN: {_fmt_num(_tar_exec_serial_mean(row), sig=5)}",
+        ]
+    )
 
 
 def _tar_initial_overall_status_from_rows(rows: list[Mapping[str, Any]] | None) -> str:
@@ -6232,10 +6409,21 @@ def _tar_build_per_serial_comparison_rows(
         run_name = str(spec.get("run") or "").strip()
         param_name = str(spec.get("param") or "").strip()
         units = str(spec.get("units") or "").strip()
+        selection = dict(spec.get("selection") or {})
         selection_fields = dict(spec.get("selection_fields") or {})
         initial_payload = spec.get("initial_plot_payload") if isinstance(spec.get("initial_plot_payload"), Mapping) else None
         regrade_payloads = spec.get("regrade_plot_payloads") if isinstance(spec.get("regrade_plot_payloads"), Mapping) else {}
         final_override = spec.get("filter_state_override") if isinstance(spec.get("filter_state_override"), Mapping) else None
+        selection_program_title = _td_display_program_title(selection.get("program_title"))
+        selection_member_programs = _tar_unique_text_values(
+            [_td_display_program_title(value) for value in (selection.get("member_programs") or []) if _td_display_program_title(value)]
+        )
+        if not selection_member_programs and selection_program_title:
+            selection_member_programs = [selection_program_title]
+        selection_member_sequences = _tar_unique_text_values(selection.get("member_sequences") or [])
+        selection_member_runs = _tar_unique_text_values(
+            [_run_display_text(str(value).strip(), (ctx.get("run_by_name") or {})) or str(value).strip() for value in (selection.get("member_runs") or []) if str(value).strip()]
+        )
 
         final_suppression = (
             str(spec.get("suppression_voltage_label") or "").strip()
@@ -6396,6 +6584,10 @@ def _tar_build_per_serial_comparison_rows(
                 "grade": final_grade,
                 "grade_text": _tar_comparison_grade_text(initial_grade, final_grade, regrade_applied=(regrade_applied or final_pass_applied or initial_skipped)),
                 "selection_mode": selection_fields.get("mode") or "sequence",
+                "selection_program_title": selection_program_title,
+                "selection_member_programs": list(selection_member_programs),
+                "selection_member_sequences": list(selection_member_sequences),
+                "selection_member_runs": list(selection_member_runs),
                 "base_condition_label": str(spec.get("base_condition_label") or "").strip(),
                 "initial_suppression_voltage_label": initial_suppression,
                 "final_suppression_voltage_label": row_final_suppression,
@@ -6548,6 +6740,186 @@ def _tar_outcome_mix_text(rows: list[Mapping[str, Any]] | None) -> str:
     )
 
 
+_TAR_EXEC_SERIAL_MAX_ROWS = 10
+_TAR_EXEC_DETAIL_MAX_ROWS = 8
+
+
+def _tar_exec_scope_table_rows(
+    ctx: Mapping[str, Any],
+    *,
+    quick_summary: Mapping[str, object] | None,
+    exception_rows: list[Mapping[str, Any]] | None = None,
+) -> list[list[str]]:
+    summary = dict(quick_summary or {})
+    linked_rows = [
+        row
+        for row in (exception_rows or [])
+        if isinstance(row, Mapping) and str(row.get("chart_label") or "").strip()
+    ]
+    linked_pages: set[int] = set()
+    for row in linked_rows:
+        try:
+            linked_pages.add(int(row.get("chart_target_page_index")))
+        except Exception:
+            continue
+    overall_by_sn = (ctx.get("overall_by_sn") or {}) if isinstance(ctx, Mapping) else {}
+    comparison_rows = [dict(row) for row in (ctx.get("comparison_rows") or []) if isinstance(row, Mapping)]
+    grade_counts = _tar_grade_counts_from_rows(comparison_rows)
+    serial_counts = {
+        "CERTIFIED": sum(1 for status in overall_by_sn.values() if status == "CERTIFIED"),
+        "WATCH": sum(1 for status in overall_by_sn.values() if status == "WATCH"),
+        "FAILED": sum(1 for status in overall_by_sn.values() if status == "FAILED"),
+        "LIMITED": sum(1 for status in overall_by_sn.values() if status == "LIMITED"),
+    }
+    return [
+        ["Scope Item", "Summary"],
+        [
+            "SNs analyzed",
+            _tar_join_pipe_limited(_tar_display_serial_values(ctx.get("hi") or [], ctx=ctx), max_items=10, empty="(none)"),
+        ],
+        [
+            "Parameters analyzed",
+            _tar_join_pipe_limited(ctx.get("params") or [], max_items=10, empty="(none)"),
+        ],
+        [
+            "Run conditions",
+            _tar_join_pipe_limited(summary.get("selected_run_conditions") or [], max_items=6, empty="(none)"),
+        ],
+        [
+            "Programs compared",
+            _tar_join_pipe_limited(summary.get("comparison_programs") or summary.get("certifying_programs") or [], max_items=6, empty="(unknown)"),
+        ],
+        [
+            "Final voltage scope",
+            (
+                f"Suppression: {str(summary.get('final_suppression_voltage') or 'All').strip() or 'All'}"
+                f" | Valve: {str(summary.get('final_valve_voltage') or 'All').strip() or 'All'}"
+            ),
+        ],
+        [
+            "Serial disposition",
+            (
+                f"CERTIFIED {serial_counts['CERTIFIED']} | WATCH {serial_counts['WATCH']} | "
+                f"FAILED {serial_counts['FAILED']} | LIMITED {serial_counts['LIMITED']}"
+            ),
+        ],
+        [
+            "Graded items",
+            (
+                f"PASS {grade_counts['PASS']} | WATCH {grade_counts['WATCH']} | "
+                f"FAIL {grade_counts['FAIL']} | LIMITED {grade_counts['LIMITED']}"
+            ),
+        ],
+        [
+            "Linked watch/fail charts",
+            f"{len(linked_rows)} item link(s) across {len(linked_pages)} chart page(s)",
+        ],
+    ]
+
+
+def _tar_exec_grading_table_rows(ctx: Mapping[str, Any]) -> list[list[str]]:
+    z_pass, z_watch = _tar_exec_grade_thresholds(ctx)
+    return [
+        ["Grade Item", "Computation / Meaning", "Rule / Threshold"],
+        [
+            "Official graded mean",
+            "Mean of the selected comparison pool after the certification serial is removed from its own baseline.",
+            "This is the baseline mean shown in the summary and SN comparison pages.",
+        ],
+        [
+            "SN mean",
+            "Mean for the certification serial on the same run condition, sequence scope, and parameter.",
+            "Compared directly to the official graded mean.",
+        ],
+        [
+            "Difference %",
+            "abs(SN mean - graded mean) / max(abs(SN mean), abs(graded mean)) * 100",
+            "Shown in the WATCH / FAIL detail table for a quick magnitude check.",
+        ],
+        [
+            "Deviation score",
+            "Official grading score from the selected-pool or exact-condition pass.",
+            (
+                f"PASS: |score| <= {_fmt_num(z_pass, sig=4)} | "
+                f"WATCH: {_fmt_num(z_pass, sig=4)} < |score| <= {_fmt_num(z_watch, sig=4)} | "
+                f"FAIL: |score| > {_fmt_num(z_watch, sig=4)}"
+            ),
+        ],
+        [
+            "Final grade",
+            "If an exact-condition regrade exists, the final grade replaces the initial pre-pass grade for the official result.",
+            "Chart links jump to the supporting curve page for each WATCH / FAIL item.",
+        ],
+    ]
+
+
+def _tar_exec_serial_table_rows(
+    ctx: Mapping[str, Any],
+    comparison_rows_by_serial: Mapping[str, list[Mapping[str, Any]]] | None,
+) -> list[list[str]]:
+    rows = [
+        [
+            _tar_display_serial(ctx, serial) or serial,
+            _tar_exec_overall_text(
+                (ctx.get("initial_overall_by_sn") or {}).get(serial, ""),
+                (ctx.get("final_overall_by_sn") or {}).get(serial, ""),
+            ),
+            _tar_meta(ctx, serial, "program_title"),
+            _tar_meta(ctx, serial, "part_number"),
+            _tar_meta(ctx, serial, "revision"),
+            _tar_outcome_mix_text((comparison_rows_by_serial or {}).get(serial) or []),
+        ]
+        for serial in (ctx.get("hi") or [])
+    ]
+    if len(rows) > _TAR_EXEC_SERIAL_MAX_ROWS:
+        hidden = len(rows) - _TAR_EXEC_SERIAL_MAX_ROWS
+        rows = rows[:_TAR_EXEC_SERIAL_MAX_ROWS]
+        rows.append(["Additional serials", f"+{hidden} more", "", "", "", "Listed in the scope table above."])
+    return [["SN", "Initial / Final", "Program", "Part #", "Rev", "P/W/F items"], *rows]
+
+
+def _tar_exec_exception_table_rows(
+    ctx: Mapping[str, Any],
+    exception_rows: list[Mapping[str, Any]] | None,
+) -> list[list[str]]:
+    rows = [dict(row) for row in (exception_rows or []) if isinstance(row, Mapping)]
+    if not rows:
+        return [
+            ["SN", "Run Condition", "Sequence(s)", "Parameter", "Graded / SN Mean", "Diff %", "Score", "Grade", "Chart"],
+            ["-", "No WATCH or FAIL items were produced for the selected certification scope.", "", "", "", "", "", "", ""],
+        ]
+    limited_rows = rows[:_TAR_EXEC_DETAIL_MAX_ROWS]
+    table_rows = [
+        [
+            _tar_display_serial(ctx, row.get("serial")) or str(row.get("serial") or "").strip(),
+            _tar_run_condition_bullet_text(row),
+            _tar_sequence_bullet_text(row) or str(row.get("sequence_text") or ""),
+            str(row.get("parameter") or ""),
+            _tar_exec_mean_pair_text(row),
+            _fmt_num(_tar_exec_difference_pct(row), sig=4),
+            _fmt_num(_tar_exec_deviation_score(row), sig=4),
+            str(row.get("final_status") or row.get("official_grade") or "").strip().upper(),
+            str(row.get("chart_label") or ""),
+        ]
+        for row in limited_rows
+    ]
+    if len(rows) > len(limited_rows):
+        table_rows.append(
+            [
+                "Additional items",
+                f"+{len(rows) - len(limited_rows)} more WATCH / FAIL row(s) are summarized in the body charts.",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+            ]
+        )
+    return [["SN", "Run Condition", "Sequence(s)", "Parameter", "Graded / SN Mean", "Diff %", "Score", "Grade", "Chart"], *table_rows]
+
+
 def _tar_pass_fail_synopsis_lines(
     ctx: Mapping[str, Any],
     *,
@@ -6676,6 +7048,18 @@ def _tar_build_exec_exception_rows(ctx: Mapping[str, Any]) -> list[dict[str, Any
                 "sequence_text": str(raw_row.get("sequence_text") or "").strip(),
                 "parameter": str(raw_row.get("parameter") or raw_row.get("param") or "").strip(),
                 "final_status": final_status,
+                "official_baseline_mean": raw_row.get("official_baseline_mean"),
+                "official_serial_mean": raw_row.get("official_serial_mean"),
+                "official_deviation_score": _tar_exec_deviation_score(raw_row),
+                "official_grade": str(raw_row.get("official_grade") or final_status).strip().upper() or final_status,
+                "difference_pct": _tar_exec_difference_pct(raw_row),
+                "grade_basis_text": str(raw_row.get("grade_basis_text") or "").strip(),
+                "selection_program_title": str(raw_row.get("selection_program_title") or "").strip(),
+                "selection_member_programs": list(raw_row.get("selection_member_programs") or []),
+                "selection_member_sequences": list(raw_row.get("selection_member_sequences") or []),
+                "selection_member_runs": list(raw_row.get("selection_member_runs") or []),
+                "official_suppression_voltage_label": str(raw_row.get("official_suppression_voltage_label") or "").strip(),
+                "official_valve_voltage_label": str(raw_row.get("official_valve_voltage_label") or "").strip(),
                 "regrade_cohort_id": cohort_id,
                 "chart_target_section": chart_target_section,
                 "chart_target_page_index": chart_target_page_index,
@@ -10076,60 +10460,15 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
     Spacer = rl["Spacer"]
     PageBreak = rl["PageBreak"]
     inch = rl["inch"]
-    colors = rl["colors"]
-
-    status_counts = {
-        "CERTIFIED": sum(1 for status in (ctx.get("overall_by_sn") or {}).values() if status == "CERTIFIED"),
-        "WATCH": sum(1 for status in (ctx.get("overall_by_sn") or {}).values() if status == "WATCH"),
-        "FAILED": sum(1 for status in (ctx.get("overall_by_sn") or {}).values() if status == "FAILED"),
-        "LIMITED": sum(1 for status in (ctx.get("overall_by_sn") or {}).values() if status == "LIMITED"),
-    }
-    highlight_lines = []
-    nonpass_findings = list(ctx.get("nonpass_findings") or [])
-    pair_by_id = ctx.get("pair_by_id") or {}
-    if nonpass_findings:
-        for finding in nonpass_findings[:8]:
-            pair_id = str(finding.get("pair_id") or "").strip()
-            pair = pair_by_id.get(pair_id) or {}
-            run_name = str(finding.get("run") or "").strip()
-            param_name = str(finding.get("param") or "").strip()
-            display_text = (
-                str(finding.get("selection_label") or "").strip()
-                or str(pair.get("selection_label") or "").strip()
-                or str((pair.get("selection_fields") or {}).get("display_text") or "").strip()
-                or run_name
-            )
-            highlight_lines.append(
-                f"{_tar_display_serial(ctx, finding.get('serial')) or str(finding.get('serial') or '').strip()} | "
-                f"{display_text} | {param_name} | {finding.get('grade')} | "
-                f"Max % {_fmt_num(finding.get('max_pct'))} | score {_fmt_num(finding.get('z'), sig=4)}"
-            )
-        if len(nonpass_findings) > len(highlight_lines):
-            highlight_lines.append(f"+{len(nonpass_findings) - len(highlight_lines)} more WATCH / FAIL findings")
-    else:
-        highlight_lines = ["No WATCH or FAIL curve findings for the selected certification serials."]
-
     quick_summary = dict(ctx.get("quick_summary") or _tar_build_quick_summary(ctx))
-    metadata_snapshot_lines = _tar_metadata_snapshot_lines(ctx)
     comparison_rows = [dict(row) for row in (ctx.get("comparison_rows") or []) if isinstance(row, Mapping)]
     exception_rows = _tar_build_exec_exception_rows(ctx)
-    pass_fail_synopsis_lines = _tar_pass_fail_synopsis_lines(ctx, exception_rows=exception_rows)
     comparison_rows_by_serial: dict[str, list[dict[str, Any]]] = {}
     for row in comparison_rows:
         serial = str(row.get("serial") or "").strip()
         if serial:
             comparison_rows_by_serial.setdefault(serial, []).append(dict(row))
-    initial_vs_final_lines = [
-        (
-            "Pool Selection: Noise-aware pre-pass chooses compatible programs within each base run condition, parameter, and X axis. "
-            f"Suppression Voltage: {str(quick_summary.get('initial_suppression_voltage') or 'All').strip() or 'All'} | "
-            f"Valve Voltage: {str(quick_summary.get('initial_valve_voltage') or 'All').strip() or 'All'}"
-        ),
-        (
-            "Official Grade: Each certification serial is removed from its own selected-pool baseline, then graded against the remaining "
-            "program median and band using a sustained deviation score."
-        ),
-    ]
+    z_pass, z_watch = _tar_exec_grade_thresholds(ctx)
 
     story: list[Any] = []
     print_ctx = ctx["print_ctx"]
@@ -10147,116 +10486,70 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
     )
     story.append(Spacer(1, 0.14 * inch))
     story.append(_portrait_paragraph("Executive Summary", styles["section"], rl))
-
-    exec_rows = [
-        [
-            _tar_display_serial(ctx, serial) or serial,
-            _tar_exec_overall_text(
-                (ctx.get("initial_overall_by_sn") or {}).get(serial, ""),
-                (ctx.get("final_overall_by_sn") or {}).get(serial, ""),
-            ),
-            _tar_meta(ctx, serial, "program_title"),
-            _tar_meta(ctx, serial, "part_number"),
-            _tar_meta(ctx, serial, "revision"),
-            _tar_outcome_mix_text(comparison_rows_by_serial.get(serial) or []),
-        ]
-        for serial in (ctx.get("hi") or [])
-    ]
-    for start in range(0, len(exec_rows), 14):
-        if start:
-            story.append(PageBreak())
-            story.append(_portrait_paragraph("Executive Summary (Continued)", styles["section"], rl))
-        story.append(
-            _portrait_box_table(
-                [["Serial", "Overall", "Program", "Part #", "Rev", "Pass / Watch / Fail"], *exec_rows[start : start + 14]],
-                col_widths=[0.78 * inch, 1.18 * inch, 1.12 * inch, 0.98 * inch, 0.48 * inch, 2.36 * inch],
-                styles=styles,
-                rl=rl,
-                repeat_rows=1,
-                compact=True,
-            )
-        )
-    story.append(Spacer(1, 0.10 * inch))
-    story.append(_portrait_card("Pass / Fail Synopsis", pass_fail_synopsis_lines, styles=styles, rl=rl))
-    if exception_rows:
-        story.append(Spacer(1, 0.10 * inch))
-        story.append(
-            _portrait_box_table(
-                [
-                    ["Serial", "Run Condition", "Sequence(s)", "Parameter", "Final Status", "Chart"],
-                    *[
-                        [
-                            _tar_display_serial(ctx, row.get("serial")) or str(row.get("serial") or "").strip(),
-                            str(row.get("run_condition") or ""),
-                            str(row.get("sequence_text") or ""),
-                            str(row.get("parameter") or ""),
-                            str(row.get("final_status") or ""),
-                            str(row.get("chart_label") or ""),
-                        ]
-                        for row in exception_rows
-                    ],
-                ],
-                col_widths=[0.70 * inch, 1.65 * inch, 1.40 * inch, 1.05 * inch, 0.75 * inch, 1.35 * inch],
-                styles=styles,
-                rl=rl,
-                repeat_rows=1,
-                compact=True,
-            )
-        )
-
-    story.append(Spacer(1, 0.10 * inch))
     story.append(
-        _portrait_card(
-            "Disposition",
-            [
-                f"CERTIFIED: {status_counts['CERTIFIED']}",
-                f"WATCH: {status_counts['WATCH']}",
-                f"FAILED: {status_counts['FAILED']}",
-                f"LIMITED: {status_counts['LIMITED']}",
-                f"Curves evaluated: {len(ctx.get('pair_specs') or [])}",
-                f"Performance plots configured: {len(ctx.get('performance_plot_specs') or [])}",
-            ],
-            styles=styles,
-            rl=rl,
+        _portrait_paragraph(
+            "This summary shows which certification serial numbers, run conditions, and parameters were analyzed, then surfaces the scored items that matter first. "
+            "The detailed comparison and chart sections later in the report still carry the full trace-level evidence.",
+            styles["body"],
+            rl,
         )
     )
-    story.append(Spacer(1, 0.10 * inch))
-    story.append(_portrait_card("Program Pool Grading", initial_vs_final_lines, styles=styles, rl=rl))
-    story.append(Spacer(1, 0.10 * inch))
-    story.append(_portrait_card("Watch / Review Highlights", highlight_lines, styles=styles, rl=rl))
-    story.append(Spacer(1, 0.10 * inch))
+    story.append(
+        _portrait_paragraph(
+            "Each scored row compares the official graded mean against the certification serial mean for the same scope. "
+            f"Difference % is reported as an easy magnitude check, while the official deviation score drives the grade bands: PASS at or below {_fmt_num(z_pass, sig=4)}, "
+            f"WATCH above {_fmt_num(z_pass, sig=4)} through {_fmt_num(z_watch, sig=4)}, and FAIL above {_fmt_num(z_watch, sig=4)}. "
+            "If an exact-condition regrade exists, that result becomes the official grade shown here.",
+            styles["body"],
+            rl,
+        )
+    )
+    story.append(Spacer(1, 0.08 * inch))
+    story.append(_portrait_paragraph("Report Scope", styles["card_title"], rl))
     story.append(
         _portrait_box_table(
-            [
-                ["Serials Under Certification", "Runs Included", "Parameters Included", "Watch / Non-PASS Curves"],
-                [str(len(ctx.get("hi") or [])), str(len(ctx.get("runs") or [])), str(len(ctx.get("params") or [])), str(len(ctx.get("watch_pair_ids") or []))],
-            ],
-            col_widths=[1.7 * inch, 1.45 * inch, 1.45 * inch, 2.3 * inch],
+            _tar_exec_scope_table_rows(ctx, quick_summary=quick_summary, exception_rows=exception_rows),
+            col_widths=[1.55 * inch, 5.35 * inch],
             styles=styles,
             rl=rl,
             repeat_rows=1,
+            compact=True,
         )
     )
-    story.append(Spacer(1, 0.12 * inch))
+    story.append(Spacer(1, 0.08 * inch))
+    story.append(_portrait_paragraph("Grading Logic", styles["card_title"], rl))
     story.append(
-        _portrait_card(
-            "Metadata Snapshot",
-            metadata_snapshot_lines,
+        _portrait_box_table(
+            _tar_exec_grading_table_rows(ctx),
+            col_widths=[1.15 * inch, 3.35 * inch, 2.40 * inch],
             styles=styles,
             rl=rl,
+            repeat_rows=1,
+            compact=True,
         )
     )
-    story.append(Spacer(1, 0.10 * inch))
+    story.append(Spacer(1, 0.08 * inch))
+    story.append(_portrait_paragraph("Serial Results", styles["card_title"], rl))
     story.append(
-        _portrait_card(
-            "Build Notes",
-            [
-                f"Printed: {print_ctx.printed_at}",
-                str(ctx.get("change_summary") or "").splitlines()[0] if str(ctx.get("change_summary") or "").strip() else "No config update summary available.",
-                "Legacy page caps and appendix trimming are disabled for this report layout.",
-            ],
+        _portrait_box_table(
+            _tar_exec_serial_table_rows(ctx, comparison_rows_by_serial),
+            col_widths=[0.78 * inch, 1.18 * inch, 1.12 * inch, 0.98 * inch, 0.48 * inch, 2.36 * inch],
             styles=styles,
             rl=rl,
+            repeat_rows=1,
+            compact=True,
+        )
+    )
+    story.append(Spacer(1, 0.08 * inch))
+    story.append(_portrait_paragraph("WATCH / FAIL Detail", styles["card_title"], rl))
+    story.append(
+        _portrait_box_table(
+            _tar_exec_exception_table_rows(ctx, exception_rows),
+            col_widths=[0.52 * inch, 1.10 * inch, 1.00 * inch, 0.62 * inch, 1.08 * inch, 0.54 * inch, 0.50 * inch, 0.48 * inch, 0.60 * inch],
+            styles=styles,
+            rl=rl,
+            repeat_rows=1,
+            compact=True,
         )
     )
 

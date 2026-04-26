@@ -1649,7 +1649,7 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
             "inch": 1.0,
             "colors": types.SimpleNamespace(HexColor=lambda value: value, white="#ffffff"),
         }
-        fake_styles = {name: name for name in ("cover_title", "cover_subtitle", "body", "section", "small")}
+        fake_styles = {name: name for name in ("cover_title", "cover_subtitle", "body", "section", "small", "card_title")}
         ctx = {
             "print_ctx": tar._capture_print_context(),
             "pair_specs": [{"selection_fields": {"mode": "condition", "display_text": "Condition A | Supp 100"}}],
@@ -1755,13 +1755,19 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
             story = tar._tar_build_intro_story(ctx)
 
         tables = [item[1] for item in story if isinstance(item, tuple) and item and item[0] == "Table"]
-        exec_table = next(rows for rows in tables if rows and rows[0][0] == "Serial" and rows[0][1] == "Overall")
-        exception_table = next(rows for rows in tables if rows and rows[0][0] == "Serial" and rows[0][1] == "Run Condition")
-        self.assertEqual(exec_table[1][1], "Initial: FAILED\nFinal: WATCH")
-        self.assertEqual(exec_table[0], ["Serial", "Overall", "Program", "Part #", "Rev", "Pass / Watch / Fail"])
-        self.assertEqual(exec_table[1][5], "PASS 1/2 (50%)\nWATCH 1/2 (50%)\nFAIL 0/2 (0%)")
-        self.assertEqual([row[4] for row in exception_table[1:]], ["WATCH"])
-        self.assertTrue(str(exception_table[1][5]).startswith("Chart "))
+        scope_table = next(rows for rows in tables if rows and rows[0][0] == "Scope Item")
+        grading_table = next(rows for rows in tables if rows and rows[0][0] == "Grade Item")
+        serial_table = next(rows for rows in tables if rows and rows[0][0] == "SN" and rows[0][1] == "Initial / Final")
+        exception_table = next(rows for rows in tables if rows and rows[0][0] == "SN" and rows[0][1] == "Run Condition")
+        self.assertEqual(scope_table[1][0], "SNs analyzed")
+        self.assertEqual(grading_table[1][0], "Official graded mean")
+        self.assertEqual(serial_table[1][1], "Initial: FAILED\nFinal: WATCH")
+        self.assertEqual(serial_table[0], ["SN", "Initial / Final", "Program", "Part #", "Rev", "P/W/F items"])
+        self.assertEqual(serial_table[1][5], "PASS 1/2 (50%)\nWATCH 1/2 (50%)\nFAIL 0/2 (0%)")
+        self.assertEqual(exception_table[1][7], "WATCH")
+        self.assertTrue(str(exception_table[1][8]).startswith("Chart "))
+        self.assertIn("Suppression Voltage: 100", str(exception_table[1][1]))
+        self.assertIn("Seq 2", str(exception_table[1][2]))
         self.assertFalse(any(rows and str(rows[0][0]).startswith("Run Condition:") for rows in tables))
 
     def test_plan_comparison_pages_pivots_by_serial_and_splits_by_run_blocks(self):
@@ -1877,7 +1883,9 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         matrix_rows, style_cmds = tar._tar_build_comparison_page_matrix(first_page)
         self.assertEqual(matrix_rows[0][:5], ["Run Condition", "Sequence(s)", "Metric", "Pressure", "Flow"])
         self.assertEqual(matrix_rows[1][:5], ["", "", "", "psi", "kg/s"])
-        self.assertEqual(matrix_rows[2][:5], ["Condition 00", "Seq 00", "Initial Status", "PASS", "PASS"])
+        self.assertEqual(matrix_rows[2][2:5], ["Initial Status", "PASS", "PASS"])
+        self.assertIn("Condition 00", matrix_rows[2][0])
+        self.assertIn("Seq 00", matrix_rows[2][1])
         self.assertEqual(matrix_rows[3][:5], ["", "", "Graded Mean", "12", "20"])
         self.assertEqual(matrix_rows[4][:5], ["", "", "Certified Serial Mean", "11", "19"])
         self.assertEqual(matrix_rows[5][:5], ["", "", "Deviation Score", "-1", "-1"])

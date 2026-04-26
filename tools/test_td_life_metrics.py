@@ -90,8 +90,8 @@ class TestTDLifeMetrics(unittest.TestCase):
         serial: str,
         x_name: str,
         y_name: str,
-        xs: list[float | int],
-        ys: list[float | int],
+        xs: list[object],
+        ys: list[object],
     ) -> None:
         raw_conn.execute(
             """
@@ -289,6 +289,189 @@ class TestTDLifeMetrics(unittest.TestCase):
                 ).fetchone()
 
             self.assertEqual(tuple(float(value) for value in row), (4.0, 12.0, 12.0))
+
+    def test_pm_impulse_prefers_raw_cumulative_impulse_endpoint(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            db_path, raw_db_path, workbook_path = self._make_paths(td)
+            self._init_dbs(db_path, raw_db_path)
+            with sqlite3.connect(str(db_path)) as conn:
+                self._insert_sequence(
+                    conn,
+                    obs_id="SN1__Program_A__Seq1",
+                    run_name="cond_a",
+                    display_name="Test Block A",
+                    source_run_name="Seq1",
+                    run_type="PM",
+                    pulse_width=0.2,
+                    control_period=1.0,
+                    metrics={"pc": 35.0, "impulse bit": 3.0, "thrust": 9.0},
+                )
+                conn.commit()
+            with sqlite3.connect(str(raw_db_path)) as raw_conn:
+                self._insert_raw_pulse_axis(raw_conn, obs_id="SN1__Program_A__Seq1", run_name="cond_a", serial="SN1", pulses=[1, 2, 3, 4])
+                self._insert_raw_curve(
+                    raw_conn,
+                    obs_id="SN1__Program_A__Seq1",
+                    run_name="cond_a",
+                    serial="SN1",
+                    x_name="Pulse Number",
+                    y_name="I bit",
+                    xs=[1, 2, 3, 4],
+                    ys=[10.0, 10.0, 10.0, 10.0],
+                )
+                self._insert_raw_curve(
+                    raw_conn,
+                    obs_id="SN1__Program_A__Seq1",
+                    run_name="cond_a",
+                    serial="SN1",
+                    x_name="Pulse Number",
+                    y_name="cum impulse",
+                    xs=[1, 2, 3, 4],
+                    ys=[2.0, 5.0, 9.0, 13.0],
+                )
+                raw_conn.commit()
+
+            with sqlite3.connect(str(db_path)) as conn:
+                be._td_rebuild_life_metrics(  # type: ignore[attr-defined]
+                    conn,
+                    workbook_path=workbook_path,
+                    project_cfg={},
+                    raw_db_path=raw_db_path,
+                    computed_epoch_ns=99,
+                )
+                row = conn.execute(
+                    """
+                    SELECT sequence_pulses, sequence_impulse, cumulative_impulse
+                    FROM td_life_metrics
+                    WHERE parameter_name='pc'
+                    """
+                ).fetchone()
+
+            self.assertEqual(tuple(float(value) for value in row), (4.0, 13.0, 13.0))
+
+    def test_pm_cumulative_impulse_rolls_up_raw_endpoints_by_sequence(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            db_path, raw_db_path, workbook_path = self._make_paths(td)
+            self._init_dbs(db_path, raw_db_path)
+            with sqlite3.connect(str(db_path)) as conn:
+                self._insert_sequence(
+                    conn,
+                    obs_id="SN1__Program_A__Seq1",
+                    run_name="cond_a",
+                    display_name="Test Block A",
+                    source_run_name="Seq1",
+                    run_type="PM",
+                    pulse_width=0.2,
+                    control_period=1.0,
+                    metrics={"pc": 35.0, "impulse bit": 3.0},
+                )
+                self._insert_sequence(
+                    conn,
+                    obs_id="SN1__Program_A__Seq2",
+                    run_name="cond_b",
+                    display_name="Test Block B",
+                    source_run_name="Seq2",
+                    run_type="PM",
+                    pulse_width=0.2,
+                    control_period=1.0,
+                    metrics={"pc": 36.0, "impulse bit": 9.0},
+                )
+                conn.commit()
+            with sqlite3.connect(str(raw_db_path)) as raw_conn:
+                self._insert_raw_pulse_axis(raw_conn, obs_id="SN1__Program_A__Seq1", run_name="cond_a", serial="SN1", pulses=[1, 2, 3, 4])
+                self._insert_raw_pulse_axis(raw_conn, obs_id="SN1__Program_A__Seq2", run_name="cond_b", serial="SN1", pulses=[1, 2])
+                self._insert_raw_curve(
+                    raw_conn,
+                    obs_id="SN1__Program_A__Seq1",
+                    run_name="cond_a",
+                    serial="SN1",
+                    x_name="Pulse Number",
+                    y_name="Cum. Impulse",
+                    xs=[1, 2, 3, 4],
+                    ys=[1.0, 4.0, 8.0, 13.0],
+                )
+                self._insert_raw_curve(
+                    raw_conn,
+                    obs_id="SN1__Program_A__Seq2",
+                    run_name="cond_b",
+                    serial="SN1",
+                    x_name="Pulse Number",
+                    y_name="Cumulative Impulse",
+                    xs=[1, 2],
+                    ys=[3.0, 6.5],
+                )
+                raw_conn.commit()
+
+            with sqlite3.connect(str(db_path)) as conn:
+                be._td_rebuild_life_metrics(  # type: ignore[attr-defined]
+                    conn,
+                    workbook_path=workbook_path,
+                    project_cfg={},
+                    raw_db_path=raw_db_path,
+                    computed_epoch_ns=99,
+                )
+                rows = conn.execute(
+                    """
+                    SELECT sequence_index, sequence_impulse, cumulative_impulse
+                    FROM td_life_metrics
+                    WHERE parameter_name='pc'
+                    ORDER BY sequence_index
+                    """
+                ).fetchall()
+
+            self.assertEqual(
+                [(int(row[0]), float(row[1]), float(row[2])) for row in rows],
+                [(1, 13.0, 13.0), (2, 6.5, 19.5)],
+            )
+
+    def test_pm_cumulative_impulse_uses_last_finite_tail_value(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            db_path, raw_db_path, workbook_path = self._make_paths(td)
+            self._init_dbs(db_path, raw_db_path)
+            with sqlite3.connect(str(db_path)) as conn:
+                self._insert_sequence(
+                    conn,
+                    obs_id="SN1__Program_A__Seq1",
+                    run_name="cond_a",
+                    display_name="Test Block A",
+                    source_run_name="Seq1",
+                    run_type="PM",
+                    pulse_width=0.2,
+                    control_period=1.0,
+                    metrics={"pc": 35.0, "impulse bit": 3.0},
+                )
+                conn.commit()
+            with sqlite3.connect(str(raw_db_path)) as raw_conn:
+                self._insert_raw_pulse_axis(raw_conn, obs_id="SN1__Program_A__Seq1", run_name="cond_a", serial="SN1", pulses=[1, 2, 3, 4])
+                self._insert_raw_curve(
+                    raw_conn,
+                    obs_id="SN1__Program_A__Seq1",
+                    run_name="cond_a",
+                    serial="SN1",
+                    x_name="Pulse Number",
+                    y_name="cumulative impulse",
+                    xs=[1, 2, 3, 4],
+                    ys=[2.0, 5.0, None, None],
+                )
+                raw_conn.commit()
+
+            with sqlite3.connect(str(db_path)) as conn:
+                be._td_rebuild_life_metrics(  # type: ignore[attr-defined]
+                    conn,
+                    workbook_path=workbook_path,
+                    project_cfg={},
+                    raw_db_path=raw_db_path,
+                    computed_epoch_ns=99,
+                )
+                row = conn.execute(
+                    """
+                    SELECT sequence_impulse, cumulative_impulse
+                    FROM td_life_metrics
+                    WHERE parameter_name='pc'
+                    """
+                ).fetchone()
+
+            self.assertEqual(tuple(float(value) for value in row), (5.0, 5.0))
 
     def test_steady_state_uses_raw_thrust_time_integration(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:

@@ -112,6 +112,20 @@ class TestBackendEdinProgramFolders(unittest.TestCase):
             "SN-001__SN-002__SN-003__plus_1_more_Test Data Report.pdf",
         )
 
+    def test_td_display_serial_label_extracts_serial_from_prefixed_composite_source_key(self) -> None:
+        serial = backend.td_display_serial_label(
+            r"C:\repo\EIDAT Support\doc_a / Program Alpha / Valve / Primary / SN-001 / source_a"
+        )
+        self.assertEqual(serial, "SN-001")
+
+    def test_td_auto_report_default_filename_uses_display_serial_for_composite_source_keys(self) -> None:
+        name = backend.td_auto_report_default_filename(
+            "Program Alpha",
+            [r"C:\repo\EIDAT Support\doc_a / Program Alpha / Valve / Primary / SN-001 / source_a"],
+            when=backend.datetime(2026, 4, 9, 12, 0, 0),
+        )
+        self.assertEqual(name, "SN-001_Test Data Report.pdf")
+
     def test_get_repo_root_prefers_active_node_root_over_configured_repo_root(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

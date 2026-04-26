@@ -642,6 +642,25 @@ class TestQtMainMetricPlotSource(unittest.TestCase):
             if tmpdir:
                 shutil.rmtree(str(tmpdir), ignore_errors=True)
 
+    def test_curve_trace_label_uses_serial_number_from_prefixed_composite_source_key(self) -> None:
+        window = self._make_window()
+        try:
+            label = window._curve_trace_label(
+                "CondA",
+                {
+                    "serial": r"C:\repo\EIDAT Support\doc_a / Program Alpha / Valve / Primary / SN-001 / source_a",
+                    "program_title": "Program Alpha",
+                    "source_run_name": "Seq-1",
+                },
+                multi_run=False,
+            )
+            self.assertEqual(label, "SN-001 | Program Alpha | Seq-1")
+        finally:
+            window.close()
+            tmpdir = getattr(window, "_test_tmpdir", "")
+            if tmpdir:
+                shutil.rmtree(str(tmpdir), ignore_errors=True)
+
     def test_stats_panel_displays_serial_number_from_composite_source_key(self) -> None:
         window = self._make_window()
         try:

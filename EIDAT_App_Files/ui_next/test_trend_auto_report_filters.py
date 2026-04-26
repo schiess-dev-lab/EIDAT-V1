@@ -427,6 +427,26 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         self.assertIn("Certified Serial(s): SN-001", summary["lines"])
         self.assertFalse(any(composite_serial in line for line in summary["lines"]))
 
+    def test_build_quick_summary_lines_show_display_serial_for_prefixed_composite_source_keys(self) -> None:
+        composite_serial = r"C:\repo\EIDAT Support\doc_a / Program A / Valve / Injector / SN-001 / source_a"
+        other_serial = r"C:\repo\EIDAT Support\doc_b / Program B / Valve / Pilot / SN-002 / source_b"
+        ctx = {
+            "hi": [composite_serial],
+            "all_serials": [composite_serial, other_serial],
+            "pair_specs": [],
+            "meta_by_sn": {
+                composite_serial: {"program_title": "Program A", "serial_number": "SN-001"},
+                other_serial: {"program_title": "Program B", "serial_number": "SN-002"},
+            },
+            "comparison_rows": [],
+            "filter_state": {},
+        }
+
+        summary = tar._tar_build_quick_summary(ctx)
+
+        self.assertIn("Certified Serial(s): SN-001", summary["lines"])
+        self.assertFalse(any(composite_serial in line for line in summary["lines"]))
+
     def test_metadata_snapshot_lines_include_each_certified_serial(self) -> None:
         ctx = {
             "hi": ["SN-001", "SN-002"],
@@ -1834,44 +1854,33 @@ class TestTrendAutoReportFilters(unittest.TestCase):
             for idx, item in enumerate(story)
             if isinstance(item, _FakeParagraph) and item.text == "Plot Table of Contents"
         )
-        counts_idx = next(
+        scope_idx = next(
             idx
             for idx, item in enumerate(story)
-            if isinstance(item, _FakeTable) and _table_text(item)[0][0] == "Serials Under Certification"
+            if isinstance(item, _FakeTable) and _table_text(item)[0][0] == "Scope Item"
         )
-        exec_table_idx = next(
+        grading_idx = next(
             idx
             for idx, item in enumerate(story)
-            if isinstance(item, _FakeTable) and _table_text(item)[0][0] == "Serial" and _table_text(item)[0][1] == "Overall"
+            if isinstance(item, _FakeTable) and _table_text(item)[0][0] == "Grade Item"
+        )
+        serial_table_idx = next(
+            idx
+            for idx, item in enumerate(story)
+            if isinstance(item, _FakeTable) and _table_text(item)[0][0] == "SN" and _table_text(item)[0][1] == "Initial / Final"
         )
         exception_table_idx = next(
             idx
             for idx, item in enumerate(story)
-            if isinstance(item, _FakeTable) and _table_text(item)[0][0] == "Serial" and _table_text(item)[0][1] == "Run Condition"
-        )
-        disposition_idx = next(
-            idx
-            for idx, item in enumerate(story)
-            if isinstance(item, _FakeTable) and _table_text(item)[0][0] == "Disposition"
-        )
-        program_pool_idx = next(
-            idx
-            for idx, item in enumerate(story)
-            if isinstance(item, _FakeTable) and _table_text(item)[0][0] == "Program Pool Grading"
-        )
-        watch_idx = next(
-            idx
-            for idx, item in enumerate(story)
-            if isinstance(item, _FakeTable) and _table_text(item)[0][0] == "Watch / Review Highlights"
+            if isinstance(item, _FakeTable) and _table_text(item)[0][0] == "SN" and _table_text(item)[0][1] == "Run Condition"
         )
         self.assertLess(exec_idx, page_break_idx)
         self.assertGreater(toc_idx, page_break_idx)
-        self.assertLess(exec_table_idx, disposition_idx)
-        self.assertLess(exception_table_idx, disposition_idx)
-        self.assertLess(disposition_idx, program_pool_idx)
-        self.assertLess(program_pool_idx, watch_idx)
-        self.assertLess(watch_idx, counts_idx)
-        self.assertLess(counts_idx, toc_idx)
+        self.assertLess(scope_idx, grading_idx)
+        self.assertLess(grading_idx, serial_table_idx)
+        self.assertLess(serial_table_idx, exception_table_idx)
+        self.assertLess(exception_table_idx, page_break_idx)
+        self.assertLess(page_break_idx, toc_idx)
 
         self.assertFalse(
             any(

@@ -767,6 +767,69 @@ def edin_program_report_dir(
     return report_dir
 
 
+def _td_display_label_parts(value: object) -> list[str]:
+    raw = str(value or "").strip()
+    if not raw:
+        return []
+    return [part.strip() for part in re.split(r"\s*\|\s*|\s+/\s+", raw) if part.strip()]
+
+
+def _td_display_serial_candidate(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    match = re.match(r"(?i)^(?:serial(?: number)?|s/?n)\s*[:#]\s*(.+)$", text)
+    if match:
+        text = str(match.group(1) or "").strip()
+    if not text or any(sep in text for sep in ("\\", "/")):
+        return ""
+    if re.search(r"\.(?:json|sqlite|sqlite3|pdf|xlsx|xls|xlsm|mat)$", text, flags=re.IGNORECASE):
+        return ""
+    token = text.casefold()
+    if token in {
+        "source",
+        "aggregate",
+        "unknown serial",
+        "unknown type",
+        "unknown asset",
+        "unknown program",
+    }:
+        return ""
+    has_alpha = any(ch.isalpha() for ch in text)
+    has_digit = any(ch.isdigit() for ch in text)
+    if has_alpha and has_digit:
+        return text
+    if text.lower().startswith("sn") and (has_alpha or has_digit):
+        return text
+    if has_digit and " " not in text and len(text) <= 40:
+        return text
+    return ""
+
+
+def _td_display_serial_from_text(value: object) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    parts = _td_display_label_parts(raw)
+    if not parts:
+        return raw
+    for part in reversed(parts):
+        candidate = _td_display_serial_candidate(part)
+        if candidate:
+            return candidate
+    if len(parts) >= 2:
+        tail = str(parts[-1]).strip().casefold()
+        if tail.startswith("source") or re.search(
+            r"\.(?:json|sqlite|sqlite3|pdf|xlsx|xls|xlsm|mat)$",
+            str(parts[-1]).strip(),
+            flags=re.IGNORECASE,
+        ):
+            return str(parts[-2]).strip() or str(parts[-1]).strip()
+    if len(parts) == 4:
+        return str(parts[3]).strip()
+    return str(parts[-1]).strip()
+
+
 def td_display_serial_label(value: object | Mapping[str, object]) -> str:
     if isinstance(value, Mapping):
         for key in ("serial_number", "source_serial_number"):
@@ -776,14 +839,7 @@ def td_display_serial_label(value: object | Mapping[str, object]) -> str:
         raw = str(value.get("serial") or value.get("source_key") or "").strip()
     else:
         raw = str(value or "").strip()
-    if not raw:
-        return ""
-    parts = [part.strip() for part in re.split(r"\s*[|/]\s*", raw) if part.strip()]
-    if len(parts) >= 4:
-        return parts[3]
-    if parts:
-        return parts[-1]
-    return raw
+    return _td_display_serial_from_text(raw)
 
 
 def td_auto_report_serial_token(serials: Sequence[object] | None) -> str:
@@ -2901,12 +2957,21 @@ GLOBAL_RUN_MIRROR_DIRNAME = "global_run_mirror"
 LOCAL_PROJECTS_MIRROR_DIRNAME = "projects"
 PROJECT_UPDATE_DEBUG_JSON = "update_debug.json"
 TD_CACHE_DEBUG_JSON = "td_cache_debug.json"
-TD_PROJECT_CACHE_SCHEMA_VERSION = "6"
+TD_PROJECT_CACHE_SCHEMA_VERSION = "7"
 TD_LIFE_METRICS_TABLE = "td_life_metrics"
 TD_PLOTTER_SEQUENCES_TABLE = "td_plotter_sequences"
 TD_PLOTTER_CURVE_CATALOG_TABLE = "td_plotter_curve_catalog"
 TD_PLOTTER_OBSERVATIONS_TABLE = "td_plotter_condition_observations"
 TD_PLOTTER_CURVES_TABLE = "td_plotter_curves_raw"
+TD_PARAM_DISCOVERY_TABLE = "td_param_discovery"
+TD_PARAM_NORM_GROUPS_TABLE = "td_param_norm_groups"
+TD_PARAM_NORM_RULES_TABLE = "td_param_norm_rules"
+TD_PARAM_RUNTIME_ENTRIES_TABLE = "td_param_runtime_entries"
+TD_PARAM_RUNTIME_GROUPS_TABLE = "td_param_runtime_groups"
+TD_PARAM_DISCOVERY_SIGNATURE_META_KEY = "td_param_discovery_signature"
+TD_PARAM_RUNTIME_SIGNATURE_META_KEY = "td_param_runtime_signature"
+TD_PARAM_DISCOVERY_BUILT_META_KEY = "td_param_discovery_built_epoch_ns"
+TD_PARAM_RUNTIME_BUILT_META_KEY = "td_param_runtime_built_epoch_ns"
 
 # Central runtime config used to define Test Data trending workbooks (independent of node-local DATA_ROOT).
 CENTRAL_EXCEL_TREND_CONFIG = ROOT / "user_inputs" / "excel_trend_config.json"
@@ -4271,30 +4336,482 @@ def _td_effective_parameter_display(
     return display_name
 
 
-def td_build_parameter_normalization_context(
-    project_dir: Path,
-    workbook_path: Path | None = None,
-    db_path: Path | None = None,
-    normalization_override: Mapping[str, object] | None = None,
+def _td_parameter_discovery_table_ready(conn: sqlite3.Connection, *, require_rows: bool = False) -> bool:
+    _ensure_test_data_impl_tables(conn)
+    required = {
+        "surface",
+        "run_name",
+        "raw_name",
+        "raw_norm",
+        "units",
+        "program_title",
+        "asset_type",
+        "asset_specific_type",
+        "source_run_name",
+        "source_key",
+    }
+    if not required.issubset(_td_table_columns(conn, TD_PARAM_DISCOVERY_TABLE)):
+        return False
+    if not require_rows:
+        return True
+    try:
+        return int(conn.execute(f"SELECT COUNT(*) FROM {TD_PARAM_DISCOVERY_TABLE}").fetchone()[0] or 0) > 0
+    except Exception:
+        return False
+
+
+def _td_parameter_runtime_tables_ready(conn: sqlite3.Connection, *, require_rows: bool = False) -> bool:
+    _ensure_test_data_impl_tables(conn)
+    required_specs = {
+        TD_PARAM_NORM_GROUPS_TABLE: {"canonical_id", "display_name", "preferred_units", "explicit"},
+        TD_PARAM_NORM_RULES_TABLE: {
+            "raw_name",
+            "raw_norm",
+            "program_title",
+            "program_norm",
+            "asset_type",
+            "asset_norm",
+            "asset_specific_type",
+            "asset_specific_norm",
+            "canonical_id",
+            "default_display_parameter",
+            "displayed_parameter",
+            "preferred_units",
+            "edited",
+        },
+        TD_PARAM_RUNTIME_ENTRIES_TABLE: {
+            "surface",
+            "run_name",
+            "raw_name",
+            "raw_norm",
+            "units",
+            "program_title",
+            "asset_type",
+            "asset_specific_type",
+            "source_run_name",
+            "source_key",
+            "canonical_id",
+            "default_display_parameter",
+        },
+        TD_PARAM_RUNTIME_GROUPS_TABLE: {
+            "canonical_id",
+            "display_name",
+            "preferred_units",
+            "raw_names_json",
+            "units_json",
+            "program_titles_json",
+            "asset_types_json",
+            "asset_specific_types_json",
+            "source_run_names_json",
+            "surfaces_json",
+            "run_names_json",
+            "unit_conflict",
+            "explicit",
+        },
+    }
+    for table_name, required_cols in required_specs.items():
+        if not required_cols.issubset(_td_table_columns(conn, table_name)):
+            return False
+    if not require_rows:
+        return True
+    try:
+        group_count = int(conn.execute(f"SELECT COUNT(*) FROM {TD_PARAM_RUNTIME_GROUPS_TABLE}").fetchone()[0] or 0)
+        entry_count = int(conn.execute(f"SELECT COUNT(*) FROM {TD_PARAM_RUNTIME_ENTRIES_TABLE}").fetchone()[0] or 0)
+    except Exception:
+        return False
+    return bool(group_count > 0 and entry_count > 0 and _td_meta_value(conn, TD_PARAM_RUNTIME_SIGNATURE_META_KEY))
+
+
+def _td_parameter_discovery_signature(conn: sqlite3.Connection) -> str:
+    return _td_hash_payload(
+        {
+            "cache_schema_version": TD_PROJECT_CACHE_SCHEMA_VERSION,
+            "built_epoch_ns": _td_meta_value(conn, "built_epoch_ns"),
+        }
+    )
+
+
+def _td_parameter_runtime_signature(
+    discovery_signature: str,
+    repo_parameter_rows: Sequence[Mapping[str, object]] | None,
+) -> str:
+    normalized_rows = [
+        {
+            "program_title": str(item.get("program_title") or "").strip(),
+            "asset_type": str(item.get("asset_type") or "").strip(),
+            "asset_specific_type": str(item.get("asset_specific_type") or "").strip(),
+            "ingested_parameter": str(item.get("ingested_parameter") or "").strip(),
+            "default_display_parameter": str(item.get("default_display_parameter") or "").strip(),
+            "displayed_parameter": str(item.get("displayed_parameter") or "").strip(),
+            "preferred_units": str(item.get("preferred_units") or "").strip(),
+            "edited": bool(item.get("edited")),
+        }
+        for item in (
+            _td_program_parameter_mapping_normalize(row)
+            for row in (repo_parameter_rows or [])
+        )
+        if item and str(item.get("ingested_parameter") or "").strip()
+    ]
+    normalized_rows.sort(key=_td_stable_json)
+    return _td_hash_payload(
+        {
+            "discovery_signature": str(discovery_signature or "").strip(),
+            "repo_parameter_rows": normalized_rows,
+        }
+    )
+
+
+def _td_parameter_runtime_context_enabled(context: Mapping[str, object] | None) -> bool:
+    ctx = dict(context or {})
+    return bool(
+        str(ctx.get("runtime_mode") or "").strip().lower() == "db"
+        and str(ctx.get("db_path") or "").strip()
+    )
+
+
+def _td_parameter_discovery_rows_from_table(conn: sqlite3.Connection) -> list[dict[str, str]]:
+    if not _td_parameter_discovery_table_ready(conn, require_rows=False):
+        return []
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT
+                surface,
+                run_name,
+                raw_name,
+                raw_norm,
+                COALESCE(units, ''),
+                COALESCE(program_title, ''),
+                COALESCE(asset_type, ''),
+                COALESCE(asset_specific_type, ''),
+                COALESCE(source_run_name, ''),
+                COALESCE(source_key, '')
+            FROM {TD_PARAM_DISCOVERY_TABLE}
+            ORDER BY surface, run_name, raw_name, program_title, asset_type, asset_specific_type, source_run_name
+            """
+        ).fetchall()
+    except Exception:
+        return []
+    out: list[dict[str, str]] = []
+    for surface, run_name, raw_name, raw_norm, units, program_title, asset_type, asset_specific_type, source_run_name, source_key in rows:
+        text = str(raw_name or "").strip()
+        if not text:
+            continue
+        out.append(
+            {
+                "surface": str(surface or "").strip().lower(),
+                "run_name": str(run_name or "").strip(),
+                "raw_name": text,
+                "raw_norm": str(raw_norm or _td_param_norm_name(text)).strip(),
+                "units": str(units or "").strip(),
+                "program_title": str(program_title or "").strip(),
+                "asset_type": str(asset_type or "").strip(),
+                "asset_specific_type": str(asset_specific_type or "").strip(),
+                "source_run_name": str(source_run_name or "").strip(),
+                "source_key": str(source_key or "").strip(),
+            }
+        )
+    return out
+
+
+def _td_collect_parameter_discovery_rows_from_cache(
+    impl_db: Path,
+    raw_db: Path,
+) -> list[dict[str, str]]:
+    rows_out: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str, str, str, str, str, str, str]] = set()
+
+    def _append_row(
+        *,
+        surface: object,
+        run_name: object,
+        raw_name: object,
+        units: object = "",
+        program_title: object = "",
+        asset_type: object = "",
+        asset_specific_type: object = "",
+        source_run_name: object = "",
+        source_key: object = "",
+    ) -> None:
+        surface_text = str(surface or "").strip().lower()
+        run_text = str(run_name or "").strip()
+        raw_text = str(raw_name or "").strip()
+        if not surface_text or not run_text or not raw_text:
+            return
+        record = {
+            "surface": surface_text,
+            "run_name": run_text,
+            "raw_name": raw_text,
+            "raw_norm": _td_param_norm_name(raw_text),
+            "units": str(units or "").strip(),
+            "program_title": str(program_title or "").strip(),
+            "asset_type": _td_program_parameter_scope_text(asset_type),
+            "asset_specific_type": _td_program_parameter_scope_text(asset_specific_type),
+            "source_run_name": str(source_run_name or "").strip(),
+            "source_key": str(source_key or "").strip(),
+        }
+        key = (
+            record["surface"],
+            record["run_name"],
+            record["raw_name"],
+            record["program_title"],
+            record["asset_type"],
+            record["asset_specific_type"],
+            record["source_run_name"],
+            record["source_key"],
+            record["units"],
+        )
+        if key in seen:
+            return
+        seen.add(key)
+        rows_out.append(record)
+
+    if impl_db.exists():
+        with sqlite3.connect(str(impl_db)) as conn:
+            _ensure_test_data_impl_tables(conn)
+            try:
+                metric_rows = conn.execute(
+                    """
+                    SELECT DISTINCT
+                        m.run_name,
+                        m.column_name,
+                        COALESCE(c.units, ''),
+                        COALESCE(m.program_title, ''),
+                        COALESCE(m.source_run_name, ''),
+                        COALESCE(sm.asset_type, ''),
+                        COALESCE(sm.asset_specific_type, ''),
+                        COALESCE(sm.source_serial_number, m.serial)
+                    FROM td_metrics_calc m
+                    LEFT JOIN td_columns_calc c
+                      ON c.run_name = m.run_name AND c.name = m.column_name AND c.kind = 'y'
+                    LEFT JOIN td_source_metadata sm
+                      ON sm.serial = m.serial
+                    WHERE m.value_num IS NOT NULL
+                    ORDER BY m.run_name, m.column_name
+                    """
+                ).fetchall()
+            except Exception:
+                metric_rows = []
+            for run_name, raw_name, units, program_title, source_run_name, asset_type, asset_specific_type, source_key in metric_rows:
+                _append_row(
+                    surface="metrics",
+                    run_name=run_name,
+                    raw_name=raw_name,
+                    units=units,
+                    program_title=program_title,
+                    asset_type=asset_type,
+                    asset_specific_type=asset_specific_type,
+                    source_run_name=source_run_name,
+                    source_key=source_key,
+                )
+                _append_row(
+                    surface="performance",
+                    run_name=run_name,
+                    raw_name=raw_name,
+                    units=units,
+                    program_title=program_title,
+                    asset_type=asset_type,
+                    asset_specific_type=asset_specific_type,
+                    source_run_name=source_run_name,
+                    source_key=source_key,
+                )
+            try:
+                life_rows = conn.execute(
+                    f"""
+                    SELECT DISTINCT
+                        condition_key,
+                        parameter_name,
+                        COALESCE(units, ''),
+                        COALESCE(program_title, ''),
+                        COALESCE(source_run_name, ''),
+                        COALESCE(sm.asset_type, ''),
+                        COALESCE(sm.asset_specific_type, ''),
+                        COALESCE(sm.source_serial_number, l.serial)
+                    FROM {TD_LIFE_METRICS_TABLE} l
+                    LEFT JOIN td_source_metadata sm
+                      ON sm.serial = l.serial
+                    WHERE lower(stat) = 'mean'
+                    ORDER BY condition_key, parameter_name
+                    """
+                ).fetchall()
+            except Exception:
+                life_rows = []
+            for run_name, raw_name, units, program_title, source_run_name, asset_type, asset_specific_type, source_key in life_rows:
+                _append_row(
+                    surface="life_metrics",
+                    run_name=run_name,
+                    raw_name=raw_name,
+                    units=units,
+                    program_title=program_title,
+                    asset_type=asset_type,
+                    asset_specific_type=asset_specific_type,
+                    source_run_name=source_run_name,
+                    source_key=source_key,
+                )
+            try:
+                curve_rows = conn.execute(
+                    f"""
+                    SELECT DISTINCT
+                        c.run_name,
+                        c.y_name,
+                        COALESCE(cat.units, ''),
+                        COALESCE(c.program_title, ''),
+                        COALESCE(c.source_run_name, ''),
+                        COALESCE(sm.asset_type, ''),
+                        COALESCE(sm.asset_specific_type, ''),
+                        COALESCE(sm.source_serial_number, c.serial)
+                    FROM {TD_PLOTTER_CURVES_TABLE} c
+                    LEFT JOIN {TD_PLOTTER_CURVE_CATALOG_TABLE} cat
+                      ON cat.run_name = c.run_name AND cat.parameter_name = c.y_name
+                    LEFT JOIN td_source_metadata sm
+                      ON sm.serial = c.serial
+                    ORDER BY c.run_name, c.y_name
+                    """
+                ).fetchall()
+            except Exception:
+                curve_rows = []
+            for run_name, raw_name, units, program_title, source_run_name, asset_type, asset_specific_type, source_key in curve_rows:
+                _append_row(
+                    surface="curves",
+                    run_name=run_name,
+                    raw_name=raw_name,
+                    units=units,
+                    program_title=program_title,
+                    asset_type=asset_type,
+                    asset_specific_type=asset_specific_type,
+                    source_run_name=source_run_name,
+                    source_key=source_key,
+                )
+
+    if not rows_out and raw_db.exists():
+        with sqlite3.connect(str(raw_db)) as conn:
+            _ensure_test_data_raw_cache_tables(conn)
+            try:
+                curve_rows = conn.execute(
+                    """
+                    SELECT DISTINCT
+                        c.run_name,
+                        c.y_name,
+                        COALESCE(cat.units, ''),
+                        COALESCE(c.program_title, ''),
+                        COALESCE(c.source_run_name, '')
+                    FROM td_curves_raw c
+                    LEFT JOIN td_raw_curve_catalog cat
+                      ON cat.run_name = c.run_name AND cat.parameter_name = c.y_name
+                    ORDER BY c.run_name, c.y_name
+                    """
+                ).fetchall()
+            except Exception:
+                curve_rows = []
+        for run_name, raw_name, units, program_title, source_run_name in curve_rows:
+            _append_row(
+                surface="curves",
+                run_name=run_name,
+                raw_name=raw_name,
+                units=units,
+                program_title=program_title,
+                source_run_name=source_run_name,
+            )
+
+    rows_out.sort(
+        key=lambda item: (
+            str(item.get("surface") or "").casefold(),
+            str(item.get("run_name") or "").casefold(),
+            str(item.get("raw_name") or "").casefold(),
+            str(item.get("program_title") or "").casefold(),
+            str(item.get("asset_type") or "").casefold(),
+            str(item.get("asset_specific_type") or "").casefold(),
+            str(item.get("source_run_name") or "").casefold(),
+            str(item.get("units") or "").casefold(),
+        )
+    )
+    return rows_out
+
+
+def _td_write_parameter_discovery_rows(
+    conn: sqlite3.Connection,
+    rows: Sequence[Mapping[str, object]] | None,
+) -> None:
+    _ensure_test_data_impl_tables(conn)
+    conn.execute(f"DELETE FROM {TD_PARAM_DISCOVERY_TABLE}")
+    payload = [
+        (
+            str(row.get("surface") or "").strip().lower(),
+            str(row.get("run_name") or "").strip(),
+            str(row.get("raw_name") or "").strip(),
+            str(row.get("raw_norm") or _td_param_norm_name(row.get("raw_name"))).strip(),
+            str(row.get("units") or "").strip(),
+            str(row.get("program_title") or "").strip(),
+            str(row.get("asset_type") or "").strip(),
+            str(row.get("asset_specific_type") or "").strip(),
+            str(row.get("source_run_name") or "").strip(),
+            str(row.get("source_key") or "").strip(),
+        )
+        for row in (rows or [])
+        if str(row.get("surface") or "").strip()
+        and str(row.get("run_name") or "").strip()
+        and str(row.get("raw_name") or "").strip()
+    ]
+    if payload:
+        conn.executemany(
+            f"""
+            INSERT OR REPLACE INTO {TD_PARAM_DISCOVERY_TABLE} (
+                surface,
+                run_name,
+                raw_name,
+                raw_norm,
+                units,
+                program_title,
+                asset_type,
+                asset_specific_type,
+                source_run_name,
+                source_key
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            payload,
+        )
+
+
+def _td_clear_parameter_runtime_tables(conn: sqlite3.Connection) -> None:
+    _ensure_test_data_impl_tables(conn)
+    for table_name in (
+        TD_PARAM_NORM_GROUPS_TABLE,
+        TD_PARAM_NORM_RULES_TABLE,
+        TD_PARAM_RUNTIME_ENTRIES_TABLE,
+        TD_PARAM_RUNTIME_GROUPS_TABLE,
+    ):
+        conn.execute(f"DELETE FROM {table_name}")
+    for meta_key in (
+        TD_PARAM_RUNTIME_SIGNATURE_META_KEY,
+        TD_PARAM_RUNTIME_BUILT_META_KEY,
+    ):
+        conn.execute("DELETE FROM td_meta WHERE key=?", (meta_key,))
+
+
+def invalidate_td_parameter_runtime_cache(db_path: Path) -> None:
+    path = Path(db_path).expanduser()
+    if not path.exists():
+        return
+    with sqlite3.connect(str(path)) as conn:
+        _td_clear_parameter_runtime_tables(conn)
+        conn.commit()
+
+
+def _td_build_parameter_context_from_discovery_rows(
+    *,
+    proj_dir: Path,
+    workbook: Path,
+    impl_db: Path,
+    raw_db: Path,
+    normalization: Mapping[str, object] | None,
+    repo_parameter_rows: Sequence[Mapping[str, object]] | None,
+    discovery_rows: Sequence[Mapping[str, object]] | None,
 ) -> dict[str, object]:
-    proj_dir = Path(project_dir).expanduser()
-    impl_db = Path(db_path).expanduser() if db_path else (proj_dir / EIDAT_PROJECT_IMPLEMENTATION_DB)
-    raw_db = td_raw_cache_db_path_for(proj_dir)
-    workbook = Path(workbook_path).expanduser() if workbook_path else Path()
-    repo_parameter_rows = load_td_repo_parameter_mappings(
-        proj_dir,
-        workbook_path=workbook if workbook else None,
-        db_path=impl_db,
-    )
-    normalization = (
-        _td_normalize_parameter_normalization(normalization_override)
-        if isinstance(normalization_override, Mapping)
-        else _td_build_repo_parameter_normalization(repo_parameter_rows)
-    )
     config_candidates = _td_parameter_config_candidates(workbook if workbook else None)
     inventory_acc: dict[tuple[str, str, str, str], dict[str, object]] = {}
-    entry_keys: set[tuple[str, str, str, str, str, str, str, str]] = set()
+    entry_keys: set[tuple[str, str, str, str, str, str, str, str, str]] = set()
     entries: list[dict[str, str]] = []
+    normalized = _td_normalize_parameter_normalization(normalization)
 
     def _inventory_row(
         raw_name: str,
@@ -4337,13 +4854,14 @@ def td_build_parameter_normalization_context(
         asset_specific_type: object = "",
         source_run_name: object = "",
         run_name: object = "",
-        surfaces: Sequence[str] | None = None,
+        surface: object = "",
         source_key: object = "",
         fallback_display: object = "",
     ) -> None:
         text = str(raw_name or "").strip()
         if not text:
             return
+        surface_text = str(surface or "").strip().lower()
         program_text = str(program_title or "").strip()
         asset_text = _td_program_parameter_scope_text(asset_type)
         asset_specific_text = _td_program_parameter_scope_text(asset_specific_type)
@@ -4366,7 +4884,7 @@ def td_build_parameter_normalization_context(
         if source_key_text:
             cast(set[str], row["_source_keys"]).add(source_key_text)
         row["default_display_parameter"] = _td_effective_parameter_display(
-            normalization,
+            normalized,
             text,
             program_title=program_text,
             asset_type=asset_text,
@@ -4374,189 +4892,66 @@ def td_build_parameter_normalization_context(
             fallback_display=fallback_display or text,
         ) or str(fallback_display or text).strip()
         row["mapping_rule"] = _td_find_parameter_mapping_rule(
-            normalization,
+            normalized,
             text,
             program_title=program_text,
             asset_type=asset_text,
             asset_specific_type=asset_specific_text,
         )
-        for surface in (surfaces or []):
-            surface_key = str(surface or "").strip().lower()
-            if not surface_key:
-                continue
-            cast(set[str], row["_surfaces"]).add(surface_key)
-            entry_key = (
-                surface_key,
-                run_text.casefold(),
-                _td_param_norm_name(text),
-                _td_param_norm_program(program_text),
-                _td_param_norm_program(asset_text),
-                _td_param_norm_program(asset_specific_text),
-                source_run_text.casefold(),
-                source_key_text.casefold(),
-                _td_param_norm_name(units_text),
-            )
-            if entry_key in entry_keys:
-                continue
-            entry_keys.add(entry_key)
-            entries.append(
-                {
-                    "surface": surface_key,
-                    "run_name": run_text,
-                    "raw_name": text,
-                    "raw_norm": _td_param_norm_name(text),
-                    "units": units_text,
-                    "program_title": program_text,
-                    "program_norm": _td_param_norm_program(program_text),
-                    "asset_type": asset_text,
-                    "asset_specific_type": asset_specific_text,
-                    "source_run_name": source_run_text,
-                    "source_key": source_key_text,
-                    "default_display_parameter": str(row.get("default_display_parameter") or "").strip(),
-                }
-            )
+        if not surface_text:
+            return
+        cast(set[str], row["_surfaces"]).add(surface_text)
+        entry_key = (
+            surface_text,
+            run_text.casefold(),
+            _td_param_norm_name(text),
+            _td_param_norm_program(program_text),
+            _td_param_norm_program(asset_text),
+            _td_param_norm_program(asset_specific_text),
+            source_run_text.casefold(),
+            source_key_text.casefold(),
+            _td_param_norm_name(units_text),
+        )
+        if entry_key in entry_keys:
+            return
+        entry_keys.add(entry_key)
+        entries.append(
+            {
+                "surface": surface_text,
+                "run_name": run_text,
+                "raw_name": text,
+                "raw_norm": _td_param_norm_name(text),
+                "units": units_text,
+                "program_title": program_text,
+                "program_norm": _td_param_norm_program(program_text),
+                "asset_type": asset_text,
+                "asset_specific_type": asset_specific_text,
+                "source_run_name": source_run_text,
+                "source_key": source_key_text,
+                "default_display_parameter": str(row.get("default_display_parameter") or "").strip(),
+            }
+        )
 
-    if impl_db.exists():
-        with sqlite3.connect(str(impl_db)) as conn:
-            _ensure_test_data_impl_tables(conn)
-            try:
-                metric_rows = conn.execute(
-                    """
-                    SELECT DISTINCT
-                        m.run_name,
-                        m.column_name,
-                        COALESCE(c.units, ''),
-                        COALESCE(m.program_title, ''),
-                        COALESCE(m.source_run_name, ''),
-                        COALESCE(sm.asset_type, ''),
-                        COALESCE(sm.asset_specific_type, ''),
-                        COALESCE(sm.source_serial_number, m.serial)
-                    FROM td_metrics_calc m
-                    LEFT JOIN td_columns_calc c
-                      ON c.run_name = m.run_name AND c.name = m.column_name AND c.kind = 'y'
-                    LEFT JOIN td_source_metadata sm
-                      ON sm.serial = m.serial
-                    WHERE m.value_num IS NOT NULL
-                    ORDER BY m.run_name, m.column_name
-                    """
-                ).fetchall()
-            except Exception:
-                metric_rows = []
-            for run_name, raw_name, units, program_title, source_run_name, asset_type, asset_specific_type, source_key in metric_rows:
-                _add_entry(
-                    raw_name=raw_name,
-                    units=units,
-                    program_title=program_title,
-                    asset_type=asset_type,
-                    asset_specific_type=asset_specific_type,
-                    source_run_name=source_run_name,
-                    run_name=run_name,
-                    surfaces=("metrics", "performance"),
-                    source_key=source_key,
-                )
-            try:
-                life_rows = conn.execute(
-                    f"""
-                    SELECT DISTINCT
-                        condition_key,
-                        parameter_name,
-                        COALESCE(units, ''),
-                        COALESCE(program_title, ''),
-                        COALESCE(source_run_name, ''),
-                        COALESCE(sm.asset_type, ''),
-                        COALESCE(sm.asset_specific_type, ''),
-                        COALESCE(sm.source_serial_number, l.serial)
-                    FROM {TD_LIFE_METRICS_TABLE}
-                    LEFT JOIN td_source_metadata sm
-                      ON sm.serial = l.serial
-                    WHERE lower(stat) = 'mean'
-                    ORDER BY condition_key, parameter_name
-                    """
-                ).fetchall()
-            except Exception:
-                life_rows = []
-            for run_name, raw_name, units, program_title, source_run_name, asset_type, asset_specific_type, source_key in life_rows:
-                _add_entry(
-                    raw_name=raw_name,
-                    units=units,
-                    program_title=program_title,
-                    asset_type=asset_type,
-                    asset_specific_type=asset_specific_type,
-                    source_run_name=source_run_name,
-                    run_name=run_name,
-                    surfaces=("life_metrics",),
-                    source_key=source_key,
-                )
-            try:
-                curve_rows = conn.execute(
-                    f"""
-                    SELECT DISTINCT
-                        c.run_name,
-                        c.y_name,
-                        COALESCE(cat.units, ''),
-                        COALESCE(c.program_title, ''),
-                        COALESCE(c.source_run_name, ''),
-                        COALESCE(sm.asset_type, ''),
-                        COALESCE(sm.asset_specific_type, ''),
-                        COALESCE(sm.source_serial_number, c.serial)
-                    FROM {TD_PLOTTER_CURVES_TABLE} c
-                    LEFT JOIN {TD_PLOTTER_CURVE_CATALOG_TABLE} cat
-                      ON cat.run_name = c.run_name AND cat.parameter_name = c.y_name
-                    LEFT JOIN td_source_metadata sm
-                      ON sm.serial = c.serial
-                    ORDER BY c.run_name, c.y_name
-                    """
-                ).fetchall()
-            except Exception:
-                curve_rows = []
-            for run_name, raw_name, units, program_title, source_run_name, asset_type, asset_specific_type, source_key in curve_rows:
-                _add_entry(
-                    raw_name=raw_name,
-                    units=units,
-                    program_title=program_title,
-                    asset_type=asset_type,
-                    asset_specific_type=asset_specific_type,
-                    source_run_name=source_run_name,
-                    run_name=run_name,
-                    surfaces=("curves",),
-                    source_key=source_key,
-                )
-
-    if not entries and raw_db.exists():
-        with sqlite3.connect(str(raw_db)) as conn:
-            _ensure_test_data_raw_cache_tables(conn)
-            try:
-                curve_rows = conn.execute(
-                    """
-                    SELECT DISTINCT
-                        c.run_name,
-                        c.y_name,
-                        COALESCE(cat.units, ''),
-                        COALESCE(c.program_title, ''),
-                        COALESCE(c.source_run_name, '')
-                    FROM td_curves_raw c
-                    LEFT JOIN td_raw_curve_catalog cat
-                      ON cat.run_name = c.run_name AND cat.parameter_name = c.y_name
-                    ORDER BY c.run_name, c.y_name
-                    """
-                ).fetchall()
-            except Exception:
-                curve_rows = []
-            for run_name, raw_name, units, program_title, source_run_name in curve_rows:
-                _add_entry(
-                    raw_name=raw_name,
-                    units=units,
-                    program_title=program_title,
-                    source_run_name=source_run_name,
-                    run_name=run_name,
-                    surfaces=("curves",),
-                )
+    for discovery_row in (discovery_rows or []):
+        if not isinstance(discovery_row, Mapping):
+            continue
+        _add_entry(
+            raw_name=discovery_row.get("raw_name"),
+            units=discovery_row.get("units"),
+            program_title=discovery_row.get("program_title"),
+            asset_type=discovery_row.get("asset_type"),
+            asset_specific_type=discovery_row.get("asset_specific_type"),
+            source_run_name=discovery_row.get("source_run_name"),
+            run_name=discovery_row.get("run_name"),
+            surface=discovery_row.get("surface"),
+            source_key=discovery_row.get("source_key"),
+        )
 
     canonical_groups: dict[str, dict[str, object]] = {}
     for entry in entries:
         raw_name = str(entry.get("raw_name") or "").strip()
         canonical_id = _td_effective_parameter_canonical(
-            normalization,
+            normalized,
             raw_name,
             entry.get("program_title"),
             entry.get("asset_type"),
@@ -4577,7 +4972,7 @@ def td_build_parameter_normalization_context(
                 "_source_run_names": set(),
                 "_surfaces": set(),
                 "_run_names": set(),
-                "explicit": canonical_id in cast(dict[str, dict[str, object]], normalization.get("groups_by_id") or {}),
+                "explicit": canonical_id in cast(dict[str, dict[str, object]], normalized.get("groups_by_id") or {}),
             },
         )
         cast(set[str], group["_raw_names"]).add(raw_name)
@@ -4599,14 +4994,14 @@ def td_build_parameter_normalization_context(
         raw_names = sorted(cast(set[str], group.get("_raw_names") or set()), key=str.casefold)
         units = sorted(cast(set[str], group.get("_units") or set()), key=str.casefold)
         group["display_name"] = _td_parameter_display_name_for_group(
-            normalization,
+            normalized,
             group_id,
             raw_names=raw_names,
             fallback=(raw_names[0] if raw_names else group_id),
         )
         preferred_units = str(
-            ((normalization.get("groups_by_id") or {}).get(group_id) or {}).get("preferred_units")
-            if isinstance(normalization.get("groups_by_id"), Mapping)
+            ((normalized.get("groups_by_id") or {}).get(group_id) or {}).get("preferred_units")
+            if isinstance(normalized.get("groups_by_id"), Mapping)
             else ""
         ).strip()
         if not preferred_units and len(units) == 1:
@@ -4621,7 +5016,16 @@ def td_build_parameter_normalization_context(
         group["surfaces"] = sorted(cast(set[str], group.get("_surfaces") or set()), key=str.casefold)
         group["run_names"] = sorted(cast(set[str], group.get("_run_names") or set()), key=str.casefold)
         group["unit_conflict"] = len([value for value in units if str(value).strip()]) > 1
-        for key in ("_raw_names", "_units", "_program_titles", "_asset_types", "_asset_specific_types", "_source_run_names", "_surfaces", "_run_names"):
+        for key in (
+            "_raw_names",
+            "_units",
+            "_program_titles",
+            "_asset_types",
+            "_asset_specific_types",
+            "_source_run_names",
+            "_surfaces",
+            "_run_names",
+        ):
             group.pop(key, None)
 
     inventory: list[dict[str, object]] = []
@@ -4640,7 +5044,7 @@ def td_build_parameter_normalization_context(
         asset_specific_type = str(row.get("asset_specific_type") or "").strip()
         mapping_rule = dict(row.get("mapping_rule") or {})
         canonical_id = _td_effective_parameter_canonical(
-            normalization,
+            normalized,
             raw_name,
             program_title,
             asset_type,
@@ -4660,7 +5064,7 @@ def td_build_parameter_normalization_context(
         elif suggestion:
             status = "suggested"
         display_name = _td_effective_parameter_display(
-            normalization,
+            normalized,
             raw_name,
             program_title=program_title,
             asset_type=asset_type,
@@ -4697,8 +5101,8 @@ def td_build_parameter_normalization_context(
         "workbook_path": str(workbook or ""),
         "db_path": str(impl_db),
         "raw_db_path": str(raw_db),
-        "normalization": normalization,
-        "repo_parameter_rows": repo_parameter_rows,
+        "normalization": normalized,
+        "repo_parameter_rows": [dict(row) for row in (repo_parameter_rows or []) if isinstance(row, Mapping)],
         "inventory": inventory,
         "inventory_by_raw_norm": {
             str(row.get("raw_norm") or "").strip(): dict(row)
@@ -4715,6 +5119,501 @@ def td_build_parameter_normalization_context(
     }
 
 
+def rebuild_td_parameter_discovery_cache(
+    project_dir: Path,
+    workbook_path: Path,
+    db_path: Path,
+    progress_cb: Callable[[str], None] | None = None,
+) -> dict[str, object]:
+    import time
+
+    proj_dir = Path(project_dir).expanduser()
+    del workbook_path
+    impl_db = Path(db_path).expanduser()
+    raw_db = td_raw_cache_db_path_for(proj_dir)
+    started = time.perf_counter()
+    with sqlite3.connect(str(impl_db)) as conn:
+        _ensure_test_data_impl_tables(conn)
+        discovery_signature = _td_parameter_discovery_signature(conn)
+        if (
+            _td_meta_value(conn, TD_PARAM_DISCOVERY_SIGNATURE_META_KEY) == discovery_signature
+            and _td_parameter_discovery_table_ready(conn, require_rows=True)
+        ):
+            return {
+                "mode": "noop",
+                "rows": int(conn.execute(f"SELECT COUNT(*) FROM {TD_PARAM_DISCOVERY_TABLE}").fetchone()[0] or 0),
+                "signature": discovery_signature,
+                "elapsed_s": round(time.perf_counter() - started, 3),
+            }
+    _td_emit_progress(progress_cb, "Scanning parameter discovery rows from TD caches")
+    discovery_rows = _td_collect_parameter_discovery_rows_from_cache(impl_db, raw_db)
+    with sqlite3.connect(str(impl_db)) as conn:
+        _ensure_test_data_impl_tables(conn)
+        _td_write_parameter_discovery_rows(conn, discovery_rows)
+        discovery_signature = _td_parameter_discovery_signature(conn)
+        built_epoch_ns = _td_meta_value(conn, "built_epoch_ns")
+        conn.execute(
+            "INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)",
+            (TD_PARAM_DISCOVERY_SIGNATURE_META_KEY, discovery_signature),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)",
+            (TD_PARAM_DISCOVERY_BUILT_META_KEY, built_epoch_ns),
+        )
+        conn.commit()
+    elapsed = round(time.perf_counter() - started, 3)
+    _td_emit_progress(progress_cb, f"Parameter discovery cache ready in {elapsed:.3f}s ({len(discovery_rows)} rows)")
+    return {
+        "mode": "rebuilt",
+        "rows": len(discovery_rows),
+        "signature": discovery_signature,
+        "elapsed_s": elapsed,
+    }
+
+
+def refresh_td_parameter_runtime_cache(
+    project_dir: Path,
+    workbook_path: Path,
+    db_path: Path,
+    progress_cb: Callable[[str], None] | None = None,
+) -> dict[str, object]:
+    import time
+
+    proj_dir = Path(project_dir).expanduser()
+    workbook = Path(workbook_path).expanduser()
+    impl_db = Path(db_path).expanduser()
+    discovery_payload = rebuild_td_parameter_discovery_cache(
+        proj_dir,
+        workbook,
+        impl_db,
+        progress_cb=progress_cb,
+    )
+    repo_parameter_rows = load_td_repo_parameter_mappings(
+        proj_dir,
+        workbook_path=workbook,
+        db_path=impl_db,
+    )
+    started = time.perf_counter()
+    with sqlite3.connect(str(impl_db)) as conn:
+        _ensure_test_data_impl_tables(conn)
+        discovery_signature = _td_meta_value(conn, TD_PARAM_DISCOVERY_SIGNATURE_META_KEY) or _td_parameter_discovery_signature(conn)
+        runtime_signature = _td_parameter_runtime_signature(discovery_signature, repo_parameter_rows)
+        if (
+            _td_meta_value(conn, TD_PARAM_RUNTIME_SIGNATURE_META_KEY) == runtime_signature
+            and _td_parameter_runtime_tables_ready(conn, require_rows=True)
+        ):
+            return {
+                "mode": "noop",
+                "signature": runtime_signature,
+                "elapsed_s": round(time.perf_counter() - started, 3),
+                "discovery": dict(discovery_payload),
+            }
+    _td_emit_progress(progress_cb, "Building parameter runtime normalization cache")
+    context = td_build_parameter_normalization_context(
+        proj_dir,
+        workbook,
+        impl_db,
+    )
+    normalization = _td_normalize_parameter_normalization(context.get("normalization"))
+    canonical_groups = {
+        str(group_id): dict(group)
+        for group_id, group in dict(context.get("canonical_groups") or {}).items()
+        if str(group_id).strip() and isinstance(group, Mapping)
+    }
+    runtime_entries = [
+        dict(item)
+        for item in (context.get("entries") or [])
+        if isinstance(item, Mapping)
+    ]
+    with sqlite3.connect(str(impl_db)) as conn:
+        _ensure_test_data_impl_tables(conn)
+        _td_clear_parameter_runtime_tables(conn)
+        group_rows = [
+            (
+                str(group.get("id") or "").strip(),
+                str(group.get("display_name") or "").strip(),
+                str(group.get("preferred_units") or "").strip(),
+                1 if bool(group.get("explicit")) else 0,
+            )
+            for group in (normalization.get("groups") or [])
+            if isinstance(group, Mapping) and str(group.get("id") or "").strip()
+        ]
+        if group_rows:
+            conn.executemany(
+                f"""
+                INSERT OR REPLACE INTO {TD_PARAM_NORM_GROUPS_TABLE} (
+                    canonical_id,
+                    display_name,
+                    preferred_units,
+                    explicit
+                ) VALUES (?, ?, ?, ?)
+                """,
+                group_rows,
+            )
+        rule_rows = []
+        for rule in (normalization.get("mappings") or []):
+            if not isinstance(rule, Mapping):
+                continue
+            raw_name = str(rule.get("raw_name") or "").strip()
+            canonical_id = str(rule.get("canonical_id") or "").strip()
+            if not raw_name or not canonical_id:
+                continue
+            program_title = ",".join(
+                sorted({str(value).strip() for value in (rule.get("program_titles") or []) if str(value).strip()}, key=str.casefold)
+            )
+            asset_type = ",".join(
+                sorted({str(value).strip() for value in (rule.get("asset_types") or []) if str(value).strip()}, key=str.casefold)
+            )
+            asset_specific_type = ",".join(
+                sorted({str(value).strip() for value in (rule.get("asset_specific_types") or []) if str(value).strip()}, key=str.casefold)
+            )
+            rule_rows.append(
+                (
+                    raw_name,
+                    _td_param_norm_name(raw_name),
+                    program_title,
+                    _td_param_norm_program(program_title),
+                    asset_type,
+                    _td_param_norm_program(asset_type),
+                    asset_specific_type,
+                    _td_param_norm_program(asset_specific_type),
+                    canonical_id,
+                    str(rule.get("default_display_parameter") or "").strip(),
+                    str(rule.get("displayed_parameter") or "").strip(),
+                    str(rule.get("preferred_units") or "").strip(),
+                    1 if bool(rule.get("edited")) else 0,
+                )
+            )
+        if rule_rows:
+            conn.executemany(
+                f"""
+                INSERT OR REPLACE INTO {TD_PARAM_NORM_RULES_TABLE} (
+                    raw_name,
+                    raw_norm,
+                    program_title,
+                    program_norm,
+                    asset_type,
+                    asset_norm,
+                    asset_specific_type,
+                    asset_specific_norm,
+                    canonical_id,
+                    default_display_parameter,
+                    displayed_parameter,
+                    preferred_units,
+                    edited
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rule_rows,
+            )
+        entry_rows = [
+            (
+                str(item.get("surface") or "").strip().lower(),
+                str(item.get("run_name") or "").strip(),
+                str(item.get("raw_name") or "").strip(),
+                str(item.get("raw_norm") or _td_param_norm_name(item.get("raw_name"))).strip(),
+                str(item.get("units") or "").strip(),
+                str(item.get("program_title") or "").strip(),
+                str(item.get("asset_type") or "").strip(),
+                str(item.get("asset_specific_type") or "").strip(),
+                str(item.get("source_run_name") or "").strip(),
+                str(item.get("source_key") or "").strip(),
+                _td_effective_parameter_canonical(
+                    normalization,
+                    item.get("raw_name"),
+                    item.get("program_title"),
+                    item.get("asset_type"),
+                    item.get("asset_specific_type"),
+                    fallback_display=item.get("default_display_parameter"),
+                ),
+                str(item.get("default_display_parameter") or "").strip(),
+            )
+            for item in runtime_entries
+            if str(item.get("surface") or "").strip()
+            and str(item.get("run_name") or "").strip()
+            and str(item.get("raw_name") or "").strip()
+        ]
+        if entry_rows:
+            conn.executemany(
+                f"""
+                INSERT OR REPLACE INTO {TD_PARAM_RUNTIME_ENTRIES_TABLE} (
+                    surface,
+                    run_name,
+                    raw_name,
+                    raw_norm,
+                    units,
+                    program_title,
+                    asset_type,
+                    asset_specific_type,
+                    source_run_name,
+                    source_key,
+                    canonical_id,
+                    default_display_parameter
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                entry_rows,
+            )
+        runtime_group_rows = [
+            (
+                str(group_id).strip(),
+                str(group.get("display_name") or "").strip(),
+                str(group.get("preferred_units") or "").strip(),
+                json.dumps([str(value).strip() for value in (group.get("raw_names") or []) if str(value).strip()], separators=(",", ":")),
+                json.dumps([str(value).strip() for value in (group.get("units") or []) if str(value).strip()], separators=(",", ":")),
+                json.dumps([str(value).strip() for value in (group.get("program_titles") or []) if str(value).strip()], separators=(",", ":")),
+                json.dumps([str(value).strip() for value in (group.get("asset_types") or []) if str(value).strip()], separators=(",", ":")),
+                json.dumps([str(value).strip() for value in (group.get("asset_specific_types") or []) if str(value).strip()], separators=(",", ":")),
+                json.dumps([str(value).strip() for value in (group.get("source_run_names") or []) if str(value).strip()], separators=(",", ":")),
+                json.dumps([str(value).strip() for value in (group.get("surfaces") or []) if str(value).strip()], separators=(",", ":")),
+                json.dumps([str(value).strip() for value in (group.get("run_names") or []) if str(value).strip()], separators=(",", ":")),
+                1 if bool(group.get("unit_conflict")) else 0,
+                1 if bool(group.get("explicit")) else 0,
+            )
+            for group_id, group in canonical_groups.items()
+            if str(group_id).strip()
+        ]
+        if runtime_group_rows:
+            conn.executemany(
+                f"""
+                INSERT OR REPLACE INTO {TD_PARAM_RUNTIME_GROUPS_TABLE} (
+                    canonical_id,
+                    display_name,
+                    preferred_units,
+                    raw_names_json,
+                    units_json,
+                    program_titles_json,
+                    asset_types_json,
+                    asset_specific_types_json,
+                    source_run_names_json,
+                    surfaces_json,
+                    run_names_json,
+                    unit_conflict,
+                    explicit
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                runtime_group_rows,
+            )
+        discovery_signature = _td_meta_value(conn, TD_PARAM_DISCOVERY_SIGNATURE_META_KEY) or _td_parameter_discovery_signature(conn)
+        runtime_signature = _td_parameter_runtime_signature(discovery_signature, repo_parameter_rows)
+        built_epoch_ns = _td_meta_value(conn, "built_epoch_ns")
+        conn.execute(
+            "INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)",
+            (TD_PARAM_RUNTIME_SIGNATURE_META_KEY, runtime_signature),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)",
+            (TD_PARAM_RUNTIME_BUILT_META_KEY, built_epoch_ns),
+        )
+        conn.commit()
+    elapsed = round(time.perf_counter() - started, 3)
+    _td_emit_progress(
+        progress_cb,
+        f"Parameter runtime cache ready in {elapsed:.3f}s ({len(runtime_entries)} entries, {len(canonical_groups)} groups)",
+    )
+    return {
+        "mode": "rebuilt",
+        "entries": len(runtime_entries),
+        "groups": len(canonical_groups),
+        "signature": runtime_signature,
+        "elapsed_s": elapsed,
+        "discovery": dict(discovery_payload),
+    }
+
+
+def td_load_parameter_runtime_context(project_dir: Path, db_path: Path) -> dict[str, object]:
+    proj_dir = Path(project_dir).expanduser()
+    impl_db = Path(db_path).expanduser()
+    if not impl_db.exists():
+        return {}
+    with sqlite3.connect(str(impl_db)) as conn:
+        if not _td_parameter_runtime_tables_ready(conn, require_rows=True):
+            return {}
+        group_rows = conn.execute(
+            f"""
+            SELECT canonical_id, display_name, preferred_units, explicit
+            FROM {TD_PARAM_NORM_GROUPS_TABLE}
+            ORDER BY canonical_id
+            """
+        ).fetchall()
+        rule_rows = conn.execute(
+            f"""
+            SELECT
+                canonical_id,
+                raw_name,
+                program_title,
+                asset_type,
+                asset_specific_type,
+                default_display_parameter,
+                displayed_parameter,
+                preferred_units,
+                edited
+            FROM {TD_PARAM_NORM_RULES_TABLE}
+            ORDER BY raw_norm, program_norm, asset_norm, asset_specific_norm, canonical_id
+            """
+        ).fetchall()
+        runtime_group_rows = conn.execute(
+            f"""
+            SELECT
+                canonical_id,
+                display_name,
+                preferred_units,
+                raw_names_json,
+                units_json,
+                program_titles_json,
+                asset_types_json,
+                asset_specific_types_json,
+                source_run_names_json,
+                surfaces_json,
+                run_names_json,
+                unit_conflict,
+                explicit
+            FROM {TD_PARAM_RUNTIME_GROUPS_TABLE}
+            ORDER BY canonical_id
+            """
+        ).fetchall()
+    normalization_groups = [
+        {
+            "id": str(canonical_id or "").strip(),
+            "display_name": str(display_name or "").strip(),
+            "preferred_units": str(preferred_units or "").strip(),
+            "explicit": bool(explicit),
+        }
+        for canonical_id, display_name, preferred_units, explicit in group_rows
+        if str(canonical_id or "").strip()
+    ]
+    normalization_rules = [
+        {
+            "canonical_id": str(canonical_id or "").strip(),
+            "raw_name": str(raw_name or "").strip(),
+            "program_titles": [str(value).strip() for value in str(program_title or "").split(",") if str(value).strip()],
+            "asset_types": [str(value).strip() for value in str(asset_type or "").split(",") if str(value).strip()],
+            "asset_specific_types": [str(value).strip() for value in str(asset_specific_type or "").split(",") if str(value).strip()],
+            "default_display_parameter": str(default_display_parameter or "").strip(),
+            "displayed_parameter": str(displayed_parameter or "").strip(),
+            "preferred_units": str(preferred_units or "").strip(),
+            "edited": bool(edited),
+        }
+        for canonical_id, raw_name, program_title, asset_type, asset_specific_type, default_display_parameter, displayed_parameter, preferred_units, edited in rule_rows
+        if str(canonical_id or "").strip() and str(raw_name or "").strip()
+    ]
+    canonical_groups: dict[str, dict[str, object]] = {}
+    for row in runtime_group_rows:
+        (
+            canonical_id,
+            display_name,
+            preferred_units,
+            raw_names_json,
+            units_json,
+            program_titles_json,
+            asset_types_json,
+            asset_specific_types_json,
+            source_run_names_json,
+            surfaces_json,
+            run_names_json,
+            unit_conflict,
+            explicit,
+        ) = row
+        key = str(canonical_id or "").strip()
+        if not key:
+            continue
+        try:
+            raw_names = json.loads(raw_names_json or "[]")
+        except Exception:
+            raw_names = []
+        try:
+            units = json.loads(units_json or "[]")
+        except Exception:
+            units = []
+        try:
+            program_titles = json.loads(program_titles_json or "[]")
+        except Exception:
+            program_titles = []
+        try:
+            asset_types = json.loads(asset_types_json or "[]")
+        except Exception:
+            asset_types = []
+        try:
+            asset_specific_types = json.loads(asset_specific_types_json or "[]")
+        except Exception:
+            asset_specific_types = []
+        try:
+            source_run_names = json.loads(source_run_names_json or "[]")
+        except Exception:
+            source_run_names = []
+        try:
+            surfaces = json.loads(surfaces_json or "[]")
+        except Exception:
+            surfaces = []
+        try:
+            run_names = json.loads(run_names_json or "[]")
+        except Exception:
+            run_names = []
+        canonical_groups[key] = {
+            "id": key,
+            "display_name": str(display_name or "").strip(),
+            "preferred_units": str(preferred_units or "").strip(),
+            "raw_names": [str(value).strip() for value in raw_names if str(value).strip()],
+            "units": [str(value).strip() for value in units if str(value).strip()],
+            "program_titles": [str(value).strip() for value in program_titles if str(value).strip()],
+            "asset_types": [str(value).strip() for value in asset_types if str(value).strip()],
+            "asset_specific_types": [str(value).strip() for value in asset_specific_types if str(value).strip()],
+            "source_run_names": [str(value).strip() for value in source_run_names if str(value).strip()],
+            "surfaces": [str(value).strip() for value in surfaces if str(value).strip()],
+            "run_names": [str(value).strip() for value in run_names if str(value).strip()],
+            "unit_conflict": bool(unit_conflict),
+            "explicit": bool(explicit),
+        }
+    return {
+        "project_dir": str(proj_dir),
+        "db_path": str(impl_db),
+        "runtime_mode": "db",
+        "normalization": _td_normalize_parameter_normalization(
+            {
+                "version": TD_PARAMETER_NORMALIZATION_VERSION,
+                "groups": normalization_groups,
+                "mappings": normalization_rules,
+            }
+        ),
+        "canonical_groups": canonical_groups,
+    }
+
+
+def td_build_parameter_normalization_context(
+    project_dir: Path,
+    workbook_path: Path | None = None,
+    db_path: Path | None = None,
+    normalization_override: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    proj_dir = Path(project_dir).expanduser()
+    impl_db = Path(db_path).expanduser() if db_path else (proj_dir / EIDAT_PROJECT_IMPLEMENTATION_DB)
+    raw_db = td_raw_cache_db_path_for(proj_dir)
+    workbook = Path(workbook_path).expanduser() if workbook_path else Path()
+    repo_parameter_rows = load_td_repo_parameter_mappings(
+        proj_dir,
+        workbook_path=workbook if workbook else None,
+        db_path=impl_db,
+    )
+    normalization = (
+        _td_normalize_parameter_normalization(normalization_override)
+        if isinstance(normalization_override, Mapping)
+        else _td_build_repo_parameter_normalization(repo_parameter_rows)
+    )
+    discovery_rows: list[dict[str, str]] = []
+    if impl_db.exists():
+        with sqlite3.connect(str(impl_db)) as conn:
+            discovery_rows = _td_parameter_discovery_rows_from_table(conn)
+    if not discovery_rows:
+        discovery_rows = _td_collect_parameter_discovery_rows_from_cache(impl_db, raw_db)
+    return _td_build_parameter_context_from_discovery_rows(
+        proj_dir=proj_dir,
+        workbook=workbook,
+        impl_db=impl_db,
+        raw_db=raw_db,
+        normalization=normalization,
+        repo_parameter_rows=repo_parameter_rows,
+        discovery_rows=discovery_rows,
+    )
+
+
 def td_build_parameter_selector_options(
     context: Mapping[str, object] | None,
     *,
@@ -4727,6 +5626,123 @@ def td_build_parameter_selector_options(
     run_set = {str(value).strip() for value in (run_names or []) if str(value).strip()}
     surface_key = str(surface or "").strip().lower()
     raw_norms = {_td_param_norm_name(value) for value in (raw_names or []) if _td_param_norm_name(value)}
+    if _td_parameter_runtime_context_enabled(ctx):
+        db_path = Path(str(ctx.get("db_path") or "")).expanduser()
+        if db_path.exists():
+            query_parts = [
+                "SELECT canonical_id, raw_name, COALESCE(units, ''), COALESCE(program_title, ''),",
+                "       COALESCE(asset_type, ''), COALESCE(asset_specific_type, ''), run_name, surface",
+                f"FROM {TD_PARAM_RUNTIME_ENTRIES_TABLE}",
+                "WHERE 1=1",
+            ]
+            params: list[object] = []
+            if surface_key:
+                query_parts.append("AND surface=?")
+                params.append(surface_key)
+            if run_set:
+                placeholders = ",".join("?" for _ in run_set)
+                query_parts.append(f"AND run_name IN ({placeholders})")
+                params.extend(sorted(run_set))
+            if raw_norms:
+                placeholders = ",".join("?" for _ in raw_norms)
+                query_parts.append(f"AND raw_norm IN ({placeholders})")
+                params.extend(sorted(raw_norms))
+            query_parts.append("ORDER BY canonical_id, raw_name")
+            groups_runtime: dict[str, dict[str, object]] = {}
+            try:
+                with sqlite3.connect(str(db_path)) as conn:
+                    _ensure_test_data_impl_tables(conn)
+                    rows = conn.execute(" ".join(query_parts), tuple(params)).fetchall()
+            except Exception:
+                rows = []
+            for canonical_id, raw_name, units, program_title, asset_type, asset_specific_type, run_name, entry_surface in rows:
+                canonical_key = str(canonical_id or "").strip()
+                raw_text = str(raw_name or "").strip()
+                if not canonical_key or not raw_text:
+                    continue
+                group = groups_runtime.setdefault(
+                    canonical_key,
+                    {
+                        "canonical_id": canonical_key,
+                        "_raw_names": set(),
+                        "_units": set(),
+                        "_program_titles": set(),
+                        "_asset_types": set(),
+                        "_asset_specific_types": set(),
+                        "_run_names": set(),
+                        "_surfaces": set(),
+                    },
+                )
+                cast(set[str], group["_raw_names"]).add(raw_text)
+                if str(units or "").strip():
+                    cast(set[str], group["_units"]).add(str(units or "").strip())
+                if str(program_title or "").strip():
+                    cast(set[str], group["_program_titles"]).add(str(program_title or "").strip())
+                if str(asset_type or "").strip():
+                    cast(set[str], group["_asset_types"]).add(str(asset_type or "").strip())
+                if str(asset_specific_type or "").strip():
+                    cast(set[str], group["_asset_specific_types"]).add(str(asset_specific_type or "").strip())
+                if str(run_name or "").strip():
+                    cast(set[str], group["_run_names"]).add(str(run_name or "").strip())
+                if str(entry_surface or "").strip():
+                    cast(set[str], group["_surfaces"]).add(str(entry_surface or "").strip())
+            options_runtime: list[dict[str, object]] = []
+            for canonical_id, group in groups_runtime.items():
+                raw_name_list = sorted(cast(set[str], group.get("_raw_names") or set()), key=str.casefold)
+                if not raw_name_list:
+                    continue
+                units = sorted(cast(set[str], group.get("_units") or set()), key=str.casefold)
+                unit_conflict = len([value for value in units if str(value).strip()]) > 1
+                display_name = _td_parameter_display_name_for_group(
+                    normalization,
+                    canonical_id,
+                    raw_names=raw_name_list,
+                    fallback=raw_name_list[0],
+                )
+                preferred_units = str(
+                    ((normalization.get("groups_by_id") or {}).get(canonical_id) or {}).get("preferred_units")
+                    if isinstance(normalization.get("groups_by_id"), Mapping)
+                    else ""
+                ).strip()
+                if not preferred_units and len(units) == 1:
+                    preferred_units = units[0]
+                label = f"{display_name} ({preferred_units})" if preferred_units else display_name
+                if unit_conflict:
+                    label = f"{label} [unit conflict]"
+                search = " ".join(
+                    [
+                        display_name,
+                        label,
+                        " ".join(raw_name_list),
+                        " ".join(sorted(cast(set[str], group.get("_program_titles") or set()), key=str.casefold)),
+                    ]
+                ).strip().lower()
+                options_runtime.append(
+                    {
+                        "value": td_parameter_selector_value(canonical_id),
+                        "canonical_id": canonical_id,
+                        "display_name": display_name,
+                        "label": label,
+                        "preferred_units": preferred_units,
+                        "units": units,
+                        "unit_conflict": unit_conflict,
+                        "raw_names": raw_name_list,
+                        "program_titles": sorted(cast(set[str], group.get("_program_titles") or set()), key=str.casefold),
+                        "asset_types": sorted(cast(set[str], group.get("_asset_types") or set()), key=str.casefold),
+                        "asset_specific_types": sorted(cast(set[str], group.get("_asset_specific_types") or set()), key=str.casefold),
+                        "run_names": sorted(cast(set[str], group.get("_run_names") or set()), key=str.casefold),
+                        "surfaces": sorted(cast(set[str], group.get("_surfaces") or set()), key=str.casefold),
+                        "search": search,
+                    }
+                )
+            options_runtime.sort(
+                key=lambda item: (
+                    str(item.get("display_name") or "").casefold(),
+                    str(item.get("label") or "").casefold(),
+                )
+            )
+            if options_runtime:
+                return options_runtime
     groups: dict[str, dict[str, object]] = {}
     for entry in (ctx.get("entries") or []):
         if not isinstance(entry, Mapping):
@@ -4900,6 +5916,39 @@ def td_parameter_selection_raw_names(
         return []
     if not td_parameter_selector_is_canonical(selected):
         return [selected]
+    ctx = dict(context or {})
+    if _td_parameter_runtime_context_enabled(ctx):
+        db_path = Path(str(ctx.get("db_path") or "")).expanduser()
+        if db_path.exists():
+            wanted_id = td_parameter_selector_canonical_id(selected)
+            surface_key = str(surface or "").strip().lower()
+            run_set = {str(value).strip() for value in (run_names or []) if str(value).strip()}
+            raw_norms = {_td_param_norm_name(value) for value in (raw_names or []) if _td_param_norm_name(value)}
+            query_parts = [
+                f"SELECT DISTINCT raw_name FROM {TD_PARAM_RUNTIME_ENTRIES_TABLE} WHERE canonical_id=?"
+            ]
+            params: list[object] = [wanted_id]
+            if surface_key:
+                query_parts.append("AND surface=?")
+                params.append(surface_key)
+            if run_set:
+                placeholders = ",".join("?" for _ in run_set)
+                query_parts.append(f"AND run_name IN ({placeholders})")
+                params.extend(sorted(run_set))
+            if raw_norms:
+                placeholders = ",".join("?" for _ in raw_norms)
+                query_parts.append(f"AND raw_norm IN ({placeholders})")
+                params.extend(sorted(raw_norms))
+            query_parts.append("ORDER BY raw_name")
+            try:
+                with sqlite3.connect(str(db_path)) as conn:
+                    _ensure_test_data_impl_tables(conn)
+                    rows = conn.execute(" ".join(query_parts), tuple(params)).fetchall()
+            except Exception:
+                rows = []
+            resolved = [str(row[0] or "").strip() for row in rows if str(row[0] or "").strip()]
+            if resolved:
+                return resolved
     for option in td_build_parameter_selector_options(
         context,
         run_names=run_names,
@@ -5371,6 +6420,147 @@ def _ensure_test_data_impl_tables(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    conn.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {TD_PARAM_DISCOVERY_TABLE} (
+            surface TEXT NOT NULL,
+            run_name TEXT NOT NULL,
+            raw_name TEXT NOT NULL,
+            raw_norm TEXT NOT NULL,
+            units TEXT,
+            program_title TEXT,
+            asset_type TEXT,
+            asset_specific_type TEXT,
+            source_run_name TEXT,
+            source_key TEXT,
+            PRIMARY KEY (
+                surface,
+                run_name,
+                raw_name,
+                program_title,
+                asset_type,
+                asset_specific_type,
+                source_run_name,
+                source_key,
+                units
+            )
+        )
+        """
+    )
+    conn.execute(
+        f"""
+        CREATE INDEX IF NOT EXISTS td_param_discovery_surface_run_idx
+        ON {TD_PARAM_DISCOVERY_TABLE} (surface, run_name, raw_norm)
+        """
+    )
+    conn.execute(
+        f"""
+        CREATE INDEX IF NOT EXISTS td_param_discovery_raw_norm_idx
+        ON {TD_PARAM_DISCOVERY_TABLE} (raw_norm, program_title, asset_type, asset_specific_type)
+        """
+    )
+    conn.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {TD_PARAM_NORM_GROUPS_TABLE} (
+            canonical_id TEXT PRIMARY KEY,
+            display_name TEXT,
+            preferred_units TEXT,
+            explicit INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+    conn.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {TD_PARAM_NORM_RULES_TABLE} (
+            raw_name TEXT NOT NULL,
+            raw_norm TEXT NOT NULL,
+            program_title TEXT,
+            program_norm TEXT,
+            asset_type TEXT,
+            asset_norm TEXT,
+            asset_specific_type TEXT,
+            asset_specific_norm TEXT,
+            canonical_id TEXT NOT NULL,
+            default_display_parameter TEXT,
+            displayed_parameter TEXT,
+            preferred_units TEXT,
+            edited INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (
+                raw_norm,
+                program_norm,
+                asset_norm,
+                asset_specific_norm,
+                canonical_id
+            )
+        )
+        """
+    )
+    conn.execute(
+        f"""
+        CREATE INDEX IF NOT EXISTS td_param_norm_rules_raw_scope_idx
+        ON {TD_PARAM_NORM_RULES_TABLE} (raw_norm, program_norm, asset_norm, asset_specific_norm)
+        """
+    )
+    conn.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {TD_PARAM_RUNTIME_ENTRIES_TABLE} (
+            surface TEXT NOT NULL,
+            run_name TEXT NOT NULL,
+            raw_name TEXT NOT NULL,
+            raw_norm TEXT NOT NULL,
+            units TEXT,
+            program_title TEXT,
+            asset_type TEXT,
+            asset_specific_type TEXT,
+            source_run_name TEXT,
+            source_key TEXT,
+            canonical_id TEXT NOT NULL,
+            default_display_parameter TEXT,
+            PRIMARY KEY (
+                surface,
+                run_name,
+                raw_name,
+                program_title,
+                asset_type,
+                asset_specific_type,
+                source_run_name,
+                source_key,
+                units
+            )
+        )
+        """
+    )
+    conn.execute(
+        f"""
+        CREATE INDEX IF NOT EXISTS td_param_runtime_entries_surface_run_idx
+        ON {TD_PARAM_RUNTIME_ENTRIES_TABLE} (surface, run_name, raw_norm)
+        """
+    )
+    conn.execute(
+        f"""
+        CREATE INDEX IF NOT EXISTS td_param_runtime_entries_canonical_idx
+        ON {TD_PARAM_RUNTIME_ENTRIES_TABLE} (canonical_id, surface, run_name)
+        """
+    )
+    conn.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {TD_PARAM_RUNTIME_GROUPS_TABLE} (
+            canonical_id TEXT PRIMARY KEY,
+            display_name TEXT,
+            preferred_units TEXT,
+            raw_names_json TEXT,
+            units_json TEXT,
+            program_titles_json TEXT,
+            asset_types_json TEXT,
+            asset_specific_types_json TEXT,
+            source_run_names_json TEXT,
+            surfaces_json TEXT,
+            run_names_json TEXT,
+            unit_conflict INTEGER NOT NULL DEFAULT 0,
+            explicit INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
     _ensure_test_data_curve_plotter_tables(conn)
 
 
@@ -5403,14 +6593,57 @@ TD_LIFE_BASE_ALIASES: dict[str, tuple[str, ...]] = {
     "prop_per_pulse": ("prop per pulse", "prop_per_pulse", "propellant per pulse", "mass per pulse"),
     "flow_rate": ("flowrate", "flow rate", "mass flow rate", "mdot", "m_dot"),
     "impulse_per_pulse": ("impulse bit", "impulse per pulse", "impulse_bit", "i bit", "i-bit", "ibit"),
+    "cumulative_impulse": ("cumulative impulse", "cum impulse", "cumulative_impulse", "cum_impulse", "total impulse"),
     "elapsed_time": ("elapsed time", "time elapsed", "duration", "run time"),
     "on_time": ("on time", "ontime", "pulse on", "pulse_on", "pulse width on", "pulse_width_on"),
     "thrust": ("thrust",),
 }
 
+TD_LIFE_CUMULATIVE_IMPULSE_FUZZY_MIN_RATIO = 0.82
+
 
 def _td_life_norm_key(value: object) -> str:
     return "".join(ch.lower() for ch in str(value or "").strip() if ch.isalnum())
+
+
+def _td_life_alias_match_score(target: object, candidate: object) -> float:
+    target_text = str(target or "").strip()
+    candidate_text = str(candidate or "").strip()
+    if not target_text or not candidate_text:
+        return 0.0
+    target_key = _normalize_key(target_text)
+    candidate_key = _normalize_key(candidate_text)
+    seq = SequenceMatcher(None, target_key, candidate_key).ratio() if (target_key and candidate_key) else 0.0
+    cov = _token_overlap_score(target_text, candidate_text)
+    return float(max(cov, (seq + cov) / 2.0))
+
+
+def _td_life_matches_cumulative_impulse_alias(
+    value: object,
+    aliases: Sequence[object],
+    *,
+    min_ratio: float = TD_LIFE_CUMULATIVE_IMPULSE_FUZZY_MIN_RATIO,
+) -> bool:
+    text = str(value or "").strip()
+    norm = _td_life_norm_key(text)
+    if not norm:
+        return False
+    alias_values = [str(alias or "").strip() for alias in aliases if str(alias or "").strip()]
+    if any(_td_life_norm_key(alias) == norm for alias in alias_values):
+        return True
+    ratio = max(0.0, min(1.0, float(min_ratio)))
+    for alias in alias_values:
+        if _td_life_alias_match_score(alias, text) >= ratio:
+            return True
+    return False
+
+
+def _td_life_last_finite_value(values: Sequence[object]) -> float | None:
+    for raw_value in reversed(values):
+        value = _td_finite_float(raw_value)
+        if value is not None:
+            return float(value)
+    return None
 
 
 def _td_life_unique_aliases(values: Iterable[object]) -> list[str]:
@@ -5474,6 +6707,7 @@ def _td_life_alias_sets(project_cfg: Mapping[str, object] | None) -> dict[str, l
         "prop_per_pulse": ("prop_per_pulse", "prop_per_pulse_aliases", "propellant_per_pulse"),
         "flow_rate": ("flow_rate", "flow_rate_aliases", "flowrate", "flowrate_aliases"),
         "impulse_per_pulse": ("impulse_per_pulse", "impulse_per_pulse_aliases", "impulse_bit"),
+        "cumulative_impulse": ("cumulative_impulse", "cumulative_impulse_aliases", "cum_impulse", "total_impulse"),
         "elapsed_time": ("elapsed_time", "elapsed_time_aliases", "time_elapsed"),
         "on_time": ("on_time", "on_time_aliases", "pulse_on_time", "pulse_width_on"),
         "thrust": ("thrust", "thrust_aliases"),
@@ -5632,15 +6866,17 @@ def _td_life_raw_curve_metrics(
     pulse_aliases: set[str],
     time_aliases: set[str],
     impulse_aliases: set[str],
+    cumulative_impulse_aliases: Sequence[str],
     thrust_aliases: set[str],
-) -> tuple[dict[str, float], dict[str, float], dict[str, float], dict[str, float]]:
+) -> tuple[dict[str, float], dict[str, float], dict[str, float], dict[str, float], dict[str, float]]:
     pulse_counts: dict[str, float] = {}
     elapsed_times: dict[str, float] = {}
     pulse_impulses: dict[str, float] = {}
     steady_impulses: dict[str, float] = {}
+    cumulative_impulses: dict[str, float] = {}
     path = Path(raw_db_path).expanduser()
     if not path.exists() or not path.is_file():
-        return pulse_counts, elapsed_times, pulse_impulses, steady_impulses
+        return pulse_counts, elapsed_times, pulse_impulses, steady_impulses, cumulative_impulses
     try:
         with sqlite3.connect(str(path)) as raw_conn:
             _ensure_test_data_raw_cache_tables(raw_conn)
@@ -5655,7 +6891,7 @@ def _td_life_raw_curve_metrics(
                 """
             ).fetchall()
     except Exception:
-        return pulse_counts, elapsed_times, pulse_impulses, steady_impulses
+        return pulse_counts, elapsed_times, pulse_impulses, steady_impulses, cumulative_impulses
     for observation_id, x_name, y_name, x_json, y_json in rows:
         obs_id = str(observation_id or "").strip()
         x_key = _td_life_norm_key(x_name)
@@ -5670,6 +6906,12 @@ def _td_life_raw_curve_metrics(
             ys = json.loads(y_json or "[]")
         except Exception:
             ys = []
+        if isinstance(ys, list) and _td_life_matches_cumulative_impulse_alias(y_name, cumulative_impulse_aliases):
+            cumulative_endpoint = _td_life_last_finite_value(ys)
+            if cumulative_endpoint is not None:
+                prior_endpoint = cumulative_impulses.get(obs_id)
+                if prior_endpoint is None or float(cumulative_endpoint) > float(prior_endpoint):
+                    cumulative_impulses[obs_id] = float(cumulative_endpoint)
         if not isinstance(xs, list):
             continue
         if x_key in pulse_aliases:
@@ -5688,7 +6930,7 @@ def _td_life_raw_curve_metrics(
                 thrust_integral = _td_life_series_trapezoid(xs, ys)
                 if thrust_integral is not None:
                     steady_impulses[obs_id] = max(float(steady_impulses.get(obs_id, 0.0)), float(thrust_integral))
-    return pulse_counts, elapsed_times, pulse_impulses, steady_impulses
+    return pulse_counts, elapsed_times, pulse_impulses, steady_impulses, cumulative_impulses
 
 
 def _td_life_sequence_number(value: object) -> int | None:
@@ -5763,12 +7005,14 @@ def _td_rebuild_life_metrics(
     alias_sets = _td_life_alias_sets(project_cfg)
     pulse_axis_aliases, time_axis_aliases = _td_life_axis_aliases(project_cfg)
     impulse_aliases = {_td_life_norm_key(value) for value in (alias_sets.get("impulse_per_pulse") or []) if _td_life_norm_key(value)}
+    cumulative_impulse_aliases = list(alias_sets.get("cumulative_impulse") or [])
     thrust_aliases = {_td_life_norm_key(value) for value in (alias_sets.get("thrust") or []) if _td_life_norm_key(value)}
-    raw_pulse_counts, raw_elapsed_times, raw_pulse_impulses, raw_steady_impulses = _td_life_raw_curve_metrics(
+    raw_pulse_counts, raw_elapsed_times, raw_pulse_impulses, raw_steady_impulses, raw_cumulative_impulses = _td_life_raw_curve_metrics(
         raw_db_path,
         pulse_aliases=pulse_axis_aliases,
         time_aliases=time_axis_aliases,
         impulse_aliases=impulse_aliases,
+        cumulative_impulse_aliases=cumulative_impulse_aliases,
         thrust_aliases=thrust_aliases,
     )
     try:
@@ -5928,6 +7172,7 @@ def _td_rebuild_life_metrics(
             sequence_elapsed_time: float | None = None
             sequence_throughput: float | None = None
             sequence_impulse: float | None = None
+            raw_cumulative_impulse = raw_cumulative_impulses.get(obs_id)
 
             if is_pm:
                 if sequence_pulses is None:
@@ -5949,7 +7194,9 @@ def _td_rebuild_life_metrics(
                 else:
                     diagnostics.append("missing throughput inputs")
                 raw_pulse_impulse = raw_pulse_impulses.get(obs_id)
-                if raw_pulse_impulse is not None:
+                if raw_cumulative_impulse is not None:
+                    sequence_impulse = float(raw_cumulative_impulse)
+                elif raw_pulse_impulse is not None:
                     sequence_impulse = float(raw_pulse_impulse)
                 elif impulse_per_pulse is not None and sequence_pulses is not None:
                     sequence_impulse = float(impulse_per_pulse) * float(sequence_pulses)
@@ -5973,7 +7220,9 @@ def _td_rebuild_life_metrics(
                 else:
                     diagnostics.append("missing throughput inputs")
                 raw_steady_impulse = raw_steady_impulses.get(obs_id)
-                if raw_steady_impulse is not None:
+                if raw_cumulative_impulse is not None:
+                    sequence_impulse = float(raw_cumulative_impulse)
+                elif raw_steady_impulse is not None:
                     sequence_impulse = float(raw_steady_impulse)
                 elif thrust is not None and sequence_on_time is not None:
                     sequence_impulse = float(thrust) * float(sequence_on_time)
@@ -11792,6 +13041,46 @@ def _td_impl_cache_counts(conn: sqlite3.Connection) -> dict[str, int | bool]:
     }
 
 
+def _td_parameter_runtime_counts(conn: sqlite3.Connection) -> dict[str, int | bool]:
+    _ensure_test_data_impl_tables(conn)
+    try:
+        discovery_rows = int(conn.execute(f"SELECT COUNT(*) FROM {TD_PARAM_DISCOVERY_TABLE}").fetchone()[0] or 0)
+    except Exception:
+        discovery_rows = 0
+    try:
+        norm_groups = int(conn.execute(f"SELECT COUNT(*) FROM {TD_PARAM_NORM_GROUPS_TABLE}").fetchone()[0] or 0)
+    except Exception:
+        norm_groups = 0
+    try:
+        norm_rules = int(conn.execute(f"SELECT COUNT(*) FROM {TD_PARAM_NORM_RULES_TABLE}").fetchone()[0] or 0)
+    except Exception:
+        norm_rules = 0
+    try:
+        runtime_entries = int(conn.execute(f"SELECT COUNT(*) FROM {TD_PARAM_RUNTIME_ENTRIES_TABLE}").fetchone()[0] or 0)
+    except Exception:
+        runtime_entries = 0
+    try:
+        runtime_groups = int(conn.execute(f"SELECT COUNT(*) FROM {TD_PARAM_RUNTIME_GROUPS_TABLE}").fetchone()[0] or 0)
+    except Exception:
+        runtime_groups = 0
+    discovery_signature = _td_meta_value(conn, TD_PARAM_DISCOVERY_SIGNATURE_META_KEY)
+    runtime_signature = _td_meta_value(conn, TD_PARAM_RUNTIME_SIGNATURE_META_KEY)
+    discovery_ready = _td_parameter_discovery_table_ready(conn, require_rows=True)
+    runtime_ready = _td_parameter_runtime_tables_ready(conn, require_rows=True)
+    return {
+        "discovery_rows": discovery_rows,
+        "norm_groups": norm_groups,
+        "norm_rules": norm_rules,
+        "runtime_entries": runtime_entries,
+        "runtime_groups": runtime_groups,
+        "discovery_signature_present": bool(discovery_signature),
+        "runtime_signature_present": bool(runtime_signature),
+        "discovery_ready": bool(discovery_ready),
+        "runtime_ready": bool(runtime_ready),
+        "complete": bool(discovery_ready and runtime_ready and discovery_signature and runtime_signature),
+    }
+
+
 def _td_raw_cache_counts(conn: sqlite3.Connection) -> dict[str, int | bool]:
     _ensure_test_data_raw_cache_tables(conn)
     try:
@@ -11821,6 +13110,7 @@ def _td_is_recoverable_cache_validation_error(exc: BaseException | str) -> bool:
     recoverable_markers = (
         "Project cache DB not found",
         "Project cache DB is incomplete",
+        "Project parameter runtime cache is incomplete",
         "Project raw cache DB not found",
         "Project raw cache DB is incomplete",
         "Project cache is stale",
@@ -11905,6 +13195,7 @@ def inspect_test_data_project_cache_state(project_dir: Path, workbook_path: Path
         cached_project_raw_signature = _td_meta_value(conn, "project_raw_signature")
         cached_schema_version = _td_meta_value(conn, "cache_schema_version")
         impl_counts = _td_impl_cache_counts(conn)
+        parameter_runtime_counts = _td_parameter_runtime_counts(conn)
     with closing(sqlite3.connect(str(raw_db_path))) as conn:
         raw_counts = _td_raw_cache_counts(conn)
         curve_count = int(raw_counts.get("raw_curves") or 0)
@@ -11993,8 +13284,10 @@ def inspect_test_data_project_cache_state(project_dir: Path, workbook_path: Path
         "mode": refresh_mode,
         "reason": refresh_reason,
         "impl_counts": dict(impl_counts),
+        "parameter_runtime_counts": dict(parameter_runtime_counts),
         "raw_counts": dict(raw_counts),
         "impl_complete": bool(impl_counts.get("complete")),
+        "parameter_runtime_complete": bool(parameter_runtime_counts.get("complete")),
         "raw_complete": bool(raw_counts.get("complete")),
         "project_raw_signature": project_raw_signature,
         "current_stats_csv": current_stats_csv,
@@ -12028,12 +13321,18 @@ def inspect_test_data_project_cache_state(project_dir: Path, workbook_path: Path
 def _td_cache_state_summary(state: Mapping[str, object] | None) -> dict[str, object]:
     raw_state = dict(state or {})
     impl_counts_raw = raw_state.get("impl_counts") if isinstance(raw_state.get("impl_counts"), Mapping) else {}
+    parameter_runtime_counts_raw = (
+        raw_state.get("parameter_runtime_counts")
+        if isinstance(raw_state.get("parameter_runtime_counts"), Mapping)
+        else {}
+    )
     raw_counts_raw = raw_state.get("raw_counts") if isinstance(raw_state.get("raw_counts"), Mapping) else {}
     sync_counts_raw = raw_state.get("counts") if isinstance(raw_state.get("counts"), Mapping) else {}
     return {
         "mode": str(raw_state.get("mode") or "").strip(),
         "reason": str(raw_state.get("reason") or "").strip(),
         "impl_complete": bool(raw_state.get("impl_complete")),
+        "parameter_runtime_complete": bool(raw_state.get("parameter_runtime_complete")),
         "raw_complete": bool(raw_state.get("raw_complete")),
         "impl_counts": {
             "td_runs": int(impl_counts_raw.get("runs") or 0),
@@ -12042,6 +13341,13 @@ def _td_cache_state_summary(state: Mapping[str, object] | None) -> dict[str, obj
             "td_condition_observations_sequences": int(impl_counts_raw.get("sequence_observations") or 0),
             "td_metrics_calc_sequences": int(impl_counts_raw.get("sequence_metrics") or 0),
             "td_life_metrics": int(impl_counts_raw.get("life_metrics") or 0),
+        },
+        "parameter_runtime_counts": {
+            "td_param_discovery": int(parameter_runtime_counts_raw.get("discovery_rows") or 0),
+            "td_param_norm_groups": int(parameter_runtime_counts_raw.get("norm_groups") or 0),
+            "td_param_norm_rules": int(parameter_runtime_counts_raw.get("norm_rules") or 0),
+            "td_param_runtime_entries": int(parameter_runtime_counts_raw.get("runtime_entries") or 0),
+            "td_param_runtime_groups": int(parameter_runtime_counts_raw.get("runtime_groups") or 0),
         },
         "raw_counts": {
             "td_raw_sequences": int(raw_counts_raw.get("raw_runs") or 0),
@@ -12064,12 +13370,18 @@ def _td_cache_state_summary(state: Mapping[str, object] | None) -> dict[str, obj
 def _td_cache_validation_summary_line(summary: Mapping[str, object] | None) -> str:
     state = dict(summary or {})
     impl_counts = state.get("impl_counts") if isinstance(state.get("impl_counts"), Mapping) else {}
+    parameter_runtime_counts = (
+        state.get("parameter_runtime_counts")
+        if isinstance(state.get("parameter_runtime_counts"), Mapping)
+        else {}
+    )
     raw_counts = state.get("raw_counts") if isinstance(state.get("raw_counts"), Mapping) else {}
     sync_counts = state.get("sync_counts") if isinstance(state.get("sync_counts"), Mapping) else {}
     parts = [
         f"mode={str(state.get('mode') or 'n/a').strip() or 'n/a'}",
         f"reason={str(state.get('reason') or 'n/a').strip() or 'n/a'}",
         f"impl_complete={bool(state.get('impl_complete'))}",
+        f"parameter_runtime_complete={bool(state.get('parameter_runtime_complete'))}",
         f"raw_complete={bool(state.get('raw_complete'))}",
         f"td_runs={int(impl_counts.get('td_runs') or 0)}",
         f"td_columns_calc_y={int(impl_counts.get('td_columns_calc_y') or 0)}",
@@ -12077,6 +13389,11 @@ def _td_cache_validation_summary_line(summary: Mapping[str, object] | None) -> s
         f"td_condition_observations_sequences={int(impl_counts.get('td_condition_observations_sequences') or 0)}",
         f"td_metrics_calc_sequences={int(impl_counts.get('td_metrics_calc_sequences') or 0)}",
         f"td_life_metrics={int(impl_counts.get('td_life_metrics') or 0)}",
+        f"td_param_discovery={int(parameter_runtime_counts.get('td_param_discovery') or 0)}",
+        f"td_param_norm_groups={int(parameter_runtime_counts.get('td_param_norm_groups') or 0)}",
+        f"td_param_norm_rules={int(parameter_runtime_counts.get('td_param_norm_rules') or 0)}",
+        f"td_param_runtime_entries={int(parameter_runtime_counts.get('td_param_runtime_entries') or 0)}",
+        f"td_param_runtime_groups={int(parameter_runtime_counts.get('td_param_runtime_groups') or 0)}",
         f"td_raw_sequences={int(raw_counts.get('td_raw_sequences') or 0)}",
         f"td_columns_raw_y={int(raw_counts.get('td_columns_raw_y') or 0)}",
         f"td_curves_raw={int(raw_counts.get('td_curves_raw') or 0)}",
@@ -12675,14 +13992,19 @@ def _td_collect_project_readiness(
                 "td_condition_observations_sequences",
                 "td_metrics_calc_sequences",
                 TD_LIFE_METRICS_TABLE,
+                TD_PARAM_DISCOVERY_TABLE,
+                TD_PARAM_NORM_GROUPS_TABLE,
+                TD_PARAM_NORM_RULES_TABLE,
+                TD_PARAM_RUNTIME_ENTRIES_TABLE,
+                TD_PARAM_RUNTIME_GROUPS_TABLE,
             )
             impl_tables = {
                 str(row[0] or "").strip()
                 for row in conn.execute(
-                    """
+                    f"""
                     SELECT name
                     FROM sqlite_master
-                    WHERE type='table' AND name IN (?, ?, ?, ?, ?, ?)
+                    WHERE type='table' AND name IN ({','.join('?' for _ in required_impl_tables)})
                     """,
                     required_impl_tables,
                 ).fetchall()
@@ -12696,6 +14018,17 @@ def _td_collect_project_readiness(
             impl_counts = _td_impl_cache_counts(conn)
             if not bool(impl_counts.get("complete")):
                 problems.append(f"Project cache DB is incomplete: {db_path}.")
+            parameter_runtime_counts = _td_parameter_runtime_counts(conn)
+            summary["parameter_runtime_counts"] = {
+                "td_param_discovery": int(parameter_runtime_counts.get("discovery_rows") or 0),
+                "td_param_norm_groups": int(parameter_runtime_counts.get("norm_groups") or 0),
+                "td_param_norm_rules": int(parameter_runtime_counts.get("norm_rules") or 0),
+                "td_param_runtime_entries": int(parameter_runtime_counts.get("runtime_entries") or 0),
+                "td_param_runtime_groups": int(parameter_runtime_counts.get("runtime_groups") or 0),
+            }
+            summary["parameter_runtime_complete"] = bool(parameter_runtime_counts.get("complete"))
+            if not bool(parameter_runtime_counts.get("complete")):
+                problems.append(f"Project parameter runtime cache is incomplete: {db_path}.")
 
             source_failures = _td_excluded_source_details(conn)
             compiled_serials = _td_compiled_serials_from_cache(conn, wb_path)
@@ -14002,6 +15335,11 @@ def _rebuild_test_data_project_calc_cache_from_raw(
         except Exception:
             raw_obs_rows = []
     timings["raw_cache_read_s"] = round(time.perf_counter() - t0, 3)
+    _td_emit_progress(
+        progress_cb,
+        "Read raw Test Data cache complete "
+        + f"in {timings['raw_cache_read_s']:.3f}s (runs={len(raw_runs)}, y_columns={len(raw_y_cols)}, curves={len(raw_curve_rows)})",
+    )
     if not raw_runs or not raw_y_cols or not raw_curve_rows:
         raise RuntimeError(
             f"Project raw cache DB is incomplete: {raw_db_path}. "
@@ -14509,6 +15847,12 @@ def _rebuild_test_data_project_calc_cache_from_raw(
                     )
                     metrics_written += 1
         timings["calc_aggregate_s"] = round(time.perf_counter() - t0, 3)
+        _td_emit_progress(
+            progress_cb,
+            "Aggregated calculated metrics from raw cache "
+            + f"in {timings['calc_aggregate_s']:.3f}s "
+            + f"(conditions={len(aggregated_obs_meta)}, metric_rows={len(metric_rows_to_write)}, sequence_metric_rows={len(sequence_metric_rows_by_key)})",
+        )
 
         support_mtime_ns = 0
         try:
@@ -14649,6 +15993,12 @@ def _rebuild_test_data_project_calc_cache_from_raw(
         )
         conn.commit()
         timings["calc_write_s"] = round(time.perf_counter() - t0, 3)
+        _td_emit_progress(
+            progress_cb,
+            "Wrote calculated Test Data cache "
+            + f"in {timings['calc_write_s']:.3f}s "
+            + f"(metrics={metrics_written}, calc_columns={calc_columns_written}, life_metrics={life_metrics_written})",
+        )
 
     timings["total_s"] = round(time.perf_counter() - total_started, 3)
 
@@ -14722,6 +16072,11 @@ def validate_test_data_project_cache_for_open(project_dir: Path, workbook_path: 
                     "td_condition_observations_sequences",
                     "td_metrics_calc_sequences",
                     TD_LIFE_METRICS_TABLE,
+                    TD_PARAM_DISCOVERY_TABLE,
+                    TD_PARAM_NORM_GROUPS_TABLE,
+                    TD_PARAM_NORM_RULES_TABLE,
+                    TD_PARAM_RUNTIME_ENTRIES_TABLE,
+                    TD_PARAM_RUNTIME_GROUPS_TABLE,
                 ),
             )
             if missing_impl_tables:
@@ -14735,6 +16090,7 @@ def validate_test_data_project_cache_for_open(project_dir: Path, workbook_path: 
             sequence_obs_count = int(conn.execute("SELECT COUNT(*) FROM td_condition_observations_sequences").fetchone()[0] or 0)
             sequence_metrics_count = int(conn.execute("SELECT COUNT(*) FROM td_metrics_calc_sequences").fetchone()[0] or 0)
             life_metrics_count = int(conn.execute(f"SELECT COUNT(*) FROM {TD_LIFE_METRICS_TABLE}").fetchone()[0] or 0)
+            parameter_runtime_counts = _td_parameter_runtime_counts(conn)
     except RuntimeError:
         raise
     except Exception as exc:
@@ -14748,6 +16104,7 @@ def validate_test_data_project_cache_for_open(project_dir: Path, workbook_path: 
         or sequence_obs_count <= 0
         or sequence_metrics_count <= 0
         or life_metrics_count <= 0
+        or not bool(parameter_runtime_counts.get("complete"))
     ):
         raise RuntimeError(f"Project cache DB is incomplete: {db_path}. {guidance}")
 
@@ -14966,63 +16323,84 @@ def sync_test_data_project_cache(
     rebuild: bool = False,
     progress_cb: Callable[[str], None] | None = None,
 ) -> dict[str, object]:
+    import time
+
     proj_dir = Path(project_dir).expanduser()
     wb_path = Path(workbook_path).expanduser()
     if not wb_path.exists():
         raise FileNotFoundError(f"Workbook not found: {wb_path}")
     db_path = proj_dir / EIDAT_PROJECT_IMPLEMENTATION_DB
 
+    state: dict[str, object] = {}
+    refresh_reason = ""
     if rebuild:
         _td_emit_progress(progress_cb, "Refreshing raw Test Data cache (forced full rebuild)")
         payload = rebuild_test_data_project_cache(db_path, wb_path, progress_cb=progress_cb)
         payload["mode"] = "full_rebuild"
         payload.setdefault("counts", {})
         payload["reason"] = "forced full rebuild"
-        return payload
-
-    state = inspect_test_data_project_cache_state(proj_dir, wb_path)
-    refresh_mode = str(state.get("mode") or "").strip().lower() or "none"
-    refresh_reason = str(state.get("reason") or "").strip()
-    if refresh_mode == "full":
-        _td_emit_progress(progress_cb, f"Refreshing raw Test Data cache ({refresh_reason})")
-        payload = rebuild_test_data_project_cache(db_path, wb_path, progress_cb=progress_cb)
-        payload["mode"] = "full_rebuild"
-    elif refresh_mode == "incremental_raw":
-        _td_emit_progress(progress_cb, f"Refreshing raw Test Data cache ({refresh_reason})")
-        payload = rebuild_test_data_project_cache(
-            db_path,
-            wb_path,
-            progress_cb=progress_cb,
-            _entries_override=[
-                dict((state.get("source_state_by_serial") or {}).get(serial) or {}).get("source_row")
-                for serial in list(state.get("added_serials") or []) + list(state.get("changed_serials") or [])
-                if dict((state.get("source_state_by_serial") or {}).get(serial) or {}).get("source_row")
-            ],
-            _full_reset=False,
-            _removed_serials=list(state.get("removed_serials") or []),
-            _source_fingerprints=dict(state.get("fingerprints_by_serial") or {}),
-            _preclassified_counts=dict(state.get("counts") or {}),
-        )
-        payload["mode"] = "incremental_raw"
-    elif refresh_mode == "calc":
-        _td_emit_progress(progress_cb, f"Refreshing calculated Test Data cache ({refresh_reason})")
-        payload = _rebuild_test_data_project_calc_cache_from_raw(db_path, wb_path, progress_cb=progress_cb)
-        payload["mode"] = "calc_only"
-        payload["counts"] = dict(state.get("counts") or {})
     else:
-        payload = {
-            "db_path": str(db_path),
-            "raw_db_path": str(td_raw_cache_db_path_for(proj_dir)),
-            "workbook": str(wb_path),
-            "mode": "noop",
-            "counts": dict(state.get("counts") or {}),
-            "reason": refresh_reason,
-        }
+        state = inspect_test_data_project_cache_state(proj_dir, wb_path)
+        refresh_mode = str(state.get("mode") or "").strip().lower() or "none"
+        refresh_reason = str(state.get("reason") or "").strip()
+        if refresh_mode == "full":
+            _td_emit_progress(progress_cb, f"Refreshing raw Test Data cache ({refresh_reason})")
+            payload = rebuild_test_data_project_cache(db_path, wb_path, progress_cb=progress_cb)
+            payload["mode"] = "full_rebuild"
+        elif refresh_mode == "incremental_raw":
+            _td_emit_progress(progress_cb, f"Refreshing raw Test Data cache ({refresh_reason})")
+            payload = rebuild_test_data_project_cache(
+                db_path,
+                wb_path,
+                progress_cb=progress_cb,
+                _entries_override=[
+                    dict((state.get("source_state_by_serial") or {}).get(serial) or {}).get("source_row")
+                    for serial in list(state.get("added_serials") or []) + list(state.get("changed_serials") or [])
+                    if dict((state.get("source_state_by_serial") or {}).get(serial) or {}).get("source_row")
+                ],
+                _full_reset=False,
+                _removed_serials=list(state.get("removed_serials") or []),
+                _source_fingerprints=dict(state.get("fingerprints_by_serial") or {}),
+                _preclassified_counts=dict(state.get("counts") or {}),
+            )
+            payload["mode"] = "incremental_raw"
+        elif refresh_mode == "calc":
+            _td_emit_progress(progress_cb, f"Refreshing calculated Test Data cache ({refresh_reason})")
+            payload = _rebuild_test_data_project_calc_cache_from_raw(db_path, wb_path, progress_cb=progress_cb)
+            payload["mode"] = "calc_only"
+            payload["counts"] = dict(state.get("counts") or {})
+        else:
+            payload = {
+                "db_path": str(db_path),
+                "raw_db_path": str(td_raw_cache_db_path_for(proj_dir)),
+                "workbook": str(wb_path),
+                "mode": "noop",
+                "counts": dict(state.get("counts") or {}),
+                "reason": refresh_reason,
+            }
     payload["db_path"] = str(payload.get("db_path") or db_path)
     payload["raw_db_path"] = str(payload.get("raw_db_path") or td_raw_cache_db_path_for(proj_dir))
     payload["workbook"] = str(payload.get("workbook") or wb_path)
     payload["counts"] = dict(payload.get("counts") or state.get("counts") or {})
     payload["reason"] = str(payload.get("reason") or refresh_reason).strip()
+    _td_emit_progress(progress_cb, "Refreshing parameter runtime cache")
+    t0 = time.perf_counter()
+    runtime_payload = refresh_td_parameter_runtime_cache(
+        proj_dir,
+        wb_path,
+        Path(str(payload.get("db_path") or db_path)).expanduser(),
+        progress_cb=progress_cb,
+    )
+    runtime_elapsed = round(time.perf_counter() - t0, 3)
+    payload["parameter_runtime"] = dict(runtime_payload)
+    timings = dict(payload.get("timings") or {})
+    timings["parameter_runtime_s"] = runtime_elapsed
+    payload["timings"] = timings
+    _td_emit_progress(
+        progress_cb,
+        "Parameter runtime cache stage complete "
+        + f"in {runtime_elapsed:.3f}s (mode={str(runtime_payload.get('mode') or 'unknown').strip() or 'unknown'})",
+    )
     return payload
 
 
@@ -16959,6 +18337,11 @@ def rebuild_test_data_project_cache(
     impl_conn.commit()
     raw_conn.commit()
     timings["raw_db_write_s"] += time.perf_counter() - t0
+    _td_emit_progress(
+        progress_cb,
+        "Wrote raw Test Data cache tables "
+        + f"in {round(timings['raw_db_write_s'], 3):.3f}s (runs={len(runs_all)}, curves={total_curve_count})",
+    )
     impl_conn.close()
     raw_conn.close()
 
@@ -17010,6 +18393,12 @@ def rebuild_test_data_project_cache(
     else:
         calc_payload = _rebuild_test_data_project_calc_cache_from_raw(db_path, wb_path, progress_cb=progress_cb)
     timings["calc_rebuild_s"] = round(time.perf_counter() - t0, 3)
+    _td_emit_progress(
+        progress_cb,
+        "Rebuilt calculated Test Data cache "
+        + f"in {timings['calc_rebuild_s']:.3f}s "
+        + f"(metrics={int(calc_payload.get('metrics_written') or 0)}, life_metrics={int(calc_payload.get('life_metrics_written') or 0)})",
+    )
     timings["total_s"] = round(time.perf_counter() - total_started, 3)
     metrics_written = int(calc_payload.get("metrics_written") or 0)
     with closing(sqlite3.connect(str(db_path))) as conn:
@@ -18091,6 +19480,110 @@ def td_load_metric_series(
         }
         for r in rows
         if str(r[0] or "").strip() and str(r[1] or "").strip()
+    ]
+
+
+def td_load_metric_summary_for_selection(
+    db_path: Path,
+    run_name: str,
+    column_names: Sequence[object],
+    serial: object,
+    stats: Sequence[object],
+    *,
+    program_title: str | None = None,
+    source_run_name: str | None = None,
+    control_period_filter: object = None,
+    run_type_filter: object = None,
+    metric_source: object = TD_METRIC_PLOT_SOURCE_AGGREGATE,
+) -> list[dict]:
+    path = Path(db_path).expanduser()
+    if not path.exists():
+        return []
+    run = str(run_name or "").strip()
+    serial_txt = str(serial or "").strip()
+    raw_columns = [str(value or "").strip() for value in (column_names or []) if str(value or "").strip()]
+    stats_norm = [str(value or "").strip().lower() for value in (stats or []) if str(value or "").strip()]
+    if not run or not serial_txt or not raw_columns or not stats_norm:
+        return []
+    metric_source_norm = td_metric_normalize_plot_source(metric_source)
+    metrics_table = _td_metric_source_table_name(metric_source_norm)
+    observations_table = _td_metric_source_observation_table_name(metric_source_norm)
+    column_placeholders = ",".join("?" for _ in raw_columns)
+    stat_placeholders = ",".join("?" for _ in stats_norm)
+    metric_sql = [
+        f"""
+        SELECT
+            m.observation_id,
+            m.serial,
+            m.column_name,
+            lower(m.stat),
+            m.value_num,
+            COALESCE(m.program_title, ''),
+            COALESCE(m.source_run_name, ''),
+            COALESCE(sm.asset_type, ''),
+            COALESCE(sm.asset_specific_type, ''),
+            COALESCE(o.run_type, ''),
+            o.control_period,
+            o.suppression_voltage,
+            o.valve_voltage
+        FROM {metrics_table} m
+        LEFT JOIN {observations_table} o
+          ON o.observation_id = m.observation_id
+        LEFT JOIN td_source_metadata sm
+          ON sm.serial = m.serial
+        WHERE m.run_name=? AND m.serial=?
+          AND m.column_name IN ({column_placeholders})
+          AND lower(m.stat) IN ({stat_placeholders})
+        """
+    ]
+    metric_params: list[object] = [run, serial_txt, *raw_columns, *stats_norm]
+    prog = str(program_title or "").strip() if metric_source_norm == TD_METRIC_PLOT_SOURCE_ALL_SEQUENCES else ""
+    src_run = str(source_run_name or "").strip() if metric_source_norm == TD_METRIC_PLOT_SOURCE_ALL_SEQUENCES else ""
+    if prog:
+        metric_sql.append(" AND lower(COALESCE(m.program_title, '')) = lower(?)")
+        metric_params.append(prog)
+    if src_run:
+        metric_sql.append(" AND lower(COALESCE(m.source_run_name, '')) = lower(?)")
+        metric_params.append(src_run)
+    run_type_sql, run_type_params = _td_perf_run_type_sql_clause(run_type_filter, "o.run_type")
+    if run_type_sql:
+        metric_sql.append(run_type_sql)
+        metric_params.extend(run_type_params)
+    if control_period_filter not in (None, ""):
+        cp_filter_num = _to_support_number(control_period_filter)
+        run_type_key = _td_perf_run_type_sql_key("o.run_type")
+        if cp_filter_num is not None:
+            metric_sql.append(
+                f" AND ({run_type_key} NOT IN ('pm', 'pulsemode', 'pulsedmode', 'pulsed', 'pulse') OR ABS(COALESCE(o.control_period, 0) - ?) <= 1e-9)"
+            )
+            metric_params.append(cp_filter_num)
+        else:
+            metric_sql.append(
+                f" AND ({run_type_key} NOT IN ('pm', 'pulsemode', 'pulsedmode', 'pulsed', 'pulse') OR lower(TRIM(CAST(o.control_period AS TEXT))) = lower(TRIM(CAST(? AS TEXT))))"
+            )
+            metric_params.append(str(control_period_filter))
+    metric_sql.append(" ORDER BY m.column_name, lower(m.stat), m.observation_id")
+    with sqlite3.connect(str(path)) as conn:
+        _ensure_test_data_impl_tables(conn)
+        rows = conn.execute("".join(metric_sql), tuple(metric_params)).fetchall()
+    return [
+        {
+            "observation_id": str(r[0] or "").strip(),
+            "serial": str(r[1] or "").strip(),
+            "column_name": str(r[2] or "").strip(),
+            "stat": str(r[3] or "").strip().lower(),
+            "value_num": r[4],
+            "program_title": str(r[5] or "").strip(),
+            "source_run_name": str(r[6] or "").strip(),
+            "asset_type": str(r[7] or "").strip(),
+            "asset_specific_type": str(r[8] or "").strip(),
+            "run_type": str(r[9] or "").strip(),
+            "control_period": r[10],
+            "suppression_voltage": r[11],
+            "valve_voltage": r[12],
+        }
+        for r in rows
+        if str(r[0] or "").strip() and str(r[1] or "").strip() and str(r[2] or "").strip()
     ]
 
 
@@ -31760,6 +33253,15 @@ def update_test_data_trending_project_workbook(
         "post_cache_workbook_build_s": 0.0,
     }
     total_started = time.perf_counter()
+
+    def _stage_start(label: str) -> None:
+        _td_emit_progress(progress_cb, f"{label} [start]")
+
+    def _stage_done(label: str, started_at: float, *, details: str = "") -> None:
+        elapsed = time.perf_counter() - started_at
+        suffix = f" | {details}" if details else ""
+        _td_emit_progress(progress_cb, f"{label} [done {elapsed:.3f}s]{suffix}")
+
     repo = Path(global_repo).expanduser()
     project_dir = wb_path.parent
     db_path = project_dir / EIDAT_PROJECT_IMPLEMENTATION_DB
@@ -32021,7 +33523,7 @@ def update_test_data_trending_project_workbook(
     cfg_cols = [dict(c) for c in (project_cfg.get("columns") or []) if isinstance(c, dict)]
     cfg_order = [str(c.get("name") or "").strip() for c in cfg_cols if str(c.get("name") or "").strip()]
     if not dry_run:
-        _td_emit_progress(progress_cb, "Refreshing support workbook")
+        _stage_start("Refreshing support workbook")
         t0 = time.perf_counter()
         _sync_td_support_workbook_program_sheets(
             wb_path,
@@ -32035,6 +33537,7 @@ def update_test_data_trending_project_workbook(
             param_defs=cfg_cols,
         )
         timings["support_refresh_s"] = round(time.perf_counter() - t0, 3)
+        _stage_done("Refreshing support workbook", t0)
 
     # Migration: legacy workbooks used `Data` as the computed metrics sheet ("Metric" in A1).
     if "Data_calc" not in wb.sheetnames and "Data" in wb.sheetnames:
@@ -32087,11 +33590,12 @@ def update_test_data_trending_project_workbook(
     excluded_sources: list[dict[str, str]] = []
     warning_summary = ""
     if not dry_run:
-        _td_emit_progress(progress_cb, "Saving workbook before cache validation")
+        _stage_start("Saving workbook before cache validation")
         t0 = time.perf_counter()
         wb.save(str(wb_path))
         timings["pre_cache_workbook_save_s"] = round(time.perf_counter() - t0, 3)
-        _td_emit_progress(progress_cb, "Ensuring project cache")
+        _stage_done("Saving workbook before cache validation", t0)
+        _stage_start("Ensuring project cache")
         t0 = time.perf_counter()
         try:
             cache_sync_payload = sync_test_data_project_cache(
@@ -32105,8 +33609,20 @@ def update_test_data_trending_project_workbook(
             raise
         db_path = Path(str(cache_sync_payload.get("db_path") or db_path)).expanduser()
         timings["cache_ensure_s"] = round(time.perf_counter() - t0, 3)
+        cache_counts = dict(cache_sync_payload.get("counts") or {})
+        _stage_done(
+            "Ensuring project cache",
+            t0,
+            details=(
+                f"mode={str(cache_sync_payload.get('mode') or 'unknown').strip() or 'unknown'}, "
+                f"added={int(cache_counts.get('added') or 0)}, "
+                f"changed={int(cache_counts.get('changed') or 0)}, "
+                f"removed={int(cache_counts.get('removed') or 0)}, "
+                f"reingested={int(cache_counts.get('reingested') or 0)}"
+            ),
+        )
 
-    _td_emit_progress(progress_cb, "Reading project cache")
+    _stage_start("Reading project cache")
     t0 = time.perf_counter()
     with closing(sqlite3.connect(str(db_path))) as conn:
         _ensure_test_data_impl_tables(conn)
@@ -32216,6 +33732,16 @@ def update_test_data_trending_project_workbook(
             """
         ).fetchall()
     timings["cache_read_s"] = round(time.perf_counter() - t0, 3)
+    _stage_done(
+        "Reading project cache",
+        t0,
+        details=(
+            f"metrics_long={len(metric_rows_long)}, "
+            f"metrics_long_sequences={len(metric_rows_long_sequences)}, "
+            f"life_metrics={len(life_metric_rows)}, "
+            f"raw_cache_long={len(raw_cache_long_rows)}"
+        ),
+    )
     post_cache_started = time.perf_counter()
     warning_summary = _td_excluded_source_warning_summary(excluded_sources)
 
@@ -32243,7 +33769,7 @@ def update_test_data_trending_project_workbook(
             continue
         y_by_run.setdefault(r, []).append(n)
 
-    _td_emit_progress(progress_cb, "Rebuilding Data_calc")
+    _stage_start("Rebuilding Data_calc")
     t0 = time.perf_counter()
     # Clear and rebuild Data_calc sheet.
     try:
@@ -32317,8 +33843,13 @@ def update_test_data_trending_project_workbook(
                 ws_data_calc.cell(r, cidx).value = new_value
                 updated_cells += 1
     timings["data_calc_build_s"] = round(time.perf_counter() - t0, 3)
+    _stage_done(
+        "Rebuilding Data_calc",
+        t0,
+        details=f"rows={max(0, int(ws_data_calc.max_row or 0) - 1)}, updated_cells={updated_cells}, missing_value={missing_value}",
+    )
 
-    _td_emit_progress(progress_cb, "Writing Metrics_long")
+    _stage_start("Writing Metrics_long")
     t0 = time.perf_counter()
     ws_metrics_long = _td_reset_workbook_sheet(
         wb,
@@ -32339,8 +33870,9 @@ def update_test_data_trending_project_workbook(
     for row in metric_rows_long:
         ws_metrics_long.append(list(row))
     timings["metrics_long_sheet_s"] = round(time.perf_counter() - t0, 3)
+    _stage_done("Writing Metrics_long", t0, details=f"rows={len(metric_rows_long)}")
 
-    _td_emit_progress(progress_cb, "Writing Metrics_long_sequences")
+    _stage_start("Writing Metrics_long_sequences")
     t0 = time.perf_counter()
     ws_metrics_long_sequences = _td_reset_workbook_sheet(
         wb,
@@ -32361,8 +33893,9 @@ def update_test_data_trending_project_workbook(
     for row in metric_rows_long_sequences:
         ws_metrics_long_sequences.append(list(row))
     timings["metrics_long_sequences_sheet_s"] = round(time.perf_counter() - t0, 3)
+    _stage_done("Writing Metrics_long_sequences", t0, details=f"rows={len(metric_rows_long_sequences)}")
 
-    _td_emit_progress(progress_cb, "Writing Life_metrics")
+    _stage_start("Writing Life_metrics")
     t0 = time.perf_counter()
     ws_life_metrics = _td_reset_workbook_sheet(
         wb,
@@ -32398,8 +33931,9 @@ def update_test_data_trending_project_workbook(
     for row in life_metric_rows:
         ws_life_metrics.append(list(row))
     timings["life_metrics_sheet_s"] = round(time.perf_counter() - t0, 3)
+    _stage_done("Writing Life_metrics", t0, details=f"rows={len(life_metric_rows)}")
 
-    _td_emit_progress(progress_cb, "Writing RawCache_long")
+    _stage_start("Writing RawCache_long")
     t0 = time.perf_counter()
     ws_raw_long = _td_reset_workbook_sheet(
         wb,
@@ -32421,6 +33955,7 @@ def update_test_data_trending_project_workbook(
     for row in raw_cache_long_rows:
         ws_raw_long.append(list(row))
     timings["raw_cache_long_sheet_s"] = round(time.perf_counter() - t0, 3)
+    _stage_done("Writing RawCache_long", t0, details=f"rows={len(raw_cache_long_rows)}")
 
     if include_performance_sheets:
         _td_write_performance_candidate_sheets(
@@ -32431,7 +33966,7 @@ def update_test_data_trending_project_workbook(
         )
 
     # Sync workbook metadata sheets/rows to the canonical index (best-effort).
-    _td_emit_progress(progress_cb, "Syncing workbook metadata")
+    _stage_start("Syncing workbook metadata")
     t0 = time.perf_counter()
     try:
         support_dir = eidat_support_dir(repo)
@@ -32452,13 +33987,15 @@ def update_test_data_trending_project_workbook(
         pass
     timings["metadata_sync_s"] = round(time.perf_counter() - t0, 3)
     timings["post_cache_workbook_build_s"] = round(time.perf_counter() - post_cache_started, 3)
+    _stage_done("Syncing workbook metadata", t0)
 
     try:
         if not dry_run:
-            _td_emit_progress(progress_cb, "Saving updated workbook")
+            _stage_start("Saving updated workbook")
             t0 = time.perf_counter()
             wb.save(str(wb_path))
             timings["final_workbook_save_s"] = round(time.perf_counter() - t0, 3)
+            _stage_done("Saving updated workbook", t0)
     finally:
         try:
             wb.close()

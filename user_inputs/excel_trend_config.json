@@ -23,6 +23,7 @@
     "prop_per_pulse": ["prop per pulse", "prop_per_pulse", "propellant per pulse", "mass per pulse"],
     "flow_rate": ["flowrate", "flow rate", "mass flow rate", "mdot", "m_dot"],
     "impulse_per_pulse": ["impulse bit", "impulse per pulse", "impulse_bit"],
+    "cumulative_impulse": ["cumulative impulse", "cum impulse", "cumulative_impulse", "cum_impulse", "total impulse"],
     "elapsed_time": ["elapsed time", "time elapsed", "duration", "run time"]
   },
   "sheet_name": null,
