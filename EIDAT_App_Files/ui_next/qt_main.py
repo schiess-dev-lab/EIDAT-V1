@@ -2673,6 +2673,7 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
         self._display_rows: list[dict[str, object]] = []
         self._table_refreshing = False
         self._dirty = False
+        self._save_in_progress = False
         self.saved = False
 
         self.setWindowTitle("Project Parameters")
@@ -2795,8 +2796,37 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
 
     def _set_dirty(self, dirty: bool) -> None:
         self._dirty = bool(dirty)
+        self._update_save_button_text()
+
+    def _update_save_button_text(self) -> None:
         if hasattr(self, "btn_save"):
-            self.btn_save.setText("Save Defaults*" if self._dirty else "Save Defaults")
+            if self._save_in_progress:
+                self.btn_save.setText("Saving...")
+            else:
+                self.btn_save.setText("Save Defaults*" if self._dirty else "Save Defaults")
+
+    def _set_save_busy(self, busy: bool) -> None:
+        self._save_in_progress = bool(busy)
+        for widget in (
+            getattr(self, "ed_filter", None),
+            getattr(self, "tbl", None),
+            getattr(self, "btn_set_display", None),
+            getattr(self, "btn_reset", None),
+            getattr(self, "btn_save", None),
+            getattr(self, "btn_close", None),
+        ):
+            if isinstance(widget, QtWidgets.QWidget):
+                widget.setEnabled(not busy)
+        app = QtWidgets.QApplication.instance()
+        if app is not None:
+            try:
+                if busy:
+                    app.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
+                elif app.overrideCursor() is not None:
+                    app.restoreOverrideCursor()
+            except Exception:
+                pass
+        self._update_save_button_text()
 
     def _timestamp_text(self) -> str:
         try:
@@ -2856,6 +2886,12 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
             self._norm_name(normalized.get("asset_specific_type")),
             self._norm_name(normalized.get("ingested_parameter")),
         )
+
+    @staticmethod
+    def _coerce_row_key(value: object) -> tuple[str, str, str, str] | None:
+        if isinstance(value, (list, tuple)) and len(value) == 4:
+            return tuple(str(part or "").strip() for part in value)
+        return None
 
     def _sorted_rows(self, rows: Sequence[Mapping[str, object]] | None) -> list[dict[str, object]]:
         normalized_rows = [self._normalize_row(item) for item in (rows or [])]
@@ -2964,8 +3000,8 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
         keys: list[tuple[str, str, str, str]] = []
         seen: set[tuple[str, str, str, str]] = set()
         for item in self.tbl.selectedItems():
-            key = item.data(QtCore.Qt.ItemDataRole.UserRole)
-            if isinstance(key, tuple) and len(key) == 4 and key not in seen:
+            key = self._coerce_row_key(item.data(QtCore.Qt.ItemDataRole.UserRole))
+            if key is not None and key not in seen:
                 seen.add(key)
                 keys.append(key)
         return keys
@@ -2974,10 +3010,9 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
         rows: list[dict[str, object]] = []
         seen: set[tuple[str, str, str, str]] = set()
         for row in self._display_rows:
-            key = row.get("_key")
-            if isinstance(key, tuple) and key not in seen and any(
-                isinstance(item.data(QtCore.Qt.ItemDataRole.UserRole), tuple)
-                and item.data(QtCore.Qt.ItemDataRole.UserRole) == key
+            key = self._coerce_row_key(row.get("_key"))
+            if key is not None and key not in seen and any(
+                self._coerce_row_key(item.data(QtCore.Qt.ItemDataRole.UserRole)) == key
                 for item in self.tbl.selectedItems()
             ):
                 seen.add(key)
@@ -3007,9 +3042,21 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
             return inv_status.replace("_", " ").title()
         return "Default"
 
-    def _refresh_table(self) -> None:
+    def _refresh_table(
+        self,
+        *_args,
+        select_keys: Sequence[tuple[str, str, str, str]] | None = None,
+    ) -> None:
         search = str(self.ed_filter.text() or "").strip().lower()
-        wanted_keys = self._current_selected_keys()
+        if select_keys is None:
+            wanted_keys = self._current_selected_keys()
+        else:
+            wanted_keys = [
+                coerced
+                for key in select_keys
+                for coerced in [self._coerce_row_key(key)]
+                if coerced is not None
+            ]
         inventory_index = self._inventory_index()
         rows: list[dict[str, object]] = []
         for row in self._working_rows:
@@ -3169,13 +3216,7 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
         repo_rows = [row for row in repo_rows if row]
         discovered_rows = self._rows_from_inventory(self._context)
         self._working_rows = self._merge_rows(self._working_rows or repo_rows, discovered_rows)
-        self._refresh_table()
-        if select_keys:
-            self.tbl.clearSelection()
-            for row_idx, row in enumerate(self._display_rows):
-                if row.get("_key") in set(select_keys):
-                    self.tbl.selectRow(row_idx)
-        self._sync_selection()
+        self._refresh_table(select_keys=select_keys)
 
     def _prompt_display_name(self, *, title: str, prompt: str, default: str) -> str | None:
         text, ok = QtWidgets.QInputDialog.getText(self, title, prompt, text=str(default or "").strip())
@@ -3219,7 +3260,7 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
             return
         self._working_rows = self._sorted_rows(updated_rows)
         self._set_dirty(True)
-        self._reload_context(select_keys=list(wanted))
+        self._refresh_table(select_keys=list(wanted))
 
     def _act_set_display_name(self) -> None:
         rows = self._selected_rows()
@@ -3261,13 +3302,14 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
     def _on_item_changed(self, item: QtWidgets.QTableWidgetItem) -> None:
         if self._table_refreshing or item is None or item.column() != self.COL_DISPLAYED:
             return
-        key = item.data(QtCore.Qt.ItemDataRole.UserRole)
-        if not isinstance(key, tuple) or len(key) != 4:
+        key = self._coerce_row_key(item.data(QtCore.Qt.ItemDataRole.UserRole))
+        if key is None:
             return
         display_name = str(item.text() or "").strip()
         self._apply_display_value(row_keys=[key], display_name=display_name)
 
     def _act_save(self) -> None:
+        self._set_save_busy(True)
         try:
             saved_rows = be.save_td_repo_parameter_mappings(self._project_dir, self._working_rows)
             refresh_warning = ""
@@ -3290,10 +3332,12 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
             self._working_rows = self._sorted_rows(saved_rows)
             self._set_dirty(False)
             self.saved = True
+            self._set_save_busy(False)
             if refresh_warning:
                 QtWidgets.QMessageBox.warning(self, "Project Parameters", refresh_warning)
             self.accept()
         except Exception as exc:
+            self._set_save_busy(False)
             QtWidgets.QMessageBox.warning(self, "Project Parameters", str(exc))
 
 

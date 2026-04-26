@@ -2407,6 +2407,252 @@ class TestTDSupportWorkbook(unittest.TestCase):
             "header_row": 0,
         }
 
+    def _make_parameter_normalization_context(self) -> dict[str, object]:
+        return {
+            "repo_parameter_rows": [
+                {
+                    "program_title": "Program A",
+                    "asset_type": "Thruster",
+                    "asset_specific_type": "Valve",
+                    "ingested_parameter": "feed pressure",
+                    "default_display_parameter": "feed pressure",
+                    "displayed_parameter": "feed pressure",
+                    "preferred_units": "psia",
+                    "edited": False,
+                    "updated_at": "",
+                }
+            ],
+            "inventory": [
+                {
+                    "program_title": "Program A",
+                    "asset_type": "Thruster",
+                    "asset_specific_type": "Valve",
+                    "raw_name": "feed pressure",
+                    "default_display_parameter": "feed pressure",
+                    "displayed_parameter": "feed pressure",
+                    "canonical_display": "feed pressure",
+                    "units": ["psia"],
+                    "status": "default",
+                    "source_run_names": ["RunA"],
+                    "surfaces": ["performance"],
+                    "run_names": ["RunA"],
+                    "source_count": 1,
+                    "program_count": 1,
+                }
+            ],
+        }
+
+    @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
+    def test_parameter_normalization_dialog_initial_load_builds_context_once(self) -> None:
+        _qt_app()
+        from EIDAT_App_Files.ui_next import qt_main as qm  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            project_dir = root / "ProjectA"
+            project_dir.mkdir()
+            workbook = root / "project.xlsx"
+            workbook.write_text("", encoding="utf-8")
+            db_path = project_dir / "implementation_trending.sqlite3"
+            context = self._make_parameter_normalization_context()
+
+            with mock.patch.object(qm.be, "validate_test_data_project_cache_for_open", return_value=db_path):
+                with mock.patch.object(qm.be, "td_build_parameter_normalization_context", return_value=context) as builder_mock:
+                    dlg = qm.TDParameterNormalizationDialog(project_dir, workbook)
+
+            try:
+                self.assertEqual(builder_mock.call_count, 1)
+                self.assertEqual(dlg.tbl.rowCount(), 1)
+                self.assertEqual(dlg.tbl.item(0, dlg.COL_DISPLAYED).text(), "feed pressure")
+                self.assertIn("Rows: 1", dlg.lbl_summary.text())
+                self.assertIn("Edited: 0", dlg.lbl_summary.text())
+            finally:
+                dlg.close()
+
+    @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
+    def test_parameter_normalization_dialog_inline_edit_stays_local(self) -> None:
+        app = _qt_app()
+        from EIDAT_App_Files.ui_next import qt_main as qm  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            project_dir = root / "ProjectA"
+            project_dir.mkdir()
+            workbook = root / "project.xlsx"
+            workbook.write_text("", encoding="utf-8")
+            db_path = project_dir / "implementation_trending.sqlite3"
+            context = self._make_parameter_normalization_context()
+
+            with mock.patch.object(qm.be, "validate_test_data_project_cache_for_open", return_value=db_path):
+                with mock.patch.object(qm.be, "td_build_parameter_normalization_context", return_value=context) as builder_mock:
+                    dlg = qm.TDParameterNormalizationDialog(project_dir, workbook)
+
+            try:
+                dlg.tbl.selectRow(0)
+                dlg.tbl.item(0, dlg.COL_DISPLAYED).setText("Chamber Feed Pressure")
+                app.processEvents()
+
+                self.assertEqual(builder_mock.call_count, 1)
+                self.assertEqual(dlg.tbl.item(0, dlg.COL_DISPLAYED).text(), "Chamber Feed Pressure")
+                self.assertEqual(dlg.tbl.item(0, dlg.COL_STATUS).text(), "Edited")
+                self.assertEqual(dlg.btn_save.text(), "Save Defaults*")
+                self.assertIn("Edited: 1", dlg.lbl_summary.text())
+                self.assertIn("Displayed Parameter: Chamber Feed Pressure", dlg.detail.toPlainText())
+            finally:
+                dlg.close()
+
+    @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
+    def test_parameter_normalization_dialog_set_display_and_reset_do_not_reload_context(self) -> None:
+        _qt_app()
+        from PySide6 import QtWidgets
+        from EIDAT_App_Files.ui_next import qt_main as qm  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            project_dir = root / "ProjectA"
+            project_dir.mkdir()
+            workbook = root / "project.xlsx"
+            workbook.write_text("", encoding="utf-8")
+            db_path = project_dir / "implementation_trending.sqlite3"
+            context = self._make_parameter_normalization_context()
+
+            with mock.patch.object(qm.be, "validate_test_data_project_cache_for_open", return_value=db_path):
+                with mock.patch.object(qm.be, "td_build_parameter_normalization_context", return_value=context) as builder_mock:
+                    dlg = qm.TDParameterNormalizationDialog(project_dir, workbook)
+
+            try:
+                dlg.tbl.selectRow(0)
+                with mock.patch.object(dlg, "_prompt_display_name", return_value="Chamber Feed Pressure"):
+                    dlg._act_set_display_name()
+                self.assertEqual(builder_mock.call_count, 1)
+                self.assertEqual(dlg.tbl.item(0, dlg.COL_DISPLAYED).text(), "Chamber Feed Pressure")
+
+                with mock.patch.object(QtWidgets.QMessageBox, "question", return_value=QtWidgets.QMessageBox.StandardButton.Yes):
+                    dlg._act_reset_rows()
+                self.assertEqual(builder_mock.call_count, 1)
+                self.assertEqual(dlg.tbl.item(0, dlg.COL_DISPLAYED).text(), "feed pressure")
+                self.assertEqual(dlg.tbl.item(0, dlg.COL_STATUS).text(), "Default")
+            finally:
+                dlg.close()
+
+    @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
+    def test_parameter_normalization_dialog_save_calls_save_and_refresh_once(self) -> None:
+        app = _qt_app()
+        from PySide6 import QtWidgets
+        from EIDAT_App_Files.ui_next import qt_main as qm  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            project_dir = root / "ProjectA"
+            project_dir.mkdir()
+            workbook = root / "project.xlsx"
+            workbook.write_text("", encoding="utf-8")
+            db_path = project_dir / "implementation_trending.sqlite3"
+            context = self._make_parameter_normalization_context()
+
+            with mock.patch.object(qm.be, "validate_test_data_project_cache_for_open", return_value=db_path):
+                with mock.patch.object(qm.be, "td_build_parameter_normalization_context", return_value=context):
+                    dlg = qm.TDParameterNormalizationDialog(project_dir, workbook)
+
+            try:
+                dlg.tbl.selectRow(0)
+                dlg.tbl.item(0, dlg.COL_DISPLAYED).setText("Chamber Feed Pressure")
+                app.processEvents()
+
+                saved_rows = [dict(row) for row in dlg._working_rows]
+                with mock.patch.object(qm.be, "save_td_repo_parameter_mappings", return_value=saved_rows) as save_mock:
+                    with mock.patch.object(qm.be, "refresh_td_parameter_runtime_cache") as refresh_mock:
+                        with mock.patch.object(QtWidgets.QMessageBox, "warning") as warning_mock:
+                            dlg._act_save()
+
+                save_mock.assert_called_once_with(project_dir, dlg._working_rows)
+                refresh_mock.assert_called_once_with(project_dir, workbook, db_path)
+                warning_mock.assert_not_called()
+                self.assertTrue(dlg.saved)
+                self.assertEqual(dlg.result(), int(QtWidgets.QDialog.DialogCode.Accepted))
+            finally:
+                dlg.close()
+
+    @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
+    def test_parameter_normalization_dialog_save_failure_restores_controls(self) -> None:
+        app = _qt_app()
+        from PySide6 import QtWidgets
+        from EIDAT_App_Files.ui_next import qt_main as qm  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            project_dir = root / "ProjectA"
+            project_dir.mkdir()
+            workbook = root / "project.xlsx"
+            workbook.write_text("", encoding="utf-8")
+            db_path = project_dir / "implementation_trending.sqlite3"
+            context = self._make_parameter_normalization_context()
+
+            with mock.patch.object(qm.be, "validate_test_data_project_cache_for_open", return_value=db_path):
+                with mock.patch.object(qm.be, "td_build_parameter_normalization_context", return_value=context):
+                    dlg = qm.TDParameterNormalizationDialog(project_dir, workbook)
+
+            try:
+                dlg.tbl.selectRow(0)
+                dlg.tbl.item(0, dlg.COL_DISPLAYED).setText("Chamber Feed Pressure")
+                app.processEvents()
+
+                with mock.patch.object(qm.be, "save_td_repo_parameter_mappings", side_effect=RuntimeError("boom")):
+                    with mock.patch.object(QtWidgets.QMessageBox, "warning") as warning_mock:
+                        dlg._act_save()
+
+                self.assertFalse(dlg.saved)
+                self.assertTrue(dlg.tbl.isEnabled())
+                self.assertTrue(dlg.btn_save.isEnabled())
+                self.assertTrue(dlg.btn_close.isEnabled())
+                self.assertEqual(dlg.btn_save.text(), "Save Defaults*")
+                self.assertEqual(dlg.result(), 0)
+                warning_mock.assert_called_once()
+                self.assertIn("boom", str(warning_mock.call_args.args[2]))
+            finally:
+                dlg.close()
+
+    @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
+    def test_parameter_normalization_dialog_refresh_failure_invalidates_cache_and_warns(self) -> None:
+        app = _qt_app()
+        from PySide6 import QtWidgets
+        from EIDAT_App_Files.ui_next import qt_main as qm  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            project_dir = root / "ProjectA"
+            project_dir.mkdir()
+            workbook = root / "project.xlsx"
+            workbook.write_text("", encoding="utf-8")
+            db_path = project_dir / "implementation_trending.sqlite3"
+            context = self._make_parameter_normalization_context()
+
+            with mock.patch.object(qm.be, "validate_test_data_project_cache_for_open", return_value=db_path):
+                with mock.patch.object(qm.be, "td_build_parameter_normalization_context", return_value=context):
+                    dlg = qm.TDParameterNormalizationDialog(project_dir, workbook)
+
+            try:
+                dlg.tbl.selectRow(0)
+                dlg.tbl.item(0, dlg.COL_DISPLAYED).setText("Chamber Feed Pressure")
+                app.processEvents()
+
+                saved_rows = [dict(row) for row in dlg._working_rows]
+                with mock.patch.object(qm.be, "save_td_repo_parameter_mappings", return_value=saved_rows) as save_mock:
+                    with mock.patch.object(qm.be, "refresh_td_parameter_runtime_cache", side_effect=RuntimeError("cache fail")) as refresh_mock:
+                        with mock.patch.object(qm.be, "invalidate_td_parameter_runtime_cache") as invalidator_mock:
+                            with mock.patch.object(QtWidgets.QMessageBox, "warning") as warning_mock:
+                                dlg._act_save()
+
+                save_mock.assert_called_once_with(project_dir, dlg._working_rows)
+                refresh_mock.assert_called_once_with(project_dir, workbook, db_path)
+                invalidator_mock.assert_called_once_with(db_path)
+                warning_mock.assert_called_once()
+                self.assertIn("runtime parameter cache could not be refreshed", str(warning_mock.call_args.args[2]))
+                self.assertTrue(dlg.saved)
+                self.assertEqual(dlg.result(), int(QtWidgets.QDialog.DialogCode.Accepted))
+            finally:
+                dlg.close()
+
     def test_duplicate_serials_are_keyed_by_program_asset_source_identity(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
 
