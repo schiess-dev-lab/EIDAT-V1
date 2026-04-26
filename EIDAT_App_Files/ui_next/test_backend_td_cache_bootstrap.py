@@ -456,6 +456,67 @@ def _set_fixture_source_missing(project_dir: Path, workbook_path: Path, *, seria
 
 
 class TestBackendTdCacheBootstrap(unittest.TestCase):
+    def test_source_runtime_state_fingerprint_uses_healed_official_links(self) -> None:
+        if Workbook is None:
+            self.skipTest("openpyxl is required for TD readiness tests")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            workbook_path = root / "project.xlsx"
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "Sources"
+            ws.append(
+                ["serial_number", "program_title", "document_type", "metadata_rel", "artifacts_rel", "excel_sqlite_rel"]
+            )
+            ws.append(["SN-001", "Program Alpha", "TD", "", "", "stale\\SN-001.sqlite3"])
+            wb.save(str(workbook_path))
+            wb.close()
+
+            source_row = {
+                "serial": "SN-001",
+                "serial_number": "SN-001",
+                "program_title": "Program Alpha",
+                "document_type": "TD",
+                "asset_type": "Thruster",
+                "asset_specific_type": "Valve",
+                "metadata_rel": "",
+                "artifacts_rel": "",
+                "excel_sqlite_rel": "stale\\SN-001.sqlite3",
+            }
+            official_sqlite = backend._td_official_sqlite_path_for_source_like(root, source_row)
+            self.assertIsNotNone(official_sqlite)
+            assert official_sqlite is not None
+            official_sqlite.parent.mkdir(parents=True, exist_ok=True)
+            with closing(sqlite3.connect(str(official_sqlite))) as conn:
+                conn.commit()
+
+            runtime_state = backend._td_source_runtime_state(
+                workbook_path,
+                source_row,
+                project_raw_signature="synthetic-signature",
+            )
+            source_resolution = dict(runtime_state.get("source_resolution") or {})
+
+            self.assertEqual(str(runtime_state.get("artifacts_rel") or ""), str(source_resolution.get("healed_artifacts_rel") or ""))
+            self.assertEqual(str(runtime_state.get("excel_sqlite_rel") or ""), str(source_resolution.get("healed_excel_sqlite_rel") or ""))
+
+            legacy_fingerprint = backend._td_hash_payload(
+                {
+                    "serial": "SN-001",
+                    "serial_number": "SN-001",
+                    "status": str(runtime_state.get("status") or ""),
+                    "sqlite_path": str(official_sqlite),
+                    "mtime_ns": int(runtime_state.get("mtime_ns") or 0),
+                    "size_bytes": int(runtime_state.get("size_bytes") or 0),
+                    "metadata_rel": "",
+                    "artifacts_rel": "",
+                    "excel_sqlite_rel": "stale\\SN-001.sqlite3",
+                    "metadata_mtime_ns": 0,
+                    "project_raw_signature": "synthetic-signature",
+                }
+            )
+            self.assertNotEqual(str(runtime_state.get("fingerprint") or ""), legacy_fingerprint)
+
     def test_export_debug_excels_ensures_cache_before_export(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             project_dir = Path(tmpdir) / "project"

@@ -11415,7 +11415,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         return self._run_display_text(run) or str(selection.get("sequence_name") or run).strip()
 
     def _auto_report_condition_label(self, selection: dict | None) -> str:
-        return self._selection_condition_label(selection)
+        base_label = self._selection_condition_label(selection)
+        suppression_labels = self._selection_member_suppression_voltages(selection)
+        if suppression_labels:
+            suffix = f"Supp {'/'.join(suppression_labels)}"
+            return f"{base_label} | {suffix}" if base_label else suffix
+        return base_label
 
     def _auto_report_selection_display_text(self, selection: dict | None) -> str:
         if not isinstance(selection, dict):

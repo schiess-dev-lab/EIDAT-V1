@@ -7263,6 +7263,58 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 int((((post_build.get("cache_state") or {}).get("impl_counts") or {}).get("td_runs") or 0)),
                 int(impl_counts.get("td_runs") or 0),
             )
+            state = be.inspect_test_data_project_cache_state(root, wb_path)
+            self.assertEqual(str(state.get("mode") or ""), "none")
+            self.assertEqual(int(((state.get("counts") or {}).get("changed") or 0)), 0)
+
+    def test_update_workbook_leaves_cache_current_after_official_source_link_healing(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            docs: list[dict[str, object]] = []
+            for idx in range(1, 3):
+                doc = {
+                    "serial_number": f"SN{idx}",
+                    "program_title": "Program A",
+                    "asset_type": "Thruster",
+                    "asset_specific_type": "Valve",
+                    "metadata_rel": "",
+                    "artifacts_rel": "",
+                    "excel_sqlite_rel": f"stale\\SN{idx}.sqlite3",
+                }
+                official_sqlite = be._td_official_sqlite_path_for_source_like(root, doc)
+                self.assertIsNotNone(official_sqlite)
+                assert official_sqlite is not None
+                official_sqlite.parent.mkdir(parents=True, exist_ok=True)
+                self._make_source_sqlite(official_sqlite)
+                docs.append(doc)
+
+            wb_path = root / "project.xlsx"
+            be._write_test_data_trending_workbook(
+                wb_path,
+                global_repo=root,
+                serials=["SN1", "SN2"],
+                docs=docs,
+                config=self._make_config(),
+            )
+            support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+            be._write_td_support_workbook(
+                support_path,
+                sequence_names=["RunA"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+            )
+
+            result = be.update_test_data_trending_project_workbook(root, wb_path, overwrite=True)
+
+            self.assertTrue(bool(result.get("cache_validation_ok")))
+            state = be.inspect_test_data_project_cache_state(root, wb_path)
+            self.assertEqual(str(state.get("mode") or ""), "none")
+            counts = state.get("counts") if isinstance(state.get("counts"), dict) else {}
+            self.assertEqual(int(counts.get("changed") or 0), 0)
+            self.assertEqual(int(counts.get("added") or 0), 0)
+            self.assertEqual(int(counts.get("removed") or 0), 0)
+            self.assertEqual(int(counts.get("unchanged") or 0), 2)
 
     def test_update_workbook_raises_when_post_build_validation_fails(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
@@ -7338,6 +7390,52 @@ class TestTDSupportWorkbook(unittest.TestCase):
 
             validated = be.validate_existing_test_data_project_cache(root, wb_path)
             self.assertEqual(str(validated), str(root / "implementation_trending.sqlite3"))
+
+    def test_group_program_rows_into_conditions_ignores_voltage_differences(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        rows = [
+            {
+                "program_title": be.TD_SUPPORT_DEFAULT_PROGRAM_TITLE,
+                "source_run_name": "Seq1",
+                "condition_key": "Seq1",
+                "display_name": "Seq1",
+                "feed_pressure": 250,
+                "feed_pressure_units": "psia",
+                "run_type": "PM",
+                "pulse_width_on": 5,
+                "control_period": 60,
+                "suppression_voltage": 24,
+                "valve_voltage": 12,
+                "enabled": True,
+            },
+            {
+                "program_title": be.TD_SUPPORT_DEFAULT_PROGRAM_TITLE,
+                "source_run_name": "Seq2",
+                "condition_key": "Seq2",
+                "display_name": "Seq2",
+                "feed_pressure": 250,
+                "feed_pressure_units": "psia",
+                "run_type": "PM",
+                "pulse_width_on": 5,
+                "control_period": 60,
+                "suppression_voltage": 28,
+                "valve_voltage": 24,
+                "enabled": True,
+            },
+        ]
+
+        groups = be._td_group_program_rows_into_conditions(rows)
+
+        self.assertEqual(len(groups), 1)
+        group = groups[0]
+        self.assertEqual(str(group.get("display_name") or ""), "250 psia, PM, 5 Sec ON / 55 Sec OFF")
+        self.assertEqual(group.get("member_sequences"), ["Seq1", "Seq2"])
+        self.assertEqual(group.get("member_suppression_voltages"), [24, 28])
+        self.assertEqual(group.get("member_valve_voltages"), [12, 24])
+        self.assertIsNone(group.get("suppression_voltage"))
+        self.assertIsNone(group.get("valve_voltage"))
+        self.assertNotIn(str(group.get("condition_key") or ""), {"Seq1", "Seq2"})
 
     def test_td_list_x_columns_falls_back_to_raw_curves(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore

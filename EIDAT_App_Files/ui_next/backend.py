@@ -8432,20 +8432,10 @@ def _td_source_runtime_state(
         or source_row.get("excel_sqlite_rel")
         or ""
     ).strip()
-    effective_excel_sqlite_rel = healed_excel_sqlite_rel or workbook_excel_sqlite_rel
-    fingerprint_payload = {
-        "serial": source_key,
-        "serial_number": serial_number,
-        "status": status,
-        "sqlite_path": str(sqlite_path) if sqlite_path else "",
-        "mtime_ns": int(mtime_ns),
-        "size_bytes": int(size_bytes),
-        "metadata_rel": str(source_meta.get("metadata_rel") or "").strip(),
-        "artifacts_rel": str(source_meta.get("artifacts_rel") or "").strip(),
-        "excel_sqlite_rel": effective_excel_sqlite_rel,
-        "metadata_mtime_ns": int(source_meta.get("metadata_mtime_ns") or 0),
-        "project_raw_signature": str(project_raw_signature),
-    }
+    effective_links = _td_effective_source_link_fields(source_row, source_meta, source_resolution)
+    effective_excel_sqlite_rel = str(effective_links.get("excel_sqlite_rel") or "").strip()
+    effective_metadata_rel = str(effective_links.get("metadata_rel") or "").strip()
+    effective_artifacts_rel = str(effective_links.get("artifacts_rel") or "").strip()
     return {
         "serial": source_key,
         "source_key": source_key,
@@ -8457,8 +8447,22 @@ def _td_source_runtime_state(
         "sqlite_path": str(sqlite_path) if sqlite_path else "",
         "mtime_ns": int(mtime_ns),
         "size_bytes": int(size_bytes),
+        "metadata_rel": effective_metadata_rel,
+        "artifacts_rel": effective_artifacts_rel,
         "excel_sqlite_rel": effective_excel_sqlite_rel,
-        "fingerprint": _td_hash_payload(fingerprint_payload),
+        "fingerprint": _td_source_raw_fingerprint(
+            source_key=source_key,
+            serial_number=serial_number,
+            status=status,
+            sqlite_path=sqlite_path,
+            mtime_ns=mtime_ns,
+            size_bytes=size_bytes,
+            metadata_rel=effective_metadata_rel,
+            artifacts_rel=effective_artifacts_rel,
+            excel_sqlite_rel=effective_excel_sqlite_rel,
+            metadata_mtime_ns=int(source_meta.get("metadata_mtime_ns") or 0),
+            project_raw_signature=project_raw_signature,
+        ),
     }
 
 
@@ -8479,6 +8483,77 @@ def _td_build_project_raw_signature(
         "x_axis": x_axis_cfg,
     }
     return _td_hash_payload(payload)
+
+
+def _td_effective_source_link_fields(
+    source_row: Mapping[str, object],
+    source_meta: Mapping[str, object] | None,
+    source_resolution: Mapping[str, object] | None,
+) -> dict[str, str]:
+    row = dict(source_row or {})
+    meta = dict(source_meta or {})
+    resolution = dict(source_resolution or {})
+    metadata_rel = str(
+        resolution.get("healed_metadata_rel")
+        or resolution.get("metadata_rel")
+        or row.get("metadata_rel")
+        or meta.get("metadata_rel")
+        or ""
+    ).strip()
+    artifacts_rel = str(
+        resolution.get("healed_artifacts_rel")
+        or resolution.get("artifacts_rel")
+        or row.get("artifacts_rel")
+        or meta.get("artifacts_rel")
+        or ""
+    ).strip()
+    workbook_excel_sqlite_rel = str(
+        resolution.get("workbook_excel_sqlite_rel")
+        or resolution.get("excel_sqlite_rel")
+        or row.get("excel_sqlite_rel")
+        or meta.get("excel_sqlite_rel")
+        or ""
+    ).strip()
+    excel_sqlite_rel = str(
+        resolution.get("healed_excel_sqlite_rel")
+        or workbook_excel_sqlite_rel
+    ).strip()
+    return {
+        "metadata_rel": metadata_rel,
+        "artifacts_rel": artifacts_rel,
+        "excel_sqlite_rel": excel_sqlite_rel,
+    }
+
+
+def _td_source_raw_fingerprint(
+    *,
+    source_key: str,
+    serial_number: str,
+    status: str,
+    sqlite_path: Path | str | None,
+    mtime_ns: int | None,
+    size_bytes: int | None,
+    metadata_rel: str,
+    artifacts_rel: str,
+    excel_sqlite_rel: str,
+    metadata_mtime_ns: int | None,
+    project_raw_signature: str,
+) -> str:
+    return _td_hash_payload(
+        {
+            "serial": str(source_key or "").strip(),
+            "serial_number": str(serial_number or "").strip(),
+            "status": str(status or "").strip().lower(),
+            "sqlite_path": str(Path(sqlite_path).expanduser()) if sqlite_path else "",
+            "mtime_ns": int(mtime_ns or 0),
+            "size_bytes": int(size_bytes or 0),
+            "metadata_rel": str(metadata_rel or "").strip(),
+            "artifacts_rel": str(artifacts_rel or "").strip(),
+            "excel_sqlite_rel": str(excel_sqlite_rel or "").strip(),
+            "metadata_mtime_ns": int(metadata_mtime_ns or 0),
+            "project_raw_signature": str(project_raw_signature or "").strip(),
+        }
+    )
 
 
 def _td_source_sqlite_artifact_candidates(
@@ -10801,7 +10876,7 @@ def _td_support_program_row_defaults(source_run_name: object, *, program_title: 
     }
 
 
-def _td_condition_identity_parts(row: Mapping[str, object]) -> tuple[str, str, str, str, str, str, str, str, str]:
+def _td_condition_identity_parts(row: Mapping[str, object]) -> tuple[str, str, str, str, str, str, str]:
     return (
         _td_format_compact_value(row.get("feed_pressure")).lower(),
         str(row.get("feed_pressure_units") or "").strip().lower(),
@@ -10810,8 +10885,6 @@ def _td_condition_identity_parts(row: Mapping[str, object]) -> tuple[str, str, s
         td_normalize_run_type(row.get("run_type")).lower(),
         _td_format_compact_value(row.get("pulse_width_on", row.get("pulse_width"))).lower(),
         _td_format_compact_value(row.get("control_period")).lower(),
-        _td_format_compact_value(row.get("suppression_voltage")).lower(),
-        _td_format_compact_value(row.get("valve_voltage")).lower(),
     )
 
 
@@ -10844,15 +10917,30 @@ def _td_condition_base_key(row: Mapping[str, object]) -> str:
     return explicit or source_run_name
 
 
-def _td_support_condition_group_identity(row: Mapping[str, object]) -> tuple[str, str, str, str, str, str, str, str, str, str]:
+def _td_support_condition_group_identity(row: Mapping[str, object]) -> tuple[str, str, str, str, str, str, str, str]:
     condition_parts = _td_condition_identity_parts(row)
     if any(bool(part) for part in condition_parts):
         return ("",) + condition_parts
     return (_td_condition_base_key(row),) + condition_parts
 
 
+def _td_distinct_condition_values(rows: Sequence[Mapping[str, object]], field_name: str) -> list[object]:
+    values_by_key: dict[str, object] = {}
+    for row in rows or []:
+        if not isinstance(row, Mapping):
+            continue
+        value = row.get(field_name)
+        label = _td_format_compact_value(value)
+        if not label:
+            continue
+        key = label.casefold()
+        if key not in values_by_key:
+            values_by_key[key] = value
+    return list(values_by_key.values())
+
+
 def _td_group_program_rows_into_conditions(rows: Sequence[Mapping[str, object]]) -> list[dict]:
-    grouped: dict[tuple[str, str, str, str, str, str, str, str, str, str], dict] = {}
+    grouped: dict[tuple[str, str, str, str, str, str, str, str], dict] = {}
     for raw_row in rows or []:
         if not isinstance(raw_row, Mapping):
             continue
@@ -10927,11 +11015,16 @@ def _td_group_program_rows_into_conditions(rows: Sequence[Mapping[str, object]])
                 td_normalize_run_type(group.get("run_type")),
                 _td_format_compact_value(group.get("pulse_width_on")),
                 _td_format_compact_value(group.get("control_period")),
-                _td_format_compact_value(group.get("suppression_voltage")),
-                _td_format_compact_value(group.get("valve_voltage")),
             ]
             suffix = re.sub(r"[^A-Za-z0-9]+", "_", "_".join([p for p in suffix_parts if str(p).strip()])).strip("_")
             group["condition_key"] = f"{base_key}_{suffix or str(dup_count + 1)}"
+        member_rows = [dict(row) for row in (group.get("member_rows") or []) if isinstance(row, Mapping)]
+        member_suppression_voltages = _td_distinct_condition_values(member_rows, "suppression_voltage")
+        member_valve_voltages = _td_distinct_condition_values(member_rows, "valve_voltage")
+        group["suppression_voltage"] = member_suppression_voltages[0] if len(member_suppression_voltages) == 1 else None
+        group["valve_voltage"] = member_valve_voltages[0] if len(member_valve_voltages) == 1 else None
+        group["member_suppression_voltages"] = list(member_suppression_voltages)
+        group["member_valve_voltages"] = list(member_valve_voltages)
         group["sheet_name"] = _td_support_condition_sheet_name(str(group.get("condition_key") or ""), idx)
     return out
 
@@ -12002,6 +12095,9 @@ def _read_td_support_workbook(workbook_path: Path, *, project_dir: Path | None =
                     "pulse_width_on": group.get("pulse_width_on"),
                     "control_period": group.get("control_period"),
                     "suppression_voltage": group.get("suppression_voltage"),
+                    "valve_voltage": group.get("valve_voltage"),
+                    "member_suppression_voltages": list(group.get("member_suppression_voltages") or []),
+                    "member_valve_voltages": list(group.get("member_valve_voltages") or []),
                     "sheet_name": str(group.get("sheet_name") or "").strip(),
                     "member_sequences_text": ", ".join([str(v).strip() for v in (group.get("member_sequences") or []) if str(v).strip()]),
                     "member_programs_text": ", ".join([str(v).strip() for v in (group.get("member_programs") or []) if str(v).strip()]),
@@ -12030,7 +12126,8 @@ def _read_td_support_workbook(workbook_path: Path, *, project_dir: Path | None =
                             "pulse_width": group.get("pulse_width_on"),
                             "pulse_width_on": group.get("pulse_width_on"),
                             "control_period": group.get("control_period"),
-                            "suppression_voltage": group.get("suppression_voltage"),
+                            "suppression_voltage": member.get("suppression_voltage"),
+                            "valve_voltage": member.get("valve_voltage"),
                             "exclude_first_n": member.get("exclude_first_n"),
                             "last_n_rows": member.get("last_n_rows"),
                             "enabled": bool(member.get("enabled", True)),
@@ -12059,6 +12156,7 @@ def _read_td_support_workbook(workbook_path: Path, *, project_dir: Path | None =
                             "pulse_width_on": condition.get("pulse_width_on"),
                             "control_period": condition.get("control_period"),
                             "suppression_voltage": condition.get("suppression_voltage"),
+                            "valve_voltage": condition.get("valve_voltage"),
                             "exclude_first_n": row.get("exclude_first_n"),
                             "last_n_rows": row.get("last_n_rows"),
                             "enabled": bool(row.get("enabled", True) and condition.get("enabled", True)),
@@ -13185,6 +13283,13 @@ def inspect_test_data_project_cache_state(project_dir: Path, workbook_path: Path
             for row in cached_sources_rows
             if str(row[0] or "").strip()
         }
+        cached_source_serial_numbers = {
+            str(row[0] or "").strip(): str(row[1] or "").strip()
+            for row in conn.execute(
+                "SELECT serial, COALESCE(source_serial_number, '') FROM td_source_metadata"
+            ).fetchall()
+            if str(row[0] or "").strip()
+        }
         cached_stats_csv = _td_meta_value(conn, "statistics")
         cached_raw_cols_csv = _td_meta_value(conn, "raw_columns")
         cached_support_raw_signature = _td_meta_value(conn, "support_raw_signature")
@@ -13226,6 +13331,14 @@ def inspect_test_data_project_cache_state(project_dir: Path, workbook_path: Path
     source_rebuild_needed = False
     fingerprints_by_serial: dict[str, str] = {}
     source_state_by_serial: dict[str, dict[str, object]] = {}
+    cached_keys_by_source_serial_number: dict[str, list[str]] = {}
+    for cached_serial, source_serial_number in cached_source_serial_numbers.items():
+        serial_number_key = str(source_serial_number or "").strip()
+        if not serial_number_key:
+            continue
+        cached_keys_by_source_serial_number.setdefault(serial_number_key, []).append(cached_serial)
+    matched_cached_serials: set[str] = set()
+    comparison_expected_serials: set[str] = set()
     for item in source_states:
         serial = str(item.get("serial") or "").strip()
         if not serial:
@@ -13233,7 +13346,21 @@ def inspect_test_data_project_cache_state(project_dir: Path, workbook_path: Path
         source_state_by_serial[serial] = dict(item)
         fingerprint = str(item.get("fingerprint") or "").strip()
         fingerprints_by_serial[serial] = fingerprint
-        cached = cached_sources.get(serial) or {}
+        serial_number = str(item.get("serial_number") or "").strip()
+        cached_serial = serial
+        cached = cached_sources.get(cached_serial) or {}
+        if not cached and serial_number and serial_number in cached_sources:
+            cached_serial = serial_number
+            cached = cached_sources.get(cached_serial) or {}
+        if not cached and serial_number:
+            alias_candidates = list(cached_keys_by_source_serial_number.get(serial_number) or [])
+            if len(alias_candidates) == 1:
+                cached_serial = alias_candidates[0]
+                cached = cached_sources.get(cached_serial) or {}
+        if cached_serial:
+            comparison_expected_serials.add(cached_serial)
+        else:
+            comparison_expected_serials.add(serial)
         item_status = str(item.get("status") or "").strip().lower()
         if item_status == "missing":
             missing_serials.append(serial)
@@ -13244,14 +13371,31 @@ def inspect_test_data_project_cache_state(project_dir: Path, workbook_path: Path
             if item_status == "ok":
                 source_rebuild_needed = True
             continue
-        if str(cached.get("raw_fingerprint") or "").strip() != fingerprint:
+        matched_cached_serials.add(cached_serial)
+        cached_fingerprint = str(cached.get("raw_fingerprint") or "").strip()
+        fingerprint_matches = cached_fingerprint == fingerprint
+        if not fingerprint_matches and cached_serial and cached_serial != serial:
+            fingerprint_matches = cached_fingerprint == _td_source_raw_fingerprint(
+                source_key=cached_serial,
+                serial_number=serial_number,
+                status=str(item.get("status") or "").strip().lower(),
+                sqlite_path=item.get("sqlite_path"),
+                mtime_ns=int(item.get("mtime_ns") or 0),
+                size_bytes=int(item.get("size_bytes") or 0),
+                metadata_rel=str(item.get("metadata_rel") or "").strip(),
+                artifacts_rel=str(item.get("artifacts_rel") or "").strip(),
+                excel_sqlite_rel=str(item.get("excel_sqlite_rel") or "").strip(),
+                metadata_mtime_ns=int((dict(item.get("source_meta") or {})).get("metadata_mtime_ns") or 0),
+                project_raw_signature=project_raw_signature,
+            )
+        if not fingerprint_matches:
             changed_serials.append(serial)
             if item_status == "ok":
                 source_rebuild_needed = True
             continue
         unchanged_serials.append(serial)
 
-    removed_serials = sorted(set(cached_sources.keys()) - expected_serials)
+    removed_serials = sorted(set(cached_sources.keys()) - matched_cached_serials)
     source_state_stale = bool(source_rebuild_needed or removed_serials)
     if cached_schema_version != TD_PROJECT_CACHE_SCHEMA_VERSION:
         source_state_stale = True
@@ -13264,7 +13408,7 @@ def inspect_test_data_project_cache_state(project_dir: Path, workbook_path: Path
         curve_count=int(curve_count),
         raw_complete=bool(raw_counts.get("complete")),
         impl_complete=bool(impl_counts.get("complete")),
-        expected_serials=set(expected_serials),
+        expected_serials=set(comparison_expected_serials),
         cached_serials=set(cached_sources.keys()),
         cached_stats_csv=str(cached_stats_csv),
         current_stats_csv=str(current_stats_csv),
@@ -16360,7 +16504,6 @@ def sync_test_data_project_cache(
                 ],
                 _full_reset=False,
                 _removed_serials=list(state.get("removed_serials") or []),
-                _source_fingerprints=dict(state.get("fingerprints_by_serial") or {}),
                 _preclassified_counts=dict(state.get("counts") or {}),
             )
             payload["mode"] = "incremental_raw"
@@ -16412,7 +16555,6 @@ def rebuild_test_data_project_cache(
     _entries_override: list[dict] | None = None,
     _full_reset: bool = True,
     _removed_serials: Sequence[object] | None = None,
-    _source_fingerprints: Mapping[str, str] | None = None,
     _preclassified_counts: Mapping[str, object] | None = None,
 ) -> dict:
     """
@@ -16452,11 +16594,6 @@ def rebuild_test_data_project_cache(
     )
     full_reset = bool(_full_reset)
     removed_serials = sorted({str(value).strip() for value in (_removed_serials or []) if str(value).strip()})
-    source_fingerprints = {
-        str(serial).strip(): str(value).strip()
-        for serial, value in (_source_fingerprints or {}).items()
-        if str(serial).strip()
-    }
     preclassified_counts = {
         str(key): int(value or 0)
         for key, value in (_preclassified_counts or {}).items()
@@ -17392,6 +17529,25 @@ def rebuild_test_data_project_cache(
             else:
                 source_link_updates.pop(sn, None)
 
+        effective_links = _td_effective_source_link_fields(entry, source_meta, source_resolution)
+        raw_fingerprint = _td_source_raw_fingerprint(
+            source_key=sn,
+            serial_number=source_serial_number,
+            status=status,
+            sqlite_path=sqlite_path,
+            mtime_ns=mtime_ns,
+            size_bytes=size_bytes,
+            metadata_rel=str(effective_links.get("metadata_rel") or "").strip(),
+            artifacts_rel=str(effective_links.get("artifacts_rel") or "").strip(),
+            excel_sqlite_rel=str(effective_links.get("excel_sqlite_rel") or "").strip(),
+            metadata_mtime_ns=int(source_meta.get("metadata_mtime_ns") or 0),
+            project_raw_signature=_td_build_project_raw_signature(
+                wb_path,
+                raw_columns_csv=",".join(
+                    [str(c.get("name") or "").strip() for c in cfg_cols if str(c.get("name") or "").strip()]
+                ),
+            ),
+        )
         impl_conn.execute(
             """
             INSERT OR REPLACE INTO td_sources(serial, sqlite_path, mtime_ns, size_bytes, status, last_ingested_epoch_ns, raw_fingerprint)
@@ -17404,33 +17560,9 @@ def rebuild_test_data_project_cache(
                 size_bytes,
                 status,
                 computed_epoch_ns,
-                str(source_fingerprints.get(sn) or ""),
+                raw_fingerprint,
             ),
         )
-        raw_fingerprint = str(source_fingerprints.get(sn) or "").strip()
-        if not raw_fingerprint:
-            raw_fingerprint = _td_hash_payload(
-                {
-                    "serial": sn,
-                    "serial_number": source_serial_number,
-                    "status": status,
-                    "sqlite_path": str(sqlite_path) if sqlite_path else "",
-                    "mtime_ns": int(mtime_ns or 0),
-                    "size_bytes": int(size_bytes or 0),
-                    "metadata_rel": str(source_meta.get("metadata_rel") or "").strip(),
-                    "artifacts_rel": str(source_meta.get("artifacts_rel") or "").strip(),
-                    "excel_sqlite_rel": str(source_meta.get("excel_sqlite_rel") or "").strip(),
-                    "metadata_mtime_ns": int(source_meta.get("metadata_mtime_ns") or 0),
-                    "project_raw_signature": _td_build_project_raw_signature(
-                        wb_path,
-                        raw_columns_csv=",".join([str(c.get("name") or "").strip() for c in cfg_cols if str(c.get("name") or "").strip()]),
-                    ),
-                }
-            )
-            impl_conn.execute(
-                "UPDATE td_sources SET raw_fingerprint=? WHERE serial=?",
-                (raw_fingerprint, sn),
-            )
         timings["source_resolution_s"] += time.perf_counter() - t_source_resolution
         source_program_title = str(source_meta.get("program_title") or "").strip()
         source_info["program_title"] = source_program_title
