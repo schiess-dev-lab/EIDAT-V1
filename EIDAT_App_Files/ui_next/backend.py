@@ -3955,6 +3955,7 @@ def _td_normalize_parameter_normalization(raw: object) -> dict[str, object]:
                 "default_display_parameter": str(item.get("default_display_parameter") or "").strip(),
                 "displayed_parameter": displayed_parameter,
                 "preferred_units": preferred_units,
+                "enabled": _td_bool(item.get("enabled"), True),
                 "edited": bool(item.get("edited")),
             }
         )
@@ -4006,6 +4007,7 @@ def _td_parameter_normalization_persistable(normalization: Mapping[str, object] 
                 "default_display_parameter": str(rule.get("default_display_parameter") or "").strip(),
                 "displayed_parameter": str(rule.get("displayed_parameter") or "").strip(),
                 "preferred_units": str(rule.get("preferred_units") or "").strip(),
+                "enabled": _td_bool(rule.get("enabled"), True),
                 "edited": bool(rule.get("edited")),
             }
             for rule in (normalized.get("mappings") or [])
@@ -4360,6 +4362,7 @@ def _td_build_repo_parameter_normalization(
                 "default_display_parameter": str(normalized_row.get("default_display_parameter") or "").strip(),
                 "displayed_parameter": str(normalized_row.get("displayed_parameter") or "").strip(),
                 "preferred_units": str(normalized_row.get("preferred_units") or "").strip(),
+                "enabled": _td_bool(normalized_row.get("enabled"), True),
                 "edited": bool(normalized_row.get("edited")),
             }
         )
@@ -4403,6 +4406,12 @@ def _td_find_parameter_mapping_rule(
             best_score = score
             best_rule = dict(raw_rule)
     return best_rule
+
+
+def _td_parameter_mapping_rule_enabled(rule: Mapping[str, object] | None) -> bool:
+    if not isinstance(rule, Mapping):
+        return True
+    return _td_bool(rule.get("enabled"), True)
 
 
 def _td_effective_parameter_display(
@@ -4472,6 +4481,7 @@ def _td_parameter_runtime_tables_ready(conn: sqlite3.Connection, *, require_rows
             "default_display_parameter",
             "displayed_parameter",
             "preferred_units",
+            "enabled",
             "edited",
         },
         TD_PARAM_RUNTIME_ENTRIES_TABLE: {
@@ -4539,6 +4549,7 @@ def _td_parameter_runtime_signature(
             "default_display_parameter": str(item.get("default_display_parameter") or "").strip(),
             "displayed_parameter": str(item.get("displayed_parameter") or "").strip(),
             "preferred_units": str(item.get("preferred_units") or "").strip(),
+            "enabled": _td_bool(item.get("enabled"), True),
             "edited": bool(item.get("edited")),
         }
         for item in (
@@ -5154,9 +5165,13 @@ def _td_build_parameter_context_from_discovery_rows(
             config_candidates=config_candidates,
         )
         primary_canonical_id = canonical_id or _td_parameter_implicit_canonical_id(raw_name)
+        enabled = _td_parameter_mapping_rule_enabled(mapping_rule)
         status = "implicit"
         if mapping_rule:
-            status = "edited" if bool(mapping_rule.get("edited")) else "default"
+            if not enabled:
+                status = "disabled"
+            else:
+                status = "edited" if bool(mapping_rule.get("edited")) else "default"
         elif suggestion:
             status = "suggested"
         preferred_units = str(
@@ -5193,6 +5208,7 @@ def _td_build_parameter_context_from_discovery_rows(
                 "preferred_units": preferred_units,
                 "default_preferred_units": preferred_units,
                 "primary_canonical_id": primary_canonical_id,
+                "enabled": enabled,
                 "status": status,
                 "edited": bool(mapping_rule.get("edited")),
                 "suggestion": suggestion,
@@ -5325,9 +5341,13 @@ def _td_build_runtime_inventory_from_entries(
             )
         )
         group = dict(groups_by_id.get(primary_canonical_id) or {})
+        enabled = _td_parameter_mapping_rule_enabled(mapping_rule)
         status = "implicit"
         if mapping_rule:
-            status = "edited" if bool(mapping_rule.get("edited")) else "default"
+            if not enabled:
+                status = "disabled"
+            else:
+                status = "edited" if bool(mapping_rule.get("edited")) else "default"
         preferred_units = str(
             mapping_rule.get("preferred_units")
             or group.get("preferred_units")
@@ -5362,6 +5382,7 @@ def _td_build_runtime_inventory_from_entries(
                 "preferred_units": preferred_units,
                 "default_preferred_units": preferred_units,
                 "primary_canonical_id": primary_canonical_id,
+                "enabled": enabled,
                 "status": status,
                 "edited": bool(mapping_rule.get("edited")),
                 "suggestion": {},
@@ -5534,6 +5555,7 @@ def refresh_td_parameter_runtime_cache(
                     str(rule.get("default_display_parameter") or "").strip(),
                     str(rule.get("displayed_parameter") or "").strip(),
                     str(rule.get("preferred_units") or "").strip(),
+                    1 if _td_parameter_mapping_rule_enabled(rule) else 0,
                     1 if bool(rule.get("edited")) else 0,
                 )
             )
@@ -5553,8 +5575,9 @@ def refresh_td_parameter_runtime_cache(
                     default_display_parameter,
                     displayed_parameter,
                     preferred_units,
+                    enabled,
                     edited
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 rule_rows,
             )
@@ -5698,6 +5721,7 @@ def td_load_parameter_runtime_context(project_dir: Path, db_path: Path) -> dict[
                 default_display_parameter,
                 displayed_parameter,
                 preferred_units,
+                enabled,
                 edited
             FROM {TD_PARAM_NORM_RULES_TABLE}
             ORDER BY raw_norm, program_norm, asset_norm, asset_specific_norm, canonical_id
@@ -5762,9 +5786,10 @@ def td_load_parameter_runtime_context(project_dir: Path, db_path: Path) -> dict[
             "default_display_parameter": str(default_display_parameter or "").strip(),
             "displayed_parameter": str(displayed_parameter or "").strip(),
             "preferred_units": str(preferred_units or "").strip(),
+            "enabled": bool(enabled),
             "edited": bool(edited),
         }
-        for canonical_id, raw_name, program_title, asset_type, asset_specific_type, default_display_parameter, displayed_parameter, preferred_units, edited in rule_rows
+        for canonical_id, raw_name, program_title, asset_type, asset_specific_type, default_display_parameter, displayed_parameter, preferred_units, enabled, edited in rule_rows
         if str(canonical_id or "").strip() and str(raw_name or "").strip()
     ]
     canonical_groups: dict[str, dict[str, object]] = {}
@@ -5977,6 +6002,15 @@ def td_build_parameter_selector_options(
                 raw_text = str(raw_name or "").strip()
                 if not canonical_key or not raw_text:
                     continue
+                rule = _td_find_parameter_mapping_rule(
+                    normalization,
+                    raw_text,
+                    program_title=program_title,
+                    asset_type=asset_type,
+                    asset_specific_type=asset_specific_type,
+                )
+                if rule and not _td_parameter_mapping_rule_enabled(rule):
+                    continue
                 group = groups_runtime.setdefault(
                     canonical_key,
                     {
@@ -6074,6 +6108,15 @@ def td_build_parameter_selector_options(
         entry_raw_norm = _td_param_norm_name(entry_raw_name)
         if raw_norms and entry_raw_norm not in raw_norms:
             continue
+        rule = _td_find_parameter_mapping_rule(
+            normalization,
+            entry_raw_name,
+            program_title=entry.get("program_title"),
+            asset_type=entry.get("asset_type"),
+            asset_specific_type=entry.get("asset_specific_type"),
+        )
+        if rule and not _td_parameter_mapping_rule_enabled(rule):
+            continue
         canonical_id = _td_effective_parameter_canonical(
             normalization,
             entry_raw_name,
@@ -6118,6 +6161,8 @@ def td_build_parameter_selector_options(
             if any(raw_text in cast(set[str], group.get("_raw_names") or set()) for group in groups.values()):
                 continue
             inventory_row = dict(inventory_by_raw_norm.get(raw_norm) or {})
+            if inventory_row and not _td_bool(inventory_row.get("enabled"), True):
+                continue
             canonical_id = str(inventory_row.get("primary_canonical_id") or "").strip() or _td_parameter_implicit_canonical_id(raw_text)
             group = groups.setdefault(
                 canonical_id,
@@ -6801,6 +6846,7 @@ def _ensure_test_data_impl_tables(conn: sqlite3.Connection) -> None:
             default_display_parameter TEXT,
             displayed_parameter TEXT,
             preferred_units TEXT,
+            enabled INTEGER NOT NULL DEFAULT 1,
             edited INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (
                 raw_norm,
@@ -6818,6 +6864,10 @@ def _ensure_test_data_impl_tables(conn: sqlite3.Connection) -> None:
         ON {TD_PARAM_NORM_RULES_TABLE} (raw_norm, program_norm, asset_norm, asset_specific_norm)
         """
     )
+    try:
+        conn.execute(f"ALTER TABLE {TD_PARAM_NORM_RULES_TABLE} ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1")
+    except Exception:
+        pass
     conn.execute(
         f"""
         CREATE TABLE IF NOT EXISTS {TD_PARAM_RUNTIME_ENTRIES_TABLE} (
@@ -9586,6 +9636,7 @@ TD_PROGRAM_PARAMETER_MAP_HEADERS = [
     "default_display_parameter",
     "displayed_parameter",
     "preferred_units",
+    "enabled",
     "edited",
     "updated_at",
 ]
@@ -9661,6 +9712,7 @@ def _td_program_parameter_mapping_normalize(
             or raw.get("default_units")
             or ""
         ).strip(),
+        "enabled": _td_bool(raw.get("enabled"), True),
         "edited": bool(edited),
         "updated_at": str(raw.get("updated_at") or "").strip(),
     }
@@ -9724,6 +9776,7 @@ def _td_program_parameter_merge_rows(
                 or merged.get("default_preferred_units")
                 or ""
             ).strip()
+            merged["enabled"] = _td_bool(existing.get("enabled"), True)
             existing_edited = bool(existing.get("edited"))
             existing_display = str(existing.get("displayed_parameter") or "").strip()
             existing_default = str(existing.get("default_display_parameter") or "").strip()
@@ -9738,6 +9791,8 @@ def _td_program_parameter_merge_rows(
                 merged["displayed_parameter"] = str(merged.get("default_display_parameter") or merged.get("ingested_parameter") or "").strip()
                 merged["edited"] = False
                 merged["updated_at"] = str(merged.get("updated_at") or "").strip()
+        else:
+            merged["enabled"] = _td_bool(merged.get("enabled"), True)
         out_by_key[key] = merged
     return sorted(out_by_key.values(), key=_td_program_parameter_mapping_sort_key)
 
@@ -10516,6 +10571,7 @@ def _td_program_requirements_write_parameter_map_sheet(
                 str(normalized.get("default_display_parameter") or "").strip(),
                 str(normalized.get("displayed_parameter") or "").strip(),
                 str(normalized.get("preferred_units") or "").strip(),
+                bool(normalized.get("enabled", True)),
                 bool(normalized.get("edited")),
                 str(normalized.get("updated_at") or "").strip(),
             ]

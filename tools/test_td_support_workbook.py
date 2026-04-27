@@ -2418,6 +2418,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
                     "default_display_parameter": "feed pressure",
                     "displayed_parameter": "feed pressure",
                     "preferred_units": "psia",
+                    "enabled": True,
                     "edited": False,
                     "updated_at": "",
                 }
@@ -2432,6 +2433,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
                     "displayed_parameter": "feed pressure",
                     "canonical_display": "feed pressure",
                     "units": ["psia"],
+                    "enabled": True,
                     "status": "default",
                     "source_run_names": ["RunA"],
                     "surfaces": ["performance"],
@@ -2464,6 +2466,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 self.assertEqual(builder_mock.call_count, 1)
                 self.assertEqual(dlg.tbl.rowCount(), 1)
                 self.assertEqual(dlg.tbl.item(0, dlg.COL_DISPLAYED).text(), "feed pressure")
+                self.assertEqual(dlg.tbl.item(0, dlg.COL_ENABLED).text(), "Yes")
                 self.assertIn("Rows: 1", dlg.lbl_summary.text())
                 self.assertIn("Edited: 0", dlg.lbl_summary.text())
             finally:
@@ -2532,6 +2535,43 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 self.assertEqual(builder_mock.call_count, 1)
                 self.assertEqual(dlg.tbl.item(0, dlg.COL_DISPLAYED).text(), "feed pressure")
                 self.assertEqual(dlg.tbl.item(0, dlg.COL_STATUS).text(), "Default")
+            finally:
+                dlg.close()
+
+    @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
+    def test_parameter_normalization_dialog_disable_and_enable_rows_updates_local_state(self) -> None:
+        app = _qt_app()
+        from EIDAT_App_Files.ui_next import qt_main as qm  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            project_dir = root / "ProjectA"
+            project_dir.mkdir()
+            workbook = root / "project.xlsx"
+            workbook.write_text("", encoding="utf-8")
+            db_path = project_dir / "implementation_trending.sqlite3"
+            context = self._make_parameter_normalization_context()
+
+            with mock.patch.object(qm.be, "validate_test_data_project_cache_for_open", return_value=db_path):
+                with mock.patch.object(qm.be, "td_build_parameter_normalization_context", return_value=context):
+                    dlg = qm.TDParameterNormalizationDialog(project_dir, workbook)
+
+            try:
+                dlg.tbl.selectRow(0)
+                dlg._act_disable_rows()
+                app.processEvents()
+
+                self.assertEqual(dlg.tbl.item(0, dlg.COL_ENABLED).text(), "No")
+                self.assertEqual(dlg.tbl.item(0, dlg.COL_STATUS).text(), "Disabled")
+                self.assertIn("Disabled: 1", dlg.lbl_summary.text())
+                self.assertIn("Enabled: No", dlg.detail.toPlainText())
+
+                dlg._act_enable_rows()
+                app.processEvents()
+
+                self.assertEqual(dlg.tbl.item(0, dlg.COL_ENABLED).text(), "Yes")
+                self.assertEqual(dlg.tbl.item(0, dlg.COL_STATUS).text(), "Default")
+                self.assertIn("Disabled: 0", dlg.lbl_summary.text())
             finally:
                 dlg.close()
 
@@ -4775,6 +4815,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
             for row in updated_rows:
                 if str(row.get("ingested_parameter") or "").strip() == "feed pressure":
                     row["displayed_parameter"] = "Chamber Feed Pressure"
+                    row["enabled"] = False
                     row["edited"] = True
             be.save_td_repo_parameter_mappings(project_dir, updated_rows)
 
@@ -4788,6 +4829,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 str(reloaded_feed.get("displayed_parameter") or "").strip(),
                 "Chamber Feed Pressure",
             )
+            self.assertFalse(bool(reloaded_feed.get("enabled", True)))
             self.assertTrue(bool(reloaded_feed.get("edited")))
 
             pr_path = self._program_requirements_workbook_path(be, root, "Program A")
@@ -4806,6 +4848,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
                         "displayed_parameter": str(
                             ws_map.cell(row_idx, headers["displayed_parameter"]).value or ""
                         ).strip(),
+                        "enabled": bool(ws_map.cell(row_idx, headers["enabled"]).value),
                         "edited": bool(ws_map.cell(row_idx, headers["edited"]).value),
                     }
                     for row_idx in range(2, (ws_map.max_row or 0) + 1)
@@ -4819,6 +4862,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
             self.assertEqual(rows_by_ingested["feed pressure"]["asset_specific_type"], "Valve")
             self.assertEqual(rows_by_ingested["feed pressure"]["default_display_parameter"], "feed pressure")
             self.assertEqual(rows_by_ingested["feed pressure"]["displayed_parameter"], "Chamber Feed Pressure")
+            self.assertFalse(rows_by_ingested["feed pressure"]["enabled"])
             self.assertTrue(rows_by_ingested["feed pressure"]["edited"])
 
     def test_rebuild_surfaces_discovered_source_headers_in_calc_columns(self) -> None:

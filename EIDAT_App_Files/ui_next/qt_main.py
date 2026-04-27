@@ -2651,6 +2651,7 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
         "Default Display",
         "Displayed",
         "Units",
+        "Enabled",
         "Status",
     ]
 
@@ -2661,7 +2662,8 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
     COL_DEFAULT = 4
     COL_DISPLAYED = 5
     COL_UNITS = 6
-    COL_STATUS = 7
+    COL_ENABLED = 7
+    COL_STATUS = 8
 
     def __init__(self, project_dir: Path, workbook_path: Path, parent=None):
         super().__init__(parent)
@@ -2770,8 +2772,16 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
         action_row = QtWidgets.QHBoxLayout()
         self.btn_set_display = QtWidgets.QPushButton("Set Display...")
         self.btn_set_units = QtWidgets.QPushButton("Set Units...")
+        self.btn_enable = QtWidgets.QPushButton("Enable Selected")
+        self.btn_disable = QtWidgets.QPushButton("Disable Selected")
         self.btn_reset = QtWidgets.QPushButton("Reset Selected")
-        for button in (self.btn_set_display, self.btn_set_units, self.btn_reset):
+        for button in (
+            self.btn_set_display,
+            self.btn_set_units,
+            self.btn_enable,
+            self.btn_disable,
+            self.btn_reset,
+        ):
             action_row.addWidget(button)
         action_row.addStretch(1)
         right_layout.addLayout(action_row)
@@ -2786,6 +2796,8 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
 
         self.btn_set_display.clicked.connect(self._act_set_display_name)
         self.btn_set_units.clicked.connect(self._act_set_units)
+        self.btn_enable.clicked.connect(self._act_enable_rows)
+        self.btn_disable.clicked.connect(self._act_disable_rows)
         self.btn_reset.clicked.connect(self._act_reset_rows)
         self.btn_save.clicked.connect(self._act_save)
         self.btn_close.clicked.connect(self.reject)
@@ -2814,6 +2826,8 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
             getattr(self, "tbl", None),
             getattr(self, "btn_set_display", None),
             getattr(self, "btn_set_units", None),
+            getattr(self, "btn_enable", None),
+            getattr(self, "btn_disable", None),
             getattr(self, "btn_reset", None),
             getattr(self, "btn_save", None),
             getattr(self, "btn_close", None),
@@ -2873,6 +2887,7 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
             "displayed_parameter": displayed,
             "preferred_units": str(raw.get("preferred_units") or raw.get("units") or "").strip(),
             "default_preferred_units": str(raw.get("default_preferred_units") or "").strip(),
+            "enabled": bool(raw.get("enabled", True)),
             "edited": self._norm_name(displayed) != self._norm_name(default_display),
             "updated_at": str(raw.get("updated_at") or "").strip(),
         }
@@ -2990,6 +3005,7 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
                     "displayed_parameter": raw_item.get("displayed_parameter") or raw_item.get("canonical_display") or raw_name,
                     "preferred_units": preferred_units,
                     "default_preferred_units": str(raw_item.get("default_preferred_units") or preferred_units).strip(),
+                    "enabled": bool(raw_item.get("enabled", True)),
                     "edited": bool(raw_item.get("edited")),
                 }
             )
@@ -3062,15 +3078,22 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
                 units.append(text)
         return units
 
-    def _status_text(self, row: Mapping[str, object], inventory_row: Mapping[str, object] | None = None) -> str:
+    def _row_has_custom_edits(self, row: Mapping[str, object]) -> bool:
         displayed = str(row.get("displayed_parameter") or "").strip()
         default_display = str(row.get("default_display_parameter") or "").strip()
         preferred_units = str(row.get("preferred_units") or "").strip()
         default_units = str(row.get("default_preferred_units") or "").strip()
         units_edited = bool(preferred_units or default_units) and self._norm_name(preferred_units) != self._norm_name(default_units)
-        if bool(row.get("edited")) or self._norm_name(displayed) != self._norm_name(default_display) or units_edited:
+        return bool(row.get("edited")) or self._norm_name(displayed) != self._norm_name(default_display) or units_edited
+
+    def _status_text(self, row: Mapping[str, object], inventory_row: Mapping[str, object] | None = None) -> str:
+        if not bool(row.get("enabled", True)):
+            return "Disabled"
+        if self._row_has_custom_edits(row):
             return "Edited"
         inv_status = str((inventory_row or {}).get("status") or "").strip().lower()
+        if inv_status == "disabled":
+            return "Disabled"
         if inv_status == "suggested":
             return "Suggested"
         if inv_status:
@@ -3117,6 +3140,7 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
                     "_row_keys": [row_key],
                     "_program_titles_set": set(),
                     "_units_set": set(),
+                    "_enabled_values": set(),
                     "_source_run_names_set": set(),
                     "_surfaces_set": set(),
                     "_run_names_set": set(),
@@ -3130,6 +3154,8 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
                     "displayed_parameter": str(row.get("displayed_parameter") or "").strip(),
                     "preferred_units": str(row.get("preferred_units") or "").strip(),
                     "default_preferred_units": str(row.get("default_preferred_units") or "").strip(),
+                    "enabled": bool(row.get("enabled", True)),
+                    "enabled_text": "Yes" if bool(row.get("enabled", True)) else "No",
                     "units": [],
                     "status_text": status_text,
                     "edited": False,
@@ -3160,6 +3186,7 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
                 text = str(value).strip()
                 if text:
                     cast(set[str], display_row["_run_names_set"]).add(text)
+            cast(set[bool], display_row["_enabled_values"]).add(bool(row.get("enabled", True)))
             cast(set[str], display_row["_status_values"]).add(status_text)
             display_row["edited"] = bool(display_row.get("edited")) or status_text == "Edited"
             display_row["source_count"] = int(display_row.get("source_count") or 0) + source_count
@@ -3168,6 +3195,7 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
         for display_row in grouped_rows.values():
             program_titles = sorted(cast(set[str], display_row.pop("_program_titles_set", set())), key=str.casefold)
             units = sorted(cast(set[str], display_row.pop("_units_set", set())), key=str.casefold)
+            enabled_values = cast(set[bool], display_row.pop("_enabled_values", set()))
             source_run_names = sorted(cast(set[str], display_row.pop("_source_run_names_set", set())), key=str.casefold)
             surfaces = sorted(cast(set[str], display_row.pop("_surfaces_set", set())), key=str.casefold)
             run_names = sorted(cast(set[str], display_row.pop("_run_names_set", set())), key=str.casefold)
@@ -3182,6 +3210,8 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
             display_row["program_titles"] = program_titles
             display_row["program_title"] = ", ".join(program_titles)
             display_row["units"] = units
+            display_row["enabled"] = True if enabled_values == {True} else False if enabled_values == {False} else None
+            display_row["enabled_text"] = "Yes" if enabled_values == {True} else "No" if enabled_values == {False} else "Mixed"
             display_row["source_run_names"] = source_run_names
             display_row["surfaces"] = surfaces
             display_row["run_names"] = run_names
@@ -3195,6 +3225,7 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
                     str(display_row.get("ingested_parameter") or ""),
                     str(display_row.get("default_display_parameter") or ""),
                     str(display_row.get("displayed_parameter") or ""),
+                    str(display_row.get("enabled_text") or ""),
                     " ".join(units),
                 ]
             ).lower()
@@ -3223,6 +3254,7 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
                     str(row.get("default_display_parameter") or "").strip(),
                     str(row.get("displayed_parameter") or "").strip(),
                     ", ".join([str(value).strip() for value in (row.get("units") or []) if str(value).strip()]) or "-",
+                    str(row.get("enabled_text") or "").strip() or "-",
                     str(row.get("status_text") or "").strip(),
                 ]
                 for col_idx, value in enumerate(values):
@@ -3235,6 +3267,7 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
                         f"Ingested: {str(row.get('ingested_parameter') or '').strip()}",
                         f"Default Display: {str(row.get('default_display_parameter') or '').strip()}",
                         f"Displayed: {str(row.get('displayed_parameter') or '').strip()}",
+                        f"Enabled: {str(row.get('enabled_text') or '').strip() or '-'}",
                         f"Member Rows: {len(self._coerce_row_keys(row.get('_row_keys')))}",
                     ]
                     item.setToolTip("\n".join(tooltip_lines))
@@ -3247,6 +3280,7 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
                 self.tbl.resizeColumnsToContents()
                 self.tbl.horizontalHeader().setSectionResizeMode(self.COL_DISPLAYED, QtWidgets.QHeaderView.ResizeMode.Stretch)
                 self.tbl.horizontalHeader().setSectionResizeMode(self.COL_UNITS, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+                self.tbl.horizontalHeader().setSectionResizeMode(self.COL_ENABLED, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
                 self.tbl.horizontalHeader().setSectionResizeMode(self.COL_STATUS, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
             except Exception:
                 pass
@@ -3263,13 +3297,14 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
     def _sync_selection(self) -> None:
         rows = self._selected_rows()
         count = len(rows)
-        edited_count = len([row for row in self._working_rows if self._status_text(row).lower() == "edited"])
+        edited_count = len([row for row in self._working_rows if self._row_has_custom_edits(row)])
+        disabled_count = len([row for row in self._working_rows if not bool(row.get("enabled", True))])
         self.lbl_summary.setText(
-            f"Rows: {len(self._display_rows)} | Source Rows: {len(self._working_rows)} | Edited: {edited_count} | Selected: {count}"
+            f"Rows: {len(self._display_rows)} | Source Rows: {len(self._working_rows)} | Edited: {edited_count} | Disabled: {disabled_count} | Selected: {count}"
         )
         if not rows:
             self.detail.setPlainText(
-                "Select one or more parameter rows to inspect their program scope, ingested name, displayed parameter, and units."
+                "Select one or more parameter rows to inspect their program scope, enabled state, ingested name, displayed parameter, and units."
             )
         elif count == 1:
             row = rows[0]
@@ -3280,6 +3315,7 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
                 f"Ingested Parameter: {str(row.get('ingested_parameter') or '').strip()}",
                 f"Default Display: {str(row.get('default_display_parameter') or '').strip() or '-'}",
                 f"Displayed Parameter: {str(row.get('displayed_parameter') or '').strip() or '-'}",
+                f"Enabled: {str(row.get('enabled_text') or '').strip() or '-'}",
                 f"Preferred Units: {str(row.get('preferred_units') or '').strip() or '-'}",
                 f"Units: {', '.join([str(value).strip() for value in (row.get('units') or []) if str(value).strip()]) or '-'}",
                 f"Surfaces: {', '.join([str(value).strip() for value in (row.get('surfaces') or []) if str(value).strip()]) or '-'}",
@@ -3304,14 +3340,17 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
                     [
                         f"Selected Rows: {len(rows)}",
                         f"Programs: {', '.join(sorted({str(value).strip() for row in rows for value in (row.get('program_titles') or []) if str(value).strip()}, key=str.casefold)) or '-'}",
+                        f"Enabled: {len([row for row in rows if row.get('enabled') is True])} enabled, {len([row for row in rows if row.get('enabled') is False])} disabled",
                         f"Ingested Parameters: {', '.join(ingested)}",
                         f"Displayed Parameters: {', '.join(displayed) or '-'}",
-                        "Use Set Display or Set Units to apply the same values to every selected member row.",
+                        "Use Set Display, Set Units, Enable Selected, or Disable Selected to apply the same values to every selected member row.",
                     ]
                 )
             )
         self.btn_set_display.setEnabled(count >= 1)
         self.btn_set_units.setEnabled(count >= 1)
+        self.btn_enable.setEnabled(count >= 1)
+        self.btn_disable.setEnabled(count >= 1)
         self.btn_reset.setEnabled(count >= 1)
 
     def _reload_context(self, *, select_keys: Sequence[tuple[str, str, str, str]] | None = None) -> None:
@@ -3439,6 +3478,30 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
         self._set_dirty(True)
         self._refresh_table(select_keys=list(wanted))
 
+    def _apply_enabled_value(
+        self,
+        *,
+        row_keys: Sequence[tuple[str, str, str, str]],
+        enabled: bool,
+    ) -> None:
+        wanted = {tuple(key) for key in row_keys if isinstance(key, tuple) and len(key) == 4}
+        if not wanted:
+            return
+        updated_rows: list[dict[str, object]] = []
+        changed = False
+        for raw_row in self._working_rows:
+            row = self._normalize_row(raw_row)
+            key = self._row_key(row)
+            if key in wanted and bool(row.get("enabled", True)) != bool(enabled):
+                row["enabled"] = bool(enabled)
+                changed = True
+            updated_rows.append(row)
+        if not changed:
+            return
+        self._working_rows = self._sorted_rows(updated_rows)
+        self._set_dirty(True)
+        self._refresh_table(select_keys=list(wanted))
+
     def _act_set_display_name(self) -> None:
         rows = self._selected_rows()
         if not rows:
@@ -3482,6 +3545,32 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
             for key in self._coerce_row_keys(row.get("_row_keys"))
         ]
         self._apply_units_value(row_keys=row_keys, units_text=units_text)
+
+    def _act_enable_rows(self) -> None:
+        rows = self._selected_rows()
+        if not rows:
+            return
+        self._apply_enabled_value(
+            row_keys=[
+                key
+                for row in rows
+                for key in self._coerce_row_keys(row.get("_row_keys"))
+            ],
+            enabled=True,
+        )
+
+    def _act_disable_rows(self) -> None:
+        rows = self._selected_rows()
+        if not rows:
+            return
+        self._apply_enabled_value(
+            row_keys=[
+                key
+                for row in rows
+                for key in self._coerce_row_keys(row.get("_row_keys"))
+            ],
+            enabled=False,
+        )
 
     def _act_reset_rows(self) -> None:
         rows = self._selected_rows()
@@ -5951,20 +6040,27 @@ class TestDataTrendDialog(QtWidgets.QDialog):
     ) -> list[dict[str, object]]:
         run_list = [str(value).strip() for value in (run_names or []) if str(value).strip()]
         raw_name_list = [str(value).strip() for value in (raw_names or []) if str(value).strip()]
+        context = dict(getattr(self, "_parameter_normalization_context", None) or {})
+        have_parameter_context = any(
+            bool(context.get(key))
+            for key in ("entries", "inventory", "repo_parameter_rows", "canonical_groups")
+        )
         builder = getattr(be, "td_build_parameter_selector_options", None)
+        builder_failed = False
         if callable(builder):
             try:
                 options = builder(
-                    getattr(self, "_parameter_normalization_context", None),
+                    context,
                     run_names=run_list,
                     surface=surface,
                     raw_names=raw_name_list or None,
                 )
             except Exception:
                 options = []
+                builder_failed = True
             if isinstance(options, list):
                 cleaned = [dict(option) for option in options if isinstance(option, Mapping) and str(option.get("value") or "").strip()]
-                if cleaned:
+                if cleaned or (have_parameter_context and not builder_failed):
                     return cleaned
         fallback_union: dict[str, dict[str, object]] = {}
         if raw_columns:
@@ -5993,6 +6089,63 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                         "search": " ".join([name, units]).strip().lower(),
                     }
         return sorted(fallback_union.values(), key=lambda option: str(option.get("display_name") or "").casefold())
+
+    def _available_td_y_columns(
+        self,
+        run_names: Sequence[object] | None,
+        *,
+        surface: str = "performance",
+    ) -> list[dict[str, str]]:
+        if not getattr(self, "_db_path", None):
+            return []
+        run_list = [str(value).strip() for value in (run_names or []) if str(value).strip()]
+        union: dict[str, dict[str, str]] = {}
+        for run_name in run_list:
+            try:
+                columns = be.td_list_y_columns(self._db_path, run_name)
+            except Exception:
+                columns = []
+            for column in columns:
+                if isinstance(column, Mapping):
+                    name = str(column.get("name") or "").strip()
+                    units = str(column.get("units") or "").strip()
+                else:
+                    name = str(column or "").strip()
+                    units = ""
+                if not name:
+                    continue
+                key = self._perf_norm_name(name)
+                if key not in union:
+                    union[key] = {"name": name, "units": units}
+                elif units and not str(union[key].get("units") or "").strip():
+                    union[key]["units"] = units
+        raw_columns = list(union.values())
+        if not raw_columns:
+            return []
+        options = self._parameter_selector_options(
+            surface=surface,
+            run_names=run_list,
+            raw_names=[str(item.get("name") or "").strip() for item in raw_columns if str(item.get("name") or "").strip()],
+            raw_columns=raw_columns,
+        )
+        if not options:
+            return []
+        allowed_keys: set[str] = set()
+        for option in options:
+            display_name = str(option.get("display_name") or "").strip()
+            if display_name:
+                allowed_keys.add(self._perf_norm_name(display_name))
+            for raw_name in (option.get("raw_names") or []):
+                text = str(raw_name or "").strip()
+                if text:
+                    allowed_keys.add(self._perf_norm_name(text))
+        if not allowed_keys:
+            return []
+        return [
+            dict(column)
+            for column in raw_columns
+            if self._perf_norm_name(column.get("name")) in allowed_keys
+        ]
 
     def _selector_option_by_value(
         self,
@@ -10543,16 +10696,15 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 y_norms: set[str] = set()
                 y_names: list[str] = []
                 try:
-                    for rn in _local_selected_member_runs():
-                        for col in be.td_list_y_columns(self._db_path, rn):
-                            name = str((col or {}).get("name") or "").strip()
-                            if not name:
-                                continue
-                            nk = _norm_name(name)
-                            if nk in x_exclude_norms or nk in y_norms:
-                                continue
-                            y_norms.add(nk)
-                            y_names.append(name)
+                    for col in self._available_td_y_columns(_local_selected_member_runs(), surface="performance"):
+                        name = str((col or {}).get("name") or "").strip()
+                        if not name:
+                            continue
+                        nk = _norm_name(name)
+                        if nk in x_exclude_norms or nk in y_norms:
+                            continue
+                        y_norms.add(nk)
+                        y_names.append(name)
                 except Exception:
                     y_names = []
                 y_names = sorted(y_names, key=lambda value: value.lower())
@@ -10846,7 +10998,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             try:
                 for rn in runs_sel:
                     y_by_run_norm.setdefault(rn, set())
-                    for c in be.td_list_y_columns(self._db_path, rn):
+                    for c in self._available_td_y_columns([rn], surface="performance"):
                         name = str((c or {}).get("name") or "").strip()
                         if not name:
                             continue
@@ -11197,7 +11349,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 by_run_norm: dict[str, set[str]] = {}
                 if self._db_path:
                     for rn in runs_sel:
-                        by_run_norm[rn] = {_norm_name(str((c or {}).get("name") or "")) for c in be.td_list_y_columns(self._db_path, rn)}
+                        by_run_norm[rn] = {
+                            _norm_name(str((c or {}).get("name") or ""))
+                            for c in self._available_td_y_columns([rn], surface="performance")
+                        }
 
                 for r in range(tbl_perf.rowCount()):
                     cbx = tbl_perf.cellWidget(r, 0)

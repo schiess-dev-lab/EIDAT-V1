@@ -1088,6 +1088,73 @@ class TestBackendTdCacheBootstrap(unittest.TestCase):
             self.assertEqual(str(inventory[0].get("preferred_units") or ""), "ms")
             self.assertEqual(int(inventory[0].get("source_count") or 0), 1)
 
+    def test_parameter_selector_options_omit_disabled_parameter_rules(self) -> None:
+        raw_name = "Time_1_2_Impluse"
+        raw_norm = backend._td_param_norm_name(raw_name)
+        context = {
+            "normalization": {
+                "groups": [
+                    {
+                        "id": "display:timeto12impulse",
+                        "display_name": "Time to 1/2 Impulse",
+                        "preferred_units": "ms",
+                    }
+                ],
+                "mappings": [
+                    {
+                        "canonical_id": "display:timeto12impulse",
+                        "raw_name": raw_name,
+                        "program_titles": ["Program Alpha"],
+                        "asset_types": ["Valve"],
+                        "asset_specific_types": ["Main"],
+                        "default_display_parameter": "Time to 1/2 Impulse",
+                        "displayed_parameter": "Time to 1/2 Impulse",
+                        "preferred_units": "ms",
+                        "enabled": False,
+                    }
+                ],
+            },
+            "entries": [
+                {
+                    "surface": "metrics",
+                    "run_name": "RunA",
+                    "raw_name": raw_name,
+                    "raw_norm": raw_norm,
+                    "units": "ms",
+                    "program_title": "Program Alpha",
+                    "asset_type": "Valve",
+                    "asset_specific_type": "Main",
+                    "source_run_name": "RunA",
+                    "source_key": "SN-001",
+                    "default_display_parameter": "Time to 1/2 Impulse",
+                }
+            ],
+            "inventory_by_raw_norm": {
+                raw_norm: {
+                    "raw_name": raw_name,
+                    "raw_norm": raw_norm,
+                    "program_title": "Program Alpha",
+                    "asset_type": "Valve",
+                    "asset_specific_type": "Main",
+                    "primary_canonical_id": "display:timeto12impulse",
+                    "units": ["ms"],
+                    "program_titles": ["Program Alpha"],
+                    "run_names": ["RunA"],
+                    "surfaces": ["metrics"],
+                    "enabled": False,
+                }
+            },
+        }
+
+        options = backend.td_build_parameter_selector_options(
+            context,
+            run_names=["RunA"],
+            surface="metrics",
+            raw_names=[raw_name],
+        )
+
+        self.assertEqual(options, [])
+
     def test_update_refreshes_parameter_runtime_after_program_requirements_sync(self) -> None:
         if Workbook is None:
             self.skipTest("openpyxl is required for TD readiness tests")
