@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from contextlib import ExitStack, closing
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 
 APP_ROOT = Path(__file__).resolve().parents[1]
@@ -970,6 +970,188 @@ class TestBackendTdCacheBootstrap(unittest.TestCase):
             warnings = [str(value).strip() for value in (payload.get("cache_validation_warnings") or []) if str(value).strip()]
             self.assertTrue(any("selected statistics changed" in warning for warning in warnings))
             self.assertTrue(any("RawCache_long" in warning for warning in warnings))
+
+    def test_autonormalize_parameter_mapping_rows_prefers_human_readable_name_with_units(self) -> None:
+        rows = [
+            {
+                "program_title": "Program Alpha",
+                "asset_type": "Valve",
+                "asset_specific_type": "Main",
+                "ingested_parameter": "Time_1_2_Impluse",
+                "default_display_parameter": "Time_1_2_Impluse",
+                "displayed_parameter": "Time_1_2_Impluse",
+                "preferred_units": "",
+            },
+            {
+                "program_title": "Program Alpha",
+                "asset_type": "Valve",
+                "asset_specific_type": "Main",
+                "ingested_parameter": "Time to 1/2 Impulse",
+                "default_display_parameter": "Time to 1/2 Impulse",
+                "displayed_parameter": "Time to 1/2 Impulse",
+                "preferred_units": "ms",
+            },
+        ]
+
+        normalized = backend._td_autonormalize_parameter_mapping_rows(rows)
+
+        self.assertEqual(len(normalized), 2)
+        self.assertEqual(
+            {
+                str(row.get("default_display_parameter") or "").strip()
+                for row in normalized
+            },
+            {"Time to 1/2 Impulse"},
+        )
+        typo_row = next(
+            row
+            for row in normalized
+            if str(row.get("ingested_parameter") or "").strip() == "Time_1_2_Impluse"
+        )
+        self.assertEqual(str(typo_row.get("displayed_parameter") or "").strip(), "Time to 1/2 Impulse")
+        self.assertEqual(str(typo_row.get("preferred_units") or "").strip(), "ms")
+
+    def test_load_parameter_runtime_context_returns_inventory_from_runtime_tables(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir) / "project"
+            project_dir.mkdir(parents=True, exist_ok=True)
+            db_path = project_dir / backend.EIDAT_PROJECT_IMPLEMENTATION_DB
+            with closing(sqlite3.connect(str(db_path))) as conn:
+                backend._ensure_test_data_impl_tables(conn)
+                conn.execute(
+                    "INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)",
+                    (backend.TD_PARAM_RUNTIME_SIGNATURE_META_KEY, "runtime-signature"),
+                )
+                conn.execute(
+                    f"""
+                    INSERT OR REPLACE INTO {backend.TD_PARAM_NORM_GROUPS_TABLE}(
+                        canonical_id, display_name, preferred_units, explicit
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    ("display:timeto12impulse", "Time to 1/2 Impulse", "ms", 0),
+                )
+                conn.execute(
+                    f"""
+                    INSERT OR REPLACE INTO {backend.TD_PARAM_RUNTIME_GROUPS_TABLE}(
+                        canonical_id, display_name, preferred_units, raw_names_json, units_json,
+                        program_titles_json, asset_types_json, asset_specific_types_json,
+                        source_run_names_json, surfaces_json, run_names_json, unit_conflict, explicit
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "display:timeto12impulse",
+                        "Time to 1/2 Impulse",
+                        "ms",
+                        "[\"Time_1_2_Impluse\"]",
+                        "[\"ms\"]",
+                        "[\"Program Alpha\"]",
+                        "[\"Valve\"]",
+                        "[\"Main\"]",
+                        "[\"RunA\"]",
+                        "[\"metrics\"]",
+                        "[\"RunA\"]",
+                        0,
+                        0,
+                    ),
+                )
+                conn.execute(
+                    f"""
+                    INSERT OR REPLACE INTO {backend.TD_PARAM_RUNTIME_ENTRIES_TABLE}(
+                        surface, run_name, raw_name, raw_norm, units, program_title, asset_type,
+                        asset_specific_type, source_run_name, source_key, canonical_id, default_display_parameter
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "metrics",
+                        "RunA",
+                        "Time_1_2_Impluse",
+                        backend._td_param_norm_name("Time_1_2_Impluse"),
+                        "ms",
+                        "Program Alpha",
+                        "Valve",
+                        "Main",
+                        "RunA",
+                        "SN-001",
+                        "display:timeto12impulse",
+                        "Time to 1/2 Impulse",
+                    ),
+                )
+                conn.commit()
+
+            context = backend.td_load_parameter_runtime_context(project_dir, db_path)
+
+            self.assertEqual(str(context.get("runtime_mode") or ""), "db")
+            self.assertEqual(len(context.get("entries") or []), 1)
+            inventory = list(context.get("inventory") or [])
+            self.assertEqual(len(inventory), 1)
+            self.assertEqual(str(inventory[0].get("default_display_parameter") or ""), "Time to 1/2 Impulse")
+            self.assertEqual(str(inventory[0].get("preferred_units") or ""), "ms")
+            self.assertEqual(int(inventory[0].get("source_count") or 0), 1)
+
+    def test_update_refreshes_parameter_runtime_after_program_requirements_sync(self) -> None:
+        if Workbook is None:
+            self.skipTest("openpyxl is required for TD readiness tests")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir) / "project"
+            workbook_path, impl_db, _raw_db = _create_ready_td_project_fixture(project_dir)
+            doc = {
+                "metadata_rel": "docs/sn001.json",
+                "program_title": "Program Alpha",
+            }
+            with _td_update_context(project_dir, workbook_path), patch.object(
+                backend,
+                "read_eidat_index_documents",
+                return_value=[doc],
+            ), patch.object(
+                backend,
+                "_project_selected_metadata_rels",
+                return_value=["docs/sn001.json"],
+            ), patch.object(
+                backend,
+                "_sync_td_program_requirements_workbooks_for_docs",
+                return_value={"workbooks": [], "warnings": [], "created_count": 0, "updated_count": 0, "skipped_missing_count": 0},
+            ), patch.object(
+                backend,
+                "_sync_td_support_program_requirements_import",
+                return_value={"path": "", "updated": False, "condition_count": 0, "requirements_count": 0, "warnings": []},
+            ), patch.object(
+                backend,
+                "refresh_td_parameter_runtime_cache",
+                return_value={"mode": "rebuilt", "entries": 1, "groups": 1},
+            ) as refresh_mock, patch.object(
+                backend,
+                "_td_collect_project_readiness",
+                return_value={
+                    "summary": {
+                        "mode": "none",
+                        "impl_complete": True,
+                        "parameter_runtime_complete": True,
+                        "raw_complete": True,
+                    },
+                    "compiled_serials": ["SN-001"],
+                    "excluded_sources": [],
+                    "warning_summary": "",
+                    "warnings": [],
+                    "problems": [],
+                },
+            ), patch.object(
+                backend,
+                "validate_existing_test_data_project_cache",
+                return_value=impl_db,
+            ):
+                payload = backend.update_test_data_trending_project_workbook(
+                    project_dir,
+                    workbook_path,
+                    require_existing_cache=False,
+                )
+
+            refresh_mock.assert_called_once_with(
+                project_dir,
+                workbook_path,
+                impl_db,
+                progress_cb=ANY,
+            )
+            self.assertIn("parameter_runtime_after_program_requirements_s", dict(payload.get("timings") or {}))
 
     def test_ready_validator_allows_workbook_output_mismatch_as_warning(self) -> None:
         if Workbook is None:

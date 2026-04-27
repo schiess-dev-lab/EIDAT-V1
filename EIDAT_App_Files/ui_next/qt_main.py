@@ -12,7 +12,7 @@ import math
 import statistics
 import datetime
 from pathlib import Path
-from typing import Callable, Mapping
+from typing import Callable, Mapping, cast
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
@@ -2769,8 +2769,9 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
 
         action_row = QtWidgets.QHBoxLayout()
         self.btn_set_display = QtWidgets.QPushButton("Set Display...")
+        self.btn_set_units = QtWidgets.QPushButton("Set Units...")
         self.btn_reset = QtWidgets.QPushButton("Reset Selected")
-        for button in (self.btn_set_display, self.btn_reset):
+        for button in (self.btn_set_display, self.btn_set_units, self.btn_reset):
             action_row.addWidget(button)
         action_row.addStretch(1)
         right_layout.addLayout(action_row)
@@ -2784,6 +2785,7 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
         layout.addLayout(button_row)
 
         self.btn_set_display.clicked.connect(self._act_set_display_name)
+        self.btn_set_units.clicked.connect(self._act_set_units)
         self.btn_reset.clicked.connect(self._act_reset_rows)
         self.btn_save.clicked.connect(self._act_save)
         self.btn_close.clicked.connect(self.reject)
@@ -2811,6 +2813,7 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
             getattr(self, "ed_filter", None),
             getattr(self, "tbl", None),
             getattr(self, "btn_set_display", None),
+            getattr(self, "btn_set_units", None),
             getattr(self, "btn_reset", None),
             getattr(self, "btn_save", None),
             getattr(self, "btn_close", None),
@@ -2842,6 +2845,13 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
             except Exception:
                 normalized = {}
             if normalized:
+                raw = dict(row or {})
+                normalized["default_preferred_units"] = str(
+                    raw.get("default_preferred_units")
+                    or normalized.get("default_preferred_units")
+                    or raw.get("preferred_units_default")
+                    or ""
+                ).strip()
                 return normalized
         raw = dict(row or {})
         ingested = str(raw.get("ingested_parameter") or raw.get("raw_name") or "").strip()
@@ -2862,6 +2872,7 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
             "default_display_parameter": default_display,
             "displayed_parameter": displayed,
             "preferred_units": str(raw.get("preferred_units") or raw.get("units") or "").strip(),
+            "default_preferred_units": str(raw.get("default_preferred_units") or "").strip(),
             "edited": self._norm_name(displayed) != self._norm_name(default_display),
             "updated_at": str(raw.get("updated_at") or "").strip(),
         }
@@ -2892,6 +2903,20 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
         if isinstance(value, (list, tuple)) and len(value) == 4:
             return tuple(str(part or "").strip() for part in value)
         return None
+
+    def _coerce_row_keys(self, value: object) -> list[tuple[str, str, str, str]]:
+        direct = self._coerce_row_key(value)
+        if direct is not None:
+            return [direct]
+        out: list[tuple[str, str, str, str]] = []
+        seen: set[tuple[str, str, str, str]] = set()
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                coerced = self._coerce_row_key(item)
+                if coerced is not None and coerced not in seen:
+                    seen.add(coerced)
+                    out.append(coerced)
+        return out
 
     def _sorted_rows(self, rows: Sequence[Mapping[str, object]] | None) -> list[dict[str, object]]:
         normalized_rows = [self._normalize_row(item) for item in (rows or [])]
@@ -2952,6 +2977,9 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
             if not raw_name:
                 continue
             units = [str(value).strip() for value in (raw_item.get("units") or []) if str(value).strip()]
+            preferred_units = str(raw_item.get("preferred_units") or "").strip()
+            if not preferred_units and len(units) == 1:
+                preferred_units = units[0]
             row = self._normalize_row(
                 {
                     "program_title": raw_item.get("program_title"),
@@ -2960,7 +2988,8 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
                     "ingested_parameter": raw_name,
                     "default_display_parameter": raw_item.get("default_display_parameter") or raw_name,
                     "displayed_parameter": raw_item.get("displayed_parameter") or raw_item.get("canonical_display") or raw_name,
-                    "preferred_units": (units[0] if len(units) == 1 else ""),
+                    "preferred_units": preferred_units,
+                    "default_preferred_units": str(raw_item.get("default_preferred_units") or preferred_units).strip(),
                     "edited": bool(raw_item.get("edited")),
                 }
             )
@@ -3000,22 +3029,25 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
         keys: list[tuple[str, str, str, str]] = []
         seen: set[tuple[str, str, str, str]] = set()
         for item in self.tbl.selectedItems():
-            key = self._coerce_row_key(item.data(QtCore.Qt.ItemDataRole.UserRole))
-            if key is not None and key not in seen:
-                seen.add(key)
-                keys.append(key)
+            for key in self._coerce_row_keys(item.data(QtCore.Qt.ItemDataRole.UserRole)):
+                if key not in seen:
+                    seen.add(key)
+                    keys.append(key)
         return keys
 
     def _selected_rows(self) -> list[dict[str, object]]:
         rows: list[dict[str, object]] = []
+        wanted = set(self._current_selected_keys())
+        if not wanted:
+            return rows
         seen: set[tuple[str, str, str, str]] = set()
         for row in self._display_rows:
-            key = self._coerce_row_key(row.get("_key"))
-            if key is not None and key not in seen and any(
-                self._coerce_row_key(item.data(QtCore.Qt.ItemDataRole.UserRole)) == key
-                for item in self.tbl.selectedItems()
-            ):
-                seen.add(key)
+            row_keys = self._coerce_row_keys(row.get("_row_keys"))
+            if not row_keys or not any(key in wanted for key in row_keys):
+                continue
+            identity = row_keys[0]
+            if identity not in seen:
+                seen.add(identity)
                 rows.append(dict(row))
         return rows
 
@@ -3033,7 +3065,10 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
     def _status_text(self, row: Mapping[str, object], inventory_row: Mapping[str, object] | None = None) -> str:
         displayed = str(row.get("displayed_parameter") or "").strip()
         default_display = str(row.get("default_display_parameter") or "").strip()
-        if bool(row.get("edited")) or self._norm_name(displayed) != self._norm_name(default_display):
+        preferred_units = str(row.get("preferred_units") or "").strip()
+        default_units = str(row.get("default_preferred_units") or "").strip()
+        units_edited = bool(preferred_units or default_units) and self._norm_name(preferred_units) != self._norm_name(default_units)
+        if bool(row.get("edited")) or self._norm_name(displayed) != self._norm_name(default_display) or units_edited:
             return "Edited"
         inv_status = str((inventory_row or {}).get("status") or "").strip().lower()
         if inv_status == "suggested":
@@ -3058,29 +3093,100 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
                 if coerced is not None
             ]
         inventory_index = self._inventory_index()
-        rows: list[dict[str, object]] = []
+        grouped_rows: dict[tuple[str, str, str, str, str, str], dict[str, object]] = {}
         for row in self._working_rows:
-            inventory_row = inventory_index.get(self._row_key(row)) or {}
+            row_key = self._row_key(row)
+            inventory_row = inventory_index.get(row_key) or {}
+            source_count = int(inventory_row.get("source_count") or 0)
+            if source_count <= 0:
+                continue
             units = self._row_units(row, inventory_row)
             status_text = self._status_text(row, inventory_row)
-            display_row = {
-                "_key": self._row_key(row),
-                "program_title": str(row.get("program_title") or "").strip(),
-                "asset_type": str(row.get("asset_type") or "").strip(),
-                "asset_specific_type": str(row.get("asset_specific_type") or "").strip(),
-                "ingested_parameter": str(row.get("ingested_parameter") or "").strip(),
-                "default_display_parameter": str(row.get("default_display_parameter") or "").strip(),
-                "displayed_parameter": str(row.get("displayed_parameter") or "").strip(),
-                "preferred_units": str(row.get("preferred_units") or "").strip(),
-                "units": units,
-                "status_text": status_text,
-                "edited": bool(row.get("edited")) or self._norm_name(row.get("displayed_parameter")) != self._norm_name(row.get("default_display_parameter")),
-                "source_run_names": list(inventory_row.get("source_run_names") or []),
-                "surfaces": list(inventory_row.get("surfaces") or []),
-                "run_names": list(inventory_row.get("run_names") or []),
-                "source_count": int(inventory_row.get("source_count") or 0),
-                "program_count": int(inventory_row.get("program_count") or 0),
-            }
+            group_key = (
+                self._norm_name(row.get("asset_type")),
+                self._norm_name(row.get("asset_specific_type")),
+                self._norm_name(row.get("ingested_parameter")),
+                self._norm_name(row.get("default_display_parameter")),
+                self._norm_name(row.get("displayed_parameter")),
+                self._norm_name(row.get("preferred_units")),
+            )
+            display_row = grouped_rows.get(group_key)
+            if display_row is None:
+                display_row = {
+                    "_key": row_key,
+                    "_row_keys": [row_key],
+                    "_program_titles_set": set(),
+                    "_units_set": set(),
+                    "_source_run_names_set": set(),
+                    "_surfaces_set": set(),
+                    "_run_names_set": set(),
+                    "_status_values": set(),
+                    "program_title": "",
+                    "program_titles": [],
+                    "asset_type": str(row.get("asset_type") or "").strip(),
+                    "asset_specific_type": str(row.get("asset_specific_type") or "").strip(),
+                    "ingested_parameter": str(row.get("ingested_parameter") or "").strip(),
+                    "default_display_parameter": str(row.get("default_display_parameter") or "").strip(),
+                    "displayed_parameter": str(row.get("displayed_parameter") or "").strip(),
+                    "preferred_units": str(row.get("preferred_units") or "").strip(),
+                    "default_preferred_units": str(row.get("default_preferred_units") or "").strip(),
+                    "units": [],
+                    "status_text": status_text,
+                    "edited": False,
+                    "source_run_names": [],
+                    "surfaces": [],
+                    "run_names": [],
+                    "source_count": 0,
+                    "program_count": 0,
+                }
+                grouped_rows[group_key] = display_row
+            else:
+                cast(list[tuple[str, str, str, str]], display_row["_row_keys"]).append(row_key)
+            program_title = str(row.get("program_title") or "").strip()
+            if program_title:
+                cast(set[str], display_row["_program_titles_set"]).add(program_title)
+            for value in units:
+                if str(value).strip():
+                    cast(set[str], display_row["_units_set"]).add(str(value).strip())
+            for value in (inventory_row.get("source_run_names") or []):
+                text = str(value).strip()
+                if text:
+                    cast(set[str], display_row["_source_run_names_set"]).add(text)
+            for value in (inventory_row.get("surfaces") or []):
+                text = str(value).strip()
+                if text:
+                    cast(set[str], display_row["_surfaces_set"]).add(text)
+            for value in (inventory_row.get("run_names") or []):
+                text = str(value).strip()
+                if text:
+                    cast(set[str], display_row["_run_names_set"]).add(text)
+            cast(set[str], display_row["_status_values"]).add(status_text)
+            display_row["edited"] = bool(display_row.get("edited")) or status_text == "Edited"
+            display_row["source_count"] = int(display_row.get("source_count") or 0) + source_count
+
+        rows: list[dict[str, object]] = []
+        for display_row in grouped_rows.values():
+            program_titles = sorted(cast(set[str], display_row.pop("_program_titles_set", set())), key=str.casefold)
+            units = sorted(cast(set[str], display_row.pop("_units_set", set())), key=str.casefold)
+            source_run_names = sorted(cast(set[str], display_row.pop("_source_run_names_set", set())), key=str.casefold)
+            surfaces = sorted(cast(set[str], display_row.pop("_surfaces_set", set())), key=str.casefold)
+            run_names = sorted(cast(set[str], display_row.pop("_run_names_set", set())), key=str.casefold)
+            status_values = cast(set[str], display_row.pop("_status_values", set()))
+            status_text = "Mixed"
+            if "Edited" in status_values:
+                status_text = "Edited"
+            elif len(status_values) == 1:
+                status_text = next(iter(status_values))
+            elif not status_values:
+                status_text = "Default"
+            display_row["program_titles"] = program_titles
+            display_row["program_title"] = ", ".join(program_titles)
+            display_row["units"] = units
+            display_row["source_run_names"] = source_run_names
+            display_row["surfaces"] = surfaces
+            display_row["run_names"] = run_names
+            display_row["status_text"] = status_text
+            display_row["program_count"] = len(program_titles)
             search_blob = "\n".join(
                 [
                     str(display_row.get("program_title") or ""),
@@ -3095,6 +3201,15 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
             if search and search not in search_blob:
                 continue
             rows.append(display_row)
+        rows.sort(
+            key=lambda item: (
+                str(item.get("program_title") or "").casefold(),
+                str(item.get("asset_type") or "").casefold(),
+                str(item.get("asset_specific_type") or "").casefold(),
+                str(item.get("ingested_parameter") or "").casefold(),
+                str(item.get("displayed_parameter") or "").casefold(),
+            )
+        )
         self._display_rows = rows
         self._table_refreshing = True
         try:
@@ -3112,17 +3227,18 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
                 ]
                 for col_idx, value in enumerate(values):
                     item = QtWidgets.QTableWidgetItem(value)
-                    item.setData(QtCore.Qt.ItemDataRole.UserRole, row.get("_key"))
+                    item.setData(QtCore.Qt.ItemDataRole.UserRole, row.get("_row_keys"))
                     tooltip_lines = [
-                        f"Program: {str(row.get('program_title') or '').strip() or '-'}",
+                        f"Programs: {str(row.get('program_title') or '').strip() or '-'}",
                         f"Asset: {str(row.get('asset_type') or '').strip() or '-'}",
                         f"Specific: {str(row.get('asset_specific_type') or '').strip() or '-'}",
                         f"Ingested: {str(row.get('ingested_parameter') or '').strip()}",
                         f"Default Display: {str(row.get('default_display_parameter') or '').strip()}",
                         f"Displayed: {str(row.get('displayed_parameter') or '').strip()}",
+                        f"Member Rows: {len(self._coerce_row_keys(row.get('_row_keys')))}",
                     ]
                     item.setToolTip("\n".join(tooltip_lines))
-                    if col_idx == self.COL_DISPLAYED:
+                    if col_idx in (self.COL_DISPLAYED, self.COL_UNITS):
                         item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsEditable)
                     else:
                         item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
@@ -3130,6 +3246,7 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
             try:
                 self.tbl.resizeColumnsToContents()
                 self.tbl.horizontalHeader().setSectionResizeMode(self.COL_DISPLAYED, QtWidgets.QHeaderView.ResizeMode.Stretch)
+                self.tbl.horizontalHeader().setSectionResizeMode(self.COL_UNITS, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
                 self.tbl.horizontalHeader().setSectionResizeMode(self.COL_STATUS, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
             except Exception:
                 pass
@@ -3139,7 +3256,7 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
             self.tbl.clearSelection()
             wanted = {key for key in wanted_keys}
             for row_idx, row in enumerate(self._display_rows):
-                if row.get("_key") in wanted:
+                if any(key in wanted for key in self._coerce_row_keys(row.get("_row_keys"))):
                     self.tbl.selectRow(row_idx)
         self._sync_selection()
 
@@ -3148,25 +3265,27 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
         count = len(rows)
         edited_count = len([row for row in self._working_rows if self._status_text(row).lower() == "edited"])
         self.lbl_summary.setText(
-            f"Rows: {len(self._working_rows)} | Edited: {edited_count} | Selected: {count}"
+            f"Rows: {len(self._display_rows)} | Source Rows: {len(self._working_rows)} | Edited: {edited_count} | Selected: {count}"
         )
         if not rows:
             self.detail.setPlainText(
-                "Select one or more parameter rows to inspect their program/asset scope, ingested name, and displayed parameter."
+                "Select one or more parameter rows to inspect their program scope, ingested name, displayed parameter, and units."
             )
         elif count == 1:
             row = rows[0]
             lines = [
-                f"Program: {str(row.get('program_title') or '').strip() or '-'}",
+                f"Programs: {str(row.get('program_title') or '').strip() or '-'}",
                 f"Asset: {str(row.get('asset_type') or '').strip() or '-'}",
                 f"Specific: {str(row.get('asset_specific_type') or '').strip() or '-'}",
                 f"Ingested Parameter: {str(row.get('ingested_parameter') or '').strip()}",
                 f"Default Display: {str(row.get('default_display_parameter') or '').strip() or '-'}",
                 f"Displayed Parameter: {str(row.get('displayed_parameter') or '').strip() or '-'}",
+                f"Preferred Units: {str(row.get('preferred_units') or '').strip() or '-'}",
                 f"Units: {', '.join([str(value).strip() for value in (row.get('units') or []) if str(value).strip()]) or '-'}",
                 f"Surfaces: {', '.join([str(value).strip() for value in (row.get('surfaces') or []) if str(value).strip()]) or '-'}",
                 f"Source Runs: {', '.join([str(value).strip() for value in (row.get('source_run_names') or []) if str(value).strip()][:12]) or '-'}",
                 f"Observed Sources: {int(row.get('source_count') or 0)}",
+                f"Member Rows: {len(self._coerce_row_keys(row.get('_row_keys')))}",
                 f"Status: {str(row.get('status_text') or '').strip() or '-'}",
             ]
             self.detail.setPlainText("\n".join(lines))
@@ -3184,30 +3303,39 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
                 "\n".join(
                     [
                         f"Selected Rows: {len(rows)}",
+                        f"Programs: {', '.join(sorted({str(value).strip() for row in rows for value in (row.get('program_titles') or []) if str(value).strip()}, key=str.casefold)) or '-'}",
                         f"Ingested Parameters: {', '.join(ingested)}",
                         f"Displayed Parameters: {', '.join(displayed) or '-'}",
-                        "Use Set Display to assign the same displayed parameter to every selected row.",
+                        "Use Set Display or Set Units to apply the same values to every selected member row.",
                     ]
                 )
             )
         self.btn_set_display.setEnabled(count >= 1)
+        self.btn_set_units.setEnabled(count >= 1)
         self.btn_reset.setEnabled(count >= 1)
 
     def _reload_context(self, *, select_keys: Sequence[tuple[str, str, str, str]] | None = None) -> None:
-        builder = getattr(be, "td_build_parameter_normalization_context", None)
-        if callable(builder):
-            override = self._working_override_normalization()
-            self._context = dict(
-                builder(
-                    self._project_dir,
-                    self._workbook_path,
-                    self._db_path,
-                    normalization_override=override,
+        override = self._working_override_normalization()
+        self._context = {}
+        if override is None:
+            loader = getattr(be, "td_load_parameter_runtime_context", None)
+            if callable(loader):
+                try:
+                    self._context = dict(loader(self._project_dir, self._db_path) or {})
+                except Exception:
+                    self._context = {}
+        if not self._context:
+            builder = getattr(be, "td_build_parameter_normalization_context", None)
+            if callable(builder):
+                self._context = dict(
+                    builder(
+                        self._project_dir,
+                        self._workbook_path,
+                        self._db_path,
+                        normalization_override=override,
+                    )
+                    or {}
                 )
-                or {}
-            )
-        else:
-            self._context = {}
         repo_rows = [
             self._normalize_row(item)
             for item in (self._context.get("repo_parameter_rows") or [])
@@ -3218,12 +3346,20 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
         self._working_rows = self._merge_rows(self._working_rows or repo_rows, discovered_rows)
         self._refresh_table(select_keys=select_keys)
 
-    def _prompt_display_name(self, *, title: str, prompt: str, default: str) -> str | None:
+    def _prompt_text(self, *, title: str, prompt: str, default: str, allow_empty: bool = False) -> str | None:
         text, ok = QtWidgets.QInputDialog.getText(self, title, prompt, text=str(default or "").strip())
         if not ok:
             return None
         clean = str(text or "").strip()
+        if allow_empty:
+            return clean
         return clean or None
+
+    def _prompt_display_name(self, *, title: str, prompt: str, default: str) -> str | None:
+        return self._prompt_text(title=title, prompt=prompt, default=default, allow_empty=False)
+
+    def _prompt_units(self, *, title: str, prompt: str, default: str) -> str | None:
+        return self._prompt_text(title=title, prompt=prompt, default=default, allow_empty=True)
 
     def _apply_display_value(
         self,
@@ -3243,16 +3379,57 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
             key = self._row_key(row)
             if key in wanted:
                 default_display = str(row.get("default_display_parameter") or row.get("ingested_parameter") or "").strip()
+                default_units = str(row.get("default_preferred_units") or "").strip()
+                current_units = str(row.get("preferred_units") or "").strip()
                 next_display = default_display if reset else str(display_name or "").strip()
                 if not next_display:
                     next_display = default_display
-                edited = self._norm_name(next_display) != self._norm_name(default_display)
+                edited = (
+                    self._norm_name(next_display) != self._norm_name(default_display)
+                    or self._norm_name(current_units) != self._norm_name(default_units)
+                )
                 if (
                     str(row.get("displayed_parameter") or "").strip() != next_display
                     or bool(row.get("edited")) != edited
                 ):
                     changed = True
                 row["displayed_parameter"] = next_display
+                row["edited"] = edited
+                row["updated_at"] = timestamp if edited else ""
+            updated_rows.append(row)
+        if not changed:
+            return
+        self._working_rows = self._sorted_rows(updated_rows)
+        self._set_dirty(True)
+        self._refresh_table(select_keys=list(wanted))
+
+    def _apply_units_value(
+        self,
+        *,
+        row_keys: Sequence[tuple[str, str, str, str]],
+        units_text: str,
+    ) -> None:
+        wanted = {tuple(key) for key in row_keys if isinstance(key, tuple) and len(key) == 4}
+        if not wanted:
+            return
+        updated_rows: list[dict[str, object]] = []
+        changed = False
+        timestamp = self._timestamp_text()
+        for raw_row in self._working_rows:
+            row = self._normalize_row(raw_row)
+            key = self._row_key(row)
+            if key in wanted:
+                next_units = str(units_text or "").strip()
+                default_display = str(row.get("default_display_parameter") or row.get("ingested_parameter") or "").strip()
+                default_units = str(row.get("default_preferred_units") or "").strip()
+                displayed = str(row.get("displayed_parameter") or default_display).strip() or default_display
+                edited = (
+                    self._norm_name(displayed) != self._norm_name(default_display)
+                    or self._norm_name(next_units) != self._norm_name(default_units)
+                )
+                if str(row.get("preferred_units") or "").strip() != next_units or bool(row.get("edited")) != edited:
+                    changed = True
+                row["preferred_units"] = next_units
                 row["edited"] = edited
                 row["updated_at"] = timestamp if edited else ""
             updated_rows.append(row)
@@ -3279,9 +3456,32 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
         if not display_name:
             return
         self._apply_display_value(
-            row_keys=[row.get("_key") for row in rows if isinstance(row.get("_key"), tuple)],
+            row_keys=[
+                key
+                for row in rows
+                for key in self._coerce_row_keys(row.get("_row_keys"))
+            ],
             display_name=display_name,
         )
+
+    def _act_set_units(self) -> None:
+        rows = self._selected_rows()
+        if not rows:
+            return
+        default_units = str(rows[0].get("preferred_units") or "").strip()
+        units_text = self._prompt_units(
+            title="Set Units",
+            prompt="Preferred units (leave blank to clear):",
+            default=default_units,
+        )
+        if units_text is None:
+            return
+        row_keys = [
+            key
+            for row in rows
+            for key in self._coerce_row_keys(row.get("_row_keys"))
+        ]
+        self._apply_units_value(row_keys=row_keys, units_text=units_text)
 
     def _act_reset_rows(self) -> None:
         rows = self._selected_rows()
@@ -3295,18 +3495,26 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
         if answer != QtWidgets.QMessageBox.StandardButton.Yes:
             return
         self._apply_display_value(
-            row_keys=[row.get("_key") for row in rows if isinstance(row.get("_key"), tuple)],
+            row_keys=[
+                key
+                for row in rows
+                for key in self._coerce_row_keys(row.get("_row_keys"))
+            ],
             reset=True,
         )
 
     def _on_item_changed(self, item: QtWidgets.QTableWidgetItem) -> None:
-        if self._table_refreshing or item is None or item.column() != self.COL_DISPLAYED:
+        if self._table_refreshing or item is None or item.column() not in (self.COL_DISPLAYED, self.COL_UNITS):
             return
-        key = self._coerce_row_key(item.data(QtCore.Qt.ItemDataRole.UserRole))
-        if key is None:
+        row_keys = self._coerce_row_keys(item.data(QtCore.Qt.ItemDataRole.UserRole))
+        if not row_keys:
             return
-        display_name = str(item.text() or "").strip()
-        self._apply_display_value(row_keys=[key], display_name=display_name)
+        if item.column() == self.COL_DISPLAYED:
+            display_name = str(item.text() or "").strip()
+            self._apply_display_value(row_keys=row_keys, display_name=display_name)
+            return
+        units_text = str(item.text() or "").strip()
+        self._apply_units_value(row_keys=row_keys, units_text=units_text)
 
     def _act_save(self) -> None:
         self._set_save_busy(True)

@@ -3742,6 +3742,119 @@ def _td_parameter_display_name_for_group(
     return str(fallback or "").strip()
 
 
+_TD_PARAMETER_SIMILARITY_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "at",
+    "for",
+    "in",
+    "of",
+    "on",
+    "the",
+    "to",
+}
+
+
+def _td_parameter_similarity_tokens(value: object) -> list[str]:
+    tokens = _td_parameter_tokens(value)
+    filtered = [token for token in tokens if token not in _TD_PARAMETER_SIMILARITY_STOPWORDS]
+    return filtered or tokens
+
+
+def _td_parameter_names_similar(lhs: object, rhs: object) -> bool:
+    lhs_text = str(lhs or "").strip()
+    rhs_text = str(rhs or "").strip()
+    lhs_norm = _td_param_norm_name(lhs_text)
+    rhs_norm = _td_param_norm_name(rhs_text)
+    if not lhs_norm or not rhs_norm:
+        return False
+    if lhs_norm == rhs_norm:
+        return True
+    lhs_tokens = _td_parameter_similarity_tokens(lhs_text)
+    rhs_tokens = _td_parameter_similarity_tokens(rhs_text)
+    if not lhs_tokens or not rhs_tokens:
+        return SequenceMatcher(None, lhs_norm, rhs_norm).ratio() >= 0.9
+    lhs_digits = [token for token in lhs_tokens if token.isdigit()]
+    rhs_digits = [token for token in rhs_tokens if token.isdigit()]
+    if lhs_digits and rhs_digits and lhs_digits != rhs_digits:
+        return False
+    lhs_set = set(lhs_tokens)
+    rhs_set = set(rhs_tokens)
+    overlap = len(lhs_set & rhs_set)
+    min_count = min(len(lhs_set), len(rhs_set))
+    raw_ratio = SequenceMatcher(None, lhs_norm, rhs_norm).ratio()
+    token_ratio = SequenceMatcher(None, "".join(lhs_tokens), "".join(rhs_tokens)).ratio()
+    best_ratio = max(raw_ratio, token_ratio)
+    if min_count and overlap >= max(1, min_count - 1):
+        return True
+    if best_ratio >= 0.9:
+        return True
+    return bool(
+        lhs_digits == rhs_digits
+        and lhs_digits
+        and overlap >= max(1, min_count - 2)
+        and best_ratio >= 0.82
+    )
+
+
+def _td_parameter_display_candidate_sort_key(
+    display_name: object,
+    *,
+    units: object = "",
+) -> tuple[int, int, int, int, int]:
+    text = str(display_name or "").strip()
+    tokens = _td_parameter_similarity_tokens(text)
+    alpha_words = sum(1 for token in tokens if token.isalpha() and len(token) >= 3)
+    score = 0
+    if str(units or "").strip():
+        score += 10
+    if " " in text:
+        score += 4
+    if "/" in text:
+        score += 2
+    if "(" in text or ")" in text:
+        score += 1
+    if alpha_words >= 2:
+        score += 1
+    score += min(len(tokens), 4)
+    score -= text.count("_") * 2
+    score -= text.count("-")
+    if text.isupper() and any(ch.isalpha() for ch in text):
+        score -= 1
+    return (
+        score,
+        len(set(tokens)),
+        len(text),
+        -text.count("_"),
+        -text.count("-"),
+    )
+
+
+def _td_parameter_config_candidates_from_defs(
+    param_defs: Sequence[Mapping[str, object]] | None,
+) -> list[dict[str, object]]:
+    out: list[dict[str, object]] = []
+    for column in (param_defs or []):
+        if not isinstance(column, Mapping):
+            continue
+        display_name = str(column.get("name") or "").strip()
+        if not display_name:
+            continue
+        aliases = [display_name]
+        aliases.extend(
+            [str(value).strip() for value in (column.get("aliases") or []) if str(value).strip()]
+        )
+        out.append(
+            {
+                "display_name": display_name,
+                "units": str(column.get("units") or "").strip(),
+                "aliases": aliases,
+            }
+        )
+    return out
+
+
 def _td_normalize_parameter_normalization(raw: object) -> dict[str, object]:
     payload = raw if isinstance(raw, Mapping) else {}
     groups_raw = payload.get("groups") if isinstance(payload.get("groups"), list) else []
@@ -4157,25 +4270,7 @@ def _td_parameter_config_candidates(workbook_path: Path | None) -> list[dict[str
         project_cfg = _load_project_td_trend_config(wb_path)
     except Exception:
         return []
-    out: list[dict[str, object]] = []
-    for column in (project_cfg.get("columns") or []):
-        if not isinstance(column, Mapping):
-            continue
-        display_name = str(column.get("name") or "").strip()
-        if not display_name:
-            continue
-        aliases = [display_name]
-        aliases.extend(
-            [str(value).strip() for value in (column.get("aliases") or []) if str(value).strip()]
-        )
-        out.append(
-            {
-                "display_name": display_name,
-                "units": str(column.get("units") or "").strip(),
-                "aliases": aliases,
-            }
-        )
-    return out
+    return _td_parameter_config_candidates_from_defs(project_cfg.get("columns") or [])
 
 
 def _td_parameter_inventory_suggestion(
@@ -5043,6 +5138,7 @@ def _td_build_parameter_context_from_discovery_rows(
         asset_type = str(row.get("asset_type") or "").strip()
         asset_specific_type = str(row.get("asset_specific_type") or "").strip()
         mapping_rule = dict(row.get("mapping_rule") or {})
+        units_sorted = sorted(cast(set[str], row.get("_units") or set()), key=str.casefold)
         canonical_id = _td_effective_parameter_canonical(
             normalized,
             raw_name,
@@ -5054,7 +5150,7 @@ def _td_build_parameter_context_from_discovery_rows(
         canonical_ids = [canonical_id] if canonical_id else []
         suggestion = _td_parameter_inventory_suggestion(
             raw_name,
-            units=sorted(cast(set[str], row.get("_units") or set()), key=str.casefold),
+            units=units_sorted,
             config_candidates=config_candidates,
         )
         primary_canonical_id = canonical_id or _td_parameter_implicit_canonical_id(raw_name)
@@ -5063,6 +5159,13 @@ def _td_build_parameter_context_from_discovery_rows(
             status = "edited" if bool(mapping_rule.get("edited")) else "default"
         elif suggestion:
             status = "suggested"
+        preferred_units = str(
+            mapping_rule.get("preferred_units")
+            or suggestion.get("preferred_units")
+            or ""
+        ).strip()
+        if not preferred_units and len(units_sorted) == 1:
+            preferred_units = units_sorted[0]
         display_name = _td_effective_parameter_display(
             normalized,
             raw_name,
@@ -5075,7 +5178,7 @@ def _td_build_parameter_context_from_discovery_rows(
             {
                 "raw_name": raw_name,
                 "raw_norm": str(row.get("raw_norm") or "").strip(),
-                "units": sorted(cast(set[str], row.get("_units") or set()), key=str.casefold),
+                "units": units_sorted,
                 "program_title": program_title,
                 "program_titles": [program_title] if program_title else [],
                 "asset_type": asset_type,
@@ -5087,6 +5190,8 @@ def _td_build_parameter_context_from_discovery_rows(
                 "canonical_display": display_name,
                 "default_display_parameter": str(row.get("default_display_parameter") or raw_name).strip(),
                 "displayed_parameter": display_name,
+                "preferred_units": preferred_units,
+                "default_preferred_units": preferred_units,
                 "primary_canonical_id": primary_canonical_id,
                 "status": status,
                 "edited": bool(mapping_rule.get("edited")),
@@ -5117,6 +5222,154 @@ def _td_build_parameter_context_from_discovery_rows(
         },
         "config_candidates": config_candidates,
     }
+
+
+def _td_build_runtime_inventory_from_entries(
+    normalization: Mapping[str, object] | None,
+    entries: Sequence[Mapping[str, object]] | None,
+    *,
+    canonical_groups: Mapping[str, Mapping[str, object]] | None = None,
+) -> list[dict[str, object]]:
+    normalized = _td_normalize_parameter_normalization(normalization)
+    groups_by_id = {
+        str(key): dict(value)
+        for key, value in dict(canonical_groups or {}).items()
+        if str(key).strip() and isinstance(value, Mapping)
+    }
+    inventory_acc: dict[tuple[str, str, str, str], dict[str, object]] = {}
+    for entry in (entries or []):
+        if not isinstance(entry, Mapping):
+            continue
+        raw_name = str(entry.get("raw_name") or "").strip()
+        raw_norm = str(entry.get("raw_norm") or _td_param_norm_name(raw_name)).strip()
+        if not raw_name or not raw_norm:
+            continue
+        program_title = str(entry.get("program_title") or "").strip()
+        asset_type = _td_program_parameter_scope_text(entry.get("asset_type"))
+        asset_specific_type = _td_program_parameter_scope_text(entry.get("asset_specific_type"))
+        row_key = (
+            raw_norm,
+            _td_param_norm_program(program_title),
+            _td_param_norm_program(asset_type),
+            _td_param_norm_program(asset_specific_type),
+        )
+        row = inventory_acc.get(row_key)
+        if row is None:
+            row = {
+                "raw_name": raw_name,
+                "raw_norm": raw_norm,
+                "program_title": program_title,
+                "asset_type": asset_type,
+                "asset_specific_type": asset_specific_type,
+                "default_display_parameter": str(entry.get("default_display_parameter") or raw_name).strip() or raw_name,
+                "_units": set(),
+                "_source_run_names": set(),
+                "_surfaces": set(),
+                "_run_names": set(),
+                "_source_keys": set(),
+                "_canonical_ids": set(),
+            }
+            inventory_acc[row_key] = row
+        units_text = str(entry.get("units") or "").strip()
+        if units_text:
+            cast(set[str], row["_units"]).add(units_text)
+        source_run_name = str(entry.get("source_run_name") or "").strip()
+        if source_run_name:
+            cast(set[str], row["_source_run_names"]).add(source_run_name)
+        surface_text = str(entry.get("surface") or "").strip().lower()
+        if surface_text:
+            cast(set[str], row["_surfaces"]).add(surface_text)
+        run_name = str(entry.get("run_name") or "").strip()
+        if run_name:
+            cast(set[str], row["_run_names"]).add(run_name)
+        source_key = str(entry.get("source_key") or "").strip()
+        if source_key:
+            cast(set[str], row["_source_keys"]).add(source_key)
+        canonical_id = str(entry.get("canonical_id") or "").strip()
+        if canonical_id:
+            cast(set[str], row["_canonical_ids"]).add(canonical_id)
+
+    inventory: list[dict[str, object]] = []
+    for row in sorted(
+        inventory_acc.values(),
+        key=lambda item: (
+            str(item.get("program_title") or "").casefold(),
+            str(item.get("asset_type") or "").casefold(),
+            str(item.get("asset_specific_type") or "").casefold(),
+            str(item.get("raw_name") or "").casefold(),
+        ),
+    ):
+        raw_name = str(row.get("raw_name") or "").strip()
+        program_title = str(row.get("program_title") or "").strip()
+        asset_type = str(row.get("asset_type") or "").strip()
+        asset_specific_type = str(row.get("asset_specific_type") or "").strip()
+        units_sorted = sorted(cast(set[str], row.get("_units") or set()), key=str.casefold)
+        mapping_rule = _td_find_parameter_mapping_rule(
+            normalized,
+            raw_name,
+            program_title=program_title,
+            asset_type=asset_type,
+            asset_specific_type=asset_specific_type,
+        )
+        canonical_ids = sorted(cast(set[str], row.get("_canonical_ids") or set()), key=str.casefold)
+        primary_canonical_id = (
+            canonical_ids[0]
+            if canonical_ids
+            else _td_effective_parameter_canonical(
+                normalized,
+                raw_name,
+                program_title,
+                asset_type,
+                asset_specific_type,
+                fallback_display=row.get("default_display_parameter") or raw_name,
+            )
+        )
+        group = dict(groups_by_id.get(primary_canonical_id) or {})
+        status = "implicit"
+        if mapping_rule:
+            status = "edited" if bool(mapping_rule.get("edited")) else "default"
+        preferred_units = str(
+            mapping_rule.get("preferred_units")
+            or group.get("preferred_units")
+            or ""
+        ).strip()
+        if not preferred_units and len(units_sorted) == 1:
+            preferred_units = units_sorted[0]
+        display_name = _td_effective_parameter_display(
+            normalized,
+            raw_name,
+            program_title=program_title,
+            asset_type=asset_type,
+            asset_specific_type=asset_specific_type,
+            fallback_display=row.get("default_display_parameter") or group.get("display_name") or raw_name,
+        )
+        inventory.append(
+            {
+                "raw_name": raw_name,
+                "raw_norm": str(row.get("raw_norm") or "").strip(),
+                "units": units_sorted,
+                "program_title": program_title,
+                "program_titles": [program_title] if program_title else [],
+                "asset_type": asset_type,
+                "asset_specific_type": asset_specific_type,
+                "source_run_names": sorted(cast(set[str], row.get("_source_run_names") or set()), key=str.casefold),
+                "surfaces": sorted(cast(set[str], row.get("_surfaces") or set()), key=str.casefold),
+                "run_names": sorted(cast(set[str], row.get("_run_names") or set()), key=str.casefold),
+                "canonical_ids": canonical_ids or [primary_canonical_id],
+                "canonical_display": display_name,
+                "default_display_parameter": str(row.get("default_display_parameter") or raw_name).strip() or raw_name,
+                "displayed_parameter": display_name,
+                "preferred_units": preferred_units,
+                "default_preferred_units": preferred_units,
+                "primary_canonical_id": primary_canonical_id,
+                "status": status,
+                "edited": bool(mapping_rule.get("edited")),
+                "suggestion": {},
+                "source_count": len(cast(set[str], row.get("_source_keys") or set())) or len(cast(set[str], row.get("_source_run_names") or set())),
+                "program_count": 1 if program_title else 0,
+            }
+        )
+    return inventory
 
 
 def rebuild_td_parameter_discovery_cache(
@@ -5424,7 +5677,7 @@ def td_load_parameter_runtime_context(project_dir: Path, db_path: Path) -> dict[
     impl_db = Path(db_path).expanduser()
     if not impl_db.exists():
         return {}
-    with sqlite3.connect(str(impl_db)) as conn:
+    with closing(sqlite3.connect(str(impl_db))) as conn:
         if not _td_parameter_runtime_tables_ready(conn, require_rows=True):
             return {}
         group_rows = conn.execute(
@@ -5468,6 +5721,25 @@ def td_load_parameter_runtime_context(project_dir: Path, db_path: Path) -> dict[
                 explicit
             FROM {TD_PARAM_RUNTIME_GROUPS_TABLE}
             ORDER BY canonical_id
+            """
+        ).fetchall()
+        entry_rows = conn.execute(
+            f"""
+            SELECT
+                surface,
+                run_name,
+                raw_name,
+                raw_norm,
+                COALESCE(units, ''),
+                COALESCE(program_title, ''),
+                COALESCE(asset_type, ''),
+                COALESCE(asset_specific_type, ''),
+                COALESCE(source_run_name, ''),
+                COALESCE(source_key, ''),
+                COALESCE(canonical_id, ''),
+                COALESCE(default_display_parameter, '')
+            FROM {TD_PARAM_RUNTIME_ENTRIES_TABLE}
+            ORDER BY surface, run_name, raw_name, program_title, asset_type, asset_specific_type, source_run_name
             """
         ).fetchall()
     normalization_groups = [
@@ -5562,17 +5834,62 @@ def td_load_parameter_runtime_context(project_dir: Path, db_path: Path) -> dict[
             "unit_conflict": bool(unit_conflict),
             "explicit": bool(explicit),
         }
+    entries = [
+        {
+            "surface": str(surface or "").strip().lower(),
+            "run_name": str(run_name or "").strip(),
+            "raw_name": str(raw_name or "").strip(),
+            "raw_norm": str(raw_norm or _td_param_norm_name(raw_name)).strip(),
+            "units": str(units or "").strip(),
+            "program_title": str(program_title or "").strip(),
+            "program_norm": _td_param_norm_program(program_title),
+            "asset_type": str(asset_type or "").strip(),
+            "asset_specific_type": str(asset_specific_type or "").strip(),
+            "source_run_name": str(source_run_name or "").strip(),
+            "source_key": str(source_key or "").strip(),
+            "canonical_id": str(canonical_id or "").strip(),
+            "default_display_parameter": str(default_display_parameter or "").strip(),
+        }
+        for (
+            surface,
+            run_name,
+            raw_name,
+            raw_norm,
+            units,
+            program_title,
+            asset_type,
+            asset_specific_type,
+            source_run_name,
+            source_key,
+            canonical_id,
+            default_display_parameter,
+        ) in entry_rows
+        if str(raw_name or "").strip()
+    ]
+    normalization = _td_normalize_parameter_normalization(
+        {
+            "version": TD_PARAMETER_NORMALIZATION_VERSION,
+            "groups": normalization_groups,
+            "mappings": normalization_rules,
+        }
+    )
+    inventory = _td_build_runtime_inventory_from_entries(
+        normalization,
+        entries,
+        canonical_groups=canonical_groups,
+    )
     return {
         "project_dir": str(proj_dir),
         "db_path": str(impl_db),
         "runtime_mode": "db",
-        "normalization": _td_normalize_parameter_normalization(
-            {
-                "version": TD_PARAMETER_NORMALIZATION_VERSION,
-                "groups": normalization_groups,
-                "mappings": normalization_rules,
-            }
-        ),
+        "normalization": normalization,
+        "entries": entries,
+        "inventory": inventory,
+        "inventory_by_raw_norm": {
+            str(row.get("raw_norm") or "").strip(): dict(row)
+            for row in inventory
+            if isinstance(row, Mapping) and str(row.get("raw_norm") or "").strip()
+        },
         "canonical_groups": canonical_groups,
     }
 
@@ -9338,6 +9655,12 @@ def _td_program_parameter_mapping_normalize(
         "default_display_parameter": default_display,
         "displayed_parameter": displayed_parameter,
         "preferred_units": str(raw.get("preferred_units") or raw.get("units") or "").strip(),
+        "default_preferred_units": str(
+            raw.get("default_preferred_units")
+            or raw.get("preferred_units_default")
+            or raw.get("default_units")
+            or ""
+        ).strip(),
         "edited": bool(edited),
         "updated_at": str(raw.get("updated_at") or "").strip(),
     }
@@ -9396,6 +9719,11 @@ def _td_program_parameter_merge_rows(
         merged = dict(discovered)
         if existing:
             merged["preferred_units"] = str(existing.get("preferred_units") or merged.get("preferred_units") or "").strip()
+            merged["default_preferred_units"] = str(
+                existing.get("default_preferred_units")
+                or merged.get("default_preferred_units")
+                or ""
+            ).strip()
             existing_edited = bool(existing.get("edited"))
             existing_display = str(existing.get("displayed_parameter") or "").strip()
             existing_default = str(existing.get("default_display_parameter") or "").strip()
@@ -9717,6 +10045,136 @@ def _td_source_sqlite_column_specs(
     return out
 
 
+def _td_autonormalize_parameter_mapping_rows(
+    rows: Sequence[Mapping[str, object]] | None,
+    *,
+    config_candidates: Sequence[Mapping[str, object]] | None = None,
+) -> list[dict[str, object]]:
+    normalized_rows: list[dict[str, object]] = []
+    for row in (rows or []):
+        normalized = _td_program_parameter_mapping_normalize(row)
+        if normalized:
+            normalized_rows.append(normalized)
+    if len(normalized_rows) <= 1:
+        return sorted(normalized_rows, key=_td_program_parameter_mapping_sort_key)
+
+    scopes: dict[tuple[str, str, str], list[dict[str, object]]] = {}
+    for row in normalized_rows:
+        scope_key = (
+            _td_param_norm_program(row.get("program_title")),
+            _td_param_norm_program(row.get("asset_type")),
+            _td_param_norm_program(row.get("asset_specific_type")),
+        )
+        scopes.setdefault(scope_key, []).append(dict(row))
+
+    out: list[dict[str, object]] = []
+    for scoped_rows in scopes.values():
+        metas: list[dict[str, object]] = []
+        for row in scoped_rows:
+            raw_name = str(row.get("ingested_parameter") or "").strip()
+            candidate_name = str(
+                row.get("default_display_parameter")
+                or row.get("displayed_parameter")
+                or raw_name
+                or ""
+            ).strip()
+            preferred_units = str(row.get("preferred_units") or "").strip()
+            suggestion = _td_parameter_inventory_suggestion(
+                raw_name,
+                units=[preferred_units] if preferred_units else [],
+                config_candidates=config_candidates,
+            )
+            metas.append(
+                {
+                    "row": row,
+                    "raw_name": raw_name,
+                    "candidate_name": candidate_name or raw_name,
+                    "preferred_units": preferred_units,
+                    "suggestion": suggestion,
+                }
+            )
+
+        visited: set[int] = set()
+        for start_idx in range(len(metas)):
+            if start_idx in visited:
+                continue
+            component: list[int] = []
+            queue = [start_idx]
+            visited.add(start_idx)
+            while queue:
+                idx = queue.pop()
+                component.append(idx)
+                lhs = metas[idx]
+                lhs_suggestion = _td_param_norm_name((lhs.get("suggestion") or {}).get("display_name"))
+                lhs_texts = {
+                    str(lhs.get("candidate_name") or "").strip(),
+                    str(lhs.get("raw_name") or "").strip(),
+                }
+                for other_idx, rhs in enumerate(metas):
+                    if other_idx in visited:
+                        continue
+                    rhs_suggestion = _td_param_norm_name((rhs.get("suggestion") or {}).get("display_name"))
+                    same_suggestion = bool(lhs_suggestion and lhs_suggestion == rhs_suggestion)
+                    similar_text = any(
+                        _td_parameter_names_similar(lhs_text, rhs_text)
+                        for lhs_text in lhs_texts
+                        for rhs_text in {
+                            str(rhs.get("candidate_name") or "").strip(),
+                            str(rhs.get("raw_name") or "").strip(),
+                        }
+                        if lhs_text and rhs_text
+                    )
+                    if not same_suggestion and not similar_text:
+                        continue
+                    visited.add(other_idx)
+                    queue.append(other_idx)
+
+            cluster = [metas[idx] for idx in component]
+            suggestion_map = {
+                _td_param_norm_name((meta.get("suggestion") or {}).get("display_name")): dict(meta.get("suggestion") or {})
+                for meta in cluster
+                if _td_param_norm_name((meta.get("suggestion") or {}).get("display_name"))
+            }
+            chosen_display = ""
+            chosen_units = ""
+            if len(suggestion_map) == 1:
+                chosen = next(iter(suggestion_map.values()))
+                chosen_display = str(chosen.get("display_name") or "").strip()
+                chosen_units = str(chosen.get("preferred_units") or "").strip()
+            else:
+                best = max(
+                    cluster,
+                    key=lambda meta: _td_parameter_display_candidate_sort_key(
+                        meta.get("candidate_name"),
+                        units=meta.get("preferred_units"),
+                    ),
+                )
+                chosen_display = str(best.get("candidate_name") or best.get("raw_name") or "").strip()
+                chosen_units = str(best.get("preferred_units") or "").strip()
+            if not chosen_units:
+                cluster_units = sorted(
+                    {
+                        str(meta.get("preferred_units") or "").strip()
+                        for meta in cluster
+                        if str(meta.get("preferred_units") or "").strip()
+                    },
+                    key=str.casefold,
+                )
+                if len(cluster_units) == 1:
+                    chosen_units = cluster_units[0]
+            for meta in cluster:
+                row = dict(meta.get("row") or {})
+                if chosen_display:
+                    row["default_display_parameter"] = chosen_display
+                    if not bool(row.get("edited")):
+                        row["displayed_parameter"] = chosen_display
+                if chosen_units and not str(row.get("preferred_units") or "").strip():
+                    row["preferred_units"] = chosen_units
+                out.append(row)
+
+    return sorted(out, key=_td_program_parameter_mapping_sort_key)
+
+
 def _td_program_requirements_discover_conditions_by_program(
     global_repo: Path | None,
     docs: Sequence[Mapping[str, object]] | None,
@@ -9838,6 +10296,7 @@ def _td_program_requirements_discover_parameter_mappings_by_program(
     param_defs: Sequence[Mapping[str, object]] | None,
 ) -> dict[str, list[dict[str, object]]]:
     repo = Path(global_repo).expanduser() if global_repo is not None else None
+    config_candidates = _td_parameter_config_candidates_from_defs(param_defs)
     rows_by_program: dict[str, dict[tuple[str, str, str, str], dict[str, object]]] = {}
     for doc in docs or []:
         if repo is None or not isinstance(doc, Mapping):
@@ -9941,7 +10400,10 @@ def _td_program_requirements_discover_parameter_mappings_by_program(
         except Exception:
             continue
     return {
-        program_title: sorted(program_rows.values(), key=_td_program_parameter_mapping_sort_key)
+        program_title: _td_autonormalize_parameter_mapping_rows(
+            list(program_rows.values()),
+            config_candidates=config_candidates,
+        )
         for program_title, program_rows in rows_by_program.items()
     }
 
@@ -34337,6 +34799,16 @@ def update_test_data_trending_project_workbook(
                 text = str(warning or "").strip()
                 if text:
                     _td_emit_progress(progress_cb, f"ProgramRequirements warning: {text}")
+            _td_emit_progress(progress_cb, "Refreshing parameter runtime cache after ProgramRequirements sync")
+            t0 = time.perf_counter()
+            final_runtime_payload = refresh_td_parameter_runtime_cache(
+                project_dir,
+                wb_path,
+                db_path,
+                progress_cb=progress_cb,
+            )
+            timings["parameter_runtime_after_program_requirements_s"] = round(time.perf_counter() - t0, 3)
+            cache_sync_payload["parameter_runtime"] = dict(final_runtime_payload)
 
     timings["total_s"] = round(time.perf_counter() - total_started, 3)
     debug_payload = {
