@@ -565,6 +565,12 @@ class TestBackendTdMetricSources(unittest.TestCase):
                 [(1, 1.0, 1.5), (2, 2.0, 4.0)],
             )
 
+    def test_cumulative_impulse_alias_match_accepts_embedded_cum_imp_headers(self) -> None:
+        aliases = backend._td_life_cumulative_impulse_aliases()
+        self.assertTrue(backend._td_life_matches_cumulative_impulse_alias("Main Cum Imp", aliases))
+        self.assertTrue(backend._td_life_matches_cumulative_impulse_alias("seq_cum_imp_total", aliases))
+        self.assertTrue(backend._td_life_matches_cumulative_impulse_alias("thruster cumulative impulse value", aliases))
+
 
 if __name__ == "__main__":
     unittest.main()

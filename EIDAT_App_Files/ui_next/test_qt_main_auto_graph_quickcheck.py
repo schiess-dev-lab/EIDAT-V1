@@ -87,6 +87,137 @@ class TestQtMainAutoGraphQuickcheck(unittest.TestCase):
                 window.close()
                 window.deleteLater()
 
+    def test_open_project_graph_item_uses_auto_graph_file_viewer_for_legacy_graph_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project_dir = root / "project"
+            project_dir.mkdir(parents=True, exist_ok=True)
+            workbook_path = project_dir / "project.xlsx"
+            workbook_path.write_text("", encoding="utf-8")
+            (project_dir / "auto_plots_test_data.json").write_text(
+                json.dumps(
+                    {
+                        "version": 4,
+                        "graph_files": [
+                            {
+                                "id": "legacy",
+                                "name": "Legacy File",
+                                "global_selection": {
+                                    "run_scope": "sequence",
+                                    "selected_selection_ids": [],
+                                    "filters": {
+                                        "programs": [],
+                                        "serials": [],
+                                        "control_periods": [],
+                                        "suppression_voltages": [],
+                                        "valve_voltages": [],
+                                    },
+                                },
+                                "plots": [
+                                    {
+                                        "name": "Pressure Mean",
+                                        "plot_definition": {
+                                            "mode": "metrics",
+                                            "selector_mode": "sequence",
+                                            "selection_id": "sequence:CondA|Program Alpha|Seq-1",
+                                            "stats": ["mean"],
+                                            "y": ["Pressure"],
+                                            "metric_plot_source": "all_sequences",
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            graph_item = next(
+                item
+                for item in be.list_project_graph_items(project_dir, be.EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING)
+                if str(item.get("kind") or "") == "Auto-Graph File"
+            )
+
+            window = self._make_window(project_dir, workbook_path)
+            try:
+                with mock.patch.object(window, "_open_auto_graph_file_viewer") as legacy_viewer_mock, mock.patch.object(
+                    window,
+                    "_open_auto_graph_quickcheck_viewer",
+                ) as quickcheck_viewer_mock:
+                    window._open_project_graph_item(graph_item)
+                legacy_viewer_mock.assert_called_once()
+                quickcheck_viewer_mock.assert_not_called()
+                payload = legacy_viewer_mock.call_args.args[0]
+                self.assertEqual(str(payload.get("name") or ""), "Legacy File")
+                self.assertEqual(
+                    str(((payload.get("plots") or [])[0] or {}).get("plot_definition", {}).get("metric_plot_source") or ""),
+                    "all_sequences",
+                )
+            finally:
+                window.close()
+                window.deleteLater()
+
+    def test_upsert_auto_graph_file_entry_refreshes_linked_pdf(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project_dir = root / "project"
+            project_dir.mkdir(parents=True, exist_ok=True)
+            workbook_path = project_dir / "project.xlsx"
+            workbook_path.write_text("", encoding="utf-8")
+            pdf_path = project_dir / "linked.pdf"
+
+            window = self._make_window(project_dir, workbook_path)
+            try:
+                refreshed_paths: list[str] = []
+                graph_file = {
+                    "id": "graph-1",
+                    "name": "Linked Graph",
+                    "pdf_export_path": str(pdf_path),
+                    "global_selection": {
+                        "run_scope": "sequence",
+                        "selected_selection_ids": [],
+                        "filters": {
+                            "programs": [],
+                            "serials": [],
+                            "control_periods": [],
+                            "suppression_voltages": [],
+                            "valve_voltages": [],
+                        },
+                    },
+                    "track_program_serials": False,
+                    "plots": [
+                        {
+                            "name": "Pressure Mean",
+                            "plot_definition": {
+                                "mode": "metrics",
+                                "selector_mode": "sequence",
+                                "selection_id": "sequence:CondA|Program Alpha|Seq-1",
+                                "stats": ["mean"],
+                                "y": ["Pressure"],
+                            },
+                        }
+                    ],
+                }
+
+                with mock.patch.object(
+                    window,
+                    "_save_auto_graph_file_pdf_to_path",
+                    side_effect=lambda entry, path, **kwargs: (
+                        refreshed_paths.append(str(Path(path).expanduser())),
+                        dict(entry),
+                    )[1],
+                ):
+                    saved = window._upsert_auto_graph_file_entry(graph_file)
+
+                self.assertIsNotNone(saved)
+                self.assertEqual(refreshed_paths, [str(pdf_path)])
+                payload = json.loads((project_dir / "auto_plots_test_data.json").read_text(encoding="utf-8"))
+                self.assertEqual(str((payload.get("graph_files") or [])[0].get("pdf_export_path") or ""), str(pdf_path))
+            finally:
+                window.close()
+                window.deleteLater()
+
 
 if __name__ == "__main__":
     unittest.main()

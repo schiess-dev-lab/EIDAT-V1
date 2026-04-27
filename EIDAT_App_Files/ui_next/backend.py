@@ -6976,6 +6976,14 @@ TD_LIFE_BASE_ALIASES: dict[str, tuple[str, ...]] = {
 
 TD_LIFE_CUMULATIVE_IMPULSE_FUZZY_MIN_RATIO = 0.82
 TD_LIFE_CUMULATIVE_IMPULSE_DISPLAY_NAME = "Cumulative Impulse"
+TD_LIFE_CUMULATIVE_IMPULSE_SUBSTRINGS: tuple[str, ...] = (
+    "cumimp",
+    "cum impulse",
+    "cum_imp",
+    "cumulativeimp",
+    "cumulative impulse",
+    "cumulative_imp",
+)
 
 
 def _td_life_norm_key(value: object) -> str:
@@ -7004,8 +7012,11 @@ def _td_life_matches_cumulative_impulse_alias(
     norm = _td_life_norm_key(text)
     if not norm:
         return False
+    lower_text = text.lower()
     alias_values = [str(alias or "").strip() for alias in aliases if str(alias or "").strip()]
     if any(_td_life_norm_key(alias) == norm for alias in alias_values):
+        return True
+    if any(fragment in norm or fragment in lower_text for fragment in TD_LIFE_CUMULATIVE_IMPULSE_SUBSTRINGS):
         return True
     ratio = max(0.0, min(1.0, float(min_ratio)))
     for alias in alias_values:
@@ -20736,7 +20747,7 @@ def td_load_life_metric_xy(
                 y.sequence_index,
                 COALESCE(y.sequence_label, ''),
                 y.cumulative_impulse,
-                my.value_num,
+                COALESCE(my.value_num, y.value_num),
                 '',
                 COALESCE(NULLIF(y.units, ''), COALESCE(cy.units, '')),
                 y.cumulative_pulses,
@@ -20749,7 +20760,7 @@ def td_load_life_metric_xy(
                 o.suppression_voltage,
                 o.valve_voltage
             FROM {TD_LIFE_METRICS_TABLE} y
-            INNER JOIN td_metrics_calc_sequences my
+            LEFT JOIN td_metrics_calc_sequences my
               ON my.observation_id = y.observation_id
              AND my.serial = y.serial
              AND my.run_name = y.condition_key
@@ -20788,7 +20799,7 @@ def td_load_life_metric_xy(
                 COALESCE(sm.asset_specific_type, ''),
                 x.sequence_index,
                 COALESCE(x.sequence_label, ''),
-                mx.value_num,
+                COALESCE(mx.value_num, x.value_num),
                 x.cumulative_impulse,
                 COALESCE(NULLIF(x.units, ''), COALESCE(cx.units, '')),
                 '',
@@ -20802,7 +20813,7 @@ def td_load_life_metric_xy(
                 o.suppression_voltage,
                 o.valve_voltage
             FROM {TD_LIFE_METRICS_TABLE} x
-            INNER JOIN td_metrics_calc_sequences mx
+            LEFT JOIN td_metrics_calc_sequences mx
               ON mx.observation_id = x.observation_id
              AND mx.serial = x.serial
              AND mx.run_name = x.condition_key
@@ -20841,8 +20852,8 @@ def td_load_life_metric_xy(
                 COALESCE(sm.asset_specific_type, ''),
                 x.sequence_index,
                 COALESCE(x.sequence_label, ''),
-                mx.value_num,
-                my.value_num,
+                COALESCE(mx.value_num, x.value_num),
+                COALESCE(my.value_num, y.value_num),
                 COALESCE(NULLIF(x.units, ''), COALESCE(cx.units, '')),
                 COALESCE(NULLIF(y.units, ''), COALESCE(cy.units, '')),
                 x.cumulative_pulses,
@@ -20860,13 +20871,13 @@ def td_load_life_metric_xy(
              AND y.observation_id = x.observation_id
              AND lower(y.stat) = 'mean'
              AND y.parameter_name = ?
-            INNER JOIN td_metrics_calc_sequences mx
+            LEFT JOIN td_metrics_calc_sequences mx
               ON mx.observation_id = x.observation_id
              AND mx.serial = x.serial
              AND mx.run_name = x.condition_key
              AND mx.column_name = x.parameter_name
              AND lower(mx.stat) = ?
-            INNER JOIN td_metrics_calc_sequences my
+            LEFT JOIN td_metrics_calc_sequences my
               ON my.observation_id = x.observation_id
              AND my.serial = x.serial
              AND my.run_name = x.condition_key
@@ -40400,8 +40411,12 @@ def project_graph_store_path(project_dir: Path, project_type: str) -> Path:
     return proj / "auto_plots.json"
 
 
-def _load_project_graph_store(project_dir: Path, project_type: str) -> dict[str, object]:
-    path = project_graph_store_path(project_dir, project_type)
+def _test_data_legacy_graph_store_path(project_dir: Path) -> Path:
+    return Path(project_dir).expanduser() / "auto_plots_test_data.json"
+
+
+def _load_graph_store_from_path(path: Path) -> dict[str, object]:
+    path = Path(path).expanduser()
     if not path.exists():
         return {"path": path, "kind": "missing", "payload": None, "entries": []}
     try:
@@ -40428,6 +40443,10 @@ def _load_project_graph_store(project_dir: Path, project_type: str) -> dict[str,
                 "entries": [item for item in entries if isinstance(item, Mapping)],
             }
     return {"path": path, "kind": "unknown", "payload": payload, "entries": []}
+
+
+def _load_project_graph_store(project_dir: Path, project_type: str) -> dict[str, object]:
+    return _load_graph_store_from_path(project_graph_store_path(project_dir, project_type))
 
 
 def _write_project_graph_store(store: Mapping[str, object], entries: Sequence[Mapping[str, object]]) -> None:
@@ -40515,6 +40534,49 @@ def _project_graph_definition_items(project_dir: Path, project_type: str) -> lis
     return out
 
 
+def _test_data_legacy_graph_definition_items(project_dir: Path) -> list[dict[str, object]]:
+    store = _load_graph_store_from_path(_test_data_legacy_graph_store_path(project_dir))
+    store_path = Path(store.get("path") or _test_data_legacy_graph_store_path(project_dir)).expanduser()
+    out: list[dict[str, object]] = []
+    for idx, raw_entry in enumerate(store.get("entries") or []):
+        if not isinstance(raw_entry, Mapping):
+            continue
+        graph_key = _project_graph_entry_key(raw_entry, idx)
+        updated_at = str(raw_entry.get("updated_at") or raw_entry.get("saved_at") or "").strip()
+        modified_epoch = 0.0
+        if updated_at:
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+                try:
+                    modified_epoch = datetime.strptime(updated_at, fmt).timestamp()
+                    break
+                except Exception:
+                    continue
+        if not modified_epoch:
+            try:
+                modified_epoch = float(store_path.stat().st_mtime)
+            except Exception:
+                modified_epoch = 0.0
+        plots = raw_entry.get("plots")
+        plot_count = len(plots) if isinstance(plots, list) else 1
+        out.append(
+            {
+                "id": f"graph_definition:legacy_graph_file:{graph_key}",
+                "type": "graph_definition",
+                "kind": "Auto-Graph File",
+                "name": _project_graph_entry_name(raw_entry, idx),
+                "scope": f"{plot_count} plot{'s' if plot_count != 1 else ''}",
+                "location": str(store_path),
+                "path": str(store_path),
+                "allowed_dir": str(store_path.parent),
+                "graph_key": f"legacy_graph_file:{graph_key}",
+                "store_path": str(store_path),
+                "modified_epoch": modified_epoch,
+                "size_bytes": 0,
+            }
+        )
+    return out
+
+
 def _project_graph_pdf_items(project_dir: Path) -> list[dict[str, object]]:
     proj = Path(project_dir).expanduser()
     out: list[dict[str, object]] = []
@@ -40581,6 +40643,7 @@ def list_project_graph_items(project_dir: Path, project_type: str) -> list[dict[
                     "size_bytes": 0,
                 }
             )
+        out.extend(_test_data_legacy_graph_definition_items(project_dir))
         out.extend(_project_graph_pdf_items(project_dir))
         out.sort(
             key=lambda item: (
@@ -40678,6 +40741,28 @@ def rename_project_graph_definition(project_dir: Path, project_type: str, graph_
     if str(project_type or "").strip() == EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING:
         from . import auto_graph_quickcheck as agq  # local import
 
+        legacy_prefix = "legacy_graph_file:"
+        raw_graph_key = str(graph_key or "").strip()
+        if raw_graph_key.startswith(legacy_prefix):
+            legacy_key = raw_graph_key[len(legacy_prefix):]
+            store = _load_graph_store_from_path(_test_data_legacy_graph_store_path(project_dir))
+            entries = [dict(entry) for entry in (store.get("entries") or []) if isinstance(entry, Mapping)]
+            target_idx = -1
+            for idx, entry in enumerate(entries):
+                if _project_graph_entry_matches(entry, idx, legacy_key):
+                    target_idx = idx
+                    break
+            if target_idx < 0:
+                raise RuntimeError("Selected graph definition was not found.")
+            cleaned_name = _safe_windows_path_name(new_name, fallback="Auto-Graph File")
+            entries[target_idx]["name"] = cleaned_name
+            entries[target_idx]["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            _write_project_graph_store(store, entries)
+            return {
+                "graph_key": f"{legacy_prefix}{_project_graph_entry_key(entries[target_idx], target_idx)}",
+                "name": cleaned_name,
+                "store_path": str(store.get("path") or ""),
+            }
         return agq.rename_auto_graph_quickcheck_pack(project_dir, graph_key, _safe_windows_path_name(new_name, fallback="Quick-Check Pack"))
     store = _load_project_graph_store(project_dir, project_type)
     entries = [dict(entry) for entry in (store.get("entries") or []) if isinstance(entry, Mapping)]
@@ -40703,6 +40788,27 @@ def delete_project_graph_definition(project_dir: Path, project_type: str, graph_
     if str(project_type or "").strip() == EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING:
         from . import auto_graph_quickcheck as agq  # local import
 
+        legacy_prefix = "legacy_graph_file:"
+        raw_graph_key = str(graph_key or "").strip()
+        if raw_graph_key.startswith(legacy_prefix):
+            legacy_key = raw_graph_key[len(legacy_prefix):]
+            store = _load_graph_store_from_path(_test_data_legacy_graph_store_path(project_dir))
+            entries = [dict(entry) for entry in (store.get("entries") or []) if isinstance(entry, Mapping)]
+            kept: list[dict[str, object]] = []
+            deleted = False
+            for idx, entry in enumerate(entries):
+                if _project_graph_entry_matches(entry, idx, legacy_key):
+                    deleted = True
+                    continue
+                kept.append(entry)
+            if not deleted:
+                raise RuntimeError("Selected graph definition was not found.")
+            _write_project_graph_store(store, kept)
+            return {
+                "deleted": True,
+                "graph_key": raw_graph_key,
+                "store_path": str(store.get("path") or ""),
+            }
         return agq.delete_auto_graph_quickcheck_pack(project_dir, graph_key)
     store = _load_project_graph_store(project_dir, project_type)
     entries = [dict(entry) for entry in (store.get("entries") or []) if isinstance(entry, Mapping)]

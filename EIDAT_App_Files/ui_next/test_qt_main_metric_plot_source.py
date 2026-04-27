@@ -74,6 +74,9 @@ class _DummyCanvas:
     def draw(self) -> None:
         return None
 
+    def draw_idle(self) -> None:
+        return None
+
 
 class _DummyComboBox:
     def findData(self, _value: object) -> int:
@@ -87,6 +90,93 @@ class _DummyComboBox:
 
     def currentText(self) -> str:
         return "sequence"
+
+
+class _ResetAxes:
+    name = "rectilinear"
+
+    def __init__(
+        self,
+        *,
+        xlim: tuple[float, float] = (2.0, 4.0),
+        ylim: tuple[float, float] = (3.0, 5.0),
+        ignore_limit_updates: bool = False,
+    ) -> None:
+        self._xlim = tuple(float(v) for v in xlim)
+        self._ylim = tuple(float(v) for v in ylim)
+        self.ignore_limit_updates = bool(ignore_limit_updates)
+        self.autoscale_enabled = False
+        self.relim_calls = 0
+        self.autoscale_view_calls = 0
+
+    def get_xlim(self) -> tuple[float, float]:
+        return self._xlim
+
+    def get_ylim(self) -> tuple[float, float]:
+        return self._ylim
+
+    def set_xlim(self, lo: float, hi: float) -> None:
+        if not self.ignore_limit_updates:
+            self._xlim = (float(lo), float(hi))
+
+    def set_ylim(self, lo: float, hi: float) -> None:
+        if not self.ignore_limit_updates:
+            self._ylim = (float(lo), float(hi))
+
+    def set_autoscale_on(self, enabled: bool) -> None:
+        self.autoscale_enabled = bool(enabled)
+
+    def relim(self) -> None:
+        self.relim_calls += 1
+
+    def autoscale_view(self) -> None:
+        self.autoscale_view_calls += 1
+
+
+class _ResetCanvas:
+    def __init__(self) -> None:
+        self.draw_idle_calls = 0
+
+    def draw_idle(self) -> None:
+        self.draw_idle_calls += 1
+
+
+class _ResetButton:
+    def __init__(self) -> None:
+        self.checked: bool | None = None
+
+    def setChecked(self, value: bool) -> None:
+        self.checked = bool(value)
+
+
+class _ResetRect:
+    def __init__(self) -> None:
+        self.removed = False
+
+    def remove(self) -> None:
+        self.removed = True
+
+
+class _ResetHarness:
+    _axis_bounds_valid = staticmethod(TestDataTrendDialog._axis_bounds_valid)
+    _axis_bounds_match = staticmethod(TestDataTrendDialog._axis_bounds_match)
+
+    def __init__(self, axes: _ResetAxes) -> None:
+        self._axes = axes
+        self._canvas = _ResetCanvas()
+        self._plot_base_xlim = (0.0, 10.0)
+        self._plot_base_ylim = (0.0, 20.0)
+        self._zone_zoom_press_xy = (1.0, 1.0)
+        self._zone_zoom_rect = _ResetRect()
+        self.btn_zone_zoom = _ResetButton()
+        self._last_plot_def = {"mode": "metrics", "selection_id": "sequence:test"}
+        self.restore_calls = 0
+
+    def _restore_main_plot_from_last_definition(self) -> bool:
+        self.restore_calls += 1
+        self._axes._xlim = tuple(float(v) for v in self._plot_base_xlim)
+        self._axes._ylim = tuple(float(v) for v in self._plot_base_ylim)
+        return True
 
 
 def _create_plot_filter_db(tmpdir: str) -> Path:
@@ -260,6 +350,31 @@ class TestQtMainMetricPlotSource(unittest.TestCase):
             }
         ]
         return axes
+
+    def test_reset_main_plot_zoom_restores_saved_inline_limits(self) -> None:
+        harness = _ResetHarness(_ResetAxes())
+
+        TestDataTrendDialog._reset_main_plot_zoom(harness)  # type: ignore[arg-type]
+
+        self.assertEqual(harness._axes.get_xlim(), harness._plot_base_xlim)
+        self.assertEqual(harness._axes.get_ylim(), harness._plot_base_ylim)
+        self.assertEqual(harness.restore_calls, 0)
+        self.assertEqual(harness._canvas.draw_idle_calls, 1)
+        self.assertEqual(harness.btn_zone_zoom.checked, False)
+        self.assertTrue(harness._zone_zoom_rect is None)
+        self.assertTrue(harness._zone_zoom_press_xy is None)
+
+    def test_reset_main_plot_zoom_replays_plot_when_inline_limits_do_not_restore(self) -> None:
+        harness = _ResetHarness(_ResetAxes(ignore_limit_updates=True))
+
+        TestDataTrendDialog._reset_main_plot_zoom(harness)  # type: ignore[arg-type]
+
+        self.assertEqual(harness.restore_calls, 1)
+        self.assertEqual(harness._axes.get_xlim(), harness._plot_base_xlim)
+        self.assertEqual(harness._axes.get_ylim(), harness._plot_base_ylim)
+        self.assertEqual(harness.btn_zone_zoom.checked, False)
+        self.assertTrue(harness._zone_zoom_rect is None)
+        self.assertTrue(harness._zone_zoom_press_xy is None)
 
     def test_plot_metrics_uses_selected_metric_source_and_persists_it(self) -> None:
         window = self._make_window()

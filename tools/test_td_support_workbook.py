@@ -2444,6 +2444,115 @@ class TestTDSupportWorkbook(unittest.TestCase):
             ],
         }
 
+    def _make_parameter_normalization_context_with_shared_display(self) -> dict[str, object]:
+        return {
+            "repo_parameter_rows": [
+                {
+                    "program_title": "Program A",
+                    "asset_type": "Thruster",
+                    "asset_specific_type": "Valve",
+                    "ingested_parameter": "feed pressure",
+                    "default_display_parameter": "feed pressure",
+                    "displayed_parameter": "Chamber Feed Pressure",
+                    "preferred_units": "psia",
+                    "enabled": True,
+                    "edited": True,
+                    "updated_at": "",
+                },
+                {
+                    "program_title": "Program B",
+                    "asset_type": "Thruster",
+                    "asset_specific_type": "Valve",
+                    "ingested_parameter": "feed pressure",
+                    "default_display_parameter": "feed pressure",
+                    "displayed_parameter": "Chamber Feed Pressure",
+                    "preferred_units": "bar",
+                    "enabled": True,
+                    "edited": True,
+                    "updated_at": "",
+                },
+                {
+                    "program_title": "Program C",
+                    "asset_type": "Thruster",
+                    "asset_specific_type": "Valve",
+                    "ingested_parameter": "pulse width on",
+                    "default_display_parameter": "pulse width on",
+                    "displayed_parameter": "Pulse Width On",
+                    "preferred_units": "ms",
+                    "enabled": True,
+                    "edited": False,
+                    "updated_at": "",
+                },
+            ],
+            "inventory": [
+                {
+                    "program_title": "Program A",
+                    "asset_type": "Thruster",
+                    "asset_specific_type": "Valve",
+                    "raw_name": "feed pressure",
+                    "default_display_parameter": "feed pressure",
+                    "displayed_parameter": "Chamber Feed Pressure",
+                    "canonical_display": "Chamber Feed Pressure",
+                    "units": ["psia"],
+                    "enabled": True,
+                    "status": "edited",
+                    "source_run_names": ["RunA"],
+                    "surfaces": ["performance"],
+                    "run_names": ["RunA"],
+                    "source_count": 1,
+                    "program_count": 1,
+                },
+                {
+                    "program_title": "Program B",
+                    "asset_type": "Thruster",
+                    "asset_specific_type": "Valve",
+                    "raw_name": "feed pressure",
+                    "default_display_parameter": "feed pressure",
+                    "displayed_parameter": "Chamber Feed Pressure",
+                    "canonical_display": "Chamber Feed Pressure",
+                    "units": ["bar"],
+                    "enabled": True,
+                    "status": "edited",
+                    "source_run_names": ["RunB"],
+                    "surfaces": ["performance"],
+                    "run_names": ["RunB"],
+                    "source_count": 1,
+                    "program_count": 1,
+                },
+                {
+                    "program_title": "Program C",
+                    "asset_type": "Thruster",
+                    "asset_specific_type": "Valve",
+                    "raw_name": "pulse width on",
+                    "default_display_parameter": "pulse width on",
+                    "displayed_parameter": "Pulse Width On",
+                    "canonical_display": "Pulse Width On",
+                    "units": ["ms"],
+                    "enabled": True,
+                    "status": "default",
+                    "source_run_names": ["RunC"],
+                    "surfaces": ["performance"],
+                    "run_names": ["RunC"],
+                    "source_count": 1,
+                    "program_count": 1,
+                },
+            ],
+        }
+
+    def _wait_for_parameter_dialog_idle(self, dlg, app, *, timeout_s: float = 3.0) -> None:
+        deadline = time.time() + float(timeout_s)
+        while time.time() < deadline:
+            app.processEvents()
+            worker = getattr(dlg, "_save_worker", None)
+            timer = getattr(dlg, "_autosave_timer", None)
+            worker_busy = bool(worker is not None and worker.isRunning())
+            timer_busy = bool(timer is not None and timer.isActive())
+            if not worker_busy and not timer_busy:
+                app.processEvents()
+                return
+            time.sleep(0.01)
+        self.fail("Timed out waiting for parameter dialog autosave to go idle.")
+
     @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
     def test_parameter_normalization_dialog_initial_load_builds_context_once(self) -> None:
         _qt_app()
@@ -2465,16 +2574,63 @@ class TestTDSupportWorkbook(unittest.TestCase):
             try:
                 self.assertEqual(builder_mock.call_count, 1)
                 self.assertEqual(dlg.tbl.rowCount(), 1)
+                headers = [dlg.tbl.horizontalHeaderItem(i).text() for i in range(dlg.tbl.columnCount())]
+                self.assertNotIn("Default Display", headers)
                 self.assertEqual(dlg.tbl.item(0, dlg.COL_DISPLAYED).text(), "feed pressure")
                 self.assertEqual(dlg.tbl.item(0, dlg.COL_ENABLED).text(), "Yes")
                 self.assertIn("Rows: 1", dlg.lbl_summary.text())
                 self.assertIn("Edited: 0", dlg.lbl_summary.text())
             finally:
+                dlg._allow_direct_close = True
                 dlg.close()
 
     @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
-    def test_parameter_normalization_dialog_inline_edit_stays_local(self) -> None:
+    def test_parameter_normalization_dialog_inline_edit_autosaves_and_refreshes(self) -> None:
         app = _qt_app()
+        from EIDAT_App_Files.ui_next import qt_main as qm  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            project_dir = root / "ProjectA"
+            project_dir.mkdir()
+            workbook = root / "project.xlsx"
+            workbook.write_text("", encoding="utf-8")
+            db_path = project_dir / "implementation_trending.sqlite3"
+            context = self._make_parameter_normalization_context()
+            saved_rows = [dict(row) for row in context["repo_parameter_rows"]]
+            saved_rows[0]["displayed_parameter"] = "Chamber Feed Pressure"
+            saved_rows[0]["edited"] = True
+
+            with mock.patch.object(qm.be, "validate_test_data_project_cache_for_open", return_value=db_path):
+                with mock.patch.object(qm.be, "td_build_parameter_normalization_context", return_value=context) as builder_mock:
+                    with mock.patch.object(qm.be, "save_td_repo_parameter_mappings", return_value=saved_rows) as save_mock:
+                        with mock.patch.object(qm.be, "refresh_td_parameter_runtime_cache") as refresh_mock:
+                            dlg = qm.TDParameterNormalizationDialog(project_dir, workbook)
+
+                            try:
+                                dlg._autosave_timer.setInterval(0)
+                                dlg.tbl.selectRow(0)
+                                dlg.tbl.item(0, dlg.COL_DISPLAYED).setText("Chamber Feed Pressure")
+                                app.processEvents()
+                                self._wait_for_parameter_dialog_idle(dlg, app)
+
+                                self.assertEqual(builder_mock.call_count, 1)
+                                save_mock.assert_called_once_with(project_dir, mock.ANY)
+                                refresh_mock.assert_called_once_with(project_dir, workbook, db_path)
+                                self.assertEqual(dlg.tbl.item(0, dlg.COL_DISPLAYED).text(), "Chamber Feed Pressure")
+                                self.assertEqual(dlg.tbl.item(0, dlg.COL_STATUS).text(), "Edited")
+                                self.assertEqual(dlg.btn_save.text(), "Save Now")
+                                self.assertFalse(dlg._dirty)
+                                self.assertIn("Edited: 1", dlg.lbl_summary.text())
+                                self.assertIn("Displayed Parameter: Chamber Feed Pressure", dlg.detail.toPlainText())
+                            finally:
+                                dlg._allow_direct_close = True
+                                dlg.close()
+
+    @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
+    def test_parameter_normalization_dialog_display_editor_uses_autocomplete_values(self) -> None:
+        _qt_app()
+        from PySide6 import QtCore, QtWidgets
         from EIDAT_App_Files.ui_next import qt_main as qm  # type: ignore
 
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
@@ -2487,21 +2643,38 @@ class TestTDSupportWorkbook(unittest.TestCase):
             context = self._make_parameter_normalization_context()
 
             with mock.patch.object(qm.be, "validate_test_data_project_cache_for_open", return_value=db_path):
-                with mock.patch.object(qm.be, "td_build_parameter_normalization_context", return_value=context) as builder_mock:
+                with mock.patch.object(qm.be, "td_build_parameter_normalization_context", return_value=context):
                     dlg = qm.TDParameterNormalizationDialog(project_dir, workbook)
 
             try:
-                dlg.tbl.selectRow(0)
-                dlg.tbl.item(0, dlg.COL_DISPLAYED).setText("Chamber Feed Pressure")
-                app.processEvents()
+                delegate = dlg.tbl.itemDelegateForColumn(dlg.COL_DISPLAYED)
+                self.assertIsNotNone(delegate)
+                editor = delegate.createEditor(  # type: ignore[call-arg]
+                    dlg.tbl,
+                    QtWidgets.QStyleOptionViewItem(),
+                    dlg.tbl.model().index(0, dlg.COL_DISPLAYED),
+                )
+                completer = editor.completer()
+                self.assertIsNotNone(completer)
+                model = completer.model()
+                suggestions = []
+                if isinstance(model, QtCore.QStringListModel):
+                    suggestions = model.stringList()
+                self.assertIn("feed pressure", suggestions)
 
-                self.assertEqual(builder_mock.call_count, 1)
-                self.assertEqual(dlg.tbl.item(0, dlg.COL_DISPLAYED).text(), "Chamber Feed Pressure")
-                self.assertEqual(dlg.tbl.item(0, dlg.COL_STATUS).text(), "Edited")
-                self.assertEqual(dlg.btn_save.text(), "Save Defaults*")
-                self.assertIn("Edited: 1", dlg.lbl_summary.text())
-                self.assertIn("Displayed Parameter: Chamber Feed Pressure", dlg.detail.toPlainText())
+                dlg._working_rows[0]["displayed_parameter"] = "Chamber Feed Pressure"
+                dlg._refresh_display_completer()
+                editor2 = delegate.createEditor(  # type: ignore[call-arg]
+                    dlg.tbl,
+                    QtWidgets.QStyleOptionViewItem(),
+                    dlg.tbl.model().index(0, dlg.COL_DISPLAYED),
+                )
+                completer2 = editor2.completer()
+                model2 = completer2.model() if completer2 is not None else None
+                suggestions2 = model2.stringList() if isinstance(model2, QtCore.QStringListModel) else []
+                self.assertIn("Chamber Feed Pressure", suggestions2)
             finally:
+                dlg._allow_direct_close = True
                 dlg.close()
 
     @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
@@ -2524,18 +2697,67 @@ class TestTDSupportWorkbook(unittest.TestCase):
                     dlg = qm.TDParameterNormalizationDialog(project_dir, workbook)
 
             try:
+                dlg._autosave_timer.setInterval(999999)
                 dlg.tbl.selectRow(0)
                 with mock.patch.object(dlg, "_prompt_display_name", return_value="Chamber Feed Pressure"):
                     dlg._act_set_display_name()
+                dlg._autosave_timer.stop()
                 self.assertEqual(builder_mock.call_count, 1)
                 self.assertEqual(dlg.tbl.item(0, dlg.COL_DISPLAYED).text(), "Chamber Feed Pressure")
 
                 with mock.patch.object(QtWidgets.QMessageBox, "question", return_value=QtWidgets.QMessageBox.StandardButton.Yes):
                     dlg._act_reset_rows()
+                dlg._autosave_timer.stop()
                 self.assertEqual(builder_mock.call_count, 1)
                 self.assertEqual(dlg.tbl.item(0, dlg.COL_DISPLAYED).text(), "feed pressure")
                 self.assertEqual(dlg.tbl.item(0, dlg.COL_STATUS).text(), "Default")
             finally:
+                dlg._allow_direct_close = True
+                dlg.close()
+
+    @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
+    def test_parameter_normalization_dialog_units_apply_to_all_rows_with_same_displayed_parameter(self) -> None:
+        _qt_app()
+        from EIDAT_App_Files.ui_next import qt_main as qm  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            project_dir = root / "ProjectA"
+            project_dir.mkdir()
+            workbook = root / "project.xlsx"
+            workbook.write_text("", encoding="utf-8")
+            db_path = project_dir / "implementation_trending.sqlite3"
+            context = self._make_parameter_normalization_context_with_shared_display()
+
+            with mock.patch.object(qm.be, "validate_test_data_project_cache_for_open", return_value=db_path):
+                with mock.patch.object(qm.be, "td_build_parameter_normalization_context", return_value=context):
+                    dlg = qm.TDParameterNormalizationDialog(project_dir, workbook)
+
+            try:
+                dlg._autosave_timer.setInterval(999999)
+                dlg.tbl.selectRow(0)
+                dlg._apply_units_value(
+                    row_keys=dlg._coerce_row_keys(dlg.tbl.item(0, dlg.COL_UNITS).data(qm.QtCore.Qt.ItemDataRole.UserRole)),
+                    units_text="kPa",
+                )
+                dlg._autosave_timer.stop()
+
+                shared_rows = [
+                    row
+                    for row in dlg._working_rows
+                    if str(row.get("displayed_parameter") or "").strip() == "Chamber Feed Pressure"
+                ]
+                self.assertEqual(len(shared_rows), 2)
+                self.assertEqual({str(row.get("preferred_units") or "").strip() for row in shared_rows}, {"kPa"})
+                other_rows = [
+                    row
+                    for row in dlg._working_rows
+                    if str(row.get("displayed_parameter") or "").strip() == "pulse width on"
+                ]
+                self.assertEqual(len(other_rows), 1)
+                self.assertEqual(str(other_rows[0].get("preferred_units") or "").strip(), "ms")
+            finally:
+                dlg._allow_direct_close = True
                 dlg.close()
 
     @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
@@ -2557,9 +2779,11 @@ class TestTDSupportWorkbook(unittest.TestCase):
                     dlg = qm.TDParameterNormalizationDialog(project_dir, workbook)
 
             try:
+                dlg._autosave_timer.setInterval(999999)
                 dlg.tbl.selectRow(0)
                 dlg._act_disable_rows()
                 app.processEvents()
+                dlg._autosave_timer.stop()
 
                 self.assertEqual(dlg.tbl.item(0, dlg.COL_ENABLED).text(), "No")
                 self.assertEqual(dlg.tbl.item(0, dlg.COL_STATUS).text(), "Disabled")
@@ -2568,11 +2792,59 @@ class TestTDSupportWorkbook(unittest.TestCase):
 
                 dlg._act_enable_rows()
                 app.processEvents()
+                dlg._autosave_timer.stop()
 
                 self.assertEqual(dlg.tbl.item(0, dlg.COL_ENABLED).text(), "Yes")
                 self.assertEqual(dlg.tbl.item(0, dlg.COL_STATUS).text(), "Default")
                 self.assertIn("Disabled: 0", dlg.lbl_summary.text())
             finally:
+                dlg._allow_direct_close = True
+                dlg.close()
+
+    @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
+    def test_parameter_normalization_dialog_enabled_column_checkbox_updates_local_state(self) -> None:
+        app = _qt_app()
+        from PySide6 import QtCore
+        from EIDAT_App_Files.ui_next import qt_main as qm  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            project_dir = root / "ProjectA"
+            project_dir.mkdir()
+            workbook = root / "project.xlsx"
+            workbook.write_text("", encoding="utf-8")
+            db_path = project_dir / "implementation_trending.sqlite3"
+            context = self._make_parameter_normalization_context()
+
+            with mock.patch.object(qm.be, "validate_test_data_project_cache_for_open", return_value=db_path):
+                with mock.patch.object(qm.be, "td_build_parameter_normalization_context", return_value=context):
+                    dlg = qm.TDParameterNormalizationDialog(project_dir, workbook)
+
+            try:
+                dlg._autosave_timer.setInterval(999999)
+                enabled_item = dlg.tbl.item(0, dlg.COL_ENABLED)
+                self.assertIsNotNone(enabled_item)
+                self.assertEqual(enabled_item.checkState(), QtCore.Qt.CheckState.Checked)
+
+                enabled_item.setCheckState(QtCore.Qt.CheckState.Unchecked)
+                app.processEvents()
+                dlg._autosave_timer.stop()
+
+                self.assertEqual(dlg.tbl.item(0, dlg.COL_ENABLED).text(), "No")
+                self.assertEqual(dlg.tbl.item(0, dlg.COL_ENABLED).checkState(), QtCore.Qt.CheckState.Unchecked)
+                self.assertEqual(dlg.tbl.item(0, dlg.COL_STATUS).text(), "Disabled")
+                self.assertIn("Disabled: 1", dlg.lbl_summary.text())
+
+                dlg.tbl.item(0, dlg.COL_ENABLED).setCheckState(QtCore.Qt.CheckState.Checked)
+                app.processEvents()
+                dlg._autosave_timer.stop()
+
+                self.assertEqual(dlg.tbl.item(0, dlg.COL_ENABLED).text(), "Yes")
+                self.assertEqual(dlg.tbl.item(0, dlg.COL_ENABLED).checkState(), QtCore.Qt.CheckState.Checked)
+                self.assertEqual(dlg.tbl.item(0, dlg.COL_STATUS).text(), "Default")
+                self.assertIn("Disabled: 0", dlg.lbl_summary.text())
+            finally:
+                dlg._allow_direct_close = True
                 dlg.close()
 
     @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
@@ -2595,6 +2867,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
                     dlg = qm.TDParameterNormalizationDialog(project_dir, workbook)
 
             try:
+                dlg._autosave_timer.setInterval(999999)
                 dlg.tbl.selectRow(0)
                 dlg.tbl.item(0, dlg.COL_DISPLAYED).setText("Chamber Feed Pressure")
                 app.processEvents()
@@ -2604,13 +2877,16 @@ class TestTDSupportWorkbook(unittest.TestCase):
                     with mock.patch.object(qm.be, "refresh_td_parameter_runtime_cache") as refresh_mock:
                         with mock.patch.object(QtWidgets.QMessageBox, "warning") as warning_mock:
                             dlg._act_save()
+                            self._wait_for_parameter_dialog_idle(dlg, app)
 
-                save_mock.assert_called_once_with(project_dir, dlg._working_rows)
+                save_mock.assert_called_once_with(project_dir, mock.ANY)
                 refresh_mock.assert_called_once_with(project_dir, workbook, db_path)
                 warning_mock.assert_not_called()
                 self.assertTrue(dlg.saved)
-                self.assertEqual(dlg.result(), int(QtWidgets.QDialog.DialogCode.Accepted))
+                self.assertEqual(dlg.result(), 0)
+                self.assertFalse(dlg._dirty)
             finally:
+                dlg._allow_direct_close = True
                 dlg.close()
 
     @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
@@ -2633,6 +2909,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
                     dlg = qm.TDParameterNormalizationDialog(project_dir, workbook)
 
             try:
+                dlg._autosave_timer.setInterval(999999)
                 dlg.tbl.selectRow(0)
                 dlg.tbl.item(0, dlg.COL_DISPLAYED).setText("Chamber Feed Pressure")
                 app.processEvents()
@@ -2640,16 +2917,18 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 with mock.patch.object(qm.be, "save_td_repo_parameter_mappings", side_effect=RuntimeError("boom")):
                     with mock.patch.object(QtWidgets.QMessageBox, "warning") as warning_mock:
                         dlg._act_save()
+                        self._wait_for_parameter_dialog_idle(dlg, app)
 
                 self.assertFalse(dlg.saved)
                 self.assertTrue(dlg.tbl.isEnabled())
                 self.assertTrue(dlg.btn_save.isEnabled())
                 self.assertTrue(dlg.btn_close.isEnabled())
-                self.assertEqual(dlg.btn_save.text(), "Save Defaults*")
+                self.assertEqual(dlg.btn_save.text(), "Save Now*")
                 self.assertEqual(dlg.result(), 0)
                 warning_mock.assert_called_once()
                 self.assertIn("boom", str(warning_mock.call_args.args[2]))
             finally:
+                dlg._allow_direct_close = True
                 dlg.close()
 
     @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
@@ -2672,6 +2951,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
                     dlg = qm.TDParameterNormalizationDialog(project_dir, workbook)
 
             try:
+                dlg._autosave_timer.setInterval(999999)
                 dlg.tbl.selectRow(0)
                 dlg.tbl.item(0, dlg.COL_DISPLAYED).setText("Chamber Feed Pressure")
                 app.processEvents()
@@ -2682,14 +2962,15 @@ class TestTDSupportWorkbook(unittest.TestCase):
                         with mock.patch.object(qm.be, "invalidate_td_parameter_runtime_cache") as invalidator_mock:
                             with mock.patch.object(QtWidgets.QMessageBox, "warning") as warning_mock:
                                 dlg._act_save()
+                                self._wait_for_parameter_dialog_idle(dlg, app)
 
-                save_mock.assert_called_once_with(project_dir, dlg._working_rows)
+                save_mock.assert_called_once_with(project_dir, mock.ANY)
                 refresh_mock.assert_called_once_with(project_dir, workbook, db_path)
                 invalidator_mock.assert_called_once_with(db_path)
                 warning_mock.assert_called_once()
                 self.assertIn("runtime parameter cache could not be refreshed", str(warning_mock.call_args.args[2]))
                 self.assertTrue(dlg.saved)
-                self.assertEqual(dlg.result(), int(QtWidgets.QDialog.DialogCode.Accepted))
+                self.assertEqual(dlg.result(), 0)
             finally:
                 dlg.close()
 

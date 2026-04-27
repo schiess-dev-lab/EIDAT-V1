@@ -14,10 +14,11 @@ if str(APP_ROOT) not in sys.path:
 
 
 try:
-    from PySide6 import QtWidgets
+    from PySide6 import QtCore, QtWidgets
     from ui_next import backend as be  # type: ignore
     from ui_next.qt_main import MainWindow, ProjectDocumentManagerDialog  # type: ignore
 except Exception:  # pragma: no cover - optional dependency guard
+    QtCore = None  # type: ignore[assignment]
     QtWidgets = None  # type: ignore[assignment]
     be = None  # type: ignore[assignment]
     MainWindow = None  # type: ignore[assignment]
@@ -90,7 +91,7 @@ class TestProjectDocumentManagerUi(unittest.TestCase):
                     "workbook": str(workbook),
                 },
                 request_update=lambda refresh: captured.update({"refresh": refresh}),
-                open_graph_library=lambda: None,
+                open_graph_library=lambda item=None: None,
             )
             try:
                 with mock.patch.object(dlg, "refresh_items") as refresh_mock:
@@ -99,6 +100,49 @@ class TestProjectDocumentManagerUi(unittest.TestCase):
                     self.assertTrue(callable(refresh))
                     refresh()  # type: ignore[operator]
                     refresh_mock.assert_called_once()
+            finally:
+                dlg.close()
+                dlg.deleteLater()
+
+    def test_graph_definition_open_passes_selected_item_to_callback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workbook = root / "Proj.xlsx"
+            workbook.write_text("placeholder", encoding="utf-8")
+            captured: dict[str, object] = {}
+            item = {
+                "id": "graph_definition:legacy_graph_file:id:graph-1",
+                "type": "graph_definition",
+                "kind": "Auto-Graph File",
+                "name": "Saved Graph",
+                "graph_key": "legacy_graph_file:id:graph-1",
+                "path": str(root / "auto_plots_test_data.json"),
+            }
+
+            dlg = ProjectDocumentManagerDialog(
+                mode="graphs",
+                global_repo=root,
+                record={
+                    "name": "Proj",
+                    "type": be.EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING,
+                    "folder": str(root),
+                    "workbook": str(workbook),
+                },
+                request_update=lambda refresh: None,
+                open_graph_library=lambda selected_item=None: captured.update({"item": dict(selected_item or {})}),
+            )
+            try:
+                dlg.tbl.setRowCount(1)
+                cell = QtWidgets.QTableWidgetItem(str(item.get("name") or ""))
+                cell.setData(QtCore.Qt.ItemDataRole.UserRole, dict(item))
+                dlg.tbl.setItem(0, 0, cell)
+                for col in range(1, dlg.tbl.columnCount()):
+                    dlg.tbl.setItem(0, col, QtWidgets.QTableWidgetItem(""))
+                dlg.tbl.selectRow(0)
+
+                dlg._act_open()
+
+                self.assertEqual((captured.get("item") or {}).get("graph_key"), "legacy_graph_file:id:graph-1")
             finally:
                 dlg.close()
                 dlg.deleteLater()

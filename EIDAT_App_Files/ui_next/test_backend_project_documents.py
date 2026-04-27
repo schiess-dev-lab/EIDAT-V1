@@ -186,12 +186,15 @@ class TestProjectDocumentsBackend(unittest.TestCase):
             saved = be.save_auto_graph_quickcheck_pack(project_dir, {"name": "Quick Pack", "plots": []})
 
             items = be.list_project_graph_items(project_dir, be.EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING)
-            self.assertEqual(items[0].get("graph_key"), str(saved.get("id") or "").strip())
-            self.assertEqual(items[0].get("name"), "Quick Pack")
+            quick_item = next(item for item in items if str(item.get("kind") or "") == "Quick-Check Pack")
+            legacy_item = next(item for item in items if str(item.get("kind") or "") == "Auto-Graph File")
+            self.assertEqual(quick_item.get("graph_key"), str(saved.get("id") or "").strip())
+            self.assertEqual(quick_item.get("name"), "Quick Pack")
+            self.assertEqual(legacy_item.get("name"), "Old Legacy")
             be.rename_project_graph_definition(
                 project_dir,
                 be.EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING,
-                str(saved.get("id") or "").strip(),
+                str(quick_item.get("graph_key") or "").strip(),
                 "New",
             )
             payload = be.load_auto_graph_quickcheck_library(project_dir)
@@ -202,12 +205,54 @@ class TestProjectDocumentsBackend(unittest.TestCase):
             be.delete_project_graph_definition(
                 project_dir,
                 be.EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING,
-                str(saved.get("id") or "").strip(),
+                str(quick_item.get("graph_key") or "").strip(),
             )
             payload = be.load_auto_graph_quickcheck_library(project_dir)
             self.assertEqual(payload.get("packs"), [])
             legacy_payload = json.loads(legacy_store.read_text(encoding="utf-8"))
             self.assertEqual(legacy_payload.get("graph_files")[0].get("name"), "Old Legacy")
+
+    def test_td_graph_definition_mutations_support_legacy_graph_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            legacy_store = project_dir / "auto_plots_test_data.json"
+            legacy_store.write_text(
+                json.dumps(
+                    {
+                        "version": 4,
+                        "graph_files": [
+                            {
+                                "id": "legacy-1",
+                                "name": "Legacy File",
+                                "global_selection": {"filters": {}},
+                                "plots": [{"plot_definition": {"mode": "metrics", "stats": ["mean"], "y": ["Pressure"]}}],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            items = be.list_project_graph_items(project_dir, be.EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING)
+            legacy_item = next(item for item in items if str(item.get("kind") or "") == "Auto-Graph File")
+            self.assertTrue(str(legacy_item.get("graph_key") or "").startswith("legacy_graph_file:"))
+
+            be.rename_project_graph_definition(
+                project_dir,
+                be.EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING,
+                str(legacy_item.get("graph_key") or "").strip(),
+                "Renamed Graph",
+            )
+            payload = json.loads(legacy_store.read_text(encoding="utf-8"))
+            self.assertEqual(payload.get("graph_files")[0].get("name"), "Renamed Graph")
+
+            be.delete_project_graph_definition(
+                project_dir,
+                be.EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING,
+                str(legacy_item.get("graph_key") or "").strip(),
+            )
+            payload = json.loads(legacy_store.read_text(encoding="utf-8"))
+            self.assertEqual(payload.get("graph_files"), [])
 
     def test_eidp_graph_definition_mutations_preserve_list_schema(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

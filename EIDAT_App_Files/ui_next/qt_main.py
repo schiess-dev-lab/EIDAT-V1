@@ -111,6 +111,27 @@ class _CollapsibleSection(QtWidgets.QFrame):
         self.toggled.emit(expanded)
 
 
+class _TDParameterDisplayedDelegate(QtWidgets.QStyledItemDelegate):
+    def __init__(self, owner, parent=None):
+        super().__init__(parent or owner)
+        self._owner = owner
+
+    def createEditor(self, parent, option, index):  # type: ignore[override]
+        editor = QtWidgets.QLineEdit(parent)
+        editor.setClearButtonEnabled(True)
+        completer = QtWidgets.QCompleter(editor)
+        completer.setCaseSensitivity(QtCore.Qt.CaseSensitivity.CaseInsensitive)
+        completer.setCompletionMode(QtWidgets.QCompleter.CompletionMode.PopupCompletion)
+        try:
+            completer.setFilterMode(QtCore.Qt.MatchFlag.MatchContains)
+        except Exception:
+            pass
+        model = QtCore.QStringListModel(self._owner._display_name_autocomplete_values(), completer)
+        completer.setModel(model)
+        editor.setCompleter(completer)
+        return editor
+
+
 def _td_serial_metadata_by_serial(rows: list[dict]) -> dict[str, dict]:
     by_sn: dict[str, dict] = {}
     for row in rows or []:
@@ -2648,7 +2669,6 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
         "Asset",
         "Specific",
         "Ingested",
-        "Default Display",
         "Displayed",
         "Units",
         "Enabled",
@@ -2659,11 +2679,10 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
     COL_ASSET = 1
     COL_SPECIFIC = 2
     COL_INGESTED = 3
-    COL_DEFAULT = 4
-    COL_DISPLAYED = 5
-    COL_UNITS = 6
-    COL_ENABLED = 7
-    COL_STATUS = 8
+    COL_DISPLAYED = 4
+    COL_UNITS = 5
+    COL_ENABLED = 6
+    COL_STATUS = 7
 
     def __init__(self, project_dir: Path, workbook_path: Path, parent=None):
         super().__init__(parent)
@@ -2676,7 +2695,18 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
         self._table_refreshing = False
         self._dirty = False
         self._save_in_progress = False
+        self._save_revision = 0
+        self._saving_revision = 0
+        self._saved_revision = 0
+        self._save_requested_while_busy = False
+        self._close_requested = False
+        self._allow_direct_close = False
+        self._save_worker: ProjectTaskWorker | None = None
         self.saved = False
+        self._autosave_timer = QtCore.QTimer(self)
+        self._autosave_timer.setSingleShot(True)
+        self._autosave_timer.setInterval(350)
+        self._autosave_timer.timeout.connect(lambda: self._start_background_save())
 
         self.setWindowTitle("Project Parameters")
         self.resize(1360, 760)
@@ -2716,8 +2746,9 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
 
         hint = QtWidgets.QLabel(
             "Review every ingested source parameter grouped by program and asset. "
-            "The displayed parameter is what the GUI uses for trending, analysis, and mapping. "
-            "Saving writes these defaults back into the ProgramRequirements workbook files for reuse by other projects."
+            "The displayed parameter is the user-facing name the GUI uses for trending, analysis, and mapping. "
+            "Edits autosave in the background to the ProgramRequirements workbook files for reuse by other projects. "
+            "Use the Enabled column or the side actions to make parameters active or inactive."
         )
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #475569; font-size: 11px;")
@@ -2746,6 +2777,7 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
             | QtWidgets.QAbstractItemView.EditTrigger.SelectedClicked
             | QtWidgets.QAbstractItemView.EditTrigger.EditKeyPressed
         )
+        self.tbl.setItemDelegateForColumn(self.COL_DISPLAYED, _TDParameterDisplayedDelegate(self, self.tbl))
         self.tbl.itemSelectionChanged.connect(self._sync_selection)
         self.tbl.itemChanged.connect(self._on_item_changed)
         left_layout.addWidget(self.tbl, 1)
@@ -2788,7 +2820,7 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
 
         button_row = QtWidgets.QHBoxLayout()
         button_row.addStretch(1)
-        self.btn_save = QtWidgets.QPushButton("Save Defaults")
+        self.btn_save = QtWidgets.QPushButton("Save Now")
         self.btn_close = QtWidgets.QPushButton("Close")
         button_row.addWidget(self.btn_save)
         button_row.addWidget(self.btn_close)
@@ -2800,7 +2832,7 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
         self.btn_disable.clicked.connect(self._act_disable_rows)
         self.btn_reset.clicked.connect(self._act_reset_rows)
         self.btn_save.clicked.connect(self._act_save)
-        self.btn_close.clicked.connect(self.reject)
+        self.btn_close.clicked.connect(self._act_close)
 
         self._reload_context()
 
@@ -2815,34 +2847,16 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
     def _update_save_button_text(self) -> None:
         if hasattr(self, "btn_save"):
             if self._save_in_progress:
-                self.btn_save.setText("Saving...")
+                self.btn_save.setText("Autosaving...")
+            elif self._dirty and getattr(self, "_autosave_timer", None) is not None and self._autosave_timer.isActive():
+                self.btn_save.setText("Autosave Pending*")
             else:
-                self.btn_save.setText("Save Defaults*" if self._dirty else "Save Defaults")
+                self.btn_save.setText("Save Now*" if self._dirty else "Save Now")
 
     def _set_save_busy(self, busy: bool) -> None:
         self._save_in_progress = bool(busy)
-        for widget in (
-            getattr(self, "ed_filter", None),
-            getattr(self, "tbl", None),
-            getattr(self, "btn_set_display", None),
-            getattr(self, "btn_set_units", None),
-            getattr(self, "btn_enable", None),
-            getattr(self, "btn_disable", None),
-            getattr(self, "btn_reset", None),
-            getattr(self, "btn_save", None),
-            getattr(self, "btn_close", None),
-        ):
-            if isinstance(widget, QtWidgets.QWidget):
-                widget.setEnabled(not busy)
-        app = QtWidgets.QApplication.instance()
-        if app is not None:
-            try:
-                if busy:
-                    app.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
-                elif app.overrideCursor() is not None:
-                    app.restoreOverrideCursor()
-            except Exception:
-                pass
+        if isinstance(getattr(self, "btn_save", None), QtWidgets.QWidget):
+            self.btn_save.setEnabled(True)
         self._update_save_button_text()
 
     def _timestamp_text(self) -> str:
@@ -2850,6 +2864,146 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
             return time.strftime("%Y-%m-%d %H:%M:%S")
         except Exception:
             return ""
+
+    def _display_name_autocomplete_values(self) -> list[str]:
+        values: list[str] = []
+        seen: set[str] = set()
+        candidate_groups = [
+            self._working_rows,
+            self._context.get("repo_parameter_rows") if isinstance(self._context, Mapping) else [],
+            self._context.get("inventory") if isinstance(self._context, Mapping) else [],
+        ]
+        for group in candidate_groups:
+            for item in group or []:
+                if not isinstance(item, Mapping):
+                    continue
+                text = str(
+                    item.get("displayed_parameter")
+                    or item.get("canonical_display")
+                    or ""
+                ).strip()
+                key = text.casefold()
+                if text and key not in seen:
+                    seen.add(key)
+                    values.append(text)
+        return sorted(values, key=str.casefold)
+
+    def _refresh_display_completer(self) -> None:
+        delegate = self.tbl.itemDelegateForColumn(self.COL_DISPLAYED) if hasattr(self, "tbl") else None
+        if not isinstance(delegate, _TDParameterDisplayedDelegate):
+            return
+        values = self._display_name_autocomplete_values()
+        for child in self.tbl.findChildren(QtWidgets.QLineEdit):
+            completer = child.completer()
+            if not isinstance(completer, QtWidgets.QCompleter):
+                continue
+            model = completer.model()
+            if isinstance(model, QtCore.QStringListModel):
+                model.setStringList(values)
+
+    def _mark_local_change(self) -> None:
+        self._save_revision += 1
+        self._set_dirty(True)
+        self._save_requested_while_busy = True
+        self._autosave_timer.start()
+        self._refresh_display_completer()
+
+    def _snapshot_working_rows(self) -> list[dict[str, object]]:
+        return [self._normalize_row(row) for row in self._working_rows if self._normalize_row(row)]
+
+    def _perform_parameter_mapping_save(
+        self,
+        snapshot_rows: Sequence[Mapping[str, object]],
+        *,
+        report=None,
+    ) -> dict[str, object]:
+        del report
+        saved_rows = be.save_td_repo_parameter_mappings(self._project_dir, snapshot_rows)
+        refresh_warning = ""
+        refresher = getattr(be, "refresh_td_parameter_runtime_cache", None)
+        if callable(refresher):
+            try:
+                refresher(self._project_dir, self._workbook_path, self._db_path)
+            except Exception as refresh_exc:
+                invalidator = getattr(be, "invalidate_td_parameter_runtime_cache", None)
+                if callable(invalidator):
+                    try:
+                        invalidator(self._db_path)
+                    except Exception:
+                        pass
+                refresh_warning = (
+                    "ProgramRequirements mappings were saved, but the runtime parameter cache could not be refreshed.\n\n"
+                    "Run Update Project before opening Trend / Analyze again.\n\n"
+                    f"Details: {refresh_exc}"
+                )
+        return {
+            "saved_rows": [dict(row) for row in saved_rows],
+            "refresh_warning": refresh_warning,
+        }
+
+    def _start_background_save(self, *, force: bool = False) -> None:
+        if getattr(self, "_autosave_timer", None) is not None and self._autosave_timer.isActive():
+            self._autosave_timer.stop()
+        if self._save_worker is not None and self._save_worker.isRunning():
+            self._save_requested_while_busy = True
+            return
+        if not force and not self._dirty:
+            return
+        snapshot_rows = self._snapshot_working_rows()
+        self._saving_revision = self._save_revision
+        self._save_requested_while_busy = False
+        self._set_save_busy(True)
+        self._save_worker = ProjectTaskWorker(
+            lambda _report: self._perform_parameter_mapping_save(snapshot_rows, report=_report)
+        )
+        self._save_worker.completed.connect(self._handle_background_save_completed)
+        self._save_worker.failed.connect(self._handle_background_save_failed)
+        self._save_worker.start()
+
+    def _handle_background_save_completed(self, payload: object) -> None:
+        self._save_worker = None
+        self._set_save_busy(False)
+        result = dict(payload) if isinstance(payload, Mapping) else {}
+        saved_rows = [
+            self._normalize_row(row)
+            for row in (result.get("saved_rows") or [])
+            if isinstance(row, Mapping)
+        ]
+        saved_rows = [row for row in saved_rows if row]
+        completed_revision = int(self._saving_revision)
+        self.saved = True
+        self._saved_revision = max(self._saved_revision, completed_revision)
+        if completed_revision >= self._save_revision:
+            if saved_rows:
+                self._working_rows = self._sorted_rows(saved_rows)
+            self._set_dirty(False)
+        else:
+            self._save_requested_while_busy = True
+            self._set_dirty(True)
+        self._refresh_display_completer()
+        refresh_warning = str(result.get("refresh_warning") or "").strip()
+        if refresh_warning:
+            QtWidgets.QMessageBox.warning(self, "Project Parameters", refresh_warning)
+        if self._save_requested_while_busy or self._dirty:
+            self._autosave_timer.start()
+        if self._close_requested and not self._dirty and self._save_worker is None:
+            self._allow_direct_close = True
+            self.close()
+
+    def _handle_background_save_failed(self, message: str) -> None:
+        self._save_worker = None
+        self._set_save_busy(False)
+        self._set_dirty(True)
+        self._save_requested_while_busy = True
+        self._close_requested = False
+        QtWidgets.QMessageBox.warning(self, "Project Parameters", str(message or "Unable to save project parameters."))
+
+    def _act_close(self) -> None:
+        if self._save_in_progress or self._dirty or self._autosave_timer.isActive():
+            self._close_requested = True
+            self._start_background_save(force=True)
+            return
+        self.reject()
 
     def _normalize_row(self, row: Mapping[str, object] | None) -> dict[str, object]:
         normalizer = getattr(be, "_td_program_parameter_mapping_normalize", None)
@@ -3223,7 +3377,6 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
                     str(display_row.get("asset_type") or ""),
                     str(display_row.get("asset_specific_type") or ""),
                     str(display_row.get("ingested_parameter") or ""),
-                    str(display_row.get("default_display_parameter") or ""),
                     str(display_row.get("displayed_parameter") or ""),
                     str(display_row.get("enabled_text") or ""),
                     " ".join(units),
@@ -3251,7 +3404,6 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
                     str(row.get("asset_type") or "").strip() or "-",
                     str(row.get("asset_specific_type") or "").strip() or "-",
                     str(row.get("ingested_parameter") or "").strip(),
-                    str(row.get("default_display_parameter") or "").strip(),
                     str(row.get("displayed_parameter") or "").strip(),
                     ", ".join([str(value).strip() for value in (row.get("units") or []) if str(value).strip()]) or "-",
                     str(row.get("enabled_text") or "").strip() or "-",
@@ -3265,13 +3417,24 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
                         f"Asset: {str(row.get('asset_type') or '').strip() or '-'}",
                         f"Specific: {str(row.get('asset_specific_type') or '').strip() or '-'}",
                         f"Ingested: {str(row.get('ingested_parameter') or '').strip()}",
-                        f"Default Display: {str(row.get('default_display_parameter') or '').strip()}",
                         f"Displayed: {str(row.get('displayed_parameter') or '').strip()}",
                         f"Enabled: {str(row.get('enabled_text') or '').strip() or '-'}",
                         f"Member Rows: {len(self._coerce_row_keys(row.get('_row_keys')))}",
                     ]
                     item.setToolTip("\n".join(tooltip_lines))
-                    if col_idx in (self.COL_DISPLAYED, self.COL_UNITS):
+                    if col_idx == self.COL_ENABLED:
+                        item.setFlags(
+                            (item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+                            & ~QtCore.Qt.ItemFlag.ItemIsEditable
+                        )
+                        enabled_value = row.get("enabled")
+                        if enabled_value is True:
+                            item.setCheckState(QtCore.Qt.CheckState.Checked)
+                        elif enabled_value is False:
+                            item.setCheckState(QtCore.Qt.CheckState.Unchecked)
+                        else:
+                            item.setCheckState(QtCore.Qt.CheckState.PartiallyChecked)
+                    elif col_idx in (self.COL_DISPLAYED, self.COL_UNITS):
                         item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsEditable)
                     else:
                         item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
@@ -3304,7 +3467,8 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
         )
         if not rows:
             self.detail.setPlainText(
-                "Select one or more parameter rows to inspect their program scope, enabled state, ingested name, displayed parameter, and units."
+                "Select one or more parameter rows to inspect their program scope, enabled state, ingested name, displayed parameter, and units. "
+                "Unit edits apply everywhere the exact displayed parameter is used."
             )
         elif count == 1:
             row = rows[0]
@@ -3313,7 +3477,6 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
                 f"Asset: {str(row.get('asset_type') or '').strip() or '-'}",
                 f"Specific: {str(row.get('asset_specific_type') or '').strip() or '-'}",
                 f"Ingested Parameter: {str(row.get('ingested_parameter') or '').strip()}",
-                f"Default Display: {str(row.get('default_display_parameter') or '').strip() or '-'}",
                 f"Displayed Parameter: {str(row.get('displayed_parameter') or '').strip() or '-'}",
                 f"Enabled: {str(row.get('enabled_text') or '').strip() or '-'}",
                 f"Preferred Units: {str(row.get('preferred_units') or '').strip() or '-'}",
@@ -3322,6 +3485,7 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
                 f"Source Runs: {', '.join([str(value).strip() for value in (row.get('source_run_names') or []) if str(value).strip()][:12]) or '-'}",
                 f"Observed Sources: {int(row.get('source_count') or 0)}",
                 f"Member Rows: {len(self._coerce_row_keys(row.get('_row_keys')))}",
+                "Units Scope: Editing units applies to every row with this exact displayed parameter.",
                 f"Status: {str(row.get('status_text') or '').strip() or '-'}",
             ]
             self.detail.setPlainText("\n".join(lines))
@@ -3343,6 +3507,7 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
                         f"Enabled: {len([row for row in rows if row.get('enabled') is True])} enabled, {len([row for row in rows if row.get('enabled') is False])} disabled",
                         f"Ingested Parameters: {', '.join(ingested)}",
                         f"Displayed Parameters: {', '.join(displayed) or '-'}",
+                        "Set Units applies to every working row that shares the same exact displayed parameter as the selected rows.",
                         "Use Set Display, Set Units, Enable Selected, or Disable Selected to apply the same values to every selected member row.",
                     ]
                 )
@@ -3384,6 +3549,7 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
         discovered_rows = self._rows_from_inventory(self._context)
         self._working_rows = self._merge_rows(self._working_rows or repo_rows, discovered_rows)
         self._refresh_table(select_keys=select_keys)
+        self._refresh_display_completer()
 
     def _prompt_text(self, *, title: str, prompt: str, default: str, allow_empty: bool = False) -> str | None:
         text, ok = QtWidgets.QInputDialog.getText(self, title, prompt, text=str(default or "").strip())
@@ -3399,6 +3565,46 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
 
     def _prompt_units(self, *, title: str, prompt: str, default: str) -> str | None:
         return self._prompt_text(title=title, prompt=prompt, default=default, allow_empty=True)
+
+    def _display_name_scope_keys(
+        self,
+        row_keys: Sequence[tuple[str, str, str, str]],
+    ) -> list[tuple[str, str, str, str]]:
+        wanted = {tuple(key) for key in row_keys if isinstance(key, tuple) and len(key) == 4}
+        if not wanted:
+            return []
+        selected_display_names: set[str] = set()
+        for raw_row in self._working_rows:
+            row = self._normalize_row(raw_row)
+            key = self._row_key(row)
+            if key not in wanted:
+                continue
+            display_name = (
+                str(row.get("displayed_parameter") or "").strip()
+                or str(row.get("default_display_parameter") or "").strip()
+                or str(row.get("ingested_parameter") or "").strip()
+            )
+            norm_display = self._norm_name(display_name)
+            if norm_display:
+                selected_display_names.add(norm_display)
+        if not selected_display_names:
+            return list(wanted)
+        expanded: list[tuple[str, str, str, str]] = []
+        seen: set[tuple[str, str, str, str]] = set()
+        for raw_row in self._working_rows:
+            row = self._normalize_row(raw_row)
+            display_name = (
+                str(row.get("displayed_parameter") or "").strip()
+                or str(row.get("default_display_parameter") or "").strip()
+                or str(row.get("ingested_parameter") or "").strip()
+            )
+            if self._norm_name(display_name) not in selected_display_names:
+                continue
+            key = self._row_key(row)
+            if key not in seen:
+                seen.add(key)
+                expanded.append(key)
+        return expanded
 
     def _apply_display_value(
         self,
@@ -3439,7 +3645,7 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
         if not changed:
             return
         self._working_rows = self._sorted_rows(updated_rows)
-        self._set_dirty(True)
+        self._mark_local_change()
         self._refresh_table(select_keys=list(wanted))
 
     def _apply_units_value(
@@ -3448,7 +3654,11 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
         row_keys: Sequence[tuple[str, str, str, str]],
         units_text: str,
     ) -> None:
-        wanted = {tuple(key) for key in row_keys if isinstance(key, tuple) and len(key) == 4}
+        wanted = {
+            tuple(key)
+            for key in self._display_name_scope_keys(row_keys)
+            if isinstance(key, tuple) and len(key) == 4
+        }
         if not wanted:
             return
         updated_rows: list[dict[str, object]] = []
@@ -3475,7 +3685,7 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
         if not changed:
             return
         self._working_rows = self._sorted_rows(updated_rows)
-        self._set_dirty(True)
+        self._mark_local_change()
         self._refresh_table(select_keys=list(wanted))
 
     def _apply_enabled_value(
@@ -3499,7 +3709,7 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
         if not changed:
             return
         self._working_rows = self._sorted_rows(updated_rows)
-        self._set_dirty(True)
+        self._mark_local_change()
         self._refresh_table(select_keys=list(wanted))
 
     def _act_set_display_name(self) -> None:
@@ -3593,10 +3803,16 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
         )
 
     def _on_item_changed(self, item: QtWidgets.QTableWidgetItem) -> None:
-        if self._table_refreshing or item is None or item.column() not in (self.COL_DISPLAYED, self.COL_UNITS):
+        if self._table_refreshing or item is None or item.column() not in (self.COL_DISPLAYED, self.COL_UNITS, self.COL_ENABLED):
             return
         row_keys = self._coerce_row_keys(item.data(QtCore.Qt.ItemDataRole.UserRole))
         if not row_keys:
+            return
+        if item.column() == self.COL_ENABLED:
+            self._apply_enabled_value(
+                row_keys=row_keys,
+                enabled=item.checkState() != QtCore.Qt.CheckState.Unchecked,
+            )
             return
         if item.column() == self.COL_DISPLAYED:
             display_name = str(item.text() or "").strip()
@@ -3606,36 +3822,18 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
         self._apply_units_value(row_keys=row_keys, units_text=units_text)
 
     def _act_save(self) -> None:
-        self._set_save_busy(True)
-        try:
-            saved_rows = be.save_td_repo_parameter_mappings(self._project_dir, self._working_rows)
-            refresh_warning = ""
-            refresher = getattr(be, "refresh_td_parameter_runtime_cache", None)
-            if callable(refresher):
-                try:
-                    refresher(self._project_dir, self._workbook_path, self._db_path)
-                except Exception as refresh_exc:
-                    invalidator = getattr(be, "invalidate_td_parameter_runtime_cache", None)
-                    if callable(invalidator):
-                        try:
-                            invalidator(self._db_path)
-                        except Exception:
-                            pass
-                    refresh_warning = (
-                        "ProgramRequirements mappings were saved, but the runtime parameter cache could not be refreshed.\n\n"
-                        "Run Update Project before opening Trend / Analyze again.\n\n"
-                        f"Details: {refresh_exc}"
-                    )
-            self._working_rows = self._sorted_rows(saved_rows)
-            self._set_dirty(False)
-            self.saved = True
-            self._set_save_busy(False)
-            if refresh_warning:
-                QtWidgets.QMessageBox.warning(self, "Project Parameters", refresh_warning)
-            self.accept()
-        except Exception as exc:
-            self._set_save_busy(False)
-            QtWidgets.QMessageBox.warning(self, "Project Parameters", str(exc))
+        self._start_background_save(force=True)
+
+    def closeEvent(self, event: QtGui.QCloseEvent):  # type: ignore[override]
+        if self._allow_direct_close:
+            super().closeEvent(event)
+            return
+        if self._save_in_progress or self._dirty or self._autosave_timer.isActive():
+            self._close_requested = True
+            self._start_background_save(force=True)
+            event.ignore()
+            return
+        super().closeEvent(event)
 
 
 class ImplementationTrendDialog(QtWidgets.QDialog):
@@ -7637,6 +7835,19 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             return False
         return math.isfinite(lo) and math.isfinite(hi) and abs(hi - lo) > 1e-12
 
+    @staticmethod
+    def _axis_bounds_match(
+        current: tuple[float, float] | None,
+        expected: tuple[float, float] | None,
+        *,
+        tolerance: float = 1e-9,
+    ) -> bool:
+        if not TestDataTrendDialog._axis_bounds_valid(current) or not TestDataTrendDialog._axis_bounds_valid(expected):
+            return False
+        current_lo, current_hi = (float(current[0]), float(current[1]))
+        expected_lo, expected_hi = (float(expected[0]), float(expected[1]))
+        return abs(current_lo - expected_lo) <= tolerance and abs(current_hi - expected_hi) <= tolerance
+
     def _capture_main_plot_base_view(self) -> None:
         if not self._axes:
             return
@@ -7694,6 +7905,16 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             except Exception:
                 pass
 
+    def _restore_main_plot_from_last_definition(self) -> bool:
+        plot_definition = dict(getattr(self, "_last_plot_def", {}) or {})
+        if not plot_definition:
+            return False
+        try:
+            self._apply_auto_graph_quickcheck_plot_to_live_gui({"plot_definition": plot_definition})
+        except Exception:
+            return False
+        return True
+
     def _reset_main_plot_zoom(self) -> None:
         if not self._axes or not self._canvas:
             return
@@ -7726,6 +7947,24 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 pass
         self._zone_zoom_press_xy = None
         self._zone_zoom_rect = None
+        fallback_needed = False
+        if reset_done:
+            current_xlim = None
+            current_ylim = None
+            try:
+                current_xlim = tuple(float(v) for v in self._axes.get_xlim())  # type: ignore[assignment]
+                current_ylim = tuple(float(v) for v in self._axes.get_ylim())  # type: ignore[assignment]
+            except Exception:
+                fallback_needed = True
+            else:
+                fallback_needed = not (
+                    self._axis_bounds_match(current_xlim, self._plot_base_xlim)
+                    and self._axis_bounds_match(current_ylim, self._plot_base_ylim)
+                )
+        else:
+            fallback_needed = True
+        if fallback_needed and self._restore_main_plot_from_last_definition():
+            return
         try:
             self._canvas.draw_idle()
         except Exception:
@@ -23981,6 +24220,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         saved_at = str(raw.get("saved_at") or "").strip() or now_text
         updated_at = str(raw.get("updated_at") or "").strip() or saved_at
         file_id = str(raw.get("id") or "").strip() or _td_auto_graph_file_id(name, global_selection, normalized_plots)
+        pdf_export_path = str(raw.get("pdf_export_path") or "").strip()
         return {
             "id": file_id,
             "name": name or "Auto-Graph File",
@@ -23988,6 +24228,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             "updated_at": updated_at,
             "global_selection": global_selection,
             "track_program_serials": bool(raw.get("track_program_serials")),
+            "pdf_export_path": pdf_export_path,
             "plots": normalized_plots,
         }
 
@@ -24121,6 +24362,141 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._sync_main_auto_plot_actions()
         self._refresh_auto_plots_list()
 
+    def _load_saved_auto_graph_file_entries(self) -> list[dict[str, object]]:
+        raw_graph_files: list[object] = []
+        try:
+            if self._auto_plot_path.exists():
+                data = json.loads(self._auto_plot_path.read_text(encoding="utf-8"))
+            else:
+                data = None
+            if isinstance(data, list):
+                raw_graph_files = [
+                    self._legacy_auto_graph_file_from_entry(entry)
+                    for entry in data
+                    if isinstance(entry, Mapping)
+                ]
+            elif isinstance(data, Mapping):
+                raw_files = data.get("graph_files")
+                if isinstance(raw_files, list):
+                    raw_graph_files = [dict(item) for item in raw_files if isinstance(item, Mapping)]
+                else:
+                    fallback_selection = data.get("global_selection")
+                    entries = data.get("entries")
+                    if isinstance(entries, list):
+                        raw_graph_files = [
+                            self._legacy_auto_graph_file_from_entry(
+                                entry if isinstance(entry, Mapping) else None,
+                                fallback_global_selection=(
+                                    fallback_selection if isinstance(fallback_selection, Mapping) else None
+                                ),
+                            )
+                            for entry in entries
+                        ]
+        except Exception:
+            raw_graph_files = []
+        out: list[dict[str, object]] = []
+        seen_ids: set[str] = set()
+        for item in raw_graph_files:
+            if not isinstance(item, Mapping):
+                continue
+            normalized = self._normalize_auto_graph_file(item)
+            if normalized is None:
+                continue
+            file_id = str(normalized.get("id") or "").strip()
+            if file_id and file_id in seen_ids:
+                continue
+            if file_id:
+                seen_ids.add(file_id)
+            out.append(normalized)
+        out.sort(
+            key=lambda entry: (
+                _td_auto_plot_sort_datetime(entry.get("updated_at") or entry.get("saved_at")),
+                str(entry.get("name") or "").strip().lower(),
+            ),
+            reverse=True,
+        )
+        return [dict(entry) for entry in out]
+
+    def _save_saved_auto_graph_file_entries(
+        self,
+        entries: Sequence[Mapping[str, object]],
+    ) -> list[dict[str, object]]:
+        normalized_entries: list[dict[str, object]] = []
+        seen_ids: set[str] = set()
+        for item in entries:
+            if not isinstance(item, Mapping):
+                continue
+            normalized = self._normalize_auto_graph_file(item)
+            if normalized is None:
+                continue
+            file_id = str(normalized.get("id") or "").strip()
+            if file_id and file_id in seen_ids:
+                continue
+            if file_id:
+                seen_ids.add(file_id)
+            normalized_entries.append(normalized)
+        normalized_entries.sort(
+            key=lambda entry: (
+                _td_auto_plot_sort_datetime(entry.get("updated_at") or entry.get("saved_at")),
+                str(entry.get("name") or "").strip().lower(),
+            ),
+            reverse=True,
+        )
+        payload = {
+            "version": TD_AUTO_PLOT_STORE_VERSION,
+            "graph_files": [dict(entry) for entry in normalized_entries],
+        }
+        self._auto_plot_path.write_text(
+            json.dumps(payload, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        return [dict(entry) for entry in normalized_entries]
+
+    def _upsert_auto_graph_file_entry(
+        self,
+        entry: Mapping[str, object] | None,
+        *,
+        refresh_pdf: bool = True,
+    ) -> dict[str, object] | None:
+        normalized = self._normalize_auto_graph_file(entry if isinstance(entry, Mapping) else None)
+        if normalized is None:
+            return None
+        entries = self._load_saved_auto_graph_file_entries()
+        target_id = str(normalized.get("id") or "").strip()
+        replaced = False
+        for idx, existing in enumerate(entries):
+            if target_id and str(existing.get("id") or "").strip() == target_id:
+                entries[idx] = normalized
+                replaced = True
+                break
+        if not replaced:
+            entries.append(normalized)
+        saved_entries = self._save_saved_auto_graph_file_entries(entries)
+        saved = next(
+            (
+                dict(item)
+                for item in saved_entries
+                if str(item.get("id") or "").strip() == target_id
+            ),
+            dict(normalized),
+        )
+        pdf_path_text = str(saved.get("pdf_export_path") or "").strip()
+        if refresh_pdf and pdf_path_text:
+            try:
+                self._save_auto_graph_file_pdf_to_path(
+                    saved,
+                    Path(pdf_path_text),
+                    persist_path=False,
+                    show_result=False,
+                )
+            except Exception as exc:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Auto-Graphs",
+                    f"Graph file was saved, but the linked PDF could not be refreshed:\n{exc}",
+                )
+        return saved
+
     def _auto_graph_file_program_values(self, graph_file: Mapping[str, object] | None) -> list[str]:
         if not isinstance(graph_file, Mapping):
             return []
@@ -24158,6 +24534,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             "Track serials from programs: On" if bool(graph_file.get("track_program_serials")) else "Track serials from programs: Off",
             f"Filters: {self._auto_plot_filter_summary_text(filters)}",
         ]
+        pdf_export_path = str(graph_file.get("pdf_export_path") or "").strip()
+        if pdf_export_path:
+            lines.append(f"PDF Export: {pdf_export_path}")
         saved_at = str(graph_file.get("saved_at") or "").strip()
         updated_at = str(graph_file.get("updated_at") or "").strip()
         if saved_at:
@@ -24384,37 +24763,79 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             message = str(exc or "Unable to render this Auto-Graph plot.")
             return self._auto_plot_warning_figure(title=title or "Auto-Graph", message=message), message
 
-    def _save_auto_graph_file_pdf(self, graph_file: Mapping[str, object]) -> None:
+    def _save_auto_graph_file_pdf_to_path(
+        self,
+        graph_file: Mapping[str, object],
+        pdf_path: Path,
+        *,
+        persist_path: bool = False,
+        show_result: bool = True,
+    ) -> dict[str, object] | None:
         normalized = self._normalize_auto_graph_file(graph_file if isinstance(graph_file, Mapping) else None)
         if normalized is None or not self._plot_ready or not self._db_path:
-            return
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self,
-            "Save Auto-Graph File PDF",
-            str(self._project_dir / f"{_td_auto_plot_slug(normalized.get('name'), fallback='auto_graph_file')}.pdf"),
-            "PDF Files (*.pdf)",
-        )
-        if not path:
-            return
+            return None
+        target = Path(pdf_path).expanduser()
+        if target.suffix.lower() != ".pdf":
+            target = target.with_suffix(".pdf")
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
         warning_count = 0
         try:
             from matplotlib.backends.backend_pdf import PdfPages
 
-            with PdfPages(path) as pdf:
+            with PdfPages(str(target)) as pdf:
                 for plot_entry in self._auto_graph_file_plot_entries(normalized):
                     fig, warning_text = self._render_auto_graph_plot_figure(normalized, plot_entry)
                     if warning_text:
                         warning_count += 1
                     pdf.savefig(fig)
         except Exception as exc:
-            QtWidgets.QMessageBox.warning(self, "Auto-Graphs", str(exc))
-            return
-        if warning_count:
+            raise RuntimeError(str(exc)) from exc
+        saved = dict(normalized)
+        if persist_path:
+            persisted = dict(normalized)
+            persisted["pdf_export_path"] = str(target)
+            maybe_saved = self._upsert_auto_graph_file_entry(persisted, refresh_pdf=False)
+            if maybe_saved is not None:
+                saved = dict(maybe_saved)
+            else:
+                saved["pdf_export_path"] = str(target)
+        if show_result and warning_count:
             QtWidgets.QMessageBox.information(
                 self,
                 "Auto-Graphs",
                 f"Saved PDF with {warning_count} warning page{'s' if warning_count != 1 else ''}.",
             )
+        return saved
+
+    def _save_auto_graph_file_pdf(self, graph_file: Mapping[str, object]) -> dict[str, object] | None:
+        normalized = self._normalize_auto_graph_file(graph_file if isinstance(graph_file, Mapping) else None)
+        if normalized is None or not self._plot_ready or not self._db_path:
+            return None
+        existing_path = str(normalized.get("pdf_export_path") or "").strip()
+        default_path = existing_path or str(
+            self._project_dir / f"{_td_auto_plot_slug(normalized.get('name'), fallback='auto_graph_file')}.pdf"
+        )
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Save Auto-Graph File PDF",
+            default_path,
+            "PDF Files (*.pdf)",
+        )
+        if not path:
+            return None
+        try:
+            return self._save_auto_graph_file_pdf_to_path(
+                normalized,
+                Path(path),
+                persist_path=True,
+                show_result=True,
+            )
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Auto-Graphs", str(exc))
+            return None
 
     def _delete_selected_auto_plots(
         self,
@@ -24558,6 +24979,13 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         subtitle.setText(f"Filters: {self._auto_plot_filter_summary_text(self._resolve_auto_graph_file_filter_state(normalized))}")
         subtitle.setVisible(True)
         layout.addWidget(subtitle)
+        pdf_status = QtWidgets.QLabel("")
+        pdf_status.setWordWrap(True)
+        pdf_status.setStyleSheet(
+            "QLabel { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 10px; "
+            "padding: 8px 10px; color: #475569; font-size: 11px; }"
+        )
+        layout.addWidget(pdf_status)
 
         splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
         layout.addWidget(splitter, 1)
@@ -24603,6 +25031,18 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         def _plots() -> list[dict[str, object]]:
             return self._auto_graph_file_plot_entries(current_file["value"])
 
+        def _refresh_file_summary(saved_file: Mapping[str, object] | None) -> None:
+            normalized_file = self._normalize_auto_graph_file(saved_file if isinstance(saved_file, Mapping) else None)
+            if normalized_file is None:
+                return
+            current_file["value"] = dict(normalized_file)
+            title.setText(str(normalized_file.get("name") or "Auto-Graph File"))
+            subtitle.setText(
+                f"Filters: {self._auto_plot_filter_summary_text(self._resolve_auto_graph_file_filter_state(normalized_file))}"
+            )
+            pdf_path_text = str(normalized_file.get("pdf_export_path") or "").strip()
+            pdf_status.setText(f"PDF Export: {pdf_path_text}" if pdf_path_text else "PDF Export: Not linked")
+
         def _refresh_plot_list(select_plot_id: str = "") -> None:
             plot_list.clear()
             target_id = str(select_plot_id or "").strip()
@@ -24641,19 +25081,33 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             warning_label.setText(warning_text)
             canvas_layout.addWidget(FigureCanvas(fig), 1)
 
+        _refresh_file_summary(current_file["value"])
         _refresh_plot_list()
         plot_list.itemSelectionChanged.connect(_render_selected)
         _render_selected()
 
         btn_row = QtWidgets.QHBoxLayout()
         btn_row.addStretch(1)
+        btn_load_live = QtWidgets.QPushButton("Load Selected Plot Into Live GUI")
         btn_edit = QtWidgets.QPushButton("Edit File")
-        btn_save_pdf = QtWidgets.QPushButton("Save PDF")
+        btn_save_pdf = QtWidgets.QPushButton("Export PDF...")
         btn_close = QtWidgets.QPushButton("Close")
+        btn_row.addWidget(btn_load_live)
         btn_row.addWidget(btn_edit)
         btn_row.addWidget(btn_save_pdf)
         btn_row.addWidget(btn_close)
         layout.addLayout(btn_row)
+
+        def _load_selected_plot() -> None:
+            selected_items = plot_list.selectedItems()
+            if not selected_items:
+                return
+            payload = selected_items[0].data(QtCore.Qt.ItemDataRole.UserRole)
+            plot_entry = self._normalize_auto_plot_entry(payload if isinstance(payload, Mapping) else None)
+            if plot_entry is None:
+                return
+            self._apply_auto_graph_quickcheck_plot_to_live_gui(plot_entry)
+            dlg.accept()
 
         def _edit_file() -> None:
             selected_items = plot_list.selectedItems()
@@ -24665,17 +25119,21 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             edited = self._open_auto_graph_file_editor(current_file["value"])
             if edited is None:
                 return
-            saved = self._upsert_auto_plot_entry(edited)
+            saved = self._upsert_auto_graph_file_entry(edited)
             if saved is None:
                 return
-            current_file["value"] = dict(saved)
-            title.setText(str(saved.get("name") or "Auto-Graph File"))
-            subtitle.setText("")
+            _refresh_file_summary(saved)
             _refresh_plot_list(select_plot_id=selected_plot_id)
             _render_selected()
 
+        def _export_pdf() -> None:
+            saved = self._save_auto_graph_file_pdf(current_file["value"])
+            if saved is not None:
+                _refresh_file_summary(saved)
+
+        btn_load_live.clicked.connect(_load_selected_plot)
         btn_edit.clicked.connect(_edit_file)
-        btn_save_pdf.clicked.connect(lambda: self._save_auto_graph_file_pdf(current_file["value"]))
+        btn_save_pdf.clicked.connect(_export_pdf)
         btn_close.clicked.connect(dlg.accept)
 
         _fit_widget_to_screen(dlg)
@@ -24699,6 +25157,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 "name": "",
                 "saved_at": "",
                 "updated_at": "",
+                "pdf_export_path": "",
                 "global_selection": self._default_auto_plot_global_selection(),
                 "track_program_serials": False,
                 "plots": seed_plots,
@@ -24986,6 +25445,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     "name": str(ed_name.text() or "").strip(),
                     "saved_at": str(seed_file.get("saved_at") or "").strip(),
                     "updated_at": str(seed_file.get("updated_at") or "").strip(),
+                    "pdf_export_path": str(seed_file.get("pdf_export_path") or "").strip(),
                     "global_selection": self._normalize_auto_plot_global_selection(
                         state.get("global_selection"),
                         default_to_current=True,
@@ -25423,6 +25883,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 "name": name,
                 "saved_at": str(seed_file.get("saved_at") or "").strip() or now_text,
                 "updated_at": now_text,
+                "pdf_export_path": str(seed_file.get("pdf_export_path") or "").strip(),
                 "global_selection": self._normalize_auto_plot_global_selection(state.get("global_selection"), default_to_current=True),
                 "track_program_serials": bool(cb_track_serials.isChecked()),
                 "plots": list(state.get("plots") or []),
@@ -26825,6 +27286,51 @@ class TestDataTrendDialog(QtWidgets.QDialog):
     def _open_all_auto_plots_panel(self) -> None:
         self._open_auto_plots_popup()
 
+    def _open_project_graph_item(self, graph_item: Mapping[str, object] | None) -> None:
+        if not isinstance(graph_item, Mapping):
+            self._open_auto_plots_popup()
+            return
+        graph_key = str(graph_item.get("graph_key") or "").strip()
+        if not graph_key:
+            self._open_auto_plots_popup()
+            return
+        legacy_prefix = "legacy_graph_file:"
+        if graph_key.startswith(legacy_prefix):
+            target_key = graph_key[len(legacy_prefix):]
+            for idx, entry in enumerate(self._load_saved_auto_graph_file_entries()):
+                entry_id = str(entry.get("id") or "").strip()
+                current_key = f"id:{entry_id}" if entry_id else f"index:{idx}"
+                if current_key == target_key:
+                    self._open_auto_graph_file_viewer(entry)
+                    return
+            QtWidgets.QMessageBox.warning(self, "Auto-Graphs", "The selected saved graph file was not found.")
+            return
+        selected_pack = next(
+            (
+                dict(item)
+                for item in (self._auto_plots or [])
+                if isinstance(item, Mapping) and str(item.get("id") or "").strip() == graph_key
+            ),
+            None,
+        )
+        if selected_pack is None:
+            try:
+                library = be.load_auto_graph_quickcheck_library(self._project_dir)
+            except Exception:
+                library = {}
+            selected_pack = next(
+                (
+                    dict(item)
+                    for item in (library.get("packs") or [])
+                    if isinstance(item, Mapping) and str(item.get("id") or "").strip() == graph_key
+                ),
+                None,
+            )
+        if selected_pack is not None:
+            self._open_auto_graph_quickcheck_viewer(selected_pack)
+            return
+        self._open_auto_plots_popup()
+
     def _auto_plot_warning_figure(self, *, title: str, message: str):
         from matplotlib.figure import Figure
 
@@ -27056,7 +27562,7 @@ class ProjectDocumentManagerDialog(QtWidgets.QDialog):
             return
         try:
             if str(item.get("type") or "") == "graph_definition":
-                self._open_graph_library()
+                self._open_graph_library(dict(item))
                 return
             path = Path(str(item.get("path") or "")).expanduser()
             if not path.exists():
@@ -31185,7 +31691,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 global_repo=repo,
                 record=record,
                 request_update=_request_update,
-                open_graph_library=lambda: self._open_project_graph_library(record),
+                open_graph_library=lambda item=None: self._open_project_graph_library(record, graph_item=item),
                 parent=self,
             )
             self._prepare_dialog(dlg)
@@ -31194,13 +31700,23 @@ class MainWindow(QtWidgets.QMainWindow):
             title = "View Graphs" if str(mode or "").strip().lower() == "graphs" else "View Reports"
             QtWidgets.QMessageBox.warning(self, title, str(exc))
 
-    def _open_project_graph_library(self, record: Mapping[str, object]) -> None:
+    def _open_project_graph_library(
+        self,
+        record: Mapping[str, object],
+        graph_item: Mapping[str, object] | None = None,
+    ) -> None:
         ptype = str((record or {}).get("type") or "").strip()
         project_dir = Path(str((record or {}).get("folder") or "")).expanduser()
         workbook = Path(str((record or {}).get("workbook") or "")).expanduser()
         if ptype == getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending"):
             dlg = TestDataTrendDialog(project_dir, workbook, self)
-            QtCore.QTimer.singleShot(0, dlg._open_auto_plots_popup)
+            if isinstance(graph_item, Mapping) and str(graph_item.get("type") or "").strip() == "graph_definition":
+                QtCore.QTimer.singleShot(
+                    0,
+                    lambda item=dict(graph_item): dlg._open_project_graph_item(item),
+                )
+            else:
+                QtCore.QTimer.singleShot(0, dlg._open_auto_plots_popup)
         else:
             dlg = ImplementationTrendDialog(project_dir, workbook, self)
             if hasattr(dlg, "_open_auto_plot_panel"):
