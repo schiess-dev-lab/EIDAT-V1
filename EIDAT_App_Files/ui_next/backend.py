@@ -4281,13 +4281,18 @@ def _td_parameter_inventory_suggestion(
     units: Sequence[object] | None = None,
     config_candidates: Sequence[Mapping[str, object]] | None = None,
 ) -> dict[str, str]:
-    raw_norm = _td_param_norm_name(raw_name)
-    if not raw_norm:
+    raw_variants = _td_parameter_name_match_variants(raw_name)
+    raw_norms = {_td_param_norm_name(value) for value in raw_variants if _td_param_norm_name(value)}
+    if not raw_norms:
         return {}
     candidates = [dict(item) for item in (config_candidates or []) if isinstance(item, Mapping)]
     exact_matches: list[dict[str, object]] = []
     fuzzy_matches: list[dict[str, object]] = []
-    raw_tokens = set(_td_parameter_tokens(raw_name))
+    raw_token_variants = [
+        set(_td_parameter_tokens(value))
+        for value in raw_variants
+        if set(_td_parameter_tokens(value))
+    ]
     for candidate in candidates:
         display_name = str(candidate.get("display_name") or "").strip()
         if not display_name:
@@ -4296,18 +4301,21 @@ def _td_parameter_inventory_suggestion(
             continue
         aliases = [str(value).strip() for value in (candidate.get("aliases") or []) if str(value).strip()]
         alias_norms = {_td_param_norm_name(value) for value in aliases if _td_param_norm_name(value)}
-        if raw_norm in alias_norms:
+        if raw_norms & alias_norms:
             exact_matches.append(candidate)
             continue
-        if not raw_tokens:
+        if not raw_token_variants:
             continue
         best_ratio = 0.0
         best_token_match = False
         for alias in aliases:
             alias_norm = _td_param_norm_name(alias)
             alias_tokens = set(_td_parameter_tokens(alias))
-            best_ratio = max(best_ratio, SequenceMatcher(None, raw_norm, alias_norm).ratio())
-            if raw_tokens == alias_tokens and alias_tokens:
+            for raw_variant in raw_variants:
+                raw_variant_norm = _td_param_norm_name(raw_variant)
+                if raw_variant_norm:
+                    best_ratio = max(best_ratio, SequenceMatcher(None, raw_variant_norm, alias_norm).ratio())
+            if alias_tokens and any(raw_tokens == alias_tokens for raw_tokens in raw_token_variants):
                 best_token_match = True
         if best_token_match or best_ratio >= 0.92:
             fuzzy_matches.append(candidate)
@@ -6967,6 +6975,7 @@ TD_LIFE_BASE_ALIASES: dict[str, tuple[str, ...]] = {
 }
 
 TD_LIFE_CUMULATIVE_IMPULSE_FUZZY_MIN_RATIO = 0.82
+TD_LIFE_CUMULATIVE_IMPULSE_DISPLAY_NAME = "Cumulative Impulse"
 
 
 def _td_life_norm_key(value: object) -> str:
@@ -7003,6 +7012,26 @@ def _td_life_matches_cumulative_impulse_alias(
         if _td_life_alias_match_score(alias, text) >= ratio:
             return True
     return False
+
+
+def _td_life_cumulative_impulse_aliases() -> tuple[str, ...]:
+    return tuple(str(alias or "").strip() for alias in (TD_LIFE_BASE_ALIASES.get("cumulative_impulse") or ()) if str(alias or "").strip())
+
+
+def _td_life_is_cumulative_impulse_parameter(value: object) -> bool:
+    return _td_life_matches_cumulative_impulse_alias(value, _td_life_cumulative_impulse_aliases())
+
+
+def _td_life_cumulative_impulse_units_from_pairs(rows: Sequence[Sequence[object]]) -> str:
+    aliases = _td_life_cumulative_impulse_aliases()
+    for row in rows:
+        if not isinstance(row, Sequence) or len(row) < 2:
+            continue
+        name = row[0]
+        units = str(row[1] or "").strip()
+        if units and _td_life_matches_cumulative_impulse_alias(name, aliases):
+            return units
+    return ""
 
 
 def _td_life_last_finite_value(values: Sequence[object]) -> float | None:
@@ -9975,6 +10004,97 @@ def _td_program_requirements_param_def_map(param_defs: Sequence[Mapping[str, obj
     return out
 
 
+_TD_DISCOVERABLE_UNIT_TOKENS = {
+    "s": "s",
+    "sec": "sec",
+    "secs": "sec",
+    "second": "sec",
+    "seconds": "sec",
+    "ms": "ms",
+    "msec": "msec",
+    "msecs": "msec",
+    "psi": "psi",
+    "psia": "psia",
+    "lbf": "lbf",
+    "v": "V",
+    "kv": "kV",
+    "a": "A",
+    "amp": "A",
+    "amps": "A",
+    "ma": "mA",
+    "mv": "mV",
+    "hz": "Hz",
+    "khz": "kHz",
+    "%": "%",
+    "pct": "%",
+    "percent": "%",
+    "f": "F",
+    "c": "C",
+    "degf": "F",
+    "degc": "C",
+    "in2": "in^2",
+    "in^2": "in^2",
+    "ft2": "ft^2",
+    "ft^2": "ft^2",
+}
+
+
+def _td_discovered_unit_from_header_value(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    match = re.search(r"\(([^()]+)\)\s*$", text)
+    if match:
+        candidate = re.sub(r"\s+", "", str(match.group(1) or "").strip())
+        if candidate:
+            return _TD_DISCOVERABLE_UNIT_TOKENS.get(candidate.casefold(), candidate)
+    # Fall back to a known trailing unit token when the source header was flattened
+    # into text such as "Time sec" or "Pressure psia".
+    tokens = re.findall(r"[A-Za-z0-9%^./]+|%", text)
+    if not tokens:
+        return ""
+    candidate = str(tokens[-1] or "").strip()
+    if not candidate:
+        return ""
+    return _TD_DISCOVERABLE_UNIT_TOKENS.get(candidate.casefold(), "")
+
+
+def _td_discovered_unit_from_column_names(*values: object) -> str:
+    for value in values:
+        unit = _td_discovered_unit_from_header_value(value)
+        if unit:
+            return unit
+    return ""
+
+
+def _td_parameter_name_match_variants(value: object) -> list[str]:
+    raw = str(value or "").strip()
+    if not raw:
+        return []
+    variants: list[str] = []
+    seen: set[str] = set()
+
+    def _add(text: object) -> None:
+        candidate = str(text or "").strip()
+        norm = _td_param_norm_name(candidate)
+        if not candidate or not norm or norm in seen:
+            return
+        seen.add(norm)
+        variants.append(candidate)
+
+    _add(raw)
+    _add(re.sub(r"\s*\(([^()]*)\)\s*$", "", raw).strip())
+    unit_norms = {_td_param_norm_name(key) for key in _TD_DISCOVERABLE_UNIT_TOKENS if _td_param_norm_name(key)}
+    for candidate in list(variants):
+        tokens = [token for token in re.split(r"[_\s]+", candidate) if token]
+        if len(tokens) <= 1:
+            continue
+        if _td_param_norm_name(tokens[-1]) in unit_norms:
+            _add(" ".join(tokens[:-1]))
+            _add("_".join(tokens[:-1]))
+    return variants
+
+
 def _td_program_requirements_is_parameter_column(column_name: object, *, x_aliases: set[str]) -> bool:
     raw = str(column_name or "").strip()
     if not raw or raw.startswith("__"):
@@ -10083,6 +10203,8 @@ def _td_source_sqlite_column_specs(
             or {}
         )
         preferred_units = str(param_match.get("units") or "").strip()
+        if not preferred_units:
+            preferred_units = _td_discovered_unit_from_column_names(header, mapped_header, sqlite_column)
         candidate_name = mapped_header or header
         is_parameter = _td_program_requirements_is_parameter_column(candidate_name, x_aliases=x_aliases)
         if is_parameter and not _td_program_requirements_is_parameter_column(header, x_aliases=x_aliases):
@@ -10110,7 +10232,7 @@ def _td_autonormalize_parameter_mapping_rows(
         normalized = _td_program_parameter_mapping_normalize(row)
         if normalized:
             normalized_rows.append(normalized)
-    if len(normalized_rows) <= 1:
+    if not normalized_rows:
         return sorted(normalized_rows, key=_td_program_parameter_mapping_sort_key)
 
     scopes: dict[tuple[str, str, str], list[dict[str, object]]] = {}
@@ -20256,7 +20378,7 @@ def td_list_life_parameter_options(db_path: Path, run_names: Sequence[object]) -
     runs = [str(value or "").strip() for value in (run_names or []) if str(value or "").strip()]
     sql = [
         f"""
-        SELECT parameter_name, COALESCE(units, '')
+        SELECT parameter_name, COALESCE(units, ''), cumulative_impulse
         FROM {TD_LIFE_METRICS_TABLE}
         WHERE lower(stat) = 'mean'
         """
@@ -20270,9 +20392,14 @@ def td_list_life_parameter_options(db_path: Path, run_names: Sequence[object]) -
         _ensure_test_data_impl_tables(conn)
         rows = conn.execute("".join(sql), tuple(params)).fetchall()
     union: dict[str, dict[str, str]] = {}
-    for raw_name, raw_units in rows:
+    cumulative_impulse_option: dict[str, str] | None = None
+    cumulative_impulse_units = _td_life_cumulative_impulse_units_from_pairs(rows)
+    has_cumulative_impulse = False
+    for raw_name, raw_units, raw_cumulative_impulse in rows:
         name = str(raw_name or "").strip()
         if not name:
+            if _td_finite_float(raw_cumulative_impulse) is not None:
+                has_cumulative_impulse = True
             continue
         units = str(raw_units or "").strip()
         key = _td_param_norm_name(name)
@@ -20280,6 +20407,18 @@ def td_list_life_parameter_options(db_path: Path, run_names: Sequence[object]) -
             union[key] = {"name": name, "units": units}
         elif units and not str(union[key].get("units") or "").strip():
             union[key]["units"] = units
+        if _td_life_is_cumulative_impulse_parameter(name):
+            cumulative_impulse_option = union[key]
+        if _td_finite_float(raw_cumulative_impulse) is not None:
+            has_cumulative_impulse = True
+    if has_cumulative_impulse:
+        if cumulative_impulse_option is None:
+            union[_td_param_norm_name(TD_LIFE_CUMULATIVE_IMPULSE_DISPLAY_NAME)] = {
+                "name": TD_LIFE_CUMULATIVE_IMPULSE_DISPLAY_NAME,
+                "units": cumulative_impulse_units,
+            }
+        elif cumulative_impulse_units and not str(cumulative_impulse_option.get("units") or "").strip():
+            cumulative_impulse_option["units"] = cumulative_impulse_units
     return sorted(union.values(), key=lambda item: str(item.get("name") or "").casefold())
 
 
@@ -20315,6 +20454,7 @@ def td_load_life_metric_series(
     parameter: str,
     life_axis: str,
     serials: Sequence[object] | None = None,
+    stat: object = "mean",
 ) -> list[dict]:
     path = Path(db_path).expanduser()
     if not path.exists():
@@ -20322,69 +20462,160 @@ def td_load_life_metric_series(
     runs = [str(value or "").strip() for value in (run_names or []) if str(value or "").strip()]
     param = str(parameter or "").strip()
     axis = _td_normalize_life_axis(life_axis)
+    stat_key = str(stat or "").strip().lower()
+    if stat_key not in TD_ALLOWED_STATS:
+        stat_key = "mean"
     allowed_axes = {key for key, _label in TD_LIFE_AXIS_OPTIONS}
     if axis not in allowed_axes:
         axis = "sequence_index"
     serial_list = [str(value or "").strip() for value in (serials or []) if str(value or "").strip()]
     if not runs or not param:
         return []
-    sql = [
-        f"""
-        SELECT
-            l.observation_id,
-            l.serial,
-            l.condition_key,
-            COALESCE(l.condition_display, ''),
-            COALESCE(l.program_title, ''),
-            COALESCE(l.source_run_name, ''),
-            COALESCE(sm.asset_type, ''),
-            COALESCE(sm.asset_specific_type, ''),
-            l.sequence_index,
-            COALESCE(l.sequence_label, ''),
-            l.parameter_name,
-            l.value_num,
-            COALESCE(l.units, ''),
-            l.{axis},
-            l.sequence_pulses,
-            l.cumulative_pulses,
-            l.sequence_on_time,
-            l.cumulative_on_time,
-            l.sequence_elapsed_time,
-            l.cumulative_elapsed_time,
-            l.sequence_throughput,
-            l.cumulative_throughput,
-            l.sequence_impulse,
-            l.cumulative_impulse,
-            COALESCE(l.diagnostics, ''),
-            COALESCE(o.run_type, ''),
-            o.control_period,
-            o.suppression_voltage,
-            o.valve_voltage
-        FROM {TD_LIFE_METRICS_TABLE} l
-        LEFT JOIN td_condition_observations_sequences o
-          ON o.observation_id = l.observation_id
-        LEFT JOIN td_source_metadata sm
-          ON sm.serial = l.serial
-        WHERE l.parameter_name = ?
-          AND lower(l.stat) = 'mean'
-        """
-    ]
-    params: list[object] = [param]
-    sql.append(f" AND l.condition_key IN ({','.join('?' for _ in runs)})")
-    params.extend(runs)
-    if serial_list:
-        sql.append(f" AND l.serial IN ({','.join('?' for _ in serial_list)})")
-        params.extend(serial_list)
-    sql.append(" ORDER BY l.serial, l.sequence_index, l.condition_key, l.observation_id")
+    param_is_cumulative_impulse = _td_life_is_cumulative_impulse_parameter(param)
+    params: list[object]
+    sql: list[str]
+    if param_is_cumulative_impulse:
+        sql = [
+            f"""
+            SELECT
+                l.observation_id,
+                l.serial,
+                l.condition_key,
+                COALESCE(l.condition_display, ''),
+                COALESCE(l.program_title, ''),
+                COALESCE(l.source_run_name, ''),
+                COALESCE(sm.asset_type, ''),
+                COALESCE(sm.asset_specific_type, ''),
+                l.sequence_index,
+                COALESCE(l.sequence_label, ''),
+                ?,
+                l.cumulative_impulse,
+                '',
+                l.{axis},
+                l.sequence_pulses,
+                l.cumulative_pulses,
+                l.sequence_on_time,
+                l.cumulative_on_time,
+                l.sequence_elapsed_time,
+                l.cumulative_elapsed_time,
+                l.sequence_throughput,
+                l.cumulative_throughput,
+                l.sequence_impulse,
+                l.cumulative_impulse,
+                COALESCE(l.diagnostics, ''),
+                COALESCE(o.run_type, ''),
+                o.control_period,
+                o.suppression_voltage,
+                o.valve_voltage
+            FROM {TD_LIFE_METRICS_TABLE} l
+            LEFT JOIN td_condition_observations_sequences o
+              ON o.observation_id = l.observation_id
+            LEFT JOIN td_source_metadata sm
+              ON sm.serial = l.serial
+            WHERE lower(l.stat) = 'mean'
+              AND l.cumulative_impulse IS NOT NULL
+            """
+        ]
+        params = [TD_LIFE_CUMULATIVE_IMPULSE_DISPLAY_NAME]
+        sql.append(f" AND l.condition_key IN ({','.join('?' for _ in runs)})")
+        params.extend(runs)
+        if serial_list:
+            sql.append(f" AND l.serial IN ({','.join('?' for _ in serial_list)})")
+            params.extend(serial_list)
+        sql.append(" ORDER BY l.serial, l.sequence_index, l.condition_key, l.observation_id, l.parameter_name")
+    else:
+        sql = [
+            f"""
+            SELECT
+                l.observation_id,
+                l.serial,
+                l.condition_key,
+                COALESCE(l.condition_display, ''),
+                COALESCE(l.program_title, ''),
+                COALESCE(l.source_run_name, ''),
+                COALESCE(sm.asset_type, ''),
+                COALESCE(sm.asset_specific_type, ''),
+                l.sequence_index,
+                COALESCE(l.sequence_label, ''),
+                l.parameter_name,
+                m.value_num,
+                COALESCE(NULLIF(l.units, ''), COALESCE(c.units, '')),
+                l.{axis},
+                l.sequence_pulses,
+                l.cumulative_pulses,
+                l.sequence_on_time,
+                l.cumulative_on_time,
+                l.sequence_elapsed_time,
+                l.cumulative_elapsed_time,
+                l.sequence_throughput,
+                l.cumulative_throughput,
+                l.sequence_impulse,
+                l.cumulative_impulse,
+                COALESCE(l.diagnostics, ''),
+                COALESCE(o.run_type, ''),
+                o.control_period,
+                o.suppression_voltage,
+                o.valve_voltage
+            FROM {TD_LIFE_METRICS_TABLE} l
+            INNER JOIN td_metrics_calc_sequences m
+              ON m.observation_id = l.observation_id
+             AND m.serial = l.serial
+             AND m.run_name = l.condition_key
+             AND m.column_name = l.parameter_name
+             AND lower(m.stat) = ?
+            LEFT JOIN td_columns_calc c
+              ON c.run_name = m.run_name
+             AND c.name = m.column_name
+             AND c.kind = 'y'
+            LEFT JOIN td_condition_observations_sequences o
+              ON o.observation_id = l.observation_id
+            LEFT JOIN td_source_metadata sm
+              ON sm.serial = l.serial
+            WHERE l.parameter_name = ?
+              AND lower(l.stat) = 'mean'
+            """
+        ]
+        params = [stat_key, param]
+        sql.append(f" AND l.condition_key IN ({','.join('?' for _ in runs)})")
+        params.extend(runs)
+        if serial_list:
+            sql.append(f" AND l.serial IN ({','.join('?' for _ in serial_list)})")
+            params.extend(serial_list)
+        sql.append(" ORDER BY l.serial, l.sequence_index, l.condition_key, l.observation_id")
     with sqlite3.connect(str(path)) as conn:
         _ensure_test_data_impl_tables(conn)
+        cumulative_impulse_units = ""
+        if param_is_cumulative_impulse:
+            units_sql = [
+                f"""
+                SELECT parameter_name, COALESCE(units, '')
+                FROM {TD_LIFE_METRICS_TABLE}
+                WHERE lower(stat) = 'mean'
+                """
+            ]
+            units_params: list[object] = []
+            units_sql.append(f" AND condition_key IN ({','.join('?' for _ in runs)})")
+            units_params.extend(runs)
+            if serial_list:
+                units_sql.append(f" AND serial IN ({','.join('?' for _ in serial_list)})")
+                units_params.extend(serial_list)
+            units_sql.append(" ORDER BY parameter_name, units")
+            cumulative_impulse_units = _td_life_cumulative_impulse_units_from_pairs(
+                conn.execute("".join(units_sql), tuple(units_params)).fetchall()
+            )
         rows = conn.execute("".join(sql), tuple(params)).fetchall()
     out: list[dict] = []
+    seen_observations: set[tuple[str, str]] = set()
     for row in rows:
         x_value = _td_finite_float(row[13])
         y_value = _td_finite_float(row[11])
         if x_value is None or y_value is None:
             continue
+        if param_is_cumulative_impulse:
+            obs_key = (str(row[0] or "").strip(), str(row[1] or "").strip())
+            if obs_key in seen_observations:
+                continue
+            seen_observations.add(obs_key)
         out.append(
             {
                 "observation_id": str(row[0] or "").strip(),
@@ -20398,8 +20629,9 @@ def td_load_life_metric_series(
                 "sequence_index": int(row[8] or 0),
                 "sequence_label": str(row[9] or "").strip(),
                 "parameter_name": str(row[10] or "").strip(),
+                "stat": stat_key,
                 "value_num": y_value,
-                "units": str(row[12] or "").strip(),
+                "units": cumulative_impulse_units if param_is_cumulative_impulse else str(row[12] or "").strip(),
                 "life_axis": axis,
                 "x_value": x_value,
                 "y_value": y_value,
@@ -20429,6 +20661,7 @@ def td_load_life_metric_xy(
     x_parameter: str,
     y_parameter: str,
     serials: Sequence[object] | None = None,
+    stat: object = "mean",
 ) -> list[dict]:
     path = Path(db_path).expanduser()
     if not path.exists():
@@ -20436,65 +20669,266 @@ def td_load_life_metric_xy(
     runs = [str(value or "").strip() for value in (run_names or []) if str(value or "").strip()]
     x_param = str(x_parameter or "").strip()
     y_param = str(y_parameter or "").strip()
+    stat_key = str(stat or "").strip().lower()
+    if stat_key not in TD_ALLOWED_STATS:
+        stat_key = "mean"
     serial_list = [str(value or "").strip() for value in (serials or []) if str(value or "").strip()]
     if not runs or not x_param or not y_param:
         return []
-    sql = [
-        f"""
-        SELECT
-            x.observation_id,
-            x.serial,
-            x.condition_key,
-            COALESCE(x.condition_display, ''),
-            COALESCE(x.program_title, ''),
-            COALESCE(x.source_run_name, ''),
-            COALESCE(sm.asset_type, ''),
-            COALESCE(sm.asset_specific_type, ''),
-            x.sequence_index,
-            COALESCE(x.sequence_label, ''),
-            x.value_num,
-            y.value_num,
-            COALESCE(x.units, ''),
-            COALESCE(y.units, ''),
-            x.cumulative_pulses,
-            x.cumulative_on_time,
-            x.cumulative_throughput,
-            x.cumulative_impulse,
-            COALESCE(x.diagnostics, ''),
-            COALESCE(o.run_type, ''),
-            o.control_period,
-            o.suppression_voltage,
-            o.valve_voltage
-        FROM {TD_LIFE_METRICS_TABLE} x
-        INNER JOIN {TD_LIFE_METRICS_TABLE} y
-          ON y.serial = x.serial
-         AND y.observation_id = x.observation_id
-         AND lower(y.stat) = 'mean'
-         AND y.parameter_name = ?
-        LEFT JOIN td_condition_observations_sequences o
-          ON o.observation_id = x.observation_id
-        LEFT JOIN td_source_metadata sm
-          ON sm.serial = x.serial
-        WHERE x.parameter_name = ?
-          AND lower(x.stat) = 'mean'
-        """
-    ]
-    params: list[object] = [y_param, x_param]
-    sql.append(f" AND x.condition_key IN ({','.join('?' for _ in runs)})")
-    params.extend(runs)
-    if serial_list:
-        sql.append(f" AND x.serial IN ({','.join('?' for _ in serial_list)})")
-        params.extend(serial_list)
-    sql.append(" ORDER BY x.serial, x.sequence_index, x.condition_key, x.observation_id")
+    x_is_cumulative_impulse = _td_life_is_cumulative_impulse_parameter(x_param)
+    y_is_cumulative_impulse = _td_life_is_cumulative_impulse_parameter(y_param)
+    params: list[object] = []
+    sql: list[str]
+    if x_is_cumulative_impulse and y_is_cumulative_impulse:
+        sql = [
+            f"""
+            SELECT
+                l.observation_id,
+                l.serial,
+                l.condition_key,
+                COALESCE(l.condition_display, ''),
+                COALESCE(l.program_title, ''),
+                COALESCE(l.source_run_name, ''),
+                COALESCE(sm.asset_type, ''),
+                COALESCE(sm.asset_specific_type, ''),
+                l.sequence_index,
+                COALESCE(l.sequence_label, ''),
+                l.cumulative_impulse,
+                l.cumulative_impulse,
+                '',
+                '',
+                l.cumulative_pulses,
+                l.cumulative_on_time,
+                l.cumulative_throughput,
+                l.cumulative_impulse,
+                COALESCE(l.diagnostics, ''),
+                COALESCE(o.run_type, ''),
+                o.control_period,
+                o.suppression_voltage,
+                o.valve_voltage
+            FROM {TD_LIFE_METRICS_TABLE} l
+            LEFT JOIN td_condition_observations_sequences o
+              ON o.observation_id = l.observation_id
+            LEFT JOIN td_source_metadata sm
+              ON sm.serial = l.serial
+            WHERE lower(l.stat) = 'mean'
+              AND l.cumulative_impulse IS NOT NULL
+            """
+        ]
+        sql.append(f" AND l.condition_key IN ({','.join('?' for _ in runs)})")
+        params.extend(runs)
+        if serial_list:
+            sql.append(f" AND l.serial IN ({','.join('?' for _ in serial_list)})")
+            params.extend(serial_list)
+        sql.append(" ORDER BY l.serial, l.sequence_index, l.condition_key, l.observation_id, l.parameter_name")
+    elif x_is_cumulative_impulse:
+        sql = [
+            f"""
+            SELECT
+                y.observation_id,
+                y.serial,
+                y.condition_key,
+                COALESCE(y.condition_display, ''),
+                COALESCE(y.program_title, ''),
+                COALESCE(y.source_run_name, ''),
+                COALESCE(sm.asset_type, ''),
+                COALESCE(sm.asset_specific_type, ''),
+                y.sequence_index,
+                COALESCE(y.sequence_label, ''),
+                y.cumulative_impulse,
+                my.value_num,
+                '',
+                COALESCE(NULLIF(y.units, ''), COALESCE(cy.units, '')),
+                y.cumulative_pulses,
+                y.cumulative_on_time,
+                y.cumulative_throughput,
+                y.cumulative_impulse,
+                COALESCE(y.diagnostics, ''),
+                COALESCE(o.run_type, ''),
+                o.control_period,
+                o.suppression_voltage,
+                o.valve_voltage
+            FROM {TD_LIFE_METRICS_TABLE} y
+            INNER JOIN td_metrics_calc_sequences my
+              ON my.observation_id = y.observation_id
+             AND my.serial = y.serial
+             AND my.run_name = y.condition_key
+             AND my.column_name = y.parameter_name
+             AND lower(my.stat) = ?
+            LEFT JOIN td_columns_calc cy
+              ON cy.run_name = my.run_name
+             AND cy.name = my.column_name
+             AND cy.kind = 'y'
+            LEFT JOIN td_condition_observations_sequences o
+              ON o.observation_id = y.observation_id
+            LEFT JOIN td_source_metadata sm
+              ON sm.serial = y.serial
+            WHERE y.parameter_name = ?
+              AND lower(y.stat) = 'mean'
+            """
+        ]
+        params.extend([stat_key, y_param])
+        sql.append(f" AND y.condition_key IN ({','.join('?' for _ in runs)})")
+        params.extend(runs)
+        if serial_list:
+            sql.append(f" AND y.serial IN ({','.join('?' for _ in serial_list)})")
+            params.extend(serial_list)
+        sql.append(" ORDER BY y.serial, y.sequence_index, y.condition_key, y.observation_id")
+    elif y_is_cumulative_impulse:
+        sql = [
+            f"""
+            SELECT
+                x.observation_id,
+                x.serial,
+                x.condition_key,
+                COALESCE(x.condition_display, ''),
+                COALESCE(x.program_title, ''),
+                COALESCE(x.source_run_name, ''),
+                COALESCE(sm.asset_type, ''),
+                COALESCE(sm.asset_specific_type, ''),
+                x.sequence_index,
+                COALESCE(x.sequence_label, ''),
+                mx.value_num,
+                x.cumulative_impulse,
+                COALESCE(NULLIF(x.units, ''), COALESCE(cx.units, '')),
+                '',
+                x.cumulative_pulses,
+                x.cumulative_on_time,
+                x.cumulative_throughput,
+                x.cumulative_impulse,
+                COALESCE(x.diagnostics, ''),
+                COALESCE(o.run_type, ''),
+                o.control_period,
+                o.suppression_voltage,
+                o.valve_voltage
+            FROM {TD_LIFE_METRICS_TABLE} x
+            INNER JOIN td_metrics_calc_sequences mx
+              ON mx.observation_id = x.observation_id
+             AND mx.serial = x.serial
+             AND mx.run_name = x.condition_key
+             AND mx.column_name = x.parameter_name
+             AND lower(mx.stat) = ?
+            LEFT JOIN td_columns_calc cx
+              ON cx.run_name = mx.run_name
+             AND cx.name = mx.column_name
+             AND cx.kind = 'y'
+            LEFT JOIN td_condition_observations_sequences o
+              ON o.observation_id = x.observation_id
+            LEFT JOIN td_source_metadata sm
+              ON sm.serial = x.serial
+            WHERE x.parameter_name = ?
+              AND lower(x.stat) = 'mean'
+            """
+        ]
+        params.extend([stat_key, x_param])
+        sql.append(f" AND x.condition_key IN ({','.join('?' for _ in runs)})")
+        params.extend(runs)
+        if serial_list:
+            sql.append(f" AND x.serial IN ({','.join('?' for _ in serial_list)})")
+            params.extend(serial_list)
+        sql.append(" ORDER BY x.serial, x.sequence_index, x.condition_key, x.observation_id")
+    else:
+        sql = [
+            f"""
+            SELECT
+                x.observation_id,
+                x.serial,
+                x.condition_key,
+                COALESCE(x.condition_display, ''),
+                COALESCE(x.program_title, ''),
+                COALESCE(x.source_run_name, ''),
+                COALESCE(sm.asset_type, ''),
+                COALESCE(sm.asset_specific_type, ''),
+                x.sequence_index,
+                COALESCE(x.sequence_label, ''),
+                mx.value_num,
+                my.value_num,
+                COALESCE(NULLIF(x.units, ''), COALESCE(cx.units, '')),
+                COALESCE(NULLIF(y.units, ''), COALESCE(cy.units, '')),
+                x.cumulative_pulses,
+                x.cumulative_on_time,
+                x.cumulative_throughput,
+                x.cumulative_impulse,
+                COALESCE(x.diagnostics, ''),
+                COALESCE(o.run_type, ''),
+                o.control_period,
+                o.suppression_voltage,
+                o.valve_voltage
+            FROM {TD_LIFE_METRICS_TABLE} x
+            INNER JOIN {TD_LIFE_METRICS_TABLE} y
+              ON y.serial = x.serial
+             AND y.observation_id = x.observation_id
+             AND lower(y.stat) = 'mean'
+             AND y.parameter_name = ?
+            INNER JOIN td_metrics_calc_sequences mx
+              ON mx.observation_id = x.observation_id
+             AND mx.serial = x.serial
+             AND mx.run_name = x.condition_key
+             AND mx.column_name = x.parameter_name
+             AND lower(mx.stat) = ?
+            INNER JOIN td_metrics_calc_sequences my
+              ON my.observation_id = x.observation_id
+             AND my.serial = x.serial
+             AND my.run_name = x.condition_key
+             AND my.column_name = y.parameter_name
+             AND lower(my.stat) = ?
+            LEFT JOIN td_columns_calc cx
+              ON cx.run_name = mx.run_name
+             AND cx.name = mx.column_name
+             AND cx.kind = 'y'
+            LEFT JOIN td_columns_calc cy
+              ON cy.run_name = my.run_name
+             AND cy.name = my.column_name
+             AND cy.kind = 'y'
+            LEFT JOIN td_condition_observations_sequences o
+              ON o.observation_id = x.observation_id
+            LEFT JOIN td_source_metadata sm
+              ON sm.serial = x.serial
+            WHERE x.parameter_name = ?
+              AND lower(x.stat) = 'mean'
+            """
+        ]
+        params.extend([y_param, stat_key, stat_key, x_param])
+        sql.append(f" AND x.condition_key IN ({','.join('?' for _ in runs)})")
+        params.extend(runs)
+        if serial_list:
+            sql.append(f" AND x.serial IN ({','.join('?' for _ in serial_list)})")
+            params.extend(serial_list)
+        sql.append(" ORDER BY x.serial, x.sequence_index, x.condition_key, x.observation_id")
     with sqlite3.connect(str(path)) as conn:
         _ensure_test_data_impl_tables(conn)
+        cumulative_impulse_units = ""
+        if x_is_cumulative_impulse or y_is_cumulative_impulse:
+            units_sql = [
+                f"""
+                SELECT parameter_name, COALESCE(units, '')
+                FROM {TD_LIFE_METRICS_TABLE}
+                WHERE lower(stat) = 'mean'
+                """
+            ]
+            units_params: list[object] = []
+            units_sql.append(f" AND condition_key IN ({','.join('?' for _ in runs)})")
+            units_params.extend(runs)
+            if serial_list:
+                units_sql.append(f" AND serial IN ({','.join('?' for _ in serial_list)})")
+                units_params.extend(serial_list)
+            units_sql.append(" ORDER BY parameter_name, units")
+            cumulative_impulse_units = _td_life_cumulative_impulse_units_from_pairs(
+                conn.execute("".join(units_sql), tuple(units_params)).fetchall()
+            )
         rows = conn.execute("".join(sql), tuple(params)).fetchall()
     out: list[dict] = []
+    seen_observations: set[tuple[str, str]] = set()
     for row in rows:
         x_value = _td_finite_float(row[10])
         y_value = _td_finite_float(row[11])
         if x_value is None or y_value is None:
             continue
+        if x_is_cumulative_impulse and y_is_cumulative_impulse:
+            obs_key = (str(row[0] or "").strip(), str(row[1] or "").strip())
+            if obs_key in seen_observations:
+                continue
+            seen_observations.add(obs_key)
         out.append(
             {
                 "observation_id": str(row[0] or "").strip(),
@@ -20509,10 +20943,11 @@ def td_load_life_metric_xy(
                 "sequence_label": str(row[9] or "").strip(),
                 "x_parameter": x_param,
                 "y_parameter": y_param,
+                "stat": stat_key,
                 "x_value": x_value,
                 "y_value": y_value,
-                "x_units": str(row[12] or "").strip(),
-                "y_units": str(row[13] or "").strip(),
+                "x_units": cumulative_impulse_units if x_is_cumulative_impulse else str(row[12] or "").strip(),
+                "y_units": cumulative_impulse_units if y_is_cumulative_impulse else str(row[13] or "").strip(),
                 "cumulative_pulses": row[14],
                 "cumulative_on_time": row[15],
                 "cumulative_throughput": row[16],

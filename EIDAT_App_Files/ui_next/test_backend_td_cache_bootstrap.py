@@ -1011,6 +1011,81 @@ class TestBackendTdCacheBootstrap(unittest.TestCase):
         self.assertEqual(str(typo_row.get("displayed_parameter") or "").strip(), "Time to 1/2 Impulse")
         self.assertEqual(str(typo_row.get("preferred_units") or "").strip(), "ms")
 
+    def test_discover_parameter_mappings_uses_single_run_suggestion_and_header_units(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            repo = Path(tmpdir)
+            sqlite_path = repo / "src.sqlite3"
+            with closing(sqlite3.connect(str(sqlite_path))) as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE __sheet_info (
+                        sheet_name TEXT PRIMARY KEY,
+                        table_name TEXT
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE __column_map (
+                        sheet_name TEXT NOT NULL,
+                        header TEXT NOT NULL,
+                        mapped_header TEXT NOT NULL,
+                        sqlite_column TEXT NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE sheet__RunA (
+                        excel_row INTEGER,
+                        Time REAL,
+                        Thrust REAL
+                    )
+                    """
+                )
+                conn.execute(
+                    "INSERT INTO __sheet_info(sheet_name, table_name) VALUES (?, ?)",
+                    ("RunA", "sheet__RunA"),
+                )
+                conn.executemany(
+                    "INSERT INTO __column_map(sheet_name, header, mapped_header, sqlite_column) VALUES (?, ?, ?, ?)",
+                    [
+                        ("RunA", "Time sec", "Time", "Time"),
+                        ("RunA", "Thrust-N Calc (lbf)", "Thrust-N Calc", "Thrust"),
+                    ],
+                )
+                conn.commit()
+
+            discovered = backend._td_program_requirements_discover_parameter_mappings_by_program(
+                repo,
+                [
+                    {
+                        "program_title": "Program Alpha",
+                        "asset_type": "Valve",
+                        "asset_specific_type": "Main",
+                        "excel_sqlite_rel": "src.sqlite3",
+                        "artifacts_rel": "",
+                    }
+                ],
+                param_defs=[
+                    {
+                        "name": "Thrust",
+                        "units": "",
+                        "aliases": ["Thrust-N Calc"],
+                    }
+                ],
+            )
+
+            rows = list(discovered.get("Program Alpha") or [])
+            thrust_row = next(
+                row
+                for row in rows
+                if str(row.get("ingested_parameter") or "").strip() == "Thrust-N Calc (lbf)"
+            )
+            self.assertEqual(str(thrust_row.get("default_display_parameter") or "").strip(), "Thrust")
+            self.assertEqual(str(thrust_row.get("displayed_parameter") or "").strip(), "Thrust")
+            self.assertEqual(str(thrust_row.get("preferred_units") or "").strip(), "lbf")
+
     def test_load_parameter_runtime_context_returns_inventory_from_runtime_tables(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             project_dir = Path(tmpdir) / "project"

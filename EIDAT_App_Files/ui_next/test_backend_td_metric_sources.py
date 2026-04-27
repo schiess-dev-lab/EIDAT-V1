@@ -216,6 +216,147 @@ def _create_legacy_curve_db(tmpdir: str) -> Path:
     return db_path
 
 
+def _create_life_metric_db(tmpdir: str) -> Path:
+    db_path = Path(tmpdir) / "life_metrics.sqlite3"
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        backend._ensure_test_data_impl_tables(conn)
+        conn.executemany(
+            """
+            INSERT OR REPLACE INTO td_condition_observations_sequences(
+                observation_id, serial, run_name, program_title, source_run_name, run_type, pulse_width,
+                control_period, suppression_voltage, valve_voltage, source_mtime_ns, computed_epoch_ns
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                ("life-1", "SN-001", "CondLife", "Program Alpha", "Seq-1", "PM", 0.5, 10.0, 5.0, 28.0, 1, 1),
+                ("life-2", "SN-001", "CondLife", "Program Alpha", "Seq-2", "PM", 0.5, 10.0, 5.0, 28.0, 1, 1),
+            ],
+        )
+        conn.executemany(
+            f"""
+            INSERT OR REPLACE INTO {backend.TD_LIFE_METRICS_TABLE}(
+                observation_id, serial, sequence_index, sequence_label, condition_key, condition_display,
+                program_title, source_run_name, parameter_name, stat, value_num, units,
+                sequence_pulses, cumulative_pulses, sequence_on_time, cumulative_on_time,
+                sequence_elapsed_time, cumulative_elapsed_time, sequence_throughput, cumulative_throughput,
+                sequence_impulse, cumulative_impulse, diagnostics, source_mtime_ns, computed_epoch_ns
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    "life-1",
+                    "SN-001",
+                    1,
+                    "Seq-1",
+                    "CondLife",
+                    "Condition Life",
+                    "Program Alpha",
+                    "Seq-1",
+                    "Thrust",
+                    "mean",
+                    10.0,
+                    "mN",
+                    100.0,
+                    100.0,
+                    1.0,
+                    1.0,
+                    10.0,
+                    10.0,
+                    0.5,
+                    0.5,
+                    1.5,
+                    1.5,
+                    "",
+                    1,
+                    1,
+                ),
+                (
+                    "life-1",
+                    "SN-001",
+                    1,
+                    "Seq-1",
+                    "CondLife",
+                    "Condition Life",
+                    "Program Alpha",
+                    "Seq-1",
+                    "Pulse Count",
+                    "mean",
+                    100.0,
+                    "count",
+                    100.0,
+                    100.0,
+                    1.0,
+                    1.0,
+                    10.0,
+                    10.0,
+                    0.5,
+                    0.5,
+                    1.5,
+                    1.5,
+                    "",
+                    1,
+                    1,
+                ),
+                (
+                    "life-2",
+                    "SN-001",
+                    2,
+                    "Seq-2",
+                    "CondLife",
+                    "Condition Life",
+                    "Program Alpha",
+                    "Seq-2",
+                    "Thrust",
+                    "mean",
+                    12.0,
+                    "mN",
+                    150.0,
+                    250.0,
+                    2.0,
+                    3.0,
+                    20.0,
+                    30.0,
+                    0.75,
+                    1.25,
+                    2.5,
+                    4.0,
+                    "",
+                    1,
+                    1,
+                ),
+                (
+                    "life-2",
+                    "SN-001",
+                    2,
+                    "Seq-2",
+                    "CondLife",
+                    "Condition Life",
+                    "Program Alpha",
+                    "Seq-2",
+                    "Pulse Count",
+                    "mean",
+                    150.0,
+                    "count",
+                    150.0,
+                    250.0,
+                    2.0,
+                    3.0,
+                    20.0,
+                    30.0,
+                    0.75,
+                    1.25,
+                    2.5,
+                    4.0,
+                    "",
+                    1,
+                    1,
+                ),
+            ],
+        )
+        conn.commit()
+    return db_path
+
+
 class TestBackendTdMetricSources(unittest.TestCase):
     def test_aggregate_metric_source_ignores_sequence_filters(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
@@ -374,6 +515,55 @@ class TestBackendTdMetricSources(unittest.TestCase):
             )
             self.assertEqual(len(legacy_rows), 1)
             self.assertEqual(legacy_rows[0]["valve_voltage"], 28.0)
+
+    def test_life_parameter_options_include_synthetic_cumulative_impulse(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            db_path = _create_life_metric_db(tmpdir)
+            options = backend.td_list_life_parameter_options(db_path, ["CondLife"])
+            self.assertEqual(
+                [item["name"] for item in options],
+                ["Cumulative Impulse", "Pulse Count", "Thrust"],
+            )
+
+    def test_load_life_metric_xy_uses_cumulative_impulse_rollup_for_synthetic_parameter(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            db_path = _create_life_metric_db(tmpdir)
+
+            x_rollup_rows = backend.td_load_life_metric_xy(
+                db_path,
+                ["CondLife"],
+                "Cumulative Impulse",
+                "Thrust",
+            )
+            self.assertEqual(
+                [(row["sequence_index"], row["x_value"], row["y_value"]) for row in x_rollup_rows],
+                [(1, 1.5, 10.0), (2, 4.0, 12.0)],
+            )
+
+            y_rollup_rows = backend.td_load_life_metric_xy(
+                db_path,
+                ["CondLife"],
+                "Thrust",
+                "Total Impulse",
+            )
+            self.assertEqual(
+                [(row["sequence_index"], row["x_value"], row["y_value"]) for row in y_rollup_rows],
+                [(1, 10.0, 1.5), (2, 12.0, 4.0)],
+            )
+
+    def test_load_life_metric_series_uses_cumulative_impulse_rollup_for_synthetic_parameter(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            db_path = _create_life_metric_db(tmpdir)
+            rows = backend.td_load_life_metric_series(
+                db_path,
+                ["CondLife"],
+                "Cumulative Impulse",
+                "sequence_index",
+            )
+            self.assertEqual(
+                [(row["sequence_index"], row["x_value"], row["y_value"]) for row in rows],
+                [(1, 1.0, 1.5), (2, 2.0, 4.0)],
+            )
 
 
 if __name__ == "__main__":

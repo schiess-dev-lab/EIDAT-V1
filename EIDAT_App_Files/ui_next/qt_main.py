@@ -4975,6 +4975,34 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         life_x_param_row_layout.addWidget(self.cb_life_x_param, 1)
         life_layout.addWidget(self.life_x_param_row)
 
+        self.list_life_stats = QtWidgets.QListWidget(tab_life)
+        self.list_life_stats.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.list_life_stats.setMaximumHeight(92)
+        self.list_life_stats.hide()
+        self.list_life_stats.itemSelectionChanged.connect(self._refresh_life_stats_summary)
+        for st in ["mean", "min", "max", "std"]:
+            self.list_life_stats.addItem(QtWidgets.QListWidgetItem(st))
+        for i in range(self.list_life_stats.count()):
+            it = self.list_life_stats.item(i)
+            if it.text().strip().lower() == "mean":
+                it.setSelected(True)
+                break
+
+        life_stats_row = QtWidgets.QHBoxLayout()
+        life_stats_row.setSpacing(8)
+        self.btn_life_stats_popup = QtWidgets.QPushButton("Stats...")
+        self.btn_life_stats_popup.clicked.connect(self._open_life_stats_popup)
+        self.lbl_life_stats_summary = QtWidgets.QLabel("Stats: mean")
+        self.lbl_life_stats_summary.setStyleSheet("color: #64748b; font-size: 11px;")
+        self.lbl_life_stats_summary.setWordWrap(False)
+        self.lbl_life_stats_summary.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Fixed,
+        )
+        life_stats_row.addWidget(self.btn_life_stats_popup)
+        life_stats_row.addWidget(self.lbl_life_stats_summary, 1)
+        life_layout.addLayout(life_stats_row)
+
         self.lbl_life_summary = QtWidgets.QLabel("Life metrics: -")
         self.lbl_life_summary.setStyleSheet("color: #64748b; font-size: 11px;")
         self.lbl_life_summary.setWordWrap(True)
@@ -6330,6 +6358,36 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         finally:
             list_widget.blockSignals(False)
 
+    def _rebuild_stat_list_widget(
+        self,
+        list_widget: QtWidgets.QListWidget | None,
+        *,
+        available_stats: Sequence[object] | None,
+        previous_selected: Sequence[object] | None = None,
+    ) -> None:
+        if not isinstance(list_widget, QtWidgets.QListWidget):
+            return
+        previous = {str(value).strip().lower() for value in (previous_selected or []) if str(value).strip()}
+        list_widget.blockSignals(True)
+        try:
+            list_widget.clear()
+            restored = False
+            seen: set[str] = set()
+            for raw_value in available_stats or []:
+                text = str(raw_value or "").strip().lower()
+                if not text or text == "average" or text in seen:
+                    continue
+                seen.add(text)
+                item = QtWidgets.QListWidgetItem(text)
+                list_widget.addItem(item)
+                if text in previous:
+                    item.setSelected(True)
+                    restored = True
+            if not restored and list_widget.count() > 0:
+                list_widget.item(0).setSelected(True)
+        finally:
+            list_widget.blockSignals(False)
+
     def _on_metric_y_selection_changed(self) -> None:
         self._refresh_metric_y_columns_summary()
         self._refresh_stats_preview()
@@ -6352,6 +6410,16 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         text = "Stats: " + self._popup_selection_summary(selected, total_count=len(all_items))
         self.lbl_metric_stats_summary.setText(text)
         self.lbl_metric_stats_summary.setToolTip(", ".join(selected))
+        self._schedule_mode_panel_height_sync()
+
+    def _refresh_life_stats_summary(self) -> None:
+        if not hasattr(self, "lbl_life_stats_summary"):
+            return
+        selected = self._selected_list_widget_texts(getattr(self, "list_life_stats", None))
+        all_items = self._list_widget_item_texts(getattr(self, "list_life_stats", None))
+        text = "Stats: " + self._popup_selection_summary(selected, total_count=len(all_items))
+        self.lbl_life_stats_summary.setText(text)
+        self.lbl_life_stats_summary.setToolTip(", ".join(selected))
         self._schedule_mode_panel_height_sync()
 
     def _refresh_metric_selector_summaries(self) -> None:
@@ -6437,6 +6505,11 @@ class TestDataTrendDialog(QtWidgets.QDialog):
     def _current_life_x_parameter(self) -> str:
         return self._combo_box_current_value(getattr(self, "cb_life_x_param", None))
 
+    def _selected_life_stats(self) -> list[str]:
+        selected = [text.lower() for text in self._selected_list_widget_texts(getattr(self, "list_life_stats", None))]
+        selected = [value for value in selected if value]
+        return selected or ["mean"]
+
     def _refresh_life_controls(self) -> None:
         plot_type = self._selected_life_plot_type()
         metric_xy = plot_type == "metric_xy"
@@ -6512,6 +6585,23 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             return
         self._set_list_widget_selection(self.list_stats, chosen)
         self._refresh_metric_stats_summary()
+
+    def _open_life_stats_popup(self) -> None:
+        if not hasattr(self, "list_life_stats"):
+            return
+        entries = [
+            {"value": text, "label": text, "search": text.lower()}
+            for text in self._list_widget_item_texts(self.list_life_stats)
+        ]
+        chosen = self._show_filter_checklist_popup(
+            title="Life Metric Stats",
+            entries=entries,
+            selected_values=self._selected_list_widget_texts(self.list_life_stats),
+        )
+        if chosen is None:
+            return
+        self._set_list_widget_selection(self.list_life_stats, chosen)
+        self._refresh_life_stats_summary()
 
     def _show_filter_single_select_popup(
         self,
@@ -11839,6 +11929,48 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             y_text = f"{y_text} ({stats_label})"
         return f"Serial Number vs {y_text}"
 
+    @staticmethod
+    def _life_plot_stats_from_definition(plot_definition: Mapping[str, object] | None) -> list[str]:
+        allowed_stats = set(getattr(be, "TD_ALLOWED_STATS", {"mean", "min", "max", "std"}))
+        stats = (
+            [str(value).strip().lower() for value in (plot_definition.get("stats") or []) if str(value).strip()]
+            if isinstance(plot_definition, Mapping) and isinstance(plot_definition.get("stats"), list)
+            else []
+        )
+        if not stats and isinstance(plot_definition, Mapping):
+            stat_value = str(plot_definition.get("stat") or "").strip().lower()
+            if stat_value:
+                stats = [stat_value]
+        out: list[str] = []
+        for value in stats or ["mean"]:
+            text = str(value or "").strip().lower()
+            if text and text in allowed_stats and text not in out:
+                out.append(text)
+        return out or ["mean"]
+
+    def _life_graph_type_text(
+        self,
+        *,
+        plot_type: str,
+        y_parameter: object,
+        stats: Sequence[object] | None,
+        x_parameter: object = "",
+        life_axis_label: object = "",
+    ) -> str:
+        y_text = str(y_parameter or "").strip() or "Y Parameter"
+        if str(plot_type or "").strip().lower() == "metric_xy":
+            x_text = str(x_parameter or "").strip() or "X Parameter"
+            graph_text = f"{x_text} vs {y_text}"
+        else:
+            axis_text = str(life_axis_label or "").strip() or "Life"
+            graph_text = f"{axis_text} vs {y_text}"
+        stats_label = self._metric_title_suffix(
+            [str(stat).strip().lower() for stat in (stats or []) if str(stat).strip()]
+        )
+        if stats_label:
+            graph_text = f"{graph_text} ({stats_label})"
+        return graph_text
+
     def _performance_graph_type_text(
         self,
         input1: object,
@@ -12224,6 +12356,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         parameter_value: object,
         life_axis: str,
         *,
+        stat: object = "mean",
         serials: Sequence[object] | None = None,
         filter_state: Mapping[str, object] | None = None,
     ) -> list[dict]:
@@ -12248,6 +12381,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 raw_name,
                 life_axis,
                 serials=active_serials or None,
+                stat=stat,
             )
             filtered_rows = self._filter_rows_for_global_selection(rows, filter_state=filter_state)
             for row in filtered_rows:
@@ -12278,6 +12412,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         x_parameter_value: object,
         y_parameter_value: object,
         *,
+        stat: object = "mean",
         serials: Sequence[object] | None = None,
         filter_state: Mapping[str, object] | None = None,
     ) -> list[dict]:
@@ -12303,6 +12438,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     x_raw_name,
                     y_raw_name,
                     serials=active_serials or None,
+                    stat=stat,
                 )
                 filtered_rows = self._filter_rows_for_global_selection(rows, filter_state=filter_state)
                 for row in filtered_rows:
@@ -14090,9 +14226,11 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             )
             return
         y_display = self._parameter_display_name(y_param, options=self._life_parameter_options, fallback=y_param)
+        stats = self._selected_life_stats()
 
         self._axes.clear()
         any_plotted = False
+        rows_for_note: list[dict] = []
         hi_set = {str(v).strip() for v in (self._highlight_sns or []) if str(v).strip()}
 
         if plot_type == "metric_xy":
@@ -14110,54 +14248,100 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 return
             x_display = self._parameter_display_name(x_param, options=self._life_parameter_options, fallback=x_param)
             try:
-                rows = self._load_life_metric_xy_for_selection(
-                    runs,
-                    x_param,
-                    y_param,
-                    serials=serials,
-                )
+                rows_by_stat = {
+                    stat: self._load_life_metric_xy_for_selection(
+                        runs,
+                        x_param,
+                        y_param,
+                        stat=stat,
+                        serials=serials,
+                    )
+                    for stat in stats
+                }
             except Exception as exc:
                 QtWidgets.QMessageBox.warning(self, "Life Metrics", str(exc))
                 return
-            if not rows:
+            rows_by_stat = {key: value for key, value in rows_by_stat.items() if value}
+            if not rows_by_stat:
                 QtWidgets.QMessageBox.information(self, "Life Metrics", "No life metric values found for this selection.")
                 return
-            x_units = str(next((row.get("x_units") for row in rows if str(row.get("x_units") or "").strip()), "") or "").strip()
-            y_units = str(next((row.get("y_units") for row in rows if str(row.get("y_units") or "").strip()), "") or "").strip()
+            rows_for_note = [dict(row) for stat_rows in rows_by_stat.values() for row in stat_rows if isinstance(row, dict)]
+            x_units = str(
+                next(
+                    (
+                        row.get("x_units")
+                        for stat_rows in rows_by_stat.values()
+                        for row in stat_rows
+                        if str(row.get("x_units") or "").strip()
+                    ),
+                    "",
+                )
+                or ""
+            ).strip()
+            y_units = str(
+                next(
+                    (
+                        row.get("y_units")
+                        for stat_rows in rows_by_stat.values()
+                        for row in stat_rows
+                        if str(row.get("y_units") or "").strip()
+                    ),
+                    "",
+                )
+                or ""
+            ).strip()
             x_label = f"{x_display} ({x_units})" if x_units else x_display
             y_label = f"{y_display} ({y_units})" if y_units else y_display
-            self._axes.set_title(self._compose_run_title(selection, f"{x_display} vs {y_display}"))
-            self._axes.set_xlabel(x_label)
-            self._axes.set_ylabel(y_label)
-            grouped: dict[str, list[dict]] = {}
-            for row in rows:
-                sn = str(row.get("serial") or "").strip()
-                if sn:
-                    grouped.setdefault(sn, []).append(dict(row))
-            for sn in serials:
-                points = grouped.get(sn) or []
-                if not points:
-                    continue
-                points = sorted(
-                    points,
-                    key=lambda row: (
-                        int(row.get("sequence_index") or 0),
-                        str(row.get("condition_key") or "").lower(),
-                        str(row.get("observation_id") or "").lower(),
+            self._axes.set_title(
+                self._compose_run_title(
+                    selection,
+                    self._life_graph_type_text(
+                        plot_type=plot_type,
+                        x_parameter=x_display,
+                        y_parameter=y_display,
+                        stats=stats,
                     ),
                 )
-                xs = [float(row.get("x_value") or 0.0) for row in points]
-                ys = [float(row.get("y_value") or 0.0) for row in points]
-                self._axes.plot(
-                    xs,
-                    ys,
-                    marker="o",
-                    linewidth=(2.4 if sn in hi_set else 1.3),
-                    alpha=(1.0 if sn in hi_set else 0.82),
-                    label=_td_plot_serial_label(sn) or sn,
-                )
-                any_plotted = True
+            )
+            self._axes.set_xlabel(x_label)
+            self._axes.set_ylabel(y_label)
+            multi_stat = len(rows_by_stat) > 1
+            for stat in stats:
+                rows = rows_by_stat.get(stat) or []
+                grouped: dict[str, list[dict]] = {}
+                for row in rows:
+                    sn = str(row.get("serial") or "").strip()
+                    if sn:
+                        grouped.setdefault(sn, []).append(dict(row))
+                for sn in serials:
+                    points = grouped.get(sn) or []
+                    if not points:
+                        continue
+                    points = sorted(
+                        points,
+                        key=lambda row: (
+                            int(row.get("sequence_index") or 0),
+                            str(row.get("condition_key") or "").lower(),
+                            str(row.get("observation_id") or "").lower(),
+                        ),
+                    )
+                    xs = [float(row.get("x_value") or 0.0) for row in points]
+                    ys = [float(row.get("y_value") or 0.0) for row in points]
+                    label = _td_plot_serial_label(sn) or sn
+                    if multi_stat:
+                        label = f"{label} ({stat})"
+                    self._axes.plot(
+                        xs,
+                        ys,
+                        marker="o",
+                        linewidth=(2.4 if sn in hi_set else 1.3),
+                        alpha=(1.0 if sn in hi_set else 0.82),
+                        label=label,
+                    )
+                    any_plotted = True
             last_plot_extra = {
+                "stats": list(stats),
+                "stat": stats[0] if stats else "mean",
                 "x_parameter": x_param,
                 "y_parameter": y_param,
                 "x_parameter_label": x_display,
@@ -14167,52 +14351,87 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             life_axis = self._current_life_axis()
             life_axis_label = str(self.cb_life_axis.currentText() if hasattr(self, "cb_life_axis") else "").strip() or life_axis
             try:
-                rows = self._load_life_metric_series_for_selection(
-                    runs,
-                    y_param,
-                    life_axis,
-                    serials=serials,
-                )
+                rows_by_stat = {
+                    stat: self._load_life_metric_series_for_selection(
+                        runs,
+                        y_param,
+                        life_axis,
+                        stat=stat,
+                        serials=serials,
+                    )
+                    for stat in stats
+                }
             except Exception as exc:
                 QtWidgets.QMessageBox.warning(self, "Life Metrics", str(exc))
                 return
-            if not rows:
+            rows_by_stat = {key: value for key, value in rows_by_stat.items() if value}
+            if not rows_by_stat:
                 QtWidgets.QMessageBox.information(self, "Life Metrics", "No life metric values found for this selection.")
                 return
-            y_units = str(next((row.get("units") for row in rows if str(row.get("units") or "").strip()), "") or "").strip()
+            rows_for_note = [dict(row) for stat_rows in rows_by_stat.values() for row in stat_rows if isinstance(row, dict)]
+            y_units = str(
+                next(
+                    (
+                        row.get("units")
+                        for stat_rows in rows_by_stat.values()
+                        for row in stat_rows
+                        if str(row.get("units") or "").strip()
+                    ),
+                    "",
+                )
+                or ""
+            ).strip()
             y_label = f"{y_display} ({y_units})" if y_units else y_display
-            self._axes.set_title(self._compose_run_title(selection, f"{life_axis_label} vs {y_display}"))
-            self._axes.set_xlabel(life_axis_label)
-            self._axes.set_ylabel(y_label)
-            grouped: dict[str, list[dict]] = {}
-            for row in rows:
-                sn = str(row.get("serial") or "").strip()
-                if sn:
-                    grouped.setdefault(sn, []).append(dict(row))
-            for sn in serials:
-                points = grouped.get(sn) or []
-                if not points:
-                    continue
-                points = sorted(
-                    points,
-                    key=lambda row: (
-                        float(row.get("x_value") or 0.0),
-                        int(row.get("sequence_index") or 0),
-                        str(row.get("condition_key") or "").lower(),
+            self._axes.set_title(
+                self._compose_run_title(
+                    selection,
+                    self._life_graph_type_text(
+                        plot_type=plot_type,
+                        life_axis_label=life_axis_label,
+                        y_parameter=y_display,
+                        stats=stats,
                     ),
                 )
-                xs = [float(row.get("x_value") or 0.0) for row in points]
-                ys = [float(row.get("y_value") or 0.0) for row in points]
-                self._axes.plot(
-                    xs,
-                    ys,
-                    marker="o",
-                    linewidth=(2.4 if sn in hi_set else 1.3),
-                    alpha=(1.0 if sn in hi_set else 0.82),
-                    label=_td_plot_serial_label(sn) or sn,
-                )
-                any_plotted = True
+            )
+            self._axes.set_xlabel(life_axis_label)
+            self._axes.set_ylabel(y_label)
+            multi_stat = len(rows_by_stat) > 1
+            for stat in stats:
+                rows = rows_by_stat.get(stat) or []
+                grouped: dict[str, list[dict]] = {}
+                for row in rows:
+                    sn = str(row.get("serial") or "").strip()
+                    if sn:
+                        grouped.setdefault(sn, []).append(dict(row))
+                for sn in serials:
+                    points = grouped.get(sn) or []
+                    if not points:
+                        continue
+                    points = sorted(
+                        points,
+                        key=lambda row: (
+                            float(row.get("x_value") or 0.0),
+                            int(row.get("sequence_index") or 0),
+                            str(row.get("condition_key") or "").lower(),
+                        ),
+                    )
+                    xs = [float(row.get("x_value") or 0.0) for row in points]
+                    ys = [float(row.get("y_value") or 0.0) for row in points]
+                    label = _td_plot_serial_label(sn) or sn
+                    if multi_stat:
+                        label = f"{label} ({stat})"
+                    self._axes.plot(
+                        xs,
+                        ys,
+                        marker="o",
+                        linewidth=(2.4 if sn in hi_set else 1.3),
+                        alpha=(1.0 if sn in hi_set else 0.82),
+                        label=label,
+                    )
+                    any_plotted = True
             last_plot_extra = {
+                "stats": list(stats),
+                "stat": stats[0] if stats else "mean",
                 "life_axis": life_axis,
                 "life_axis_label": life_axis_label,
                 "y_parameter": y_param,
@@ -14230,7 +14449,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         diagnostics_count = len(
             [
                 row
-                for row in (rows or [])
+                for row in (rows_for_note or [])
                 if str(row.get("diagnostics") or "").strip()
             ]
         )
@@ -18268,29 +18487,28 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 "average" in prev
                 or (hasattr(self, "cb_metric_average") and self.cb_metric_average.isChecked())
             )
-            self.list_stats.blockSignals(True)
-            try:
-                self.list_stats.clear()
-                for st in self._perf_available_stats:
-                    if str(st).strip().lower() == "average":
-                        continue
-                    self.list_stats.addItem(QtWidgets.QListWidgetItem(st))
-                restored = False
-                if prev:
-                    for i in range(self.list_stats.count()):
-                        it = self.list_stats.item(i)
-                        if it and it.text().strip().lower() in prev:
-                            it.setSelected(True)
-                            restored = True
-                if not restored and self.list_stats.count() > 0:
-                    self.list_stats.item(0).setSelected(True)
-            finally:
-                self.list_stats.blockSignals(False)
+            self._rebuild_stat_list_widget(self.list_stats, available_stats=self._perf_available_stats, previous_selected=prev)
             if hasattr(self, "cb_metric_average"):
                 self.cb_metric_average.blockSignals(True)
                 self.cb_metric_average.setChecked(prev_average)
                 self.cb_metric_average.blockSignals(False)
             self._refresh_metric_stats_summary()
+
+        if hasattr(self, "list_life_stats"):
+            try:
+                prev_life = {
+                    it.text().strip().lower()
+                    for it in self.list_life_stats.selectedItems()
+                    if it and it.text().strip()
+                }
+            except Exception:
+                prev_life = set()
+            self._rebuild_stat_list_widget(
+                self.list_life_stats,
+                available_stats=self._perf_available_stats,
+                previous_selected=prev_life,
+            )
+            self._refresh_life_stats_summary()
 
         prev_output, prev_input1, prev_input2 = self._perf_var_names()
         prev_run_type_mode = self._selected_perf_run_type_mode()
@@ -21961,6 +22179,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 options=self._life_parameter_options,
                 fallback=y_param,
             )
+            stats = self._life_plot_stats_from_definition(d)
             plotted_any = False
             if plot_type == "metric_xy":
                 x_param = str(d.get("x_parameter") or "").strip()
@@ -21974,50 +22193,90 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     options=self._life_parameter_options,
                     fallback=x_param,
                 )
-                rows = self._load_life_metric_xy_for_selection(
-                    runs,
-                    x_param,
-                    y_param,
-                    serials=active_serials,
-                    filter_state=render_filter_state,
-                )
-                if not rows:
+                rows_by_stat = {
+                    stat: self._load_life_metric_xy_for_selection(
+                        runs,
+                        x_param,
+                        y_param,
+                        stat=stat,
+                        serials=active_serials,
+                        filter_state=render_filter_state,
+                    )
+                    for stat in stats
+                }
+                rows_by_stat = {key: value for key, value in rows_by_stat.items() if value}
+                if not rows_by_stat:
                     raise RuntimeError("No life metric data matched this saved graph after applying the saved global filters.")
                 x_units = str(
-                    next((row.get("x_units") for row in rows if str(row.get("x_units") or "").strip()), "") or ""
+                    next(
+                        (
+                            row.get("x_units")
+                            for stat_rows in rows_by_stat.values()
+                            for row in stat_rows
+                            if str(row.get("x_units") or "").strip()
+                        ),
+                        "",
+                    )
+                    or ""
                 ).strip()
                 y_units = str(
-                    next((row.get("y_units") for row in rows if str(row.get("y_units") or "").strip()), "") or ""
+                    next(
+                        (
+                            row.get("y_units")
+                            for stat_rows in rows_by_stat.values()
+                            for row in stat_rows
+                            if str(row.get("y_units") or "").strip()
+                        ),
+                        "",
+                    )
+                    or ""
                 ).strip()
-                ax.set_title(title_override or self._compose_run_title(selection, f"{x_display} vs {y_display}"))
-                ax.set_xlabel(f"{x_display} ({x_units})" if x_units else x_display)
-                ax.set_ylabel(f"{y_display} ({y_units})" if y_units else y_display)
-                grouped: dict[str, list[dict]] = {}
-                for row in rows:
-                    serial = str(row.get("serial") or "").strip()
-                    if serial:
-                        grouped.setdefault(serial, []).append(dict(row))
-                for serial in active_serials:
-                    points = grouped.get(serial) or []
-                    if not points:
-                        continue
-                    points = sorted(
-                        points,
-                        key=lambda row: (
-                            int(row.get("sequence_index") or 0),
-                            str(row.get("condition_key") or "").lower(),
-                            str(row.get("observation_id") or "").lower(),
+                ax.set_title(
+                    title_override
+                    or self._compose_run_title(
+                        selection,
+                        self._life_graph_type_text(
+                            plot_type=plot_type,
+                            x_parameter=x_display,
+                            y_parameter=y_display,
+                            stats=stats,
                         ),
                     )
-                    ax.plot(
-                        [float(row.get("x_value") or 0.0) for row in points],
-                        [float(row.get("y_value") or 0.0) for row in points],
-                        marker="o",
-                        linewidth=1.3,
-                        alpha=0.88,
-                        label=_td_plot_serial_label(serial) or serial,
-                    )
-                    plotted_any = True
+                )
+                ax.set_xlabel(f"{x_display} ({x_units})" if x_units else x_display)
+                ax.set_ylabel(f"{y_display} ({y_units})" if y_units else y_display)
+                multi_stat = len(rows_by_stat) > 1
+                for stat in stats:
+                    rows = rows_by_stat.get(stat) or []
+                    grouped: dict[str, list[dict]] = {}
+                    for row in rows:
+                        serial = str(row.get("serial") or "").strip()
+                        if serial:
+                            grouped.setdefault(serial, []).append(dict(row))
+                    for serial in active_serials:
+                        points = grouped.get(serial) or []
+                        if not points:
+                            continue
+                        points = sorted(
+                            points,
+                            key=lambda row: (
+                                int(row.get("sequence_index") or 0),
+                                str(row.get("condition_key") or "").lower(),
+                                str(row.get("observation_id") or "").lower(),
+                            ),
+                        )
+                        label = _td_plot_serial_label(serial) or serial
+                        if multi_stat:
+                            label = f"{label} ({stat})"
+                        ax.plot(
+                            [float(row.get("x_value") or 0.0) for row in points],
+                            [float(row.get("y_value") or 0.0) for row in points],
+                            marker="o",
+                            linewidth=1.3,
+                            alpha=0.88,
+                            label=label,
+                        )
+                        plotted_any = True
             else:
                 life_axis = str(d.get("life_axis") or "sequence_index").strip() or "sequence_index"
                 life_axis_label = str(d.get("life_axis_label") or "").strip()
@@ -22033,45 +22292,78 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                             life_axis_label = str((item or {}).get("label") or "").strip()
                             break
                 life_axis_label = life_axis_label or life_axis
-                rows = self._load_life_metric_series_for_selection(
-                    runs,
-                    y_param,
-                    life_axis,
-                    serials=active_serials,
-                    filter_state=render_filter_state,
-                )
-                if not rows:
+                rows_by_stat = {
+                    stat: self._load_life_metric_series_for_selection(
+                        runs,
+                        y_param,
+                        life_axis,
+                        stat=stat,
+                        serials=active_serials,
+                        filter_state=render_filter_state,
+                    )
+                    for stat in stats
+                }
+                rows_by_stat = {key: value for key, value in rows_by_stat.items() if value}
+                if not rows_by_stat:
                     raise RuntimeError("No life metric data matched this saved graph after applying the saved global filters.")
-                y_units = str(next((row.get("units") for row in rows if str(row.get("units") or "").strip()), "") or "").strip()
-                ax.set_title(title_override or self._compose_run_title(selection, f"{life_axis_label} vs {y_display}"))
-                ax.set_xlabel(life_axis_label)
-                ax.set_ylabel(f"{y_display} ({y_units})" if y_units else y_display)
-                grouped: dict[str, list[dict]] = {}
-                for row in rows:
-                    serial = str(row.get("serial") or "").strip()
-                    if serial:
-                        grouped.setdefault(serial, []).append(dict(row))
-                for serial in active_serials:
-                    points = grouped.get(serial) or []
-                    if not points:
-                        continue
-                    points = sorted(
-                        points,
-                        key=lambda row: (
-                            float(row.get("x_value") or 0.0),
-                            int(row.get("sequence_index") or 0),
-                            str(row.get("condition_key") or "").lower(),
+                y_units = str(
+                    next(
+                        (
+                            row.get("units")
+                            for stat_rows in rows_by_stat.values()
+                            for row in stat_rows
+                            if str(row.get("units") or "").strip()
+                        ),
+                        "",
+                    )
+                    or ""
+                ).strip()
+                ax.set_title(
+                    title_override
+                    or self._compose_run_title(
+                        selection,
+                        self._life_graph_type_text(
+                            plot_type=plot_type,
+                            life_axis_label=life_axis_label,
+                            y_parameter=y_display,
+                            stats=stats,
                         ),
                     )
-                    ax.plot(
-                        [float(row.get("x_value") or 0.0) for row in points],
-                        [float(row.get("y_value") or 0.0) for row in points],
-                        marker="o",
-                        linewidth=1.3,
-                        alpha=0.88,
-                        label=_td_plot_serial_label(serial) or serial,
-                    )
-                    plotted_any = True
+                )
+                ax.set_xlabel(life_axis_label)
+                ax.set_ylabel(f"{y_display} ({y_units})" if y_units else y_display)
+                multi_stat = len(rows_by_stat) > 1
+                for stat in stats:
+                    rows = rows_by_stat.get(stat) or []
+                    grouped: dict[str, list[dict]] = {}
+                    for row in rows:
+                        serial = str(row.get("serial") or "").strip()
+                        if serial:
+                            grouped.setdefault(serial, []).append(dict(row))
+                    for serial in active_serials:
+                        points = grouped.get(serial) or []
+                        if not points:
+                            continue
+                        points = sorted(
+                            points,
+                            key=lambda row: (
+                                float(row.get("x_value") or 0.0),
+                                int(row.get("sequence_index") or 0),
+                                str(row.get("condition_key") or "").lower(),
+                            ),
+                        )
+                        label = _td_plot_serial_label(serial) or serial
+                        if multi_stat:
+                            label = f"{label} ({stat})"
+                        ax.plot(
+                            [float(row.get("x_value") or 0.0) for row in points],
+                            [float(row.get("y_value") or 0.0) for row in points],
+                            marker="o",
+                            linewidth=1.3,
+                            alpha=0.88,
+                            label=label,
+                        )
+                        plotted_any = True
             if not plotted_any:
                 raise RuntimeError("No life metric data matched this saved graph after applying the saved global filters.")
             ax.grid(True, alpha=0.25)
@@ -22756,6 +23048,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             return f"Curves: {y_name or 'Y'} vs {x_name}"
         if mode == "life_metrics":
             plot_type = str(plot_definition.get("plot_type") or "life_axis").strip().lower()
+            stats = self._life_plot_stats_from_definition(plot_definition)
             y_param = str(
                 plot_definition.get("y_parameter_label")
                 or self._parameter_display_name(plot_definition.get("y_parameter") or "", options=self._life_parameter_options, fallback="")
@@ -22769,7 +23062,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     or plot_definition.get("x_parameter")
                     or ""
                 ).strip() or "X Parameter"
-                return f"Life Metrics: {x_param} vs {y_param}"
+                return "Life Metrics: " + self._life_graph_type_text(
+                    plot_type=plot_type,
+                    x_parameter=x_param,
+                    y_parameter=y_param,
+                    stats=stats,
+                )
             axis_label = str(plot_definition.get("life_axis_label") or "").strip()
             if not axis_label:
                 axis_key = str(plot_definition.get("life_axis") or "sequence_index").strip()
@@ -22780,7 +23078,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     "cumulative_on_time": "Cumulative On Time",
                     "cumulative_impulse": "Cumulative Impulse",
                 }.get(axis_key, axis_key or "Life")
-            return f"Life Metrics: {y_param} over {axis_label}"
+            return "Life Metrics: " + self._life_graph_type_text(
+                plot_type=plot_type,
+                life_axis_label=axis_label,
+                y_parameter=y_param,
+                stats=stats,
+            )
         if mode == "performance":
             output = self._perf_display_name(plot_definition.get("output") or "") or str(plot_definition.get("output") or "").strip() or "Output"
             input1 = self._perf_display_name(plot_definition.get("input1") or "") or str(plot_definition.get("input1") or "").strip() or "Input"
@@ -22818,6 +23121,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             return f"{x_name} vs {y_name or 'Y'}"
         if mode == "life_metrics":
             plot_type = str(plot_definition.get("plot_type") or "life_axis").strip().lower()
+            stats = self._life_plot_stats_from_definition(plot_definition)
             y_param = str(
                 plot_definition.get("y_parameter_label")
                 or self._parameter_display_name(plot_definition.get("y_parameter") or "", options=self._life_parameter_options, fallback="")
@@ -22831,7 +23135,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     or plot_definition.get("x_parameter")
                     or ""
                 ).strip() or "X Parameter"
-                return f"{x_param} vs {y_param}"
+                return self._life_graph_type_text(
+                    plot_type=plot_type,
+                    x_parameter=x_param,
+                    y_parameter=y_param,
+                    stats=stats,
+                )
             axis_label = str(plot_definition.get("life_axis_label") or "").strip()
             if not axis_label:
                 axis_key = str(plot_definition.get("life_axis") or "sequence_index").strip()
@@ -22842,7 +23151,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     "cumulative_on_time": "Cumulative On Time",
                     "cumulative_impulse": "Cumulative Impulse",
                 }.get(axis_key, axis_key or "Life")
-            return f"{axis_label} vs {y_param}"
+            return self._life_graph_type_text(
+                plot_type=plot_type,
+                life_axis_label=axis_label,
+                y_parameter=y_param,
+                stats=stats,
+            )
         if mode == "performance":
             return self._performance_graph_type_text(
                 plot_definition.get("input1") or "Input 1",
@@ -23174,6 +23488,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             if plot_type not in {"life_axis", "metric_xy"}:
                 plot_type = "life_axis"
             normalized_plot_definition["plot_type"] = plot_type
+            normalized_plot_definition["stats"] = self._life_plot_stats_from_definition(plot_definition)
             normalized_plot_definition["life_axis"] = (
                 str(plot_definition.get("life_axis") or "sequence_index").strip() or "sequence_index"
             )
@@ -25385,13 +25700,19 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
         if mode == "life_metrics":
             plot_type = str(plot_definition.get("plot_type") or "life_axis").strip().lower()
+            stats = self._life_plot_stats_from_definition(plot_definition)
             self._set_mode("life_metrics")
             self._set_combo_to_value(getattr(self, "cb_life_plot_type", None), plot_type)
             self._set_combo_to_value(getattr(self, "cb_life_y_param", None), str(plot_definition.get("y_parameter") or "").strip())
+            if hasattr(self, "list_life_stats"):
+                self._set_list_widget_selection(self.list_life_stats, stats)
+                if not self.list_life_stats.selectedItems() and self.list_life_stats.count() > 0:
+                    self.list_life_stats.item(0).setSelected(True)
             if plot_type == "metric_xy":
                 self._set_combo_to_value(getattr(self, "cb_life_x_param", None), str(plot_definition.get("x_parameter") or "").strip())
             else:
                 self._set_combo_to_value(getattr(self, "cb_life_axis", None), str(plot_definition.get("life_axis") or "sequence_index").strip())
+            self._refresh_life_stats_summary()
             self._refresh_life_controls()
             self._plot_life_metrics()
             return

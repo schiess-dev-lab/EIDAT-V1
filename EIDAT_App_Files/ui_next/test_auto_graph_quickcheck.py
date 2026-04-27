@@ -207,6 +207,7 @@ class TestAutoGraphQuickcheck(unittest.TestCase):
                                 "plot_type": "life_axis",
                                 "y_parameter": "LifeMetric",
                                 "life_axis": "sequence_index",
+                                "stats": ["max"],
                             },
                             "finding_rule": {
                                 "mode": "zscore",
@@ -287,8 +288,9 @@ class TestAutoGraphQuickcheck(unittest.TestCase):
                     ]
                 return [{"serial": "SN-NEW", "value_num": 30.0}]
 
-            def _fake_life_metric_series(db_arg, run_names, parameter, life_axis, serials=None):
+            def _fake_life_metric_series(db_arg, run_names, parameter, life_axis, serials=None, stat="mean"):
                 _ = (run_names, parameter, life_axis, serials)
+                self.assertEqual(str(stat), "max")
                 if Path(db_arg).expanduser() == snapshot_db:
                     return [{"y_value": 10.0}, {"y_value": 11.0}]
                 return [{"y_value": 10.4}, {"y_value": 10.6}]

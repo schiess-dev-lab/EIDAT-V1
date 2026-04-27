@@ -55,19 +55,29 @@ class TestTDLifeMetrics(unittest.TestCase):
             (obs_id, serial, run_name, "Program A", source_run_name, run_type, pulse_width, control_period, None, None, 1, 1),
         )
         for name, value in metrics.items():
+            stat_values: dict[str, float]
+            if isinstance(value, dict):
+                stat_values = {
+                    str(stat or "").strip().lower(): float(stat_value)
+                    for stat, stat_value in value.items()
+                    if str(stat or "").strip()
+                }
+            else:
+                stat_values = {"mean": float(value)}
             conn.execute(
                 "INSERT OR REPLACE INTO td_columns_calc(run_name, name, units, kind) VALUES (?, ?, ?, 'y')",
                 (run_name, name, "u"),
             )
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO td_metrics_calc_sequences(
-                    observation_id, serial, run_name, column_name, stat, value_num,
-                    computed_epoch_ns, source_mtime_ns, program_title, source_run_name
-                ) VALUES (?, ?, ?, ?, 'mean', ?, ?, ?, ?, ?)
-                """,
-                (obs_id, serial, run_name, name, value, 1, 1, "Program A", source_run_name),
-            )
+            for stat, stat_value in stat_values.items():
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO td_metrics_calc_sequences(
+                        observation_id, serial, run_name, column_name, stat, value_num,
+                        computed_epoch_ns, source_mtime_ns, program_title, source_run_name
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (obs_id, serial, run_name, name, stat, stat_value, 1, 1, "Program A", source_run_name),
+                )
 
     def _insert_raw_pulse_axis(self, raw_conn: sqlite3.Connection, *, obs_id: str, run_name: str, serial: str, pulses: list[int]) -> None:
         self._insert_raw_curve(
@@ -212,6 +222,81 @@ class TestTDLifeMetrics(unittest.TestCase):
             self.assertEqual([row["y_value"] for row in series], [35.0, 40.0])
             xy = be.td_load_life_metric_xy(db_path, ["cond_a", "cond_b"], "pc", "thrust", serials=["SN1"])
             self.assertEqual([(row["x_value"], row["y_value"]) for row in xy], [(35.0, 9.0), (40.0, 10.0)])
+
+    def test_loaders_support_selected_non_mean_stats(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            db_path, raw_db_path, workbook_path = self._make_paths(td)
+            self._init_dbs(db_path, raw_db_path)
+            with sqlite3.connect(str(db_path)) as conn:
+                self._insert_sequence(
+                    conn,
+                    obs_id="SN1__Program_A__Seq1",
+                    run_name="cond_a",
+                    display_name="Test Block A",
+                    source_run_name="Seq1",
+                    run_type="PM",
+                    pulse_width=0.1,
+                    control_period=1.0,
+                    metrics={
+                        "pc": {"mean": 35.0, "max": 45.0},
+                        "prop_per_pulse": 2.0,
+                        "impulse bit": 3.0,
+                        "thrust": {"mean": 9.0, "max": 12.0},
+                    },
+                )
+                self._insert_sequence(
+                    conn,
+                    obs_id="SN1__Program_A__Seq2",
+                    run_name="cond_b",
+                    display_name="Test Block B",
+                    source_run_name="Seq2",
+                    run_type="PM",
+                    pulse_width=0.1,
+                    control_period=1.0,
+                    metrics={
+                        "pc": {"mean": 40.0, "max": 52.0},
+                        "prop_per_pulse": 1.0,
+                        "impulse bit": 4.0,
+                        "thrust": {"mean": 10.0, "max": 14.0},
+                    },
+                )
+                conn.commit()
+            with sqlite3.connect(str(raw_db_path)) as raw_conn:
+                self._insert_raw_pulse_axis(raw_conn, obs_id="SN1__Program_A__Seq1", run_name="cond_a", serial="SN1", pulses=[1, 2, 3, 4, 5])
+                self._insert_raw_pulse_axis(raw_conn, obs_id="SN1__Program_A__Seq2", run_name="cond_b", serial="SN1", pulses=[1, 2])
+                raw_conn.commit()
+
+            with sqlite3.connect(str(db_path)) as conn:
+                be._td_rebuild_life_metrics(  # type: ignore[attr-defined]
+                    conn,
+                    workbook_path=workbook_path,
+                    project_cfg={},
+                    raw_db_path=raw_db_path,
+                    computed_epoch_ns=99,
+                )
+
+            series = be.td_load_life_metric_series(
+                db_path,
+                ["cond_a", "cond_b"],
+                "pc",
+                "cumulative_pulses",
+                serials=["SN1"],
+                stat="max",
+            )
+            self.assertEqual([row["x_value"] for row in series], [5.0, 7.0])
+            self.assertEqual([row["y_value"] for row in series], [45.0, 52.0])
+            self.assertTrue(all(str(row.get("stat") or "") == "max" for row in series))
+
+            xy = be.td_load_life_metric_xy(
+                db_path,
+                ["cond_a", "cond_b"],
+                "pc",
+                "thrust",
+                serials=["SN1"],
+                stat="max",
+            )
+            self.assertEqual([(row["x_value"], row["y_value"]) for row in xy], [(45.0, 12.0), (52.0, 14.0)])
+            self.assertTrue(all(str(row.get("stat") or "") == "max" for row in xy))
 
     def test_missing_pm_pulse_count_does_not_use_row_count_fallback(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:

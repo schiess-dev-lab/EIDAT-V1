@@ -895,29 +895,64 @@ def _metric_like_plot_result(
     elif mode == "life_metrics":
         plot_type = str(plot_definition.get("plot_type") or "life_axis").strip().lower()
         y_name = str(plot_definition.get("y_parameter") or "").strip()
+        stats = _normalize_text_list(plot_definition.get("stats")) or [str(plot_definition.get("stat") or "mean").strip().lower() or "mean"]
         try:
             if plot_type == "metric_xy":
                 x_name = str(plot_definition.get("x_parameter") or "").strip()
-                baseline_rows = be.td_load_life_metric_xy(baseline_db_path, runs, x_name, y_name, serials=list(baseline_serials))
-                target_rows = be.td_load_life_metric_xy(source_db_path, runs, x_name, y_name, serials=list(target_serials))
-                compare = _distribution_compare(
-                    [_safe_float(row.get("y_value")) for row in baseline_rows if isinstance(row, Mapping)],
-                    [_safe_float(row.get("y_value")) for row in target_rows if isinstance(row, Mapping)],
-                )
-                if compare is not None:
-                    compare.update({"run_name": ", ".join(runs), "y_name": y_name, "x_name": x_name})
-                    best_compare = compare
+                for stat in stats:
+                    baseline_rows = be.td_load_life_metric_xy(
+                        baseline_db_path,
+                        runs,
+                        x_name,
+                        y_name,
+                        serials=list(baseline_serials),
+                        stat=stat,
+                    )
+                    target_rows = be.td_load_life_metric_xy(
+                        source_db_path,
+                        runs,
+                        x_name,
+                        y_name,
+                        serials=list(target_serials),
+                        stat=stat,
+                    )
+                    compare = _distribution_compare(
+                        [_safe_float(row.get("y_value")) for row in baseline_rows if isinstance(row, Mapping)],
+                        [_safe_float(row.get("y_value")) for row in target_rows if isinstance(row, Mapping)],
+                    )
+                    if compare is None:
+                        continue
+                    compare.update({"run_name": ", ".join(runs), "y_name": y_name, "x_name": x_name, "stat": stat})
+                    if best_compare is None or _safe_float(compare.get("zscore")) >= _safe_float(best_compare.get("zscore")):
+                        best_compare = compare
             else:
                 life_axis = str(plot_definition.get("life_axis") or "sequence_index").strip() or "sequence_index"
-                baseline_rows = be.td_load_life_metric_series(baseline_db_path, runs, y_name, life_axis, serials=list(baseline_serials))
-                target_rows = be.td_load_life_metric_series(source_db_path, runs, y_name, life_axis, serials=list(target_serials))
-                compare = _distribution_compare(
-                    [_safe_float(row.get("y_value")) for row in baseline_rows if isinstance(row, Mapping)],
-                    [_safe_float(row.get("y_value")) for row in target_rows if isinstance(row, Mapping)],
-                )
-                if compare is not None:
-                    compare.update({"run_name": ", ".join(runs), "y_name": y_name, "life_axis": life_axis})
-                    best_compare = compare
+                for stat in stats:
+                    baseline_rows = be.td_load_life_metric_series(
+                        baseline_db_path,
+                        runs,
+                        y_name,
+                        life_axis,
+                        serials=list(baseline_serials),
+                        stat=stat,
+                    )
+                    target_rows = be.td_load_life_metric_series(
+                        source_db_path,
+                        runs,
+                        y_name,
+                        life_axis,
+                        serials=list(target_serials),
+                        stat=stat,
+                    )
+                    compare = _distribution_compare(
+                        [_safe_float(row.get("y_value")) for row in baseline_rows if isinstance(row, Mapping)],
+                        [_safe_float(row.get("y_value")) for row in target_rows if isinstance(row, Mapping)],
+                    )
+                    if compare is None:
+                        continue
+                    compare.update({"run_name": ", ".join(runs), "y_name": y_name, "life_axis": life_axis, "stat": stat})
+                    if best_compare is None or _safe_float(compare.get("zscore")) >= _safe_float(best_compare.get("zscore")):
+                        best_compare = compare
         except Exception as exc:
             warning_text = str(exc)
     else:

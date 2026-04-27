@@ -218,6 +218,15 @@ class TestQtMainMetricPlotSource(unittest.TestCase):
             matches[0].setSelected(True)
 
     @staticmethod
+    def _ensure_selected_items(list_widget: QtWidgets.QListWidget, texts: list[str]) -> None:
+        wanted = {str(text or "").strip().lower() for text in texts if str(text or "").strip()}
+        list_widget.clearSelection()
+        for index in range(list_widget.count()):
+            item = list_widget.item(index)
+            if item is not None and str(item.text() or "").strip().lower() in wanted:
+                item.setSelected(True)
+
+    @staticmethod
     def _prepare_plot_window(window: TestDataTrendDialog, db_path: Path, *, mode: str) -> _DummyAxes:
         axes = _DummyAxes()
         window._db_path = db_path
@@ -455,6 +464,91 @@ class TestQtMainMetricPlotSource(unittest.TestCase):
                 info_mock.assert_not_called()
                 self.assertEqual(window._last_plot_def["mode"], "metrics")
                 self.assertTrue(axes.plot_calls)
+        finally:
+            window.close()
+            tmpdir = getattr(window, "_test_tmpdir", "")
+            if tmpdir:
+                shutil.rmtree(str(tmpdir), ignore_errors=True)
+
+    def test_plot_life_metrics_uses_selected_stats_and_persists_them(self) -> None:
+        window = self._make_window()
+        try:
+            with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+                db_path = Path(tmpdir) / "cache.sqlite3"
+                db_path.write_text("", encoding="utf-8")
+                axes = self._prepare_plot_window(window, db_path, mode="life_metrics")
+                selection = {
+                    "mode": "condition",
+                    "id": "condition:CondA",
+                    "run_name": "CondA",
+                    "display_text": "Condition A",
+                    "run_condition": "Condition A",
+                    "member_runs": ["CondA"],
+                    "member_sequences": ["Seq-1"],
+                }
+                requested_stats: list[str] = []
+                window.cb_life_y_param.clear()
+                window.cb_life_y_param.addItem("LifeMetric", "LifeMetric")
+                window.cb_life_axis.clear()
+                window.cb_life_axis.addItem("Sequence", "sequence_index")
+                self._ensure_selected_items(window.list_life_stats, ["mean", "max"])
+
+                def _fake_loader(
+                    run_names: list[str],
+                    parameter_value: object,
+                    life_axis: str,
+                    *,
+                    stat: object = "mean",
+                    serials: list[str] | None = None,
+                    filter_state: object = None,
+                ) -> list[dict]:
+                    del run_names, parameter_value, life_axis, serials, filter_state
+                    requested_stats.append(str(stat))
+                    return [
+                        {
+                            "serial": "SN-001",
+                            "observation_id": f"obs-{stat}",
+                            "sequence_index": 1,
+                            "condition_key": "CondA",
+                            "x_value": 1.0,
+                            "y_value": 1.0 if str(stat) == "mean" else 2.0,
+                            "units": "psi",
+                        }
+                    ]
+
+                with patch.object(window, "_current_run_selector_mode", return_value="condition"), patch.object(
+                    window, "_current_run_selection", return_value=selection
+                ), patch.object(
+                    window, "_current_run_selections", return_value=[selection]
+                ), patch.object(
+                    window, "_current_member_runs", return_value=["CondA"]
+                ), patch.object(
+                    window, "_active_serials", return_value=["SN-001"]
+                ), patch.object(
+                    window, "_ensure_main_axes", return_value=None
+                ), patch.object(
+                    window, "_compose_run_title", return_value="Life Plot"
+                ), patch.object(
+                    window, "_apply_interactive_legend_policy", return_value=[]
+                ), patch.object(
+                    window, "_apply_plot_view_bands_to_axes", return_value=None
+                ), patch.object(
+                    window, "_refresh_plot_note", return_value=None
+                ), patch.object(
+                    window, "_capture_main_plot_base_view", return_value=None
+                ), patch.object(
+                    window, "_update_perf_primary_equation_banner", return_value=None
+                ), patch.object(
+                    window, "_load_life_metric_series_for_selection", side_effect=_fake_loader
+                ), patch(
+                    "ui_next.qt_main.QtWidgets.QMessageBox.information"
+                ) as info_mock:
+                    window._plot_life_metrics()
+
+                info_mock.assert_not_called()
+                self.assertEqual(requested_stats, ["mean", "max"])
+                self.assertEqual(window._last_plot_def.get("stats"), ["mean", "max"])
+                self.assertEqual(len(axes.plot_calls), 2)
         finally:
             window.close()
             tmpdir = getattr(window, "_test_tmpdir", "")
