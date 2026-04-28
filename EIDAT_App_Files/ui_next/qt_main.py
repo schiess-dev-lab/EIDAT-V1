@@ -2699,6 +2699,9 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
         self._saving_revision = 0
         self._saved_revision = 0
         self._save_requested_while_busy = False
+        self._refresh_after_save_requested = False
+        self._saving_refresh_project_state = False
+        self._saving_selected_keys: list[tuple[str, str, str, str]] = []
         self._close_requested = False
         self._allow_direct_close = False
         self._save_worker: ProjectTaskWorker | None = None
@@ -2917,10 +2920,27 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
         self,
         snapshot_rows: Sequence[Mapping[str, object]],
         *,
+        refresh_project_state: bool = False,
         report=None,
     ) -> dict[str, object]:
-        del report
+        support_refresh_warning = ""
         saved_rows = be.save_td_repo_parameter_mappings(self._project_dir, snapshot_rows)
+        if refresh_project_state:
+            support_refresher = getattr(be, "refresh_td_parameter_support_workbook", None)
+            if callable(support_refresher):
+                try:
+                    support_refresher(
+                        self._project_dir,
+                        self._workbook_path,
+                        self._db_path,
+                        progress_cb=report,
+                    )
+                except Exception as support_exc:
+                    support_refresh_warning = (
+                        "ProgramRequirements mappings were saved, but the project support workbook could not be refreshed.\n\n"
+                        "Run Update Project to rebuild and consolidate the project rows.\n\n"
+                        f"Details: {support_exc}"
+                    )
         refresh_warning = ""
         refresher = getattr(be, "refresh_td_parameter_runtime_cache", None)
         if callable(refresher):
@@ -2938,25 +2958,36 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
                     "Run Update Project before opening Trend / Analyze again.\n\n"
                     f"Details: {refresh_exc}"
                 )
+        warning_text = "\n\n".join([text for text in (support_refresh_warning, refresh_warning) if text.strip()])
         return {
             "saved_rows": [dict(row) for row in saved_rows],
-            "refresh_warning": refresh_warning,
+            "refresh_warning": warning_text,
         }
 
-    def _start_background_save(self, *, force: bool = False) -> None:
+    def _start_background_save(self, *, force: bool = False, refresh_project_state: bool = False) -> None:
+        if refresh_project_state:
+            self._refresh_after_save_requested = True
         if getattr(self, "_autosave_timer", None) is not None and self._autosave_timer.isActive():
             self._autosave_timer.stop()
         if self._save_worker is not None and self._save_worker.isRunning():
             self._save_requested_while_busy = True
             return
-        if not force and not self._dirty:
+        refresh_requested = bool(self._refresh_after_save_requested)
+        if not force and not self._dirty and not refresh_requested:
             return
         snapshot_rows = self._snapshot_working_rows()
         self._saving_revision = self._save_revision
+        self._saving_refresh_project_state = refresh_requested
+        self._saving_selected_keys = list(self._current_selected_keys())
+        self._refresh_after_save_requested = False
         self._save_requested_while_busy = False
         self._set_save_busy(True)
         self._save_worker = ProjectTaskWorker(
-            lambda _report: self._perform_parameter_mapping_save(snapshot_rows, report=_report)
+            lambda _report, _snapshot=snapshot_rows, _refresh=refresh_requested: self._perform_parameter_mapping_save(
+                _snapshot,
+                refresh_project_state=_refresh,
+                report=_report,
+            )
         )
         self._save_worker.completed.connect(self._handle_background_save_completed)
         self._save_worker.failed.connect(self._handle_background_save_failed)
@@ -2973,6 +3004,8 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
         ]
         saved_rows = [row for row in saved_rows if row]
         completed_revision = int(self._saving_revision)
+        refresh_requested = bool(self._saving_refresh_project_state)
+        selected_keys = list(self._saving_selected_keys)
         self.saved = True
         self._saved_revision = max(self._saved_revision, completed_revision)
         if completed_revision >= self._save_revision:
@@ -2982,11 +3015,14 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
         else:
             self._save_requested_while_busy = True
             self._set_dirty(True)
-        self._refresh_display_completer()
+        if refresh_requested and not self._dirty:
+            self._reload_context(select_keys=selected_keys)
+        else:
+            self._refresh_display_completer()
         refresh_warning = str(result.get("refresh_warning") or "").strip()
         if refresh_warning:
             QtWidgets.QMessageBox.warning(self, "Project Parameters", refresh_warning)
-        if self._save_requested_while_busy or self._dirty:
+        if self._save_requested_while_busy or self._dirty or self._refresh_after_save_requested:
             self._autosave_timer.start()
         if self._close_requested and not self._dirty and self._save_worker is None:
             self._close_requested = False
@@ -3830,7 +3866,7 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
         self._apply_units_value(row_keys=row_keys, units_text=units_text)
 
     def _act_save(self) -> None:
-        self._start_background_save(force=True)
+        self._start_background_save(force=True, refresh_project_state=True)
 
     def reject(self) -> None:  # type: ignore[override]
         if self._allow_direct_close:
@@ -31864,7 +31900,14 @@ class MainWindow(QtWidgets.QMainWindow):
                         and getattr(self, "cb_project_force_rebuild", None)
                         and self.cb_project_force_rebuild.isChecked()
                     )
-                    self._run_project_update(current_record, force_project_rebuild=force_full)
+                    self._run_project_update(
+                        current_record,
+                        force_project_rebuild=force_full,
+                        on_success_extra=lambda _payload, _project_dir=project_dir: (
+                            self._refresh_projects(),
+                            self._select_project_by_dir(_project_dir),
+                        ),
+                    )
         except Exception as exc:
             message = str(exc)
             if "Trend / Analyze" in message or "cache" in message.casefold():

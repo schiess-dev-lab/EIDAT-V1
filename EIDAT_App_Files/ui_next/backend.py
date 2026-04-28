@@ -4165,6 +4165,78 @@ def save_td_repo_parameter_mappings(
     return sorted(normalized_rows, key=_td_program_parameter_mapping_sort_key)
 
 
+def refresh_td_parameter_support_workbook(
+    project_dir: Path,
+    workbook_path: Path,
+    db_path: Path,
+    progress_cb: Callable[[str], None] | None = None,
+) -> dict[str, object]:
+    proj_dir = Path(project_dir).expanduser()
+    workbook = Path(workbook_path).expanduser()
+    impl_db = Path(db_path).expanduser()
+    repo = _td_project_global_repo(proj_dir)
+    if repo is None:
+        raise RuntimeError("Project is missing its Global Repo path.")
+
+    project_cfg = _load_project_td_trend_config(workbook)
+    cfg_cols = [dict(c) for c in (project_cfg.get("columns") or []) if isinstance(c, dict)]
+
+    _td_emit_progress(progress_cb, "Refreshing support workbook program sheets")
+    support_refresh = _sync_td_support_workbook_program_sheets(
+        workbook,
+        global_repo=repo,
+        project_dir=proj_dir,
+        param_defs=cfg_cols,
+    )
+
+    _td_emit_progress(progress_cb, "Consolidating support workbook run conditions")
+    run_conditions_refresh = _refresh_td_support_run_conditions_sheet(
+        workbook,
+        project_dir=proj_dir,
+        param_defs=cfg_cols,
+    )
+
+    docs: list[dict[str, object]] = []
+    try:
+        selected_rels = _project_selected_metadata_rels(proj_dir)
+    except Exception:
+        selected_rels = set()
+    if selected_rels:
+        try:
+            docs = [
+                dict(doc)
+                for doc in read_eidat_index_documents(repo)
+                if isinstance(doc, Mapping)
+                and str(doc.get("metadata_rel") or "").strip() in selected_rels
+            ]
+        except Exception:
+            docs = []
+    if not docs:
+        docs = [
+            {"program_title": title}
+            for title in _td_project_program_titles(
+                proj_dir,
+                workbook_path=workbook,
+                db_path=impl_db,
+            )
+            if str(title).strip()
+        ]
+
+    _td_emit_progress(progress_cb, "Importing ProgramRequirements into support workbook")
+    program_requirements_import = _sync_td_support_program_requirements_import(
+        workbook,
+        global_repo=repo,
+        project_dir=proj_dir,
+        docs=docs,
+    )
+
+    return {
+        "support_refresh": dict(support_refresh),
+        "run_conditions_refresh": dict(run_conditions_refresh),
+        "program_requirements_import": dict(program_requirements_import),
+    }
+
+
 def load_td_project_parameter_normalization(project_dir: Path) -> dict[str, object]:
     meta = _read_project_meta(Path(project_dir).expanduser())
     return _td_normalize_parameter_normalization(meta.get(TD_PARAMETER_NORMALIZATION_KEY))

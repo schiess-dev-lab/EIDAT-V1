@@ -2225,10 +2225,11 @@ class TestProjectUpdateUI(unittest.TestCase):
             act()
 
         harness._show_toast.assert_called_once_with("Project parameters saved")
-        harness._run_project_update.assert_called_once_with(
-            harness._selected_project_record(),
-            force_project_rebuild=True,
-        )
+        harness._run_project_update.assert_called_once()
+        args, kwargs = harness._run_project_update.call_args
+        self.assertEqual(args[0], harness._selected_project_record())
+        self.assertTrue(bool(kwargs.get("force_project_rebuild")))
+        self.assertTrue(callable(kwargs.get("on_success_extra")))
 
     def test_project_parameter_normalization_does_not_run_update_when_not_requested(self) -> None:
         _qt_app()
@@ -2684,28 +2685,30 @@ class TestTDSupportWorkbook(unittest.TestCase):
             with mock.patch.object(qm.be, "validate_test_data_project_cache_for_open", return_value=db_path):
                 with mock.patch.object(qm.be, "td_build_parameter_normalization_context", return_value=context) as builder_mock:
                     with mock.patch.object(qm.be, "save_td_repo_parameter_mappings", return_value=saved_rows) as save_mock:
-                        with mock.patch.object(qm.be, "refresh_td_parameter_runtime_cache") as refresh_mock:
-                            dlg = qm.TDParameterNormalizationDialog(project_dir, workbook)
+                        with mock.patch.object(qm.be, "refresh_td_parameter_support_workbook") as support_mock:
+                            with mock.patch.object(qm.be, "refresh_td_parameter_runtime_cache") as refresh_mock:
+                                dlg = qm.TDParameterNormalizationDialog(project_dir, workbook)
 
-                            try:
-                                dlg._autosave_timer.setInterval(0)
-                                dlg.tbl.selectRow(0)
-                                dlg.tbl.item(0, dlg.COL_DISPLAYED).setText("Chamber Feed Pressure")
-                                app.processEvents()
-                                self._wait_for_parameter_dialog_idle(dlg, app)
+                                try:
+                                    dlg._autosave_timer.setInterval(0)
+                                    dlg.tbl.selectRow(0)
+                                    dlg.tbl.item(0, dlg.COL_DISPLAYED).setText("Chamber Feed Pressure")
+                                    app.processEvents()
+                                    self._wait_for_parameter_dialog_idle(dlg, app)
 
-                                self.assertEqual(builder_mock.call_count, 1)
-                                save_mock.assert_called_once_with(project_dir, mock.ANY)
-                                refresh_mock.assert_called_once_with(project_dir, workbook, db_path)
-                                self.assertEqual(dlg.tbl.item(0, dlg.COL_DISPLAYED).text(), "Chamber Feed Pressure")
-                                self.assertEqual(dlg.tbl.item(0, dlg.COL_STATUS).text(), "Edited")
-                                self.assertEqual(dlg.btn_save.text(), "Save Now")
-                                self.assertFalse(dlg._dirty)
-                                self.assertIn("Edited: 1", dlg.lbl_summary.text())
-                                self.assertIn("Displayed Parameter: Chamber Feed Pressure", dlg.detail.toPlainText())
-                            finally:
-                                dlg._allow_direct_close = True
-                                dlg.close()
+                                    self.assertEqual(builder_mock.call_count, 1)
+                                    save_mock.assert_called_once_with(project_dir, mock.ANY)
+                                    support_mock.assert_not_called()
+                                    refresh_mock.assert_called_once_with(project_dir, workbook, db_path)
+                                    self.assertEqual(dlg.tbl.item(0, dlg.COL_DISPLAYED).text(), "Chamber Feed Pressure")
+                                    self.assertEqual(dlg.tbl.item(0, dlg.COL_STATUS).text(), "Edited")
+                                    self.assertEqual(dlg.btn_save.text(), "Save Now")
+                                    self.assertFalse(dlg._dirty)
+                                    self.assertIn("Edited: 1", dlg.lbl_summary.text())
+                                    self.assertIn("Displayed Parameter: Chamber Feed Pressure", dlg.detail.toPlainText())
+                                finally:
+                                    dlg._allow_direct_close = True
+                                    dlg.close()
 
     @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
     def test_parameter_normalization_dialog_display_editor_uses_autocomplete_values(self) -> None:
@@ -2954,16 +2957,59 @@ class TestTDSupportWorkbook(unittest.TestCase):
 
                 saved_rows = [dict(row) for row in dlg._working_rows]
                 with mock.patch.object(qm.be, "save_td_repo_parameter_mappings", return_value=saved_rows) as save_mock:
-                    with mock.patch.object(qm.be, "refresh_td_parameter_runtime_cache") as refresh_mock:
-                        with mock.patch.object(QtWidgets.QMessageBox, "warning") as warning_mock:
-                            dlg._act_save()
-                            self._wait_for_parameter_dialog_idle(dlg, app)
+                    with mock.patch.object(qm.be, "refresh_td_parameter_support_workbook", return_value={}) as support_mock:
+                        with mock.patch.object(qm.be, "refresh_td_parameter_runtime_cache") as refresh_mock:
+                            with mock.patch.object(QtWidgets.QMessageBox, "warning") as warning_mock:
+                                dlg._act_save()
+                                self._wait_for_parameter_dialog_idle(dlg, app)
 
                 save_mock.assert_called_once_with(project_dir, mock.ANY)
+                support_mock.assert_called_once()
+                support_args, support_kwargs = support_mock.call_args
+                self.assertEqual(support_args, (project_dir, workbook, db_path))
+                self.assertTrue(callable(support_kwargs.get("progress_cb")))
                 refresh_mock.assert_called_once_with(project_dir, workbook, db_path)
                 warning_mock.assert_not_called()
                 self.assertTrue(dlg.saved)
                 self.assertEqual(dlg.result(), 0)
+                self.assertFalse(dlg._dirty)
+            finally:
+                dlg._allow_direct_close = True
+                dlg.close()
+
+    @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
+    def test_parameter_normalization_dialog_explicit_save_refreshes_support_workbook_when_clean(self) -> None:
+        app = _qt_app()
+        from PySide6 import QtWidgets
+        from EIDAT_App_Files.ui_next import qt_main as qm  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            project_dir = root / "ProjectA"
+            project_dir.mkdir()
+            workbook = root / "project.xlsx"
+            workbook.write_text("", encoding="utf-8")
+            db_path = project_dir / "implementation_trending.sqlite3"
+            context = self._make_parameter_normalization_context()
+
+            with mock.patch.object(qm.be, "validate_test_data_project_cache_for_open", return_value=db_path):
+                with mock.patch.object(qm.be, "td_build_parameter_normalization_context", return_value=context):
+                    dlg = qm.TDParameterNormalizationDialog(project_dir, workbook)
+
+            try:
+                saved_rows = [dict(row) for row in dlg._working_rows]
+                with mock.patch.object(qm.be, "save_td_repo_parameter_mappings", return_value=saved_rows) as save_mock:
+                    with mock.patch.object(qm.be, "refresh_td_parameter_support_workbook", return_value={}) as support_mock:
+                        with mock.patch.object(qm.be, "refresh_td_parameter_runtime_cache") as refresh_mock:
+                            with mock.patch.object(QtWidgets.QMessageBox, "warning") as warning_mock:
+                                dlg._act_save()
+                                self._wait_for_parameter_dialog_idle(dlg, app)
+
+                save_mock.assert_called_once_with(project_dir, mock.ANY)
+                support_mock.assert_called_once()
+                refresh_mock.assert_called_once_with(project_dir, workbook, db_path)
+                warning_mock.assert_not_called()
+                self.assertTrue(dlg.saved)
                 self.assertFalse(dlg._dirty)
             finally:
                 dlg._allow_direct_close = True
@@ -3146,13 +3192,15 @@ class TestTDSupportWorkbook(unittest.TestCase):
 
                 saved_rows = [dict(row) for row in dlg._working_rows]
                 with mock.patch.object(qm.be, "save_td_repo_parameter_mappings", return_value=saved_rows) as save_mock:
-                    with mock.patch.object(qm.be, "refresh_td_parameter_runtime_cache", side_effect=RuntimeError("cache fail")) as refresh_mock:
-                        with mock.patch.object(qm.be, "invalidate_td_parameter_runtime_cache") as invalidator_mock:
-                            with mock.patch.object(QtWidgets.QMessageBox, "warning") as warning_mock:
-                                dlg._act_save()
-                                self._wait_for_parameter_dialog_idle(dlg, app)
+                    with mock.patch.object(qm.be, "refresh_td_parameter_support_workbook", return_value={}) as support_mock:
+                        with mock.patch.object(qm.be, "refresh_td_parameter_runtime_cache", side_effect=RuntimeError("cache fail")) as refresh_mock:
+                            with mock.patch.object(qm.be, "invalidate_td_parameter_runtime_cache") as invalidator_mock:
+                                with mock.patch.object(QtWidgets.QMessageBox, "warning") as warning_mock:
+                                    dlg._act_save()
+                                    self._wait_for_parameter_dialog_idle(dlg, app)
 
                 save_mock.assert_called_once_with(project_dir, mock.ANY)
+                support_mock.assert_called_once()
                 refresh_mock.assert_called_once_with(project_dir, workbook, db_path)
                 invalidator_mock.assert_called_once_with(db_path)
                 warning_mock.assert_called_once()
