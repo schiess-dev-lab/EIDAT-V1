@@ -2703,6 +2703,7 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
         self._allow_direct_close = False
         self._save_worker: ProjectTaskWorker | None = None
         self.saved = False
+        self.update_requested = False
         self._autosave_timer = QtCore.QTimer(self)
         self._autosave_timer.setSingleShot(True)
         self._autosave_timer.setInterval(350)
@@ -2748,7 +2749,8 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
             "Review every ingested source parameter grouped by program and asset. "
             "The displayed parameter is the user-facing name the GUI uses for trending, analysis, and mapping. "
             "Edits autosave in the background to the ProgramRequirements workbook files for reuse by other projects. "
-            "Use the Enabled column or the side actions to make parameters active or inactive."
+            "Use the Enabled column or the side actions to make parameters active or inactive. "
+            "Closing this popup saves any pending changes and then runs Update Project."
         )
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #475569; font-size: 11px;")
@@ -2821,7 +2823,7 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
         button_row = QtWidgets.QHBoxLayout()
         button_row.addStretch(1)
         self.btn_save = QtWidgets.QPushButton("Save Now")
-        self.btn_close = QtWidgets.QPushButton("Close")
+        self.btn_close = QtWidgets.QPushButton("Close + Update")
         button_row.addWidget(self.btn_save)
         button_row.addWidget(self.btn_close)
         layout.addLayout(button_row)
@@ -2987,8 +2989,10 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
         if self._save_requested_while_busy or self._dirty:
             self._autosave_timer.start()
         if self._close_requested and not self._dirty and self._save_worker is None:
+            self._close_requested = False
+            self.update_requested = True
             self._allow_direct_close = True
-            self.close()
+            self.accept()
 
     def _handle_background_save_failed(self, message: str) -> None:
         self._save_worker = None
@@ -2996,6 +3000,7 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
         self._set_dirty(True)
         self._save_requested_while_busy = True
         self._close_requested = False
+        self.update_requested = False
         QtWidgets.QMessageBox.warning(self, "Project Parameters", str(message or "Unable to save project parameters."))
 
     def _act_close(self) -> None:
@@ -3003,7 +3008,10 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
             self._close_requested = True
             self._start_background_save(force=True)
             return
-        self.reject()
+        self._close_requested = False
+        self.update_requested = True
+        self._allow_direct_close = True
+        self.accept()
 
     def _normalize_row(self, row: Mapping[str, object] | None) -> dict[str, object]:
         normalizer = getattr(be, "_td_program_parameter_mapping_normalize", None)
@@ -3824,6 +3832,12 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
     def _act_save(self) -> None:
         self._start_background_save(force=True)
 
+    def reject(self) -> None:  # type: ignore[override]
+        if self._allow_direct_close:
+            super().reject()
+            return
+        self._act_close()
+
     def closeEvent(self, event: QtGui.QCloseEvent):  # type: ignore[override]
         if self._allow_direct_close:
             super().closeEvent(event)
@@ -3833,7 +3847,11 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
             self._start_background_save(force=True)
             event.ignore()
             return
-        super().closeEvent(event)
+        self._close_requested = False
+        self.update_requested = True
+        self._allow_direct_close = True
+        self.accept()
+        event.ignore()
 
 
 class ImplementationTrendDialog(QtWidgets.QDialog):
@@ -31835,8 +31853,18 @@ class MainWindow(QtWidgets.QMainWindow):
             workbook = Path(str(record.get("workbook") or "")).expanduser()
             dlg = TDParameterNormalizationDialog(project_dir, workbook, self)
             self._prepare_dialog(dlg)
-            if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted and getattr(dlg, "saved", False):
-                self._show_toast("Project parameters saved")
+            if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+                if getattr(dlg, "saved", False):
+                    self._show_toast("Project parameters saved")
+                if getattr(dlg, "update_requested", False):
+                    current_record = self._selected_project_record() or record
+                    current_type = str(current_record.get("type") or "").strip()
+                    force_full = bool(
+                        current_type == getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending")
+                        and getattr(self, "cb_project_force_rebuild", None)
+                        and self.cb_project_force_rebuild.isChecked()
+                    )
+                    self._run_project_update(current_record, force_project_rebuild=force_full)
         except Exception as exc:
             message = str(exc)
             if "Trend / Analyze" in message or "cache" in message.casefold():

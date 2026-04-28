@@ -2169,6 +2169,7 @@ class TestProjectUpdateUI(unittest.TestCase):
         harness._append_log = lambda *_args, **_kwargs: None
         captured: dict[str, object] = {}
         harness._start_project_task = lambda **kwargs: captured.update(kwargs)
+        harness._run_project_update = MainWindow._run_project_update.__get__(harness, _Harness)
         act = MainWindow._act_update_project.__get__(harness, _Harness)
 
         with mock.patch.object(be, "update_test_data_trending_project_workbook", return_value={"workbook": "x"}) as update_mock:
@@ -2187,6 +2188,85 @@ class TestProjectUpdateUI(unittest.TestCase):
         self.assertTrue(bool(kwargs.get("overwrite")))
         self.assertTrue(bool(kwargs.get("include_performance_sheets")))
         self.assertTrue(callable(kwargs.get("progress_cb")))
+
+    def test_project_parameter_normalization_runs_update_after_accepting_close(self) -> None:
+        _qt_app()
+        from PySide6 import QtWidgets
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+        from EIDAT_App_Files.ui_next import qt_main as qm  # type: ignore
+        from EIDAT_App_Files.ui_next.qt_main import MainWindow  # type: ignore
+
+        class _Harness:
+            pass
+
+        class _DialogStub:
+            def __init__(self, *args, **kwargs):
+                self.saved = True
+                self.update_requested = True
+
+            def exec(self):
+                return QtWidgets.QDialog.DialogCode.Accepted
+
+        harness = _Harness()
+        harness.cb_project_force_rebuild = QtWidgets.QCheckBox()
+        harness.cb_project_force_rebuild.setChecked(True)
+        harness._selected_project_record = lambda: {
+            "name": "Proj",
+            "type": getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending"),
+            "folder": "C:/tmp/repo/projects/Proj",
+            "workbook": "C:/tmp/repo/projects/Proj/project.xlsx",
+        }
+        harness._prepare_dialog = lambda dlg: None
+        harness._show_toast = mock.Mock()
+        harness._run_project_update = mock.Mock()
+        act = MainWindow._act_project_parameter_normalization.__get__(harness, _Harness)
+
+        with mock.patch.object(qm, "TDParameterNormalizationDialog", _DialogStub):
+            act()
+
+        harness._show_toast.assert_called_once_with("Project parameters saved")
+        harness._run_project_update.assert_called_once_with(
+            harness._selected_project_record(),
+            force_project_rebuild=True,
+        )
+
+    def test_project_parameter_normalization_does_not_run_update_when_not_requested(self) -> None:
+        _qt_app()
+        from PySide6 import QtWidgets
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+        from EIDAT_App_Files.ui_next import qt_main as qm  # type: ignore
+        from EIDAT_App_Files.ui_next.qt_main import MainWindow  # type: ignore
+
+        class _Harness:
+            pass
+
+        class _DialogStub:
+            def __init__(self, *args, **kwargs):
+                self.saved = False
+                self.update_requested = False
+
+            def exec(self):
+                return QtWidgets.QDialog.DialogCode.Rejected
+
+        harness = _Harness()
+        harness.cb_project_force_rebuild = QtWidgets.QCheckBox()
+        harness.cb_project_force_rebuild.setChecked(True)
+        harness._selected_project_record = lambda: {
+            "name": "Proj",
+            "type": getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending"),
+            "folder": "C:/tmp/repo/projects/Proj",
+            "workbook": "C:/tmp/repo/projects/Proj/project.xlsx",
+        }
+        harness._prepare_dialog = lambda dlg: None
+        harness._show_toast = mock.Mock()
+        harness._run_project_update = mock.Mock()
+        act = MainWindow._act_project_parameter_normalization.__get__(harness, _Harness)
+
+        with mock.patch.object(qm, "TDParameterNormalizationDialog", _DialogStub):
+            act()
+
+        harness._show_toast.assert_not_called()
+        harness._run_project_update.assert_not_called()
 
     def test_node_backend_update_project_dispatches_td_projects_with_performance_refresh(self) -> None:
         from EIDAT_App_Files.Production import node_backend  # type: ignore
@@ -2890,6 +2970,75 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 dlg.close()
 
     @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
+    def test_parameter_normalization_dialog_clean_close_accepts_and_requests_update(self) -> None:
+        _qt_app()
+        from EIDAT_App_Files.ui_next import qt_main as qm  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            project_dir = root / "ProjectA"
+            project_dir.mkdir()
+            workbook = root / "project.xlsx"
+            workbook.write_text("", encoding="utf-8")
+            db_path = project_dir / "implementation_trending.sqlite3"
+            context = self._make_parameter_normalization_context()
+
+            with mock.patch.object(qm.be, "validate_test_data_project_cache_for_open", return_value=db_path):
+                with mock.patch.object(qm.be, "td_build_parameter_normalization_context", return_value=context):
+                    dlg = qm.TDParameterNormalizationDialog(project_dir, workbook)
+
+            try:
+                dlg._act_close()
+
+                self.assertEqual(dlg.result(), int(qm.QtWidgets.QDialog.DialogCode.Accepted))
+                self.assertTrue(dlg.update_requested)
+                self.assertFalse(dlg.saved)
+            finally:
+                dlg._allow_direct_close = True
+                dlg.close()
+
+    @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
+    def test_parameter_normalization_dialog_dirty_close_saves_accepts_and_requests_update(self) -> None:
+        app = _qt_app()
+        from EIDAT_App_Files.ui_next import qt_main as qm  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            project_dir = root / "ProjectA"
+            project_dir.mkdir()
+            workbook = root / "project.xlsx"
+            workbook.write_text("", encoding="utf-8")
+            db_path = project_dir / "implementation_trending.sqlite3"
+            context = self._make_parameter_normalization_context()
+            saved_rows = [dict(row) for row in context["repo_parameter_rows"]]
+            saved_rows[0]["displayed_parameter"] = "Chamber Feed Pressure"
+            saved_rows[0]["edited"] = True
+
+            with mock.patch.object(qm.be, "validate_test_data_project_cache_for_open", return_value=db_path):
+                with mock.patch.object(qm.be, "td_build_parameter_normalization_context", return_value=context):
+                    dlg = qm.TDParameterNormalizationDialog(project_dir, workbook)
+
+            try:
+                dlg._autosave_timer.setInterval(999999)
+                dlg.tbl.selectRow(0)
+                dlg.tbl.item(0, dlg.COL_DISPLAYED).setText("Chamber Feed Pressure")
+                app.processEvents()
+
+                with mock.patch.object(qm.be, "save_td_repo_parameter_mappings", return_value=saved_rows) as save_mock:
+                    with mock.patch.object(qm.be, "refresh_td_parameter_runtime_cache") as refresh_mock:
+                        dlg._act_close()
+                        self._wait_for_parameter_dialog_idle(dlg, app)
+
+                save_mock.assert_called_once_with(project_dir, mock.ANY)
+                refresh_mock.assert_called_once_with(project_dir, workbook, db_path)
+                self.assertEqual(dlg.result(), int(qm.QtWidgets.QDialog.DialogCode.Accepted))
+                self.assertTrue(dlg.update_requested)
+                self.assertTrue(dlg.saved)
+            finally:
+                dlg._allow_direct_close = True
+                dlg.close()
+
+    @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
     def test_parameter_normalization_dialog_save_failure_restores_controls(self) -> None:
         app = _qt_app()
         from PySide6 import QtWidgets
@@ -2925,6 +3074,45 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 self.assertTrue(dlg.btn_close.isEnabled())
                 self.assertEqual(dlg.btn_save.text(), "Save Now*")
                 self.assertEqual(dlg.result(), 0)
+                warning_mock.assert_called_once()
+                self.assertIn("boom", str(warning_mock.call_args.args[2]))
+            finally:
+                dlg._allow_direct_close = True
+                dlg.close()
+
+    @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
+    def test_parameter_normalization_dialog_close_failure_stays_open_and_skips_update(self) -> None:
+        app = _qt_app()
+        from PySide6 import QtWidgets
+        from EIDAT_App_Files.ui_next import qt_main as qm  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            project_dir = root / "ProjectA"
+            project_dir.mkdir()
+            workbook = root / "project.xlsx"
+            workbook.write_text("", encoding="utf-8")
+            db_path = project_dir / "implementation_trending.sqlite3"
+            context = self._make_parameter_normalization_context()
+
+            with mock.patch.object(qm.be, "validate_test_data_project_cache_for_open", return_value=db_path):
+                with mock.patch.object(qm.be, "td_build_parameter_normalization_context", return_value=context):
+                    dlg = qm.TDParameterNormalizationDialog(project_dir, workbook)
+
+            try:
+                dlg._autosave_timer.setInterval(999999)
+                dlg.tbl.selectRow(0)
+                dlg.tbl.item(0, dlg.COL_DISPLAYED).setText("Chamber Feed Pressure")
+                app.processEvents()
+
+                with mock.patch.object(qm.be, "save_td_repo_parameter_mappings", side_effect=RuntimeError("boom")):
+                    with mock.patch.object(QtWidgets.QMessageBox, "warning") as warning_mock:
+                        dlg._act_close()
+                        self._wait_for_parameter_dialog_idle(dlg, app)
+
+                self.assertEqual(dlg.result(), 0)
+                self.assertFalse(dlg.update_requested)
+                self.assertFalse(dlg._close_requested)
                 warning_mock.assert_called_once()
                 self.assertIn("boom", str(warning_mock.call_args.args[2]))
             finally:
