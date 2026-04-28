@@ -1,3 +1,5 @@
+import json
+import os
 import sys
 import sqlite3
 import tempfile
@@ -18,6 +20,94 @@ try:
     from openpyxl import Workbook
 except Exception:  # pragma: no cover - optional dependency guard for local runs
     Workbook = None  # type: ignore[assignment]
+
+
+class TestTdTrendOpenStatusSnapshot(unittest.TestCase):
+    @staticmethod
+    def _set_mtime_ns(path: Path, epoch_ns: int) -> None:
+        os.utime(path, ns=(int(epoch_ns), int(epoch_ns)))
+
+    def test_missing_snapshot_returns_non_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir) / "project"
+            project_dir.mkdir(parents=True, exist_ok=True)
+            workbook_path = project_dir / "project.xlsx"
+            workbook_path.write_text("", encoding="utf-8")
+            (project_dir / backend.EIDAT_PROJECT_META).write_text("{}", encoding="utf-8")
+
+            decision = backend.inspect_test_data_trend_open_status(project_dir, workbook_path)
+
+            self.assertEqual(
+                Path(str(decision.get("snapshot_path") or "")),
+                backend.td_trend_open_status_path(project_dir),
+            )
+            self.assertFalse(bool(decision.get("snapshot_exists")))
+            self.assertFalse(bool(decision.get("is_newer_than_snapshot")))
+            self.assertGreater(int(decision.get("current_project_stamp_epoch_ns") or 0), 0)
+
+    def test_newer_project_file_than_snapshot_returns_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir) / "project"
+            project_dir.mkdir(parents=True, exist_ok=True)
+            workbook_path = project_dir / "project.xlsx"
+            meta_path = project_dir / backend.EIDAT_PROJECT_META
+            workbook_path.write_text("", encoding="utf-8")
+            meta_path.write_text("{}", encoding="utf-8")
+            base_ns = 1_710_000_000_000_000_000
+            self._set_mtime_ns(workbook_path, base_ns)
+            self._set_mtime_ns(meta_path, base_ns)
+
+            backend.write_test_data_trend_open_status(project_dir, workbook_path)
+            self._set_mtime_ns(meta_path, base_ns + 5_000_000_000)
+
+            decision = backend.inspect_test_data_trend_open_status(project_dir, workbook_path)
+
+            self.assertTrue(bool(decision.get("snapshot_exists")))
+            self.assertTrue(bool(decision.get("is_newer_than_snapshot")))
+            self.assertEqual(str(decision.get("current_stamp_source_path") or ""), str(meta_path))
+
+    def test_equal_or_older_project_stamp_than_snapshot_returns_non_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir) / "project"
+            project_dir.mkdir(parents=True, exist_ok=True)
+            workbook_path = project_dir / "project.xlsx"
+            meta_path = project_dir / backend.EIDAT_PROJECT_META
+            workbook_path.write_text("", encoding="utf-8")
+            meta_path.write_text("{}", encoding="utf-8")
+            base_ns = 1_720_000_000_000_000_000
+            self._set_mtime_ns(workbook_path, base_ns)
+            self._set_mtime_ns(meta_path, base_ns)
+
+            backend.write_test_data_trend_open_status(project_dir, workbook_path)
+            equal_decision = backend.inspect_test_data_trend_open_status(project_dir, workbook_path)
+            self.assertFalse(bool(equal_decision.get("is_newer_than_snapshot")))
+
+            snapshot_path = backend.td_trend_open_status_path(project_dir)
+            snapshot_payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
+            snapshot_payload["project_stamp_epoch_ns"] = base_ns + 7_000_000_000
+            snapshot_payload["project_stamp_text"] = backend._td_epoch_ns_text(snapshot_payload["project_stamp_epoch_ns"])
+            snapshot_path.write_text(json.dumps(snapshot_payload, indent=2), encoding="utf-8")
+
+            older_decision = backend.inspect_test_data_trend_open_status(project_dir, workbook_path)
+            self.assertTrue(bool(older_decision.get("snapshot_exists")))
+            self.assertFalse(bool(older_decision.get("is_newer_than_snapshot")))
+
+    def test_project_stamp_prefers_newest_tracked_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir) / "project"
+            project_dir.mkdir(parents=True, exist_ok=True)
+            workbook_path = project_dir / "project.xlsx"
+            meta_path = project_dir / backend.EIDAT_PROJECT_META
+            workbook_path.write_text("", encoding="utf-8")
+            meta_path.write_text("{}", encoding="utf-8")
+            base_ns = 1_730_000_000_000_000_000
+            self._set_mtime_ns(workbook_path, base_ns)
+            self._set_mtime_ns(meta_path, base_ns + 9_000_000_000)
+
+            stamp = backend.collect_test_data_trend_open_project_stamp(project_dir, workbook_path)
+
+            self.assertEqual(int(stamp.get("project_stamp_epoch_ns") or 0), base_ns + 9_000_000_000)
+            self.assertEqual(str(stamp.get("stamp_source_path") or ""), str(meta_path))
 
 
 TEST_TD_STATS = ["mean", "max"]

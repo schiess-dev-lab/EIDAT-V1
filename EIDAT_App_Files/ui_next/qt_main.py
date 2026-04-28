@@ -2704,6 +2704,7 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
         self._saving_selected_keys: list[tuple[str, str, str, str]] = []
         self._close_requested = False
         self._allow_direct_close = False
+        self._discard_requested = False
         self._save_worker: ProjectTaskWorker | None = None
         self.saved = False
         self.update_requested = False
@@ -2753,7 +2754,8 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
             "The displayed parameter is the user-facing name the GUI uses for trending, analysis, and mapping. "
             "Edits autosave in the background to the ProgramRequirements workbook files for reuse by other projects. "
             "Use the Enabled column or the side actions to make parameters active or inactive. "
-            "Closing this popup saves any pending changes and then runs Update Project."
+            "Use Close to save, discard, or cancel your pending edits. "
+            "Use Close + Update to save and then run Update Project."
         )
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #475569; font-size: 11px;")
@@ -2826,9 +2828,11 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
         button_row = QtWidgets.QHBoxLayout()
         button_row.addStretch(1)
         self.btn_save = QtWidgets.QPushButton("Save Now")
-        self.btn_close = QtWidgets.QPushButton("Close + Update")
+        self.btn_close = QtWidgets.QPushButton("Close")
+        self.btn_close_update = QtWidgets.QPushButton("Close + Update")
         button_row.addWidget(self.btn_save)
         button_row.addWidget(self.btn_close)
+        button_row.addWidget(self.btn_close_update)
         layout.addLayout(button_row)
 
         self.btn_set_display.clicked.connect(self._act_set_display_name)
@@ -2838,12 +2842,40 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
         self.btn_reset.clicked.connect(self._act_reset_rows)
         self.btn_save.clicked.connect(self._act_save)
         self.btn_close.clicked.connect(self._act_close)
+        self.btn_close_update.clicked.connect(self._act_close_update)
 
         self._reload_context()
 
     @staticmethod
     def _norm_name(value: object) -> str:
         return "".join(ch.lower() for ch in str(value or "").strip() if ch.isalnum())
+
+    @staticmethod
+    def _units_text(value: object) -> str:
+        return str(value or "").strip()
+
+    def _display_text_changed(self, displayed: object, default_display: object) -> bool:
+        return self._norm_name(displayed) != self._norm_name(default_display)
+
+    def _units_text_changed(self, preferred_units: object, default_units: object) -> bool:
+        return self._units_text(preferred_units) != self._units_text(default_units)
+
+    def _row_edit_state(
+        self,
+        *,
+        displayed: object,
+        default_display: object,
+        preferred_units: object,
+        default_units: object,
+    ) -> bool:
+        return self._display_text_changed(displayed, default_display) or self._units_text_changed(
+            preferred_units,
+            default_units,
+        )
+
+    def _has_pending_save_state(self) -> bool:
+        worker_running = self._save_worker is not None and self._save_worker.isRunning()
+        return bool(worker_running or self._save_in_progress or self._dirty or self._autosave_timer.isActive())
 
     def _set_dirty(self, dirty: bool) -> None:
         self._dirty = bool(dirty)
@@ -2921,6 +2953,7 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
         snapshot_rows: Sequence[Mapping[str, object]],
         *,
         refresh_project_state: bool = False,
+        refresh_runtime_cache: bool = False,
         report=None,
     ) -> dict[str, object]:
         support_refresh_warning = ""
@@ -2942,29 +2975,36 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
                         f"Details: {support_exc}"
                     )
         refresh_warning = ""
-        refresher = getattr(be, "refresh_td_parameter_runtime_cache", None)
-        if callable(refresher):
-            try:
-                refresher(self._project_dir, self._workbook_path, self._db_path)
-            except Exception as refresh_exc:
-                invalidator = getattr(be, "invalidate_td_parameter_runtime_cache", None)
-                if callable(invalidator):
-                    try:
-                        invalidator(self._db_path)
-                    except Exception:
-                        pass
-                refresh_warning = (
-                    "ProgramRequirements mappings were saved, but the runtime parameter cache could not be refreshed.\n\n"
-                    "Run Update Project before opening Trend / Analyze again.\n\n"
-                    f"Details: {refresh_exc}"
-                )
+        if refresh_runtime_cache:
+            refresher = getattr(be, "refresh_td_parameter_runtime_cache", None)
+            if callable(refresher):
+                try:
+                    refresher(self._project_dir, self._workbook_path, self._db_path)
+                except Exception as refresh_exc:
+                    invalidator = getattr(be, "invalidate_td_parameter_runtime_cache", None)
+                    if callable(invalidator):
+                        try:
+                            invalidator(self._db_path)
+                        except Exception:
+                            pass
+                    refresh_warning = (
+                        "ProgramRequirements mappings were saved, but the runtime parameter cache could not be refreshed.\n\n"
+                        "Run Update Project before opening Trend / Analyze again.\n\n"
+                        f"Details: {refresh_exc}"
+                    )
         warning_text = "\n\n".join([text for text in (support_refresh_warning, refresh_warning) if text.strip()])
         return {
             "saved_rows": [dict(row) for row in saved_rows],
             "refresh_warning": warning_text,
         }
 
-    def _start_background_save(self, *, force: bool = False, refresh_project_state: bool = False) -> None:
+    def _start_background_save(
+        self,
+        *,
+        force: bool = False,
+        refresh_project_state: bool = False,
+        refresh_runtime_cache: bool = False,
+    ) -> None:
         if refresh_project_state:
             self._refresh_after_save_requested = True
         if getattr(self, "_autosave_timer", None) is not None and self._autosave_timer.isActive():
@@ -2973,7 +3013,8 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
             self._save_requested_while_busy = True
             return
         refresh_requested = bool(self._refresh_after_save_requested)
-        if not force and not self._dirty and not refresh_requested:
+        runtime_refresh_requested = bool(refresh_runtime_cache or refresh_requested)
+        if not force and not self._dirty and not refresh_requested and not runtime_refresh_requested:
             return
         snapshot_rows = self._snapshot_working_rows()
         self._saving_revision = self._save_revision
@@ -2983,9 +3024,10 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
         self._save_requested_while_busy = False
         self._set_save_busy(True)
         self._save_worker = ProjectTaskWorker(
-            lambda _report, _snapshot=snapshot_rows, _refresh=refresh_requested: self._perform_parameter_mapping_save(
+            lambda _report, _snapshot=snapshot_rows, _refresh=refresh_requested, _runtime_refresh=runtime_refresh_requested: self._perform_parameter_mapping_save(
                 _snapshot,
                 refresh_project_state=_refresh,
+                refresh_runtime_cache=_runtime_refresh,
                 report=_report,
             )
         )
@@ -3006,48 +3048,106 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
         completed_revision = int(self._saving_revision)
         refresh_requested = bool(self._saving_refresh_project_state)
         selected_keys = list(self._saving_selected_keys)
+        discard_requested = bool(self._discard_requested)
+        self._discard_requested = False
         self.saved = True
         self._saved_revision = max(self._saved_revision, completed_revision)
-        if completed_revision >= self._save_revision:
-            if saved_rows:
-                self._working_rows = self._sorted_rows(saved_rows)
+        if discard_requested:
+            self._save_requested_while_busy = False
+            self._refresh_after_save_requested = False
             self._set_dirty(False)
         else:
-            self._save_requested_while_busy = True
-            self._set_dirty(True)
-        if refresh_requested and not self._dirty:
+            if completed_revision >= self._save_revision:
+                if saved_rows:
+                    self._working_rows = self._sorted_rows(saved_rows)
+                self._set_dirty(False)
+            else:
+                self._save_requested_while_busy = True
+                self._set_dirty(True)
+        if refresh_requested and not self._dirty and not discard_requested:
             self._reload_context(select_keys=selected_keys)
         else:
             self._refresh_display_completer()
         refresh_warning = str(result.get("refresh_warning") or "").strip()
-        if refresh_warning:
+        if refresh_warning and not discard_requested:
             QtWidgets.QMessageBox.warning(self, "Project Parameters", refresh_warning)
-        if self._save_requested_while_busy or self._dirty or self._refresh_after_save_requested:
+        if not discard_requested and (self._save_requested_while_busy or self._dirty or self._refresh_after_save_requested):
             self._autosave_timer.start()
         if self._close_requested and not self._dirty and self._save_worker is None:
             self._close_requested = False
-            self.update_requested = True
-            self._allow_direct_close = True
-            self.accept()
+            self._finish_dialog(update_requested=True)
 
     def _handle_background_save_failed(self, message: str) -> None:
         self._save_worker = None
         self._set_save_busy(False)
+        discard_requested = bool(self._discard_requested)
+        self._discard_requested = False
+        self._close_requested = False
+        if discard_requested:
+            self._save_requested_while_busy = False
+            self._refresh_after_save_requested = False
+            self._set_dirty(False)
+            return
         self._set_dirty(True)
         self._save_requested_while_busy = True
-        self._close_requested = False
         self.update_requested = False
         QtWidgets.QMessageBox.warning(self, "Project Parameters", str(message or "Unable to save project parameters."))
 
-    def _act_close(self) -> None:
-        if self._save_in_progress or self._dirty or self._autosave_timer.isActive():
+    def _finish_dialog(self, *, update_requested: bool) -> None:
+        self.update_requested = bool(update_requested)
+        self._allow_direct_close = True
+        if getattr(self, "_autosave_timer", None) is not None and self._autosave_timer.isActive():
+            self._autosave_timer.stop()
+        if update_requested:
+            self.accept()
+        else:
+            self.reject()
+
+    def _discard_and_close(self) -> None:
+        self._close_requested = False
+        self.update_requested = False
+        if getattr(self, "_autosave_timer", None) is not None and self._autosave_timer.isActive():
+            self._autosave_timer.stop()
+        worker_running = self._save_worker is not None and self._save_worker.isRunning()
+        if worker_running:
+            self._discard_requested = True
+            self._save_requested_while_busy = False
+            self._refresh_after_save_requested = False
+            self._set_dirty(False)
+        self._finish_dialog(update_requested=False)
+
+    def _prompt_close_choice(self) -> QtWidgets.QMessageBox.StandardButton:
+        return QtWidgets.QMessageBox.question(
+            self,
+            "Close Project Parameters",
+            "Save changes before closing?\n\n"
+            "Save will close this popup and run Update Project.",
+            QtWidgets.QMessageBox.StandardButton.Save
+            | QtWidgets.QMessageBox.StandardButton.Discard
+            | QtWidgets.QMessageBox.StandardButton.Cancel,
+            QtWidgets.QMessageBox.StandardButton.Save,
+        )
+
+    def _request_close_with_update(self) -> None:
+        if self._has_pending_save_state():
             self._close_requested = True
             self._start_background_save(force=True)
             return
         self._close_requested = False
-        self.update_requested = True
-        self._allow_direct_close = True
-        self.accept()
+        self._finish_dialog(update_requested=True)
+
+    def _act_close(self) -> None:
+        if self._has_pending_save_state():
+            answer = self._prompt_close_choice()
+            if answer == QtWidgets.QMessageBox.StandardButton.Save:
+                self._request_close_with_update()
+            elif answer == QtWidgets.QMessageBox.StandardButton.Discard:
+                self._discard_and_close()
+            return
+        self._discard_and_close()
+
+    def _act_close_update(self) -> None:
+        self._request_close_with_update()
 
     def _normalize_row(self, row: Mapping[str, object] | None) -> dict[str, object]:
         normalizer = getattr(be, "_td_program_parameter_mapping_normalize", None)
@@ -3086,7 +3186,7 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
             "preferred_units": str(raw.get("preferred_units") or raw.get("units") or "").strip(),
             "default_preferred_units": str(raw.get("default_preferred_units") or "").strip(),
             "enabled": bool(raw.get("enabled", True)),
-            "edited": self._norm_name(displayed) != self._norm_name(default_display),
+            "edited": self._display_text_changed(displayed, default_display),
             "updated_at": str(raw.get("updated_at") or "").strip(),
         }
 
@@ -3281,8 +3381,12 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
         default_display = str(row.get("default_display_parameter") or "").strip()
         preferred_units = str(row.get("preferred_units") or "").strip()
         default_units = str(row.get("default_preferred_units") or "").strip()
-        units_edited = bool(preferred_units or default_units) and self._norm_name(preferred_units) != self._norm_name(default_units)
-        return bool(row.get("edited")) or self._norm_name(displayed) != self._norm_name(default_display) or units_edited
+        return bool(row.get("edited")) or self._row_edit_state(
+            displayed=displayed,
+            default_display=default_display,
+            preferred_units=preferred_units,
+            default_units=default_units,
+        )
 
     def _status_text(self, row: Mapping[str, object], inventory_row: Mapping[str, object] | None = None) -> str:
         if not bool(row.get("enabled", True)):
@@ -3329,7 +3433,7 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
                 self._norm_name(row.get("ingested_parameter")),
                 self._norm_name(row.get("default_display_parameter")),
                 self._norm_name(row.get("displayed_parameter")),
-                self._norm_name(row.get("preferred_units")),
+                self._units_text(row.get("preferred_units")),
             )
             display_row = grouped_rows.get(group_key)
             if display_row is None:
@@ -3673,9 +3777,11 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
                 next_display = default_display if reset else str(display_name or "").strip()
                 if not next_display:
                     next_display = default_display
-                edited = (
-                    self._norm_name(next_display) != self._norm_name(default_display)
-                    or self._norm_name(current_units) != self._norm_name(default_units)
+                edited = self._row_edit_state(
+                    displayed=next_display,
+                    default_display=default_display,
+                    preferred_units=current_units,
+                    default_units=default_units,
                 )
                 if (
                     str(row.get("displayed_parameter") or "").strip() != next_display
@@ -3716,9 +3822,11 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
                 default_display = str(row.get("default_display_parameter") or row.get("ingested_parameter") or "").strip()
                 default_units = str(row.get("default_preferred_units") or "").strip()
                 displayed = str(row.get("displayed_parameter") or default_display).strip() or default_display
-                edited = (
-                    self._norm_name(displayed) != self._norm_name(default_display)
-                    or self._norm_name(next_units) != self._norm_name(default_units)
+                edited = self._row_edit_state(
+                    displayed=displayed,
+                    default_display=default_display,
+                    preferred_units=next_units,
+                    default_units=default_units,
                 )
                 if str(row.get("preferred_units") or "").strip() != next_units or bool(row.get("edited")) != edited:
                     changed = True
@@ -3866,7 +3974,7 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
         self._apply_units_value(row_keys=row_keys, units_text=units_text)
 
     def _act_save(self) -> None:
-        self._start_background_save(force=True, refresh_project_state=True)
+        self._start_background_save(force=True, refresh_project_state=True, refresh_runtime_cache=True)
 
     def reject(self) -> None:  # type: ignore[override]
         if self._allow_direct_close:
@@ -3878,15 +3986,7 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
         if self._allow_direct_close:
             super().closeEvent(event)
             return
-        if self._save_in_progress or self._dirty or self._autosave_timer.isActive():
-            self._close_requested = True
-            self._start_background_save(force=True)
-            event.ignore()
-            return
-        self._close_requested = False
-        self.update_requested = True
-        self._allow_direct_close = True
-        self.accept()
+        self._act_close()
         event.ignore()
 
 
@@ -31415,6 +31515,7 @@ class MainWindow(QtWidgets.QMainWindow):
         backend_module_path = str(payload.get("backend_module_path") or "").strip()
         dbg = str(payload.get("debug_json") or "").strip()
         log_path = str(payload.get("log_path") or "").strip()
+        td_open_snapshot_warning = ""
         elapsed_s = round(time.perf_counter() - started, 3)
         self._append_log(
             f"[PROJECT UPDATE] Finished in {elapsed_s:.3f}s: updated={updated}, serials={serials}, added={serials_added}, sources={have_src}, missing_source={missing_src}, missing_value={missing_val}"
@@ -31442,6 +31543,16 @@ class MainWindow(QtWidgets.QMainWindow):
             if log_path:
                 failure_lines.append(f"Log: {log_path}")
             raise RuntimeError("\n".join(failure_lines))
+        if ptype == getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending"):
+            try:
+                snapshot_payload = be.write_test_data_trend_open_status(wb_path.parent, wb_path)
+                self._append_log(
+                    "[PROJECT UPDATE] TD open-status snapshot refreshed: "
+                    + str(snapshot_payload.get("snapshot_path") or "")
+                )
+            except Exception as exc:
+                td_open_snapshot_warning = f"Trend/Analyze opener snapshot was not updated: {exc}"
+                self._append_log(f"[PROJECT UPDATE WARNING] {td_open_snapshot_warning}")
         if ptype == getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending"):
             self._append_log(
                 "[PROJECT UPDATE] TD cache validation="
@@ -31575,6 +31686,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 lines.append(f"TD cache summary: {cache_validation_summary}")
             if cache_debug_path:
                 lines.append(f"TD cache debug: {cache_debug_path}")
+            if td_open_snapshot_warning:
+                lines.append(td_open_snapshot_warning)
             lines.append("Trend/Analyze is ready. No additional cache build is required.")
             lines.append("Performance candidate sheets remain on demand.")
             saved_refresh = payload.get("saved_equation_refresh")
@@ -31754,6 +31867,121 @@ class MainWindow(QtWidgets.QMainWindow):
             title = "View Graphs" if str(mode or "").strip().lower() == "graphs" else "View Reports"
             QtWidgets.QMessageBox.warning(self, title, str(exc))
 
+    def _append_td_trend_open_log(self, message: object) -> None:
+        logger = getattr(self, "_append_log", None)
+        if callable(logger):
+            logger(f"[TD TREND OPEN] {str(message or '').strip()}")
+
+    def _test_data_trend_open_status_prompt_text(self, decision: Mapping[str, object]) -> str:
+        current_stamp_text = str(decision.get("current_project_stamp_text") or "").strip() or "unknown"
+        saved_stamp_text = str(decision.get("saved_project_stamp_text") or "").strip() or "unknown"
+        stamp_source_path = str(decision.get("current_stamp_source_path") or "").strip()
+        lines = [
+            f"Current project timestamp: {current_stamp_text}",
+            f"Saved Trend / Analyze snapshot: {saved_stamp_text}",
+        ]
+        if stamp_source_path:
+            lines.append(f"Most recent project file: {stamp_source_path}")
+        lines.extend(
+            [
+                "",
+                "Update Project refreshes the cache used by this popup.",
+                "Leave As Is opens Trend / Analyze with older cached project data.",
+            ]
+        )
+        return "\n".join(lines)
+
+    def _prompt_test_data_trend_open_status_action(self, decision: Mapping[str, object]) -> str:
+        prompt = QtWidgets.QMessageBox(self)
+        prompt.setIcon(QtWidgets.QMessageBox.Icon.Warning)
+        prompt.setWindowTitle("Trend / Analyze Data")
+        prompt.setText("This Test Data project changed after the last Trend / Analyze status snapshot.")
+        prompt.setInformativeText(MainWindow._test_data_trend_open_status_prompt_text(self, decision))
+        update_button = prompt.addButton("Update Project", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+        leave_button = prompt.addButton("Leave As Is", QtWidgets.QMessageBox.ButtonRole.ActionRole)
+        cancel_button = prompt.addButton(QtWidgets.QMessageBox.StandardButton.Cancel)
+        prompt.setDefaultButton(cast(QtWidgets.QPushButton, update_button))
+        prompt.setEscapeButton(cast(QtWidgets.QPushButton, cancel_button))
+        prompt.exec()
+        clicked = prompt.clickedButton()
+        if clicked is update_button:
+            return "update"
+        if clicked is leave_button:
+            return "leave"
+        return "cancel"
+
+    def _open_test_data_trend_dialog(
+        self,
+        project_dir: Path,
+        workbook: Path,
+        *,
+        post_open: Callable[[TestDataTrendDialog], None] | None = None,
+    ) -> None:
+        dlg = TestDataTrendDialog(project_dir, workbook, self)
+        if callable(post_open):
+            QtCore.QTimer.singleShot(0, lambda _dlg=dlg, _post_open=post_open: _post_open(_dlg))
+        self._prepare_dialog(dlg)
+        dlg.exec()
+
+    def _open_test_data_trend_dialog_with_preopen_gate(
+        self,
+        record: Mapping[str, object],
+        *,
+        post_open: Callable[[TestDataTrendDialog], None] | None = None,
+    ) -> None:
+        record_dict = dict(record or {}) if isinstance(record, Mapping) else {}
+        project_dir = Path(str(record_dict.get("folder") or "")).expanduser()
+        workbook = Path(str(record_dict.get("workbook") or "")).expanduser()
+        decision = be.inspect_test_data_trend_open_status(project_dir, workbook)
+        if not bool(decision.get("snapshot_exists")):
+            try:
+                be.write_test_data_trend_open_status(project_dir, workbook)
+            except Exception as exc:
+                MainWindow._append_td_trend_open_log(self, f"Failed to initialize open-status snapshot: {exc}")
+            MainWindow._open_test_data_trend_dialog(self, project_dir, workbook, post_open=post_open)
+            return
+        if not bool(decision.get("is_newer_than_snapshot")):
+            MainWindow._open_test_data_trend_dialog(self, project_dir, workbook, post_open=post_open)
+            return
+        prompt_fn = getattr(self, "_prompt_test_data_trend_open_status_action", None)
+        action = (
+            str(prompt_fn(decision)).strip().lower()
+            if callable(prompt_fn)
+            else MainWindow._prompt_test_data_trend_open_status_action(self, decision)
+        )
+        if action == "leave":
+            MainWindow._open_test_data_trend_dialog(self, project_dir, workbook, post_open=post_open)
+            return
+        if action == "update":
+            force_full = bool(
+                getattr(self, "cb_project_force_rebuild", None)
+                and self.cb_project_force_rebuild.isChecked()
+            )
+            update_runner = getattr(self, "_run_project_update", None)
+            if callable(update_runner):
+                update_runner(
+                    record_dict,
+                    force_project_rebuild=force_full,
+                    on_success_extra=lambda _payload, _project_dir=project_dir, _workbook=workbook, _post_open=post_open: MainWindow._open_test_data_trend_dialog(
+                        self,
+                        _project_dir,
+                        _workbook,
+                        post_open=_post_open,
+                    ),
+                )
+                return
+            MainWindow._run_project_update(
+                self,
+                record_dict,
+                force_project_rebuild=force_full,
+                on_success_extra=lambda _payload, _project_dir=project_dir, _workbook=workbook, _post_open=post_open: MainWindow._open_test_data_trend_dialog(
+                    self,
+                    _project_dir,
+                    _workbook,
+                    post_open=_post_open,
+                ),
+            )
+
     def _open_project_graph_library(
         self,
         record: Mapping[str, object],
@@ -31763,14 +31991,19 @@ class MainWindow(QtWidgets.QMainWindow):
         project_dir = Path(str((record or {}).get("folder") or "")).expanduser()
         workbook = Path(str((record or {}).get("workbook") or "")).expanduser()
         if ptype == getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending"):
-            dlg = TestDataTrendDialog(project_dir, workbook, self)
             if isinstance(graph_item, Mapping) and str(graph_item.get("type") or "").strip() == "graph_definition":
-                QtCore.QTimer.singleShot(
-                    0,
-                    lambda item=dict(graph_item): dlg._open_project_graph_item(item),
+                MainWindow._open_test_data_trend_dialog_with_preopen_gate(
+                    self,
+                    dict(record or {}),
+                    post_open=lambda dlg, item=dict(graph_item): dlg._open_project_graph_item(item),
                 )
             else:
-                QtCore.QTimer.singleShot(0, dlg._open_auto_plots_popup)
+                MainWindow._open_test_data_trend_dialog_with_preopen_gate(
+                    self,
+                    dict(record or {}),
+                    post_open=lambda dlg: dlg._open_auto_plots_popup(),
+                )
+            return
         else:
             dlg = ImplementationTrendDialog(project_dir, workbook, self)
             if hasattr(dlg, "_open_auto_plot_panel"):
@@ -31786,7 +32019,8 @@ class MainWindow(QtWidgets.QMainWindow):
             workbook = Path(str(record.get("workbook") or "")).expanduser()
 
             if ptype == getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending"):
-                dlg = TestDataTrendDialog(project_dir, workbook, self)
+                MainWindow._open_test_data_trend_dialog_with_preopen_gate(self, record)
+                return
             else:
                 dlg = ImplementationTrendDialog(project_dir, workbook, self)
             self._prepare_dialog(dlg)

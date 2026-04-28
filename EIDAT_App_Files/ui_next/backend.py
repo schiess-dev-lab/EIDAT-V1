@@ -2949,6 +2949,8 @@ EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING = "Test Data Trending"
 EIDAT_PROJECT_IMPLEMENTATION_DB = "implementation_trending.sqlite3"
 EIDAT_PROJECT_TD_RAW_CACHE_DB = "test_data_raw_cache.sqlite3"
 EIDAT_PROJECT_TD_RAW_POINTS_XLSX = "test_data_raw_points.xlsx"
+TD_TREND_OPEN_STATUS_FILENAME = "test_data_trend_open_status.json"
+TD_TREND_OPEN_STATUS_VERSION = 1
 TD_PARAMETER_NORMALIZATION_KEY = "parameter_normalization"
 TD_PARAMETER_NORMALIZATION_VERSION = 1
 TD_PARAMETER_SELECTOR_CANONICAL_PREFIX = "canonical:"
@@ -3662,6 +3664,134 @@ def _write_project_meta(project_dir: Path, meta: Mapping[str, object]) -> dict[s
     payload = dict(meta or {})
     (proj_dir / EIDAT_PROJECT_META).write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return payload
+
+
+def td_trend_open_status_path(project_dir: Path) -> Path:
+    return Path(project_dir).expanduser() / TD_TREND_OPEN_STATUS_FILENAME
+
+
+def _td_file_mtime_ns(path: Path) -> int:
+    try:
+        st = Path(path).expanduser().stat()
+    except Exception:
+        return 0
+    return int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)))
+
+
+def _td_epoch_ns_text(epoch_ns: object) -> str:
+    try:
+        epoch_ns_int = int(epoch_ns or 0)
+    except Exception:
+        epoch_ns_int = 0
+    if epoch_ns_int <= 0:
+        return ""
+    try:
+        return datetime.fromtimestamp(epoch_ns_int / 1_000_000_000).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return ""
+
+
+def _normalize_td_trend_open_status_snapshot(raw: Mapping[str, object] | None) -> dict[str, object]:
+    source = dict(raw or {}) if isinstance(raw, Mapping) else {}
+    tracked_paths = [
+        str(value).strip()
+        for value in (source.get("tracked_paths") or [])
+        if str(value).strip()
+    ]
+    project_stamp_epoch_ns = int(source.get("project_stamp_epoch_ns") or 0)
+    project_stamp_text = str(source.get("project_stamp_text") or "").strip() or _td_epoch_ns_text(project_stamp_epoch_ns)
+    stamp_source_path = str(source.get("stamp_source_path") or "").strip()
+    return {
+        "version": int(source.get("version") or TD_TREND_OPEN_STATUS_VERSION),
+        "project_stamp_epoch_ns": project_stamp_epoch_ns,
+        "project_stamp_text": project_stamp_text,
+        "tracked_paths": tracked_paths,
+        "stamp_source_path": stamp_source_path,
+    }
+
+
+def collect_test_data_trend_open_project_stamp(project_dir: Path, workbook_path: Path) -> dict[str, object]:
+    proj_dir = Path(project_dir).expanduser()
+    wb_path = Path(workbook_path).expanduser()
+    if not wb_path.exists():
+        raise FileNotFoundError(f"Project workbook not found: {wb_path}")
+
+    tracked_paths = [
+        str(wb_path),
+        str(proj_dir / EIDAT_PROJECT_META),
+    ]
+    project_stamp_epoch_ns = 0
+    stamp_source_path = ""
+    for path_txt in tracked_paths:
+        stamp_ns = _td_file_mtime_ns(Path(path_txt).expanduser())
+        if stamp_ns > project_stamp_epoch_ns:
+            project_stamp_epoch_ns = stamp_ns
+            stamp_source_path = path_txt
+    if project_stamp_epoch_ns <= 0:
+        project_stamp_epoch_ns = _td_file_mtime_ns(wb_path)
+        stamp_source_path = str(wb_path) if project_stamp_epoch_ns > 0 else ""
+    return {
+        "project_stamp_epoch_ns": int(project_stamp_epoch_ns),
+        "project_stamp_text": _td_epoch_ns_text(project_stamp_epoch_ns),
+        "tracked_paths": list(tracked_paths),
+        "stamp_source_path": stamp_source_path,
+    }
+
+
+def read_test_data_trend_open_status(project_dir: Path) -> dict[str, object]:
+    snapshot_path = td_trend_open_status_path(project_dir)
+    try:
+        raw = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(raw, Mapping):
+        return {}
+    normalized = _normalize_td_trend_open_status_snapshot(raw)
+    if int(normalized.get("project_stamp_epoch_ns") or 0) <= 0:
+        return {}
+    normalized["snapshot_path"] = str(snapshot_path)
+    return normalized
+
+
+def write_test_data_trend_open_status(project_dir: Path, workbook_path: Path) -> dict[str, object]:
+    proj_dir = Path(project_dir).expanduser()
+    snapshot_path = td_trend_open_status_path(proj_dir)
+    stamp = collect_test_data_trend_open_project_stamp(proj_dir, workbook_path)
+    payload = {
+        "version": TD_TREND_OPEN_STATUS_VERSION,
+        "project_stamp_epoch_ns": int(stamp.get("project_stamp_epoch_ns") or 0),
+        "project_stamp_text": str(stamp.get("project_stamp_text") or "").strip(),
+        "tracked_paths": list(stamp.get("tracked_paths") or []),
+        "stamp_source_path": str(stamp.get("stamp_source_path") or "").strip(),
+    }
+    proj_dir.mkdir(parents=True, exist_ok=True)
+    snapshot_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    normalized = _normalize_td_trend_open_status_snapshot(payload)
+    normalized["snapshot_path"] = str(snapshot_path)
+    return normalized
+
+
+def inspect_test_data_trend_open_status(project_dir: Path, workbook_path: Path) -> dict[str, object]:
+    proj_dir = Path(project_dir).expanduser()
+    snapshot_path = td_trend_open_status_path(proj_dir)
+    current = collect_test_data_trend_open_project_stamp(proj_dir, workbook_path)
+    saved = read_test_data_trend_open_status(proj_dir)
+    snapshot_exists = bool(saved)
+    current_stamp_epoch_ns = int(current.get("project_stamp_epoch_ns") or 0)
+    saved_stamp_epoch_ns = int(saved.get("project_stamp_epoch_ns") or 0)
+    return {
+        "snapshot_path": str(snapshot_path),
+        "snapshot_exists": snapshot_exists,
+        "current_project_stamp_epoch_ns": current_stamp_epoch_ns,
+        "current_project_stamp_text": str(current.get("project_stamp_text") or "").strip(),
+        "current_tracked_paths": list(current.get("tracked_paths") or []),
+        "current_stamp_source_path": str(current.get("stamp_source_path") or "").strip(),
+        "saved_project_stamp_epoch_ns": saved_stamp_epoch_ns,
+        "saved_project_stamp_text": str(saved.get("project_stamp_text") or "").strip(),
+        "saved_tracked_paths": list(saved.get("tracked_paths") or []),
+        "saved_stamp_source_path": str(saved.get("stamp_source_path") or "").strip(),
+        "is_newer_than_snapshot": bool(snapshot_exists and current_stamp_epoch_ns > saved_stamp_epoch_ns),
+    }
 
 
 def _td_param_norm_name(value: object) -> str:

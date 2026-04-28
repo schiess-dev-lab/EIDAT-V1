@@ -176,6 +176,260 @@ class TestProjectTaskWorker(unittest.TestCase):
         self.assertEqual(dummy.toasts, ["Project updated with warnings: 12 cell(s)"])
         self.assertIn("with warnings", result)
 
+    def test_project_update_success_refreshes_td_open_status_snapshot(self) -> None:
+        dummy = _DummyMainWindow()
+        payload = {
+            "updated_cells": 3,
+            "missing_source": 0,
+            "missing_value": 0,
+            "serials_in_workbook": 1,
+            "serials_with_source": 1,
+            "serials_added": 0,
+            "added_serials": [],
+            "compiled_serials": ["SN-001"],
+            "compiled_serials_count": 1,
+            "excluded_sources": [],
+            "excluded_sources_count": 0,
+            "warning_summary": "",
+            "workbook": "C:\\temp\\project.xlsx",
+            "cache_sync_mode": "noop",
+            "cache_sync_reason": "",
+            "cache_sync_counts": {},
+            "cache_state": {},
+            "cache_validation_ok": True,
+            "cache_validation_error": "",
+            "cache_validation_summary": "mode=none",
+            "cache_debug_path": "",
+            "backend_module_path": "C:\\temp\\backend.py",
+            "saved_equation_refresh": {"refreshed_count": 0, "failed_count": 0, "errors": []},
+            "debug_json": "",
+        }
+
+        with patch("ui_next.qt_main.be.write_test_data_trend_open_status", return_value={"snapshot_path": "C:\\temp\\test_data_trend_open_status.json"}) as snapshot_mock, patch.object(
+            QtWidgets.QMessageBox,
+            "information",
+        ):
+            MainWindow._handle_project_update_success(
+                dummy,
+                payload,
+                wb_path=Path("C:/temp/project.xlsx"),
+                ptype="Test Data Trending",
+                started=0.0,
+            )
+
+        snapshot_mock.assert_called_once_with(Path("C:/temp"), Path("C:/temp/project.xlsx"))
+        self.assertTrue(any("TD open-status snapshot refreshed" in log for log in dummy.logs))
+
+    def test_test_data_trend_preopen_gate_opens_directly_when_snapshot_is_fresh(self) -> None:
+        class _DummyOpenWindow:
+            def __init__(self) -> None:
+                self.prepared: list[object] = []
+                self.update_calls: list[dict[str, object]] = []
+                self.logs: list[str] = []
+
+            def _prepare_dialog(self, dlg) -> None:
+                self.prepared.append(dlg)
+
+            def _run_project_update(self, record: dict, *, force_project_rebuild: bool = False, on_success_extra=None) -> None:
+                self.update_calls.append(
+                    {
+                        "record": dict(record),
+                        "force_project_rebuild": bool(force_project_rebuild),
+                        "on_success_extra": on_success_extra,
+                    }
+                )
+
+            def _append_log(self, text: str) -> None:
+                self.logs.append(str(text))
+
+        class _FakeDialog:
+            def __init__(self, project_dir: Path, workbook_path: Path, parent=None) -> None:
+                self.project_dir = Path(project_dir)
+                self.workbook_path = Path(workbook_path)
+                self.parent = parent
+                self.exec_calls = 0
+
+            def exec(self) -> None:
+                self.exec_calls += 1
+
+        dummy = _DummyOpenWindow()
+        record = {
+            "name": "TD Project",
+            "type": "Test Data Trending",
+            "folder": "C:/temp/project",
+            "workbook": "C:/temp/project/project.xlsx",
+        }
+        created_dialogs: list[_FakeDialog] = []
+
+        def _make_dialog(project_dir: Path, workbook_path: Path, parent=None) -> _FakeDialog:
+            dlg = _FakeDialog(project_dir, workbook_path, parent=parent)
+            created_dialogs.append(dlg)
+            return dlg
+
+        with patch("ui_next.qt_main.be.inspect_test_data_trend_open_status", return_value={"snapshot_exists": True, "is_newer_than_snapshot": False}) as inspect_mock, patch(
+            "ui_next.qt_main.TestDataTrendDialog",
+            side_effect=_make_dialog,
+        ) as dialog_mock:
+            MainWindow._open_test_data_trend_dialog_with_preopen_gate(dummy, record)
+
+        inspect_mock.assert_called_once_with(Path("C:/temp/project"), Path("C:/temp/project/project.xlsx"))
+        dialog_mock.assert_called_once()
+        self.assertEqual(len(created_dialogs), 1)
+        self.assertEqual(created_dialogs[0].exec_calls, 1)
+        self.assertEqual(dummy.prepared, created_dialogs)
+        self.assertEqual(dummy.update_calls, [])
+
+    def test_test_data_trend_preopen_gate_leave_as_is_opens_without_update(self) -> None:
+        class _DummyOpenWindow:
+            def __init__(self) -> None:
+                self.prepared: list[object] = []
+                self.update_calls: list[dict[str, object]] = []
+
+            def _prepare_dialog(self, dlg) -> None:
+                self.prepared.append(dlg)
+
+            def _run_project_update(self, record: dict, *, force_project_rebuild: bool = False, on_success_extra=None) -> None:
+                self.update_calls.append(
+                    {
+                        "record": dict(record),
+                        "force_project_rebuild": bool(force_project_rebuild),
+                        "on_success_extra": on_success_extra,
+                    }
+                )
+
+        class _FakeDialog:
+            def __init__(self, *_args, **_kwargs) -> None:
+                self.exec_calls = 0
+
+            def exec(self) -> None:
+                self.exec_calls += 1
+
+        dummy = _DummyOpenWindow()
+        record = {
+            "name": "TD Project",
+            "type": "Test Data Trending",
+            "folder": "C:/temp/project",
+            "workbook": "C:/temp/project/project.xlsx",
+        }
+        created_dialogs: list[_FakeDialog] = []
+
+        def _make_dialog(*_args, **_kwargs) -> _FakeDialog:
+            dlg = _FakeDialog()
+            created_dialogs.append(dlg)
+            return dlg
+
+        stale_state = {
+            "snapshot_exists": True,
+            "is_newer_than_snapshot": True,
+            "current_project_stamp_text": "2026-04-28 10:00:00",
+            "saved_project_stamp_text": "2026-04-27 09:00:00",
+        }
+
+        with patch("ui_next.qt_main.be.inspect_test_data_trend_open_status", return_value=stale_state), patch.object(
+            MainWindow,
+            "_prompt_test_data_trend_open_status_action",
+            return_value="leave",
+        ) as prompt_mock, patch("ui_next.qt_main.TestDataTrendDialog", side_effect=_make_dialog):
+            MainWindow._open_test_data_trend_dialog_with_preopen_gate(dummy, record)
+
+        prompt_mock.assert_called_once()
+        self.assertEqual(len(created_dialogs), 1)
+        self.assertEqual(created_dialogs[0].exec_calls, 1)
+        self.assertEqual(dummy.prepared, created_dialogs)
+        self.assertEqual(dummy.update_calls, [])
+
+    def test_test_data_trend_preopen_gate_update_delays_open_until_project_update_succeeds(self) -> None:
+        class _DummyOpenWindow:
+            def __init__(self) -> None:
+                self.prepared: list[object] = []
+                self.update_calls: list[dict[str, object]] = []
+
+            def _prepare_dialog(self, dlg) -> None:
+                self.prepared.append(dlg)
+
+            def _run_project_update(self, record: dict, *, force_project_rebuild: bool = False, on_success_extra=None) -> None:
+                self.update_calls.append(
+                    {
+                        "record": dict(record),
+                        "force_project_rebuild": bool(force_project_rebuild),
+                        "on_success_extra": on_success_extra,
+                    }
+                )
+
+        class _FakeDialog:
+            def __init__(self, *_args, **_kwargs) -> None:
+                self.exec_calls = 0
+
+            def exec(self) -> None:
+                self.exec_calls += 1
+
+        dummy = _DummyOpenWindow()
+        record = {
+            "name": "TD Project",
+            "type": "Test Data Trending",
+            "folder": "C:/temp/project",
+            "workbook": "C:/temp/project/project.xlsx",
+        }
+        created_dialogs: list[_FakeDialog] = []
+
+        def _make_dialog(*_args, **_kwargs) -> _FakeDialog:
+            dlg = _FakeDialog()
+            created_dialogs.append(dlg)
+            return dlg
+
+        with patch("ui_next.qt_main.be.inspect_test_data_trend_open_status", return_value={"snapshot_exists": True, "is_newer_than_snapshot": True}), patch.object(
+            MainWindow,
+            "_prompt_test_data_trend_open_status_action",
+            return_value="update",
+        ), patch("ui_next.qt_main.TestDataTrendDialog", side_effect=_make_dialog):
+            MainWindow._open_test_data_trend_dialog_with_preopen_gate(dummy, record)
+
+        self.assertEqual(len(dummy.update_calls), 1)
+        self.assertEqual(len(created_dialogs), 0)
+        callback = dummy.update_calls[0].get("on_success_extra")
+        self.assertTrue(callable(callback))
+        callback({"workbook": record["workbook"]})
+        self.assertEqual(len(created_dialogs), 1)
+        self.assertEqual(created_dialogs[0].exec_calls, 1)
+        self.assertEqual(dummy.prepared, created_dialogs)
+
+    def test_test_data_trend_preopen_gate_cancel_skips_open_and_update(self) -> None:
+        class _DummyOpenWindow:
+            def __init__(self) -> None:
+                self.prepared: list[object] = []
+                self.update_calls: list[dict[str, object]] = []
+
+            def _prepare_dialog(self, dlg) -> None:
+                self.prepared.append(dlg)
+
+            def _run_project_update(self, record: dict, *, force_project_rebuild: bool = False, on_success_extra=None) -> None:
+                self.update_calls.append(
+                    {
+                        "record": dict(record),
+                        "force_project_rebuild": bool(force_project_rebuild),
+                        "on_success_extra": on_success_extra,
+                    }
+                )
+
+        dummy = _DummyOpenWindow()
+        record = {
+            "name": "TD Project",
+            "type": "Test Data Trending",
+            "folder": "C:/temp/project",
+            "workbook": "C:/temp/project/project.xlsx",
+        }
+
+        with patch("ui_next.qt_main.be.inspect_test_data_trend_open_status", return_value={"snapshot_exists": True, "is_newer_than_snapshot": True}), patch.object(
+            MainWindow,
+            "_prompt_test_data_trend_open_status_action",
+            return_value="cancel",
+        ), patch("ui_next.qt_main.TestDataTrendDialog") as dialog_mock:
+            MainWindow._open_test_data_trend_dialog_with_preopen_gate(dummy, record)
+
+        dialog_mock.assert_not_called()
+        self.assertEqual(dummy.prepared, [])
+        self.assertEqual(dummy.update_calls, [])
+
     def test_test_data_trend_load_cache_uses_fast_open_validator(self) -> None:
         class _DummyTrendDialog:
             def __init__(self) -> None:
