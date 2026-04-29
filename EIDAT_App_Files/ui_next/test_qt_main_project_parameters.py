@@ -72,6 +72,72 @@ class TestTDParameterNormalizationDialog(unittest.TestCase):
             ],
         }
 
+    def _merged_context(self) -> dict[str, object]:
+        return {
+            "repo_parameter_rows": [
+                {
+                    "program_title": "Program A",
+                    "asset_type": "Valve",
+                    "asset_specific_type": "Main",
+                    "ingested_parameter": "PulsePressure",
+                    "default_display_parameter": "Pulse Pressure",
+                    "displayed_parameter": "Pulse Pressure",
+                    "preferred_units": "psia-second",
+                    "default_preferred_units": "psia-second",
+                    "enabled": True,
+                    "edited": False,
+                },
+                {
+                    "program_title": "Program B",
+                    "asset_type": "Valve",
+                    "asset_specific_type": "Main",
+                    "ingested_parameter": "PulsePressureAvg",
+                    "default_display_parameter": "Pulse Pressure",
+                    "displayed_parameter": "Pulse Pressure",
+                    "preferred_units": "psia-second",
+                    "default_preferred_units": "psia-second",
+                    "enabled": True,
+                    "edited": False,
+                },
+            ],
+            "inventory": [
+                {
+                    "program_title": "Program A",
+                    "asset_type": "Valve",
+                    "asset_specific_type": "Main",
+                    "raw_name": "PulsePressure",
+                    "displayed_parameter": "Pulse Pressure",
+                    "default_display_parameter": "Pulse Pressure",
+                    "preferred_units": "psia-second",
+                    "default_preferred_units": "psia-second",
+                    "units": ["psia-second"],
+                    "enabled": True,
+                    "source_count": 1,
+                    "source_run_names": ["Run-1"],
+                    "surfaces": ["metrics"],
+                    "run_names": ["Run-1"],
+                    "status": "default",
+                },
+                {
+                    "program_title": "Program B",
+                    "asset_type": "Valve",
+                    "asset_specific_type": "Main",
+                    "raw_name": "PulsePressureAvg",
+                    "displayed_parameter": "Pulse Pressure",
+                    "default_display_parameter": "Pulse Pressure",
+                    "preferred_units": "psia-second",
+                    "default_preferred_units": "psia-second",
+                    "units": ["psia-second"],
+                    "enabled": True,
+                    "source_count": 1,
+                    "source_run_names": ["Run-2"],
+                    "surfaces": ["metrics"],
+                    "run_names": ["Run-2"],
+                    "status": "default",
+                },
+            ],
+        }
+
     def _cleanup_dialog(self, dialog: TDParameterNormalizationDialog) -> None:
         try:
             dialog._allow_direct_close = True
@@ -99,58 +165,98 @@ class TestTDParameterNormalizationDialog(unittest.TestCase):
         self.addCleanup(self._cleanup_dialog, dialog)
         return dialog
 
-    def _set_dirty_units(self, dialog: TDParameterNormalizationDialog, value: str = "psia second") -> None:
-        dialog.tbl.selectRow(0)
-        self._app.processEvents()
-        with patch.object(dialog, "_prompt_units", return_value=value):
-            dialog._act_set_units()
-        self._app.processEvents()
-        if dialog._autosave_timer.isActive():
-            dialog._autosave_timer.stop()
-
-    def test_set_units_keeps_exact_text_and_marks_row_edited(self) -> None:
-        dialog = self._make_dialog()
-
-        self._set_dirty_units(dialog, "psia second")
-
-        self.assertTrue(dialog._dirty)
-        self.assertEqual(str(dialog._working_rows[0].get("preferred_units") or ""), "psia second")
-        self.assertIn("psia second", dialog.tbl.item(0, dialog.COL_UNITS).text())
-        self.assertEqual(dialog.tbl.item(0, dialog.COL_STATUS).text(), "Edited")
-
-    def test_window_close_save_closes_and_requests_update_without_runtime_refresh(self) -> None:
-        save_mock = Mock(side_effect=lambda _project_dir, rows: [dict(item) for item in rows])
-        runtime_refresh_mock = Mock(return_value={"mode": "rebuilt"})
-        support_refresh_mock = Mock(return_value={"updated": True})
-        dialog = self._make_dialog(sync_worker=True)
-        self._set_dirty_units(dialog, "psia second")
-        dialog.show()
-        self._app.processEvents()
-
-        with patch("ui_next.qt_main.be.save_td_repo_parameter_mappings", save_mock), patch(
-            "ui_next.qt_main.be.refresh_td_parameter_runtime_cache",
-            runtime_refresh_mock,
+    def _advance_to_phase2(self, dialog: TDParameterNormalizationDialog, *, merged: bool = False) -> None:
+        repo_rows = self._merged_context()["repo_parameter_rows"] if merged else self._base_context()["repo_parameter_rows"]
+        phase2_rows = [
+            {
+                "canonical_id": "display:pulsepressure",
+                "displayed_parameter": "Pulse Pressure",
+                "raw_names": ["PulsePressure", "PulsePressureAvg"] if merged else ["PulsePressure"],
+                "raw_names_text": "PulsePressure, PulsePressureAvg" if merged else "PulsePressure",
+                "program_titles": ["Program A", "Program B"] if merged else ["Program A"],
+                "program_titles_text": "Program A, Program B" if merged else "Program A",
+                "source_units": ["psia-second"],
+                "preferred_units": "psia-second",
+                "unit_conflict": False,
+            }
+        ]
+        with patch("ui_next.qt_main.be.save_td_repo_parameter_mappings", return_value=[dict(row) for row in repo_rows]), patch(
+            "ui_next.qt_main.be.td_rebuild_project_parameter_units_catalog",
+            return_value={"groups": []},
         ), patch(
-            "ui_next.qt_main.be.refresh_td_parameter_support_workbook",
-            support_refresh_mock,
-        ), patch(
-            "ui_next.qt_main.QtWidgets.QMessageBox.question",
-            return_value=QtWidgets.QMessageBox.StandardButton.Save,
+            "ui_next.qt_main.be.td_build_project_parameter_units_rows",
+            return_value=phase2_rows,
         ):
-            dialog.close()
+            dialog.btn_save.click()
             self._app.processEvents()
 
-        self.assertFalse(dialog.isVisible())
+    def test_phase1_hides_units_and_allows_display_edits(self) -> None:
+        dialog = self._make_dialog()
+
+        headers = [dialog.tbl.horizontalHeaderItem(idx).text() for idx in range(dialog.tbl.columnCount())]
+        self.assertEqual(headers, dialog.PHASE1_COLS)
+        self.assertTrue(dialog.btn_set_units.isHidden())
+
+        dialog.tbl.selectRow(0)
+        self._app.processEvents()
+        with patch.object(dialog, "_prompt_display_name", return_value="Pulse Pressure Display"):
+            dialog._act_set_display_name()
+        self._app.processEvents()
+
+        self.assertTrue(dialog._dirty)
+        self.assertEqual(str(dialog._working_rows[0].get("displayed_parameter") or ""), "Pulse Pressure Display")
+        self.assertEqual(dialog.tbl.item(0, dialog.COL_STATUS).text(), "Edited")
+
+    def test_save_phase1_advances_to_units_phase(self) -> None:
+        dialog = self._make_dialog(sync_worker=True, context=self._merged_context())
+
+        self._advance_to_phase2(dialog, merged=True)
+
+        self.assertEqual(dialog._phase, dialog.PHASE_UNITS)
+        self.assertEqual(dialog.result(), 0)
+        self.assertFalse(dialog.update_requested)
+        headers = [dialog.tbl.horizontalHeaderItem(idx).text() for idx in range(dialog.tbl.columnCount())]
+        self.assertEqual(headers, dialog.PHASE2_COLS)
+        self.assertFalse(dialog.btn_set_units.isHidden())
+
+    def test_phase2_merges_matching_displayed_parameters(self) -> None:
+        dialog = self._make_dialog(sync_worker=True, context=self._merged_context())
+
+        self._advance_to_phase2(dialog, merged=True)
+
+        self.assertEqual(dialog.tbl.rowCount(), 1)
+        self.assertIn("PulsePressure", dialog.tbl.item(0, dialog.UNIT_COL_RAW_NAMES).text())
+        self.assertIn("PulsePressureAvg", dialog.tbl.item(0, dialog.UNIT_COL_RAW_NAMES).text())
+        self.assertIn("Program A", dialog.tbl.item(0, dialog.UNIT_COL_PROGRAMS).text())
+        self.assertIn("Program B", dialog.tbl.item(0, dialog.UNIT_COL_PROGRAMS).text())
+
+    def test_save_phase2_sets_update_requested(self) -> None:
+        dialog = self._make_dialog(sync_worker=True, context=self._merged_context())
+        self._advance_to_phase2(dialog, merged=True)
+        dialog.tbl.selectRow(0)
+        self._app.processEvents()
+
+        with patch.object(dialog, "_prompt_units", return_value="psi"):
+            dialog._act_set_units()
+        self._app.processEvents()
+
+        save_units_mock = Mock(return_value={"saved_rows": [dict(row) for row in self._merged_context()["repo_parameter_rows"]]})
+        with patch("ui_next.qt_main.be.td_save_project_parameter_units", save_units_mock):
+            dialog.btn_save.click()
+            self._app.processEvents()
+
         self.assertEqual(dialog.result(), int(QtWidgets.QDialog.DialogCode.Accepted))
         self.assertTrue(dialog.update_requested)
-        save_mock.assert_called_once()
-        runtime_refresh_mock.assert_not_called()
-        support_refresh_mock.assert_not_called()
+        save_units_mock.assert_called_once()
 
-    def test_window_close_discard_closes_without_update(self) -> None:
-        dialog = self._make_dialog()
-        self._set_dirty_units(dialog, "psia second")
-        dialog.show()
+    def test_close_phase2_discard_keeps_saved_phase1_without_update(self) -> None:
+        dialog = self._make_dialog(sync_worker=True, context=self._merged_context())
+        self._advance_to_phase2(dialog, merged=True)
+        dialog.tbl.selectRow(0)
+        self._app.processEvents()
+
+        with patch.object(dialog, "_prompt_units", return_value="psi"):
+            dialog._act_set_units()
         self._app.processEvents()
 
         with patch(
@@ -160,102 +266,6 @@ class TestTDParameterNormalizationDialog(unittest.TestCase):
             dialog.close()
             self._app.processEvents()
 
-        self.assertFalse(dialog.isVisible())
         self.assertEqual(dialog.result(), int(QtWidgets.QDialog.DialogCode.Rejected))
         self.assertFalse(dialog.update_requested)
-
-    def test_window_close_cancel_leaves_dialog_open(self) -> None:
-        dialog = self._make_dialog()
-        self._set_dirty_units(dialog, "psia second")
-        dialog.show()
-        self._app.processEvents()
-
-        with patch(
-            "ui_next.qt_main.QtWidgets.QMessageBox.question",
-            return_value=QtWidgets.QMessageBox.StandardButton.Cancel,
-        ):
-            dialog.close()
-            self._app.processEvents()
-
-        self.assertTrue(dialog.isVisible())
-        self.assertEqual(dialog.result(), 0)
-        self.assertFalse(dialog.update_requested)
-
-    def test_close_button_save_matches_window_close_save_behavior(self) -> None:
-        save_mock = Mock(side_effect=lambda _project_dir, rows: [dict(item) for item in rows])
-        runtime_refresh_mock = Mock(return_value={"mode": "rebuilt"})
-        support_refresh_mock = Mock(return_value={"updated": True})
-        dialog = self._make_dialog(sync_worker=True)
-        self._set_dirty_units(dialog, "psia second")
-        dialog.show()
-        self._app.processEvents()
-
-        with patch("ui_next.qt_main.be.save_td_repo_parameter_mappings", save_mock), patch(
-            "ui_next.qt_main.be.refresh_td_parameter_runtime_cache",
-            runtime_refresh_mock,
-        ), patch(
-            "ui_next.qt_main.be.refresh_td_parameter_support_workbook",
-            support_refresh_mock,
-        ), patch(
-            "ui_next.qt_main.QtWidgets.QMessageBox.question",
-            return_value=QtWidgets.QMessageBox.StandardButton.Save,
-        ):
-            dialog.btn_close.click()
-            self._app.processEvents()
-
-        self.assertFalse(dialog.isVisible())
-        self.assertEqual(dialog.result(), int(QtWidgets.QDialog.DialogCode.Accepted))
-        self.assertTrue(dialog.update_requested)
-        save_mock.assert_called_once()
-        runtime_refresh_mock.assert_not_called()
-        support_refresh_mock.assert_not_called()
-
-    def test_close_update_saves_and_closes_without_prompt(self) -> None:
-        save_mock = Mock(side_effect=lambda _project_dir, rows: [dict(item) for item in rows])
-        runtime_refresh_mock = Mock(return_value={"mode": "rebuilt"})
-        support_refresh_mock = Mock(return_value={"updated": True})
-        dialog = self._make_dialog(sync_worker=True)
-        self._set_dirty_units(dialog, "psia second")
-        dialog.show()
-        self._app.processEvents()
-
-        with patch("ui_next.qt_main.be.save_td_repo_parameter_mappings", save_mock), patch(
-            "ui_next.qt_main.be.refresh_td_parameter_runtime_cache",
-            runtime_refresh_mock,
-        ), patch(
-            "ui_next.qt_main.be.refresh_td_parameter_support_workbook",
-            support_refresh_mock,
-        ), patch("ui_next.qt_main.QtWidgets.QMessageBox.question") as question_mock:
-            dialog.btn_close_update.click()
-            self._app.processEvents()
-
-        self.assertFalse(dialog.isVisible())
-        self.assertEqual(dialog.result(), int(QtWidgets.QDialog.DialogCode.Accepted))
-        self.assertTrue(dialog.update_requested)
-        save_mock.assert_called_once()
-        runtime_refresh_mock.assert_not_called()
-        support_refresh_mock.assert_not_called()
-        question_mock.assert_not_called()
-
-    def test_save_now_runs_support_and_runtime_refresh(self) -> None:
-        save_mock = Mock(side_effect=lambda _project_dir, rows: [dict(item) for item in rows])
-        runtime_refresh_mock = Mock(return_value={"mode": "rebuilt"})
-        support_refresh_mock = Mock(return_value={"updated": True})
-        dialog = self._make_dialog(sync_worker=True)
-        self._set_dirty_units(dialog, "psia second")
-
-        with patch("ui_next.qt_main.be.save_td_repo_parameter_mappings", save_mock), patch(
-            "ui_next.qt_main.be.refresh_td_parameter_runtime_cache",
-            runtime_refresh_mock,
-        ), patch(
-            "ui_next.qt_main.be.refresh_td_parameter_support_workbook",
-            support_refresh_mock,
-        ):
-            dialog.btn_save.click()
-            self._app.processEvents()
-
         self.assertTrue(dialog.saved)
-        self.assertFalse(dialog.update_requested)
-        save_mock.assert_called_once()
-        runtime_refresh_mock.assert_called_once()
-        support_refresh_mock.assert_called_once()

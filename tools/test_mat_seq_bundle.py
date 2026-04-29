@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import sys
 import tempfile
@@ -32,15 +33,47 @@ except Exception:
 
 @unittest.skipUnless(np is not None and savemat is not None, "numpy/scipy not installed")
 class TestMatSeqBundle(unittest.TestCase):
-    def _write_valid_mat(self, path: Path, offset: float) -> None:
-        savemat(
-            str(path),
-            {
-                "time": np.array([0.0, 1.0, 2.0], dtype=float),
-                "thrust": np.array([10.0 + offset, 11.0 + offset, 12.0 + offset], dtype=float),
-                "pressure": np.array([[100.0 + offset], [101.0 + offset], [102.0 + offset]], dtype=float),
-                "junkTelemetry": np.array([5000.0 + offset, 5001.0 + offset, 5002.0 + offset], dtype=float),
-                "ignored_matrix": np.array([[1.0, 2.0], [3.0, 4.0]], dtype=float),
+    def _write_valid_mat(self, path: Path, offset: float, *, context: dict[str, object] | None = None) -> None:
+        payload: dict[str, object] = {
+            "time": np.array([0.0, 1.0, 2.0], dtype=float),
+            "thrust": np.array([10.0 + offset, 11.0 + offset, 12.0 + offset], dtype=float),
+            "pressure": np.array([[100.0 + offset], [101.0 + offset], [102.0 + offset]], dtype=float),
+            "junkTelemetry": np.array([5000.0 + offset, 5001.0 + offset, 5002.0 + offset], dtype=float),
+            "ignored_matrix": np.array([[1.0, 2.0], [3.0, 4.0]], dtype=float),
+        }
+        if context:
+            payload.update(dict(context))
+        savemat(str(path), payload)
+
+    def _write_valid_mat_with_context(
+        self,
+        path: Path,
+        offset: float,
+        *,
+        on_time: float,
+        off_time: float,
+        nominal_pf: float,
+        suppression_voltage: float,
+        valve_voltage: float,
+        data_mode: str = "Pulse Mode",
+        nominal_tf: float = 70.0,
+    ) -> None:
+        self._write_valid_mat(
+            path,
+            offset,
+            context={
+                "sequence_context": {
+                    "data_mode_raw": data_mode,
+                    "on_time": {"value": float(on_time), "units": "sec"},
+                    "off_time_value": float(off_time),
+                    "off_time_units": "sec",
+                    "nominal_pf_value": float(nominal_pf),
+                    "nominal_pf_units": "psia",
+                    "nominal_tf": {"value": float(nominal_tf), "units": "F"},
+                    "suppression_voltage_value": float(suppression_voltage),
+                    "suppression_voltage_units": "V",
+                    "valve_voltage": {"value": float(valve_voltage), "units": "V"},
+                }
             },
         )
 
@@ -127,6 +160,17 @@ class TestMatSeqBundle(unittest.TestCase):
             )
             conn.commit()
 
+    def _sequence_context_row(self, sqlite_path: Path, *, sheet_name: str) -> dict[str, object]:
+        with sqlite3.connect(str(sqlite_path)) as conn:
+            cursor = conn.execute(
+                "SELECT * FROM __sequence_context WHERE sheet_name=? LIMIT 1",
+                (sheet_name,),
+            )
+            row = cursor.fetchone()
+            self.assertIsNotNone(row, f"expected __sequence_context row for {sheet_name}")
+            names = [str(col[0] or "") for col in (cursor.description or [])]
+        return {names[idx]: row[idx] for idx in range(min(len(names), len(row or [])))}
+
     def test_bundle_detector_matches_seq_files_only(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
             repo = Path(td)
@@ -200,10 +244,13 @@ class TestMatSeqBundle(unittest.TestCase):
                 seq1_cols = [str(row[1] or "") for row in conn.execute('PRAGMA table_info("sheet__seq1")').fetchall()]
             self.assertEqual(runs, ["seq1", "seq2", "seq3"])
             self.assertEqual(member_count, 3)
-            self.assertIn("Time", seq1_cols)
-            self.assertIn("Thrust", seq1_cols)
-            self.assertIn("pressure", seq1_cols)
-            self.assertNotIn("junkTelemetry", seq1_cols)
+            seq1_cols_norm = {str(value or "").strip().casefold() for value in seq1_cols}
+            self.assertIn("time", seq1_cols_norm)
+            self.assertIn("thrust", seq1_cols_norm)
+            self.assertIn("pressure", seq1_cols_norm)
+            self.assertNotIn("junktelemetry", seq1_cols_norm)
+            seq1_context = self._sequence_context_row(sqlite_path, sheet_name="seq1")
+            self.assertEqual(str(seq1_context.get("extraction_status") or "").strip(), "incomplete")
 
             build_index(paths)
             docs = read_eidat_index_documents(repo)
@@ -218,6 +265,190 @@ class TestMatSeqBundle(unittest.TestCase):
 
             scan_after = scan_global_repo(paths)
             self.assertEqual(len(scan_after.candidates), 0)
+
+    def test_processes_mat_bundle_populates_sequence_context_and_support_conditions(self) -> None:
+        try:
+            from openpyxl import load_workbook  # noqa: F401
+        except Exception:
+            self.skipTest("openpyxl not installed")
+
+        from ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            repo = Path(td)
+            src_dir = repo / "Valve" / "ModelX"
+            src_dir.mkdir(parents=True, exist_ok=True)
+            seq1 = src_dir / "SN123_seq1.mat"
+            seq2 = src_dir / "SN123_seq2.mat"
+            seq3 = src_dir / "SN123_seq3.mat"
+            self._write_valid_mat_with_context(
+                seq1,
+                0.0,
+                on_time=0.10,
+                off_time=1.90,
+                nominal_pf=257.0,
+                suppression_voltage=30.0,
+                valve_voltage=28.0,
+            )
+            self._write_valid_mat_with_context(
+                seq2,
+                10.0,
+                on_time=0.10,
+                off_time=1.90,
+                nominal_pf=257.0,
+                suppression_voltage=30.0,
+                valve_voltage=28.0,
+            )
+            self._write_valid_mat_with_context(
+                seq3,
+                20.0,
+                on_time=0.20,
+                off_time=1.80,
+                nominal_pf=300.0,
+                suppression_voltage=32.0,
+                valve_voltage=26.0,
+            )
+
+            paths = support_paths(repo)
+            scan_global_repo(paths)
+            results = process_candidates(paths)
+            self.assertEqual(sum(1 for item in results if item.ok), 3)
+
+            bundle = detect_mat_bundle_member(seq1, repo_root=repo)
+            assert bundle is not None
+            artifacts_dir = paths.support_dir / "debug" / "ocr" / f"{bundle.bundle_stem}__excel"
+            sqlite_path = artifacts_dir / f"{bundle.bundle_stem}.sqlite3"
+            self.assertTrue(sqlite_path.exists())
+
+            seq1_context = self._sequence_context_row(sqlite_path, sheet_name="seq1")
+            seq2_context = self._sequence_context_row(sqlite_path, sheet_name="seq2")
+            seq3_context = self._sequence_context_row(sqlite_path, sheet_name="seq3")
+            for row in (seq1_context, seq2_context, seq3_context):
+                self.assertEqual(str(row.get("extraction_status") or "").strip(), "ok")
+                self.assertEqual(str(row.get("run_type") or "").strip(), "PM")
+                self.assertEqual(str(row.get("nominal_pf_units") or "").strip(), "psia")
+                self.assertEqual(str(row.get("suppression_voltage_units") or "").strip(), "V")
+                self.assertEqual(str(row.get("valve_voltage_units") or "").strip(), "V")
+            self.assertAlmostEqual(float(seq1_context.get("control_period") or 0.0), 2.0, places=8)
+            self.assertAlmostEqual(float(seq1_context.get("nominal_pf_value") or 0.0), 257.0, places=8)
+            self.assertAlmostEqual(float(seq3_context.get("nominal_pf_value") or 0.0), 300.0, places=8)
+
+            build_index(paths)
+            docs = read_eidat_index_documents(repo)
+            td_docs = [doc for doc in docs if str(doc.get("serial_number") or "").strip() == "SN123"]
+            self.assertEqual(len(td_docs), 1)
+            project_meta = {
+                "global_repo": str(repo),
+                "selected_metadata_rel": [str(td_docs[0].get("metadata_rel") or "").strip()],
+            }
+            (repo / be.EIDAT_PROJECT_META).write_text(json.dumps(project_meta, indent=2), encoding="utf-8")
+
+            wb_path = repo / "td_project.xlsx"
+            param_defs = [{"name": "Thrust", "units": "lbf"}]
+            be._sync_td_support_workbook_program_sheets(
+                wb_path,
+                global_repo=repo,
+                project_dir=repo,
+                param_defs=param_defs,
+            )
+            be._refresh_td_support_run_conditions_sheet(
+                wb_path,
+                project_dir=repo,
+                param_defs=param_defs,
+            )
+            support_cfg = be._read_td_support_workbook(wb_path, project_dir=repo)
+            self.assertTrue(bool(support_cfg.get("run_conditions")))
+
+            program_rows = list((support_cfg.get("program_mappings") or {}).get("Unknown") or [])
+            by_source = {
+                str(row.get("source_run_name") or "").strip(): dict(row)
+                for row in program_rows
+                if isinstance(row, dict)
+            }
+            self.assertEqual(str(by_source["seq1"].get("run_type") or "").strip(), "PM")
+            self.assertAlmostEqual(float(by_source["seq1"].get("feed_pressure") or 0.0), 257.0, places=8)
+            self.assertAlmostEqual(float(by_source["seq3"].get("feed_pressure") or 0.0), 300.0, places=8)
+
+            member_sets = {
+                frozenset(
+                    str(part).strip()
+                    for part in str(row.get("member_sequences_text") or "").split(",")
+                    if str(part).strip()
+                )
+                for row in (support_cfg.get("run_conditions") or [])
+                if isinstance(row, dict)
+            }
+            self.assertIn(frozenset({"seq1", "seq2"}), member_sets)
+            self.assertIn(frozenset({"seq3"}), member_sets)
+
+    def test_bundle_without_context_leaves_support_rows_manual(self) -> None:
+        try:
+            from openpyxl import load_workbook  # type: ignore
+        except Exception:
+            self.skipTest("openpyxl not installed")
+
+        from ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            repo = Path(td)
+            src_dir = repo / "Valve" / "ModelX"
+            src_dir.mkdir(parents=True, exist_ok=True)
+            seq1 = src_dir / "SN123_seq1.mat"
+            seq2 = src_dir / "SN123_seq2.mat"
+            self._write_valid_mat(seq1, 0.0)
+            self._write_valid_mat(seq2, 10.0)
+
+            paths = support_paths(repo)
+            scan_global_repo(paths)
+            results = process_candidates(paths)
+            self.assertEqual(sum(1 for item in results if item.ok), 2)
+
+            build_index(paths)
+            docs = read_eidat_index_documents(repo)
+            td_docs = [doc for doc in docs if str(doc.get("serial_number") or "").strip() == "SN123"]
+            self.assertEqual(len(td_docs), 1)
+            (repo / be.EIDAT_PROJECT_META).write_text(
+                json.dumps(
+                    {
+                        "global_repo": str(repo),
+                        "selected_metadata_rel": [str(td_docs[0].get("metadata_rel") or "").strip()],
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            wb_path = repo / "td_project.xlsx"
+            be._sync_td_support_workbook_program_sheets(
+                wb_path,
+                global_repo=repo,
+                project_dir=repo,
+                param_defs=[{"name": "Thrust", "units": "lbf"}],
+            )
+            be._refresh_td_support_run_conditions_sheet(
+                wb_path,
+                project_dir=repo,
+                param_defs=[{"name": "Thrust", "units": "lbf"}],
+            )
+            support_cfg = be._read_td_support_workbook(wb_path, project_dir=repo)
+            self.assertEqual(list(support_cfg.get("run_conditions") or []), [])
+
+            program_sheet = str((support_cfg.get("programs") or [{}])[0].get("sheet_name") or "")
+            self.assertTrue(program_sheet)
+            support_path = be.td_support_workbook_path_for(wb_path, project_dir=repo)
+            wb = load_workbook(str(support_path), data_only=True)
+            try:
+                ws = wb[program_sheet]
+                headers = {
+                    str(ws.cell(1, col).value or "").strip(): col
+                    for col in range(1, (ws.max_column or 0) + 1)
+                    if str(ws.cell(1, col).value or "").strip()
+                }
+                self.assertEqual(str(ws.cell(2, headers["source_run_name"]).value or "").strip(), "seq1")
+                self.assertEqual(str(ws.cell(2, headers["condition_key"]).value or "").strip(), "")
+                self.assertEqual(str(ws.cell(2, headers["display_name"]).value or "").strip(), "")
+            finally:
+                wb.close()
 
     def test_invalid_bundle_member_fails_bundle(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
@@ -248,7 +479,10 @@ class TestMatSeqBundle(unittest.TestCase):
             self.assertTrue(any(item.ok for item in results))
             raw_dir = paths.support_dir / "debug" / "ocr" / "capture__excel"
             self.assertTrue(raw_dir.exists())
-            self.assertTrue((raw_dir / "capture.sqlite3").exists())
+            sqlite_path = raw_dir / "capture.sqlite3"
+            self.assertTrue(sqlite_path.exists())
+            context_row = self._sequence_context_row(sqlite_path, sheet_name="time")
+            self.assertEqual(str(context_row.get("extraction_status") or "").strip(), "incomplete")
 
     def test_rebuild_td_serial_aggregates_prefers_newest_metadata_for_header(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:

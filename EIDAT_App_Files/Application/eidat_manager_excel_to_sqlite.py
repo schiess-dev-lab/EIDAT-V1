@@ -658,6 +658,222 @@ def _mat_payload_to_frames(payload: dict[str, Any]) -> list[tuple[str, Any]]:
     return sheets
 
 
+_MAT_CONTEXT_GENERIC_VALUE_LABELS = {"value", "raw", "val", "data", "text", "string"}
+_MAT_CONTEXT_UNIT_LABELS = {"unit", "units"}
+
+
+def _default_sequence_context_row(
+    *,
+    sheet_name: str,
+    source_sheet_name: str,
+    reason: str,
+) -> dict[str, object]:
+    return {
+        "sheet_name": str(sheet_name or "").strip(),
+        "source_sheet_name": str(source_sheet_name or "").strip(),
+        "data_mode_raw": "",
+        "run_type": "",
+        "on_time_value": None,
+        "on_time_units": "",
+        "off_time_value": None,
+        "off_time_units": "",
+        "control_period": None,
+        "nominal_pf_value": None,
+        "nominal_pf_units": "",
+        "nominal_tf_value": None,
+        "nominal_tf_units": "",
+        "suppression_voltage_value": None,
+        "suppression_voltage_units": "",
+        "valve_voltage_value": None,
+        "valve_voltage_units": "",
+        "extraction_status": "incomplete",
+        "extraction_reason": str(reason or "").strip(),
+    }
+
+
+def _mat_collect_scalar_fields(value: Any, prefix: str = "") -> dict[str, Any]:
+    try:
+        import numpy as np  # type: ignore
+    except Exception:
+        np = None  # type: ignore
+
+    out: dict[str, Any] = {}
+    if _mat_is_scalar(value):
+        name = str(prefix or "value").strip() or "value"
+        out[name] = _mat_coerce_scalar(value)
+        return out
+
+    if isinstance(value, dict):
+        for key, item in value.items():
+            child = f"{prefix}.{key}" if prefix else str(key)
+            out.update(_mat_collect_scalar_fields(item, child))
+        return out
+
+    if isinstance(value, (list, tuple)):
+        if len(value) == 1 and _mat_is_scalar(value[0]):
+            name = str(prefix or "value").strip() or "value"
+            out[name] = _mat_coerce_scalar(value[0])
+            return out
+        for idx, item in enumerate(value):
+            child = f"{prefix}[{idx}]"
+            out.update(_mat_collect_scalar_fields(item, child))
+        return out
+
+    if np is not None and isinstance(value, np.ndarray):
+        if value.ndim == 0:
+            name = str(prefix or "value").strip() or "value"
+            out[name] = _mat_coerce_scalar(value.item())
+            return out
+        if int(getattr(value, "size", 0) or 0) == 1:
+            try:
+                scalar = value.reshape(-1)[0]
+            except Exception:
+                scalar = None
+            if scalar is not None:
+                out.update(_mat_collect_scalar_fields(scalar, prefix))
+            return out
+        if value.dtype.names:
+            for name in value.dtype.names:
+                child = f"{prefix}.{name}" if prefix else str(name)
+                try:
+                    out.update(_mat_collect_scalar_fields(value[name], child))
+                except Exception:
+                    continue
+            return out
+        if value.dtype == object:
+            for idx, item in enumerate(value.reshape(-1).tolist()):
+                child = f"{prefix}[{idx}]"
+                out.update(_mat_collect_scalar_fields(item, child))
+            return out
+    return out
+
+
+def _mat_scalar_path_parts(path: str) -> list[str]:
+    raw_parts = [str(part or "").strip() for part in str(path or "").split(".") if str(part or "").strip()]
+    parts: list[str] = []
+    for raw_part in raw_parts:
+        clean = re.sub(r"\[\d+\]", "", raw_part).strip()
+        if clean:
+            parts.append(clean)
+    return parts
+
+
+def _mat_sequence_context_scalar_entries(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for raw_key, raw_value in sorted(payload.items()):
+        key = str(raw_key or "").strip()
+        if not key or key.startswith("__"):
+            continue
+        nested = _mat_collect_scalar_fields(raw_value, key)
+        for raw_path, scalar_value in sorted(nested.items()):
+            parts = _mat_scalar_path_parts(raw_path)
+            if not parts:
+                continue
+            leaf = parts[-1]
+            parent_path = ".".join(parts[:-1])
+            parent_leaf = parts[-2] if len(parts) > 1 else ""
+            leaf_norm = _normalize_header(leaf)
+            value_suffix = re.match(r"(?i)^(?P<base>.+?)(?:[_\s-]*(?:value|raw|val|data|text|string))$", leaf)
+            unit_suffix = re.match(r"(?i)^(?P<base>.+?)(?:[_\s-]*(?:unit|units))$", leaf)
+            if unit_suffix and str(unit_suffix.group("base") or "").strip():
+                label = ""
+                base_path = parent_path
+            elif value_suffix and str(value_suffix.group("base") or "").strip():
+                label = str(value_suffix.group("base") or "").strip()
+                base_path = parent_path
+            elif leaf_norm in _MAT_CONTEXT_UNIT_LABELS:
+                label = ""
+                base_path = parent_path
+            elif leaf_norm in _MAT_CONTEXT_GENERIC_VALUE_LABELS and parent_leaf:
+                label = parent_leaf
+                base_path = parent_path
+            else:
+                label = leaf
+                base_path = ".".join(parts)
+            out.append(
+                {
+                    "path": ".".join(parts),
+                    "parent_path": parent_path,
+                    "leaf": leaf,
+                    "leaf_norm": leaf_norm,
+                    "label": label,
+                    "base_path": base_path,
+                    "value": scalar_value,
+                }
+            )
+    return out
+
+
+def _mat_sequence_context_units_hint(
+    entry: Mapping[str, Any],
+    entries: Sequence[Mapping[str, Any]],
+) -> str:
+    label_norm = _normalize_header(entry.get("label"))
+    base_path = str(entry.get("base_path") or "").strip()
+    parent_path = str(entry.get("parent_path") or "").strip()
+    for candidate in entries:
+        if candidate is entry:
+            continue
+        cand_text = _collapse_meta_text(candidate.get("value"))
+        if not cand_text or _try_float(cand_text) is not None:
+            continue
+        cand_leaf_norm = str(candidate.get("leaf_norm") or "").strip()
+        cand_parent = str(candidate.get("parent_path") or "").strip()
+        if base_path and cand_parent == base_path and cand_leaf_norm in _MAT_CONTEXT_UNIT_LABELS:
+            return cand_text
+        if parent_path and cand_parent == parent_path and label_norm and cand_leaf_norm in {
+            f"{label_norm} unit",
+            f"{label_norm} units",
+        }:
+            return cand_text
+    return ""
+
+
+def _mat_sequence_context_meta_cells(payload: Mapping[str, Any]) -> list[tuple[int, int, str]]:
+    entries = _mat_sequence_context_scalar_entries(payload)
+    meta_cells: list[tuple[int, int, str]] = []
+    row_idx = 1
+    for entry in entries:
+        label = _collapse_meta_text(entry.get("label"))
+        raw_value = entry.get("value")
+        if not label or _is_blank(raw_value):
+            continue
+        meta_cells.append((int(row_idx), 1, label))
+        meta_cells.append((int(row_idx), 2, _collapse_meta_text(raw_value)))
+        units_hint = _mat_sequence_context_units_hint(entry, entries)
+        if units_hint:
+            meta_cells.append((int(row_idx), 3, units_hint))
+        row_idx += 1
+    return meta_cells
+
+
+def _sequence_context_from_mat_payload(
+    *,
+    sheet_name: str,
+    source_sheet_name: str,
+    payload: Mapping[str, Any] | None,
+    unavailable_reason: str,
+) -> dict[str, object]:
+    if not isinstance(payload, Mapping) or not payload:
+        return _default_sequence_context_row(
+            sheet_name=sheet_name,
+            source_sheet_name=source_sheet_name,
+            reason=unavailable_reason,
+        )
+    meta_cells = _mat_sequence_context_meta_cells(payload)
+    if not meta_cells:
+        return _default_sequence_context_row(
+            sheet_name=sheet_name,
+            source_sheet_name=source_sheet_name,
+            reason=unavailable_reason,
+        )
+    return _sequence_context_from_meta_cells(
+        sheet_name=sheet_name,
+        source_sheet_name=source_sheet_name,
+        meta_cells=meta_cells,
+    )
+
+
 def _write_mat_sqlite(*, mat_path: Path, sqlite_path: Path, overwrite: bool) -> dict[str, Any]:
     sqlite_path.parent.mkdir(parents=True, exist_ok=True)
     if sqlite_path.exists():
@@ -675,6 +891,12 @@ def _write_mat_sqlite(*, mat_path: Path, sqlite_path: Path, overwrite: bool) -> 
 
     payload = _load_mat_payload(mat_path)
     sheets = _mat_payload_to_frames(payload)
+    default_sequence_context = _sequence_context_from_mat_payload(
+        sheet_name="data",
+        source_sheet_name="data",
+        payload=payload,
+        unavailable_reason="sequence context unavailable for MAT source",
+    )
     _stderr(f"[MAT] {mat_path}")
 
     conn = sqlite3.connect(str(sqlite_path))
@@ -813,28 +1035,10 @@ def _write_mat_sqlite(*, mat_path: Path, sqlite_path: Path, overwrite: bool) -> 
                 )
             except Exception:
                 pass
-            _insert_sequence_context_row(
-                conn,
-                {
-                    "sheet_name": safe_sheet_name,
-                    "source_sheet_name": safe_sheet_name,
-                    "data_mode_raw": "",
-                    "run_type": "",
-                    "on_time_value": None,
-                    "on_time_units": "",
-                    "off_time_value": None,
-                    "off_time_units": "",
-                    "control_period": None,
-                    "nominal_pf_value": None,
-                    "nominal_pf_units": "",
-                    "nominal_tf_value": None,
-                    "nominal_tf_units": "",
-                    "suppression_voltage_value": None,
-                    "suppression_voltage_units": "",
-                    "extraction_status": "incomplete",
-                    "extraction_reason": "sequence context unavailable for MAT source",
-                },
-            )
+            sequence_context = dict(default_sequence_context)
+            sequence_context["sheet_name"] = safe_sheet_name
+            sequence_context["source_sheet_name"] = safe_sheet_name
+            _insert_sequence_context_row(conn, sequence_context)
             outputs.append(
                 {
                     "sheet": safe_sheet_name,
@@ -954,11 +1158,12 @@ def _mat_collect_numeric_series(value: Any, prefix: str = "") -> dict[str, list[
 def _mat_extract_run_table(
     mat_path: Path,
     *,
+    payload: Mapping[str, Any] | None = None,
     canonical_defs: list[dict[str, Any]],
     fuzzy_min_ratio: float,
     allowed_header_norms: set[str] | None = None,
 ) -> dict[str, Any]:
-    payload = _load_mat_payload(mat_path)
+    payload = payload if isinstance(payload, Mapping) else _load_mat_payload(mat_path)
     series_by_name: dict[str, list[float | int | None]] = {}
     for raw_key, raw_value in sorted(payload.items()):
         key = str(raw_key or "").strip()
@@ -1138,11 +1343,19 @@ def write_mat_bundle_sqlite(
             m = re.search(r"(seq\d+)$", seq_name, flags=re.IGNORECASE)
             if m:
                 seq_name = str(m.group(1) or "").lower() or seq_name
+            payload = _load_mat_payload(mat_path)
             run = _mat_extract_run_table(
                 mat_path,
+                payload=payload,
                 canonical_defs=canonical_defs,
                 fuzzy_min_ratio=float(fuzzy_min_ratio),
                 allowed_header_norms=allowed_header_norms,
+            )
+            sequence_context = _sequence_context_from_mat_payload(
+                sheet_name=seq_name,
+                source_sheet_name=seq_name,
+                payload=payload,
+                unavailable_reason="sequence context unavailable for MAT bundle source",
             )
             table_name = _safe_table_name(seq_name)
             col_defs = ", ".join([f"\"{c}\" REAL" for c in run["col_idents"]])
@@ -1205,28 +1418,7 @@ def write_mat_bundle_sqlite(
                     "",
                 ),
             )
-            _insert_sequence_context_row(
-                conn,
-                {
-                    "sheet_name": seq_name,
-                    "source_sheet_name": seq_name,
-                    "data_mode_raw": "",
-                    "run_type": "",
-                    "on_time_value": None,
-                    "on_time_units": "",
-                    "off_time_value": None,
-                    "off_time_units": "",
-                    "control_period": None,
-                    "nominal_pf_value": None,
-                    "nominal_pf_units": "",
-                    "nominal_tf_value": None,
-                    "nominal_tf_units": "",
-                    "suppression_voltage_value": None,
-                    "suppression_voltage_units": "",
-                    "extraction_status": "incomplete",
-                    "extraction_reason": "sequence context unavailable for MAT bundle source",
-                },
-            )
+            _insert_sequence_context_row(conn, sequence_context)
             outputs.append(
                 {
                     "sheet": seq_name,

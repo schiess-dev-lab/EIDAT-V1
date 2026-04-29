@@ -4369,16 +4369,368 @@ def refresh_td_parameter_support_workbook(
 
 def load_td_project_parameter_normalization(project_dir: Path) -> dict[str, object]:
     meta = _read_project_meta(Path(project_dir).expanduser())
-    return _td_normalize_parameter_normalization(meta.get(TD_PARAMETER_NORMALIZATION_KEY))
+    return _td_project_parameter_group_catalog(meta.get(TD_PARAMETER_NORMALIZATION_KEY))
 
 
 def save_td_project_parameter_normalization(project_dir: Path, normalization: Mapping[str, object] | None) -> dict[str, object]:
     proj_dir = Path(project_dir).expanduser()
     meta = _read_project_meta(proj_dir)
-    payload = _td_parameter_normalization_persistable(normalization)
+    payload = _td_parameter_normalization_persistable(_td_project_parameter_group_catalog(normalization))
     meta[TD_PARAMETER_NORMALIZATION_KEY] = payload
     _write_project_meta(proj_dir, meta)
-    return _td_normalize_parameter_normalization(payload)
+    return _td_project_parameter_group_catalog(payload)
+
+
+def _td_project_parameter_group_catalog(normalization: Mapping[str, object] | object | None) -> dict[str, object]:
+    normalized = _td_normalize_parameter_normalization(normalization)
+    return _td_normalize_parameter_normalization(
+        {
+            "version": int(normalized.get("version") or TD_PARAMETER_NORMALIZATION_VERSION),
+            "groups": [
+                {
+                    "id": str(group.get("id") or "").strip(),
+                    "display_name": str(group.get("display_name") or "").strip(),
+                    "preferred_units": str(group.get("preferred_units") or "").strip(),
+                }
+                for group in (normalized.get("groups") or [])
+                if isinstance(group, Mapping) and str(group.get("id") or "").strip()
+            ],
+            "mappings": [],
+        }
+    )
+
+
+def _td_project_parameter_group_overrides(
+    project_dir: Path,
+    normalization: Mapping[str, object] | None,
+    *,
+    canonical_groups: Mapping[str, Mapping[str, object]] | None = None,
+) -> tuple[dict[str, object], dict[str, dict[str, object]]]:
+    normalized = _td_normalize_parameter_normalization(normalization)
+    project_catalog = load_td_project_parameter_normalization(project_dir)
+    override_groups_by_id: dict[str, dict[str, object]] = {
+        str(group.get("id") or "").strip(): {
+            "id": str(group.get("id") or "").strip(),
+            "display_name": str(group.get("display_name") or "").strip(),
+            "preferred_units": str(group.get("preferred_units") or "").strip(),
+        }
+        for group in (normalized.get("groups") or [])
+        if isinstance(group, Mapping) and str(group.get("id") or "").strip()
+    }
+    for project_group in (project_catalog.get("groups") or []):
+        if not isinstance(project_group, Mapping):
+            continue
+        canonical_id = str(project_group.get("id") or "").strip()
+        if not canonical_id:
+            continue
+        merged_group = dict(
+            override_groups_by_id.get(canonical_id)
+            or {"id": canonical_id, "display_name": "", "preferred_units": ""}
+        )
+        project_display = str(project_group.get("display_name") or "").strip()
+        project_units = str(project_group.get("preferred_units") or "").strip()
+        if project_display:
+            merged_group["display_name"] = project_display
+        merged_group["preferred_units"] = project_units
+        override_groups_by_id[canonical_id] = merged_group
+    merged_normalization = dict(normalized)
+    merged_groups_by_id: dict[str, dict[str, object]] = {
+        str(key): dict(value)
+        for key, value in dict(normalized.get("groups_by_id") or {}).items()
+        if str(key).strip() and isinstance(value, Mapping)
+    }
+    for canonical_id, override in override_groups_by_id.items():
+        merged_group = dict(merged_groups_by_id.get(canonical_id) or {"id": canonical_id})
+        if str(override.get("display_name") or "").strip():
+            merged_group["display_name"] = str(override.get("display_name") or "").strip()
+        if "preferred_units" in override:
+            merged_group["preferred_units"] = str(override.get("preferred_units") or "").strip()
+        merged_groups_by_id[canonical_id] = merged_group
+    merged_groups: list[dict[str, object]] = []
+    seen_group_ids: set[str] = set()
+    for group in (normalized.get("groups") or []):
+        if not isinstance(group, Mapping):
+            continue
+        canonical_id = str(group.get("id") or "").strip()
+        if not canonical_id or canonical_id in seen_group_ids:
+            continue
+        seen_group_ids.add(canonical_id)
+        merged_groups.append(dict(merged_groups_by_id.get(canonical_id) or group))
+    for canonical_id, group in merged_groups_by_id.items():
+        if canonical_id in seen_group_ids:
+            continue
+        merged_groups.append(dict(group))
+    merged_normalization["groups_by_id"] = merged_groups_by_id
+    merged_normalization["groups"] = merged_groups
+    merged_canonical_groups: dict[str, dict[str, object]] = {
+        str(key): dict(value)
+        for key, value in dict(canonical_groups or {}).items()
+        if str(key).strip() and isinstance(value, Mapping)
+    }
+    for canonical_id, group in merged_canonical_groups.items():
+        override = dict(override_groups_by_id.get(canonical_id) or {})
+        if not override:
+            continue
+        if str(override.get("display_name") or "").strip():
+            group["display_name"] = str(override.get("display_name") or "").strip()
+        preferred_units = str(override.get("preferred_units") or "").strip()
+        if preferred_units or "preferred_units" in override:
+            group["preferred_units"] = preferred_units
+        if preferred_units:
+            group["unit_conflict"] = False
+        merged_canonical_groups[canonical_id] = group
+    return merged_normalization, merged_canonical_groups
+
+
+def _td_parameter_group_units(units: Sequence[object] | None) -> str:
+    distinct = sorted(
+        {
+            str(value or "").strip()
+            for value in (units or [])
+            if str(value or "").strip()
+        },
+        key=str.casefold,
+    )
+    return distinct[0] if len(distinct) == 1 else ""
+
+
+def _td_parameter_group_has_conflict(units: Sequence[object] | None, preferred_units: object = "") -> bool:
+    if str(preferred_units or "").strip():
+        return False
+    distinct = {
+        str(value or "").strip()
+        for value in (units or [])
+        if str(value or "").strip()
+    }
+    return len(distinct) > 1
+
+
+def td_rebuild_project_parameter_units_catalog(
+    project_dir: Path,
+    repo_rows: Sequence[Mapping[str, object]] | None,
+) -> dict[str, object]:
+    groups_by_id: dict[str, dict[str, object]] = {}
+    for raw_row in (repo_rows or []):
+        row = _td_program_parameter_mapping_normalize(raw_row)
+        if not row:
+            continue
+        display_name = _td_program_parameter_effective_display(row)
+        canonical_id = _td_program_parameter_canonical_id(display_name)
+        if not canonical_id:
+            continue
+        group = groups_by_id.setdefault(
+            canonical_id,
+            {
+                "id": canonical_id,
+                "display_name": display_name,
+                "_units": set(),
+            },
+        )
+        if display_name:
+            group["display_name"] = display_name
+        units_text = str(row.get("preferred_units") or "").strip()
+        if units_text:
+            cast(set[str], group["_units"]).add(units_text)
+    groups = []
+    for canonical_id, group in sorted(groups_by_id.items(), key=lambda item: str(item[1].get("display_name") or item[0]).casefold()):
+        groups.append(
+            {
+                "id": canonical_id,
+                "display_name": str(group.get("display_name") or "").strip(),
+                "preferred_units": _td_parameter_group_units(sorted(cast(set[str], group.get("_units") or set()), key=str.casefold)),
+            }
+        )
+    return save_td_project_parameter_normalization(
+        project_dir,
+        {
+            "version": TD_PARAMETER_NORMALIZATION_VERSION,
+            "groups": groups,
+            "mappings": [],
+        },
+    )
+
+
+def td_build_project_parameter_units_rows(
+    project_dir: Path,
+    repo_rows: Sequence[Mapping[str, object]] | None,
+    context: Mapping[str, object] | None = None,
+) -> list[dict[str, object]]:
+    normalized_rows = [
+        _td_program_parameter_mapping_normalize(row)
+        for row in (repo_rows or [])
+        if _td_program_parameter_mapping_normalize(row)
+    ]
+    base_normalization = _td_build_repo_parameter_normalization(normalized_rows)
+    normalization, _canonical_groups_unused = _td_project_parameter_group_overrides(project_dir, base_normalization)
+    inventory_rows = [
+        dict(item)
+        for item in (dict(context or {}).get("inventory") or [])
+        if isinstance(item, Mapping)
+    ]
+    groups_by_id: dict[str, dict[str, object]] = {}
+
+    def _ensure_group(canonical_id: str, fallback_display: object = "") -> dict[str, object]:
+        group = groups_by_id.get(canonical_id)
+        if group is not None:
+            return group
+        display_name = _td_parameter_display_name_for_group(
+            normalization,
+            canonical_id,
+            raw_names=[],
+            fallback=fallback_display,
+        ) or str(fallback_display or "").strip()
+        group = {
+            "canonical_id": canonical_id,
+            "displayed_parameter": display_name,
+            "_raw_names": set(),
+            "_program_titles": set(),
+            "_units": set(),
+        }
+        groups_by_id[canonical_id] = group
+        return group
+
+    for row in normalized_rows:
+        display_name = _td_program_parameter_effective_display(row)
+        canonical_id = _td_program_parameter_canonical_id(display_name)
+        if not canonical_id:
+            continue
+        group = _ensure_group(canonical_id, display_name)
+        cast(set[str], group["_raw_names"]).add(str(row.get("ingested_parameter") or "").strip())
+        program_title = str(row.get("program_title") or "").strip()
+        if program_title:
+            cast(set[str], group["_program_titles"]).add(program_title)
+        units_text = str(row.get("preferred_units") or "").strip()
+        if units_text:
+            cast(set[str], group["_units"]).add(units_text)
+
+    for inventory_row in inventory_rows:
+        raw_name = str(inventory_row.get("raw_name") or "").strip()
+        if not raw_name:
+            continue
+        canonical_id = _td_effective_parameter_canonical(
+            normalization,
+            raw_name,
+            inventory_row.get("program_title"),
+            inventory_row.get("asset_type"),
+            inventory_row.get("asset_specific_type"),
+            fallback_display=(
+                inventory_row.get("displayed_parameter")
+                or inventory_row.get("default_display_parameter")
+                or raw_name
+            ),
+        )
+        if not canonical_id:
+            continue
+        group = _ensure_group(
+            canonical_id,
+            inventory_row.get("displayed_parameter")
+            or inventory_row.get("default_display_parameter")
+            or raw_name,
+        )
+        cast(set[str], group["_raw_names"]).add(raw_name)
+        program_title = str(inventory_row.get("program_title") or "").strip()
+        if program_title:
+            cast(set[str], group["_program_titles"]).add(program_title)
+        for value in (inventory_row.get("units") or []):
+            units_text = str(value or "").strip()
+            if units_text:
+                cast(set[str], group["_units"]).add(units_text)
+        preferred_units = str(inventory_row.get("preferred_units") or "").strip()
+        if preferred_units:
+            cast(set[str], group["_units"]).add(preferred_units)
+
+    rows: list[dict[str, object]] = []
+    for canonical_id, group in groups_by_id.items():
+        raw_names = sorted(
+            {str(value).strip() for value in cast(set[str], group.get("_raw_names") or set()) if str(value).strip()},
+            key=str.casefold,
+        )
+        if not raw_names:
+            continue
+        display_name = _td_parameter_display_name_for_group(
+            normalization,
+            canonical_id,
+            raw_names=raw_names,
+            fallback=group.get("displayed_parameter") or raw_names[0],
+        )
+        source_units = sorted(
+            {str(value).strip() for value in cast(set[str], group.get("_units") or set()) if str(value).strip()},
+            key=str.casefold,
+        )
+        preferred_units = str(
+            ((normalization.get("groups_by_id") or {}).get(canonical_id) or {}).get("preferred_units")
+            if isinstance(normalization.get("groups_by_id"), Mapping)
+            else ""
+        ).strip()
+        if not preferred_units:
+            preferred_units = _td_parameter_group_units(source_units)
+        rows.append(
+            {
+                "canonical_id": canonical_id,
+                "displayed_parameter": display_name,
+                "raw_names": raw_names,
+                "raw_names_text": ", ".join(raw_names),
+                "program_titles": sorted(
+                    {str(value).strip() for value in cast(set[str], group.get("_program_titles") or set()) if str(value).strip()},
+                    key=str.casefold,
+                ),
+                "source_units": source_units,
+                "preferred_units": preferred_units,
+                "unit_conflict": _td_parameter_group_has_conflict(source_units, preferred_units),
+            }
+        )
+    for row in rows:
+        row["program_titles_text"] = ", ".join(row.get("program_titles") or [])
+    rows.sort(
+        key=lambda item: (
+            str(item.get("displayed_parameter") or "").casefold(),
+            str(item.get("canonical_id") or "").casefold(),
+        )
+    )
+    return rows
+
+
+def td_save_project_parameter_units(
+    project_dir: Path,
+    repo_rows: Sequence[Mapping[str, object]] | None,
+    unit_rows: Sequence[Mapping[str, object]] | None,
+) -> dict[str, object]:
+    preferred_units_by_canonical: dict[str, str] = {}
+    preferred_display_by_canonical: dict[str, str] = {}
+    for raw_row in (unit_rows or []):
+        if not isinstance(raw_row, Mapping):
+            continue
+        canonical_id = str(raw_row.get("canonical_id") or "").strip()
+        display_name = str(raw_row.get("displayed_parameter") or "").strip()
+        if not canonical_id and display_name:
+            canonical_id = _td_program_parameter_canonical_id(display_name)
+        if not canonical_id:
+            continue
+        preferred_units_by_canonical[canonical_id] = str(raw_row.get("preferred_units") or "").strip()
+        if display_name:
+            preferred_display_by_canonical[canonical_id] = display_name
+
+    mirrored_rows: list[dict[str, object]] = []
+    for raw_row in (repo_rows or []):
+        row = _td_program_parameter_mapping_normalize(raw_row)
+        if not row:
+            continue
+        display_name = _td_program_parameter_effective_display(row)
+        canonical_id = _td_program_parameter_canonical_id(display_name)
+        if canonical_id in preferred_units_by_canonical:
+            units_text = preferred_units_by_canonical[canonical_id]
+            row["preferred_units"] = units_text
+            row["default_preferred_units"] = units_text
+            if preferred_display_by_canonical.get(canonical_id):
+                row["displayed_parameter"] = preferred_display_by_canonical[canonical_id]
+        mirrored_rows.append(row)
+
+    saved_rows = save_td_repo_parameter_mappings(project_dir, mirrored_rows)
+    normalization = td_rebuild_project_parameter_units_catalog(project_dir, saved_rows)
+    return {
+        "saved_rows": [dict(row) for row in saved_rows],
+        "normalization": normalization,
+    }
 
 
 def _td_parameter_mapping_match_score(
@@ -5331,7 +5683,7 @@ def _td_build_parameter_context_from_discovery_rows(
         group["source_run_names"] = sorted(cast(set[str], group.get("_source_run_names") or set()), key=str.casefold)
         group["surfaces"] = sorted(cast(set[str], group.get("_surfaces") or set()), key=str.casefold)
         group["run_names"] = sorted(cast(set[str], group.get("_run_names") or set()), key=str.casefold)
-        group["unit_conflict"] = len([value for value in units if str(value).strip()]) > 1
+        group["unit_conflict"] = _td_parameter_group_has_conflict(units, preferred_units)
         for key in (
             "_raw_names",
             "_units",
@@ -6108,6 +6460,11 @@ def td_load_parameter_runtime_context(project_dir: Path, db_path: Path) -> dict[
             "mappings": normalization_rules,
         }
     )
+    normalization, canonical_groups = _td_project_parameter_group_overrides(
+        proj_dir,
+        normalization,
+        canonical_groups=canonical_groups,
+    )
     inventory = _td_build_runtime_inventory_from_entries(
         normalization,
         entries,
@@ -6148,6 +6505,10 @@ def td_build_parameter_normalization_context(
         _td_normalize_parameter_normalization(normalization_override)
         if isinstance(normalization_override, Mapping)
         else _td_build_repo_parameter_normalization(repo_parameter_rows)
+    )
+    normalization, _canonical_groups_unused = _td_project_parameter_group_overrides(
+        proj_dir,
+        normalization,
     )
     discovery_rows: list[dict[str, str]] = []
     if impl_db.exists():
@@ -6253,7 +6614,7 @@ def td_build_parameter_selector_options(
                 if not raw_name_list:
                     continue
                 units = sorted(cast(set[str], group.get("_units") or set()), key=str.casefold)
-                unit_conflict = len([value for value in units if str(value).strip()]) > 1
+                unit_conflict = False
                 display_name = _td_parameter_display_name_for_group(
                     normalization,
                     canonical_id,
@@ -6267,6 +6628,7 @@ def td_build_parameter_selector_options(
                 ).strip()
                 if not preferred_units and len(units) == 1:
                     preferred_units = units[0]
+                unit_conflict = _td_parameter_group_has_conflict(units, preferred_units)
                 label = f"{display_name} ({preferred_units})" if preferred_units else display_name
                 if unit_conflict:
                     label = f"{label} [unit conflict]"
@@ -6396,7 +6758,7 @@ def td_build_parameter_selector_options(
         if not raw_name_list:
             continue
         units = sorted(cast(set[str], group.get("_units") or set()), key=str.casefold)
-        unit_conflict = len([value for value in units if str(value).strip()]) > 1
+        unit_conflict = False
         display_name = _td_parameter_display_name_for_group(
             normalization,
             canonical_id,
@@ -6410,6 +6772,7 @@ def td_build_parameter_selector_options(
         ).strip()
         if not preferred_units and len(units) == 1:
             preferred_units = units[0]
+        unit_conflict = _td_parameter_group_has_conflict(units, preferred_units)
         label = f"{display_name} ({preferred_units})" if preferred_units else display_name
         if unit_conflict:
             label = f"{label} [unit conflict]"

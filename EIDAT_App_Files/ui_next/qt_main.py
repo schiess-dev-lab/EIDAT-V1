@@ -2664,54 +2664,56 @@ class TDProjectEditorDialog(NewProjectWizardDialog):
 
 
 class TDParameterNormalizationDialog(QtWidgets.QDialog):
-    COLS = [
+    PHASE_PARAMETERS = "parameters"
+    PHASE_UNITS = "units"
+
+    PHASE1_COLS = [
         "Program",
         "Asset",
         "Specific",
         "Ingested",
         "Displayed",
-        "Units",
         "Enabled",
         "Status",
     ]
-
     COL_PROGRAM = 0
     COL_ASSET = 1
     COL_SPECIFIC = 2
     COL_INGESTED = 3
     COL_DISPLAYED = 4
-    COL_UNITS = 5
-    COL_ENABLED = 6
-    COL_STATUS = 7
+    COL_ENABLED = 5
+    COL_STATUS = 6
+
+    PHASE2_COLS = [
+        "Displayed Parameter",
+        "Extracted Names",
+        "Programs",
+        "Units",
+    ]
+    UNIT_COL_DISPLAYED = 0
+    UNIT_COL_RAW_NAMES = 1
+    UNIT_COL_PROGRAMS = 2
+    UNIT_COL_UNITS = 3
 
     def __init__(self, project_dir: Path, workbook_path: Path, parent=None):
         super().__init__(parent)
         self._project_dir = Path(project_dir).expanduser()
         self._workbook_path = Path(workbook_path).expanduser()
         self._db_path = be.validate_test_data_project_cache_for_open(self._project_dir, self._workbook_path)
+        self._phase = self.PHASE_PARAMETERS
         self._working_rows: list[dict[str, object]] = []
+        self._phase2_rows: list[dict[str, object]] = []
         self._context: dict[str, object] = {}
         self._display_rows: list[dict[str, object]] = []
         self._table_refreshing = False
         self._dirty = False
-        self._save_in_progress = False
-        self._save_revision = 0
-        self._saving_revision = 0
-        self._saved_revision = 0
-        self._save_requested_while_busy = False
-        self._refresh_after_save_requested = False
-        self._saving_refresh_project_state = False
-        self._saving_selected_keys: list[tuple[str, str, str, str]] = []
-        self._close_requested = False
-        self._allow_direct_close = False
-        self._discard_requested = False
+        self._phase1_saved = False
+        self._save_mode = ""
         self._save_worker: ProjectTaskWorker | None = None
+        self._allow_direct_close = False
         self.saved = False
         self.update_requested = False
-        self._autosave_timer = QtCore.QTimer(self)
-        self._autosave_timer.setSingleShot(True)
-        self._autosave_timer.setInterval(350)
-        self._autosave_timer.timeout.connect(lambda: self._start_background_save())
+        self._progress_popup = RepoScanDialog(self)
 
         self.setWindowTitle("Project Parameters")
         self.resize(1360, 760)
@@ -2745,24 +2747,16 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
         layout.setContentsMargins(14, 14, 14, 14)
         layout.setSpacing(10)
 
-        title = QtWidgets.QLabel("Project Parameters")
-        title.setStyleSheet("font-size: 15px; font-weight: 800;")
-        layout.addWidget(title)
+        self.lbl_title = QtWidgets.QLabel("Project Parameters")
+        self.lbl_title.setStyleSheet("font-size: 15px; font-weight: 800;")
+        layout.addWidget(self.lbl_title)
 
-        hint = QtWidgets.QLabel(
-            "Review every ingested source parameter grouped by program and asset. "
-            "The displayed parameter is the user-facing name the GUI uses for trending, analysis, and mapping. "
-            "Edits autosave in the background to the ProgramRequirements workbook files for reuse by other projects. "
-            "Use the Enabled column or the side actions to make parameters active or inactive. "
-            "Use Close to save, discard, or cancel your pending edits. "
-            "Use Close + Update to save and then run Update Project."
-        )
-        hint.setWordWrap(True)
-        hint.setStyleSheet("color: #475569; font-size: 11px;")
-        layout.addWidget(hint)
+        self.lbl_hint = QtWidgets.QLabel("")
+        self.lbl_hint.setWordWrap(True)
+        self.lbl_hint.setStyleSheet("color: #475569; font-size: 11px;")
+        layout.addWidget(self.lbl_hint)
 
         self.ed_filter = QtWidgets.QLineEdit()
-        self.ed_filter.setPlaceholderText("Filter programs, assets, ingested names, or displayed names...")
         self.ed_filter.textChanged.connect(self._refresh_table)
         layout.addWidget(self.ed_filter)
 
@@ -2775,8 +2769,7 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
         left_layout.setSpacing(8)
         splitter.addWidget(left)
 
-        self.tbl = QtWidgets.QTableWidget(0, len(self.COLS))
-        self.tbl.setHorizontalHeaderLabels(self.COLS)
+        self.tbl = QtWidgets.QTableWidget(0, len(self.PHASE1_COLS))
         self.tbl.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
         self.tbl.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
         self.tbl.setEditTriggers(
@@ -2827,12 +2820,10 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
 
         button_row = QtWidgets.QHBoxLayout()
         button_row.addStretch(1)
-        self.btn_save = QtWidgets.QPushButton("Save Now")
+        self.btn_save = QtWidgets.QPushButton("Save + Units")
         self.btn_close = QtWidgets.QPushButton("Close")
-        self.btn_close_update = QtWidgets.QPushButton("Close + Update")
         button_row.addWidget(self.btn_save)
         button_row.addWidget(self.btn_close)
-        button_row.addWidget(self.btn_close_update)
         layout.addLayout(button_row)
 
         self.btn_set_display.clicked.connect(self._act_set_display_name)
@@ -2842,83 +2833,48 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
         self.btn_reset.clicked.connect(self._act_reset_rows)
         self.btn_save.clicked.connect(self._act_save)
         self.btn_close.clicked.connect(self._act_close)
-        self.btn_close_update.clicked.connect(self._act_close_update)
 
         self._reload_context()
+        self._set_phase(self.PHASE_PARAMETERS)
 
     @staticmethod
     def _norm_name(value: object) -> str:
         return "".join(ch.lower() for ch in str(value or "").strip() if ch.isalnum())
 
-    @staticmethod
-    def _units_text(value: object) -> str:
-        return str(value or "").strip()
-
     def _display_text_changed(self, displayed: object, default_display: object) -> bool:
         return self._norm_name(displayed) != self._norm_name(default_display)
 
-    def _units_text_changed(self, preferred_units: object, default_units: object) -> bool:
-        return self._units_text(preferred_units) != self._units_text(default_units)
-
-    def _row_edit_state(
-        self,
-        *,
-        displayed: object,
-        default_display: object,
-        preferred_units: object,
-        default_units: object,
-    ) -> bool:
-        return self._display_text_changed(displayed, default_display) or self._units_text_changed(
-            preferred_units,
-            default_units,
-        )
-
-    def _has_pending_save_state(self) -> bool:
-        worker_running = self._save_worker is not None and self._save_worker.isRunning()
-        return bool(worker_running or self._save_in_progress or self._dirty or self._autosave_timer.isActive())
-
     def _set_dirty(self, dirty: bool) -> None:
         self._dirty = bool(dirty)
-        self._update_save_button_text()
-
-    def _update_save_button_text(self) -> None:
-        if hasattr(self, "btn_save"):
-            if self._save_in_progress:
-                self.btn_save.setText("Autosaving...")
-            elif self._dirty and getattr(self, "_autosave_timer", None) is not None and self._autosave_timer.isActive():
-                self.btn_save.setText("Autosave Pending*")
-            else:
-                self.btn_save.setText("Save Now*" if self._dirty else "Save Now")
+        if self._phase == self.PHASE_PARAMETERS:
+            self.btn_save.setText("Save + Units*" if self._dirty else "Save + Units")
+        else:
+            self.btn_save.setText("Save Units + Update*" if self._dirty else "Save Units + Update")
 
     def _set_save_busy(self, busy: bool) -> None:
-        self._save_in_progress = bool(busy)
-        if isinstance(getattr(self, "btn_save", None), QtWidgets.QWidget):
-            self.btn_save.setEnabled(True)
-        self._update_save_button_text()
-
-    def _timestamp_text(self) -> str:
-        try:
-            return time.strftime("%Y-%m-%d %H:%M:%S")
-        except Exception:
-            return ""
+        enabled = not bool(busy)
+        self.ed_filter.setEnabled(enabled)
+        self.tbl.setEnabled(enabled)
+        self.btn_set_display.setEnabled(enabled and self.btn_set_display.isVisible())
+        self.btn_set_units.setEnabled(enabled and self.btn_set_units.isVisible())
+        self.btn_enable.setEnabled(enabled and self.btn_enable.isVisible())
+        self.btn_disable.setEnabled(enabled and self.btn_disable.isVisible())
+        self.btn_reset.setEnabled(enabled and self.btn_reset.isVisible())
+        self.btn_save.setEnabled(enabled)
+        self.btn_close.setEnabled(enabled)
 
     def _display_name_autocomplete_values(self) -> list[str]:
         values: list[str] = []
         seen: set[str] = set()
-        candidate_groups = [
+        for group in (
             self._working_rows,
             self._context.get("repo_parameter_rows") if isinstance(self._context, Mapping) else [],
             self._context.get("inventory") if isinstance(self._context, Mapping) else [],
-        ]
-        for group in candidate_groups:
+        ):
             for item in group or []:
                 if not isinstance(item, Mapping):
                     continue
-                text = str(
-                    item.get("displayed_parameter")
-                    or item.get("canonical_display")
-                    or ""
-                ).strip()
+                text = str(item.get("displayed_parameter") or item.get("canonical_display") or "").strip()
                 key = text.casefold()
                 if text and key not in seen:
                     seen.add(key)
@@ -2938,217 +2894,6 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
             if isinstance(model, QtCore.QStringListModel):
                 model.setStringList(values)
 
-    def _mark_local_change(self) -> None:
-        self._save_revision += 1
-        self._set_dirty(True)
-        self._save_requested_while_busy = True
-        self._autosave_timer.start()
-        self._refresh_display_completer()
-
-    def _snapshot_working_rows(self) -> list[dict[str, object]]:
-        return [self._normalize_row(row) for row in self._working_rows if self._normalize_row(row)]
-
-    def _perform_parameter_mapping_save(
-        self,
-        snapshot_rows: Sequence[Mapping[str, object]],
-        *,
-        refresh_project_state: bool = False,
-        refresh_runtime_cache: bool = False,
-        report=None,
-    ) -> dict[str, object]:
-        support_refresh_warning = ""
-        saved_rows = be.save_td_repo_parameter_mappings(self._project_dir, snapshot_rows)
-        if refresh_project_state:
-            support_refresher = getattr(be, "refresh_td_parameter_support_workbook", None)
-            if callable(support_refresher):
-                try:
-                    support_refresher(
-                        self._project_dir,
-                        self._workbook_path,
-                        self._db_path,
-                        progress_cb=report,
-                    )
-                except Exception as support_exc:
-                    support_refresh_warning = (
-                        "ProgramRequirements mappings were saved, but the project support workbook could not be refreshed.\n\n"
-                        "Run Update Project to rebuild and consolidate the project rows.\n\n"
-                        f"Details: {support_exc}"
-                    )
-        refresh_warning = ""
-        if refresh_runtime_cache:
-            refresher = getattr(be, "refresh_td_parameter_runtime_cache", None)
-            if callable(refresher):
-                try:
-                    refresher(self._project_dir, self._workbook_path, self._db_path)
-                except Exception as refresh_exc:
-                    invalidator = getattr(be, "invalidate_td_parameter_runtime_cache", None)
-                    if callable(invalidator):
-                        try:
-                            invalidator(self._db_path)
-                        except Exception:
-                            pass
-                    refresh_warning = (
-                        "ProgramRequirements mappings were saved, but the runtime parameter cache could not be refreshed.\n\n"
-                        "Run Update Project before opening Trend / Analyze again.\n\n"
-                        f"Details: {refresh_exc}"
-                    )
-        warning_text = "\n\n".join([text for text in (support_refresh_warning, refresh_warning) if text.strip()])
-        return {
-            "saved_rows": [dict(row) for row in saved_rows],
-            "refresh_warning": warning_text,
-        }
-
-    def _start_background_save(
-        self,
-        *,
-        force: bool = False,
-        refresh_project_state: bool = False,
-        refresh_runtime_cache: bool = False,
-    ) -> None:
-        if refresh_project_state:
-            self._refresh_after_save_requested = True
-        if getattr(self, "_autosave_timer", None) is not None and self._autosave_timer.isActive():
-            self._autosave_timer.stop()
-        if self._save_worker is not None and self._save_worker.isRunning():
-            self._save_requested_while_busy = True
-            return
-        refresh_requested = bool(self._refresh_after_save_requested)
-        runtime_refresh_requested = bool(refresh_runtime_cache or refresh_requested)
-        if not force and not self._dirty and not refresh_requested and not runtime_refresh_requested:
-            return
-        snapshot_rows = self._snapshot_working_rows()
-        self._saving_revision = self._save_revision
-        self._saving_refresh_project_state = refresh_requested
-        self._saving_selected_keys = list(self._current_selected_keys())
-        self._refresh_after_save_requested = False
-        self._save_requested_while_busy = False
-        self._set_save_busy(True)
-        self._save_worker = ProjectTaskWorker(
-            lambda _report, _snapshot=snapshot_rows, _refresh=refresh_requested, _runtime_refresh=runtime_refresh_requested: self._perform_parameter_mapping_save(
-                _snapshot,
-                refresh_project_state=_refresh,
-                refresh_runtime_cache=_runtime_refresh,
-                report=_report,
-            )
-        )
-        self._save_worker.completed.connect(self._handle_background_save_completed)
-        self._save_worker.failed.connect(self._handle_background_save_failed)
-        self._save_worker.start()
-
-    def _handle_background_save_completed(self, payload: object) -> None:
-        self._save_worker = None
-        self._set_save_busy(False)
-        result = dict(payload) if isinstance(payload, Mapping) else {}
-        saved_rows = [
-            self._normalize_row(row)
-            for row in (result.get("saved_rows") or [])
-            if isinstance(row, Mapping)
-        ]
-        saved_rows = [row for row in saved_rows if row]
-        completed_revision = int(self._saving_revision)
-        refresh_requested = bool(self._saving_refresh_project_state)
-        selected_keys = list(self._saving_selected_keys)
-        discard_requested = bool(self._discard_requested)
-        self._discard_requested = False
-        self.saved = True
-        self._saved_revision = max(self._saved_revision, completed_revision)
-        if discard_requested:
-            self._save_requested_while_busy = False
-            self._refresh_after_save_requested = False
-            self._set_dirty(False)
-        else:
-            if completed_revision >= self._save_revision:
-                if saved_rows:
-                    self._working_rows = self._sorted_rows(saved_rows)
-                self._set_dirty(False)
-            else:
-                self._save_requested_while_busy = True
-                self._set_dirty(True)
-        if refresh_requested and not self._dirty and not discard_requested:
-            self._reload_context(select_keys=selected_keys)
-        else:
-            self._refresh_display_completer()
-        refresh_warning = str(result.get("refresh_warning") or "").strip()
-        if refresh_warning and not discard_requested:
-            QtWidgets.QMessageBox.warning(self, "Project Parameters", refresh_warning)
-        if not discard_requested and (self._save_requested_while_busy or self._dirty or self._refresh_after_save_requested):
-            self._autosave_timer.start()
-        if self._close_requested and not self._dirty and self._save_worker is None:
-            self._close_requested = False
-            self._finish_dialog(update_requested=True)
-
-    def _handle_background_save_failed(self, message: str) -> None:
-        self._save_worker = None
-        self._set_save_busy(False)
-        discard_requested = bool(self._discard_requested)
-        self._discard_requested = False
-        self._close_requested = False
-        if discard_requested:
-            self._save_requested_while_busy = False
-            self._refresh_after_save_requested = False
-            self._set_dirty(False)
-            return
-        self._set_dirty(True)
-        self._save_requested_while_busy = True
-        self.update_requested = False
-        QtWidgets.QMessageBox.warning(self, "Project Parameters", str(message or "Unable to save project parameters."))
-
-    def _finish_dialog(self, *, update_requested: bool) -> None:
-        self.update_requested = bool(update_requested)
-        self._allow_direct_close = True
-        if getattr(self, "_autosave_timer", None) is not None and self._autosave_timer.isActive():
-            self._autosave_timer.stop()
-        if update_requested:
-            self.accept()
-        else:
-            self.reject()
-
-    def _discard_and_close(self) -> None:
-        self._close_requested = False
-        self.update_requested = False
-        if getattr(self, "_autosave_timer", None) is not None and self._autosave_timer.isActive():
-            self._autosave_timer.stop()
-        worker_running = self._save_worker is not None and self._save_worker.isRunning()
-        if worker_running:
-            self._discard_requested = True
-            self._save_requested_while_busy = False
-            self._refresh_after_save_requested = False
-            self._set_dirty(False)
-        self._finish_dialog(update_requested=False)
-
-    def _prompt_close_choice(self) -> QtWidgets.QMessageBox.StandardButton:
-        return QtWidgets.QMessageBox.question(
-            self,
-            "Close Project Parameters",
-            "Save changes before closing?\n\n"
-            "Save will close this popup and run Update Project.",
-            QtWidgets.QMessageBox.StandardButton.Save
-            | QtWidgets.QMessageBox.StandardButton.Discard
-            | QtWidgets.QMessageBox.StandardButton.Cancel,
-            QtWidgets.QMessageBox.StandardButton.Save,
-        )
-
-    def _request_close_with_update(self) -> None:
-        if self._has_pending_save_state():
-            self._close_requested = True
-            self._start_background_save(force=True)
-            return
-        self._close_requested = False
-        self._finish_dialog(update_requested=True)
-
-    def _act_close(self) -> None:
-        if self._has_pending_save_state():
-            answer = self._prompt_close_choice()
-            if answer == QtWidgets.QMessageBox.StandardButton.Save:
-                self._request_close_with_update()
-            elif answer == QtWidgets.QMessageBox.StandardButton.Discard:
-                self._discard_and_close()
-            return
-        self._discard_and_close()
-
-    def _act_close_update(self) -> None:
-        self._request_close_with_update()
-
     def _normalize_row(self, row: Mapping[str, object] | None) -> dict[str, object]:
         normalizer = getattr(be, "_td_program_parameter_mapping_normalize", None)
         if callable(normalizer):
@@ -3164,6 +2909,10 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
                     or raw.get("preferred_units_default")
                     or ""
                 ).strip()
+                normalized["edited"] = self._display_text_changed(
+                    normalized.get("displayed_parameter"),
+                    normalized.get("default_display_parameter"),
+                )
                 return normalized
         raw = dict(row or {})
         ingested = str(raw.get("ingested_parameter") or raw.get("raw_name") or "").strip()
@@ -3264,8 +3013,7 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
         merger = getattr(be, "_td_program_parameter_merge_rows", None)
         if callable(merger):
             try:
-                merged = merger(existing_rows, discovered_rows)
-                return self._sorted_rows(merged)
+                return self._sorted_rows(merger(existing_rows, discovered_rows))
             except Exception:
                 pass
         out_by_key: dict[tuple[str, str, str, str], dict[str, object]] = {}
@@ -3311,17 +3059,6 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
                 rows.append(row)
         return rows
 
-    def _working_override_normalization(self) -> dict[str, object] | None:
-        if not self._working_rows:
-            return None
-        builder = getattr(be, "_td_build_repo_parameter_normalization", None)
-        if callable(builder):
-            try:
-                return dict(builder(self._working_rows) or {})
-            except Exception:
-                return None
-        return None
-
     def _inventory_index(self) -> dict[tuple[str, str, str, str], dict[str, object]]:
         out: dict[tuple[str, str, str, str], dict[str, object]] = {}
         for item in (self._context.get("inventory") or []):
@@ -3339,53 +3076,10 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
                 out[key] = dict(item)
         return out
 
-    def _current_selected_keys(self) -> list[tuple[str, str, str, str]]:
-        keys: list[tuple[str, str, str, str]] = []
-        seen: set[tuple[str, str, str, str]] = set()
-        for item in self.tbl.selectedItems():
-            for key in self._coerce_row_keys(item.data(QtCore.Qt.ItemDataRole.UserRole)):
-                if key not in seen:
-                    seen.add(key)
-                    keys.append(key)
-        return keys
-
-    def _selected_rows(self) -> list[dict[str, object]]:
-        rows: list[dict[str, object]] = []
-        wanted = set(self._current_selected_keys())
-        if not wanted:
-            return rows
-        seen: set[tuple[str, str, str, str]] = set()
-        for row in self._display_rows:
-            row_keys = self._coerce_row_keys(row.get("_row_keys"))
-            if not row_keys or not any(key in wanted for key in row_keys):
-                continue
-            identity = row_keys[0]
-            if identity not in seen:
-                seen.add(identity)
-                rows.append(dict(row))
-        return rows
-
-    def _row_units(self, row: Mapping[str, object], inventory_row: Mapping[str, object] | None) -> list[str]:
-        units: list[str] = []
-        preferred = str(row.get("preferred_units") or "").strip()
-        if preferred:
-            units.append(preferred)
-        for value in (dict(inventory_row or {}).get("units") or []):
-            text = str(value or "").strip()
-            if text and text not in units:
-                units.append(text)
-        return units
-
     def _row_has_custom_edits(self, row: Mapping[str, object]) -> bool:
-        displayed = str(row.get("displayed_parameter") or "").strip()
-        default_display = str(row.get("default_display_parameter") or "").strip()
-        preferred_units = str(row.get("preferred_units") or "").strip()
-        default_units = str(row.get("default_preferred_units") or "").strip()
-        return bool(row.get("edited")) or self._row_edit_state(
-            displayed=displayed,
-            default_display=default_display,
-            preferred_units=preferred_units,
-            default_units=default_units,
+        return self._display_text_changed(
+            row.get("displayed_parameter"),
+            row.get("default_display_parameter"),
         )
 
     def _status_text(self, row: Mapping[str, object], inventory_row: Mapping[str, object] | None = None) -> str:
@@ -3402,30 +3096,102 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
             return inv_status.replace("_", " ").title()
         return "Default"
 
-    def _refresh_table(
-        self,
-        *_args,
-        select_keys: Sequence[tuple[str, str, str, str]] | None = None,
-    ) -> None:
-        search = str(self.ed_filter.text() or "").strip().lower()
-        if select_keys is None:
-            wanted_keys = self._current_selected_keys()
+    def _reload_context(self) -> None:
+        self._context = {}
+        loader = getattr(be, "td_load_parameter_runtime_context", None)
+        if callable(loader):
+            try:
+                self._context = dict(loader(self._project_dir, self._db_path) or {})
+            except Exception:
+                self._context = {}
+        if not self._context:
+            builder = getattr(be, "td_build_parameter_normalization_context", None)
+            if callable(builder):
+                self._context = dict(builder(self._project_dir, self._workbook_path, self._db_path) or {})
+        repo_rows = [
+            self._normalize_row(item)
+            for item in (self._context.get("repo_parameter_rows") or [])
+            if isinstance(item, Mapping)
+        ]
+        repo_rows = [row for row in repo_rows if row]
+        self._working_rows = self._merge_rows(repo_rows, self._rows_from_inventory(self._context))
+        self._refresh_display_completer()
+
+    def _set_phase(self, phase: str) -> None:
+        self._phase = phase
+        if phase == self.PHASE_PARAMETERS:
+            self.lbl_title.setText("Project Parameters")
+            self.lbl_hint.setText(
+                "Review every ingested source parameter grouped by program and asset. "
+                "The displayed parameter is the user-facing name the GUI uses for trending, analysis, and mapping. "
+                "Save these names first, then the workflow automatically opens a global units step."
+            )
+            self.ed_filter.setPlaceholderText("Filter programs, assets, ingested names, or displayed names...")
+            self.btn_set_display.show()
+            self.btn_enable.show()
+            self.btn_disable.show()
+            self.btn_reset.show()
+            self.btn_set_units.hide()
         else:
-            wanted_keys = [
-                coerced
-                for key in select_keys
-                for coerced in [self._coerce_row_key(key)]
-                if coerced is not None
-            ]
+            self.lbl_title.setText("Parameter Units")
+            self.lbl_hint.setText(
+                "Edit units globally by displayed parameter. "
+                "Each row merges all extracted names and programs that currently share the same displayed parameter. "
+                "Saving this step mirrors the units into ProgramRequirements and then runs Update Project."
+            )
+            self.ed_filter.setPlaceholderText("Filter displayed parameters, extracted names, or programs...")
+            self.btn_set_display.hide()
+            self.btn_enable.hide()
+            self.btn_disable.hide()
+            self.btn_reset.hide()
+            self.btn_set_units.show()
+        self._set_dirty(False)
+        self._refresh_table()
+
+    def _current_selected_phase1_keys(self) -> list[tuple[str, str, str, str]]:
+        keys: list[tuple[str, str, str, str]] = []
+        seen: set[tuple[str, str, str, str]] = set()
+        for item in self.tbl.selectedItems():
+            for key in self._coerce_row_keys(item.data(QtCore.Qt.ItemDataRole.UserRole)):
+                if key not in seen:
+                    seen.add(key)
+                    keys.append(key)
+        return keys
+
+    def _current_selected_phase2_ids(self) -> list[str]:
+        values: list[str] = []
+        seen: set[str] = set()
+        for item in self.tbl.selectedItems():
+            text = str(item.data(QtCore.Qt.ItemDataRole.UserRole) or "").strip()
+            if text and text not in seen:
+                seen.add(text)
+                values.append(text)
+        return values
+
+    def _selected_rows(self) -> list[dict[str, object]]:
+        if self._phase == self.PHASE_PARAMETERS:
+            wanted = set(self._current_selected_phase1_keys())
+            rows: list[dict[str, object]] = []
+            seen: set[tuple[str, str, str, str]] = set()
+            for row in self._display_rows:
+                row_keys = self._coerce_row_keys(row.get("_row_keys"))
+                if not row_keys or not any(key in wanted for key in row_keys):
+                    continue
+                identity = row_keys[0]
+                if identity not in seen:
+                    seen.add(identity)
+                    rows.append(dict(row))
+            return rows
+        wanted_ids = set(self._current_selected_phase2_ids())
+        return [dict(row) for row in self._display_rows if str(row.get("canonical_id") or "").strip() in wanted_ids]
+
+    def _build_phase1_rows(self, search: str) -> list[dict[str, object]]:
         inventory_index = self._inventory_index()
-        grouped_rows: dict[tuple[str, str, str, str, str, str], dict[str, object]] = {}
+        grouped_rows: dict[tuple[str, str, str, str, str], dict[str, object]] = {}
         for row in self._working_rows:
             row_key = self._row_key(row)
             inventory_row = inventory_index.get(row_key) or {}
-            source_count = int(inventory_row.get("source_count") or 0)
-            if source_count <= 0:
-                continue
-            units = self._row_units(row, inventory_row)
+            source_count = max(1, int(inventory_row.get("source_count") or 0))
             status_text = self._status_text(row, inventory_row)
             group_key = (
                 self._norm_name(row.get("asset_type")),
@@ -3433,15 +3199,12 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
                 self._norm_name(row.get("ingested_parameter")),
                 self._norm_name(row.get("default_display_parameter")),
                 self._norm_name(row.get("displayed_parameter")),
-                self._units_text(row.get("preferred_units")),
             )
             display_row = grouped_rows.get(group_key)
             if display_row is None:
                 display_row = {
-                    "_key": row_key,
                     "_row_keys": [row_key],
                     "_program_titles_set": set(),
-                    "_units_set": set(),
                     "_enabled_values": set(),
                     "_source_run_names_set": set(),
                     "_surfaces_set": set(),
@@ -3454,18 +3217,13 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
                     "ingested_parameter": str(row.get("ingested_parameter") or "").strip(),
                     "default_display_parameter": str(row.get("default_display_parameter") or "").strip(),
                     "displayed_parameter": str(row.get("displayed_parameter") or "").strip(),
-                    "preferred_units": str(row.get("preferred_units") or "").strip(),
-                    "default_preferred_units": str(row.get("default_preferred_units") or "").strip(),
                     "enabled": bool(row.get("enabled", True)),
                     "enabled_text": "Yes" if bool(row.get("enabled", True)) else "No",
-                    "units": [],
                     "status_text": status_text,
-                    "edited": False,
                     "source_run_names": [],
                     "surfaces": [],
                     "run_names": [],
                     "source_count": 0,
-                    "program_count": 0,
                 }
                 grouped_rows[group_key] = display_row
             else:
@@ -3473,9 +3231,6 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
             program_title = str(row.get("program_title") or "").strip()
             if program_title:
                 cast(set[str], display_row["_program_titles_set"]).add(program_title)
-            for value in units:
-                if str(value).strip():
-                    cast(set[str], display_row["_units_set"]).add(str(value).strip())
             for value in (inventory_row.get("source_run_names") or []):
                 text = str(value).strip()
                 if text:
@@ -3490,13 +3245,11 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
                     cast(set[str], display_row["_run_names_set"]).add(text)
             cast(set[bool], display_row["_enabled_values"]).add(bool(row.get("enabled", True)))
             cast(set[str], display_row["_status_values"]).add(status_text)
-            display_row["edited"] = bool(display_row.get("edited")) or status_text == "Edited"
             display_row["source_count"] = int(display_row.get("source_count") or 0) + source_count
 
         rows: list[dict[str, object]] = []
         for display_row in grouped_rows.values():
             program_titles = sorted(cast(set[str], display_row.pop("_program_titles_set", set())), key=str.casefold)
-            units = sorted(cast(set[str], display_row.pop("_units_set", set())), key=str.casefold)
             enabled_values = cast(set[bool], display_row.pop("_enabled_values", set()))
             source_run_names = sorted(cast(set[str], display_row.pop("_source_run_names_set", set())), key=str.casefold)
             surfaces = sorted(cast(set[str], display_row.pop("_surfaces_set", set())), key=str.casefold)
@@ -3511,14 +3264,12 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
                 status_text = "Default"
             display_row["program_titles"] = program_titles
             display_row["program_title"] = ", ".join(program_titles)
-            display_row["units"] = units
             display_row["enabled"] = True if enabled_values == {True} else False if enabled_values == {False} else None
             display_row["enabled_text"] = "Yes" if enabled_values == {True} else "No" if enabled_values == {False} else "Mixed"
             display_row["source_run_names"] = source_run_names
             display_row["surfaces"] = surfaces
             display_row["run_names"] = run_names
             display_row["status_text"] = status_text
-            display_row["program_count"] = len(program_titles)
             search_blob = "\n".join(
                 [
                     str(display_row.get("program_title") or ""),
@@ -3527,7 +3278,6 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
                     str(display_row.get("ingested_parameter") or ""),
                     str(display_row.get("displayed_parameter") or ""),
                     str(display_row.get("enabled_text") or ""),
-                    " ".join(units),
                 ]
             ).lower()
             if search and search not in search_blob:
@@ -3542,162 +3292,210 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
                 str(item.get("displayed_parameter") or "").casefold(),
             )
         )
-        self._display_rows = rows
+        return rows
+
+    def _build_phase2_rows(self, search: str) -> list[dict[str, object]]:
+        rows = [dict(row) for row in (self._phase2_rows or [])]
+        out: list[dict[str, object]] = []
+        for row in rows:
+            search_blob = "\n".join(
+                [
+                    str(row.get("displayed_parameter") or ""),
+                    str(row.get("raw_names_text") or ""),
+                    str(row.get("program_titles_text") or ""),
+                    str(row.get("preferred_units") or ""),
+                    ", ".join([str(value).strip() for value in (row.get("source_units") or []) if str(value).strip()]),
+                ]
+            ).lower()
+            if search and search not in search_blob:
+                continue
+            out.append(row)
+        return out
+
+    def _refresh_table(self, *_args) -> None:
+        search = str(self.ed_filter.text() or "").strip().lower()
+        self._display_rows = self._build_phase1_rows(search) if self._phase == self.PHASE_PARAMETERS else self._build_phase2_rows(search)
         self._table_refreshing = True
         try:
-            self.tbl.setRowCount(len(rows))
-            for row_idx, row in enumerate(rows):
-                values = [
-                    str(row.get("program_title") or "").strip() or "-",
-                    str(row.get("asset_type") or "").strip() or "-",
-                    str(row.get("asset_specific_type") or "").strip() or "-",
-                    str(row.get("ingested_parameter") or "").strip(),
-                    str(row.get("displayed_parameter") or "").strip(),
-                    ", ".join([str(value).strip() for value in (row.get("units") or []) if str(value).strip()]) or "-",
-                    str(row.get("enabled_text") or "").strip() or "-",
-                    str(row.get("status_text") or "").strip(),
-                ]
+            if self._phase == self.PHASE_PARAMETERS:
+                self.tbl.setColumnCount(len(self.PHASE1_COLS))
+                self.tbl.setHorizontalHeaderLabels(self.PHASE1_COLS)
+            else:
+                self.tbl.setColumnCount(len(self.PHASE2_COLS))
+                self.tbl.setHorizontalHeaderLabels(self.PHASE2_COLS)
+            self.tbl.setRowCount(len(self._display_rows))
+            for row_idx, row in enumerate(self._display_rows):
+                if self._phase == self.PHASE_PARAMETERS:
+                    values = [
+                        str(row.get("program_title") or "").strip() or "-",
+                        str(row.get("asset_type") or "").strip() or "-",
+                        str(row.get("asset_specific_type") or "").strip() or "-",
+                        str(row.get("ingested_parameter") or "").strip(),
+                        str(row.get("displayed_parameter") or "").strip(),
+                        str(row.get("enabled_text") or "").strip() or "-",
+                        str(row.get("status_text") or "").strip(),
+                    ]
+                    row_value = row.get("_row_keys")
+                else:
+                    values = [
+                        str(row.get("displayed_parameter") or "").strip(),
+                        str(row.get("raw_names_text") or "").strip(),
+                        str(row.get("program_titles_text") or "").strip() or "-",
+                        str(row.get("preferred_units") or "").strip(),
+                    ]
+                    row_value = str(row.get("canonical_id") or "").strip()
                 for col_idx, value in enumerate(values):
                     item = QtWidgets.QTableWidgetItem(value)
-                    item.setData(QtCore.Qt.ItemDataRole.UserRole, row.get("_row_keys"))
-                    tooltip_lines = [
-                        f"Programs: {str(row.get('program_title') or '').strip() or '-'}",
-                        f"Asset: {str(row.get('asset_type') or '').strip() or '-'}",
-                        f"Specific: {str(row.get('asset_specific_type') or '').strip() or '-'}",
-                        f"Ingested: {str(row.get('ingested_parameter') or '').strip()}",
-                        f"Displayed: {str(row.get('displayed_parameter') or '').strip()}",
-                        f"Enabled: {str(row.get('enabled_text') or '').strip() or '-'}",
-                        f"Member Rows: {len(self._coerce_row_keys(row.get('_row_keys')))}",
-                    ]
-                    item.setToolTip("\n".join(tooltip_lines))
-                    if col_idx == self.COL_ENABLED:
-                        item.setFlags(
-                            (item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
-                            & ~QtCore.Qt.ItemFlag.ItemIsEditable
+                    item.setData(QtCore.Qt.ItemDataRole.UserRole, row_value)
+                    if self._phase == self.PHASE_PARAMETERS:
+                        item.setToolTip(
+                            "\n".join(
+                                [
+                                    f"Programs: {str(row.get('program_title') or '').strip() or '-'}",
+                                    f"Asset: {str(row.get('asset_type') or '').strip() or '-'}",
+                                    f"Specific: {str(row.get('asset_specific_type') or '').strip() or '-'}",
+                                    f"Ingested: {str(row.get('ingested_parameter') or '').strip()}",
+                                    f"Displayed: {str(row.get('displayed_parameter') or '').strip()}",
+                                    f"Enabled: {str(row.get('enabled_text') or '').strip() or '-'}",
+                                    f"Member Rows: {len(self._coerce_row_keys(row.get('_row_keys')))}",
+                                ]
+                            )
                         )
-                        enabled_value = row.get("enabled")
-                        if enabled_value is True:
-                            item.setCheckState(QtCore.Qt.CheckState.Checked)
-                        elif enabled_value is False:
-                            item.setCheckState(QtCore.Qt.CheckState.Unchecked)
+                        if col_idx == self.COL_ENABLED:
+                            item.setFlags(
+                                (item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+                                & ~QtCore.Qt.ItemFlag.ItemIsEditable
+                            )
+                            enabled_value = row.get("enabled")
+                            if enabled_value is True:
+                                item.setCheckState(QtCore.Qt.CheckState.Checked)
+                            elif enabled_value is False:
+                                item.setCheckState(QtCore.Qt.CheckState.Unchecked)
+                            else:
+                                item.setCheckState(QtCore.Qt.CheckState.PartiallyChecked)
+                        elif col_idx == self.COL_DISPLAYED:
+                            item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsEditable)
                         else:
-                            item.setCheckState(QtCore.Qt.CheckState.PartiallyChecked)
-                    elif col_idx in (self.COL_DISPLAYED, self.COL_UNITS):
-                        item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsEditable)
+                            item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
                     else:
-                        item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+                        source_units = ", ".join([str(value).strip() for value in (row.get("source_units") or []) if str(value).strip()]) or "-"
+                        item.setToolTip(
+                            "\n".join(
+                                [
+                                    f"Displayed Parameter: {str(row.get('displayed_parameter') or '').strip()}",
+                                    f"Extracted Names: {str(row.get('raw_names_text') or '').strip() or '-'}",
+                                    f"Programs: {str(row.get('program_titles_text') or '').strip() or '-'}",
+                                    f"Observed Units: {source_units}",
+                                    f"Units Conflict: {'Yes' if bool(row.get('unit_conflict')) else 'No'}",
+                                ]
+                            )
+                        )
+                        if col_idx == self.UNIT_COL_UNITS:
+                            item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsEditable)
+                        else:
+                            item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
                     self.tbl.setItem(row_idx, col_idx, item)
             try:
                 self.tbl.resizeColumnsToContents()
-                self.tbl.horizontalHeader().setSectionResizeMode(self.COL_DISPLAYED, QtWidgets.QHeaderView.ResizeMode.Stretch)
-                self.tbl.horizontalHeader().setSectionResizeMode(self.COL_UNITS, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
-                self.tbl.horizontalHeader().setSectionResizeMode(self.COL_ENABLED, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
-                self.tbl.horizontalHeader().setSectionResizeMode(self.COL_STATUS, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+                if self._phase == self.PHASE_PARAMETERS:
+                    self.tbl.horizontalHeader().setSectionResizeMode(self.COL_DISPLAYED, QtWidgets.QHeaderView.ResizeMode.Stretch)
+                    self.tbl.horizontalHeader().setSectionResizeMode(self.COL_ENABLED, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+                    self.tbl.horizontalHeader().setSectionResizeMode(self.COL_STATUS, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+                else:
+                    self.tbl.horizontalHeader().setSectionResizeMode(self.UNIT_COL_DISPLAYED, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+                    self.tbl.horizontalHeader().setSectionResizeMode(self.UNIT_COL_RAW_NAMES, QtWidgets.QHeaderView.ResizeMode.Stretch)
+                    self.tbl.horizontalHeader().setSectionResizeMode(self.UNIT_COL_PROGRAMS, QtWidgets.QHeaderView.ResizeMode.Stretch)
+                    self.tbl.horizontalHeader().setSectionResizeMode(self.UNIT_COL_UNITS, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
             except Exception:
                 pass
         finally:
             self._table_refreshing = False
-        if wanted_keys:
-            self.tbl.clearSelection()
-            wanted = {key for key in wanted_keys}
-            for row_idx, row in enumerate(self._display_rows):
-                if any(key in wanted for key in self._coerce_row_keys(row.get("_row_keys"))):
-                    self.tbl.selectRow(row_idx)
         self._sync_selection()
 
     def _sync_selection(self) -> None:
         rows = self._selected_rows()
         count = len(rows)
-        edited_count = len([row for row in self._working_rows if self._row_has_custom_edits(row)])
-        disabled_count = len([row for row in self._working_rows if not bool(row.get("enabled", True))])
-        self.lbl_summary.setText(
-            f"Rows: {len(self._display_rows)} | Source Rows: {len(self._working_rows)} | Edited: {edited_count} | Disabled: {disabled_count} | Selected: {count}"
-        )
-        if not rows:
-            self.detail.setPlainText(
-                "Select one or more parameter rows to inspect their program scope, enabled state, ingested name, displayed parameter, and units. "
-                "Unit edits apply everywhere the exact displayed parameter is used."
+        if self._phase == self.PHASE_PARAMETERS:
+            edited_count = len([row for row in self._working_rows if self._row_has_custom_edits(row)])
+            disabled_count = len([row for row in self._working_rows if not bool(row.get("enabled", True))])
+            self.lbl_summary.setText(
+                f"Rows: {len(self._display_rows)} | Source Rows: {len(self._working_rows)} | Edited: {edited_count} | Disabled: {disabled_count} | Selected: {count}"
             )
-        elif count == 1:
-            row = rows[0]
-            lines = [
-                f"Programs: {str(row.get('program_title') or '').strip() or '-'}",
-                f"Asset: {str(row.get('asset_type') or '').strip() or '-'}",
-                f"Specific: {str(row.get('asset_specific_type') or '').strip() or '-'}",
-                f"Ingested Parameter: {str(row.get('ingested_parameter') or '').strip()}",
-                f"Displayed Parameter: {str(row.get('displayed_parameter') or '').strip() or '-'}",
-                f"Enabled: {str(row.get('enabled_text') or '').strip() or '-'}",
-                f"Preferred Units: {str(row.get('preferred_units') or '').strip() or '-'}",
-                f"Units: {', '.join([str(value).strip() for value in (row.get('units') or []) if str(value).strip()]) or '-'}",
-                f"Surfaces: {', '.join([str(value).strip() for value in (row.get('surfaces') or []) if str(value).strip()]) or '-'}",
-                f"Source Runs: {', '.join([str(value).strip() for value in (row.get('source_run_names') or []) if str(value).strip()][:12]) or '-'}",
-                f"Observed Sources: {int(row.get('source_count') or 0)}",
-                f"Member Rows: {len(self._coerce_row_keys(row.get('_row_keys')))}",
-                "Units Scope: Editing units applies to every row with this exact displayed parameter.",
-                f"Status: {str(row.get('status_text') or '').strip() or '-'}",
-            ]
-            self.detail.setPlainText("\n".join(lines))
-        else:
-            ingested = [str(row.get("ingested_parameter") or "").strip() for row in rows if str(row.get("ingested_parameter") or "").strip()]
-            displayed = sorted(
-                {
-                    str(row.get("displayed_parameter") or "").strip()
-                    for row in rows
-                    if str(row.get("displayed_parameter") or "").strip()
-                },
-                key=str.casefold,
-            )
-            self.detail.setPlainText(
-                "\n".join(
-                    [
-                        f"Selected Rows: {len(rows)}",
-                        f"Programs: {', '.join(sorted({str(value).strip() for row in rows for value in (row.get('program_titles') or []) if str(value).strip()}, key=str.casefold)) or '-'}",
-                        f"Enabled: {len([row for row in rows if row.get('enabled') is True])} enabled, {len([row for row in rows if row.get('enabled') is False])} disabled",
-                        f"Ingested Parameters: {', '.join(ingested)}",
-                        f"Displayed Parameters: {', '.join(displayed) or '-'}",
-                        "Set Units applies to every working row that shares the same exact displayed parameter as the selected rows.",
-                        "Use Set Display, Set Units, Enable Selected, or Disable Selected to apply the same values to every selected member row.",
-                    ]
+            if not rows:
+                self.detail.setPlainText(
+                    "Select one or more parameter rows to inspect their program scope, enabled state, ingested name, and displayed parameter."
                 )
-            )
-        self.btn_set_display.setEnabled(count >= 1)
-        self.btn_set_units.setEnabled(count >= 1)
-        self.btn_enable.setEnabled(count >= 1)
-        self.btn_disable.setEnabled(count >= 1)
-        self.btn_reset.setEnabled(count >= 1)
-
-    def _reload_context(self, *, select_keys: Sequence[tuple[str, str, str, str]] | None = None) -> None:
-        override = self._working_override_normalization()
-        self._context = {}
-        if override is None:
-            loader = getattr(be, "td_load_parameter_runtime_context", None)
-            if callable(loader):
-                try:
-                    self._context = dict(loader(self._project_dir, self._db_path) or {})
-                except Exception:
-                    self._context = {}
-        if not self._context:
-            builder = getattr(be, "td_build_parameter_normalization_context", None)
-            if callable(builder):
-                self._context = dict(
-                    builder(
-                        self._project_dir,
-                        self._workbook_path,
-                        self._db_path,
-                        normalization_override=override,
+            elif count == 1:
+                row = rows[0]
+                self.detail.setPlainText(
+                    "\n".join(
+                        [
+                            f"Programs: {str(row.get('program_title') or '').strip() or '-'}",
+                            f"Asset: {str(row.get('asset_type') or '').strip() or '-'}",
+                            f"Specific: {str(row.get('asset_specific_type') or '').strip() or '-'}",
+                            f"Ingested Parameter: {str(row.get('ingested_parameter') or '').strip()}",
+                            f"Displayed Parameter: {str(row.get('displayed_parameter') or '').strip() or '-'}",
+                            f"Enabled: {str(row.get('enabled_text') or '').strip() or '-'}",
+                            f"Observed Sources: {int(row.get('source_count') or 0)}",
+                            f"Member Rows: {len(self._coerce_row_keys(row.get('_row_keys')))}",
+                            f"Status: {str(row.get('status_text') or '').strip() or '-'}",
+                        ]
                     )
-                    or {}
                 )
-        repo_rows = [
-            self._normalize_row(item)
-            for item in (self._context.get("repo_parameter_rows") or [])
-            if isinstance(item, Mapping)
-        ]
-        repo_rows = [row for row in repo_rows if row]
-        discovered_rows = self._rows_from_inventory(self._context)
-        self._working_rows = self._merge_rows(self._working_rows or repo_rows, discovered_rows)
-        self._refresh_table(select_keys=select_keys)
-        self._refresh_display_completer()
+            else:
+                self.detail.setPlainText(
+                    "\n".join(
+                        [
+                            f"Selected Rows: {len(rows)}",
+                            f"Programs: {', '.join(sorted({str(value).strip() for row in rows for value in (row.get('program_titles') or []) if str(value).strip()}, key=str.casefold)) or '-'}",
+                            f"Displayed Parameters: {', '.join(sorted({str(row.get('displayed_parameter') or '').strip() for row in rows if str(row.get('displayed_parameter') or '').strip()}, key=str.casefold)) or '-'}",
+                            "Use Set Display, Enable Selected, Disable Selected, or Reset Selected to update all selected member rows.",
+                        ]
+                    )
+                )
+            self.btn_set_display.setEnabled(count >= 1)
+            self.btn_set_units.setEnabled(False)
+            self.btn_enable.setEnabled(count >= 1)
+            self.btn_disable.setEnabled(count >= 1)
+            self.btn_reset.setEnabled(count >= 1)
+        else:
+            self.lbl_summary.setText(
+                f"Rows: {len(self._display_rows)} | Global Unit Rows: {len(self._phase2_rows)} | Selected: {count}"
+            )
+            if not rows:
+                self.detail.setPlainText(
+                    "Select one or more displayed parameters to inspect the merged extracted names, programs, and source units. "
+                    "Editing units here applies globally to that displayed parameter."
+                )
+            elif count == 1:
+                row = rows[0]
+                self.detail.setPlainText(
+                    "\n".join(
+                        [
+                            f"Displayed Parameter: {str(row.get('displayed_parameter') or '').strip()}",
+                            f"Extracted Names: {str(row.get('raw_names_text') or '').strip() or '-'}",
+                            f"Programs: {str(row.get('program_titles_text') or '').strip() or '-'}",
+                            f"Observed Units: {', '.join([str(value).strip() for value in (row.get('source_units') or []) if str(value).strip()]) or '-'}",
+                            f"Preferred Units: {str(row.get('preferred_units') or '').strip() or '-'}",
+                            f"Units Conflict: {'Yes' if bool(row.get('unit_conflict')) else 'No'}",
+                        ]
+                    )
+                )
+            else:
+                self.detail.setPlainText(
+                    "\n".join(
+                        [
+                            f"Selected Rows: {len(rows)}",
+                            f"Displayed Parameters: {', '.join([str(row.get('displayed_parameter') or '').strip() for row in rows if str(row.get('displayed_parameter') or '').strip()]) or '-'}",
+                            "Use Set Units or edit the Units cells directly to assign one global unit per displayed parameter.",
+                        ]
+                    )
+                )
+            self.btn_set_display.setEnabled(False)
+            self.btn_set_units.setEnabled(count >= 1)
+            self.btn_enable.setEnabled(False)
+            self.btn_disable.setEnabled(False)
+            self.btn_reset.setEnabled(False)
 
     def _prompt_text(self, *, title: str, prompt: str, default: str, allow_empty: bool = False) -> str | None:
         text, ok = QtWidgets.QInputDialog.getText(self, title, prompt, text=str(default or "").strip())
@@ -3714,46 +3512,6 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
     def _prompt_units(self, *, title: str, prompt: str, default: str) -> str | None:
         return self._prompt_text(title=title, prompt=prompt, default=default, allow_empty=True)
 
-    def _display_name_scope_keys(
-        self,
-        row_keys: Sequence[tuple[str, str, str, str]],
-    ) -> list[tuple[str, str, str, str]]:
-        wanted = {tuple(key) for key in row_keys if isinstance(key, tuple) and len(key) == 4}
-        if not wanted:
-            return []
-        selected_display_names: set[str] = set()
-        for raw_row in self._working_rows:
-            row = self._normalize_row(raw_row)
-            key = self._row_key(row)
-            if key not in wanted:
-                continue
-            display_name = (
-                str(row.get("displayed_parameter") or "").strip()
-                or str(row.get("default_display_parameter") or "").strip()
-                or str(row.get("ingested_parameter") or "").strip()
-            )
-            norm_display = self._norm_name(display_name)
-            if norm_display:
-                selected_display_names.add(norm_display)
-        if not selected_display_names:
-            return list(wanted)
-        expanded: list[tuple[str, str, str, str]] = []
-        seen: set[tuple[str, str, str, str]] = set()
-        for raw_row in self._working_rows:
-            row = self._normalize_row(raw_row)
-            display_name = (
-                str(row.get("displayed_parameter") or "").strip()
-                or str(row.get("default_display_parameter") or "").strip()
-                or str(row.get("ingested_parameter") or "").strip()
-            )
-            if self._norm_name(display_name) not in selected_display_names:
-                continue
-            key = self._row_key(row)
-            if key not in seen:
-                seen.add(key)
-                expanded.append(key)
-        return expanded
-
     def _apply_display_value(
         self,
         *,
@@ -3766,79 +3524,26 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
             return
         updated_rows: list[dict[str, object]] = []
         changed = False
-        timestamp = self._timestamp_text()
         for raw_row in self._working_rows:
             row = self._normalize_row(raw_row)
             key = self._row_key(row)
             if key in wanted:
                 default_display = str(row.get("default_display_parameter") or row.get("ingested_parameter") or "").strip()
-                default_units = str(row.get("default_preferred_units") or "").strip()
-                current_units = str(row.get("preferred_units") or "").strip()
                 next_display = default_display if reset else str(display_name or "").strip()
                 if not next_display:
                     next_display = default_display
-                edited = self._row_edit_state(
-                    displayed=next_display,
-                    default_display=default_display,
-                    preferred_units=current_units,
-                    default_units=default_units,
-                )
-                if (
-                    str(row.get("displayed_parameter") or "").strip() != next_display
-                    or bool(row.get("edited")) != edited
-                ):
+                edited = self._display_text_changed(next_display, default_display)
+                if str(row.get("displayed_parameter") or "").strip() != next_display or bool(row.get("edited")) != edited:
                     changed = True
                 row["displayed_parameter"] = next_display
                 row["edited"] = edited
-                row["updated_at"] = timestamp if edited else ""
             updated_rows.append(row)
         if not changed:
             return
         self._working_rows = self._sorted_rows(updated_rows)
-        self._mark_local_change()
-        self._refresh_table(select_keys=list(wanted))
-
-    def _apply_units_value(
-        self,
-        *,
-        row_keys: Sequence[tuple[str, str, str, str]],
-        units_text: str,
-    ) -> None:
-        wanted = {
-            tuple(key)
-            for key in self._display_name_scope_keys(row_keys)
-            if isinstance(key, tuple) and len(key) == 4
-        }
-        if not wanted:
-            return
-        updated_rows: list[dict[str, object]] = []
-        changed = False
-        timestamp = self._timestamp_text()
-        for raw_row in self._working_rows:
-            row = self._normalize_row(raw_row)
-            key = self._row_key(row)
-            if key in wanted:
-                next_units = str(units_text or "").strip()
-                default_display = str(row.get("default_display_parameter") or row.get("ingested_parameter") or "").strip()
-                default_units = str(row.get("default_preferred_units") or "").strip()
-                displayed = str(row.get("displayed_parameter") or default_display).strip() or default_display
-                edited = self._row_edit_state(
-                    displayed=displayed,
-                    default_display=default_display,
-                    preferred_units=next_units,
-                    default_units=default_units,
-                )
-                if str(row.get("preferred_units") or "").strip() != next_units or bool(row.get("edited")) != edited:
-                    changed = True
-                row["preferred_units"] = next_units
-                row["edited"] = edited
-                row["updated_at"] = timestamp if edited else ""
-            updated_rows.append(row)
-        if not changed:
-            return
-        self._working_rows = self._sorted_rows(updated_rows)
-        self._mark_local_change()
-        self._refresh_table(select_keys=list(wanted))
+        self._set_dirty(True)
+        self._refresh_display_completer()
+        self._refresh_table()
 
     def _apply_enabled_value(
         self,
@@ -3861,12 +3566,38 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
         if not changed:
             return
         self._working_rows = self._sorted_rows(updated_rows)
-        self._mark_local_change()
-        self._refresh_table(select_keys=list(wanted))
+        self._set_dirty(True)
+        self._refresh_table()
+
+    def _apply_phase2_units_value(self, *, canonical_ids: Sequence[str], units_text: str) -> None:
+        wanted = {str(value or "").strip() for value in canonical_ids if str(value or "").strip()}
+        if not wanted:
+            return
+        next_rows: list[dict[str, object]] = []
+        changed = False
+        for raw_row in self._phase2_rows:
+            row = dict(raw_row)
+            canonical_id = str(row.get("canonical_id") or "").strip()
+            if canonical_id in wanted:
+                next_units = str(units_text or "").strip()
+                if str(row.get("preferred_units") or "").strip() != next_units:
+                    row["preferred_units"] = next_units
+                    conflict_helper = getattr(be, "_td_parameter_group_has_conflict", None)
+                    if callable(conflict_helper):
+                        row["unit_conflict"] = bool(conflict_helper(row.get("source_units") or [], next_units))
+                    else:
+                        row["unit_conflict"] = False
+                    changed = True
+            next_rows.append(row)
+        if not changed:
+            return
+        self._phase2_rows = next_rows
+        self._set_dirty(True)
+        self._refresh_table()
 
     def _act_set_display_name(self) -> None:
         rows = self._selected_rows()
-        if not rows:
+        if not rows or self._phase != self.PHASE_PARAMETERS:
             return
         default_name = (
             str(rows[0].get("displayed_parameter") or "").strip()
@@ -3881,17 +3612,13 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
         if not display_name:
             return
         self._apply_display_value(
-            row_keys=[
-                key
-                for row in rows
-                for key in self._coerce_row_keys(row.get("_row_keys"))
-            ],
+            row_keys=[key for row in rows for key in self._coerce_row_keys(row.get("_row_keys"))],
             display_name=display_name,
         )
 
     def _act_set_units(self) -> None:
         rows = self._selected_rows()
-        if not rows:
+        if not rows or self._phase != self.PHASE_UNITS:
             return
         default_units = str(rows[0].get("preferred_units") or "").strip()
         units_text = self._prompt_units(
@@ -3901,42 +3628,32 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
         )
         if units_text is None:
             return
-        row_keys = [
-            key
-            for row in rows
-            for key in self._coerce_row_keys(row.get("_row_keys"))
-        ]
-        self._apply_units_value(row_keys=row_keys, units_text=units_text)
+        self._apply_phase2_units_value(
+            canonical_ids=[str(row.get("canonical_id") or "").strip() for row in rows],
+            units_text=units_text,
+        )
 
     def _act_enable_rows(self) -> None:
         rows = self._selected_rows()
-        if not rows:
+        if not rows or self._phase != self.PHASE_PARAMETERS:
             return
         self._apply_enabled_value(
-            row_keys=[
-                key
-                for row in rows
-                for key in self._coerce_row_keys(row.get("_row_keys"))
-            ],
+            row_keys=[key for row in rows for key in self._coerce_row_keys(row.get("_row_keys"))],
             enabled=True,
         )
 
     def _act_disable_rows(self) -> None:
         rows = self._selected_rows()
-        if not rows:
+        if not rows or self._phase != self.PHASE_PARAMETERS:
             return
         self._apply_enabled_value(
-            row_keys=[
-                key
-                for row in rows
-                for key in self._coerce_row_keys(row.get("_row_keys"))
-            ],
+            row_keys=[key for row in rows for key in self._coerce_row_keys(row.get("_row_keys"))],
             enabled=False,
         )
 
     def _act_reset_rows(self) -> None:
         rows = self._selected_rows()
-        if not rows:
+        if not rows or self._phase != self.PHASE_PARAMETERS:
             return
         answer = QtWidgets.QMessageBox.question(
             self,
@@ -3946,35 +3663,164 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
         if answer != QtWidgets.QMessageBox.StandardButton.Yes:
             return
         self._apply_display_value(
-            row_keys=[
-                key
-                for row in rows
-                for key in self._coerce_row_keys(row.get("_row_keys"))
-            ],
+            row_keys=[key for row in rows for key in self._coerce_row_keys(row.get("_row_keys"))],
             reset=True,
         )
 
     def _on_item_changed(self, item: QtWidgets.QTableWidgetItem) -> None:
-        if self._table_refreshing or item is None or item.column() not in (self.COL_DISPLAYED, self.COL_UNITS, self.COL_ENABLED):
+        if self._table_refreshing or item is None:
             return
-        row_keys = self._coerce_row_keys(item.data(QtCore.Qt.ItemDataRole.UserRole))
-        if not row_keys:
+        if self._phase == self.PHASE_PARAMETERS:
+            if item.column() not in (self.COL_DISPLAYED, self.COL_ENABLED):
+                return
+            row_keys = self._coerce_row_keys(item.data(QtCore.Qt.ItemDataRole.UserRole))
+            if not row_keys:
+                return
+            if item.column() == self.COL_ENABLED:
+                self._apply_enabled_value(
+                    row_keys=row_keys,
+                    enabled=item.checkState() != QtCore.Qt.CheckState.Unchecked,
+                )
+                return
+            self._apply_display_value(row_keys=row_keys, display_name=str(item.text() or "").strip())
             return
-        if item.column() == self.COL_ENABLED:
-            self._apply_enabled_value(
-                row_keys=row_keys,
-                enabled=item.checkState() != QtCore.Qt.CheckState.Unchecked,
+        if item.column() != self.UNIT_COL_UNITS:
+            return
+        canonical_id = str(item.data(QtCore.Qt.ItemDataRole.UserRole) or "").strip()
+        if not canonical_id:
+            return
+        self._apply_phase2_units_value(canonical_ids=[canonical_id], units_text=str(item.text() or "").strip())
+
+    def _snapshot_working_rows(self) -> list[dict[str, object]]:
+        return [self._normalize_row(row) for row in self._working_rows if self._normalize_row(row)]
+
+    def _perform_phase1_save(self, report) -> dict[str, object]:
+        snapshot_rows = self._snapshot_working_rows()
+        report("Saving ProgramRequirements parameter mappings")
+        saved_rows = be.save_td_repo_parameter_mappings(self._project_dir, snapshot_rows)
+        rebuild_units = getattr(be, "td_rebuild_project_parameter_units_catalog", None)
+        if callable(rebuild_units):
+            report("Rebuilding project-global units catalog")
+            rebuild_units(self._project_dir, saved_rows)
+        build_units_rows = getattr(be, "td_build_project_parameter_units_rows", None)
+        report("Preparing global units list")
+        phase2_rows = (
+            build_units_rows(self._project_dir, saved_rows, self._context)
+            if callable(build_units_rows)
+            else []
+        )
+        return {
+            "saved_rows": [dict(row) for row in saved_rows],
+            "phase2_rows": [dict(row) for row in (phase2_rows or []) if isinstance(row, Mapping)],
+        }
+
+    def _perform_phase2_save(self, report) -> dict[str, object]:
+        saver = getattr(be, "td_save_project_parameter_units", None)
+        if not callable(saver):
+            raise RuntimeError("Unable to save project parameter units.")
+        report("Saving global parameter units")
+        return dict(saver(self._project_dir, self._working_rows, self._phase2_rows) or {})
+
+    def _begin_save(self, *, mode: str) -> None:
+        if self._save_worker is not None and self._save_worker.isRunning():
+            return
+        self._save_mode = mode
+        self._set_save_busy(True)
+        if mode == self.PHASE_PARAMETERS:
+            self._progress_popup.begin("Saving displayed parameters", heading="Project Parameters")
+        else:
+            self._progress_popup.begin("Saving global parameter units", heading="Project Parameters")
+        self._save_worker = ProjectTaskWorker(
+            lambda report: self._perform_phase1_save(report) if mode == self.PHASE_PARAMETERS else self._perform_phase2_save(report),
+            parent=self,
+        )
+        self._save_worker.progress.connect(self._on_save_progress)
+        self._save_worker.completed.connect(self._on_save_completed)
+        self._save_worker.failed.connect(self._on_save_failed)
+        self._save_worker.start()
+
+    def _on_save_progress(self, text: str) -> None:
+        self._progress_popup.append_detail_line(str(text or "").strip())
+
+    def _on_save_completed(self, payload: object) -> None:
+        mode = self._save_mode
+        self._save_mode = ""
+        self._save_worker = None
+        self._set_save_busy(False)
+        result = dict(payload) if isinstance(payload, Mapping) else {}
+        saved_rows = [
+            self._normalize_row(row)
+            for row in (result.get("saved_rows") or [])
+            if isinstance(row, Mapping)
+        ]
+        saved_rows = [row for row in saved_rows if row]
+        if saved_rows:
+            self._working_rows = self._sorted_rows(saved_rows)
+        self.saved = True
+        self._set_dirty(False)
+        if mode == self.PHASE_PARAMETERS:
+            self._phase1_saved = True
+            self._phase2_rows = [dict(row) for row in (result.get("phase2_rows") or []) if isinstance(row, Mapping)]
+            self._refresh_display_completer()
+            self._progress_popup.finish("Displayed parameters saved", success=True)
+            if self._phase2_rows:
+                self._set_phase(self.PHASE_UNITS)
+            else:
+                self._finish_dialog(update_requested=True)
+            return
+        self._progress_popup.finish("Global parameter units saved", success=True)
+        self._finish_dialog(update_requested=True)
+
+    def _on_save_failed(self, message: str) -> None:
+        self._save_mode = ""
+        self._save_worker = None
+        self._set_save_busy(False)
+        self._progress_popup.finish("Project parameter save failed", success=False)
+        QtWidgets.QMessageBox.warning(self, "Project Parameters", str(message or "Unable to save project parameters."))
+
+    def _finish_dialog(self, *, update_requested: bool) -> None:
+        self.update_requested = bool(update_requested)
+        self._allow_direct_close = True
+        if update_requested:
+            self.accept()
+        else:
+            self.reject()
+
+    def _prompt_close_choice(self) -> QtWidgets.QMessageBox.StandardButton:
+        if self._phase == self.PHASE_PARAMETERS:
+            message = (
+                "Save displayed-parameter changes before closing?\n\n"
+                "Save will continue to the units step."
             )
-            return
-        if item.column() == self.COL_DISPLAYED:
-            display_name = str(item.text() or "").strip()
-            self._apply_display_value(row_keys=row_keys, display_name=display_name)
-            return
-        units_text = str(item.text() or "").strip()
-        self._apply_units_value(row_keys=row_keys, units_text=units_text)
+        else:
+            message = (
+                "Save units before closing?\n\n"
+                "Save will close this popup and run Update Project."
+            )
+        return QtWidgets.QMessageBox.question(
+            self,
+            "Close Project Parameters",
+            message,
+            QtWidgets.QMessageBox.StandardButton.Save
+            | QtWidgets.QMessageBox.StandardButton.Discard
+            | QtWidgets.QMessageBox.StandardButton.Cancel,
+            QtWidgets.QMessageBox.StandardButton.Save,
+        )
 
     def _act_save(self) -> None:
-        self._start_background_save(force=True, refresh_project_state=True, refresh_runtime_cache=True)
+        self._begin_save(mode=self._phase)
+
+    def _act_close(self) -> None:
+        if self._save_worker is not None and self._save_worker.isRunning():
+            return
+        if self._dirty:
+            answer = self._prompt_close_choice()
+            if answer == QtWidgets.QMessageBox.StandardButton.Save:
+                self._begin_save(mode=self._phase)
+                return
+            if answer == QtWidgets.QMessageBox.StandardButton.Cancel:
+                return
+        self._finish_dialog(update_requested=False)
 
     def reject(self) -> None:  # type: ignore[override]
         if self._allow_direct_close:
