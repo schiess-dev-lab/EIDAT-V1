@@ -4253,11 +4253,11 @@ def save_td_repo_parameter_mappings(
     repo = _td_project_global_repo(proj_dir)
     if repo is None:
         raise RuntimeError("Project is missing its Global Repo path.")
-    normalized_rows = [
-        _td_program_parameter_mapping_normalize(row)
-        for row in (rows or [])
-        if _td_program_parameter_mapping_normalize(row)
-    ]
+    normalized_rows: list[dict[str, object]] = []
+    for row in (rows or []):
+        committed = _td_program_parameter_mapping_commit(row)
+        if committed:
+            normalized_rows.append(committed)
     rows_by_program: dict[str, list[dict[str, object]]] = {}
     for row in normalized_rows:
         program_title = str(row.get("program_title") or "").strip() or TD_SUPPORT_DEFAULT_PROGRAM_TITLE
@@ -4414,25 +4414,9 @@ def _td_project_parameter_group_overrides(
             "display_name": str(group.get("display_name") or "").strip(),
             "preferred_units": str(group.get("preferred_units") or "").strip(),
         }
-        for group in (normalized.get("groups") or [])
+        for group in (project_catalog.get("groups") or [])
         if isinstance(group, Mapping) and str(group.get("id") or "").strip()
     }
-    for project_group in (project_catalog.get("groups") or []):
-        if not isinstance(project_group, Mapping):
-            continue
-        canonical_id = str(project_group.get("id") or "").strip()
-        if not canonical_id:
-            continue
-        merged_group = dict(
-            override_groups_by_id.get(canonical_id)
-            or {"id": canonical_id, "display_name": "", "preferred_units": ""}
-        )
-        project_display = str(project_group.get("display_name") or "").strip()
-        project_units = str(project_group.get("preferred_units") or "").strip()
-        if project_display:
-            merged_group["display_name"] = project_display
-        merged_group["preferred_units"] = project_units
-        override_groups_by_id[canonical_id] = merged_group
     merged_normalization = dict(normalized)
     merged_groups_by_id: dict[str, dict[str, object]] = {
         str(key): dict(value)
@@ -4441,9 +4425,9 @@ def _td_project_parameter_group_overrides(
     }
     for canonical_id, override in override_groups_by_id.items():
         merged_group = dict(merged_groups_by_id.get(canonical_id) or {"id": canonical_id})
-        if str(override.get("display_name") or "").strip():
+        if not str(merged_group.get("display_name") or "").strip() and str(override.get("display_name") or "").strip():
             merged_group["display_name"] = str(override.get("display_name") or "").strip()
-        if "preferred_units" in override:
+        if not str(merged_group.get("preferred_units") or "").strip() and str(override.get("preferred_units") or "").strip():
             merged_group["preferred_units"] = str(override.get("preferred_units") or "").strip()
         merged_groups_by_id[canonical_id] = merged_group
     merged_groups: list[dict[str, object]] = []
@@ -4471,10 +4455,10 @@ def _td_project_parameter_group_overrides(
         override = dict(override_groups_by_id.get(canonical_id) or {})
         if not override:
             continue
-        if str(override.get("display_name") or "").strip():
+        if not str(group.get("display_name") or "").strip() and str(override.get("display_name") or "").strip():
             group["display_name"] = str(override.get("display_name") or "").strip()
         preferred_units = str(override.get("preferred_units") or "").strip()
-        if preferred_units or "preferred_units" in override:
+        if not str(group.get("preferred_units") or "").strip() and preferred_units:
             group["preferred_units"] = preferred_units
         if preferred_units:
             group["unit_conflict"] = False
@@ -10368,6 +10352,26 @@ def _td_program_parameter_mapping_normalize(
     }
 
 
+def _td_program_parameter_mapping_commit(
+    row: Mapping[str, object] | None,
+    *,
+    program_title: object = "",
+) -> dict[str, object]:
+    normalized = _td_program_parameter_mapping_normalize(row, program_title=program_title)
+    if not normalized:
+        return {}
+    display_name = str(
+        normalized.get("displayed_parameter")
+        or normalized.get("default_display_parameter")
+        or normalized.get("ingested_parameter")
+        or ""
+    ).strip() or str(normalized.get("ingested_parameter") or "").strip()
+    normalized["default_display_parameter"] = display_name
+    normalized["displayed_parameter"] = display_name
+    normalized["edited"] = False
+    return normalized
+
+
 def _td_program_parameter_effective_display(row: Mapping[str, object] | None) -> str:
     payload = _td_program_parameter_mapping_normalize(row)
     if not payload:
@@ -10398,7 +10402,7 @@ def _td_program_parameter_merge_rows(
 ) -> list[dict[str, object]]:
     out_by_key: dict[tuple[str, str, str, str], dict[str, object]] = {}
     for item in existing_rows or []:
-        normalized = _td_program_parameter_mapping_normalize(item, program_title=program_title)
+        normalized = _td_program_parameter_mapping_commit(item, program_title=program_title)
         key = _td_program_parameter_scope_key(
             normalized.get("program_title"),
             normalized.get("asset_type"),
@@ -10420,27 +10424,35 @@ def _td_program_parameter_merge_rows(
         existing = dict(out_by_key.get(key) or {})
         merged = dict(discovered)
         if existing:
-            merged["preferred_units"] = str(existing.get("preferred_units") or merged.get("preferred_units") or "").strip()
+            committed_existing = _td_program_parameter_mapping_commit(existing, program_title=program_title)
+            existing_units = str(committed_existing.get("preferred_units") or "").strip()
+            discovered_units = str(merged.get("preferred_units") or "").strip()
+            merged["preferred_units"] = existing_units or discovered_units
             merged["default_preferred_units"] = str(
-                existing.get("default_preferred_units")
+                committed_existing.get("default_preferred_units")
                 or merged.get("default_preferred_units")
+                or merged.get("preferred_units")
                 or ""
             ).strip()
             merged["enabled"] = _td_bool(existing.get("enabled"), True)
-            existing_edited = bool(existing.get("edited"))
-            existing_display = str(existing.get("displayed_parameter") or "").strip()
-            existing_default = str(existing.get("default_display_parameter") or "").strip()
-            if existing_edited or (
-                existing_display
-                and _td_param_norm_name(existing_display) != _td_param_norm_name(existing_default)
-            ):
-                merged["displayed_parameter"] = existing_display or merged["displayed_parameter"]
-                merged["edited"] = True
-                merged["updated_at"] = str(existing.get("updated_at") or merged.get("updated_at") or "").strip()
-            else:
-                merged["displayed_parameter"] = str(merged.get("default_display_parameter") or merged.get("ingested_parameter") or "").strip()
-                merged["edited"] = False
-                merged["updated_at"] = str(merged.get("updated_at") or "").strip()
+            existing_default = str(committed_existing.get("default_display_parameter") or "").strip()
+            existing_display = str(committed_existing.get("displayed_parameter") or existing_default).strip()
+            discovered_default = str(
+                merged.get("default_display_parameter")
+                or merged.get("displayed_parameter")
+                or merged.get("ingested_parameter")
+                or ""
+            ).strip()
+            discovered_display = str(
+                merged.get("displayed_parameter")
+                or merged.get("default_display_parameter")
+                or merged.get("ingested_parameter")
+                or ""
+            ).strip()
+            merged["default_display_parameter"] = existing_default or discovered_default
+            merged["displayed_parameter"] = existing_display or discovered_display or discovered_default
+            merged["edited"] = bool(committed_existing.get("edited"))
+            merged["updated_at"] = str(existing.get("updated_at") or merged.get("updated_at") or "").strip()
         else:
             merged["enabled"] = _td_bool(merged.get("enabled"), True)
         out_by_key[key] = merged
@@ -11671,6 +11683,14 @@ def _td_program_requirements_write_workbook(
                 wb.remove(wb["Sheet"])
             except Exception:
                 pass
+
+        try:
+            target_index = 1 if TD_PROGRAM_REQUIREMENTS_INDEX_SHEET in wb.sheetnames else 0
+            current_index = list(wb.sheetnames).index(TD_PROGRAM_PARAMETER_MAP_SHEET)
+            if current_index != target_index:
+                wb.move_sheet(ws_parameter_map, offset=(target_index - current_index))
+        except Exception:
+            pass
 
         wb.save(str(wb_path))
     finally:
@@ -17787,12 +17807,23 @@ def sync_test_data_project_cache(
     payload["workbook"] = str(payload.get("workbook") or wb_path)
     payload["counts"] = dict(payload.get("counts") or state.get("counts") or {})
     payload["reason"] = str(payload.get("reason") or refresh_reason).strip()
+    runtime_db_path = Path(str(payload.get("db_path") or db_path)).expanduser()
+    repo_parameter_rows = load_td_repo_parameter_mappings(
+        proj_dir,
+        workbook_path=wb_path,
+        db_path=runtime_db_path,
+    )
+    _td_emit_progress(progress_cb, "Rebuilding project parameter group catalog from ProgramRequirements")
+    td_rebuild_project_parameter_units_catalog(
+        proj_dir,
+        repo_parameter_rows,
+    )
     _td_emit_progress(progress_cb, "Refreshing parameter runtime cache")
     t0 = time.perf_counter()
     runtime_payload = refresh_td_parameter_runtime_cache(
         proj_dir,
         wb_path,
-        Path(str(payload.get("db_path") or db_path)).expanduser(),
+        runtime_db_path,
         progress_cb=progress_cb,
     )
     runtime_elapsed = round(time.perf_counter() - t0, 3)
@@ -35911,6 +35942,16 @@ def update_test_data_trending_project_workbook(
                 text = str(warning or "").strip()
                 if text:
                     _td_emit_progress(progress_cb, f"ProgramRequirements warning: {text}")
+            repo_parameter_rows = load_td_repo_parameter_mappings(
+                project_dir,
+                workbook_path=wb_path,
+                db_path=db_path,
+            )
+            _td_emit_progress(progress_cb, "Rebuilding project parameter group catalog from ProgramRequirements")
+            td_rebuild_project_parameter_units_catalog(
+                project_dir,
+                repo_parameter_rows,
+            )
             _td_emit_progress(progress_cb, "Refreshing parameter runtime cache after ProgramRequirements sync")
             t0 = time.perf_counter()
             final_runtime_payload = refresh_td_parameter_runtime_cache(

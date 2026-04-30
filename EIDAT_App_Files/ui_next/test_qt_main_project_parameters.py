@@ -408,4 +408,20 @@ class TestTDParameterNormalizationDialog(unittest.TestCase):
         reopened = TDParameterNormalizationDialog(Path("."), Path("dummy.xlsx"))
         self.addCleanup(self._cleanup_dialog, reopened)
         self.assertEqual(str(reopened._working_rows[0].get("displayed_parameter") or ""), "Pulse Pressure Saved")
+        self.assertEqual(
+            str(reopened._working_rows[0].get("default_display_parameter") or ""),
+            "Pulse Pressure Saved",
+        )
         self.assertEqual(reopened.tbl.item(0, reopened.COL_DISPLAYED).text(), "Pulse Pressure Saved")
+        reopened.tbl.selectRow(0)
+        self._app.processEvents()
+        with patch.object(reopened, "_prompt_display_name", return_value="Pulse Pressure Temp"):
+            reopened._act_set_display_name()
+        self._app.processEvents()
+        with patch(
+            "ui_next.qt_main.QtWidgets.QMessageBox.question",
+            return_value=QtWidgets.QMessageBox.StandardButton.Yes,
+        ):
+            reopened._act_reset_rows()
+            self._app.processEvents()
+        self.assertEqual(str(reopened._working_rows[0].get("displayed_parameter") or ""), "Pulse Pressure Saved")

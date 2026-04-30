@@ -628,6 +628,7 @@ class TestQtMainMetricPlotSource(unittest.TestCase):
                             "x_value": 1.0,
                             "y_value": 1.0 if str(stat) == "mean" else 2.0,
                             "units": "psi",
+                            "program_title": "Program Alpha",
                         }
                     ]
 
@@ -664,6 +665,9 @@ class TestQtMainMetricPlotSource(unittest.TestCase):
                 self.assertEqual(requested_stats, ["mean", "max"])
                 self.assertEqual(window._last_plot_def.get("stats"), ["mean", "max"])
                 self.assertEqual(len(axes.plot_calls), 2)
+                labels = [str(kwargs.get("label") or "") for _, kwargs in axes.plot_calls]
+                self.assertIn("SN-001 | Program Alpha (mean)", labels)
+                self.assertIn("SN-001 | Program Alpha (max)", labels)
         finally:
             window.close()
             tmpdir = getattr(window, "_test_tmpdir", "")

@@ -5013,6 +5013,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
             wb = load_workbook(str(pr_path))
             try:
                 self.assertIn("Index", wb.sheetnames)
+                self.assertEqual(wb.sheetnames[:2], ["Index", be.TD_PROGRAM_PARAMETER_MAP_SHEET])
                 self.assertIn("_validation", wb.sheetnames)
                 self.assertEqual(str(wb["_validation"].sheet_state or "").strip().lower(), "hidden")
 
@@ -5032,7 +5033,12 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 self.assertEqual(str(ws_cond.cell(2, 1).value or "").strip(), "condition_key")
                 self.assertEqual(str(ws_cond.cell(10, 2).value or "").strip(), "parameter_name")
                 self.assertIs(ws_cond.cell(11, 1).value, True)
-                self.assertEqual(str(wb["_validation"].cell(2, 1).value or "").strip(), "thrust")
+                validation_values = [
+                    str(wb["_validation"].cell(row_idx, 1).value or "").strip()
+                    for row_idx in range(2, (wb["_validation"].max_row or 0) + 1)
+                    if str(wb["_validation"].cell(row_idx, 1).value or "").strip()
+                ]
+                self.assertIn("thrust", validation_values)
                 self.assertGreaterEqual(len(list(ws_cond.data_validations.dataValidation)), 1)
             finally:
                 wb.close()

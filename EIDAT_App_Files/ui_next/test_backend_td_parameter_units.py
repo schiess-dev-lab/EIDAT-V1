@@ -19,7 +19,7 @@ class TestTDProjectParameterUnits(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         return Path(tmp.name)
 
-    def test_build_units_rows_prefers_project_global_units(self) -> None:
+    def test_build_units_rows_uses_project_units_as_fallback_only(self) -> None:
         project_dir = self._project_dir()
         backend.save_td_project_parameter_normalization(
             project_dir,
@@ -44,7 +44,7 @@ class TestTDProjectParameterUnits(unittest.TestCase):
                     "ingested_parameter": "PulsePressure",
                     "default_display_parameter": "Pulse Pressure",
                     "displayed_parameter": "Pulse Pressure",
-                    "preferred_units": "repo-u",
+                    "preferred_units": "",
                 }
             ],
             {
@@ -65,6 +65,52 @@ class TestTDProjectParameterUnits(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(str(rows[0].get("preferred_units") or ""), "global-u")
         self.assertFalse(bool(rows[0].get("unit_conflict")))
+
+    def test_build_units_rows_do_not_let_stale_project_group_display_override_repo_row(self) -> None:
+        project_dir = self._project_dir()
+        backend.save_td_project_parameter_normalization(
+            project_dir,
+            {
+                "groups": [
+                    {
+                        "id": backend._td_program_parameter_canonical_id("Chamber Temp"),
+                        "display_name": "ChamberTemp",
+                        "preferred_units": "degC",
+                    }
+                ]
+            },
+        )
+
+        rows = backend.td_build_project_parameter_units_rows(
+            project_dir,
+            [
+                {
+                    "program_title": "Program A",
+                    "asset_type": "Chamber",
+                    "asset_specific_type": "Main",
+                    "ingested_parameter": "TC",
+                    "default_display_parameter": "Chamber Temp",
+                    "displayed_parameter": "Chamber Temp",
+                    "preferred_units": "degC",
+                }
+            ],
+            {
+                "inventory": [
+                    {
+                        "program_title": "Program A",
+                        "asset_type": "Chamber",
+                        "asset_specific_type": "Main",
+                        "raw_name": "TC",
+                        "displayed_parameter": "Chamber Temp",
+                        "default_display_parameter": "Chamber Temp",
+                        "units": ["degC"],
+                    }
+                ]
+            },
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(str(rows[0].get("displayed_parameter") or ""), "Chamber Temp")
 
     def test_build_units_rows_leaves_blank_when_units_conflict(self) -> None:
         project_dir = self._project_dir()
@@ -202,6 +248,43 @@ class TestTDProjectParameterUnits(unittest.TestCase):
             str(((normalization.get("groups_by_id") or {}).get("display:newname") or {}).get("preferred_units") or ""),
             "bar",
         )
+
+    def test_program_parameter_merge_rows_preserve_existing_exact_mapping(self) -> None:
+        rows = backend._td_program_parameter_merge_rows(
+            [
+                {
+                    "program_title": "Program A",
+                    "asset_type": "Chamber",
+                    "asset_specific_type": "Main",
+                    "ingested_parameter": "TC",
+                    "default_display_parameter": "TC",
+                    "displayed_parameter": "Chamber Temp",
+                    "preferred_units": "degC",
+                    "enabled": True,
+                    "edited": True,
+                }
+            ],
+            [
+                {
+                    "program_title": "Program A",
+                    "asset_type": "Chamber",
+                    "asset_specific_type": "Main",
+                    "ingested_parameter": "TC",
+                    "default_display_parameter": "Thermocouple",
+                    "displayed_parameter": "Thermocouple",
+                    "preferred_units": "celsius",
+                    "enabled": True,
+                    "edited": False,
+                }
+            ],
+            program_title="Program A",
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(str(rows[0].get("default_display_parameter") or ""), "Chamber Temp")
+        self.assertEqual(str(rows[0].get("displayed_parameter") or ""), "Chamber Temp")
+        self.assertEqual(str(rows[0].get("preferred_units") or ""), "degC")
+        self.assertFalse(bool(rows[0].get("edited")))
 
     def test_selector_options_clear_conflict_when_group_units_exist(self) -> None:
         normalization = backend._td_normalize_parameter_normalization(

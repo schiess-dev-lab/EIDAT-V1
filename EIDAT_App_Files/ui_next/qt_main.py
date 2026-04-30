@@ -13044,6 +13044,18 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         display_y = self._parameter_display_name(y_name, options=self._curve_parameter_options, fallback=y_name)
         return f"{display_y} | {base}" if multi_y else base
 
+    def _life_metric_trace_label(self, row: Mapping[str, object] | None, *, stat: str = "") -> str:
+        source_row = row if isinstance(row, Mapping) else {}
+        raw_serial = str(source_row.get("serial") or "").strip()
+        serial = _td_plot_serial_label(source_row) or raw_serial or "SN"
+        program_title = str(source_row.get("program_title") or "").strip()
+        if not program_title and raw_serial:
+            meta_row = self._serial_source_by_serial.get(raw_serial) or {}
+            program_title = str(meta_row.get("program_title") or "").strip()
+        base = " | ".join([part for part in (serial, program_title) if str(part).strip()])
+        stat_text = str(stat or "").strip()
+        return f"{base} ({stat_text})" if stat_text else base
+
     def _select_run_by_name(self, run_name: str) -> None:
         rn = str(run_name or "").strip()
         if not rn:
@@ -14543,9 +14555,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     )
                     xs = [float(row.get("x_value") or 0.0) for row in points]
                     ys = [float(row.get("y_value") or 0.0) for row in points]
-                    label = _td_plot_serial_label(sn) or sn
-                    if multi_stat:
-                        label = f"{label} ({stat})"
+                    label = self._life_metric_trace_label(points[0], stat=(stat if multi_stat else ""))
                     self._axes.plot(
                         xs,
                         ys,
@@ -14633,9 +14643,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     )
                     xs = [float(row.get("x_value") or 0.0) for row in points]
                     ys = [float(row.get("y_value") or 0.0) for row in points]
-                    label = _td_plot_serial_label(sn) or sn
-                    if multi_stat:
-                        label = f"{label} ({stat})"
+                    label = self._life_metric_trace_label(points[0], stat=(stat if multi_stat else ""))
                     self._axes.plot(
                         xs,
                         ys,

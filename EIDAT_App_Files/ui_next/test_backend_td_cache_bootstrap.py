@@ -1501,6 +1501,51 @@ class TestBackendTdCacheBootstrap(unittest.TestCase):
                 backend._td_program_parameter_canonical_id("Pulse Pressure Old"),
             )
 
+    def test_load_parameter_runtime_context_does_not_let_project_group_display_override_workbook_name(self) -> None:
+        if Workbook is None:
+            self.skipTest("openpyxl is required for TD runtime mapping tests")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir) / "project"
+            _repo_root, db_path, discovery_signature = _create_parameter_runtime_mapping_fixture(
+                project_dir,
+                workbook_display_name="Chamber Temp",
+                runtime_display_name="Chamber Temp",
+            )
+            repo_rows = backend.load_td_repo_parameter_mappings(project_dir, db_path=db_path)
+            expected_signature = backend._td_parameter_runtime_signature(discovery_signature, repo_rows)
+            with closing(sqlite3.connect(str(db_path))) as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)",
+                    (backend.TD_PARAM_RUNTIME_SIGNATURE_META_KEY, expected_signature),
+                )
+                conn.commit()
+            backend.save_td_project_parameter_normalization(
+                project_dir,
+                {
+                    "groups": [
+                        {
+                            "id": backend._td_program_parameter_canonical_id("Chamber Temp"),
+                            "display_name": "ChamberTemp",
+                            "preferred_units": "psi",
+                        }
+                    ]
+                },
+            )
+
+            context = backend.td_load_parameter_runtime_context(project_dir, db_path)
+
+            self.assertEqual(str(context.get("runtime_mode") or ""), "db")
+            inventory = list(context.get("inventory") or [])
+            self.assertEqual(len(inventory), 1)
+            self.assertEqual(str(inventory[0].get("displayed_parameter") or ""), "Chamber Temp")
+            options = backend.td_build_parameter_selector_options(
+                context,
+                surface="metrics",
+                raw_names=["PulsePressure"],
+            )
+            self.assertEqual(len(options), 1)
+            self.assertEqual(str(options[0].get("display_name") or ""), "Chamber Temp")
+
     def test_parameter_selector_options_omit_disabled_parameter_rules(self) -> None:
         raw_name = "Time_1_2_Impluse"
         raw_norm = backend._td_param_norm_name(raw_name)
@@ -1578,6 +1623,20 @@ class TestBackendTdCacheBootstrap(unittest.TestCase):
                 "metadata_rel": "docs/sn001.json",
                 "program_title": "Program Alpha",
             }
+            repo_rows = [
+                {
+                    "program_title": "Program Alpha",
+                    "asset_type": "Valve",
+                    "asset_specific_type": "Main",
+                    "ingested_parameter": "PulsePressure",
+                    "default_display_parameter": "Pulse Pressure Saved",
+                    "displayed_parameter": "Pulse Pressure Saved",
+                    "preferred_units": "psi",
+                    "enabled": True,
+                    "edited": False,
+                }
+            ]
+            events: list[str] = []
             with _td_update_context(project_dir, workbook_path), patch.object(
                 backend,
                 "read_eidat_index_documents",
@@ -1596,8 +1655,16 @@ class TestBackendTdCacheBootstrap(unittest.TestCase):
                 return_value={"path": "", "updated": False, "condition_count": 0, "requirements_count": 0, "warnings": []},
             ), patch.object(
                 backend,
+                "load_td_repo_parameter_mappings",
+                side_effect=lambda *args, **kwargs: events.append("load") or [dict(row) for row in repo_rows],
+            ) as load_repo_mock, patch.object(
+                backend,
+                "td_rebuild_project_parameter_units_catalog",
+                side_effect=lambda *args, **kwargs: events.append("catalog") or {"groups": []},
+            ), patch.object(
+                backend,
                 "refresh_td_parameter_runtime_cache",
-                return_value={"mode": "rebuilt", "entries": 1, "groups": 1},
+                side_effect=lambda *args, **kwargs: events.append("runtime") or {"mode": "rebuilt", "entries": 1, "groups": 1},
             ) as refresh_mock, patch.object(
                 backend,
                 "_td_collect_project_readiness",
@@ -1625,13 +1692,74 @@ class TestBackendTdCacheBootstrap(unittest.TestCase):
                     require_existing_cache=False,
                 )
 
+            load_repo_mock.assert_called_once_with(
+                project_dir,
+                workbook_path=workbook_path,
+                db_path=impl_db,
+            )
             refresh_mock.assert_called_once_with(
                 project_dir,
                 workbook_path,
                 impl_db,
                 progress_cb=ANY,
             )
+            self.assertEqual(events, ["load", "catalog", "runtime"])
             self.assertIn("parameter_runtime_after_program_requirements_s", dict(payload.get("timings") or {}))
+
+    def test_sync_project_cache_rebuilds_parameter_group_catalog_before_runtime_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir) / "project"
+            project_dir.mkdir(parents=True, exist_ok=True)
+            workbook_path = project_dir / "project.xlsx"
+            workbook_path.write_text("", encoding="utf-8")
+            repo_rows = [
+                {
+                    "program_title": "Program Alpha",
+                    "asset_type": "Valve",
+                    "asset_specific_type": "Main",
+                    "ingested_parameter": "PulsePressure",
+                    "default_display_parameter": "Pulse Pressure Saved",
+                    "displayed_parameter": "Pulse Pressure Saved",
+                    "preferred_units": "psi",
+                    "enabled": True,
+                    "edited": False,
+                }
+            ]
+            events: list[str] = []
+
+            with patch.object(
+                backend,
+                "inspect_test_data_project_cache_state",
+                return_value={"mode": "none", "reason": "", "counts": {}},
+            ), patch.object(
+                backend,
+                "load_td_repo_parameter_mappings",
+                side_effect=lambda *args, **kwargs: events.append("load") or [dict(row) for row in repo_rows],
+            ) as load_repo_mock, patch.object(
+                backend,
+                "td_rebuild_project_parameter_units_catalog",
+                side_effect=lambda *args, **kwargs: events.append("catalog") or {"groups": []},
+            ), patch.object(
+                backend,
+                "refresh_td_parameter_runtime_cache",
+                side_effect=lambda *args, **kwargs: events.append("runtime") or {"mode": "rebuilt", "entries": 1, "groups": 1},
+            ) as runtime_mock:
+                payload = backend.sync_test_data_project_cache(project_dir, workbook_path, rebuild=False)
+
+            impl_db = project_dir / backend.EIDAT_PROJECT_IMPLEMENTATION_DB
+            load_repo_mock.assert_called_once_with(
+                project_dir,
+                workbook_path=workbook_path,
+                db_path=impl_db,
+            )
+            runtime_mock.assert_called_once_with(
+                project_dir,
+                workbook_path,
+                impl_db,
+                progress_cb=None,
+            )
+            self.assertEqual(events, ["load", "catalog", "runtime"])
+            self.assertEqual(str((payload.get("parameter_runtime") or {}).get("mode") or ""), "rebuilt")
 
     def test_ready_validator_allows_workbook_output_mismatch_as_warning(self) -> None:
         if Workbook is None:
