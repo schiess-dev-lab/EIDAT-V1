@@ -3191,6 +3191,58 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 dlg.close()
 
     @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
+    def test_parameter_normalization_dialog_units_save_passes_workbook_path(self) -> None:
+        app = _qt_app()
+        from PySide6 import QtWidgets
+        from EIDAT_App_Files.ui_next import qt_main as qm  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            project_dir = root / "ProjectA"
+            project_dir.mkdir()
+            workbook = root / "project.xlsx"
+            workbook.write_text("", encoding="utf-8")
+            db_path = project_dir / "implementation_trending.sqlite3"
+            context = self._make_parameter_normalization_context()
+
+            with mock.patch.object(qm.be, "validate_test_data_project_cache_for_open", return_value=db_path):
+                with mock.patch.object(qm.be, "td_build_parameter_normalization_context", return_value=context):
+                    dlg = qm.TDParameterNormalizationDialog(project_dir, workbook)
+
+            try:
+                dlg._phase2_rows = [
+                    {
+                        "canonical_id": "chamber_feed_pressure",
+                        "displayed_parameter": "Chamber Feed Pressure",
+                        "raw_names_text": "feed pressure",
+                        "program_titles_text": "Program A",
+                        "preferred_units": "kPa",
+                        "source_units": ["psia"],
+                        "unit_conflict": True,
+                    }
+                ]
+                dlg._set_phase(dlg.PHASE_UNITS)
+                saved_rows = [dict(row) for row in dlg._working_rows]
+                with mock.patch.object(qm.be, "td_save_project_parameter_units", return_value={"saved_rows": saved_rows}) as saver_mock:
+                    with mock.patch.object(QtWidgets.QMessageBox, "warning") as warning_mock:
+                        dlg._act_save()
+                        self._wait_for_parameter_dialog_idle(dlg, app)
+
+                saver_mock.assert_called_once_with(
+                    project_dir,
+                    mock.ANY,
+                    mock.ANY,
+                    workbook_path=workbook,
+                )
+                warning_mock.assert_not_called()
+                self.assertTrue(dlg.saved)
+                self.assertEqual(dlg.result(), int(qm.QtWidgets.QDialog.DialogCode.Accepted))
+                self.assertTrue(dlg.update_requested)
+            finally:
+                dlg._allow_direct_close = True
+                dlg.close()
+
+    @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
     def test_parameter_normalization_dialog_clean_close_accepts_and_requests_update(self) -> None:
         _qt_app()
         from EIDAT_App_Files.ui_next import qt_main as qm  # type: ignore
@@ -5562,6 +5614,225 @@ class TestTDSupportWorkbook(unittest.TestCase):
             self.assertEqual(rows_by_ingested["feed pressure"]["displayed_parameter"], "Chamber Feed Pressure")
             self.assertFalse(rows_by_ingested["feed pressure"]["enabled"])
             self.assertTrue(rows_by_ingested["feed pressure"]["edited"])
+
+    def test_load_td_repo_parameter_mappings_recovers_missing_global_repo_from_workbook_metadata(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            src_db = root / "src.sqlite3"
+            self._make_source_sqlite(src_db)
+
+            docs = [
+                {
+                    "metadata_rel": "run.json",
+                    "program_title": "Program A",
+                    "asset_type": "Thruster",
+                    "asset_specific_type": "Valve",
+                    "serial_number": "SN1",
+                    "excel_sqlite_rel": str(src_db),
+                }
+            ]
+            be._sync_td_program_requirements_workbooks_for_docs(
+                root,
+                docs,
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+                create_missing=True,
+            )
+
+            project_dir = be.eidat_projects_root(root) / "ProjectA"
+            project_dir.mkdir(parents=True, exist_ok=True)
+            workbook_path = project_dir / "ProjectA.xlsx"
+            workbook_path.write_text("", encoding="utf-8")
+            be._write_project_meta(
+                project_dir,
+                {
+                    "workbook": str(workbook_path),
+                    "selected_metadata_rel": ["run.json"],
+                },
+            )
+
+            impl_db = project_dir / be.EIDAT_PROJECT_IMPLEMENTATION_DB
+            with sqlite3.connect(str(impl_db)) as conn:
+                be._ensure_test_data_impl_tables(conn)
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO td_source_metadata(
+                        serial,
+                        source_serial_number,
+                        program_title,
+                        asset_type,
+                        asset_specific_type,
+                        document_type,
+                        metadata_rel,
+                        artifacts_rel,
+                        excel_sqlite_rel
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "SN1",
+                        "SN1",
+                        "Program A",
+                        "Thruster",
+                        "Valve",
+                        "TD",
+                        "run.json",
+                        "",
+                        str(src_db),
+                    ),
+                )
+                conn.commit()
+
+            loaded_rows = be.load_td_repo_parameter_mappings(project_dir, db_path=impl_db)
+            self.assertTrue(loaded_rows)
+            self.assertIn(
+                "feed pressure",
+                {
+                    str(row.get("ingested_parameter") or "").strip()
+                    for row in loaded_rows
+                    if str(row.get("ingested_parameter") or "").strip()
+                },
+            )
+            saved_meta = json.loads((project_dir / be.EIDAT_PROJECT_META).read_text(encoding="utf-8"))
+            self.assertEqual(saved_meta.get("global_repo"), str(root))
+
+    def test_save_td_repo_parameter_mappings_recovers_missing_global_repo_from_workbook_metadata(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            src_db = root / "src.sqlite3"
+            self._make_source_sqlite(src_db)
+
+            docs = [
+                {
+                    "metadata_rel": "run.json",
+                    "program_title": "Program A",
+                    "asset_type": "Thruster",
+                    "asset_specific_type": "Valve",
+                    "serial_number": "SN1",
+                    "excel_sqlite_rel": str(src_db),
+                }
+            ]
+            be._sync_td_program_requirements_workbooks_for_docs(
+                root,
+                docs,
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+                create_missing=True,
+            )
+
+            project_dir = be.eidat_projects_root(root) / "ProjectA"
+            project_dir.mkdir(parents=True, exist_ok=True)
+            workbook_path = project_dir / "ProjectA.xlsx"
+            workbook_path.write_text("", encoding="utf-8")
+            be._write_project_meta(
+                project_dir,
+                {
+                    "workbook": str(workbook_path),
+                    "selected_metadata_rel": ["run.json"],
+                },
+            )
+
+            impl_db = project_dir / be.EIDAT_PROJECT_IMPLEMENTATION_DB
+            with sqlite3.connect(str(impl_db)) as conn:
+                be._ensure_test_data_impl_tables(conn)
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO td_source_metadata(
+                        serial,
+                        source_serial_number,
+                        program_title,
+                        asset_type,
+                        asset_specific_type,
+                        document_type,
+                        metadata_rel,
+                        artifacts_rel,
+                        excel_sqlite_rel
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "SN1",
+                        "SN1",
+                        "Program A",
+                        "Thruster",
+                        "Valve",
+                        "TD",
+                        "run.json",
+                        "",
+                        str(src_db),
+                    ),
+                )
+                conn.commit()
+
+            loaded_rows = be.load_td_repo_parameter_mappings(project_dir, db_path=impl_db)
+            be._write_project_meta(
+                project_dir,
+                {
+                    "workbook": str(workbook_path),
+                    "selected_metadata_rel": ["run.json"],
+                },
+            )
+            updated_rows = [dict(row) for row in loaded_rows]
+            for row in updated_rows:
+                if str(row.get("ingested_parameter") or "").strip() == "feed pressure":
+                    row["displayed_parameter"] = "Chamber Feed Pressure"
+                    row["edited"] = True
+
+            saved_rows = be.save_td_repo_parameter_mappings(project_dir, updated_rows)
+            self.assertIn(
+                "Chamber Feed Pressure",
+                {
+                    str(row.get("displayed_parameter") or "").strip()
+                    for row in saved_rows
+                    if str(row.get("displayed_parameter") or "").strip()
+                },
+            )
+            saved_meta = json.loads((project_dir / be.EIDAT_PROJECT_META).read_text(encoding="utf-8"))
+            self.assertEqual(saved_meta.get("global_repo"), str(root))
+
+    def test_refresh_td_parameter_support_workbook_recovers_missing_global_repo_from_workbook_metadata(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            project_dir = be.eidat_projects_root(root) / "ProjectA"
+            project_dir.mkdir(parents=True, exist_ok=True)
+            workbook_path = project_dir / "ProjectA.xlsx"
+            be._write_test_data_trending_workbook(
+                workbook_path,
+                global_repo=root,
+                serials=["SN1"],
+                docs=[{"serial_number": "SN1", "excel_sqlite_rel": str(root / "src.sqlite3")}],
+                config=self._make_config(),
+            )
+            impl_db = project_dir / be.EIDAT_PROJECT_IMPLEMENTATION_DB
+            be._write_project_meta(
+                project_dir,
+                {
+                    "workbook": str(workbook_path),
+                    "selected_metadata_rel": [],
+                },
+            )
+
+            with mock.patch.object(be, "_sync_td_support_workbook_program_sheets", return_value={"status": "ok"}) as support_mock:
+                with mock.patch.object(be, "_refresh_td_support_run_conditions_sheet", return_value={"status": "ok"}) as conditions_mock:
+                    with mock.patch.object(be, "_sync_td_support_program_requirements_import", return_value={"status": "ok"}) as import_mock:
+                        with mock.patch.object(be, "_td_project_program_titles", return_value=["Program A"]):
+                            result = be.refresh_td_parameter_support_workbook(project_dir, workbook_path, impl_db)
+
+            self.assertEqual(result.get("support_refresh"), {"status": "ok"})
+            self.assertEqual(result.get("run_conditions_refresh"), {"status": "ok"})
+            self.assertEqual(result.get("program_requirements_import"), {"status": "ok"})
+            support_mock.assert_called_once_with(
+                workbook_path,
+                global_repo=root,
+                project_dir=project_dir,
+                param_defs=mock.ANY,
+            )
+            conditions_mock.assert_called_once()
+            import_mock.assert_called_once()
+            saved_meta = json.loads((project_dir / be.EIDAT_PROJECT_META).read_text(encoding="utf-8"))
+            self.assertEqual(saved_meta.get("global_repo"), str(root))
 
     def test_rebuild_surfaces_discovered_source_headers_in_calc_columns(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore

@@ -4148,10 +4148,54 @@ def _td_parameter_normalization_persistable(normalization: Mapping[str, object] 
     }
 
 
-def _td_project_global_repo(project_dir: Path) -> Path | None:
-    meta = _read_project_meta(Path(project_dir).expanduser())
+def _td_project_global_repo(
+    project_dir: Path,
+    *,
+    workbook_path: Path | None = None,
+) -> Path | None:
+    proj_dir = Path(project_dir).expanduser()
+    meta_path = proj_dir / EIDAT_PROJECT_META
+    meta = _read_project_meta(proj_dir)
     raw = str(meta.get("global_repo") or "").strip()
-    return Path(raw).expanduser() if raw else None
+    if raw:
+        return Path(raw).expanduser()
+
+    def _coerce_workbook_path(value: object) -> Path | None:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        candidate = Path(text).expanduser()
+        if not candidate.is_absolute():
+            candidate = proj_dir / candidate
+        return candidate
+
+    workbook = _coerce_workbook_path(workbook_path)
+    if workbook is None:
+        workbook = _coerce_workbook_path(meta.get("workbook"))
+    if workbook is None:
+        return None
+
+    try:
+        repo = resolve_test_data_project_global_repo(proj_dir, workbook)
+    except Exception:
+        return None
+    resolved_repo = Path(repo).expanduser()
+
+    if meta_path.exists():
+        updated_meta = dict(meta)
+        updated = False
+        if not str(updated_meta.get("global_repo") or "").strip():
+            updated_meta["global_repo"] = str(resolved_repo)
+            updated = True
+        if not str(updated_meta.get("workbook") or "").strip():
+            updated_meta["workbook"] = str(workbook)
+            updated = True
+        if updated:
+            try:
+                _write_project_meta(proj_dir, updated_meta)
+            except Exception:
+                pass
+    return resolved_repo
 
 
 def _td_project_program_titles(
@@ -4180,7 +4224,7 @@ def _td_project_program_titles(
             pass
     if programs:
         return sorted(programs, key=str.casefold)
-    repo = _td_project_global_repo(proj_dir)
+    repo = _td_project_global_repo(proj_dir, workbook_path=workbook_path)
     if repo is None:
         return []
     meta = _read_project_meta(proj_dir)
@@ -4213,7 +4257,7 @@ def load_td_repo_parameter_mappings(
     db_path: Path | None = None,
 ) -> list[dict[str, object]]:
     proj_dir = Path(project_dir).expanduser()
-    repo = _td_project_global_repo(proj_dir)
+    repo = _td_project_global_repo(proj_dir, workbook_path=workbook_path)
     if repo is None:
         return []
     rows: list[dict[str, object]] = []
@@ -4248,9 +4292,11 @@ def load_td_repo_parameter_mappings(
 def save_td_repo_parameter_mappings(
     project_dir: Path,
     rows: Sequence[Mapping[str, object]] | None,
+    *,
+    workbook_path: Path | None = None,
 ) -> list[dict[str, object]]:
     proj_dir = Path(project_dir).expanduser()
-    repo = _td_project_global_repo(proj_dir)
+    repo = _td_project_global_repo(proj_dir, workbook_path=workbook_path)
     if repo is None:
         raise RuntimeError("Project is missing its Global Repo path.")
     normalized_rows: list[dict[str, object]] = []
@@ -4304,7 +4350,7 @@ def refresh_td_parameter_support_workbook(
     proj_dir = Path(project_dir).expanduser()
     workbook = Path(workbook_path).expanduser()
     impl_db = Path(db_path).expanduser()
-    repo = _td_project_global_repo(proj_dir)
+    repo = _td_project_global_repo(proj_dir, workbook_path=workbook)
     if repo is None:
         raise RuntimeError("Project is missing its Global Repo path.")
 
@@ -4678,6 +4724,8 @@ def td_save_project_parameter_units(
     project_dir: Path,
     repo_rows: Sequence[Mapping[str, object]] | None,
     unit_rows: Sequence[Mapping[str, object]] | None,
+    *,
+    workbook_path: Path | None = None,
 ) -> dict[str, object]:
     preferred_units_by_canonical: dict[str, str] = {}
     preferred_display_by_canonical: dict[str, str] = {}
@@ -4709,7 +4757,11 @@ def td_save_project_parameter_units(
                 row["displayed_parameter"] = preferred_display_by_canonical[canonical_id]
         mirrored_rows.append(row)
 
-    saved_rows = save_td_repo_parameter_mappings(project_dir, mirrored_rows)
+    saved_rows = save_td_repo_parameter_mappings(
+        project_dir,
+        mirrored_rows,
+        workbook_path=workbook_path,
+    )
     normalization = td_rebuild_project_parameter_units_catalog(project_dir, saved_rows)
     return {
         "saved_rows": [dict(row) for row in saved_rows],

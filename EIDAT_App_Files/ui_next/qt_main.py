@@ -3669,7 +3669,15 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
         if not callable(saver):
             raise RuntimeError("Unable to save project parameter units.")
         report("Saving global parameter units")
-        return dict(saver(self._project_dir, self._working_rows, self._phase2_rows) or {})
+        return dict(
+            saver(
+                self._project_dir,
+                self._working_rows,
+                self._phase2_rows,
+                workbook_path=self._workbook_path,
+            )
+            or {}
+        )
 
     def _begin_save(self, *, mode: str) -> None:
         if self._save_worker is not None and self._save_worker.isRunning():
