@@ -1456,6 +1456,67 @@ def _td_agg_ordered_sheet_info(conn: sqlite3.Connection) -> list[sqlite3.Row]:
         return []
 
 
+def _td_agg_source_imported_epoch_ns(conn: sqlite3.Connection) -> int:
+    try:
+        row = conn.execute("SELECT MAX(imported_epoch_ns) FROM __workbook").fetchone()
+    except Exception:
+        return 0
+    try:
+        return int((row[0] if row else 0) or 0)
+    except Exception:
+        return 0
+
+
+def _td_agg_duplicate_sequence_name(member: Mapping[str, Any]) -> str:
+    return str(member.get("source_sheet_name") or member.get("sheet_name") or "").strip()
+
+
+def _td_agg_duplicate_sequence_key(member: Mapping[str, Any]) -> str:
+    return _td_agg_duplicate_sequence_name(member).casefold()
+
+
+def _td_agg_duplicate_sequence_winner_key(member: Mapping[str, Any]) -> tuple[int, int, str, int, str]:
+    return (
+        -int(member.get("source_imported_epoch_ns") or 0),
+        -int(member.get("metadata_mtime_ns") or 0),
+        str(member.get("metadata_rel") or "").casefold(),
+        int(member.get("import_order") or 0),
+        _td_agg_duplicate_sequence_name(member).casefold(),
+    )
+
+
+def _td_agg_dedupe_sequence_members(
+    group_members: Sequence[Mapping[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    winners_by_key: dict[str, dict[str, Any]] = {}
+    deduped: list[dict[str, Any]] = []
+    dropped: list[dict[str, Any]] = []
+    emitted_keys: set[str] = set()
+
+    for raw_member in group_members:
+        member = dict(raw_member)
+        dup_key = _td_agg_duplicate_sequence_key(member)
+        grouped.setdefault(dup_key, []).append(member)
+
+    for dup_key, items in grouped.items():
+        winners_by_key[dup_key] = min(items, key=_td_agg_duplicate_sequence_winner_key)
+
+    for raw_member in group_members:
+        member = dict(raw_member)
+        dup_key = _td_agg_duplicate_sequence_key(member)
+        winner = dict(winners_by_key.get(dup_key) or member)
+        if _td_agg_duplicate_sequence_winner_key(member) == _td_agg_duplicate_sequence_winner_key(winner):
+            if dup_key not in emitted_keys:
+                emitted_keys.add(dup_key)
+                deduped.append(member)
+            else:
+                dropped.append({"member": member, "winner": winner})
+            continue
+        dropped.append({"member": member, "winner": winner})
+    return deduped, dropped
+
+
 def _td_agg_collect_members(paths: SupportPaths) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     support_dir = Path(paths.support_dir)
     members: list[dict[str, Any]] = []
@@ -1494,6 +1555,7 @@ def _td_agg_collect_members(paths: SupportPaths) -> tuple[list[dict[str, Any]], 
             with sqlite3.connect(str(sqlite_path)) as src:
                 src.row_factory = sqlite3.Row
                 sheet_rows = _td_agg_ordered_sheet_info(src)
+                source_imported_epoch_ns = _td_agg_source_imported_epoch_ns(src)
                 source_members: list[dict[str, Any]] = []
                 tab_serial_candidates: list[str] = []
                 for sheet_row in sheet_rows:
@@ -1529,6 +1591,7 @@ def _td_agg_collect_members(paths: SupportPaths) -> tuple[list[dict[str, Any]], 
                             "sheet_info": {k: sheet_row[k] for k in sheet_row.keys()},
                             "tab_serial": _td_agg_normalize_serial(tab_serial),
                             "tab_serial_source": str(tab_serial_source or "").strip(),
+                            "source_imported_epoch_ns": int(source_imported_epoch_ns),
                         }
                     )
         except Exception:
@@ -1576,6 +1639,7 @@ def _td_agg_collect_members(paths: SupportPaths) -> tuple[list[dict[str, Any]], 
                     "metadata_mtime_ns": int(metadata_mtime_ns),
                     "artifacts_rel": artifacts_rel,
                     "source_file": str(meta_raw.get("source_file") or ""),
+                    "source_imported_epoch_ns": int(item.get("source_imported_epoch_ns") or 0),
                     "sheet_name": str(item.get("sheet_name") or ""),
                     "source_sheet_name": str(item.get("source_sheet_name") or ""),
                     "table_name": str(item.get("table_name") or ""),
@@ -1794,6 +1858,7 @@ def _td_agg_write_group(
     )
     header_meta = dict(first.get("metadata") or {})
     header_meta.update(dict(header_member.get("metadata") or {}))
+    selected_members, dropped_duplicates = _td_agg_dedupe_sequence_members(group_members)
     serial = str(header_member.get("serial_number") or first.get("serial_number") or "").strip()
     program_title = str(header_member.get("program_title") or first.get("program_title") or "Unknown").strip() or "Unknown"
     asset_type = str(header_member.get("asset_type") or first.get("asset_type") or "Unknown").strip() or "Unknown"
@@ -1815,24 +1880,33 @@ def _td_agg_write_group(
 
     warnings: list[str] = []
     manifest_members: list[dict[str, Any]] = []
-    used_run_names: dict[str, int] = {}
+    for dropped_info in dropped_duplicates:
+        member = dict(dropped_info.get("member") or {})
+        winner = dict(dropped_info.get("winner") or {})
+        seq_name = _td_agg_duplicate_sequence_name(member) or "sequence"
+        dropped_source = str(member.get("metadata_rel") or member.get("sqlite_rel") or "").strip() or "unknown source"
+        kept_source = str(winner.get("metadata_rel") or winner.get("sqlite_rel") or "").strip() or "unknown source"
+        dropped_imported = int(member.get("source_imported_epoch_ns") or 0)
+        kept_imported = int(winner.get("source_imported_epoch_ns") or 0)
+        if kept_imported > dropped_imported:
+            kept_reason = "newer ingest source"
+        else:
+            kept_reason = "newer metadata source"
+        warnings.append(
+            f"Duplicate sequence {seq_name!r} dropped source {dropped_source!r}; kept {kept_reason} {kept_source!r}."
+        )
     now_ns = time.time_ns()
     with sqlite3.connect(str(sqlite_path)) as dest:
         _td_agg_create_schema(dest)
-        for idx, raw_member in enumerate(group_members, start=1):
+        for idx, raw_member in enumerate(selected_members, start=1):
             member = dict(raw_member)
             source_sqlite = Path(member.get("sqlite_path") or "")
             source_sheet = str(member.get("sheet_name") or "").strip()
             source_tab = str(member.get("source_sheet_name") or source_sheet).strip()
             source_table = str(member.get("table_name") or "").strip()
             base_run = source_tab or source_sheet or f"seq_{idx}"
-            run_key = base_run.casefold()
-            dup_idx = used_run_names.get(run_key, 0) + 1
-            used_run_names[run_key] = dup_idx
-            output_run = base_run if dup_idx == 1 else f"{base_run}__{dup_idx}"
-            duplicate_of = "" if dup_idx == 1 else base_run
-            if duplicate_of:
-                warnings.append(f"Duplicate sequence name {base_run!r} was written as {output_run!r}.")
+            output_run = base_run
+            duplicate_of = ""
             tab_serial = str(member.get("tab_serial") or "").strip()
             if tab_serial and tab_serial != serial:
                 warnings.append(

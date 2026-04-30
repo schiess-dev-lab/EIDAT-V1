@@ -102,6 +102,8 @@ class _PerfAxisHarness:
         ):
             setattr(self, name, getattr(TestDataTrendDialog, name).__get__(self, _PerfAxisHarness))
 
+        self._perf_display_name = lambda value: str(value or "").strip()
+        self._perf_var_display_names = lambda: self._perf_var_names()
         self._update_perf_fit_controls = lambda: None
         self._update_perf_control_period_state = lambda: None
         self._clear_perf_results = lambda: setattr(self, "clear_calls", self.clear_calls + 1)
@@ -760,10 +762,12 @@ class _RunSelectionHarness:
         self._available_serial_filter_rows = [{"serial": "SN1"}, {"serial": "SN2"}]
         self._available_control_period_filters = []
         self._available_suppression_voltage_filters = ["24", "28"]
+        self._available_valve_voltage_filters = []
         self._checked_program_filters = list(self._available_program_filters)
         self._checked_serial_filters = ["SN1", "SN2"]
         self._checked_control_period_filters = []
         self._checked_suppression_voltage_filters = list(self._available_suppression_voltage_filters)
+        self._checked_valve_voltage_filters = []
         self._is_internal_run_label = TestDataTrendDialog._is_internal_run_label
         self._metric_title_suffix = TestDataTrendDialog._metric_title_suffix
         self._selection_summary_text = TestDataTrendDialog._selection_summary_text
@@ -808,6 +812,7 @@ class _RunSelectionHarness:
             "_current_run_selector_mode",
             "_metrics_condition_multiselect_active",
             "_checked_metric_condition_selections",
+            "_set_all_metric_condition_checks",
             "_set_metric_condition_selection_ids",
             "_combine_run_selections",
             "_current_run_selections",
@@ -830,6 +835,13 @@ class _RunSelectionHarness:
             "_active_control_period_filter_values",
             "_active_program_filter_values",
             "_active_suppression_voltage_filter_values",
+            "_active_valve_voltage_filter_values",
+            "_restrictive_filter_values",
+            "_restrictive_control_period_filter_values",
+            "_restrictive_suppression_voltage_filter_values",
+            "_restrictive_valve_voltage_filter_values",
+            "_filter_state_without_valve_voltages",
+            "_selection_filter_state",
             "_selection_member_control_periods",
             "_selection_member_suppression_voltages",
             "_selection_run_type_modes",
@@ -849,6 +861,7 @@ class _RunSelectionHarness:
             "_delete_selected_auto_plots",
         ):
             setattr(self, name, getattr(TestDataTrendDialog, name).__get__(self, _RunSelectionHarness))
+        self._restrictive_filter_values = TestDataTrendDialog._restrictive_filter_values
 
         self._refresh_columns_for_run = lambda: None
         self._refresh_stats_preview = lambda: None
@@ -1589,7 +1602,7 @@ class TestTDTrendDialogLayout(unittest.TestCase):
             self.assertEqual(dlg.lbl_metric_stats_summary.text(), "Stats: mean")
 
             dlg.list_y_metrics.clearSelection()
-            dlg.list_y_metrics.item(1).setSelected(True)
+            dlg._set_list_widget_selection_by_value(dlg.list_y_metrics, ["Flow"])
             self.assertEqual(dlg.lbl_metric_y_columns_summary.text(), "Y Columns: current")
 
             dlg.list_stats.clearSelection()
@@ -1645,6 +1658,130 @@ class TestTDTrendDialogLayout(unittest.TestCase):
             )
         finally:
             dlg.close()
+
+    def test_refresh_columns_for_run_metric_y_defaults_to_empty_and_preserves_selection(self) -> None:
+        dlg = _build_test_data_dialog()
+        try:
+            from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+            dlg._db_path = Path("C:/tmp/fake.sqlite3")
+            dlg._current_member_runs = lambda: ["RunA"]
+            dlg._current_run_selection = lambda: {"details_text": "Sequence: RunA"}
+
+            with mock.patch.object(be, "td_list_raw_y_columns", return_value=[]), mock.patch.object(
+                be,
+                "td_list_metric_y_columns",
+                return_value=[
+                    {"name": "Pressure", "units": "psi"},
+                    {"name": "Flow", "units": "lbm/s"},
+                ],
+            ), mock.patch.object(be, "td_list_x_columns", return_value=[]), mock.patch.object(
+                be, "td_list_life_parameter_options", return_value=[]
+            ), mock.patch.object(be, "td_list_life_axes", return_value=[]):
+                dlg._refresh_columns_for_run()
+
+            self.assertEqual([item.text() for item in dlg.list_y_metrics.selectedItems()], [])
+            self.assertEqual(dlg.lbl_metric_y_columns_summary.text(), "Y Columns: None selected")
+
+            for i in range(dlg.list_y_metrics.count()):
+                item = dlg.list_y_metrics.item(i)
+                if item is not None and str(item.text() or "").startswith("Flow"):
+                    item.setSelected(True)
+                    break
+
+            with mock.patch.object(be, "td_list_raw_y_columns", return_value=[]), mock.patch.object(
+                be,
+                "td_list_metric_y_columns",
+                return_value=[
+                    {"name": "Pressure", "units": "psi"},
+                    {"name": "Flow", "units": "lbm/s"},
+                ],
+            ), mock.patch.object(be, "td_list_x_columns", return_value=[]), mock.patch.object(
+                be, "td_list_life_parameter_options", return_value=[]
+            ), mock.patch.object(be, "td_list_life_axes", return_value=[]):
+                dlg._refresh_columns_for_run()
+
+            selected_labels = dlg._selected_list_widget_labels(dlg.list_y_metrics)
+            self.assertEqual(len(selected_labels), 1)
+            self.assertTrue(selected_labels[0].startswith("Flow"))
+        finally:
+            dlg.close()
+
+    def test_refresh_columns_for_run_life_parameter_combos_default_to_blank(self) -> None:
+        dlg = _build_test_data_dialog()
+        try:
+            from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+            dlg._db_path = Path("C:/tmp/fake.sqlite3")
+            dlg._current_member_runs = lambda: ["RunA"]
+            dlg._current_run_selection = lambda: {"details_text": "Condition: RunA"}
+
+            with mock.patch.object(be, "td_list_raw_y_columns", return_value=[]), mock.patch.object(
+                be, "td_list_metric_y_columns", return_value=[]
+            ), mock.patch.object(be, "td_list_x_columns", return_value=[]), mock.patch.object(
+                be,
+                "td_list_life_parameter_options",
+                return_value=[
+                    {"name": "Life Metric A", "units": "psi"},
+                    {"name": "Life Metric B", "units": "ms"},
+                ],
+            ), mock.patch.object(
+                be,
+                "td_list_life_axes",
+                return_value=[{"key": "sequence_index", "label": "Sequence"}],
+            ):
+                dlg._refresh_columns_for_run()
+
+            self.assertEqual(dlg._current_life_y_parameter(), "")
+            self.assertEqual(dlg._current_life_x_parameter(), "")
+            self.assertEqual(dlg.cb_life_y_param.itemData(0), "")
+            self.assertEqual(dlg.cb_life_x_param.itemData(0), "")
+            self.assertEqual(dlg.lbl_life_summary.text(), "Life metrics: - over Sequence")
+        finally:
+            dlg.close()
+
+    def test_open_selected_auto_plot_restores_metric_y_selection_from_empty_default(self) -> None:
+        from PySide6 import QtWidgets
+        from EIDAT_App_Files.ui_next.qt_main import TestDataTrendDialog  # type: ignore
+
+        harness = _RunSelectionHarness()
+        harness._plot_ready = True
+        harness._set_metric_plot_source = lambda *args, **kwargs: None
+        apply_plot = getattr(
+            TestDataTrendDialog,
+            "_apply_auto_graph_quickcheck_plot_to_live_gui",
+        ).__get__(harness, _RunSelectionHarness)
+        selection = {
+            "mode": "sequence",
+            "id": "sequence:RunA",
+            "run_name": "RunA",
+            "sequence_name": "RunA",
+            "display_text": "RunA",
+            "member_runs": ["RunA"],
+            "member_sequences": ["RunA"],
+            "details_text": "Sequence: RunA",
+        }
+        harness._run_selection_views = {"sequence": [selection], "condition": []}
+        harness.cb_run.clear()
+        harness.cb_run.addItem("RunA", selection)
+        harness.list_y_metrics.clear()
+        for name in ("Pressure", "Flow"):
+            harness.list_y_metrics.addItem(QtWidgets.QListWidgetItem(name))
+
+        self.assertEqual([item.text() for item in harness.list_y_metrics.selectedItems()], [])
+
+        plot_def = {
+            "mode": "metrics",
+            "selector_mode": "sequence",
+            "selection_id": "sequence:RunA",
+            "stats": ["mean"],
+            "y": ["Pressure"],
+        }
+
+        apply_plot(plot_def)
+
+        self.assertEqual([item.text() for item in harness.list_y_metrics.selectedItems()], ["Pressure"])
+        self.assertTrue(harness._plot_metrics_called)
 
     def test_curve_popup_summaries_reflect_backing_selection_state(self) -> None:
         dlg = _build_test_data_dialog()
@@ -1704,9 +1841,12 @@ class TestTDTrendDialogLayout(unittest.TestCase):
             dlg._db_path = Path("C:/tmp/fake.sqlite3")
             dlg._mode = "curves"
             dlg._current_member_runs = lambda: ["RunA"]
+            dlg.cb_x.blockSignals(True)
             dlg.cb_x.clear()
             dlg.cb_x.addItem("Time", "time_s")
             dlg.cb_x.setCurrentIndex(0)
+            dlg.cb_x.blockSignals(False)
+            dlg._curve_y_columns_by_run_x = {}
 
             calls: list[tuple[str, str]] = []
 
@@ -1714,12 +1854,47 @@ class TestTDTrendDialogLayout(unittest.TestCase):
                 calls.append((str(run_name), str(x_name)))
                 return [{"name": "thrust", "units": "lbf"}]
 
-            with mock.patch.object(be, "td_list_curve_y_columns", side_effect=_fake_list_curve_y_columns):
+            with mock.patch.object(be, "td_list_x_columns", return_value=["time_s"]), mock.patch.object(
+                be,
+                "td_list_curve_y_columns",
+                side_effect=_fake_list_curve_y_columns,
+            ):
                 dlg._refresh_curve_y_columns()
 
             self.assertEqual(calls, [("RunA", "time_s")])
-            self.assertEqual(dlg._current_curve_y_name(), "thrust")
-            self.assertEqual(dlg.lbl_curve_y_column_summary.text(), "Y Column: thrust")
+            self.assertEqual(dlg._current_curve_y_name(), "")
+            self.assertEqual(dlg.lbl_curve_y_column_summary.text(), "Y Columns: None selected")
+        finally:
+            dlg.close()
+
+    def test_refresh_performance_ui_defaults_axes_to_blank(self) -> None:
+        dlg = _build_test_data_dialog()
+        try:
+            from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+            dlg._db_path = Path("C:/tmp/fake.sqlite3")
+
+            with mock.patch.object(be, "load_excel_trend_config", return_value={"statistics": ["mean", "max"]}), mock.patch.object(
+                be, "td_list_runs", return_value=["RunA"]
+            ), mock.patch.object(
+                be, "td_list_performance_run_type_modes", return_value=["steady_state", "pulsed_mode"]
+            ), mock.patch.object(
+                be,
+                "td_list_y_columns",
+                return_value=[
+                    {"name": "Output A", "units": "lbf"},
+                    {"name": "Input A", "units": "psi"},
+                    {"name": "Input B", "units": "ms"},
+                ],
+            ):
+                dlg._refresh_performance_ui()
+
+            self.assertEqual(dlg._perf_var_names(), ("", "", ""))
+            self.assertEqual(dlg.cb_perf_y_col.currentData(), "")
+            self.assertEqual(dlg.cb_perf_x_col.currentData(), "")
+            self.assertEqual(dlg.cb_perf_z_col.currentData(), "")
+            self.assertEqual(dlg.lbl_perf_axes.text(), "Output: - | Input 1: - | Input 2: -")
+            self.assertEqual(dlg.lbl_perf_common_runs.text(), "Common runs for selected variables: -")
         finally:
             dlg.close()
 
@@ -9624,7 +9799,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
         )
 
     @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
-    def test_metrics_condition_checklist_populates_and_defaults_all_checked(self) -> None:
+    def test_metrics_condition_checklist_populates_and_defaults_all_unchecked(self) -> None:
         harness = _RunSelectionHarness()
         harness._run_selection_views["condition"] = [
             {
@@ -9652,7 +9827,41 @@ class TestTDSupportWorkbook(unittest.TestCase):
         harness.cb_run_mode.setCurrentIndex(harness.cb_run_mode.findData("condition"))
 
         self.assertEqual(harness.list_metric_run_conditions.count(), 2)
-        self.assertEqual(harness.checked_condition_ids(), ["condition:seq1", "condition:seq3"])
+        self.assertEqual(harness.checked_condition_ids(), [])
+
+    @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
+    def test_metrics_condition_checklist_select_all_and_clear_controls(self) -> None:
+        harness = _RunSelectionHarness()
+        harness._run_selection_views["condition"] = [
+            {
+                "mode": "condition",
+                "id": "condition:seq1",
+                "run_name": "Seq1",
+                "display_text": "350 psia, SS",
+                "run_condition": "350 psia, SS",
+                "member_runs": ["Seq1"],
+                "member_sequences": ["Seq1"],
+                "details_text": "Source Sequences: Seq1",
+            },
+            {
+                "mode": "condition",
+                "id": "condition:seq2",
+                "run_name": "Seq2",
+                "display_text": "410 psia, PM",
+                "run_condition": "410 psia, PM",
+                "member_runs": ["Seq2"],
+                "member_sequences": ["Seq2"],
+                "details_text": "Source Sequences: Seq2",
+            },
+        ]
+        harness._set_mode("metrics")
+        harness.cb_run_mode.setCurrentIndex(harness.cb_run_mode.findData("condition"))
+
+        harness._set_all_metric_condition_checks(True)
+        self.assertEqual(harness.checked_condition_ids(), ["condition:seq1", "condition:seq2"])
+
+        harness._set_all_metric_condition_checks(False)
+        self.assertEqual(harness.checked_condition_ids(), [])
 
     @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
     def test_run_dropdown_hides_unchecked_program_items(self) -> None:

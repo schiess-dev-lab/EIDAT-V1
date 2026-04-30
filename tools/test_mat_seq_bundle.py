@@ -85,7 +85,15 @@ class TestMatSeqBundle(unittest.TestCase):
             },
         )
 
-    def _write_td_source_sqlite(self, path: Path, *, source_sheet_name: str, serial_number: str, thrust_offset: float = 0.0) -> None:
+    def _write_td_source_sqlite(
+        self,
+        path: Path,
+        *,
+        source_sheet_name: str,
+        serial_number: str,
+        thrust_offset: float = 0.0,
+        imported_epoch_ns: int | None = None,
+    ) -> None:
         table_name = f"sheet__{source_sheet_name}"
         with sqlite3.connect(str(path)) as conn:
             conn.execute(
@@ -158,6 +166,24 @@ class TestMatSeqBundle(unittest.TestCase):
                     (source_sheet_name, 1, 2, serial_number),
                 ],
             )
+            if imported_epoch_ns is not None:
+                conn.execute(
+                    """
+                    CREATE TABLE __workbook (
+                        source_file TEXT NOT NULL,
+                        imported_epoch_ns INTEGER NOT NULL,
+                        excel_size_bytes INTEGER NOT NULL,
+                        excel_mtime_ns INTEGER NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO __workbook(source_file, imported_epoch_ns, excel_size_bytes, excel_mtime_ns)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (str(path), int(imported_epoch_ns), 0, 0),
+                )
             conn.commit()
 
     def _sequence_context_row(self, sqlite_path: Path, *, sheet_name: str) -> dict[str, object]:
@@ -464,6 +490,181 @@ class TestMatSeqBundle(unittest.TestCase):
             scan_global_repo(paths)
             results = process_candidates(paths)
             self.assertTrue(any((not item.ok) and "did not contain any numeric 1-D series" in str(item.error or "") for item in results))
+
+    def test_rebuild_td_serial_aggregates_drops_duplicate_sequence_and_keeps_newest_ingest(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            repo = Path(td)
+            paths = support_paths(repo)
+            support_dir = paths.support_dir
+            src_old_rel = Path("debug/ocr/source_old__excel")
+            src_new_rel = Path("debug/ocr/source_new__excel")
+            src_old_dir = support_dir / src_old_rel
+            src_new_dir = support_dir / src_new_rel
+            src_old_dir.mkdir(parents=True, exist_ok=True)
+            src_new_dir.mkdir(parents=True, exist_ok=True)
+            src_old_sqlite = src_old_dir / "source_old.sqlite3"
+            src_new_sqlite = src_new_dir / "source_new.sqlite3"
+            self._write_td_source_sqlite(
+                src_old_sqlite,
+                source_sheet_name="seq1",
+                serial_number="SN123",
+                thrust_offset=0.0,
+                imported_epoch_ns=100,
+            )
+            self._write_td_source_sqlite(
+                src_new_sqlite,
+                source_sheet_name="seq1",
+                serial_number="SN123",
+                thrust_offset=100.0,
+                imported_epoch_ns=200,
+            )
+
+            meta_old = src_old_dir / "source_old_metadata.json"
+            meta_new = src_new_dir / "source_new_metadata.json"
+            src_old_rel_text = str(src_old_rel).replace("/", "\\")
+            src_new_rel_text = str(src_new_rel).replace("/", "\\")
+            meta_old.write_text(
+                __import__("json").dumps(
+                    {
+                        "program_title": "Program A",
+                        "asset_type": "Thruster",
+                        "asset_specific_type": "Valve",
+                        "serial_number": "SN123",
+                        "document_type": "TD",
+                        "document_type_acronym": "TD",
+                        "document_type_status": "confirmed",
+                        "document_type_review_required": False,
+                        "excel_sqlite_rel": f"EIDAT Support\\{src_old_rel_text}\\source_old.sqlite3",
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            meta_new.write_text(
+                __import__("json").dumps(
+                    {
+                        "program_title": "Program A",
+                        "asset_type": "Thruster",
+                        "asset_specific_type": "Valve",
+                        "serial_number": "SN123",
+                        "document_type": "TD",
+                        "document_type_acronym": "TD",
+                        "document_type_status": "confirmed",
+                        "document_type_review_required": False,
+                        "excel_sqlite_rel": f"EIDAT Support\\{src_new_rel_text}\\source_new.sqlite3",
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            payload = rebuild_td_serial_aggregates(paths)
+            self.assertEqual(int(payload.get("aggregate_count") or 0), 1)
+
+            aggregate_dir = support_dir / "Test Data File Extractions" / "Program_A" / "Thruster" / "Valve" / "SN123"
+            aggregate_manifest = __import__("json").loads((aggregate_dir / "td_serial_aggregate.json").read_text(encoding="utf-8"))
+            self.assertEqual(int(aggregate_manifest.get("sequence_count") or 0), 1)
+            warnings = list(aggregate_manifest.get("warnings") or [])
+            self.assertTrue(any("kept newer ingest source" in str(msg) for msg in warnings))
+
+            with sqlite3.connect(str(aggregate_dir / "SN123.sqlite3")) as conn:
+                sheet_names = [str(row[0] or "") for row in conn.execute("SELECT sheet_name FROM __sheet_info ORDER BY sheet_name").fetchall()]
+                table_names = [str(row[0] or "") for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'sheet__%' ORDER BY name").fetchall()]
+                member_rows = conn.execute(
+                    "SELECT source_metadata_rel, duplicate_of FROM __td_serial_aggregate_members ORDER BY sheet_name"
+                ).fetchall()
+                thrust_rows = [float(row[0] or 0.0) for row in conn.execute('SELECT thrust FROM "sheet__seq1" ORDER BY excel_row').fetchall()]
+            self.assertEqual(sheet_names, ["seq1"])
+            self.assertEqual(table_names, ["sheet__seq1"])
+            self.assertEqual(len(member_rows), 1)
+            self.assertEqual(str(member_rows[0][0] or "").replace("\\", "/"), str((src_new_rel / "source_new_metadata.json")).replace("\\", "/"))
+            self.assertEqual(str(member_rows[0][1] or "").strip(), "")
+            self.assertEqual(thrust_rows, [110.0, 120.0, 130.0])
+
+    def test_rebuild_td_serial_aggregates_duplicate_sequence_falls_back_to_newest_metadata(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            repo = Path(td)
+            paths = support_paths(repo)
+            support_dir = paths.support_dir
+            src_old_rel = Path("debug/ocr/source_meta_old__excel")
+            src_new_rel = Path("debug/ocr/source_meta_new__excel")
+            src_old_dir = support_dir / src_old_rel
+            src_new_dir = support_dir / src_new_rel
+            src_old_dir.mkdir(parents=True, exist_ok=True)
+            src_new_dir.mkdir(parents=True, exist_ok=True)
+            src_old_sqlite = src_old_dir / "source_meta_old.sqlite3"
+            src_new_sqlite = src_new_dir / "source_meta_new.sqlite3"
+            self._write_td_source_sqlite(
+                src_old_sqlite,
+                source_sheet_name="seq1",
+                serial_number="SN123",
+                thrust_offset=0.0,
+                imported_epoch_ns=0,
+            )
+            self._write_td_source_sqlite(
+                src_new_sqlite,
+                source_sheet_name="seq1",
+                serial_number="SN123",
+                thrust_offset=200.0,
+                imported_epoch_ns=0,
+            )
+
+            meta_old = src_old_dir / "source_meta_old_metadata.json"
+            meta_new = src_new_dir / "source_meta_new_metadata.json"
+            src_old_rel_text = str(src_old_rel).replace("/", "\\")
+            src_new_rel_text = str(src_new_rel).replace("/", "\\")
+            meta_old.write_text(
+                __import__("json").dumps(
+                    {
+                        "program_title": "Program A",
+                        "asset_type": "Thruster",
+                        "asset_specific_type": "Valve",
+                        "serial_number": "SN123",
+                        "document_type": "TD",
+                        "document_type_acronym": "TD",
+                        "document_type_status": "confirmed",
+                        "document_type_review_required": False,
+                        "excel_sqlite_rel": f"EIDAT Support\\{src_old_rel_text}\\source_meta_old.sqlite3",
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            time.sleep(0.05)
+            meta_new.write_text(
+                __import__("json").dumps(
+                    {
+                        "program_title": "Program A",
+                        "asset_type": "Thruster",
+                        "asset_specific_type": "Valve",
+                        "serial_number": "SN123",
+                        "document_type": "TD",
+                        "document_type_acronym": "TD",
+                        "document_type_status": "confirmed",
+                        "document_type_review_required": False,
+                        "excel_sqlite_rel": f"EIDAT Support\\{src_new_rel_text}\\source_meta_new.sqlite3",
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            payload = rebuild_td_serial_aggregates(paths)
+            self.assertEqual(int(payload.get("aggregate_count") or 0), 1)
+
+            aggregate_dir = support_dir / "Test Data File Extractions" / "Program_A" / "Thruster" / "Valve" / "SN123"
+            aggregate_manifest = __import__("json").loads((aggregate_dir / "td_serial_aggregate.json").read_text(encoding="utf-8"))
+            warnings = list(aggregate_manifest.get("warnings") or [])
+            self.assertTrue(any("kept newer metadata source" in str(msg) for msg in warnings))
+
+            with sqlite3.connect(str(aggregate_dir / "SN123.sqlite3")) as conn:
+                member_rows = conn.execute(
+                    "SELECT source_metadata_rel FROM __td_serial_aggregate_members ORDER BY sheet_name"
+                ).fetchall()
+                thrust_rows = [float(row[0] or 0.0) for row in conn.execute('SELECT thrust FROM "sheet__seq1" ORDER BY excel_row').fetchall()]
+            self.assertEqual(len(member_rows), 1)
+            self.assertEqual(str(member_rows[0][0] or "").replace("\\", "/"), str((src_new_rel / "source_meta_new_metadata.json")).replace("\\", "/"))
+            self.assertEqual(thrust_rows, [210.0, 220.0, 230.0])
 
     def test_non_bundle_mat_still_uses_standalone_artifacts(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:

@@ -5562,9 +5562,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         metrics_condition_layout.addWidget(self.list_metric_run_conditions, 1)
         metrics_condition_actions = QtWidgets.QHBoxLayout()
         self.btn_metric_run_conditions_all = QtWidgets.QPushButton("Select All")
-        self.btn_metric_run_conditions_all.clicked.connect(lambda: self._set_metric_condition_selection_ids(None))
+        self.btn_metric_run_conditions_all.clicked.connect(lambda: self._set_all_metric_condition_checks(True))
         self.btn_metric_run_conditions_clear = QtWidgets.QPushButton("Clear")
-        self.btn_metric_run_conditions_clear.clicked.connect(lambda: self._set_metric_condition_selection_ids([]))
+        self.btn_metric_run_conditions_clear.clicked.connect(lambda: self._set_all_metric_condition_checks(False))
         metrics_condition_actions.addWidget(self.btn_metric_run_conditions_all)
         metrics_condition_actions.addWidget(self.btn_metric_run_conditions_clear)
         metrics_condition_actions.addStretch(1)
@@ -6177,9 +6177,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             value = combo_box.currentData()
         except Exception:
             value = None
-        txt = str(value if value is not None else combo_box.currentText() or "").strip()
-        if txt:
-            return txt
+        if value is not None:
+            txt = str(value).strip()
+            if txt or value == "":
+                return txt
         return str(combo_box.currentText() or "").strip()
 
     @staticmethod
@@ -6542,6 +6543,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
     def _current_combo_label(self, combo_box: QtWidgets.QComboBox | None) -> str:
         if combo_box is None:
             return ""
+        if not self._combo_box_current_value(combo_box):
+            return ""
         return str(combo_box.currentText() or "").strip()
 
     def _set_list_widget_selection(self, list_widget: QtWidgets.QListWidget, values: list[str] | tuple[str, ...]) -> None:
@@ -6668,7 +6671,11 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             return
         selected = self._selected_list_widget_labels(getattr(self, "list_y_curve", None))
         if not selected and hasattr(self, "cb_y_curve"):
-            current_label = str(self.cb_y_curve.currentText() or "").strip()
+            current_label = (
+                str(self.cb_y_curve.currentText() or "").strip()
+                if self._combo_box_current_value(self.cb_y_curve)
+                else ""
+            )
             selected = [current_label] if current_label else []
         all_items = self._list_widget_item_texts(getattr(self, "list_y_curve", None))
         text = "Y Columns: " + self._popup_selection_summary(selected, total_count=len(all_items))
@@ -11922,14 +11929,24 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 out.append(dict(data))
         return out
 
+    def _set_all_metric_condition_checks(self, checked: bool) -> None:
+        if not hasattr(self, "list_metric_run_conditions"):
+            return
+        self.list_metric_run_conditions.blockSignals(True)
+        try:
+            for i in range(self.list_metric_run_conditions.count()):
+                it = self.list_metric_run_conditions.item(i)
+                if not it:
+                    continue
+                it.setCheckState(QtCore.Qt.CheckState.Checked if checked else QtCore.Qt.CheckState.Unchecked)
+        finally:
+            self.list_metric_run_conditions.blockSignals(False)
+        self._on_metric_condition_selection_changed()
+
     def _set_metric_condition_selection_ids(self, selection_ids: list[str] | tuple[str, ...] | set[str] | None) -> None:
         if not hasattr(self, "list_metric_run_conditions"):
             return
-        ids = (
-            {str(v).strip() for v in selection_ids if str(v).strip()}
-            if selection_ids is not None
-            else None
-        )
+        ids = {str(v).strip() for v in (selection_ids or []) if str(v).strip()}
         self.list_metric_run_conditions.blockSignals(True)
         try:
             for i in range(self.list_metric_run_conditions.count()):
@@ -11938,7 +11955,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     continue
                 data = it.data(QtCore.Qt.ItemDataRole.UserRole)
                 sel_id = str(data.get("id") or "").strip() if isinstance(data, dict) else ""
-                checked = True if ids is None else sel_id in ids
+                checked = sel_id in ids
                 it.setCheckState(QtCore.Qt.CheckState.Checked if checked else QtCore.Qt.CheckState.Unchecked)
         finally:
             self.list_metric_run_conditions.blockSignals(False)
@@ -12825,7 +12842,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 it = QtWidgets.QListWidgetItem(label)
                 it.setFlags(it.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
                 sel_id = str(item.get("id") or "").strip()
-                checked = (sel_id in prev_checked_ids) if had_items else True
+                checked = (sel_id in prev_checked_ids) if had_items else False
                 it.setCheckState(QtCore.Qt.CheckState.Checked if checked else QtCore.Qt.CheckState.Unchecked)
                 it.setData(QtCore.Qt.ItemDataRole.UserRole, item)
                 self.list_metric_run_conditions.addItem(it)
@@ -13223,7 +13240,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             self.list_y_metrics,
             self._metric_parameter_options,
             previous_values=prev_selected,
-            select_all_default=True,
+            select_all_default=False,
         )
         self._refresh_metric_y_columns_summary()
 
@@ -13274,14 +13291,24 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     self.cb_life_y_param,
                     self._life_parameter_options,
                     previous_value=prev_life_y,
+                    allow_blank=True,
+                    blank_label="Select Y Parameter",
                 )
                 self._populate_parameter_combo(
                     self.cb_life_x_param,
                     self._life_parameter_options,
                     previous_value=prev_life_x,
+                    allow_blank=True,
+                    blank_label="Select X Parameter",
                 )
-                if self.cb_life_x_param.count() > 1 and self.cb_life_x_param.currentIndex() == self.cb_life_y_param.currentIndex():
-                    self.cb_life_x_param.setCurrentIndex(1)
+                current_life_y = self._combo_box_current_value(self.cb_life_y_param)
+                current_life_x = self._combo_box_current_value(self.cb_life_x_param)
+                if current_life_y and current_life_x and self._perf_norm_name(current_life_x) == self._perf_norm_name(current_life_y):
+                    for index in range(self.cb_life_x_param.count()):
+                        item_norm = self._perf_norm_name(self.cb_life_x_param.itemData(index))
+                        if item_norm and item_norm != self._perf_norm_name(current_life_y):
+                            self.cb_life_x_param.setCurrentIndex(index)
+                            break
             finally:
                 self.cb_life_y_param.blockSignals(False)
                 self.cb_life_x_param.blockSignals(False)
@@ -13378,6 +13405,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             self.cb_y_curve,
             self._curve_parameter_options,
             previous_value=(prev_y[0] if prev_y else ""),
+            allow_blank=True,
+            blank_label="Select Y Column",
         )
         if hasattr(self, "list_y_curve"):
             self._populate_parameter_list_widget(
@@ -13388,8 +13417,6 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             )
         if prev_y:
             self._set_curve_y_selection(prev_y)
-        elif self._curve_parameter_options:
-            self._set_curve_y_selection([str((self._curve_parameter_options[0] or {}).get("value") or "").strip()])
         self.cb_y_curve.blockSignals(False)
         if hasattr(self, "list_y_curve"):
             self.list_y_curve.blockSignals(False)
@@ -15488,13 +15515,14 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         *,
         allowed_norms: set[str] | None = None,
         allow_blank: bool = False,
+        blank_label: str = "None",
     ) -> None:
         prev = self._perf_current_col_name(cb)
         prev_norm = self._perf_norm_name(prev)
         blocker = QtCore.QSignalBlocker(cb)
         cb.clear()
         if allow_blank:
-            cb.addItem("None", "")
+            cb.addItem(blank_label, "")
         for col in (getattr(self, "_perf_available_columns", []) or []):
             value = str((col or {}).get("value") or (col or {}).get("name") or "").strip()
             if not value:
@@ -15528,7 +15556,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     if item_norm and item_norm == want_norm and item_norm not in blocked:
                         cb.setCurrentIndex(i)
                         return True
-            if allow_blank and cb.count() > 0:
+            elif allow_blank and cb.count() > 0:
                 cb.setCurrentIndex(0)
                 return True
             for i in range(cb.count()):
@@ -15657,11 +15685,11 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                         for col in (self._perf_available_columns or [])
                         if self._perf_norm_name(str((col or {}).get("name") or "").strip()) not in disallow
                     }
-                self._fill_perf_axis_combo(cb, allowed_norms=allowed_norms, allow_blank=(key == "z"))
+                self._fill_perf_axis_combo(cb, allowed_norms=allowed_norms, allow_blank=True)
                 self._set_perf_axis_combo_by_norm(
                     cb,
                     desired_norm,
-                    allow_blank=(key == "z"),
+                    allow_blank=True,
                     disallow_norms=disallow,
                 )
                 selected_norms[key] = self._perf_norm_name(self._perf_current_col_name(cb))
@@ -18794,11 +18822,11 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         }
         self._perf_all_runs = [str(r).strip() for r in runs if str(r).strip()]
 
-        self._fill_perf_axis_combo(self.cb_perf_x_col)
-        self._fill_perf_axis_combo(self.cb_perf_y_col)
-        self._fill_perf_axis_combo(self.cb_perf_z_col, allow_blank=True)
-        self._set_perf_axis_combo_by_norm(self.cb_perf_x_col, self._perf_norm_name(prev_input1))
-        self._set_perf_axis_combo_by_norm(self.cb_perf_y_col, self._perf_norm_name(prev_output))
+        self._fill_perf_axis_combo(self.cb_perf_x_col, allow_blank=True, blank_label="Select Input 1")
+        self._fill_perf_axis_combo(self.cb_perf_y_col, allow_blank=True, blank_label="Select Output")
+        self._fill_perf_axis_combo(self.cb_perf_z_col, allow_blank=True, blank_label="Select Input 2 (Optional)")
+        self._set_perf_axis_combo_by_norm(self.cb_perf_x_col, self._perf_norm_name(prev_input1), allow_blank=True)
+        self._set_perf_axis_combo_by_norm(self.cb_perf_y_col, self._perf_norm_name(prev_output), allow_blank=True)
         self._set_perf_axis_combo_by_norm(self.cb_perf_z_col, self._perf_norm_name(prev_input2), allow_blank=True)
         available_run_type_set = {
             be.td_perf_normalize_run_type_mode(mode)
@@ -19374,7 +19402,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             restore_ids = list(selection_ids)
             if not restore_ids and sel_id:
                 restore_ids = [sel_id]
-            self._set_metric_condition_selection_ids(restore_ids if restore_ids else None)
+            self._set_metric_condition_selection_ids(restore_ids)
         if sel_id and not (mode in {"curves", "metrics"} and want_mode == "condition"):
             self._select_run_by_id(sel_id)
         self._set_mode(mode)
@@ -26097,7 +26125,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             restore_ids = list(selection_ids)
             if not restore_ids and selection_id:
                 restore_ids = [selection_id]
-            self._set_metric_condition_selection_ids(restore_ids if restore_ids else None)
+            self._set_metric_condition_selection_ids(restore_ids)
         elif selection_id:
             self._select_run_by_id(selection_id)
 
