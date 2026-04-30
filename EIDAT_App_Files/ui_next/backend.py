@@ -4165,7 +4165,7 @@ def _td_project_program_titles(
     impl_db = Path(db_path).expanduser() if db_path else (proj_dir / EIDAT_PROJECT_IMPLEMENTATION_DB)
     if impl_db.exists():
         try:
-            with sqlite3.connect(str(impl_db)) as conn:
+            with closing(sqlite3.connect(str(impl_db))) as conn:
                 _ensure_test_data_impl_tables(conn)
                 rows = conn.execute(
                     """
@@ -6262,9 +6262,49 @@ def td_load_parameter_runtime_context(project_dir: Path, db_path: Path) -> dict[
     impl_db = Path(db_path).expanduser()
     if not impl_db.exists():
         return {}
+    repo_parameter_rows = load_td_repo_parameter_mappings(
+        proj_dir,
+        db_path=impl_db,
+    )
+
+    rebuilt_context: dict[str, object] | None = None
+
+    def _rebuilt_runtime_context() -> dict[str, object]:
+        nonlocal rebuilt_context
+        if rebuilt_context is not None:
+            return dict(rebuilt_context)
+        context = td_build_parameter_normalization_context(
+            proj_dir,
+            db_path=impl_db,
+        )
+        rebuilt_context = dict(context) if isinstance(context, Mapping) else {}
+        if rebuilt_context:
+            rebuilt_context["project_dir"] = str(proj_dir)
+            rebuilt_context["db_path"] = str(impl_db)
+            rebuilt_context["runtime_mode"] = "rebuilt"
+            rebuilt_context["repo_parameter_rows"] = [
+                dict(row)
+                for row in repo_parameter_rows
+                if isinstance(row, Mapping)
+            ]
+        return dict(rebuilt_context)
+
     with closing(sqlite3.connect(str(impl_db))) as conn:
         if not _td_parameter_runtime_tables_ready(conn, require_rows=True):
-            return {}
+            return _rebuilt_runtime_context()
+        discovery_signature = str(_td_meta_value(conn, TD_PARAM_DISCOVERY_SIGNATURE_META_KEY) or "").strip()
+        discovery_rows_ready = _td_parameter_discovery_table_ready(conn, require_rows=True)
+        if discovery_rows_ready and not discovery_signature:
+            discovery_signature = _td_parameter_discovery_signature(conn)
+        can_validate_runtime = bool(repo_parameter_rows) or discovery_rows_ready or bool(discovery_signature)
+        if can_validate_runtime:
+            expected_runtime_signature = _td_parameter_runtime_signature(
+                discovery_signature,
+                repo_parameter_rows,
+            )
+            cached_runtime_signature = str(_td_meta_value(conn, TD_PARAM_RUNTIME_SIGNATURE_META_KEY) or "").strip()
+            if cached_runtime_signature != expected_runtime_signature:
+                return _rebuilt_runtime_context()
         group_rows = conn.execute(
             f"""
             SELECT canonical_id, display_name, preferred_units, explicit
@@ -6475,6 +6515,11 @@ def td_load_parameter_runtime_context(project_dir: Path, db_path: Path) -> dict[
         "db_path": str(impl_db),
         "runtime_mode": "db",
         "normalization": normalization,
+        "repo_parameter_rows": [
+            dict(row)
+            for row in repo_parameter_rows
+            if isinstance(row, Mapping)
+        ],
         "entries": entries,
         "inventory": inventory,
         "inventory_by_raw_norm": {
@@ -6512,7 +6557,7 @@ def td_build_parameter_normalization_context(
     )
     discovery_rows: list[dict[str, str]] = []
     if impl_db.exists():
-        with sqlite3.connect(str(impl_db)) as conn:
+        with closing(sqlite3.connect(str(impl_db))) as conn:
             discovery_rows = _td_parameter_discovery_rows_from_table(conn)
     if not discovery_rows:
         discovery_rows = _td_collect_parameter_discovery_rows_from_cache(impl_db, raw_db)
@@ -6563,7 +6608,7 @@ def td_build_parameter_selector_options(
             query_parts.append("ORDER BY canonical_id, raw_name")
             groups_runtime: dict[str, dict[str, object]] = {}
             try:
-                with sqlite3.connect(str(db_path)) as conn:
+                with closing(sqlite3.connect(str(db_path))) as conn:
                     _ensure_test_data_impl_tables(conn)
                     rows = conn.execute(" ".join(query_parts), tuple(params)).fetchall()
             except Exception:
@@ -6876,7 +6921,7 @@ def td_parameter_selection_raw_names(
                 params.extend(sorted(raw_norms))
             query_parts.append("ORDER BY raw_name")
             try:
-                with sqlite3.connect(str(db_path)) as conn:
+                with closing(sqlite3.connect(str(db_path))) as conn:
                     _ensure_test_data_impl_tables(conn)
                     rows = conn.execute(" ".join(query_parts), tuple(params)).fetchall()
             except Exception:

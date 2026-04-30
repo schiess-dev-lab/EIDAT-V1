@@ -545,6 +545,175 @@ def _set_fixture_source_missing(project_dir: Path, workbook_path: Path, *, seria
         conn.commit()
 
 
+def _create_parameter_runtime_mapping_fixture(
+    project_dir: Path,
+    *,
+    workbook_display_name: str,
+    runtime_display_name: str,
+    cached_runtime_signature: str = "stale-runtime-signature",
+) -> tuple[Path, Path, str]:
+    if Workbook is None:
+        raise RuntimeError("openpyxl is required for TD runtime mapping tests")
+
+    project_dir.mkdir(parents=True, exist_ok=True)
+    repo_root = project_dir / "repo"
+    impl_db = project_dir / backend.EIDAT_PROJECT_IMPLEMENTATION_DB
+    backend._write_project_meta(
+        project_dir,
+        {
+            "global_repo": str(repo_root),
+            "selected_metadata_rel": ["docs/sn001.json"],
+        },
+    )
+
+    workbook_file = backend.td_program_requirements_workbook_path_for(repo_root, "Program Alpha")
+    backend._td_program_requirements_write_workbook(
+        workbook_file,
+        program_title="Program Alpha",
+        discovered_conditions=[],
+        parameter_mappings=[
+            {
+                "program_title": "Program Alpha",
+                "asset_type": "Valve",
+                "asset_specific_type": "Main",
+                "ingested_parameter": "PulsePressure",
+                "default_display_parameter": workbook_display_name,
+                "displayed_parameter": workbook_display_name,
+                "preferred_units": "psi",
+                "enabled": True,
+                "edited": False,
+            }
+        ],
+    )
+
+    with closing(sqlite3.connect(str(impl_db))) as conn:
+        backend._ensure_test_data_impl_tables(conn)
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO td_source_metadata(
+                serial, source_serial_number, program_title, asset_type, asset_specific_type, metadata_rel
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            ("SN-001", "SN-001", "Program Alpha", "Valve", "Main", "docs/sn001.json"),
+        )
+        conn.execute(
+            f"""
+            INSERT OR REPLACE INTO {backend.TD_PARAM_DISCOVERY_TABLE} (
+                surface, run_name, raw_name, raw_norm, units, program_title, asset_type,
+                asset_specific_type, source_run_name, source_key
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "metrics",
+                "RunA",
+                "PulsePressure",
+                backend._td_param_norm_name("PulsePressure"),
+                "psi",
+                "Program Alpha",
+                "Valve",
+                "Main",
+                "RunA",
+                "SN-001",
+            ),
+        )
+        discovery_signature = backend._td_parameter_discovery_signature(conn)
+        runtime_canonical_id = backend._td_program_parameter_canonical_id(runtime_display_name)
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)
+            """,
+            (backend.TD_PARAM_DISCOVERY_SIGNATURE_META_KEY, discovery_signature),
+        )
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)
+            """,
+            (backend.TD_PARAM_RUNTIME_SIGNATURE_META_KEY, cached_runtime_signature),
+        )
+        conn.execute(
+            f"""
+            INSERT OR REPLACE INTO {backend.TD_PARAM_NORM_GROUPS_TABLE}(
+                canonical_id, display_name, preferred_units, explicit
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (runtime_canonical_id, runtime_display_name, "psi", 1),
+        )
+        conn.execute(
+            f"""
+            INSERT OR REPLACE INTO {backend.TD_PARAM_NORM_RULES_TABLE}(
+                raw_name, raw_norm, program_title, program_norm, asset_type, asset_norm,
+                asset_specific_type, asset_specific_norm, canonical_id, default_display_parameter,
+                displayed_parameter, preferred_units, enabled, edited
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "PulsePressure",
+                backend._td_param_norm_name("PulsePressure"),
+                "Program Alpha",
+                backend._td_param_norm_program("Program Alpha"),
+                "Valve",
+                backend._td_param_norm_program("Valve"),
+                "Main",
+                backend._td_param_norm_program("Main"),
+                runtime_canonical_id,
+                runtime_display_name,
+                runtime_display_name,
+                "psi",
+                1,
+                0,
+            ),
+        )
+        conn.execute(
+            f"""
+            INSERT OR REPLACE INTO {backend.TD_PARAM_RUNTIME_GROUPS_TABLE}(
+                canonical_id, display_name, preferred_units, raw_names_json, units_json,
+                program_titles_json, asset_types_json, asset_specific_types_json,
+                source_run_names_json, surfaces_json, run_names_json, unit_conflict, explicit
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                runtime_canonical_id,
+                runtime_display_name,
+                "psi",
+                "[\"PulsePressure\"]",
+                "[\"psi\"]",
+                "[\"Program Alpha\"]",
+                "[\"Valve\"]",
+                "[\"Main\"]",
+                "[\"RunA\"]",
+                "[\"metrics\"]",
+                "[\"RunA\"]",
+                0,
+                1,
+            ),
+        )
+        conn.execute(
+            f"""
+            INSERT OR REPLACE INTO {backend.TD_PARAM_RUNTIME_ENTRIES_TABLE}(
+                surface, run_name, raw_name, raw_norm, units, program_title, asset_type,
+                asset_specific_type, source_run_name, source_key, canonical_id, default_display_parameter
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "metrics",
+                "RunA",
+                "PulsePressure",
+                backend._td_param_norm_name("PulsePressure"),
+                "psi",
+                "Program Alpha",
+                "Valve",
+                "Main",
+                "RunA",
+                "SN-001",
+                runtime_canonical_id,
+                runtime_display_name,
+            ),
+        )
+        conn.commit()
+
+    return repo_root, impl_db, discovery_signature
+
+
 class TestBackendTdCacheBootstrap(unittest.TestCase):
     def test_source_runtime_state_fingerprint_uses_healed_official_links(self) -> None:
         if Workbook is None:
@@ -1252,6 +1421,85 @@ class TestBackendTdCacheBootstrap(unittest.TestCase):
             self.assertEqual(str(inventory[0].get("default_display_parameter") or ""), "Time to 1/2 Impulse")
             self.assertEqual(str(inventory[0].get("preferred_units") or ""), "ms")
             self.assertEqual(int(inventory[0].get("source_count") or 0), 1)
+
+    def test_load_parameter_runtime_context_db_mode_includes_repo_parameter_rows_when_signature_matches(self) -> None:
+        if Workbook is None:
+            self.skipTest("openpyxl is required for TD runtime mapping tests")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir) / "project"
+            _repo_root, db_path, discovery_signature = _create_parameter_runtime_mapping_fixture(
+                project_dir,
+                workbook_display_name="Pulse Pressure Saved",
+                runtime_display_name="Pulse Pressure Saved",
+            )
+            repo_rows = backend.load_td_repo_parameter_mappings(project_dir, db_path=db_path)
+            expected_signature = backend._td_parameter_runtime_signature(discovery_signature, repo_rows)
+            with closing(sqlite3.connect(str(db_path))) as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)",
+                    (backend.TD_PARAM_RUNTIME_SIGNATURE_META_KEY, expected_signature),
+                )
+                conn.commit()
+
+            context = backend.td_load_parameter_runtime_context(project_dir, db_path)
+
+            self.assertEqual(str(context.get("runtime_mode") or ""), "db")
+            self.assertEqual(len(context.get("repo_parameter_rows") or []), 1)
+            self.assertEqual(
+                str((context.get("repo_parameter_rows") or [{}])[0].get("displayed_parameter") or ""),
+                "Pulse Pressure Saved",
+            )
+
+    def test_load_parameter_runtime_context_rebuilds_when_repo_mappings_newer_than_runtime_cache(self) -> None:
+        if Workbook is None:
+            self.skipTest("openpyxl is required for TD runtime mapping tests")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir) / "project"
+            _repo_root, db_path, _discovery_signature = _create_parameter_runtime_mapping_fixture(
+                project_dir,
+                workbook_display_name="Pulse Pressure Saved",
+                runtime_display_name="Pulse Pressure Old",
+            )
+
+            context = backend.td_load_parameter_runtime_context(project_dir, db_path)
+
+            self.assertEqual(str(context.get("runtime_mode") or ""), "rebuilt")
+            self.assertEqual(
+                str((context.get("repo_parameter_rows") or [{}])[0].get("displayed_parameter") or ""),
+                "Pulse Pressure Saved",
+            )
+            inventory = list(context.get("inventory") or [])
+            self.assertEqual(len(inventory), 1)
+            self.assertEqual(str(inventory[0].get("displayed_parameter") or ""), "Pulse Pressure Saved")
+
+    def test_parameter_selector_options_use_saved_workbook_mapping_after_runtime_mismatch(self) -> None:
+        if Workbook is None:
+            self.skipTest("openpyxl is required for TD runtime mapping tests")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir) / "project"
+            _repo_root, db_path, _discovery_signature = _create_parameter_runtime_mapping_fixture(
+                project_dir,
+                workbook_display_name="Pulse Pressure Saved",
+                runtime_display_name="Pulse Pressure Old",
+            )
+
+            context = backend.td_load_parameter_runtime_context(project_dir, db_path)
+            options = backend.td_build_parameter_selector_options(
+                context,
+                surface="metrics",
+                raw_names=["PulsePressure"],
+            )
+
+            self.assertEqual(len(options), 1)
+            self.assertEqual(str(options[0].get("display_name") or ""), "Pulse Pressure Saved")
+            self.assertEqual(
+                str(options[0].get("canonical_id") or ""),
+                backend._td_program_parameter_canonical_id("Pulse Pressure Saved"),
+            )
+            self.assertNotEqual(
+                str(options[0].get("canonical_id") or ""),
+                backend._td_program_parameter_canonical_id("Pulse Pressure Old"),
+            )
 
     def test_parameter_selector_options_omit_disabled_parameter_rules(self) -> None:
         raw_name = "Time_1_2_Impluse"

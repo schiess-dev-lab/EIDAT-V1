@@ -3122,7 +3122,7 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
         if phase == self.PHASE_PARAMETERS:
             self.lbl_title.setText("Project Parameters")
             self.lbl_hint.setText(
-                "Review every ingested source parameter grouped by program and asset. "
+                "Review every ingested source parameter as its own program and asset mapping. "
                 "The displayed parameter is the user-facing name the GUI uses for trending, analysis, and mapping. "
                 "Save these names first, then the workflow automatically opens a global units step."
             )
@@ -3187,89 +3187,40 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
 
     def _build_phase1_rows(self, search: str) -> list[dict[str, object]]:
         inventory_index = self._inventory_index()
-        grouped_rows: dict[tuple[str, str, str, str, str], dict[str, object]] = {}
+        rows: list[dict[str, object]] = []
         for row in self._working_rows:
             row_key = self._row_key(row)
             inventory_row = inventory_index.get(row_key) or {}
-            source_count = max(1, int(inventory_row.get("source_count") or 0))
-            status_text = self._status_text(row, inventory_row)
-            group_key = (
-                self._norm_name(row.get("asset_type")),
-                self._norm_name(row.get("asset_specific_type")),
-                self._norm_name(row.get("ingested_parameter")),
-                self._norm_name(row.get("default_display_parameter")),
-                self._norm_name(row.get("displayed_parameter")),
-            )
-            display_row = grouped_rows.get(group_key)
-            if display_row is None:
-                display_row = {
-                    "_row_keys": [row_key],
-                    "_program_titles_set": set(),
-                    "_enabled_values": set(),
-                    "_source_run_names_set": set(),
-                    "_surfaces_set": set(),
-                    "_run_names_set": set(),
-                    "_status_values": set(),
-                    "program_title": "",
-                    "program_titles": [],
-                    "asset_type": str(row.get("asset_type") or "").strip(),
-                    "asset_specific_type": str(row.get("asset_specific_type") or "").strip(),
-                    "ingested_parameter": str(row.get("ingested_parameter") or "").strip(),
-                    "default_display_parameter": str(row.get("default_display_parameter") or "").strip(),
-                    "displayed_parameter": str(row.get("displayed_parameter") or "").strip(),
-                    "enabled": bool(row.get("enabled", True)),
-                    "enabled_text": "Yes" if bool(row.get("enabled", True)) else "No",
-                    "status_text": status_text,
-                    "source_run_names": [],
-                    "surfaces": [],
-                    "run_names": [],
-                    "source_count": 0,
-                }
-                grouped_rows[group_key] = display_row
-            else:
-                cast(list[tuple[str, str, str, str]], display_row["_row_keys"]).append(row_key)
             program_title = str(row.get("program_title") or "").strip()
-            if program_title:
-                cast(set[str], display_row["_program_titles_set"]).add(program_title)
-            for value in (inventory_row.get("source_run_names") or []):
-                text = str(value).strip()
-                if text:
-                    cast(set[str], display_row["_source_run_names_set"]).add(text)
-            for value in (inventory_row.get("surfaces") or []):
-                text = str(value).strip()
-                if text:
-                    cast(set[str], display_row["_surfaces_set"]).add(text)
-            for value in (inventory_row.get("run_names") or []):
-                text = str(value).strip()
-                if text:
-                    cast(set[str], display_row["_run_names_set"]).add(text)
-            cast(set[bool], display_row["_enabled_values"]).add(bool(row.get("enabled", True)))
-            cast(set[str], display_row["_status_values"]).add(status_text)
-            display_row["source_count"] = int(display_row.get("source_count") or 0) + source_count
-
-        rows: list[dict[str, object]] = []
-        for display_row in grouped_rows.values():
-            program_titles = sorted(cast(set[str], display_row.pop("_program_titles_set", set())), key=str.casefold)
-            enabled_values = cast(set[bool], display_row.pop("_enabled_values", set()))
-            source_run_names = sorted(cast(set[str], display_row.pop("_source_run_names_set", set())), key=str.casefold)
-            surfaces = sorted(cast(set[str], display_row.pop("_surfaces_set", set())), key=str.casefold)
-            run_names = sorted(cast(set[str], display_row.pop("_run_names_set", set())), key=str.casefold)
-            status_values = cast(set[str], display_row.pop("_status_values", set()))
-            status_text = "Mixed"
-            if "Edited" in status_values:
-                status_text = "Edited"
-            elif len(status_values) == 1:
-                status_text = next(iter(status_values))
-            elif not status_values:
-                status_text = "Default"
-            display_row["program_titles"] = program_titles
-            display_row["program_title"] = ", ".join(program_titles)
-            display_row["enabled"] = True if enabled_values == {True} else False if enabled_values == {False} else None
-            display_row["enabled_text"] = "Yes" if enabled_values == {True} else "No" if enabled_values == {False} else "Mixed"
-            display_row["source_run_names"] = source_run_names
-            display_row["surfaces"] = surfaces
-            display_row["run_names"] = run_names
-            display_row["status_text"] = status_text
+            enabled_value = bool(row.get("enabled", True))
+            enabled_text = "Yes" if enabled_value else "No"
+            status_text = self._status_text(row, inventory_row)
+            display_row = {
+                "_row_keys": [row_key],
+                "program_title": program_title,
+                "program_titles": [program_title] if program_title else [],
+                "asset_type": str(row.get("asset_type") or "").strip(),
+                "asset_specific_type": str(row.get("asset_specific_type") or "").strip(),
+                "ingested_parameter": str(row.get("ingested_parameter") or "").strip(),
+                "default_display_parameter": str(row.get("default_display_parameter") or "").strip(),
+                "displayed_parameter": str(row.get("displayed_parameter") or "").strip(),
+                "enabled": enabled_value,
+                "enabled_text": enabled_text,
+                "status_text": status_text,
+                "source_run_names": sorted(
+                    {str(value).strip() for value in (inventory_row.get("source_run_names") or []) if str(value).strip()},
+                    key=str.casefold,
+                ),
+                "surfaces": sorted(
+                    {str(value).strip() for value in (inventory_row.get("surfaces") or []) if str(value).strip()},
+                    key=str.casefold,
+                ),
+                "run_names": sorted(
+                    {str(value).strip() for value in (inventory_row.get("run_names") or []) if str(value).strip()},
+                    key=str.casefold,
+                ),
+                "source_count": max(1, int(inventory_row.get("source_count") or 0)),
+            }
             search_blob = "\n".join(
                 [
                     str(display_row.get("program_title") or ""),
@@ -3351,13 +3302,13 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
                         item.setToolTip(
                             "\n".join(
                                 [
-                                    f"Programs: {str(row.get('program_title') or '').strip() or '-'}",
+                                    f"Program: {str(row.get('program_title') or '').strip() or '-'}",
                                     f"Asset: {str(row.get('asset_type') or '').strip() or '-'}",
                                     f"Specific: {str(row.get('asset_specific_type') or '').strip() or '-'}",
                                     f"Ingested: {str(row.get('ingested_parameter') or '').strip()}",
                                     f"Displayed: {str(row.get('displayed_parameter') or '').strip()}",
                                     f"Enabled: {str(row.get('enabled_text') or '').strip() or '-'}",
-                                    f"Member Rows: {len(self._coerce_row_keys(row.get('_row_keys')))}",
+                                    f"Observed Sources: {int(row.get('source_count') or 0)}",
                                 ]
                             )
                         )
@@ -3430,14 +3381,13 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
                 self.detail.setPlainText(
                     "\n".join(
                         [
-                            f"Programs: {str(row.get('program_title') or '').strip() or '-'}",
+                            f"Program: {str(row.get('program_title') or '').strip() or '-'}",
                             f"Asset: {str(row.get('asset_type') or '').strip() or '-'}",
                             f"Specific: {str(row.get('asset_specific_type') or '').strip() or '-'}",
                             f"Ingested Parameter: {str(row.get('ingested_parameter') or '').strip()}",
                             f"Displayed Parameter: {str(row.get('displayed_parameter') or '').strip() or '-'}",
                             f"Enabled: {str(row.get('enabled_text') or '').strip() or '-'}",
                             f"Observed Sources: {int(row.get('source_count') or 0)}",
-                            f"Member Rows: {len(self._coerce_row_keys(row.get('_row_keys')))}",
                             f"Status: {str(row.get('status_text') or '').strip() or '-'}",
                         ]
                     )
@@ -3449,7 +3399,7 @@ class TDParameterNormalizationDialog(QtWidgets.QDialog):
                             f"Selected Rows: {len(rows)}",
                             f"Programs: {', '.join(sorted({str(value).strip() for row in rows for value in (row.get('program_titles') or []) if str(value).strip()}, key=str.casefold)) or '-'}",
                             f"Displayed Parameters: {', '.join(sorted({str(row.get('displayed_parameter') or '').strip() for row in rows if str(row.get('displayed_parameter') or '').strip()}, key=str.casefold)) or '-'}",
-                            "Use Set Display, Enable Selected, Disable Selected, or Reset Selected to update all selected member rows.",
+                            "Use Set Display, Enable Selected, Disable Selected, or Reset Selected to update all selected rows.",
                         ]
                     )
                 )
@@ -31997,9 +31947,10 @@ class MainWindow(QtWidgets.QMainWindow):
             workbook = Path(str(record.get("workbook") or "")).expanduser()
             dlg = TDParameterNormalizationDialog(project_dir, workbook, self)
             self._prepare_dialog(dlg)
-            if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
-                if getattr(dlg, "saved", False):
-                    self._show_toast("Project parameters saved")
+            result = dlg.exec()
+            if getattr(dlg, "saved", False):
+                self._show_toast("Project parameters saved")
+            if result == QtWidgets.QDialog.DialogCode.Accepted:
                 if getattr(dlg, "update_requested", False):
                     current_record = self._selected_project_record() or record
                     current_type = str(current_record.get("type") or "").strip()
