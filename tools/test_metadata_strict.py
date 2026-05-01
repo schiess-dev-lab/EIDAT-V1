@@ -108,6 +108,39 @@ class TestStrictMetadataAllowlists(unittest.TestCase):
             meta = emd.extract_metadata_from_text("=== Page 1 ===\n(no title)\n", pdf_path=p)
             self.assertEqual(meta.get("program_title"), "Starlink")
 
+    def test_program_title_directory_fallback_at_depth_eight(self):
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as repo_td:
+            data_root = Path(td)
+            _write_candidates(data_root, {"program_titles": ["Starlink"]})
+            _write_doc_type_strategies(data_root, _strategy_payload())
+            os.environ["EIDAT_DATA_ROOT"] = str(data_root)
+
+            p = Path(repo_td) / "Starlink" / "l1" / "l2" / "l3" / "l4" / "l5" / "l6" / "l7" / "file.pdf"
+            meta = emd.extract_metadata_from_text("=== Page 1 ===\n(no title)\n", pdf_path=p)
+            self.assertEqual(meta.get("program_title"), "Starlink")
+
+    def test_program_title_directory_fallback_prefers_nearest_match(self):
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as repo_td:
+            data_root = Path(td)
+            _write_candidates(data_root, {"program_titles": ["Program X", "Program Y"]})
+            _write_doc_type_strategies(data_root, _strategy_payload())
+            os.environ["EIDAT_DATA_ROOT"] = str(data_root)
+
+            p = Path(repo_td) / "Program Y" / "l1" / "l2" / "l3" / "Program X" / "l4" / "l5" / "file.pdf"
+            meta = emd.extract_metadata_from_text("=== Page 1 ===\n(no title)\n", pdf_path=p)
+            self.assertEqual(meta.get("program_title"), "Program X")
+
+    def test_program_title_directory_fallback_beyond_depth_eight_is_unknown(self):
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as repo_td:
+            data_root = Path(td)
+            _write_candidates(data_root, {"program_titles": ["Starlink"]})
+            _write_doc_type_strategies(data_root, _strategy_payload())
+            os.environ["EIDAT_DATA_ROOT"] = str(data_root)
+
+            p = Path(repo_td) / "Starlink" / "l1" / "l2" / "l3" / "l4" / "l5" / "l6" / "l7" / "l8" / "file.pdf"
+            meta = emd.extract_metadata_from_text("=== Page 1 ===\n(no title)\n", pdf_path=p)
+            self.assertEqual(meta.get("program_title"), "Unknown")
+
     def test_program_title_alias_object_resolves_to_canonical(self):
         with tempfile.TemporaryDirectory() as td:
             data_root = Path(td)
@@ -366,6 +399,23 @@ class TestStrictMetadataAllowlists(unittest.TestCase):
             p = Path(td) / "Starlink" / "Pump" / "x.pdf"
             meta = emd.canonicalize_metadata_for_file(p, existing_meta=None, extracted_meta={}, default_document_type="EIDP")
             self.assertEqual(meta.get("asset_type"), "Pump")
+
+    def test_canonicalize_asset_type_from_path_at_depth_eight(self):
+        with tempfile.TemporaryDirectory() as td:
+            data_root = Path(td)
+            _write_candidates(
+                data_root,
+                {
+                    "program_titles": ["Starlink"],
+                    "asset_types": ["Valve", "Pump"],
+                },
+            )
+            _write_doc_type_strategies(data_root, _strategy_payload())
+            os.environ["EIDAT_DATA_ROOT"] = str(data_root)
+
+            p = Path(td) / "Valve" / "l1" / "l2" / "l3" / "l4" / "l5" / "l6" / "l7" / "x.pdf"
+            meta = emd.canonicalize_metadata_for_file(p, existing_meta=None, extracted_meta={}, default_document_type="EIDP")
+            self.assertEqual(meta.get("asset_type"), "Valve")
 
     def test_asset_specific_type_rule_sets_asset_type_and_vendor(self):
         with tempfile.TemporaryDirectory() as td:

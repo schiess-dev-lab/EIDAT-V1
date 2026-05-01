@@ -103,6 +103,8 @@ DEFAULT_CANDIDATES = {
     "asset_specific_type_rules": [],
 }
 
+STRICT_FIELD_FOLDER_LEVELS = 8
+
 DEFAULT_DOCUMENT_TYPE_STRATEGIES = {
     "version": 1,
     "document_types": [
@@ -469,9 +471,11 @@ def _best_named_entry_match_in_blob(blob: str, entries: list[dict]) -> str | Non
     return best[1] if best else None
 
 
-def _infer_named_entry_from_path(path: Optional[Path], entries: list[dict], *, max_levels: int = 5) -> str | None:
+def _infer_named_entry_from_path(
+    path: Optional[Path], entries: list[dict], *, max_levels: int = STRICT_FIELD_FOLDER_LEVELS
+) -> str | None:
     """
-    Walk up parent directories (up to max_levels) and return the first entry whose alias
+    Walk up parent directories (up to max_levels) and return the nearest entry whose alias
     exactly equals a directory name under normalized matching.
     """
     if path is None or not entries:
@@ -501,7 +505,6 @@ def _infer_named_entry_from_path(path: Optional[Path], entries: list[dict], *, m
     except Exception:
         cur = Path(path).parent
 
-    best: tuple[int, str] | None = None
     for _ in range(int(max_levels)):
         try:
             dname = str(cur.name or "").strip()
@@ -510,8 +513,7 @@ def _infer_named_entry_from_path(path: Optional[Path], entries: list[dict], *, m
         if dname:
             hit = alias_norm_to_best.get(_norm_alnum_spaces(dname))
             if hit is not None:
-                if best is None or hit[0] > best[0]:
-                    best = hit
+                return hit[1]
         try:
             if cur.parent == cur:
                 break
@@ -519,7 +521,7 @@ def _infer_named_entry_from_path(path: Optional[Path], entries: list[dict], *, m
         except Exception:
             break
 
-    return best[1] if best else None
+    return None
 
 
 def _first_pages_blob(lines: list[str], *, pages: int = 3, max_lines: int = 800) -> str:
@@ -545,7 +547,7 @@ def resolve_strict_field(
     entries: list[dict],
     label_aliases: dict[str, list[str]],
     pages: int = 3,
-    max_folder_levels: int = 5,
+    max_folder_levels: int = STRICT_FIELD_FOLDER_LEVELS,
 ) -> str | None:
     """
     Strict allowlist resolver:
@@ -828,7 +830,7 @@ def canonicalize_metadata_for_file(
         m = _best_named_entry_match_in_blob(filename_blob, entries)
         if m:
             return m
-        m = _infer_named_entry_from_path(p, entries, max_levels=5)
+        m = _infer_named_entry_from_path(p, entries, max_levels=STRICT_FIELD_FOLDER_LEVELS)
         if m:
             return m
         return "Unknown"
@@ -1838,22 +1840,22 @@ def extract_metadata_from_text(text: str, *, asset_types: Optional[list[str]] = 
 
     # Strict fields: document text -> filename -> folders -> Unknown.
     meta["program_title"] = resolve_strict_field(
-        "program_title", lines=lines, pdf_path=pdf_path, entries=program_entries, label_aliases=label_aliases, pages=3, max_folder_levels=5
+        "program_title", lines=lines, pdf_path=pdf_path, entries=program_entries, label_aliases=label_aliases, pages=3, max_folder_levels=STRICT_FIELD_FOLDER_LEVELS
     ) or "Unknown"
     meta["vendor"] = resolve_strict_field(
-        "vendor", lines=lines, pdf_path=pdf_path, entries=vendor_entries, label_aliases=label_aliases, pages=3, max_folder_levels=5
+        "vendor", lines=lines, pdf_path=pdf_path, entries=vendor_entries, label_aliases=label_aliases, pages=3, max_folder_levels=STRICT_FIELD_FOLDER_LEVELS
     ) or "Unknown"
     meta["asset_type"] = resolve_strict_field(
-        "asset_type", lines=lines, pdf_path=pdf_path, entries=asset_type_entries, label_aliases=label_aliases, pages=3, max_folder_levels=5
+        "asset_type", lines=lines, pdf_path=pdf_path, entries=asset_type_entries, label_aliases=label_aliases, pages=3, max_folder_levels=STRICT_FIELD_FOLDER_LEVELS
     ) or "Unknown"
     meta["asset_specific_type"] = resolve_strict_field(
-        "asset_specific_type", lines=lines, pdf_path=pdf_path, entries=asset_specific_entries, label_aliases=label_aliases, pages=3, max_folder_levels=5
+        "asset_specific_type", lines=lines, pdf_path=pdf_path, entries=asset_specific_entries, label_aliases=label_aliases, pages=3, max_folder_levels=STRICT_FIELD_FOLDER_LEVELS
     ) or "Unknown"
     meta["part_number"] = resolve_strict_field(
-        "part_number", lines=lines, pdf_path=pdf_path, entries=pn_entries, label_aliases=label_aliases, pages=3, max_folder_levels=5
+        "part_number", lines=lines, pdf_path=pdf_path, entries=pn_entries, label_aliases=label_aliases, pages=3, max_folder_levels=STRICT_FIELD_FOLDER_LEVELS
     ) or "Unknown"
     meta["acceptance_test_plan_number"] = resolve_strict_field(
-        "acceptance_test_plan_number", lines=lines, pdf_path=pdf_path, entries=atp_entries, label_aliases=label_aliases, pages=3, max_folder_levels=5
+        "acceptance_test_plan_number", lines=lines, pdf_path=pdf_path, entries=atp_entries, label_aliases=label_aliases, pages=3, max_folder_levels=STRICT_FIELD_FOLDER_LEVELS
     ) or "Unknown"
 
     classifier_path = pdf_path if pdf_path is not None else Path("document.unknown")
