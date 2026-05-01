@@ -68,6 +68,10 @@ DEFAULT_ACCEPTANCE_HEURISTICS = DATA_ROOT / "user_inputs" / "acceptance_heuristi
 EXCEL_EXTENSIONS = {".xlsx", ".xls", ".xlsm", ".mat"}
 EXCEL_ARTIFACT_SUFFIX = "__excel"
 TD_SERIAL_SOURCES_DIRNAME = "Test Data File Extractions"
+UI_VISIBLE_FILES_DIRNAME = "UI Visible Files"
+UI_VISIBLE_TD_DIRNAME = "Test Data File Extractions"
+UI_VISIBLE_EIDP_DIRNAME = "EIDP File Extractions"
+UI_VISIBLE_METADATA_FILENAME = "metadata.json"
 TD_LEGACY_SERIAL_SOURCES_DIRNAME = "td_serial_sources"
 TD_SERIAL_SOURCE_ARTIFACTS_DIRNAME = "sources"
 TD_OFFICIAL_METADATA_SOURCES = {"td_serial_aggregate", "td_serial_official_source"}
@@ -663,6 +667,16 @@ def _fallback_eidat_program_titles(global_repo: Path) -> list[str]:
     seen: set[str] = set()
     candidate_patterns: list[tuple[Path, tuple[str, ...]]] = [
         (
+            support_dir / UI_VISIBLE_FILES_DIRNAME,
+            (
+                "*/metadata.json",
+                "*/*/metadata.json",
+                "*/*/*/metadata.json",
+                "*/*/*/*/metadata.json",
+                "*/*/*/*/*/metadata.json",
+            ),
+        ),
+        (
             support_dir / "debug" / "ocr",
             (
                 "*/*_metadata.json",
@@ -1035,6 +1049,80 @@ def _merge_metadata(primary: Optional[Mapping[str, object]], fallback: Optional[
     return out
 
 
+def _load_eidat_index_module():
+    try:
+        from Application import eidat_manager_index as emi  # type: ignore
+        return emi
+    except Exception:
+        mod_path = APP_ROOT / "Application" / "eidat_manager_index.py"
+        spec = importlib.util.spec_from_file_location("eidat_manager_index", mod_path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"Unable to load index module: {mod_path}")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)  # type: ignore[attr-defined]
+        return mod
+
+
+def _ui_visible_root(repo: Path) -> Path:
+    return eidat_support_dir(Path(repo).expanduser()) / UI_VISIBLE_FILES_DIRNAME
+
+
+def _bundle_rel_from_metadata_rel(metadata_rel: object) -> str:
+    rel = str(metadata_rel or "").strip().replace("\\", "/")
+    if not rel:
+        return ""
+    path_obj = Path(rel)
+    if path_obj.name.casefold() == UI_VISIBLE_METADATA_FILENAME.casefold():
+        return str(path_obj.parent).replace("\\", "/")
+    return rel
+
+
+def _parse_json_list(value: object) -> list[str]:
+    raw = value
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            raw = []
+    if not isinstance(raw, list):
+        return []
+    return [str(v).strip() for v in raw if str(v).strip()]
+
+
+def _read_json_file(path: Path) -> dict[str, object] | None:
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return dict(payload) if isinstance(payload, dict) else None
+
+
+def _write_json_file(path: Path, payload: Mapping[str, object]) -> None:
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    Path(path).write_text(json.dumps(dict(payload), indent=2, ensure_ascii=True), encoding="utf-8")
+
+
+def _visible_bundle_doc_maps(docs: Sequence[Mapping[str, object]]) -> tuple[dict[str, dict[str, object]], dict[str, dict[str, object]]]:
+    by_bundle_rel: dict[str, dict[str, object]] = {}
+    by_metadata_rel: dict[str, dict[str, object]] = {}
+    for item in docs:
+        row = dict(item or {})
+        metadata_rel = str(row.get("metadata_rel") or "").strip().replace("\\", "/")
+        bundle_rel = _bundle_rel_from_metadata_rel(metadata_rel)
+        if metadata_rel and metadata_rel not in by_metadata_rel:
+            by_metadata_rel[metadata_rel] = row
+        if bundle_rel and bundle_rel not in by_bundle_rel:
+            by_bundle_rel[bundle_rel] = row
+    return by_bundle_rel, by_metadata_rel
+
+
+def _clear_manual_override_fields(payload: Mapping[str, object]) -> dict[str, object]:
+    out = dict(payload or {})
+    out["manual_override_fields"] = []
+    out["manual_override_updated_at"] = ""
+    return out
+
+
 METADATA_EDITOR_FIELDS = (
     "program_title",
     "asset_type",
@@ -1112,10 +1200,39 @@ def refresh_metadata_only(
     failed = 0
     skipped = 0
     updated_metadata_rels: set[str] = set()
+    support_dir = eidat_support_dir(repo)
+    emi = _load_eidat_index_module()
+    try:
+        docs_for_visible = read_eidat_index_documents(repo)
+    except Exception:
+        docs_for_visible = []
+    docs_by_bundle_rel, docs_by_metadata_rel = _visible_bundle_doc_maps(docs_for_visible)
 
     clean_rel_paths = [str(p).strip() for p in (rel_paths or []) if str(p).strip()]
     for rel_path in clean_rel_paths:
         try:
+            rel_norm = str(rel_path or "").strip().replace("\\", "/")
+            visible_doc = docs_by_bundle_rel.get(rel_norm) or docs_by_metadata_rel.get(rel_norm)
+            if visible_doc is not None:
+                metadata_rel = str(visible_doc.get("metadata_rel") or "").strip()
+                if not metadata_rel:
+                    raise FileNotFoundError(f"Visible metadata file not found for: {rel_path}")
+                metadata_path = support_dir / metadata_rel
+                if not metadata_path.exists():
+                    raise FileNotFoundError(f"Visible metadata file not found for: {rel_path}")
+                if overwrite_manual_fields:
+                    raw_visible = _read_json_file(metadata_path) or {}
+                    _write_json_file(metadata_path, _clear_manual_override_fields(raw_visible))
+                updated_metadata_rels.add(metadata_rel)
+                results.append(
+                    {
+                        "rel_path": rel_path,
+                        "ok": True,
+                        "metadata_path": str(metadata_path),
+                    }
+                )
+                updated += 1
+                continue
             abs_path = (repo / rel_path).expanduser()
             if not abs_path.exists():
                 raise FileNotFoundError(f"Missing file: {abs_path}")
@@ -1202,6 +1319,13 @@ def refresh_metadata_only(
             )
             failed += 1
 
+    try:
+        from Application.eidat_manager_db import support_paths as _support_paths  # type: ignore
+
+        emi.publish_visible_bundles(_support_paths(repo))
+    except Exception:
+        pass
+
     index_result = None
     index_error = None
     try:
@@ -1247,10 +1371,54 @@ def edit_metadata_for_files(
     updated = 0
     failed = 0
     updated_metadata_rels: set[str] = set()
+    support_dir = eidat_support_dir(repo)
+    emi = _load_eidat_index_module()
+    try:
+        docs_for_visible = read_eidat_index_documents(repo)
+    except Exception:
+        docs_for_visible = []
+    docs_by_bundle_rel, docs_by_metadata_rel = _visible_bundle_doc_maps(docs_for_visible)
 
     clean_rel_paths = [str(p).strip() for p in (rel_paths or []) if str(p).strip()]
     for rel_path in clean_rel_paths:
         try:
+            rel_norm = str(rel_path or "").strip().replace("\\", "/")
+            visible_doc = docs_by_bundle_rel.get(rel_norm) or docs_by_metadata_rel.get(rel_norm)
+            if visible_doc is not None:
+                metadata_rel = str(visible_doc.get("metadata_rel") or "").strip()
+                if not metadata_rel:
+                    raise FileNotFoundError(f"Visible metadata file not found for: {rel_path}")
+                metadata_path = support_dir / metadata_rel
+                existing_meta = _read_json_file(metadata_path)
+                if not existing_meta:
+                    raise FileNotFoundError(f"Visible metadata file not found for: {rel_path}")
+                preserved = {
+                    key: existing_meta.get(key)
+                    for key in (
+                        "artifacts_rel",
+                        "excel_sqlite_rel",
+                        "tables_sqlite_rel",
+                        "source_rel_path",
+                        "source_rel_paths",
+                        "internal_metadata_rel",
+                        "similarity_group",
+                        "file_extension",
+                    )
+                    if key in existing_meta
+                }
+                clean_meta = emd.apply_manual_metadata_overrides(existing_meta, updates)
+                clean_meta.update(preserved)
+                _write_json_file(metadata_path, clean_meta)
+                updated_metadata_rels.add(metadata_rel)
+                results.append(
+                    {
+                        "rel_path": rel_path,
+                        "ok": True,
+                        "metadata_path": str(metadata_path),
+                    }
+                )
+                updated += 1
+                continue
             abs_path = (repo / rel_path).expanduser()
             if not abs_path.exists():
                 raise FileNotFoundError(f"Missing file: {abs_path}")
@@ -1325,6 +1493,13 @@ def edit_metadata_for_files(
                 }
             )
             failed += 1
+
+    try:
+        from Application.eidat_manager_db import support_paths as _support_paths  # type: ignore
+
+        emi.publish_visible_bundles(_support_paths(repo))
+    except Exception:
+        pass
 
     index_result = None
     index_error = None
@@ -36175,11 +36350,18 @@ def read_eidat_index_documents(global_repo: Path) -> list[dict]:
             "acceptance_test_plan_number",
             "excel_sqlite_rel",
             "tables_sqlite_rel",
+            "source_rel_path",
+            "source_rel_paths_json",
+            "internal_metadata_rel",
             "file_extension",
+            "title_norm",
             "metadata_source",
             "manual_override_fields_json",
             "manual_override_updated_at",
             "applied_asset_specific_type_rule",
+            "indexed_epoch_ns",
+            "certification_status",
+            "certification_pass_rate",
         ):
             if opt in cols:
                 select_cols.append(opt)
@@ -36204,11 +36386,18 @@ def read_eidat_index_documents(global_repo: Path) -> list[dict]:
         d.setdefault("acceptance_test_plan_number", None)
         d.setdefault("excel_sqlite_rel", None)
         d.setdefault("tables_sqlite_rel", None)
+        d.setdefault("source_rel_path", None)
+        d.setdefault("source_rel_paths_json", None)
+        d.setdefault("internal_metadata_rel", None)
         d.setdefault("file_extension", None)
+        d.setdefault("title_norm", None)
         d.setdefault("metadata_source", None)
         d.setdefault("manual_override_fields_json", None)
         d.setdefault("manual_override_updated_at", None)
         d.setdefault("applied_asset_specific_type_rule", None)
+        d.setdefault("indexed_epoch_ns", None)
+        d.setdefault("certification_status", None)
+        d.setdefault("certification_pass_rate", None)
         try:
             raw_manual_fields = json.loads(str(d.get("manual_override_fields_json") or "[]"))
         except Exception:
@@ -36218,6 +36407,8 @@ def read_eidat_index_documents(global_repo: Path) -> list[dict]:
         manual_fields = [str(v).strip() for v in raw_manual_fields if str(v).strip()]
         d["manual_override_fields"] = manual_fields
         d["has_manual_override"] = bool(manual_fields)
+        d["source_rel_paths"] = _parse_json_list(d.get("source_rel_paths_json"))
+        d["rel_path"] = _bundle_rel_from_metadata_rel(d.get("metadata_rel"))
         docs.append(d)
     return docs
 
@@ -36256,125 +36447,99 @@ def read_eidat_support_files(global_repo: Path) -> list[dict]:
 
 
 def read_files_with_index_metadata(global_repo: Path) -> list[dict]:
-    """Join files from support DB with documents from index DB for unified view."""
+    """Return frontend-visible bundle rows from the index DB."""
     repo = Path(global_repo).expanduser()
-    support_db = eidat_support_dir(repo) / "eidat_support.sqlite3"
-    index_db = eidat_support_dir(repo) / "eidat_index.sqlite3"
     support_dir = eidat_support_dir(repo)
-
-    def _norm_rel(rel_path: object) -> str:
-        try:
-            return str(rel_path or "").replace("\\", "/").strip()
-        except Exception:
-            return str(rel_path or "").strip()
-
-    def _ignore_rel_path(rel_path: str) -> bool:
-        # Hide generated PDFs/Excels from the Files tab. These are outputs, not
-        # original documents.
-        try:
-            parts = [p.casefold() for p in Path(str(rel_path or "")).parts]
-        except Exception:
-            parts = []
-        ignored = {"eidat", "eidat support", "edat", "edat support"}
-        return any(p in ignored for p in parts)
-
-    # Read all files
-    files_by_path: dict[str, dict] = {}
-    if support_db.exists():
-        with closing(sqlite3.connect(str(support_db))) as conn:
-            conn.row_factory = sqlite3.Row
-            for r in conn.execute("SELECT * FROM files").fetchall():
-                rel = str(r["rel_path"] or "")
-                if _ignore_rel_path(rel):
-                    continue
-                files_by_path[rel] = dict(r)
-
-    # Read all indexed documents
-    docs_by_artifacts: dict[str, dict] = {}
-    if index_db.exists():
-        with closing(sqlite3.connect(str(index_db))) as conn:
-            conn.row_factory = sqlite3.Row
-            for r in conn.execute("SELECT * FROM documents").fetchall():
-                doc = dict(r)
-                try:
-                    raw_manual_fields = json.loads(str(doc.get("manual_override_fields_json") or "[]"))
-                except Exception:
-                    raw_manual_fields = []
-                if not isinstance(raw_manual_fields, list):
-                    raw_manual_fields = []
-                doc["manual_override_fields"] = [str(v).strip() for v in raw_manual_fields if str(v).strip()]
-                doc["has_manual_override"] = bool(doc["manual_override_fields"])
-                artifacts = _norm_rel(doc.get("artifacts_rel") or "")
-                docs_by_artifacts[artifacts] = doc
-
-    # Join: for each file, try to find its document metadata
+    docs = read_eidat_index_documents(repo)
     result: list[dict] = []
-    for rel_path, file_info in files_by_path.items():
-        # Match file to document by exact artifacts folder (avoids stem substring collisions).
-        matched_doc = None
+    for doc in docs:
+        metadata_rel = str(doc.get("metadata_rel") or "").strip()
+        bundle_rel = str(doc.get("rel_path") or _bundle_rel_from_metadata_rel(metadata_rel)).strip()
+        metadata_path = support_dir / metadata_rel if metadata_rel else Path()
+        mtime_ns = 0
+        size_bytes = 0
         try:
-            art_dir = get_file_artifacts_path(repo, rel_path)
+            if metadata_path.exists():
+                stat = metadata_path.stat()
+                mtime_ns = int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1e9)))
+                size_bytes = int(stat.st_size)
         except Exception:
-            art_dir = None
-        if art_dir:
-            try:
-                art_rel = str(Path(art_dir).resolve().relative_to(support_dir.resolve()))
-            except Exception:
-                try:
-                    art_rel = str(Path(art_dir).relative_to(support_dir))
-                except Exception:
-                    art_rel = str(art_dir)
-            matched_doc = docs_by_artifacts.get(_norm_rel(art_rel))
-
-        merged = {**file_info}
-        if matched_doc:
-            merged.update({
-                # Keep document id separate from support DB file id.
-                "document_id": matched_doc.get("id"),
-                "program_title": matched_doc.get("program_title"),
-                "asset_type": matched_doc.get("asset_type"),
-                "asset_specific_type": matched_doc.get("asset_specific_type"),
-                "serial_number": matched_doc.get("serial_number"),
-                "part_number": matched_doc.get("part_number"),
-                "revision": matched_doc.get("revision"),
-                "test_date": matched_doc.get("test_date"),
-                "report_date": matched_doc.get("report_date"),
-                "document_type": matched_doc.get("document_type"),
-                "document_type_acronym": matched_doc.get("document_type_acronym"),
-                "vendor": matched_doc.get("vendor"),
-                "acceptance_test_plan_number": matched_doc.get("acceptance_test_plan_number"),
-                "excel_sqlite_rel": matched_doc.get("excel_sqlite_rel"),
-                "file_extension": matched_doc.get("file_extension"),
-                "title_norm": matched_doc.get("title_norm"),
-                "metadata_rel": matched_doc.get("metadata_rel"),
-                "artifacts_rel": matched_doc.get("artifacts_rel"),
-                "similarity_group": matched_doc.get("similarity_group"),
-                "indexed_epoch_ns": matched_doc.get("indexed_epoch_ns"),
-                "certification_status": matched_doc.get("certification_status"),
-                "certification_pass_rate": matched_doc.get("certification_pass_rate"),
-                "metadata_source": matched_doc.get("metadata_source"),
+            mtime_ns = 0
+            size_bytes = 0
+        result.append(
+            {
+                "id": doc.get("id"),
+                "document_id": doc.get("id"),
+                "rel_path": bundle_rel,
+                "metadata_rel": metadata_rel,
+                "artifacts_rel": str(doc.get("artifacts_rel") or "").strip(),
+                "source_rel_path": str(doc.get("source_rel_path") or "").strip(),
+                "source_rel_paths": list(doc.get("source_rel_paths") or []),
+                "source_rel_paths_json": str(doc.get("source_rel_paths_json") or "").strip(),
+                "internal_metadata_rel": str(doc.get("internal_metadata_rel") or "").strip(),
+                "program_title": doc.get("program_title"),
+                "asset_type": doc.get("asset_type"),
+                "asset_specific_type": doc.get("asset_specific_type"),
+                "serial_number": doc.get("serial_number"),
+                "part_number": doc.get("part_number"),
+                "revision": doc.get("revision"),
+                "test_date": doc.get("test_date"),
+                "report_date": doc.get("report_date"),
+                "document_type": doc.get("document_type"),
+                "document_type_acronym": doc.get("document_type_acronym"),
+                "vendor": doc.get("vendor"),
+                "acceptance_test_plan_number": doc.get("acceptance_test_plan_number"),
+                "excel_sqlite_rel": doc.get("excel_sqlite_rel"),
+                "tables_sqlite_rel": doc.get("tables_sqlite_rel"),
+                "file_extension": doc.get("file_extension"),
+                "title_norm": doc.get("title_norm"),
+                "similarity_group": doc.get("similarity_group"),
+                "indexed_epoch_ns": doc.get("indexed_epoch_ns"),
+                "certification_status": doc.get("certification_status"),
+                "certification_pass_rate": doc.get("certification_pass_rate"),
+                "metadata_source": doc.get("metadata_source"),
                 "manual_override_fields": ", ".join(
-                    str(v).strip() for v in (matched_doc.get("manual_override_fields") or []) if str(v).strip()
+                    str(v).strip() for v in (doc.get("manual_override_fields") or []) if str(v).strip()
                 ),
-                "manual_override_updated_at": matched_doc.get("manual_override_updated_at"),
-                "applied_asset_specific_type_rule": matched_doc.get("applied_asset_specific_type_rule"),
-                "has_manual_override": bool(matched_doc.get("has_manual_override")),
-            })
-        result.append(merged)
-
+                "manual_override_updated_at": doc.get("manual_override_updated_at"),
+                "applied_asset_specific_type_rule": doc.get("applied_asset_specific_type_rule"),
+                "has_manual_override": bool(doc.get("has_manual_override")),
+                "mtime_ns": mtime_ns,
+                "size_bytes": size_bytes,
+                "first_seen_epoch_ns": doc.get("indexed_epoch_ns"),
+                "last_seen_epoch_ns": doc.get("indexed_epoch_ns"),
+                "last_processed_epoch_ns": doc.get("indexed_epoch_ns"),
+                "last_processed_mtime_ns": mtime_ns,
+                "needs_processing": 0,
+            }
+        )
     return result
 
 
 def get_file_artifacts_path(global_repo: Path, rel_path: str) -> Path | None:
     """Return full path to artifacts folder for a file."""
     repo = Path(global_repo).expanduser()
-    path_obj = Path(rel_path)
+    rel_norm = str(rel_path or "").strip().replace("\\", "/")
+    support_dir = eidat_support_dir(repo)
+    if rel_norm:
+        try:
+            docs = read_eidat_index_documents(repo)
+        except Exception:
+            docs = []
+        docs_by_bundle_rel, docs_by_metadata_rel = _visible_bundle_doc_maps(docs)
+        visible_doc = docs_by_bundle_rel.get(rel_norm) or docs_by_metadata_rel.get(rel_norm)
+        if visible_doc is not None:
+            artifacts_rel = str(visible_doc.get("artifacts_rel") or "").strip()
+            if artifacts_rel:
+                artifacts_path = support_dir / artifacts_rel
+                if artifacts_path.exists():
+                    return artifacts_path
+    path_obj = Path(rel_norm)
     stem = path_obj.stem
     ext = path_obj.suffix.lower()
     root = eidat_debug_ocr_root(repo)
     candidates: list[Path] = []
     raw_candidates: list[Path] = []
-    support_dir = eidat_support_dir(repo)
     td_root = support_dir / TD_SERIAL_SOURCES_DIRNAME
     if ext == ".mat" and detect_mat_bundle_member is not None and mat_bundle_artifacts_dir is not None:
         try:
@@ -41776,6 +41941,8 @@ def list_product_center_products(global_repo: Path) -> list[dict]:
             "rel_path": str(matched.get("rel_path") or "").strip(),
             "metadata_rel": metadata_rel,
             "artifacts_rel": artifacts_rel,
+            "source_rel_path": str(doc.get("source_rel_path") or matched.get("source_rel_path") or "").strip(),
+            "source_rel_paths": list(doc.get("source_rel_paths") or matched.get("source_rel_paths") or []),
             "document_type": str(doc.get("document_type") or "").strip(),
             "document_type_acronym": str(doc.get("document_type_acronym") or "").strip(),
             "serial_number": str(doc.get("serial_number") or "").strip(),

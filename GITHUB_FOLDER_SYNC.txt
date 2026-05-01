@@ -1,0 +1,89 @@
+GITHUB FOLDER SYNC FOR THIS REPO
+
+Use this when you need to pull a folder from the public GitHub repo without installing Git on the target machine.
+
+Repo:
+- Owner: schiess-dev-lab
+- Repo: EIDAT-V1
+- Branch: EDEN_EDAT_V4
+
+Recommended default:
+- Use robocopy /E to copy files from GitHub and overwrite matching files.
+- This preserves local-only files that exist on the delivered machine.
+
+Optional exact replacement:
+- Use robocopy /MIR if you want the destination folder to match GitHub exactly.
+- Warning: /MIR deletes local files that are not present in GitHub.
+- In this repo, that includes ignored local items such as user_inputs\scanner.local.env and user_inputs\__pycache__.
+
+1) Open PowerShell.
+
+2) Change to your local EIDAT repo root.
+
+Example:
+Set-Location "C:\path\to\your\EIDAT-V1"
+
+3) Paste this function into PowerShell.
+
+function Sync-GitHubFolder {
+    param(
+        [string]$Owner,
+        [string]$Repo,
+        [string]$Branch,
+        [string]$SourceFolder,
+        [string]$DestinationFolder,
+        [switch]$MirrorExact
+    )
+
+    $zip = Join-Path $env:TEMP "$Repo-$Branch.zip"
+    $extractRoot = Join-Path $env:TEMP "gh-sync-$Repo-$Branch"
+
+    Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $extractRoot -Recurse -Force -ErrorAction SilentlyContinue
+
+    Invoke-WebRequest "https://github.com/$Owner/$Repo/archive/refs/heads/$Branch.zip" -OutFile $zip
+    Expand-Archive -LiteralPath $zip -DestinationPath $extractRoot -Force
+
+    $repoRoot = Get-ChildItem -LiteralPath $extractRoot -Directory | Select-Object -First 1 -ExpandProperty FullName
+    $source = Join-Path $repoRoot $SourceFolder
+
+    if (-not (Test-Path -LiteralPath $source)) {
+        throw "Source folder not found in archive: $SourceFolder"
+    }
+
+    New-Item -ItemType Directory -Path $DestinationFolder -Force | Out-Null
+
+    if ($MirrorExact) {
+        robocopy $source $DestinationFolder /MIR /R:1 /W:1
+    }
+    else {
+        robocopy $source $DestinationFolder /E /R:1 /W:1
+    }
+
+    if ($LASTEXITCODE -ge 8) {
+        throw "robocopy failed with exit code $LASTEXITCODE"
+    }
+}
+
+4) Example: sync user_inputs and preserve local-only files.
+
+Sync-GitHubFolder `
+  -Owner "schiess-dev-lab" `
+  -Repo "EIDAT-V1" `
+  -Branch "EDEN_EDAT_V4" `
+  -SourceFolder "user_inputs" `
+  -DestinationFolder ".\user_inputs"
+
+5) Optional: exact mirror for user_inputs.
+
+Sync-GitHubFolder `
+  -Owner "schiess-dev-lab" `
+  -Repo "EIDAT-V1" `
+  -Branch "EDEN_EDAT_V4" `
+  -SourceFolder "user_inputs" `
+  -DestinationFolder ".\user_inputs" `
+  -MirrorExact
+
+Notes:
+- GitHub does not provide a direct raw download for a folder by URL, so this method downloads the branch ZIP and copies the folder out of it.
+- If you only need one file, you can also use Invoke-WebRequest against the raw file URL instead of downloading the full branch ZIP.

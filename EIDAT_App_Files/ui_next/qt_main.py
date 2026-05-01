@@ -30910,12 +30910,16 @@ class MainWindow(QtWidgets.QMainWindow):
         repo_raw = (self.ed_global_repo.text() or "").strip()
         if not doc or not repo_raw:
             return
+        source_rel = str(doc.get("source_rel_path") or "").strip()
         rel_path = str(doc.get("rel_path") or "").strip()
-        if not rel_path:
-            QtWidgets.QMessageBox.warning(self, "Product Center", "No tracked source file is linked to this document.")
+        if not source_rel and not rel_path:
+            QtWidgets.QMessageBox.warning(self, "Product Center", "No source file is linked to this document.")
             return
         try:
-            be.open_path(Path(repo_raw).expanduser() / rel_path)
+            if source_rel:
+                be.open_path(Path(repo_raw).expanduser() / source_rel)
+            else:
+                be.open_path(be.eidat_support_dir(Path(repo_raw).expanduser()) / rel_path)
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "Open File", str(exc))
 
@@ -32973,12 +32977,15 @@ class MainWindow(QtWidgets.QMainWindow):
         repo_raw = (self.ed_global_repo.text() or "").strip()
         if not repo_raw:
             return
-        rel_path = info.get("rel_path", "")
-        if not rel_path:
+        source_rel = str(info.get("source_rel_path") or "").strip()
+        rel_path = str(info.get("rel_path") or "").strip()
+        if not source_rel and not rel_path:
             return
-        full_path = Path(repo_raw) / rel_path
         try:
-            be.open_path(full_path)
+            if source_rel:
+                be.open_path(Path(repo_raw) / source_rel)
+            else:
+                be.open_path(be.eidat_support_dir(Path(repo_raw)) / rel_path)
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "Open File", str(exc))
 
@@ -33052,10 +33059,13 @@ class MainWindow(QtWidgets.QMainWindow):
         repo_raw = (self.ed_global_repo.text() or "").strip()
         if not repo_raw:
             return
-        rel_path = info.get("rel_path", "")
-        full_path = Path(repo_raw) / rel_path
         try:
-            be.open_path(full_path.parent)
+            source_rel = str(info.get("source_rel_path") or "").strip()
+            rel_path = str(info.get("rel_path") or "").strip()
+            if source_rel:
+                be.open_path((Path(repo_raw) / source_rel).parent)
+            elif rel_path:
+                be.open_path(be.eidat_support_dir(Path(repo_raw)) / rel_path)
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "Show in Explorer", str(exc))
 
