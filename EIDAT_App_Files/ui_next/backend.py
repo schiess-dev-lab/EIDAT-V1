@@ -10219,22 +10219,28 @@ def _td_read_sequence_context_by_run(conn: sqlite3.Connection) -> dict[str, dict
     return by_run
 
 
+def _td_support_row_has_labelable_condition(row: Mapping[str, object] | None) -> bool:
+    if not isinstance(row, Mapping):
+        return False
+    run_type = td_normalize_run_type(row.get("run_type"))
+    if run_type not in {"PM", "SS"}:
+        return False
+    if _td_support_blankish(row.get("feed_pressure")):
+        return False
+    if not str(row.get("feed_pressure_units") or "").strip():
+        return False
+    if run_type == "SS":
+        return True
+    pulse_width = row.get("pulse_width_on", row.get("pulse_width"))
+    if _td_support_blankish(pulse_width):
+        return False
+    return not _td_support_blankish(row.get("control_period")) or not _td_support_blankish(row.get("off_time"))
+
+
 def _td_sequence_context_is_usable(row: Mapping[str, object] | None) -> bool:
     if not isinstance(row, Mapping):
         return False
-    status = str(row.get("extraction_status") or "").strip().lower()
-    if status != "ok":
-        return False
-    run_type = td_normalize_run_type(row.get("run_type"))
-    pressure_units = str(row.get("nominal_pf_units") or "").strip()
-    return bool(
-        run_type
-        and row.get("on_time_value") not in (None, "")
-        and row.get("off_time_value") not in (None, "")
-        and row.get("control_period") not in (None, "")
-        and row.get("nominal_pf_value") not in (None, "")
-        and pressure_units
-    )
+    return _td_support_row_has_labelable_condition(_td_sequence_context_support_fields(row))
 
 
 def _td_support_blankish(value: object) -> bool:
@@ -10244,6 +10250,12 @@ def _td_support_blankish(value: object) -> bool:
 def _td_sequence_context_support_fields(row: Mapping[str, object] | None) -> dict[str, object]:
     if not isinstance(row, Mapping):
         return {}
+    control_period = row.get("control_period")
+    if _td_support_blankish(control_period):
+        on_time_value = _td_finite_float(row.get("on_time_value"))
+        off_time_value = _td_finite_float(row.get("off_time_value"))
+        if on_time_value is not None and off_time_value is not None:
+            control_period = float(on_time_value) + float(off_time_value)
     return {
         "feed_pressure": row.get("nominal_pf_value"),
         "feed_pressure_units": str(row.get("nominal_pf_units") or "").strip(),
@@ -10252,7 +10264,8 @@ def _td_sequence_context_support_fields(row: Mapping[str, object] | None) -> dic
         "run_type": td_normalize_run_type(row.get("run_type")),
         "pulse_width": row.get("on_time_value"),
         "pulse_width_on": row.get("on_time_value"),
-        "control_period": row.get("control_period", row.get("off_time_value")),
+        "off_time": row.get("off_time_value"),
+        "control_period": control_period,
         "suppression_voltage": row.get("suppression_voltage_value"),
         "valve_voltage": row.get("valve_voltage_value"),
     }
@@ -10301,6 +10314,7 @@ def _td_support_row_has_condition_values(row: Mapping[str, object] | None) -> bo
             "run_type",
             "pulse_width_on",
             "pulse_width",
+            "off_time",
             "control_period",
             "suppression_voltage",
             "valve_voltage",
@@ -10309,15 +10323,7 @@ def _td_support_row_has_condition_values(row: Mapping[str, object] | None) -> bo
 
 
 def _td_support_row_has_core_bundle(row: Mapping[str, object] | None) -> bool:
-    if not isinstance(row, Mapping):
-        return False
-    return bool(
-        not _td_support_blankish(row.get("feed_pressure"))
-        and str(row.get("feed_pressure_units") or "").strip()
-        and td_normalize_run_type(row.get("run_type"))
-        and not _td_support_blankish(row.get("pulse_width_on", row.get("pulse_width")))
-        and not _td_support_blankish(row.get("control_period"))
-    )
+    return _td_support_row_has_labelable_condition(row)
 
 
 def _td_support_row_is_promotable(row: Mapping[str, object] | None) -> bool:
@@ -12322,6 +12328,7 @@ def _sync_td_support_program_requirements_import(
                     condition.get("pulse_width_on"),
                     condition.get("control_period"),
                     condition.get("suppression_voltage"),
+                    condition.get("valve_voltage"),
                     str(condition.get("member_sequences_text") or "").strip(),
                     str(condition.get("source_workbook") or "").strip(),
                     str(condition.get("source_sheet_name") or "").strip(),
@@ -12349,6 +12356,7 @@ def _sync_td_support_program_requirements_import(
                         condition.get("pulse_width_on"),
                         condition.get("control_period"),
                         condition.get("suppression_voltage"),
+                        condition.get("valve_voltage"),
                         str(condition.get("member_sequences_text") or "").strip(),
                         str(condition.get("source_workbook") or "").strip(),
                         str(condition.get("source_sheet_name") or "").strip(),

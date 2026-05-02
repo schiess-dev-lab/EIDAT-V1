@@ -4863,7 +4863,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
             root = Path(td)
             src_db = root / "src.sqlite3"
-            self._make_source_sqlite(src_db)
+            self._make_source_sqlite_with_sequence_context(src_db)
             wb_path = root / "project.xlsx"
             Workbook().save(str(wb_path))
             support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
@@ -4918,6 +4918,140 @@ class TestTDSupportWorkbook(unittest.TestCase):
             finally:
                 wb.close()
 
+    def test_sync_support_workbook_prefills_steady_state_sequence_context(self) -> None:
+        from openpyxl import Workbook, load_workbook  # type: ignore
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            src_db = root / "src.sqlite3"
+            self._make_source_sqlite_with_sequence_context(
+                src_db,
+                data_mode_raw="Steady State",
+                run_type="steady state",
+                on_time_value=None,
+                on_time_units="",
+                off_time_value=None,
+                off_time_units="",
+                nominal_pf_value=410.0,
+                nominal_pf_units="psia",
+                nominal_tf_value=None,
+                nominal_tf_units="",
+                suppression_voltage_units="",
+            )
+            wb_path = root / "project.xlsx"
+            Workbook().save(str(wb_path))
+            support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+            be._write_td_support_workbook(
+                support_path,
+                sequence_names=["RunA"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+            )
+
+            docs = [
+                {
+                    "metadata_rel": "run.json",
+                    "program_title": be.TD_SUPPORT_DEFAULT_PROGRAM_TITLE,
+                    "serial_number": "SN1",
+                    "excel_sqlite_rel": str(src_db),
+                }
+            ]
+            with mock.patch.object(be, "read_eidat_index_documents", return_value=docs):
+                with mock.patch.object(be, "_project_selected_metadata_rels", return_value={"run.json"}):
+                    be._sync_td_support_workbook_program_sheets(
+                        wb_path,
+                        global_repo=root,
+                        project_dir=root,
+                        param_defs=[{"name": "thrust", "units": "lbf"}],
+                    )
+                    be._refresh_td_support_run_conditions_sheet(
+                        wb_path,
+                        project_dir=root,
+                        param_defs=[{"name": "thrust", "units": "lbf"}],
+                    )
+
+            wb = load_workbook(str(support_path), read_only=True, data_only=True)
+            try:
+                ws_prog = wb[self._default_program_sheet_name(be)]
+                headers = self._sheet_header_map(ws_prog)
+                self.assertEqual(ws_prog.cell(2, headers["source_run_name"]).value, "RunA")
+                self.assertEqual(str(ws_prog.cell(2, headers["condition_key"]).value or "").strip(), "410 psia, SS")
+                self.assertEqual(str(ws_prog.cell(2, headers["display_name"]).value or "").strip(), "410 psia, SS")
+                self.assertEqual(ws_prog.cell(2, headers["feed_pressure"]).value, 410)
+                self.assertEqual(str(ws_prog.cell(2, headers["feed_pressure_units"]).value or "").strip(), "psia")
+                self.assertEqual(str(ws_prog.cell(2, headers["run_type"]).value or "").strip(), "SS")
+                self.assertIsNone(ws_prog.cell(2, headers["pulse_width_on"]).value)
+                self.assertIsNone(ws_prog.cell(2, headers["control_period"]).value)
+
+                ws_cond = wb["RunConditions"]
+                self.assertEqual(str(ws_cond.cell(2, 1).value or "").strip(), "410 psia, SS")
+            finally:
+                wb.close()
+
+    def test_sync_support_workbook_uses_labelable_conflicted_context_and_keeps_voltage_values_without_units(self) -> None:
+        from openpyxl import Workbook, load_workbook  # type: ignore
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            src_db = root / "src.sqlite3"
+            self._make_source_sqlite_with_sequence_context(
+                src_db,
+                extraction_status="conflict",
+                extraction_reason="suppression voltage units missing",
+                suppression_voltage_units="",
+                valve_voltage_value=12.0,
+                valve_voltage_units="",
+            )
+            wb_path = root / "project.xlsx"
+            Workbook().save(str(wb_path))
+            support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+            be._write_td_support_workbook(
+                support_path,
+                sequence_names=["RunA"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+            )
+
+            docs = [
+                {
+                    "metadata_rel": "run.json",
+                    "program_title": be.TD_SUPPORT_DEFAULT_PROGRAM_TITLE,
+                    "serial_number": "SN1",
+                    "excel_sqlite_rel": str(src_db),
+                }
+            ]
+            with mock.patch.object(be, "read_eidat_index_documents", return_value=docs):
+                with mock.patch.object(be, "_project_selected_metadata_rels", return_value={"run.json"}):
+                    be._sync_td_support_workbook_program_sheets(
+                        wb_path,
+                        global_repo=root,
+                        project_dir=root,
+                        param_defs=[{"name": "thrust", "units": "lbf"}],
+                    )
+                    be._refresh_td_support_run_conditions_sheet(
+                        wb_path,
+                        project_dir=root,
+                        param_defs=[{"name": "thrust", "units": "lbf"}],
+                    )
+
+            wb = load_workbook(str(support_path), read_only=True, data_only=True)
+            try:
+                ws_prog = wb[self._default_program_sheet_name(be)]
+                headers = self._sheet_header_map(ws_prog)
+                self.assertEqual(
+                    str(ws_prog.cell(2, headers["condition_key"]).value or "").strip(),
+                    "100 psia, PM, 5 Sec ON / 20 Sec OFF",
+                )
+                self.assertEqual(str(ws_prog.cell(2, headers["display_name"]).value or "").strip(), "100 psia, PM, 5 Sec ON / 20 Sec OFF")
+                self.assertEqual(str(ws_prog.cell(2, headers["run_type"]).value or "").strip(), "PM")
+                self.assertEqual(ws_prog.cell(2, headers["suppression_voltage"]).value, 24)
+                self.assertEqual(ws_prog.cell(2, headers["valve_voltage"]).value, 12)
+
+                ws_cond = wb["RunConditions"]
+                self.assertEqual(str(ws_cond.cell(2, 1).value or "").strip(), "100 psia, PM, 5 Sec ON / 20 Sec OFF")
+            finally:
+                wb.close()
+
     def test_sync_support_workbook_preserves_manual_values_when_prefilling_sequence_context(self) -> None:
         from openpyxl import Workbook, load_workbook  # type: ignore
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
@@ -4925,7 +5059,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
             root = Path(td)
             src_db = root / "src.sqlite3"
-            self._make_source_sqlite(src_db)
+            self._make_source_sqlite_with_sequence_context(src_db)
             wb_path = root / "project.xlsx"
             Workbook().save(str(wb_path))
             support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
@@ -4980,7 +5114,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
             finally:
                 wb.close()
 
-    def test_sync_support_workbook_skips_unusable_sequence_context(self) -> None:
+    def test_sync_support_workbook_falls_back_to_sequence_when_context_cannot_label_condition(self) -> None:
         from openpyxl import Workbook, load_workbook  # type: ignore
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
 
@@ -5029,12 +5163,14 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 ws_prog = wb[self._default_program_sheet_name(be)]
                 headers = self._sheet_header_map(ws_prog)
                 self.assertEqual(ws_prog.cell(2, headers["source_run_name"]).value, "RunA")
-                self.assertEqual(str(ws_prog.cell(2, headers["condition_key"]).value or "").strip(), "")
-                self.assertEqual(str(ws_prog.cell(2, headers["display_name"]).value or "").strip(), "")
+                self.assertEqual(str(ws_prog.cell(2, headers["condition_key"]).value or "").strip(), "RunA")
+                self.assertEqual(str(ws_prog.cell(2, headers["display_name"]).value or "").strip(), "RunA")
                 self.assertEqual(str(ws_prog.cell(2, headers["run_type"]).value or "").strip(), "")
 
                 ws_cond = wb["RunConditions"]
-                self.assertEqual(int(ws_cond.max_row or 0), 1)
+                self.assertEqual(int(ws_cond.max_row or 0), 2)
+                self.assertEqual(str(ws_cond.cell(2, 1).value or "").strip(), "RunA")
+                self.assertEqual(str(ws_cond.cell(2, 2).value or "").strip(), "RunA")
             finally:
                 wb.close()
 
@@ -5096,6 +5232,65 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 ]
                 self.assertIn("thrust", validation_values)
                 self.assertGreaterEqual(len(list(ws_cond.data_validations.dataValidation)), 1)
+            finally:
+                wb.close()
+
+    def test_program_requirements_workbook_creation_uses_steady_state_condition_context(self) -> None:
+        from openpyxl import load_workbook  # type: ignore
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            src_db = root / "src.sqlite3"
+            self._make_source_sqlite_with_sequence_context(
+                src_db,
+                data_mode_raw="Steady State",
+                run_type="steady state",
+                on_time_value=None,
+                on_time_units="",
+                off_time_value=None,
+                off_time_units="",
+                nominal_pf_value=410.0,
+                nominal_pf_units="psia",
+                nominal_tf_value=None,
+                nominal_tf_units="",
+                suppression_voltage_units="",
+                valve_voltage_value=12.0,
+                valve_voltage_units="",
+            )
+            docs = [
+                {
+                    "metadata_rel": "run.json",
+                    "program_title": "Program A",
+                    "serial_number": "SN1",
+                    "excel_sqlite_rel": str(src_db),
+                }
+            ]
+
+            result = be._sync_td_program_requirements_workbooks_for_docs(
+                root,
+                docs,
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+                create_missing=True,
+            )
+
+            self.assertEqual(int(result.get("created_count") or 0), 1)
+            pr_path = self._program_requirements_workbook_path(be, root, "Program A")
+            wb = load_workbook(str(pr_path))
+            try:
+                ws_index = wb["Index"]
+                headers = self._sheet_header_map(ws_index)
+                self.assertEqual(str(ws_index.cell(2, headers["condition_key"]).value or "").strip(), "410 psia, SS")
+                self.assertEqual(str(ws_index.cell(2, headers["display_name"]).value or "").strip(), "410 psia, SS")
+                self.assertEqual(str(ws_index.cell(2, headers["run_type"]).value or "").strip(), "SS")
+                self.assertEqual(ws_index.cell(2, headers["suppression_voltage"]).value, 24)
+                self.assertEqual(ws_index.cell(2, headers["valve_voltage"]).value, 12)
+
+                cond_sheet = self._program_requirements_first_condition_sheet(wb)
+                self.assertTrue(cond_sheet)
+                ws_cond = wb[cond_sheet]
+                self.assertEqual(str(ws_cond.cell(2, 1).value or "").strip(), "condition_key")
+                self.assertEqual(str(ws_cond.cell(2, 2).value or "").strip(), "410 psia, SS")
             finally:
                 wb.close()
 
@@ -5980,7 +6175,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 param_defs=[{"name": "thrust", "units": "lbf"}],
             )
 
-            with mock.patch.object(be, "ensure_test_data_project_cache", wraps=be.ensure_test_data_project_cache) as mocked_ensure:
+            with mock.patch.object(be, "sync_test_data_project_cache", wraps=be.sync_test_data_project_cache) as mocked_ensure:
                 be.update_test_data_trending_project_workbook(root, wb_path, overwrite=True, require_existing_cache=False)
             self.assertEqual(mocked_ensure.call_count, 1)
 
