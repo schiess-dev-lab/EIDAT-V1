@@ -31357,6 +31357,7 @@ class MainWindow(QtWidgets.QMainWindow):
         cache_validation_summary = str(payload.get("cache_validation_summary") or "").strip()
         cache_debug_path = str(payload.get("cache_debug_path") or "").strip()
         backend_module_path = str(payload.get("backend_module_path") or "").strip()
+        implementation_excel = str(payload.get("implementation_excel") or "").strip()
         dbg = str(payload.get("debug_json") or "").strip()
         log_path = str(payload.get("log_path") or "").strip()
         td_open_snapshot_warning = ""
@@ -31409,6 +31410,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._append_log(f"[PROJECT UPDATE] TD cache debug: {cache_debug_path}")
             if backend_module_path:
                 self._append_log(f"[PROJECT UPDATE] Backend module: {backend_module_path}")
+            if implementation_excel:
+                self._append_log(f"[PROJECT UPDATE] Implementation cache Excel: {implementation_excel}")
             timings = payload.get("timings")
             if not isinstance(timings, dict) and dbg:
                 try:
@@ -31530,6 +31533,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 lines.append(f"TD cache summary: {cache_validation_summary}")
             if cache_debug_path:
                 lines.append(f"TD cache debug: {cache_debug_path}")
+            if implementation_excel:
+                lines.append(f"Implementation cache Excel: {implementation_excel}")
             if td_open_snapshot_warning:
                 lines.append(td_open_snapshot_warning)
             lines.append("Trend/Analyze is ready. No additional cache build is required.")

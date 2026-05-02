@@ -2574,6 +2574,7 @@ class TestProjectUpdateUI(unittest.TestCase):
             "cache_validation_summary": "mode=none, reason=n/a, impl_complete=True, raw_complete=True",
             "cache_debug_path": "C:/tmp/repo/projects/Proj/td_cache_debug.json",
             "backend_module_path": "C:/tmp/repo/EIDAT_App_Files/ui_next/backend.py",
+            "implementation_excel": "C:/tmp/repo/projects/Proj/implementation_trending.xlsx",
             "timings": {"total_s": 1.23},
             "saved_equation_refresh": {"refreshed_count": 0, "failed_count": 0, "errors": []},
             "debug_json": json.dumps({"timings_s": {"total_s": 1.23}}),
@@ -2591,7 +2592,10 @@ class TestProjectUpdateUI(unittest.TestCase):
         self.assertTrue(any("TD cache summary:" in line for line in logs))
         self.assertTrue(any("TD cache debug:" in line for line in logs))
         self.assertTrue(any("Backend module:" in line for line in logs))
-        self.assertIn("Project updated in", result)
+        self.assertTrue(any("Implementation cache Excel:" in line for line in logs))
+        self.assertIn("Project updated", result)
+        info_args = info_mock.call_args.args
+        self.assertIn("implementation_trending.xlsx", info_args[2])
         info_mock.assert_called_once()
 
     def test_on_project_task_error_logs_failure_message(self) -> None:
@@ -8259,6 +8263,9 @@ class TestTDSupportWorkbook(unittest.TestCase):
             self.assertEqual(str(result.get("cache_validation_error") or ""), "")
             self.assertTrue(str(result.get("cache_validation_summary") or "").strip())
             self.assertEqual(str(result.get("backend_module_path") or ""), str(Path(be.__file__).resolve()))
+            impl_excel = Path(str(result.get("implementation_excel") or ""))
+            self.assertEqual(impl_excel, root / "implementation_trending.xlsx")
+            self.assertTrue(impl_excel.exists())
             cache_state = result.get("cache_state") if isinstance(result.get("cache_state"), dict) else {}
             impl_counts = cache_state.get("impl_counts") if isinstance(cache_state.get("impl_counts"), dict) else {}
             raw_counts = cache_state.get("raw_counts") if isinstance(cache_state.get("raw_counts"), dict) else {}

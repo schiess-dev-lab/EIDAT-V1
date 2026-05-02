@@ -28,7 +28,7 @@ class TestTdTrendOpenStatusSnapshot(unittest.TestCase):
         os.utime(path, ns=(int(epoch_ns), int(epoch_ns)))
 
     def test_missing_snapshot_returns_non_stale(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             project_dir = Path(tmpdir) / "project"
             project_dir.mkdir(parents=True, exist_ok=True)
             workbook_path = project_dir / "project.xlsx"
@@ -46,7 +46,7 @@ class TestTdTrendOpenStatusSnapshot(unittest.TestCase):
             self.assertGreater(int(decision.get("current_project_stamp_epoch_ns") or 0), 0)
 
     def test_newer_project_file_than_snapshot_returns_stale(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             project_dir = Path(tmpdir) / "project"
             project_dir.mkdir(parents=True, exist_ok=True)
             workbook_path = project_dir / "project.xlsx"
@@ -376,6 +376,71 @@ def _create_ready_td_project_fixture(project_dir: Path) -> tuple[Path, Path, Pat
         conn.commit()
 
     return workbook_path, impl_db, raw_db
+
+
+def _write_test_td_support_workbook(
+    project_dir: Path,
+    workbook_path: Path,
+    *,
+    programs: dict[str, list[dict[str, object]]],
+) -> Path:
+    if Workbook is None:
+        raise RuntimeError("openpyxl is required for TD support workbook tests")
+
+    support_path = backend.td_support_workbook_path_for(workbook_path, project_dir=project_dir)
+    wb = Workbook()
+    ws_programs = wb.active
+    ws_programs.title = backend.TD_SUPPORT_PROGRAMS_SHEET
+    ws_programs.append(["program_title", "sheet_name", "enabled"])
+    row_headers = [
+        "source_run_name",
+        "condition_key",
+        "display_name",
+        "feed_pressure",
+        "feed_pressure_units",
+        "run_type",
+        "pulse_width_on",
+        "control_period",
+        "exclude_first_n",
+        "last_n_rows",
+        "enabled",
+        "feed_temperature",
+        "feed_temperature_units",
+        "suppression_voltage",
+        "valve_voltage",
+    ]
+    for idx, (program_title, rows) in enumerate(programs.items()):
+        sheet_name = backend._td_support_program_sheet_name(program_title, idx)
+        ws_programs.append([program_title, sheet_name, True])
+        ws_program = wb.create_sheet(sheet_name)
+        ws_program.append(list(row_headers))
+        for raw_row in rows:
+            row = dict(raw_row)
+            source_run_name = str(row.get("source_run_name") or "").strip()
+            condition_key = str(row.get("condition_key") or source_run_name).strip()
+            display_name = str(row.get("display_name") or condition_key or source_run_name).strip()
+            ws_program.append(
+                [
+                    source_run_name,
+                    condition_key,
+                    display_name,
+                    row.get("feed_pressure"),
+                    str(row.get("feed_pressure_units") or "").strip(),
+                    str(row.get("run_type") or "").strip(),
+                    row.get("pulse_width_on", row.get("pulse_width")),
+                    row.get("control_period"),
+                    row.get("exclude_first_n"),
+                    row.get("last_n_rows"),
+                    bool(row.get("enabled", True)),
+                    row.get("feed_temperature"),
+                    str(row.get("feed_temperature_units") or "").strip(),
+                    row.get("suppression_voltage"),
+                    row.get("valve_voltage"),
+                ]
+            )
+    wb.save(str(support_path))
+    wb.close()
+    return support_path
 
 
 def _append_excluded_td_source_to_fixture(
@@ -1003,6 +1068,227 @@ class TestBackendTdCacheBootstrap(unittest.TestCase):
             self.assertTrue(raw_db.exists())
             self.assertEqual(meta["cache_db_path"], str(impl_db))
             self.assertEqual(meta["raw_cache_db_path"], str(raw_db))
+
+    def test_support_sync_imports_source_display_label_for_incomplete_sequence_context(self) -> None:
+        if Workbook is None:
+            self.skipTest("openpyxl is required for TD support workbook tests")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir) / "project"
+            project_dir.mkdir(parents=True, exist_ok=True)
+            workbook_path = project_dir / "project.xlsx"
+            Workbook().save(str(workbook_path))
+            doc = {"metadata_rel": "docs/sn001.json", "program_title": "Program Alpha"}
+            run_name = "RunCommon"
+            source_label = "Displayed Condition"
+            sequence_context = {
+                "sheet_name": run_name,
+                "source_sheet_name": source_label,
+                "extraction_status": "incomplete",
+                "extraction_reason": "missing nominal pressure",
+            }
+            with patch.object(
+                backend,
+                "read_eidat_index_documents",
+                return_value=[doc],
+            ), patch.object(
+                backend,
+                "_project_selected_metadata_rels",
+                return_value={"docs/sn001.json"},
+            ), patch.object(
+                backend,
+                "_discover_td_runs_by_program_for_docs",
+                return_value={"Program Alpha": [run_name]},
+            ), patch.object(
+                backend,
+                "_discover_td_runs_for_docs",
+                return_value=[run_name],
+            ), patch.object(
+                backend,
+                "_discover_td_sequence_context_by_program_for_docs",
+                return_value={
+                    "Program Alpha": {
+                        backend._td_support_norm_name(run_name): dict(sequence_context),
+                    }
+                },
+            ):
+                backend._sync_td_support_workbook_program_sheets(
+                    workbook_path,
+                    global_repo=project_dir,
+                    project_dir=project_dir,
+                    param_defs=list(TEST_TD_COLUMNS),
+                )
+
+            support_cfg = backend._read_td_support_workbook(workbook_path, project_dir=project_dir)
+            program_rows = list((support_cfg.get("program_mappings") or {}).get("Program Alpha") or [])
+            self.assertEqual(len(program_rows), 1)
+            self.assertEqual(str(program_rows[0].get("condition_key") or ""), source_label)
+            self.assertEqual(str(program_rows[0].get("display_name") or ""), source_label)
+            run_conditions = list(support_cfg.get("run_conditions") or [])
+            self.assertEqual(len(run_conditions), 1)
+            self.assertEqual(str(run_conditions[0].get("condition_key") or ""), source_label)
+            self.assertEqual(str(run_conditions[0].get("display_name") or ""), source_label)
+            self.assertEqual(
+                dict(support_cfg.get("condition_group_diagnostics") or {}).get("source_label_promoted"),
+                1,
+            )
+
+    def test_read_support_workbook_preserves_default_fallback_condition_without_core_bundle(self) -> None:
+        if Workbook is None:
+            self.skipTest("openpyxl is required for TD support workbook tests")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir) / "project"
+            project_dir.mkdir(parents=True, exist_ok=True)
+            workbook_path = project_dir / "project.xlsx"
+            Workbook().save(str(workbook_path))
+            _write_test_td_support_workbook(
+                project_dir,
+                workbook_path,
+                programs={
+                    "Program Alpha": [
+                        {
+                            "source_run_name": "RunCommon",
+                            "condition_key": "RunCommon",
+                            "display_name": "RunCommon",
+                            "enabled": True,
+                        }
+                    ]
+                },
+            )
+
+            support_cfg = backend._read_td_support_workbook(workbook_path, project_dir=project_dir)
+            run_conditions = list(support_cfg.get("run_conditions") or [])
+            self.assertEqual(len(run_conditions), 1)
+            self.assertEqual(str(run_conditions[0].get("condition_key") or ""), "RunCommon")
+            self.assertEqual(str(run_conditions[0].get("display_name") or ""), "RunCommon")
+            self.assertEqual(
+                dict(support_cfg.get("condition_group_diagnostics") or {}).get("fallback_promoted"),
+                1,
+            )
+
+    def test_read_support_workbook_merges_shared_fallback_sequences_across_programs(self) -> None:
+        if Workbook is None:
+            self.skipTest("openpyxl is required for TD support workbook tests")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir) / "project"
+            project_dir.mkdir(parents=True, exist_ok=True)
+            workbook_path = project_dir / "project.xlsx"
+            Workbook().save(str(workbook_path))
+            _write_test_td_support_workbook(
+                project_dir,
+                workbook_path,
+                programs={
+                    "Program Alpha": [
+                        {
+                            "source_run_name": "RunCommon",
+                            "condition_key": "RunCommon",
+                            "display_name": "RunCommon",
+                            "enabled": True,
+                        }
+                    ],
+                    "Program Beta": [
+                        {
+                            "source_run_name": "RunCommon",
+                            "condition_key": "RunCommon",
+                            "display_name": "RunCommon",
+                            "enabled": True,
+                        }
+                    ],
+                },
+            )
+
+            support_cfg = backend._read_td_support_workbook(workbook_path, project_dir=project_dir)
+            run_conditions = list(support_cfg.get("run_conditions") or [])
+            self.assertEqual(len(run_conditions), 1)
+            member_programs = str(run_conditions[0].get("member_programs_text") or "")
+            self.assertIn("Program Alpha", member_programs)
+            self.assertIn("Program Beta", member_programs)
+            self.assertEqual(
+                dict(support_cfg.get("condition_group_diagnostics") or {}).get("fallback_promoted"),
+                2,
+            )
+            sequences = list(support_cfg.get("sequences") or [])
+            self.assertEqual(len(sequences), 2)
+
+    def test_preserved_condition_reaches_calc_cache_run_selection_views(self) -> None:
+        if Workbook is None:
+            self.skipTest("openpyxl is required for TD support workbook tests")
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            project_dir = Path(tmpdir) / "project"
+            project_dir.mkdir(parents=True, exist_ok=True)
+            workbook_path = project_dir / "project.xlsx"
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "Sources"
+            ws.append(
+                ["serial_number", "program_title", "document_type", "metadata_rel", "artifacts_rel", "excel_sqlite_rel"]
+            )
+            wb.save(str(workbook_path))
+            wb.close()
+            _write_test_td_support_workbook(
+                project_dir,
+                workbook_path,
+                programs={
+                    "Program Alpha": [
+                        {
+                            "source_run_name": "RunCommon",
+                            "condition_key": "Displayed Condition",
+                            "display_name": "Displayed Condition",
+                            "enabled": True,
+                        }
+                    ]
+                },
+            )
+            support_cfg = backend._read_td_support_workbook(workbook_path, project_dir=project_dir)
+            condition = dict((support_cfg.get("run_conditions") or [])[0])
+            condition_key = str(condition.get("condition_key") or "")
+            db_path = project_dir / backend.EIDAT_PROJECT_IMPLEMENTATION_DB
+            backend._write_test_data_project_calc_cache_from_aggregates(
+                db_path,
+                workbook_path,
+                cfg_cols=[{"name": "Pressure", "units": "psi"}],
+                cfg_units={"Pressure": "psi"},
+                selected_stats=["mean"],
+                support_cfg=support_cfg,
+                support_settings={},
+                bounds_by_sequence={},
+                condition_defaults_by_run={
+                    condition_key: {
+                        "display_name": str(condition.get("display_name") or condition_key),
+                        "default_x": "Time",
+                        "run_type": str(condition.get("run_type") or ""),
+                        "control_period": condition.get("control_period"),
+                        "pulse_width": condition.get("pulse_width_on", condition.get("pulse_width")),
+                        "suppression_voltage": condition.get("suppression_voltage"),
+                        "valve_voltage": condition.get("valve_voltage"),
+                    }
+                },
+                condition_meta_by_key={condition_key: dict(condition)},
+                aggregated_curve_values={(condition_key, "SN-001", "Pressure"): [1.0, 2.0]},
+                aggregated_obs_meta={
+                    (condition_key, "SN-001"): {
+                        "program_titles": {"Program Alpha"},
+                        "source_run_names": {"RunCommon"},
+                        "source_mtime_ns": [1],
+                    }
+                },
+                condition_y_names={condition_key: {"Pressure"}},
+                sequence_obs_rows=[
+                    ("obs1", "SN-001", condition_key, "Program Alpha", "RunCommon", "", None, None, None, None, 1, 1)
+                ],
+                sequence_metric_rows=[
+                    ("obs1", "SN-001", condition_key, "Pressure", "mean", 1.5, 1, 1, "Program Alpha", "RunCommon")
+                ],
+                project_cfg={"columns": [{"name": "Pressure", "units": "psi"}], "statistics": ["mean"]},
+                computed_epoch_ns=1,
+                progress_cb=None,
+            )
+
+            runs = backend.td_list_runs_ex(db_path)
+            self.assertEqual(runs, [{"run_name": "Displayed Condition", "display_name": "Displayed Condition"}])
+            views = backend.td_list_run_selection_views(db_path, workbook_path)
+            self.assertEqual(len(views["condition"]), 1)
+            self.assertEqual(str(views["condition"][0].get("display_text") or ""), "Displayed Condition")
+            self.assertEqual(list(views["condition"][0].get("member_sequences") or []), ["RunCommon"])
 
     def test_ready_validator_accepts_fully_built_td_project(self) -> None:
         if Workbook is None:

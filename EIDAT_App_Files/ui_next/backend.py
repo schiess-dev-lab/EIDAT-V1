@@ -10258,6 +10258,28 @@ def _td_sequence_context_support_fields(row: Mapping[str, object] | None) -> dic
     }
 
 
+def _td_sequence_context_source_label(
+    row: Mapping[str, object] | None,
+    *,
+    source_run_name: object = "",
+) -> str:
+    if not isinstance(row, Mapping):
+        return ""
+    source_run = str(source_run_name or row.get("sheet_name") or "").strip()
+    for candidate in (
+        row.get("source_sheet_name"),
+        row.get("display_name"),
+        row.get("sheet_name"),
+    ):
+        text = str(candidate or "").strip()
+        if not text:
+            continue
+        if source_run and _td_support_norm_name(text) == _td_support_norm_name(source_run):
+            continue
+        return text
+    return ""
+
+
 def _td_support_name_is_default(value: object, source_run_name: object) -> bool:
     text = str(value or "").strip()
     if not text:
@@ -10319,20 +10341,37 @@ def _td_prefill_support_row_from_sequence_context(
 ) -> dict[str, object]:
     payload = dict(row or {})
     source_run_name = str(payload.get("source_run_name") or "").strip()
+    source_label = _td_sequence_context_source_label(source_context, source_run_name=source_run_name)
     had_condition_values = _td_support_row_has_condition_values(payload)
+    source_label_applied = False
+
+    def _apply_source_label() -> None:
+        nonlocal source_label_applied
+        if not source_label:
+            return
+        if (
+            _td_support_blankish(payload.get("condition_key"))
+            or _td_support_name_is_default(payload.get("condition_key"), source_run_name)
+        ):
+            payload["condition_key"] = source_label
+            source_label_applied = True
+        if (
+            _td_support_blankish(payload.get("display_name"))
+            or _td_support_name_is_default(payload.get("display_name"), source_run_name)
+        ):
+            payload["display_name"] = source_label
+            source_label_applied = True
+
     if not _td_sequence_context_is_usable(source_context):
-        if (
-            blank_unusable_defaults
-            and not _td_support_row_has_condition_values(payload)
-            and _td_support_name_is_default(payload.get("condition_key"), source_run_name)
-        ):
-            payload["condition_key"] = ""
-        if (
-            blank_unusable_defaults
-            and not _td_support_row_has_condition_values(payload)
-            and _td_support_name_is_default(payload.get("display_name"), source_run_name)
-        ):
-            payload["display_name"] = ""
+        _apply_source_label()
+        fallback_label = source_label or source_run_name
+        if blank_unusable_defaults and not _td_support_row_has_condition_values(payload):
+            if _td_support_blankish(payload.get("condition_key")) and fallback_label:
+                payload["condition_key"] = fallback_label
+            if _td_support_blankish(payload.get("display_name")) and fallback_label:
+                payload["display_name"] = fallback_label
+        if source_label_applied:
+            payload["__source_label_promoted"] = True
         return payload
 
     support_fields = _td_sequence_context_support_fields(source_context)
@@ -10345,6 +10384,10 @@ def _td_prefill_support_row_from_sequence_context(
             payload["condition_key"] = derived_label
         if _td_support_name_is_default(payload.get("display_name"), source_run_name):
             payload["display_name"] = derived_label
+    elif not derived_label:
+        _apply_source_label()
+    if source_label_applied:
+        payload["__source_label_promoted"] = True
     return payload
 
 
@@ -12447,18 +12490,57 @@ def _td_distinct_condition_values(rows: Sequence[Mapping[str, object]], field_na
     return list(values_by_key.values())
 
 
-def _td_group_program_rows_into_conditions(rows: Sequence[Mapping[str, object]]) -> list[dict]:
+def _td_group_program_rows_into_conditions(
+    rows: Sequence[Mapping[str, object]],
+    *,
+    diagnostics: dict[str, int] | None = None,
+) -> list[dict]:
     grouped: dict[tuple[str, str, str, str, str, str, str, str], dict] = {}
+    diag = diagnostics if isinstance(diagnostics, dict) else None
+    if diag is not None:
+        diag.clear()
+        diag.update(
+            {
+                "full_promoted": 0,
+                "source_label_promoted": 0,
+                "fallback_promoted": 0,
+                "dropped": 0,
+                "disabled_rows": 0,
+            }
+        )
     for raw_row in rows or []:
         if not isinstance(raw_row, Mapping):
             continue
         if not bool(raw_row.get("enabled", True)):
-            continue
-        if not _td_support_row_is_promotable(raw_row):
+            if diag is not None:
+                diag["disabled_rows"] += 1
             continue
         source_run_name = str(raw_row.get("source_run_name") or "").strip()
+        is_promotable = _td_support_row_is_promotable(raw_row)
+        if not is_promotable and not source_run_name:
+            if diag is not None:
+                diag["dropped"] += 1
+            continue
+        if diag is not None:
+            explicit_condition_key = str(raw_row.get("condition_key") or "").strip()
+            explicit_display_name = str(raw_row.get("display_name") or "").strip()
+            explicit_label_without_core = bool(
+                not _td_support_row_has_core_bundle(raw_row)
+                and (
+                    (explicit_condition_key and not _td_support_name_is_default(explicit_condition_key, source_run_name))
+                    or (explicit_display_name and not _td_support_name_is_default(explicit_display_name, source_run_name))
+                )
+            )
+            if bool(raw_row.get("__source_label_promoted")) or explicit_label_without_core:
+                diag["source_label_promoted"] += 1
+            elif is_promotable:
+                diag["full_promoted"] += 1
+            else:
+                diag["fallback_promoted"] += 1
         condition_key = _td_condition_base_key(raw_row)
         if not condition_key or not source_run_name:
+            if diag is not None and not source_run_name:
+                diag["dropped"] += 1
             continue
         identity = _td_support_condition_group_identity(raw_row)
         group = grouped.get(identity)
@@ -12712,6 +12794,7 @@ def _refresh_td_support_run_conditions_sheet(
         return {"path": str(support_path), "updated": False, "condition_count": 0, "rows_written": 0}
 
     support_cfg = _read_td_support_workbook(wb_path, project_dir=project_dir)
+    condition_group_diagnostics = dict(support_cfg.get("condition_group_diagnostics") or {})
     run_conditions = [
         dict(row)
         for row in ((support_cfg.get("run_conditions") or []))
@@ -12842,6 +12925,7 @@ def _refresh_td_support_run_conditions_sheet(
                 "updated": False,
                 "condition_count": len(run_conditions),
                 "rows_written": rows_written,
+                "condition_group_diagnostics": condition_group_diagnostics,
             }
 
         for sheet_name in list(wb.sheetnames):
@@ -12867,6 +12951,7 @@ def _refresh_td_support_run_conditions_sheet(
         "updated": True,
         "condition_count": len(run_conditions),
         "rows_written": rows_written,
+        "condition_group_diagnostics": condition_group_diagnostics,
     }
 
 
@@ -13587,9 +13672,19 @@ def _read_td_support_workbook(workbook_path: Path, *, project_dir: Path | None =
         ]
         has_new_program_schema = bool(new_program_schema_detected)
 
+        condition_group_diagnostics = {
+            "full_promoted": 0,
+            "source_label_promoted": 0,
+            "fallback_promoted": 0,
+            "dropped": 0,
+            "disabled_rows": 0,
+        }
         sequences: list[dict] = []
         if has_new_program_schema:
-            grouped_conditions = _td_group_program_rows_into_conditions(full_program_rows)
+            grouped_conditions = _td_group_program_rows_into_conditions(
+                full_program_rows,
+                diagnostics=condition_group_diagnostics,
+            )
             run_conditions = [
                 {
                     "condition_key": str(group.get("condition_key") or "").strip(),
@@ -13682,6 +13777,7 @@ def _read_td_support_workbook(workbook_path: Path, *, project_dir: Path | None =
             "condition_bounds": condition_bounds,
             "sequences": sequences,
             "bounds_by_sequence": condition_bounds,
+            "condition_group_diagnostics": condition_group_diagnostics,
         }
     finally:
         try:
@@ -36035,6 +36131,7 @@ def update_test_data_trending_project_workbook(
     cache_validation_ok = False
     cache_validation_error = ""
     cache_debug_path = str(cache_sync_payload.get("debug_path") or "").strip()
+    implementation_excel_path = ""
     backend_module_path = str(Path(__file__).resolve())
     if not dry_run:
         validation_exc: Exception | None = None
@@ -36111,6 +36208,11 @@ def update_test_data_trending_project_workbook(
             )
             _td_emit_progress(progress_cb, failure_message)
             raise RuntimeError(failure_message)
+        _td_emit_progress(progress_cb, "Exporting implementation cache Excel mirror")
+        impl_xlsx_path = _sync_sqlite_excel_mirror(db_path, force=True)
+        if impl_xlsx_path is None:
+            raise RuntimeError(f"Failed to export implementation cache Excel mirror: {db_path}")
+        implementation_excel_path = str(impl_xlsx_path)
         if warning_summary:
             _td_emit_progress(progress_cb, warning_summary)
 
@@ -36207,6 +36309,7 @@ def update_test_data_trending_project_workbook(
         "cache_validation_warnings": list(readiness_warnings),
         "program_requirements_sync": dict(program_requirements_sync_payload),
         "program_requirements_import": dict(program_requirements_import_payload),
+        "implementation_excel": str(implementation_excel_path or "").strip(),
     }
 
     return {
@@ -36242,6 +36345,7 @@ def update_test_data_trending_project_workbook(
         "backend_module_path": backend_module_path,
         "program_requirements_sync": dict(program_requirements_sync_payload),
         "program_requirements_import": dict(program_requirements_import_payload),
+        "implementation_excel": str(implementation_excel_path or "").strip(),
         "debug_json": json.dumps(debug_payload, separators=(",", ":")),
     }
 
