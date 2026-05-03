@@ -4264,6 +4264,44 @@ class TestTDSupportWorkbook(unittest.TestCase):
             param_defs=[{"name": "thrust", "units": "lbf"}],
         )
 
+    def _build_project_cache_from_sequence_context(
+        self,
+        root: Path,
+        *,
+        serial_number: str = "SN2777",
+        program_title: str = "P267",
+        **sequence_context_kwargs: object,
+    ) -> dict[str, Path]:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        src_db = root / "src.sqlite3"
+        self._make_source_sqlite_with_sequence_context(src_db, **sequence_context_kwargs)
+
+        wb_path = root / "project.xlsx"
+        be._write_test_data_trending_workbook(
+            wb_path,
+            global_repo=root,
+            serials=[serial_number],
+            docs=[{"serial_number": serial_number, "excel_sqlite_rel": str(src_db), "program_title": program_title}],
+            config=self._make_config(),
+        )
+        support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+        be._write_td_support_workbook(
+            support_path,
+            sequence_names=["RunA"],
+            param_defs=[{"name": "thrust", "units": "lbf"}],
+            program_titles=[program_title],
+            sequences_by_program={program_title: ["RunA"]},
+        )
+        be.sync_test_data_project_cache(root, wb_path, rebuild=True)
+        return {
+            "wb_path": wb_path,
+            "src_db": src_db,
+            "support_path": support_path,
+            "impl_db": root / "implementation_trending.sqlite3",
+            "raw_db": root / "test_data_raw_cache.sqlite3",
+        }
+
     def _seed_perf_candidate_db(
         self,
         root: Path,
@@ -9009,6 +9047,258 @@ class TestTDSupportWorkbook(unittest.TestCase):
             curves = be.td_load_curves(impl_db, "RunA", "thrust", "Time")
             self.assertEqual([row.get("control_period") for row in curves], [60.0])
             self.assertEqual([row.get("suppression_voltage") for row in curves], [24.0])
+
+    def test_cache_state_requests_full_rebuild_when_raw_condition_metadata_drops(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            paths = self._build_project_cache_from_sequence_context(
+                root,
+                run_type="PM",
+                on_time_value=0.016,
+                on_time_units="sec",
+                off_time_value=1.984,
+                off_time_units="sec",
+                nominal_pf_value=257.0,
+                nominal_pf_units="psia",
+                nominal_tf_value=70.0,
+                nominal_tf_units="F",
+                suppression_voltage_value=20.0,
+                suppression_voltage_units="V",
+                valve_voltage_value=28.0,
+                valve_voltage_units="V",
+            )
+            raw_db = paths["raw_db"]
+            impl_db = paths["impl_db"]
+            wb_path = paths["wb_path"]
+
+            with sqlite3.connect(str(raw_db)) as conn:
+                conn.execute(
+                    """
+                    UPDATE td_raw_condition_observations
+                    SET run_type=NULL, pulse_width=NULL, control_period=NULL, suppression_voltage=NULL, valve_voltage=NULL
+                    """
+                )
+                conn.commit()
+            with sqlite3.connect(str(impl_db)) as conn:
+                conn.execute(
+                    """
+                    UPDATE td_condition_observations
+                    SET run_type=NULL, pulse_width=NULL, control_period=NULL, suppression_voltage=NULL, valve_voltage=NULL
+                    """
+                )
+                conn.execute(
+                    """
+                    UPDATE td_condition_observations_sequences
+                    SET run_type=NULL, pulse_width=NULL, control_period=NULL, suppression_voltage=NULL, valve_voltage=NULL
+                    """
+                )
+                conn.commit()
+
+            state = be.inspect_test_data_project_cache_state(root, wb_path)
+            self.assertEqual(str(state.get("mode") or ""), "full")
+            self.assertEqual(str(state.get("reason") or ""), "raw cache missing source-backed run condition fields")
+            self.assertFalse(bool(state.get("raw_condition_metadata_ok")))
+
+            payload = be.sync_test_data_project_cache(root, wb_path, rebuild=False)
+            self.assertEqual(str(payload.get("mode") or ""), "full_rebuild")
+            self.assertEqual(str(payload.get("reason") or ""), "raw cache missing source-backed run condition fields")
+
+            with sqlite3.connect(str(raw_db)) as conn:
+                raw_row = conn.execute(
+                    "SELECT run_type, pulse_width, control_period, suppression_voltage, valve_voltage FROM td_raw_condition_observations"
+                ).fetchone()
+            self.assertIsNotNone(raw_row)
+            assert raw_row is not None
+            self.assertEqual(str(raw_row[0] or "").strip(), "PM")
+            self.assertAlmostEqual(float(raw_row[1] or 0.0), 0.016)
+            self.assertAlmostEqual(float(raw_row[2] or 0.0), 2.0)
+            self.assertAlmostEqual(float(raw_row[3] or 0.0), 20.0)
+            self.assertAlmostEqual(float(raw_row[4] or 0.0), 28.0)
+
+            with sqlite3.connect(str(impl_db)) as conn:
+                obs_row = conn.execute(
+                    "SELECT run_type, pulse_width, control_period, suppression_voltage, valve_voltage FROM td_condition_observations"
+                ).fetchone()
+                seq_row = conn.execute(
+                    "SELECT run_type, pulse_width, control_period, suppression_voltage, valve_voltage FROM td_condition_observations_sequences"
+                ).fetchone()
+            self.assertIsNotNone(obs_row)
+            self.assertIsNotNone(seq_row)
+            assert obs_row is not None
+            assert seq_row is not None
+            self.assertEqual(str(obs_row[0] or "").strip(), "PM")
+            self.assertAlmostEqual(float(obs_row[1] or 0.0), 0.016)
+            self.assertAlmostEqual(float(obs_row[2] or 0.0), 2.0)
+            self.assertAlmostEqual(float(obs_row[3] or 0.0), 20.0)
+            self.assertAlmostEqual(float(obs_row[4] or 0.0), 28.0)
+            self.assertEqual(str(seq_row[0] or "").strip(), "PM")
+            self.assertAlmostEqual(float(seq_row[1] or 0.0), 0.016)
+            self.assertAlmostEqual(float(seq_row[2] or 0.0), 2.0)
+            self.assertAlmostEqual(float(seq_row[3] or 0.0), 20.0)
+            self.assertAlmostEqual(float(seq_row[4] or 0.0), 28.0)
+
+    def test_cache_state_requests_calc_when_impl_condition_metadata_drops(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            paths = self._build_project_cache_from_sequence_context(
+                root,
+                run_type="PM",
+                on_time_value=0.016,
+                on_time_units="sec",
+                off_time_value=1.984,
+                off_time_units="sec",
+                nominal_pf_value=257.0,
+                nominal_pf_units="psia",
+                nominal_tf_value=70.0,
+                nominal_tf_units="F",
+                suppression_voltage_value=20.0,
+                suppression_voltage_units="V",
+                valve_voltage_value=28.0,
+                valve_voltage_units="V",
+            )
+            impl_db = paths["impl_db"]
+            wb_path = paths["wb_path"]
+
+            with sqlite3.connect(str(impl_db)) as conn:
+                conn.execute(
+                    """
+                    UPDATE td_condition_observations
+                    SET run_type=NULL, pulse_width=NULL, control_period=NULL, suppression_voltage=NULL, valve_voltage=NULL
+                    """
+                )
+                conn.execute(
+                    """
+                    UPDATE td_condition_observations_sequences
+                    SET run_type=NULL, pulse_width=NULL, control_period=NULL, suppression_voltage=NULL, valve_voltage=NULL
+                    """
+                )
+                conn.commit()
+
+            state = be.inspect_test_data_project_cache_state(root, wb_path)
+            self.assertEqual(str(state.get("mode") or ""), "calc")
+            self.assertEqual(str(state.get("reason") or ""), "implementation cache missing run condition fields from raw cache")
+            self.assertTrue(bool(state.get("raw_condition_metadata_ok")))
+            self.assertFalse(bool(state.get("impl_condition_metadata_ok")))
+
+            payload = be.sync_test_data_project_cache(root, wb_path, rebuild=False)
+            self.assertEqual(str(payload.get("mode") or ""), "calc_only")
+            self.assertEqual(str(payload.get("reason") or ""), "implementation cache missing run condition fields from raw cache")
+
+            with sqlite3.connect(str(impl_db)) as conn:
+                obs_row = conn.execute(
+                    "SELECT run_type, pulse_width, control_period, suppression_voltage, valve_voltage FROM td_condition_observations"
+                ).fetchone()
+                seq_row = conn.execute(
+                    "SELECT run_type, pulse_width, control_period, suppression_voltage, valve_voltage FROM td_condition_observations_sequences"
+                ).fetchone()
+            self.assertIsNotNone(obs_row)
+            self.assertIsNotNone(seq_row)
+            assert obs_row is not None
+            assert seq_row is not None
+            self.assertEqual(str(obs_row[0] or "").strip(), "PM")
+            self.assertAlmostEqual(float(obs_row[1] or 0.0), 0.016)
+            self.assertAlmostEqual(float(obs_row[2] or 0.0), 2.0)
+            self.assertAlmostEqual(float(obs_row[3] or 0.0), 20.0)
+            self.assertAlmostEqual(float(obs_row[4] or 0.0), 28.0)
+            self.assertEqual(str(seq_row[0] or "").strip(), "PM")
+            self.assertAlmostEqual(float(seq_row[1] or 0.0), 0.016)
+            self.assertAlmostEqual(float(seq_row[2] or 0.0), 2.0)
+            self.assertAlmostEqual(float(seq_row[3] or 0.0), 20.0)
+            self.assertAlmostEqual(float(seq_row[4] or 0.0), 28.0)
+
+    def test_cache_state_allows_blank_aggregate_fields_when_sequence_values_conflict(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            paths = self._build_project_cache_from_sequence_context(
+                root,
+                run_type="PM",
+                on_time_value=0.016,
+                on_time_units="sec",
+                off_time_value=1.984,
+                off_time_units="sec",
+                nominal_pf_value=257.0,
+                nominal_pf_units="psia",
+                nominal_tf_value=70.0,
+                nominal_tf_units="F",
+                suppression_voltage_value=20.0,
+                suppression_voltage_units="V",
+                valve_voltage_value=28.0,
+                valve_voltage_units="V",
+            )
+            impl_db = paths["impl_db"]
+            wb_path = paths["wb_path"]
+
+            with sqlite3.connect(str(impl_db)) as conn:
+                base_row = conn.execute(
+                    """
+                    SELECT
+                        serial,
+                        run_name,
+                        program_title,
+                        run_type,
+                        pulse_width,
+                        source_mtime_ns,
+                        computed_epoch_ns
+                    FROM td_condition_observations_sequences
+                    LIMIT 1
+                    """
+                ).fetchone()
+                self.assertIsNotNone(base_row)
+                assert base_row is not None
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO td_condition_observations_sequences(
+                        observation_id,
+                        serial,
+                        run_name,
+                        program_title,
+                        source_run_name,
+                        run_type,
+                        pulse_width,
+                        control_period,
+                        suppression_voltage,
+                        valve_voltage,
+                        source_mtime_ns,
+                        computed_epoch_ns
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "obs_extra",
+                        str(base_row[0] or ""),
+                        str(base_row[1] or ""),
+                        str(base_row[2] or ""),
+                        "RunA_Copy",
+                        str(base_row[3] or ""),
+                        base_row[4],
+                        4.0,
+                        24.0,
+                        32.0,
+                        int(base_row[5] or 0),
+                        int(base_row[6] or 0),
+                    ),
+                )
+                conn.execute(
+                    """
+                    UPDATE td_condition_observations
+                    SET control_period=NULL, suppression_voltage=NULL, valve_voltage=NULL
+                    """
+                )
+                conn.commit()
+
+            state = be.inspect_test_data_project_cache_state(root, wb_path)
+            self.assertEqual(str(state.get("mode") or ""), "none")
+            self.assertEqual(str(state.get("reason") or ""), "")
+            self.assertTrue(bool(state.get("impl_condition_metadata_ok")))
+
+            payload = be.sync_test_data_project_cache(root, wb_path, rebuild=False)
+            self.assertEqual(str(payload.get("mode") or ""), "noop")
+            self.assertEqual(str(payload.get("reason") or ""), "")
 
     def test_rebuild_populates_impl_curve_plotter_tables_and_curves_survive_raw_cache_removal(self) -> None:
         from openpyxl import load_workbook  # type: ignore

@@ -14650,6 +14650,277 @@ def td_list_runs_ex(db_path: Path) -> list[dict]:
     return out
 
 
+TD_CONDITION_METADATA_FIELDS = (
+    "run_type",
+    "pulse_width",
+    "control_period",
+    "suppression_voltage",
+    "valve_voltage",
+)
+
+
+def _td_condition_metadata_normalized_value(field_name: str, value: object) -> str | float | None:
+    if str(field_name or "").strip() == "run_type":
+        text = str(td_normalize_run_type(value) or "").strip()
+        return text or None
+    return _td_finite_float(value)
+
+
+def _td_condition_metadata_has_value(field_name: str, value: object) -> bool:
+    return _td_condition_metadata_normalized_value(field_name, value) is not None
+
+
+def _td_condition_metadata_unique_value(field_name: str, values: Sequence[object]) -> str | float | None:
+    if str(field_name or "").strip() == "run_type":
+        values_by_key: dict[str, str] = {}
+        for value in values or []:
+            text = str(td_normalize_run_type(value) or "").strip()
+            if not text:
+                continue
+            values_by_key.setdefault(text.casefold(), text)
+        if len(values_by_key) == 1:
+            return next(iter(values_by_key.values()))
+        return None
+
+    values_by_key: dict[float, float] = {}
+    for value in values or []:
+        numeric = _td_finite_float(value)
+        if numeric is None:
+            continue
+        values_by_key.setdefault(round(float(numeric), 12), float(numeric))
+    if len(values_by_key) == 1:
+        return next(iter(values_by_key.values()))
+    return None
+
+
+def _td_source_backed_condition_fields_by_key(
+    source_states: Sequence[Mapping[str, object]] | None,
+) -> dict[tuple[str, str], dict[str, object]]:
+    usable_rows_by_path: dict[str, list[dict[str, object]]] = {}
+    out: dict[tuple[str, str], dict[str, object]] = {}
+    for state in source_states or []:
+        serial = str(state.get("serial") or "").strip()
+        status = str(state.get("status") or "").strip().lower()
+        sqlite_path_text = str(state.get("sqlite_path") or "").strip()
+        if not serial or status != "ok" or not sqlite_path_text:
+            continue
+        sqlite_path = Path(sqlite_path_text).expanduser()
+        path_key = str(sqlite_path)
+        usable_rows = usable_rows_by_path.get(path_key)
+        if usable_rows is None:
+            usable_rows = []
+            if sqlite_path.exists() and sqlite_path.is_file():
+                try:
+                    with sqlite3.connect(str(sqlite_path)) as conn:
+                        for row in _td_read_sequence_context_rows(conn):
+                            if _td_sequence_context_is_usable(row):
+                                usable_rows.append(dict(row))
+                except Exception:
+                    usable_rows = []
+            usable_rows_by_path[path_key] = usable_rows
+
+        for row in usable_rows:
+            support_fields = _td_sequence_context_support_fields(row)
+            if not any(
+                _td_condition_metadata_has_value(field_name, support_fields.get(field_name))
+                for field_name in TD_CONDITION_METADATA_FIELDS
+            ):
+                continue
+            run_keys: list[str] = []
+            for candidate in (row.get("sheet_name"), row.get("source_sheet_name")):
+                run_key = _td_support_norm_name(candidate)
+                if run_key and run_key not in run_keys:
+                    run_keys.append(run_key)
+            for run_key in run_keys:
+                out.setdefault((serial, run_key), dict(support_fields))
+    return out
+
+
+def _td_raw_condition_metadata_health(
+    raw_conn: sqlite3.Connection,
+    source_states: Sequence[Mapping[str, object]] | None,
+) -> dict[str, object]:
+    expected_by_key = _td_source_backed_condition_fields_by_key(source_states)
+    if not expected_by_key:
+        return {"ok": True, "missing": []}
+    try:
+        rows = raw_conn.execute(
+            """
+            SELECT
+                serial,
+                COALESCE(source_run_name, ''),
+                COALESCE(run_type, ''),
+                pulse_width,
+                control_period,
+                suppression_voltage,
+                valve_voltage
+            FROM td_raw_condition_observations
+            """
+        ).fetchall()
+    except Exception:
+        return {"ok": False, "missing": ["td_raw_condition_observations unavailable"]}
+
+    rows_by_key: dict[tuple[str, str], list[dict[str, object]]] = {}
+    for serial, source_run_name, run_type, pulse_width, control_period, suppression_voltage, valve_voltage in rows:
+        serial_txt = str(serial or "").strip()
+        run_key = _td_support_norm_name(source_run_name)
+        if not serial_txt or not run_key:
+            continue
+        rows_by_key.setdefault((serial_txt, run_key), []).append(
+            {
+                "run_type": run_type,
+                "pulse_width": pulse_width,
+                "control_period": control_period,
+                "suppression_voltage": suppression_voltage,
+                "valve_voltage": valve_voltage,
+            }
+        )
+
+    missing: list[str] = []
+    for key, expected_fields in expected_by_key.items():
+        cached_rows = rows_by_key.get(key) or []
+        if not cached_rows:
+            continue
+        for field_name in TD_CONDITION_METADATA_FIELDS:
+            if not _td_condition_metadata_has_value(field_name, expected_fields.get(field_name)):
+                continue
+            if any(_td_condition_metadata_has_value(field_name, row.get(field_name)) for row in cached_rows):
+                continue
+            missing.append(f"{key[0]} | {key[1]} | {field_name}")
+    return {"ok": not missing, "missing": missing}
+
+
+def _td_impl_condition_metadata_health(
+    raw_conn: sqlite3.Connection,
+    impl_conn: sqlite3.Connection,
+) -> dict[str, object]:
+    try:
+        raw_rows = raw_conn.execute(
+            """
+            SELECT
+                serial,
+                COALESCE(source_run_name, ''),
+                COALESCE(run_type, ''),
+                pulse_width,
+                control_period,
+                suppression_voltage,
+                valve_voltage
+            FROM td_raw_condition_observations
+            """
+        ).fetchall()
+    except Exception:
+        return {"ok": False, "missing": ["td_raw_condition_observations unavailable"]}
+    try:
+        sequence_rows = impl_conn.execute(
+            """
+            SELECT
+                serial,
+                COALESCE(run_name, ''),
+                COALESCE(source_run_name, ''),
+                COALESCE(run_type, ''),
+                pulse_width,
+                control_period,
+                suppression_voltage,
+                valve_voltage
+            FROM td_condition_observations_sequences
+            """
+        ).fetchall()
+    except Exception:
+        return {"ok": False, "missing": ["td_condition_observations_sequences unavailable"]}
+    try:
+        aggregate_rows = impl_conn.execute(
+            """
+            SELECT
+                serial,
+                COALESCE(run_name, ''),
+                COALESCE(run_type, ''),
+                pulse_width,
+                control_period,
+                suppression_voltage,
+                valve_voltage
+            FROM td_condition_observations
+            """
+        ).fetchall()
+    except Exception:
+        return {"ok": False, "missing": ["td_condition_observations unavailable"]}
+
+    raw_rows_by_source_key: dict[tuple[str, str], list[dict[str, object]]] = {}
+    for serial, source_run_name, run_type, pulse_width, control_period, suppression_voltage, valve_voltage in raw_rows:
+        serial_txt = str(serial or "").strip()
+        run_key = _td_support_norm_name(source_run_name)
+        if not serial_txt or not run_key:
+            continue
+        raw_rows_by_source_key.setdefault((serial_txt, run_key), []).append(
+            {
+                "run_type": run_type,
+                "pulse_width": pulse_width,
+                "control_period": control_period,
+                "suppression_voltage": suppression_voltage,
+                "valve_voltage": valve_voltage,
+            }
+        )
+
+    sequence_rows_by_source_key: dict[tuple[str, str], list[dict[str, object]]] = {}
+    sequence_rows_by_aggregate_key: dict[tuple[str, str], list[dict[str, object]]] = {}
+    for serial, run_name, source_run_name, run_type, pulse_width, control_period, suppression_voltage, valve_voltage in sequence_rows:
+        serial_txt = str(serial or "").strip()
+        run_txt = str(run_name or "").strip()
+        source_key = _td_support_norm_name(source_run_name)
+        row_payload = {
+            "run_type": run_type,
+            "pulse_width": pulse_width,
+            "control_period": control_period,
+            "suppression_voltage": suppression_voltage,
+            "valve_voltage": valve_voltage,
+        }
+        if serial_txt and source_key:
+            sequence_rows_by_source_key.setdefault((serial_txt, source_key), []).append(dict(row_payload))
+        if serial_txt and run_txt:
+            sequence_rows_by_aggregate_key.setdefault((serial_txt, run_txt), []).append(dict(row_payload))
+
+    aggregate_rows_by_key: dict[tuple[str, str], dict[str, object]] = {}
+    for serial, run_name, run_type, pulse_width, control_period, suppression_voltage, valve_voltage in aggregate_rows:
+        serial_txt = str(serial or "").strip()
+        run_txt = str(run_name or "").strip()
+        if not serial_txt or not run_txt:
+            continue
+        aggregate_rows_by_key[(serial_txt, run_txt)] = {
+            "run_type": run_type,
+            "pulse_width": pulse_width,
+            "control_period": control_period,
+            "suppression_voltage": suppression_voltage,
+            "valve_voltage": valve_voltage,
+        }
+
+    missing: list[str] = []
+    for key, raw_rows_for_key in raw_rows_by_source_key.items():
+        cached_rows = sequence_rows_by_source_key.get(key) or []
+        if not cached_rows:
+            continue
+        for field_name in TD_CONDITION_METADATA_FIELDS:
+            if not any(_td_condition_metadata_has_value(field_name, row.get(field_name)) for row in raw_rows_for_key):
+                continue
+            if any(_td_condition_metadata_has_value(field_name, row.get(field_name)) for row in cached_rows):
+                continue
+            missing.append(f"sequence | {key[0]} | {key[1]} | {field_name}")
+
+    for key, sequence_rows_for_run in sequence_rows_by_aggregate_key.items():
+        aggregate_row = aggregate_rows_by_key.get(key) or {}
+        if not aggregate_row:
+            continue
+        for field_name in TD_CONDITION_METADATA_FIELDS:
+            unique_value = _td_condition_metadata_unique_value(
+                field_name,
+                [row.get(field_name) for row in sequence_rows_for_run],
+            )
+            if unique_value is None:
+                continue
+            if _td_condition_metadata_has_value(field_name, aggregate_row.get(field_name)):
+                continue
+            missing.append(f"aggregate | {key[0]} | {key[1]} | {field_name}")
+    return {"ok": not missing, "missing": missing}
+
+
 def _td_project_cache_refresh_mode(
     *,
     stale_context: bool,
@@ -14668,6 +14939,8 @@ def _td_project_cache_refresh_mode(
     support_calc_signature: str,
     cached_builder_signature: str,
     builder_signature: str,
+    raw_condition_metadata_ok: bool,
+    impl_condition_metadata_ok: bool,
     source_state_stale: bool,
 ) -> tuple[str, str]:
     if stale_context:
@@ -14682,12 +14955,16 @@ def _td_project_cache_refresh_mode(
         return "full", "configured raw columns changed"
     if cached_support_raw_signature and cached_support_raw_signature != support_raw_signature:
         return "full", "support workbook raw inputs changed"
+    if not raw_condition_metadata_ok:
+        return "full", "raw cache missing source-backed run condition fields"
     if source_state_stale:
         return "incremental_raw", "source SQLite inputs changed"
     if expected_serials and expected_serials != cached_serials:
         return "incremental_raw", "source serial set changed"
     if raw_complete and not impl_complete:
         return "calc", "implementation cache is incomplete"
+    if not impl_condition_metadata_ok:
+        return "calc", "implementation cache missing run condition fields from raw cache"
     if cached_stats_csv != current_stats_csv:
         return "calc", "selected statistics changed"
     if cached_support_calc_signature and cached_support_calc_signature != support_calc_signature:
@@ -14913,9 +15190,12 @@ def inspect_test_data_project_cache_state(project_dir: Path, workbook_path: Path
         cached_schema_version = _td_meta_value(conn, "cache_schema_version")
         impl_counts = _td_impl_cache_counts(conn)
         parameter_runtime_counts = _td_parameter_runtime_counts(conn)
+    raw_condition_metadata = {"ok": True, "missing": []}
     with closing(sqlite3.connect(str(raw_db_path))) as conn:
         raw_counts = _td_raw_cache_counts(conn)
         curve_count = int(raw_counts.get("raw_curves") or 0)
+        if bool(raw_counts.get("complete")):
+            raw_condition_metadata = _td_raw_condition_metadata_health(conn, source_states)
 
     current_node_root = str(_infer_node_root_from_workbook_path(wb_path))
     stale_context = False
@@ -15015,6 +15295,17 @@ def inspect_test_data_project_cache_state(project_dir: Path, workbook_path: Path
     if cached_project_raw_signature and cached_project_raw_signature != project_raw_signature:
         stale_context = True
 
+    impl_condition_metadata = {"ok": True, "missing": []}
+    if (
+        bool(raw_counts.get("complete"))
+        and bool(raw_condition_metadata.get("ok"))
+        and bool(impl_counts.get("complete"))
+    ):
+        with closing(sqlite3.connect(str(db_path))) as impl_conn, closing(sqlite3.connect(str(raw_db_path))) as raw_conn:
+            _ensure_test_data_impl_tables(impl_conn)
+            _ensure_test_data_raw_cache_tables(raw_conn)
+            impl_condition_metadata = _td_impl_condition_metadata_health(raw_conn, impl_conn)
+
     refresh_mode, refresh_reason = _td_project_cache_refresh_mode(
         stale_context=bool(stale_context),
         curve_count=int(curve_count),
@@ -15032,8 +15323,20 @@ def inspect_test_data_project_cache_state(project_dir: Path, workbook_path: Path
         support_calc_signature=str(support_calc_signature),
         cached_builder_signature=str(cached_builder_signature),
         builder_signature=str(builder_signature),
+        raw_condition_metadata_ok=bool(raw_condition_metadata.get("ok")),
+        impl_condition_metadata_ok=bool(impl_condition_metadata.get("ok")),
         source_state_stale=bool(source_state_stale),
     )
+    raw_condition_metadata_missing = [
+        str(item).strip()
+        for item in (raw_condition_metadata.get("missing") or [])
+        if str(item).strip()
+    ]
+    impl_condition_metadata_missing = [
+        str(item).strip()
+        for item in (impl_condition_metadata.get("missing") or [])
+        if str(item).strip()
+    ]
     return {
         "db_path": db_path,
         "raw_db_path": raw_db_path,
@@ -15052,6 +15355,12 @@ def inspect_test_data_project_cache_state(project_dir: Path, workbook_path: Path
         "support_calc_signature": support_calc_signature,
         "builder_signature": builder_signature,
         "support_mtime_ns": int(support_mtime_ns),
+        "raw_condition_metadata_ok": bool(raw_condition_metadata.get("ok")),
+        "raw_condition_metadata_issue_count": len(raw_condition_metadata_missing),
+        "raw_condition_metadata_issues": raw_condition_metadata_missing[:10],
+        "impl_condition_metadata_ok": bool(impl_condition_metadata.get("ok")),
+        "impl_condition_metadata_issue_count": len(impl_condition_metadata_missing),
+        "impl_condition_metadata_issues": impl_condition_metadata_missing[:10],
         "source_states": source_states,
         "source_state_by_serial": source_state_by_serial,
         "fingerprints_by_serial": fingerprints_by_serial,
@@ -17386,21 +17695,27 @@ def _rebuild_test_data_project_calc_cache_from_raw(
                 obs_meta["source_mtime_ns"].append(int(source_mtime_ns))
 
             raw_obs_meta = dict(raw_obs_by_id.get(obs_id) or {})
-            sequence_pulse_width = _finite_float(
-                support_row.get("pulse_width_on", support_row.get("pulse_width", raw_obs_meta.get("pulse_width")))
+            sequence_pulse_width = _td_first_finite_from_values(
+                support_row.get("pulse_width_on"),
+                support_row.get("pulse_width"),
+                raw_obs_meta.get("pulse_width"),
             )
-            sequence_control_period = _finite_float(
-                support_row.get("control_period", raw_obs_meta.get("control_period"))
+            sequence_control_period = _td_first_finite_from_values(
+                support_row.get("control_period"),
+                raw_obs_meta.get("control_period"),
             )
-            sequence_suppression_voltage = _finite_float(
-                support_row.get("suppression_voltage", raw_obs_meta.get("suppression_voltage"))
+            sequence_suppression_voltage = _td_first_finite_from_values(
+                support_row.get("suppression_voltage"),
+                raw_obs_meta.get("suppression_voltage"),
             )
-            sequence_valve_voltage = _finite_float(
-                support_row.get("valve_voltage", raw_obs_meta.get("valve_voltage"))
+            sequence_valve_voltage = _td_first_finite_from_values(
+                support_row.get("valve_voltage"),
+                raw_obs_meta.get("valve_voltage"),
             )
-            sequence_run_type = str(
-                support_row.get("run_type") or raw_obs_meta.get("run_type") or ""
-            ).strip()
+            sequence_run_type = _td_first_text_from_values(
+                support_row.get("run_type"),
+                raw_obs_meta.get("run_type"),
+            )
             sequence_source_mtime = int(source_mtime_ns or raw_obs_meta.get("source_mtime_ns") or 0)
             sequence_obs_rows_by_id[obs_id] = (
                 obs_id,
