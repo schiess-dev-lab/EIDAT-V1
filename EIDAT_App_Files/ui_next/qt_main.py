@@ -31367,6 +31367,13 @@ class MainWindow(QtWidgets.QMainWindow):
         backend_module_path = str(payload.get("backend_module_path") or "").strip()
         implementation_excel = str(payload.get("implementation_excel") or "").strip()
         dbg = str(payload.get("debug_json") or "").strip()
+        run_condition_debug = payload.get("run_condition_debug") if isinstance(payload.get("run_condition_debug"), dict) else {}
+        run_condition_debug_summary = (
+            run_condition_debug.get("summary")
+            if isinstance(run_condition_debug, dict) and isinstance(run_condition_debug.get("summary"), dict)
+            else {}
+        )
+        run_condition_debug_path = str(payload.get("run_condition_debug_path") or "").strip()
         log_path = str(payload.get("log_path") or "").strip()
         td_open_snapshot_warning = ""
         elapsed_s = round(time.perf_counter() - started, 3)
@@ -31420,6 +31427,27 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._append_log(f"[PROJECT UPDATE] Backend module: {backend_module_path}")
             if implementation_excel:
                 self._append_log(f"[PROJECT UPDATE] Implementation cache Excel: {implementation_excel}")
+            if run_condition_debug_summary:
+                self._append_log(
+                    "[PROJECT UPDATE] Run condition debug: "
+                    f"support_rows={int(run_condition_debug_summary.get('support_rows_read') or 0)}, "
+                    f"run_conditions={int(run_condition_debug_summary.get('run_conditions_consolidated') or 0)}, "
+                    f"raw_non_default={int(run_condition_debug_summary.get('raw_cache_non_default_condition_labels') or 0)}, "
+                    f"impl_non_default={int(run_condition_debug_summary.get('implementation_non_default_condition_labels') or 0)}, "
+                    f"gui_sequence_defaults={int(run_condition_debug_summary.get('gui_run_condition_labels_equal_sequence') or 0)}"
+                )
+                if int(run_condition_debug_summary.get("raw_cache_default_labels_despite_support_non_default") or 0):
+                    self._append_log(
+                        "[PROJECT UPDATE WARNING] Run condition debug found raw cache default labels despite non-default support labels: "
+                        f"{int(run_condition_debug_summary.get('raw_cache_default_labels_despite_support_non_default') or 0)}"
+                    )
+                if int(run_condition_debug_summary.get("implementation_default_labels_despite_support_non_default") or 0):
+                    self._append_log(
+                        "[PROJECT UPDATE WARNING] Run condition debug found implementation default labels despite non-default support labels: "
+                        f"{int(run_condition_debug_summary.get('implementation_default_labels_despite_support_non_default') or 0)}"
+                    )
+                if run_condition_debug_path:
+                    self._append_log(f"[PROJECT UPDATE] Run condition debug JSON: {run_condition_debug_path}")
             timings = payload.get("timings")
             if not isinstance(timings, dict) and dbg:
                 try:
@@ -31543,6 +31571,30 @@ class MainWindow(QtWidgets.QMainWindow):
                 lines.append(f"TD cache debug: {cache_debug_path}")
             if implementation_excel:
                 lines.append(f"Implementation cache Excel: {implementation_excel}")
+            if run_condition_debug_summary:
+                lines.extend(
+                    [
+                        "",
+                        "Run Condition Debug:",
+                        f"Support rows read: {int(run_condition_debug_summary.get('support_rows_read') or 0)}",
+                        f"Run conditions consolidated: {int(run_condition_debug_summary.get('run_conditions_consolidated') or 0)}",
+                        "Raw cache non-default labels: "
+                        f"{int(run_condition_debug_summary.get('raw_cache_non_default_condition_labels') or 0)}",
+                        "Implementation non-default labels: "
+                        f"{int(run_condition_debug_summary.get('implementation_non_default_condition_labels') or 0)}",
+                        "GUI labels still equal sequence/source: "
+                        f"{int(run_condition_debug_summary.get('gui_run_condition_labels_equal_sequence') or 0)}",
+                    ]
+                )
+                raw_default = int(run_condition_debug_summary.get("raw_cache_default_labels_despite_support_non_default") or 0)
+                impl_default = int(run_condition_debug_summary.get("implementation_default_labels_despite_support_non_default") or 0)
+                if raw_default or impl_default:
+                    lines.append(
+                        "Default-label mismatches: "
+                        f"raw={raw_default}, implementation={impl_default}"
+                    )
+                if run_condition_debug_path:
+                    lines.append(f"Run condition debug JSON: {run_condition_debug_path}")
             if td_open_snapshot_warning:
                 lines.append(td_open_snapshot_warning)
             lines.append("Trend/Analyze is ready. No additional cache build is required.")

@@ -3134,6 +3134,7 @@ GLOBAL_RUN_MIRROR_DIRNAME = "global_run_mirror"
 LOCAL_PROJECTS_MIRROR_DIRNAME = "projects"
 PROJECT_UPDATE_DEBUG_JSON = "update_debug.json"
 TD_CACHE_DEBUG_JSON = "td_cache_debug.json"
+TD_RUN_CONDITION_DEBUG_JSON = "run_condition_debug.json"
 TD_PROJECT_CACHE_SCHEMA_VERSION = "8"
 TD_LIFE_METRICS_TABLE = "td_life_metrics"
 TD_PLOTTER_SEQUENCES_TABLE = "td_plotter_sequences"
@@ -22250,6 +22251,578 @@ def _td_table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
     return {str(row[1] or "").strip() for row in rows if str(row[1] or "").strip()}
 
 
+TD_RUN_CONDITION_DEBUG_FIELDS = (
+    "program_title",
+    "source_run_name",
+    "condition_key",
+    "display_name",
+    "condition_display",
+    "feed_pressure",
+    "feed_pressure_units",
+    "feed_temperature",
+    "feed_temperature_units",
+    "run_type",
+    "pulse_width_on",
+    "pulse_width",
+    "pulse_width_units",
+    "off_time",
+    "off_time_units",
+    "control_period",
+    "suppression_voltage",
+    "suppression_voltage_units",
+    "valve_voltage",
+    "valve_voltage_units",
+    "data_mode_raw",
+    "source_sheet_name",
+    "extraction_status",
+    "extraction_reason",
+)
+
+
+def _td_run_condition_debug_text(value: object) -> str:
+    return str(value or "").strip()
+
+
+def _td_run_condition_debug_value(value: object) -> object:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return bool(value)
+    if isinstance(value, (int, float)):
+        f = _td_finite_float(value)
+        if f is None:
+            return None
+        if abs(f - round(f)) < 1e-9:
+            return int(round(f))
+        return float(f)
+    return str(value or "").strip()
+
+
+def _td_run_condition_debug_payload(
+    row: Mapping[str, object] | None,
+    *,
+    stage: str,
+    row_kind: str,
+    support_index: Mapping[str, object] | None = None,
+    extra: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    raw = dict(row or {})
+    source_run = _td_run_condition_debug_text(
+        raw.get("source_run_name")
+        or raw.get("sequence_name")
+        or raw.get("member_sequences")
+        or raw.get("run_name")
+    )
+    condition_key = _td_run_condition_debug_text(
+        raw.get("condition_key")
+        or raw.get("run_name")
+        or raw.get("sequence_name")
+    )
+    display_text = _td_run_condition_debug_text(
+        raw.get("condition_display")
+        or raw.get("display_name")
+        or raw.get("run_condition")
+        or raw.get("display_text")
+        or condition_key
+    )
+    support_row = {}
+    support_status = "not_checked"
+    if support_index is not None:
+        support_by_program_source = support_index.get("by_program_source") if isinstance(support_index, Mapping) else {}
+        support_by_source = support_index.get("by_source") if isinstance(support_index, Mapping) else {}
+        support_by_condition = support_index.get("by_condition") if isinstance(support_index, Mapping) else {}
+        program_norm = _td_support_norm_name(raw.get("program_title"))
+        source_norm = _td_support_norm_name(source_run)
+        condition_norm = _td_support_norm_name(condition_key)
+        if isinstance(support_by_program_source, Mapping):
+            support_row = dict(support_by_program_source.get((program_norm, source_norm)) or {})
+        if not support_row and isinstance(support_by_source, Mapping):
+            candidates = [
+                dict(item)
+                for item in (support_by_source.get(source_norm) or [])
+                if isinstance(item, Mapping)
+            ]
+            if len(candidates) == 1:
+                support_row = candidates[0]
+        if not support_row and isinstance(support_by_condition, Mapping):
+            support_row = dict(support_by_condition.get(condition_norm) or {})
+        if support_row:
+            support_status = "disabled" if not bool(support_row.get("enabled", True)) else "matched"
+        else:
+            support_status = "missing"
+
+    display_equals_source = bool(
+        display_text
+        and source_run
+        and _td_support_norm_name(display_text) == _td_support_norm_name(source_run)
+    )
+    condition_equals_source = bool(
+        condition_key
+        and source_run
+        and _td_support_norm_name(condition_key) == _td_support_norm_name(source_run)
+    )
+    support_display = _td_run_condition_debug_text(
+        support_row.get("condition_display")
+        or support_row.get("display_name")
+        or support_row.get("condition_key")
+    )
+    support_has_non_default_label = bool(
+        support_display
+        and source_run
+        and _td_support_norm_name(support_display) != _td_support_norm_name(source_run)
+    )
+    non_default_label = bool(display_text and source_run and not display_equals_source)
+    metadata_present = any(
+        _td_run_condition_debug_text(raw.get(field))
+        for field in (
+            "feed_pressure",
+            "feed_temperature",
+            "run_type",
+            "pulse_width_on",
+            "pulse_width",
+            "off_time",
+            "control_period",
+            "suppression_voltage",
+            "valve_voltage",
+            "data_mode_raw",
+            "source_sheet_name",
+        )
+    )
+    if support_status == "disabled":
+        fallback_reason = "support_mapping_disabled"
+    elif support_status == "missing":
+        fallback_reason = "missing_support_mapping"
+    elif support_has_non_default_label and display_equals_source:
+        fallback_reason = "support_non_default_cache_default"
+    elif display_equals_source:
+        fallback_reason = "display_equals_source_sequence"
+    elif condition_equals_source and metadata_present:
+        fallback_reason = "metadata_present_but_condition_key_equals_source"
+    elif non_default_label:
+        fallback_reason = "non_default_condition_label_present"
+    else:
+        fallback_reason = "no_condition_label"
+
+    out: dict[str, object] = {
+        "stage": stage,
+        "row_kind": row_kind,
+        "match_status": support_status,
+        "fallback_reason": fallback_reason,
+        "display_equals_source_sequence": bool(display_equals_source),
+        "condition_key_equals_source_sequence": bool(condition_equals_source),
+        "non_default_condition_label": bool(non_default_label),
+        "support_non_default_condition_label": bool(support_has_non_default_label),
+        "metadata_present": bool(metadata_present),
+    }
+    for field in TD_RUN_CONDITION_DEBUG_FIELDS:
+        out[field] = _td_run_condition_debug_value(raw.get(field))
+    if "run_name" in raw:
+        out["run_name"] = _td_run_condition_debug_value(raw.get("run_name"))
+    if "serial" in raw:
+        out["serial"] = _td_run_condition_debug_value(raw.get("serial"))
+    if "observation_id" in raw:
+        out["observation_id"] = _td_run_condition_debug_value(raw.get("observation_id"))
+    if support_row:
+        out["matched_support_condition_key"] = _td_run_condition_debug_text(support_row.get("condition_key"))
+        out["matched_support_display_name"] = _td_run_condition_debug_text(
+            support_row.get("condition_display") or support_row.get("display_name")
+        )
+    for key, value in dict(extra or {}).items():
+        out[str(key)] = _td_run_condition_debug_value(value)
+    return out
+
+
+def _td_run_condition_support_index(support_rows: Sequence[Mapping[str, object]]) -> dict[str, object]:
+    by_program_source: dict[tuple[str, str], dict[str, object]] = {}
+    by_source: dict[str, list[dict[str, object]]] = {}
+    by_condition: dict[str, dict[str, object]] = {}
+    for row in support_rows or []:
+        if not isinstance(row, Mapping):
+            continue
+        payload = dict(row)
+        program_norm = _td_support_norm_name(payload.get("program_title"))
+        source_norm = _td_support_norm_name(payload.get("source_run_name"))
+        condition_norm = _td_support_norm_name(payload.get("condition_key") or payload.get("sequence_name"))
+        if source_norm:
+            by_program_source.setdefault((program_norm, source_norm), dict(payload))
+            by_source.setdefault(source_norm, []).append(dict(payload))
+        if condition_norm:
+            by_condition.setdefault(condition_norm, dict(payload))
+    return {
+        "by_program_source": by_program_source,
+        "by_source": by_source,
+        "by_condition": by_condition,
+    }
+
+
+def _td_run_condition_debug_query_rows(
+    conn: sqlite3.Connection,
+    table_name: str,
+    columns: Sequence[str],
+    *,
+    limit: int = 500,
+) -> list[dict[str, object]]:
+    if not _td_table_exists(conn, table_name):
+        return []
+    available = _td_table_columns(conn, table_name)
+    selected = [name for name in columns if name in available]
+    if not selected:
+        return []
+    order_cols = [name for name in ("run_name", "program_title", "source_run_name", "serial", "observation_id") if name in available]
+    order_sql = ", ".join(_quote_ident(name) for name in order_cols) if order_cols else "rowid"
+    sql = (
+        "SELECT "
+        + ", ".join(_quote_ident(name) for name in selected)
+        + f" FROM {_quote_ident(table_name)} ORDER BY {order_sql} LIMIT ?"
+    )
+    rows = conn.execute(sql, (max(1, int(limit)),)).fetchall()
+    return [{name: row[idx] for idx, name in enumerate(selected)} for row in rows]
+
+
+def _collect_td_run_condition_debug(
+    project_dir: Path,
+    workbook_path: Path,
+    db_path: Path,
+    *,
+    sample_limit: int = 80,
+) -> dict[str, object]:
+    wb_path = Path(workbook_path).expanduser()
+    proj_dir = Path(project_dir).expanduser()
+    impl_db = Path(db_path).expanduser()
+    raw_db = _td_resolve_raw_cache_db_path(impl_db)
+    support_cfg: dict[str, object] = {}
+    errors: list[str] = []
+    try:
+        support_cfg = _read_td_support_workbook(wb_path, project_dir=proj_dir)
+    except Exception as exc:
+        errors.append(f"support workbook read failed: {exc}")
+        support_cfg = {}
+
+    program_rows = [
+        dict(row)
+        for rows in ((support_cfg.get("program_mappings") or {}) if isinstance(support_cfg, Mapping) else {}).values()
+        for row in (rows or [])
+        if isinstance(row, Mapping)
+    ]
+    sequence_rows = [
+        dict(row)
+        for row in ((support_cfg.get("sequences") or []) if isinstance(support_cfg, Mapping) else [])
+        if isinstance(row, Mapping)
+    ]
+    support_rows = sequence_rows or program_rows
+    support_index = _td_run_condition_support_index(support_rows)
+    run_conditions = [
+        dict(row)
+        for row in ((support_cfg.get("run_conditions") or []) if isinstance(support_cfg, Mapping) else [])
+        if isinstance(row, Mapping)
+    ]
+    for row in run_conditions:
+        key = _td_support_norm_name(row.get("condition_key"))
+        if key:
+            cast(dict[str, dict[str, object]], support_index["by_condition"]).setdefault(key, dict(row))
+
+    samples: list[dict[str, object]] = []
+    support_non_default = 0
+    support_disabled = 0
+    for row in support_rows:
+        payload = _td_run_condition_debug_payload(row, stage="support_workbook", row_kind="program_mapping")
+        if payload.get("non_default_condition_label") or payload.get("metadata_present"):
+            support_non_default += 1
+        if not bool(row.get("enabled", True)):
+            support_disabled += 1
+        if len(samples) < sample_limit:
+            samples.append(payload)
+    for row in run_conditions:
+        payload = _td_run_condition_debug_payload(row, stage="support_workbook", row_kind="run_condition")
+        if len(samples) < sample_limit:
+            samples.append(payload)
+
+    raw_obs_rows: list[dict[str, object]] = []
+    raw_sequence_rows: list[dict[str, object]] = []
+    if raw_db.exists():
+        try:
+            with sqlite3.connect(str(raw_db)) as conn:
+                raw_obs_rows = _td_run_condition_debug_query_rows(
+                    conn,
+                    "td_raw_condition_observations",
+                    [
+                        "observation_id",
+                        "serial",
+                        "run_name",
+                        "program_title",
+                        "source_run_name",
+                        "condition_display",
+                        "feed_pressure",
+                        "feed_pressure_units",
+                        "feed_temperature",
+                        "feed_temperature_units",
+                        "run_type",
+                        "pulse_width",
+                        "pulse_width_units",
+                        "off_time",
+                        "off_time_units",
+                        "control_period",
+                        "suppression_voltage",
+                        "suppression_voltage_units",
+                        "valve_voltage",
+                        "valve_voltage_units",
+                        "data_mode_raw",
+                        "source_sheet_name",
+                        "extraction_status",
+                        "extraction_reason",
+                    ],
+                    limit=sample_limit,
+                )
+                raw_sequence_rows = _td_run_condition_debug_query_rows(
+                    conn,
+                    "td_raw_sequences",
+                    [
+                        "run_name",
+                        "display_name",
+                        "source_run_name",
+                        "condition_display",
+                        "feed_pressure",
+                        "feed_pressure_units",
+                        "feed_temperature",
+                        "feed_temperature_units",
+                        "run_type",
+                        "pulse_width",
+                        "pulse_width_units",
+                        "off_time",
+                        "off_time_units",
+                        "control_period",
+                        "suppression_voltage",
+                        "suppression_voltage_units",
+                        "valve_voltage",
+                        "valve_voltage_units",
+                        "data_mode_raw",
+                        "source_sheet_name",
+                        "extraction_status",
+                        "extraction_reason",
+                    ],
+                    limit=sample_limit,
+                )
+        except Exception as exc:
+            errors.append(f"raw cache read failed: {exc}")
+    else:
+        errors.append(f"raw cache DB not found: {raw_db}")
+
+    raw_non_default = 0
+    raw_default_with_support_non_default = 0
+    for row in raw_sequence_rows:
+        payload = _td_run_condition_debug_payload(row, stage="raw_cache", row_kind="td_raw_sequences", support_index=support_index)
+        raw_non_default += 1 if bool(payload.get("non_default_condition_label")) else 0
+        raw_default_with_support_non_default += 1 if payload.get("fallback_reason") == "support_non_default_cache_default" else 0
+        if len(samples) < sample_limit:
+            samples.append(payload)
+    for row in raw_obs_rows:
+        payload = _td_run_condition_debug_payload(row, stage="raw_cache", row_kind="td_raw_condition_observations", support_index=support_index)
+        raw_non_default += 1 if bool(payload.get("non_default_condition_label")) else 0
+        raw_default_with_support_non_default += 1 if payload.get("fallback_reason") == "support_non_default_cache_default" else 0
+        if len(samples) < sample_limit:
+            samples.append(payload)
+
+    impl_run_rows: list[dict[str, object]] = []
+    impl_obs_rows: list[dict[str, object]] = []
+    impl_sequence_rows: list[dict[str, object]] = []
+    if impl_db.exists():
+        try:
+            with sqlite3.connect(str(impl_db)) as conn:
+                impl_run_rows = _td_run_condition_debug_query_rows(
+                    conn,
+                    "td_runs",
+                    [
+                        "run_name",
+                        "display_name",
+                        "condition_display",
+                        "feed_pressure",
+                        "feed_pressure_units",
+                        "feed_temperature",
+                        "feed_temperature_units",
+                        "run_type",
+                        "pulse_width",
+                        "pulse_width_units",
+                        "off_time",
+                        "off_time_units",
+                        "control_period",
+                        "suppression_voltage",
+                        "suppression_voltage_units",
+                        "valve_voltage",
+                        "valve_voltage_units",
+                        "data_mode_raw",
+                        "source_sheet_name",
+                        "extraction_status",
+                        "extraction_reason",
+                    ],
+                    limit=sample_limit,
+                )
+                impl_obs_rows = _td_run_condition_debug_query_rows(
+                    conn,
+                    "td_condition_observations",
+                    [
+                        "observation_id",
+                        "serial",
+                        "run_name",
+                        "program_title",
+                        "source_run_name",
+                        "condition_display",
+                        "feed_pressure",
+                        "feed_pressure_units",
+                        "feed_temperature",
+                        "feed_temperature_units",
+                        "run_type",
+                        "pulse_width",
+                        "pulse_width_units",
+                        "off_time",
+                        "off_time_units",
+                        "control_period",
+                        "suppression_voltage",
+                        "suppression_voltage_units",
+                        "valve_voltage",
+                        "valve_voltage_units",
+                        "data_mode_raw",
+                        "source_sheet_name",
+                        "extraction_status",
+                        "extraction_reason",
+                    ],
+                    limit=sample_limit,
+                )
+                impl_sequence_rows = _td_run_condition_debug_query_rows(
+                    conn,
+                    "td_condition_observations_sequences",
+                    [
+                        "observation_id",
+                        "serial",
+                        "run_name",
+                        "program_title",
+                        "source_run_name",
+                        "condition_display",
+                        "feed_pressure",
+                        "feed_pressure_units",
+                        "feed_temperature",
+                        "feed_temperature_units",
+                        "run_type",
+                        "pulse_width",
+                        "pulse_width_units",
+                        "off_time",
+                        "off_time_units",
+                        "control_period",
+                        "suppression_voltage",
+                        "suppression_voltage_units",
+                        "valve_voltage",
+                        "valve_voltage_units",
+                        "data_mode_raw",
+                        "source_sheet_name",
+                        "extraction_status",
+                        "extraction_reason",
+                    ],
+                    limit=sample_limit,
+                )
+        except Exception as exc:
+            errors.append(f"implementation cache read failed: {exc}")
+    else:
+        errors.append(f"implementation cache DB not found: {impl_db}")
+
+    impl_non_default = 0
+    impl_default_with_support_non_default = 0
+    for row_kind, rows in (
+        ("td_runs", impl_run_rows),
+        ("td_condition_observations", impl_obs_rows),
+        ("td_condition_observations_sequences", impl_sequence_rows),
+    ):
+        for row in rows:
+            payload = _td_run_condition_debug_payload(row, stage="implementation_cache", row_kind=row_kind, support_index=support_index)
+            impl_non_default += 1 if bool(payload.get("non_default_condition_label")) else 0
+            impl_default_with_support_non_default += 1 if payload.get("fallback_reason") == "support_non_default_cache_default" else 0
+            if len(samples) < sample_limit:
+                samples.append(payload)
+
+    gui_sequence_rows: list[dict[str, object]] = []
+    gui_condition_rows: list[dict[str, object]] = []
+    gui_equal_sequence = 0
+    try:
+        if impl_db.exists():
+            selection_views = td_list_run_selection_views(impl_db, wb_path, project_dir=proj_dir)
+            gui_sequence_rows = [dict(row) for row in (selection_views.get("sequence") or []) if isinstance(row, Mapping)]
+            gui_condition_rows = [dict(row) for row in (selection_views.get("condition") or []) if isinstance(row, Mapping)]
+            for row in gui_sequence_rows:
+                payload = _td_run_condition_debug_payload(
+                    {
+                        **row,
+                        "condition_display": row.get("run_condition"),
+                        "source_run_name": row.get("source_run_name") or row.get("sequence_name"),
+                        "condition_key": row.get("run_name"),
+                    },
+                    stage="gui_selection",
+                    row_kind="sequence_view",
+                    support_index=support_index,
+                    extra={"display_text": row.get("display_text")},
+                )
+                gui_equal_sequence += 1 if bool(payload.get("display_equals_source_sequence")) else 0
+                if len(samples) < sample_limit:
+                    samples.append(payload)
+            for row in gui_condition_rows:
+                payload = _td_run_condition_debug_payload(
+                    {
+                        **row,
+                        "condition_display": row.get("run_condition") or row.get("display_text"),
+                        "condition_key": row.get("run_name"),
+                    },
+                    stage="gui_selection",
+                    row_kind="condition_view",
+                    support_index=support_index,
+                    extra={"display_text": row.get("display_text")},
+                )
+                if len(samples) < sample_limit:
+                    samples.append(payload)
+    except Exception as exc:
+        errors.append(f"GUI selection read failed: {exc}")
+
+    summary = {
+        "support_rows_read": int(len(support_rows)),
+        "support_program_rows_read": int(len(program_rows)),
+        "support_sequence_rows_read": int(len(sequence_rows)),
+        "support_disabled_rows": int(support_disabled),
+        "support_rows_with_metadata_or_non_default_label": int(support_non_default),
+        "run_conditions_consolidated": int(len(run_conditions)),
+        "raw_cache_rows": int(len(raw_obs_rows)),
+        "raw_sequence_rows": int(len(raw_sequence_rows)),
+        "raw_cache_non_default_condition_labels": int(raw_non_default),
+        "raw_cache_default_labels_despite_support_non_default": int(raw_default_with_support_non_default),
+        "implementation_run_rows": int(len(impl_run_rows)),
+        "implementation_observation_rows": int(len(impl_obs_rows)),
+        "implementation_sequence_rows": int(len(impl_sequence_rows)),
+        "implementation_non_default_condition_labels": int(impl_non_default),
+        "implementation_default_labels_despite_support_non_default": int(impl_default_with_support_non_default),
+        "gui_sequence_rows": int(len(gui_sequence_rows)),
+        "gui_condition_rows": int(len(gui_condition_rows)),
+        "gui_run_condition_labels_equal_sequence": int(gui_equal_sequence),
+        "sample_rows": int(len(samples)),
+        "errors": int(len(errors)),
+    }
+    return {
+        "summary": summary,
+        "samples": samples,
+        "errors": errors,
+        "paths": {
+            "support_workbook": str(support_cfg.get("path") or td_support_workbook_path_for(wb_path, project_dir=proj_dir)),
+            "implementation_db": str(impl_db),
+            "raw_cache_db": str(raw_db),
+            "workbook": str(wb_path),
+        },
+    }
+
+
+def _write_td_run_condition_debug_json(project_dir: Path, payload: Mapping[str, object]) -> Path | None:
+    path = Path(project_dir).expanduser() / "logs" / TD_RUN_CONDITION_DEBUG_JSON
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(dict(payload), indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+    except Exception:
+        return None
+    return path
+
+
 def _td_impl_curve_plotter_table_specs() -> dict[str, set[str]]:
     return {
         TD_PLOTTER_SEQUENCES_TABLE: {"run_name", "x_axis_kind"},
@@ -37287,6 +37860,8 @@ def update_test_data_trending_project_workbook(
     source_refresh_payload: dict[str, object] = {}
     program_requirements_sync_payload: dict[str, object] = {}
     program_requirements_import_payload: dict[str, object] = {}
+    run_condition_debug_payload: dict[str, object] = {}
+    run_condition_debug_path = ""
     source_refresh_mode_norm = str(source_refresh_mode or "none").strip().lower() or "none"
     if not dry_run and source_refresh_mode_norm == "smart":
         _td_emit_progress(progress_cb, "Scanning repository for changed TD source files")
@@ -38281,6 +38856,26 @@ def update_test_data_trending_project_workbook(
             timings["parameter_runtime_after_program_requirements_s"] = round(time.perf_counter() - t0, 3)
             cache_sync_payload["parameter_runtime"] = dict(final_runtime_payload)
 
+    if not dry_run:
+        try:
+            _td_emit_progress(progress_cb, "Collecting run condition debug trace")
+            run_condition_debug_payload = _collect_td_run_condition_debug(project_dir, wb_path, db_path)
+            debug_path_obj = _write_td_run_condition_debug_json(project_dir, run_condition_debug_payload)
+            if debug_path_obj is not None:
+                run_condition_debug_path = str(debug_path_obj)
+                _td_emit_progress(progress_cb, f"Run condition debug trace: {run_condition_debug_path}")
+        except Exception as exc:
+            run_condition_debug_payload = {
+                "summary": {"errors": 1},
+                "samples": [],
+                "errors": [str(exc)],
+                "paths": {
+                    "workbook": str(wb_path),
+                    "implementation_db": str(db_path),
+                    "raw_cache_db": str(_td_resolve_raw_cache_db_path(db_path)),
+                },
+            }
+
     timings["total_s"] = round(time.perf_counter() - total_started, 3)
     debug_payload = {
         "timings_s": dict(timings),
@@ -38298,6 +38893,8 @@ def update_test_data_trending_project_workbook(
         "cache_validation_warnings": list(readiness_warnings),
         "program_requirements_sync": dict(program_requirements_sync_payload),
         "program_requirements_import": dict(program_requirements_import_payload),
+        "run_condition_debug": dict(run_condition_debug_payload),
+        "run_condition_debug_path": str(run_condition_debug_path or "").strip(),
         "implementation_excel": str(implementation_excel_path or "").strip(),
     }
 
@@ -38334,6 +38931,8 @@ def update_test_data_trending_project_workbook(
         "backend_module_path": backend_module_path,
         "program_requirements_sync": dict(program_requirements_sync_payload),
         "program_requirements_import": dict(program_requirements_import_payload),
+        "run_condition_debug": dict(run_condition_debug_payload),
+        "run_condition_debug_path": str(run_condition_debug_path or "").strip(),
         "implementation_excel": str(implementation_excel_path or "").strip(),
         "debug_json": json.dumps(debug_payload, separators=(",", ":")),
     }

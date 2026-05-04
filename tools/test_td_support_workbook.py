@@ -2584,6 +2584,20 @@ class TestProjectUpdateUI(unittest.TestCase):
             "implementation_excel": "C:/tmp/repo/projects/Proj/implementation_trending.xlsx",
             "timings": {"total_s": 1.23},
             "saved_equation_refresh": {"refreshed_count": 0, "failed_count": 0, "errors": []},
+            "run_condition_debug": {
+                "summary": {
+                    "support_rows_read": 2,
+                    "run_conditions_consolidated": 1,
+                    "raw_cache_non_default_condition_labels": 0,
+                    "implementation_non_default_condition_labels": 0,
+                    "gui_run_condition_labels_equal_sequence": 2,
+                    "raw_cache_default_labels_despite_support_non_default": 1,
+                    "implementation_default_labels_despite_support_non_default": 1,
+                },
+                "samples": [],
+                "errors": [],
+            },
+            "run_condition_debug_path": "C:/tmp/repo/projects/Proj/logs/run_condition_debug.json",
             "debug_json": json.dumps({"timings_s": {"total_s": 1.23}}),
         }
 
@@ -2600,9 +2614,15 @@ class TestProjectUpdateUI(unittest.TestCase):
         self.assertTrue(any("TD cache debug:" in line for line in logs))
         self.assertTrue(any("Backend module:" in line for line in logs))
         self.assertTrue(any("Implementation cache Excel:" in line for line in logs))
+        self.assertTrue(any("Run condition debug:" in line for line in logs))
+        self.assertTrue(any("Run condition debug JSON:" in line for line in logs))
         self.assertIn("Project updated", result)
         info_args = info_mock.call_args.args
         self.assertIn("implementation_trending.xlsx", info_args[2])
+        self.assertIn("Run Condition Debug:", info_args[2])
+        self.assertIn("Support rows read: 2", info_args[2])
+        self.assertIn("Default-label mismatches: raw=1, implementation=1", info_args[2])
+        self.assertIn("run_condition_debug.json", info_args[2])
         info_mock.assert_called_once()
 
     def test_on_project_task_error_logs_failure_message(self) -> None:
@@ -4174,6 +4194,227 @@ class TestTDSupportWorkbook(unittest.TestCase):
         for key, value in values.items():
             self.assertIn(key, headers, f"expected header {key!r} in worksheet {ws.title!r}")
             ws.cell(row_idx, headers[key]).value = value
+
+    def _make_debug_support_workbook(
+        self,
+        root: Path,
+        be,
+        *,
+        enabled: bool = True,
+    ) -> tuple[Path, Path, str]:
+        from openpyxl import Workbook, load_workbook  # type: ignore
+
+        wb_path = root / "project.xlsx"
+        Workbook().save(str(wb_path))
+        support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+        be._write_td_support_workbook(
+            support_path,
+            sequence_names=["RunA"],
+            param_defs=[{"name": "thrust", "units": "lbf"}],
+            program_titles=["P267"],
+            sequences_by_program={"P267": ["RunA"]},
+        )
+        wb = load_workbook(str(support_path))
+        try:
+            ws = wb[be._td_support_program_sheet_name("P267", 0)]
+            self._set_sheet_row(
+                ws,
+                2,
+                {
+                    "source_run_name": "RunA",
+                    "condition_key": "RunA",
+                    "display_name": "RunA",
+                    "feed_pressure": 257.0,
+                    "feed_pressure_units": "psia",
+                    "feed_temperature": 70.0,
+                    "feed_temperature_units": "F",
+                    "run_type": "PM",
+                    "pulse_width_on": 0.016,
+                    "pulse_width_units": "sec",
+                    "off_time": 1.984,
+                    "off_time_units": "sec",
+                    "control_period": 2.0,
+                    "suppression_voltage": 20.0,
+                    "suppression_voltage_units": "V",
+                    "valve_voltage": 28.0,
+                    "valve_voltage_units": "V",
+                    "data_mode_raw": "Pulse Mode",
+                    "source_sheet_name": "RunA",
+                    "extraction_status": "ok",
+                    "enabled": bool(enabled),
+                },
+            )
+            wb.save(str(support_path))
+        finally:
+            wb.close()
+        return wb_path, support_path, "257 psia, PM, 0.016 Sec ON / 1.984 Sec OFF"
+
+    def _make_debug_cache_rows(
+        self,
+        root: Path,
+        be,
+        *,
+        condition_key: str,
+        condition_display: str,
+    ) -> Path:
+        impl_db = root / be.EIDAT_PROJECT_IMPLEMENTATION_DB
+        raw_db = root / be.EIDAT_PROJECT_TD_RAW_CACHE_DB
+        with sqlite3.connect(str(raw_db)) as conn:
+            be._ensure_test_data_raw_cache_tables(conn)
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO td_raw_sequences(
+                    run_name, display_name, x_axis_kind, source_run_name, pulse_width, run_type, control_period,
+                    condition_display, feed_pressure, feed_pressure_units, feed_temperature, feed_temperature_units,
+                    pulse_width_units, off_time, off_time_units, suppression_voltage, suppression_voltage_units,
+                    valve_voltage, valve_voltage_units, data_mode_raw, source_sheet_name, extraction_status,
+                    extraction_reason, computed_epoch_ns
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    condition_key,
+                    condition_display,
+                    "Time",
+                    "RunA",
+                    None,
+                    "",
+                    None,
+                    condition_display,
+                    None,
+                    "",
+                    None,
+                    "",
+                    "",
+                    None,
+                    "",
+                    None,
+                    "",
+                    None,
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    123,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO td_raw_condition_observations(
+                    observation_id, run_name, serial, program_title, source_run_name, run_type, pulse_width, control_period,
+                    suppression_voltage, valve_voltage, condition_display, feed_pressure, feed_pressure_units,
+                    feed_temperature, feed_temperature_units, pulse_width_units, off_time, off_time_units,
+                    suppression_voltage_units, valve_voltage_units, data_mode_raw, source_sheet_name,
+                    extraction_status, extraction_reason, source_mtime_ns, computed_epoch_ns
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "obs_sn1",
+                    condition_key,
+                    "SN1",
+                    "P267",
+                    "RunA",
+                    "",
+                    None,
+                    None,
+                    None,
+                    None,
+                    condition_display,
+                    None,
+                    "",
+                    None,
+                    "",
+                    "",
+                    None,
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    123,
+                    456,
+                ),
+            )
+            conn.commit()
+        with sqlite3.connect(str(impl_db)) as conn:
+            be._ensure_test_data_impl_tables(conn)
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO td_runs(
+                    run_name, default_x, display_name, run_type, control_period, pulse_width,
+                    condition_display, feed_pressure, feed_pressure_units, feed_temperature, feed_temperature_units,
+                    pulse_width_units, off_time, off_time_units, suppression_voltage, suppression_voltage_units,
+                    valve_voltage, valve_voltage_units, data_mode_raw, source_sheet_name, extraction_status, extraction_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    condition_key,
+                    "Time",
+                    condition_display,
+                    "",
+                    None,
+                    None,
+                    condition_display,
+                    None,
+                    "",
+                    None,
+                    "",
+                    "",
+                    None,
+                    "",
+                    None,
+                    "",
+                    None,
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                ),
+            )
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO td_condition_observations_sequences(
+                    observation_id, serial, run_name, program_title, source_run_name, run_type, pulse_width, control_period,
+                    suppression_voltage, valve_voltage, source_mtime_ns, computed_epoch_ns, condition_display, feed_pressure,
+                    feed_pressure_units, feed_temperature, feed_temperature_units, off_time, pulse_width_units,
+                    off_time_units, suppression_voltage_units, valve_voltage_units, data_mode_raw, source_sheet_name,
+                    extraction_status, extraction_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "obs_sn1",
+                    "SN1",
+                    condition_key,
+                    "P267",
+                    "RunA",
+                    "",
+                    None,
+                    None,
+                    None,
+                    None,
+                    123,
+                    456,
+                    condition_display,
+                    None,
+                    "",
+                    None,
+                    "",
+                    None,
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                ),
+            )
+            conn.commit()
+        return impl_db
 
     def _make_source_sqlite_with_sequence_context(
         self,
@@ -9822,6 +10063,61 @@ class TestTDSupportWorkbook(unittest.TestCase):
             self.assertEqual([item.get("display_text") for item in selection_views.get("condition") or []], [expected_label])
             self.assertEqual([item.get("run_condition") for item in selection_views.get("sequence") or []], [expected_label])
 
+    def test_run_condition_debug_flags_cache_default_label_despite_support_metadata(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            wb_path, _support_path, _expected_label = self._make_debug_support_workbook(root, be)
+            impl_db = self._make_debug_cache_rows(root, be, condition_key="RunA", condition_display="RunA")
+
+            payload = be._collect_td_run_condition_debug(root, wb_path, impl_db, sample_limit=200)
+
+        summary = dict(payload.get("summary") or {})
+        self.assertEqual(int(summary.get("support_rows_read") or 0), 1)
+        self.assertEqual(int(summary.get("run_conditions_consolidated") or 0), 1)
+        self.assertEqual(int(summary.get("raw_cache_non_default_condition_labels") or 0), 0)
+        self.assertEqual(int(summary.get("implementation_non_default_condition_labels") or 0), 0)
+        self.assertGreater(int(summary.get("raw_cache_default_labels_despite_support_non_default") or 0), 0)
+        self.assertGreater(int(summary.get("implementation_default_labels_despite_support_non_default") or 0), 0)
+        reasons = {str(row.get("fallback_reason") or "") for row in (payload.get("samples") or []) if isinstance(row, dict)}
+        self.assertIn("support_non_default_cache_default", reasons)
+
+    def test_run_condition_debug_counts_preserved_non_default_cache_labels(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            wb_path, _support_path, expected_label = self._make_debug_support_workbook(root, be)
+            impl_db = self._make_debug_cache_rows(root, be, condition_key=expected_label, condition_display=expected_label)
+
+            payload = be._collect_td_run_condition_debug(root, wb_path, impl_db, sample_limit=200)
+
+        summary = dict(payload.get("summary") or {})
+        self.assertGreater(int(summary.get("raw_cache_non_default_condition_labels") or 0), 0)
+        self.assertGreater(int(summary.get("implementation_non_default_condition_labels") or 0), 0)
+        self.assertEqual(int(summary.get("raw_cache_default_labels_despite_support_non_default") or 0), 0)
+        self.assertEqual(int(summary.get("implementation_default_labels_despite_support_non_default") or 0), 0)
+        reasons = {str(row.get("fallback_reason") or "") for row in (payload.get("samples") or []) if isinstance(row, dict)}
+        self.assertIn("non_default_condition_label_present", reasons)
+
+    def test_run_condition_debug_reports_disabled_support_mapping(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            wb_path, _support_path, _expected_label = self._make_debug_support_workbook(root, be, enabled=False)
+            impl_db = self._make_debug_cache_rows(root, be, condition_key="RunA", condition_display="RunA")
+
+            payload = be._collect_td_run_condition_debug(root, wb_path, impl_db, sample_limit=200)
+
+        summary = dict(payload.get("summary") or {})
+        self.assertEqual(int(summary.get("support_disabled_rows") or 0), 1)
+        reasons = {str(row.get("fallback_reason") or "") for row in (payload.get("samples") or []) if isinstance(row, dict)}
+        statuses = {str(row.get("match_status") or "") for row in (payload.get("samples") or []) if isinstance(row, dict)}
+        self.assertIn("support_mapping_disabled", reasons)
+        self.assertIn("disabled", statuses)
+
     def test_update_workbook_exports_raw_cache_payload_and_synthesizes_sequence_context_feed_metrics(self) -> None:
         from openpyxl import Workbook, load_workbook  # type: ignore
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
@@ -9866,6 +10162,8 @@ class TestTDSupportWorkbook(unittest.TestCase):
             result = be.update_test_data_trending_project_workbook(root, wb_path, overwrite=True)
             impl_db = root / "implementation_trending.sqlite3"
             self.assertTrue(Path(str(result.get("implementation_excel") or "")).exists())
+            self.assertTrue(Path(str(result.get("run_condition_debug_path") or "")).exists())
+            self.assertIsInstance(result.get("run_condition_debug"), dict)
 
             with sqlite3.connect(str(impl_db)) as conn:
                 calc_names = {
