@@ -1640,6 +1640,143 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         self.assertEqual(row["prepass_included_programs"], ["Program A", "Program B"])
         self.assertEqual(row["prepass_excluded_programs"], [])
 
+    def test_report_parameter_display_mapping_preserves_raw_analysis_name(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        class FakeBackend:
+            @staticmethod
+            def td_list_raw_y_columns(_db_path, _run_name):
+                return [{"name": "feed_pressure_raw", "units": "psi"}]
+
+            @staticmethod
+            def td_list_curve_y_columns(_db_path, _run_name):
+                return []
+
+            @staticmethod
+            def td_build_parameter_selector_options(_context, *, run_names=None, surface="", raw_names=None):
+                return [
+                    {
+                        "value": "parameter:chamber_feed_pressure",
+                        "label": "Chamber Feed Pressure (psia)",
+                        "display_name": "Chamber Feed Pressure",
+                        "preferred_units": "psia",
+                        "raw_names": ["feed_pressure_raw"],
+                    }
+                ]
+
+            @staticmethod
+            def td_parameter_selection_raw_names(_context, selection_value, *, run_names=None, surface="", raw_names=None):
+                if selection_value == "parameter:chamber_feed_pressure":
+                    return ["feed_pressure_raw"]
+                return [selection_value]
+
+            @staticmethod
+            def td_parameter_value_display_name(_context, selection_value, fallback=""):
+                if selection_value == "parameter:chamber_feed_pressure":
+                    return "Chamber Feed Pressure"
+                return fallback
+
+        with sqlite3.connect(":memory:") as conn:
+            params, display_by_raw = tar._tar_resolve_params_for_report(
+                FakeBackend(),
+                Path("cache.sqlite3"),
+                conn,
+                runs=["Run1"],
+                options={"params": ["parameter:chamber_feed_pressure"]},
+                parameter_context={"normalization": {"source": "test"}},
+            )
+
+        raw_key = tar._norm_key("feed_pressure_raw")
+        self.assertEqual(params, ["feed_pressure_raw"])
+        self.assertEqual(display_by_raw[raw_key]["display_name"], "Chamber Feed Pressure")
+        self.assertEqual(display_by_raw[raw_key]["display_units"], "psia")
+        self.assertEqual(
+            tar._tar_param_display_name(display_by_raw, "feed_pressure_raw"),
+            "Chamber Feed Pressure",
+        )
+        self.assertEqual(tar._tar_param_display_units(display_by_raw, "feed_pressure_raw", "psi"), "psia")
+
+    def test_report_scope_uses_display_parameters_when_available(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        rows = tar._tar_exec_scope_table_rows(
+            {
+                "hi": ["SN1"],
+                "meta_by_sn": {},
+                "params": ["feed_pressure_raw"],
+                "display_params": ["Chamber Feed Pressure"],
+                "execution_summary": {
+                    "selected_run_conditions": ["Condition A"],
+                    "comparison_programs": ["Program A"],
+                },
+                "overall_by_sn": {"SN1": "CERTIFIED"},
+                "comparison_rows": [],
+            },
+            quick_summary={
+                "selected_run_conditions": ["Condition A"],
+                "comparison_programs": ["Program A"],
+            },
+        )
+
+        by_name = {str(row[0]): str(row[1]) for row in rows[1:]}
+        self.assertEqual(by_name["Parameters analyzed"], "Chamber Feed Pressure")
+
+    def test_comparison_rows_render_display_parameter_and_keep_raw_parameter(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        pair_spec = {
+            "pair_id": "pair-display",
+            "selection_id": "selection-display",
+            "run": "Run1",
+            "run_title": "Run 1",
+            "param": "feed_pressure_raw",
+            "param_display": "Chamber Feed Pressure",
+            "units": "psi",
+            "display_units": "psia",
+            "selection_fields": {
+                "mode": "condition",
+                "condition_text": "Condition A",
+                "sequence_text": "Seq 1",
+            },
+            "base_condition_label": "Condition A",
+            "initial_plot_payload": {
+                "master_y": [1.0, 1.0],
+                "y_resampled_by_sn": {"SN1": [1.5, 1.5], "SN2": [2.5, 2.5]},
+            },
+        }
+
+        with mock.patch.object(tar, "_tar_metric_map_for_pair", return_value={"SN1": 1.5, "SN2": 2.5}):
+            rows = tar._tar_build_per_serial_comparison_rows(
+                {
+                    "filter_state": {},
+                    "be": object(),
+                    "db_path": Path("fake.sqlite3"),
+                    "options": {},
+                    "program_by_serial": {"SN1": "Program A", "SN2": "Program B"},
+                },
+                pair_specs=[pair_spec],
+                all_serials=["SN1", "SN2"],
+                hi=["SN1"],
+                initial_grade_map_by_pair_serial={("pair-display", "SN1"): "PASS"},
+                final_grade_map_by_pair_serial={("pair-display", "SN1"): "PASS"},
+                finding_by_pair_serial={
+                    ("pair-display", "SN1"): {
+                        "initial_z": -0.25,
+                        "final_z": -0.25,
+                        "official_pass_type": "initial_prepass",
+                        "initial_status": "PASS",
+                        "official_grade": "PASS",
+                    }
+                },
+            )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["parameter"], "Chamber Feed Pressure")
+        self.assertEqual(rows[0]["param"], "feed_pressure_raw")
+        self.assertEqual(rows[0]["raw_parameter"], "feed_pressure_raw")
+        self.assertEqual(rows[0]["units"], "psia")
+        self.assertEqual(rows[0]["raw_units"], "psi")
+
     def test_build_intro_story_renders_outcome_mix_and_exception_rows(self):
         from EIDAT_App_Files.ui_next import trend_auto_report as tar
 

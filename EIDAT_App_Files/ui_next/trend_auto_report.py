@@ -10,7 +10,7 @@ on optional plotting/scientific libraries (matplotlib, numpy).
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Collection, Iterable, Mapping
+from typing import Any, Callable, Collection, Iterable, Mapping, Sequence
 
 import html
 import importlib
@@ -2001,6 +2001,218 @@ def _resolve_selected_params(
             seen.add(nk)
             auto.append(name)
     return sorted(auto, key=lambda s: s.lower())
+
+
+def _tar_load_parameter_context(be: Any, project_dir: Path, workbook_path: Path, db_path: Path) -> dict[str, object]:
+    for loader_name, args in (
+        ("td_load_parameter_runtime_context", (project_dir, db_path)),
+        ("td_build_parameter_normalization_context", (project_dir, workbook_path, db_path)),
+    ):
+        loader = getattr(be, loader_name, None)
+        if not callable(loader):
+            continue
+        try:
+            context = loader(*args)
+        except Exception:
+            context = {}
+        if isinstance(context, Mapping) and dict(context):
+            return dict(context)
+    return {}
+
+
+def _tar_y_column_catalog(
+    be: Any,
+    db_path: Path,
+    conn: sqlite3.Connection,
+    runs: Sequence[object],
+) -> dict[str, dict[str, str]]:
+    catalog: dict[str, dict[str, str]] = {}
+    for run in [str(value).strip() for value in (runs or []) if str(value).strip()]:
+        columns: list[dict] = []
+        try:
+            columns = be.td_list_raw_y_columns(db_path, run)
+        except Exception:
+            columns = []
+        if not columns:
+            try:
+                columns = be.td_list_curve_y_columns(db_path, run)
+            except Exception:
+                columns = []
+        if not columns:
+            columns = _td_list_y_columns(conn, run)
+        for col in columns or []:
+            if not isinstance(col, Mapping):
+                continue
+            name = str(col.get("name") or "").strip()
+            if not name:
+                continue
+            norm = _norm_key(name)
+            if norm not in catalog:
+                catalog[norm] = {"name": name, "units": str(col.get("units") or "").strip()}
+            elif not str(catalog[norm].get("units") or "").strip() and str(col.get("units") or "").strip():
+                catalog[norm]["units"] = str(col.get("units") or "").strip()
+    return catalog
+
+
+def _tar_parameter_options(
+    be: Any,
+    parameter_context: Mapping[str, object] | None,
+    *,
+    runs: Sequence[object],
+    raw_names: Sequence[object],
+) -> list[dict[str, object]]:
+    builder = getattr(be, "td_build_parameter_selector_options", None)
+    if not callable(builder):
+        return []
+    try:
+        options = builder(
+            parameter_context,
+            run_names=[str(value).strip() for value in (runs or []) if str(value).strip()],
+            surface="performance",
+            raw_names=[str(value).strip() for value in (raw_names or []) if str(value).strip()],
+        )
+    except Exception:
+        return []
+    return [dict(option) for option in (options or []) if isinstance(option, Mapping)]
+
+
+def _tar_resolve_params_for_report(
+    be: Any,
+    db_path: Path,
+    conn: sqlite3.Connection,
+    *,
+    runs: list[str],
+    options: dict,
+    parameter_context: Mapping[str, object] | None,
+) -> tuple[list[str], dict[str, dict[str, str]]]:
+    raw_catalog = _tar_y_column_catalog(be, db_path, conn, runs)
+    raw_names = [str(item.get("name") or "").strip() for item in raw_catalog.values() if str(item.get("name") or "").strip()]
+    selector_options = _tar_parameter_options(be, parameter_context, runs=runs, raw_names=raw_names)
+    options_by_value = {
+        str(option.get("value") or "").strip(): dict(option)
+        for option in selector_options
+        if str(option.get("value") or "").strip()
+    }
+    options_by_raw_norm: dict[str, dict[str, object]] = {}
+    for option in selector_options:
+        for raw in option.get("raw_names") or []:
+            raw_norm = _norm_key(str(raw or ""))
+            if raw_norm and raw_norm not in options_by_raw_norm:
+                options_by_raw_norm[raw_norm] = dict(option)
+
+    selected_values = [
+        str(value).strip()
+        for value in (options.get("params") or [])
+        if str(value).strip()
+    ] if isinstance(options.get("params") or [], list) else []
+    if not selected_values:
+        selected_values = _resolve_selected_params(be, db_path, conn, runs=runs, options=options)
+
+    selection_raw_resolver = getattr(be, "td_parameter_selection_raw_names", None)
+    display_resolver = getattr(be, "td_parameter_value_display_name", None)
+
+    resolved_params: list[str] = []
+    display_by_raw_norm: dict[str, dict[str, str]] = {}
+    seen_raw_norms: set[str] = set()
+
+    def _option_for_selection(selection_value: str) -> dict[str, object]:
+        option = options_by_value.get(selection_value)
+        if option:
+            return dict(option)
+        return dict(options_by_raw_norm.get(_norm_key(selection_value)) or {})
+
+    for selected_value in selected_values:
+        option = _option_for_selection(selected_value)
+        candidate_raw_names: list[str] = []
+        if callable(selection_raw_resolver):
+            try:
+                candidate_raw_names = [
+                    str(value).strip()
+                    for value in selection_raw_resolver(
+                        parameter_context,
+                        selected_value,
+                        run_names=runs,
+                        surface="performance",
+                        raw_names=raw_names,
+                    )
+                    if str(value).strip()
+                ]
+            except Exception:
+                candidate_raw_names = []
+        if not candidate_raw_names:
+            candidate_raw_names = [str(value).strip() for value in (option.get("raw_names") or []) if str(value).strip()]
+        if not candidate_raw_names:
+            candidate_raw_names = [selected_value]
+
+        display_name = str(option.get("display_name") or "").strip()
+        if not display_name and callable(display_resolver):
+            try:
+                display_name = str(display_resolver(parameter_context, selected_value, fallback=selected_value) or "").strip()
+            except Exception:
+                display_name = ""
+        display_units = str(option.get("preferred_units") or "").strip()
+
+        for raw_name in candidate_raw_names:
+            raw_norm = _norm_key(raw_name)
+            if raw_norm not in raw_catalog:
+                continue
+            actual_raw = str(raw_catalog[raw_norm].get("name") or raw_name).strip()
+            if raw_norm not in seen_raw_norms:
+                seen_raw_norms.add(raw_norm)
+                resolved_params.append(actual_raw)
+            display_by_raw_norm[raw_norm] = {
+                "raw_name": actual_raw,
+                "display_name": display_name or actual_raw,
+                "display_units": display_units or str(raw_catalog[raw_norm].get("units") or "").strip(),
+                "selection_value": selected_value,
+            }
+
+    if not resolved_params and selected_values:
+        resolved_params = _resolve_selected_params(be, db_path, conn, runs=runs, options={**options, "params": []})
+
+    for raw_param in resolved_params:
+        raw_norm = _norm_key(raw_param)
+        if raw_norm in display_by_raw_norm:
+            continue
+        option = options_by_raw_norm.get(raw_norm) or {}
+        display_by_raw_norm[raw_norm] = {
+            "raw_name": raw_param,
+            "display_name": str(option.get("display_name") or raw_param).strip() or raw_param,
+            "display_units": str(option.get("preferred_units") or raw_catalog.get(raw_norm, {}).get("units") or "").strip(),
+            "selection_value": str(option.get("value") or raw_param).strip(),
+        }
+
+    return resolved_params, display_by_raw_norm
+
+
+def _tar_param_display_name(ctx_or_meta: Mapping[str, Any] | None, raw_param: object) -> str:
+    raw = str(raw_param or "").strip()
+    if not raw:
+        return ""
+    source = dict(ctx_or_meta or {})
+    if "param_display_by_raw" in source:
+        source = dict((source.get("param_display_by_raw") or {}) if isinstance(source.get("param_display_by_raw"), Mapping) else {})
+    meta = dict(source.get(_norm_key(raw)) or {}) if isinstance(source, Mapping) else {}
+    return str(meta.get("display_name") or raw).strip() or raw
+
+
+def _tar_param_display_units(ctx_or_meta: Mapping[str, Any] | None, raw_param: object, raw_units: object = "") -> str:
+    raw = str(raw_param or "").strip()
+    source = dict(ctx_or_meta or {})
+    if "param_display_by_raw" in source:
+        source = dict((source.get("param_display_by_raw") or {}) if isinstance(source.get("param_display_by_raw"), Mapping) else {})
+    meta = dict(source.get(_norm_key(raw)) or {}) if raw and isinstance(source, Mapping) else {}
+    return str(meta.get("display_units") or raw_units or "").strip()
+
+
+def _tar_pair_param_label(pair_spec: Mapping[str, Any] | None) -> str:
+    spec = dict(pair_spec or {})
+    return str(spec.get("param_display") or spec.get("display_param") or spec.get("parameter") or spec.get("param") or "").strip()
+
+
+def _tar_pair_units_label(pair_spec: Mapping[str, Any] | None) -> str:
+    spec = dict(pair_spec or {})
+    return str(spec.get("display_units") or spec.get("units") or "").strip()
 
 
 def _finding_sort_key(r: dict) -> tuple[int, float, float]:
@@ -6408,7 +6620,9 @@ def _tar_build_per_serial_comparison_rows(
         pair_id = str(spec.get("pair_id") or "").strip()
         run_name = str(spec.get("run") or "").strip()
         param_name = str(spec.get("param") or "").strip()
-        units = str(spec.get("units") or "").strip()
+        param_display = _tar_pair_param_label(spec) or param_name
+        units = _tar_pair_units_label(spec)
+        raw_units = str(spec.get("units") or "").strip()
         selection = dict(spec.get("selection") or {})
         selection_fields = dict(spec.get("selection_fields") or {})
         initial_payload = spec.get("initial_plot_payload") if isinstance(spec.get("initial_plot_payload"), Mapping) else None
@@ -6564,8 +6778,11 @@ def _tar_build_per_serial_comparison_rows(
                 "run_condition": run_condition,
                 "sequence_text": sequence_text,
                 "serial": serial,
-                "parameter": param_name,
+                "parameter": param_display,
+                "param": param_name,
+                "raw_parameter": param_name,
                 "units": units,
+                "raw_units": raw_units,
                 "initial_family_mean": initial_family_mean,
                 "final_family_mean": final_family_mean,
                 "initial_serial_mean": initial_serial_mean,
@@ -6779,7 +6996,7 @@ def _tar_exec_scope_table_rows(
         ],
         [
             "Parameters analyzed",
-            _tar_join_pipe_limited(ctx.get("params") or [], max_items=10, empty="(none)"),
+            _tar_join_pipe_limited(ctx.get("display_params") or ctx.get("params") or [], max_items=10, empty="(none)"),
         ],
         [
             "Run conditions",
@@ -7603,7 +7820,8 @@ def _tar_plan_plot_specs(ctx: Mapping[str, Any], *, intro_pages: int) -> list[di
             {
                 "section": "run_condition_plot_metrics",
                 "cohort_id": str(cohort_spec.get("cohort_id") or ""),
-                "param": str(cohort_spec.get("param") or "").strip(),
+                "param": _tar_pair_param_label(cohort_spec),
+                "raw_param": str(cohort_spec.get("param") or "").strip(),
                 "stat": str(metric_stat or "").strip(),
                 "x_name": str(cohort_spec.get("x_name") or "").strip(),
                 "run_condition_label": _tar_plot_run_condition_label(cohort_spec, run_by_name=(ctx.get("run_by_name") or {})),
@@ -7623,7 +7841,8 @@ def _tar_plan_plot_specs(ctx: Mapping[str, Any], *, intro_pages: int) -> list[di
             {
                 "section": "run_condition_curve_overlays",
                 "cohort_id": str(cohort_spec.get("cohort_id") or ""),
-                "param": str(cohort_spec.get("param") or "").strip(),
+                "param": _tar_pair_param_label(cohort_spec),
+                "raw_param": str(cohort_spec.get("param") or "").strip(),
                 "x_name": str(cohort_spec.get("x_name") or "").strip(),
                 "run_condition_label": _tar_plot_run_condition_label(cohort_spec, run_by_name=(ctx.get("run_by_name") or {})),
                 "base_condition_label": str(cohort_spec.get("base_condition_label") or "").strip(),
@@ -7649,7 +7868,8 @@ def _tar_plan_plot_specs(ctx: Mapping[str, Any], *, intro_pages: int) -> list[di
             {
                 "section": "regrade_pass_plot_metrics",
                 "cohort_id": str(cohort_spec.get("cohort_id") or ""),
-                "param": str(cohort_spec.get("param") or "").strip(),
+                "param": _tar_pair_param_label(cohort_spec),
+                "raw_param": str(cohort_spec.get("param") or "").strip(),
                 "stat": str(metric_stat or "").strip(),
                 "x_name": str(cohort_spec.get("x_name") or "").strip(),
                 "run_condition_label": _tar_plot_run_condition_label(cohort_spec, run_by_name=(ctx.get("run_by_name") or {})),
@@ -7669,7 +7889,8 @@ def _tar_plan_plot_specs(ctx: Mapping[str, Any], *, intro_pages: int) -> list[di
             {
                 "section": "regrade_pass_curve_overlays",
                 "cohort_id": str(cohort_spec.get("cohort_id") or ""),
-                "param": str(cohort_spec.get("param") or "").strip(),
+                "param": _tar_pair_param_label(cohort_spec),
+                "raw_param": str(cohort_spec.get("param") or "").strip(),
                 "x_name": str(cohort_spec.get("x_name") or "").strip(),
                 "run_condition_label": _tar_plot_run_condition_label(cohort_spec, run_by_name=(ctx.get("run_by_name") or {})),
                 "base_condition_label": str(cohort_spec.get("base_condition_label") or "").strip(),
@@ -7719,7 +7940,8 @@ def _tar_plan_plot_specs(ctx: Mapping[str, Any], *, intro_pages: int) -> list[di
                 "section": "watch_nonpass_curves",
                 "pair_id": str(pair_spec.get("pair_id") or "").strip(),
                 "run": str(pair_spec.get("run") or "").strip(),
-                "param": str(pair_spec.get("param") or "").strip(),
+                "param": _tar_pair_param_label(pair_spec),
+                "raw_param": str(pair_spec.get("param") or "").strip(),
                 "run_condition_label": _tar_plot_run_condition_label(
                     pair_spec,
                     selection=(pair_spec.get("selection") if isinstance(pair_spec.get("selection"), Mapping) else None),
@@ -8599,6 +8821,7 @@ def _tar_prepare_row_specs(
     params: list[str],
     filter_rows: list[dict],
     filter_state: Mapping[str, object] | None,
+    parameter_display_by_raw: Mapping[str, Mapping[str, object]] | None = None,
     progress_cb: Callable[[str], None] | None = None,
 ) -> list[dict]:
     row_specs: list[dict] = []
@@ -8638,7 +8861,9 @@ def _tar_prepare_row_specs(
                 continue
             param_name = str(actual_col.get("name") or "").strip()
             units = str(actual_col.get("units") or "").strip()
-            _tar_emit_progress(progress_cb, f"Analyzing curves {pair_index}/{total_pairs}: {selection_label} | {param_name}")
+            param_display = _tar_param_display_name(parameter_display_by_raw, param_name)
+            display_units = _tar_param_display_units(parameter_display_by_raw, param_name, units)
+            _tar_emit_progress(progress_cb, f"Analyzing curves {pair_index}/{total_pairs}: {selection_label} | {param_display}")
             series = _load_curves_for_selection(
                 be,
                 db_path,
@@ -8746,7 +8971,9 @@ def _tar_prepare_row_specs(
                     "suppression_voltage_label": (suppression_values[0] if len(suppression_values) == 1 else ""),
                     "valve_voltage_label": (valve_values[0] if len(valve_values) == 1 else ""),
                     "param": param_name,
+                    "param_display": param_display,
                     "units": units,
+                    "display_units": display_units,
                     "x_name": x_name,
                     "base_filter_state": _tar_clone_filter_state(filter_state),
                     "series": list(series),
@@ -8840,7 +9067,9 @@ def _tar_initial_skip_row(
         "serial": str(serial or "").strip(),
         "run": str(spec.get("run") or ""),
         "param": str(spec.get("param") or ""),
+        "param_display": _tar_pair_param_label(spec),
         "units": str(spec.get("units") or ""),
+        "display_units": _tar_pair_units_label(spec),
         "x_name": str(spec.get("x_name") or ""),
         "base_condition_label": str(spec.get("base_condition_label") or ""),
         "suppression_voltage_label": str(spec.get("suppression_voltage_label") or ""),
@@ -9083,7 +9312,9 @@ def _tar_analyze_curve_groups(
                 spec["initial_plot_payload"] = {
                     "run": spec.get("run"),
                     "param": spec.get("param"),
+                    "param_display": _tar_pair_param_label(spec),
                     "units": str(spec.get("units") or ""),
+                    "display_units": _tar_pair_units_label(spec),
                     "selection": dict(spec.get("selection") or {}),
                     "x_name": str(initial_model.get("x_name") or ""),
                     "x_grid": list(x_grid),
@@ -9117,7 +9348,9 @@ def _tar_analyze_curve_groups(
                 spec["initial_plot_payload"] = {
                     "run": spec.get("run"),
                     "param": spec.get("param"),
+                    "param_display": _tar_pair_param_label(spec),
                     "units": str(spec.get("units") or ""),
+                    "display_units": _tar_pair_units_label(spec),
                     "selection": dict(spec.get("selection") or {}),
                     "x_name": str(spec.get("x_name") or ""),
                     "x_grid": list(x_grid),
@@ -9212,7 +9445,9 @@ def _tar_analyze_curve_groups(
                         "serial": serial,
                         "run": str(spec.get("run") or ""),
                         "param": str(spec.get("param") or ""),
+                        "param_display": _tar_pair_param_label(spec),
                         "units": str(spec.get("units") or ""),
+                        "display_units": _tar_pair_units_label(spec),
                         "x_name": str(spec.get("x_name") or ""),
                         "base_condition_label": str(spec.get("base_condition_label") or ""),
                         "suppression_voltage_label": str(spec.get("suppression_voltage_label") or ""),
@@ -9267,7 +9502,9 @@ def _tar_analyze_curve_groups(
                     "cohort_id": f"initial:{group_index}:{_norm_key(members[0].get('base_condition_label') or '')}:{_norm_key(members[0].get('param') or '')}:{_norm_key(members[0].get('x_name') or '')}",
                     "cohort_type": "initial",
                     "param": str(members[0].get("param") or ""),
+                    "param_display": _tar_pair_param_label(members[0]),
                     "units": str(members[0].get("units") or ""),
+                    "display_units": _tar_pair_units_label(members[0]),
                     "x_name": str(cohort_model.get("x_name") or ""),
                     "base_condition_label": str(members[0].get("base_condition_label") or ""),
                     "suppression_voltage_label": "",
@@ -9460,7 +9697,9 @@ def _tar_analyze_curve_groups(
                         "serial": serial,
                         "run": str(spec.get("run") or ""),
                         "param": str(spec.get("param") or ""),
+                        "param_display": _tar_pair_param_label(spec),
                         "units": str(spec.get("units") or ""),
+                        "display_units": _tar_pair_units_label(spec),
                         "x_name": str(spec.get("x_name") or ""),
                         "base_condition_label": str(spec.get("base_condition_label") or ""),
                         "suppression_voltage_label": suppression_value,
@@ -9482,7 +9721,9 @@ def _tar_analyze_curve_groups(
                     "cohort_id": f"regrade:{family_index}:{_norm_key(str(member_specs[0].get('base_condition_label') or members[0].get('base_condition_label') or ''))}:{_norm_key(suppression_value)}:{_norm_key(valve_value)}:{_norm_key(str(member_specs[0].get('param') or members[0].get('param') or ''))}:{_norm_key(str(member_specs[0].get('x_name') or members[0].get('x_name') or ''))}",
                     "cohort_type": "regrade",
                     "param": str(member_specs[0].get("param") or members[0].get("param") or ""),
+                    "param_display": _tar_pair_param_label(member_specs[0] if member_specs else members[0]),
                     "units": str(member_specs[0].get("units") or members[0].get("units") or ""),
+                    "display_units": _tar_pair_units_label(member_specs[0] if member_specs else members[0]),
                     "x_name": str(final_model.get("x_name") or ""),
                     "base_condition_label": str(member_specs[0].get("base_condition_label") or members[0].get("base_condition_label") or ""),
                     "suppression_voltage_label": suppression_value,
@@ -9922,12 +10163,21 @@ def _tar_prepare_base(
             "Update Project again and verify TD source resolution for this project."
         )
 
-    params = _resolve_selected_params(be, db_path, conn, runs=runs, options=options)
+    parameter_context = _tar_load_parameter_context(be, proj, wb, db_path)
+    params, param_display_by_raw = _tar_resolve_params_for_report(
+        be,
+        db_path,
+        conn,
+        runs=runs,
+        options=options,
+        parameter_context=parameter_context,
+    )
     if not params:
         raise RuntimeError(
             "Auto Report found no reportable Test Data parameters in the current project cache. "
             "Check the workbook Sources sheet, cache diagnostics, and configured TD columns."
         )
+    display_params = _tar_unique_text_values([_tar_param_display_name(param_display_by_raw, param) for param in params])
 
     hi = [serial for serial in highlighted_serials if serial in all_serials]
     if not hi:
@@ -10023,6 +10273,7 @@ def _tar_prepare_base(
         params=params,
         filter_rows=filter_rows,
         filter_state=filter_state,
+        parameter_display_by_raw=param_display_by_raw,
         progress_cb=progress_cb,
     )
     if not pair_specs:
@@ -10065,6 +10316,7 @@ def _tar_prepare_base(
         str(spec.get("pair_id") or ""): {
             "run": str(spec.get("run") or ""),
             "param": str(spec.get("param") or ""),
+            "param_display": _tar_pair_param_label(spec),
             "selection_label": str(spec.get("selection_label") or ""),
             "base_condition_label": str(spec.get("base_condition_label") or ""),
             "suppression_voltage_label": str(spec.get("suppression_voltage_label") or ""),
@@ -10093,6 +10345,9 @@ def _tar_prepare_base(
         "run_by_name": run_by_name,
         "runs": runs,
         "params": params,
+        "display_params": display_params,
+        "param_display_by_raw": param_display_by_raw,
+        "parameter_context": parameter_context,
         "all_serials": all_serials,
         "hi": hi,
         "filter_state": filter_state,
@@ -10681,8 +10936,9 @@ def _tar_render_metric_cohort_page(
 ) -> dict[str, Any] | None:
     import matplotlib.pyplot as plt  # type: ignore
 
-    param_name = str(cohort_spec.get("param") or "").strip()
-    units = str(cohort_spec.get("units") or "").strip()
+    raw_param_name = str(cohort_spec.get("param") or "").strip()
+    param_name = _tar_pair_param_label(cohort_spec) or raw_param_name
+    units = _tar_pair_units_label(cohort_spec)
     x_name = str(cohort_spec.get("x_name") or "").strip()
     selection_labels = _tar_unique_text_values(cohort_spec.get("selection_labels") or [])
     run_condition_label = _tar_plot_run_condition_label(
@@ -10781,6 +11037,7 @@ def _tar_render_metric_cohort_page(
         "section": section_key,
         "cohort_id": str(cohort_spec.get("cohort_id") or ""),
         "param": param_name,
+        "raw_param": raw_param_name,
         "stat": metric_stat,
         "x_name": x_name,
         "run_condition_label": run_condition_label,
@@ -10816,9 +11073,10 @@ def _tar_render_curve_cohort_page(
     if not (x_grid and master_y and trace_curves):
         return None
 
-    param_name = str(cohort_spec.get("param") or "").strip()
+    raw_param_name = str(cohort_spec.get("param") or "").strip()
+    param_name = _tar_pair_param_label(cohort_spec) or raw_param_name
     x_name = str(cohort_spec.get("x_name") or "").strip()
-    units = str(cohort_spec.get("units") or "").strip()
+    units = _tar_pair_units_label(cohort_spec)
     run_condition_label = _tar_plot_run_condition_label(
         cohort_spec,
         run_by_name=(ctx.get("run_by_name") or {}),
@@ -10909,6 +11167,7 @@ def _tar_render_curve_cohort_page(
         "section": section_key,
         "cohort_id": str(cohort_spec.get("cohort_id") or ""),
         "param": param_name,
+        "raw_param": raw_param_name,
         "x_name": x_name,
         "run_condition_label": run_condition_label,
         "base_condition_label": str(cohort_spec.get("base_condition_label") or ""),
@@ -10930,8 +11189,9 @@ def _tar_render_watch_curve_page(
 
     pair_id = str(pair_spec.get("pair_id") or "").strip()
     run_name = str(pair_spec.get("run") or "").strip()
-    param_name = str(pair_spec.get("param") or "").strip()
-    plot_payload = _tar_curve_plot_payload_for_pair(ctx, run_name, param_name, pair_spec=pair_spec)
+    raw_param_name = str(pair_spec.get("param") or "").strip()
+    param_name = _tar_pair_param_label(pair_spec) or raw_param_name
+    plot_payload = _tar_curve_plot_payload_for_pair(ctx, run_name, raw_param_name, pair_spec=pair_spec)
     if not plot_payload:
         return None
     final_grade_map = ctx.get("final_grade_map_by_pair_serial") or {}
@@ -10965,7 +11225,7 @@ def _tar_render_watch_curve_page(
     ax.set_position([0.06, 0.09, 0.66, 0.70])
     ax_side = fig.add_axes([0.76, 0.11, 0.20, 0.66])
     ax_side.axis("off")
-    units = str(pair_spec.get("units") or "").strip()
+    units = _tar_pair_units_label(pair_spec)
     run_title = str(pair_spec.get("run_title") or run_name).strip() or run_name
     ax.set_title(f"{run_title} - {param_name}", loc="left", fontsize=13, fontweight="bold", pad=10)
     ax.set_xlabel(x_name)
@@ -11023,6 +11283,7 @@ def _tar_render_watch_curve_page(
         "pair_id": pair_id,
         "run": run_name,
         "param": param_name,
+        "raw_param": raw_param_name,
         "run_condition_label": run_condition_label,
         "selection_label": str(pair_spec.get("selection_label") or "").strip(),
         "base_condition_label": str(pair_spec.get("base_condition_label") or "").strip(),
@@ -11472,7 +11733,7 @@ def _tar_render_plot_sections(
         if initial_metric_specs:
             _tar_emit_progress(progress_cb, f"Rendering pooled run-condition metric pages ({len(initial_metric_specs)} planned)")
         for index, (cohort_spec, metric_stat) in enumerate(initial_metric_specs, start=1):
-            _tar_emit_progress(progress_cb, f"Pooled metric page {index}/{len(initial_metric_specs)}: {cohort_spec.get('param')} | {cohort_spec.get('x_name')} | {metric_stat}")
+            _tar_emit_progress(progress_cb, f"Pooled metric page {index}/{len(initial_metric_specs)}: {_tar_pair_param_label(cohort_spec)} | {cohort_spec.get('x_name')} | {metric_stat}")
             plot_spec = _tar_render_metric_cohort_page(
                 ctx,
                 pdf,
@@ -11492,7 +11753,7 @@ def _tar_render_plot_sections(
         if initial_cohort_specs:
             _tar_emit_progress(progress_cb, f"Rendering pooled run-condition curve pages ({len(initial_cohort_specs)} planned)")
         for index, cohort_spec in enumerate(initial_cohort_specs, start=1):
-            _tar_emit_progress(progress_cb, f"Pooled curve page {index}/{len(initial_cohort_specs)}: {cohort_spec.get('param')} | {cohort_spec.get('x_name')}")
+            _tar_emit_progress(progress_cb, f"Pooled curve page {index}/{len(initial_cohort_specs)}: {_tar_pair_param_label(cohort_spec)} | {cohort_spec.get('x_name')}")
             plot_spec = _tar_render_curve_cohort_page(
                 ctx,
                 pdf,
@@ -11501,7 +11762,7 @@ def _tar_render_plot_sections(
                 section_title="Run Condition Curve Overlay",
                 section_key="run_condition_curve_overlays",
                 subtitle=(
-                    f"Parameter: {str(cohort_spec.get('param') or '').strip()} | "
+                    f"Parameter: {_tar_pair_param_label(cohort_spec)} | "
                     f"X Axis: {str(cohort_spec.get('x_name') or '').strip()} | "
                     f"Selected: {_tar_join_limited(_tar_unique_text_values(cohort_spec.get('selection_labels') or []), max_items=5, empty='(none)')}"
                 ),
@@ -11523,7 +11784,7 @@ def _tar_render_plot_sections(
             valve_value = str(cohort_spec.get("valve_voltage_label") or "").strip()
             _tar_emit_progress(
                 progress_cb,
-                f"Final exact-condition metric page {index}/{len(regrade_metric_specs)}: {cohort_spec.get('param')} | "
+                f"Final exact-condition metric page {index}/{len(regrade_metric_specs)}: {_tar_pair_param_label(cohort_spec)} | "
                 f"Supp {suppression_value or 'n/a'} | Valve {valve_value or 'n/a'} | {metric_stat}",
             )
             filter_override = _tar_clone_filter_state(
@@ -11555,7 +11816,7 @@ def _tar_render_plot_sections(
             valve_value = str(cohort_spec.get("valve_voltage_label") or "").strip()
             _tar_emit_progress(
                 progress_cb,
-                f"Final exact-condition curve page {index}/{len(regrade_cohort_specs)}: {cohort_spec.get('param')} | "
+                f"Final exact-condition curve page {index}/{len(regrade_cohort_specs)}: {_tar_pair_param_label(cohort_spec)} | "
                 f"Supp {suppression_value or 'n/a'} | Valve {valve_value or 'n/a'}",
             )
             plot_spec = _tar_render_curve_cohort_page(
@@ -11569,7 +11830,7 @@ def _tar_render_plot_sections(
                     f"Run Condition: {str(cohort_spec.get('base_condition_label') or '').strip() or '(unknown)'} | "
                     f"Suppression Voltage: {suppression_value or '(unknown)'} | "
                     f"Valve Voltage: {valve_value or '(unknown)'} | "
-                    f"Parameter: {str(cohort_spec.get('param') or '').strip()} | X Axis: {str(cohort_spec.get('x_name') or '').strip()}"
+                    f"Parameter: {_tar_pair_param_label(cohort_spec)} | X Axis: {str(cohort_spec.get('x_name') or '').strip()}"
                 ),
                 grade_map_by_pair_serial=(ctx.get("final_grade_map_by_pair_serial") or {}),
                 metric_prefix="final",
@@ -11703,7 +11964,7 @@ def _tar_render_plot_sections(
             pair_spec = pair_by_id.get(str(pair_id or "").strip())
             if not pair_spec:
                 continue
-            _tar_emit_progress(progress_cb, f"Watch / non-pass page {watch_index}/{len(watch_pair_ids)}: {pair_spec.get('run')} | {pair_spec.get('param')}")
+            _tar_emit_progress(progress_cb, f"Watch / non-pass page {watch_index}/{len(watch_pair_ids)}: {pair_spec.get('run')} | {_tar_pair_param_label(pair_spec)}")
             plot_spec = _tar_render_watch_curve_page(
                 ctx,
                 pdf,
@@ -12212,6 +12473,8 @@ def generate_test_data_auto_report(
             "initial_non_pass_findings": ctx.get("initial_nonpass_findings") or [],
             "runs": ctx["runs"],
             "params": ctx["params"],
+            "display_params": ctx.get("display_params") or ctx["params"],
+            "parameter_display_by_raw": ctx.get("param_display_by_raw") or {},
             "metric_stats": ctx["metric_stats"],
             "quick_summary": ctx.get("quick_summary") or _tar_build_quick_summary(ctx),
             "curve_models": ctx["curves_summary"],

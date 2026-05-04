@@ -199,7 +199,7 @@ class TestTDProjectParameterUnits(unittest.TestCase):
 
         with patch(
             "ui_next.backend.save_td_repo_parameter_mappings",
-            side_effect=lambda _project_dir, rows: [dict(row) for row in rows],
+            side_effect=lambda _project_dir, rows, **_kwargs: [dict(row) for row in rows],
         ) as save_repo_mock:
             payload = backend.td_save_project_parameter_units(project_dir, repo_rows, unit_rows)
 

@@ -674,6 +674,101 @@ class TestQtMainMetricPlotSource(unittest.TestCase):
             if tmpdir:
                 shutil.rmtree(str(tmpdir), ignore_errors=True)
 
+    def test_plot_life_metrics_allows_multiple_y_parameters(self) -> None:
+        window = self._make_window()
+        try:
+            with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+                db_path = Path(tmpdir) / "cache.sqlite3"
+                db_path.write_text("", encoding="utf-8")
+                axes = self._prepare_plot_window(window, db_path, mode="life_metrics")
+                selection = {
+                    "mode": "condition",
+                    "id": "condition:CondA",
+                    "run_name": "CondA",
+                    "display_text": "Condition A",
+                    "run_condition": "Condition A",
+                    "member_runs": ["CondA"],
+                    "member_sequences": ["Seq-1"],
+                }
+                requested_params: list[str] = []
+                window.cb_life_y_param.clear()
+                window.list_life_y_params.clear()
+                for name in ("LifeMetricA", "LifeMetricB"):
+                    window.cb_life_y_param.addItem(name, name)
+                    window.list_life_y_params.addItem(name)
+                window.cb_life_axis.clear()
+                window.cb_life_axis.addItem("Sequence", "sequence_index")
+                self._ensure_selected_items(window.list_life_stats, ["mean"])
+                window._set_life_y_parameter_selection(["LifeMetricA", "LifeMetricB"])
+
+                def _fake_loader(
+                    run_names: list[str],
+                    parameter_value: object,
+                    life_axis: str,
+                    *,
+                    stat: object = "mean",
+                    serials: list[str] | None = None,
+                    filter_state: object = None,
+                ) -> list[dict]:
+                    del run_names, life_axis, stat, serials, filter_state
+                    param = str(parameter_value)
+                    requested_params.append(param)
+                    return [
+                        {
+                            "serial": "SN-001",
+                            "observation_id": f"obs-{param}",
+                            "sequence_index": 1,
+                            "condition_key": "CondA",
+                            "x_value": 1.0,
+                            "y_value": 1.0 if param == "LifeMetricA" else 2.0,
+                            "units": "psi",
+                            "program_title": "Program Alpha",
+                        }
+                    ]
+
+                with patch.object(window, "_current_run_selector_mode", return_value="condition"), patch.object(
+                    window, "_current_run_selection", return_value=selection
+                ), patch.object(
+                    window, "_current_run_selections", return_value=[selection]
+                ), patch.object(
+                    window, "_current_member_runs", return_value=["CondA"]
+                ), patch.object(
+                    window, "_active_serials", return_value=["SN-001"]
+                ), patch.object(
+                    window, "_ensure_main_axes", return_value=None
+                ), patch.object(
+                    window, "_compose_run_title", return_value="Life Plot"
+                ), patch.object(
+                    window, "_apply_interactive_legend_policy", return_value=[]
+                ), patch.object(
+                    window, "_apply_plot_view_bands_to_axes", return_value=None
+                ), patch.object(
+                    window, "_refresh_plot_note", return_value=None
+                ), patch.object(
+                    window, "_capture_main_plot_base_view", return_value=None
+                ), patch.object(
+                    window, "_update_perf_primary_equation_banner", return_value=None
+                ), patch.object(
+                    window, "_load_life_metric_series_for_selection", side_effect=_fake_loader
+                ), patch(
+                    "ui_next.qt_main.QtWidgets.QMessageBox.information"
+                ) as info_mock:
+                    window._plot_life_metrics()
+
+                info_mock.assert_not_called()
+                self.assertEqual(requested_params, ["LifeMetricA", "LifeMetricB"])
+                self.assertEqual(window._last_plot_def.get("y_parameters"), ["LifeMetricA", "LifeMetricB"])
+                self.assertEqual(window._last_plot_def.get("y_parameter"), "LifeMetricA")
+                self.assertEqual(len(axes.plot_calls), 2)
+                labels = [str(kwargs.get("label") or "") for _, kwargs in axes.plot_calls]
+                self.assertIn("LifeMetricA | SN-001 | Program Alpha", labels)
+                self.assertIn("LifeMetricB | SN-001 | Program Alpha", labels)
+        finally:
+            window.close()
+            tmpdir = getattr(window, "_test_tmpdir", "")
+            if tmpdir:
+                shutil.rmtree(str(tmpdir), ignore_errors=True)
+
     def test_plot_curves_keeps_visible_rows_when_live_valve_filter_is_active(self) -> None:
         window = self._make_window()
         try:

@@ -1790,6 +1790,24 @@ class TestTDTrendDialogLayout(unittest.TestCase):
         self.assertEqual([item.text() for item in harness.list_y_metrics.selectedItems()], ["Pressure"])
         self.assertTrue(harness._plot_metrics_called)
 
+    def test_auto_report_certification_serial_selection_uses_raw_user_role_value(self) -> None:
+        from PySide6 import QtCore, QtWidgets
+        from EIDAT_App_Files.ui_next.qt_main import TestDataTrendDialog  # type: ignore
+
+        _qt_app()
+        serials = QtWidgets.QListWidget()
+        serials.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        item = QtWidgets.QListWidgetItem("SN-001 - displayed certification label")
+        item.setData(QtCore.Qt.ItemDataRole.UserRole, "SN-001")
+        serials.addItem(item)
+        item.setSelected(True)
+
+        self.assertEqual(TestDataTrendDialog._selected_list_widget_values(serials), ["SN-001"])
+        self.assertEqual(
+            TestDataTrendDialog._selected_list_widget_labels(serials),
+            ["SN-001 - displayed certification label"],
+        )
+
     def test_curve_popup_summaries_reflect_backing_selection_state(self) -> None:
         dlg = _build_test_data_dialog()
         try:

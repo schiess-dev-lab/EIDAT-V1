@@ -5118,9 +5118,29 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         life_y_row = QtWidgets.QHBoxLayout()
         life_y_row.addWidget(QtWidgets.QLabel("Y Parameter:"))
         self.cb_life_y_param = QtWidgets.QComboBox(tab_life)
-        self.cb_life_y_param.currentIndexChanged.connect(lambda *_: self._refresh_life_controls())
+        self.cb_life_y_param.currentIndexChanged.connect(lambda *_: self._on_life_y_parameter_combo_changed())
         life_y_row.addWidget(self.cb_life_y_param, 1)
         life_layout.addLayout(life_y_row)
+
+        self.list_life_y_params = QtWidgets.QListWidget(tab_life)
+        self.list_life_y_params.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.list_life_y_params.hide()
+        self.list_life_y_params.itemSelectionChanged.connect(self._on_life_y_parameter_selection_changed)
+
+        life_y_pick_row = QtWidgets.QHBoxLayout()
+        life_y_pick_row.setSpacing(8)
+        self.btn_life_y_params_popup = QtWidgets.QPushButton("Y Parameters...")
+        self.btn_life_y_params_popup.clicked.connect(self._open_life_y_parameters_popup)
+        self.lbl_life_y_params_summary = QtWidgets.QLabel("Y Parameters: None selected")
+        self.lbl_life_y_params_summary.setStyleSheet("color: #64748b; font-size: 11px;")
+        self.lbl_life_y_params_summary.setWordWrap(False)
+        self.lbl_life_y_params_summary.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Fixed,
+        )
+        life_y_pick_row.addWidget(self.btn_life_y_params_popup)
+        life_y_pick_row.addWidget(self.lbl_life_y_params_summary, 1)
+        life_layout.addLayout(life_y_pick_row)
 
         self.life_x_param_row = QtWidgets.QWidget(tab_life)
         life_x_param_row_layout = QtWidgets.QHBoxLayout(self.life_x_param_row)
@@ -6581,6 +6601,16 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self.lbl_life_stats_summary.setToolTip(", ".join(selected))
         self._schedule_mode_panel_height_sync()
 
+    def _refresh_life_y_parameters_summary(self) -> None:
+        if not hasattr(self, "lbl_life_y_params_summary"):
+            return
+        selected = self._selected_list_widget_labels(getattr(self, "list_life_y_params", None))
+        all_items = self._list_widget_item_texts(getattr(self, "list_life_y_params", None))
+        text = "Y Parameters: " + self._popup_selection_summary(selected, total_count=len(all_items))
+        self.lbl_life_y_params_summary.setText(text)
+        self.lbl_life_y_params_summary.setToolTip(", ".join(selected))
+        self._schedule_mode_panel_height_sync()
+
     def _refresh_metric_selector_summaries(self) -> None:
         self._refresh_metric_y_columns_summary()
         self._refresh_metric_stats_summary()
@@ -6663,7 +6693,68 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         return value or "sequence_index"
 
     def _current_life_y_parameter(self) -> str:
-        return self._combo_box_current_value(getattr(self, "cb_life_y_param", None))
+        selected = self._selected_life_y_parameters()
+        return str(selected[0] or "").strip() if selected else self._combo_box_current_value(getattr(self, "cb_life_y_param", None))
+
+    def _selected_life_y_parameters(self) -> list[str]:
+        list_widget = getattr(self, "list_life_y_params", None)
+        if isinstance(list_widget, QtWidgets.QListWidget):
+            selected = self._selected_list_widget_values(list_widget)
+            if selected:
+                return selected
+        current = self._combo_box_current_value(getattr(self, "cb_life_y_param", None))
+        return [current] if current else []
+
+    def _set_life_y_parameter_selection(self, values: Sequence[object] | None) -> None:
+        selected: list[str] = []
+        seen: set[str] = set()
+        for value in values or []:
+            text = str(value or "").strip()
+            norm = self._perf_norm_name(text)
+            if text and norm and norm not in seen:
+                seen.add(norm)
+                selected.append(text)
+        list_widget = getattr(self, "list_life_y_params", None)
+        if isinstance(list_widget, QtWidgets.QListWidget):
+            self._set_list_widget_selection_by_value(list_widget, selected)
+        if hasattr(self, "cb_life_y_param"):
+            self.cb_life_y_param.blockSignals(True)
+            try:
+                if selected:
+                    self._set_combo_to_value(self.cb_life_y_param, selected[0])
+                elif self.cb_life_y_param.count() > 0:
+                    self.cb_life_y_param.setCurrentIndex(0)
+            finally:
+                self.cb_life_y_param.blockSignals(False)
+        self._refresh_life_y_parameters_summary()
+        self._refresh_life_controls()
+
+    def _on_life_y_parameter_combo_changed(self) -> None:
+        value = self._combo_box_current_value(getattr(self, "cb_life_y_param", None))
+        if value:
+            self._set_life_y_parameter_selection([value])
+        else:
+            list_widget = getattr(self, "list_life_y_params", None)
+            if isinstance(list_widget, QtWidgets.QListWidget):
+                list_widget.blockSignals(True)
+                try:
+                    list_widget.clearSelection()
+                finally:
+                    list_widget.blockSignals(False)
+            self._refresh_life_y_parameters_summary()
+            self._refresh_life_controls()
+
+    def _on_life_y_parameter_selection_changed(self) -> None:
+        selected = self._selected_list_widget_values(getattr(self, "list_life_y_params", None))
+        if hasattr(self, "cb_life_y_param"):
+            self.cb_life_y_param.blockSignals(True)
+            try:
+                if selected:
+                    self._set_combo_to_value(self.cb_life_y_param, selected[0])
+            finally:
+                self.cb_life_y_param.blockSignals(False)
+        self._refresh_life_y_parameters_summary()
+        self._refresh_life_controls()
 
     def _current_life_x_parameter(self) -> str:
         return self._combo_box_current_value(getattr(self, "cb_life_x_param", None))
@@ -6681,7 +6772,11 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         if hasattr(self, "life_x_param_row"):
             self.life_x_param_row.setVisible(metric_xy)
         if hasattr(self, "lbl_life_summary"):
-            y_param = self._current_combo_label(getattr(self, "cb_life_y_param", None))
+            y_params = self._selected_list_widget_labels(getattr(self, "list_life_y_params", None))
+            if not y_params:
+                y_param = self._current_combo_label(getattr(self, "cb_life_y_param", None))
+                y_params = [y_param] if y_param else []
+            y_param = self._plot_value_summary(y_params, max_items=2)
             if metric_xy:
                 x_param = self._current_combo_label(getattr(self, "cb_life_x_param", None))
                 self.lbl_life_summary.setText(f"Life metrics: {x_param or '-'} vs {y_param or '-'}")
@@ -6765,6 +6860,32 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             return
         self._set_list_widget_selection(self.list_life_stats, chosen)
         self._refresh_life_stats_summary()
+
+    def _open_life_y_parameters_popup(self) -> None:
+        if not hasattr(self, "list_life_y_params"):
+            return
+        entries = [
+            {
+                "value": self._list_widget_item_value(self.list_life_y_params.item(i)),
+                "label": str(self.list_life_y_params.item(i).text() or "").strip(),
+                "search": " ".join(
+                    [
+                        str(self.list_life_y_params.item(i).text() or "").strip().lower(),
+                        str(self.list_life_y_params.item(i).toolTip() or "").strip().lower(),
+                    ]
+                ).strip(),
+            }
+            for i in range(self.list_life_y_params.count())
+            if self.list_life_y_params.item(i) is not None and self._list_widget_item_value(self.list_life_y_params.item(i))
+        ]
+        chosen = self._show_filter_checklist_popup(
+            title="Life Metric Y Parameters",
+            entries=entries,
+            selected_values=self._selected_life_y_parameters(),
+        )
+        if chosen is None:
+            return
+        self._set_life_y_parameter_selection(chosen)
 
     def _show_filter_single_select_popup(
         self,
@@ -10349,7 +10470,15 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             for i in range(listw.count()):
                 it = listw.item(i)
                 if it and it.checkState() == QtCore.Qt.CheckState.Checked:
-                    out.append(it.text().strip())
+                    out.append(self._list_widget_item_value(it))
+            return [x for x in out if x]
+
+        def _collect_checked_labels(listw: QtWidgets.QListWidget) -> list[str]:
+            out = []
+            for i in range(listw.count()):
+                it = listw.item(i)
+                if it and it.checkState() == QtCore.Qt.CheckState.Checked:
+                    out.append(str(it.text() or "").strip())
             return [x for x in out if x]
 
         def _norm_name(s: str) -> str:
@@ -10488,12 +10617,21 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 for i in range(work_list.count()):
                     it = work_list.item(i)
                     if it:
+                        value = self._list_widget_item_value(it)
+                        if value:
+                            states[value] = it.checkState()
                         states[it.text()] = it.checkState()
                 target_list.blockSignals(True)
                 for i in range(target_list.count()):
                     it = target_list.item(i)
-                    if it and it.text() in states:
-                        it.setCheckState(states[it.text()])
+                    if not it:
+                        continue
+                    value = self._list_widget_item_value(it)
+                    state = states.get(value) if value else None
+                    if state is None:
+                        state = states.get(it.text())
+                    if state is not None:
+                        it.setCheckState(state)
                 target_list.blockSignals(False)
                 if callable(extra_apply):
                     extra_apply(ctx)
@@ -10610,11 +10748,11 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             lbl_runs_auto.setToolTip(", ".join(sel))
 
         def _update_params_label():
-            sel = _collect_checked(list_params)
+            sel = _collect_checked_labels(list_params)
             lbl_params_auto.setText(f"Certification Parameters: {_selection_summary(sel, list_params.count())}")
 
         def _update_metric_params_label():
-            params_sel = _collect_checked(list_params)
+            params_sel = _collect_checked_labels(list_params)
             stats_sel = _collect_checked(list_metric_stats)
             stats_text = ", ".join(stats_sel) if stats_sel else "none"
             lbl_metrics_auto.setText(
@@ -10876,7 +11014,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             for i in range(list_params.count()):
                 it = list_params.item(i)
                 if it is not None:
-                    local_param_states[_norm_name(it.text())] = bool(it.checkState() == QtCore.Qt.CheckState.Checked)
+                    checked = bool(it.checkState() == QtCore.Qt.CheckState.Checked)
+                    local_param_states[_norm_name(self._list_widget_item_value(it))] = checked
+                    local_param_states[_norm_name(it.text())] = checked
 
             def _local_selected_serials() -> list[str]:
                 out: list[str] = []
@@ -10942,9 +11082,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 for i in range(local_params.count()):
                     it = local_params.item(i)
                     if it is not None:
-                        local_param_states[_norm_name(it.text())] = bool(
-                            it.checkState() == QtCore.Qt.CheckState.Checked
-                        )
+                        checked = bool(it.checkState() == QtCore.Qt.CheckState.Checked)
+                        local_param_states[_norm_name(self._list_widget_item_value(it))] = checked
+                        local_param_states[_norm_name(it.text())] = checked
 
             def _local_selected_member_runs() -> list[str]:
                 out: list[str] = []
@@ -10988,7 +11128,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 if capture_current:
                     _local_capture_param_states()
                 y_norms: set[str] = set()
-                y_names: list[str] = []
+                raw_columns: list[dict[str, str]] = []
                 try:
                     for col in self._available_td_y_columns(_local_selected_member_runs(), surface="performance"):
                         name = str((col or {}).get("name") or "").strip()
@@ -10998,17 +11138,34 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                         if nk in x_exclude_norms or nk in y_norms:
                             continue
                         y_norms.add(nk)
-                        y_names.append(name)
+                        raw_columns.append({"name": name, "units": str((col or {}).get("units") or "").strip()})
                 except Exception:
-                    y_names = []
-                y_names = sorted(y_names, key=lambda value: value.lower())
+                    raw_columns = []
+                raw_columns = sorted(raw_columns, key=lambda value: str(value.get("name") or "").lower())
+                param_options = self._parameter_selector_options(
+                    surface="performance",
+                    run_names=_local_selected_member_runs(),
+                    raw_names=[str(item.get("name") or "").strip() for item in raw_columns if str(item.get("name") or "").strip()],
+                    raw_columns=raw_columns,
+                )
                 local_params.blockSignals(True)
                 try:
                     local_params.clear()
-                    for name in y_names:
-                        it = QtWidgets.QListWidgetItem(name)
+                    for option in param_options:
+                        value = str(option.get("value") or "").strip()
+                        label = str(option.get("label") or option.get("display_name") or value).strip()
+                        if not value or not label:
+                            continue
+                        raw_names = [str(raw or "").strip() for raw in (option.get("raw_names") or []) if str(raw or "").strip()]
+                        it = QtWidgets.QListWidgetItem(label)
                         it.setFlags(it.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
-                        checked = bool(local_param_states.get(_norm_name(name), False))
+                        it.setData(QtCore.Qt.ItemDataRole.UserRole, value)
+                        it.setToolTip("\n".join([part for part in (label, ", ".join(raw_names)) if part]))
+                        checked = bool(
+                            local_param_states.get(_norm_name(value), False)
+                            or local_param_states.get(_norm_name(label), False)
+                            or any(local_param_states.get(_norm_name(raw), False) for raw in raw_names)
+                        )
                         it.setCheckState(QtCore.Qt.CheckState.Checked if checked else QtCore.Qt.CheckState.Unchecked)
                         local_params.addItem(it)
                 finally:
@@ -11205,7 +11362,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                         it = list_params.item(i)
                         if it is None:
                             continue
-                        checked = bool(local_param_states.get(_norm_name(it.text()), False))
+                        checked = bool(
+                            local_param_states.get(_norm_name(self._list_widget_item_value(it)), False)
+                            or local_param_states.get(_norm_name(it.text()), False)
+                        )
                         it.setCheckState(
                             QtCore.Qt.CheckState.Checked if checked else QtCore.Qt.CheckState.Unchecked
                         )
@@ -11277,17 +11437,21 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 it = list_params.item(i)
                 if not it:
                     continue
-                prev_checked[_norm_name(it.text())] = it.checkState() == QtCore.Qt.CheckState.Checked
+                checked = it.checkState() == QtCore.Qt.CheckState.Checked
+                prev_checked[_norm_name(self._list_widget_item_value(it))] = checked
+                prev_checked[_norm_name(it.text())] = checked
 
             prev_metric_checked: dict[str, bool] = {}
             for i in range(list_metric_params.count()):
                 it = list_metric_params.item(i)
                 if not it:
                     continue
-                prev_metric_checked[_norm_name(it.text())] = it.checkState() == QtCore.Qt.CheckState.Checked
+                checked = it.checkState() == QtCore.Qt.CheckState.Checked
+                prev_metric_checked[_norm_name(self._list_widget_item_value(it))] = checked
+                prev_metric_checked[_norm_name(it.text())] = checked
 
             y_norms: set[str] = set()
-            y_names: list[str] = []
+            raw_columns: list[dict[str, str]] = []
             y_by_run_norm: dict[str, set[str]] = {}
             try:
                 for rn in runs_sel:
@@ -11306,32 +11470,58 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                         if nk in y_norms:
                             continue
                         y_norms.add(nk)
-                        y_names.append(name)
+                        raw_columns.append({"name": name, "units": str((c or {}).get("units") or "").strip()})
             except Exception:
-                y_names = []
+                raw_columns = []
                 y_by_run_norm = {}
 
-            y_names = sorted(y_names, key=lambda s: s.lower())
+            raw_columns = sorted(raw_columns, key=lambda item: str(item.get("name") or "").lower())
+            param_options = self._parameter_selector_options(
+                surface="performance",
+                run_names=runs_sel,
+                raw_names=[str(item.get("name") or "").strip() for item in raw_columns if str(item.get("name") or "").strip()],
+                raw_columns=raw_columns,
+            )
             list_params.blockSignals(True)
             list_params.clear()
-            for name in y_names:
-                it = QtWidgets.QListWidgetItem(name)
+            for option in param_options:
+                value = str(option.get("value") or "").strip()
+                label = str(option.get("label") or option.get("display_name") or value).strip()
+                if not value or not label:
+                    continue
+                raw_names = [str(raw or "").strip() for raw in (option.get("raw_names") or []) if str(raw or "").strip()]
+                it = QtWidgets.QListWidgetItem(label)
                 it.setFlags(it.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
-                checked = prev_checked.get(_norm_name(name))
+                it.setData(QtCore.Qt.ItemDataRole.UserRole, value)
+                it.setToolTip("\n".join([part for part in (label, ", ".join(raw_names)) if part]))
+                checked = prev_checked.get(_norm_name(value))
                 if checked is None:
-                    checked = False
+                    checked = prev_checked.get(_norm_name(label))
+                if checked is None:
+                    checked = any(prev_checked.get(_norm_name(raw), False) for raw in raw_names)
                 it.setCheckState(QtCore.Qt.CheckState.Checked if checked else QtCore.Qt.CheckState.Unchecked)
                 list_params.addItem(it)
             list_params.blockSignals(False)
 
             list_metric_params.blockSignals(True)
             list_metric_params.clear()
-            for name in y_names:
-                it = QtWidgets.QListWidgetItem(name)
+            for option in param_options:
+                value = str(option.get("value") or "").strip()
+                label = str(option.get("label") or option.get("display_name") or value).strip()
+                if not value or not label:
+                    continue
+                raw_names = [str(raw or "").strip() for raw in (option.get("raw_names") or []) if str(raw or "").strip()]
+                it = QtWidgets.QListWidgetItem(label)
                 it.setFlags(it.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
-                checked = prev_metric_checked.get(_norm_name(name))
+                it.setData(QtCore.Qt.ItemDataRole.UserRole, value)
+                it.setToolTip("\n".join([part for part in (label, ", ".join(raw_names)) if part]))
+                checked = prev_metric_checked.get(_norm_name(value))
                 if checked is None:
-                    checked = prev_checked.get(_norm_name(name), False)
+                    checked = prev_metric_checked.get(_norm_name(label))
+                if checked is None:
+                    checked = next((True for raw in raw_names if prev_metric_checked.get(_norm_name(raw), False)), None)
+                if checked is None:
+                    checked = prev_checked.get(_norm_name(value), False)
                 it.setCheckState(QtCore.Qt.CheckState.Checked if checked else QtCore.Qt.CheckState.Unchecked)
                 list_metric_params.addItem(it)
             list_metric_params.blockSignals(False)
@@ -11477,10 +11667,18 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         def _perf_available_names() -> list[str]:
             # Pull from the current param list (y columns across checked runs).
             out: list[str] = []
+            runs_for_params = _selected_member_runs()
             for i in range(list_params.count()):
                 it = list_params.item(i)
-                if it and it.text().strip():
-                    out.append(it.text().strip())
+                value = self._list_widget_item_value(it)
+                if not value:
+                    continue
+                raw_names = self._parameter_selection_raw_names(
+                    value,
+                    run_names=runs_for_params,
+                    surface="performance",
+                )
+                out.append(raw_names[0] if raw_names else value)
             return out
 
         def _refresh_perf_eq_options() -> None:
@@ -11609,7 +11807,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             run_selections_sel = _collect_checked_run_selections()
             runs_sel = _selected_member_runs()
             filtered_serials = self._active_serials(filter_state=report_filter_state)
-            hi_sel = [it.text().strip() for it in list_sn.selectedItems() if it and it.text().strip()]
+            hi_sel = _selected_certification_serials()
             out_path = str(Path(out_path).expanduser())
             if not runs_sel:
                 QtWidgets.QMessageBox.information(dlg, "Auto Report", "Select at least one run.")
@@ -12162,6 +12360,27 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 out.append(text)
         return out or ["mean"]
 
+    @staticmethod
+    def _life_plot_y_values(plot_definition: Mapping[str, object] | None) -> list[str]:
+        if not isinstance(plot_definition, Mapping):
+            return []
+        values = (
+            [str(value).strip() for value in (plot_definition.get("y_parameters") or []) if str(value).strip()]
+            if isinstance(plot_definition.get("y_parameters"), list)
+            else []
+        )
+        if values:
+            return values
+        values = (
+            [str(value).strip() for value in (plot_definition.get("y") or []) if str(value).strip()]
+            if isinstance(plot_definition.get("y"), list)
+            else []
+        )
+        if values:
+            return values
+        fallback = str(plot_definition.get("y_parameter") or "").strip()
+        return [fallback] if fallback else []
+
     def _life_graph_type_text(
         self,
         *,
@@ -12171,7 +12390,11 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         x_parameter: object = "",
         life_axis_label: object = "",
     ) -> str:
-        y_text = str(y_parameter or "").strip() or "Y Parameter"
+        if isinstance(y_parameter, (list, tuple)):
+            y_text = self._plot_value_summary(y_parameter, max_items=2)
+        else:
+            y_text = str(y_parameter or "").strip()
+        y_text = y_text or "Y Parameter"
         if str(plot_type or "").strip().lower() == "metric_xy":
             x_text = str(x_parameter or "").strip() or "X Parameter"
             graph_text = f"{x_text} vs {y_text}"
@@ -13052,7 +13275,13 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         display_y = self._parameter_display_name(y_name, options=self._curve_parameter_options, fallback=y_name)
         return f"{display_y} | {base}" if multi_y else base
 
-    def _life_metric_trace_label(self, row: Mapping[str, object] | None, *, stat: str = "") -> str:
+    def _life_metric_trace_label(
+        self,
+        row: Mapping[str, object] | None,
+        *,
+        stat: str = "",
+        parameter: object = "",
+    ) -> str:
         source_row = row if isinstance(row, Mapping) else {}
         raw_serial = str(source_row.get("serial") or "").strip()
         serial = _td_plot_serial_label(source_row) or raw_serial or "SN"
@@ -13060,7 +13289,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         if not program_title and raw_serial:
             meta_row = self._serial_source_by_serial.get(raw_serial) or {}
             program_title = str(meta_row.get("program_title") or "").strip()
-        base = " | ".join([part for part in (serial, program_title) if str(part).strip()])
+        param_text = str(parameter or "").strip()
+        base = " | ".join([part for part in (param_text, serial, program_title) if str(part).strip()])
         stat_text = str(stat or "").strip()
         return f"{base} ({stat_text})" if stat_text else base
 
@@ -13125,8 +13355,11 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 self.cb_life_y_param.clear()
             if hasattr(self, "cb_life_x_param"):
                 self.cb_life_x_param.clear()
+            if hasattr(self, "list_life_y_params"):
+                self.list_life_y_params.clear()
             self._refresh_metric_selector_summaries()
             self._refresh_curve_selector_summaries()
+            self._refresh_life_y_parameters_summary()
             self._refresh_life_controls()
             self._schedule_mode_panel_height_sync()
             return
@@ -13215,7 +13448,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._refresh_metric_y_columns_summary()
 
         if hasattr(self, "cb_life_y_param") and hasattr(self, "cb_life_x_param"):
-            prev_life_y = self._current_life_y_parameter()
+            prev_life_y_values = self._selected_life_y_parameters()
+            prev_life_y = prev_life_y_values[0] if prev_life_y_values else self._current_life_y_parameter()
             prev_life_x = self._current_life_x_parameter()
             prev_life_axis = self._current_life_axis()
             life_key = tuple(sorted({str(value).strip() for value in runs if str(value).strip()}, key=str.casefold))
@@ -13254,9 +13488,18 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     self.cb_life_axis.blockSignals(False)
             self.cb_life_y_param.blockSignals(True)
             self.cb_life_x_param.blockSignals(True)
+            if hasattr(self, "list_life_y_params"):
+                self.list_life_y_params.blockSignals(True)
             try:
                 self.cb_life_y_param.clear()
                 self.cb_life_x_param.clear()
+                if hasattr(self, "list_life_y_params"):
+                    self._populate_parameter_list_widget(
+                        self.list_life_y_params,
+                        self._life_parameter_options,
+                        previous_values=prev_life_y_values,
+                        select_all_default=False,
+                    )
                 self._populate_parameter_combo(
                     self.cb_life_y_param,
                     self._life_parameter_options,
@@ -13282,6 +13525,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             finally:
                 self.cb_life_y_param.blockSignals(False)
                 self.cb_life_x_param.blockSignals(False)
+                if hasattr(self, "list_life_y_params"):
+                    self.list_life_y_params.blockSignals(False)
+            self._refresh_life_y_parameters_summary()
             self._refresh_life_controls()
 
         prev_x = self._current_curve_x_key() or self._current_curve_x_label()
@@ -14449,19 +14695,28 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             return
 
         plot_type = self._selected_life_plot_type()
-        y_param = self._current_life_y_parameter()
-        if not y_param:
-            QtWidgets.QMessageBox.information(self, "Life Metrics", "Select a Y parameter.")
+        y_params = self._selected_life_y_parameters()
+        if not y_params:
+            QtWidgets.QMessageBox.information(self, "Life Metrics", "Select at least one Y parameter.")
             return
-        y_option = self._selector_option_by_value(self._life_parameter_options, y_param)
-        if bool(y_option.get("unit_conflict")):
+        conflicting_y = [
+            self._parameter_display_name(value, options=self._life_parameter_options, fallback=value)
+            for value in y_params
+            if bool(self._selector_option_by_value(self._life_parameter_options, value).get("unit_conflict"))
+        ]
+        if conflicting_y:
             QtWidgets.QMessageBox.warning(
                 self,
                 "Life Metrics",
-                "The selected Y parameter has conflicting units across its merged sources. Resolve the conflict in Project Parameters first.",
+                "One or more selected Y parameters have conflicting units across merged sources. Resolve the conflict in Project Parameters first.",
             )
             return
-        y_display = self._parameter_display_name(y_param, options=self._life_parameter_options, fallback=y_param)
+        y_display_names = {
+            value: self._parameter_display_name(value, options=self._life_parameter_options, fallback=value)
+            for value in y_params
+        }
+        y_display = self._plot_value_summary(list(y_display_names.values()), max_items=2)
+        multi_y_param = len(y_params) > 1
         stats = self._selected_life_stats()
 
         self._axes.clear()
@@ -14484,16 +14739,21 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 return
             x_display = self._parameter_display_name(x_param, options=self._life_parameter_options, fallback=x_param)
             try:
-                rows_by_stat = {
-                    stat: self._load_life_metric_xy_for_selection(
-                        runs,
-                        x_param,
-                        y_param,
-                        stat=stat,
-                        serials=serials,
-                    )
-                    for stat in stats
-                }
+                rows_by_stat: dict[str, list[dict]] = {}
+                for stat in stats:
+                    combined_rows: list[dict] = []
+                    for y_param in y_params:
+                        for row in self._load_life_metric_xy_for_selection(
+                            runs,
+                            x_param,
+                            y_param,
+                            stat=stat,
+                            serials=serials,
+                        ):
+                            tagged = dict(row)
+                            tagged["_life_plot_y_parameter"] = str(y_param or "").strip()
+                            combined_rows.append(tagged)
+                    rows_by_stat[stat] = combined_rows
             except Exception as exc:
                 QtWidgets.QMessageBox.warning(self, "Life Metrics", str(exc))
                 return
@@ -14527,7 +14787,20 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 or ""
             ).strip()
             x_label = f"{x_display} ({x_units})" if x_units else x_display
-            y_label = f"{y_display} ({y_units})" if y_units else y_display
+            y_unit_values = sorted(
+                {
+                    str(row.get("y_units") or "").strip()
+                    for stat_rows in rows_by_stat.values()
+                    for row in stat_rows
+                    if str(row.get("y_units") or "").strip()
+                },
+                key=str.casefold,
+            )
+            y_label = (
+                f"{y_display} ({y_unit_values[0]})"
+                if len(y_unit_values) == 1
+                else (y_display if not multi_y_param else "Life metric value")
+            )
             self._axes.set_title(
                 self._compose_run_title(
                     selection,
@@ -14544,57 +14817,71 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             multi_stat = len(rows_by_stat) > 1
             for stat in stats:
                 rows = rows_by_stat.get(stat) or []
-                grouped: dict[str, list[dict]] = {}
+                grouped: dict[tuple[str, str], list[dict]] = {}
                 for row in rows:
                     sn = str(row.get("serial") or "").strip()
-                    if sn:
-                        grouped.setdefault(sn, []).append(dict(row))
-                for sn in serials:
-                    points = grouped.get(sn) or []
-                    if not points:
-                        continue
-                    points = sorted(
-                        points,
-                        key=lambda row: (
-                            int(row.get("sequence_index") or 0),
-                            str(row.get("condition_key") or "").lower(),
-                            str(row.get("observation_id") or "").lower(),
-                        ),
-                    )
-                    xs = [float(row.get("x_value") or 0.0) for row in points]
-                    ys = [float(row.get("y_value") or 0.0) for row in points]
-                    label = self._life_metric_trace_label(points[0], stat=(stat if multi_stat else ""))
-                    self._axes.plot(
-                        xs,
-                        ys,
-                        marker="o",
-                        linewidth=(2.4 if sn in hi_set else 1.3),
-                        alpha=(1.0 if sn in hi_set else 0.82),
-                        label=label,
-                    )
-                    any_plotted = True
+                    param = str(row.get("_life_plot_y_parameter") or "").strip()
+                    if sn and param:
+                        grouped.setdefault((param, sn), []).append(dict(row))
+                for y_param in y_params:
+                    param_label = y_display_names.get(y_param, y_param) if multi_y_param else ""
+                    for sn in serials:
+                        points = grouped.get((y_param, sn)) or []
+                        if not points:
+                            continue
+                        points = sorted(
+                            points,
+                            key=lambda row: (
+                                int(row.get("sequence_index") or 0),
+                                str(row.get("condition_key") or "").lower(),
+                                str(row.get("observation_id") or "").lower(),
+                            ),
+                        )
+                        xs = [float(row.get("x_value") or 0.0) for row in points]
+                        ys = [float(row.get("y_value") or 0.0) for row in points]
+                        label = self._life_metric_trace_label(
+                            points[0],
+                            stat=(stat if multi_stat else ""),
+                            parameter=param_label,
+                        )
+                        self._axes.plot(
+                            xs,
+                            ys,
+                            marker="o",
+                            linewidth=(2.4 if sn in hi_set else 1.3),
+                            alpha=(1.0 if sn in hi_set else 0.82),
+                            label=label,
+                        )
+                        any_plotted = True
             last_plot_extra = {
                 "stats": list(stats),
                 "stat": stats[0] if stats else "mean",
                 "x_parameter": x_param,
-                "y_parameter": y_param,
+                "y_parameter": y_params[0],
+                "y_parameters": list(y_params),
                 "x_parameter_label": x_display,
-                "y_parameter_label": y_display,
+                "y_parameter_label": y_display_names.get(y_params[0], y_params[0]),
+                "y_parameter_labels": [y_display_names.get(value, value) for value in y_params],
             }
         else:
             life_axis = self._current_life_axis()
             life_axis_label = str(self.cb_life_axis.currentText() if hasattr(self, "cb_life_axis") else "").strip() or life_axis
             try:
-                rows_by_stat = {
-                    stat: self._load_life_metric_series_for_selection(
-                        runs,
-                        y_param,
-                        life_axis,
-                        stat=stat,
-                        serials=serials,
-                    )
-                    for stat in stats
-                }
+                rows_by_stat: dict[str, list[dict]] = {}
+                for stat in stats:
+                    combined_rows: list[dict] = []
+                    for y_param in y_params:
+                        for row in self._load_life_metric_series_for_selection(
+                            runs,
+                            y_param,
+                            life_axis,
+                            stat=stat,
+                            serials=serials,
+                        ):
+                            tagged = dict(row)
+                            tagged["_life_plot_y_parameter"] = str(y_param or "").strip()
+                            combined_rows.append(tagged)
+                    rows_by_stat[stat] = combined_rows
             except Exception as exc:
                 QtWidgets.QMessageBox.warning(self, "Life Metrics", str(exc))
                 return
@@ -14615,7 +14902,20 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 )
                 or ""
             ).strip()
-            y_label = f"{y_display} ({y_units})" if y_units else y_display
+            y_unit_values = sorted(
+                {
+                    str(row.get("units") or "").strip()
+                    for stat_rows in rows_by_stat.values()
+                    for row in stat_rows
+                    if str(row.get("units") or "").strip()
+                },
+                key=str.casefold,
+            )
+            y_label = (
+                f"{y_display} ({y_unit_values[0]})"
+                if len(y_unit_values) == 1
+                else (y_display if not multi_y_param else "Life metric value")
+            )
             self._axes.set_title(
                 self._compose_run_title(
                     selection,
@@ -14632,42 +14932,51 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             multi_stat = len(rows_by_stat) > 1
             for stat in stats:
                 rows = rows_by_stat.get(stat) or []
-                grouped: dict[str, list[dict]] = {}
+                grouped: dict[tuple[str, str], list[dict]] = {}
                 for row in rows:
                     sn = str(row.get("serial") or "").strip()
-                    if sn:
-                        grouped.setdefault(sn, []).append(dict(row))
-                for sn in serials:
-                    points = grouped.get(sn) or []
-                    if not points:
-                        continue
-                    points = sorted(
-                        points,
-                        key=lambda row: (
-                            float(row.get("x_value") or 0.0),
-                            int(row.get("sequence_index") or 0),
-                            str(row.get("condition_key") or "").lower(),
-                        ),
-                    )
-                    xs = [float(row.get("x_value") or 0.0) for row in points]
-                    ys = [float(row.get("y_value") or 0.0) for row in points]
-                    label = self._life_metric_trace_label(points[0], stat=(stat if multi_stat else ""))
-                    self._axes.plot(
-                        xs,
-                        ys,
-                        marker="o",
-                        linewidth=(2.4 if sn in hi_set else 1.3),
-                        alpha=(1.0 if sn in hi_set else 0.82),
-                        label=label,
-                    )
-                    any_plotted = True
+                    param = str(row.get("_life_plot_y_parameter") or "").strip()
+                    if sn and param:
+                        grouped.setdefault((param, sn), []).append(dict(row))
+                for y_param in y_params:
+                    param_label = y_display_names.get(y_param, y_param) if multi_y_param else ""
+                    for sn in serials:
+                        points = grouped.get((y_param, sn)) or []
+                        if not points:
+                            continue
+                        points = sorted(
+                            points,
+                            key=lambda row: (
+                                float(row.get("x_value") or 0.0),
+                                int(row.get("sequence_index") or 0),
+                                str(row.get("condition_key") or "").lower(),
+                            ),
+                        )
+                        xs = [float(row.get("x_value") or 0.0) for row in points]
+                        ys = [float(row.get("y_value") or 0.0) for row in points]
+                        label = self._life_metric_trace_label(
+                            points[0],
+                            stat=(stat if multi_stat else ""),
+                            parameter=param_label,
+                        )
+                        self._axes.plot(
+                            xs,
+                            ys,
+                            marker="o",
+                            linewidth=(2.4 if sn in hi_set else 1.3),
+                            alpha=(1.0 if sn in hi_set else 0.82),
+                            label=label,
+                        )
+                        any_plotted = True
             last_plot_extra = {
                 "stats": list(stats),
                 "stat": stats[0] if stats else "mean",
                 "life_axis": life_axis,
                 "life_axis_label": life_axis_label,
-                "y_parameter": y_param,
-                "y_parameter_label": y_display,
+                "y_parameter": y_params[0],
+                "y_parameters": list(y_params),
+                "y_parameter_label": y_display_names.get(y_params[0], y_params[0]),
+                "y_parameter_labels": [y_display_names.get(value, value) for value in y_params],
             }
 
         if not any_plotted:
@@ -22409,17 +22718,31 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             plot_type = str(d.get("plot_type") or "life_axis").strip().lower()
             if plot_type not in {"life_axis", "metric_xy"}:
                 plot_type = "life_axis"
-            y_param = str(d.get("y_parameter") or "").strip()
-            if not y_param:
+            y_params = self._life_plot_y_values(d)
+            if not y_params:
                 raise RuntimeError("The saved life metrics graph is missing its Y parameter.")
-            y_option = self._selector_option_by_value(self._life_parameter_options, y_param)
-            if bool(y_option.get("unit_conflict")):
+            if any(
+                bool(self._selector_option_by_value(self._life_parameter_options, value).get("unit_conflict"))
+                for value in y_params
+            ):
                 raise RuntimeError("Resolve the saved life-metric Y parameter unit conflict in Project Parameters first.")
-            y_display = str(d.get("y_parameter_label") or "").strip() or self._parameter_display_name(
-                y_param,
-                options=self._life_parameter_options,
-                fallback=y_param,
+            label_values = (
+                [str(value).strip() for value in (d.get("y_parameter_labels") or []) if str(value).strip()]
+                if isinstance(d.get("y_parameter_labels"), list)
+                else []
             )
+            y_display_names = {
+                value: (
+                    label_values[index]
+                    if index < len(label_values) and label_values[index]
+                    else self._parameter_display_name(value, options=self._life_parameter_options, fallback=value)
+                )
+                for index, value in enumerate(y_params)
+            }
+            if len(y_params) == 1 and str(d.get("y_parameter_label") or "").strip():
+                y_display_names[y_params[0]] = str(d.get("y_parameter_label") or "").strip()
+            y_display = self._plot_value_summary(list(y_display_names.values()), max_items=2)
+            multi_y_param = len(y_params) > 1
             stats = self._life_plot_stats_from_definition(d)
             plotted_any = False
             if plot_type == "metric_xy":
@@ -22434,17 +22757,22 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     options=self._life_parameter_options,
                     fallback=x_param,
                 )
-                rows_by_stat = {
-                    stat: self._load_life_metric_xy_for_selection(
-                        runs,
-                        x_param,
-                        y_param,
-                        stat=stat,
-                        serials=active_serials,
-                        filter_state=render_filter_state,
-                    )
-                    for stat in stats
-                }
+                rows_by_stat: dict[str, list[dict]] = {}
+                for stat in stats:
+                    combined_rows: list[dict] = []
+                    for y_param in y_params:
+                        for row in self._load_life_metric_xy_for_selection(
+                            runs,
+                            x_param,
+                            y_param,
+                            stat=stat,
+                            serials=active_serials,
+                            filter_state=render_filter_state,
+                        ):
+                            tagged = dict(row)
+                            tagged["_life_plot_y_parameter"] = str(y_param or "").strip()
+                            combined_rows.append(tagged)
+                    rows_by_stat[stat] = combined_rows
                 rows_by_stat = {key: value for key, value in rows_by_stat.items() if value}
                 if not rows_by_stat:
                     raise RuntimeError("No life metric data matched this saved graph after applying the saved global filters.")
@@ -22484,40 +22812,58 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                         ),
                     )
                 )
+                y_unit_values = sorted(
+                    {
+                        str(row.get("y_units") or "").strip()
+                        for stat_rows in rows_by_stat.values()
+                        for row in stat_rows
+                        if str(row.get("y_units") or "").strip()
+                    },
+                    key=str.casefold,
+                )
                 ax.set_xlabel(f"{x_display} ({x_units})" if x_units else x_display)
-                ax.set_ylabel(f"{y_display} ({y_units})" if y_units else y_display)
+                ax.set_ylabel(
+                    f"{y_display} ({y_unit_values[0]})"
+                    if len(y_unit_values) == 1
+                    else (y_display if not multi_y_param else "Life metric value")
+                )
                 multi_stat = len(rows_by_stat) > 1
                 for stat in stats:
                     rows = rows_by_stat.get(stat) or []
-                    grouped: dict[str, list[dict]] = {}
+                    grouped: dict[tuple[str, str], list[dict]] = {}
                     for row in rows:
                         serial = str(row.get("serial") or "").strip()
-                        if serial:
-                            grouped.setdefault(serial, []).append(dict(row))
-                    for serial in active_serials:
-                        points = grouped.get(serial) or []
-                        if not points:
-                            continue
-                        points = sorted(
-                            points,
-                            key=lambda row: (
-                                int(row.get("sequence_index") or 0),
-                                str(row.get("condition_key") or "").lower(),
-                                str(row.get("observation_id") or "").lower(),
-                            ),
-                        )
-                        label = _td_plot_serial_label(serial) or serial
-                        if multi_stat:
-                            label = f"{label} ({stat})"
-                        ax.plot(
-                            [float(row.get("x_value") or 0.0) for row in points],
-                            [float(row.get("y_value") or 0.0) for row in points],
-                            marker="o",
-                            linewidth=1.3,
-                            alpha=0.88,
-                            label=label,
-                        )
-                        plotted_any = True
+                        param = str(row.get("_life_plot_y_parameter") or "").strip()
+                        if serial and param:
+                            grouped.setdefault((param, serial), []).append(dict(row))
+                    for y_param in y_params:
+                        param_label = y_display_names.get(y_param, y_param) if multi_y_param else ""
+                        for serial in active_serials:
+                            points = grouped.get((y_param, serial)) or []
+                            if not points:
+                                continue
+                            points = sorted(
+                                points,
+                                key=lambda row: (
+                                    int(row.get("sequence_index") or 0),
+                                    str(row.get("condition_key") or "").lower(),
+                                    str(row.get("observation_id") or "").lower(),
+                                ),
+                            )
+                            label = _td_plot_serial_label(serial) or serial
+                            if param_label:
+                                label = f"{param_label} | {label}"
+                            if multi_stat:
+                                label = f"{label} ({stat})"
+                            ax.plot(
+                                [float(row.get("x_value") or 0.0) for row in points],
+                                [float(row.get("y_value") or 0.0) for row in points],
+                                marker="o",
+                                linewidth=1.3,
+                                alpha=0.88,
+                                label=label,
+                            )
+                            plotted_any = True
             else:
                 life_axis = str(d.get("life_axis") or "sequence_index").strip() or "sequence_index"
                 life_axis_label = str(d.get("life_axis_label") or "").strip()
@@ -22533,17 +22879,22 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                             life_axis_label = str((item or {}).get("label") or "").strip()
                             break
                 life_axis_label = life_axis_label or life_axis
-                rows_by_stat = {
-                    stat: self._load_life_metric_series_for_selection(
-                        runs,
-                        y_param,
-                        life_axis,
-                        stat=stat,
-                        serials=active_serials,
-                        filter_state=render_filter_state,
-                    )
-                    for stat in stats
-                }
+                rows_by_stat: dict[str, list[dict]] = {}
+                for stat in stats:
+                    combined_rows: list[dict] = []
+                    for y_param in y_params:
+                        for row in self._load_life_metric_series_for_selection(
+                            runs,
+                            y_param,
+                            life_axis,
+                            stat=stat,
+                            serials=active_serials,
+                            filter_state=render_filter_state,
+                        ):
+                            tagged = dict(row)
+                            tagged["_life_plot_y_parameter"] = str(y_param or "").strip()
+                            combined_rows.append(tagged)
+                    rows_by_stat[stat] = combined_rows
                 rows_by_stat = {key: value for key, value in rows_by_stat.items() if value}
                 if not rows_by_stat:
                     raise RuntimeError("No life metric data matched this saved graph after applying the saved global filters.")
@@ -22571,40 +22922,58 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                         ),
                     )
                 )
+                y_unit_values = sorted(
+                    {
+                        str(row.get("units") or "").strip()
+                        for stat_rows in rows_by_stat.values()
+                        for row in stat_rows
+                        if str(row.get("units") or "").strip()
+                    },
+                    key=str.casefold,
+                )
                 ax.set_xlabel(life_axis_label)
-                ax.set_ylabel(f"{y_display} ({y_units})" if y_units else y_display)
+                ax.set_ylabel(
+                    f"{y_display} ({y_unit_values[0]})"
+                    if len(y_unit_values) == 1
+                    else (y_display if not multi_y_param else "Life metric value")
+                )
                 multi_stat = len(rows_by_stat) > 1
                 for stat in stats:
                     rows = rows_by_stat.get(stat) or []
-                    grouped: dict[str, list[dict]] = {}
+                    grouped: dict[tuple[str, str], list[dict]] = {}
                     for row in rows:
                         serial = str(row.get("serial") or "").strip()
-                        if serial:
-                            grouped.setdefault(serial, []).append(dict(row))
-                    for serial in active_serials:
-                        points = grouped.get(serial) or []
-                        if not points:
-                            continue
-                        points = sorted(
-                            points,
-                            key=lambda row: (
-                                float(row.get("x_value") or 0.0),
-                                int(row.get("sequence_index") or 0),
-                                str(row.get("condition_key") or "").lower(),
-                            ),
-                        )
-                        label = _td_plot_serial_label(serial) or serial
-                        if multi_stat:
-                            label = f"{label} ({stat})"
-                        ax.plot(
-                            [float(row.get("x_value") or 0.0) for row in points],
-                            [float(row.get("y_value") or 0.0) for row in points],
-                            marker="o",
-                            linewidth=1.3,
-                            alpha=0.88,
-                            label=label,
-                        )
-                        plotted_any = True
+                        param = str(row.get("_life_plot_y_parameter") or "").strip()
+                        if serial and param:
+                            grouped.setdefault((param, serial), []).append(dict(row))
+                    for y_param in y_params:
+                        param_label = y_display_names.get(y_param, y_param) if multi_y_param else ""
+                        for serial in active_serials:
+                            points = grouped.get((y_param, serial)) or []
+                            if not points:
+                                continue
+                            points = sorted(
+                                points,
+                                key=lambda row: (
+                                    float(row.get("x_value") or 0.0),
+                                    int(row.get("sequence_index") or 0),
+                                    str(row.get("condition_key") or "").lower(),
+                                ),
+                            )
+                            label = _td_plot_serial_label(serial) or serial
+                            if param_label:
+                                label = f"{param_label} | {label}"
+                            if multi_stat:
+                                label = f"{label} ({stat})"
+                            ax.plot(
+                                [float(row.get("x_value") or 0.0) for row in points],
+                                [float(row.get("y_value") or 0.0) for row in points],
+                                marker="o",
+                                linewidth=1.3,
+                                alpha=0.88,
+                                label=label,
+                            )
+                            plotted_any = True
             if not plotted_any:
                 raise RuntimeError("No life metric data matched this saved graph after applying the saved global filters.")
             ax.grid(True, alpha=0.25)
@@ -23290,12 +23659,22 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         if mode == "life_metrics":
             plot_type = str(plot_definition.get("plot_type") or "life_axis").strip().lower()
             stats = self._life_plot_stats_from_definition(plot_definition)
-            y_param = str(
-                plot_definition.get("y_parameter_label")
-                or self._parameter_display_name(plot_definition.get("y_parameter") or "", options=self._life_parameter_options, fallback="")
-                or plot_definition.get("y_parameter")
-                or ""
-            ).strip() or "Y Parameter"
+            y_values = self._life_plot_y_values(plot_definition)
+            label_values = (
+                [str(value).strip() for value in (plot_definition.get("y_parameter_labels") or []) if str(value).strip()]
+                if isinstance(plot_definition.get("y_parameter_labels"), list)
+                else []
+            )
+            if len(y_values) == 1 and str(plot_definition.get("y_parameter_label") or "").strip():
+                y_labels = [str(plot_definition.get("y_parameter_label") or "").strip()]
+            else:
+                y_labels = [
+                    label_values[index]
+                    if index < len(label_values) and label_values[index]
+                    else self._parameter_display_name(value, options=self._life_parameter_options, fallback=value)
+                    for index, value in enumerate(y_values)
+                ]
+            y_param = self._plot_value_summary(y_labels, max_items=2) or "Y Parameter"
             if plot_type == "metric_xy":
                 x_param = str(
                     plot_definition.get("x_parameter_label")
@@ -23363,12 +23742,22 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         if mode == "life_metrics":
             plot_type = str(plot_definition.get("plot_type") or "life_axis").strip().lower()
             stats = self._life_plot_stats_from_definition(plot_definition)
-            y_param = str(
-                plot_definition.get("y_parameter_label")
-                or self._parameter_display_name(plot_definition.get("y_parameter") or "", options=self._life_parameter_options, fallback="")
-                or plot_definition.get("y_parameter")
-                or ""
-            ).strip() or "Y Parameter"
+            y_values = self._life_plot_y_values(plot_definition)
+            label_values = (
+                [str(value).strip() for value in (plot_definition.get("y_parameter_labels") or []) if str(value).strip()]
+                if isinstance(plot_definition.get("y_parameter_labels"), list)
+                else []
+            )
+            if len(y_values) == 1 and str(plot_definition.get("y_parameter_label") or "").strip():
+                y_labels = [str(plot_definition.get("y_parameter_label") or "").strip()]
+            else:
+                y_labels = [
+                    label_values[index]
+                    if index < len(label_values) and label_values[index]
+                    else self._parameter_display_name(value, options=self._life_parameter_options, fallback=value)
+                    for index, value in enumerate(y_values)
+                ]
+            y_param = self._plot_value_summary(y_labels, max_items=2) or "Y Parameter"
             if plot_type == "metric_xy":
                 x_param = str(
                     plot_definition.get("x_parameter_label")
@@ -23668,6 +24057,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             elif (
                 str(plot_definition.get("plot_type") or "").strip().lower() in {"life_axis", "metric_xy"}
                 or str(plot_definition.get("y_parameter") or "").strip()
+                or isinstance(plot_definition.get("y_parameters"), list)
                 or str(plot_definition.get("life_axis") or "").strip()
                 or str(plot_definition.get("x_parameter") or "").strip()
             ):
@@ -23733,12 +24123,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             normalized_plot_definition["life_axis"] = (
                 str(plot_definition.get("life_axis") or "sequence_index").strip() or "sequence_index"
             )
-            y_parameter = str(
-                plot_definition.get("y_parameter")
-                or (((plot_definition.get("y") or [None])[0]) if isinstance(plot_definition.get("y"), list) else "")
-                or ""
-            ).strip()
-            normalized_plot_definition["y_parameter"] = y_parameter
+            y_parameters = self._life_plot_y_values(plot_definition)
+            normalized_plot_definition["y_parameters"] = list(y_parameters)
+            normalized_plot_definition["y_parameter"] = y_parameters[0] if y_parameters else ""
             x_parameter = str(plot_definition.get("x_parameter") or "").strip()
             if plot_type == "metric_xy" and x_parameter:
                 normalized_plot_definition["x_parameter"] = x_parameter
@@ -26164,9 +26551,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         if mode == "life_metrics":
             plot_type = str(plot_definition.get("plot_type") or "life_axis").strip().lower()
             stats = self._life_plot_stats_from_definition(plot_definition)
+            y_values = self._life_plot_y_values(plot_definition)
             self._set_mode("life_metrics")
             self._set_combo_to_value(getattr(self, "cb_life_plot_type", None), plot_type)
-            self._set_combo_to_value(getattr(self, "cb_life_y_param", None), str(plot_definition.get("y_parameter") or "").strip())
+            self._set_life_y_parameter_selection(y_values)
             if hasattr(self, "list_life_stats"):
                 self._set_list_widget_selection(self.list_life_stats, stats)
                 if not self.list_life_stats.selectedItems() and self.list_life_stats.count() > 0:
