@@ -809,6 +809,110 @@ def _resolve_td_y_col_from_rows(rows: list[dict], target: str) -> tuple[str, str
     return tgt, ""
 
 
+def _tar_perf_target_metadata(
+    be: Any,
+    parameter_context: Mapping[str, object] | None,
+    target_spec: Mapping[str, object] | None,
+    *,
+    fallback_target: object = "",
+) -> dict[str, str]:
+    spec = dict(target_spec or {})
+    selection_value = str(spec.get("selection_value") or "").strip()
+    raw_column = str(spec.get("column") or fallback_target or "").strip()
+    target_value = selection_value or raw_column
+    display_name = str(spec.get("display_name") or "").strip()
+    if not display_name and target_value:
+        resolver = getattr(be, "td_parameter_value_display_name", None)
+        if callable(resolver):
+            try:
+                display_name = str(
+                    resolver(parameter_context, target_value, fallback=(raw_column or target_value))
+                    or ""
+                ).strip()
+            except Exception:
+                display_name = ""
+    if not display_name:
+        display_name = raw_column or target_value
+    return {
+        "selection_value": target_value,
+        "raw_column": raw_column,
+        "display_name": display_name,
+    }
+
+
+def _tar_perf_target_text(target_spec: Mapping[str, object] | None, fallback: object = "") -> str:
+    spec = dict(target_spec or {})
+    return (
+        str(spec.get("display_name") or "").strip()
+        or str(spec.get("column") or "").strip()
+        or str(spec.get("selection_value") or "").strip()
+        or str(fallback or "").strip()
+    )
+
+
+def _tar_perf_resolve_target_column_for_run(
+    *,
+    be: Any,
+    parameter_context: Mapping[str, object] | None,
+    run_name: str,
+    metric_cols: list[dict],
+    target_spec: Mapping[str, object] | None,
+) -> tuple[str, str]:
+    spec = dict(target_spec or {})
+    target_value = str(spec.get("selection_value") or spec.get("raw_column") or spec.get("column") or "").strip()
+    if not target_value:
+        return "", ""
+    metric_by_norm: dict[str, tuple[str, str]] = {}
+    for col in metric_cols or []:
+        if not isinstance(col, Mapping):
+            continue
+        name = str(col.get("name") or "").strip()
+        if not name:
+            continue
+        metric_by_norm.setdefault(_norm_key(name), (name, str(col.get("units") or "").strip()))
+    candidate_raw_names: list[str] = []
+    selection_raw_resolver = getattr(be, "td_parameter_selection_raw_names", None)
+    if callable(selection_raw_resolver):
+        try:
+            candidate_raw_names = [
+                str(value).strip()
+                for value in selection_raw_resolver(
+                    parameter_context,
+                    target_value,
+                    run_names=[run_name] if str(run_name or "").strip() else None,
+                    surface="performance",
+                    raw_names=[
+                        str((col or {}).get("name") or "").strip()
+                        for col in metric_cols
+                        if isinstance(col, Mapping) and str((col or {}).get("name") or "").strip()
+                    ],
+                )
+                if str(value).strip()
+            ]
+        except Exception:
+            candidate_raw_names = []
+    if not candidate_raw_names:
+        candidate_raw_names = [
+            value
+            for value in (
+                str(spec.get("raw_column") or "").strip(),
+                str(spec.get("column") or "").strip(),
+                target_value,
+            )
+            if value
+        ]
+    seen: set[str] = set()
+    for candidate in candidate_raw_names:
+        key = _norm_key(candidate)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        resolved = metric_by_norm.get(key)
+        if resolved:
+            return resolved
+    return "", ""
+
+
 def _resolve_curve_x_key(be: Any, db_path: Path, run_name: str, x_label: str) -> str:
     run = str(run_name or "").strip()
     label = str(x_label or "").strip()
@@ -1129,11 +1233,16 @@ def _collect_performance_curves_for_stat(
     stat: str,
     options: dict,
     require_min_points: int,
+    parameter_context: Mapping[str, object] | None = None,
+    x_target_spec: Mapping[str, object] | None = None,
+    y_target_spec: Mapping[str, object] | None = None,
     control_period_filter: object = None,
     filter_state: Mapping[str, object] | None = None,
     metric_series_cache: dict[tuple[str, str, str, str, str, str], list[dict]] | None = None,
 ) -> tuple[dict[str, list[tuple[float, float, str]]], list[float], list[float], str, str]:
     serial_set = {str(sn).strip() for sn in serials if str(sn).strip()}
+    x_spec = _tar_perf_target_metadata(be, parameter_context, x_target_spec, fallback_target=x_target)
+    y_spec = _tar_perf_target_metadata(be, parameter_context, y_target_spec, fallback_target=y_target)
     per_run: list[tuple[str, str, dict[str, dict], dict[str, dict], str, str]] = []
     for rn in runs:
         run_selection = _selection_for_run(rn, options)
@@ -1144,9 +1253,21 @@ def _collect_performance_curves_for_stat(
             metric_cols = []
         if not metric_cols:
             metric_cols = _td_list_y_columns(conn, rn)
-        x_col, x_units = _resolve_td_y_col_from_rows(metric_cols, x_target)
-        y_col, y_units = _resolve_td_y_col_from_rows(metric_cols, y_target)
-        if not x_col or not y_col:
+        x_col, x_units = _tar_perf_resolve_target_column_for_run(
+            be=be,
+            parameter_context=parameter_context,
+            run_name=rn,
+            metric_cols=metric_cols,
+            target_spec=x_spec,
+        )
+        y_col, y_units = _tar_perf_resolve_target_column_for_run(
+            be=be,
+            parameter_context=parameter_context,
+            run_name=rn,
+            metric_cols=metric_cols,
+            target_spec=y_spec,
+        )
+        if not x_col or not y_col or _norm_key(x_col) == _norm_key(y_col):
             continue
         program_title, source_run_name = _selection_observation_filters(run_selection)
 
@@ -4423,8 +4544,20 @@ def generate_test_data_auto_report(
                         continue
                     x_spec = pd.get("x") or {}
                     y_spec = pd.get("y") or {}
-                    x_target = str((x_spec.get("column") if isinstance(x_spec, dict) else "") or "").strip()
-                    y_target = str((y_spec.get("column") if isinstance(y_spec, dict) else "") or "").strip()
+                    x_target = str(
+                        (
+                            (x_spec.get("selection_value") if isinstance(x_spec, dict) else "")
+                            or (x_spec.get("column") if isinstance(x_spec, dict) else "")
+                            or ""
+                        )
+                    ).strip()
+                    y_target = str(
+                        (
+                            (y_spec.get("selection_value") if isinstance(y_spec, dict) else "")
+                            or (y_spec.get("column") if isinstance(y_spec, dict) else "")
+                            or ""
+                        )
+                    ).strip()
                     if x_target and y_target:
                         perf_defs_all.append(pd)
         except Exception:
@@ -4697,8 +4830,20 @@ def generate_test_data_auto_report(
                     name = str(pd.get("name") or "Performance").strip() or "Performance"
                     x_spec = pd.get("x") or {}
                     y_spec = pd.get("y") or {}
-                    x_target = str((x_spec.get("column") if isinstance(x_spec, dict) else "") or "").strip()
-                    y_target = str((y_spec.get("column") if isinstance(y_spec, dict) else "") or "").strip()
+                    x_target = str(
+                        (
+                            (x_spec.get("selection_value") if isinstance(x_spec, dict) else "")
+                            or (x_spec.get("column") if isinstance(x_spec, dict) else "")
+                            or ""
+                        )
+                    ).strip()
+                    y_target = str(
+                        (
+                            (y_spec.get("selection_value") if isinstance(y_spec, dict) else "")
+                            or (y_spec.get("column") if isinstance(y_spec, dict) else "")
+                            or ""
+                        )
+                    ).strip()
                     if not x_target or not y_target:
                         continue
 
@@ -5097,8 +5242,20 @@ def generate_test_data_auto_report(
                     name = str(pd.get("name") or "Performance").strip() or "Performance"
                     x_spec = pd.get("x") or {}
                     y_spec = pd.get("y") or {}
-                    x_target = str((x_spec.get("column") if isinstance(x_spec, dict) else "") or "").strip()
-                    y_target = str((y_spec.get("column") if isinstance(y_spec, dict) else "") or "").strip()
+                    x_target = str(
+                        (
+                            (x_spec.get("selection_value") if isinstance(x_spec, dict) else "")
+                            or (x_spec.get("column") if isinstance(x_spec, dict) else "")
+                            or ""
+                        )
+                    ).strip()
+                    y_target = str(
+                        (
+                            (y_spec.get("selection_value") if isinstance(y_spec, dict) else "")
+                            or (y_spec.get("column") if isinstance(y_spec, dict) else "")
+                            or ""
+                        )
+                    ).strip()
                     stats_list = pd.get("stats")
                     if isinstance(stats_list, list) and all(isinstance(s, str) for s in stats_list):
                         stats_list = [str(s).strip().lower() for s in stats_list if str(s).strip()]
@@ -7910,8 +8067,8 @@ def _tar_plan_plot_specs(ctx: Mapping[str, Any], *, intro_pages: int) -> list[di
             {
                 "section": "performance_plots",
                 "name": str(perf_spec.get("name") or "Performance").strip() or "Performance",
-                "x": str(((perf_spec.get("x") or {}).get("column") or "")).strip(),
-                "y": str(((perf_spec.get("y") or {}).get("column") or "")).strip(),
+                "x": _tar_perf_target_text(perf_spec.get("x") if isinstance(perf_spec.get("x"), Mapping) else {}, fallback=""),
+                "y": _tar_perf_target_text(perf_spec.get("y") if isinstance(perf_spec.get("y"), Mapping) else {}, fallback=""),
                 "stat": str(perf_spec.get("stat") or "").strip(),
                 "run_condition_label": _tar_context_run_condition_label(ctx),
                 "page_number": page_number,
@@ -10579,8 +10736,20 @@ def _tar_prepare_performance_models(ctx: dict[str, Any]) -> None:
             name = str(perf_def.get("name") or "Performance").strip() or "Performance"
             x_spec = perf_def.get("x") or {}
             y_spec = perf_def.get("y") or {}
-            x_target = str((x_spec.get("column") if isinstance(x_spec, dict) else "") or "").strip()
-            y_target = str((y_spec.get("column") if isinstance(y_spec, dict) else "") or "").strip()
+            x_target_meta = _tar_perf_target_metadata(
+                be,
+                ctx.get("parameter_context"),
+                x_spec if isinstance(x_spec, Mapping) else {},
+            )
+            y_target_meta = _tar_perf_target_metadata(
+                be,
+                ctx.get("parameter_context"),
+                y_spec if isinstance(y_spec, Mapping) else {},
+            )
+            x_target = str(x_target_meta.get("selection_value") or x_target_meta.get("raw_column") or "").strip()
+            y_target = str(y_target_meta.get("selection_value") or y_target_meta.get("raw_column") or "").strip()
+            x_label = _tar_perf_target_text(x_target_meta, fallback=x_target)
+            y_label = _tar_perf_target_text(y_target_meta, fallback=y_target)
             if not x_target or not y_target:
                 continue
             stats_list = perf_def.get("stats")
@@ -10600,7 +10769,7 @@ def _tar_prepare_performance_models(ctx: dict[str, Any]) -> None:
                 perf_spec_index += 1
                 _tar_emit_progress(
                     progress_cb,
-                    f"Preparing performance model {perf_spec_index}/{max(1, total_perf_specs)}: {name} | {y_target} vs {x_target} | {perf_stat}",
+                    f"Preparing performance model {perf_spec_index}/{max(1, total_perf_specs)}: {name} | {y_label} vs {x_label} | {perf_stat}",
                 )
                 curves, pooled_x, pooled_y, x_units, y_units = _collect_performance_curves_for_stat(
                     be=be,
@@ -10614,6 +10783,9 @@ def _tar_prepare_performance_models(ctx: dict[str, Any]) -> None:
                     stat=perf_stat,
                     options=options,
                     require_min_points=require_min_points,
+                    parameter_context=ctx.get("parameter_context"),
+                    x_target_spec=x_target_meta,
+                    y_target_spec=y_target_meta,
                     filter_state=ctx["filter_state"],
                     metric_series_cache=metric_series_cache,
                 )
@@ -10650,8 +10822,18 @@ def _tar_prepare_performance_models(ctx: dict[str, Any]) -> None:
 
                 model_row = {
                     "name": name,
-                    "x": {"column": x_target, "units": x_units},
-                    "y": {"column": y_target, "units": y_units},
+                    "x": {
+                        "column": str(x_target_meta.get("raw_column") or x_target).strip(),
+                        "selection_value": str(x_target_meta.get("selection_value") or x_target).strip(),
+                        "display_name": x_label,
+                        "units": x_units,
+                    },
+                    "y": {
+                        "column": str(y_target_meta.get("raw_column") or y_target).strip(),
+                        "selection_value": str(y_target_meta.get("selection_value") or y_target).strip(),
+                        "display_name": y_label,
+                        "units": y_units,
+                    },
                     "stat": perf_stat,
                     "fit": {"degree": int(fit_degree), "normalize_x": bool(fit_norm)},
                     "require_min_points": int(require_min_points),
@@ -10676,7 +10858,7 @@ def _tar_prepare_performance_models(ctx: dict[str, Any]) -> None:
                             "kind": "family",
                             "title": f"{name} | Family Fit",
                             "lines": [
-                                f"Parameters: {y_target} vs {x_target}",
+                                f"Parameters: {y_label} vs {x_label}",
                                 f"Statistic: {perf_stat}",
                                 f"Equation: {master_eqn}",
                                 f"RMSE: {_fmt_num(master_poly.get('rmse'), sig=5)}",
@@ -10696,7 +10878,7 @@ def _tar_prepare_performance_models(ctx: dict[str, Any]) -> None:
                             "kind": "serial",
                             "title": f"{name} | {_tar_display_serial(ctx, serial) or serial}",
                             "lines": [
-                                f"Parameters: {y_target} vs {x_target}",
+                                f"Parameters: {y_label} vs {x_label}",
                                 f"Statistic: {perf_stat}",
                                 f"Equation: {equation}",
                                 f"RMSE: {_fmt_num(highlighted.get('rmse'), sig=5)}",
@@ -10837,8 +11019,8 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
 
 def _tar_equation_summary_model_label(model: Mapping[str, Any]) -> str:
     name = str(model.get("name") or "Performance").strip() or "Performance"
-    x_target = str(((model.get("x") or {}).get("column") or "") if isinstance(model.get("x"), Mapping) else "").strip()
-    y_target = str(((model.get("y") or {}).get("column") or "") if isinstance(model.get("y"), Mapping) else "").strip()
+    x_target = _tar_perf_target_text(model.get("x") if isinstance(model.get("x"), Mapping) else {}, fallback="")
+    y_target = _tar_perf_target_text(model.get("y") if isinstance(model.get("y"), Mapping) else {}, fallback="")
     stat = str(model.get("stat") or "").strip()
     compare_text = f"{y_target} vs {x_target}".strip(" |") if x_target or y_target else ""
     return " | ".join(value for value in [name, compare_text, f"Stat: {stat}" if stat else ""] if value)
@@ -11481,8 +11663,8 @@ def _tar_render_plot_sections(
             _tar_emit_progress(progress_cb, f"Rendering performance plot pages ({len(performance_plot_specs)} planned)")
         for perf_index, perf_spec in enumerate(performance_plot_specs, start=1):
             name = str(perf_spec.get("name") or "Performance").strip() or "Performance"
-            x_target = str(((perf_spec.get("x") or {}).get("column") or "")).strip()
-            y_target = str(((perf_spec.get("y") or {}).get("column") or "")).strip()
+            x_target = _tar_perf_target_text(perf_spec.get("x") if isinstance(perf_spec.get("x"), Mapping) else {}, fallback="")
+            y_target = _tar_perf_target_text(perf_spec.get("y") if isinstance(perf_spec.get("y"), Mapping) else {}, fallback="")
             perf_stat = str(perf_spec.get("stat") or "").strip()
             curves = perf_spec.get("curves") or {}
             if not isinstance(curves, dict) or not curves:
@@ -11847,8 +12029,8 @@ def _tar_render_plot_sections(
             _tar_emit_progress(progress_cb, f"Rendering performance plot pages ({len(performance_plot_specs)} planned)")
         for perf_index, perf_spec in enumerate(performance_plot_specs, start=1):
             name = str(perf_spec.get("name") or "Performance").strip() or "Performance"
-            x_target = str(((perf_spec.get("x") or {}).get("column") or "")).strip()
-            y_target = str(((perf_spec.get("y") or {}).get("column") or "")).strip()
+            x_target = _tar_perf_target_text(perf_spec.get("x") if isinstance(perf_spec.get("x"), Mapping) else {}, fallback="")
+            y_target = _tar_perf_target_text(perf_spec.get("y") if isinstance(perf_spec.get("y"), Mapping) else {}, fallback="")
             perf_stat = str(perf_spec.get("stat") or "").strip()
             curves = perf_spec.get("curves") or {}
             if not isinstance(curves, dict) or not curves:

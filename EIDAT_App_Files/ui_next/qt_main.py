@@ -10487,6 +10487,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         time_norms = {_norm_name(x) for x in ("time", "time_s", "time(sec)", "time(s)", "time (s)", "time_sec", "times")}
         pulse_norms = {_norm_name(x) for x in ("pulse number", "pulse#", "pulse #", "pulse_number", "pulsenumber", "cycle")}
         x_exclude_norms = time_norms | pulse_norms | {_norm_name("excel_row")}
+        perf_param_options: list[dict[str, object]] = []
 
         def _set_filtered_hidden(listw: QtWidgets.QListWidget, needle: str) -> None:
             needle = (needle or "").strip().lower()
@@ -11419,8 +11420,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             _apply_report_filter_change()
 
         def _refresh_params_from_runs():
+            nonlocal perf_param_options
             runs_sel = _selected_member_runs()
             if not runs_sel or not self._db_path:
+                perf_param_options = []
                 list_params.clear()
                 list_metric_params.clear()
                 _update_runs_label()
@@ -11482,6 +11485,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 raw_names=[str(item.get("name") or "").strip() for item in raw_columns if str(item.get("name") or "").strip()],
                 raw_columns=raw_columns,
             )
+            perf_param_options = [dict(option) for option in param_options if isinstance(option, Mapping)]
             list_params.blockSignals(True)
             list_params.clear()
             for option in param_options:
@@ -11664,37 +11668,96 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             cb.setEditable(False)
             return cb
 
-        def _perf_available_names() -> list[str]:
-            # Pull from the current param list (y columns across checked runs).
-            out: list[str] = []
-            runs_for_params = _selected_member_runs()
+        def _perf_selector_is_canonical(value: object) -> bool:
+            checker = getattr(be, "td_parameter_selector_is_canonical", None)
+            if callable(checker):
+                try:
+                    return bool(checker(value))
+                except Exception:
+                    pass
+            return str(value or "").strip().startswith("parameter:")
+
+        def _perf_available_options() -> list[dict[str, object]]:
+            if perf_param_options:
+                return [dict(option) for option in perf_param_options if isinstance(option, Mapping)]
+            fallback: list[dict[str, object]] = []
             for i in range(list_params.count()):
                 it = list_params.item(i)
-                value = self._list_widget_item_value(it)
-                if not value:
+                if it is None:
                     continue
-                raw_names = self._parameter_selection_raw_names(
-                    value,
-                    run_names=runs_for_params,
-                    surface="performance",
+                value = self._list_widget_item_value(it)
+                label = str(it.text() or value).strip()
+                if not value or not label:
+                    continue
+                fallback.append(
+                    {
+                        "value": value,
+                        "label": label,
+                        "display_name": label,
+                        "raw_names": [value],
+                    }
                 )
-                out.append(raw_names[0] if raw_names else value)
-            return out
+            return fallback
+
+        def _perf_combo_match_index(cb: QtWidgets.QComboBox, value: object) -> int:
+            want = _norm_name(str(value or "").strip())
+            if not want:
+                return -1
+            raw_names_role = int(QtCore.Qt.ItemDataRole.UserRole) + 1
+            display_name_role = int(QtCore.Qt.ItemDataRole.UserRole) + 2
+            for idx in range(cb.count()):
+                candidates: list[str] = []
+                for candidate in (
+                    cb.itemData(idx),
+                    cb.itemText(idx),
+                    cb.itemData(idx, display_name_role),
+                ):
+                    text = str(candidate or "").strip()
+                    if text:
+                        candidates.append(text)
+                raw_names = cb.itemData(idx, raw_names_role)
+                if isinstance(raw_names, list):
+                    candidates.extend(str(raw or "").strip() for raw in raw_names if str(raw or "").strip())
+                if any(_norm_name(candidate) == want for candidate in candidates):
+                    return idx
+            return -1
+
+        def _perf_combo_set_current_value(cb: QtWidgets.QComboBox, value: object) -> None:
+            idx = _perf_combo_match_index(cb, value)
+            if idx >= 0:
+                cb.setCurrentIndex(idx)
 
         def _refresh_perf_eq_options() -> None:
-            names = _perf_available_names()
+            options = _perf_available_options()
+            raw_names_role = int(QtCore.Qt.ItemDataRole.UserRole) + 1
+            display_name_role = int(QtCore.Qt.ItemDataRole.UserRole) + 2
             for r in range(tbl_perf.rowCount()):
                 for c in (0, 1):
                     cb = tbl_perf.cellWidget(r, c)
                     if not isinstance(cb, QtWidgets.QComboBox):
                         continue
-                    prev = str(cb.currentText() or "").strip()
+                    prev = self._combo_box_current_value(cb)
                     cb.blockSignals(True)
                     cb.clear()
-                    for n in names:
-                        cb.addItem(n, n)
+                    for option in options:
+                        value = str(option.get("value") or "").strip()
+                        label = str(option.get("label") or option.get("display_name") or value).strip()
+                        if not value or not label:
+                            continue
+                        cb.addItem(label, value)
+                        idx = cb.count() - 1
+                        cb.setItemData(
+                            idx,
+                            [str(raw or "").strip() for raw in (option.get("raw_names") or []) if str(raw or "").strip()],
+                            raw_names_role,
+                        )
+                        cb.setItemData(
+                            idx,
+                            str(option.get("display_name") or label).strip(),
+                            display_name_role,
+                        )
                     if prev:
-                        cb.setCurrentText(prev)
+                        _perf_combo_set_current_value(cb, prev)
                     cb.blockSignals(False)
 
         def _add_perf_row(
@@ -11740,16 +11803,17 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
             _refresh_perf_eq_options()
             if x_val:
-                cbx.setCurrentText(str(x_val))
+                _perf_combo_set_current_value(cbx, x_val)
             if y_val:
-                cby.setCurrentText(str(y_val))
+                _perf_combo_set_current_value(cby, y_val)
             if not x_val or not y_val:
-                names = _perf_available_names()
-                if names:
+                options = _perf_available_options()
+                values = [str(option.get("value") or "").strip() for option in options if str(option.get("value") or "").strip()]
+                if values:
                     if not x_val:
-                        cbx.setCurrentText(names[0])
+                        _perf_combo_set_current_value(cbx, values[0])
                     if not y_val:
-                        cby.setCurrentText(names[1] if len(names) > 1 else names[0])
+                        _perf_combo_set_current_value(cby, values[1] if len(values) > 1 else values[0])
 
         def _remove_perf_selected() -> None:
             r = tbl_perf.currentRow()
@@ -11770,8 +11834,20 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     nm = str(pd.get("name") or "").strip() or None
                     x_spec = pd.get("x") or {}
                     y_spec = pd.get("y") or {}
-                    x_col = str((x_spec.get("column") if isinstance(x_spec, dict) else "") or "").strip()
-                    y_col = str((y_spec.get("column") if isinstance(y_spec, dict) else "") or "").strip()
+                    x_col = str(
+                        (
+                            (x_spec.get("selection_value") if isinstance(x_spec, dict) else "")
+                            or (x_spec.get("column") if isinstance(x_spec, dict) else "")
+                            or ""
+                        )
+                    ).strip()
+                    y_col = str(
+                        (
+                            (y_spec.get("selection_value") if isinstance(y_spec, dict) else "")
+                            or (y_spec.get("column") if isinstance(y_spec, dict) else "")
+                            or ""
+                        )
+                    ).strip()
                     raw_stats = pd.get("stats")
                     if isinstance(raw_stats, list) and all(isinstance(s, str) for s in raw_stats):
                         stats_list = [str(s).strip().lower() for s in raw_stats if str(s).strip()]
@@ -11846,13 +11922,34 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                             for c in self._available_td_y_columns([rn], surface="performance")
                         }
 
+                def _perf_raw_candidates_for_run(selection_value: str, run_name: str) -> list[str]:
+                    raw_names = self._parameter_selection_raw_names(
+                        selection_value,
+                        run_names=([run_name] if run_name else []),
+                        surface="performance",
+                    )
+                    if not raw_names and selection_value:
+                        raw_names = [selection_value]
+                    avail = by_run_norm.get(run_name) or set()
+                    out: list[str] = []
+                    seen: set[str] = set()
+                    for raw_name in raw_names:
+                        key = _norm_name(raw_name)
+                        if not key or key in seen or key not in avail:
+                            continue
+                        seen.add(key)
+                        out.append(str(raw_name).strip())
+                    return out
+
                 for r in range(tbl_perf.rowCount()):
                     cbx = tbl_perf.cellWidget(r, 0)
                     cby = tbl_perf.cellWidget(r, 1)
                     sp = tbl_perf.cellWidget(r, 2)
                     cn = tbl_perf.cellWidget(r, 3)
-                    x_col = str(cbx.currentText() if isinstance(cbx, QtWidgets.QComboBox) else "").strip()
-                    y_col = str(cby.currentText() if isinstance(cby, QtWidgets.QComboBox) else "").strip()
+                    x_col = self._combo_box_current_value(cbx if isinstance(cbx, QtWidgets.QComboBox) else None)
+                    y_col = self._combo_box_current_value(cby if isinstance(cby, QtWidgets.QComboBox) else None)
+                    x_label = str(cbx.currentText() if isinstance(cbx, QtWidgets.QComboBox) else x_col).strip()
+                    y_label = str(cby.currentText() if isinstance(cby, QtWidgets.QComboBox) else y_col).strip()
                     deg = int(sp.value() if isinstance(sp, QtWidgets.QSpinBox) else 2)
                     normx = bool(cn.isChecked() if isinstance(cn, QtWidgets.QCheckBox) else True)
                     nm = str(cbx.property("_perf_name") or "").strip() if isinstance(cbx, QtWidgets.QComboBox) else ""
@@ -11876,25 +11973,34 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                         return
 
                     common_runs = 0
-                    nx = _norm_name(x_col)
-                    ny = _norm_name(y_col)
                     for rn in runs_sel:
-                        avail = by_run_norm.get(rn) or set()
-                        if nx in avail and ny in avail:
+                        x_candidates = _perf_raw_candidates_for_run(x_col, rn)
+                        y_candidates = _perf_raw_candidates_for_run(y_col, rn)
+                        if not x_candidates or not y_candidates:
+                            continue
+                        if any(_norm_name(x_name) != _norm_name(y_name) for x_name in x_candidates for y_name in y_candidates):
                             common_runs += 1
                     if common_runs < req_pts_i:
                         QtWidgets.QMessageBox.information(
                             dlg,
                             "Auto Report",
-                            f"Performance equation '{y_col} vs {x_col}' requires at least {req_pts_i} selected runs where both columns exist.",
+                            f"Performance equation '{y_label} vs {x_label}' requires at least {req_pts_i} selected runs where both parameters exist.",
                         )
                         return
 
                     perf_plotters.append(
                         {
-                            "name": nm or f"{y_col} vs {x_col}",
-                            "x": {"column": x_col},
-                            "y": {"column": y_col},
+                            "name": nm or f"{y_label} vs {x_label}",
+                            "x": (
+                                {"selection_value": x_col}
+                                if _perf_selector_is_canonical(x_col) or x_col
+                                else {}
+                            ),
+                            "y": (
+                                {"selection_value": y_col}
+                                if _perf_selector_is_canonical(y_col) or y_col
+                                else {}
+                            ),
                             "stats": stats_list,
                             "require_min_points": req_pts_i,
                             "fit": {"degree": max(0, min(int(deg), 6)), "normalize_x": bool(normx)},

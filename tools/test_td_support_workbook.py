@@ -10124,6 +10124,89 @@ class TestTDSupportWorkbook(unittest.TestCase):
         self.assertAlmostEqual(float(seq.get("off_time") or 0.0), 1.984)
         self.assertAlmostEqual(float(seq.get("control_period") or 0.0), 2.0)
 
+    def test_support_sync_uses_seq_run_name_for_mat_official_source_with_sparse_context(self) -> None:
+        from openpyxl import Workbook, load_workbook  # type: ignore
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+        from eidat_manager_db import support_paths  # type: ignore
+        from eidat_manager_index import build_index  # type: ignore
+        from eidat_manager_process import process_candidates  # type: ignore
+        from eidat_manager_scan import scan_global_repo  # type: ignore
+        from EIDAT_App_Files.ui_next.backend import read_eidat_index_documents  # type: ignore
+
+        if not _have_scipy():
+            self.skipTest("scipy not installed")
+
+        import numpy as np  # type: ignore
+        from scipy.io import savemat  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            src_dir = root / "Valve" / "ModelX"
+            src_dir.mkdir(parents=True, exist_ok=True)
+            mat_path = src_dir / "SN123_seq1.mat"
+            savemat(
+                str(mat_path),
+                {
+                    "time": np.array([0.0, 1.0, 2.0], dtype=float),
+                    "thrust": np.array([10.0, 11.0, 12.0], dtype=float),
+                    "pressure": np.array([[100.0], [101.0], [102.0]], dtype=float),
+                },
+            )
+
+            paths = support_paths(root)
+            scan_global_repo(paths)
+            results = process_candidates(paths)
+            self.assertEqual(sum(1 for item in results if item.ok), 1)
+
+            build_index(paths)
+            docs = read_eidat_index_documents(root)
+            td_doc = next(
+                doc
+                for doc in docs
+                if str(doc.get("serial_number") or "").strip() == "SN123"
+                and str(doc.get("document_type_source") or "").strip() == "td_serial_official_source"
+            )
+            (root / be.EIDAT_PROJECT_META).write_text(
+                json.dumps(
+                    {
+                        "global_repo": str(root),
+                        "selected_metadata_rel": [str(td_doc.get("metadata_rel") or "").strip()],
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            wb_path = root / "project.xlsx"
+            Workbook().save(str(wb_path))
+            be._sync_td_support_workbook_program_sheets(
+                wb_path,
+                global_repo=root,
+                project_dir=root,
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+            )
+            be._refresh_td_support_run_conditions_sheet(
+                wb_path,
+                project_dir=root,
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+            )
+            support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+            wb = load_workbook(str(support_path), read_only=True, data_only=True)
+            try:
+                ws_prog = wb[be._td_support_program_sheet_name("Unknown", 0)]
+                headers = self._sheet_header_map(ws_prog)
+                self.assertEqual(str(ws_prog.cell(2, headers["source_run_name"]).value or "").strip(), "seq1")
+                self.assertEqual(str(ws_prog.cell(2, headers["source_sheet_name"]).value or "").strip(), "SN123_seq1")
+                self.assertEqual(str(ws_prog.cell(2, headers["condition_key"]).value or "").strip(), "")
+                self.assertEqual(str(ws_prog.cell(2, headers["display_name"]).value or "").strip(), "")
+                self.assertEqual(str(ws_prog.cell(2, headers["run_type"]).value or "").strip(), "")
+                self.assertEqual(str(ws_prog.cell(2, headers["extraction_status"]).value or "").strip(), "incomplete")
+
+                ws_cond = wb["RunConditions"]
+                self.assertEqual(int(ws_cond.max_row or 0), 1)
+            finally:
+                wb.close()
+
     def test_support_sync_enriches_existing_default_rows_from_sequence_context(self) -> None:
         from openpyxl import Workbook  # type: ignore
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore

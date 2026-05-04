@@ -835,6 +835,184 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
                 eqn = tar._fmt_equation(poly)
                 self.assertTrue(bool(eqn))
 
+    def test_prepare_performance_models_resolves_selector_values_per_run(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        class FakeBackend:
+            @staticmethod
+            def td_parameter_selection_raw_names(_context, selection_value, *, run_names=None, surface="", raw_names=None):
+                run_name = str((run_names or [""])[0] or "").strip()
+                mapping = {
+                    ("parameter:specific_impulse", "Run1"): ["isp_raw"],
+                    ("parameter:specific_impulse", "Run2"): ["specific_impulse"],
+                    ("parameter:thrust", "Run1"): ["thrust_raw"],
+                    ("parameter:thrust", "Run2"): ["gross_thrust"],
+                }
+                return mapping.get((str(selection_value or "").strip(), run_name), [str(selection_value or "").strip()])
+
+            @staticmethod
+            def td_parameter_value_display_name(_context, selection_value, fallback=""):
+                return {
+                    "parameter:specific_impulse": "Specific Impulse",
+                    "parameter:thrust": "Thrust",
+                }.get(str(selection_value or "").strip(), str(fallback or "").strip())
+
+            @staticmethod
+            def td_list_metric_y_columns(_db_path, run_name):
+                cols_by_run = {
+                    "Run1": [
+                        {"name": "isp_raw", "units": "s"},
+                        {"name": "thrust_raw", "units": "lbf"},
+                    ],
+                    "Run2": [
+                        {"name": "specific_impulse", "units": "s"},
+                        {"name": "gross_thrust", "units": "lbf"},
+                    ],
+                }
+                return list(cols_by_run.get(str(run_name or "").strip(), []))
+
+            @staticmethod
+            def td_load_metric_series(_db_path, run_name, column_name, stat, **_kwargs):
+                series_map = {
+                    ("Run1", "isp_raw", "mean"): [
+                        {"observation_id": "Run1-SN1", "serial": "SN1", "value_num": 200.0},
+                        {"observation_id": "Run1-SN2", "serial": "SN2", "value_num": 210.0},
+                    ],
+                    ("Run1", "thrust_raw", "mean"): [
+                        {"observation_id": "Run1-SN1", "serial": "SN1", "value_num": 10.0},
+                        {"observation_id": "Run1-SN2", "serial": "SN2", "value_num": 11.0},
+                    ],
+                    ("Run2", "specific_impulse", "mean"): [
+                        {"observation_id": "Run2-SN1", "serial": "SN1", "value_num": 220.0},
+                        {"observation_id": "Run2-SN2", "serial": "SN2", "value_num": 230.0},
+                    ],
+                    ("Run2", "gross_thrust", "mean"): [
+                        {"observation_id": "Run2-SN1", "serial": "SN1", "value_num": 12.0},
+                        {"observation_id": "Run2-SN2", "serial": "SN2", "value_num": 13.0},
+                    ],
+                }
+                return list(series_map.get((str(run_name), str(column_name), str(stat).lower()), []))
+
+        ctx = {
+            "excel_cfg": {},
+            "options": {
+                "performance_plotters": [
+                    {
+                        "name": "Displayed Parameter Fit",
+                        "x": {"selection_value": "parameter:specific_impulse"},
+                        "y": {"selection_value": "parameter:thrust"},
+                        "stats": ["mean"],
+                        "require_min_points": 2,
+                        "fit": {"degree": 0, "normalize_x": True},
+                    }
+                ]
+            },
+            "conn": sqlite3.connect(":memory:"),
+            "be": FakeBackend(),
+            "db_path": Path("cache.sqlite3"),
+            "run_by_name": {
+                "Run1": {"display_name": "Run 1"},
+                "Run2": {"display_name": "Run 2"},
+            },
+            "runs": ["Run1", "Run2"],
+            "all_serials": ["SN1", "SN2"],
+            "hi": ["SN1"],
+            "filter_state": {},
+            "parameter_context": {"normalization": {"source": "test"}},
+        }
+        try:
+            tar._tar_prepare_performance_models(ctx)
+        finally:
+            ctx["conn"].close()
+
+        self.assertEqual(len(ctx["performance_models"]), 1)
+        model = ctx["performance_models"][0]
+        self.assertEqual(model["name"], "Displayed Parameter Fit")
+        self.assertEqual(model["x"]["display_name"], "Specific Impulse")
+        self.assertEqual(model["y"]["display_name"], "Thrust")
+        self.assertEqual(model["x"]["selection_value"], "parameter:specific_impulse")
+        self.assertEqual(model["y"]["selection_value"], "parameter:thrust")
+        self.assertEqual(model["points_total"], 4)
+        self.assertEqual(model["serials_curves"], 2)
+
+        curves = ctx["performance_plot_specs"][0]["curves"]
+        self.assertEqual(len(curves["SN1"]), 2)
+        self.assertEqual(len(curves["SN2"]), 2)
+        self.assertEqual(curves["SN1"][0][:2], (200.0, 10.0))
+        self.assertEqual(curves["SN1"][1][:2], (220.0, 12.0))
+
+    def test_prepare_performance_models_accepts_legacy_raw_targets(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        class FakeBackend:
+            @staticmethod
+            def td_list_metric_y_columns(_db_path, run_name):
+                return [
+                    {"name": "isp", "units": "s"},
+                    {"name": "thrust", "units": "lbf"},
+                ]
+
+            @staticmethod
+            def td_load_metric_series(_db_path, run_name, column_name, stat, **_kwargs):
+                series_map = {
+                    ("Run1", "isp", "mean"): [
+                        {"observation_id": "Run1-SN1", "serial": "SN1", "value_num": 200.0},
+                        {"observation_id": "Run1-SN2", "serial": "SN2", "value_num": 210.0},
+                    ],
+                    ("Run1", "thrust", "mean"): [
+                        {"observation_id": "Run1-SN1", "serial": "SN1", "value_num": 10.0},
+                        {"observation_id": "Run1-SN2", "serial": "SN2", "value_num": 11.0},
+                    ],
+                    ("Run2", "isp", "mean"): [
+                        {"observation_id": "Run2-SN1", "serial": "SN1", "value_num": 220.0},
+                        {"observation_id": "Run2-SN2", "serial": "SN2", "value_num": 230.0},
+                    ],
+                    ("Run2", "thrust", "mean"): [
+                        {"observation_id": "Run2-SN1", "serial": "SN1", "value_num": 12.0},
+                        {"observation_id": "Run2-SN2", "serial": "SN2", "value_num": 13.0},
+                    ],
+                }
+                return list(series_map.get((str(run_name), str(column_name), str(stat).lower()), []))
+
+        ctx = {
+            "excel_cfg": {},
+            "options": {
+                "performance_plotters": [
+                    {
+                        "name": "Legacy Raw Fit",
+                        "x": {"column": "isp"},
+                        "y": {"column": "thrust"},
+                        "stats": ["mean"],
+                        "require_min_points": 2,
+                        "fit": {"degree": 0, "normalize_x": True},
+                    }
+                ]
+            },
+            "conn": sqlite3.connect(":memory:"),
+            "be": FakeBackend(),
+            "db_path": Path("cache.sqlite3"),
+            "run_by_name": {
+                "Run1": {"display_name": "Run 1"},
+                "Run2": {"display_name": "Run 2"},
+            },
+            "runs": ["Run1", "Run2"],
+            "all_serials": ["SN1", "SN2"],
+            "hi": ["SN1"],
+            "filter_state": {},
+            "parameter_context": {},
+        }
+        try:
+            tar._tar_prepare_performance_models(ctx)
+        finally:
+            ctx["conn"].close()
+
+        self.assertEqual(len(ctx["performance_models"]), 1)
+        model = ctx["performance_models"][0]
+        self.assertEqual(model["name"], "Legacy Raw Fit")
+        self.assertEqual(model["x"]["display_name"], "isp")
+        self.assertEqual(model["y"]["display_name"], "thrust")
+        self.assertEqual(model["points_total"], 4)
+
     @unittest.skipUnless(_have_numpy(), "numpy not installed")
     def test_analyze_curve_groups_regrades_mixed_suppression_and_final_watch_uses_final_grade(self):
         from EIDAT_App_Files.ui_next import trend_auto_report as tar

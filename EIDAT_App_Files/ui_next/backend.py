@@ -10430,7 +10430,6 @@ def _td_sequence_context_source_label(
         return ""
     source_run = str(source_run_name or row.get("sheet_name") or "").strip()
     for candidate in (
-        row.get("source_sheet_name"),
         row.get("display_name"),
         row.get("sheet_name"),
     ):
@@ -10497,6 +10496,7 @@ def _td_prefill_support_row_from_sequence_context(
 ) -> dict[str, object]:
     payload = dict(row or {})
     source_run_name = str(payload.get("source_run_name") or "").strip()
+    support_fields = _td_sequence_context_support_fields(source_context)
     source_label = _td_sequence_context_source_label(source_context, source_run_name=source_run_name)
     had_condition_values = _td_support_row_has_condition_values(payload)
     source_label_applied = False
@@ -10519,18 +10519,20 @@ def _td_prefill_support_row_from_sequence_context(
             source_label_applied = True
 
     if not _td_sequence_context_is_usable(source_context):
-        _apply_source_label()
-        fallback_label = source_label or source_run_name
+        for field_name in ("source_sheet_name", "extraction_status", "extraction_reason", "data_mode_raw"):
+            if _td_support_blankish(payload.get(field_name)) and not _td_support_blankish(support_fields.get(field_name)):
+                payload[field_name] = support_fields.get(field_name)
         if blank_unusable_defaults and not _td_support_row_has_condition_values(payload):
-            if _td_support_blankish(payload.get("condition_key")) and fallback_label:
-                payload["condition_key"] = fallback_label
-            if _td_support_blankish(payload.get("display_name")) and fallback_label:
-                payload["display_name"] = fallback_label
+            if _td_support_name_is_default(payload.get("condition_key"), source_run_name):
+                payload["condition_key"] = ""
+            if _td_support_name_is_default(payload.get("display_name"), source_run_name):
+                payload["display_name"] = ""
+        else:
+            _apply_source_label()
         if source_label_applied:
             payload["__source_label_promoted"] = True
         return payload
 
-    support_fields = _td_sequence_context_support_fields(source_context)
     for field_name, field_value in support_fields.items():
         if _td_support_blankish(payload.get(field_name)):
             payload[field_name] = field_value
@@ -12767,7 +12769,7 @@ def _td_group_program_rows_into_conditions(
             continue
         source_run_name = str(raw_row.get("source_run_name") or "").strip()
         is_promotable = _td_support_row_is_promotable(raw_row)
-        if not is_promotable and not source_run_name:
+        if not is_promotable:
             if diag is not None:
                 diag["dropped"] += 1
             continue
@@ -45175,11 +45177,13 @@ def _load_excel_trend_config(path: Path) -> dict:
             y_spec = raw.get("y") or {}
             if not isinstance(x_spec, dict) or not isinstance(y_spec, dict):
                 raise ValueError(f"Excel trend config `performance_plotters[{idx}].x/.y` must be objects.")
+            x_sel = str(x_spec.get("selection_value") or "").strip()
+            y_sel = str(y_spec.get("selection_value") or "").strip()
             x_col = str(x_spec.get("column") or "").strip()
             y_col = str(y_spec.get("column") or "").strip()
-            if not x_col or not y_col:
+            if not (x_sel or x_col) or not (y_sel or y_col):
                 raise ValueError(
-                    f"Excel trend config `performance_plotters[{idx}]` must include `x.column` and `y.column`."
+                    f"Excel trend config `performance_plotters[{idx}]` must include `x.selection_value`/`x.column` and `y.selection_value`/`y.column`."
                 )
 
             stats_raw = raw.get("stats", None)
@@ -45217,8 +45221,14 @@ def _load_excel_trend_config(path: Path) -> dict:
             normalized.append(
                 {
                     "name": name,
-                    "x": {"column": x_col},
-                    "y": {"column": y_col},
+                    "x": {
+                        **({"selection_value": x_sel} if x_sel else {}),
+                        **({"column": x_col} if x_col else {}),
+                    },
+                    "y": {
+                        **({"selection_value": y_sel} if y_sel else {}),
+                        **({"column": y_col} if y_col else {}),
+                    },
                     "stats": stats,
                     "fit": {"degree": degree, "normalize_x": normalize_x},
                     "require_min_points": require_min_points,

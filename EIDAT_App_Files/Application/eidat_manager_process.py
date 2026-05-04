@@ -1057,14 +1057,18 @@ def _bundle_identity_path(member: MatBundleMember) -> Path:
     return member.file_path.with_name(f"{member.bundle_stem}.mat")
 
 
-def _bundle_folder_asset_hints(member: MatBundleMember) -> dict[str, str]:
-    parent = member.file_path.parent
+def _mat_folder_asset_hints(file_path: Path) -> dict[str, str]:
+    parent = Path(file_path).expanduser().parent
     asset_specific_type = str(parent.name or "").strip()
     asset_type = str(parent.parent.name or "").strip() if parent.parent != parent else ""
     return {
         "asset_type": asset_type or "Unknown",
         "asset_specific_type": asset_specific_type or "Unknown",
     }
+
+
+def _bundle_folder_asset_hints(member: MatBundleMember) -> dict[str, str]:
+    return _mat_folder_asset_hints(member.file_path)
 
 
 def _merge_bundle_metadata(items: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1280,6 +1284,16 @@ def _td_agg_natural_sequence_key(value: object) -> list[tuple[int, object]]:
     return key
 
 
+def _td_agg_effective_sequence_name(*, sheet_name: object, source_sheet_name: object) -> str:
+    source_text = str(source_sheet_name or "").strip()
+    if _td_agg_is_sequence_sheet_name(source_text):
+        return source_text
+    sheet_text = str(sheet_name or "").strip()
+    if _td_agg_is_sequence_sheet_name(sheet_text):
+        return sheet_text
+    return source_text or sheet_text
+
+
 def _td_agg_normalize_serial(value: object) -> str:
     txt = str(value or "").strip()
     if not txt or txt.casefold() in {"unknown", "none", "null", "n/a"}:
@@ -1468,7 +1482,13 @@ def _td_agg_source_imported_epoch_ns(conn: sqlite3.Connection) -> int:
 
 
 def _td_agg_duplicate_sequence_name(member: Mapping[str, Any]) -> str:
-    return str(member.get("source_sheet_name") or member.get("sheet_name") or "").strip()
+    effective = str(member.get("effective_sheet_name") or "").strip()
+    if effective:
+        return effective
+    return _td_agg_effective_sequence_name(
+        sheet_name=member.get("sheet_name"),
+        source_sheet_name=member.get("source_sheet_name"),
+    )
 
 
 def _td_agg_duplicate_sequence_key(member: Mapping[str, Any]) -> str:
@@ -1563,8 +1583,11 @@ def _td_agg_collect_members(paths: SupportPaths) -> tuple[list[dict[str, Any]], 
                     source_sheet_name = str(
                         sheet_row["source_sheet_name"] if "source_sheet_name" in sheet_row.keys() else sheet_name
                     ).strip()
-                    real_tab_name = source_sheet_name or sheet_name
-                    if not _td_agg_is_sequence_sheet_name(real_tab_name):
+                    effective_sheet_name = _td_agg_effective_sequence_name(
+                        sheet_name=sheet_name,
+                        source_sheet_name=source_sheet_name,
+                    )
+                    if not _td_agg_is_sequence_sheet_name(effective_sheet_name):
                         continue
                     tab_serial, tab_serial_source = _td_agg_extract_tab_serial(
                         src,
@@ -1583,11 +1606,12 @@ def _td_agg_collect_members(paths: SupportPaths) -> tuple[list[dict[str, Any]], 
                     source_members.append(
                         {
                             "sheet_name": sheet_name,
-                            "source_sheet_name": real_tab_name,
+                            "source_sheet_name": source_sheet_name,
+                            "effective_sheet_name": effective_sheet_name,
                             "table_name": table_name,
                             "import_order": int(import_order),
-                            "sequence_token": _td_agg_sequence_token(real_tab_name),
-                            "sequence_order_key": _td_agg_natural_sequence_key(real_tab_name),
+                            "sequence_token": _td_agg_sequence_token(effective_sheet_name),
+                            "sequence_order_key": _td_agg_natural_sequence_key(effective_sheet_name),
                             "sheet_info": {k: sheet_row[k] for k in sheet_row.keys()},
                             "tab_serial": _td_agg_normalize_serial(tab_serial),
                             "tab_serial_source": str(tab_serial_source or "").strip(),
@@ -1642,6 +1666,7 @@ def _td_agg_collect_members(paths: SupportPaths) -> tuple[list[dict[str, Any]], 
                     "source_imported_epoch_ns": int(item.get("source_imported_epoch_ns") or 0),
                     "sheet_name": str(item.get("sheet_name") or ""),
                     "source_sheet_name": str(item.get("source_sheet_name") or ""),
+                    "effective_sheet_name": str(item.get("effective_sheet_name") or ""),
                     "table_name": str(item.get("table_name") or ""),
                     "import_order": int(item.get("import_order") or 0),
                     "sequence_token": str(item.get("sequence_token") or ""),
@@ -1903,14 +1928,15 @@ def _td_agg_write_group(
             source_sqlite = Path(member.get("sqlite_path") or "")
             source_sheet = str(member.get("sheet_name") or "").strip()
             source_tab = str(member.get("source_sheet_name") or source_sheet).strip()
+            effective_sheet_name = _td_agg_duplicate_sequence_name(member)
             source_table = str(member.get("table_name") or "").strip()
-            base_run = source_tab or source_sheet or f"seq_{idx}"
+            base_run = effective_sheet_name or source_sheet or f"seq_{idx}"
             output_run = base_run
             duplicate_of = ""
             tab_serial = str(member.get("tab_serial") or "").strip()
             if tab_serial and tab_serial != serial:
                 warnings.append(
-                    f"Ignored tab serial {tab_serial!r} for {source_tab or source_sheet or output_run!r}; using authoritative serial {serial!r}."
+                    f"Ignored tab serial {tab_serial!r} for {output_run!r}; using authoritative serial {serial!r}."
                 )
             output_table = _td_agg_table_name(output_run)
             try:
@@ -2642,11 +2668,13 @@ def process_candidates(
                             )
                         except Exception:
                             raw_meta = extracted_meta if isinstance(extracted_meta, dict) else {}
-                        if is_mat_bundle and bundle_seed is not None and isinstance(raw_meta, dict):
-                            folder_hints = _bundle_folder_asset_hints(bundle_seed)
-                            raw_meta["serial_number"] = bundle_seed.serial_number
-                            raw_meta["document_type"] = "TD"
-                            raw_meta["document_type_acronym"] = "TD"
+                        if is_mat and isinstance(raw_meta, dict):
+                            mat_hint_path = bundle_seed.file_path if is_mat_bundle and bundle_seed is not None else abs_path
+                            folder_hints = _mat_folder_asset_hints(mat_hint_path)
+                            if is_mat_bundle and bundle_seed is not None:
+                                raw_meta["serial_number"] = bundle_seed.serial_number
+                                raw_meta["document_type"] = "TD"
+                                raw_meta["document_type_acronym"] = "TD"
                             if str(raw_meta.get("asset_type") or "").strip() in {"", "Unknown", "unknown"}:
                                 raw_meta["asset_type"] = folder_hints.get("asset_type") or "Unknown"
                             if str(raw_meta.get("asset_specific_type") or "").strip() in {"", "Unknown", "unknown"}:
@@ -2798,11 +2826,13 @@ def process_candidates(
                             extracted_meta=raw_meta,
                             default_document_type="TD" if is_mat else "Unknown",
                         )
-                        if is_mat_bundle and bundle_seed is not None:
-                            folder_hints = _bundle_folder_asset_hints(bundle_seed)
-                            clean_meta["serial_number"] = bundle_seed.serial_number
-                            clean_meta["document_type"] = "TD"
-                            clean_meta["document_type_acronym"] = "TD"
+                        if is_mat:
+                            mat_hint_path = bundle_seed.file_path if is_mat_bundle and bundle_seed is not None else abs_path
+                            folder_hints = _mat_folder_asset_hints(mat_hint_path)
+                            if is_mat_bundle and bundle_seed is not None:
+                                clean_meta["serial_number"] = bundle_seed.serial_number
+                                clean_meta["document_type"] = "TD"
+                                clean_meta["document_type_acronym"] = "TD"
                             if str(clean_meta.get("asset_type") or "").strip() in {"", "Unknown", "unknown"}:
                                 clean_meta["asset_type"] = folder_hints.get("asset_type") or "Unknown"
                             if str(clean_meta.get("asset_specific_type") or "").strip() in {"", "Unknown", "unknown"}:

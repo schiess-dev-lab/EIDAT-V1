@@ -22,6 +22,14 @@ except Exception:  # pragma: no cover
     # Package mode fallback.
     from .eidat_manager_db import support_paths  # type: ignore
 
+try:
+    from eidat_manager_mat_bundle import detect_mat_bundle_member  # type: ignore
+except Exception:  # pragma: no cover
+    try:
+        from .eidat_manager_mat_bundle import detect_mat_bundle_member  # type: ignore
+    except Exception:  # pragma: no cover
+        detect_mat_bundle_member = None  # type: ignore
+
 
 EXCEL_EXTENSIONS = {".xlsx", ".xlsm", ".xls"}
 MAT_EXTENSIONS = {".mat"}
@@ -874,6 +882,164 @@ def _sequence_context_from_mat_payload(
     )
 
 
+def _mat_header_runtime_config() -> tuple[list[dict[str, Any]], float, set[str]]:
+    env = _load_test_data_env()
+    fuzzy_enabled = _truthy(env.get("EIDAT_TEST_DATA_FUZZY_HEADER_STICK", "1"))
+    fuzzy_min_ratio = _float(env.get("EIDAT_TEST_DATA_FUZZY_HEADER_MIN_RATIO", "0.82"), 0.82)
+    trend_col_defs = _load_trend_column_defs() if fuzzy_enabled else []
+    canonical_defs = _canonical_header_defs(trend_col_defs)
+    allowed_header_norms = _mat_relevant_header_targets(canonical_defs, fuzzy_min_ratio=float(fuzzy_min_ratio))
+    return canonical_defs, float(fuzzy_min_ratio), allowed_header_norms
+
+
+def _mat_detect_sequence_member(mat_path: Path) -> Any | None:
+    if detect_mat_bundle_member is None:
+        return None
+    try:
+        return detect_mat_bundle_member(Path(mat_path).expanduser(), repo_root=None)
+    except Exception:
+        return None
+
+
+def _ensure_mat_sqlite_schema(conn: sqlite3.Connection) -> None:
+    conn.execute("PRAGMA journal_mode=DELETE;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA temp_store=MEMORY;")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS __workbook (
+          source_file TEXT NOT NULL,
+          imported_epoch_ns INTEGER NOT NULL,
+          excel_size_bytes INTEGER NOT NULL,
+          excel_mtime_ns INTEGER NOT NULL
+        );
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS __sheet_info (
+          sheet_name TEXT PRIMARY KEY,
+          source_sheet_name TEXT,
+          table_name TEXT NOT NULL,
+          header_row INTEGER NOT NULL,
+          import_order INTEGER,
+          excel_col_indices_json TEXT NOT NULL,
+          headers_json TEXT NOT NULL,
+          columns_json TEXT NOT NULL,
+          rows_inserted INTEGER NOT NULL
+        );
+        """
+    )
+    try:
+        existing_cols = {r[1] for r in conn.execute("PRAGMA table_info(__sheet_info)").fetchall()}
+        if "source_sheet_name" not in existing_cols:
+            conn.execute("ALTER TABLE __sheet_info ADD COLUMN source_sheet_name TEXT;")
+        if "import_order" not in existing_cols:
+            conn.execute("ALTER TABLE __sheet_info ADD COLUMN import_order INTEGER;")
+        if "mapped_headers_json" not in existing_cols:
+            conn.execute("ALTER TABLE __sheet_info ADD COLUMN mapped_headers_json TEXT;")
+    except Exception:
+        pass
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS __column_map (
+          sheet_name TEXT NOT NULL,
+          header TEXT NOT NULL,
+          mapped_header TEXT NOT NULL,
+          sqlite_column TEXT NOT NULL,
+          PRIMARY KEY(sheet_name, header)
+        );
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS __meta_cells (
+          sheet_name TEXT NOT NULL,
+          excel_row INTEGER NOT NULL,
+          excel_col INTEGER NOT NULL,
+          value TEXT NOT NULL
+        );
+        """
+    )
+    _create_sequence_context_table(conn)
+
+
+def _insert_mat_run_sheet(
+    conn: sqlite3.Connection,
+    *,
+    sheet_name: str,
+    source_sheet_name: str,
+    headers: Sequence[str],
+    mapped_headers: Sequence[str],
+    col_idents: Sequence[str],
+    rows: Sequence[Sequence[Any]],
+    import_order: int,
+    sequence_context: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    safe_sheet_name = str(sheet_name or "data").strip() or "data"
+    safe_source_sheet_name = str(source_sheet_name or safe_sheet_name).strip() or safe_sheet_name
+    table_name = _safe_table_name(safe_sheet_name)
+    col_defs = ", ".join([f"\"{c}\" REAL" for c in col_idents])
+    conn.execute(f"DROP TABLE IF EXISTS \"{table_name}\";")
+    conn.execute(f"CREATE TABLE \"{table_name}\" (excel_row INTEGER NOT NULL, {col_defs});")
+
+    placeholders = ", ".join(["?"] * (1 + len(col_idents)))
+    ins_sql = (
+        f"INSERT INTO \"{table_name}\" (excel_row, "
+        + ", ".join([f"\"{c}\"" for c in col_idents])
+        + f") VALUES({placeholders})"
+    )
+    batch = [(idx + 2, *tuple(row)) for idx, row in enumerate(rows)]
+    if batch:
+        conn.executemany(ins_sql, batch)
+    rows_inserted = int(len(batch))
+
+    excel_col_indices = [i + 1 for i in range(len(headers))]
+    conn.execute(
+        """
+        INSERT INTO __sheet_info(
+          sheet_name, source_sheet_name, table_name, header_row, import_order,
+          excel_col_indices_json, headers_json, columns_json,
+          mapped_headers_json,
+          rows_inserted
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            safe_sheet_name,
+            safe_source_sheet_name,
+            table_name,
+            1,
+            int(import_order),
+            json.dumps(excel_col_indices),
+            json.dumps(list(headers), ensure_ascii=False),
+            json.dumps({h: c for h, c in zip(headers, col_idents)}, ensure_ascii=False),
+            json.dumps(list(mapped_headers), ensure_ascii=False),
+            rows_inserted,
+        ),
+    )
+    conn.executemany(
+        "INSERT OR REPLACE INTO __column_map(sheet_name, header, mapped_header, sqlite_column) VALUES(?, ?, ?, ?)",
+        [
+            (safe_sheet_name, h, mh, ci)
+            for h, mh, ci in zip(headers, mapped_headers, col_idents)
+        ],
+    )
+
+    sequence_context_row = dict(sequence_context or {})
+    sequence_context_row["sheet_name"] = safe_sheet_name
+    sequence_context_row["source_sheet_name"] = safe_source_sheet_name
+    _insert_sequence_context_row(conn, sequence_context_row)
+    return {
+        "sheet": safe_sheet_name,
+        "source_sheet_name": safe_source_sheet_name,
+        "table": table_name,
+        "header_row": 1,
+        "columns": list(headers),
+        "mapped_columns": list(mapped_headers),
+        "rows_inserted": rows_inserted,
+    }
+
+
 def _write_mat_sqlite(*, mat_path: Path, sqlite_path: Path, overwrite: bool) -> dict[str, Any]:
     sqlite_path.parent.mkdir(parents=True, exist_ok=True)
     if sqlite_path.exists():
@@ -890,166 +1056,87 @@ def _write_mat_sqlite(*, mat_path: Path, sqlite_path: Path, overwrite: bool) -> 
             pass
 
     payload = _load_mat_payload(mat_path)
-    sheets = _mat_payload_to_frames(payload)
-    default_sequence_context = _sequence_context_from_mat_payload(
-        sheet_name="data",
-        source_sheet_name="data",
-        payload=payload,
-        unavailable_reason="sequence context unavailable for MAT source",
-    )
+    sequence_member = _mat_detect_sequence_member(mat_path)
     _stderr(f"[MAT] {mat_path}")
 
     conn = sqlite3.connect(str(sqlite_path))
     try:
-        conn.execute("PRAGMA journal_mode=DELETE;")
-        conn.execute("PRAGMA synchronous=NORMAL;")
-        conn.execute("PRAGMA temp_store=MEMORY;")
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS __workbook (
-              source_file TEXT NOT NULL,
-              imported_epoch_ns INTEGER NOT NULL,
-              excel_size_bytes INTEGER NOT NULL,
-              excel_mtime_ns INTEGER NOT NULL
-            );
-            """
-        )
+        _ensure_mat_sqlite_schema(conn)
         st = mat_path.stat()
         conn.execute(
             "INSERT INTO __workbook(source_file, imported_epoch_ns, excel_size_bytes, excel_mtime_ns) VALUES(?, ?, ?, ?)",
             (str(mat_path), int(_now_ns()), int(st.st_size), int(st.st_mtime_ns)),
         )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS __sheet_info (
-              sheet_name TEXT PRIMARY KEY,
-              source_sheet_name TEXT,
-              table_name TEXT NOT NULL,
-              header_row INTEGER NOT NULL,
-              import_order INTEGER,
-              excel_col_indices_json TEXT NOT NULL,
-              headers_json TEXT NOT NULL,
-              columns_json TEXT NOT NULL,
-              rows_inserted INTEGER NOT NULL
-            );
-            """
-        )
-        try:
-            existing_cols = {r[1] for r in conn.execute("PRAGMA table_info(__sheet_info)").fetchall()}
-            if "source_sheet_name" not in existing_cols:
-                conn.execute("ALTER TABLE __sheet_info ADD COLUMN source_sheet_name TEXT;")
-            if "import_order" not in existing_cols:
-                conn.execute("ALTER TABLE __sheet_info ADD COLUMN import_order INTEGER;")
-            if "mapped_headers_json" not in existing_cols:
-                conn.execute("ALTER TABLE __sheet_info ADD COLUMN mapped_headers_json TEXT;")
-        except Exception:
-            pass
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS __column_map (
-              sheet_name TEXT NOT NULL,
-              header TEXT NOT NULL,
-              mapped_header TEXT NOT NULL,
-              sqlite_column TEXT NOT NULL,
-              PRIMARY KEY(sheet_name, header)
-            );
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS __meta_cells (
-              sheet_name TEXT NOT NULL,
-              excel_row INTEGER NOT NULL,
-              excel_col INTEGER NOT NULL,
-              value TEXT NOT NULL
-            );
-            """
-        )
-        _create_sequence_context_table(conn)
-
         outputs: list[dict[str, Any]] = []
-        for sheet_name, df in sheets:
-            safe_sheet_name = str(sheet_name or "data")
-            if len(list(df.columns)) <= 0:
-                try:
-                    import pandas as pd  # type: ignore
-                    df = pd.DataFrame({"value": []})
-                except Exception:
-                    pass
-            table_name = _safe_table_name(safe_sheet_name)
-            columns = [str(c or "").strip() or f"col_{i+1}" for i, c in enumerate(list(df.columns))]
-            mapped_headers = list(columns)
-            col_idents = _dedupe_idents(columns)
-            col_defs = ", ".join([f"\"{c}\" REAL" for c in col_idents])
-            conn.execute(f"DROP TABLE IF EXISTS \"{table_name}\";")
-            conn.execute(f"CREATE TABLE \"{table_name}\" (excel_row INTEGER NOT NULL, {col_defs});")
-
-            placeholders = ", ".join(["?"] * (1 + len(col_idents)))
-            ins_sql = (
-                f"INSERT INTO \"{table_name}\" (excel_row, "
-                + ", ".join([f"\"{c}\"" for c in col_idents])
-                + f") VALUES({placeholders})"
+        if sequence_member is not None:
+            canonical_defs, fuzzy_min_ratio, allowed_header_norms = _mat_header_runtime_config()
+            sequence_name = str(getattr(sequence_member, "sequence_name", "") or "").strip().lower()
+            source_sheet_name = str(mat_path.stem or "").strip() or sequence_name or "data"
+            run = _mat_extract_run_table(
+                mat_path,
+                payload=payload,
+                canonical_defs=canonical_defs,
+                fuzzy_min_ratio=float(fuzzy_min_ratio),
+                allowed_header_norms=allowed_header_norms,
             )
-
-            rows_inserted = 0
-            batch: list[tuple[Any, ...]] = []
-            for pos, row in enumerate(df.itertuples(index=False, name=None), start=2):
-                vals = [_mat_coerce_scalar(v) for v in list(row)]
-                batch.append((int(pos), *vals))
-                if len(batch) >= 1000:
-                    conn.executemany(ins_sql, batch)
-                    rows_inserted += len(batch)
-                    batch.clear()
-            if batch:
-                conn.executemany(ins_sql, batch)
-                rows_inserted += len(batch)
-                batch.clear()
-
-            excel_col_indices = [i + 1 for i in range(len(columns))]
-            conn.execute(
-                """
-                INSERT INTO __sheet_info(
-                  sheet_name, source_sheet_name, table_name, header_row, import_order,
-                  excel_col_indices_json, headers_json, columns_json,
-                  mapped_headers_json,
-                  rows_inserted
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    safe_sheet_name,
-                    safe_sheet_name,
-                    table_name,
-                    1,
-                    int(len(outputs) + 1),
-                    json.dumps(excel_col_indices),
-                    json.dumps(columns, ensure_ascii=False),
-                    json.dumps({h: c for h, c in zip(columns, col_idents)}, ensure_ascii=False),
-                    json.dumps(mapped_headers, ensure_ascii=False),
-                    int(rows_inserted),
-                ),
+            sequence_context = _sequence_context_from_mat_payload(
+                sheet_name=sequence_name or source_sheet_name,
+                source_sheet_name=source_sheet_name,
+                payload=payload,
+                unavailable_reason="sequence context unavailable for MAT source",
             )
-            try:
-                conn.executemany(
-                    "INSERT OR REPLACE INTO __column_map(sheet_name, header, mapped_header, sqlite_column) VALUES(?, ?, ?, ?)",
-                    [(safe_sheet_name, h, h, ci) for h, ci in zip(columns, col_idents)],
+            output = _insert_mat_run_sheet(
+                conn,
+                sheet_name=sequence_name or source_sheet_name,
+                source_sheet_name=source_sheet_name,
+                headers=list(run["headers"]),
+                mapped_headers=list(run["mapped_headers"]),
+                col_idents=list(run["col_idents"]),
+                rows=list(run["rows"]),
+                import_order=1,
+                sequence_context=sequence_context,
+            )
+            outputs.append(output)
+            _stderr(f"[MAT SEQ] {mat_path.name} -> {output['sheet']}: rows={output['rows_inserted']}")
+        else:
+            sheets = _mat_payload_to_frames(payload)
+            default_sequence_context = _sequence_context_from_mat_payload(
+                sheet_name="data",
+                source_sheet_name="data",
+                payload=payload,
+                unavailable_reason="sequence context unavailable for MAT source",
+            )
+            for sheet_name, df in sheets:
+                safe_sheet_name = str(sheet_name or "data")
+                if len(list(df.columns)) <= 0:
+                    try:
+                        import pandas as pd  # type: ignore
+                        df = pd.DataFrame({"value": []})
+                    except Exception:
+                        pass
+                columns = [str(c or "").strip() or f"col_{i+1}" for i, c in enumerate(list(df.columns))]
+                mapped_headers = list(columns)
+                col_idents = _dedupe_idents(columns)
+                rows: list[tuple[Any, ...]] = []
+                for row in df.itertuples(index=False, name=None):
+                    vals = [_mat_coerce_scalar(v) for v in list(row)]
+                    rows.append(tuple(vals))
+                sequence_context = dict(default_sequence_context)
+                sequence_context["sheet_name"] = safe_sheet_name
+                sequence_context["source_sheet_name"] = safe_sheet_name
+                output = _insert_mat_run_sheet(
+                    conn,
+                    sheet_name=safe_sheet_name,
+                    source_sheet_name=safe_sheet_name,
+                    headers=columns,
+                    mapped_headers=mapped_headers,
+                    col_idents=col_idents,
+                    rows=rows,
+                    import_order=int(len(outputs) + 1),
+                    sequence_context=sequence_context,
                 )
-            except Exception:
-                pass
-            sequence_context = dict(default_sequence_context)
-            sequence_context["sheet_name"] = safe_sheet_name
-            sequence_context["source_sheet_name"] = safe_sheet_name
-            _insert_sequence_context_row(conn, sequence_context)
-            outputs.append(
-                {
-                    "sheet": safe_sheet_name,
-                    "table": table_name,
-                    "header_row": 1,
-                    "columns": list(columns),
-                    "mapped_columns": list(mapped_headers),
-                    "rows_inserted": int(rows_inserted),
-                }
-            )
-            _stderr(f"[SHEET DONE] {safe_sheet_name}: rows={rows_inserted}")
+                outputs.append(output)
+                _stderr(f"[SHEET DONE] {safe_sheet_name}: rows={output['rows_inserted']}")
 
         conn.commit()
     finally:
@@ -1247,75 +1334,11 @@ def write_mat_bundle_sqlite(
         except Exception:
             pass
 
-    env = _load_test_data_env()
-    fuzzy_enabled = _truthy(env.get("EIDAT_TEST_DATA_FUZZY_HEADER_STICK", "1"))
-    fuzzy_min_ratio = _float(env.get("EIDAT_TEST_DATA_FUZZY_HEADER_MIN_RATIO", "0.82"), 0.82)
-    trend_col_defs = _load_trend_column_defs() if fuzzy_enabled else []
-    canonical_defs = _canonical_header_defs(trend_col_defs)
-    allowed_header_norms = _mat_relevant_header_targets(canonical_defs, fuzzy_min_ratio=float(fuzzy_min_ratio))
+    canonical_defs, fuzzy_min_ratio, allowed_header_norms = _mat_header_runtime_config()
 
     conn = sqlite3.connect(str(sqlite_path))
     try:
-        conn.execute("PRAGMA journal_mode=DELETE;")
-        conn.execute("PRAGMA synchronous=NORMAL;")
-        conn.execute("PRAGMA temp_store=MEMORY;")
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS __workbook (
-              source_file TEXT NOT NULL,
-              imported_epoch_ns INTEGER NOT NULL,
-              excel_size_bytes INTEGER NOT NULL,
-              excel_mtime_ns INTEGER NOT NULL
-            );
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS __sheet_info (
-              sheet_name TEXT PRIMARY KEY,
-              source_sheet_name TEXT,
-              table_name TEXT NOT NULL,
-              header_row INTEGER NOT NULL,
-              import_order INTEGER,
-              excel_col_indices_json TEXT NOT NULL,
-              headers_json TEXT NOT NULL,
-              columns_json TEXT NOT NULL,
-              rows_inserted INTEGER NOT NULL
-            );
-            """
-        )
-        try:
-            existing_cols = {r[1] for r in conn.execute("PRAGMA table_info(__sheet_info)").fetchall()}
-            if "source_sheet_name" not in existing_cols:
-                conn.execute("ALTER TABLE __sheet_info ADD COLUMN source_sheet_name TEXT;")
-            if "import_order" not in existing_cols:
-                conn.execute("ALTER TABLE __sheet_info ADD COLUMN import_order INTEGER;")
-            if "mapped_headers_json" not in existing_cols:
-                conn.execute("ALTER TABLE __sheet_info ADD COLUMN mapped_headers_json TEXT;")
-        except Exception:
-            pass
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS __column_map (
-              sheet_name TEXT NOT NULL,
-              header TEXT NOT NULL,
-              mapped_header TEXT NOT NULL,
-              sqlite_column TEXT NOT NULL,
-              PRIMARY KEY(sheet_name, header)
-            );
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS __meta_cells (
-              sheet_name TEXT NOT NULL,
-              excel_row INTEGER NOT NULL,
-              excel_col INTEGER NOT NULL,
-              value TEXT NOT NULL
-            );
-            """
-        )
-        _create_sequence_context_table(conn)
+        _ensure_mat_sqlite_schema(conn)
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS __mat_bundle_members (
@@ -1339,10 +1362,14 @@ def write_mat_bundle_sqlite(
                 (str(mat_path), int(_now_ns()), int(st.st_size), int(st.st_mtime_ns)),
             )
 
-            seq_name = str(mat_path.stem or "").strip()
-            m = re.search(r"(seq\d+)$", seq_name, flags=re.IGNORECASE)
-            if m:
-                seq_name = str(m.group(1) or "").lower() or seq_name
+            bundle_member = _mat_detect_sequence_member(mat_path)
+            seq_name = str(getattr(bundle_member, "sequence_name", "") or "").strip().lower()
+            if not seq_name:
+                seq_name = str(mat_path.stem or "").strip()
+                m = re.search(r"(seq\d+)$", seq_name, flags=re.IGNORECASE)
+                if m:
+                    seq_name = str(m.group(1) or "").lower() or seq_name
+            source_sheet_name = str(mat_path.stem or "").strip() or seq_name
             payload = _load_mat_payload(mat_path)
             run = _mat_extract_run_table(
                 mat_path,
@@ -1353,53 +1380,20 @@ def write_mat_bundle_sqlite(
             )
             sequence_context = _sequence_context_from_mat_payload(
                 sheet_name=seq_name,
-                source_sheet_name=seq_name,
+                source_sheet_name=source_sheet_name,
                 payload=payload,
                 unavailable_reason="sequence context unavailable for MAT bundle source",
             )
-            table_name = _safe_table_name(seq_name)
-            col_defs = ", ".join([f"\"{c}\" REAL" for c in run["col_idents"]])
-            conn.execute(f"DROP TABLE IF EXISTS \"{table_name}\";")
-            conn.execute(f"CREATE TABLE \"{table_name}\" (excel_row INTEGER NOT NULL, {col_defs});")
-
-            placeholders = ", ".join(["?"] * (1 + len(run["col_idents"])))
-            ins_sql = (
-                f"INSERT INTO \"{table_name}\" (excel_row, "
-                + ", ".join([f"\"{c}\"" for c in run["col_idents"]])
-                + f") VALUES({placeholders})"
-            )
-            batch = [(idx + 2, *row) for idx, row in enumerate(run["rows"])]
-            if batch:
-                conn.executemany(ins_sql, batch)
-            excel_col_indices = [i + 1 for i in range(len(run["headers"]))]
-            conn.execute(
-                """
-                INSERT INTO __sheet_info(
-                  sheet_name, source_sheet_name, table_name, header_row, import_order,
-                  excel_col_indices_json, headers_json, columns_json,
-                  mapped_headers_json,
-                  rows_inserted
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    seq_name,
-                    seq_name,
-                    table_name,
-                    1,
-                    int(len(outputs) + 1),
-                    json.dumps(excel_col_indices),
-                    json.dumps(run["headers"], ensure_ascii=False),
-                    json.dumps({h: c for h, c in zip(run["headers"], run["col_idents"])}, ensure_ascii=False),
-                    json.dumps(run["mapped_headers"], ensure_ascii=False),
-                    int(run["row_count"]),
-                ),
-            )
-            conn.executemany(
-                "INSERT OR REPLACE INTO __column_map(sheet_name, header, mapped_header, sqlite_column) VALUES(?, ?, ?, ?)",
-                [
-                    (seq_name, h, mh, ci)
-                    for h, mh, ci in zip(run["headers"], run["mapped_headers"], run["col_idents"])
-                ],
+            output = _insert_mat_run_sheet(
+                conn,
+                sheet_name=seq_name,
+                source_sheet_name=source_sheet_name,
+                headers=list(run["headers"]),
+                mapped_headers=list(run["mapped_headers"]),
+                col_idents=list(run["col_idents"]),
+                rows=list(run["rows"]),
+                import_order=int(len(outputs) + 1),
+                sequence_context=sequence_context,
             )
             conn.execute(
                 """
@@ -1413,24 +1407,14 @@ def write_mat_bundle_sqlite(
                     str(mat_path),
                     int(st.st_mtime_ns),
                     int(st.st_size),
-                    int(run["row_count"]),
+                    int(output["rows_inserted"]),
                     "ok",
                     "",
                 ),
             )
-            _insert_sequence_context_row(conn, sequence_context)
-            outputs.append(
-                {
-                    "sheet": seq_name,
-                    "table": table_name,
-                    "header_row": 1,
-                    "columns": list(run["headers"]),
-                    "mapped_columns": list(run["mapped_headers"]),
-                    "rows_inserted": int(run["row_count"]),
-                    "source_file": str(mat_path),
-                }
-            )
-            _stderr(f"[MAT BUNDLE] {mat_path.name} -> {seq_name}: rows={run['row_count']}")
+            output["source_file"] = str(mat_path)
+            outputs.append(output)
+            _stderr(f"[MAT BUNDLE] {mat_path.name} -> {seq_name}: rows={output['rows_inserted']}")
 
         conn.commit()
     finally:

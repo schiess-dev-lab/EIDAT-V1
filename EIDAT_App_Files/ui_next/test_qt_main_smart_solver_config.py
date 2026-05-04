@@ -1548,9 +1548,210 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
                 self.assertEqual(payload["certifying_program"], "Program Alpha")
                 self.assertEqual(payload["highlighted_serials"], ["SN-002"])
                 self.assertEqual(payload["filtered_serials"], ["SN-001", "SN-002", "SN-101"])
-                self.assertEqual(payload["params"], ["Flow", "Thrust"])
+                self.assertEqual(
+                    [str(value).split(":")[-1].strip().lower() for value in payload["params"]],
+                    ["flow", "thrust"],
+                )
                 self.assertIn("Program Alpha", str(payload["output_pdf"]))
                 self.assertIn("EDAT reports", str(payload["output_pdf"]))
+        finally:
+            window.close()
+            tmpdir = getattr(window, "_test_tmpdir", "")
+            if tmpdir:
+                shutil.rmtree(str(tmpdir), ignore_errors=True)
+
+    def test_auto_report_dialog_perf_plotters_emit_selector_values(self) -> None:
+        window = self._make_window()
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                repo = Path(td) / "repo"
+                repo.mkdir(parents=True, exist_ok=True)
+                db_path = Path(td) / "cache.sqlite3"
+                db_path.write_text("", encoding="utf-8")
+                window._plot_ready = True
+                window._db_path = db_path
+                window._available_program_filters = ["Program Alpha"]
+                window._checked_program_filters = ["Program Alpha"]
+                window._available_control_period_filters = ["10"]
+                window._checked_control_period_filters = ["10"]
+                window._available_suppression_voltage_filters = ["5"]
+                window._checked_suppression_voltage_filters = ["5"]
+                window._available_valve_voltage_filters = ["28"]
+                window._checked_valve_voltage_filters = ["28"]
+                window._available_serial_filter_rows = [
+                    {"serial": "SN-001", "program_title": "Program Alpha"},
+                    {"serial": "SN-002", "program_title": "Program Alpha"},
+                ]
+                window._checked_serial_filters = ["SN-001", "SN-002"]
+                window._global_filter_rows = [
+                    {
+                        "serial": "SN-001",
+                        "program_title": "Program Alpha",
+                        "source_run_name": "Seq 1",
+                        "control_period": 10.0,
+                        "suppression_voltage": 5.0,
+                        "valve_voltage": 28.0,
+                    },
+                    {
+                        "serial": "SN-002",
+                        "program_title": "Program Alpha",
+                        "source_run_name": "Seq 2",
+                        "control_period": 10.0,
+                        "suppression_voltage": 5.0,
+                        "valve_voltage": 28.0,
+                    },
+                ]
+                window._run_selection_views = {
+                    "sequence": [
+                        {
+                            "mode": "sequence",
+                            "id": "sequence:seq-group",
+                            "run_name": "run_seq1",
+                            "program_title": "Program Alpha",
+                            "member_programs": ["Program Alpha"],
+                            "member_runs": ["run_seq1", "run_seq2"],
+                            "member_sequences": ["Seq 1", "Seq 2"],
+                            "member_control_periods": ["10"],
+                            "member_suppression_voltages": ["5"],
+                            "member_valve_voltages": ["28"],
+                            "member_run_type_modes": ["pulsed_mode"],
+                        },
+                    ],
+                    "condition": [],
+                }
+
+                captured: dict[str, object] = {}
+
+                def _selector_options(_context, *, run_names=None, surface="", raw_names=None):
+                    return [
+                        {
+                            "value": "parameter:chamber_feed_pressure",
+                            "label": "Chamber Feed Pressure (psia)",
+                            "display_name": "Chamber Feed Pressure",
+                            "preferred_units": "psia",
+                            "raw_names": ["feed_pressure_raw", "chamber_press"],
+                        },
+                        {
+                            "value": "parameter:thrust",
+                            "label": "Thrust (lbf)",
+                            "display_name": "Thrust",
+                            "preferred_units": "lbf",
+                            "raw_names": ["thrust_raw", "gross_thrust"],
+                        },
+                    ]
+
+                def _selection_raw_names(_context, selection_value, *, run_names=None, surface="", raw_names=None):
+                    run_name = str((run_names or [""])[0] or "").strip()
+                    mapping = {
+                        ("parameter:chamber_feed_pressure", "run_seq1"): ["feed_pressure_raw"],
+                        ("parameter:chamber_feed_pressure", "run_seq2"): ["chamber_press"],
+                        ("parameter:thrust", "run_seq1"): ["thrust_raw"],
+                        ("parameter:thrust", "run_seq2"): ["gross_thrust"],
+                    }
+                    return mapping.get((str(selection_value or "").strip(), run_name), [str(selection_value or "").strip()])
+
+                def _td_columns(_db_path, run_name):
+                    cols_by_run = {
+                        "run_seq1": [
+                            {"name": "feed_pressure_raw", "units": "psia"},
+                            {"name": "thrust_raw", "units": "lbf"},
+                        ],
+                        "run_seq2": [
+                            {"name": "chamber_press", "units": "psia"},
+                            {"name": "gross_thrust", "units": "lbf"},
+                        ],
+                    }
+                    return list(cols_by_run.get(str(run_name or "").strip(), []))
+
+                def _run_dialog() -> int:
+                    dialog = next(
+                        widget
+                        for widget in self._app.topLevelWidgets()
+                        if isinstance(widget, QtWidgets.QDialog) and widget.windowTitle() == "Auto Report Options"
+                    )
+                    hidden_serials = dialog.findChild(QtWidgets.QListWidget, "auto_report_certification_serials")
+                    hidden_params = dialog.findChild(QtWidgets.QListWidget, "auto_report_certification_params")
+                    perf_table = next(
+                        table
+                        for table in dialog.findChildren(QtWidgets.QTableWidget)
+                        if table.columnCount() == 4
+                    )
+                    self.assertIsNotNone(hidden_serials)
+                    self.assertIsNotNone(hidden_params)
+
+                    if not hidden_serials.selectedItems():
+                        hidden_serials.clearSelection()
+                        hidden_serials.selectionModel().select(
+                            hidden_serials.model().index(0, 0),
+                            QtCore.QItemSelectionModel.SelectionFlag.ClearAndSelect
+                            | QtCore.QItemSelectionModel.SelectionFlag.Rows,
+                        )
+                    for i in range(hidden_params.count()):
+                        hidden_params.item(i).setCheckState(QtCore.Qt.CheckState.Checked)
+                    self._app.processEvents()
+
+                    add_btn = next(btn for btn in dialog.findChildren(QtWidgets.QPushButton) if btn.text() == "Add Equation")
+                    add_btn.click()
+                    self._app.processEvents()
+
+                    cbx = perf_table.cellWidget(0, 0)
+                    cby = perf_table.cellWidget(0, 1)
+                    self.assertIsInstance(cbx, QtWidgets.QComboBox)
+                    self.assertIsInstance(cby, QtWidgets.QComboBox)
+                    idx_x = cbx.findData("parameter:chamber_feed_pressure")
+                    idx_y = cby.findData("parameter:thrust")
+                    self.assertGreaterEqual(idx_x, 0)
+                    self.assertGreaterEqual(idx_y, 0)
+                    cbx.setCurrentIndex(idx_x)
+                    cby.setCurrentIndex(idx_y)
+                    self._app.processEvents()
+
+                    gen_btn = next(btn for btn in dialog.findChildren(QtWidgets.QPushButton) if btn.text() == "Generate Report")
+                    gen_btn.click()
+                    return int(QtWidgets.QDialog.DialogCode.Accepted)
+
+                def _capture_payload(*args, **_kwargs) -> None:
+                    payload = args[-1] if args else {}
+                    captured["payload"] = dict(payload)
+
+                with patch("ui_next.qt_main.be.get_repo_root", return_value=repo), patch(
+                    "ui_next.qt_main.be.td_cached_statistics", return_value=["mean"]
+                ), patch(
+                    "ui_next.qt_main.be.load_trend_auto_report_config",
+                    return_value={"grading": {"zscore_pass_max": 1.5, "zscore_watch_max": 2.5}},
+                ), patch(
+                    "ui_next.qt_main.be.load_excel_trend_config", return_value={}
+                ), patch(
+                    "ui_next.qt_main.be.td_list_y_columns", side_effect=_td_columns
+                ), patch(
+                    "ui_next.qt_main.be.td_build_parameter_selector_options", side_effect=_selector_options
+                ), patch(
+                    "ui_next.qt_main.be.td_parameter_selection_raw_names", side_effect=_selection_raw_names
+                ), patch.object(
+                    TestDataTrendDialog, "_run_auto_report", side_effect=_capture_payload
+                ), patch(
+                    "ui_next.qt_main.QtWidgets.QMessageBox.information"
+                ) as info_mock, patch(
+                    "ui_next.qt_main.QtWidgets.QDialog.exec",
+                    side_effect=_run_dialog,
+                ), patch(
+                    "ui_next.qt_main._fit_widget_to_screen",
+                    lambda *_args, **_kwargs: None,
+                ):
+                    window._open_auto_report_options()
+
+                info_mock.assert_not_called()
+                payload = captured["payload"]
+                self.assertEqual(
+                    payload["params"],
+                    ["parameter:chamber_feed_pressure", "parameter:thrust"],
+                )
+                self.assertEqual(len(payload["performance_plotters"]), 1)
+                perf_plotter = payload["performance_plotters"][0]
+                self.assertEqual(perf_plotter["x"], {"selection_value": "parameter:chamber_feed_pressure"})
+                self.assertEqual(perf_plotter["y"], {"selection_value": "parameter:thrust"})
+                self.assertNotIn("column", perf_plotter["x"])
+                self.assertNotIn("column", perf_plotter["y"])
         finally:
             window.close()
             tmpdir = getattr(window, "_test_tmpdir", "")
