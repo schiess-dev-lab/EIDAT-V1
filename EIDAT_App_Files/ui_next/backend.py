@@ -13181,6 +13181,7 @@ def _sync_td_support_workbook_program_sheets(
     global_repo: Path | None,
     project_dir: Path | None = None,
     param_defs: list[dict] | None = None,
+    source_rows: Sequence[Mapping[str, object]] | None = None,
 ) -> dict:
     wb_path = Path(workbook_path).expanduser()
     proj_dir = Path(project_dir).expanduser() if project_dir is not None else wb_path.parent
@@ -13203,17 +13204,29 @@ def _sync_td_support_workbook_program_sheets(
         if selected
         else []
     )
+    discovery_docs = [
+        dict(row)
+        for row in (source_rows or [])
+        if isinstance(row, Mapping)
+        and (
+            str(row.get("excel_sqlite_rel") or "").strip()
+            or str(row.get("artifacts_rel") or "").strip()
+            or str(row.get("metadata_rel") or "").strip()
+        )
+    ]
+    if not discovery_docs:
+        discovery_docs = [dict(row) for row in chosen_docs if isinstance(row, Mapping)]
     discovered_program_titles = sorted(
         {
             str(doc.get("program_title") or "").strip()
-            for doc in chosen_docs
+            for doc in discovery_docs
             if isinstance(doc, dict) and str(doc.get("program_title") or "").strip()
         }
     )
-    discovered_runs_by_program = _discover_td_runs_by_program_for_docs(repo, chosen_docs) if chosen_docs else {}
-    discovered_sequence_names = _discover_td_runs_for_docs(repo, chosen_docs) if chosen_docs else []
+    discovered_runs_by_program = _discover_td_runs_by_program_for_docs(repo, discovery_docs) if discovery_docs else {}
+    discovered_sequence_names = _discover_td_runs_for_docs(repo, discovery_docs) if discovery_docs else []
     discovered_sequence_context_by_program = (
-        _discover_td_sequence_context_by_program_for_docs(repo, chosen_docs) if chosen_docs else {}
+        _discover_td_sequence_context_by_program_for_docs(repo, discovery_docs) if discovery_docs else {}
     )
     clean_param_defs = [
         dict(d)
@@ -14476,6 +14489,13 @@ def _td_effective_run_condition_label(
 ) -> str:
     if not isinstance(row, Mapping):
         return str(fallback_display_name or "").strip()
+    source_run_name = str(row.get("source_run_name") or "").strip()
+    explicit_display = str(row.get("display_name") or "").strip()
+    if explicit_display and source_run_name and not _td_support_name_is_default(explicit_display, source_run_name):
+        return explicit_display
+    explicit_fallback = str(fallback_display_name or "").strip()
+    if explicit_fallback and source_run_name and not _td_support_name_is_default(explicit_fallback, source_run_name):
+        return explicit_fallback
     derived = td_build_run_condition_label(dict(row))
     if derived:
         return derived
@@ -18990,7 +19010,25 @@ def _rebuild_test_data_project_calc_cache_from_raw(
         )
         for (condition_key, serial_txt), meta in aggregated_obs_meta.items():
             condition_meta = dict(condition_meta_by_key.get(condition_key) or {})
-            run_display_name = str(condition_meta.get("display_name") or condition_key).strip() or condition_key
+            condition_sequence_rows = sequence_rows_by_condition.get(condition_key) or []
+            sequence_condition_display = _td_unique_sequence_text(
+                condition_sequence_rows,
+                TD_SEQUENCE_OBS_CONDITION_DISPLAY_IDX,
+            )
+            support_display_candidate = str(
+                condition_meta.get("display_name") or condition_meta.get("condition_display") or ""
+            ).strip()
+            if _td_support_name_is_default(support_display_candidate, condition_key):
+                support_display_candidate = ""
+            raw_display_candidate = str((raw_run_defaults.get(condition_key) or {}).get("condition_display") or "").strip()
+            if _td_support_name_is_default(raw_display_candidate, condition_key):
+                raw_display_candidate = ""
+            run_display_name = _td_first_text_from_values(
+                support_display_candidate,
+                raw_display_candidate,
+                sequence_condition_display,
+                condition_key,
+            )
             default_x = "Time"
             member_source_runs = sorted({str(v).strip() for v in (meta.get("source_run_names") or set()) if str(v).strip()})
             for source_run in member_source_runs:
@@ -18998,7 +19036,6 @@ def _rebuild_test_data_project_calc_cache_from_raw(
                 if raw_default:
                     default_x = raw_default
                     break
-            condition_sequence_rows = sequence_rows_by_condition.get(condition_key) or []
             run_pulse_width_value = _td_first_finite_from_values(
                 condition_meta.get("pulse_width_on"),
                 condition_meta.get("pulse_width"),
@@ -19024,10 +19061,10 @@ def _rebuild_test_data_project_calc_cache_from_raw(
             )
             run_metadata_row = {
                 "condition_display": _td_first_text_from_values(
-                    condition_meta.get("condition_display"),
-                    (raw_run_defaults.get(condition_key) or {}).get("condition_display"),
-                    run_display_name,
+                    support_display_candidate,
+                    raw_display_candidate,
                     _td_unique_sequence_text(condition_sequence_rows, TD_SEQUENCE_OBS_CONDITION_DISPLAY_IDX),
+                    run_display_name,
                 ),
                 "feed_pressure": _td_first_finite_from_values(
                     condition_meta.get("feed_pressure"),
@@ -38124,6 +38161,7 @@ def update_test_data_trending_project_workbook(
             global_repo=repo,
             project_dir=project_dir,
             param_defs=cfg_cols,
+            source_rows=materialized_source_rows,
         )
         _refresh_td_support_run_conditions_sheet(
             wb_path,
@@ -46090,17 +46128,19 @@ def create_eidat_project(
             ),
         )
         support_workbook_path = td_support_workbook_path_for(workbook_path, project_dir=project_dir)
-        sequences_by_program = _discover_td_runs_by_program_for_docs(repo, chosen_docs)
+        support_source_rows = _td_materialize_source_rows(repo, chosen_docs, docs_pool=docs)
+        support_discovery_docs = support_source_rows or chosen_docs
+        sequences_by_program = _discover_td_runs_by_program_for_docs(repo, support_discovery_docs)
         _ensure_file_written(
             support_workbook_path,
             create_fn=lambda: _write_td_support_workbook(
                 support_workbook_path,
-                sequence_names=_discover_td_runs_for_docs(repo, chosen_docs) or ["Run1"],
+                sequence_names=_discover_td_runs_for_docs(repo, support_discovery_docs) or ["Run1"],
                 param_defs=list(cfg.get("columns") or []),
                 program_titles=sorted(
                     {
                         str(doc.get("program_title") or "").strip()
-                        for doc in (chosen_docs or [])
+                        for doc in (support_discovery_docs or [])
                         if isinstance(doc, dict) and str(doc.get("program_title") or "").strip()
                     }
                 ),
@@ -46112,6 +46152,7 @@ def create_eidat_project(
             global_repo=repo,
             project_dir=project_dir,
             param_defs=list(cfg.get("columns") or []),
+            source_rows=support_source_rows,
         )
         _refresh_td_support_run_conditions_sheet(
             workbook_path,

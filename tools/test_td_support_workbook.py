@@ -10063,6 +10063,132 @@ class TestTDSupportWorkbook(unittest.TestCase):
             self.assertEqual([item.get("display_text") for item in selection_views.get("condition") or []], [expected_label])
             self.assertEqual([item.get("run_condition") for item in selection_views.get("sequence") or []], [expected_label])
 
+    def test_support_sync_creates_workbook_with_sequence_context_metadata_from_source_rows(self) -> None:
+        from openpyxl import Workbook  # type: ignore
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            src_db = root / "src.sqlite3"
+            self._make_source_sqlite_with_sequence_context(
+                src_db,
+                run_type="PM",
+                on_time_value=0.016,
+                off_time_value=1.984,
+                nominal_pf_value=257.0,
+            )
+            wb_path = root / "project.xlsx"
+            Workbook().save(str(wb_path))
+
+            be._sync_td_support_workbook_program_sheets(
+                wb_path,
+                global_repo=root,
+                project_dir=root,
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+                source_rows=[{"serial_number": "SN1", "program_title": "P267", "excel_sqlite_rel": str(src_db)}],
+            )
+            be._refresh_td_support_run_conditions_sheet(
+                wb_path,
+                project_dir=root,
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+            )
+            support_cfg = be._read_td_support_workbook(wb_path, project_dir=root)
+
+        seq = (support_cfg.get("sequences") or [])[0]
+        cond = (support_cfg.get("run_conditions") or [])[0]
+        self.assertEqual(str(seq.get("source_run_name") or ""), "RunA")
+        self.assertEqual(str(seq.get("display_name") or ""), "257 psia, PM, 0.016 Sec ON / 1.984 Sec OFF")
+        self.assertEqual(str(cond.get("display_name") or ""), "257 psia, PM, 0.016 Sec ON / 1.984 Sec OFF")
+        self.assertAlmostEqual(float(seq.get("feed_pressure") or 0.0), 257.0)
+        self.assertEqual(str(seq.get("feed_pressure_units") or ""), "psia")
+        self.assertEqual(str(seq.get("run_type") or ""), "PM")
+        self.assertAlmostEqual(float(seq.get("pulse_width_on") or 0.0), 0.016)
+        self.assertAlmostEqual(float(seq.get("off_time") or 0.0), 1.984)
+        self.assertAlmostEqual(float(seq.get("control_period") or 0.0), 2.0)
+
+    def test_support_sync_enriches_existing_default_rows_from_sequence_context(self) -> None:
+        from openpyxl import Workbook  # type: ignore
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            src_db = root / "src.sqlite3"
+            self._make_source_sqlite_with_sequence_context(src_db, nominal_pf_value=350.0, run_type="SS")
+            wb_path = root / "project.xlsx"
+            Workbook().save(str(wb_path))
+            support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+            be._write_td_support_workbook(
+                support_path,
+                sequence_names=["RunA"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+                program_titles=["P267"],
+                sequences_by_program={"P267": ["RunA"]},
+            )
+
+            be._sync_td_support_workbook_program_sheets(
+                wb_path,
+                global_repo=root,
+                project_dir=root,
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+                source_rows=[{"serial_number": "SN1", "program_title": "P267", "excel_sqlite_rel": str(src_db)}],
+            )
+            support_cfg = be._read_td_support_workbook(wb_path, project_dir=root)
+
+        seq = (support_cfg.get("sequences") or [])[0]
+        self.assertEqual(str(seq.get("display_name") or ""), "350 psia, SS")
+        self.assertAlmostEqual(float(seq.get("feed_pressure") or 0.0), 350.0)
+        self.assertEqual(str(seq.get("run_type") or ""), "SS")
+
+    def test_support_sync_preserves_manual_condition_values_over_sequence_context(self) -> None:
+        from openpyxl import Workbook, load_workbook  # type: ignore
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            src_db = root / "src.sqlite3"
+            self._make_source_sqlite_with_sequence_context(src_db, nominal_pf_value=257.0, run_type="PM")
+            wb_path = root / "project.xlsx"
+            Workbook().save(str(wb_path))
+            support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+            be._write_td_support_workbook(
+                support_path,
+                sequence_names=["RunA"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+                program_titles=["P267"],
+                sequences_by_program={"P267": ["RunA"]},
+            )
+            wb = load_workbook(str(support_path))
+            try:
+                ws = wb[be._td_support_program_sheet_name("P267", 0)]
+                self._set_sheet_row(
+                    ws,
+                    2,
+                    {
+                        "condition_key": "Manual Condition",
+                        "display_name": "Manual Condition",
+                        "feed_pressure": 999.0,
+                        "feed_pressure_units": "psia",
+                    },
+                )
+                wb.save(str(support_path))
+            finally:
+                wb.close()
+
+            be._sync_td_support_workbook_program_sheets(
+                wb_path,
+                global_repo=root,
+                project_dir=root,
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+                source_rows=[{"serial_number": "SN1", "program_title": "P267", "excel_sqlite_rel": str(src_db)}],
+            )
+            support_cfg = be._read_td_support_workbook(wb_path, project_dir=root)
+
+        seq = (support_cfg.get("sequences") or [])[0]
+        self.assertEqual(str(seq.get("condition_key") or ""), "Manual Condition")
+        self.assertEqual(str(seq.get("display_name") or ""), "Manual Condition")
+        self.assertAlmostEqual(float(seq.get("feed_pressure") or 0.0), 999.0)
+        self.assertEqual(str(seq.get("run_type") or ""), "PM")
+
     def test_run_condition_debug_flags_cache_default_label_despite_support_metadata(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
 
@@ -10164,6 +10290,11 @@ class TestTDSupportWorkbook(unittest.TestCase):
             self.assertTrue(Path(str(result.get("implementation_excel") or "")).exists())
             self.assertTrue(Path(str(result.get("run_condition_debug_path") or "")).exists())
             self.assertIsInstance(result.get("run_condition_debug"), dict)
+            support_cfg = be._read_td_support_workbook(wb_path, project_dir=root)
+            support_seq = (support_cfg.get("sequences") or [])[0]
+            self.assertEqual(str(support_seq.get("display_name") or "").strip(), "257 psia, PM, 0.016 Sec ON / 1.984 Sec OFF")
+            self.assertAlmostEqual(float(support_seq.get("feed_pressure") or 0.0), 257.0)
+            self.assertEqual(str(support_seq.get("run_type") or "").strip(), "PM")
 
             with sqlite3.connect(str(impl_db)) as conn:
                 calc_names = {
@@ -10198,6 +10329,12 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 self.assertIn("feed temperature", {row["parameter_name"] for row in metric_rows})
             finally:
                 wb.close()
+
+            selection_views = be.td_list_run_selection_views(impl_db, wb_path)
+            self.assertEqual(
+                [item.get("display_text") for item in selection_views.get("condition") or []],
+                ["257 psia, PM, 0.016 Sec ON / 1.984 Sec OFF"],
+            )
 
     def test_project_cache_does_not_duplicate_measured_feed_pressure_metric(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
